@@ -22,13 +22,13 @@ Launch the panel:
 - In a SINGLE message, launch two background subagents via the `Agent` tool, each with the identical brief as its prompt:
   - `codex-rescue` (subagent type `codex:codex-rescue`)
   - `grok-rescue` (subagent type `grok:grok-rescue`; use plain `grok-rescue` if the namespaced form is not found)
-- Add `deep-reasoner` as a third track only when the user asks for a three way panel or the question hinges on Claude native long horizon reasoning.
+- Add `fusion:deep-reasoner` as a third track only when the user asks for a three way panel or the question hinges on Claude native long horizon reasoning.
 
 Degrade when a track is unavailable:
 
 - A panel never runs with fewer than two tracks. Two isolated instances of the same model still measurably outperform one; the independent synthesis carries much of the lift.
-- If a track fails to launch because its agent type does not exist (plugin not installed) or returns an unavailability line such as `grok unavailable: ...`, do not abort the panel: rerun the missing track as `deep-reasoner` with the identical brief, and note the substitution in the final synthesis.
-- If neither external engine is available, run a Claude only panel: two `deep-reasoner` tracks with explicitly different lenses (prefix one brief with "Adopt a risk first lens." and the other with "Adopt a simplest viable answer lens."), and tell the user the panel ran without external engines.
+- If a track fails to launch because its agent type does not exist (plugin not installed) or returns an unavailability line such as `grok unavailable: ...`, do not abort the panel: rerun the missing track as `fusion:deep-reasoner` (plain `deep-reasoner` if the namespaced form is not found) with the identical brief, and note the substitution in the final synthesis.
+- If neither external engine is available, run a Claude only panel: two `fusion:deep-reasoner` (plain `deep-reasoner` if the namespaced form is not found) tracks with explicitly different lenses (prefix one brief with "Adopt a risk first lens." and the other with "Adopt a simplest viable answer lens."), and tell the user the panel ran without external engines.
 - Availability failures are infrastructure, not verdicts; never present a missing engine as agreeing or disagreeing.
 
 Wait and stay blind:

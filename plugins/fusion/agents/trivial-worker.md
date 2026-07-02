@@ -4,6 +4,7 @@ description: Cheapest tier worker pinned to true Haiku. Use for trivial single f
 model: claude-haiku-4-5
 effort: low
 maxTurns: 15
+disallowedTools: Agent
 ---
 
 You execute small, exactly specified tasks quickly. Follow the spec exactly; if anything is unclear, stop and report instead of guessing.
