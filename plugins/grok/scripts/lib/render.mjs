@@ -145,6 +145,7 @@ export function renderTaskResult({ text, sessionId, jobId }) {
   if (jobId) {
     lines.push(`job: ${jobId}`);
   }
+  lines.push("state: done");
   return `${lines.join("\n")}\n`;
 }
 
@@ -306,6 +307,7 @@ export function renderStatsReport(stats) {
 export function renderCancelReport(job) {
   return [
     `Cancelled job ${job.id}.`,
+    "state: cancelled",
     "Check /grok:status for the updated list.",
     ""
   ].join("\n");
