@@ -14,7 +14,7 @@ Compose the brief:
 - Write ONE neutral, self contained brief containing: the decision or question, the constraints that bound the answer, the relevant file paths, and what a good answer must address.
 - Never include a candidate answer, a leaning, any prior model opinion, or any context from this conversation. The panel is blind; a brief that hints at a preferred answer is invalid.
 - End the brief with: "This is a consultation. Analyze and recommend; do not modify any files."
-- Save the exact brief text to a file with `Write` before launching any track, so the text every engine received is traceable.
+- Save the exact brief text to a file with `Write` before launching any track, so the text every engine received is traceable. Save it outside the repository (a temp directory or the session scratchpad); the panel must never dirty the working tree.
 - If the request is too thin to build a self contained brief, ask the user for the missing constraints before launching.
 
 Launch the panel:
@@ -26,7 +26,7 @@ Launch the panel:
 
 Degrade when a track is unavailable:
 
-- A panel never runs with fewer than two tracks. Two isolated instances of the same model still measurably outperform one; the independent synthesis carries much of the lift.
+- A panel never runs with fewer than two tracks. Two isolated instances of the same model still tend to outperform one in published multi-model deliberation results; the independent synthesis carries much of the lift.
 - If a track fails to launch because its agent type does not exist (plugin not installed) or returns an unavailability line such as `grok unavailable: ...`, do not abort the panel: rerun the missing track as `fusion:deep-reasoner` (plain `deep-reasoner` if the namespaced form is not found) with the identical brief, and note the substitution in the final synthesis.
 - If neither external engine is available, run a Claude only panel: two `fusion:deep-reasoner` (plain `deep-reasoner` if the namespaced form is not found) tracks with explicitly different lenses (prefix one brief with "Adopt a risk first lens." and the other with "Adopt a simplest viable answer lens."), and tell the user the panel ran without external engines.
 - Availability failures are infrastructure, not verdicts; never present a missing engine as agreeing or disagreeing.

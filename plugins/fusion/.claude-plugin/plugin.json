@@ -1,9 +1,9 @@
 {
   "name": "fusion",
-  "version": "0.0.2",
-  "description": "Multi-model orchestration: tier agents, routing rules, a blind two engine panel, and a model drift doctor.",
+  "version": "0.0.3",
+  "description": "Multi-model orchestration: tier agents, routing rules, a blind multi-model panel, and a model drift doctor.",
   "author": {
-    "name": "okisdev"
+    "name": "Harry Yep"
   },
   "license": "MIT"
 }

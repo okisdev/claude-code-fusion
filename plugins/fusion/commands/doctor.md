@@ -14,8 +14,8 @@ Environment overrides captured at invocation:
 
 Checks to perform:
 
-1. A set CLAUDE_CODE_SUBAGENT_MODEL silently overrides every agent model pin; flag it as a problem unless the user says it is deliberate.
-2. Read ~/.claude/settings.json and report the `model` key. It should be an alias, preferably `best[1m]` (Fable when available, latest Opus otherwise, floats to future releases). Flag any dated full model ID as a rot risk. Also confirm grok@claude-code-fusion, fusion@claude-code-fusion, and codex@openai-codex appear in enabledPlugins.
+1. A set CLAUDE_CODE_SUBAGENT_MODEL can silently override every agent model pin (Claude Code behavior as observed on 2.1.x); flag it as a problem unless the user says it is deliberate.
+2. Read ~/.claude/settings.json and report the `model` key. It should be an alias, preferably `best[1m]` (Fable when available, latest Opus otherwise, floats to future releases). Flag any dated full model ID as a rot risk. Also confirm grok@claude-code-fusion and fusion@claude-code-fusion appear in enabledPlugins; codex@openai-codex is optional, and its absence only means the codex track degrades.
 3. Read the frontmatter of every file in ${CLAUDE_PLUGIN_ROOT}/agents/ and report each `model` value. Alias pins (opus, sonnet, haiku) float to new releases automatically and are healthy. Full model ID pins are rot risks; fusion:trivial-worker's claude-haiku-4-5 pin is deliberate on machines where ANTHROPIC_DEFAULT_HAIKU_MODEL remaps the haiku alias, but it must be bumped by hand when a newer cheap tier ships.
 4. List ~/.claude/agents/ if it exists. A file whose name matches a plugin agent (deep-reasoner, fast-worker, trivial-worker) registers as a duplicate agent alongside the fusion: namespaced one and confuses auto delegation; flag it as a stale leftover to delete unless the user says it is a deliberate local override.
 5. Compare ~/.claude/rules/orchestration.md against ${CLAUDE_PLUGIN_ROOT}/rules/orchestration.md. Missing or drifted means the routing policy is stale; point at /fusion:setup to install or update it.

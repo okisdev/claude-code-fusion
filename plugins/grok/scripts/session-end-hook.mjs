@@ -38,7 +38,8 @@ function main() {
         status: "cancelled",
         pid: null,
         grokPid: null,
-        finishedAt: new Date().toISOString()
+        finishedAt: new Date().toISOString(),
+        failureKind: "cancelled"
       });
     } catch {
       continue;

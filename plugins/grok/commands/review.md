@@ -18,7 +18,7 @@ Core constraint:
 Execution mode rules:
 
 - Estimate the review size first: `git status --short --untracked-files=all` plus `git diff --shortstat` and `git diff --shortstat --cached`, or `git diff --shortstat <base>...HEAD` when `--base` is given.
-- Treat untracked files as reviewable work even when the diff stat is empty.
+- Treat untracked files as reviewable work even when the diff stat is empty, and note that untracked files reach the review as a name list only, not content; say so when findings depend on new files.
 - Recommend waiting only when the review is clearly tiny, roughly 1 or 2 files. In every other case, including unclear size, recommend background.
 - Use `AskUserQuestion` exactly once with two options, putting the recommended option first and suffixing its label with `(Recommended)`:
   - `Wait for results`

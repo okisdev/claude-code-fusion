@@ -115,6 +115,14 @@ function parsePositiveInteger(value, flag) {
   return parsed;
 }
 
+function parseBestOfN(value) {
+  const parsed = parsePositiveInteger(value, "--best-of-n");
+  if (parsed < 2 || parsed > 10) {
+    throw new Error("Expected --best-of-n between 2 and 10.");
+  }
+  return parsed;
+}
+
 function sleepMs(ms) {
   Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
 }
@@ -224,7 +232,7 @@ function failJob(jobFile, logFile, result, timeoutMs) {
     errorTail: tail || message,
     failureKind
   });
-  throw new Error([message, `failure: ${failureKind}`, tail].filter(Boolean).join("\n"));
+  throw new Error([message, "state: error", `failure: ${failureKind}`, tail].filter(Boolean).join("\n"));
 }
 
 function describeLaunchFailure(error) {
@@ -232,6 +240,12 @@ function describeLaunchFailure(error) {
     return `The grok CLI (${resolveGrokBin()}) was not found on PATH. Install and authenticate it, then run /grok:setup to verify.`;
   }
   return error instanceof Error ? error.message : String(error);
+}
+
+function launchFailureError(error) {
+  return new Error(
+    [describeLaunchFailure(error), "state: error", `failure: ${classifyFailure({ spawnError: error })}`].join("\n")
+  );
 }
 
 function recordSpawnFailure(jobFile, error) {
@@ -273,7 +287,7 @@ async function handleTask(argv) {
     prompt = CONTINUE_PROMPT;
   }
 
-  const bestOfN = options["best-of-n"] ? parsePositiveInteger(options["best-of-n"], "--best-of-n") : null;
+  const bestOfN = options["best-of-n"] ? parseBestOfN(options["best-of-n"]) : null;
   const maxTurns = options["max-turns"] ? parsePositiveInteger(options["max-turns"], "--max-turns") : null;
   const mode = options.write || bestOfN ? "write" : "consult";
 
@@ -329,7 +343,7 @@ async function handleTask(argv) {
     });
   } catch (error) {
     recordSpawnFailure(jobFile, error);
-    throw new Error(describeLaunchFailure(error));
+    throw launchFailureError(error);
   }
 
   if (result.exitCode !== 0 || result.timedOut) {
@@ -562,7 +576,7 @@ async function handleReview(argv) {
     first = await runGrok({ briefFile, mode: "consult", cwd, logFile, timeoutMs, onSpawn: recordGrokPid });
   } catch (error) {
     recordSpawnFailure(jobFile, error);
-    throw new Error(describeLaunchFailure(error));
+    throw launchFailureError(error);
   }
   if (first.exitCode !== 0 || first.timedOut) {
     failJob(jobFile, logFile, first, timeoutMs);
@@ -587,7 +601,7 @@ async function handleReview(argv) {
       });
     } catch (error) {
       recordSpawnFailure(jobFile, error);
-      throw new Error(describeLaunchFailure(error));
+      throw launchFailureError(error);
     }
     if (retry.exitCode === 0 && !retry.timedOut) {
       review = evaluateReviewText(retry.text);

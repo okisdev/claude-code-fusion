@@ -5,15 +5,15 @@
     "email": "hi@okis.dev"
   },
   "metadata": {
-    "description": "Personal multi-model orchestration marketplace.",
-    "version": "0.0.2"
+    "description": "Multi-model orchestration marketplace for Claude Code.",
+    "version": "0.0.3"
   },
   "plugins": [
     {
       "name": "grok",
       "source": "./plugins/grok",
-      "description": "Delegate coding, review, and second-opinion work to the local Grok CLI.",
-      "version": "0.0.2",
+      "description": "Delegate coding, review, and second opinion work to the local Grok CLI.",
+      "version": "0.0.3",
       "author": {
         "name": "Harry Yep"
       }
@@ -21,8 +21,8 @@
     {
       "name": "fusion",
       "source": "./plugins/fusion",
-      "description": "Multi-model orchestration commands for high stakes decisions.",
-      "version": "0.0.2",
+      "description": "Multi-model orchestration: tier agents, routing rules, a blind multi-model panel, and a model drift doctor.",
+      "version": "0.0.3",
       "author": {
         "name": "Harry Yep"
       }
