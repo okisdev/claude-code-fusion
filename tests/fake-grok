@@ -1,0 +1,131 @@
+#!/usr/bin/env node
+(async () => {
+  const fs = await import("node:fs");
+
+  const argsFile = process.env.FAKE_GROK_ARGS_FILE;
+  if (argsFile) {
+    fs.appendFileSync(argsFile, JSON.stringify(process.argv.slice(2)) + "\n");
+  }
+
+  const mode = process.env.FAKE_GROK_MODE || "ok";
+
+  const reviewObject = {
+    verdict: "needs-attention",
+    findings: [
+      {
+        severity: "high",
+        title: "Example finding",
+        body: "Example body describing the defect.",
+        file: "src/app.mjs",
+        line_start: 10,
+        line_end: 12,
+        confidence: 0.9,
+        recommendation: "Fix the defect before merging."
+      }
+    ],
+    next_steps: ["Run the tests."]
+  };
+
+  const emit = (envelope) => {
+    process.stdout.write(JSON.stringify(envelope) + "\n");
+  };
+
+  if (mode === "ok") {
+    emit({
+      text: "FAKE-OK",
+      stopReason: "EndTurn",
+      sessionId: "11111111-1111-7111-8111-111111111111",
+      requestId: "req-1"
+    });
+    process.exit(0);
+  }
+
+  if (mode === "review-ok") {
+    emit({
+      text: "```json\n" + JSON.stringify(reviewObject) + "\n```",
+      stopReason: "EndTurn",
+      sessionId: "33333333-3333-7333-8333-333333333333",
+      requestId: "req-1"
+    });
+    process.exit(0);
+  }
+
+  if (mode === "badjson-then-ok") {
+    const counterFile = (argsFile || "fake-grok") + ".count";
+    let count = 0;
+    try {
+      count = Number(fs.readFileSync(counterFile, "utf8")) || 0;
+    } catch {}
+    fs.writeFileSync(counterFile, String(count + 1));
+    if (count === 0) {
+      emit({
+        text: "```markdown\nI could not produce the requested object, sorry.\n```",
+        stopReason: "EndTurn",
+        sessionId: "22222222-2222-7222-8222-222222222222",
+        requestId: "req-1"
+      });
+    } else {
+      emit({
+        text: "```json\n" + JSON.stringify(reviewObject) + "\n```",
+        stopReason: "EndTurn",
+        sessionId: "22222222-2222-7222-8222-222222222222",
+        requestId: "req-2"
+      });
+    }
+    process.exit(0);
+  }
+
+  if (mode === "badjson") {
+    emit({
+      text: "```markdown\nI still cannot produce the requested object.\n```",
+      stopReason: "EndTurn",
+      sessionId: "44444444-4444-7444-8444-444444444444",
+      requestId: "req-1"
+    });
+    process.exit(0);
+  }
+
+  if (mode === "gate-allow") {
+    emit({
+      text: "ALLOW\nNo blocking issues found.",
+      stopReason: "EndTurn",
+      sessionId: "55555555-5555-7555-8555-555555555555",
+      requestId: "req-1"
+    });
+    process.exit(0);
+  }
+
+  if (mode === "gate-block") {
+    emit({
+      text: "BLOCK: reason text\nExtra detail about the defect.",
+      stopReason: "EndTurn",
+      sessionId: "66666666-6666-7666-8666-666666666666",
+      requestId: "req-1"
+    });
+    process.exit(0);
+  }
+
+  if (mode === "error") {
+    process.stderr.write("Fake grok failed on purpose.\n");
+    process.exit(1);
+  }
+
+  if (mode === "rate-limit-error") {
+    process.stderr.write("429 too many requests\n");
+    process.exit(1);
+  }
+
+  if (mode === "auth-error") {
+    process.stderr.write("login required, AuthorizationRequired\n");
+    process.exit(1);
+  }
+
+  if (mode === "hang") {
+    process.on("SIGTERM", () => process.exit(143));
+    setTimeout(() => process.exit(0), 120000);
+    return;
+  }
+
+  process.stderr.write("Unknown FAKE_GROK_MODE: " + mode + "\n");
+  process.exit(2);
+})();
