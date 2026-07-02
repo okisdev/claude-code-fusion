@@ -1,5 +1,5 @@
 ---
-description: Convene a blind multi-model panel that fans one neutral brief out to Codex and Grok in parallel and adjudicates their verdicts
+description: Proactively use when the user is stuck between two approaches, faces a design or architecture decision where being wrong is expensive, has a diagnosis that resisted one fix, or asks to compare options or get multiple opinions. Convenes a blind Codex and Grok panel on one neutral brief and adjudicates the verdicts.
 argument-hint: '[decision or question to adjudicate]'
 allowed-tools: Write, Agent, Read, AskUserQuestion
 ---

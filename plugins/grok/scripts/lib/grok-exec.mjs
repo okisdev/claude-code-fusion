@@ -65,7 +65,10 @@ export function buildGrokArgs(options) {
   if (!bestOfN) {
     args.push("--no-subagents");
   }
-  args.push("--disable-web-search", "--max-turns", String(maxTurns));
+  if (!options.web) {
+    args.push("--disable-web-search");
+  }
+  args.push("--max-turns", String(maxTurns));
 
   if (options.model) {
     args.push("-m", options.model);

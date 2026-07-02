@@ -17,7 +17,7 @@ The facts below were verified live against grok 0.2.16 on 2026-07-02 and are imp
 - Consult mode: `--sandbox workspace --permission-mode dontAsk` with a narrow allow list (Read, Grep, git read commands) plus explicit deny rules for Edit, Write, and nested grok, claude, codex, and node launches.
 - The denies are load bearing: grok inherits permission allow rules from `~/.claude/settings.json` and deny beats allow (verified live). Without them, an inherited allow such as `Bash(node:*)` would silently extend a consult run beyond the documented read only surface. Inherited allows outside the deny list can still extend what a consult run may execute, so keep the global allowlist small.
 - Write mode: `--sandbox workspace --always-approve` with deny rules for sudo, `rm -rf`, `git push`, and nested grok, claude, and codex invocations. Everything else is auto approved.
-- `--no-subagents` stays on every call because grok auto discovers Claude Code agent definitions under `~/.claude/agents` and could otherwise recursively spawn them. Best-of-n runs are the exception, since the tournament needs subagents.
+- `--no-subagents` stays on every call because grok auto discovers Claude Code agent definitions under `~/.claude/agents` and could otherwise recursively spawn them. Best-of-n runs are the exception, since the tournament needs subagents. Web tools are disabled by default (`--disable-web-search`); the task subcommand's `--web` flag re-enables them for research briefs.
 
 ## Process lifecycle
 

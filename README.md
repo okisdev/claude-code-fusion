@@ -25,14 +25,15 @@ Then, in a new session, run `/fusion:setup` once per machine (it writes the rout
 
 | Command | What it does |
 |---|---|
-| `/grok:task <text>` | Delegate to Grok. `--write` allows edits, `--background` detaches, `--resume <uuid>` or `--resume-last` continues a thread; `--model`, `--effort`, and `--max-turns` forward explicit overrides |
+| `/grok:task <text>` | Delegate to Grok. `--write` allows edits, `--web` enables web tools for research, `--background` detaches, `--resume <uuid>` or `--resume-last` continues a thread; `--model`, `--effort`, and `--max-turns` forward explicit overrides |
 | `/grok:review [--base <ref>] [--focus <text>]` | Adversarial review of the working tree or a branch range (untracked files reach the review as names only); never applies fixes |
 | `/grok:best-of-n [--n <2-10>] <task>` | Implementation tournament in isolated worktrees; the winning candidate is applied. Keep n at 2; the companion rejects values outside 2 to 10 |
 | `/grok:status [job-id]`, `/grok:result <job-id>`, `/grok:cancel <job-id>` | Background job lifecycle |
 | `/grok:stats [--all]` | Grok delegation history by status, mode, and failure kind |
 | `/fusion:stats [--all]` | Delegation history across both grok and codex peers |
 | `/grok:setup` | Health check; `--enable-stop-gate` / `--disable-stop-gate` toggles the stop-time review gate |
-| `/fusion:panel <question>` | Blind multi-model panel with attributed adjudication, for decisions where a wrong answer is expensive |
+| `/fusion:panel <question>` | Blind multi-model panel with attributed adjudication, for decisions where a wrong answer is expensive. Also fires from plain language ("help me decide", "compare these") |
+| `/fusion:ultra <task>` | Fans a large task out as a fleet of parallel Grok and Codex agents billed to their own subscriptions, then synthesizes. Fires from "go deep", "audit everything", "be exhaustive"; skips small tasks |
 | `/fusion:setup` | Install or update the routing rules into `~/.claude/rules/`; offers the optional permission allow |
 | `/fusion:doctor` | Audit model pins, environment overrides, rules drift, and stale agent copies |
 
@@ -62,7 +63,7 @@ The grok plugin keeps job records, briefs, and logs under `~/.claude/plugins/dat
 
 - `.claude-plugin/marketplace.json`: the marketplace manifest; installs as marketplace `claude-code-fusion`.
 - `plugins/grok/`: the Grok integration (companion runtime, `grok-rescue` agent, `/grok:*` commands).
-- `plugins/fusion/`: the orchestration layer: tier agents (`agents/`), the routing policy payload (`rules/`), and the `/fusion:panel`, `/fusion:setup`, and `/fusion:doctor` commands.
+- `plugins/fusion/`: the orchestration layer: tier agents (`agents/`), the routing policy payload (`rules/`), and the `/fusion:panel`, `/fusion:setup`, `/fusion:doctor`, and `/fusion:stats` commands.
 - `tests/`: the fake-grok driven test suite.
 
 ## Internals

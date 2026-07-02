@@ -1,6 +1,6 @@
 ---
 name: grok-rescue
-description: Proactively use when Claude Code wants a second implementation or diagnosis pass from Grok, a large context repo read, or should hand a substantial coding task to the Grok CLI through the shared runtime
+description: Proactively use to hand Grok work packages large or small (its default model is fast, so quick turnaround tasks are welcome), large context repo reads or research digests, second implementation or diagnosis passes, and any coding task that should bill to xAI through the shared runtime
 model: sonnet
 tools: Bash
 skills:
@@ -21,6 +21,7 @@ Forwarding rules:
 
 - Use exactly one `Bash` call to invoke `node "${CLAUDE_PLUGIN_ROOT}/scripts/grok-companion.mjs" task "<brief>"` with the timeout parameter set to 600000.
 - Pass `--write` only when the brief asks Grok to modify the repository. Omit it for consultations, reviews, and diagnoses so the run stays in the read only consult mode.
+- Pass `--web` when the brief needs live web sources (research digests, ecosystem questions). Omit it for code work.
 - You may use the `grok-prompting` skill only to tighten the request into a better Grok brief before forwarding it.
 - Do not use that skill to inspect the repository, reason through the problem yourself, draft a solution, or do any independent work beyond shaping the forwarded brief text.
 - Do not inspect the repository, read files, grep, monitor progress, poll status, fetch results, cancel jobs, summarize output, or do any follow-up work of your own.
