@@ -107,6 +107,7 @@ test("foreground task renders the text plus grok-session and job lines", (t) => 
   assert.ok(result.stdout.includes("FAKE-OK"));
   assert.match(result.stdout, /^grok-session: 11111111-1111-7111-8111-111111111111$/m);
   assert.match(result.stdout, /^job: [0-9a-f]{8}$/m);
+  assert.match(result.stdout, /^state: done$/m);
 });
 
 test("foreground task exits nonzero when grok fails", (t) => {

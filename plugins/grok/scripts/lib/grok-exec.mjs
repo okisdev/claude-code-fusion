@@ -19,6 +19,15 @@ const CONSULT_ALLOW_RULES = [
   "Bash(git blame*)"
 ];
 
+const CONSULT_DENY_RULES = [
+  "Edit",
+  "Write",
+  "Bash(grok*)",
+  "Bash(claude*)",
+  "Bash(codex*)",
+  "Bash(node*)"
+];
+
 const WRITE_DENY_RULES = [
   "Bash(sudo*)",
   "Bash(rm -rf*)",
@@ -70,7 +79,9 @@ export function buildGrokArgs(options) {
     for (const rule of CONSULT_ALLOW_RULES) {
       args.push("--allow", rule);
     }
-    args.push("--deny", "Bash(grok*)");
+    for (const rule of CONSULT_DENY_RULES) {
+      args.push("--deny", rule);
+    }
   } else {
     args.push("--always-approve");
     for (const rule of WRITE_DENY_RULES) {
@@ -154,6 +165,7 @@ export function runGrok(options) {
 
     let stdout = "";
     let timedOut = false;
+    let settled = false;
     let killTimer = null;
     const forwardTermination = () => {
       signalProcessGroup(child.pid, "SIGTERM");
@@ -164,13 +176,16 @@ export function runGrok(options) {
       timedOut = true;
       signalProcessGroup(child.pid, "SIGTERM");
       killTimer = setTimeout(() => {
-        signalProcessGroup(child.pid, "SIGKILL");
+        if (!settled) {
+          signalProcessGroup(child.pid, "SIGKILL");
+        }
       }, KILL_GRACE_MS);
       killTimer.unref?.();
     }, timeoutMs);
     timer.unref?.();
 
     const cleanup = () => {
+      settled = true;
       clearTimeout(timer);
       if (killTimer) {
         clearTimeout(killTimer);

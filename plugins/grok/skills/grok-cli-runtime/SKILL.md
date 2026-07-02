@@ -29,6 +29,6 @@ Execution rules:
 - `--background` detaches the run into a worker; the helper prints the job id plus `/grok:status` and `/grok:result` hints.
 - A user asking to resume maps to the companion's `--resume <uuid>` or `--resume-last`. Never invent a session uuid; only uuids Grok returned are resumable. `--resume-last` resumes the newest non running job with a session id for the workspace, preferring jobs started from the current Claude session.
 - Leave `--model` and `--effort` unset so Grok's own config rules, unless the user explicitly asks for a specific model or effort level.
-- Failed runs carry a `failure: <kind>` line in their rendered output; the orchestrator uses it for session circuit breaking.
+- Job outcomes end with a `state: done|error|cancelled` line, and failed runs additionally carry a `failure: <kind>` line; the orchestrator parses these for outcomes and session circuit breaking.
 - Return the stdout of the helper exactly as-is.
 - If the Bash call fails or Grok cannot be invoked, return nothing.

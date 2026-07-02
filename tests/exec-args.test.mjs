@@ -19,6 +19,15 @@ const consultAllows = [
   "Bash(git blame*)",
 ];
 
+const consultDenies = [
+  "Edit",
+  "Write",
+  "Bash(grok*)",
+  "Bash(claude*)",
+  "Bash(codex*)",
+  "Bash(node*)",
+];
+
 const writeDenies = [
   "Bash(sudo*)",
   "Bash(rm -rf*)",
@@ -115,7 +124,7 @@ test("consult task argv carries the pinned base flags and allow and deny set", (
   assert.ok(hasPair(argv, "--max-turns", "25"));
   assert.ok(hasPair(argv, "--permission-mode", "dontAsk"));
   assert.deepStrictEqual([...flagValues(argv, "--allow")].sort(), [...consultAllows].sort());
-  assert.deepStrictEqual(flagValues(argv, "--deny"), ["Bash(grok*)"]);
+  assert.deepStrictEqual([...flagValues(argv, "--deny")].sort(), [...consultDenies].sort());
   assert.ok(!argv.includes("-m"), "Model must not be passed by default.");
   assert.ok(!argv.includes("--effort"), "Effort must not be passed by default.");
   assert.ok(!argv.includes("--always-approve"));

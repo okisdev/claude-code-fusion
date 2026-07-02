@@ -1,30 +1,30 @@
 {
   "name": "claude-code-fusion",
   "owner": {
-    "name": "okisdev",
-    "email": "acc@okis.dev"
+    "name": "Harry Yep",
+    "email": "hi@okis.dev"
   },
   "metadata": {
     "description": "Personal multi-model orchestration marketplace.",
-    "version": "0.0.1"
+    "version": "0.0.2"
   },
   "plugins": [
     {
       "name": "grok",
       "source": "./plugins/grok",
       "description": "Delegate coding, review, and second-opinion work to the local Grok CLI.",
-      "version": "0.0.1",
+      "version": "0.0.2",
       "author": {
-        "name": "okisdev"
+        "name": "Harry Yep"
       }
     },
     {
       "name": "fusion",
       "source": "./plugins/fusion",
       "description": "Multi-model orchestration commands for high stakes decisions.",
-      "version": "0.0.1",
+      "version": "0.0.2",
       "author": {
-        "name": "okisdev"
+        "name": "Harry Yep"
       }
     }
   ]

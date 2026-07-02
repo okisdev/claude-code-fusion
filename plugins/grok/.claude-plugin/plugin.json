@@ -1,8 +1,9 @@
 {
   "name": "grok",
-  "version": "0.0.1",
+  "version": "0.0.2",
   "description": "Use Grok from Claude Code to review code or delegate tasks through the local Grok CLI.",
   "author": {
     "name": "okisdev"
-  }
+  },
+  "license": "MIT"
 }
