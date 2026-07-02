@@ -1,8 +1,9 @@
 {
   "name": "fusion",
-  "version": "0.0.1",
+  "version": "0.0.2",
   "description": "Multi-model orchestration commands for high stakes decisions.",
   "author": {
     "name": "okisdev"
-  }
+  },
+  "license": "MIT"
 }
