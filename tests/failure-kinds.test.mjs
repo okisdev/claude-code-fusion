@@ -92,6 +92,7 @@ test("missing binary yields failure kind missing_cli", (t) => {
   const resultOutput = runCompanion(["result", record.id], { cwd: sandbox.workDir, env });
   assert.strictEqual(resultOutput.status, 0, resultOutput.stderr);
   assert.match(resultOutput.stdout, /^failure: missing_cli$/m);
+  assert.match(resultOutput.stdout, /^state: error$/m);
 });
 
 test("rate limited stderr yields failure kind rate_limited", (t) => {

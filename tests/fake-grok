@@ -105,6 +105,16 @@
     process.exit(0);
   }
 
+  if (mode === "gate-block-preamble") {
+    emit({
+      text: "Reviewing the diff for concrete defects.\nBLOCK: preamble reason text\nExtra detail about the defect.",
+      stopReason: "EndTurn",
+      sessionId: "77777777-7777-7777-8777-777777777777",
+      requestId: "req-1"
+    });
+    process.exit(0);
+  }
+
   if (mode === "error") {
     process.stderr.write("Fake grok failed on purpose.\n");
     process.exit(1);

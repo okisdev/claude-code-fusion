@@ -238,6 +238,18 @@ test("stop-gate blocks the stop with the upstream decision shape when grok repli
   assert.strictEqual(records[0].status, "done");
 });
 
+test("stop-gate finds the BLOCK line behind a preamble", (t) => {
+  const sandbox = makeSandbox(t);
+  initCleanRepo(sandbox.workDir);
+  dirtyRepo(sandbox.workDir);
+  enableGate(sandbox);
+  const result = runStopGate(sandbox, { env: envFor(sandbox, { FAKE_GROK_MODE: "gate-block-preamble" }) });
+  assert.strictEqual(result.status, 0, result.stderr);
+  const payload = JSON.parse(result.stdout);
+  assert.strictEqual(payload.decision, "block");
+  assert.ok(payload.reason.includes("preamble reason text"));
+});
+
 test("stop-gate exits silently when grok fails", (t) => {
   const sandbox = makeSandbox(t);
   initCleanRepo(sandbox.workDir);
