@@ -1,5 +1,11 @@
 # changelog
 
+## 0.0.4
+
+- /fusion:stats aggregates delegation counts across both the grok and codex peers (grok via its stats subcommand, codex read best effort from its plugin job state), degrading each engine section independently when a peer is absent; token usage still lives with each vendor
+- routing: implementation from an approved plan goes to fusion:fast-worker as one brief per work package, split rather than bundled, never to the generic catch-all agent; ordinary design uses the built in Plan agent while high stakes designs go to the panel
+- fusion:fast-worker claims approved plan implementation in its description so it competes for that moment instead of ceding it to the catch-all (observed live: bundled phases went to the catch-all on the orchestrator's model while a single scoped package correctly went to fast-worker)
+
 ## 0.0.3
 
 - readme and docs aligned with what the code actually enforces: billing wording softened, the safety model split into runtime enforced vs prompt requested, provenance anchors added to third party claims (grok 0.2.16, Claude Code 2.1.x)
