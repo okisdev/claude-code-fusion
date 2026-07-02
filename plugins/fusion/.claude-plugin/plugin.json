@@ -1,0 +1,8 @@
+{
+  "name": "fusion",
+  "version": "0.0.1",
+  "description": "Multi-model orchestration commands for high stakes decisions.",
+  "author": {
+    "name": "okisdev"
+  }
+}
