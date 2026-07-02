@@ -1,0 +1,31 @@
+{
+  "name": "claude-code-fusion",
+  "owner": {
+    "name": "okisdev",
+    "email": "acc@okis.dev"
+  },
+  "metadata": {
+    "description": "Personal multi-model orchestration marketplace.",
+    "version": "0.0.1"
+  },
+  "plugins": [
+    {
+      "name": "grok",
+      "source": "./plugins/grok",
+      "description": "Delegate coding, review, and second-opinion work to the local Grok CLI.",
+      "version": "0.0.1",
+      "author": {
+        "name": "okisdev"
+      }
+    },
+    {
+      "name": "fusion",
+      "source": "./plugins/fusion",
+      "description": "Multi-model orchestration commands for high stakes decisions.",
+      "version": "0.0.1",
+      "author": {
+        "name": "okisdev"
+      }
+    }
+  ]
+}
