@@ -12,7 +12,7 @@ Primary helper:
 
 Subcommand surface:
 
-- `task [prompt] [--prompt-file <path>] [--write] [--background] [--resume <uuid>] [--resume-last] [--model <id>] [--effort <level>] [--max-turns <n>] [--best-of-n <n>] [--cwd <dir>] [--json]`
+- `task [prompt] [--prompt-file <path>] [--write] [--web] [--background] [--resume <uuid>] [--resume-last] [--model <id>] [--effort <level>] [--max-turns <n>] [--best-of-n <n>] [--cwd <dir>] [--json]`
 - `review [--base <ref>] [--focus <text>] [--cwd <dir>] [--json]`
 - `status [job-id]`
 - `result <job-id> [--json]`
@@ -24,7 +24,7 @@ Execution rules:
 
 - Use exactly one helper call per delegation. The caller is a forwarder, not an orchestrator.
 - Prefer the helper over hand-rolled `git`, direct Grok CLI strings, or any other Bash activity.
-- Consult mode is the default; `--write` grants Grok edit permission inside the workspace sandbox.
+- Consult mode is the default; `--write` grants Grok edit permission inside the workspace sandbox, and `--web` re-enables the web tools for research briefs.
 - `--best-of-n` runs an implementation tournament (verified against grok 0.2.16, see docs/grok-contract.md; the companion accepts 2 to 10); it implies write mode with auto approval (the winning candidate is applied to the workspace), so pass it only when edits are acceptable.
 - `--background` detaches the run into a worker; the helper prints the job id plus `/grok:status` and `/grok:result` hints.
 - A user asking to resume maps to the companion's `--resume <uuid>` or `--resume-last`. Never invent a session uuid; only uuids Grok returned are resumable. `--resume-last` resumes the newest non running job with a session id for the workspace, preferring jobs started from the current Claude session.

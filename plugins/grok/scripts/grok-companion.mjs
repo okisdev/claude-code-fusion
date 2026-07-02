@@ -59,7 +59,7 @@ function printUsage() {
   console.log(
     [
       "Usage:",
-      "  node scripts/grok-companion.mjs task [prompt] [--prompt-file <path>] [--write] [--background] [--resume <uuid>] [--resume-last] [--model <id>] [--effort <level>] [--max-turns <n>] [--best-of-n <n>] [--cwd <dir>] [--json]",
+      "  node scripts/grok-companion.mjs task [prompt] [--prompt-file <path>] [--write] [--web] [--background] [--resume <uuid>] [--resume-last] [--model <id>] [--effort <level>] [--max-turns <n>] [--best-of-n <n>] [--cwd <dir>] [--json]",
       "  node scripts/grok-companion.mjs review [--base <ref>] [--focus <text>] [--cwd <dir>] [--json]",
       "  node scripts/grok-companion.mjs status [job-id] [--cwd <dir>] [--json]",
       "  node scripts/grok-companion.mjs result <job-id> [--json]",
@@ -267,7 +267,7 @@ function recordSpawnFailure(jobFile, error) {
 async function handleTask(argv) {
   const { options, positionals } = parseArgs(argv, {
     valueOptions: ["prompt-file", "resume", "model", "effort", "max-turns", "best-of-n", "cwd"],
-    booleanOptions: ["write", "background", "resume-last", "json"]
+    booleanOptions: ["write", "background", "resume-last", "web", "json"]
   });
 
   const cwd = resolveCwd(options);
@@ -307,6 +307,7 @@ async function handleTask(argv) {
       effort: options.effort ?? null,
       maxTurns,
       bestOfN,
+      web: Boolean(options.web),
       resumeSessionId
     }
   });
@@ -336,6 +337,7 @@ async function handleTask(argv) {
       effort: options.effort ?? null,
       maxTurns,
       bestOfN,
+      web: Boolean(options.web),
       cwd,
       logFile,
       timeoutMs,
@@ -409,6 +411,7 @@ async function handleTaskWorker(argv) {
       effort: request.effort ?? null,
       maxTurns: request.maxTurns ?? null,
       bestOfN: request.bestOfN ?? null,
+      web: Boolean(request.web),
       cwd: record.cwd,
       logFile,
       timeoutMs,

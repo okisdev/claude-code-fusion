@@ -17,7 +17,7 @@ Brief structure:
 
 Context rules:
 
-- Include context generously. Grok's context window is large (512k as of grok 0.2.16); err on the side of pasting relevant code, error output, and prior findings rather than referring to them.
+- Include context generously. Grok's context window is large (512k on grok-build, 200k on grok-composer, as of grok 0.2.16); err on the side of pasting relevant code, error output, and prior findings rather than referring to them.
 - Do not reference the Claude conversation, earlier turns, or "the change we discussed". The brief is the only context Grok gets.
 
 Output contract:

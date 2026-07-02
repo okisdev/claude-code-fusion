@@ -223,3 +223,13 @@ test("best-of-n outside 2 to 10 is rejected", (t) => {
   assert.match(result.stderr, /between 2 and 10/);
   assert.strictEqual(readInvocations(sandbox.argsFile).length, 0);
 });
+
+test("web flag drops the web search disable and stays consult", (t) => {
+  const sandbox = makeSandbox(t);
+  const result = runCompanion(["task", "research this", "--web"], { cwd: sandbox.workDir, env: envFor(sandbox) });
+  assert.strictEqual(result.status, 0, result.stderr);
+  const argv = singleInvocation(sandbox);
+  assert.ok(!argv.includes("--disable-web-search"));
+  assert.ok(hasPair(argv, "--permission-mode", "dontAsk"));
+  assert.ok(!argv.includes("--always-approve"));
+});
