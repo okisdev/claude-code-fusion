@@ -215,3 +215,11 @@ test("max-turns is overridable from the command line", (t) => {
   const argv = singleInvocation(sandbox);
   assert.deepStrictEqual(flagValues(argv, "--max-turns"), ["7"]);
 });
+
+test("best-of-n outside 2 to 10 is rejected", (t) => {
+  const sandbox = makeSandbox(t);
+  const result = runCompanion(["task", "hello", "--best-of-n", "11"], { cwd: sandbox.workDir, env: envFor(sandbox) });
+  assert.notStrictEqual(result.status, 0);
+  assert.match(result.stderr, /between 2 and 10/);
+  assert.strictEqual(readInvocations(sandbox.argsFile).length, 0);
+});

@@ -93,6 +93,7 @@ test("missing binary yields failure kind missing_cli", (t) => {
   assert.strictEqual(resultOutput.status, 0, resultOutput.stderr);
   assert.match(resultOutput.stdout, /^failure: missing_cli$/m);
   assert.match(resultOutput.stdout, /^state: error$/m);
+  assert.match(result.stderr, /^state: error$/m);
 });
 
 test("rate limited stderr yields failure kind rate_limited", (t) => {
