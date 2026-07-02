@@ -29,7 +29,8 @@ Then, in a new session, run `/fusion:setup` once per machine (it writes the rout
 | `/grok:review [--base <ref>] [--focus <text>]` | Adversarial review of the working tree or a branch range (untracked files reach the review as names only); never applies fixes |
 | `/grok:best-of-n [--n <2-10>] <task>` | Implementation tournament in isolated worktrees; the winning candidate is applied. Keep n at 2; the companion rejects values outside 2 to 10 |
 | `/grok:status [job-id]`, `/grok:result <job-id>`, `/grok:cancel <job-id>` | Background job lifecycle |
-| `/grok:stats [--all]` | Delegation history by status, mode, and failure kind |
+| `/grok:stats [--all]` | Grok delegation history by status, mode, and failure kind |
+| `/fusion:stats [--all]` | Delegation history across both grok and codex peers |
 | `/grok:setup` | Health check; `--enable-stop-gate` / `--disable-stop-gate` toggles the stop-time review gate |
 | `/fusion:panel <question>` | Blind multi-model panel with attributed adjudication, for decisions where a wrong answer is expensive |
 | `/fusion:setup` | Install or update the routing rules into `~/.claude/rules/`; offers the optional permission allow |
@@ -51,7 +52,7 @@ Roles bind to alias tiers, not to specific models, so a same tier release (Sonne
 
 ## Data and uninstall
 
-The grok plugin keeps job records, briefs, and logs under `~/.claude/plugins/data/grok-claude-code-fusion/`; briefs can contain your prompts and diffs, and logs can contain grok stderr. Delete that directory to clear history. Full uninstall: remove both plugins via `/plugin`, delete `~/.claude/rules/orchestration.md`, drop the optional `Bash(node:*)` entry from `permissions.allow`, and delete the data directory. Environment overrides (`GROK_BIN`, `GROK_COMPANION_DATA`, `GROK_COMPANION_TIMEOUT_MS`) are documented in [docs/grok-contract.md](docs/grok-contract.md).
+The grok plugin keeps job records, briefs, and logs under `~/.claude/plugins/data/grok-claude-code-fusion/`; briefs can contain your prompts and diffs, and logs can contain grok stderr. Delete that directory to clear history. Full uninstall: remove both plugins via `/plugin`, delete `~/.claude/rules/orchestration.md`, drop the optional `Bash(node:*)` entry from `permissions.allow`, and delete the data directory. Environment overrides (`GROK_BIN`, `GROK_COMPANION_DATA`, `GROK_COMPANION_TIMEOUT_MS`) are documented in [docs/grok-contract.md](docs/grok-contract.md). `/fusion:stats` aggregates delegation counts across both peers; token usage itself lives with each vendor (ccusage for the Claude side, the OpenAI and xAI dashboards for the peers), since peer work never touches the Claude transcript.
 
 ## Development
 

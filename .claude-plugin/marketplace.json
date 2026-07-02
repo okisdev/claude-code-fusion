@@ -6,7 +6,7 @@
   },
   "metadata": {
     "description": "Multi-model orchestration marketplace for Claude Code.",
-    "version": "0.0.3"
+    "version": "0.0.4"
   },
   "plugins": [
     {
@@ -22,7 +22,7 @@
       "name": "fusion",
       "source": "./plugins/fusion",
       "description": "Multi-model orchestration: tier agents, routing rules, a blind multi-model panel, and a model drift doctor.",
-      "version": "0.0.3",
+      "version": "0.0.4",
       "author": {
         "name": "Harry Yep"
       }
