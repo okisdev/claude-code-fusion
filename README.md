@@ -46,7 +46,7 @@ A successful foreground `/grok:task` reply ends with `grok-session: <uuid>`, `jo
 
 ## Model roles
 
-Roles bind to alias tiers, not to specific models, so a same tier release (Sonnet 5 under `sonnet`, a future Opus) needs zero configuration, and `best[1m]` floats the orchestrator to future Fable releases or degrades it to the latest Opus when Fable is unavailable. The one deliberate exception is `trivial-worker`, pinned to the full ID `claude-haiku-4-5` because the haiku alias is remapped on this machine; bump it by hand when a newer cheap tier ships. `/fusion:doctor` audits all of this.
+Roles bind to alias tiers, not to specific models, so a same tier release (Sonnet 5 under `sonnet`, a future Opus) needs zero configuration, and `best[1m]` floats the orchestrator to future Fable releases or degrades it to the latest Opus when Fable is unavailable. The one deliberate exception is `trivial-worker`, pinned to the full ID `claude-haiku-4-5` for machines where ANTHROPIC_DEFAULT_HAIKU_MODEL remaps the haiku alias; bump it by hand when a newer cheap tier ships. `/fusion:doctor` audits all of this.
 
 ## Development
 

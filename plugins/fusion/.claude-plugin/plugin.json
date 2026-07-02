@@ -1,7 +1,7 @@
 {
   "name": "fusion",
   "version": "0.0.2",
-  "description": "Multi-model orchestration commands for high stakes decisions.",
+  "description": "Multi-model orchestration: tier agents, routing rules, a blind two engine panel, and a model drift doctor.",
   "author": {
     "name": "okisdev"
   },
