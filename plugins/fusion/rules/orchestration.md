@@ -12,8 +12,10 @@ Act as the tech lead, not the implementer. Plan, decompose, delegate, judge, syn
 
 - Codebase search, inventory, and "where is X" questions: the built in Explore agent.
 - Well specified mechanical work (edits with a recipe, codemods, test runs, boilerplate, docs): fusion:fast-worker. Include exact file paths, the change spec, and a verification command.
+- Implementation from an approved plan: fusion:fast-worker, one brief per work package with the plan section as the spec; split a large plan into packages (parallel when independent) instead of handing it whole to any single agent, and consider grok for packages that should bill to xAI. Never route execution to the generic claude catch-all agent: it inherits the orchestrator's model and burns top tier quota on worker tier work.
 - Trivial single file tasks (renames, small doc fixes, short mechanical checks): fusion:trivial-worker. It is pinned to claude-haiku-4-5 in frontmatter because the Agent tool's per invocation model parameter only accepts aliases and ANTHROPIC_DEFAULT_HAIKU_MODEL may remap the haiku alias.
 - Hard reasoning (architecture, root cause on stubborn bugs, correctness, concurrency, security analysis): fusion:deep-reasoner.
+- Design and planning: the built in Plan agent for ordinary tasks; a high stakes design goes to /fusion:panel per the fan out section instead.
 - Independent second opinion, alternative diagnosis or implementation, code review: codex (the codex:codex-rescue agent, or /codex:review for diffs) and grok (the grok:grok-rescue agent, or /grok:task for delegation and /grok:review for diffs). Prefer these over fusion:deep-reasoner when a non Claude perspective adds value or Claude quota is tight.
 - Judging results, reconciling disagreement, revising the plan, and user communication stay in the main loop. That is the only work the orchestrator should spend tokens on.
 
