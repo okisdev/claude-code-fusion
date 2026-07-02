@@ -1,5 +1,13 @@
 # changelog
 
+## 0.0.5
+
+- the routing policy is rewritten around an operating model: the orchestrator runs the session like a founder with a paid bench, biases to fan out (five or more concurrent delegations is a normal state, under dispatching is the failure mode), keeps every engine drawing, and trusts then verifies instead of hovering; grok is named the fast lane and codex the deep lane
+- peer engagement policy: peers are executors, not just reviewers. plans with three or more independent packages route at least one to a peer, multi source research fans one track to a peer by default, and a per session balance check shifts the next eligible package to an idle peer (motivated by observing sessions where codex and grok barely participated while claude workers took everything)
+- auto invocation: the panel and the new fleet fire from plain language, not only a typed slash command. /fusion:panel's description is trigger shaped, and a new rules section maps natural language moments to both without the user typing a slash
+- /fusion:ultra: the peer engine answer to ultracode. asking to go deep, thorough, or exhaustive fans the work out as a fleet of parallel Grok and Codex agents (6 to 8 facets by default, up to about 12), billed to their own subscriptions, then synthesized into one deliverable; a size gate skips the fleet for small tasks
+- /grok:task gains --web, which re-enables grok's web tools for research briefs (they stay disabled for code work); grok-rescue's description now claims implementation packages and research digests first instead of introducing itself as a second opinion
+
 ## 0.0.4
 
 - /fusion:stats aggregates delegation counts across both the grok and codex peers (grok via its stats subcommand, codex read best effort from its plugin job state), degrading each engine section independently when a peer is absent; token usage still lives with each vendor
