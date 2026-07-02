@@ -683,7 +683,8 @@ function handleResult(argv) {
   if (record.status === "error") {
     const tail = readLogTail(jobLogPath(dataDir, record.cwd, record.id), 20) || record.errorTail || "";
     const lines = [
-      `Job ${record.id} failed${record.exitCode != null ? ` with exit code ${record.exitCode}` : ""}.`
+      `Job ${record.id} failed${record.exitCode != null ? ` with exit code ${record.exitCode}` : ""}.`,
+      "state: error"
     ];
     if (record.failureKind) {
       lines.push(`failure: ${record.failureKind}`);
@@ -696,7 +697,7 @@ function handleResult(argv) {
   }
 
   if (record.status === "cancelled") {
-    const lines = [`Job ${record.id} was cancelled.`];
+    const lines = [`Job ${record.id} was cancelled.`, "state: cancelled"];
     if (record.failureKind) {
       lines.push(`failure: ${record.failureKind}`);
     }
@@ -981,9 +982,12 @@ async function handleStopGate() {
   });
 
   const text = String(result.text ?? "").trim();
-  const firstLine = text.split(/\r?\n/, 1)[0].trim();
-  if (firstLine.startsWith("BLOCK:")) {
-    emitStopGateBlock(firstLine.slice("BLOCK:".length).trim() || text);
+  const blockLine = text
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .find((line) => line.startsWith("BLOCK:"));
+  if (blockLine) {
+    emitStopGateBlock(blockLine.slice("BLOCK:".length).trim() || text);
   }
 }
 
