@@ -1,6 +1,6 @@
 # Grok CLI contract
 
-The facts below were verified live against grok 0.2.16 on 2026-07-02 and are implemented by `plugins/grok/scripts/`. They are maintainer documentation; nothing here is needed to use the plugin.
+The facts below were verified live against grok 0.2.16 on 2026-07-02 and are implemented by `plugins/grok/scripts/`. They are maintainer documentation; nothing here is needed to use the plugin. The Grok CLI evolves, so treat every claim as pinned to that version and re-verify after CLI updates.
 
 ## Headless invocation
 
@@ -22,8 +22,12 @@ The facts below were verified live against grok 0.2.16 on 2026-07-02 and are imp
 ## Process lifecycle
 
 - grok is spawned detached in its own process group, and the child pid is recorded on the job record as `grokPid`. Timeout, cancel, and the SessionEnd hook signal the process group, so descendants are reaped with the leader.
-- Timeout escalates SIGTERM to SIGKILL after a 10 second grace, guarded so a process that already exited is never signaled again (PID reuse). Exit codes: 0 ok, 1 error, 130 SIGINT, 143 SIGTERM. Interrupted runs keep their file modifications and are resumable via the session uuid.
-- Failed runs carry a typed `failureKind` (missing_cli, auth, rate_limited, quota, timeout, cancelled, error) on the job record and a `failure: <kind>` line in rendered output; the routing policy uses it for session circuit breaking.
+- Timeouts: foreground runs default to 570000ms (deliberately below the 600000ms Bash timeout the forwarder agent uses, so the companion always reaps first and writes the record); background workers cap at 1800000ms; the stop gate caps its grok call at 240000ms inside the hook's 900 second budget; the `/grok:review` background flow overrides the foreground default with `GROK_COMPANION_TIMEOUT_MS=1800000`. A timeout escalates SIGTERM to SIGKILL after a 10 second grace, guarded so a process that already exited is never signaled again (PID reuse). Exit codes: 0 ok, 1 error, 130 SIGINT, 143 SIGTERM. Interrupted runs keep their file modifications and are resumable via the session uuid when grok reported one before the interruption; a run killed before emitting its JSON envelope leaves no session id on the record.
+- Failed runs carry a typed `failureKind` (missing_cli, auth, rate_limited, quota, timeout, cancelled, error) on the job record plus `state: error` and `failure: <kind>` lines in rendered output; jobs cancelled by `/grok:cancel` or the SessionEnd hook are marked with `failureKind: cancelled`. The routing policy parses these lines for session circuit breaking.
+
+## Environment overrides
+
+- `GROK_BIN`: grok binary override (tests point it at a fake). `GROK_COMPANION_DATA`: state directory override (default `~/.claude/plugins/data/grok-claude-code-fusion`). `GROK_COMPANION_TIMEOUT_MS`: foreground timeout override.
 
 ## Stop gate
 
@@ -33,4 +37,4 @@ The facts below were verified live against grok 0.2.16 on 2026-07-02 and are imp
 ## Degradation
 
 - A missing grok binary fails fast with a message pointing at `/grok:setup`, and the `grok-rescue` agent returns a single `grok unavailable: <reason>` line the orchestrator uses to stop routing to Grok for the session.
-- If the codex plugin is not installed, its agent type does not exist and the routing policy falls back symmetrically. `/fusion:panel` substitutes `deep-reasoner` for any missing track, or runs a two lens Claude only panel when both engines are missing, and says so in the synthesis.
+- If the codex plugin is not installed, its agent type does not exist and the routing policy falls back symmetrically. `/fusion:panel` substitutes `fusion:deep-reasoner` for any missing track, or runs a two lens Claude only panel when both engines are missing, and says so in the synthesis.

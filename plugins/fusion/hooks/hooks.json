@@ -6,7 +6,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "echo 'Context was compacted. Reassess routing for the remaining work: does anything now belong to deep-reasoner, a peer engine, or the panel? Has difficulty emerged since the original plan?'",
+            "command": "echo 'Context was compacted. Reassess routing for the remaining work: does anything now belong to fusion:deep-reasoner, a peer engine, or the panel? Has difficulty emerged since the original plan?'",
             "timeout": 5
           }
         ]
