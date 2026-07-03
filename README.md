@@ -5,13 +5,13 @@ Multi-model orchestration for Claude Code. The strongest available Claude model 
 | Layer | Who | Job |
 |---|---|---|
 | Orchestrator | the main session on `best[1m]` (Fable 5, or the latest Opus when Fable is unavailable) | plan, delegate, judge, synthesize |
-| Claude workers | `fusion:deep-reasoner` (Opus), `fusion:fast-worker` (Sonnet), `fusion:trivial-worker` (Haiku) | deep reasoning, mechanical work, trivial tasks |
-| Peer engineers | Codex CLI (OpenAI's official `codex` plugin) and Grok CLI (the `grok` plugin here) | second opinions, adversarial review, delegated implementation |
+| Claude workers | `fusion:deep-reasoner` (Opus), `fusion:fast-worker` (Sonnet), `fusion:trivial-worker` (Haiku) | deep reasoning, mechanical work, trivial tasks when Grok is unavailable |
+| Peer engineers | Codex CLI (OpenAI's official `codex` plugin) and Grok CLI (the `grok` plugin here) | Codex is the primary implementation lane on the current GPT 5.x flagship and expects spec grade briefs (explicit completion criteria, output contract, boundaries, verification command); Grok is the quick turnaround lane on Composer 2.5 Fast by default for small fixes, drafts, research digests, and large context reads. Trivial single file tasks default to Grok |
 | Panel | `/fusion:panel` | one blind brief to both peers in parallel, adjudicated with attribution |
 
 ## Quick start
 
-Prerequisites: Claude Code 2.1.170 or later and Node.js 22 or later (tested on 2.1.198 and Node 24; the floors are not enforced), git, macOS or Linux, and an authenticated Grok CLI on PATH (check with `grok --version`; the CLI is xAI's, so follow their install and login docs). The Codex side is optional; install the `codex` plugin from [openai/codex-plugin-cc](https://github.com/openai/codex-plugin-cc) (`codex@openai-codex`) to enable it.
+Prerequisites: Claude Code 2.1.170 or later and Node.js 22 or later (tested on 2.1.198 and Node 24; the floors are not enforced), git, macOS or Linux, and an authenticated Grok CLI on PATH (check with `grok --version`; the CLI is xAI's, so follow their install and login docs). The Codex side powers the primary implementation lane; install the `codex` plugin from [openai/codex-plugin-cc](https://github.com/openai/codex-plugin-cc) (`codex@openai-codex`) and run `/codex:setup` once. Without it fusion still runs, with spec grade implementation packages falling back to the Claude workers and Grok.
 
 ```bash
 claude plugin marketplace add okisdev/claude-code-fusion
@@ -35,6 +35,7 @@ Then, in a new session, run `/fusion:setup` once per machine (it writes the rout
 | `/fusion:panel <question>` | Blind multi-model panel with attributed adjudication, for decisions where a wrong answer is expensive. Also fires from plain language ("help me decide", "compare these") |
 | `/fusion:ultra <task>` | Fans a large task out as a fleet of parallel Grok and Codex agents billed to their own subscriptions, then synthesizes. Fires from "go deep", "audit everything", "be exhaustive"; skips small tasks |
 | `/fusion:setup` | Install or update the routing rules into `~/.claude/rules/`; offers the optional permission allow |
+| `/fusion:config` | Read the local model configuration across engines, enumerate available models, and change defaults interactively |
 | `/fusion:doctor` | Audit model pins, environment overrides, rules drift, and stale agent copies |
 
 Every companion outcome is machine parseable: successful foreground replies end with `grok-session: <uuid>`, `job: <id>`, and `state: done` lines; failures report `state: error` plus `failure: <kind>`; cancelled jobs report `state: cancelled` with `failure: cancelled`; a background launch prints the job id and how to fetch it.
@@ -49,7 +50,7 @@ Requested by prompts (the orchestrator follows the installed instructions; not r
 
 ## Model roles
 
-Roles bind to alias tiers, not to specific models, so a same tier release (Sonnet 5 under `sonnet`, a future Opus) needs zero configuration, and `best[1m]` floats the orchestrator to future Fable releases or degrades it to the latest Opus when Fable is unavailable. The one deliberate exception is `fusion:trivial-worker`, pinned to the full ID `claude-haiku-4-5` for machines where ANTHROPIC_DEFAULT_HAIKU_MODEL remaps the haiku alias; bump it by hand when a newer cheap tier ships. Alias semantics are Claude Code behavior as observed on 2.1.x, and nothing here sets your main model for you: pick it yourself, for example `/model best`. `/fusion:doctor` audits all of this.
+Roles bind to alias tiers, not to specific models, so a same tier release (Sonnet 5 under `sonnet`, a future Opus) needs zero configuration, and `best[1m]` floats the orchestrator to future Fable releases or degrades it to the latest Opus when Fable is unavailable. The one deliberate exception is `fusion:trivial-worker`, pinned to the full ID `claude-haiku-4-5` for machines where ANTHROPIC_DEFAULT_HAIKU_MODEL remaps the haiku alias; bump it by hand when a newer cheap tier ships. It is a fallback for trivial work when Grok is unavailable, not the default for single file tasks. Peer engine defaults live in each CLI's config (`~/.grok/config.toml`, `~/.codex/config.toml`); `/fusion:config` reads and changes them interactively. Alias semantics are Claude Code behavior as observed on 2.1.x, and nothing here sets your main model for you: pick it yourself, for example `/model best`. `/fusion:doctor` audits all of this.
 
 ## Benchmark
 
