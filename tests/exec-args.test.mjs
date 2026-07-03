@@ -7,6 +7,7 @@ import { test } from "node:test";
 
 const repoRoot = path.join(import.meta.dirname, "..");
 const companion = path.join(repoRoot, "plugins", "grok", "scripts", "grok-companion.mjs");
+const { buildGrokArgs } = await import(path.join(repoRoot, "plugins", "grok", "scripts", "lib", "grok-exec.mjs"));
 const fakeGrok = path.join(import.meta.dirname, "fake-grok");
 
 const consultAllows = [
@@ -17,6 +18,18 @@ const consultAllows = [
   "Bash(git show*)",
   "Bash(git status*)",
   "Bash(git blame*)",
+  "Bash(gh pr view*)",
+  "Bash(gh pr list*)",
+  "Bash(gh pr diff*)",
+  "Bash(gh pr checks*)",
+  "Bash(gh issue view*)",
+  "Bash(gh issue list*)",
+  "Bash(gh repo view*)",
+  "Bash(gh search*)",
+  "Bash(gh run view*)",
+  "Bash(gh run list*)",
+  "Bash(gh release view*)",
+  "Bash(gh release list*)",
 ];
 
 const consultDenies = [
@@ -224,6 +237,19 @@ test("best-of-n outside 2 to 10 is rejected", (t) => {
   assert.strictEqual(readInvocations(sandbox.argsFile).length, 0);
 });
 
+test("write task argv omits the gh read-only allow rules", (t) => {
+  const sandbox = makeSandbox(t);
+  const result = runCompanion(["task", "change the code", "--write"], {
+    cwd: sandbox.workDir,
+    env: envFor(sandbox),
+  });
+  assert.strictEqual(result.status, 0, result.stderr);
+  const argv = singleInvocation(sandbox);
+  assert.strictEqual(flagValues(argv, "--allow").length, 0);
+  assert.ok(!argv.includes("Bash(gh pr view*)"));
+  assert.ok(!argv.includes("Bash(gh api*)"));
+});
+
 test("web flag drops the web search disable and stays consult", (t) => {
   const sandbox = makeSandbox(t);
   const result = runCompanion(["task", "research this", "--web"], { cwd: sandbox.workDir, env: envFor(sandbox) });
@@ -232,4 +258,33 @@ test("web flag drops the web search disable and stays consult", (t) => {
   assert.ok(!argv.includes("--disable-web-search"));
   assert.ok(hasPair(argv, "--permission-mode", "dontAsk"));
   assert.ok(!argv.includes("--always-approve"));
+});
+
+const consultAllowEnv = { GROK_CONSULT_ALLOW: "Bash(jq*), Bash(curl -s*)" };
+
+function buildArgv(overrides = {}) {
+  return buildGrokArgs({ briefFile: "/tmp/grok-brief.txt", ...overrides });
+}
+
+test("GROK_CONSULT_ALLOW appends extra consult allows after the built in list", () => {
+  const argv = buildArgv({ mode: "consult", env: consultAllowEnv });
+  const allows = flagValues(argv, "--allow");
+  assert.deepStrictEqual(allows.slice(0, consultAllows.length), consultAllows);
+  assert.deepStrictEqual(allows.slice(consultAllows.length), ["Bash(jq*)", "Bash(curl -s*)"]);
+});
+
+test("GROK_CONSULT_ALLOW is ignored in write mode", () => {
+  const argv = buildArgv({ mode: "write", env: consultAllowEnv });
+  assert.strictEqual(flagValues(argv, "--allow").length, 0);
+  assert.ok(!argv.includes("Bash(jq*)"));
+  assert.ok(!argv.includes("Bash(curl -s*)"));
+});
+
+test("GROK_CONSULT_ALLOW treats unset, empty, and whitespace only entries as no extra allows", () => {
+  for (const env of [{}, { GROK_CONSULT_ALLOW: "" }, { GROK_CONSULT_ALLOW: "   " }]) {
+    const argv = buildArgv({ mode: "consult", env });
+    assert.deepStrictEqual(flagValues(argv, "--allow"), consultAllows);
+  }
+  const argv = buildArgv({ mode: "consult", env: { GROK_CONSULT_ALLOW: "  ,  , Bash(jq*)  " } });
+  assert.deepStrictEqual(flagValues(argv, "--allow"), [...consultAllows, "Bash(jq*)"]);
 });

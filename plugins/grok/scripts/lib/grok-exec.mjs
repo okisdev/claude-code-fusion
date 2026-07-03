@@ -4,6 +4,7 @@ import { appendJobLog } from "./state.mjs";
 
 const BIN_ENV = "GROK_BIN";
 const TIMEOUT_ENV = "GROK_COMPANION_TIMEOUT_MS";
+const CONSULT_ALLOW_ENV = "GROK_CONSULT_ALLOW";
 const DEFAULT_FOREGROUND_TIMEOUT_MS = 570000;
 const BACKGROUND_TIMEOUT_CAP_MS = 1800000;
 const KILL_GRACE_MS = 10000;
@@ -16,7 +17,19 @@ const CONSULT_ALLOW_RULES = [
   "Bash(git log*)",
   "Bash(git show*)",
   "Bash(git status*)",
-  "Bash(git blame*)"
+  "Bash(git blame*)",
+  "Bash(gh pr view*)",
+  "Bash(gh pr list*)",
+  "Bash(gh pr diff*)",
+  "Bash(gh pr checks*)",
+  "Bash(gh issue view*)",
+  "Bash(gh issue list*)",
+  "Bash(gh repo view*)",
+  "Bash(gh search*)",
+  "Bash(gh run view*)",
+  "Bash(gh run list*)",
+  "Bash(gh release view*)",
+  "Bash(gh release list*)"
 ];
 
 const CONSULT_DENY_RULES = [
@@ -51,6 +64,17 @@ export function resolveTimeoutMs({ background = false, env = process.env } = {})
   return configured ?? DEFAULT_FOREGROUND_TIMEOUT_MS;
 }
 
+export function resolveConsultAllowRules(env = process.env) {
+  const raw = env[CONSULT_ALLOW_ENV];
+  if (raw == null || !String(raw).trim()) {
+    return [];
+  }
+  return String(raw)
+    .split(",")
+    .map((entry) => entry.trim())
+    .filter(Boolean);
+}
+
 export function buildGrokArgs(options) {
   const bestOfN = options.bestOfN ?? null;
   const mode = bestOfN || options.mode === "write" ? "write" : "consult";
@@ -79,7 +103,11 @@ export function buildGrokArgs(options) {
 
   if (mode === "consult") {
     args.push("--permission-mode", "dontAsk");
+    const env = options.env ?? process.env;
     for (const rule of CONSULT_ALLOW_RULES) {
+      args.push("--allow", rule);
+    }
+    for (const rule of resolveConsultAllowRules(env)) {
       args.push("--allow", rule);
     }
     for (const rule of CONSULT_DENY_RULES) {

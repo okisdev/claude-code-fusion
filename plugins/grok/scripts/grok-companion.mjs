@@ -178,7 +178,17 @@ function resolveLastSessionId(dataDir, cwd, claudeSessionId) {
   return (owned ?? finished[0]).sessionId;
 }
 
-function grokFailureMessage(result, timeoutMs) {
+const PERMISSION_FAILURE_MESSAGE =
+  "Grok's turn was cancelled by the consult-mode permission gate (a tool call outside the read-only allow list). Re-dispatch with --write if repository changes are acceptable, or rewrite the brief to avoid shell commands.";
+
+function isPermissionCancelled(result) {
+  return Boolean(result) && result.exitCode === 0 && !result.timedOut && result.stopReason === "Cancelled";
+}
+
+function grokFailureMessage(result, timeoutMs, failureKind) {
+  if (failureKind === "permission") {
+    return PERMISSION_FAILURE_MESSAGE;
+  }
   return result.timedOut
     ? `Grok timed out after ${timeoutMs}ms and was terminated.`
     : `Grok exited with code ${result.exitCode}.`;
@@ -200,6 +210,9 @@ function classifyFailure({ spawnError = null, result = null, logTail = "" } = {}
   if (result && (result.exitCode === 130 || result.exitCode === 143)) {
     return "cancelled";
   }
+  if (isPermissionCancelled(result)) {
+    return "permission";
+  }
   const tail = String(logTail ?? "");
   for (const [kind, pattern] of STDERR_FAILURE_KINDS) {
     if (pattern.test(tail)) {
@@ -219,8 +232,8 @@ function finishJobRecord(jobFile, patch) {
 
 function failJob(jobFile, logFile, result, timeoutMs) {
   const tail = readLogTail(logFile, 20);
-  const message = grokFailureMessage(result, timeoutMs);
   const failureKind = classifyFailure({ result, logTail: tail });
+  const message = grokFailureMessage(result, timeoutMs, failureKind);
   finishJobRecord(jobFile, {
     status: "error",
     pid: null,
@@ -348,7 +361,7 @@ async function handleTask(argv) {
     throw launchFailureError(error);
   }
 
-  if (result.exitCode !== 0 || result.timedOut) {
+  if (result.exitCode !== 0 || result.timedOut || isPermissionCancelled(result)) {
     failJob(jobFile, logFile, result, timeoutMs);
   }
 
@@ -419,7 +432,7 @@ async function handleTaskWorker(argv) {
     });
 
     const finishedAt = nowIso();
-    if (result.exitCode === 0 && !result.timedOut) {
+    if (result.exitCode === 0 && !result.timedOut && !isPermissionCancelled(result)) {
       finishJobRecord(found.file, {
         status: "done",
         pid: null,
@@ -433,8 +446,8 @@ async function handleTaskWorker(argv) {
     }
 
     const tail = readLogTail(logFile, 20);
-    const message = grokFailureMessage(result, timeoutMs);
     const failureKind = classifyFailure({ result, logTail: tail });
+    const message = grokFailureMessage(result, timeoutMs, failureKind);
     finishJobRecord(found.file, {
       status: failureKind === "cancelled" ? "cancelled" : "error",
       pid: null,
@@ -581,7 +594,7 @@ async function handleReview(argv) {
     recordSpawnFailure(jobFile, error);
     throw launchFailureError(error);
   }
-  if (first.exitCode !== 0 || first.timedOut) {
+  if (first.exitCode !== 0 || first.timedOut || isPermissionCancelled(first)) {
     failJob(jobFile, logFile, first, timeoutMs);
   }
 
@@ -606,7 +619,7 @@ async function handleReview(argv) {
       recordSpawnFailure(jobFile, error);
       throw launchFailureError(error);
     }
-    if (retry.exitCode === 0 && !retry.timedOut) {
+    if (retry.exitCode === 0 && !retry.timedOut && !isPermissionCancelled(retry)) {
       review = evaluateReviewText(retry.text);
       if (retry.text) {
         finalText = retry.text;
@@ -972,8 +985,9 @@ async function handleStopGate() {
     return;
   }
 
-  if (result.exitCode !== 0 || result.timedOut) {
+  if (result.exitCode !== 0 || result.timedOut || isPermissionCancelled(result)) {
     const tail = readLogTail(logFile, 20);
+    const failureKind = classifyFailure({ result, logTail: tail });
     finishJobRecord(jobFile, {
       status: "error",
       pid: null,
@@ -982,8 +996,8 @@ async function handleStopGate() {
       exitCode: result.exitCode,
       sessionId: result.sessionId,
       resultText: result.text || null,
-      errorTail: tail || grokFailureMessage(result, STOP_GATE_TIMEOUT_MS),
-      failureKind: classifyFailure({ result, logTail: tail })
+      errorTail: tail || grokFailureMessage(result, STOP_GATE_TIMEOUT_MS, failureKind),
+      failureKind
     });
     return;
   }

@@ -255,6 +255,18 @@ test("background timeout marks the record error and result reports the failure",
   assert.ok(resultOutput.stdout.includes("timed out after 500ms"));
 });
 
+test("permission-cancelled task ends in an error record, not done", (t) => {
+  const sandbox = makeSandbox(t);
+  const result = runCompanion(["task", "doomed"], {
+    cwd: sandbox.workDir,
+    env: envFor(sandbox, { FAKE_GROK_MODE: "permission-cancelled" }),
+  });
+  assert.notStrictEqual(result.status, 0);
+  const record = jobRecords(sandbox.dataDir)[0];
+  assert.strictEqual(record.status, "error");
+  assert.strictEqual(record.failureKind, "permission");
+});
+
 test("foreground spawn failure records an error instead of leaving the job running", (t) => {
   const sandbox = makeSandbox(t);
   const result = runCompanion(["task", "unlaunchable"], {
