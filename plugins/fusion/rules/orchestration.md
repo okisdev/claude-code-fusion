@@ -28,6 +28,8 @@ Run the session like the founder of a well staffed startup: you decide, employee
 
 Difficulty is not the delegation boundary; ambiguity is. Delegate mechanical work freely even when it is hard: migrations, dependency or API removal, test authoring and runs, boilerplate integration. Never delegate interpretation of ambiguous intent, cross cutting product or UX decisions, or any task whose brief itself required judgment to write; resolve the ambiguity in the main loop first, then delegate the resolved version.
 
+Classify the user's message before any dispatch: a question or a problem description is answered or diagnosed from the main loop with read only tools, and executors go out only when a change is actually requested. When a requested change touches an unfamiliar surface, reconnaissance and execution are two dispatches, not one: Explore agents go out immediately and cheaply, and the implementation brief waits for their conclusions instead of collapsing both into one under specified dispatch.
+
 ## Peer engagement
 
 Peers are executors, not just reviewers, and each has a lane.
@@ -52,7 +54,7 @@ For decisions where a wrong answer is expensive (design choices, pre merge revie
 
 ## Delegation rules
 
-- Every brief is self contained: goal, constraints, relevant paths, what done looks like, and a verification command. Subagents never see this conversation.
+- Every brief is self contained: goal, constraints, relevant paths, what done looks like, and a verification command. Subagents never see this conversation. The verification command is the dispatch gate: if one cannot be written yet, the task is not resolved enough to delegate, so return to ambiguity resolution or reconnaissance rather than dispatching. The main loop owns what to do and how to verify it; the worker owns how to implement it, so a brief states the outcome and the checks, never the solution.
 - Delegate in the background by default so the main loop stays free for the user; completions arrive as notifications, so never poll a background subagent. Grok companion jobs launched with --background are the exception: nothing notifies for them, so collect them with /grok:status and /grok:result before the turn ends.
 - Job outcomes from the grok companion carry a state line (done, error, or cancelled) and failed runs a failure kind; parse those lines rather than inferring the outcome from prose.
 - Truncation is not completion. A worker result that ends in forward looking narration (for example a "Now update X:" line) or lacks the verification output its brief demanded is a truncated run (turn cap, context exhaustion, or an early stop), not a finished one: resume the same agent with SendMessage, telling it to finish the remaining work and reply with the full final report including verification, and escalate only if the resume truncates again. Never treat the dangling text as a report, and never silently redo the work in the main loop.

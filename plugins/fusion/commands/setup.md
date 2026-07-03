@@ -4,7 +4,7 @@ argument-hint: ''
 allowed-tools: Read, Write, Edit, AskUserQuestion
 ---
 
-Install the orchestration layer this plugin ships but Claude Code cannot auto load: the routing rules file. Everything else (the tier agents, the panel and doctor commands) is already active through the plugin itself.
+Install or reconcile the orchestration layer this plugin ships but Claude Code cannot auto load: the routing rules file. A SessionStart hook already syncs the rules automatically whenever the live copy matches a version the plugin has shipped before, so this command is mainly needed once (first install) or when the hook detects local edits it will not overwrite on its own. Everything else (the tier agents, the panel and doctor commands) is already active through the plugin itself.
 
 Steps:
 
@@ -14,6 +14,6 @@ Steps:
    - If it exists and is identical, report that the rules are up to date and stop.
    - If it exists and differs, show the user a compact diff summary (what changed, not necessarily every line) and ask with `AskUserQuestion` whether to overwrite (Recommended when the live copy has no local edits the user wants to keep) or keep the live copy. Overwrite only on approval.
 3. Check `~/.claude/settings.json` for a `permissions.allow` entry of `Bash(node:*)`. If absent, tell the user: adding it lets the grok forwarder run the companion without a first use permission prompt, but it is a broad allow; offer to add it via `Edit` and do so only on approval.
-4. Report what was installed, what was skipped, and remind the user that a new session picks up rules changes.
+4. Report what was installed, what was skipped, and remind the user that future plugin updates sync automatically at the next session start unless the live copy carries local edits, in which case this command is how to reconcile them.
 
 Follow the flow above exactly: a fresh install (no existing rules file) writes without asking, and every overwrite or settings change happens only on approval. This command touches only `~/.claude/rules/orchestration.md` and, on request, the settings permissions array.
