@@ -374,16 +374,19 @@ function recentSubagentTranscripts(files, mainTranscript, startedAtMs) {
   });
 }
 
+function recordSourceId(record) {
+  return record?.message?.id ?? record?.uuid ?? null;
+}
+
 function aggregateClaudeTokens(headlessOutput, mainTranscript, subagentTranscripts) {
   const tokens = {
     orchestrator: emptyTokens(),
     subagents: emptyTokens(),
     byModel: {}
   };
-  for (const entry of collectUsageEntries(headlessOutput)) {
-    addUsage(tokens, "orchestrator", entry);
-  }
   let delegationCount = 0;
+  let transcriptUsageRecordCount = 0;
+  const seenSourceIds = new Set();
   const transcriptSets = [
     { file: mainTranscript, subagentFile: false },
     ...subagentTranscripts.map((file) => ({ file, subagentFile: true }))
@@ -393,12 +396,29 @@ function aggregateClaudeTokens(headlessOutput, mainTranscript, subagentTranscrip
     for (const record of records) {
       const sidechain = transcript.subagentFile || isSidechainRecord(record);
       const role = sidechain ? "subagents" : "orchestrator";
-      for (const entry of collectUsageEntries(record)) {
-        addUsage(tokens, role, entry);
-      }
       if (!sidechain && !transcript.subagentFile) {
         delegationCount += countAgentToolUses(record);
       }
+      const entries = collectUsageEntries(record);
+      if (entries.length === 0) {
+        continue;
+      }
+      const sourceId = recordSourceId(record);
+      if (sourceId !== null) {
+        if (seenSourceIds.has(sourceId)) {
+          continue;
+        }
+        seenSourceIds.add(sourceId);
+      }
+      for (const entry of entries) {
+        addUsage(tokens, role, entry);
+        transcriptUsageRecordCount += 1;
+      }
+    }
+  }
+  if (transcriptUsageRecordCount === 0) {
+    for (const entry of collectUsageEntries(headlessOutput)) {
+      addUsage(tokens, "orchestrator", entry);
     }
   }
   return { tokens, delegationCount };

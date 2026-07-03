@@ -50,6 +50,7 @@
       {
         type: "assistant",
         message: {
+          id: "msg_agent",
           role: "assistant",
           model: "claude-sonnet-4-5",
           content: [
@@ -71,6 +72,7 @@
       {
         type: "assistant",
         message: {
+          id: "msg_final",
           role: "assistant",
           model: "claude-sonnet-4-5",
           content: [{ type: "text", text: "done" }],
@@ -86,6 +88,7 @@
         type: "assistant",
         isSidechain: true,
         message: {
+          id: "msg_subagent",
           role: "assistant",
           model: "claude-haiku-4-5",
           content: [{ type: "text", text: "subagent result" }],
@@ -108,12 +111,12 @@
         subtype,
         session_id: sessionId,
         sessionId,
-        model: "claude-opus-4-1",
+        model: "claude-sonnet-4-5",
         usage: {
-          input_tokens: 7,
-          output_tokens: 3,
-          cache_read_input_tokens: 1,
-          cache_creation_input_tokens: 0
+          input_tokens: 9000,
+          output_tokens: 9000,
+          cache_read_input_tokens: 9000,
+          cache_creation_input_tokens: 9000
         },
         result: "fake result"
       }) + "\n",

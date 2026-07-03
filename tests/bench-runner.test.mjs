@@ -114,12 +114,31 @@ test("runner appends a valid record with verifier success and split token totals
   assert.strictEqual(record.repetition, 3);
   assert.strictEqual(record.verifyExit, 0);
   assert.ok(record.wallClockSeconds >= 0);
-  assert.ok(record.claudeTokens.orchestrator.input > 0);
-  assert.ok(record.claudeTokens.orchestrator.output > 0);
-  assert.ok(record.claudeTokens.subagents.input > 0);
-  assert.ok(record.claudeTokens.byModel["claude-opus-4-1"].input > 0);
-  assert.ok(record.claudeTokens.byModel["claude-sonnet-4-5"].input > 0);
-  assert.ok(record.claudeTokens.byModel["claude-haiku-4-5"].input > 0);
+  assert.deepStrictEqual(record.claudeTokens.orchestrator, {
+    input: 130,
+    output: 52,
+    cacheRead: 13,
+    cacheCreation: 6
+  });
+  assert.deepStrictEqual(record.claudeTokens.subagents, {
+    input: 50,
+    output: 20,
+    cacheRead: 4,
+    cacheCreation: 2
+  });
+  assert.deepStrictEqual(record.claudeTokens.byModel["claude-sonnet-4-5"], {
+    input: 130,
+    output: 52,
+    cacheRead: 13,
+    cacheCreation: 6
+  });
+  assert.deepStrictEqual(record.claudeTokens.byModel["claude-haiku-4-5"], {
+    input: 50,
+    output: 20,
+    cacheRead: 4,
+    cacheCreation: 2
+  });
+  assert.strictEqual(record.claudeTokens.byModel["claude-opus-4-1"], undefined);
   assert.deepStrictEqual(record.peerTokens, { grok: null, codex: null });
   assert.strictEqual(record.delegationCount, 1);
   assert.strictEqual(record.resumeCount, 0);
