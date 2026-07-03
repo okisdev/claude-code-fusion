@@ -3,7 +3,7 @@ name: fast-worker
 description: Mechanical execution worker on Sonnet. Use for well specified edits, refactors with a clear recipe, multi file implementation of an approved plan (one work package per invocation), running tests and fixing trivial failures, codemods, boilerplate, and doc updates. An approved plan section counts as the task spec; do not send open ended design work.
 model: sonnet
 effort: medium
-maxTurns: 30
+maxTurns: 120
 disallowedTools: Agent
 ---
 

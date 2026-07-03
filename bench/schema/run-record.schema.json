@@ -1,0 +1,133 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/okisdev/claude-code-fusion/bench/schema/run-record.schema.json",
+  "title": "Benchmark run record",
+  "description": "One JSON object per line in bench/results/<date>-<version>/runs.jsonl.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "taskId",
+    "condition",
+    "repetition",
+    "verifyExit",
+    "wallClockSeconds",
+    "claudeTokens",
+    "peerTokens",
+    "delegationCount",
+    "resumeCount",
+    "escalationCount",
+    "excluded",
+    "excludedReason"
+  ],
+  "properties": {
+    "taskId": {
+      "type": "string",
+      "minLength": 1
+    },
+    "condition": {
+      "type": "string",
+      "enum": ["A", "B1", "B2"]
+    },
+    "repetition": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "verifyExit": {
+      "type": "integer"
+    },
+    "wallClockSeconds": {
+      "type": "number",
+      "minimum": 0
+    },
+    "claudeTokens": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["orchestrator", "subagents", "byModel"],
+      "properties": {
+        "orchestrator": {
+          "$ref": "#/$defs/tokenCounts"
+        },
+        "subagents": {
+          "$ref": "#/$defs/tokenCounts"
+        },
+        "byModel": {
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/$defs/tokenCounts"
+          }
+        }
+      }
+    },
+    "peerTokens": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["grok", "codex"],
+          "properties": {
+            "grok": {
+              "type": ["number", "null"],
+              "minimum": 0
+            },
+            "codex": {
+              "type": ["number", "null"],
+              "minimum": 0
+            }
+          }
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "delegationCount": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "resumeCount": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "escalationCount": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "excluded": {
+      "type": "boolean"
+    },
+    "excludedReason": {
+      "type": ["string", "null"],
+      "enum": [
+        "network_outage_all_conditions",
+        "harness_defect",
+        "external_service_outage",
+        null
+      ]
+    }
+  },
+  "$defs": {
+    "tokenCounts": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["input", "output", "cacheRead", "cacheCreation"],
+      "properties": {
+        "input": {
+          "type": "number",
+          "minimum": 0
+        },
+        "output": {
+          "type": "number",
+          "minimum": 0
+        },
+        "cacheRead": {
+          "type": "number",
+          "minimum": 0
+        },
+        "cacheCreation": {
+          "type": "number",
+          "minimum": 0
+        }
+      }
+    }
+  }
+}

@@ -51,6 +51,12 @@ Requested by prompts (the orchestrator follows the installed instructions; not r
 
 Roles bind to alias tiers, not to specific models, so a same tier release (Sonnet 5 under `sonnet`, a future Opus) needs zero configuration, and `best[1m]` floats the orchestrator to future Fable releases or degrades it to the latest Opus when Fable is unavailable. The one deliberate exception is `fusion:trivial-worker`, pinned to the full ID `claude-haiku-4-5` for machines where ANTHROPIC_DEFAULT_HAIKU_MODEL remaps the haiku alias; bump it by hand when a newer cheap tier ships. Alias semantics are Claude Code behavior as observed on 2.1.x, and nothing here sets your main model for you: pick it yourself, for example `/model best`. `/fusion:doctor` audits all of this.
 
+## Benchmark
+
+The plugin's effectiveness claims are benchmarked, not asserted. The claims and the full protocol live in [bench/METHODOLOGY.md](bench/METHODOLOGY.md): C1 quota displacement (routing bills fewer tokens to the Claude subscription than a vanilla session at equal task success, split into a Claude tiers only arm and a peer offload arm), C2 wall clock compression on plan shaped tasks versus a protocol enforced sequential baseline, and C3 typed failure surfacing, scoped to the grok companion failure kind contract the test suite already covers. The harness ships in [bench/](bench/): a runner that isolates each condition in its own Claude configuration directory and keeps verifiers outside the model visible worktree, a strict JSONL record schema, a summary script that refuses to compare snapshots from different task manifests, a redaction step for published transcripts, and a manifest tool that content hashes every task before any results exist.
+
+No results are published yet. The task suite currently holds one of the planned 8 to 12 tasks, so no snapshot would meet the methodology's own publication gate; the first dated reference snapshot ships once the pool is complete, with raw per run data committed alongside the summary table. Until then the status is plain: the procedure is public and runnable, the numbers do not exist. Readers can run the harness themselves with `node bench/run.mjs --task <id> --condition <A|B1|B2> --repetition <n> --results <dir> --claude-config <dir>` after building condition profiles per [bench/conditions/README.md](bench/conditions/README.md).
+
 ## Data and uninstall
 
 The grok plugin keeps job records, briefs, and logs under `~/.claude/plugins/data/grok-claude-code-fusion/`; briefs can contain your prompts and diffs, and logs can contain grok stderr. Delete that directory to clear history. Full uninstall: remove both plugins via `/plugin`, delete `~/.claude/rules/orchestration.md`, drop the optional `Bash(node:*)` entry from `permissions.allow`, and delete the data directory. Environment overrides (`GROK_BIN`, `GROK_COMPANION_DATA`, `GROK_COMPANION_TIMEOUT_MS`) are documented in [docs/grok-contract.md](docs/grok-contract.md). `/fusion:stats` aggregates delegation counts across both peers; token usage itself lives with each vendor (ccusage for the Claude side, the OpenAI and xAI dashboards for the peers), since peer work never touches the Claude transcript.
@@ -64,7 +70,8 @@ The grok plugin keeps job records, briefs, and logs under `~/.claude/plugins/dat
 - `.claude-plugin/marketplace.json`: the marketplace manifest; installs as marketplace `claude-code-fusion`.
 - `plugins/grok/`: the Grok integration (companion runtime, `grok-rescue` agent, `/grok:*` commands).
 - `plugins/fusion/`: the orchestration layer: tier agents (`agents/`), the routing policy payload (`rules/`), and the `/fusion:panel`, `/fusion:setup`, `/fusion:doctor`, and `/fusion:stats` commands.
-- `tests/`: the fake-grok driven test suite.
+- `bench/`: the benchmark methodology, harness, and task suite; no published results yet, see the publication gate in [bench/METHODOLOGY.md](bench/METHODOLOGY.md).
+- `tests/`: the fake-grok and fake-claude driven test suite.
 
 ## Internals
 
