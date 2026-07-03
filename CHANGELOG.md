@@ -1,5 +1,13 @@
 # changelog
 
+## 0.0.10
+
+- model aware peer lanes: codex is now the primary implementation lane (the current GPT 5.x flagship, spec grade briefs with explicit completion criteria, output contract, boundaries, and a verification command); grok is the quick turnaround lane (Composer 2.5 Fast by default) for small fixes, drafts, research digests, and large context reads; trivial single file tasks now default to grok, with fusion:trivial-worker as the fallback
+- new /fusion:config command reads local model configuration across engines, enumerates available models, and changes defaults interactively
+- /fusion:ultra facet routing: codex takes implementation and adversarial facets with spec grade briefs; grok takes high volume facets, research digests, and scoped fixes
+- /fusion:doctor gains a peer engine defaults check (model keys from each CLI config, never the full files) and points at /fusion:config and `grok models` for remediation
+- the codex prerequisite is explicit: codex@openai-codex powers the implementation lane, the rules document per call model and effort overrides (including the spark alias) and the fallback routing when the plugin is absent, and /codex:adversarial-review becomes the named cross engine review command
+
 ## 0.0.9
 
 - rules sync is automatic: a SessionStart hook compares the installed ~/.claude/rules/orchestration.md against the plugin's canonical copy and a manifest of every released version's hash; a missing file is installed, a file matching any released hash is safely updated (provably never hand edited), and unknown content is never touched, with a one line notice pointing at /fusion:setup to reconcile. /fusion:setup narrows to first install permission checks and local edit reconciliation, and a guard test fails the suite when the rules change without regenerating the manifest
