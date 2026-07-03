@@ -1,6 +1,6 @@
 {
   "name": "grok",
-  "version": "0.0.7",
+  "version": "0.0.8",
   "description": "Delegate coding, review, and second opinion work to the local Grok CLI.",
   "author": {
     "name": "Harry Yep"

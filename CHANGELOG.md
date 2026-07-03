@@ -1,5 +1,9 @@
 # changelog
 
+## 0.0.8
+
+- routing policy: worker reuse is scoped and rotated. a follow up goes to the same worker only when it touches the same files or surface as its previous brief; new packages, different surfaces, and parallelizable work get fresh agents; after about three follow up resumes or when notifications show usage nearing the context window, rotate to a fresh worker whose brief carries the accumulated decisions (observed live: one ui worker reached 78 percent of its window after five follow up resumes). truncation resumes count toward rotation and the same discipline applies to grok --resume-last threads
+
 ## 0.0.7
 
 - worker turn caps are runaway breakers, not task size estimates: fusion:fast-worker goes from 30 to 120 turns and fusion:deep-reasoner from 40 to 80, after four fast-worker packages in one day exhausted the 30 turn cap mid implementation and their dangling progress narration was reported as the final result; fusion:trivial-worker stays at 15 by design, since exhausting it means the task was routed wrong
