@@ -1,6 +1,6 @@
 {
   "name": "fusion",
-  "version": "0.0.6",
+  "version": "0.0.7",
   "description": "Multi-model orchestration: tier agents, routing rules, a blind multi-model panel, and a model drift doctor.",
   "author": {
     "name": "Harry Yep"

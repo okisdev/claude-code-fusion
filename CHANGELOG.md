@@ -1,5 +1,13 @@
 # changelog
 
+## 0.0.7
+
+- worker turn caps are runaway breakers, not task size estimates: fusion:fast-worker goes from 30 to 120 turns and fusion:deep-reasoner from 40 to 80, after four fast-worker packages in one day exhausted the 30 turn cap mid implementation and their dangling progress narration was reported as the final result; fusion:trivial-worker stays at 15 by design, since exhausting it means the task was routed wrong
+- routing policy: truncation is not completion. a worker result that ends in forward looking narration or lacks the verification output its brief demanded is treated as a truncated run and resumed with SendMessage to finish and re-report, instead of being read as a final report
+- public benchmark scaffolding: bench/METHODOLOGY.md defines the claims under test (C1a Claude tier quota displacement, C1b peer offload increment, C2 wall clock compression, C3 typed failure surfacing scoped to the tested grok contract) with condition isolation, pre registered task manifests, verifier isolation with mutant self tests, a fixed exclusion enum, and a publication gate; the draft went through a blind two engine adversarial panel and every blocking finding was folded in
+- the harness ships alongside it: run.mjs (isolated CLAUDE_CONFIG_DIR per condition, verifiers run outside the model visible worktree, token accounting by model and role from transcripts), a strict run record schema, summarize.mjs (pass matrix, median and IQR, refuses to compare snapshots from different task manifests), manifest.mjs (content hashed task registration), redact.mjs (path and credential scrubbing), and the first task T01-seeded-bug with a mutant self test; 12 new tests, suite at 60
+- no results are published yet and the README says so: the task pool holds 1 of the planned 8 to 12 tasks, so no snapshot passes the methodology's own publication gate; in tree results stay lean (runs.jsonl, env.json, summary) with full redacted transcripts attached to releases instead of committed to the tree
+
 ## 0.0.6
 
 - permission failure kind: a consult mode run whose tool call fell outside the allow list was reported as done with empty or partial output, because the grok CLI cancels the whole turn and exits 0 with stopReason Cancelled; the companion now detects that shape across the foreground, background, review, and stop gate paths and converts it to state: error, failure: permission with guidance to re-dispatch with --write or rewrite the brief (observed live: research briefs calling gh api died silently twice in a row)
