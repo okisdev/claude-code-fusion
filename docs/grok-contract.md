@@ -14,20 +14,21 @@ The facts below were verified live against grok 0.2.16 on 2026-07-02 and are imp
 
 ## Permissions
 
-- Consult mode: `--sandbox workspace --permission-mode dontAsk` with a narrow allow list (Read, Grep, git read commands) plus explicit deny rules for Edit, Write, and nested grok, claude, codex, and node launches.
+- Consult mode: `--sandbox workspace --permission-mode dontAsk` with a narrow allow list (Read, Grep, git read commands, and read only `gh` subcommands: `pr view`, `pr list`, `pr diff`, `pr checks`, `issue view`, `issue list`, `repo view`, `search`, `run view`, `run list`, `release view`, `release list`) plus explicit deny rules for Edit, Write, and nested grok, claude, codex, and node launches. `gh api` is deliberately excluded from the allow list even in consult mode, since it can send mutating requests with the user's credentials; it stays write mode only.
 - The denies are load bearing: grok inherits permission allow rules from `~/.claude/settings.json` and deny beats allow (verified live). Without them, an inherited allow such as `Bash(node:*)` would silently extend a consult run beyond the documented read only surface. Inherited allows outside the deny list can still extend what a consult run may execute, so keep the global allowlist small.
 - Write mode: `--sandbox workspace --always-approve` with deny rules for sudo, `rm -rf`, `git push`, and nested grok, claude, and codex invocations. Everything else is auto approved.
+- When a consult mode turn calls a tool outside the allow list, the `dontAsk` permission gate cancels the whole turn: the CLI exits 0 with `stopReason: "Cancelled"` and empty or partial text instead of `stopReason: "EndTurn"`. The companion detects that shape and converts it into `state: error`, `failure: permission` rather than reporting a misleading success.
 - `--no-subagents` stays on every call because grok auto discovers Claude Code agent definitions under `~/.claude/agents` and could otherwise recursively spawn them. Best-of-n runs are the exception, since the tournament needs subagents. Web tools are disabled by default (`--disable-web-search`); the task subcommand's `--web` flag re-enables them for research briefs.
 
 ## Process lifecycle
 
 - grok is spawned detached in its own process group, and the child pid is recorded on the job record as `grokPid`. Timeout, cancel, and the SessionEnd hook signal the process group, so descendants are reaped with the leader.
 - Timeouts: foreground runs default to 570000ms (deliberately below the 600000ms Bash timeout the forwarder agent uses, so the companion always reaps first and writes the record); background workers cap at 1800000ms; the stop gate caps its grok call at 240000ms inside the hook's 900 second budget; the `/grok:review` background flow overrides the foreground default with `GROK_COMPANION_TIMEOUT_MS=1800000`. A timeout escalates SIGTERM to SIGKILL after a 10 second grace, guarded so a process that already exited is never signaled again (PID reuse). Exit codes: 0 ok, 1 error, 130 SIGINT, 143 SIGTERM. Interrupted runs keep their file modifications and are resumable via the session uuid when grok reported one before the interruption; a run killed before emitting its JSON envelope leaves no session id on the record.
-- Failed runs carry a typed `failureKind` (missing_cli, auth, rate_limited, quota, timeout, cancelled, error) on the job record plus `state: error` and `failure: <kind>` lines in rendered output; jobs cancelled by `/grok:cancel` or the SessionEnd hook are marked with `failureKind: cancelled`. The routing policy parses these lines for session circuit breaking.
+- Failed runs carry a typed `failureKind` (missing_cli, auth, rate_limited, quota, timeout, permission, cancelled, error) on the job record plus `state: error` and `failure: <kind>` lines in rendered output; jobs cancelled by `/grok:cancel` or the SessionEnd hook are marked with `failureKind: cancelled`. The routing policy parses these lines for session circuit breaking.
 
 ## Environment overrides
 
-- `GROK_BIN`: grok binary override (tests point it at a fake). `GROK_COMPANION_DATA`: state directory override (default `~/.claude/plugins/data/grok-claude-code-fusion`). `GROK_COMPANION_TIMEOUT_MS`: foreground timeout override.
+- `GROK_BIN`: grok binary override (tests point it at a fake). `GROK_COMPANION_DATA`: state directory override (default `~/.claude/plugins/data/grok-claude-code-fusion`). `GROK_COMPANION_TIMEOUT_MS`: foreground timeout override. `GROK_CONSULT_ALLOW`: comma separated extra allow rules appended to the consult mode allow list; deny rules still beat them and write mode ignores this variable.
 
 ## Stop gate
 
