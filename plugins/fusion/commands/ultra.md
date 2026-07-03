@@ -21,9 +21,9 @@ Compose one self contained brief per facet:
 
 Launch the fleet in ONE message:
 
-- Spawn all facets at once as background subagents via the `Agent` tool. Route by lane: grok (`grok:grok-rescue`, the fast lane) takes the bulk, high volume facets and research digests; codex (`codex:codex-rescue`, the deep lane) takes the two or three hardest or most adversarial facets. Balance the split so both engines draw.
+- Spawn all facets at once as background subagents via the `Agent` tool. Route by lane: codex (`codex:codex-rescue`, the implementation lane) takes the implementation and adversarial facets, each with a spec grade brief; grok (`grok:grok-rescue`, the quick turnaround lane) takes the high volume facets, research digests, and scoped fixes. Balance the split so both engines draw.
 - Track the fleet with `TodoWrite` so the user sees the facets in flight. Never poll; completions arrive as notifications.
-- If an engine is unavailable (`grok unavailable: ...` or a missing agent type), route its facets to the other peer, and only fall back to `fusion:deep-reasoner` if both peers are down. Say so in the synthesis.
+- If an engine is unavailable (`grok unavailable: ...` or a missing agent type), route its facets to the other peer with their briefs intact, and only when both peers are down fall back to the Claude tiers: fusion:fast-worker for implementation facets, fusion:deep-reasoner for adversarial and synthesis facets. Say so in the synthesis.
 
 Synthesize when the fleet returns:
 
