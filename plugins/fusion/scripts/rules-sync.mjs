@@ -18,6 +18,12 @@ function readManifestHashes(manifestPath) {
   }
 }
 
+function writeAtomic(target, content) {
+  const tmpPath = target + ".tmp-" + process.pid;
+  fs.writeFileSync(tmpPath, content, "utf8");
+  fs.renameSync(tmpPath, target);
+}
+
 function main() {
   const pluginRoot = process.env.CLAUDE_PLUGIN_ROOT;
   if (!pluginRoot) {
@@ -39,7 +45,7 @@ function main() {
 
   if (!fs.existsSync(liveFile)) {
     fs.mkdirSync(path.dirname(liveFile), { recursive: true });
-    fs.writeFileSync(liveFile, canonical, "utf8");
+    writeAtomic(liveFile, canonical);
     console.log("fusion: routing rules installed (run /fusion:setup for the optional permission check)");
     return;
   }
@@ -50,7 +56,7 @@ function main() {
   }
 
   if (readManifestHashes(manifestPath).has(liveHash)) {
-    fs.writeFileSync(liveFile, canonical, "utf8");
+    writeAtomic(liveFile, canonical);
     console.log("fusion: routing rules updated to the current plugin version");
     return;
   }
