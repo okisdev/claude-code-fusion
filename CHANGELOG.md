@@ -1,5 +1,10 @@
 # changelog
 
+## 0.0.9
+
+- rules sync is automatic: a SessionStart hook compares the installed ~/.claude/rules/orchestration.md against the plugin's canonical copy and a manifest of every released version's hash; a missing file is installed, a file matching any released hash is safely updated (provably never hand edited), and unknown content is never touched, with a one line notice pointing at /fusion:setup to reconcile. /fusion:setup narrows to first install permission checks and local edit reconciliation, and a guard test fails the suite when the rules change without regenerating the manifest
+- routing policy gains the pre dispatch side: classify the user's message before any dispatch (questions and problem descriptions are handled in the main loop with read only tools, executors go out only for actual change requests); reconnaissance and execution are two dispatches on unfamiliar surfaces; and the verification command becomes the dispatch gate, with the main loop owning what to do and how to verify while the worker owns how to implement
+
 ## 0.0.8
 
 - routing policy: worker reuse is scoped and rotated. a follow up goes to the same worker only when it touches the same files or surface as its previous brief; new packages, different surfaces, and parallelizable work get fresh agents; after about three follow up resumes or when notifications show usage nearing the context window, rotate to a fresh worker whose brief carries the accumulated decisions (observed live: one ui worker reached 78 percent of its window after five follow up resumes). truncation resumes count toward rotation and the same discipline applies to grok --resume-last threads
