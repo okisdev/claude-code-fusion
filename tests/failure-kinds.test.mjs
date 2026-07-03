@@ -138,6 +138,22 @@ test("timeout yields failure kind timeout", (t) => {
   assert.match(resultOutput.stdout, /^failure: timeout$/m);
 });
 
+test("permission-cancelled turn yields failure kind permission", (t) => {
+  const sandbox = makeSandbox(t);
+  const env = envFor(sandbox, { FAKE_GROK_MODE: "permission-cancelled" });
+  const result = runCompanion(["task", "doomed"], { cwd: sandbox.workDir, env });
+  assert.notStrictEqual(result.status, 0);
+  assert.match(result.stderr, /^failure: permission$/m);
+  assert.match(result.stderr, /^state: error$/m);
+  const record = jobRecords(sandbox.dataDir)[0];
+  assert.strictEqual(record.status, "error");
+  assert.strictEqual(record.failureKind, "permission");
+  const resultOutput = runCompanion(["result", record.id], { cwd: sandbox.workDir, env });
+  assert.strictEqual(resultOutput.status, 0, resultOutput.stderr);
+  assert.match(resultOutput.stdout, /^failure: permission$/m);
+  assert.match(resultOutput.stdout, /^state: error$/m);
+});
+
 test("cancelled background job yields failure kind cancelled", async (t) => {
   const sandbox = makeSandbox(t);
   const env = envFor(sandbox, { FAKE_GROK_MODE: "hang" });

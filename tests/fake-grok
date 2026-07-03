@@ -115,6 +115,16 @@
     process.exit(0);
   }
 
+  if (mode === "permission-cancelled") {
+    emit({
+      text: "",
+      stopReason: "Cancelled",
+      sessionId: "88888888-8888-7888-8888-888888888888",
+      requestId: "req-1"
+    });
+    process.exit(0);
+  }
+
   if (mode === "error") {
     process.stderr.write("Fake grok failed on purpose.\n");
     process.exit(1);
