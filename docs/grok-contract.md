@@ -38,4 +38,4 @@ The facts below were verified live against grok 0.2.16 on 2026-07-02 and are imp
 ## Degradation
 
 - A missing grok binary fails fast with a message pointing at `/grok:setup`, and the `grok-rescue` agent returns a single `grok unavailable: <reason>` line the orchestrator uses to stop routing to Grok for the session.
-- If the codex plugin is not installed, its agent type does not exist and the routing policy falls back symmetrically. `/fusion:panel` substitutes `fusion:deep-reasoner` for any missing track, or runs a two lens Claude only panel when both engines are missing, and says so in the synthesis.
+- If the codex plugin is not installed, its agent type does not exist and the routing policy falls back asymmetrically: spec grade implementation packages go to fusion:fast-worker, scoped ones to grok, and adversarial review to fusion:deep-reasoner. `/fusion:panel` substitutes `fusion:deep-reasoner` for any missing track, or runs a two lens Claude only panel when both engines are missing, and says so in the synthesis.
