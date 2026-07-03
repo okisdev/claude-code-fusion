@@ -19,7 +19,7 @@ claude plugin install grok@claude-code-fusion
 claude plugin install fusion@claude-code-fusion
 ```
 
-Then, in a new session, run `/fusion:setup` once per machine (it writes the routing rules into `~/.claude/rules/`, where every later session loads them automatically) and `/grok:setup` once to verify the Grok side. The tier agents ship inside the fusion plugin, so nothing else needs copying; re-run `/fusion:setup` only when a plugin update changes the rules, which `/fusion:doctor` flags as drift. From there plain language is enough: ask for "a second opinion from Grok" or "hand this to Codex" and the routing rules make the orchestrator delegate on its own.
+Then, in a new session, run `/fusion:setup` once per machine (it writes the routing rules into `~/.claude/rules/`, where every later session loads them automatically) and `/grok:setup` once to verify the Grok side. The tier agents ship inside the fusion plugin, so nothing else needs copying. After that, a SessionStart hook applies rules updates from later plugin upgrades automatically at the next session start, as long as the live copy still matches a version the plugin has shipped; re-run `/fusion:setup` only if you hand edited `~/.claude/rules/orchestration.md`, which the hook and `/fusion:doctor` both flag as drift. From there plain language is enough: ask for "a second opinion from Grok" or "hand this to Codex" and the routing rules make the orchestrator delegate on its own.
 
 ## Commands
 
