@@ -1,5 +1,12 @@
 # changelog
 
+## 0.0.6
+
+- permission failure kind: a consult mode run whose tool call fell outside the allow list was reported as done with empty or partial output, because the grok CLI cancels the whole turn and exits 0 with stopReason Cancelled; the companion now detects that shape across the foreground, background, review, and stop gate paths and converts it to state: error, failure: permission with guidance to re-dispatch with --write or rewrite the brief (observed live: research briefs calling gh api died silently twice in a row)
+- consult mode allow list gains read only gh subcommands (pr view/list/diff/checks, issue view/list, repo view, search, run view/list, release view/list); gh api stays write mode only since it can send mutating requests with the user's credentials
+- GROK_CONSULT_ALLOW appends comma separated extra allow rules to consult mode per machine; deny rules still beat them and write mode ignores the variable
+- routing policy: permission does not break the engine in the circuit breaker; re-dispatch the same brief once with --write when repository changes are acceptable, otherwise rewrite the brief to avoid shell commands
+
 ## 0.0.5
 
 - the routing policy is rewritten around an operating model: the orchestrator runs the session like a founder with a paid bench, biases to fan out (five or more concurrent delegations is a normal state, under dispatching is the failure mode), keeps every engine drawing, and trusts then verifies instead of hovering; grok is named the fast lane and codex the deep lane
