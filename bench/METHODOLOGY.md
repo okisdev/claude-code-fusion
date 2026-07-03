@@ -1,0 +1,72 @@
+# Benchmark methodology
+
+This benchmark measures the operational claims made for the claude-code-fusion plugin. It ships as a package: this methodology document, the task manifest, the runner, the verifier harness, the summary script, and dated raw results committed alongside them. This document precedes the harness. Results must not be published before the runner, the verifier harness, and the summary script exist in the repo. Readers with matching subscriptions (Claude, and Grok and Codex where a condition requires them) can rerun the harness themselves, but exact numbers will differ, since hosted models, quotas, and rate limits change over time. Reproducibility here means the procedure is repeatable, not that the numbers are stable.
+
+## Claims under test
+
+C1a. Claude tier routing: at equal task success rate, routing execution to fusion's Claude worker tiers (deep-reasoner, fast-worker, trivial-worker) bills fewer tokens to the Claude subscription than a vanilla Claude Code session, because work moves off the orchestrator model onto cheaper tiers. Measured by comparing Claude subscription token totals between condition B1 and condition A on the same task suite. A task counts toward C1a only when both conditions pass verification in at least 2 of 3 repetitions. Per task pass rates are always reported next to any token comparison drawn from that task, so a token delta is never shown without the pass rates that make it comparable.
+
+C1b. Peer offload increment: enabling Grok and Codex peers on top of Claude tier routing bills fewer tokens to the Claude subscription than Claude tier routing alone, because some execution moves off the Claude subscription entirely. Measured by comparing Claude subscription token totals between condition B2 and condition B1 on the same task suite, under the same comparability gate as C1a (2 of 3 repetitions passing verification in both conditions, pass rates reported next to the comparison). Token accounting for both C1a and C1b is broken out by model and by role, orchestrator versus subagent, using the exact transcript fields named in the harness's JSONL schema (see Metrics). Failed runs never count toward token savings; a run that fails verification is excluded from the token comparison regardless of how few tokens it billed.
+
+C2. Wall clock compression: on plan shaped tasks, parallel delegation completes in less wall clock time than a protocol enforced sequential baseline. Measured on at least three plan shaped tasks, each with three or more independent work packages, not on a single task. Wall clock is defined precisely as the interval from prompt submission to the final verification exit for that run, recorded separately for condition A, condition B1, and condition B2, since B1 and B2 have different delegation surfaces. Resume and retry counts are disclosed alongside the wall clock numbers, since background peer collection latency (the time a peer job spends queued or running before its result is collected) is not under the plugin's control and can inflate or deflate a B2 timing independent of the plugin's own behavior.
+
+C3. Typed failure surfacing: this claim is scoped to what is machine checked today, which is the grok companion failure kind contract, verified by tests/failure-kinds.test.mjs and documented in docs/grok-contract.md. Claude worker turn cap truncation detection is routing policy encoded in the plugin's rules, not a tested contract, and is not covered by C3. Codex state reading (parsing codex-rescue's reported outcome) is best effort and is likewise not covered by C3. Wider engine coverage becomes part of C3 only once a canary suite exists that exercises that engine's failure paths the way tests/failure-kinds.test.mjs exercises Grok's.
+
+## Non claims
+
+This benchmark does not isolate model coding quality from orchestration quality. Quality enters the benchmark only as a verifier pass or fail; a passing run says the task's verify.sh accepted the output, nothing about how good that output is relative to some other model or approach. It does not claim dollar savings, since condition B2 requires separate Grok and Codex subscriptions in addition to a Claude subscription, so the cost claim is scoped to Claude subscription quota only, not total spend across providers. Fewer Claude billed tokens under B2 must not be read as lower total cost, since the peer engines bill their own subscriptions and those bills are outside this benchmark's accounting. All results are dated snapshots that expire when the underlying models change, and a snapshot should not be read as a permanent ranking.
+
+## Conditions
+
+- A: vanilla Claude Code, plugin disabled, same model configuration as B. Condition A runs in its own clean, isolated Claude Code configuration directory containing no fusion routing rules. This matters because the plugin's setup writes routing rules into the user configuration directory that survive disabling the plugin itself, so a condition A run inside a configuration directory that ever had fusion set up is invalid; A must be run from a home that never had fusion installed, or from one restored to that state. Condition A is also protocol bound to sequential execution, no subagent parallelism, for the C2 probes, so the C2 comparison isolates parallel delegation rather than mixing it with other differences between A and B.
+- B1: fusion enabled, Claude tiers only (deep-reasoner, fast-worker, trivial-worker), no peer engines. Both peer plugins are disabled for this condition. Reproducible with a Claude subscription alone.
+- B2: fusion enabled with Grok and Codex peers. Requires all three subscriptions and is published separately so readers without peer subscriptions can still verify B1.
+- Both B1 and B2 must actually delegate. Delegation count is recorded per run (see Metrics), and a B run that never delegates is reported as such rather than folded into the aggregate as if it exercised the routing path.
+- The exact setup commands used to construct each condition's configuration directory, including how peer plugins are disabled for B1 and how a clean home is verified for A, are published alongside the harness.
+
+## Task suite
+
+Tasks live under bench/tasks/T01-slug/ (and similarly numbered directories) with three parts: brief.md, the task statement handed to the session verbatim; verify.sh, a binary pass or fail command whose exit code is the only success criterion, with no human scoring anywhere in the suite; and either a fixtures/ directory local to the task or a pointer to a shared fixture project under bench/fixtures/. The suite holds 8 to 12 tasks and covers the plugin's routing surface: a multi file implementation task from a written spec, a seeded bug fix, a research question whose answer is machine checkable, a mechanical codemod across many files, at least three plan shaped tasks with three or more independent work packages each, which serve as the C2 probes, and at least one negative control task where the plugin is expected to provide no advantage, a small single file task where delegation is pure overhead; that task's purpose, to check that the harness does not manufacture an advantage where none exists, is stated openly in its brief.
+
+Anti gaming controls on the manifest: the full task manifest, task ids together with content hashes of each task's brief.md and verify.sh, is committed and tagged before the first results run against it. New tasks enter from a pre registered pool. Any change to a task after results exist against it requires minting a new task id rather than editing the existing one in place. External task contributions via pull request are welcome, and any externally contributed verifier requires review and sign off by a second maintainer before it is trusted to gate a task.
+
+Verifier integrity: verify.sh is executed by the harness outside the worktree visible to the model under test, so the session being measured never sees verifier content during the run. Each verifier ships with at least one known bad solution fixture, a mutant, that the verifier must reject; this mutant self test is run as part of the harness's own checks and a verifier that accepts its mutant is treated as broken, not as evidence of a passing task.
+
+## Metrics
+
+Each run produces one JSONL record with the following fields, and the data source for each:
+
+- task id: the task's manifest id, from the task manifest.
+- condition: A, B1, or B2, from the run invocation.
+- repetition: which of the three repetitions this run is, from the run invocation.
+- verify exit: the exit code returned by verify.sh, from the verifier harness.
+- wall clock seconds: elapsed time from prompt submission to the final verification exit, from the runner's own timers.
+- Claude tokens, orchestrator: tokens billed to the Claude subscription by the orchestrator model, from the session transcript usage records.
+- Claude tokens, subagent: tokens billed to the Claude subscription by subagent invocations, from the session transcript usage records, summed across subagent calls.
+- peer tokens: tokens billed to each peer subscription, from the Grok and Codex CLI logs, condition B2 only.
+- delegation count: number of subagent or peer dispatches issued during the run, from the session transcript.
+- resume count: number of resumes issued during the run, from delegation outcome records.
+- escalation count: number of rung escalations recorded during the run, from delegation outcome records.
+- excluded flag: boolean, with a reason drawn from the fixed exclusion enum in Protocol, set by the harness operator at review time and recorded in the raw data regardless of value.
+
+## Protocol
+
+Each task runs three repetitions per condition. This is explicitly a descriptive snapshot, not a statistically powered experiment; three repetitions cannot support inferential claims and none are made. Every run is published, including failed runs. For each task and condition, the published summary reports the pass matrix across repetitions, the median and interquartile range of wall clock seconds and token counts, and the min and max. Suite level aggregates are descriptive summaries of these per task numbers, not a statistical claim about the population of possible tasks.
+
+Exclusions are limited to a fixed enum of reasons: network outage affecting all conditions, harness defect, external service outage. Excluded records stay in the raw data with their reason attached; nothing is deleted. A condition specific CLI crash, for example Grok or Codex crashing only in B2, counts as a failed run for that condition rather than as an exclusion, since it is evidence about that condition rather than an infrastructure problem external to the comparison. Excluded runs may not exceed five percent of a snapshot; if they do, the snapshot is invalid and is not published as a comparison.
+
+Environment pinning: each results directory records the plugin version, the Claude Code version, the resolved model ids and effort levels for every tier, the Grok and Codex CLI versions and their configured models, the fixture commit hash, the task manifest hash, the Node version, the OS, and the run date, so a snapshot can be matched exactly to the software and configuration that produced it.
+
+A results snapshot splits into two artifacts. The in tree results directory holds runs.jsonl, env.json, and the rendered summary only, so the repository and every marketplace clone of it stay small as snapshots accumulate. Full transcripts and logs are packaged as an asset on the corresponding GitHub release rather than committed to the tree. Both artifacts pass through a published redaction step that strips absolute home paths, tokens, and credentials from every file; the redaction script is part of the harness and runs as the last step before the results directory is committed and the release asset is uploaded.
+
+## Limitations
+
+Sample size is small, so deltas on any single task are noise and only suite level aggregates should be treated as meaningful, and even those aggregates are descriptive rather than statistically powered. Results expire as the underlying models drift, so comparisons are valid only within a single results snapshot, not across snapshots taken months apart. The task suite is authored by the plugin's own authors, which is a source of bias; this is mitigated by publishing the task manifest and verifiers before results exist, by including failed runs in the published table, by shipping a negative control task, and by accepting external task contributions with second maintainer review of their verifiers. Timing numbers come from one machine on one network and transfer to other environments only approximately. Condition B2 depends on the peer subscriptions' current models and rate limits, which the plugin does not control and which can shift the B2 numbers independently of any plugin change.
+
+## Refresh policy
+
+Results are rerun on major plugin versions or when an underlying model generation changes, and each published table carries its snapshot date. Every results snapshot records the task manifest hash it was run against, and the summary script refuses to compare snapshots whose manifest hashes differ, so a comparison across snapshots always reflects the same set of tasks. Old snapshots stay in the repo rather than being overwritten, so a reader can see how the numbers moved across versions.
+
+## Publication gate
+
+Before any results are published, the following must exist in the repo: the runner; the JSONL schema described under Metrics; the summary script, including the manifest hash comparison guard described under Refresh policy; the redaction script described under Protocol; at least the full first task, complete with its fixtures and its mutant self test; and the tagged task manifest described under Task suite.

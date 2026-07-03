@@ -1,0 +1,9 @@
+{
+  "tasks": [
+    {
+      "id": "T01-seeded-bug",
+      "briefSha256": "1a5280e9d1b90a4681f4c27788c65df536a8d73c4722a70144b995c1a6bba448",
+      "verifySha256": "0083db06745d65885b2847eb9b21af308edb41cae936ab8418dd421565ea8bb7"
+    }
+  ]
+}
