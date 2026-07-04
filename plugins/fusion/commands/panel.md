@@ -20,8 +20,8 @@ Compose the brief:
 Launch the panel:
 
 - In a SINGLE message, launch two background subagents via the `Agent` tool, each with the identical brief as its prompt:
-  - `codex-rescue` (subagent type `codex:codex-rescue`)
-  - `grok-rescue` (subagent type `grok:grok-rescue`; use plain `grok-rescue` if the namespaced form is not found)
+  - `codex:codex-rescue` (use plain `codex-rescue` if the namespaced form is not found)
+  - `grok:grok-rescue` (use plain `grok-rescue` if the namespaced form is not found)
 - Add `fusion:deep-reasoner` as a third track only when the user asks for a three way panel or the question hinges on Claude native long horizon reasoning.
 
 Degrade when a track is unavailable:

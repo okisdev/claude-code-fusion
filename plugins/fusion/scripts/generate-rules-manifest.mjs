@@ -1,40 +1,50 @@
 #!/usr/bin/env node
 
-import { createHash } from "node:crypto";
 import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
+
+import { hashRulesTemplate } from "./lib/rules-template.mjs";
 
 const repoRoot = path.join(import.meta.dirname, "..", "..", "..");
 const rulesPath = path.join("plugins", "fusion", "rules", "orchestration.md");
 
-function sha256(content) {
-  return createHash("sha256").update(content).digest("hex");
+function git(args, cwd = repoRoot) {
+  return execFileSync("git", args, { cwd, encoding: "utf8" });
 }
 
-function git(args) {
-  return execFileSync("git", args, { cwd: repoRoot, encoding: "utf8" });
-}
+export function buildRulesManifest({ root = repoRoot, relativeRulesPath = rulesPath } = {}) {
+  const commits = git(["log", "--all", "--format=%H", "--", relativeRulesPath], root).split("\n").filter(Boolean);
+  const hashes = new Set();
 
-const commits = git(["log", "--all", "--format=%H", "--", rulesPath]).split("\n").filter(Boolean);
-
-const hashes = new Set();
-
-for (const commit of commits) {
-  let content;
-  try {
-    content = git(["show", `${commit}:${rulesPath}`]);
-  } catch {
-    continue;
+  for (const commit of commits) {
+    let content;
+    try {
+      content = git(["show", `${commit}:${relativeRulesPath}`], root);
+    } catch {
+      continue;
+    }
+    hashes.add(hashRulesTemplate(content));
   }
-  hashes.add(sha256(content));
+
+  hashes.add(hashRulesTemplate(fs.readFileSync(path.join(root, relativeRulesPath), "utf8")));
+
+  return { format: 2, hashes: [...hashes].sort() };
 }
 
-hashes.add(sha256(fs.readFileSync(path.join(repoRoot, rulesPath), "utf8")));
+export function main({ root = repoRoot, relativeRulesPath = rulesPath, stdout = console.log } = {}) {
+  const manifest = buildRulesManifest({ root, relativeRulesPath });
+  const manifestPath = path.join(root, "plugins", "fusion", "rules-manifest.json");
+  fs.writeFileSync(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`, "utf8");
+  stdout(`fusion: wrote ${manifest.hashes.length} unique rules template version(s) to ${manifestPath}`);
+  return manifest;
+}
 
-const sorted = [...hashes].sort();
+function isMain() {
+  return process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url);
+}
 
-const manifestPath = path.join(repoRoot, "plugins", "fusion", "rules-manifest.json");
-fs.writeFileSync(manifestPath, `${JSON.stringify({ hashes: sorted }, null, 2)}\n`, "utf8");
-
-console.log(`fusion: wrote ${sorted.length} unique rules version(s) to ${manifestPath}`);
+if (isMain()) {
+  main();
+}

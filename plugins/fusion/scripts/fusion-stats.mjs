@@ -6,12 +6,8 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
-const args = process.argv.slice(2);
-const all = args.includes("--all");
-const asJson = args.includes("--json");
-
-function newestGrokCompanion() {
-  const override = process.env.FUSION_GROK_COMPANION;
+export function newestGrokCompanion(env = process.env) {
+  const override = env.FUSION_GROK_COMPANION;
   if (override) {
     return fs.existsSync(override) ? override : null;
   }
@@ -33,12 +29,12 @@ function newestGrokCompanion() {
   return fs.existsSync(sibling) ? sibling : null;
 }
 
-function grokStats() {
-  const bin = newestGrokCompanion();
+export function grokStats({ all = false, env = process.env, cwd = process.cwd() } = {}) {
+  const bin = newestGrokCompanion(env);
   if (!bin) {
     return { available: false, reason: "grok companion not found in the plugin cache or the sibling plugin" };
   }
-  const result = spawnSync(process.execPath, [bin, "stats", ...(all ? ["--all"] : []), "--json"], { encoding: "utf8" });
+  const result = spawnSync(process.execPath, [bin, "stats", ...(all ? ["--all"] : ["--cwd", cwd]), "--json"], { encoding: "utf8", env });
   if (result.error || result.status !== 0) {
     const reason = (result.stderr || result.error?.message || "grok stats failed").trim().split("\n")[0];
     return { available: false, reason };
@@ -54,8 +50,8 @@ function bump(map, key) {
   map[key] = (map[key] ?? 0) + 1;
 }
 
-function codexStats() {
-  const root = process.env.FUSION_CODEX_STATE || path.join(os.homedir(), ".claude", "plugins", "data", "codex-openai-codex", "state");
+export function codexStats({ all = false, env = process.env, cwd = process.cwd() } = {}) {
+  const root = env.FUSION_CODEX_STATE || path.join(os.homedir(), ".claude", "plugins", "data", "codex-openai-codex", "state");
   if (!fs.existsSync(root)) {
     return { available: false, reason: "codex plugin job state not found; the codex plugin may not be installed" };
   }
@@ -80,7 +76,6 @@ function codexStats() {
   } catch (error) {
     return { available: false, reason: error instanceof Error ? error.message : String(error) };
   }
-  const cwd = process.cwd();
   const scoped = all ? jobs : jobs.filter((job) => job.workspaceRoot === cwd);
   const byStatus = {};
   const byKind = {};
@@ -152,15 +147,38 @@ function renderEngine(lines, name, stats) {
   renderCounts(lines, "By failure kind", stats.byFailureKind ?? {});
 }
 
-const grok = grokStats();
-const codex = codexStats();
+export function buildFusionStats({ all = false, env = process.env, cwd = process.cwd() } = {}) {
+  return {
+    scope: all ? "all" : cwd,
+    grok: grokStats({ all, env, cwd }),
+    codex: codexStats({ all, env, cwd })
+  };
+}
 
-if (asJson) {
-  console.log(JSON.stringify({ scope: all ? "all" : process.cwd(), grok, codex }, null, 2));
-} else {
-  const lines = ["# Fusion stats", "", `Scope: ${all ? "all workspaces" : `workspace ${process.cwd()}`}`];
-  renderEngine(lines, "Grok", grok);
-  renderEngine(lines, "Codex", codex);
+export function renderFusionStats(report) {
+  const lines = ["# Fusion stats", "", `Scope: ${report.scope === "all" ? "all workspaces" : `workspace ${report.scope}`}`];
+  renderEngine(lines, "Grok", report.grok);
+  renderEngine(lines, "Codex", report.codex);
   lines.push("", "Token usage lives with each vendor: ccusage for the Claude side, the OpenAI and xAI dashboards for the peers.");
-  process.stdout.write(`${lines.join("\n")}\n`);
+  return `${lines.join("\n")}\n`;
+}
+
+export function main(argv = process.argv.slice(2), { env = process.env, cwd = process.cwd(), stdout = process.stdout } = {}) {
+  const all = argv.includes("--all");
+  const asJson = argv.includes("--json");
+  const report = buildFusionStats({ all, env, cwd });
+  if (asJson) {
+    stdout.write(`${JSON.stringify(report, null, 2)}\n`);
+  } else {
+    stdout.write(renderFusionStats(report));
+  }
+  return report;
+}
+
+function isMain() {
+  return process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url);
+}
+
+if (isMain()) {
+  main();
 }
