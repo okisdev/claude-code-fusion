@@ -5,9 +5,10 @@ on:
   pull_request:
 jobs:
   test:
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
     strategy:
       matrix:
+        os: [ubuntu-latest, macos-latest]
         node-version: [22, 24]
     steps:
       - uses: actions/checkout@v4
@@ -15,3 +16,23 @@ jobs:
         with:
           node-version: ${{ matrix.node-version }}
       - run: npm test
+      - name: Check bench task manifest
+        run: node bench/manifest.mjs --check
+      - name: Validate JSON manifests parse
+        run: |
+          node -e "
+          const fs = require('fs');
+          const paths = [
+            '.claude-plugin/marketplace.json',
+            'plugins/fusion/.claude-plugin/plugin.json',
+            'plugins/grok/.claude-plugin/plugin.json',
+            'plugins/fusion/rules-manifest.json',
+            'plugins/grok/hooks/hooks.json',
+            'plugins/fusion/hooks/hooks.json',
+            'bench/tasks/manifest.json',
+          ];
+          for (const p of paths) {
+            JSON.parse(fs.readFileSync(p, 'utf8'));
+            console.log('ok', p);
+          }
+          "
