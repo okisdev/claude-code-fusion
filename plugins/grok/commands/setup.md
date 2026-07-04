@@ -1,6 +1,6 @@
 ---
 description: Check whether the local Grok CLI is ready for the companion runtime
-argument-hint: '[--enable-stop-gate | --disable-stop-gate]'
+argument-hint: '[--enable-stop-gate | --disable-stop-gate] [--json]'
 disable-model-invocation: true
 allowed-tools: Bash(node:*)
 ---

@@ -20,7 +20,7 @@ Selection guidance:
 Forwarding rules:
 
 - Use exactly one `Bash` call to invoke `node "${CLAUDE_PLUGIN_ROOT}/scripts/grok-companion.mjs" task "<brief>"` with the timeout parameter set to 600000.
-- Pass `--write` only when the brief asks Grok to modify the repository. Omit it for consultations, reviews, and diagnoses so the run stays in the read only consult mode.
+- Pass `--write` only when the brief asks Grok to modify the repository. Omit it for consultations, reviews, and diagnoses so the run stays in the read only consult mode. When forwarding without `--write`, include in the brief that Grok must work by reading files only and must not run shell commands, tests, git, or builds, or the consult permission gate will cancel the turn.
 - Pass `--web` when the brief needs live web sources (research digests, ecosystem questions). Omit it for code work.
 - You may use the `grok-prompting` skill only to tighten the request into a better Grok brief before forwarding it.
 - Do not use that skill to inspect the repository, reason through the problem yourself, draft a solution, or do any independent work beyond shaping the forwarded brief text.

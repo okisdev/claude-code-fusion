@@ -11,7 +11,7 @@ Multi-model orchestration for Claude Code. The strongest available Claude model 
 
 ## Quick start
 
-Prerequisites: Claude Code 2.1.170 or later and Node.js 22 or later (tested on 2.1.198 and Node 24; the floors are not enforced), git, macOS or Linux, and an authenticated Grok CLI on PATH (check with `grok --version`; the CLI is xAI's, so follow their install and login docs). The Codex side powers the primary implementation lane; install the `codex` plugin from [openai/codex-plugin-cc](https://github.com/openai/codex-plugin-cc) (`codex@openai-codex`) and run `/codex:setup` once. Without it fusion still runs, with spec grade implementation packages falling back to the Claude workers and Grok.
+Prerequisites: Claude Code 2.1.170 or later and Node.js 22 or later (tested on 2.1.198 and Node 24; the floors are not enforced), git, macOS or Linux, and xAI's grok CLI installed and authenticated per xAI's grok CLI documentation, on PATH, verified with `grok --version`. The Codex side powers the primary implementation lane; install the `codex` plugin from [openai/codex-plugin-cc](https://github.com/openai/codex-plugin-cc) (`codex@openai-codex`) and run `/codex:setup` once. Without it fusion still runs, with spec grade implementation packages falling back to the Claude workers and Grok.
 
 ```bash
 claude plugin marketplace add okisdev/claude-code-fusion
@@ -25,7 +25,7 @@ Then, in a new session, run `/fusion:setup` once per machine (it writes the rout
 
 | Command | What it does |
 |---|---|
-| `/grok:task <text>` | Delegate to Grok. `--write` allows edits, `--web` enables web tools for research, `--background` detaches, `--resume <uuid>` or `--resume-last` continues a thread; `--model`, `--effort`, and `--max-turns` forward explicit overrides |
+| `/grok:task <text>` | Delegate to Grok. `--write` allows edits, `--web` enables web tools for research, `--background` detaches, `--resume <uuid>` or `--resume-last` continues a thread; `--model`, `--effort`, and `--max-turns` forward explicit overrides; `--best-of-n` runs a tournament on the same brief (full flags and behavior under `/grok:best-of-n`) |
 | `/grok:review [--base <ref>] [--focus <text>]` | Adversarial review of the working tree or a branch range (untracked files reach the review as names only); never applies fixes |
 | `/grok:best-of-n [--n <2-10>] <task>` | Implementation tournament in isolated worktrees; the winning candidate is applied. Keep n at 2; the companion rejects values outside 2 to 10 |
 | `/grok:status [job-id]`, `/grok:result <job-id>`, `/grok:cancel <job-id>` | Background job lifecycle |
@@ -36,7 +36,7 @@ Then, in a new session, run `/fusion:setup` once per machine (it writes the rout
 | `/fusion:ultra <task>` | Fans a large task out as a fleet of parallel Grok and Codex agents billed to their own subscriptions, then synthesizes. Fires from "go deep", "audit everything", "be exhaustive"; skips small tasks |
 | `/fusion:setup` | Install or update the routing rules into `~/.claude/rules/`; offers the optional permission allow |
 | `/fusion:config` | Read the local model configuration across engines, enumerate available models, and change defaults interactively |
-| `/fusion:doctor` | Audit model pins, environment overrides, rules drift, and stale agent copies |
+| `/fusion:doctor` | Audit model pins, environment overrides, peer model defaults (grok and codex config keys), rules drift, and stale agent copies |
 
 Every companion outcome is machine parseable: successful foreground replies end with `grok-session: <uuid>`, `job: <id>`, and `state: done` lines; failures report `state: error` plus `failure: <kind>`; cancelled jobs report `state: cancelled` with `failure: cancelled`; a background launch prints the job id and how to fetch it.
 
@@ -60,7 +60,7 @@ No results are published yet. The task suite currently holds one of the planned 
 
 ## Data and uninstall
 
-The grok plugin keeps job records, briefs, and logs under `~/.claude/plugins/data/grok-claude-code-fusion/`; briefs can contain your prompts and diffs, and logs can contain grok stderr. Delete that directory to clear history. Full uninstall: remove both plugins via `/plugin`, delete `~/.claude/rules/orchestration.md`, drop the optional `Bash(node:*)` entry from `permissions.allow`, and delete the data directory. Environment overrides (`GROK_BIN`, `GROK_COMPANION_DATA`, `GROK_COMPANION_TIMEOUT_MS`) are documented in [docs/grok-contract.md](docs/grok-contract.md). `/fusion:stats` aggregates delegation counts across both peers; token usage itself lives with each vendor (ccusage for the Claude side, the OpenAI and xAI dashboards for the peers), since peer work never touches the Claude transcript.
+The grok plugin keeps job records, briefs, and logs under `~/.claude/plugins/data/grok-claude-code-fusion/`; briefs can contain your prompts and diffs, and logs can contain grok stderr. Delete that directory to clear history. Full uninstall: remove both plugins via `/plugin`, delete `~/.claude/rules/orchestration.md`, drop the optional `Bash(node:*)` entry from `permissions.allow`, and delete the data directory. Environment overrides (`GROK_BIN`, `GROK_COMPANION_DATA`, `GROK_COMPANION_TIMEOUT_MS`, `GROK_CONSULT_ALLOW`) are documented in [docs/grok-contract.md](docs/grok-contract.md). `/fusion:stats` aggregates delegation counts across both peers; token usage itself lives with each vendor (ccusage for the Claude side, the OpenAI and xAI dashboards for the peers), since peer work never touches the Claude transcript.
 
 ## Development
 
@@ -70,7 +70,7 @@ The grok plugin keeps job records, briefs, and logs under `~/.claude/plugins/dat
 
 - `.claude-plugin/marketplace.json`: the marketplace manifest; installs as marketplace `claude-code-fusion`.
 - `plugins/grok/`: the Grok integration (companion runtime, `grok-rescue` agent, `/grok:*` commands).
-- `plugins/fusion/`: the orchestration layer: tier agents (`agents/`), the routing policy payload (`rules/`), and the `/fusion:panel`, `/fusion:setup`, `/fusion:doctor`, and `/fusion:stats` commands.
+- `plugins/fusion/`: the orchestration layer: tier agents (`agents/`), the routing policy payload (`rules/`), and the `/fusion:panel`, `/fusion:setup`, `/fusion:doctor`, `/fusion:stats`, `/fusion:ultra`, and `/fusion:config` commands.
 - `bench/`: the benchmark methodology, harness, and task suite; no published results yet, see the publication gate in [bench/METHODOLOGY.md](bench/METHODOLOGY.md).
 - `tests/`: the fake-grok and fake-claude driven test suite.
 

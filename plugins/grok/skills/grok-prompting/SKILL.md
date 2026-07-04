@@ -22,9 +22,11 @@ Context rules:
 
 Output contract:
 
-- Demand explicit output sections: Verdict, Findings with file and line, Suggested next steps.
+- For review work, require the JSON object contract from `plugins/grok/prompts/review.md`: verdict, findings, and next_steps. The companion validates that shape with `validateReviewOutput`.
+- For task briefs, define prose done criteria instead of requiring review JSON. Ask Grok to report what changed, which paths it touched, and which verification command it ran.
 - For diagnosis work, ask Grok to separate observed facts from inferences.
 
 Permissions:
 
 - Always state whether Grok has write permission. In write mode, tell it to edit files directly and report the touched paths. In consult mode, tell it to propose changes without editing.
+- Read only (consult) briefs must tell Grok to work by reading files only and must not ask for shell activity (no test runs, no git commands, no build steps). The consult allow list cancels the turn when Grok calls tools outside that narrow read only set. Write capable briefs are exempt.

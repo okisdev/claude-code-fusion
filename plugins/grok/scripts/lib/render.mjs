@@ -180,6 +180,7 @@ export function renderJobDetail(job, options = {}) {
     `Job ${job.id}`,
     "",
     `Status: ${job.status}`,
+    `state: ${job.status}`,
     `Mode: ${job.mode}`,
     `Background: ${job.background ? "yes" : "no"}`,
     `Created: ${job.createdAt}`
@@ -305,12 +306,15 @@ export function renderStatsReport(stats) {
 }
 
 export function renderCancelReport(job) {
-  return [
+  const lines = [
     `Cancelled job ${job.id}.`,
     "state: cancelled",
-    "Check /grok:status for the updated list.",
-    ""
-  ].join("\n");
+  ];
+  if (job.failureKind === "cancelled") {
+    lines.push("failure: cancelled");
+  }
+  lines.push("Check /grok:status for the updated list.", "");
+  return lines.join("\n");
 }
 
 export function renderSetupReport(report) {

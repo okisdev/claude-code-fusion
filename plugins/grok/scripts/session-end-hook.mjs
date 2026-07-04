@@ -3,7 +3,7 @@
 import fs from "node:fs";
 
 import { terminateProcessGroup } from "./lib/grok-exec.mjs";
-import { SESSION_ID_ENV, listAllJobRecords, resolveDataDir, writeJobRecordFile } from "./lib/state.mjs";
+import { SESSION_ID_ENV, listAllJobRecords, nowIso, resolveDataDir, updateJobRecordFile } from "./lib/state.mjs";
 
 function readHookInput() {
   try {
@@ -14,7 +14,7 @@ function readHookInput() {
   }
 }
 
-function main() {
+async function main() {
   const input = readHookInput();
   const sessionId = input.session_id ?? process.env[SESSION_ID_ENV] ?? null;
   if (!sessionId) {
@@ -27,19 +27,21 @@ function main() {
       continue;
     }
     try {
+      const pids = new Set();
       if (record.grokPid) {
-        terminateProcessGroup(record.grokPid);
+        pids.add(record.grokPid);
       }
       if (record.background || !record.grokPid) {
-        terminateProcessGroup(record.pid);
+        pids.add(record.pid);
       }
-      writeJobRecordFile(file, {
-        ...record,
+      await Promise.all([...pids].map((pid) => terminateProcessGroup(pid)));
+      updateJobRecordFile(file, {
         status: "cancelled",
         pid: null,
         grokPid: null,
-        finishedAt: new Date().toISOString(),
-        failureKind: "cancelled"
+        finishedAt: nowIso(),
+        failureKind: "cancelled",
+        cancelRequestedAt: null
       });
     } catch {
       continue;
@@ -48,7 +50,7 @@ function main() {
 }
 
 try {
-  main();
+  await main();
 } catch {
   process.exitCode = 0;
 }

@@ -1,16 +1,25 @@
 #!/usr/bin/env node
 
-import { spawn } from "node:child_process";
+import { randomUUID } from "node:crypto";
+import { spawn, spawnSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { performance } from "node:perf_hooks";
 import { fileURLToPath } from "node:url";
+import { buildManifest } from "./manifest.mjs";
 
 const SELF_PATH = fileURLToPath(import.meta.url);
 const BENCH_DIR = path.dirname(SELF_PATH);
+const REPO_ROOT = path.dirname(BENCH_DIR);
 const DEFAULT_TASK_ROOT = path.join(BENCH_DIR, "tasks");
 const CONDITIONS = new Set(["A", "B1", "B2"]);
+const CLI_VERSION_TIMEOUT_MS = 2000;
+const PLUGIN_VERSION_FILES = [
+  { name: "fusion", file: path.join(REPO_ROOT, "plugins", "fusion", ".claude-plugin", "plugin.json") },
+  { name: "grok", file: path.join(REPO_ROOT, "plugins", "grok", ".claude-plugin", "plugin.json") },
+  { name: "codex", file: path.join(REPO_ROOT, "plugins", "codex", ".claude-plugin", "plugin.json") }
+];
 const TOKEN_FIELDS = [
   "input_tokens",
   "output_tokens",
@@ -108,7 +117,17 @@ function copyFixtures(fixturesDir) {
   const tempRoot = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "claude-bench-")));
   const workDir = path.join(tempRoot, "work");
   fs.cpSync(fixturesDir, workDir, { recursive: true });
-  return workDir;
+  return { tempRoot, workDir };
+}
+
+function cleanupTempRoot(tempRoot) {
+  if (!tempRoot) {
+    return;
+  }
+  try {
+    fs.rmSync(tempRoot, { recursive: true, force: true });
+  } catch {
+  }
 }
 
 function signalExitCode(signal) {
@@ -161,6 +180,135 @@ function runProcess(bin, args, options) {
       });
     });
   });
+}
+
+function readJsonFile(file) {
+  if (!fs.existsSync(file)) {
+    return null;
+  }
+  try {
+    return JSON.parse(fs.readFileSync(file, "utf8"));
+  } catch {
+    return null;
+  }
+}
+
+function collectPluginVersions() {
+  const versions = {};
+  const marketplace = readJsonFile(path.join(REPO_ROOT, ".claude-plugin", "marketplace.json"));
+  versions["claude-code-fusion"] = typeof marketplace?.metadata?.version === "string" ? marketplace.metadata.version : null;
+  for (const source of PLUGIN_VERSION_FILES) {
+    const plugin = readJsonFile(source.file);
+    versions[source.name] = typeof plugin?.version === "string" ? plugin.version : null;
+  }
+  return versions;
+}
+
+function hasPathSeparator(bin) {
+  return bin.includes("/") || (path.sep === "\\" && bin.includes("\\"));
+}
+
+function commandOnPath(bin) {
+  if (hasPathSeparator(bin)) {
+    try {
+      fs.accessSync(bin, fs.constants.X_OK);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+  const pathValue = process.env.PATH ?? "";
+  return pathValue.split(path.delimiter).some((entry) => {
+    if (!entry) {
+      return false;
+    }
+    try {
+      fs.accessSync(path.join(entry, bin), fs.constants.X_OK);
+      return true;
+    } catch {
+      return false;
+    }
+  });
+}
+
+function cliVersion(bin) {
+  if (!commandOnPath(bin)) {
+    return null;
+  }
+  const result = spawnSync(bin, ["--version"], {
+    cwd: REPO_ROOT,
+    env: process.env,
+    encoding: "utf8",
+    timeout: CLI_VERSION_TIMEOUT_MS
+  });
+  if (result.error || result.status !== 0) {
+    return null;
+  }
+  const text = `${result.stdout ?? ""}${result.stderr ?? ""}`.trim();
+  return text ? text.split(/\r?\n/)[0].trim() : null;
+}
+
+function collectEngineCliVersions(options) {
+  return {
+    claude: cliVersion(options.claudeBin),
+    grok: cliVersion("grok"),
+    codex: cliVersion("codex")
+  };
+}
+
+function scanConfigNames(root) {
+  if (!fs.existsSync(root)) {
+    return [];
+  }
+  const names = [];
+  const stack = [{ dir: root, depth: 0 }];
+  while (stack.length > 0) {
+    const current = stack.pop();
+    if (current.depth > 4) {
+      continue;
+    }
+    const entries = fs.readdirSync(current.dir, { withFileTypes: true });
+    for (const entry of entries) {
+      names.push(entry.name);
+      if (entry.isDirectory()) {
+        stack.push({ dir: path.join(current.dir, entry.name), depth: current.depth + 1 });
+      }
+    }
+  }
+  return names;
+}
+
+function detectConditionNotes(claudeConfigDir) {
+  const names = scanConfigNames(claudeConfigDir).map((name) => name.toLowerCase());
+  const installedPlugins = ["claude-code-fusion", "fusion", "grok", "codex"].filter((plugin) => names.some((name) => name.includes(plugin)));
+  return {
+    detection: "filesystem",
+    installedPlugins,
+    routingRulesPresent: fs.existsSync(path.join(claudeConfigDir, "rules", "orchestration.md"))
+  };
+}
+
+function taskTags(manifest) {
+  return Object.fromEntries(manifest.tasks.map((task) => [task.id, Array.isArray(task.tags) ? task.tags : []]));
+}
+
+function writeEnv(options, manifest) {
+  const env = {
+    date: new Date().toISOString(),
+    nodeVersion: process.version,
+    os: {
+      platform: os.platform(),
+      release: os.release()
+    },
+    pluginVersions: collectPluginVersions(),
+    engineCliVersions: collectEngineCliVersions(options),
+    taskManifestHash: manifest.manifestHash,
+    manifestHash: manifest.manifestHash,
+    taskTags: taskTags(manifest)
+  };
+  fs.mkdirSync(options.resultsDir, { recursive: true });
+  fs.writeFileSync(path.join(options.resultsDir, "env.json"), `${JSON.stringify(env, null, 2)}\n`, "utf8");
+  return env;
 }
 
 function tryParseObject(text) {
@@ -428,11 +576,86 @@ function oneLine(value) {
   return String(value ?? "Benchmark runner failed.").replace(/\s+/g, " ").trim();
 }
 
-async function main() {
-  const options = normalizeOptions(parseArgs(process.argv.slice(2)));
+function peerTokensFor(condition) {
+  return condition === "B2" ? { grok: null, codex: null } : null;
+}
+
+function verdictFromVerify(verifyExit) {
+  return verifyExit === 0 ? "pass" : "fail";
+}
+
+function classifyInfraFailure(error) {
+  const message = oneLine(error?.message);
+  if (/ambiguous/i.test(message) && /transcript/i.test(message)) {
+    return "ambiguous_transcript";
+  }
+  if (/transcript/i.test(message)) {
+    return "missing_transcript";
+  }
+  if (/Claude binary not found|Claude failed to start/.test(message)) {
+    return "claude_start_failure";
+  }
+  if (/Verifier binary not found|Verifier failed to start/.test(message)) {
+    return "verifier_start_failure";
+  }
+  if (/Task .*not found|Task .*escapes|Task .*fixtures|Task .*brief|Task .*verifier/.test(message)) {
+    return "task_setup_failure";
+  }
+  return "runner_failure";
+}
+
+function buildRecord(options, context) {
+  return {
+    runId: context.runId,
+    taskId: options.taskId,
+    condition: options.condition,
+    repetition: options.repetition,
+    startedAt: context.startedAt,
+    finishedAt: new Date().toISOString(),
+    taskManifestHash: context.taskManifestHash,
+    conditionNotes: context.conditionNotes,
+    claudeExit: context.claudeExit,
+    verifyExit: context.verifyExit,
+    wallClockSeconds: context.wallClockSeconds,
+    verdict: context.verdict,
+    infraFailure: context.infraFailure,
+    claudeTokens: context.claudeTokens,
+    peerTokens: peerTokensFor(options.condition),
+    delegationCount: context.delegationCount,
+    resumeCount: 0,
+    escalationCount: 0,
+    excluded: false,
+    excludedReason: null
+  };
+}
+
+function appendRecord(resultsDir, record) {
+  fs.mkdirSync(resultsDir, { recursive: true });
+  fs.appendFileSync(path.join(resultsDir, "runs.jsonl"), `${JSON.stringify(record)}\n`, "utf8");
+  process.stdout.write(`${JSON.stringify(record)}\n`);
+}
+
+function infraRecord(options, context, error) {
+  return buildRecord(options, {
+    ...context,
+    verdict: "infra_failure",
+    infraFailure: {
+      kind: classifyInfraFailure(error),
+      message: oneLine(error?.message)
+    },
+    claudeTokens: context.claudeTokens ?? {
+      orchestrator: emptyTokens(),
+      subagents: emptyTokens(),
+      byModel: {}
+    },
+    delegationCount: context.delegationCount ?? 0
+  });
+}
+
+async function executeAttempt(options, context) {
   const task = resolveTask(options.taskRoot, options.taskId);
   const brief = fs.readFileSync(task.briefFile, "utf8");
-  const workDir = copyFixtures(task.fixturesDir);
+  const { tempRoot, workDir } = copyFixtures(task.fixturesDir);
   const claudeArgs = ["-p", brief, "--output-format", "json"];
   const claudeEnv = {
     ...process.env,
@@ -440,39 +663,81 @@ async function main() {
   };
   const transcriptStartedAtMs = Date.now();
   const wallStart = performance.now();
-  const claudeResult = await runProcess(options.claudeBin, claudeArgs, {
-    cwd: workDir,
-    env: claudeEnv,
-    label: "Claude"
-  });
-  const verifyResult = await runProcess("bash", ["verify.sh", workDir], {
-    cwd: task.taskDir,
-    env: process.env,
-    label: "Verifier"
-  });
-  const wallClockSeconds = (performance.now() - wallStart) / 1000;
-  const headlessOutput = parseHeadlessOutput(claudeResult.stdout);
-  const sessionId = findSessionId(headlessOutput);
-  const { mainTranscript, files } = locateTranscript(options.claudeConfigDir, sessionId);
-  const subagentTranscripts = recentSubagentTranscripts(files, mainTranscript, transcriptStartedAtMs);
-  const { tokens, delegationCount } = aggregateClaudeTokens(headlessOutput, mainTranscript, subagentTranscripts);
-  const record = {
-    taskId: options.taskId,
-    condition: options.condition,
-    repetition: options.repetition,
-    verifyExit: verifyResult.exitCode,
-    wallClockSeconds,
-    claudeTokens: tokens,
-    peerTokens: options.condition === "B2" ? { grok: null, codex: null } : null,
-    delegationCount,
-    resumeCount: 0,
-    escalationCount: 0,
-    excluded: false,
-    excludedReason: null
+  let claudeResult = null;
+  let verifyResult = null;
+  try {
+    claudeResult = await runProcess(options.claudeBin, claudeArgs, {
+      cwd: workDir,
+      env: claudeEnv,
+      label: "Claude"
+    });
+    verifyResult = await runProcess("bash", ["verify.sh", workDir], {
+      cwd: task.taskDir,
+      env: process.env,
+      label: "Verifier"
+    });
+    const wallClockSeconds = (performance.now() - wallStart) / 1000;
+    const headlessOutput = parseHeadlessOutput(claudeResult.stdout);
+    const sessionId = findSessionId(headlessOutput);
+    const { mainTranscript, files } = locateTranscript(options.claudeConfigDir, sessionId);
+    const subagentTranscripts = recentSubagentTranscripts(files, mainTranscript, transcriptStartedAtMs);
+    const { tokens, delegationCount } = aggregateClaudeTokens(headlessOutput, mainTranscript, subagentTranscripts);
+    return buildRecord(options, {
+      ...context,
+      claudeExit: claudeResult.exitCode,
+      verifyExit: verifyResult.exitCode,
+      wallClockSeconds,
+      verdict: verdictFromVerify(verifyResult.exitCode),
+      infraFailure: null,
+      claudeTokens: tokens,
+      delegationCount
+    });
+  } catch (error) {
+    const wallClockSeconds = (performance.now() - wallStart) / 1000;
+    return infraRecord(
+      options,
+      {
+        ...context,
+        claudeExit: claudeResult?.exitCode ?? null,
+        verifyExit: verifyResult?.exitCode ?? null,
+        wallClockSeconds
+      },
+      error
+    );
+  } finally {
+    cleanupTempRoot(tempRoot);
+  }
+}
+
+async function main() {
+  let options;
+  try {
+    options = normalizeOptions(parseArgs(process.argv.slice(2)));
+  } catch (error) {
+    process.stderr.write(`${oneLine(error.message)}\n`);
+    process.exitCode = 1;
+    return;
+  }
+
+  const manifest = buildManifest(options.taskRoot);
+  writeEnv(options, manifest);
+  const context = {
+    runId: randomUUID(),
+    startedAt: new Date().toISOString(),
+    taskManifestHash: manifest.manifestHash,
+    conditionNotes: detectConditionNotes(options.claudeConfigDir),
+    claudeExit: null,
+    verifyExit: null,
+    wallClockSeconds: 0,
+    claudeTokens: null,
+    delegationCount: 0
   };
-  fs.mkdirSync(options.resultsDir, { recursive: true });
-  fs.appendFileSync(path.join(options.resultsDir, "runs.jsonl"), `${JSON.stringify(record)}\n`, "utf8");
-  process.stdout.write(`${JSON.stringify(record)}\n`);
+  const record = await executeAttempt(options, context);
+  appendRecord(options.resultsDir, record);
+  if (record.verdict === "infra_failure") {
+    process.stderr.write(`${record.infraFailure.message}\n`);
+    process.exitCode = 1;
+  }
 }
 
 main().catch((error) => {

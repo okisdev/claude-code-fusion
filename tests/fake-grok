@@ -115,6 +115,16 @@
     process.exit(0);
   }
 
+  if (mode === "gate-block-leading-blank") {
+    emit({
+      text: "\n\nBLOCK: leading blank reason text\nExtra detail about the defect.",
+      stopReason: "EndTurn",
+      sessionId: "77777777-7777-7777-8777-777777777778",
+      requestId: "req-1"
+    });
+    process.exit(0);
+  }
+
   if (mode === "permission-cancelled") {
     emit({
       text: "",
@@ -130,6 +140,16 @@
     process.exit(1);
   }
 
+  if (mode === "quota-error") {
+    process.stderr.write("quota exceeded\n");
+    process.exit(1);
+  }
+
+  if (mode === "quota-auth-error") {
+    process.stderr.write("quota exceeded, login required to update billing\n");
+    process.exit(1);
+  }
+
   if (mode === "rate-limit-error") {
     process.stderr.write("429 too many requests\n");
     process.exit(1);
@@ -140,8 +160,31 @@
     process.exit(1);
   }
 
+  if (mode === "invalid-json") {
+    process.stdout.write("not a JSON envelope\n");
+    process.exit(0);
+  }
+
+  if (mode === "large-stderr-error") {
+    fs.writeSync(2, "large stderr begins\n");
+    fs.writeSync(2, "x".repeat(2 * 1024 * 1024));
+    fs.writeSync(2, "\nlarge stderr ends\n");
+    process.exit(1);
+  }
+
+  if (mode === "sigkill") {
+    process.kill(process.pid, "SIGKILL");
+    return;
+  }
+
   if (mode === "hang") {
     process.on("SIGTERM", () => process.exit(143));
+    setTimeout(() => process.exit(0), 120000);
+    return;
+  }
+
+  if (mode === "hang-ignore-term") {
+    process.on("SIGTERM", () => {});
     setTimeout(() => process.exit(0), 120000);
     return;
   }

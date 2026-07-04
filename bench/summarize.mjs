@@ -9,6 +9,7 @@ const BENCH_DIR = path.dirname(SELF_PATH);
 const SCHEMA_PATH = path.join(BENCH_DIR, "schema", "run-record.schema.json");
 const CONDITION_ORDER = ["A", "B1", "B2"];
 const MIN_PASSES_FOR_COMPARISON = 2;
+const EXCLUSION_CAP = 0.05;
 
 function loadSchema() {
   return JSON.parse(fs.readFileSync(SCHEMA_PATH, "utf8"));
@@ -73,6 +74,22 @@ function validateAgainst(schema, value, root, pathLabel, errors) {
     return;
   }
 
+  if (typeof value === "number" && typeof resolved.minimum === "number" && value < resolved.minimum) {
+    errors.push(`${pathLabel}: expected at least ${resolved.minimum}, got ${value}`);
+  }
+
+  if (typeof value === "string" && typeof resolved.minLength === "number" && value.length < resolved.minLength) {
+    errors.push(`${pathLabel}: expected length at least ${resolved.minLength}`);
+  }
+
+  if (typeof value === "string" && typeof resolved.pattern === "string" && !new RegExp(resolved.pattern).test(value)) {
+    errors.push(`${pathLabel}: does not match pattern ${resolved.pattern}`);
+  }
+
+  if (typeof value === "string" && resolved.format === "date-time" && Number.isNaN(Date.parse(value))) {
+    errors.push(`${pathLabel}: expected date-time string`);
+  }
+
   if (types && types.includes("object") && typeof value === "object" && value !== null && !Array.isArray(value)) {
     const properties = resolved.properties ?? {};
     const required = resolved.required ?? [];
@@ -101,11 +118,60 @@ function validateAgainst(schema, value, root, pathLabel, errors) {
       }
     }
   }
+
+  if (types && types.includes("array") && Array.isArray(value)) {
+    if (typeof resolved.minItems === "number" && value.length < resolved.minItems) {
+      errors.push(`${pathLabel}: expected at least ${resolved.minItems} item(s)`);
+    }
+    if (resolved.uniqueItems === true) {
+      const seen = new Set(value.map((item) => JSON.stringify(item)));
+      if (seen.size !== value.length) {
+        errors.push(`${pathLabel}: expected unique items`);
+      }
+    }
+    if (resolved.items) {
+      value.forEach((item, index) => validateAgainst(resolved.items, item, root, `${pathLabel}[${index}]`, errors));
+    }
+  }
 }
 
 function validateRunRecord(schema, record) {
   const errors = [];
   validateAgainst(schema, record, schema, "record", errors);
+  if (!record || typeof record !== "object" || Array.isArray(record)) {
+    return errors;
+  }
+  if (record.excluded === true && record.excludedReason === null) {
+    errors.push("record.excludedReason: required when excluded is true");
+  }
+  if (record.excluded === false && record.excludedReason !== null) {
+    errors.push("record.excludedReason: expected null when excluded is false");
+  }
+  if (record.condition === "B2" && (record.peerTokens === null || typeof record.peerTokens !== "object")) {
+    errors.push("record.peerTokens: required for condition B2");
+  }
+  if ((record.condition === "A" || record.condition === "B1") && record.peerTokens !== null) {
+    errors.push(`record.peerTokens: expected null for condition ${record.condition}`);
+  }
+  if (record.verdict === "infra_failure" && record.infraFailure === null) {
+    errors.push("record.infraFailure: required when verdict is infra_failure");
+  }
+  if ((record.verdict === "pass" || record.verdict === "fail") && record.infraFailure !== null) {
+    errors.push("record.infraFailure: expected null when verdict is not infra_failure");
+  }
+  if (record.verdict === "pass" && record.verifyExit !== 0) {
+    errors.push("record.verifyExit: expected 0 when verdict is pass");
+  }
+  if (record.verdict === "fail" && (record.verifyExit === null || record.verifyExit === 0)) {
+    errors.push("record.verifyExit: expected nonzero when verdict is fail");
+  }
+  if (typeof record.startedAt === "string" && typeof record.finishedAt === "string") {
+    const started = Date.parse(record.startedAt);
+    const finished = Date.parse(record.finishedAt);
+    if (!Number.isNaN(started) && !Number.isNaN(finished) && finished < started) {
+      errors.push("record.finishedAt: expected to be at or after startedAt");
+    }
+  }
   return errors;
 }
 
@@ -209,12 +275,39 @@ function formatNumber(value) {
   return Number.isInteger(value) ? String(value) : value.toFixed(2);
 }
 
+function isPassing(record) {
+  return record.verdict === "pass";
+}
+
+function isInvalidForClaims(record) {
+  return (record.condition === "B1" || record.condition === "B2") && record.delegationCount === 0;
+}
+
+function isClaimEligiblePassing(record) {
+  return isPassing(record) && !isInvalidForClaims(record);
+}
+
+function totalTokenCounts(counts) {
+  return counts.input + counts.output + counts.cacheRead + counts.cacheCreation;
+}
+
 function totalOutputTokens(record) {
   return record.claudeTokens.orchestrator.output + record.claudeTokens.subagents.output;
 }
 
 function totalInputTokens(record) {
   return record.claudeTokens.orchestrator.input + record.claudeTokens.subagents.input;
+}
+
+function totalClaudeBilledTokens(record) {
+  return totalTokenCounts(record.claudeTokens.orchestrator) + totalTokenCounts(record.claudeTokens.subagents);
+}
+
+function passMatrixCell(record) {
+  if (record.verdict === "infra_failure") {
+    return "infra_failure";
+  }
+  return isPassing(record) ? "pass" : "fail";
 }
 
 function buildPassMatrix(groups) {
@@ -236,11 +329,11 @@ function buildPassMatrix(groups) {
         cells.push("-");
         continue;
       }
-      const passed = record.verifyExit === 0;
+      const passed = isPassing(record);
       if (passed) {
         passCount += 1;
       }
-      cells.push(passed ? "pass" : "fail");
+      cells.push(passMatrixCell(record));
     }
     rows.push([group.taskId, group.condition, ...cells, `${passCount}/${group.records.length}`]);
   }
@@ -278,6 +371,10 @@ function buildTokenTable(groups) {
     "task",
     "condition",
     "passing",
+    "billed median",
+    "billed IQR",
+    "billed min",
+    "billed max",
     "output median",
     "output IQR",
     "output min",
@@ -290,14 +387,15 @@ function buildTokenTable(groups) {
   const rows = [header, header.map(() => "---")];
 
   for (const group of groups) {
-    const passing = group.records.filter((record) => record.verifyExit === 0);
+    const passing = group.records.filter(isPassing);
     const passLabel = `${passing.length}/${group.records.length}`;
 
     if (passing.length < MIN_PASSES_FOR_COMPARISON) {
-      rows.push([group.taskId, group.condition, passLabel, "not comparable", "not comparable", "not comparable", "not comparable", "not comparable", "not comparable", "not comparable", "not comparable"]);
+      rows.push([group.taskId, group.condition, passLabel, "not comparable", "not comparable", "not comparable", "not comparable", "not comparable", "not comparable", "not comparable", "not comparable", "not comparable", "not comparable", "not comparable", "not comparable"]);
       continue;
     }
 
+    const billedStats = describe(passing.map(totalClaudeBilledTokens));
     const outputStats = describe(passing.map(totalOutputTokens));
     const inputStats = describe(passing.map(totalInputTokens));
 
@@ -305,6 +403,10 @@ function buildTokenTable(groups) {
       group.taskId,
       group.condition,
       passLabel,
+      formatNumber(billedStats.median),
+      `${formatNumber(billedStats.q1)} to ${formatNumber(billedStats.q3)}`,
+      formatNumber(billedStats.min),
+      formatNumber(billedStats.max),
       formatNumber(outputStats.median),
       `${formatNumber(outputStats.q1)} to ${formatNumber(outputStats.q3)}`,
       formatNumber(outputStats.min),
@@ -319,17 +421,155 @@ function buildTokenTable(groups) {
   return rows;
 }
 
+function buildDelegationSection(records) {
+  const bRecords = records.filter((record) => record.condition === "B1" || record.condition === "B2");
+  if (bRecords.length === 0) {
+    return ["### Delegation counts", "", "No B condition runs."].join("\n");
+  }
+  const groups = groupRecords(bRecords);
+  const maxRepetition = groups.reduce((max, group) => {
+    const groupMax = group.records.reduce((inner, record) => Math.max(inner, record.repetition), 0);
+    return Math.max(max, groupMax);
+  }, 0);
+  const header = ["task", "condition", ...Array.from({ length: maxRepetition }, (_, i) => `rep ${i + 1}`), "claim validity"];
+  const rows = [header, header.map(() => "---")];
+  for (const group of groups) {
+    const byRepetition = new Map(group.records.map((record) => [record.repetition, record]));
+    const cells = [];
+    for (let repetition = 1; repetition <= maxRepetition; repetition += 1) {
+      const record = byRepetition.get(repetition);
+      cells.push(record ? String(record.delegationCount) : "-");
+    }
+    rows.push([
+      group.taskId,
+      group.condition,
+      ...cells,
+      group.records.some(isInvalidForClaims) ? "invalid-for-claims" : "valid-for-claims"
+    ]);
+  }
+  return ["### Delegation counts", "", renderTable(rows)].join("\n");
+}
+
+function mean(values) {
+  if (values.length === 0) {
+    return null;
+  }
+  return values.reduce((sum, value) => sum + value, 0) / values.length;
+}
+
+function recordsForTaskCondition(records, taskId, condition) {
+  return records.filter((record) => record.taskId === taskId && record.condition === condition);
+}
+
+function comparableTaskDeltas(records, baselineCondition, comparisonCondition, metric) {
+  const taskIds = [...new Set(records.map((record) => record.taskId))].sort();
+  const deltas = [];
+  for (const taskId of taskIds) {
+    const baseline = recordsForTaskCondition(records, taskId, baselineCondition).filter(isClaimEligiblePassing);
+    const comparison = recordsForTaskCondition(records, taskId, comparisonCondition).filter(isClaimEligiblePassing);
+    if (baseline.length < MIN_PASSES_FOR_COMPARISON || comparison.length < MIN_PASSES_FOR_COMPARISON) {
+      continue;
+    }
+    const baselineMedian = median(baseline.map(metric).sort((left, right) => left - right));
+    const comparisonMedian = median(comparison.map(metric).sort((left, right) => left - right));
+    deltas.push(comparisonMedian - baselineMedian);
+  }
+  return deltas;
+}
+
+function formatDeltaLine(label, deltas) {
+  if (deltas.length === 0) {
+    return `- ${label}: not enough comparable passing runs.`;
+  }
+  const sorted = [...deltas].sort((left, right) => left - right);
+  return `- ${label}: mean delta ${formatNumber(mean(deltas))}, median delta ${formatNumber(median(sorted))}, tasks ${deltas.length}.`;
+}
+
+function peerTokenLine(records) {
+  const b2Records = records.filter((record) => record.condition === "B2" && isClaimEligiblePassing(record));
+  if (b2Records.length === 0) {
+    return "- C1b peer tokens: not enough comparable B2 passing runs.";
+  }
+  if (b2Records.some((record) => record.peerTokens === null || record.peerTokens.grok === null || record.peerTokens.codex === null)) {
+    return "- C1b peer tokens: not measurable while peerTokens are null.";
+  }
+  const totals = b2Records.map((record) => record.peerTokens.grok + record.peerTokens.codex);
+  const stats = describe(totals);
+  return `- C1b peer tokens: median ${formatNumber(stats.median)}, IQR ${formatNumber(stats.q1)} to ${formatNumber(stats.q3)}.`;
+}
+
+function planTaskIds(env) {
+  const tagsByTask = env.taskTags && typeof env.taskTags === "object" ? env.taskTags : {};
+  return new Set(
+    Object.entries(tagsByTask)
+      .filter((entry) => Array.isArray(entry[1]) && entry[1].includes("plan-shaped"))
+      .map((entry) => entry[0])
+  );
+}
+
+function wallClockRatioLine(records, planTasks, comparisonCondition) {
+  const ratios = [];
+  for (const taskId of planTasks) {
+    const baseline = recordsForTaskCondition(records, taskId, "A").filter(isClaimEligiblePassing);
+    const comparison = recordsForTaskCondition(records, taskId, comparisonCondition).filter(isClaimEligiblePassing);
+    if (baseline.length < MIN_PASSES_FOR_COMPARISON || comparison.length < MIN_PASSES_FOR_COMPARISON) {
+      continue;
+    }
+    const baselineMedian = median(baseline.map((record) => record.wallClockSeconds).sort((left, right) => left - right));
+    const comparisonMedian = median(comparison.map((record) => record.wallClockSeconds).sort((left, right) => left - right));
+    if (baselineMedian > 0) {
+      ratios.push(comparisonMedian / baselineMedian);
+    }
+  }
+  if (ratios.length === 0) {
+    return `- C2 ${comparisonCondition} versus A wall clock ratio: not enough comparable plan-shaped passing runs.`;
+  }
+  const sorted = [...ratios].sort((left, right) => left - right);
+  return `- C2 ${comparisonCondition} versus A wall clock ratio: mean ${formatNumber(mean(ratios))}, median ${formatNumber(median(sorted))}, tasks ${ratios.length}.`;
+}
+
+function buildComparisonsSection(records, env) {
+  const claimRecords = records.filter((record) => !record.excluded);
+  const c1a = comparableTaskDeltas(claimRecords, "A", "B1", totalClaudeBilledTokens);
+  const c1b = comparableTaskDeltas(claimRecords, "B1", "B2", totalClaudeBilledTokens);
+  const plans = planTaskIds(env);
+  const lines = [
+    "### Comparisons",
+    "",
+    formatDeltaLine("C1a A vs B1 Claude billed tokens, B1 minus A", c1a),
+    formatDeltaLine("C1b B1 vs B2 Claude billed tokens, B2 minus B1", c1b),
+    peerTokenLine(claimRecords)
+  ];
+  if (plans.size === 0) {
+    lines.push("- C2: no plan tasks in suite for now.");
+  } else {
+    lines.push(wallClockRatioLine(claimRecords, plans, "B1"), wallClockRatioLine(claimRecords, plans, "B2"));
+  }
+  return lines.join("\n");
+}
+
+function exclusionCapLine(records) {
+  const total = records.length;
+  const excluded = records.filter((record) => record.excluded).length;
+  const percent = total === 0 ? 0 : excluded / total;
+  const label = `Exclusion cap: ${excluded}/${total} (${(percent * 100).toFixed(1)}%).`;
+  if (percent > EXCLUSION_CAP) {
+    return `${label} Exceeds 5.0%, snapshot invalid as a comparison.`;
+  }
+  return `${label} Within 5.0%.`;
+}
+
 function buildExcludedSection(records) {
   const excluded = records.filter((record) => record.excluded);
   if (excluded.length === 0) {
-    return ["### Excluded runs", "", "No excluded runs."].join("\n");
+    return ["### Excluded runs", "", exclusionCapLine(records), "", "No excluded runs."].join("\n");
   }
   const header = ["task", "condition", "repetition", "reason"];
   const rows = [header, header.map(() => "---")];
   for (const record of excluded) {
     rows.push([record.taskId, record.condition, String(record.repetition), record.excludedReason ?? "unspecified"]);
   }
-  return ["### Excluded runs", "", renderTable(rows)].join("\n");
+  return ["### Excluded runs", "", exclusionCapLine(records), "", renderTable(rows)].join("\n");
 }
 
 function buildMalformedSection(malformed) {
@@ -342,9 +582,9 @@ function buildMalformedSection(malformed) {
 
 function buildSuiteAggregate(nonExcludedRecords) {
   const taskCount = new Set(nonExcludedRecords.map((record) => record.taskId)).size;
-  const passCount = nonExcludedRecords.filter((record) => record.verifyExit === 0).length;
+  const passCount = nonExcludedRecords.filter(isPassing).length;
   const totalCount = nonExcludedRecords.length;
-  const passingRecords = nonExcludedRecords.filter((record) => record.verifyExit === 0);
+  const passingRecords = nonExcludedRecords.filter(isPassing);
 
   const lines = [
     "## Suite level aggregate",
@@ -358,8 +598,10 @@ function buildSuiteAggregate(nonExcludedRecords) {
     const wallClock = describe(passingRecords.map((record) => record.wallClockSeconds));
     const output = describe(passingRecords.map(totalOutputTokens));
     const input = describe(passingRecords.map(totalInputTokens));
+    const billed = describe(passingRecords.map(totalClaudeBilledTokens));
     lines.push(
       `- Median wall clock across passing runs: ${formatNumber(wallClock.median)}s`,
+      `- Median billed Claude tokens across passing runs: ${formatNumber(billed.median)}`,
       `- Median output tokens across passing runs: ${formatNumber(output.median)}`,
       `- Median input tokens across passing runs: ${formatNumber(input.median)}`
     );
@@ -391,6 +633,10 @@ function buildReportForDir(schema, resultsDir) {
     "### Token statistics",
     "",
     renderTable(buildTokenTable(groups)),
+    "",
+    buildDelegationSection(nonExcluded),
+    "",
+    buildComparisonsSection(records, env),
     "",
     buildExcludedSection(records),
     "",

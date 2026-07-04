@@ -1,9 +1,75 @@
 {
+  "manifestHash": "95091a2baf7fba53922431f03e60e7314b166080320494dd8486d2186b7e86f4",
   "tasks": [
     {
       "id": "T01-seeded-bug",
-      "briefSha256": "1a5280e9d1b90a4681f4c27788c65df536a8d73c4722a70144b995c1a6bba448",
-      "verifySha256": "0083db06745d65885b2847eb9b21af308edb41cae936ab8418dd421565ea8bb7"
+      "taskSha256": "7a04b409c08e54f5dafd9a0381cfdd176568d226eb14f1689731bcc3f5638778",
+      "files": [
+        {
+          "path": "brief.md",
+          "sha256": "1a5280e9d1b90a4681f4c27788c65df536a8d73c4722a70144b995c1a6bba448"
+        },
+        {
+          "path": "cache.test.mjs",
+          "sha256": "47e2a4fc5023dc01611949b54ce01688d8cfcd55efa5568ec49782421ce4c65d"
+        },
+        {
+          "path": "fixtures/index.js",
+          "sha256": "6a72e8f81c0ad48787e55447b068173f031684b426feb5e462fd230921d4a037"
+        },
+        {
+          "path": "fixtures/linked-list.js",
+          "sha256": "e9356613e9e618642351c359464b0762d7725fbe015e842abda8d689406af245"
+        },
+        {
+          "path": "fixtures/lru-cache.js",
+          "sha256": "5125b30cdfcb2da2dbaf49bdcfa962eb30c7c7ca55480890db33ef0a0a332f70"
+        },
+        {
+          "path": "fixtures/package.json",
+          "sha256": "d2aaf324399446516b42d82624be18adcd6465fddf100b7ba79f57323f63da52"
+        },
+        {
+          "path": "mutant/index.js",
+          "sha256": "6a72e8f81c0ad48787e55447b068173f031684b426feb5e462fd230921d4a037"
+        },
+        {
+          "path": "mutant/linked-list.js",
+          "sha256": "e9356613e9e618642351c359464b0762d7725fbe015e842abda8d689406af245"
+        },
+        {
+          "path": "mutant/lru-cache.js",
+          "sha256": "5125b30cdfcb2da2dbaf49bdcfa962eb30c7c7ca55480890db33ef0a0a332f70"
+        },
+        {
+          "path": "mutant/package.json",
+          "sha256": "d2aaf324399446516b42d82624be18adcd6465fddf100b7ba79f57323f63da52"
+        },
+        {
+          "path": "selftest.sh",
+          "sha256": "5bdccdf6ccf8efe617f6065778fe594c3b574f1be756e4ab54f9068dde8edcb3"
+        },
+        {
+          "path": "solution/index.js",
+          "sha256": "6a72e8f81c0ad48787e55447b068173f031684b426feb5e462fd230921d4a037"
+        },
+        {
+          "path": "solution/linked-list.js",
+          "sha256": "e9356613e9e618642351c359464b0762d7725fbe015e842abda8d689406af245"
+        },
+        {
+          "path": "solution/lru-cache.js",
+          "sha256": "3337d78c7011d31fbf071039516811b303b1983b0e9c63ad2c0e3340c2e9f1c9"
+        },
+        {
+          "path": "solution/package.json",
+          "sha256": "d2aaf324399446516b42d82624be18adcd6465fddf100b7ba79f57323f63da52"
+        },
+        {
+          "path": "verify.sh",
+          "sha256": "0083db06745d65885b2847eb9b21af308edb41cae936ab8418dd421565ea8bb7"
+        }
+      ]
     }
   ]
 }

@@ -17,21 +17,20 @@ claude auth login
 
 ## Condition B1
 
-Condition B1 enables the fusion and grok plugins so the Claude tier agents and fusion routing rules are available, but the benchmark brief and routing policy must keep peer engine commands unused. The Codex plugin is disabled in this profile, and no `/grok:*` or Codex peer command output is counted for B1.
+Condition B1 enables only the fusion plugin so the Claude tier agents and fusion routing rules are available. Peer plugins are not installed for this profile. If a shared configuration directory already has Grok or Codex installed, discard that directory and create a clean B1 profile instead.
 
 ```bash
 export CLAUDE_CONFIG_DIR=/absolute/path/to/bench-configs/B1
 mkdir -p "$CLAUDE_CONFIG_DIR"
 claude auth login
 claude plugin marketplace add okisdev/claude-code-fusion
-claude plugin install grok@claude-code-fusion
 claude plugin install fusion@claude-code-fusion
-claude plugin enable grok@claude-code-fusion
 claude plugin enable fusion@claude-code-fusion
+claude plugin disable grok@claude-code-fusion
 claude plugin disable codex@openai-codex
 ```
 
-`claude auth login` is interactive. If `codex@openai-codex` is not installed, the disable command may report that there is nothing to disable, which is acceptable for B1. Start an interactive Claude session in the same `CLAUDE_CONFIG_DIR`, accept the workspace trust prompt if it appears, run `/fusion:setup`, approve the routing rule install, and approve the optional `Bash(node:*)` permission only for this benchmark profile. Run `/grok:setup` only to verify the Grok companion bootstrap and permission path, then keep Grok peer commands unused during B1 benchmark runs.
+`claude auth login` is interactive. If the Grok or Codex plugin is not installed, the disable command may report that there is nothing to disable, which is acceptable for B1. Start an interactive Claude session in the same `CLAUDE_CONFIG_DIR`, accept the workspace trust prompt if it appears, run `/fusion:setup`, approve the routing rule install, and approve the optional `Bash(node:*)` permission only for this benchmark profile. Do not run `/grok:setup`, do not authenticate Grok or Codex in this profile, and do not install peer plugins for B1.
 
 ## Condition B2
 
