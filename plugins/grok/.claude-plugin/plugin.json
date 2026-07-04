@@ -1,7 +1,7 @@
 {
   "name": "grok",
-  "version": "0.0.10",
-  "description": "Delegate coding, review, and second opinion work to the local Grok CLI.",
+  "version": "0.0.11",
+  "description": "Local Grok CLI delegation: task, review, best-of-n tournaments, background jobs, stats, and setup health checks.",
   "author": {
     "name": "Harry Yep"
   },
