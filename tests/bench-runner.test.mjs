@@ -231,9 +231,18 @@ test("runner writes env.json with manifest and cheap version capture", (t) => {
   assert.strictEqual(typeof env.os.release, "string");
   assert.match(env.taskManifestHash, /^[0-9a-f]{64}$/);
   assert.strictEqual(env.manifestHash, env.taskManifestHash);
-  assert.strictEqual(env.pluginVersions["claude-code-fusion"], "0.0.10");
-  assert.strictEqual(env.pluginVersions.fusion, "0.0.10");
-  assert.strictEqual(env.pluginVersions.grok, "0.0.10");
+  const marketplace = JSON.parse(
+    fs.readFileSync(path.join(repoRoot, ".claude-plugin", "marketplace.json"), "utf8"),
+  );
+  const fusionPlugin = JSON.parse(
+    fs.readFileSync(path.join(repoRoot, "plugins", "fusion", ".claude-plugin", "plugin.json"), "utf8"),
+  );
+  const grokPlugin = JSON.parse(
+    fs.readFileSync(path.join(repoRoot, "plugins", "grok", ".claude-plugin", "plugin.json"), "utf8"),
+  );
+  assert.strictEqual(env.pluginVersions["claude-code-fusion"], marketplace.metadata.version);
+  assert.strictEqual(env.pluginVersions.fusion, fusionPlugin.version);
+  assert.strictEqual(env.pluginVersions.grok, grokPlugin.version);
   assert.strictEqual(env.pluginVersions.codex, null);
   assert.strictEqual(env.engineCliVersions.claude, null);
   assert.strictEqual(env.engineCliVersions.grok, "grok test 1.2.3");
