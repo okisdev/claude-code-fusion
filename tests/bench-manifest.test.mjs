@@ -14,11 +14,12 @@ function makeSandbox(t) {
   return root;
 }
 
-function writeTask(root, id, { brief = "# brief\n", verify = "#!/bin/sh\nexit 0\n" } = {}) {
+function writeTask(root, id, { brief = "# brief\n", verify = "#!/bin/sh\nexit 0\n", fixture = "fixture\n" } = {}) {
   const taskDir = path.join(root, "bench", "tasks", id);
-  fs.mkdirSync(taskDir, { recursive: true });
+  fs.mkdirSync(path.join(taskDir, "fixtures"), { recursive: true });
   fs.writeFileSync(path.join(taskDir, "brief.md"), brief, "utf8");
   fs.writeFileSync(path.join(taskDir, "verify.sh"), verify, "utf8");
+  fs.writeFileSync(path.join(taskDir, "fixtures", "input.txt"), fixture, "utf8");
 }
 
 function runManifest(args, cwd) {
@@ -41,13 +42,20 @@ test("manifest generates then --check passes cleanly", (t) => {
   const manifestPath = path.join(root, "bench", "tasks", "manifest.json");
   assert.ok(fs.existsSync(manifestPath));
   const manifest = JSON.parse(fs.readFileSync(manifestPath, "utf8"));
+  assert.match(manifest.manifestHash, /^[0-9a-f]{64}$/);
   assert.deepStrictEqual(
     manifest.tasks.map((task) => task.id),
     ["T01-first", "T02-second"]
   );
   for (const task of manifest.tasks) {
-    assert.match(task.briefSha256, /^[0-9a-f]{64}$/);
-    assert.match(task.verifySha256, /^[0-9a-f]{64}$/);
+    assert.match(task.taskSha256, /^[0-9a-f]{64}$/);
+    assert.deepStrictEqual(
+      task.files.map((file) => file.path),
+      ["brief.md", "fixtures/input.txt", "verify.sh"]
+    );
+    for (const file of task.files) {
+      assert.match(file.sha256, /^[0-9a-f]{64}$/);
+    }
   }
 
   const checked = runManifest(["--check"], root);
@@ -68,6 +76,21 @@ test("manifest --check detects a modified verify.sh", (t) => {
   assert.notStrictEqual(checked.status, 0);
   assert.match(checked.stderr, /stale/);
   assert.match(checked.stderr, /T01-first: verify\.sh changed/);
+});
+
+test("manifest --check detects a modified fixture file", (t) => {
+  const root = makeSandbox(t);
+  writeTask(root, "T01-first");
+
+  const generated = runManifest([], root);
+  assert.strictEqual(generated.status, 0, generated.stderr);
+
+  fs.writeFileSync(path.join(root, "bench", "tasks", "T01-first", "fixtures", "input.txt"), "changed\n", "utf8");
+
+  const checked = runManifest(["--check"], root);
+  assert.notStrictEqual(checked.status, 0);
+  assert.match(checked.stderr, /stale/);
+  assert.match(checked.stderr, /T01-first: fixtures\/input\.txt changed/);
 });
 
 test("manifest --check fails when manifest.json is missing", (t) => {

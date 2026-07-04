@@ -14,20 +14,32 @@ function makeSandbox(t) {
   return root;
 }
 
-function tokenCounts(input, output) {
-  return { input, output, cacheRead: 0, cacheCreation: 0 };
+function tokenCounts(input, output, cacheRead = 0, cacheCreation = 0) {
+  return { input, output, cacheRead, cacheCreation };
 }
 
 function baseRecord(overrides = {}) {
-  return {
+  const record = {
+    runId: `run-${overrides.taskId ?? "T01-first"}-${overrides.condition ?? "B1"}-${overrides.repetition ?? 1}`,
     taskId: "T01-first",
     condition: "B1",
     repetition: 1,
+    startedAt: "2026-01-01T00:00:00.000Z",
+    finishedAt: "2026-01-01T00:00:10.000Z",
+    taskManifestHash: "a".repeat(64),
+    conditionNotes: {
+      detection: "filesystem",
+      installedPlugins: ["fusion"],
+      routingRulesPresent: false
+    },
+    claudeExit: 0,
     verifyExit: 0,
     wallClockSeconds: 10,
+    verdict: "pass",
+    infraFailure: null,
     claudeTokens: {
-      orchestrator: tokenCounts(100, 50),
-      subagents: tokenCounts(200, 80),
+      orchestrator: tokenCounts(100, 50, 10, 5),
+      subagents: tokenCounts(200, 80, 20, 10),
       byModel: {}
     },
     peerTokens: null,
@@ -38,6 +50,16 @@ function baseRecord(overrides = {}) {
     excludedReason: null,
     ...overrides
   };
+  if (!("verdict" in overrides)) {
+    record.verdict = record.verifyExit === 0 ? "pass" : "fail";
+  }
+  if (!("infraFailure" in overrides)) {
+    record.infraFailure = null;
+  }
+  if (!("peerTokens" in overrides)) {
+    record.peerTokens = record.condition === "B2" ? { grok: null, codex: null } : null;
+  }
+  return record;
 }
 
 function writeResultsDir(root, name, { records, env, extraLine } = {}) {
@@ -61,6 +83,8 @@ function writeResultsDir(root, name, { records, env, extraLine } = {}) {
       codexModel: "test",
       fixtureCommit: "abc123",
       manifestHash: "hash-a",
+      taskManifestHash: "hash-a",
+      taskTags: {},
       nodeVersion: process.version,
       os: process.platform,
       runDate: "2026-01-01",
@@ -122,6 +146,7 @@ test("summarize builds a pass matrix, gates the token table, and lists exclusion
   assert.match(result.stdout, /\| T01-first \| B1 \| 2\/3 \| \d/);
 
   assert.match(result.stdout, /### Excluded runs/);
+  assert.match(result.stdout, /Exclusion cap: 1\/6 \(16\.7%\)\. Exceeds 5\.0%, snapshot invalid as a comparison\./);
   assert.match(result.stdout, /T03-excluded \| B2 \| 1 \| external_service_outage/);
 
   assert.match(result.stdout, /### Malformed records/);
@@ -130,6 +155,8 @@ test("summarize builds a pass matrix, gates the token table, and lists exclusion
   assert.doesNotMatch(result.stdout, /T03-excluded[^\n]*\n[^\n]*\| pass \|/);
 
   assert.match(result.stdout, /These aggregates are descriptive summaries of the tasks above, not a statistical claim\./);
+  assert.match(result.stdout, /### Delegation counts/);
+  assert.match(result.stdout, /C2: no plan tasks in suite for now/);
 });
 
 test("summarize marks a task and condition comparable once 2 of 3 pass", (t) => {
@@ -168,4 +195,61 @@ test("summarize compares two dirs sharing the same manifest hash", (t) => {
   assert.strictEqual(result.status, 0, result.stderr);
   assert.match(result.stdout, /## run-a/);
   assert.match(result.stdout, /## run-b/);
+});
+
+test("summarize renders claim comparisons with billed Claude token deltas", (t) => {
+  const root = makeSandbox(t);
+  const billedTokens = (total) => ({
+    orchestrator: tokenCounts(total / 2, total / 4, total / 8, total / 8),
+    subagents: tokenCounts(0, 0, 0, 0),
+    byModel: {}
+  });
+  const records = [
+    baseRecord({ condition: "A", repetition: 1, claudeTokens: billedTokens(200) }),
+    baseRecord({ condition: "A", repetition: 2, claudeTokens: billedTokens(200) }),
+    baseRecord({ condition: "B1", repetition: 1, claudeTokens: billedTokens(100), delegationCount: 1 }),
+    baseRecord({ condition: "B1", repetition: 2, claudeTokens: billedTokens(100), delegationCount: 1 }),
+    baseRecord({ condition: "B2", repetition: 1, claudeTokens: billedTokens(50), delegationCount: 1 }),
+    baseRecord({ condition: "B2", repetition: 2, claudeTokens: billedTokens(50), delegationCount: 1 })
+  ];
+  const dir = writeResultsDir(root, "run-1", { records });
+
+  const result = runSummarize([dir]);
+  assert.strictEqual(result.status, 0, result.stderr);
+  assert.match(result.stdout, /C1a A vs B1 Claude billed tokens, B1 minus A: mean delta -100, median delta -100, tasks 1\./);
+  assert.match(result.stdout, /C1b B1 vs B2 Claude billed tokens, B2 minus B1: mean delta -50, median delta -50, tasks 1\./);
+  assert.match(result.stdout, /C1b peer tokens: not measurable while peerTokens are null\./);
+});
+
+test("summarize flags B runs without delegation as invalid for claims", (t) => {
+  const root = makeSandbox(t);
+  const records = [
+    baseRecord({ condition: "A", repetition: 1 }),
+    baseRecord({ condition: "A", repetition: 2 }),
+    baseRecord({ condition: "B1", repetition: 1, delegationCount: 0 }),
+    baseRecord({ condition: "B1", repetition: 2, delegationCount: 0 })
+  ];
+  const dir = writeResultsDir(root, "run-1", { records });
+
+  const result = runSummarize([dir]);
+  assert.strictEqual(result.status, 0, result.stderr);
+  assert.match(result.stdout, /\| T01-first \| B1 \| 0 \| 0 \| invalid-for-claims \|/);
+  assert.match(result.stdout, /C1a A vs B1 Claude billed tokens, B1 minus A: not enough comparable passing runs\./);
+});
+
+test("summarize rejects schema records with negative numbers and invalid exclusions", (t) => {
+  const root = makeSandbox(t);
+  const records = [
+    baseRecord(),
+    baseRecord({ repetition: 2, wallClockSeconds: -1 }),
+    baseRecord({ repetition: 3, excluded: true, excludedReason: null }),
+    baseRecord({ condition: "B2", repetition: 4, peerTokens: null })
+  ];
+  const dir = writeResultsDir(root, "run-1", { records });
+
+  const result = runSummarize([dir]);
+  assert.strictEqual(result.status, 0, result.stderr);
+  assert.match(result.stdout, /runs\.jsonl:2: record\.wallClockSeconds: expected at least 0/);
+  assert.match(result.stdout, /runs\.jsonl:3: record\.excludedReason: required when excluded is true/);
+  assert.match(result.stdout, /runs\.jsonl:4: record\.peerTokens: required for condition B2/);
 });

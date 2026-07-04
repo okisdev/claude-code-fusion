@@ -6,11 +6,19 @@
   "type": "object",
   "additionalProperties": false,
   "required": [
+    "runId",
     "taskId",
     "condition",
     "repetition",
+    "startedAt",
+    "finishedAt",
+    "taskManifestHash",
+    "conditionNotes",
+    "claudeExit",
     "verifyExit",
     "wallClockSeconds",
+    "verdict",
+    "infraFailure",
     "claudeTokens",
     "peerTokens",
     "delegationCount",
@@ -20,6 +28,10 @@
     "excludedReason"
   ],
   "properties": {
+    "runId": {
+      "type": "string",
+      "minLength": 1
+    },
     "taskId": {
       "type": "string",
       "minLength": 1
@@ -32,12 +44,46 @@
       "type": "integer",
       "minimum": 1
     },
+    "startedAt": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "finishedAt": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "taskManifestHash": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "conditionNotes": {
+      "$ref": "#/$defs/conditionNotes"
+    },
+    "claudeExit": {
+      "type": ["integer", "null"],
+      "minimum": 0
+    },
     "verifyExit": {
-      "type": "integer"
+      "type": ["integer", "null"],
+      "minimum": 0
     },
     "wallClockSeconds": {
       "type": "number",
       "minimum": 0
+    },
+    "verdict": {
+      "type": "string",
+      "enum": ["pass", "fail", "infra_failure"]
+    },
+    "infraFailure": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/infraFailure"
+        },
+        {
+          "type": "null"
+        }
+      ]
     },
     "claudeTokens": {
       "type": "object",
@@ -106,6 +152,50 @@
     }
   },
   "$defs": {
+    "conditionNotes": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["detection", "installedPlugins", "routingRulesPresent"],
+      "properties": {
+        "detection": {
+          "type": "string",
+          "enum": ["filesystem"]
+        },
+        "installedPlugins": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          },
+          "uniqueItems": true
+        },
+        "routingRulesPresent": {
+          "type": "boolean"
+        }
+      }
+    },
+    "infraFailure": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "message"],
+      "properties": {
+        "kind": {
+          "type": "string",
+          "enum": [
+            "missing_transcript",
+            "ambiguous_transcript",
+            "claude_start_failure",
+            "verifier_start_failure",
+            "task_setup_failure",
+            "runner_failure"
+          ]
+        },
+        "message": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
     "tokenCounts": {
       "type": "object",
       "additionalProperties": false,

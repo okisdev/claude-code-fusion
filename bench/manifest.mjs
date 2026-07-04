@@ -3,6 +3,7 @@
 import { createHash } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 
 const TASKS_DIR = path.join(process.cwd(), "bench", "tasks");
 const MANIFEST_PATH = path.join(TASKS_DIR, "manifest.json");
@@ -15,50 +16,86 @@ function canonicalTasksString(tasks) {
   return JSON.stringify(tasks);
 }
 
-function manifestHash(tasks) {
+export function manifestHash(tasks) {
   return createHash("sha256").update(canonicalTasksString(tasks)).digest("hex");
 }
 
-function scanTasks() {
-  if (!fs.existsSync(TASKS_DIR)) {
+function listTaskFiles(taskDir) {
+  const files = [];
+  const stack = [taskDir];
+  while (stack.length > 0) {
+    const current = stack.pop();
+    const entries = fs.readdirSync(current, { withFileTypes: true }).sort((left, right) => left.name.localeCompare(right.name));
+    for (const entry of entries) {
+      const full = path.join(current, entry.name);
+      if (entry.isDirectory()) {
+        stack.push(full);
+        continue;
+      }
+      if (!entry.isFile()) {
+        continue;
+      }
+      files.push({
+        path: path.relative(taskDir, full).split(path.sep).join("/"),
+        sha256: sha256File(full)
+      });
+    }
+  }
+  return files.sort((left, right) => left.path.localeCompare(right.path));
+}
+
+function taskHash(files) {
+  return createHash("sha256").update(JSON.stringify(files)).digest("hex");
+}
+
+export function scanTasks(tasksDir = TASKS_DIR) {
+  if (!fs.existsSync(tasksDir)) {
     return [];
   }
   const entries = fs
-    .readdirSync(TASKS_DIR, { withFileTypes: true })
+    .readdirSync(tasksDir, { withFileTypes: true })
     .filter((entry) => entry.isDirectory())
     .map((entry) => entry.name)
     .sort();
 
   const tasks = [];
   for (const id of entries) {
-    const taskDir = path.join(TASKS_DIR, id);
+    const taskDir = path.join(tasksDir, id);
     const briefFile = path.join(taskDir, "brief.md");
     const verifyFile = path.join(taskDir, "verify.sh");
     if (!fs.existsSync(briefFile) || !fs.existsSync(verifyFile)) {
       continue;
     }
+    const files = listTaskFiles(taskDir);
     tasks.push({
       id,
-      briefSha256: sha256File(briefFile),
-      verifySha256: sha256File(verifyFile)
+      taskSha256: taskHash(files),
+      files
     });
   }
   return tasks;
 }
 
-function writeManifest(tasks) {
-  fs.mkdirSync(TASKS_DIR, { recursive: true });
-  const manifest = { tasks };
-  fs.writeFileSync(MANIFEST_PATH, `${JSON.stringify(manifest, null, 2)}\n`, "utf8");
+export function buildManifest(tasksDir = TASKS_DIR) {
+  const tasks = scanTasks(tasksDir);
+  return {
+    manifestHash: manifestHash(tasks),
+    tasks
+  };
+}
+
+function writeManifest(manifest, tasksDir = TASKS_DIR) {
+  fs.mkdirSync(tasksDir, { recursive: true });
+  fs.writeFileSync(path.join(tasksDir, "manifest.json"), `${JSON.stringify(manifest, null, 2)}\n`, "utf8");
   return manifest;
 }
 
-function readManifest() {
-  if (!fs.existsSync(MANIFEST_PATH)) {
+function readManifest(manifestPath = MANIFEST_PATH) {
+  if (!fs.existsSync(manifestPath)) {
     return null;
   }
   try {
-    return JSON.parse(fs.readFileSync(MANIFEST_PATH, "utf8"));
+    return JSON.parse(fs.readFileSync(manifestPath, "utf8"));
   } catch {
     return null;
   }
@@ -76,11 +113,24 @@ function diffTasks(expected, actual) {
     }
     const expectedTask = expectedById.get(id);
     const actualTask = actualById.get(id);
-    if (expectedTask.briefSha256 !== actualTask.briefSha256) {
-      drifted.push(`${id}: brief.md changed`);
+    const expectedFiles = new Map((expectedTask.files ?? []).map((file) => [file.path, file.sha256]));
+    const actualFiles = new Map((actualTask.files ?? []).map((file) => [file.path, file.sha256]));
+    for (const filePath of expectedFiles.keys()) {
+      if (!actualFiles.has(filePath)) {
+        drifted.push(`${id}: ${filePath} removed`);
+        continue;
+      }
+      if (expectedFiles.get(filePath) !== actualFiles.get(filePath)) {
+        drifted.push(`${id}: ${filePath} changed`);
+      }
     }
-    if (expectedTask.verifySha256 !== actualTask.verifySha256) {
-      drifted.push(`${id}: verify.sh changed`);
+    for (const filePath of actualFiles.keys()) {
+      if (!expectedFiles.has(filePath)) {
+        drifted.push(`${id}: ${filePath} added`);
+      }
+    }
+    if (expectedTask.taskSha256 !== actualTask.taskSha256) {
+      drifted.push(`${id}: task hash changed`);
     }
   }
   for (const id of actualById.keys()) {
@@ -92,7 +142,7 @@ function diffTasks(expected, actual) {
 }
 
 function runCheck() {
-  const actual = scanTasks();
+  const actual = buildManifest();
   const existing = readManifest();
 
   if (!existing) {
@@ -101,7 +151,10 @@ function runCheck() {
     return;
   }
 
-  const drifted = diffTasks(existing.tasks ?? [], actual);
+  const drifted = diffTasks(existing.tasks ?? [], actual.tasks);
+  if (existing.manifestHash !== actual.manifestHash) {
+    drifted.push(`manifest hash changed from ${existing.manifestHash ?? "missing"} to ${actual.manifestHash}`);
+  }
   if (drifted.length > 0) {
     console.error("bench/tasks/manifest.json is stale:");
     for (const line of drifted) {
@@ -111,17 +164,17 @@ function runCheck() {
     return;
   }
 
-  console.log(`bench/tasks/manifest.json is up to date. manifest hash: ${manifestHash(actual)}`);
+  console.log(`bench/tasks/manifest.json is up to date. manifest hash: ${actual.manifestHash}`);
 }
 
 function runGenerate() {
-  const tasks = scanTasks();
-  writeManifest(tasks);
-  if (tasks.length === 0) {
+  const manifest = buildManifest();
+  writeManifest(manifest);
+  if (manifest.tasks.length === 0) {
     console.log("bench/tasks/ is empty or absent; wrote an empty manifest.");
     return;
   }
-  console.log(`Wrote bench/tasks/manifest.json with ${tasks.length} task(s). manifest hash: ${manifestHash(tasks)}`);
+  console.log(`Wrote bench/tasks/manifest.json with ${manifest.tasks.length} task(s). manifest hash: ${manifest.manifestHash}`);
 }
 
 function main() {
@@ -135,4 +188,6 @@ function main() {
   runGenerate();
 }
 
-main();
+if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  main();
+}
