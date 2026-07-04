@@ -7,34 +7,61 @@ import { test } from "node:test";
 
 const repoRoot = path.join(import.meta.dirname, "..");
 const companion = path.join(repoRoot, "plugins", "grok", "scripts", "grok-companion.mjs");
+const cliRuntimeSkill = path.join(repoRoot, "plugins", "grok", "skills", "grok-cli-runtime", "SKILL.md");
+const { parseArgs } = await import(path.join(repoRoot, "plugins", "grok", "scripts", "lib", "args.mjs"));
 const { buildGrokArgs } = await import(path.join(repoRoot, "plugins", "grok", "scripts", "lib", "grok-exec.mjs"));
 const fakeGrok = path.join(import.meta.dirname, "fake-grok");
 
 const consultAllows = [
   "Read",
   "Grep",
-  "Bash(git diff*)",
-  "Bash(git log*)",
-  "Bash(git show*)",
-  "Bash(git status*)",
-  "Bash(git blame*)",
-  "Bash(gh pr view*)",
-  "Bash(gh pr list*)",
-  "Bash(gh pr diff*)",
-  "Bash(gh pr checks*)",
-  "Bash(gh issue view*)",
-  "Bash(gh issue list*)",
-  "Bash(gh repo view*)",
-  "Bash(gh search*)",
-  "Bash(gh run view*)",
-  "Bash(gh run list*)",
-  "Bash(gh release view*)",
-  "Bash(gh release list*)",
+  "Bash(git diff)",
+  "Bash(git diff *)",
+  "Bash(git log)",
+  "Bash(git log *)",
+  "Bash(git show)",
+  "Bash(git show *)",
+  "Bash(git status)",
+  "Bash(git status *)",
+  "Bash(git blame)",
+  "Bash(git blame *)",
+  "Bash(gh pr view)",
+  "Bash(gh pr view *)",
+  "Bash(gh pr list)",
+  "Bash(gh pr list *)",
+  "Bash(gh pr diff)",
+  "Bash(gh pr diff *)",
+  "Bash(gh pr checks)",
+  "Bash(gh pr checks *)",
+  "Bash(gh issue view)",
+  "Bash(gh issue view *)",
+  "Bash(gh issue list)",
+  "Bash(gh issue list *)",
+  "Bash(gh repo view)",
+  "Bash(gh repo view *)",
+  "Bash(gh search)",
+  "Bash(gh search *)",
+  "Bash(gh run view)",
+  "Bash(gh run view *)",
+  "Bash(gh run list)",
+  "Bash(gh run list *)",
+  "Bash(gh release view)",
+  "Bash(gh release view *)",
+  "Bash(gh release list)",
+  "Bash(gh release list *)",
 ];
 
 const consultDenies = [
   "Edit",
   "Write",
+  "Bash(*;*)",
+  "Bash(*&&*)",
+  "Bash(*||*)",
+  "Bash(*|*)",
+  "Bash(*>*)",
+  "Bash(*<*)",
+  "Bash(*`*)",
+  "Bash(*$*)",
   "Bash(grok*)",
   "Bash(claude*)",
   "Bash(codex*)",
@@ -121,6 +148,18 @@ function singleInvocation(sandbox) {
   return invocations[0];
 }
 
+test("help and runtime skill list cancel and setup flags", (t) => {
+  const sandbox = makeSandbox(t);
+  const help = runCompanion(["--help"], { cwd: sandbox.workDir, env: envFor(sandbox) });
+  assert.strictEqual(help.status, 0, help.stderr);
+  assert.ok(help.stdout.includes("cancel <job-id> [--cwd <dir>] [--json]"));
+  assert.ok(help.stdout.includes("setup [--enable-stop-gate] [--disable-stop-gate] [--json]"));
+  const skill = fs.readFileSync(cliRuntimeSkill, "utf8");
+  assert.ok(skill.includes("status [job-id] [--cwd <dir>] [--json]"));
+  assert.ok(skill.includes("cancel <job-id> [--cwd <dir>] [--json]"));
+  assert.ok(skill.includes("setup [--enable-stop-gate] [--disable-stop-gate] [--json]"));
+});
+
 test("consult task argv carries the pinned base flags and allow and deny set", (t) => {
   const sandbox = makeSandbox(t);
   const result = runCompanion(["task", "hello there"], { cwd: sandbox.workDir, env: envFor(sandbox) });
@@ -143,6 +182,8 @@ test("consult task argv carries the pinned base flags and allow and deny set", (
   assert.ok(!argv.includes("--always-approve"));
   assert.ok(!argv.includes("--best-of-n"));
   assert.ok(!argv.includes("-r"));
+  assert.ok(!argv.includes("Bash(gh pr view*)"));
+  assert.ok(!argv.includes("Bash(git diff*)"));
 });
 
 test("model and effort are forwarded only when explicitly provided", (t) => {
@@ -155,6 +196,17 @@ test("model and effort are forwarded only when explicitly provided", (t) => {
   const argv = singleInvocation(sandbox);
   assert.ok(hasPair(argv, "-m", "grok-4-fast"));
   assert.ok(hasPair(argv, "--effort", "high"));
+});
+
+test("inline values split at the first equals sign", (t) => {
+  const sandbox = makeSandbox(t);
+  const result = runCompanion(["task", "hello", "--model=grok=custom=latest"], {
+    cwd: sandbox.workDir,
+    env: envFor(sandbox),
+  });
+  assert.strictEqual(result.status, 0, result.stderr);
+  const argv = singleInvocation(sandbox);
+  assert.ok(hasPair(argv, "-m", "grok=custom=latest"));
 });
 
 test("write task argv includes always-approve and the six deny rules", (t) => {
@@ -218,6 +270,23 @@ test("resume without a prompt sends the pinned continuation text", (t) => {
   );
 });
 
+test("known option tokens are rejected where a value is expected", (t) => {
+  const sandbox = makeSandbox(t);
+  assert.throws(
+    () =>
+      parseArgs(["--resume", "--resume-last"], {
+        valueOptions: ["resume"],
+        booleanOptions: ["resume-last"],
+      }),
+    /Missing value for --resume/,
+  );
+  const result = runCompanion(["task", "--resume", "--resume-last"], { cwd: sandbox.workDir, env: envFor(sandbox) });
+  assert.notStrictEqual(result.status, 0);
+  assert.match(result.stderr, /^state: error$/m);
+  assert.match(result.stderr, /^failure: error$/m);
+  assert.strictEqual(readInvocations(sandbox.argsFile).length, 0);
+});
+
 test("max-turns is overridable from the command line", (t) => {
   const sandbox = makeSandbox(t);
   const result = runCompanion(["task", "hello", "--max-turns", "7"], {
@@ -246,8 +315,16 @@ test("write task argv omits the gh read-only allow rules", (t) => {
   assert.strictEqual(result.status, 0, result.stderr);
   const argv = singleInvocation(sandbox);
   assert.strictEqual(flagValues(argv, "--allow").length, 0);
-  assert.ok(!argv.includes("Bash(gh pr view*)"));
+  assert.ok(!argv.includes("Bash(gh pr view)"));
   assert.ok(!argv.includes("Bash(gh api*)"));
+});
+
+test("consult deny rules block shell compound command metacharacters", () => {
+  const argv = buildArgv({ mode: "consult" });
+  const denies = flagValues(argv, "--deny");
+  for (const rule of ["Bash(*;*)", "Bash(*&&*)", "Bash(*||*)", "Bash(*|*)", "Bash(*>*)", "Bash(*<*)", "Bash(*`*)", "Bash(*$*)"]) {
+    assert.ok(denies.includes(rule), `Expected ${rule} in consult deny rules.`);
+  }
 });
 
 test("web flag drops the web search disable and stays consult", (t) => {

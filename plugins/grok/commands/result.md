@@ -1,6 +1,6 @@
 ---
 description: Show the stored result of a finished Grok job in this workspace
-argument-hint: '<job-id>'
+argument-hint: '<job-id> [--json]'
 disable-model-invocation: true
 allowed-tools: Bash(node:*)
 ---

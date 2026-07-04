@@ -41,6 +41,7 @@ import {
   readLogTail,
   resolveDataDir,
   updateJobRecordFile,
+  finishSuccessfulJobRecordFile,
   writeBrief,
   writeJobRecordFile,
   appendJobLog
@@ -63,7 +64,7 @@ function printUsage() {
       "  node scripts/grok-companion.mjs review [--base <ref>] [--focus <text>] [--cwd <dir>] [--json]",
       "  node scripts/grok-companion.mjs status [job-id] [--cwd <dir>] [--json]",
       "  node scripts/grok-companion.mjs result <job-id> [--json]",
-      "  node scripts/grok-companion.mjs cancel <job-id>",
+      "  node scripts/grok-companion.mjs cancel <job-id> [--cwd <dir>] [--json]",
       "  node scripts/grok-companion.mjs stats [--all] [--cwd <dir>] [--json]",
       "  node scripts/grok-companion.mjs setup [--enable-stop-gate] [--disable-stop-gate] [--json]",
       "  node scripts/grok-companion.mjs stop-gate"
@@ -79,8 +80,24 @@ function output(value, asJson) {
   }
 }
 
+function errorWithFailure(message, failureKind) {
+  const error = new Error(message);
+  error.failureKind = failureKind;
+  return error;
+}
+
 function resolveCwd(options) {
-  return options.cwd ? path.resolve(process.cwd(), options.cwd) : process.cwd();
+  const cwd = options.cwd ? path.resolve(process.cwd(), options.cwd) : process.cwd();
+  let stats;
+  try {
+    stats = fs.statSync(cwd);
+  } catch {
+    throw errorWithFailure(`Working directory does not exist: ${cwd}.`, "input");
+  }
+  if (!stats.isDirectory()) {
+    throw errorWithFailure(`Working directory is not a directory: ${cwd}.`, "input");
+  }
+  return cwd;
 }
 
 function currentClaudeSessionId() {
@@ -189,25 +206,31 @@ function grokFailureMessage(result, timeoutMs, failureKind) {
   if (failureKind === "permission") {
     return PERMISSION_FAILURE_MESSAGE;
   }
+  if (result.parseError) {
+    return result.parseError;
+  }
   return result.timedOut
     ? `Grok timed out after ${timeoutMs}ms and was terminated.`
     : `Grok exited with code ${result.exitCode}.`;
 }
 
 const STDERR_FAILURE_KINDS = [
-  ["auth", /auth|unauthori[sz]ed|forbidden|login required/i],
+  ["quota", /quota|insufficient credit|usage limit/i],
   ["rate_limited", /rate.?limit|429|too many requests/i],
-  ["quota", /quota|insufficient credit|usage limit/i]
+  ["auth", /auth|unauthori[sz]ed|forbidden|login required/i]
 ];
 
 function classifyFailure({ spawnError = null, result = null, logTail = "" } = {}) {
+  if (spawnError?.failureKind) {
+    return spawnError.failureKind;
+  }
   if (spawnError?.code === "ENOENT") {
     return "missing_cli";
   }
   if (result?.timedOut) {
     return "timeout";
   }
-  if (result && (result.exitCode === 130 || result.exitCode === 143)) {
+  if (result?.cancelledByCompanion) {
     return "cancelled";
   }
   if (isPermissionCancelled(result)) {
@@ -230,12 +253,30 @@ function finishJobRecord(jobFile, patch) {
   return updateJobRecordFile(jobFile, patch);
 }
 
-function failJob(jobFile, logFile, result, timeoutMs) {
+function resultFailed(result) {
+  return Boolean(result.parseError) || result.exitCode !== 0 || result.timedOut || isPermissionCancelled(result);
+}
+
+function failureTail(logFile, result) {
   const tail = readLogTail(logFile, 20);
-  const failureKind = classifyFailure({ result, logTail: tail });
+  if (!result?.parseError || !result.stdoutTail) {
+    return tail;
+  }
+  return [tail, "Stdout tail:", result.stdoutTail].filter(Boolean).join("\n");
+}
+
+function failJob(jobFile, logFile, result, timeoutMs) {
+  const tail = failureTail(logFile, result);
+  const current = readJobRecordFile(jobFile);
+  const failureKind =
+    current?.status === "cancelled" || current?.cancelRequestedAt
+      ? "cancelled"
+      : classifyFailure({ result, logTail: tail });
   const message = grokFailureMessage(result, timeoutMs, failureKind);
+  const status = failureKind === "cancelled" ? "cancelled" : "error";
+  const stateLine = status === "cancelled" ? "state: cancelled" : "state: error";
   finishJobRecord(jobFile, {
-    status: "error",
+    status,
     pid: null,
     grokPid: null,
     finishedAt: nowIso(),
@@ -243,9 +284,10 @@ function failJob(jobFile, logFile, result, timeoutMs) {
     sessionId: result.sessionId,
     resultText: result.text || null,
     errorTail: tail || message,
-    failureKind
+    failureKind,
+    cancelRequestedAt: null
   });
-  throw new Error([message, "state: error", `failure: ${failureKind}`, tail].filter(Boolean).join("\n"));
+  throw new Error([message, stateLine, `failure: ${failureKind}`, tail].filter(Boolean).join("\n"));
 }
 
 function describeLaunchFailure(error) {
@@ -361,19 +403,25 @@ async function handleTask(argv) {
     throw launchFailureError(error);
   }
 
-  if (result.exitCode !== 0 || result.timedOut || isPermissionCancelled(result)) {
+  if (resultFailed(result)) {
     failJob(jobFile, logFile, result, timeoutMs);
   }
 
-  finishJobRecord(jobFile, {
+  const finishedAt = nowIso();
+  const final = finishSuccessfulJobRecordFile(jobFile, {
     status: "done",
     pid: null,
     grokPid: null,
-    finishedAt: nowIso(),
+    finishedAt,
     exitCode: result.exitCode,
     sessionId: result.sessionId,
-    resultText: result.text
+    resultText: result.text,
+    failureKind: null
   });
+
+  if (final.status === "cancelled") {
+    throw new Error(["Job was cancelled.", "state: cancelled", "failure: cancelled"].join("\n"));
+  }
 
   const payload = {
     jobId,
@@ -432,21 +480,26 @@ async function handleTaskWorker(argv) {
     });
 
     const finishedAt = nowIso();
-    if (result.exitCode === 0 && !result.timedOut && !isPermissionCancelled(result)) {
-      finishJobRecord(found.file, {
+    if (!resultFailed(result)) {
+      finishSuccessfulJobRecordFile(found.file, {
         status: "done",
         pid: null,
         grokPid: null,
         finishedAt,
         exitCode: result.exitCode,
         sessionId: result.sessionId,
-        resultText: result.text
+        resultText: result.text,
+        failureKind: null
       });
       return;
     }
 
-    const tail = readLogTail(logFile, 20);
-    const failureKind = classifyFailure({ result, logTail: tail });
+    const tail = failureTail(logFile, result);
+    const current = readJobRecordFile(found.file);
+    const failureKind =
+      current?.status === "cancelled" || current?.cancelRequestedAt
+        ? "cancelled"
+        : classifyFailure({ result, logTail: tail });
     const message = grokFailureMessage(result, timeoutMs, failureKind);
     finishJobRecord(found.file, {
       status: failureKind === "cancelled" ? "cancelled" : "error",
@@ -457,7 +510,8 @@ async function handleTaskWorker(argv) {
       sessionId: result.sessionId,
       resultText: result.text || null,
       errorTail: tail || message,
-      failureKind
+      failureKind,
+      cancelRequestedAt: null
     });
   } catch (error) {
     appendJobLog(logFile, describeLaunchFailure(error));
@@ -594,7 +648,7 @@ async function handleReview(argv) {
     recordSpawnFailure(jobFile, error);
     throw launchFailureError(error);
   }
-  if (first.exitCode !== 0 || first.timedOut || isPermissionCancelled(first)) {
+  if (resultFailed(first)) {
     failJob(jobFile, logFile, first, timeoutMs);
   }
 
@@ -619,7 +673,7 @@ async function handleReview(argv) {
       recordSpawnFailure(jobFile, error);
       throw launchFailureError(error);
     }
-    if (retry.exitCode === 0 && !retry.timedOut && !isPermissionCancelled(retry)) {
+    if (!resultFailed(retry)) {
       review = evaluateReviewText(retry.text);
       if (retry.text) {
         finalText = retry.text;
@@ -639,7 +693,9 @@ async function handleReview(argv) {
     finishedAt: nowIso(),
     exitCode: 0,
     sessionId,
-    resultText: body
+    resultText: body,
+    failureKind: null,
+    cancelRequestedAt: null
   });
 
   const payload = {
@@ -741,7 +797,7 @@ function handleResult(argv) {
   );
 }
 
-function handleCancel(argv) {
+async function handleCancel(argv) {
   const { options, positionals } = parseArgs(argv, {
     valueOptions: ["cwd"],
     booleanOptions: ["json"]
@@ -766,20 +822,35 @@ function handleCancel(argv) {
     );
     return;
   }
+  const requested = updateJobRecordFile(found.file, { cancelRequestedAt: nowIso() });
+  if (requested.status !== "running") {
+    output(
+      options.json ? requested : `Job ${requested.id} is not running (status: ${requested.status}).\n`,
+      options.json
+    );
+    return;
+  }
 
+  const pids = new Set();
   if (record.grokPid) {
-    terminateProcessGroup(record.grokPid);
+    pids.add(record.grokPid);
   }
   if (record.background || !record.grokPid) {
-    terminateProcessGroup(record.pid);
+    pids.add(record.pid);
   }
+  await Promise.all([...pids].map((pid) => terminateProcessGroup(pid)));
   const next = updateJobRecordFile(found.file, {
     status: "cancelled",
     pid: null,
     grokPid: null,
     finishedAt: nowIso(),
-    failureKind: "cancelled"
+    failureKind: "cancelled",
+    cancelRequestedAt: null
   });
+  if (next.status !== "cancelled") {
+    output(options.json ? next : `Job ${next.id} is not running (status: ${next.status}).\n`, options.json);
+    return;
+  }
   output(options.json ? next : renderCancelReport(next), options.json);
 }
 
@@ -985,8 +1056,8 @@ async function handleStopGate() {
     return;
   }
 
-  if (result.exitCode !== 0 || result.timedOut || isPermissionCancelled(result)) {
-    const tail = readLogTail(logFile, 20);
+  if (resultFailed(result)) {
+    const tail = failureTail(logFile, result);
     const failureKind = classifyFailure({ result, logTail: tail });
     finishJobRecord(jobFile, {
       status: "error",
@@ -1009,16 +1080,18 @@ async function handleStopGate() {
     finishedAt: nowIso(),
     exitCode: result.exitCode,
     sessionId: result.sessionId,
-    resultText: result.text
+    resultText: result.text,
+    failureKind: null,
+    cancelRequestedAt: null
   });
 
   const text = String(result.text ?? "").trim();
-  const blockLine = text
+  const firstLine = text
     .split(/\r?\n/)
     .map((line) => line.trim())
-    .find((line) => line.startsWith("BLOCK:"));
-  if (blockLine) {
-    emitStopGateBlock(blockLine.slice("BLOCK:".length).trim() || text);
+    .find(Boolean);
+  if (firstLine?.startsWith("BLOCK:")) {
+    emitStopGateBlock(firstLine.slice("BLOCK:".length).trim() || text);
   }
 }
 
@@ -1046,7 +1119,7 @@ async function main() {
       handleResult(argv);
       break;
     case "cancel":
-      handleCancel(argv);
+      await handleCancel(argv);
       break;
     case "stats":
       handleStats(argv);
@@ -1066,7 +1139,45 @@ async function main() {
   }
 }
 
+function wantsJsonError() {
+  return process.argv.slice(3).some((token) => token === "--json" || token === "--json=true");
+}
+
+function errorMessage(error) {
+  return error instanceof Error ? error.message : String(error);
+}
+
+function errorFailureKind(error, message) {
+  if (error?.failureKind) {
+    return error.failureKind;
+  }
+  const match = String(message ?? "").match(/^failure: ([a-z_]+)$/m);
+  return match ? match[1] : "error";
+}
+
+function errorStatus(message) {
+  const match = String(message ?? "").match(/^state: (done|error|cancelled|running)$/m);
+  return match ? match[1] : "error";
+}
+
+function renderTopLevelError(error) {
+  const message = errorMessage(error).trimEnd();
+  const failureKind = errorFailureKind(error, message);
+  const status = errorStatus(message);
+  if (wantsJsonError()) {
+    return `${JSON.stringify({ status, failureKind, message }, null, 2)}\n`;
+  }
+  const lines = [message || "Grok companion failed."];
+  if (!/^state: /m.test(message)) {
+    lines.push("state: error");
+  }
+  if (!/^failure: /m.test(message)) {
+    lines.push(`failure: ${failureKind}`);
+  }
+  return `${lines.join("\n")}\n`;
+}
+
 main().catch((error) => {
-  process.stderr.write(`${error instanceof Error ? error.message : String(error)}\n`);
+  process.stderr.write(renderTopLevelError(error));
   process.exitCode = 1;
 });

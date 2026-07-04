@@ -4,6 +4,11 @@ import os from "node:os";
 import path from "node:path";
 
 const DATA_DIR_ENV = "GROK_COMPANION_DATA";
+const JOB_LOG_MAX_BYTES = 1024 * 1024;
+const LOG_TAIL_MAX_BYTES = 64 * 1024;
+const LOCK_TIMEOUT_MS = 2000;
+const LOCK_RETRY_MS = 20;
+const TERMINAL_STATUSES = new Set(["done", "error", "cancelled"]);
 
 export const SESSION_ID_ENV = "CLAUDE_CODE_SESSION_ID";
 
@@ -71,13 +76,68 @@ export function createJobRecord(fields) {
     resultText: null,
     errorTail: null,
     failureKind: null,
+    cancelRequestedAt: null,
     request: fields.request ?? null
   };
 }
 
-export function writeJobRecordFile(file, record) {
+function sleepMs(ms) {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
+function atomicWriteFile(file, content) {
   fs.mkdirSync(path.dirname(file), { recursive: true });
-  fs.writeFileSync(file, `${JSON.stringify(record, null, 2)}\n`, "utf8");
+  const temp = `${file}.${process.pid}.${randomBytes(6).toString("hex")}.tmp`;
+  try {
+    fs.writeFileSync(temp, content, "utf8");
+    fs.renameSync(temp, file);
+  } finally {
+    try {
+      fs.rmSync(temp, { force: true });
+    } catch {}
+  }
+}
+
+function withRecordLock(file, fn) {
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  const lockDir = `${file}.lock`;
+  const deadline = Date.now() + LOCK_TIMEOUT_MS;
+  for (;;) {
+    try {
+      fs.mkdirSync(lockDir);
+      break;
+    } catch (error) {
+      if (error?.code !== "EEXIST" || Date.now() >= deadline) {
+        throw error;
+      }
+      sleepMs(LOCK_RETRY_MS);
+    }
+  }
+  try {
+    return fn();
+  } finally {
+    try {
+      fs.rmdirSync(lockDir);
+    } catch {}
+  }
+}
+
+function preserveTerminalRecord(existing, next) {
+  if (!existing || !TERMINAL_STATUSES.has(existing.status)) {
+    return next;
+  }
+  if (next.status !== existing.status) {
+    return existing;
+  }
+  return next;
+}
+
+export function writeJobRecordFile(file, record) {
+  withRecordLock(file, () => {
+    const existing = readJobRecordFile(file);
+    const next = preserveTerminalRecord(existing, record);
+    atomicWriteFile(file, `${JSON.stringify(next, null, 2)}\n`);
+  });
   return file;
 }
 
@@ -101,13 +161,49 @@ export function readJobRecord(dataDir, cwd, jobId) {
 }
 
 export function updateJobRecordFile(file, patch) {
-  const existing = readJobRecordFile(file);
-  if (!existing) {
-    throw new Error(`No job record found at ${file}.`);
-  }
-  const next = { ...existing, ...patch };
-  writeJobRecordFile(file, next);
-  return next;
+  return withRecordLock(file, () => {
+    const existing = readJobRecordFile(file);
+    if (!existing) {
+      throw new Error(`No job record found at ${file}.`);
+    }
+    if (TERMINAL_STATUSES.has(existing.status) && !Object.hasOwn(patch, "status")) {
+      return existing;
+    }
+    const next = preserveTerminalRecord(existing, { ...existing, ...patch });
+    atomicWriteFile(file, `${JSON.stringify(next, null, 2)}\n`);
+    return next;
+  });
+}
+
+export function finishSuccessfulJobRecordFile(file, successPatch) {
+  return withRecordLock(file, () => {
+    const existing = readJobRecordFile(file);
+    if (!existing) {
+      throw new Error(`No job record found at ${file}.`);
+    }
+    if (TERMINAL_STATUSES.has(existing.status)) {
+      return existing;
+    }
+    const treatAsCancelled =
+      existing.status === "cancelled" || existing.cancelRequestedAt != null;
+    const patch = treatAsCancelled
+      ? {
+          status: "cancelled",
+          pid: null,
+          grokPid: null,
+          finishedAt: successPatch.finishedAt ?? nowIso(),
+          exitCode: successPatch.exitCode ?? null,
+          sessionId: successPatch.sessionId ?? null,
+          resultText: successPatch.resultText ?? null,
+          errorTail: null,
+          failureKind: "cancelled",
+          cancelRequestedAt: null
+        }
+      : { ...successPatch, cancelRequestedAt: null };
+    const next = preserveTerminalRecord(existing, { ...existing, ...patch });
+    atomicWriteFile(file, `${JSON.stringify(next, null, 2)}\n`);
+    return next;
+  });
 }
 
 export function listJobRecords(dataDir, cwd) {
@@ -172,15 +268,36 @@ export function appendJobLog(logFile, text) {
     return;
   }
   fs.mkdirSync(path.dirname(logFile), { recursive: true });
-  const value = String(text ?? "");
-  fs.appendFileSync(logFile, value.endsWith("\n") ? value : `${value}\n`, "utf8");
+  const raw = String(text ?? "");
+  const value = raw.endsWith("\n") ? raw : `${raw}\n`;
+  fs.appendFileSync(logFile, value.slice(-JOB_LOG_MAX_BYTES), "utf8");
+  const size = fs.statSync(logFile).size;
+  if (size > JOB_LOG_MAX_BYTES) {
+    const fd = fs.openSync(logFile, "r");
+    try {
+      const keep = Buffer.alloc(JOB_LOG_MAX_BYTES);
+      fs.readSync(fd, keep, 0, JOB_LOG_MAX_BYTES, size - JOB_LOG_MAX_BYTES);
+      atomicWriteFile(logFile, keep.toString("utf8"));
+    } finally {
+      fs.closeSync(fd);
+    }
+  }
 }
 
 export function readLogTail(logFile, maxLines = 20) {
   if (!logFile || !fs.existsSync(logFile)) {
     return "";
   }
-  const content = fs.readFileSync(logFile, "utf8").trimEnd();
+  const size = fs.statSync(logFile).size;
+  const bytes = Math.min(size, LOG_TAIL_MAX_BYTES);
+  const buffer = Buffer.alloc(bytes);
+  const fd = fs.openSync(logFile, "r");
+  try {
+    fs.readSync(fd, buffer, 0, bytes, size - bytes);
+  } finally {
+    fs.closeSync(fd);
+  }
+  const content = buffer.toString("utf8").trimEnd();
   if (!content) {
     return "";
   }

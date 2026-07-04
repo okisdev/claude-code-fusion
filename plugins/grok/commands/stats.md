@@ -1,6 +1,6 @@
 ---
 description: Show aggregate stats for Grok jobs in this workspace
-argument-hint: '[--all]'
+argument-hint: '[--all] [--cwd <dir>] [--json]'
 disable-model-invocation: true
 allowed-tools: Bash(node:*)
 ---

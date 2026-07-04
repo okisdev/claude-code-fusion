@@ -1,6 +1,6 @@
 ---
 description: Show active and recent Grok jobs for this workspace
-argument-hint: '[job-id]'
+argument-hint: '[job-id] [--cwd <dir>] [--json]'
 disable-model-invocation: true
 allowed-tools: Bash(node:*)
 ---

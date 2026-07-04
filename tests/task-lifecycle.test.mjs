@@ -8,6 +8,14 @@ import { test } from "node:test";
 const repoRoot = path.join(import.meta.dirname, "..");
 const companion = path.join(repoRoot, "plugins", "grok", "scripts", "grok-companion.mjs");
 const fakeGrok = path.join(import.meta.dirname, "fake-grok");
+const {
+  createJobRecord,
+  generateJobId,
+  jobFilePath,
+  nowIso,
+  writeBrief,
+  writeJobRecordFile,
+} = await import(path.join(repoRoot, "plugins", "grok", "scripts", "lib", "state.mjs"));
 
 function makeSandbox(t) {
   const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "grok-plugin-test-")));
@@ -148,6 +156,9 @@ test("background task creates a job record and result prints the finished output
   const resultOutput = runCompanion(["result", done.id], { cwd: sandbox.workDir, env });
   assert.strictEqual(resultOutput.status, 0, resultOutput.stderr);
   assert.ok(resultOutput.stdout.includes("FAKE-OK"));
+  const detailOutput = runCompanion(["status", done.id], { cwd: sandbox.workDir, env });
+  assert.strictEqual(detailOutput.status, 0, detailOutput.stderr);
+  assert.match(detailOutput.stdout, /^state: done$/m);
   const statusOutput = runCompanion(["status"], { cwd: sandbox.workDir, env });
   assert.strictEqual(statusOutput.status, 0, statusOutput.stderr);
   assert.ok(statusOutput.stdout.includes(done.id));
@@ -211,7 +222,11 @@ test("cancel kills a foreground grok and the record stays cancelled after the co
   const child = spawn(process.execPath, [companion, "task", "foreground hang"], {
     cwd: sandbox.workDir,
     env,
-    stdio: "ignore",
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  let stderr = "";
+  child.stderr.on("data", (chunk) => {
+    stderr += chunk;
   });
   const exited = new Promise((resolve) => child.on("close", (code) => resolve(code)));
   t.after(() => {
@@ -229,10 +244,39 @@ test("cancel kills a foreground grok and the record stays cancelled after the co
   await waitFor(() => (pidAlive(running.grokPid) ? null : true));
   const exitCode = await exited;
   assert.notStrictEqual(exitCode, 0);
+  assert.match(stderr, /^state: cancelled$/m);
+  assert.match(stderr, /^failure: cancelled$/m);
   const final = jobRecords(sandbox.dataDir)[0];
   assert.strictEqual(final.status, "cancelled");
   assert.strictEqual(final.pid, null);
   assert.strictEqual(final.grokPid, null);
+});
+
+test("cancel escalates to SIGKILL when grok ignores SIGTERM", async (t) => {
+  const sandbox = makeSandbox(t);
+  const env = envFor(sandbox, { FAKE_GROK_MODE: "hang-ignore-term" });
+  const result = runCompanion(["task", "stubborn work", "--background"], {
+    cwd: sandbox.workDir,
+    env,
+  });
+  assert.strictEqual(result.status, 0, result.stderr);
+  const running = await waitFor(() => {
+    const current = jobRecords(sandbox.dataDir)[0];
+    return current && current.status === "running" && current.pid && current.grokPid ? current : null;
+  });
+  t.after(() => {
+    killGroups(running.grokPid);
+    killGroups(running.pid);
+  });
+  const cancelOutput = runCompanion(["cancel", running.id], { cwd: sandbox.workDir, env });
+  assert.strictEqual(cancelOutput.status, 0, cancelOutput.stderr);
+  const cancelled = await waitFor(() => {
+    const current = jobRecords(sandbox.dataDir)[0];
+    return current && current.status === "cancelled" ? current : null;
+  });
+  assert.strictEqual(cancelled.failureKind, "cancelled");
+  assert.match(cancelOutput.stdout, /^failure: cancelled$/m);
+  await waitFor(() => (pidAlive(running.grokPid) ? null : true));
 });
 
 test("background timeout marks the record error and result reports the failure", async (t) => {
@@ -265,6 +309,46 @@ test("permission-cancelled task ends in an error record, not done", (t) => {
   const record = jobRecords(sandbox.dataDir)[0];
   assert.strictEqual(record.status, "error");
   assert.strictEqual(record.failureKind, "permission");
+});
+
+test("worker success after cancel was requested finishes cancelled, not done", async (t) => {
+  const sandbox = makeSandbox(t);
+  const env = envFor(sandbox);
+  const jobId = generateJobId();
+  const briefFile = writeBrief(sandbox.dataDir, sandbox.workDir, jobId, "say hi");
+  const jobFile = jobFilePath(sandbox.dataDir, sandbox.workDir, jobId);
+  writeJobRecordFile(jobFile, {
+    ...createJobRecord({
+      id: jobId,
+      mode: "consult",
+      cwd: sandbox.workDir,
+      briefFile,
+      background: true,
+    }),
+    cancelRequestedAt: nowIso(),
+  });
+  const worker = spawn(process.execPath, [companion, "task-worker", "--job-id", jobId], {
+    cwd: sandbox.workDir,
+    env,
+    stdio: "ignore",
+  });
+  t.after(() => {
+    try {
+      worker.kill("SIGKILL");
+    } catch {}
+  });
+  const cancelled = await waitFor(() => {
+    const current = jobRecords(sandbox.dataDir)[0];
+    return current && current.status === "cancelled" ? current : null;
+  });
+  assert.strictEqual(cancelled.failureKind, "cancelled");
+  assert.strictEqual(cancelled.exitCode, 0);
+  assert.strictEqual(cancelled.resultText, "FAKE-OK");
+  const resultOutput = runCompanion(["result", jobId], { cwd: sandbox.workDir, env });
+  assert.strictEqual(resultOutput.status, 0, resultOutput.stderr);
+  assert.match(resultOutput.stdout, /^Job [0-9a-f]{8} was cancelled\./m);
+  assert.match(resultOutput.stdout, /^state: cancelled$/m);
+  assert.match(resultOutput.stdout, /^failure: cancelled$/m);
 });
 
 test("foreground spawn failure records an error instead of leaving the job running", (t) => {

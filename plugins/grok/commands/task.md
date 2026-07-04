@@ -1,6 +1,6 @@
 ---
 description: Delegate a coding or consultation task to the local Grok CLI through the companion runtime
-argument-hint: '[--write] [--web] [--background] [--resume <uuid>|--resume-last] [--model <id>] [--effort <level>] [--max-turns <n>] [--best-of-n <n>] [what Grok should do]'
+argument-hint: '[--write] [--web] [--background] [--resume <uuid>|--resume-last] [--model <id>] [--effort <level>] [--max-turns <n>] [--best-of-n <n>] [--cwd <dir>] [--json] [what Grok should do]'
 allowed-tools: Bash(node:*), AskUserQuestion, Agent
 ---
 

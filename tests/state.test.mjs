@@ -125,3 +125,36 @@ test("state module exports a slug function implementing the pinned formula", asy
   assert.strictEqual(slugFn("/opt/projects/other-app"), expectedSlug("/opt/projects/other-app"));
   assert.notStrictEqual(slugFn("/opt/projects/other-app"), slugFn(sample));
 });
+
+test("terminal job records do not regress to another terminal state", async (t) => {
+  const sandbox = makeSandbox(t);
+  const stateModule = await import(stateModulePath);
+  const jobFile = stateModule.jobFilePath(sandbox.dataDir, sandbox.workDir, "terminal");
+  const record = stateModule.createJobRecord({
+    id: "terminal",
+    pid: 123,
+    mode: "consult",
+    cwd: sandbox.workDir,
+    briefFile: path.join(sandbox.dataDir, "brief.md"),
+    background: false,
+  });
+  stateModule.writeJobRecordFile(jobFile, {
+    ...record,
+    status: "cancelled",
+    pid: null,
+    grokPid: null,
+    finishedAt: stateModule.nowIso(),
+    failureKind: "cancelled",
+  });
+  const updated = stateModule.updateJobRecordFile(jobFile, {
+    status: "done",
+    exitCode: 0,
+    resultText: "late success",
+    failureKind: null,
+  });
+  assert.strictEqual(updated.status, "cancelled");
+  assert.strictEqual(updated.failureKind, "cancelled");
+  assert.strictEqual(stateModule.readJobRecordFile(jobFile).status, "cancelled");
+  const pidPatch = stateModule.updateJobRecordFile(jobFile, { pid: 999 });
+  assert.strictEqual(pidPatch.pid, null);
+});

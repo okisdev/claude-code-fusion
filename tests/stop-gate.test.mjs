@@ -238,16 +238,29 @@ test("stop-gate blocks the stop with the upstream decision shape when grok repli
   assert.strictEqual(records[0].status, "done");
 });
 
-test("stop-gate finds the BLOCK line behind a preamble", (t) => {
+test("stop-gate allows when BLOCK appears after a preamble", (t) => {
   const sandbox = makeSandbox(t);
   initCleanRepo(sandbox.workDir);
   dirtyRepo(sandbox.workDir);
   enableGate(sandbox);
   const result = runStopGate(sandbox, { env: envFor(sandbox, { FAKE_GROK_MODE: "gate-block-preamble" }) });
   assert.strictEqual(result.status, 0, result.stderr);
+  assert.strictEqual(result.stdout, "");
+  const records = jobRecords(sandbox.dataDir);
+  assert.strictEqual(records.length, 1);
+  assert.strictEqual(records[0].status, "done");
+});
+
+test("stop-gate uses the first non-empty line for BLOCK decisions", (t) => {
+  const sandbox = makeSandbox(t);
+  initCleanRepo(sandbox.workDir);
+  dirtyRepo(sandbox.workDir);
+  enableGate(sandbox);
+  const result = runStopGate(sandbox, { env: envFor(sandbox, { FAKE_GROK_MODE: "gate-block-leading-blank" }) });
+  assert.strictEqual(result.status, 0, result.stderr);
   const payload = JSON.parse(result.stdout);
   assert.strictEqual(payload.decision, "block");
-  assert.ok(payload.reason.includes("preamble reason text"));
+  assert.ok(payload.reason.includes("leading blank reason text"));
 });
 
 test("stop-gate exits silently when grok fails", (t) => {

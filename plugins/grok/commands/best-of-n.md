@@ -6,6 +6,8 @@ allowed-tools: Bash(node:*), AskUserQuestion
 
 Forward the request to the Grok companion task runtime as a best-of-n tournament.
 
+The tournament is implemented by the Grok CLI `--best-of-n` flag, not by orchestration inside the companion.
+
 Raw slash-command arguments:
 `$ARGUMENTS`
 

@@ -1,6 +1,6 @@
 ---
 description: Run an adversarial Grok review against local git state
-argument-hint: '[--base <ref>] [--focus <text>]'
+argument-hint: '[--base <ref>] [--focus <text>] [--cwd <dir>] [--json]'
 allowed-tools: Read, Glob, Grep, Bash(node:*), Bash(git:*), AskUserQuestion
 ---
 

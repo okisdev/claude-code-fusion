@@ -155,3 +155,7 @@ test("review gives up after one failed retry and renders the raw text with a par
   assert.strictEqual(payload.review, null);
   assert.ok(payload.rawText.includes("I still cannot produce the requested object."));
 });
+
+test("review output contract is enforced by validateReviewOutput instead of a schema file", () => {
+  assert.ok(!fs.existsSync(path.join(repoRoot, "plugins", "grok", "schemas", "review-output.schema.json")));
+});
