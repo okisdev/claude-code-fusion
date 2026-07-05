@@ -1,95 +1,10 @@
 import assert from "node:assert";
 import { spawnSync } from "node:child_process";
-import fs from "node:fs";
-import os from "node:os";
 import path from "node:path";
 import { test } from "node:test";
+import { envFor, jobRecords, killGroups, makeSandbox, pidAlive, repoRoot, runCompanion, waitFor } from "./lib/companion-harness.mjs";
 
-const repoRoot = path.join(import.meta.dirname, "..");
-const companion = path.join(repoRoot, "plugins", "grok", "scripts", "grok-companion.mjs");
 const sessionEndHook = path.join(repoRoot, "plugins", "grok", "scripts", "session-end-hook.mjs");
-const fakeGrok = path.join(import.meta.dirname, "fake-grok");
-
-function makeSandbox(t) {
-  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "grok-plugin-test-")));
-  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
-  const dataDir = path.join(root, "data");
-  const workDir = path.join(root, "work");
-  fs.mkdirSync(dataDir);
-  fs.mkdirSync(workDir);
-  return { root, dataDir, workDir, argsFile: path.join(root, "args.jsonl") };
-}
-
-function envFor(sandbox, extra = {}) {
-  const env = { ...process.env };
-  delete env.FAKE_GROK_MODE;
-  delete env.FAKE_GROK_ARGS_FILE;
-  delete env.GROK_COMPANION_TIMEOUT_MS;
-  delete env.CLAUDE_CODE_SESSION_ID;
-  return {
-    ...env,
-    GROK_BIN: fakeGrok,
-    GROK_COMPANION_DATA: sandbox.dataDir,
-    FAKE_GROK_ARGS_FILE: sandbox.argsFile,
-    ...extra,
-  };
-}
-
-function runCompanion(args, options) {
-  return spawnSync(process.execPath, [companion, ...args], {
-    cwd: options.cwd,
-    env: options.env,
-    input: options.input ?? "",
-    encoding: "utf8",
-    timeout: 60000,
-  });
-}
-
-function jobRecords(dataDir) {
-  const stateDir = path.join(dataDir, "state");
-  if (!fs.existsSync(stateDir)) return [];
-  const records = [];
-  for (const workspace of fs.readdirSync(stateDir)) {
-    const jobsDir = path.join(stateDir, workspace, "jobs");
-    if (!fs.existsSync(jobsDir)) continue;
-    for (const name of fs.readdirSync(jobsDir)) {
-      if (!name.endsWith(".json")) continue;
-      try {
-        records.push(JSON.parse(fs.readFileSync(path.join(jobsDir, name), "utf8")));
-      } catch {}
-    }
-  }
-  return records;
-}
-
-async function waitFor(fn, timeout = 20000) {
-  const deadline = Date.now() + timeout;
-  for (;;) {
-    const value = fn();
-    if (value) return value;
-    assert.ok(Date.now() < deadline, "Timed out waiting for the expected state.");
-    await new Promise((resolve) => setTimeout(resolve, 100));
-  }
-}
-
-function pidAlive(pid) {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-function killGroups(pid) {
-  if (!pid) return;
-  try {
-    process.kill(-pid, "SIGKILL");
-  } catch {}
-  try {
-    process.kill(pid, "SIGKILL");
-  } catch {}
-}
 
 test("session end hook cancels only running jobs owned by the exiting session", async (t) => {
   const sandbox = makeSandbox(t);
