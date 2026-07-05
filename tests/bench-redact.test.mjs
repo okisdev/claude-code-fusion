@@ -4,6 +4,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { test } from "node:test";
+import { redactText, redactionRules } from "../bench/redact.mjs";
 
 const repoRoot = path.join(import.meta.dirname, "..");
 const redactScript = path.join(repoRoot, "bench", "redact.mjs");
@@ -87,4 +88,21 @@ test("redact strips paths and credentials and is idempotent", (t) => {
   assert.strictEqual(summarySecond.github, 0);
   assert.strictEqual(summarySecond.bearer, 0);
   assert.strictEqual(summarySecond.json_secret, 0);
+});
+
+test("redaction registry entries added at runtime are applied and counted", () => {
+  const rule = {
+    id: "runtime_provider",
+    pattern: /runtime_[A-Za-z0-9]{16,}/g,
+    replacement: "[redacted]",
+  };
+  redactionRules.push(rule);
+  try {
+    const secret = `runtime_${"e".repeat(20)}`;
+    const result = redactText(`token=${secret}`);
+    assert.strictEqual(result.text, "token=[redacted]");
+    assert.strictEqual(result.counts.runtime_provider, 1);
+  } finally {
+    redactionRules.splice(redactionRules.indexOf(rule), 1);
+  }
 });

@@ -1,49 +1,9 @@
 import assert from "node:assert";
 import { spawnSync } from "node:child_process";
 import fs from "node:fs";
-import os from "node:os";
 import path from "node:path";
 import { test } from "node:test";
-
-const repoRoot = path.join(import.meta.dirname, "..");
-const companion = path.join(repoRoot, "plugins", "grok", "scripts", "grok-companion.mjs");
-const stateModulePath = path.join(repoRoot, "plugins", "grok", "scripts", "lib", "state.mjs");
-const fakeGrok = path.join(import.meta.dirname, "fake-grok");
-
-function makeSandbox(t) {
-  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "grok-plugin-test-")));
-  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
-  const dataDir = path.join(root, "data");
-  const workDir = path.join(root, "work");
-  fs.mkdirSync(dataDir);
-  fs.mkdirSync(workDir);
-  return { root, dataDir, workDir, argsFile: path.join(root, "args.jsonl") };
-}
-
-function envFor(sandbox, extra = {}) {
-  const env = { ...process.env };
-  delete env.FAKE_GROK_MODE;
-  delete env.FAKE_GROK_ARGS_FILE;
-  delete env.GROK_COMPANION_TIMEOUT_MS;
-  delete env.CLAUDE_CODE_SESSION_ID;
-  return {
-    ...env,
-    GROK_BIN: fakeGrok,
-    GROK_COMPANION_DATA: sandbox.dataDir,
-    FAKE_GROK_ARGS_FILE: sandbox.argsFile,
-    ...extra,
-  };
-}
-
-function runCompanion(args, options) {
-  return spawnSync(process.execPath, [companion, ...args], {
-    cwd: options.cwd,
-    env: options.env,
-    input: options.input ?? "",
-    encoding: "utf8",
-    timeout: 60000,
-  });
-}
+import { envFor, makeSandbox, runCompanion, stateModulePath } from "./lib/companion-harness.mjs";
 
 function sha256Hex(value) {
   const result = spawnSync(

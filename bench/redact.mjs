@@ -7,17 +7,65 @@ import { fileURLToPath } from "node:url";
 
 const REDACTED = "[redacted]";
 
+export const redactionRules = [
+  {
+    id: "home",
+    pattern: ({ homeDir }) => homeDir ? new RegExp(`${escapeRegExp(homeDir)}(?=/|$)`, "g") : null,
+    replacement: () => "~",
+  },
+  {
+    id: "home",
+    pattern: /\/Users\/[^/\s"']+\//g,
+    replacement: () => "~/",
+  },
+  {
+    id: "home",
+    pattern: /\/home\/[^/\s"']+\//g,
+    replacement: () => "~/",
+  },
+  {
+    id: "openai_sk",
+    pattern: /sk-[A-Za-z0-9_-]{16,}/g,
+    replacement: () => REDACTED,
+  },
+  {
+    id: "github",
+    pattern: /(?:ghp_|gho_|ghu_|ghs_|ghr_)[A-Za-z0-9]{20,}/g,
+    replacement: () => REDACTED,
+  },
+  {
+    id: "xai",
+    pattern: /xai-[A-Za-z0-9]{16,}/g,
+    replacement: () => REDACTED,
+  },
+  {
+    id: "napi",
+    pattern: /napi_[A-Za-z0-9]{16,}/g,
+    replacement: () => REDACTED,
+  },
+  {
+    id: "aws",
+    pattern: /AKIA[0-9A-Z]{16}/g,
+    replacement: () => REDACTED,
+  },
+  {
+    id: "bearer",
+    pattern: /Bearer\s+(\S{20,})/g,
+    replacement: () => `Bearer ${REDACTED}`,
+  },
+  {
+    id: "json_secret",
+    pattern: /"(authorization|api_key|apiKey|token)"\s*:\s*"([^"]{16,})"/g,
+    replacement: (_match, key) => `"${key}": "${REDACTED}"`,
+  },
+];
+
 function emptyCounts() {
-  return {
-    home: 0,
-    openai_sk: 0,
-    github: 0,
-    xai: 0,
-    napi: 0,
-    aws: 0,
-    bearer: 0,
-    json_secret: 0,
-  };
+  const counts = {};
+  for (const rule of redactionRules) {
+    counts[rule.id] ??= 0;
+  }
+  return counts;
 }
 
 function escapeRegExp(value) {
@@ -33,51 +81,27 @@ function replaceAll(text, regex, onMatch) {
   return { text: next, count };
 }
 
+function applyRule(text, rule, context) {
+  const pattern = typeof rule.pattern === "function" ? rule.pattern(context) : rule.pattern;
+  if (!pattern) {
+    return { text, count: 0 };
+  }
+  const replacement = typeof rule.replacement === "function" ? rule.replacement : () => rule.replacement;
+  return replaceAll(text, pattern, replacement);
+}
+
 export function redactText(input, options = {}) {
   const homeDir = options.homeDir ?? os.homedir();
+  const context = { homeDir };
   const counts = emptyCounts();
   let text = String(input ?? "");
 
-  if (homeDir) {
-    const homePattern = new RegExp(`${escapeRegExp(homeDir)}(?=/|$)`, "g");
-    const homeLiteral = replaceAll(text, homePattern, () => "~");
-    text = homeLiteral.text;
-    counts.home += homeLiteral.count;
-  }
-
-  const usersHome = replaceAll(text, /\/Users\/[^/\s"']+\//g, () => "~/");
-  text = usersHome.text;
-  counts.home += usersHome.count;
-
-  const linuxHome = replaceAll(text, /\/home\/[^/\s"']+\//g, () => "~/");
-  text = linuxHome.text;
-  counts.home += linuxHome.count;
-
-  const rules = [
-    ["openai_sk", /sk-[A-Za-z0-9_-]{16,}/g],
-    ["github", /(?:ghp_|gho_|ghu_|ghs_|ghr_)[A-Za-z0-9]{20,}/g],
-    ["xai", /xai-[A-Za-z0-9]{16,}/g],
-    ["napi", /napi_[A-Za-z0-9]{16,}/g],
-    ["aws", /AKIA[0-9A-Z]{16}/g],
-  ];
-
-  for (const [key, pattern] of rules) {
-    const applied = replaceAll(text, pattern, () => REDACTED);
+  for (const rule of redactionRules) {
+    counts[rule.id] ??= 0;
+    const applied = applyRule(text, rule, context);
     text = applied.text;
-    counts[key] += applied.count;
+    counts[rule.id] += applied.count;
   }
-
-  const bearer = replaceAll(text, /Bearer\s+(\S{20,})/g, () => `Bearer ${REDACTED}`);
-  text = bearer.text;
-  counts.bearer += bearer.count;
-
-  const jsonSecret = replaceAll(
-    text,
-    /"(authorization|api_key|apiKey|token)"\s*:\s*"([^"]{16,})"/g,
-    (_match, key) => `"${key}": "${REDACTED}"`,
-  );
-  text = jsonSecret.text;
-  counts.json_secret += jsonSecret.count;
 
   return { text, counts };
 }
@@ -130,8 +154,8 @@ export function redactDirectory(targetDir) {
     }
     const original = buffer.toString("utf8");
     const { text, counts } = redactText(original);
-    for (const key of Object.keys(summary.counts)) {
-      summary.counts[key] += counts[key];
+    for (const [key, count] of Object.entries(counts)) {
+      summary.counts[key] = (summary.counts[key] ?? 0) + count;
     }
     if (text !== original) {
       fs.writeFileSync(filePath, text, "utf8");
@@ -146,14 +170,7 @@ function printSummary(summary) {
   const lines = [
     `files scanned: ${summary.filesScanned}`,
     `files changed: ${summary.filesChanged}`,
-    `home: ${summary.counts.home}`,
-    `openai_sk: ${summary.counts.openai_sk}`,
-    `github: ${summary.counts.github}`,
-    `xai: ${summary.counts.xai}`,
-    `napi: ${summary.counts.napi}`,
-    `aws: ${summary.counts.aws}`,
-    `bearer: ${summary.counts.bearer}`,
-    `json_secret: ${summary.counts.json_secret}`,
+    ...Object.entries(summary.counts).map(([key, count]) => `${key}: ${count}`),
     `binary skipped: ${summary.binarySkipped}`,
   ];
   process.stdout.write(`${lines.join("\n")}\n`);

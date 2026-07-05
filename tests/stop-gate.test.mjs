@@ -1,108 +1,12 @@
 import assert from "node:assert";
-import { spawnSync } from "node:child_process";
 import fs from "node:fs";
-import os from "node:os";
 import path from "node:path";
 import { test } from "node:test";
-
-const repoRoot = path.join(import.meta.dirname, "..");
-const companion = path.join(repoRoot, "plugins", "grok", "scripts", "grok-companion.mjs");
-const fakeGrok = path.join(import.meta.dirname, "fake-grok");
-
-const gitIsolation = {
-  GIT_CONFIG_GLOBAL: "/dev/null",
-  GIT_CONFIG_SYSTEM: "/dev/null",
-  GIT_AUTHOR_NAME: "Test",
-  GIT_AUTHOR_EMAIL: "test@example.com",
-  GIT_COMMITTER_NAME: "Test",
-  GIT_COMMITTER_EMAIL: "test@example.com",
-};
-
-function makeSandbox(t) {
-  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "grok-plugin-test-")));
-  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
-  const dataDir = path.join(root, "data");
-  const workDir = path.join(root, "work");
-  fs.mkdirSync(dataDir);
-  fs.mkdirSync(workDir);
-  return { root, dataDir, workDir, argsFile: path.join(root, "args.jsonl") };
-}
+import { envFor as companionEnvFor, hasPair, jobRecords, makeSandbox, readInvocations, runCompanion } from "./lib/companion-harness.mjs";
+import { dirtyRepo, initCleanRepo } from "./lib/git-fixture.mjs";
 
 function envFor(sandbox, extra = {}) {
-  const env = { ...process.env };
-  delete env.FAKE_GROK_MODE;
-  delete env.FAKE_GROK_ARGS_FILE;
-  delete env.GROK_COMPANION_TIMEOUT_MS;
-  delete env.CLAUDE_CODE_SESSION_ID;
-  return {
-    ...env,
-    ...gitIsolation,
-    GROK_BIN: fakeGrok,
-    GROK_COMPANION_DATA: sandbox.dataDir,
-    FAKE_GROK_ARGS_FILE: sandbox.argsFile,
-    ...extra,
-  };
-}
-
-function runCompanion(args, options) {
-  return spawnSync(process.execPath, [companion, ...args], {
-    cwd: options.cwd,
-    env: options.env,
-    input: options.input ?? "",
-    encoding: "utf8",
-    timeout: 60000,
-  });
-}
-
-function readInvocations(argsFile) {
-  if (!fs.existsSync(argsFile)) return [];
-  return fs
-    .readFileSync(argsFile, "utf8")
-    .split("\n")
-    .filter(Boolean)
-    .map((line) => JSON.parse(line));
-}
-
-function hasPair(argv, flag, value) {
-  return argv.some((token, i) => token === flag && argv[i + 1] === value);
-}
-
-function jobRecords(dataDir) {
-  const stateDir = path.join(dataDir, "state");
-  if (!fs.existsSync(stateDir)) return [];
-  const records = [];
-  for (const workspace of fs.readdirSync(stateDir)) {
-    const jobsDir = path.join(stateDir, workspace, "jobs");
-    if (!fs.existsSync(jobsDir)) continue;
-    for (const name of fs.readdirSync(jobsDir)) {
-      if (!name.endsWith(".json")) continue;
-      try {
-        records.push(JSON.parse(fs.readFileSync(path.join(jobsDir, name), "utf8")));
-      } catch {}
-    }
-  }
-  return records;
-}
-
-function git(dir, args) {
-  const result = spawnSync("git", args, {
-    cwd: dir,
-    env: { ...process.env, ...gitIsolation },
-    encoding: "utf8",
-  });
-  assert.strictEqual(result.status, 0, result.stderr);
-}
-
-function initCleanRepo(dir) {
-  git(dir, ["init", "-q", "-b", "main"]);
-  fs.writeFileSync(path.join(dir, "app.mjs"), "export const value = 1;\n");
-  git(dir, ["add", "."]);
-  git(dir, ["commit", "-q", "-m", "init fixture"]);
-}
-
-function dirtyRepo(dir) {
-  fs.appendFileSync(path.join(dir, "app.mjs"), "export const other = 2;\n");
-  fs.writeFileSync(path.join(dir, "untracked.txt"), "new file\n");
+  return companionEnvFor(sandbox, extra, { git: true });
 }
 
 function enableGate(sandbox) {

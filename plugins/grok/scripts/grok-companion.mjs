@@ -12,6 +12,7 @@ import {
   resolveGrokBin,
   resolveTimeoutMs,
   runGrok,
+  runningJobLiveness,
   terminateProcessGroup
 } from "./lib/grok-exec.mjs";
 import {
@@ -41,6 +42,7 @@ import {
   readLogTail,
   resolveDataDir,
   updateJobRecordFile,
+  updateJobRecordFileWithCurrent,
   finishSuccessfulJobRecordFile,
   writeBrief,
   writeJobRecordFile,
@@ -247,10 +249,52 @@ function classifyFailure({ spawnError = null, result = null, logTail = "" } = {}
 
 function finishJobRecord(jobFile, patch) {
   const current = readJobRecordFile(jobFile);
-  if (current?.status === "cancelled") {
+  if (current?.status === "done" || current?.status === "error" || current?.status === "cancelled") {
     return current;
   }
   return updateJobRecordFile(jobFile, patch);
+}
+
+function deadProcessMessage(deadPids) {
+  if (deadPids.length === 0) {
+    return "No process id was recorded before the launch grace window elapsed.";
+  }
+  const label = deadPids.length === 1 ? "pid" : "pids";
+  return `Recorded ${label} ${deadPids.join(", ")} exited without recording an outcome.`;
+}
+
+function finishDiedJobRecord(file) {
+  return updateJobRecordFileWithCurrent(file, (current) => {
+    if (current.status !== "running") {
+      return current;
+    }
+    const liveness = runningJobLiveness(current);
+    if (liveness.alive) {
+      return current;
+    }
+    const message = deadProcessMessage(liveness.deadPids);
+    return {
+      ...current,
+      status: "error",
+      pid: null,
+      grokPid: null,
+      finishedAt: nowIso(),
+      errorMessage: message,
+      errorTail: message,
+      failureKind: "died",
+      cancelRequestedAt: null
+    };
+  });
+}
+
+export function refreshRunningJobRecord({ record, file }) {
+  const current = readJobRecordFile(file) ?? record;
+  const liveness = runningJobLiveness(current);
+  if (liveness.alive) {
+    return { record: current, changed: false };
+  }
+  const next = finishDiedJobRecord(file);
+  return { record: next, changed: next.status === "error" && next.failureKind === "died" };
 }
 
 function resultFailed(result) {
@@ -727,15 +771,32 @@ function handleStatus(argv) {
     if (!found) {
       throw new Error(`No job record found for ${jobId}.`);
     }
-    const record = found.record;
+    const { record } = refreshRunningJobRecord(found);
     const logTail =
       record.status === "error" ? readLogTail(jobLogPath(dataDir, record.cwd, record.id), 20) : "";
     output(options.json ? record : renderJobDetail(record, { logTail }), options.json);
     return;
   }
 
-  const jobs = listJobRecords(dataDir, resolveCwd(options));
+  const jobs = listJobRecords(dataDir, resolveCwd(options)).map((record) =>
+    refreshRunningJobRecord({ record, file: jobFilePath(dataDir, record.cwd, record.id) }).record
+  );
   output(options.json ? { jobs } : renderStatusTable(jobs, currentClaudeSessionId()), options.json);
+}
+
+function renderFailedResult(record, dataDir) {
+  const tail = readLogTail(jobLogPath(dataDir, record.cwd, record.id), 20) || record.errorTail || "";
+  const lines = [
+    `Job ${record.id} failed${record.exitCode != null ? ` with exit code ${record.exitCode}` : ""}.`,
+    "state: error"
+  ];
+  if (record.failureKind) {
+    lines.push(`failure: ${record.failureKind}`);
+  }
+  if (tail) {
+    lines.push("", "Log tail:", "", "```text", tail, "```");
+  }
+  return `${lines.join("\n")}\n`;
 }
 
 function handleResult(argv) {
@@ -755,7 +816,7 @@ function handleResult(argv) {
     throw new Error(`No job record found for ${jobId}.`);
   }
 
-  const record = found.record;
+  const { record } = refreshRunningJobRecord(found);
   if (options.json) {
     output(record, true);
     return;
@@ -767,18 +828,7 @@ function handleResult(argv) {
   }
 
   if (record.status === "error") {
-    const tail = readLogTail(jobLogPath(dataDir, record.cwd, record.id), 20) || record.errorTail || "";
-    const lines = [
-      `Job ${record.id} failed${record.exitCode != null ? ` with exit code ${record.exitCode}` : ""}.`,
-      "state: error"
-    ];
-    if (record.failureKind) {
-      lines.push(`failure: ${record.failureKind}`);
-    }
-    if (tail) {
-      lines.push("", "Log tail:", "", "```text", tail, "```");
-    }
-    output(`${lines.join("\n")}\n`, false);
+    output(renderFailedResult(record, dataDir), false);
     return;
   }
 
@@ -814,10 +864,15 @@ async function handleCancel(argv) {
     throw new Error(`No job record found for ${jobId}.`);
   }
 
-  const record = found.record;
+  const refreshed = refreshRunningJobRecord(found);
+  const record = refreshed.record;
   if (record.status !== "running") {
     output(
-      options.json ? record : `Job ${record.id} is not running (status: ${record.status}).\n`,
+      options.json
+        ? record
+        : refreshed.changed && record.status === "error"
+          ? renderFailedResult(record, dataDir)
+          : `Job ${record.id} is not running (status: ${record.status}).\n`,
       options.json
     );
     return;
@@ -914,8 +969,10 @@ function handleStats(argv) {
   const dataDir = resolveDataDir();
   const cwd = resolveCwd(options);
   const records = options.all
-    ? listAllJobRecords(dataDir).map((entry) => entry.record)
-    : listJobRecords(dataDir, cwd);
+    ? listAllJobRecords(dataDir).map((entry) => refreshRunningJobRecord(entry).record)
+    : listJobRecords(dataDir, cwd).map((record) =>
+        refreshRunningJobRecord({ record, file: jobFilePath(dataDir, record.cwd, record.id) }).record
+      );
   const stats = {
     scope: options.all ? "all" : "workspace",
     cwd: options.all ? null : cwd,
@@ -1177,7 +1234,9 @@ function renderTopLevelError(error) {
   return `${lines.join("\n")}\n`;
 }
 
-main().catch((error) => {
-  process.stderr.write(renderTopLevelError(error));
-  process.exitCode = 1;
-});
+if (process.argv[1] && path.resolve(process.argv[1]) === SELF_PATH) {
+  main().catch((error) => {
+    process.stderr.write(renderTopLevelError(error));
+    process.exitCode = 1;
+  });
+}

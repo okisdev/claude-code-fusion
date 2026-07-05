@@ -6,6 +6,14 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import {
+  FILE_ENGINE_DESCRIPTORS,
+  STATS_PROVIDER_REGISTRY,
+  buildFusionStats,
+  codexStats,
+  fileBasedEngineStats,
+  renderFusionStats
+} from "../plugins/fusion/scripts/fusion-stats.mjs";
 
 const SCRIPT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "plugins", "fusion", "scripts", "fusion-stats.mjs");
 
@@ -123,4 +131,44 @@ test("Aggregates available Grok companion stats into the merged output", (t) => 
   assert.deepStrictEqual(data.grok.byStatus, { done: 1, error: 1 });
   assert.deepStrictEqual(data.grok.byMode, { consult: 1, write: 1 });
   assert.deepStrictEqual(data.grok.byFailureKind, { quota: 1 });
+});
+
+test("file-based engine stats use the descriptor registry", () => {
+  assert.ok(FILE_ENGINE_DESCRIPTORS.codex);
+  assert.strictEqual(FILE_ENGINE_DESCRIPTORS.codex.stateEnvVar, "FUSION_CODEX_STATE");
+  assert.strictEqual(typeof fileBasedEngineStats, "function");
+});
+
+test("codexStats matches fileBasedEngineStats with the codex descriptor", (t) => {
+  const dir = sandbox(t);
+  const stateRoot = path.join(dir, "state");
+  writeCodexJob(stateRoot, dir, "via-wrapper", {
+    status: "completed",
+    jobClass: "task",
+    createdAt: "2026-07-02T06:00:00.000Z",
+    startedAt: "2026-07-02T06:00:00.000Z",
+    completedAt: "2026-07-02T06:00:05.000Z"
+  });
+  const env = { FUSION_CODEX_STATE: stateRoot };
+  const viaCodex = codexStats({ env, cwd: dir });
+  const viaDescriptor = fileBasedEngineStats(FILE_ENGINE_DESCRIPTORS.codex, { env, cwd: dir });
+  assert.deepStrictEqual(viaCodex, viaDescriptor);
+});
+
+test("report sections follow the stats provider registry order", (t) => {
+  const saved = STATS_PROVIDER_REGISTRY.slice();
+  t.after(() => {
+    STATS_PROVIDER_REGISTRY.length = 0;
+    STATS_PROVIDER_REGISTRY.push(...saved);
+  });
+  STATS_PROVIDER_REGISTRY.length = 0;
+  STATS_PROVIDER_REGISTRY.push({
+    id: "stub",
+    displayName: "StubEngine",
+    collect: () => ({ available: false, reason: "stub unavailable" })
+  });
+  const report = buildFusionStats({ cwd: "/tmp/stub-scope", env: process.env });
+  const text = renderFusionStats(report);
+  assert.match(text, /## StubEngine\n\nUnavailable: stub unavailable/);
+  assert.doesNotMatch(text, /## Grok/);
 });

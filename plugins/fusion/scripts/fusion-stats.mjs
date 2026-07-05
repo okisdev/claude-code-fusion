@@ -50,51 +50,87 @@ function bump(map, key) {
   map[key] = (map[key] ?? 0) + 1;
 }
 
-export function codexStats({ all = false, env = process.env, cwd = process.cwd() } = {}) {
-  const root = env.FUSION_CODEX_STATE || path.join(os.homedir(), ".claude", "plugins", "data", "codex-openai-codex", "state");
-  if (!fs.existsSync(root)) {
-    return { available: false, reason: "codex plugin job state not found; the codex plugin may not be installed" };
-  }
+function resolveStateRoot(descriptor, env) {
+  const override = env[descriptor.stateEnvVar];
+  return override || descriptor.defaultStateRoot(env);
+}
+
+function readWorkspaceJobFiles(stateRoot) {
   const jobs = [];
-  try {
-    for (const workspace of fs.readdirSync(root)) {
-      const dir = path.join(root, workspace, "jobs");
-      if (!fs.existsSync(dir)) {
+  for (const workspace of fs.readdirSync(stateRoot)) {
+    const dir = path.join(stateRoot, workspace, "jobs");
+    if (!fs.existsSync(dir)) {
+      continue;
+    }
+    for (const entry of fs.readdirSync(dir)) {
+      if (!entry.endsWith(".json")) {
         continue;
       }
-      for (const entry of fs.readdirSync(dir)) {
-        if (!entry.endsWith(".json")) {
-          continue;
-        }
-        try {
-          jobs.push(JSON.parse(fs.readFileSync(path.join(dir, entry), "utf8")));
-        } catch {
-          void 0;
-        }
+      try {
+        jobs.push(JSON.parse(fs.readFileSync(path.join(dir, entry), "utf8")));
+      } catch {
+        void 0;
       }
     }
+  }
+  return jobs;
+}
+
+export const FILE_ENGINE_DESCRIPTORS = {
+  codex: {
+    id: "codex",
+    stateEnvVar: "FUSION_CODEX_STATE",
+    defaultStateRoot: () => path.join(os.homedir(), ".claude", "plugins", "data", "codex-openai-codex", "state"),
+    unavailableReason: "codex plugin job state not found; the codex plugin may not be installed",
+    note: "read best effort from the codex plugin's internal job state",
+    enumerateJobs: readWorkspaceJobFiles,
+    matchesWorkspace: (raw, cwd) => raw.workspaceRoot === cwd,
+    normalizeJob(raw) {
+      const finished = raw.completedAt ?? raw.updatedAt ?? null;
+      let durationSeconds = null;
+      if (raw.status === "completed" && raw.startedAt && finished) {
+        const span = (Date.parse(finished) - Date.parse(raw.startedAt)) / 1000;
+        if (Number.isFinite(span) && span >= 0) {
+          durationSeconds = span;
+        }
+      }
+      return {
+        status: raw.status ?? "unknown",
+        kind: raw.jobClass ?? raw.kind ?? "unknown",
+        createdAt: raw.createdAt ?? null,
+        durationSeconds
+      };
+    }
+  }
+};
+
+export function fileBasedEngineStats(descriptor, { all = false, env = process.env, cwd = process.cwd() } = {}) {
+  const root = resolveStateRoot(descriptor, env);
+  if (!fs.existsSync(root)) {
+    return { available: false, reason: descriptor.unavailableReason };
+  }
+  let jobs;
+  try {
+    jobs = descriptor.enumerateJobs(root);
   } catch (error) {
     return { available: false, reason: error instanceof Error ? error.message : String(error) };
   }
-  const scoped = all ? jobs : jobs.filter((job) => job.workspaceRoot === cwd);
+  const scoped = all ? jobs : jobs.filter((job) => descriptor.matchesWorkspace(job, cwd));
   const byStatus = {};
   const byKind = {};
   let durationSum = 0;
   let durationCount = 0;
   let earliest = null;
   let latest = null;
-  for (const job of scoped) {
-    bump(byStatus, job.status ?? "unknown");
-    bump(byKind, job.jobClass ?? job.kind ?? "unknown");
-    const finished = job.completedAt ?? job.updatedAt ?? null;
-    if (job.status === "completed" && job.startedAt && finished) {
-      const span = (Date.parse(finished) - Date.parse(job.startedAt)) / 1000;
-      if (Number.isFinite(span) && span >= 0) {
-        durationSum += span;
-        durationCount += 1;
-      }
+  for (const raw of scoped) {
+    const job = descriptor.normalizeJob(raw);
+    bump(byStatus, job.status);
+    bump(byKind, job.kind);
+    if (job.durationSeconds != null) {
+      durationSum += job.durationSeconds;
+      durationCount += 1;
     }
-    const created = job.createdAt ?? null;
+    const created = job.createdAt;
     if (created) {
       if (!earliest || created < earliest) {
         earliest = created;
@@ -113,9 +149,26 @@ export function codexStats({ all = false, env = process.env, cwd = process.cwd()
     meanWallClockSeconds: durationCount > 0 ? Math.round((durationSum / durationCount) * 1000) / 1000 : null,
     earliestCreatedAt: earliest,
     latestCreatedAt: latest,
-    note: "read best effort from the codex plugin's internal job state"
+    note: descriptor.note
   };
 }
+
+export function codexStats(options = {}) {
+  return fileBasedEngineStats(FILE_ENGINE_DESCRIPTORS.codex, options);
+}
+
+export const STATS_PROVIDER_REGISTRY = [
+  {
+    id: "grok",
+    displayName: "Grok",
+    collect: (options) => grokStats(options)
+  },
+  {
+    id: "codex",
+    displayName: "Codex",
+    collect: (options) => fileBasedEngineStats(FILE_ENGINE_DESCRIPTORS.codex, options)
+  }
+];
 
 function renderCounts(lines, title, map) {
   const keys = Object.keys(map);
@@ -148,17 +201,22 @@ function renderEngine(lines, name, stats) {
 }
 
 export function buildFusionStats({ all = false, env = process.env, cwd = process.cwd() } = {}) {
+  const options = { all, env, cwd };
+  const engines = {};
+  for (const provider of STATS_PROVIDER_REGISTRY) {
+    engines[provider.id] = provider.collect(options);
+  }
   return {
     scope: all ? "all" : cwd,
-    grok: grokStats({ all, env, cwd }),
-    codex: codexStats({ all, env, cwd })
+    ...engines
   };
 }
 
 export function renderFusionStats(report) {
   const lines = ["# Fusion stats", "", `Scope: ${report.scope === "all" ? "all workspaces" : `workspace ${report.scope}`}`];
-  renderEngine(lines, "Grok", report.grok);
-  renderEngine(lines, "Codex", report.codex);
+  for (const provider of STATS_PROVIDER_REGISTRY) {
+    renderEngine(lines, provider.displayName, report[provider.id]);
+  }
   lines.push("", "Token usage lives with each vendor: ccusage for the Claude side, the OpenAI and xAI dashboards for the peers.");
   return `${lines.join("\n")}\n`;
 }

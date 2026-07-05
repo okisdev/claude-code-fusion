@@ -15,10 +15,12 @@ const REPO_ROOT = path.dirname(BENCH_DIR);
 const DEFAULT_TASK_ROOT = path.join(BENCH_DIR, "tasks");
 const CONDITIONS = new Set(["A", "B1", "B2"]);
 const CLI_VERSION_TIMEOUT_MS = 2000;
+const CLAUDE_PLUGIN_CACHE_DIR_ENV = "CLAUDE_PLUGIN_CACHE_DIR";
+const CODEX_PLUGIN_CACHE_SEGMENTS = ["openai-codex", "codex"];
+const VERSION_NAME_COLLATOR = new Intl.Collator("en", { numeric: true, sensitivity: "base" });
 const PLUGIN_VERSION_FILES = [
   { name: "fusion", file: path.join(REPO_ROOT, "plugins", "fusion", ".claude-plugin", "plugin.json") },
-  { name: "grok", file: path.join(REPO_ROOT, "plugins", "grok", ".claude-plugin", "plugin.json") },
-  { name: "codex", file: path.join(REPO_ROOT, "plugins", "codex", ".claude-plugin", "plugin.json") }
+  { name: "grok", file: path.join(REPO_ROOT, "plugins", "grok", ".claude-plugin", "plugin.json") }
 ];
 const TOKEN_FIELDS = [
   "input_tokens",
@@ -183,6 +185,9 @@ function runProcess(bin, args, options) {
 }
 
 function readJsonFile(file) {
+  if (!file) {
+    return null;
+  }
   if (!fs.existsSync(file)) {
     return null;
   }
@@ -193,7 +198,36 @@ function readJsonFile(file) {
   }
 }
 
-function collectPluginVersions() {
+function claudePluginCacheDir(env = process.env) {
+  const override = env[CLAUDE_PLUGIN_CACHE_DIR_ENV];
+  return override ? path.resolve(override) : path.join(os.homedir(), ".claude", "plugins", "cache");
+}
+
+function codexPluginManifestFile(env = process.env) {
+  const root = path.join(claudePluginCacheDir(env), ...CODEX_PLUGIN_CACHE_SEGMENTS);
+  if (!fs.existsSync(root)) {
+    return null;
+  }
+  let entries;
+  try {
+    entries = fs.readdirSync(root, { withFileTypes: true });
+  } catch {
+    return null;
+  }
+  const versionDirs = entries
+    .filter((entry) => entry.isDirectory())
+    .map((entry) => entry.name)
+    .sort((left, right) => VERSION_NAME_COLLATOR.compare(left, right));
+  for (let index = versionDirs.length - 1; index >= 0; index -= 1) {
+    const manifestFile = path.join(root, versionDirs[index], ".claude-plugin", "plugin.json");
+    if (fs.existsSync(manifestFile)) {
+      return manifestFile;
+    }
+  }
+  return null;
+}
+
+function collectPluginVersions(env = process.env) {
   const versions = {};
   const marketplace = readJsonFile(path.join(REPO_ROOT, ".claude-plugin", "marketplace.json"));
   versions["claude-code-fusion"] = typeof marketplace?.metadata?.version === "string" ? marketplace.metadata.version : null;
@@ -201,6 +235,8 @@ function collectPluginVersions() {
     const plugin = readJsonFile(source.file);
     versions[source.name] = typeof plugin?.version === "string" ? plugin.version : null;
   }
+  const codexPlugin = readJsonFile(codexPluginManifestFile(env));
+  versions.codex = typeof codexPlugin?.version === "string" ? codexPlugin.version : null;
   return versions;
 }
 
@@ -300,7 +336,7 @@ function writeEnv(options, manifest) {
       platform: os.platform(),
       release: os.release()
     },
-    pluginVersions: collectPluginVersions(),
+    pluginVersions: collectPluginVersions(process.env),
     engineCliVersions: collectEngineCliVersions(options),
     taskManifestHash: manifest.manifestHash,
     manifestHash: manifest.manifestHash,

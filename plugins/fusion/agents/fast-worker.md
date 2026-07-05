@@ -1,6 +1,6 @@
 ---
 name: fast-worker
-description: The Claude lane for work needing the Claude Code tool surface (hooks, subagent files, MCP) or a moderately specified spec, not the default for spec grade multi file packages (codex) or quick scoped fixes (grok). Mechanical execution worker on Sonnet. Use for well specified edits, refactors with a clear recipe, multi file implementation of an approved plan (one work package per invocation), running tests and fixing trivial failures, codemods, boilerplate, and doc updates. An approved plan section counts as the task spec; do not send open ended design work.
+description: The Claude lane for work needing the Claude Code tool surface (hooks, subagent files, MCP) or a moderately specified spec, not the default for spec grade multi file packages or quick scoped fixes, which route to the peer lanes per the orchestration rules. Mechanical execution worker on Sonnet. Use for well specified edits, refactors with a clear recipe, multi file implementation of an approved plan (one work package per invocation), running tests and fixing trivial failures, codemods, boilerplate, and doc updates. An approved plan section counts as the task spec; do not send open ended design work.
 model: sonnet
 effort: medium
 maxTurns: 120

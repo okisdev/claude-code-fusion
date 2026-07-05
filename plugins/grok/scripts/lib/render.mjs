@@ -297,7 +297,7 @@ export function renderStatsReport(stats) {
     `Created between ${stats.earliestCreatedAt} and ${stats.latestCreatedAt}`
   ];
   if (stats.meanWallClockSeconds != null) {
-    lines.push(`Mean wall clock for done jobs: ${stats.meanWallClockSeconds.toFixed(1)}s`);
+    lines.push(`Mean wall clock for finished jobs: ${stats.meanWallClockSeconds.toFixed(1)}s`);
   }
   pushCountSection(lines, "By status", stats.byStatus);
   pushCountSection(lines, "By mode", stats.byMode);

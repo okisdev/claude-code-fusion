@@ -1,16 +1,22 @@
 import assert from "node:assert";
-import { spawnSync } from "node:child_process";
 import fs from "node:fs";
-import os from "node:os";
 import path from "node:path";
 import { test } from "node:test";
+import {
+  envFor,
+  flagValues,
+  hasPair,
+  makeSandbox,
+  readInvocations as readHarnessInvocations,
+  repoRoot,
+  runCompanion,
+} from "./lib/companion-harness.mjs";
 
-const repoRoot = path.join(import.meta.dirname, "..");
-const companion = path.join(repoRoot, "plugins", "grok", "scripts", "grok-companion.mjs");
 const cliRuntimeSkill = path.join(repoRoot, "plugins", "grok", "skills", "grok-cli-runtime", "SKILL.md");
 const { parseArgs } = await import(path.join(repoRoot, "plugins", "grok", "scripts", "lib", "args.mjs"));
-const { buildGrokArgs } = await import(path.join(repoRoot, "plugins", "grok", "scripts", "lib", "grok-exec.mjs"));
-const fakeGrok = path.join(import.meta.dirname, "fake-grok");
+const { buildGrokArgs, NESTED_ENGINE_CLI_DENY_NAMES } = await import(
+  path.join(repoRoot, "plugins", "grok", "scripts", "lib", "grok-exec.mjs"),
+);
 
 const consultAllows = [
   "Read",
@@ -77,69 +83,8 @@ const writeDenies = [
   "Bash(codex*)",
 ];
 
-function makeSandbox(t) {
-  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "grok-plugin-test-")));
-  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
-  const dataDir = path.join(root, "data");
-  const workDir = path.join(root, "work");
-  fs.mkdirSync(dataDir);
-  fs.mkdirSync(workDir);
-  return { root, dataDir, workDir, argsFile: path.join(root, "args.jsonl") };
-}
-
-function envFor(sandbox, extra = {}) {
-  const env = { ...process.env };
-  delete env.FAKE_GROK_MODE;
-  delete env.FAKE_GROK_ARGS_FILE;
-  delete env.GROK_COMPANION_TIMEOUT_MS;
-  delete env.CLAUDE_CODE_SESSION_ID;
-  return {
-    ...env,
-    GROK_BIN: fakeGrok,
-    GROK_COMPANION_DATA: sandbox.dataDir,
-    FAKE_GROK_ARGS_FILE: sandbox.argsFile,
-    ...extra,
-  };
-}
-
-function runCompanion(args, options) {
-  return spawnSync(process.execPath, [companion, ...args], {
-    cwd: options.cwd,
-    env: options.env,
-    input: options.input ?? "",
-    encoding: "utf8",
-    timeout: 60000,
-  });
-}
-
 function readInvocations(argsFile) {
-  if (!fs.existsSync(argsFile)) return [];
-  return fs
-    .readFileSync(argsFile, "utf8")
-    .split("\n")
-    .filter(Boolean)
-    .map((line) => JSON.parse(line))
-    .map((argv) =>
-      argv.flatMap((token) => {
-        if (token.startsWith("--") && token.includes("=")) {
-          const separator = token.indexOf("=");
-          return [token.slice(0, separator), token.slice(separator + 1)];
-        }
-        return [token];
-      }),
-    );
-}
-
-function flagValues(argv, flag) {
-  const values = [];
-  for (let i = 0; i < argv.length - 1; i += 1) {
-    if (argv[i] === flag) values.push(argv[i + 1]);
-  }
-  return values;
-}
-
-function hasPair(argv, flag, value) {
-  return argv.some((token, i) => token === flag && argv[i + 1] === value);
+  return readHarnessInvocations(argsFile, { splitInlineFlags: true });
 }
 
 function singleInvocation(sandbox) {
@@ -317,6 +262,23 @@ test("write task argv omits the gh read-only allow rules", (t) => {
   assert.strictEqual(flagValues(argv, "--allow").length, 0);
   assert.ok(!argv.includes("Bash(gh pr view)"));
   assert.ok(!argv.includes("Bash(gh api*)"));
+});
+
+test("NESTED_ENGINE_CLI_DENY_NAMES expands into consult and write Bash denies", () => {
+  const nestedEngineCliDenyRules = (names) => names.map((name) => `Bash(${name}*)`);
+  const hypothetical = "peer-engine";
+  const extended = nestedEngineCliDenyRules([...NESTED_ENGINE_CLI_DENY_NAMES, hypothetical]);
+  const consultDeny = flagValues(buildArgv({ mode: "consult" }), "--deny");
+  const writeDeny = flagValues(buildArgv({ mode: "write" }), "--deny");
+  for (const rule of nestedEngineCliDenyRules(NESTED_ENGINE_CLI_DENY_NAMES)) {
+    assert.ok(consultDeny.includes(rule));
+    assert.ok(writeDeny.includes(rule));
+  }
+  assert.strictEqual(extended.at(-1), `Bash(${hypothetical}*)`);
+  assert.deepStrictEqual(
+    extended.slice(0, -1),
+    nestedEngineCliDenyRules(NESTED_ENGINE_CLI_DENY_NAMES),
+  );
 });
 
 test("consult deny rules block shell compound command metacharacters", () => {
