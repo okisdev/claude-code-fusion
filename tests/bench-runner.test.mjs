@@ -8,6 +8,7 @@ import { test } from "node:test";
 const repoRoot = path.join(import.meta.dirname, "..");
 const runner = path.join(repoRoot, "bench", "run.mjs");
 const fakeClaude = path.join(import.meta.dirname, "fake-claude");
+const claudePluginCacheDirEnv = "CLAUDE_PLUGIN_CACHE_DIR";
 
 function makeSandbox(t) {
   const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "bench-runner-test-")));
@@ -58,11 +59,18 @@ function writeFakeVersionBin(dir, name, version) {
   return file;
 }
 
+function writeCodexPlugin(cacheDir, version) {
+  const pluginDir = path.join(cacheDir, "openai-codex", "codex", version, ".claude-plugin");
+  fs.mkdirSync(pluginDir, { recursive: true });
+  fs.writeFileSync(path.join(pluginDir, "plugin.json"), JSON.stringify({ name: "codex", version }), "utf8");
+}
+
 function envFor(sandbox, extra = {}) {
   const env = { ...process.env };
   delete env.FAKE_CLAUDE_MODE;
   delete env.FAKE_CLAUDE_RUNS_FILE;
   delete env.CLAUDE_BIN;
+  delete env[claudePluginCacheDirEnv];
   return {
     ...env,
     FAKE_CLAUDE_RUNS_FILE: sandbox.fakeRunsFile,
@@ -219,6 +227,7 @@ test("runner writes env.json with manifest and cheap version capture", (t) => {
 
   const result = runBench(sandbox, {
     env: {
+      [claudePluginCacheDirEnv]: path.join(sandbox.root, "empty-plugin-cache"),
       PATH: `${binDir}${path.delimiter}${process.env.PATH ?? ""}`
     }
   });
@@ -250,4 +259,37 @@ test("runner writes env.json with manifest and cheap version capture", (t) => {
   assert.deepStrictEqual(env.taskTags, {
     [sandbox.taskId]: []
   });
+});
+
+test("runner records null codex plugin version when the plugin cache is empty", (t) => {
+  const sandbox = makeSandbox(t);
+  const emptyPluginCache = path.join(sandbox.root, "empty-plugin-cache");
+  fs.mkdirSync(emptyPluginCache);
+
+  const result = runBench(sandbox, {
+    env: {
+      [claudePluginCacheDirEnv]: emptyPluginCache
+    }
+  });
+  assert.strictEqual(result.status, 0, result.stderr);
+
+  const env = JSON.parse(fs.readFileSync(sandbox.envFile, "utf8"));
+  assert.strictEqual(env.pluginVersions.codex, null);
+});
+
+test("runner records the newest installed codex plugin version from the plugin cache", (t) => {
+  const sandbox = makeSandbox(t);
+  const pluginCache = path.join(sandbox.root, "plugin-cache");
+  writeCodexPlugin(pluginCache, "1.0.9");
+  writeCodexPlugin(pluginCache, "1.0.10");
+
+  const result = runBench(sandbox, {
+    env: {
+      [claudePluginCacheDirEnv]: pluginCache
+    }
+  });
+  assert.strictEqual(result.status, 0, result.stderr);
+
+  const env = JSON.parse(fs.readFileSync(sandbox.envFile, "utf8"));
+  assert.strictEqual(env.pluginVersions.codex, "1.0.10");
 });
