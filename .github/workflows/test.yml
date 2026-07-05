@@ -20,19 +20,28 @@ jobs:
         run: node bench/manifest.mjs --check
       - name: Validate JSON manifests parse
         run: |
+          set -euo pipefail
+          shopt -s nullglob
+          marketplace=(.claude-plugin/marketplace.json)
+          plugin_manifests=(plugins/*/.claude-plugin/plugin.json)
+          hooks_files=(plugins/*/hooks/hooks.json)
+          rules_files=(plugins/*/rules-manifest.json)
+          if [ ${#marketplace[@]} -eq 0 ]; then
+            echo 'ERROR: marketplace glob matched no files: .claude-plugin/marketplace.json' >&2
+            exit 1
+          fi
+          if [ ${#plugin_manifests[@]} -eq 0 ]; then
+            echo 'ERROR: plugin manifest glob matched no files: plugins/*/.claude-plugin/plugin.json' >&2
+            exit 1
+          fi
+          paths=("${marketplace[@]}" "${plugin_manifests[@]}" "${hooks_files[@]}" "${rules_files[@]}" bench/tasks/manifest.json)
+          printf 'Validating JSON manifests:\n'
+          printf '  %s\n' "${paths[@]}"
           node -e "
           const fs = require('fs');
-          const paths = [
-            '.claude-plugin/marketplace.json',
-            'plugins/fusion/.claude-plugin/plugin.json',
-            'plugins/grok/.claude-plugin/plugin.json',
-            'plugins/fusion/rules-manifest.json',
-            'plugins/grok/hooks/hooks.json',
-            'plugins/fusion/hooks/hooks.json',
-            'bench/tasks/manifest.json',
-          ];
+          const paths = process.argv.slice(1);
           for (const p of paths) {
             JSON.parse(fs.readFileSync(p, 'utf8'));
             console.log('ok', p);
           }
-          "
+          " "${paths[@]}"
