@@ -5,9 +5,11 @@ import { appendJobLog } from "./state.mjs";
 
 const BIN_ENV = "GROK_BIN";
 const TIMEOUT_ENV = "GROK_COMPANION_TIMEOUT_MS";
+const PIDLESS_RUNNING_GRACE_ENV = "GROK_COMPANION_PIDLESS_RUNNING_GRACE_MS";
 const CONSULT_ALLOW_ENV = "GROK_CONSULT_ALLOW";
 const DEFAULT_FOREGROUND_TIMEOUT_MS = 570000;
 const BACKGROUND_TIMEOUT_CAP_MS = 1800000;
+const DEFAULT_PIDLESS_RUNNING_GRACE_MS = 15000;
 const TERMINATION_GRACE_MS = 2000;
 const TERMINATION_POLL_MS = 50;
 const STDOUT_CAPTURE_MAX_BYTES = 1024 * 1024;
@@ -52,6 +54,10 @@ const CONSULT_ALLOW_RULES = [
   "Bash(gh release list *)"
 ];
 
+export const NESTED_ENGINE_CLI_DENY_NAMES = ["grok", "claude", "codex"];
+
+const NESTED_ENGINE_CLI_DENY_RULES = NESTED_ENGINE_CLI_DENY_NAMES.map((name) => `Bash(${name}*)`);
+
 const CONSULT_DENY_RULES = [
   "Edit",
   "Write",
@@ -63,9 +69,7 @@ const CONSULT_DENY_RULES = [
   "Bash(*<*)",
   "Bash(*`*)",
   "Bash(*$*)",
-  "Bash(grok*)",
-  "Bash(claude*)",
-  "Bash(codex*)",
+  ...NESTED_ENGINE_CLI_DENY_RULES,
   "Bash(node*)"
 ];
 
@@ -73,9 +77,7 @@ const WRITE_DENY_RULES = [
   "Bash(sudo*)",
   "Bash(rm -rf*)",
   "Bash(git push*)",
-  "Bash(grok*)",
-  "Bash(claude*)",
-  "Bash(codex*)"
+  ...NESTED_ENGINE_CLI_DENY_RULES
 ];
 
 export function resolveGrokBin(env = process.env) {
@@ -90,6 +92,11 @@ export function resolveTimeoutMs({ background = false, env = process.env } = {})
     return Math.min(configured ?? BACKGROUND_TIMEOUT_CAP_MS, BACKGROUND_TIMEOUT_CAP_MS);
   }
   return configured ?? DEFAULT_FOREGROUND_TIMEOUT_MS;
+}
+
+export function resolvePidlessRunningGraceMs(env = process.env) {
+  const raw = Number(env[PIDLESS_RUNNING_GRACE_ENV]);
+  return Number.isFinite(raw) && raw >= 0 ? Math.floor(raw) : DEFAULT_PIDLESS_RUNNING_GRACE_MS;
 }
 
 export function resolveConsultAllowRules(env = process.env) {
@@ -232,21 +239,55 @@ function signalProcessGroup(pid, signal) {
   }
 }
 
-function processGroupAlive(pid) {
+export function processGroupAlive(pid) {
   if (!Number.isInteger(pid) || pid <= 0) {
     return false;
   }
   try {
     process.kill(-pid, 0);
     return true;
-  } catch {
+  } catch (groupError) {
+    if (groupError?.code === "EPERM") {
+      return true;
+    }
     try {
       process.kill(pid, 0);
       return true;
-    } catch {
+    } catch (pidError) {
+      if (pidError?.code === "EPERM") {
+        return true;
+      }
       return false;
     }
   }
+}
+
+function normalizedPid(value) {
+  const pid = Number(value);
+  return Number.isInteger(pid) && pid > 0 ? pid : null;
+}
+
+function launchTimestampMs(record) {
+  const value = record?.startedAt ?? record?.createdAt;
+  const timestamp = Date.parse(String(value ?? ""));
+  return Number.isFinite(timestamp) ? timestamp : null;
+}
+
+export function runningJobLiveness(record, options = {}) {
+  if (record?.status !== "running") {
+    return { alive: true, pids: [], deadPids: [] };
+  }
+  const pid = normalizedPid(record.pid);
+  const grokPid = normalizedPid(record.grokPid);
+  const pids = pid ? [pid] : grokPid ? [grokPid] : [];
+  if (pids.length === 0) {
+    const launchedAt = launchTimestampMs(record);
+    const now = options.now ?? Date.now();
+    const graceMs = options.pidlessGraceMs ?? resolvePidlessRunningGraceMs(options.env ?? process.env);
+    return { alive: launchedAt == null || now - launchedAt <= graceMs, pids, deadPids: [] };
+  }
+  const deadPids = pids.filter((processPid) => !processGroupAlive(processPid));
+  return { alive: deadPids.length !== pids.length, pids, deadPids };
 }
 
 function waitMs(ms) {

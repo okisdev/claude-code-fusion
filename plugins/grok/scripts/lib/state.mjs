@@ -74,6 +74,7 @@ export function createJobRecord(fields) {
     exitCode: null,
     sessionId: null,
     resultText: null,
+    errorMessage: null,
     errorTail: null,
     failureKind: null,
     cancelRequestedAt: null,
@@ -126,10 +127,7 @@ function preserveTerminalRecord(existing, next) {
   if (!existing || !TERMINAL_STATUSES.has(existing.status)) {
     return next;
   }
-  if (next.status !== existing.status) {
-    return existing;
-  }
-  return next;
+  return existing;
 }
 
 export function writeJobRecordFile(file, record) {
@@ -170,6 +168,25 @@ export function updateJobRecordFile(file, patch) {
       return existing;
     }
     const next = preserveTerminalRecord(existing, { ...existing, ...patch });
+    atomicWriteFile(file, `${JSON.stringify(next, null, 2)}\n`);
+    return next;
+  });
+}
+
+export function updateJobRecordFileWithCurrent(file, updater) {
+  return withRecordLock(file, () => {
+    const existing = readJobRecordFile(file);
+    if (!existing) {
+      throw new Error(`No job record found at ${file}.`);
+    }
+    const updated = updater(existing);
+    if (!updated || updated === existing) {
+      return existing;
+    }
+    const next = preserveTerminalRecord(existing, updated);
+    if (next === existing) {
+      return existing;
+    }
     atomicWriteFile(file, `${JSON.stringify(next, null, 2)}\n`);
     return next;
   });
