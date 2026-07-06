@@ -17,7 +17,8 @@
           {
             "type": "command",
             "command": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/grok-companion.mjs\" stop-gate",
-            "timeout": 900
+            "timeout": 900,
+            "statusMessage": "Running the Grok stop gate review"
           }
         ]
       }

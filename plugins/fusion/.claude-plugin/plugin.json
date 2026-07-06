@@ -1,9 +1,14 @@
 {
+  "$schema": "https://json.schemastore.org/claude-code-plugin-manifest.json",
   "name": "fusion",
-  "version": "0.0.12",
+  "displayName": "Fusion Orchestrator",
+  "version": "0.0.13",
   "description": "Multi-model orchestration: tier agents, routing rules, blind panel, ultra fleet, model config, and drift doctor.",
   "author": {
     "name": "Harry Yep"
   },
-  "license": "MIT"
+  "homepage": "https://github.com/okisdev/claude-code-fusion",
+  "repository": "https://github.com/okisdev/claude-code-fusion",
+  "license": "MIT",
+  "keywords": ["orchestration", "routing", "multi-model", "subagents"]
 }

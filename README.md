@@ -11,7 +11,7 @@ Multi-model orchestration for Claude Code. The strongest available Claude model 
 
 ## Quick start
 
-Prerequisites: Claude Code 2.1.170 or later and Node.js 22 or later (tested on 2.1.198 and Node 24; the floors are not enforced), git, macOS or Linux, and xAI's grok CLI installed and authenticated per xAI's grok CLI documentation, on PATH, verified with `grok --version`. The Codex side powers the primary implementation lane; install the `codex` plugin from [openai/codex-plugin-cc](https://github.com/openai/codex-plugin-cc) (`codex@openai-codex`) and run `/codex:setup` once. Without it fusion still runs, with spec grade implementation packages falling back to the Claude workers and Grok.
+Prerequisites: Claude Code 2.1.198 or later (the dispatch flow relies on background subagents being the default) and Node.js 22 or later (tested on 2.1.198 and Node 24; the floors are not enforced), git, macOS or Linux, and xAI's grok CLI installed and authenticated per xAI's grok CLI documentation, on PATH, verified with `grok --version`. The Codex side powers the primary implementation lane; install the `codex` plugin from [openai/codex-plugin-cc](https://github.com/openai/codex-plugin-cc) (`codex@openai-codex`) and run `/codex:setup` once. Without it fusion still runs, with spec grade implementation packages falling back to the Claude workers and Grok.
 
 ```bash
 claude plugin marketplace add okisdev/claude-code-fusion
