@@ -9,6 +9,7 @@ export const repoRoot = path.join(import.meta.dirname, "..", "..");
 export const companion = path.join(repoRoot, "plugins", "grok", "scripts", "grok-companion.mjs");
 export const fakeGrok = path.join(repoRoot, "tests", "fake-grok");
 export const stateModulePath = path.join(repoRoot, "plugins", "grok", "scripts", "lib", "state.mjs");
+export const jobsMonitor = path.join(repoRoot, "plugins", "grok", "scripts", "jobs-monitor.mjs");
 
 export function makeSandbox(t) {
   const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "grok-plugin-test-")));
