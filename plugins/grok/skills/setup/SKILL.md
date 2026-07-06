@@ -11,4 +11,4 @@ Present the setup output to the user.
 
 - If the Grok CLI is missing, preserve the install guidance from the command output.
 - Model and effort defaults belong in `~/.grok/config.toml`, not in plugin flags. Preserve that guidance when present.
-- `--enable-stop-gate` turns on the stop-time review gate: when Claude Code stops with uncommitted working tree changes, Grok reviews them and can block the stop with a reason. `--disable-stop-gate` turns it off. The report shows the current gate state.
+- The primary switch for the stop-time review gate is the plugin's `Stop gate review` setting in Claude Code's plugin configuration: when enabled, Grok reviews the working tree diff whenever Claude Code stops with uncommitted changes and can block the stop with a reason. `--enable-stop-gate` and `--disable-stop-gate` remain as a scripting fallback that persists the same toggle locally; they only take effect when the plugin setting is left unset. The report shows the current gate state.
