@@ -346,7 +346,7 @@ export function renderSetupReport(report) {
   lines.push(
     "",
     "Model and effort defaults live in ~/.grok/config.toml; the companion never passes -m or --effort unless explicitly requested.",
-    "Toggle the stop-time review gate with /grok:setup --enable-stop-gate or --disable-stop-gate."
+    "Toggle the stop-time review gate from the plugin's Stop gate review setting; /grok:setup --enable-stop-gate or --disable-stop-gate is the scripting fallback."
   );
 
   return `${lines.join("\n").trimEnd()}\n`;

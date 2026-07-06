@@ -1,9 +1,22 @@
 {
+  "$schema": "https://json.schemastore.org/claude-code-plugin-manifest.json",
   "name": "grok",
-  "version": "0.0.12",
+  "displayName": "Grok Companion",
+  "version": "0.0.13",
   "description": "Local Grok CLI delegation: task, review, best-of-n tournaments, background jobs, stats, and setup health checks.",
   "author": {
     "name": "Harry Yep"
   },
-  "license": "MIT"
+  "homepage": "https://github.com/okisdev/claude-code-fusion",
+  "repository": "https://github.com/okisdev/claude-code-fusion",
+  "license": "MIT",
+  "keywords": ["grok", "xai", "delegation", "code-review", "orchestration"],
+  "userConfig": {
+    "stop_gate": {
+      "type": "boolean",
+      "title": "Stop gate review",
+      "description": "When Claude Code stops with uncommitted working tree changes, Grok reviews the diff in consult mode and can block the stop with a reason.",
+      "default": false
+    }
+  }
 }

@@ -38,6 +38,7 @@ Job statuses, liveness, rendered outcome footers, failure kind definitions, back
 
 ## Stop gate
 
+- The gate is toggled by the plugin's `stop_gate` userConfig option, exposed via `CLAUDE_PLUGIN_OPTION_STOP_GATE` in the hook's environment. Case insensitive `true` or `1` enables the gate, `false` or `0` disables it, and any other value or an unset variable falls back to the legacy flag persisted by `/grok:setup --enable-stop-gate` / `--disable-stop-gate`. Bash tool invocations of the companion never see that env var, so the legacy flag keeps scripting paths working.
 - The Stop hook pipes the hook JSON into the companion's `stop-gate` subcommand. It exits silently when the gate is off, `stop_hook_active` is set, the cwd is not a git repository, or the working tree diff is empty; otherwise grok reviews the diff in consult mode.
 - Grok uses `plugins/grok/prompts/stop-gate.md`, expects the shared first line verdict grammar, and runs in consult mode with timeout 240000ms inside the hook's 900 second budget. Infrastructure failures follow the shared fail open rule.
 

@@ -167,6 +167,55 @@ test("stop-gate uses the first non-empty line for BLOCK decisions", (t) => {
   assert.ok(payload.reason.includes("leading blank reason text"));
 });
 
+test("stop-gate runs when the userConfig env var is true even if the legacy flag is off", (t) => {
+  const sandbox = makeSandbox(t);
+  initCleanRepo(sandbox.workDir);
+  dirtyRepo(sandbox.workDir);
+  const result = runStopGate(sandbox, {
+    env: envFor(sandbox, { FAKE_GROK_MODE: "gate-allow", CLAUDE_PLUGIN_OPTION_STOP_GATE: "TRUE" }),
+  });
+  assert.strictEqual(result.status, 0, result.stderr);
+  const invocations = readInvocations(sandbox.argsFile);
+  assert.strictEqual(invocations.length, 1);
+});
+
+test("stop-gate skips when the userConfig env var is false even if the legacy flag is on", (t) => {
+  const sandbox = makeSandbox(t);
+  initCleanRepo(sandbox.workDir);
+  dirtyRepo(sandbox.workDir);
+  enableGate(sandbox);
+  const result = runStopGate(sandbox, {
+    env: envFor(sandbox, { FAKE_GROK_MODE: "gate-allow", CLAUDE_PLUGIN_OPTION_STOP_GATE: "0" }),
+  });
+  assert.strictEqual(result.status, 0, result.stderr);
+  assert.strictEqual(readInvocations(sandbox.argsFile).length, 0);
+});
+
+test("stop-gate falls back to the legacy flag when the userConfig env var is garbage", (t) => {
+  const sandbox = makeSandbox(t);
+  initCleanRepo(sandbox.workDir);
+  dirtyRepo(sandbox.workDir);
+  enableGate(sandbox);
+  const result = runStopGate(sandbox, {
+    env: envFor(sandbox, { FAKE_GROK_MODE: "gate-allow", CLAUDE_PLUGIN_OPTION_STOP_GATE: "maybe" }),
+  });
+  assert.strictEqual(result.status, 0, result.stderr);
+  assert.strictEqual(readInvocations(sandbox.argsFile).length, 1);
+});
+
+test("stop-gate preserves current behavior when the userConfig env var is unset", (t) => {
+  const sandbox = makeSandbox(t);
+  initCleanRepo(sandbox.workDir);
+  dirtyRepo(sandbox.workDir);
+  const offResult = runStopGate(sandbox, { env: envFor(sandbox, { FAKE_GROK_MODE: "gate-allow" }) });
+  assert.strictEqual(offResult.status, 0, offResult.stderr);
+  assert.strictEqual(readInvocations(sandbox.argsFile).length, 0);
+  enableGate(sandbox);
+  const onResult = runStopGate(sandbox, { env: envFor(sandbox, { FAKE_GROK_MODE: "gate-allow" }) });
+  assert.strictEqual(onResult.status, 0, onResult.stderr);
+  assert.strictEqual(readInvocations(sandbox.argsFile).length, 1);
+});
+
 test("stop-gate exits silently when grok fails", (t) => {
   const sandbox = makeSandbox(t);
   initCleanRepo(sandbox.workDir);
