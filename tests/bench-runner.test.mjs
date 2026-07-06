@@ -249,7 +249,7 @@ test("runner writes env.json with manifest and cheap version capture", (t) => {
   const grokPlugin = JSON.parse(
     fs.readFileSync(path.join(repoRoot, "plugins", "grok", ".claude-plugin", "plugin.json"), "utf8"),
   );
-  assert.strictEqual(env.pluginVersions["claude-code-fusion"], marketplace.metadata.version);
+  assert.strictEqual(env.pluginVersions["claude-code-fusion"], marketplace.version ?? marketplace.metadata?.version);
   assert.strictEqual(env.pluginVersions.fusion, fusionPlugin.version);
   assert.strictEqual(env.pluginVersions.grok, grokPlugin.version);
   assert.strictEqual(env.pluginVersions.codex, null);

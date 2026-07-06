@@ -1,0 +1,8 @@
+[
+  {
+    "name": "grok-jobs",
+    "command": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/jobs-monitor.mjs\"",
+    "description": "Grok background job completions",
+    "when": "always"
+  }
+]

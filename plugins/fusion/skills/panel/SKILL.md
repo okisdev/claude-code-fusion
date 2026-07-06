@@ -1,5 +1,6 @@
 ---
-description: Proactively use when the user is stuck between two approaches, faces a design or architecture decision where being wrong is expensive, has a diagnosis that resisted one fix, or asks to compare options or get multiple opinions. Convenes a blind Codex and Grok panel on one neutral brief and adjudicates the verdicts.
+description: Convenes a blind Codex and Grok panel on one neutral brief and adjudicates the verdicts.
+when_to_use: Proactively use when the user is stuck between two approaches, faces a design or architecture decision where being wrong is expensive, has a diagnosis that resisted one fix, or asks to compare options or get multiple opinions.
 argument-hint: '[decision or question to adjudicate]'
 allowed-tools: Write, Agent, Read, AskUserQuestion
 ---

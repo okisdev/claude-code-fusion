@@ -1,31 +1,42 @@
 {
+  "$schema": "https://json.schemastore.org/claude-code-marketplace.json",
   "name": "claude-code-fusion",
   "owner": {
     "name": "Harry Yep",
     "email": "hi@okis.dev"
   },
-  "metadata": {
-    "description": "Multi-model orchestration marketplace for Claude Code.",
-    "version": "0.0.12"
-  },
+  "description": "Multi-model orchestration marketplace for Claude Code.",
+  "version": "0.0.13",
   "plugins": [
     {
       "name": "grok",
       "source": "./plugins/grok",
+      "displayName": "Grok Companion",
       "description": "Local Grok CLI delegation: task, review, best-of-n tournaments, background jobs, stats, and setup health checks.",
-      "version": "0.0.12",
+      "version": "0.0.13",
       "author": {
         "name": "Harry Yep"
-      }
+      },
+      "homepage": "https://github.com/okisdev/claude-code-fusion",
+      "repository": "https://github.com/okisdev/claude-code-fusion",
+      "license": "MIT",
+      "category": "workflow",
+      "tags": ["grok", "xai", "delegation", "code-review", "orchestration"]
     },
     {
       "name": "fusion",
       "source": "./plugins/fusion",
+      "displayName": "Fusion Orchestrator",
       "description": "Multi-model orchestration: tier agents, routing rules, blind panel, ultra fleet, model config, and drift doctor.",
-      "version": "0.0.12",
+      "version": "0.0.13",
       "author": {
         "name": "Harry Yep"
-      }
+      },
+      "homepage": "https://github.com/okisdev/claude-code-fusion",
+      "repository": "https://github.com/okisdev/claude-code-fusion",
+      "license": "MIT",
+      "category": "workflow",
+      "tags": ["orchestration", "routing", "multi-model", "subagents"]
     }
   ]
 }

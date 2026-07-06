@@ -230,7 +230,8 @@ function codexPluginManifestFile(env = process.env) {
 function collectPluginVersions(env = process.env) {
   const versions = {};
   const marketplace = readJsonFile(path.join(REPO_ROOT, ".claude-plugin", "marketplace.json"));
-  versions["claude-code-fusion"] = typeof marketplace?.metadata?.version === "string" ? marketplace.metadata.version : null;
+  const marketplaceVersion = marketplace?.version ?? marketplace?.metadata?.version;
+  versions["claude-code-fusion"] = typeof marketplaceVersion === "string" ? marketplaceVersion : null;
   for (const source of PLUGIN_VERSION_FILES) {
     const plugin = readJsonFile(source.file);
     versions[source.name] = typeof plugin?.version === "string" ? plugin.version : null;

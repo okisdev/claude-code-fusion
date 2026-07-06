@@ -53,6 +53,7 @@ const SELF_PATH = fileURLToPath(import.meta.url);
 const ROOT_DIR = path.resolve(path.dirname(SELF_PATH), "..");
 const REVIEW_PROMPT_FILE = path.join(ROOT_DIR, "prompts", "review.md");
 const STOP_GATE_PROMPT_FILE = path.join(ROOT_DIR, "prompts", "stop-gate.md");
+const STOP_GATE_OPTION_ENV = "CLAUDE_PLUGIN_OPTION_STOP_GATE";
 const STOP_GATE_TIMEOUT_MS = 240000;
 const STOP_GATE_MAX_TURNS = 15;
 const CONTINUE_PROMPT =
@@ -124,6 +125,20 @@ function writeConfig(dataDir, patch) {
   fs.mkdirSync(dataDir, { recursive: true });
   fs.writeFileSync(configFilePath(dataDir), `${JSON.stringify(next, null, 2)}\n`, "utf8");
   return next;
+}
+
+function isStopGateEnabled(dataDir, env = process.env) {
+  const raw = env[STOP_GATE_OPTION_ENV];
+  if (raw !== undefined) {
+    const normalized = raw.trim().toLowerCase();
+    if (normalized === "true" || normalized === "1") {
+      return true;
+    }
+    if (normalized === "false" || normalized === "0") {
+      return false;
+    }
+  }
+  return Boolean(readConfig(dataDir).stopGate);
 }
 
 function parsePositiveInteger(value, flag) {
@@ -1052,7 +1067,7 @@ async function handleStopGate() {
   }
 
   const dataDir = resolveDataDir();
-  if (!readConfig(dataDir).stopGate || input.stop_hook_active) {
+  if (!isStopGateEnabled(dataDir) || input.stop_hook_active) {
     return;
   }
 

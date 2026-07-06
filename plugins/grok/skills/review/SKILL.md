@@ -1,0 +1,36 @@
+---
+description: Run an adversarial Grok review against local git state
+argument-hint: '[--base <ref>] [--focus <text>] [--cwd <dir>] [--json]'
+allowed-tools: Read, Glob, Grep, Bash(git:*), Agent
+---
+
+Run a Grok code review through the companion runtime.
+
+Raw slash-command arguments:
+`$ARGUMENTS`
+
+Core constraints:
+
+- Never ask the user how to run the review or which findings to fix. The only question that may reach the user is a finding that forces a genuine product or design decision, such as a scope change or a public API break.
+- The review never runs in the main loop, neither foreground nor through a detached shell. It rides in a tracked background subagent so completion arrives as a notification and nothing blocks.
+
+Launch:
+
+- Dispatch one background subagent of type `grok:grok-review-runner` via the `Agent` tool. Expand `${CLAUDE_PLUGIN_ROOT}` to its literal value when composing the prompt, and pass the raw arguments through unchanged:
+
+```
+Run this review command and return its output:
+GROK_COMPANION_TIMEOUT_MS=1800000 node "<plugin root>/scripts/grok-companion.mjs" review $ARGUMENTS
+```
+
+- Tell the user the review is running and end the turn. Do not poll; the completion notification delivers the result.
+
+Presenting results:
+
+- Return the runner's output verbatim, exactly as-is. Do not paraphrase, summarize, or add commentary before or after it.
+- Untracked files reach the review as a name list only, not content; say so when findings depend on new files.
+
+After presenting findings:
+
+- Triage by verification, not by asking. Verify each finding against the current code: dispatch fixes for confirmed findings by the orchestration routing rules without prompting, and drop false positives with a stated reason.
+- Close with one report: what was fixed, what was dropped, and why. Only a finding that forces a whitelisted product or design decision goes to the user as a question; everything else proceeds on defaults.

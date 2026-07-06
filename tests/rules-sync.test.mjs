@@ -180,8 +180,8 @@ test("Rules sync logs unexpected failures without blocking the session", (t) => 
 });
 
 test("Doctor and setup describe template hash comparison for live rules", () => {
-  const doctor = fs.readFileSync(path.join(repoRoot, "plugins", "fusion", "commands", "doctor.md"), "utf8");
-  const setup = fs.readFileSync(path.join(repoRoot, "plugins", "fusion", "commands", "setup.md"), "utf8");
+  const doctor = fs.readFileSync(path.join(repoRoot, "plugins", "fusion", "skills", "doctor", "SKILL.md"), "utf8");
+  const setup = fs.readFileSync(path.join(repoRoot, "plugins", "fusion", "skills", "setup", "SKILL.md"), "utf8");
   assert.match(doctor, /hashRulesTemplate/);
   assert.match(doctor, /A scored live model table is expected to differ from the shipped placeholder/);
   assert.match(setup, /hashRulesTemplate/);

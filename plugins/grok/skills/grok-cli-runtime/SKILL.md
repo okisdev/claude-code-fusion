@@ -32,7 +32,7 @@ Execution rules:
 - Leave `--model` and `--effort` unset so Grok's own config rules apply, unless the user explicitly asks for a specific model or effort level.
 - `--cwd` scopes the workspace for task, review, status, and stats. A bad value fails before a job record is created.
 - `--json` returns structured output for task, review, status, result, cancel, stats, and setup. Preflight failures with `--json` return a structured error object on stderr.
-- `setup --enable-stop-gate` turns on the stop gate, and `setup --disable-stop-gate` turns it off.
+- The stop gate is primarily toggled by the plugin's `Stop gate review` setting in Claude Code's plugin configuration; `setup --enable-stop-gate` and `setup --disable-stop-gate` persist the same toggle locally as a scripting fallback and only take effect when that setting is left unset.
 - `cancel` accepts active foreground or background job ids. It waits for process cleanup before rendering the cancelled record.
 - Job outcomes carry a `state:` line (`done`, `error`, or `cancelled`). Error and cancelled outcomes carry a `failure: <kind>` line; cancelled jobs use `failure: cancelled`.
 - Return the stdout of the helper exactly as-is.
