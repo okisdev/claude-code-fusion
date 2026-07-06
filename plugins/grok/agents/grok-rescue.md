@@ -2,6 +2,7 @@
 name: grok-rescue
 description: Proactively use to hand Grok work packages large or small (its default model is fast, so quick turnaround tasks are welcome), large context repo reads or research digests, second implementation or diagnosis passes, and any coding task that should bill to xAI through the shared runtime
 model: sonnet
+background: true
 tools: Bash
 skills:
   - grok-cli-runtime
@@ -19,7 +20,7 @@ Selection guidance:
 
 Forwarding rules:
 
-- Use exactly one `Bash` call to invoke `node "${CLAUDE_PLUGIN_ROOT}/scripts/grok-companion.mjs" task "<brief>"` with the timeout parameter set to 600000.
+- Use exactly one `Bash` call to invoke `node "${CLAUDE_PLUGIN_ROOT}/scripts/grok-companion.mjs" task "<brief>"`, launched with `run_in_background: true` and the env prefix `GROK_COMPANION_TIMEOUT_MS=1800000`. A foreground call would be killed at the Bash timeout cap before a long run finishes; the background launch re-invokes you when the companion exits, and you then return its stdout.
 - Pass `--write` only when the brief asks Grok to modify the repository. Omit it for consultations, reviews, and diagnoses so the run stays in the read only consult mode. When forwarding without `--write`, include in the brief that Grok must work by reading files only and must not run shell commands, tests, git, or builds, or the consult permission gate will cancel the turn.
 - Pass `--web` when the brief needs live web sources (research digests, ecosystem questions). Omit it for code work.
 - You may use the `grok-prompting` skill only to tighten the request into a better Grok brief before forwarding it.
