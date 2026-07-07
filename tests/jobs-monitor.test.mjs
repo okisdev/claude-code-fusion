@@ -1,12 +1,13 @@
 import assert from "node:assert";
 import { spawn } from "node:child_process";
 import fs from "node:fs";
+import path from "node:path";
 import { once } from "node:events";
 import { test } from "node:test";
 import { pathToFileURL } from "node:url";
 import { envFor as companionEnvFor, jobsMonitor, makeSandbox, stateModulePath } from "./lib/companion-harness.mjs";
 
-const { createJobRecord, generateJobId, jobFilePath, writeBrief, writeJobRecordFile } = await import(
+const { createJobRecord, generateJobId, jobFilePath, jobsDir, writeBrief, writeJobRecordFile } = await import(
   pathToFileURL(stateModulePath).href
 );
 
@@ -97,7 +98,10 @@ test("a job transitioning to done emits exactly one correctly shaped line", asyn
 
   const lines = await waitUntil(() => (monitor.lines().length > 0 ? monitor.lines() : null));
   assert.strictEqual(lines.length, 1);
-  assert.strictEqual(lines[0], `grok job ${record.id} done. run /grok:result ${record.id} for the full output`);
+  assert.strictEqual(
+    lines[0],
+    `grok job ${record.id} done. collect with /grok:result ${record.id} only if you launched it detached; a job owned by a subagent reports on its own`
+  );
 
   await new Promise((resolve) => setTimeout(resolve, 300));
   assert.strictEqual(monitor.lines().length, 1);
@@ -121,7 +125,78 @@ test("a job transitioning to error reports the failure kind", async (t) => {
   assert.strictEqual(lines.length, 1);
   assert.strictEqual(
     lines[0],
-    `grok job ${record.id} error (died). run /grok:result ${record.id} for the full output`
+    `grok job ${record.id} error (died). collect with /grok:result ${record.id} only if you launched it detached; a job owned by a subagent reports on its own`
+  );
+});
+
+test("with a monitor session id set, a matching job emits and a mismatching job stays silent", async (t) => {
+  const sandbox = makeSandbox(t);
+  const { file: ownFile, record: ownRecord } = seedJob(sandbox, {
+    status: "running",
+    claudeSessionId: "session-own",
+  });
+  const { file: otherFile, record: otherRecord } = seedJob(sandbox, {
+    status: "running",
+    claudeSessionId: "session-other",
+  });
+  const monitor = startMonitor(sandbox, envFor(sandbox, { CLAUDE_CODE_SESSION_ID: "session-own" }));
+  t.after(() => monitor.child.kill("SIGKILL"));
+  await new Promise((resolve) => setTimeout(resolve, 300));
+
+  writeJobRecordFile(ownFile, { ...ownRecord, status: "done", finishedAt: new Date().toISOString() });
+  writeJobRecordFile(otherFile, { ...otherRecord, status: "done", finishedAt: new Date().toISOString() });
+
+  const lines = await waitUntil(() => (monitor.lines().length > 0 ? monitor.lines() : null));
+  assert.strictEqual(lines.length, 1);
+  assert.strictEqual(
+    lines[0],
+    `grok job ${ownRecord.id} done. collect with /grok:result ${ownRecord.id} only if you launched it detached; a job owned by a subagent reports on its own`
+  );
+
+  await new Promise((resolve) => setTimeout(resolve, 300));
+  assert.strictEqual(monitor.lines().length, 1);
+});
+
+test("with the session id env var unset, a job from a different session still emits", async (t) => {
+  const sandbox = makeSandbox(t);
+  const { file, record } = seedJob(sandbox, { status: "running", claudeSessionId: "session-other" });
+  const monitor = startMonitor(sandbox, envFor(sandbox));
+  t.after(() => monitor.child.kill("SIGKILL"));
+  await new Promise((resolve) => setTimeout(resolve, 300));
+
+  writeJobRecordFile(file, { ...record, status: "done", finishedAt: new Date().toISOString() });
+
+  const lines = await waitUntil(() => (monitor.lines().length > 0 ? monitor.lines() : null));
+  assert.strictEqual(lines.length, 1);
+  assert.strictEqual(
+    lines[0],
+    `grok job ${record.id} done. collect with /grok:result ${record.id} only if you launched it detached; a job owned by a subagent reports on its own`
+  );
+});
+
+test("a vanished jobs directory mid run does not crash the process and a later tick still emits", async (t) => {
+  const sandbox = makeSandbox(t);
+  const monitor = startMonitor(sandbox, envFor(sandbox));
+  t.after(() => monitor.child.kill("SIGKILL"));
+  await new Promise((resolve) => setTimeout(resolve, 300));
+
+  const dir = jobsDir(sandbox.dataDir, sandbox.workDir);
+  fs.rmSync(dir, { recursive: true, force: true });
+  fs.mkdirSync(path.dirname(dir), { recursive: true });
+  fs.writeFileSync(dir, "not a directory");
+  await new Promise((resolve) => setTimeout(resolve, 500));
+  assert.strictEqual(monitor.child.exitCode, null);
+  assert.deepStrictEqual(monitor.lines(), []);
+
+  fs.rmSync(dir, { force: true });
+  const { file, record } = seedJob(sandbox, { status: "running" });
+  writeJobRecordFile(file, { ...record, status: "done", finishedAt: new Date().toISOString() });
+
+  const lines = await waitUntil(() => (monitor.lines().length > 0 ? monitor.lines() : null));
+  assert.strictEqual(lines.length, 1);
+  assert.strictEqual(
+    lines[0],
+    `grok job ${record.id} done. collect with /grok:result ${record.id} only if you launched it detached; a job owned by a subagent reports on its own`
   );
 });
 

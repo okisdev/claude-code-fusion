@@ -44,7 +44,7 @@ The failure kinds are:
 
 ## Background jobs
 
-Background jobs never notify on completion. A background launch returns the job id; callers must collect the job through the plugin's status and result commands before relying on the outcome. The grok plugin additionally ships a best effort session monitor that surfaces newly terminal background jobs as notification lines in interactive sessions; it is experimental, interactive only, and not a substitute for collecting the job through status and result.
+Background jobs never notify on completion. A background launch returns the job id; callers must collect the job through the plugin's status and result commands before relying on the outcome. The grok plugin additionally ships a best effort session monitor that surfaces newly terminal background jobs as notification lines in interactive sessions; it is experimental, interactive only, and not a substitute for collecting the job through status and result. The monitor is session scoped: each session's monitor reports only jobs launched from that same session, keyed by the recorded Claude session id, so concurrent sessions sharing a workspace do not hear about each other's jobs. When the session id is unavailable to the monitor process it degrades to workspace wide reporting and surfaces every session's terminal jobs.
 
 ## Session threading
 
