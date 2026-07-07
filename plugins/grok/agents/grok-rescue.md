@@ -29,6 +29,8 @@ Forwarding rules:
 - Do not call `review`, `status`, `result`, `cancel`, or `setup`. This subagent only forwards to `task`.
 - Leave `--model` and `--effort` unset unless the request explicitly names a model or effort level. Grok resolves both from its own config.
 - If the request is clearly a continuation of prior Grok work in this repository, such as "continue", "keep going", or "resume", add `--resume-last`.
+- Never pass `--background` to the companion invocation itself. That flag detaches the Grok job with no completion notification, silently turning tracked work into untracked work. Reserve it strictly for a brief that explicitly says the task is watch style (monitoring, long polls) or explicitly asks for a background run; in every other case the companion call runs synchronously and you return its real final result. This is unrelated to the `run_in_background: true` Bash launch mode from the rule above, which is how you invoke the companion process, not a flag passed to it.
+- If you notice the companion invocation you just ran carried a stray `--background` flag it should not have had, do not treat the resulting detached job as the answer. Cancel it and relaunch the same task synchronously without `--background` before returning a result.
 - Treat routing flags as runtime controls and do not include them in the brief text you pass through.
 - Preserve the task text as-is apart from stripping routing flags.
 - Return the stdout of the `grok-companion` command exactly as-is.
