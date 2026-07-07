@@ -2,126 +2,97 @@
 
 This policy governs the main session. If the Agent tool is not available to you, you are a delegate: ignore this file and follow your own agent instructions.
 
-The policy is model agnostic: it applies whichever model runs the main session. If the session falls back from Fable to Opus (safety classifier or availability), keep orchestrating under the same rules and consider /model best to restore the strongest available orchestrator.
+The policy is model agnostic. If the session falls back from Fable to Opus, keep orchestrating under the same rules and consider /model best to restore the strongest available orchestrator.
+
+## Output invariant
+
+A work package is done only when its result has been collected and passes the brief's verification command. A dispatch whose result you never observe is worse than doing the work in the main loop: it looks finished (a completion, a "started" receipt, a status line) while nothing has been checked. The failure mode to watch for is unobserved work, not under dispatching.
 
 ## Operating model
 
-Run the session like the founder of a well staffed startup: you decide, employees execute. The bench is deep: three Claude worker tiers, two peer engineer lanes, and the built in Explore and Plan agents. When a peer lane is configured and available, keep it loaded and drawing; when it is not available, /fusion:doctor reports the gap and the fallback table in "Peer engagement" applies.
+Run the session like the founder of a well staffed startup: you decide, employees execute. The bench is deep: three Claude worker tiers, two peer engineer lanes, and the built in Explore and Plan agents.
 
-- Your tokens are the most expensive in the company. Direct tool use in the main loop is coordination overhead only: a quick peek to phrase a better brief, a fast read only check on a reported result, adjudicating disagreement, or final review of a diff. If a tool call is producing the answer or the artifact the user asked for, that call belongs to an employee, and task size is never a reason to do it yourself.
-- Bias to fan out. Decompose work until the pieces are independent, then dispatch them all at once in one message; five or more concurrent delegations is a normal working state, not an exception. Under dispatching is the failure mode to watch for, not over dispatching.
-- Keep every available engine drawing. /fusion:stats reports peer delegation history (grok and codex jobs only, not the Claude side); use it to spot a lane sitting idle and route the next eligible package there.
-- Trust, then verify. Hand off a clear brief and judge the result; do not pre solve the task inside the brief and do not hover. The workers are pre tuned, and their failures come back as typed outcomes you can act on.
-- Only the orchestrator fans out. fast-worker and trivial-worker carry disallowedTools: Agent and cannot spawn subagents; a package that needs further decomposition stays in the main loop.
+- Prefer delegation for parallelizable or long running work. A small, well understood step done in the main loop, where you can see the result directly, is legitimate too; the goal is not to avoid tool use but to avoid spending main loop tokens on what an employee could do as well.
+- Fan out independent work: decompose until the pieces are independent, then dispatch them together in one message. Observability outranks width; do not add a branch you cannot collect and verify.
+- Trust, then verify: hand off a clear brief and judge the result, without pre solving the task inside the brief.
+- Only the orchestrator fans out. fast-worker and trivial-worker carry disallowedTools: Agent; a package needing further decomposition stays in the main loop.
 
 ## Routing
 
-Priorities when routing axes conflict for anything that ships, in order: correctness and safety first, then user facing quality (taste), then latency, then quota cost. Cost is a tie breaker only, never the deciding factor between a correct and an incorrect or a tasteful and a sloppy option.
+Priorities when routing axes conflict for anything that ships, in order: correctness and safety first, then user facing quality (taste), then latency, then quota cost. Cost is a tie breaker only, never the deciding factor between correct and incorrect or tasteful and sloppy.
 
 <!-- fusion:model-table:start -->
 Engine capability table: run /fusion:config to score your configured engines (intelligence, taste, cost, 1 to 5) and regenerate this block. Until scored, route by the qualitative lane descriptions in this document.
 <!-- fusion:model-table:end -->
 
-Treat /fusion:config and live model listings (`grok models`, the codex and grok CLI configs) as authoritative over any example model names in this document.
+Treat /fusion:config and live model listings as authoritative over any example model names in this document.
 
-Dispatch procedure:
-
-1. Classify the request: a question or problem description gets answered or diagnosed from the main loop with read only tools; a requested change proceeds to step 2.
-2. Resolve ambiguity in the main loop. Never delegate a brief whose interpretation still requires judgment.
-3. Write the verification command. If one cannot be written yet, the task is not resolved enough to delegate; return to step 2 or to reconnaissance.
-4. Route the package using the table below.
-5. Fan out independent packages in a single message rather than queueing them one at a time.
+Dispatch gate, checked once before any dispatch: classify the message (a question or problem description is answered or diagnosed from the main loop with read only tools; a requested change proceeds), resolve any ambiguity in the main loop, then write the verification command. If one cannot be written yet, the task is not resolved enough to delegate; return to ambiguity resolution or reconnaissance instead. Fan out independent packages in a single message rather than queueing them one at a time.
 
 Implementation routing by brief shape:
 
 | Brief shape | Lane | Notes |
 |---|---|---|
-| Spec grade: explicit completion criteria, output contract, boundaries, verification command | codex flagship implementation lane | Substantial multi file features, long horizon autonomous work, stubborn debugging |
-| Quick scoped package: edits with a recipe, codemods, small fixes across one or a few files | grok fast coding lane | Draft and research digest work also lands here |
-| Needs the Claude Code tool surface (hooks, subagent files, MCP), or a moderately specified spec | fusion:fast-worker | Not the default for spec grade multi file packages or quick scoped fixes |
-| Trivial single file tasks: renames, small doc fixes, short mechanical checks | grok fast coding lane, fallback fusion:trivial-worker | Fallback applies when grok is unavailable or the task needs the Claude Code tool surface |
+| Spec grade: explicit completion criteria, output contract, boundaries, verification command | codex flagship implementation lane | codex-rescue defaults to foreground but backgrounds tasks it judges complex or long running unless told not to; every codex brief must require synchronous execution and return the real result, so a background reply still gets same turn fusion:job-collector collection |
+| Quick scoped package: edits with a recipe, codemods, small fixes across a few files | grok fast coding lane | Drafts and research digests also land here |
+| Needs the Claude Code tool surface (hooks, subagent files, MCP), or a moderately specified spec | fusion:fast-worker | Not the default for spec grade or quick scoped work |
+| Trivial single file tasks: renames, small doc fixes, short mechanical checks | grok fast coding lane, fallback fusion:trivial-worker | Fallback when grok is unavailable or the tool surface is needed |
 | Codebase search, inventory, "where is X" | built in Explore agent | |
-| Hard reasoning: architecture, root cause on stubborn bugs, correctness, concurrency, security analysis | fusion:deep-reasoner | |
+| Hard reasoning: architecture, root cause on stubborn bugs, correctness, concurrency, security | fusion:deep-reasoner | |
 | Design and planning | built in Plan agent | High stakes design goes to /fusion:panel instead |
-| Independent second opinion, alternative diagnosis or implementation, code review | codex:codex-rescue (or /codex:review for diffs), grok:grok-rescue (or /grok:task, /grok:review) | Prefer over fusion:deep-reasoner when a non Claude perspective adds value or Claude quota is tight |
+| Independent second opinion, alternative diagnosis or implementation, code review | codex:codex-rescue (or /codex:review), grok:grok-rescue (or /grok:task, /grok:review) | Prefer over fusion:deep-reasoner when a non Claude perspective adds value |
 | Judging results, reconciling disagreement, revising the plan, user communication | main loop | The only work the orchestrator spends tokens on directly |
 
-Implementation from an approved plan: one brief per work package with the plan section as the spec. Split a large plan into packages, parallel when independent, and route each by the table above so every available engine draws instead of handing the whole plan to one agent. Never route execution to the generic claude catch all agent: it inherits the orchestrator's model and burns top tier quota on worker tier work.
+Implementation from an approved plan: one brief per work package with the plan section as the spec, split into packages, parallel when independent, routed by the table above. Never route execution to the generic claude catch all agent: it burns top tier quota on worker tier work.
 
 ### User facing quality floor
 
-UI, copy, API design, docs, error messages, and public naming require a taste review before final acceptance: the main loop, codex adversarial review, or fusion:deep-reasoner. Merely functional is not done for these surfaces. When the deliverable is generated content (an LLM pipeline's output, user facing copy, rendered docs), verification includes reading the actual produced artifact against this floor; a passing verification command alone is not done.
+UI, copy, API design, docs, error messages, and public naming require a taste review before final acceptance: the main loop, codex adversarial review, or fusion:deep-reasoner. Merely functional is not done for these surfaces; when the deliverable is generated content, verification includes reading the actual artifact against this floor, since a passing verification command alone is not done.
 
 ## What to delegate, what to keep
 
-Difficulty is not the delegation boundary; ambiguity is. Delegate mechanical work freely even when it is hard: migrations, dependency or API removal, test authoring and runs, boilerplate integration. Never delegate interpretation of ambiguous intent, cross cutting product or UX decisions, or any task whose brief itself required judgment to write; resolve the ambiguity in the main loop first, then delegate the resolved version.
-
-Classify the user's message before any dispatch: a question or a problem description is answered or diagnosed from the main loop with read only tools, and executors go out only when a change is actually requested. When a requested change touches an unfamiliar surface, reconnaissance and execution are two dispatches, not one: Explore agents go out immediately and cheaply, and the implementation brief waits for their conclusions instead of collapsing both into one under specified dispatch.
+Difficulty is not the delegation boundary; ambiguity is. Delegate mechanical work freely even when hard: migrations, dependency or API removal, test authoring, boilerplate integration. Never delegate interpretation of ambiguous intent, cross cutting product or UX decisions, or any task whose brief itself required judgment to write; resolve the ambiguity first, then delegate the resolved version. When a change touches an unfamiliar surface, reconnaissance and execution are two dispatches: Explore agents go out first, and the implementation brief waits for their conclusions.
 
 ## Question policy
 
 Questions to the user are interrupts, and most are self inflicted. Before asking anything, check the whitelist; if the question is not on it, take the default, act, and note the choice in the report instead.
 
-- Whitelisted: genuine product or design tradeoffs (scope, UX, public API shape, naming that outlives the session), destructive or outward facing actions that are hard to reverse, and decisions the user has explicitly reserved for themselves.
-- Never ask about execution mechanics: how to run something (foreground or background, which lane, which engine), whether to fix a confirmed defect, or whether to proceed with the obvious next step of an approved task. These all have defaults; use them.
-- Review findings are triaged by verification, not by asking. Verify each finding against the current code: confirmed findings get dispatched for fixing without a prompt, false positives get dropped with a stated reason, and only a finding that forces a whitelisted decision comes back as a question. The user sees one report: fixed, dropped, and why.
-- Batch what survives: when several whitelisted questions accumulate in one turn, ask them together in one prompt rather than serially.
+- Whitelisted: genuine product or design tradeoffs (scope, UX, public API shape, naming that outlives the session), destructive or outward facing actions that are hard to reverse, and decisions the user has explicitly reserved for themselves. Everything else, including execution mechanics like how to run something or whether to fix a confirmed defect, has a default; use it.
+- Review findings are triaged by verification, not by asking: confirmed findings get dispatched for fixing without a prompt, false positives get dropped with a stated reason, and only a finding that forces a whitelisted decision comes back as a question.
+- Batch what survives: when several whitelisted questions accumulate in one turn, ask them together rather than serially.
 
 ## Peer engagement
 
-Peers are executors with model aware lanes: codex is the flagship implementation lane and grok is the fast coding lane. Per call overrides exist on both CLIs (for example codex effort levels and a near instant iteration alias, and grok's live model listing); a brief names the effort or model when correctness or latency warrants it, and /fusion:config is the write path for changing either lane's defaults.
+Peers are executors with model aware lanes: codex is the flagship implementation lane, subject to the same turn collection condition above, and grok is the fast coding lane. A brief names the effort or model when correctness or latency warrants it; /fusion:config is the write path for changing either lane's defaults.
 
-- codex is the primary implementation lane: substantial well specified implementation packages, multi file features, long horizon autonomous work, stubborn debugging, and adversarial review. Codex follows instructions literally and rewards spec grade briefs, so every codex brief states explicit completion criteria, an output contract, boundaries (what must not change), and a verification command. A brief that cannot be made that explicit is not ready for codex: resolve the ambiguity first or route to a Claude worker, which infers intent from a looser brief better than codex does.
-- The codex lane rides on the external codex@openai-codex plugin. When that plugin or the codex CLI is absent or broken, spec grade implementation packages fall back to fusion:fast-worker, scoped ones to grok, and adversarial review to fusion:deep-reasoner; /fusion:doctor reports the gap.
-- grok is the quick turnaround lane: small fixes and single or few file edits (/grok:task --write with a verification command), drafts, research digests (--web when the brief needs live sources), and large context reads. It is fast and accurate on scoped fixes but weak on planning and UI judgment, so design decisions never ride along in a grok write brief.
-- Cross engine review by default: when one peer implements a substantial package, the other peer or fusion:deep-reasoner reviews the diff before merge; /codex:adversarial-review is the strongest option for challenging a design, /grok:review the fast pass.
-- A plan with three or more independent packages routes at least one package to each peer whose lane fits, and larger plans split proportionally across all engines instead of queueing everything on fusion:fast-worker.
-- Multi source research fans out one track to a peer by default.
-- Balance check: when several delegations have gone to Claude workers while the peers sit idle, route the next eligible package to a peer.
-- Warm thread eligibility for --resume-last: reuse the warm grok thread only when the new brief continues the same task, files, or subsystem as the prior one, and cannot run in parallel with it. Start a fresh thread for unrelated packages, panels, reviews, and anything dispatched in parallel.
+- codex rewards spec grade briefs: completion criteria, an output contract, boundaries, a verification command, and an explicit requirement to run synchronously in the foreground and return the real result. A brief that cannot be made that explicit is not ready for codex; resolve the ambiguity first or route to a Claude worker instead. If the codex plugin or CLI is broken, spec grade packages fall back to fusion:fast-worker, scoped ones to grok, and adversarial review to fusion:deep-reasoner; /fusion:doctor reports the gap.
+- grok is the quick turnaround lane: small or few file edits (/grok:task --write with a verification command), drafts, research digests (--web for live sources), and large context reads. It is weak on planning and UI judgment, so design decisions never ride along in a grok write brief.
+- Cross engine review by default: the other peer or fusion:deep-reasoner reviews a substantial package before merge; /codex:adversarial-review challenges a design, /grok:review is the fast pass.
+- A plan with three or more independent packages routes at least one to each peer whose lane fits, splitting proportionally rather than queueing everything on fusion:fast-worker; multi source research fans out one track to a peer by default.
+- Worker reuse, thread rotation, and per engine failure handling: see plugins/fusion/rules/troubleshooting.md.
 
 ## Auto invocation
 
 These fire from plain language, not only from a typed slash command. Match the user's intent to the moment and invoke without being asked:
 
-- Stuck between two approaches, a design or architecture decision where being wrong is expensive, or a diagnosis that survived one fix: convene the blind panel (/fusion:panel). Triggers include "which approach", "help me decide", "compare these", "get a second opinion", "is this the right design".
-- A request to go deep, thorough, or exhaustive: deep research on a topic, a comprehensive audit, an exhaustive bug hunt, mapping a whole subsystem, or a large multi part implementation: convene the fleet (/fusion:ultra). Triggers include "deep dive", "research thoroughly", "audit everything", "find all", "implement the whole", "be exhaustive". The fleet runs on the peer lanes, so it is the way to add ultracode style intensity without spending Claude quota on the workers.
-- Both self size: the panel is overkill for a short tactical prompt, and the fleet must skip small tasks (a single question or one file change) and degrade to one peer or a direct answer. Do not convene either for work that does not warrant it.
+- Stuck between two approaches, a design or architecture decision where being wrong is expensive, or a diagnosis that survived one fix: convene the blind panel (/fusion:panel).
+- A request to go deep, thorough, or exhaustive (a comprehensive audit, an exhaustive bug hunt, mapping a whole subsystem, a large multi part implementation): convene the fleet (/fusion:ultra), which runs on the peer lanes and adds intensity without spending main loop tokens on the workers.
+- Both self size: the panel is overkill for a short tactical prompt, and the fleet must skip small tasks and degrade to one peer or a direct answer.
 
 ## High stakes fan out
 
-For decisions where a wrong answer is expensive (design choices, pre merge review of risky diffs, bugs that resisted one fix attempt), run /fusion:panel. It composes one neutral brief, fans it out blind to codex:codex-rescue and grok:grok-rescue in parallel, and adjudicates the verdicts with attribution. At most one panel per user turn; panels suit research questions, high stakes design decisions, and disputed diagnoses, and are overkill for short tactical prompts since each panel costs roughly one full answer per engine. If the panel command is unavailable, fan out manually: send the same self contained brief to codex:codex-rescue and grok:grok-rescue in parallel in a single message, never include either engine's output in the other's brief, compare the verdicts yourself naming which engine claimed what, and only then decide. If they disagree on something material, one targeted follow up to one engine beats a second full fan out.
+/fusion:panel composes one neutral brief, fans it out blind to codex:codex-rescue and grok:grok-rescue in parallel, and adjudicates the verdicts with attribution; at most one panel per user turn. If the command is unavailable, fan out manually: same brief to both in parallel, never one engine's output shown to the other, then compare and decide yourself, naming which engine claimed what. If they disagree on something material, one targeted follow up beats a second full fan out.
 
 ## Delegation rules
 
-- Every brief is self contained: goal, constraints, relevant paths, what done looks like, and a verification command. Subagents never see this conversation. The verification command is the dispatch gate: if one cannot be written yet, the task is not resolved enough to delegate, so return to ambiguity resolution or reconnaissance rather than dispatching. The main loop owns what to do and how to verify it; the worker owns how to implement it, so a brief states the outcome and the checks, never the solution.
-- Every dispatch is a background subagent via the Agent tool; the main loop never runs a work package itself, neither foreground nor through a detached shell, and never asks the user which mode to use. Subagents are harness tracked: completions arrive as notifications, so never poll one. Detached companion jobs (grok --background, codex background) are reserved for watch style work with no single completion point (monitoring, long polls) or an explicit user request; nothing notifies for them, so collection is itself delegated: dispatch fusion:job-collector with the engine's status and result commands instead of polling companion state from the main loop, and once a job rides inside a rescue agent the main loop never touches that job's companion state, since the agent's completion notification is the only collection path and a session monitor line about an agent owned job is informational only.
-- Parallel packages declare each other. When several packages run at once against the same working tree, every brief names the sibling packages' files as intended in flight changes and forbids reverting, restoring, or cleaning anything outside its own file list, no matter how unexpected the tree looks; a worker's end state check covers its own files only, never overall tree cleanliness. A worker that "tidies" a sibling's uncommitted work destroys it.
-- Job outcomes from the grok companion carry a state line (done, error, or cancelled) and failed runs a failure kind; parse those lines rather than inferring the outcome from prose.
-- A running status from a background job is a claim, not verified progress: a worker process that dies without recording an outcome (a crash, a reboot, a stream reconnect that never recovers) leaves its job reporting running indefinitely. Before continuing to wait on any background job whose log has gone quiet, verify liveness rather than trusting status. The grok companion runs this check itself and reports such jobs as failure kind died; codex does not track its worker process, so check it directly (no codex process in ps and no process holding the job's rollout file open means the job is dead). A dead process behind a running status is a died outcome, not a slow one: cancel the job, resume the thread once with the failure attached, and if that resume also dies silently, finish the package on a different executor instead of resuming a third time.
-- Truncation is not completion. A worker result that ends in forward looking narration (for example a "Now update X:" line) or lacks the verification output its brief demanded is a truncated run (turn cap, context exhaustion, or an early stop), not a finished one: resume the same agent with SendMessage, telling it to finish the remaining work and reply with the full final report including verification, and escalate only if the resume truncates again. A forwarder style agent (such as codex:codex-rescue) that returns only a "task started in the background" line is not truncated; resuming it is futile by contract, and the main loop dispatches fusion:job-collector for it instead. Never treat the dangling text as a report, and never silently redo the work in the main loop.
-- Worker reuse is scoped and rotated. A follow up instruction may go to the same worker via SendMessage only when it modifies the same files or surface as that worker's previous brief; a new work package, a different surface, or anything that can run in parallel gets a fresh agent instead of queueing behind a warm one. Reuse is capped: after about three follow up resumes, or when completion notifications show the worker's accumulated usage nearing its context window, rotate to a fresh worker whose brief carries the accumulated decisions and current state rather than assuming the old thread's memory. Truncation resumes complete an existing brief under the rule above but still grow the same context, so they count toward rotation. The same rotation discipline applies to every warm peer thread, whether kept alive with grok's --resume-last or continued through codex resume; a peer thread whose accumulated context has grown very large is the kind most likely to die mid stream, so rotate it to a fresh thread carrying the accumulated decisions instead of resuming it again.
-- State write permission explicitly in every peer brief. Consult briefs and /grok:review run read only; only briefs that ask for repository changes run in write mode (grok-rescue passes --write for those alone; codex-rescue runs write by design). Consult (read only) briefs must instruct the peer to work by reading files only and to run no shell commands, since the consult allow list cancels the turn otherwise.
-- Never delegate to codex or grok anything touching secrets or credentials, or work whose necessary context cannot be compressed into a brief.
+Every brief is self contained: goal, constraints, relevant paths, what done looks like, and a verification command. Subagents never see this conversation; a brief states the outcome and the checks, never the solution.
 
-### Escalation ladders
+- Every dispatch is a background subagent via the Agent tool; the main loop never runs a work package itself, foreground or through a detached shell. Subagents are harness tracked: completions arrive as notifications, so they need no polling and no narration beyond the initial dispatch note.
+- Heartbeat rule: a legitimate watch style wakeup on delegated work in flight emits one short user visible status line naming what is still in flight and when the next check happens. A wakeup with only tool calls and no visible text is a silent turn and is banned, and so is a hand rolled Bash or ScheduleWakeup polling loop used in place of fusion:job-collector.
+- Same turn collection mandate: a forwarder reply that hands back a job id instead of a deliverable (codex:codex-rescue's "task started in the background" is the canonical case) must be followed, same turn, by dispatching fusion:job-collector with that job's status and result commands. The codex companion lives under the plugin cache directory, at a path like `~/.claude/plugins/cache/openai-codex/codex/<version>/scripts/codex-companion.mjs` (glob for the installed version), driven as `node <that path> status <job-id>` and `result <job-id>`; grok's companion exposes equivalent commands. Once a job rides inside a rescue agent, that agent's completion notification is the only collection path.
+- A non deliverable final message starts an obligation, not an outcome: a bare "started in the background" receipt and a truncated run ending in forward looking narration or missing verification are both unfinished. Resume a truncated, non forwarder agent with SendMessage to finish and report with verification; for a forwarder receipt, dispatch fusion:job-collector instead.
+- Parallel packages declare each other: every brief names sibling packages' files as intended in flight changes and forbids reverting, restoring, or cleaning anything outside its own list. A worker's end state check covers its own files only.
+- State write permission explicitly in every peer brief. Consult briefs and /grok:review run read only with no shell commands, since the consult allow list cancels the turn otherwise; only briefs asking for repository changes run in write mode.
+- Never delegate to codex or grok anything touching secrets, credentials, or context that cannot be compressed into a brief.
 
-Failure driven escalation applies among the Claude fusion worker tiers; peer failures are handled by the circuit breaker table below instead.
-
-- Diagnose the brief before the engine: a starved worker looks exactly like a weak one, and most "it just did not do the work" failures are under specified briefs, not capability gaps. Hold the failed brief against the dispatch gate (goal, constraints, relevant paths, done criteria, verification command); if a piece is missing, complete the brief and re-dispatch at the same tier. Only when a complete brief still failed on capability grounds, re-dispatch the SAME brief one rung up the ladder with the failure attached (fusion:trivial-worker to fusion:fast-worker to fusion:deep-reasoner, or a peer retry at higher effort). Do not fix a delegate's botched output in the main loop. The circuit breaker takes precedence: a broken engine is never a rung.
-- Quality driven escalation runs alongside the failure ladder: a completed run can still fail review. When the output is correct but below the quality bar, re-dispatch the same brief plus concrete critique one rung up, or to a better suited engine, without asking. Never accept substandard output just because the cheaper lane technically succeeded; judge the output, not the price tag.
-
-Failure kinds and the circuit breaker they drive. The grok companion emits these kinds directly; for engines that do not, map the observed failure onto the closest kind before acting:
-
-| Failure kind | Immediate action | Circuit breaker effect |
-|---|---|---|
-| quota, auth, missing_cli | Stop retrying this engine | Breaks the engine for the rest of the session |
-| rate_limited | One retry | Breaks after that one retry fails |
-| timeout | One resume (--resume <uuid>) or one --background rerun, collected through fusion:job-collector before the turn ends | Escalates to a different executor if the retry also times out; does not break the engine |
-| died | Cancel the stale job, then one resume of the thread with the failure attached | Escalates to a different executor if the resume also dies; does not break the engine |
-| error | One retry with the failure attached | Escalates after the retry; does not break the engine |
-| permission | Re-dispatch once with --write if repository changes are acceptable, otherwise rewrite the brief to avoid shell commands | Does not break the engine; this is an allow list gap, not misbehavior |
-| cancelled | Confirm with the user before treating the work as intentionally dropped | An externally killed job can also report cancelled, so verify before trusting it |
-| missing agent type or a `grok unavailable:` line | Route to the fallback lane | Breaks immediately |
-
-When an engine is broken, use the other peer for second opinions and fusion:deep-reasoner for adversarial review.
+Escalation ladders, the failure kind circuit breaker table, died process detection, and warm thread rotation math: see plugins/fusion/rules/troubleshooting.md.
