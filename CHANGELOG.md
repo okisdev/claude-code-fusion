@@ -1,5 +1,13 @@
 # changelog
 
+## 0.0.15
+
+- the routing rules are rewritten around one output invariant, done means collected and verified, and come out roughly half the length; the codex row now requires synchronous execution inside every codex brief, same turn collection through fusion:job-collector naming the codex companion's status and result commands, a heartbeat rule against silent polling turns, and receipts and truncation merged into one non deliverable rule; escalation ladders and the circuit breaker table move out to a new plugins/fusion/rules/troubleshooting.md so the live rules stay lean while the reference material is still one read away
+- new session scoped codex jobs monitor (plugins/fusion/scripts/codex-jobs-monitor.mjs, wired through plugins/fusion/monitors/monitors.json): jobs are scoped to the current workspace via the git root, failed and cancelled lines gain an errorMessage suffix, and a running record whose driving process has vanished is reported once as died instead of forever
+- fusion:job-collector's contract narrows to foreground only polling; its final message is always the collected result or a collector timeout line, never a background handoff
+- grok-rescue and the grok cli runtime skill stop passing --background on their own initiative; it is reserved for briefs that are explicitly watch style, with a documented recovery procedure for a stray flag
+- test suite grows to 144 with a dedicated suite for the codex jobs monitor (session scoping, error suffixes, died detection)
+
 ## 0.0.14
 
 - the background job monitor is session scoped: each session's monitor now emits only jobs whose recorded claude session id matches its own CLAUDE_CODE_SESSION_ID (verified injected into monitor processes), fixing live cross session noise where every session in a workspace heard every other session's completions; it degrades to workspace wide reporting when the env var is unavailable, absorbs pre existing terminal jobs regardless of owner, survives transient registry races (the per tick scan is exception proof, since claude code never restarts a crashed monitor), handles SIGHUP, and its line no longer tells the orchestrator to reflexively run /grok:result, motivated by a live monitor death (exit 144) and a user hitting the cross session leak within a day of 0.0.13

@@ -1,0 +1,8 @@
+[
+  {
+    "name": "codex-jobs",
+    "command": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/codex-jobs-monitor.mjs\"",
+    "description": "Codex background job completions",
+    "when": "always"
+  }
+]
