@@ -16,8 +16,30 @@
         "hooks": [
           {
             "type": "command",
-            "command": "echo 'Context was compacted. Reassess routing for the remaining work: does anything now belong to fusion:deep-reasoner, a peer engine, or the panel? Has difficulty emerged since the original plan?'",
+            "command": "echo 'Context was compacted. Restate the session execution posture (coordinate, implement, or triage) in your next message. If the main loop has made five or more file edits since the last collected delegate result, posture is implement: package and dispatch before further product edits. Reassess routing for the remaining work: does anything now belong to fusion:deep-reasoner, a peer engine, or the panel?'",
             "timeout": 5
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "^(Edit|Write|NotebookEdit|MultiEdit)$",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/inline-delegation-guard.mjs\"",
+            "timeout": 10
+          }
+        ]
+      },
+      {
+        "matcher": "^(Agent|Task)$",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/inline-delegation-guard.mjs\"",
+            "timeout": 10
           }
         ]
       }
