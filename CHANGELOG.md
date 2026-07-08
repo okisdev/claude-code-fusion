@@ -1,5 +1,12 @@
 # changelog
 
+## 0.0.16
+
+- new benchmark condition B3, the advisor profile: fusion enabled with claude tiers only like B1, but the main session model pinned to sonnet, testing the executor centric topology where a cheap model runs every turn and consults stronger tiers on demand; new claim C1c compares B3 against B1 claude billed tokens under the same comparability gate as C1a, so the official advisor pattern is measured against the default orchestrator profile instead of taken on faith
+- the runner observes the profile instead of trusting the flag: conditionNotes gains a required mainSessionModel field read from the profile's settings.json (null when absent), and a B3 invocation refuses to start when the detected model is not sonnet, so mislabeled runs cannot contaminate C1c after the fact
+- zero delegation handling splits by condition: B1 and B2 runs that never delegate stay invalid for claims, while a zero delegation B3 run remains claim eligible and is disclosed as valid-zero-delegation in the delegation table, since keeping work in the executor loop is the behavior under test
+- test suite grows from 144 to 146: B3 acceptance and refusal paths, mainSessionModel recording, C1c rendering, and the zero delegation label
+
 ## 0.0.15
 
 - the routing rules are rewritten around one output invariant, done means collected and verified, and come out roughly half the length; the codex row now requires synchronous execution inside every codex brief, same turn collection through fusion:job-collector naming the codex companion's status and result commands, a heartbeat rule against silent polling turns, and receipts and truncation merged into one non deliverable rule; escalation ladders and the circuit breaker table move out to a new plugins/fusion/rules/troubleshooting.md so the live rules stay lean while the reference material is still one read away
