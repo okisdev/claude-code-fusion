@@ -30,7 +30,8 @@ function baseRecord(overrides = {}) {
     conditionNotes: {
       detection: "filesystem",
       installedPlugins: ["fusion"],
-      routingRulesPresent: false
+      routingRulesPresent: false,
+      mainSessionModel: null
     },
     claudeExit: 0,
     verifyExit: 0,
@@ -58,6 +59,9 @@ function baseRecord(overrides = {}) {
   }
   if (!("peerTokens" in overrides)) {
     record.peerTokens = record.condition === "B2" ? { grok: null, codex: null } : null;
+  }
+  if (!("conditionNotes" in overrides) && record.condition === "B3") {
+    record.conditionNotes = { ...record.conditionNotes, mainSessionModel: "sonnet" };
   }
   return record;
 }
@@ -210,7 +214,9 @@ test("summarize renders claim comparisons with billed Claude token deltas", (t) 
     baseRecord({ condition: "B1", repetition: 1, claudeTokens: billedTokens(100), delegationCount: 1 }),
     baseRecord({ condition: "B1", repetition: 2, claudeTokens: billedTokens(100), delegationCount: 1 }),
     baseRecord({ condition: "B2", repetition: 1, claudeTokens: billedTokens(50), delegationCount: 1 }),
-    baseRecord({ condition: "B2", repetition: 2, claudeTokens: billedTokens(50), delegationCount: 1 })
+    baseRecord({ condition: "B2", repetition: 2, claudeTokens: billedTokens(50), delegationCount: 1 }),
+    baseRecord({ condition: "B3", repetition: 1, claudeTokens: billedTokens(80), delegationCount: 0 }),
+    baseRecord({ condition: "B3", repetition: 2, claudeTokens: billedTokens(80), delegationCount: 0 })
   ];
   const dir = writeResultsDir(root, "run-1", { records });
 
@@ -218,23 +224,35 @@ test("summarize renders claim comparisons with billed Claude token deltas", (t) 
   assert.strictEqual(result.status, 0, result.stderr);
   assert.match(result.stdout, /C1a A vs B1 Claude billed tokens, B1 minus A: mean delta -100, median delta -100, tasks 1\./);
   assert.match(result.stdout, /C1b B1 vs B2 Claude billed tokens, B2 minus B1: mean delta -50, median delta -50, tasks 1\./);
+  assert.match(result.stdout, /C1c B1 vs B3 Claude billed tokens, B3 minus B1: mean delta -20, median delta -20, tasks 1\./);
   assert.match(result.stdout, /C1b peer tokens: not measurable while peerTokens are null\./);
 });
 
-test("summarize flags B runs without delegation as invalid for claims", (t) => {
+test("summarize keeps B3 zero delegation valid for claims", (t) => {
   const root = makeSandbox(t);
+  const billedTokens = (total) => ({
+    orchestrator: tokenCounts(total / 2, total / 4, total / 8, total / 8),
+    subagents: tokenCounts(0, 0, 0, 0),
+    byModel: {}
+  });
   const records = [
-    baseRecord({ condition: "A", repetition: 1 }),
-    baseRecord({ condition: "A", repetition: 2 }),
-    baseRecord({ condition: "B1", repetition: 1, delegationCount: 0 }),
-    baseRecord({ condition: "B1", repetition: 2, delegationCount: 0 })
+    baseRecord({ condition: "A", repetition: 1, claudeTokens: billedTokens(200) }),
+    baseRecord({ condition: "A", repetition: 2, claudeTokens: billedTokens(200) }),
+    baseRecord({ condition: "B1", repetition: 1, claudeTokens: billedTokens(100), delegationCount: 0 }),
+    baseRecord({ condition: "B1", repetition: 2, claudeTokens: billedTokens(100), delegationCount: 0 }),
+    baseRecord({ taskId: "T02-second", condition: "B1", repetition: 1, claudeTokens: billedTokens(100), delegationCount: 1 }),
+    baseRecord({ taskId: "T02-second", condition: "B1", repetition: 2, claudeTokens: billedTokens(100), delegationCount: 1 }),
+    baseRecord({ taskId: "T02-second", condition: "B3", repetition: 1, claudeTokens: billedTokens(80), delegationCount: 0 }),
+    baseRecord({ taskId: "T02-second", condition: "B3", repetition: 2, claudeTokens: billedTokens(80), delegationCount: 0 })
   ];
   const dir = writeResultsDir(root, "run-1", { records });
 
   const result = runSummarize([dir]);
   assert.strictEqual(result.status, 0, result.stderr);
   assert.match(result.stdout, /\| T01-first \| B1 \| 0 \| 0 \| invalid-for-claims \|/);
+  assert.match(result.stdout, /\| T02-second \| B3 \| 0 \| 0 \| valid-zero-delegation \|/);
   assert.match(result.stdout, /C1a A vs B1 Claude billed tokens, B1 minus A: not enough comparable passing runs\./);
+  assert.match(result.stdout, /C1c B1 vs B3 Claude billed tokens, B3 minus B1: mean delta -20, median delta -20, tasks 1\./);
 });
 
 test("summarize rejects schema records with negative numbers and invalid exclusions", (t) => {
@@ -243,7 +261,16 @@ test("summarize rejects schema records with negative numbers and invalid exclusi
     baseRecord(),
     baseRecord({ repetition: 2, wallClockSeconds: -1 }),
     baseRecord({ repetition: 3, excluded: true, excludedReason: null }),
-    baseRecord({ condition: "B2", repetition: 4, peerTokens: null })
+    baseRecord({ condition: "B2", repetition: 4, peerTokens: null }),
+    baseRecord({ condition: "B3", repetition: 5, peerTokens: { grok: null, codex: null } }),
+    baseRecord({
+      repetition: 6,
+      conditionNotes: {
+        detection: "filesystem",
+        installedPlugins: ["fusion"],
+        routingRulesPresent: false
+      }
+    })
   ];
   const dir = writeResultsDir(root, "run-1", { records });
 
@@ -252,4 +279,6 @@ test("summarize rejects schema records with negative numbers and invalid exclusi
   assert.match(result.stdout, /runs\.jsonl:2: record\.wallClockSeconds: expected at least 0/);
   assert.match(result.stdout, /runs\.jsonl:3: record\.excludedReason: required when excluded is true/);
   assert.match(result.stdout, /runs\.jsonl:4: record\.peerTokens: required for condition B2/);
+  assert.match(result.stdout, /runs\.jsonl:5: record\.peerTokens: expected null for condition B3/);
+  assert.match(result.stdout, /runs\.jsonl:6: record\.conditionNotes\.mainSessionModel: missing required property/);
 });

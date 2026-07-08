@@ -13,7 +13,7 @@ const SELF_PATH = fileURLToPath(import.meta.url);
 const BENCH_DIR = path.dirname(SELF_PATH);
 const REPO_ROOT = path.dirname(BENCH_DIR);
 const DEFAULT_TASK_ROOT = path.join(BENCH_DIR, "tasks");
-const CONDITIONS = new Set(["A", "B1", "B2"]);
+const CONDITIONS = new Set(["A", "B1", "B2", "B3"]);
 const CLI_VERSION_TIMEOUT_MS = 2000;
 const CLAUDE_PLUGIN_CACHE_DIR_ENV = "CLAUDE_PLUGIN_CACHE_DIR";
 const CODEX_PLUGIN_CACHE_SEGMENTS = ["openai-codex", "codex"];
@@ -318,11 +318,22 @@ function scanConfigNames(root) {
 function detectConditionNotes(claudeConfigDir) {
   const names = scanConfigNames(claudeConfigDir).map((name) => name.toLowerCase());
   const installedPlugins = ["claude-code-fusion", "fusion", "grok", "codex"].filter((plugin) => names.some((name) => name.includes(plugin)));
+  const settings = readJsonFile(path.join(claudeConfigDir, "settings.json"));
+  const mainSessionModel = typeof settings?.model === "string" && settings.model.length > 0 ? settings.model : null;
   return {
     detection: "filesystem",
     installedPlugins,
-    routingRulesPresent: fs.existsSync(path.join(claudeConfigDir, "rules", "orchestration.md"))
+    routingRulesPresent: fs.existsSync(path.join(claudeConfigDir, "rules", "orchestration.md")),
+    mainSessionModel
   };
+}
+
+function validateConditionNotes(options, conditionNotes) {
+  if (options.condition === "B3" && conditionNotes.mainSessionModel !== "sonnet") {
+    throw new Error(
+      `Invalid B3 configuration: expected ${path.join(options.claudeConfigDir, "settings.json")} to contain {"model": "sonnet"}; detected ${JSON.stringify(conditionNotes.mainSessionModel)}.`
+    );
+  }
 }
 
 function taskTags(manifest) {
@@ -756,13 +767,22 @@ async function main() {
     return;
   }
 
+  const conditionNotes = detectConditionNotes(options.claudeConfigDir);
+  try {
+    validateConditionNotes(options, conditionNotes);
+  } catch (error) {
+    process.stderr.write(`${oneLine(error.message)}\n`);
+    process.exitCode = 1;
+    return;
+  }
+
   const manifest = buildManifest(options.taskRoot);
   writeEnv(options, manifest);
   const context = {
     runId: randomUUID(),
     startedAt: new Date().toISOString(),
     taskManifestHash: manifest.manifestHash,
-    conditionNotes: detectConditionNotes(options.claudeConfigDir),
+    conditionNotes,
     claudeExit: null,
     verifyExit: null,
     wallClockSeconds: 0,

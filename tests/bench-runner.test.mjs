@@ -138,7 +138,8 @@ test("runner appends a valid record with verifier success and split token totals
   assert.deepStrictEqual(record.conditionNotes, {
     detection: "filesystem",
     installedPlugins: ["fusion"],
-    routingRulesPresent: false
+    routingRulesPresent: false,
+    mainSessionModel: null
   });
   assert.strictEqual(record.claudeExit, 0);
   assert.strictEqual(record.verifyExit, 0);
@@ -180,6 +181,31 @@ test("runner appends a valid record with verifier success and split token totals
   assert.strictEqual(fakeRun.sawVerify, false);
   assert.deepStrictEqual(fakeRun.args, ["-p", "Edit the marker file.\n", "--output-format", "json"]);
   assert.strictEqual(fs.existsSync(fakeRun.cwd), false);
+});
+
+test("runner accepts condition B3 with null peer tokens", (t) => {
+  const sandbox = makeSandbox(t);
+  fs.writeFileSync(path.join(sandbox.claudeConfigDir, "settings.json"), JSON.stringify({ model: "sonnet" }), "utf8");
+  const result = runBench(sandbox, { condition: "B3", repetition: 1 });
+  assert.strictEqual(result.status, 0, result.stderr);
+  const records = readRecords(sandbox);
+  assert.strictEqual(records.length, 1);
+  assert.strictEqual(records[0].condition, "B3");
+  assert.strictEqual(records[0].repetition, 1);
+  assert.strictEqual(records[0].peerTokens, null);
+  assert.strictEqual(records[0].conditionNotes.mainSessionModel, "sonnet");
+});
+
+test("runner refuses condition B3 without a sonnet settings pin", (t) => {
+  const sandbox = makeSandbox(t);
+  const result = runBench(sandbox, { condition: "B3", repetition: 1 });
+  assert.notStrictEqual(result.status, 0);
+  assert.match(result.stderr, /Invalid B3 configuration/);
+  assert.match(result.stderr, /settings\.json/);
+  assert.match(result.stderr, /\{"model": "sonnet"\}/);
+  assert.deepStrictEqual(readRecords(sandbox), []);
+  assert.strictEqual(fs.existsSync(sandbox.envFile), false);
+  assert.strictEqual(fs.existsSync(sandbox.fakeRunsFile), false);
 });
 
 test("runner writes an infra failure record when the transcript is missing", (t) => {
