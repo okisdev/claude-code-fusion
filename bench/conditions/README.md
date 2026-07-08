@@ -52,3 +52,21 @@ claude plugin enable codex@openai-codex
 `claude auth login` is interactive. Grok CLI authentication and Codex CLI authentication are also interactive, but their exact login commands are owned by those CLIs and are not defined in this repository. Start an interactive Claude session in the same `CLAUDE_CONFIG_DIR`, accept the workspace trust prompt if it appears, run `/fusion:setup`, approve the routing rule install, and approve the optional `Bash(node:*)` permission for this benchmark profile. Run `/grok:setup` after the Grok CLI login so the companion can confirm the runtime path.
 
 The runner emits `peerTokens: { "grok": null, "codex": null }` for B2 in this slice. Parsing Grok and Codex subscription token logs is a later package, so B2 peer token fields are placeholders until that parser lands.
+
+## Condition B3
+
+Condition B3 enables only the fusion plugin so the Claude tier agents and fusion routing rules are available, with the main session model fixed to the Sonnet tier before any benchmark session starts. Peer plugins are not installed for this profile. B3 must not reuse the B1 directory; discard any shared directory and create a clean B3 profile instead.
+
+```bash
+export CLAUDE_CONFIG_DIR=/absolute/path/to/bench-configs/B3
+mkdir -p "$CLAUDE_CONFIG_DIR"
+printf '%s\n' '{"model": "sonnet"}' > "$CLAUDE_CONFIG_DIR/settings.json"
+claude auth login
+claude plugin marketplace add okisdev/claude-code-fusion
+claude plugin install fusion@claude-code-fusion
+claude plugin enable fusion@claude-code-fusion
+claude plugin disable grok@claude-code-fusion
+claude plugin disable codex@openai-codex
+```
+
+`claude auth login` is interactive. If the Grok or Codex plugin is not installed, the disable command may report that there is nothing to disable, which is acceptable for B3. Start an interactive Claude session in the same `CLAUDE_CONFIG_DIR`, accept the workspace trust prompt if it appears, run `/fusion:setup`, approve the routing rule install, and approve the optional `Bash(node:*)` permission only for this benchmark profile. Do not run `/grok:setup`, do not authenticate Grok or Codex in this profile, and do not install peer plugins for B3. The runner refuses a B3 invocation unless `$CLAUDE_CONFIG_DIR/settings.json` contains `{"model": "sonnet"}`.

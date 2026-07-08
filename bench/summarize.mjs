@@ -7,7 +7,7 @@ import { fileURLToPath } from "node:url";
 const SELF_PATH = fileURLToPath(import.meta.url);
 const BENCH_DIR = path.dirname(SELF_PATH);
 const SCHEMA_PATH = path.join(BENCH_DIR, "schema", "run-record.schema.json");
-const CONDITION_ORDER = ["A", "B1", "B2"];
+const CONDITION_ORDER = ["A", "B1", "B2", "B3"];
 const MIN_PASSES_FOR_COMPARISON = 2;
 const EXCLUSION_CAP = 0.05;
 
@@ -150,7 +150,7 @@ function validateRunRecord(schema, record) {
   if (record.condition === "B2" && (record.peerTokens === null || typeof record.peerTokens !== "object")) {
     errors.push("record.peerTokens: required for condition B2");
   }
-  if ((record.condition === "A" || record.condition === "B1") && record.peerTokens !== null) {
+  if (["A", "B1", "B3"].includes(record.condition) && record.peerTokens !== null) {
     errors.push(`record.peerTokens: expected null for condition ${record.condition}`);
   }
   if (record.verdict === "infra_failure" && record.infraFailure === null) {
@@ -422,9 +422,9 @@ function buildTokenTable(groups) {
 }
 
 function buildDelegationSection(records) {
-  const bRecords = records.filter((record) => record.condition === "B1" || record.condition === "B2");
+  const bRecords = records.filter((record) => record.condition === "B1" || record.condition === "B2" || record.condition === "B3");
   if (bRecords.length === 0) {
-    return ["### Delegation counts", "", "No B condition runs."].join("\n");
+    return ["### Delegation counts", "", "No fusion enabled condition runs."].join("\n");
   }
   const groups = groupRecords(bRecords);
   const maxRepetition = groups.reduce((max, group) => {
@@ -440,11 +440,16 @@ function buildDelegationSection(records) {
       const record = byRepetition.get(repetition);
       cells.push(record ? String(record.delegationCount) : "-");
     }
+    const claimValidity = group.records.some(isInvalidForClaims)
+      ? "invalid-for-claims"
+      : group.condition === "B3" && group.records.some((record) => record.delegationCount === 0)
+        ? "valid-zero-delegation"
+        : "valid-for-claims";
     rows.push([
       group.taskId,
       group.condition,
       ...cells,
-      group.records.some(isInvalidForClaims) ? "invalid-for-claims" : "valid-for-claims"
+      claimValidity
     ]);
   }
   return ["### Delegation counts", "", renderTable(rows)].join("\n");
@@ -532,12 +537,14 @@ function buildComparisonsSection(records, env) {
   const claimRecords = records.filter((record) => !record.excluded);
   const c1a = comparableTaskDeltas(claimRecords, "A", "B1", totalClaudeBilledTokens);
   const c1b = comparableTaskDeltas(claimRecords, "B1", "B2", totalClaudeBilledTokens);
+  const c1c = comparableTaskDeltas(claimRecords, "B1", "B3", totalClaudeBilledTokens);
   const plans = planTaskIds(env);
   const lines = [
     "### Comparisons",
     "",
     formatDeltaLine("C1a A vs B1 Claude billed tokens, B1 minus A", c1a),
     formatDeltaLine("C1b B1 vs B2 Claude billed tokens, B2 minus B1", c1b),
+    formatDeltaLine("C1c B1 vs B3 Claude billed tokens, B3 minus B1", c1c),
     peerTokenLine(claimRecords)
   ];
   if (plans.size === 0) {
