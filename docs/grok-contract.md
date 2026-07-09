@@ -1,8 +1,8 @@
 # Grok CLI contract
 
-The original facts below were verified live against grok 0.2.16 on July 2, 2026 and are implemented by `plugins/grok/scripts/`. Permission matcher behavior was rechecked locally against grok 0.2.82 on July 4, 2026 through `grok --help` and the installed user guide. They are maintainer documentation; nothing here is needed to use the plugin. The Grok CLI evolves, so treat every claim as pinned to those versions and reverify after CLI updates.
+The facts below are implemented by `plugins/grok/scripts/` and verified against the installed grok CLI. They are maintainer documentation; nothing here is needed to use the plugin. The Grok CLI evolves, so reverify after CLI updates.
 
-The shared companion outcome contract lives in [docs/companion-contract.md](companion-contract.md). This document is the Grok instance and records only Grok CLI invocation, flags, envelopes, field names, constants, and version pinned behavior.
+The shared companion outcome contract lives in [docs/companion-contract.md](companion-contract.md). This document is the Grok instance and records only Grok CLI invocation, flags, envelopes, field names, constants, and behavior.
 
 ## Shared companion contract
 
@@ -32,9 +32,15 @@ Job statuses, liveness, rendered outcome footers, failure kind definitions, back
 - Timeouts: foreground runs default to 570000ms (deliberately below the 600000ms Bash timeout the forwarder agent uses, so the companion always reaps first and writes the record); background workers cap at 1800000ms; the stop gate caps its grok call at 240000ms inside the hook's 900 second budget; the `/grok:review` background flow overrides the foreground default with `GROK_COMPANION_TIMEOUT_MS=1800000`. Timeout, cancel, and SessionEnd cleanup send SIGTERM, poll for up to 2000ms, then escalate to SIGKILL when the process group is still alive. Exit codes: 0 ok, 1 error, 130 SIGINT, 137 SIGKILL, 143 SIGTERM, and other signals map to 128 plus the signal number. Interrupted runs keep their file modifications and are resumable via the session uuid when grok reported one before the interruption; a run killed before emitting its JSON envelope leaves no session id on the record.
 - Grok uses `pid` for the driving worker pid and `grokPid` for the Grok CLI child pid. The pidless launcher grace window defaults to 15000ms and can be overridden with `GROK_COMPANION_PIDLESS_RUNNING_GRACE_MS`.
 
+## Background collection
+
+- `result <job-id> --wait` blocks while the job is running, polls the job record every 2000ms by default, refreshes the same liveness check as `status`, and renders the same terminal output as `result` once the job reaches `done`, `error`, or `cancelled`.
+- The wait poll interval is controlled by `GROK_COMPANION_WAIT_POLL_MS`. The wait budget defaults to 570000ms, can be set with `--wait-timeout-ms <ms>` or `GROK_COMPANION_WAIT_TIMEOUT_MS`, and is clamped to 570000ms so each foreground wait call returns under the forwarder Bash cap.
+- If the wait budget elapses while the job is still running, the command prints a compact running render ending in `state: running` and exits 0. Forwarders chain another foreground `result <job-id> --wait` call in the same turn only while the output ends in the line `state: running`; any other output is terminal.
+
 ## Environment overrides
 
-- `GROK_BIN`: grok binary override (tests point it at a fake). `GROK_COMPANION_DATA`: state directory override (default `~/.claude/plugins/data/grok-claude-code-fusion`). `GROK_COMPANION_TIMEOUT_MS`: foreground timeout override. `GROK_COMPANION_PIDLESS_RUNNING_GRACE_MS`: pidless launcher grace override. `GROK_CONSULT_ALLOW`: comma separated extra allow rules appended to the consult mode allow list; deny rules still beat them and write mode ignores this variable.
+- `GROK_BIN`: grok binary override (tests point it at a fake). `GROK_COMPANION_DATA`: state directory override (default `~/.claude/plugins/data/grok-claude-code-fusion`). `GROK_COMPANION_TIMEOUT_MS`: foreground timeout override. `GROK_COMPANION_PIDLESS_RUNNING_GRACE_MS`: pidless launcher grace override. `GROK_COMPANION_WAIT_POLL_MS`: result wait poll interval override. `GROK_COMPANION_WAIT_TIMEOUT_MS`: result wait budget override, clamped to 570000ms. `GROK_CONSULT_ALLOW`: comma separated extra allow rules appended to the consult mode allow list; deny rules still beat them and write mode ignores this variable.
 
 ## Stop gate
 
@@ -45,6 +51,7 @@ Job statuses, liveness, rendered outcome footers, failure kind definitions, back
 ## Review contract
 
 - `/grok:review` uses `plugins/grok/prompts/review.md` for the model contract and `validateReviewOutput` in `plugins/grok/scripts/lib/render.mjs` as the canonical runtime validator. There is no separate JSON schema file in the runtime contract.
+- `review --background` creates the same review job record as the foreground path, spawns a detached `review-worker --job-id <id>` with ignored stdio, and returns the standard background launch render. The review worker runs the existing review flow, including the corrective retry, and writes the same `resultText`, session id, and terminal status that the foreground review path writes.
 
 ## Degradation
 

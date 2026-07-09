@@ -13,9 +13,9 @@ Primary helper:
 Subcommand surface:
 
 - `task [prompt] [--prompt-file <path>] [--write] [--web] [--background] [--resume <uuid>] [--resume-last] [--model <id>] [--effort <level>] [--max-turns <n>] [--best-of-n <n>] [--cwd <dir>] [--json]`
-- `review [--base <ref>] [--focus <text>] [--cwd <dir>] [--json]`
+- `review [--base <ref>] [--focus <text>] [--cwd <dir>] [--background] [--json]`
 - `status [job-id] [--cwd <dir>] [--json]`
-- `result <job-id> [--json]`
+- `result <job-id> [--wait] [--wait-timeout-ms <ms>] [--json]`
 - `cancel <job-id> [--cwd <dir>] [--json]`
 - `stats [--all] [--cwd <dir>] [--json]`
 - `setup [--enable-stop-gate] [--disable-stop-gate] [--json]`
@@ -23,11 +23,12 @@ Subcommand surface:
 
 Execution rules:
 
-- Use exactly one helper call per delegation. The caller is a forwarder, not an orchestrator.
+- Forwarders call the helper through foreground `Bash` with timeout `600000`. Ordinary delegations use one helper call; long running delegations use one detached companion launch followed by a `result --wait` collection chain in the same turn.
 - Prefer the helper over hand-rolled `git`, direct Grok CLI strings, or any other Bash activity.
 - Consult mode is the default; `--write` grants Grok edit permission inside the workspace sandbox, and `--web` re-enables the web tools for research briefs.
-- `--best-of-n` runs an implementation tournament (verified against grok 0.2.16, see docs/grok-contract.md; the companion accepts 2 to 10); it implies write mode with auto approval (the winning candidate is applied to the workspace), so pass it only when edits are acceptable.
-- `--background` detaches the run into a worker; the helper prints the job id plus `/grok:status` and `/grok:result` hints. Pass it only when the caller's brief explicitly asks for watch style or background execution; a forwarding agent must never add it on its own, since a detached job has no completion notification and silently converts tracked work into untracked work.
+- `--best-of-n` runs an implementation tournament (see docs/grok-contract.md; the companion accepts 2 to 10); it implies write mode with auto approval (the winning candidate is applied to the workspace), so pass it only when edits are acceptable.
+- `--background` detaches `task` or `review` into a worker; the helper prints the job id plus `/grok:status` and `/grok:result` hints. Forwarders use it only for long runs (large write packages, `best-of-n`, or work expected past roughly nine minutes), then collect that same job in the same turn with repeated `result <job-id> --wait` calls chaining while the output ends in `state: running`; any other output is terminal.
+- `result --wait` blocks while a job is running, refreshes liveness on each poll, and prints the same terminal output as `result` when the job finishes. If its bounded wait budget elapses first, it prints a compact running render ending in `state: running` and exits zero so the forwarder can issue another foreground wait call.
 - A user asking to resume maps to the companion's `--resume <uuid>` or `--resume-last`. Never invent a session uuid; only uuids Grok returned are resumable. `--resume-last` resumes the newest non running job with a session id for the workspace, preferring jobs started from the current Claude session.
 - Leave `--model` and `--effort` unset so Grok's own config rules apply, unless the user explicitly asks for a specific model or effort level.
 - `--cwd` scopes the workspace for task, review, status, and stats. A bad value fails before a job record is created.

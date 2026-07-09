@@ -105,6 +105,24 @@ test("result marks a running record whose driver pid died as died", async (t) =>
   assert.match(updated.errorMessage, new RegExp(`pid ${pid}`));
 });
 
+test("result --wait marks a running record whose driver pid died as died", async (t) => {
+  const sandbox = makeSandbox(t);
+  const pid = await makeDeadPid();
+  const { file, record } = seedJob(sandbox, { pid });
+  const result = runCompanion(["result", record.id, "--wait"], {
+    cwd: sandbox.workDir,
+    env: envFor(sandbox, { GROK_COMPANION_WAIT_POLL_MS: "10" }),
+  });
+  assert.strictEqual(result.status, 0, result.stderr);
+  assert.match(result.stdout, /^state: error$/m);
+  assert.match(result.stdout, /^failure: died$/m);
+  assert.match(result.stdout, /exited without recording an outcome/);
+  const updated = readJobRecordFile(file);
+  assert.strictEqual(updated.status, "error");
+  assert.strictEqual(updated.failureKind, "died");
+  assert.match(updated.errorMessage, new RegExp(`pid ${pid}`));
+});
+
 test("status and result leave a running record alone when its driver process is alive", (t) => {
   const sandbox = makeSandbox(t);
   const { file, record } = seedJob(sandbox, { pid: process.pid });

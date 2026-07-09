@@ -82,6 +82,49 @@ test("background task creates a job record and result prints the finished output
   assert.ok(statusOutput.stdout.includes("done"));
 });
 
+test("result --wait on a background task returns the terminal output", async (t) => {
+  const sandbox = makeSandbox(t);
+  const env = envFor(sandbox, { GROK_COMPANION_WAIT_POLL_MS: "10" });
+  const launch = runCompanion(["task", "background wait work", "--background"], {
+    cwd: sandbox.workDir,
+    env,
+  });
+  assert.strictEqual(launch.status, 0, launch.stderr);
+  const record = await waitFor(() => jobRecords(sandbox.dataDir)[0]);
+  const result = runCompanion(["result", record.id, "--wait"], { cwd: sandbox.workDir, env });
+  assert.strictEqual(result.status, 0, result.stderr);
+  assert.ok(result.stdout.includes("FAKE-OK"));
+  assert.match(result.stdout, /^grok-session: 11111111-1111-7111-8111-111111111111$/m);
+  assert.match(result.stdout, new RegExp(`^job: ${record.id}$`, "m"));
+  assert.match(result.stdout, /^state: done$/m);
+});
+
+test("result --wait exits zero with a running state when its wait budget elapses", async (t) => {
+  const sandbox = makeSandbox(t);
+  const env = envFor(sandbox, { FAKE_GROK_MODE: "hang", GROK_COMPANION_WAIT_POLL_MS: "10" });
+  const launch = runCompanion(["task", "slow background wait", "--background"], {
+    cwd: sandbox.workDir,
+    env,
+  });
+  assert.strictEqual(launch.status, 0, launch.stderr);
+  const running = await waitFor(() => {
+    const current = jobRecords(sandbox.dataDir)[0];
+    return current && current.status === "running" && current.pid && current.grokPid ? current : null;
+  });
+  t.after(() => {
+    killGroups(running.grokPid);
+    killGroups(running.pid);
+  });
+  const result = runCompanion(["result", running.id, "--wait", "--wait-timeout-ms", "20"], {
+    cwd: sandbox.workDir,
+    env,
+  });
+  assert.strictEqual(result.status, 0, result.stderr);
+  assert.match(result.stdout, new RegExp(`^Job ${running.id}$`, "m"));
+  assert.match(result.stdout, /^Status: running$/m);
+  assert.ok(result.stdout.endsWith("state: running\n"));
+});
+
 test("background task failure ends in an error record", async (t) => {
   const sandbox = makeSandbox(t);
   const result = runCompanion(["task", "doomed", "--background"], {
