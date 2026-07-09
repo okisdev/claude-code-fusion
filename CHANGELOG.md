@@ -1,5 +1,18 @@
 # changelog
 
+## 0.0.18
+
+- the routing rules upgrade grok from the fast coding lane to a second frontier implementation lane after xAI shipped its flagship as the CLI default on 2026-07-08; quick and trivial briefs now name low effort or the fast SKU explicitly so speed is intentional rather than assumed, and the design decision exclusion becomes a capability table condition instead of a baked weakness claim
+- /fusion:doctor's drift check for the grok default becomes direction neutral against the capability table instead of assuming a fast tier
+- hardcoded model names and context windows are removed from grok-prompting and the README (retired Composer references)
+- the contract and skill docs drop version pinned verification notes and dated qualifiers; docs state the current contract only and get reverified after CLI updates
+- /fusion:config gains a proposal flow that enumerates the live engine lineup, drafts a full scorecard with rationale (verifying against live sources when a default model is newer than the assistant's knowledge), confirms everything in one batched question, and writes only confirmed rows through the existing rescore plumbing, motivated by the capability table shipping empty by design while scoring stayed a chore nobody performed, so routing ran on qualitative prose indefinitely
+- /fusion:doctor recommends the proposal flow when the table is entirely unscored and /fusion:setup points at it while the live rules still carry the placeholder table
+- the grok companion gains blocking collection with `result --wait`, including the bounded `state: running` chaining contract, and `review --background` now rides a detached `review-worker` so review jobs have the same worker backed collection path as tasks
+- grok-rescue and grok-review-runner replace `run_in_background` with foreground Bash calls using an explicit 600000ms timeout; long runs launch the companion with `--background` only when they chain `result --wait` to a terminal state in the same turn, and receipt final messages are banned, motivated by live sessions where every grok-rescue dispatch returned a started receipt instead of a deliverable and the orchestrator had to spawn a collector per package
+- the codex lane becomes explicitly single flight (one package in flight per workspace, overflow spec grade work routes to grok) and gains a consolidation heuristic (three or more quick scoped packages on one subsystem with long horizon shape merge into one spec grade codex brief), motivated by usage forensics showing the 0.0.15 collection mandate plus frictionless grok defaults cut codex CLI sessions from 27 to 5 in a day while concurrent dispatches died on single flight rejections
+- both plugins and the marketplace bump to 0.0.18
+
 ## 0.0.17
 
 - the routing rules gain a session execution posture: coordinate, implement, and triage persist per goal across turns instead of reclassifying every message, a micro step gate bounds the main loop to one small directly verified edit per goal, and four accumulation triggers (two consecutive edit turns, five edits since the last verified collection, a second fix of the same file or symptom, a failed inline verification) force a declared transition to implement before the next product edit; motivated by measured sessions after 0.0.15 where interactive debugging classified every turn as a small step and accumulated 80 plus inline edits with zero delegation while package shaped work still routed normally
