@@ -56,6 +56,11 @@ const STOP_GATE_PROMPT_FILE = path.join(ROOT_DIR, "prompts", "stop-gate.md");
 const STOP_GATE_OPTION_ENV = "CLAUDE_PLUGIN_OPTION_STOP_GATE";
 const STOP_GATE_TIMEOUT_MS = 240000;
 const STOP_GATE_MAX_TURNS = 15;
+const WAIT_POLL_ENV = "GROK_COMPANION_WAIT_POLL_MS";
+const WAIT_TIMEOUT_ENV = "GROK_COMPANION_WAIT_TIMEOUT_MS";
+const DEFAULT_WAIT_POLL_MS = 2000;
+const DEFAULT_WAIT_TIMEOUT_MS = 570000;
+const MAX_WAIT_TIMEOUT_MS = 570000;
 const CONTINUE_PROMPT =
   "Continue from the current thread state. Pick the next highest-value step and follow through until the task is resolved.";
 
@@ -64,9 +69,9 @@ function printUsage() {
     [
       "Usage:",
       "  node scripts/grok-companion.mjs task [prompt] [--prompt-file <path>] [--write] [--web] [--background] [--resume <uuid>] [--resume-last] [--model <id>] [--effort <level>] [--max-turns <n>] [--best-of-n <n>] [--cwd <dir>] [--json]",
-      "  node scripts/grok-companion.mjs review [--base <ref>] [--focus <text>] [--cwd <dir>] [--json]",
+      "  node scripts/grok-companion.mjs review [--base <ref>] [--focus <text>] [--cwd <dir>] [--background] [--json]",
       "  node scripts/grok-companion.mjs status [job-id] [--cwd <dir>] [--json]",
-      "  node scripts/grok-companion.mjs result <job-id> [--json]",
+      "  node scripts/grok-companion.mjs result <job-id> [--wait] [--wait-timeout-ms <ms>] [--json]",
       "  node scripts/grok-companion.mjs cancel <job-id> [--cwd <dir>] [--json]",
       "  node scripts/grok-companion.mjs stats [--all] [--cwd <dir>] [--json]",
       "  node scripts/grok-companion.mjs setup [--enable-stop-gate] [--disable-stop-gate] [--json]",
@@ -149,6 +154,14 @@ function parsePositiveInteger(value, flag) {
   return parsed;
 }
 
+function parseNonnegativeInteger(value, flag) {
+  const parsed = Number.parseInt(String(value), 10);
+  if (!Number.isInteger(parsed) || parsed < 0) {
+    throw new Error(`Expected a non-negative integer for ${flag}.`);
+  }
+  return parsed;
+}
+
 function parseBestOfN(value) {
   const parsed = parsePositiveInteger(value, "--best-of-n");
   if (parsed < 2 || parsed > 10) {
@@ -157,8 +170,30 @@ function parseBestOfN(value) {
   return parsed;
 }
 
+function resolveWaitPollMs(env = process.env) {
+  const raw = Number(env[WAIT_POLL_ENV]);
+  return Number.isFinite(raw) && raw > 0 ? Math.floor(raw) : DEFAULT_WAIT_POLL_MS;
+}
+
+function resolveWaitTimeoutMs(options = {}, env = process.env) {
+  if (options["wait-timeout-ms"] !== undefined) {
+    return Math.min(parseNonnegativeInteger(options["wait-timeout-ms"], "--wait-timeout-ms"), MAX_WAIT_TIMEOUT_MS);
+  }
+  const value = env[WAIT_TIMEOUT_ENV];
+  const raw = Number(value);
+  const configured =
+    value !== undefined && String(value).trim() && Number.isFinite(raw) && raw >= 0
+      ? Math.floor(raw)
+      : DEFAULT_WAIT_TIMEOUT_MS;
+  return Math.min(configured, MAX_WAIT_TIMEOUT_MS);
+}
+
 function sleepMs(ms) {
   Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
+function delayMs(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 function readStdinIfPiped() {
@@ -659,10 +694,92 @@ function buildCorrectivePrompt(error) {
   ].join(" ");
 }
 
+async function runReviewJob(record, jobFile, options = {}) {
+  const logFile = jobLogPath(resolveDataDir(), record.cwd, record.id);
+  const timeoutMs = resolveTimeoutMs({ background: Boolean(options.background), env: process.env });
+  const recordGrokPid = (pid) => updateJobRecordFile(jobFile, { grokPid: pid ?? null });
+  let first;
+  try {
+    first = await runGrok({
+      briefFile: record.briefFile,
+      mode: "consult",
+      cwd: record.cwd,
+      logFile,
+      timeoutMs,
+      onSpawn: recordGrokPid
+    });
+  } catch (error) {
+    recordSpawnFailure(jobFile, error);
+    throw launchFailureError(error);
+  }
+  if (resultFailed(first)) {
+    failJob(jobFile, logFile, first, timeoutMs);
+  }
+
+  let review = evaluateReviewText(first.text);
+  let sessionId = first.sessionId;
+  let finalText = first.text;
+
+  if (!review.valid && first.sessionId) {
+    const retryBrief = writeBrief(resolveDataDir(), record.cwd, `${record.id}-retry`, buildCorrectivePrompt(review.error));
+    let retry;
+    try {
+      retry = await runGrok({
+        briefFile: retryBrief,
+        mode: "consult",
+        resumeSessionId: first.sessionId,
+        cwd: record.cwd,
+        logFile,
+        timeoutMs,
+        onSpawn: recordGrokPid
+      });
+    } catch (error) {
+      recordSpawnFailure(jobFile, error);
+      throw launchFailureError(error);
+    }
+    if (!resultFailed(retry)) {
+      review = evaluateReviewText(retry.text);
+      if (retry.text) {
+        finalText = retry.text;
+      }
+      sessionId = retry.sessionId ?? sessionId;
+    }
+  }
+
+  const targetLabel = record.request?.reviewTargetLabel ?? "working tree changes";
+  const body = review.valid
+    ? renderReviewResult(review.value, { targetLabel })
+    : renderReviewFallback(finalText, { parseError: review.error });
+
+  finishJobRecord(jobFile, {
+    status: "done",
+    pid: null,
+    grokPid: null,
+    finishedAt: nowIso(),
+    exitCode: 0,
+    sessionId,
+    resultText: body,
+    failureKind: null,
+    cancelRequestedAt: null
+  });
+
+  const payload = {
+    jobId: record.id,
+    sessionId,
+    valid: review.valid,
+    review: review.valid ? review.value : null,
+    parseError: review.valid ? null : review.error,
+    failureKind: null,
+    rawText: finalText,
+    rendered: body
+  };
+  return payload;
+}
+
 async function handleReview(argv) {
   const { options, positionals } = parseArgs(argv, {
     valueOptions: ["base", "focus", "cwd"],
-    booleanOptions: ["json"]
+    booleanOptions: ["background", "json"]
   });
 
   const cwd = resolveCwd(options);
@@ -684,93 +801,75 @@ async function handleReview(argv) {
   const jobId = generateJobId();
   const briefFile = writeBrief(dataDir, cwd, jobId, prompt);
   const jobFile = jobFilePath(dataDir, cwd, jobId);
-  writeJobRecordFile(
-    jobFile,
-    createJobRecord({
-      id: jobId,
-      pid: process.pid,
-      mode: "consult",
-      cwd,
-      briefFile,
-      background: false,
-      claudeSessionId: currentClaudeSessionId()
-    })
-  );
-
-  const logFile = jobLogPath(dataDir, cwd, jobId);
-  const timeoutMs = resolveTimeoutMs({ env: process.env });
-  const recordGrokPid = (pid) => updateJobRecordFile(jobFile, { grokPid: pid ?? null });
-  let first;
-  try {
-    first = await runGrok({ briefFile, mode: "consult", cwd, logFile, timeoutMs, onSpawn: recordGrokPid });
-  } catch (error) {
-    recordSpawnFailure(jobFile, error);
-    throw launchFailureError(error);
-  }
-  if (resultFailed(first)) {
-    failJob(jobFile, logFile, first, timeoutMs);
-  }
-
-  let review = evaluateReviewText(first.text);
-  let sessionId = first.sessionId;
-  let finalText = first.text;
-
-  if (!review.valid && first.sessionId) {
-    const retryBrief = writeBrief(dataDir, cwd, `${jobId}-retry`, buildCorrectivePrompt(review.error));
-    let retry;
-    try {
-      retry = await runGrok({
-        briefFile: retryBrief,
-        mode: "consult",
-        resumeSessionId: first.sessionId,
-        cwd,
-        logFile,
-        timeoutMs,
-        onSpawn: recordGrokPid
-      });
-    } catch (error) {
-      recordSpawnFailure(jobFile, error);
-      throw launchFailureError(error);
-    }
-    if (!resultFailed(retry)) {
-      review = evaluateReviewText(retry.text);
-      if (retry.text) {
-        finalText = retry.text;
-      }
-      sessionId = retry.sessionId ?? sessionId;
-    }
-  }
-
-  const body = review.valid
-    ? renderReviewResult(review.value, { targetLabel: target.label })
-    : renderReviewFallback(finalText, { parseError: review.error });
-
-  finishJobRecord(jobFile, {
-    status: "done",
-    pid: null,
-    grokPid: null,
-    finishedAt: nowIso(),
-    exitCode: 0,
-    sessionId,
-    resultText: body,
-    failureKind: null,
-    cancelRequestedAt: null
+  const record = createJobRecord({
+    id: jobId,
+    pid: options.background ? null : process.pid,
+    mode: "consult",
+    cwd,
+    briefFile,
+    background: Boolean(options.background),
+    claudeSessionId: currentClaudeSessionId(),
+    request: { reviewTargetLabel: target.label }
   });
+  writeJobRecordFile(jobFile, record);
 
-  const payload = {
-    jobId,
-    sessionId,
-    valid: review.valid,
-    review: review.valid ? review.value : null,
-    parseError: review.valid ? null : review.error,
-    failureKind: null,
-    rawText: finalText,
-    rendered: body
-  };
+  if (options.background) {
+    const child = spawn(process.execPath, [SELF_PATH, "review-worker", "--job-id", jobId], {
+      detached: true,
+      stdio: "ignore"
+    });
+    child.unref();
+    updateJobRecordFile(jobFile, { pid: child.pid ?? null });
+    const payload = { jobId, status: "running", mode: "consult", background: true, failureKind: null };
+    output(options.json ? payload : renderBackgroundLaunch(jobId), options.json);
+    return;
+  }
+
+  const payload = await runReviewJob(record, jobFile);
   output(
-    options.json ? payload : renderTaskResult({ text: body.trimEnd(), sessionId, jobId }),
+    options.json
+      ? payload
+      : renderTaskResult({ text: payload.rendered.trimEnd(), sessionId: payload.sessionId, jobId }),
     options.json
   );
+}
+
+async function handleReviewWorker(argv) {
+  const { options } = parseArgs(argv, { valueOptions: ["job-id"] });
+  const jobId = options["job-id"];
+  if (!jobId) {
+    throw new Error("Missing required --job-id for review-worker.");
+  }
+
+  const dataDir = resolveDataDir();
+  const found = findJobRecordById(dataDir, jobId);
+  if (!found) {
+    throw new Error(`No job record found for ${jobId}.`);
+  }
+
+  if (found.record.status !== "running") {
+    return;
+  }
+
+  const record = updateJobRecordFile(found.file, { pid: process.pid });
+  const logFile = jobLogPath(dataDir, record.cwd, record.id);
+  try {
+    await runReviewJob(record, found.file, { background: true });
+  } catch (error) {
+    const current = readJobRecordFile(found.file);
+    if (current?.status !== "running") {
+      return;
+    }
+    appendJobLog(logFile, describeLaunchFailure(error));
+    finishJobRecord(found.file, {
+      status: "error",
+      pid: null,
+      grokPid: null,
+      finishedAt: nowIso(),
+      errorTail: readLogTail(logFile, 20),
+      failureKind: classifyFailure({ spawnError: error })
+    });
+  }
 }
 
 function handleStatus(argv) {
@@ -814,10 +913,54 @@ function renderFailedResult(record, dataDir) {
   return `${lines.join("\n")}\n`;
 }
 
-function handleResult(argv) {
+function renderRunningWaitResult(record) {
+  return [`Job ${record.id}`, "", "Status: running", "state: running"].join("\n") + "\n";
+}
+
+function renderResultRecord(record, dataDir) {
+  if (record.status === "running") {
+    return `Job ${record.id} is still running. Check /grok:status ${record.id} for progress.\n`;
+  }
+
+  if (record.status === "error") {
+    return renderFailedResult(record, dataDir);
+  }
+
+  if (record.status === "cancelled") {
+    const lines = [`Job ${record.id} was cancelled.`, "state: cancelled"];
+    if (record.failureKind) {
+      lines.push(`failure: ${record.failureKind}`);
+    }
+    return `${lines.join("\n")}\n`;
+  }
+
+  return renderTaskResult({ text: record.resultText ?? "", sessionId: record.sessionId, jobId: record.id });
+}
+
+async function waitForResultRecord(found, options) {
+  const timeoutMs = resolveWaitTimeoutMs(options);
+  const pollMs = resolveWaitPollMs();
+  const deadline = Date.now() + timeoutMs;
+  let record = found.record;
+
+  for (;;) {
+    const current = readJobRecordFile(found.file) ?? record;
+    record = refreshRunningJobRecord({ record: current, file: found.file }).record;
+    if (record.status !== "running") {
+      return record;
+    }
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) {
+      return record;
+    }
+    await delayMs(Math.min(pollMs, remaining));
+  }
+}
+
+async function handleResult(argv) {
   const { options, positionals } = parseArgs(argv, {
-    valueOptions: ["cwd"],
-    booleanOptions: ["json"]
+    valueOptions: ["cwd", "wait-timeout-ms"],
+    booleanOptions: ["json", "wait"]
   });
 
   const jobId = positionals[0];
@@ -831,35 +974,18 @@ function handleResult(argv) {
     throw new Error(`No job record found for ${jobId}.`);
   }
 
-  const { record } = refreshRunningJobRecord(found);
+  const record = options.wait ? await waitForResultRecord(found, options) : refreshRunningJobRecord(found).record;
   if (options.json) {
     output(record, true);
     return;
   }
 
-  if (record.status === "running") {
-    output(`Job ${record.id} is still running. Check /grok:status ${record.id} for progress.\n`, false);
+  if (options.wait && record.status === "running") {
+    output(renderRunningWaitResult(record), false);
     return;
   }
 
-  if (record.status === "error") {
-    output(renderFailedResult(record, dataDir), false);
-    return;
-  }
-
-  if (record.status === "cancelled") {
-    const lines = [`Job ${record.id} was cancelled.`, "state: cancelled"];
-    if (record.failureKind) {
-      lines.push(`failure: ${record.failureKind}`);
-    }
-    output(`${lines.join("\n")}\n`, false);
-    return;
-  }
-
-  output(
-    renderTaskResult({ text: record.resultText ?? "", sessionId: record.sessionId, jobId: record.id }),
-    false
-  );
+  output(renderResultRecord(record, dataDir), false);
 }
 
 async function handleCancel(argv) {
@@ -1184,11 +1310,14 @@ async function main() {
     case "review":
       await handleReview(argv);
       break;
+    case "review-worker":
+      await handleReviewWorker(argv);
+      break;
     case "status":
       handleStatus(argv);
       break;
     case "result":
-      handleResult(argv);
+      await handleResult(argv);
       break;
     case "cancel":
       await handleCancel(argv);

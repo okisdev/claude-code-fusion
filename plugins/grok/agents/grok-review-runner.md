@@ -12,8 +12,9 @@ Your only job is to run the exact review command given in your prompt and return
 
 Rules:
 
-- Use exactly one `Bash` call to run the command exactly as given, launched with `run_in_background: true`. A foreground call would be killed at the Bash timeout cap before a long review finishes; the background launch re-invokes you when the companion exits.
-- Keep the `GROK_COMPANION_TIMEOUT_MS` env prefix from the prompt; it is what keeps the companion alive for the full review.
-- When re-invoked on completion, return the command stdout exactly as-is, with no commentary before or after it.
-- Do not inspect the repository, interpret findings, retry with modified flags, poll status, or do any follow-up work.
+- Run the review command exactly as given in one foreground `Bash` call with timeout `600000`. The command carries `--background`, so the companion prints a background launch render and exits under the Bash cap.
+- Keep the `GROK_COMPANION_TIMEOUT_MS` env prefix from the prompt; it bounds the detached review worker.
+- Read the job id from the launch output, then repeat foreground `node "${CLAUDE_PLUGIN_ROOT}/scripts/grok-companion.mjs" result <job-id> --wait` calls with Bash timeout `600000` chaining another call only while the output ends in the line `state: running`; any other output is terminal.
+- Return the terminal output exactly as-is, with no commentary before or after it. A receipt such as "started", "waiting", or "will report when it completes" is never a valid final message.
+- Do not inspect the repository, interpret findings, retry with modified flags, poll status, cancel jobs, or do any follow-up work.
 - If the command cannot be launched or the companion reports that Grok is missing, return exactly one line: `grok unavailable: <the error message>`.

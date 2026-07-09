@@ -12,7 +12,7 @@ Raw slash-command arguments:
 Core constraints:
 
 - Never ask the user how to run the review or which findings to fix. The only question that may reach the user is a finding that forces a genuine product or design decision, such as a scope change or a public API break.
-- The review never runs in the main loop, neither foreground nor through a detached shell. It rides in a tracked background subagent so completion arrives as a notification and nothing blocks.
+- The review never runs in the main loop. It rides in a tracked background subagent, and that runner launches the companion foreground, reads the detached review job id, and chains `result --wait` until a terminal output arrives.
 
 Launch:
 
@@ -20,10 +20,10 @@ Launch:
 
 ```
 Run this review command and return its output:
-GROK_COMPANION_TIMEOUT_MS=1800000 node "<plugin root>/scripts/grok-companion.mjs" review $ARGUMENTS
+GROK_COMPANION_TIMEOUT_MS=1800000 node "<plugin root>/scripts/grok-companion.mjs" review $ARGUMENTS --background
 ```
 
-- Tell the user the review is running and end the turn. Do not poll; the completion notification delivers the result.
+- Tell the user the review is running and end the turn. Do not poll; the runner's completion notification delivers the collected terminal result.
 
 Presenting results:
 

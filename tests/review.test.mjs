@@ -2,7 +2,7 @@ import assert from "node:assert";
 import fs from "node:fs";
 import path from "node:path";
 import { test } from "node:test";
-import { envFor as companionEnvFor, flagValues, hasPair, makeSandbox, readInvocations, repoRoot, runCompanion } from "./lib/companion-harness.mjs";
+import { envFor as companionEnvFor, flagValues, hasPair, jobRecords, makeSandbox, readInvocations, repoRoot, runCompanion, waitFor } from "./lib/companion-harness.mjs";
 import { initFixtureRepo } from "./lib/git-fixture.mjs";
 
 function envFor(sandbox, extra = {}) {
@@ -45,6 +45,32 @@ test("review retries once by resuming the session when the output is not valid J
   assert.ok(hasPair(invocations[1], "-r", "22222222-2222-7222-8222-222222222222"));
   assert.ok(result.stdout.includes("needs-attention"));
   assert.ok(result.stdout.includes("Example finding"));
+});
+
+test("review --background drives the job to done and result returns the review output", async (t) => {
+  const sandbox = makeSandbox(t);
+  initFixtureRepo(sandbox.workDir);
+  const env = envFor(sandbox, { FAKE_GROK_MODE: "review-ok", GROK_COMPANION_WAIT_POLL_MS: "10" });
+  const launch = runCompanion(["review", "--focus", "check the error handling", "--background"], {
+    cwd: sandbox.workDir,
+    env,
+  });
+  assert.strictEqual(launch.status, 0, launch.stderr);
+  const record = await waitFor(() => {
+    const current = jobRecords(sandbox.dataDir)[0];
+    return current && current.status === "done" ? current : null;
+  });
+  assert.strictEqual(record.background, true);
+  assert.strictEqual(record.mode, "consult");
+  assert.ok(record.resultText.includes("needs-attention"));
+  assert.ok(record.resultText.includes("Example finding"));
+  const result = runCompanion(["result", record.id, "--wait"], { cwd: sandbox.workDir, env });
+  assert.strictEqual(result.status, 0, result.stderr);
+  assert.ok(result.stdout.includes("needs-attention"));
+  assert.ok(result.stdout.includes("Example finding"));
+  assert.ok(result.stdout.includes("src/app.mjs"));
+  assert.match(result.stdout, new RegExp(`^job: ${record.id}$`, "m"));
+  assert.match(result.stdout, /^state: done$/m);
 });
 
 test("review gives up after one failed retry and renders the raw text with a parse warning", (t) => {
