@@ -1,7 +1,9 @@
 #!/usr/bin/env node
 
 import { spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import fs from "node:fs";
+import path from "node:path";
 
 import { FILE_ENGINE_DESCRIPTORS } from "./fusion-stats.mjs";
 
@@ -10,6 +12,8 @@ const DEFAULT_POLL_INTERVAL_MS = 15000;
 const INTERVAL_ENV = "CODEX_JOBS_MONITOR_INTERVAL_MS";
 const SESSION_ID_ENV = "CLAUDE_CODE_SESSION_ID";
 const ERROR_MESSAGE_MAX_LENGTH = 80;
+const DEAD_STATUS_KEY = "dead";
+const RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
 
 function resolvePollIntervalMs(env = process.env) {
   const raw = env[INTERVAL_ENV];
@@ -34,12 +38,53 @@ function resolveWorkspaceRoot(cwd) {
   return cwd;
 }
 
-function listWorkspaceJobs(root, workspaceRoot) {
-  if (!fs.existsSync(root)) {
-    return [];
+function readWorkspaceJobsSnapshot(root, workspaceRoot, requiredJobDirs = new Set()) {
+  try {
+    if (!fs.statSync(root).isDirectory()) {
+      return { available: false, records: [] };
+    }
+    const records = [];
+    const sourceDirs = new Set();
+    const enumeratedJobDirs = new Set();
+    for (const workspace of fs.readdirSync(root, { withFileTypes: true })) {
+      if (!workspace.isDirectory()) {
+        continue;
+      }
+      const dir = path.join(root, workspace.name, "jobs");
+      enumeratedJobDirs.add(dir);
+      let entries;
+      try {
+        entries = fs.readdirSync(dir).filter((entry) => entry.endsWith(".json"));
+      } catch (error) {
+        if (error?.code === "ENOENT") {
+          if (requiredJobDirs.has(dir)) {
+            return { available: false, records: [], sourceDirs: new Set() };
+          }
+          continue;
+        }
+        return { available: false, records: [], sourceDirs: new Set() };
+      }
+      for (const entry of entries) {
+        try {
+          const record = JSON.parse(fs.readFileSync(path.join(dir, entry), "utf8"));
+          if (record?.workspaceRoot === workspaceRoot) {
+            records.push(record);
+            sourceDirs.add(dir);
+          }
+        } catch {
+          return { available: false, records: [], sourceDirs: new Set() };
+        }
+      }
+    }
+    for (const required of requiredJobDirs) {
+      if (!enumeratedJobDirs.has(required)) {
+        return { available: false, records: [], sourceDirs: new Set() };
+      }
+    }
+    return { available: true, records, sourceDirs };
+  } catch {
+    return { available: false, records: [], sourceDirs: new Set() };
   }
-  const descriptor = FILE_ENGINE_DESCRIPTORS.codex;
-  return descriptor.enumerateJobs(root).filter((job) => descriptor.matchesWorkspace(job, workspaceRoot));
 }
 
 function truncateErrorMessage(message) {
@@ -68,48 +113,102 @@ function isPidAlive(pid) {
   }
 }
 
-function main() {
-  const root = resolveStateRoot();
-  const cwd = process.cwd();
-  const workspaceRoot = resolveWorkspaceRoot(cwd);
-  const seen = new Set();
-  const deadReported = new Set();
-  const ownSessionId = process.env[SESSION_ID_ENV] || null;
+function announcementKey(id, status) {
+  return `${id}:${status}`;
+}
 
-  for (const record of listWorkspaceJobs(root, workspaceRoot)) {
-    if (record?.id && TERMINAL_STATUSES.has(record.status)) {
-      seen.add(record.id);
+function workspaceKey(workspaceRoot) {
+  return createHash("sha256").update(workspaceRoot).digest("hex").slice(0, 16);
+}
+
+function announcedStatePath(stateRoot, sessionId, workspaceRoot) {
+  const sessionPart = sessionId ? `.${sessionId}` : "";
+  return path.join(stateRoot, `codex-jobs-monitor-announced${sessionPart}.${workspaceKey(workspaceRoot)}.json`);
+}
+
+function quarantineMalformed(file) {
+  const quarantine = `${file}.corrupt.${Date.now()}.${process.pid}`;
+  try {
+    fs.renameSync(file, quarantine);
+  } catch {}
+  return quarantine;
+}
+
+function loadAnnounced(file) {
+  let text;
+  try {
+    text = fs.readFileSync(file, "utf8");
+  } catch (error) {
+    return { exists: error?.code !== "ENOENT", malformed: false, announced: new Set() };
+  }
+  try {
+    const raw = JSON.parse(text);
+    const keys = Array.isArray(raw) ? raw : Array.isArray(raw?.keys) ? raw.keys : null;
+    if (!keys) {
+      throw new TypeError("invalid announcement state");
+    }
+    return { exists: true, malformed: false, announced: new Set(keys.filter((key) => typeof key === "string")) };
+  } catch {
+    quarantineMalformed(file);
+    return { exists: true, malformed: true, announced: new Set() };
+  }
+}
+
+function saveAnnounced(file, announced) {
+  const dir = path.dirname(file);
+  if (!fs.statSync(dir).isDirectory()) {
+    return;
+  }
+  const temp = `${file}.${process.pid}.tmp`;
+  fs.writeFileSync(temp, `${JSON.stringify([...announced])}\n`, "utf8");
+  fs.renameSync(temp, file);
+}
+
+function pruneAnnounced(announced, liveIds) {
+  let dirty = false;
+  for (const key of [...announced]) {
+    const id = key.slice(0, key.indexOf(":"));
+    if (!id || !liveIds.has(id)) {
+      announced.delete(key);
+      dirty = true;
     }
   }
+  return dirty;
+}
 
-  const timer = setInterval(() => {
+function pruneOldStateFiles(stateRoot, currentFile) {
+  let entries;
+  try {
+    entries = fs.readdirSync(stateRoot);
+  } catch {
+    return;
+  }
+  const now = Date.now();
+  for (const entry of entries) {
+    if (!entry.startsWith("codex-jobs-monitor-announced") || path.join(stateRoot, entry) === currentFile) {
+      continue;
+    }
+    const file = path.join(stateRoot, entry);
     try {
-      for (const record of listWorkspaceJobs(root, workspaceRoot)) {
-        if (!record?.id) {
-          continue;
-        }
-        if (TERMINAL_STATUSES.has(record.status)) {
-          if (seen.has(record.id)) {
-            continue;
-          }
-          seen.add(record.id);
-          if (ownSessionId && record.sessionId !== ownSessionId) {
-            continue;
-          }
-          console.log(formatOutcomeLine(record));
-          continue;
-        }
-        if (record.status === "running" && !deadReported.has(record.id) && !isPidAlive(record.pid)) {
-          deadReported.add(record.id);
-          if (ownSessionId && record.sessionId !== ownSessionId) {
-            continue;
-          }
-          console.log(`codex job ${record.id} appears dead (process gone, status still running)`);
-        }
+      if (now - fs.statSync(file).mtimeMs > RETENTION_MS) {
+        fs.rmSync(file, { force: true });
       }
     } catch {}
-  }, resolvePollIntervalMs());
+  }
+}
 
+function safeWriteLine(line) {
+  try {
+    process.stdout.write(`${line}\n`);
+  } catch (error) {
+    if (error?.code === "EPIPE") {
+      process.exit(0);
+    }
+    throw error;
+  }
+}
+
+function installExitHandlers(timer) {
   const shutdown = () => {
     clearInterval(timer);
     process.exit(0);
@@ -117,6 +216,100 @@ function main() {
   process.on("SIGTERM", shutdown);
   process.on("SIGINT", shutdown);
   process.on("SIGHUP", shutdown);
+  process.stdout.on("error", (error) => {
+    if (error?.code === "EPIPE") {
+      clearInterval(timer);
+      process.exit(0);
+    }
+  });
+}
+
+function main() {
+  const root = resolveStateRoot();
+  const cwd = process.cwd();
+  const workspaceRoot = resolveWorkspaceRoot(cwd);
+  const ownSessionId = process.env[SESSION_ID_ENV] || null;
+  const stateFile = announcedStatePath(root, ownSessionId, workspaceRoot);
+  const loaded = loadAnnounced(stateFile);
+  const announced = loaded.announced;
+  const knownJobDirs = new Set();
+  let startupPending = true;
+
+  pruneOldStateFiles(root, stateFile);
+
+  const processSnapshot = (snapshot) => {
+    if (!snapshot.available) {
+      return;
+    }
+    for (const sourceDir of snapshot.sourceDirs) {
+      knownJobDirs.add(sourceDir);
+    }
+    const liveIds = new Set();
+    let dirty = false;
+    for (const record of snapshot.records) {
+      if (!record?.id) {
+        continue;
+      }
+      liveIds.add(record.id);
+      if (TERMINAL_STATUSES.has(record.status)) {
+        const key = announcementKey(record.id, record.status);
+        if (!announced.has(key)) {
+          announced.add(key);
+          dirty = true;
+          if (!(startupPending && !loaded.exists) && (!ownSessionId || record.sessionId === ownSessionId)) {
+            safeWriteLine(formatOutcomeLine(record));
+          }
+        }
+        continue;
+      }
+      if (record.status === "running" && !isPidAlive(record.pid)) {
+        const key = announcementKey(record.id, DEAD_STATUS_KEY);
+        if (startupPending && loaded.malformed) {
+          if (!announced.has(key)) {
+            announced.add(key);
+            dirty = true;
+          }
+          continue;
+        }
+        if (startupPending && !loaded.exists) {
+          continue;
+        }
+        if (!announced.has(key)) {
+          announced.add(key);
+          dirty = true;
+          if (!ownSessionId || record.sessionId === ownSessionId) {
+            safeWriteLine(`codex job ${record.id} appears dead (process gone, status still running)`);
+          }
+        }
+      }
+    }
+    if (pruneAnnounced(announced, liveIds)) {
+      dirty = true;
+    }
+    if (startupPending && !loaded.exists) {
+      dirty = true;
+    }
+    if (dirty) {
+      saveAnnounced(stateFile, announced);
+    }
+    startupPending = false;
+  };
+
+  try {
+    const initialSnapshot = readWorkspaceJobsSnapshot(root, workspaceRoot, knownJobDirs);
+    processSnapshot(initialSnapshot);
+    if (!initialSnapshot.available) {
+      startupPending = false;
+    }
+  } catch {}
+
+  const timer = setInterval(() => {
+    try {
+      processSnapshot(readWorkspaceJobsSnapshot(root, workspaceRoot, knownJobDirs));
+    } catch {}
+  }, resolvePollIntervalMs());
+
+  installExitHandlers(timer);
 }
 
 main();
