@@ -1,5 +1,19 @@
 # changelog
 
+## 0.0.20
+
+- fusion:deep-reasoner moves from opus to fable at unchanged xhigh effort; opus holds no standing routing seat and serves only as the fallback orchestrator when fable is unavailable
+- the capability table gains gpt-5.6-luna (fast and affordable codex volume tier) and grok-composer-2.5-fast (unbenched codemod pilot) with provisional scores to re-score after the first real jobs; quick scoped codex briefs name terra and high volume light work (drafts, review comment triage, digest backup) names luna
+- the shipped rules template carries the scored model table between the fusion:model-table sentinels instead of the unscored placeholder, so a fresh install reads concrete rows while /fusion:config regeneration still owns the block
+- panel adjudication is weighted instead of equal votes: the codex verdict from sol at ultra leads on long horizon correctness and architecture, the grok verdict at xhigh is an independent cross check on large context facts and operational pragmatics, verdicts are never averaged, and disagreement triggers exactly one targeted follow up on the disputed point
+- general-purpose and the built in Plan agent are retired from routine routing after nine days of telemetry showed them dominated on latency (general-purpose median 9.4 minutes over 167 dispatches vs Explore at 2.9 and grok consult at about 2); search goes to Explore, pinnable to haiku for simple sweeps, research goes to grok consult, and routine planning stays in the main loop
+- fast-worker gains an execution speed doctrine (single script rule, batched independent tool calls, extraction reads, lean output, verify in run), motivated by a mining package that spent 53 tool round trips and 12.5 minutes on commands totaling 19 seconds; it is also the required lane for privacy bound inputs that must not reach peer engines
+- spec grade codex routing encodes the foreground cap: a synchronous companion call dies at the Bash tool's 10 minute limit while sol at ultra jobs average about 11 minutes, so packages likely to exceed the cap run backgrounded with same turn fusion:job-collector collection and forcing foreground on such a package is a routing error; motivated by four codex jobs in one day killed mid run with their work complete but their reports lost
+- quick scoped grok routing gains a max turns guard: a long verification chain consolidates to a spec grade codex brief or carries an explicit --max-turns override, and a max turns death is a routing error, not a retry candidate; motivated by a 15.7 minute write job dying at the 60 turn budget
+- troubleshooting: hitting max turns on the first attempt marks the package too big for the lane (split or reroute, never retry the same scope), and a repeated /grok:review permission death on the same diff routes to /codex:adversarial-review or fusion:deep-reasoner while the grok CLI omits the denied call from its output
+- three orchestrator side dispatch disciplines land in the delegation rules: briefs arrive pre staged with exact paths plus a sample record for data work, independent packages dispatch in a single message, and related follow ups reuse the existing worker thread via SendMessage
+- the readme layer table tracks deep-reasoner's move to fable
+
 ## 0.0.19
 
 - gpt 5.6 era refresh: the capability table gains gpt-5.6-sol and gpt-5.6-terra rows next to gpt-5.5 (which stays the codex CLI coded default), and the quick scoped and trivial routing rows name the codex terra class fast tier as the explicit alternative when grok is unavailable or codex is preferred

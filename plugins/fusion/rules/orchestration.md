@@ -2,7 +2,7 @@
 
 This policy governs the main session. If the Agent tool is not available to you, you are a delegate: ignore this file and follow your own agent instructions.
 
-The policy is model agnostic. If the session falls back from Fable to Opus, keep orchestrating under the same rules and consider /model best to restore the strongest available orchestrator.
+The policy is model agnostic. If the session falls back from Fable to Opus, keep orchestrating under the same rules and consider /model best to restore the strongest available orchestrator. Opus holds no standing routing seat and serves only as the fallback orchestrator when Fable is unavailable.
 
 ## Output invariant
 
@@ -17,7 +17,7 @@ Run the session like the founder of a well staffed startup: you decide, employee
 - Prefer delegation for parallelizable or long running work. A small, well understood step done in the main loop, where you can see the result directly, is legitimate too; the goal is not to avoid tool use but to avoid spending main loop tokens on what an employee could do as well. If a tool call is producing the user's artifact after the micro step has been spent, that call belongs to an employee.
 - Bias to fan out once the brief is verifiable: decompose independent pieces, dispatch them together, and keep each available lane drawing only for work you can collect and verify. Observability outranks width; do not add a branch you cannot collect and verify.
 - Trust, then verify: hand off a clear brief and judge the result, without pre solving the task inside the brief.
-- Only the orchestrator fans out. fast-worker and trivial-worker carry disallowedTools: Agent; a package needing further decomposition stays in the main loop.
+- Fan out stays with the orchestrator. The sole exception is the rare package routed to general-purpose because it must itself spawn subagents. fast-worker and trivial-worker carry disallowedTools: Agent; every other package needing further decomposition stays in the main loop.
 
 ## Session execution posture
 
@@ -44,7 +44,16 @@ Posture never relaxes the output invariant: every dispatch still requires collec
 Priorities when routing axes conflict for anything that ships, in order: correctness and safety first, then user facing quality (taste), then latency, then quota cost. Cost is a tie breaker only, never the deciding factor between correct and incorrect or tasteful and sloppy.
 
 <!-- fusion:model-table:start -->
-Engine capability table: run /fusion:config to score your configured engines (intelligence, taste, cost, 1 to 5) and regenerate this block. Until scored, route by the qualitative lane descriptions in this document.
+| Engine | Lane | Intelligence | Taste | Cost | Notes |
+|---|---|---:|---:|---:|---|
+| grok-4.5 | grok | 4 | 3 | 5 | Opus class coding, 500k context, fast and cheap; taste unvalidated pending bench B2 |
+| gpt-5.6-sol | codex | 4 | 3 | 3 | Flagship successor to retired gpt-5.5 at identical API price; leads terminal and agentic benchmarks, ties grok-4.5 on SWE-Bench Pro; taste provisional pending bench B2; wall clock measured 2026-07-10: completed jobs mean ~11 min at n=7; single flight per workspace; ultra effort is a multi agent mode that burns quota |
+| gpt-5.6-terra | codex | 4 | 3 | 4 | Half price codex quick tier; gpt-5.5 class per vendor; Codex credit rate unpublished as of 2026-07-10; name it explicitly in quick scoped codex briefs |
+| gpt-5.6-luna | codex | 3 | 3 | 5 | Fast and affordable codex volume tier per vendor, GA 2026-07-09; scores provisional pending pilot; name it explicitly in briefs |
+| grok-composer-2.5-fast | grok | 3 | 2 | 5 | Ultra fast codemod tier from the live grok listing; unbenched pilot, scores provisional; name it explicitly in briefs |
+
+Scores feed the routing priorities above: intelligence proxies correctness and safety, taste is user facing quality, cost applies only as the final tie breaker.
+Scores are user-assigned via /fusion:config; re-score when the model lineup changes.
 <!-- fusion:model-table:end -->
 
 Treat /fusion:config and live model listings as authoritative over any example model names in this document.
@@ -55,18 +64,18 @@ Implementation routing by brief shape:
 
 | Brief shape | Lane | Notes |
 |---|---|---|
-| Spec grade: explicit completion criteria, output contract, boundaries, verification command | codex frontier implementation lane by default; grok frontier implementation lane when its strengths fit | codex-rescue defaults to foreground but backgrounds tasks it judges complex or long running unless told not to; every codex brief must require synchronous execution and return the real result, so a background reply still gets same turn fusion:job-collector collection |
-| Quick scoped package: edits with a recipe, codemods, small fixes across a few files | grok implementation lane | The brief names low effort, or the account's fast coding SKU from the live model listing, explicitly, because the lane default is the CLI's current flagship rather than a cheap tier. When grok is unavailable or the codex lane is preferred, codex is the alternative and the brief names its fast tier from the live model listing, the terra class SKU, explicitly, because its lane default may be a flagship rather than a cheap tier. Drafts and research digests also land here |
+| Spec grade: explicit completion criteria, output contract, boundaries, verification command | codex frontier implementation lane by default; grok frontier implementation lane when its strengths fit | A foreground synchronous companion call is capped at 10 minutes by the Bash tool, and codex jobs at ultra effort average about 11 minutes, so a package likely to exceed the cap must run backgrounded rather than being forced foreground. Every codex brief still requires the real result in the same turn, so a backgrounded run hands back a job id and the orchestrator dispatches fusion:job-collector in that same turn. Forcing foreground on a package likely to exceed the cap is a routing error |
+| Quick scoped package: edits with a recipe, codemods, small fixes across a few files | grok implementation lane | The brief names low effort, or the account's fast coding SKU from the live model listing, explicitly, because the lane default is the CLI's current flagship rather than a cheap tier. When grok is unavailable or the codex lane is preferred, codex is the alternative and the brief explicitly names the applicable live SKU: gpt-5.6-terra, the terra class SKU, for quick scoped codex packages or gpt-5.6-luna, the luna class SKU, for high volume light work such as drafts, review comment triage, and research digest backup, because its lane default may be a flagship rather than a cheap tier. Drafts and research digests also land here. A package with a long verification chain or a change surface likely to approach grok's write turn budget of 60 turns either consolidates up to a spec grade codex brief or carries an explicit --max-turns override in the brief. A max turns death is a routing error, not a retry candidate |
 | Needs the Claude Code tool surface (hooks, subagent files, MCP), or a moderately specified spec | fusion:fast-worker | Not the default for spec grade or quick scoped work |
-| Trivial single file tasks: renames, small doc fixes, short mechanical checks | grok implementation lane, fallback fusion:trivial-worker | The brief names low effort, or the account's fast coding SKU from the live model listing, explicitly, because the lane default is the CLI's current flagship rather than a cheap tier. When grok is unavailable or the codex lane is preferred, codex is the alternative and the brief names its fast tier from the live model listing, the terra class SKU, explicitly, because its lane default may be a flagship rather than a cheap tier. Fallback to fusion:trivial-worker when codex is also unavailable or the tool surface is needed |
+| Trivial single file tasks: renames, small doc fixes, short mechanical checks | grok implementation lane, fallback fusion:trivial-worker | The brief names low effort, or the account's fast coding SKU from the live model listing, explicitly, because the lane default is the CLI's current flagship rather than a cheap tier. Batch codemods may pilot the fast SKU from the live listing, currently grok-composer-2.5-fast; the brief names it explicitly. When grok is unavailable or the codex lane is preferred, codex is the alternative and the brief explicitly names the applicable live SKU: gpt-5.6-terra, the terra class SKU, for quick scoped codex packages or gpt-5.6-luna, the luna class SKU, for high volume light work such as drafts, review comment triage, and research digest backup, because its lane default may be a flagship rather than a cheap tier. Fallback to fusion:trivial-worker when codex is also unavailable or the tool surface is needed |
 | Review shaped work: PR and issue verification, review comment triage, reproducing reported bugs | /grok:review for the fast mechanical sweep; /codex:adversarial-review for depth | Interactive judgment and taste calls stay in the main loop |
-| Codebase search, inventory, "where is X" | built in Explore agent | |
-| Hard reasoning: architecture, root cause on stubborn bugs, correctness, concurrency, security | fusion:deep-reasoner | |
-| Design and planning | built in Plan agent | High stakes design goes to /fusion:panel instead |
+| Codebase search, inventory, "where is X" | built in Explore agent | Simple scoped searches may pin the Explore agent to haiku through the Agent tool's model parameter |
+| Hard reasoning: architecture, root cause on stubborn bugs, correctness, concurrency, security | fusion:deep-reasoner | Runs on Fable at maximum effort |
+| Design and planning | main loop from Explore reconnaissance | The built in Plan agent is demoted from routine routing; high stakes design goes to /fusion:panel instead |
 | Independent second opinion, alternative diagnosis or implementation, code review | codex:codex-rescue (or /codex:review), grok:grok-rescue (or /grok:task, /grok:review) | Prefer over fusion:deep-reasoner when a non Claude perspective adds value |
 | Judging results, reconciling disagreement, revising the plan, user communication | main loop | The only work the orchestrator spends tokens on directly |
 
-Implementation from an approved plan: one brief per work package with the plan section as the spec, split into packages, parallel when independent, routed by the table above. Never route execution to the generic claude catch all agent: it burns top tier quota on worker tier work.
+Implementation from an approved plan: one brief per work package with the plan section as the spec, split into packages, parallel when independent, routed by the table above. Never route execution to the generic claude catch all agent: it burns top tier quota on worker tier work. The general-purpose agent is likewise retired from routine routing: search goes to Explore and research goes to grok consult; it remains only for the rare package that must itself spawn subagents. The built in Plan agent is demoted: routine planning happens in the main loop from Explore reconnaissance, and high stakes design goes to /fusion:panel.
 
 ### User facing quality floor
 
@@ -107,16 +116,19 @@ These fire from plain language, not only from a typed slash command. Match the u
 
 ## High stakes fan out
 
-/fusion:panel composes one neutral brief, fans it out blind to codex:codex-rescue and grok:grok-rescue in parallel, and adjudicates the verdicts with attribution; at most one panel per user turn. If the command is unavailable, fan out manually: same brief to both in parallel, never one engine's output shown to the other, then compare and decide yourself, naming which engine claimed what. If they disagree on something material, one targeted follow up beats a second full fan out.
+/fusion:panel composes one neutral brief and fans it out blind to codex:codex-rescue and grok:grok-rescue in parallel; at most one panel per user turn. The codex verdict from sol at ultra is the deep lead and carries more weight on long horizon correctness and architecture. The grok verdict at xhigh is an independent cross check weighted on large context factual verification and terminal or operational pragmatics. Verdicts are never averaged and never counted as equal votes. Agreement is a strong accept signal. Disagreement triggers exactly one targeted follow up on the specific point of disagreement, never a second full fan out. The adjudicator attributes every claim to its engine. If the command is unavailable, fan out manually: send the same brief to both in parallel, never show one engine's output to the other, then apply the same weighted adjudication yourself.
 
 ## Delegation rules
 
 Every brief is self contained: goal, constraints, relevant paths, what done looks like, and a verification command. Subagents never see this conversation; a brief states the outcome and the checks, never the solution.
 
+- Briefs for data or repo work arrive pre staged: every brief includes exact paths and, for data work, one sample record or schema excerpt, so the worker starts executing instead of discovering.
+- Independent packages and independent sections of one task are decomposed and dispatched in a single message; sequential dispatch of independent work is a defect.
 - Every dispatch is a background subagent via the Agent tool; the main loop never runs a work package itself, foreground or through a detached shell. The coordinate micro step and the single triage edit are the only main loop edits, and neither is a work package. Subagents are harness tracked: completions arrive as notifications, so they need no polling and no narration beyond the initial dispatch note.
 - Heartbeat rule: a legitimate watch style wakeup on delegated work in flight emits one short user visible status line naming what is still in flight and when the next check happens. A wakeup with only tool calls and no visible text is a silent turn and is banned, and so is a hand rolled Bash or ScheduleWakeup polling loop used in place of fusion:job-collector.
 - Same turn collection mandate: a forwarder reply that hands back a job id instead of a deliverable (codex:codex-rescue's "task started in the background" is the canonical case) must be followed, same turn, by dispatching fusion:job-collector with that job's status and result commands. The codex companion lives under the plugin cache directory, at a path like `~/.claude/plugins/cache/openai-codex/codex/<version>/scripts/codex-companion.mjs` (glob for the installed version), driven as `node <that path> status <job-id>` and `result <job-id>`; grok's companion exposes equivalent commands. Once a job rides inside a rescue agent, that agent's completion notification is the only collection path.
 - A non deliverable final message starts an obligation, not an outcome: a bare "started in the background" receipt and a truncated run ending in forward looking narration or missing verification are both unfinished. Resume a truncated, non forwarder agent with SendMessage to finish and report with verification; for a forwarder receipt, dispatch fusion:job-collector instead.
+- Related follow up packages reuse the existing worker thread via SendMessage instead of cold starting a new agent, unless the thread rotation rules in troubleshooting.md say otherwise.
 - Parallel packages declare each other: every brief names sibling packages' files as intended in flight changes and forbids reverting, restoring, or cleaning anything outside its own list. A worker's end state check covers its own files only.
 - State write permission explicitly in every peer brief. Consult briefs and /grok:review run read only with no shell commands, since the consult allow list cancels the turn otherwise; only briefs asking for repository changes run in write mode.
 - Every peer brief opens with a single header line that names the lane, the effort or model tier whenever the routing row requires one, and the verification command; a brief missing that header is not ready to dispatch.

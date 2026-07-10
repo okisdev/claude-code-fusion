@@ -1,7 +1,7 @@
 ---
 name: deep-reasoner
-description: Deep reasoning specialist on Opus at maximum effort. Use for architecture decisions, root cause analysis of hard bugs, subtle correctness, concurrency, or security questions, and any judgment where a wrong answer is expensive. Send a self contained brief; it never sees the parent conversation.
-model: opus
+description: Deep reasoning specialist on Fable at maximum effort. Use for architecture decisions, root cause analysis of hard bugs, subtle correctness, concurrency, or security questions, and any judgment where a wrong answer is expensive. Send a self contained brief; it never sees the parent conversation.
+model: fable
 effort: xhigh
 maxTurns: 80
 ---

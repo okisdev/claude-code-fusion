@@ -20,7 +20,7 @@ Compose the brief:
 
 Launch the panel:
 
-- In a SINGLE message, launch two background subagents via the `Agent` tool, each with the identical brief as its prompt:
+- In a SINGLE message, launch two background subagents in parallel via the `Agent` tool, each with the identical brief as its prompt:
   - `codex:codex-rescue` (use plain `codex-rescue` if the namespaced form is not found)
   - `grok:grok-rescue` (use plain `grok-rescue` if the namespaced form is not found)
 - Add `fusion:deep-reasoner` as a third track only when the user asks for a three way panel or the question hinges on Claude native long horizon reasoning.
@@ -39,14 +39,15 @@ Wait and stay blind:
 
 Adjudicate with a structured analysis first:
 
-- Before writing any prose verdict, produce a judge analysis as a JSON object with exactly these fields, every entry attributed by engine name: `consensus` (claims the engines agree on), `contradictions` (disputed claims, each side named), `partial_coverage` (points only one engine addressed), `unique_insights` (per engine), `blind_spots` (questions no engine addressed).
-- Treat consensus as high confidence. Adjudicate contradictions on evidence, not on which engine said it.
+- Before writing any prose verdict, produce a judge analysis as a JSON object with exactly these fields: `consensus` (claims the engines agree on), `contradictions` (disputed claims, each side named), `partial_coverage` (points only one engine addressed), `unique_insights` (per engine), `blind_spots` (questions no engine addressed). Attribute every claim in every field to its engine by name.
+- Never average the verdicts or count them as equal votes. In the standard two track panel, the `codex:codex-rescue` verdict from sol at ultra is the deep lead and carries more weight on long horizon correctness and architecture. The `grok:grok-rescue` verdict at xhigh is an independent cross check weighted on large context factual verification and terminal or operational pragmatics.
+- Treat agreement as a strong accept signal and consensus as high confidence. Adjudicate each contradiction according to its subject and supporting evidence, applying these weights when both standard tracks return.
 - If a clean analysis is impossible (malformed outputs, irreconcilable framing), skip it and present each engine's verdict verbatim with attribution, stating that adjudication was skipped. Raw verdicts beat a forced synthesis.
 
 Synthesize with attribution:
 
-- Quote each engine's verdict by name; never blend positions into an anonymous consensus.
-- When material disagreement remains, prefer ONE targeted follow up to ONE engine over a second full fan out.
+- Quote each engine's verdict by name and attribute every claim to its engine; never blend positions into an anonymous consensus.
+- Disagreement triggers exactly ONE targeted follow up to ONE engine on the specific point of disagreement; never run a second full fan out.
 
 Present to the user:
 
