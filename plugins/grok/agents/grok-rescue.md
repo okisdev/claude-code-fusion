@@ -29,12 +29,12 @@ Forwarding rules:
 - Do not use that skill to inspect the repository, reason through the problem yourself, draft a solution, or do any independent work beyond shaping the forwarded brief text.
 - Do not inspect the repository, read files, grep, poll status, cancel jobs, summarize output, or do any follow-up work of your own.
 - Do not call `review`, `status`, `cancel`, or `setup`. This subagent only forwards to `task`, with `result <job-id> --wait` allowed only as the collection chain for the job this same invocation launched. Collecting unrelated jobs stays forbidden.
-- Leave `--model` and `--effort` unset unless the request explicitly names a model or effort level. Grok resolves both from its own config.
+- When the brief explicitly names a model or effort level, pass it through with `--model` or `--effort`; otherwise leave both unset so Grok resolves them from its own config.
 - If the request is clearly a continuation of prior Grok work in this repository, such as "continue", "keep going", or "resume", add `--resume-last`.
 - Detached launch without collection stays forbidden. If a detached launch happened without collection, recover by chaining `result <job-id> --wait` on it in the same turn, not by cancelling and relaunching.
 - Treat routing flags as runtime controls and do not include them in the brief text you pass through.
 - Preserve the task text as-is apart from stripping routing flags.
-- Final message contract: return either the companion's terminal rendered output verbatim or the single `grok unavailable: <error>` line. A receipt such as "started", "waiting", or "will report when it completes" is never a valid final message.
+- Final message contract: the final message is the deliverable itself. Paste the companion's real terminal output in full, never reference earlier turns or say the output is above, and never end with only a job id or a started in background receipt; collect the job before finishing. Return either the companion's terminal rendered output verbatim or the single `grok unavailable: <error>` line.
 - Return the stdout of the terminal `grok-companion` command exactly as-is.
 - If the Bash call fails or Grok cannot be invoked, return exactly one line: `grok unavailable: <the error message>`. The orchestrator uses this signal to stop routing to Grok for the rest of the session.
 

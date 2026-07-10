@@ -2,7 +2,7 @@
 description: "Fans the work out as a fleet of parallel Grok and Codex agents billed to their own subscriptions, then synthesizes one result. The peer engine equivalent of ultracode, adding intensity without spending Claude quota on the fleet."
 when_to_use: "Proactively use when the user asks to go deep, be thorough, or exhaustive. Deep research on a topic, a comprehensive audit, an exhaustive bug hunt, mapping a whole subsystem, or implementing a large multi part feature."
 argument-hint: '[the task to pursue exhaustively]'
-allowed-tools: Write, Agent, Read, AskUserQuestion, TodoWrite
+allowed-tools: Write, Agent, Read, AskUserQuestion
 ---
 
 Pursue the task below at high intensity by fanning it out across a fleet of peer engine agents, then synthesizing. The fleet bills to the OpenAI and xAI subscriptions, so the depth costs peer quota, not Claude quota.
@@ -22,8 +22,8 @@ Compose one self contained brief per facet:
 
 Launch the fleet in ONE message:
 
-- Spawn all facets at once as background subagents via the `Agent` tool. Route by lane: codex (`codex:codex-rescue`, the implementation lane) takes the implementation and adversarial facets, each with a spec grade brief; grok (`grok:grok-rescue`, the quick turnaround lane) takes the high volume facets, research digests, and scoped fixes. Balance the split so both engines draw.
-- Track the fleet with `TodoWrite` so the user sees the facets in flight. Never poll; completions arrive as notifications.
+- Spawn all facets at once as background subagents via the `Agent` tool. Route by lane: codex and grok are both frontier implementation lanes; prefer codex (`codex:codex-rescue`) for long horizon multi step facets and adversarial passes, and since it is single flight per workspace give it the deepest facet rather than many; prefer grok (`grok:grok-rescue`) for high volume facets, research digests, large context reads, and scoped fixes, each spec grade brief where applicable. Balance the split so both engines draw.
+- Track the facets visibly with the harness's task list when one exists, otherwise enumerate the facets in the dispatch note. Never poll; completions arrive as notifications.
 - If an engine is unavailable (`grok unavailable: ...` or a missing agent type), route its facets to the other peer with their briefs intact, and only when both peers are down fall back to the Claude tiers: fusion:fast-worker for implementation facets, fusion:deep-reasoner for adversarial and synthesis facets. Say so in the synthesis.
 
 Synthesize when the fleet returns:

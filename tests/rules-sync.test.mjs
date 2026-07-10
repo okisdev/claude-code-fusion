@@ -111,7 +111,7 @@ test("Live file with unknown content is left untouched and prints the local edit
   assert.strictEqual(result.status, 0);
   assert.strictEqual(
     result.stdout,
-    `fusion: local edits detected in ${sandbox.rulesFile}, run /fusion:setup to reconcile with the plugin's newer rules\n`
+    `fusion: ${sandbox.rulesFile} does not match any shipped rules version (local edits or a stale render), run /fusion:setup to reconcile; the scored model table is preserved\n`
   );
   assert.strictEqual(fs.readFileSync(sandbox.rulesFile, "utf8"), UNKNOWN_VERSION);
 });
@@ -165,7 +165,7 @@ test("Hand edited template content still looks like local edits", (t) => {
   assert.strictEqual(result.status, 0);
   assert.strictEqual(
     result.stdout,
-    `fusion: local edits detected in ${sandbox.rulesFile}, run /fusion:setup to reconcile with the plugin's newer rules\n`
+    `fusion: ${sandbox.rulesFile} does not match any shipped rules version (local edits or a stale render), run /fusion:setup to reconcile; the scored model table is preserved\n`
   );
   assert.strictEqual(fs.readFileSync(sandbox.rulesFile, "utf8"), handEdited);
 });

@@ -134,7 +134,7 @@ export function syncRulesToLive({ pluginRoot, env = process.env, liveFile = reso
   }
 
   log(
-    `fusion: local edits detected in ${displayLiveRulesPath(liveFile, env)}, run /fusion:setup to reconcile with the plugin's newer rules`
+    `fusion: ${displayLiveRulesPath(liveFile, env)} does not match any shipped rules version (local edits or a stale render), run /fusion:setup to reconcile; the scored model table is preserved`
   );
   return { status: "local-edits", liveFile };
 }
