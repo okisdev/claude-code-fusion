@@ -5,7 +5,7 @@ Multi-model orchestration for Claude Code. The strongest available Claude model 
 | Layer | Who | Job |
 |---|---|---|
 | Orchestrator | the main session on `best[1m]` (Fable 5, or the latest Opus when Fable is unavailable) | plan, delegate, judge, synthesize |
-| Claude workers | `fusion:deep-reasoner` (Opus), `fusion:fast-worker` (Sonnet), `fusion:trivial-worker` (Haiku) | deep reasoning, mechanical work, trivial tasks when Grok is unavailable |
+| Claude workers | `fusion:deep-reasoner` (Fable), `fusion:fast-worker` (Sonnet), `fusion:trivial-worker` (Haiku) | deep reasoning, mechanical work, trivial tasks when Grok is unavailable |
 | Peer engines | companion plugins implementing the shared contract. Current instances are Grok CLI (the hosted `grok` plugin here) and Codex CLI (the external `codex@openai-codex` plugin) | Codex is the primary implementation lane and expects spec grade briefs (explicit completion criteria, output contract, boundaries, verification command); Grok rides the grok CLI's flagship default and stays fast, taking implementation packages as well as small fixes, drafts, research digests, and large context reads. Each lane runs whatever its own CLI is configured for; model names and scores live in the /fusion:config capability table, refreshed from each CLI's live listing. Trivial single file tasks default to Grok at low effort |
 | Panel | `/fusion:panel` | one blind brief to available peer engines in parallel, adjudicated with attribution |
 
