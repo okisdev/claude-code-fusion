@@ -1,5 +1,6 @@
 import assert from "node:assert";
 import { execFileSync, spawn } from "node:child_process";
+import { createHash } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -319,6 +320,158 @@ test("a vanished state root mid run does not crash the process and a later tick 
   );
 });
 
+function announcedPath(sandbox, sessionId = null, workspaceRoot = sandbox.workDir) {
+  const workspaceKey = createHash("sha256").update(workspaceRoot).digest("hex").slice(0, 16);
+  const sessionPart = sessionId ? `.${sessionId}` : "";
+  const name = `codex-jobs-monitor-announced${sessionPart}.${workspaceKey}.json`;
+  return path.join(sandbox.stateRoot, name);
+}
+
+test("restart with persisted dedup state does not re-announce a completed job", async (t) => {
+  const sandbox = makeSandbox(t);
+  const { file, record } = seedJob(sandbox, { status: "running" });
+  const env = envFor(sandbox);
+
+  const first = startMonitor(sandbox, env);
+  await new Promise((resolve) => setTimeout(resolve, 300));
+  writeJobRecordFile(file, { ...record, status: "completed", completedAt: new Date().toISOString() });
+  await waitUntil(() => (first.lines().length > 0 ? first.lines() : null));
+  assert.strictEqual(first.lines().length, 1);
+  first.child.kill("SIGTERM");
+  await once(first.child, "close");
+
+  assert.ok(fs.existsSync(announcedPath(sandbox)));
+  const persisted = JSON.parse(fs.readFileSync(announcedPath(sandbox), "utf8"));
+  assert.ok(persisted.includes(`${record.id}:completed`));
+
+  writeJobRecordFile(file, { ...record, status: "running", completedAt: null });
+  const second = startMonitor(sandbox, env);
+  t.after(() => second.child.kill("SIGKILL"));
+  await new Promise((resolve) => setTimeout(resolve, 300));
+  writeJobRecordFile(file, { ...record, status: "completed", completedAt: new Date().toISOString() });
+  await new Promise((resolve) => setTimeout(resolve, 600));
+  assert.deepStrictEqual(second.lines(), []);
+});
+
+test("workspace-scoped dedup lets identical job ids announce independently and prevents cross-workspace pruning", async (t) => {
+  const sandbox = makeSandbox(t);
+  const otherWorkDir = path.join(sandbox.root, "other-work");
+  fs.mkdirSync(otherWorkDir);
+  const sharedId = "shared-job-id";
+  const firstJob = seedJob(
+    sandbox,
+    { id: sharedId, status: "running", sessionId: "shared-session" },
+    { workspace: "workspace-a", workspaceRoot: sandbox.workDir }
+  );
+  const secondJob = seedJob(
+    sandbox,
+    { id: sharedId, status: "running", sessionId: "shared-session" },
+    { workspace: "workspace-b", workspaceRoot: otherWorkDir }
+  );
+  const env = envFor(sandbox, { CLAUDE_CODE_SESSION_ID: "shared-session" });
+
+  const first = startMonitor(sandbox, env);
+  await new Promise((resolve) => setTimeout(resolve, 300));
+  writeJobRecordFile(firstJob.file, { ...firstJob.record, status: "completed", completedAt: new Date().toISOString() });
+  await waitUntil(() => (first.lines().length > 0 ? first.lines() : null));
+  first.child.kill("SIGTERM");
+  await once(first.child, "close");
+
+  const firstStateFile = announcedPath(sandbox, "shared-session", sandbox.workDir);
+  const firstState = fs.readFileSync(firstStateFile, "utf8");
+  const second = startMonitor(sandbox, env, { cwd: otherWorkDir });
+  t.after(() => second.child.kill("SIGKILL"));
+  await new Promise((resolve) => setTimeout(resolve, 300));
+  writeJobRecordFile(secondJob.file, { ...secondJob.record, status: "completed", completedAt: new Date().toISOString() });
+
+  const lines = await waitUntil(() => (second.lines().length > 0 ? second.lines() : null));
+  assert.strictEqual(lines.length, 1);
+  assert.match(lines[0], new RegExp(`codex job ${sharedId} completed`));
+  assert.notStrictEqual(firstStateFile, announcedPath(sandbox, "shared-session", otherWorkDir));
+
+  fs.rmSync(secondJob.file);
+  await new Promise((resolve) => setTimeout(resolve, 500));
+  assert.strictEqual(fs.readFileSync(firstStateFile, "utf8"), firstState);
+});
+
+test("restart catch-up announces an unrecorded terminal job owned by the active session", async (t) => {
+  const sandbox = makeSandbox(t);
+  const { record } = seedJob(sandbox, {
+    status: "completed",
+    sessionId: "session-own",
+    completedAt: new Date().toISOString()
+  });
+  fs.writeFileSync(announcedPath(sandbox, "session-own"), "[]\n", "utf8");
+
+  const monitor = startMonitor(sandbox, envFor(sandbox, { CLAUDE_CODE_SESSION_ID: "session-own" }));
+  t.after(() => monitor.child.kill("SIGKILL"));
+  const lines = await waitUntil(() => (monitor.lines().length > 0 ? monitor.lines() : null));
+  assert.deepStrictEqual(lines, [
+    `codex job ${record.id} completed. collect with /codex:result ${record.id} only if you launched it detached; a job owned by a subagent reports on its own`
+  ]);
+});
+
+test("an unavailable jobs snapshot neither prunes nor persists announcement state", async (t) => {
+  const sandbox = makeSandbox(t);
+  const { record } = seedJob(sandbox, { status: "running" });
+  const stateFile = announcedPath(sandbox);
+  fs.writeFileSync(stateFile, `${JSON.stringify([`${record.id}:completed`])}\n`, "utf8");
+  const monitor = startMonitor(sandbox, envFor(sandbox));
+  t.after(() => monitor.child.kill("SIGKILL"));
+  await new Promise((resolve) => setTimeout(resolve, 300));
+  const before = fs.readFileSync(stateFile, "utf8");
+
+  const dir = jobsDirFor(sandbox, "ws");
+  fs.rmSync(dir, { recursive: true, force: true });
+  fs.writeFileSync(dir, "not a directory", "utf8");
+  await new Promise((resolve) => setTimeout(resolve, 500));
+
+  assert.strictEqual(fs.readFileSync(stateFile, "utf8"), before);
+  assert.deepStrictEqual(monitor.lines(), []);
+});
+
+test("announcement state files older than 30 days are pruned", async (t) => {
+  const sandbox = makeSandbox(t);
+  seedJob(sandbox, { status: "running" });
+  const staleFile = path.join(sandbox.stateRoot, "codex-jobs-monitor-announced.stale-session.stale-workspace.json");
+  fs.writeFileSync(staleFile, "[]\n", "utf8");
+  const staleTime = new Date(Date.now() - 31 * 24 * 60 * 60 * 1000);
+  fs.utimesSync(staleFile, staleTime, staleTime);
+
+  const monitor = startMonitor(sandbox, envFor(sandbox));
+  t.after(() => monitor.child.kill("SIGKILL"));
+  await waitUntil(() => (!fs.existsSync(staleFile) ? true : null));
+  assert.strictEqual(fs.existsSync(staleFile), false);
+});
+
+test("malformed dedup state is quarantined and dead running jobs are reconstructed silently", async (t) => {
+  const sandbox = makeSandbox(t);
+  const shortLivedChild = spawn(process.execPath, ["-e", "setTimeout(() => {}, 0)"]);
+  const pid = shortLivedChild.pid;
+  await once(shortLivedChild, "exit");
+  const { record } = seedJob(sandbox, { status: "running", pid });
+  const stateFile = announcedPath(sandbox);
+  fs.writeFileSync(stateFile, "{ malformed", "utf8");
+
+  const monitor = startMonitor(sandbox, envFor(sandbox));
+  t.after(() => monitor.child.kill("SIGKILL"));
+  await waitUntil(() => {
+    if (!fs.existsSync(stateFile)) {
+      return null;
+    }
+    try {
+      return JSON.parse(fs.readFileSync(stateFile, "utf8")).includes(`${record.id}:dead`) ? true : null;
+    } catch {
+      return null;
+    }
+  });
+  await new Promise((resolve) => setTimeout(resolve, 500));
+
+  assert.deepStrictEqual(monitor.lines(), []);
+  const quarantinePrefix = `${path.basename(stateFile)}.corrupt.`;
+  assert.ok(fs.readdirSync(sandbox.stateRoot).some((entry) => entry.startsWith(quarantinePrefix)));
+});
+
 test("exits 0 on SIGTERM", async (t) => {
   const sandbox = makeSandbox(t);
   const monitor = startMonitor(sandbox, envFor(sandbox));
@@ -336,4 +489,5 @@ test("skips silently when the state root does not exist", async (t) => {
   await new Promise((resolve) => setTimeout(resolve, 500));
   assert.deepStrictEqual(monitor.lines(), []);
   assert.strictEqual(monitor.stderr(), "");
+  assert.strictEqual(fs.existsSync(sandbox.stateRoot), false);
 });

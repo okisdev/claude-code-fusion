@@ -166,13 +166,46 @@ test("permission-cancelled turn yields failure kind permission", (t) => {
   assert.notStrictEqual(result.status, 0);
   assert.match(result.stderr, /^failure: permission$/m);
   assert.match(result.stderr, /^state: error$/m);
+  assert.match(
+    result.stderr,
+    /consult-mode permission gate.*blocked call not reported by the CLI/s
+  );
   const record = jobRecords(sandbox.dataDir)[0];
   assert.strictEqual(record.status, "error");
   assert.strictEqual(record.failureKind, "permission");
+  assert.match(record.errorTail, /blocked call not reported by the CLI/);
   const resultOutput = runCompanion(["result", record.id], { cwd: sandbox.workDir, env });
   assert.strictEqual(resultOutput.status, 0, resultOutput.stderr);
   assert.match(resultOutput.stdout, /^failure: permission$/m);
   assert.match(resultOutput.stdout, /^state: error$/m);
+});
+
+test("permission-cancelled turn names the blocked call when the CLI reports it", (t) => {
+  const sandbox = makeSandbox(t);
+  const env = envFor(sandbox, { FAKE_GROK_MODE: "permission-cancelled-named" });
+  const result = runCompanion(["task", "doomed"], { cwd: sandbox.workDir, env });
+  assert.notStrictEqual(result.status, 0);
+  assert.match(result.stderr, /^failure: permission$/m);
+  assert.match(
+    result.stderr,
+    /blocked call: Bash\(\{"command":"git status --short && npm test"\}\)/
+  );
+  const record = jobRecords(sandbox.dataDir)[0];
+  assert.strictEqual(record.status, "error");
+  assert.strictEqual(record.failureKind, "permission");
+  assert.match(record.errorTail, /blocked call: Bash\(/);
+  const resultOutput = runCompanion(["result", record.id], { cwd: sandbox.workDir, env });
+  assert.strictEqual(resultOutput.status, 0, resultOutput.stderr);
+  assert.match(resultOutput.stdout, /^failure: permission$/m);
+});
+
+test("permission-cancelled turn reports explicit absence when the CLI omits the call", (t) => {
+  const sandbox = makeSandbox(t);
+  const env = envFor(sandbox, { FAKE_GROK_MODE: "permission-cancelled" });
+  const result = runCompanion(["task", "doomed"], { cwd: sandbox.workDir, env });
+  assert.notStrictEqual(result.status, 0);
+  assert.match(result.stderr, /blocked call not reported by the CLI/);
+  assert.doesNotMatch(result.stderr, /blocked call: /);
 });
 
 test("cancelled background job yields failure kind cancelled", async (t) => {

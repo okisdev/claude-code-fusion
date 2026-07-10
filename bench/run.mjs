@@ -293,6 +293,109 @@ function collectEngineCliVersions(options) {
   };
 }
 
+function emptyPeerEngineDefaults() {
+  return {
+    model: null,
+    effort: null
+  };
+}
+
+function emptyPeerDefaults() {
+  return {
+    grok: emptyPeerEngineDefaults(),
+    codex: emptyPeerEngineDefaults()
+  };
+}
+
+function parseTomlAssignmentValue(raw) {
+  const trimmed = String(raw ?? "").trim();
+  if (!trimmed) {
+    return null;
+  }
+  const doubleQuoted = trimmed.match(/^"((?:\\.|[^"\\])*)"/);
+  if (doubleQuoted) {
+    return doubleQuoted[1].replace(/\\([\\"])/g, "$1");
+  }
+  const singleQuoted = trimmed.match(/^'((?:\\.|[^'\\])*)'/);
+  if (singleQuoted) {
+    return singleQuoted[1].replace(/\\([\\'])/g, "$1");
+  }
+  const bare = trimmed.match(/^([^#\s]+)/);
+  return bare ? bare[1] : null;
+}
+
+function matchTomlKeyValue(line, key) {
+  const match = line.match(new RegExp(`^\\s*${key.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\s*=\\s*(.+)$`));
+  if (!match) {
+    return null;
+  }
+  return parseTomlAssignmentValue(match[1]);
+}
+
+function extractPeerKeysFromConfig(filePath, keyMap, options = {}) {
+  const values = emptyPeerEngineDefaults();
+  if (!fs.existsSync(filePath)) {
+    return values;
+  }
+  let text;
+  try {
+    text = fs.readFileSync(filePath, "utf8");
+  } catch {
+    return values;
+  }
+  const requiredSection = options.section ?? null;
+  let currentSection = null;
+  for (const line of text.split(/\r?\n/)) {
+    if (/^\s*(#|$)/.test(line)) {
+      continue;
+    }
+    const sectionMatch = line.match(/^\s*\[([^\]]+)\]\s*(?:#.*)?$/);
+    if (sectionMatch) {
+      currentSection = sectionMatch[1].trim();
+      continue;
+    }
+    const inScope = requiredSection === null ? currentSection === null : currentSection === requiredSection;
+    if (!inScope) {
+      continue;
+    }
+    for (const [fileKey, field] of Object.entries(keyMap)) {
+      if (values[field] !== null) {
+        continue;
+      }
+      const value = matchTomlKeyValue(line, fileKey);
+      if (value !== null && value.length > 0) {
+        values[field] = value;
+      }
+    }
+  }
+  return values;
+}
+
+function peerConfigHome(env = process.env) {
+  if (typeof env.HOME === "string" && env.HOME.length > 0) {
+    return env.HOME;
+  }
+  return os.homedir();
+}
+
+function collectPeerDefaults(env = process.env) {
+  const home = peerConfigHome(env);
+  return {
+    grok: extractPeerKeysFromConfig(
+      path.join(home, ".grok", "config.toml"),
+      {
+        default: "model",
+        default_reasoning_effort: "effort"
+      },
+      { section: "models" }
+    ),
+    codex: extractPeerKeysFromConfig(path.join(home, ".codex", "config.toml"), {
+      model: "model",
+      model_reasoning_effort: "effort"
+    })
+  };
+}
+
 function scanConfigNames(root) {
   if (!fs.existsSync(root)) {
     return [];
@@ -350,6 +453,7 @@ function writeEnv(options, manifest) {
     },
     pluginVersions: collectPluginVersions(process.env),
     engineCliVersions: collectEngineCliVersions(options),
+    peerDefaults: collectPeerDefaults(process.env),
     taskManifestHash: manifest.manifestHash,
     manifestHash: manifest.manifestHash,
     taskTags: taskTags(manifest)
@@ -669,6 +773,7 @@ function buildRecord(options, context) {
     infraFailure: context.infraFailure,
     claudeTokens: context.claudeTokens,
     peerTokens: peerTokensFor(options.condition),
+    peerDefaults: context.peerDefaults ?? emptyPeerDefaults(),
     delegationCount: context.delegationCount,
     resumeCount: 0,
     escalationCount: 0,
@@ -777,12 +882,14 @@ async function main() {
   }
 
   const manifest = buildManifest(options.taskRoot);
+  const peerDefaults = collectPeerDefaults(process.env);
   writeEnv(options, manifest);
   const context = {
     runId: randomUUID(),
     startedAt: new Date().toISOString(),
     taskManifestHash: manifest.manifestHash,
     conditionNotes,
+    peerDefaults,
     claudeExit: null,
     verifyExit: null,
     wallClockSeconds: 0,

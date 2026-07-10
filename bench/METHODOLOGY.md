@@ -54,6 +54,7 @@ Each run produces one JSONL record with the following fields, and the data sourc
 - Claude tokens, orchestrator: tokens billed to the Claude subscription by the orchestrator model, from the session transcript usage records.
 - Claude tokens, subagent: tokens billed to the Claude subscription by subagent invocations, from the session transcript usage records, summed across subagent calls.
 - peer tokens: tokens billed to each peer subscription, from the Grok and Codex CLI logs, condition B2 only; null for A, B1, and B3.
+- Run records capture peerDefaults, the model and effort keys from each peer CLI's home config at run time. A null model means the CLI ran its unpinned flagship default. Per call overrides and project level config are not captured; cross generation comparisons key on peerDefaults together with the recorded CLI versions.
 - delegation count: number of subagent or peer dispatches issued during the run, from the session transcript.
 - resume count: number of resumes issued during the run, from delegation outcome records. The current runner slice records 0 for every run; real extraction from delegation outcome records lands with a later slice.
 - escalation count: number of rung escalations recorded during the run, from delegation outcome records. The current runner slice records 0 for every run; real extraction from delegation outcome records lands with a later slice.

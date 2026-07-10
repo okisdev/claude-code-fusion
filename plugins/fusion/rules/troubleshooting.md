@@ -19,12 +19,17 @@ The grok companion emits these kinds directly; for engines that do not, map the 
 | rate_limited | One retry | Breaks after that one retry fails |
 | timeout | One resume (--resume <uuid>) or one --background rerun, collected through fusion:job-collector before the turn ends | Escalates to a different executor if the retry also times out; does not break the engine |
 | died | Cancel the stale job, then one resume of the thread with the failure attached | Escalates to a different executor if the resume also dies; does not break the engine |
+| session limit | When the harness quota kills a worker and the Agent failure names a reset time, preserve the package brief verbatim in the visible reply so it can be re-dispatched unchanged after the reset; never rewrite it from memory | Does not break the engine |
 | error | One retry with the failure attached | Escalates after the retry; does not break the engine |
-| permission | Re-dispatch once with --write if repository changes are acceptable, otherwise rewrite the brief to avoid shell commands | Does not break the engine; this is an allow list gap, not misbehavior |
+| permission | Re-dispatch once with --write if repository changes are acceptable, otherwise rewrite the brief to avoid shell commands. A permission failure on a read only --web consult is an allow list regression to report, not a brief to rewrite | Does not break the engine; this is an allow list gap, not misbehavior |
 | cancelled | Confirm with the user before treating the work as intentionally dropped | An externally killed job can also report cancelled, so verify before trusting it |
 | missing agent type or a `grok unavailable:` line | Route to the fallback lane | Breaks immediately |
 
 When an engine is broken, use the other peer for second opinions and fusion:deep-reasoner for adversarial review.
+
+## Collection repair
+
+A peer agent final message that is only a receipt or references content invisible to the parent is not collected. Resume that agent once via SendMessage and demand the full deliverable verbatim in its reply, explicitly stating that the parent receives only the final message. If the agent cannot be resumed, dispatch fusion:job-collector with the job's status and result commands.
 
 ## Died process detection
 

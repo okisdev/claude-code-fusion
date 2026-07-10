@@ -21,6 +21,7 @@
     "infraFailure",
     "claudeTokens",
     "peerTokens",
+    "peerDefaults",
     "delegationCount",
     "resumeCount",
     "escalationCount",
@@ -126,6 +127,19 @@
         }
       ]
     },
+    "peerDefaults": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["grok", "codex"],
+      "properties": {
+        "grok": {
+          "$ref": "#/$defs/peerEngineDefaults"
+        },
+        "codex": {
+          "$ref": "#/$defs/peerEngineDefaults"
+        }
+      }
+    },
     "delegationCount": {
       "type": "integer",
       "minimum": 0
@@ -220,6 +234,21 @@
         "cacheCreation": {
           "type": "number",
           "minimum": 0
+        }
+      }
+    },
+    "peerEngineDefaults": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["model", "effort"],
+      "properties": {
+        "model": {
+          "type": ["string", "null"],
+          "minLength": 1
+        },
+        "effort": {
+          "type": ["string", "null"],
+          "minLength": 1
         }
       }
     }

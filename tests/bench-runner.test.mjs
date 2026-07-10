@@ -287,6 +287,139 @@ test("runner writes env.json with manifest and cheap version capture", (t) => {
   });
 });
 
+test("runner records peerDefaults from seeded home configs", (t) => {
+  const sandbox = makeSandbox(t);
+  const home = sandbox.root;
+  fs.mkdirSync(path.join(home, ".grok"), { recursive: true });
+  fs.mkdirSync(path.join(home, ".codex"), { recursive: true });
+  fs.writeFileSync(
+    path.join(home, ".grok", "config.toml"),
+    [
+      "[cli]",
+      'installer = "internal"',
+      "[models]",
+      'default = "grok-4-flagship"',
+      'default_reasoning_effort = "high"',
+      'api_key = "should-not-leak"'
+    ].join("\n") + "\n",
+    "utf8",
+  );
+  fs.writeFileSync(
+    path.join(home, ".codex", "config.toml"),
+    [
+      'model = "gpt-5.6-sol"',
+      'model_reasoning_effort = "xhigh"',
+      'api_key = "should-not-leak"',
+      "approval_policy = \"never\""
+    ].join("\n") + "\n",
+    "utf8",
+  );
+
+  const result = runBench(sandbox, {
+    env: {
+      HOME: home,
+      [claudePluginCacheDirEnv]: path.join(sandbox.root, "empty-plugin-cache")
+    }
+  });
+  assert.strictEqual(result.status, 0, result.stderr);
+
+  const records = readRecords(sandbox);
+  assert.strictEqual(records.length, 1);
+  assert.deepStrictEqual(records[0].peerDefaults, {
+    grok: { model: "grok-4-flagship", effort: "high" },
+    codex: { model: "gpt-5.6-sol", effort: "xhigh" }
+  });
+  const env = JSON.parse(fs.readFileSync(sandbox.envFile, "utf8"));
+  assert.deepStrictEqual(env.peerDefaults, records[0].peerDefaults);
+  assert.doesNotMatch(JSON.stringify(records[0]), /should-not-leak/);
+  assert.doesNotMatch(JSON.stringify(env), /should-not-leak/);
+});
+
+test("runner records null peerDefaults when peer configs are missing", (t) => {
+  const sandbox = makeSandbox(t);
+  const result = runBench(sandbox, {
+    env: {
+      HOME: sandbox.root,
+      [claudePluginCacheDirEnv]: path.join(sandbox.root, "empty-plugin-cache")
+    }
+  });
+  assert.strictEqual(result.status, 0, result.stderr);
+
+  const records = readRecords(sandbox);
+  assert.strictEqual(records.length, 1);
+  assert.deepStrictEqual(records[0].peerDefaults, {
+    grok: { model: null, effort: null },
+    codex: { model: null, effort: null }
+  });
+  const env = JSON.parse(fs.readFileSync(sandbox.envFile, "utf8"));
+  assert.deepStrictEqual(env.peerDefaults, {
+    grok: { model: null, effort: null },
+    codex: { model: null, effort: null }
+  });
+});
+
+test("runner scopes grok peerDefaults keys to the [models] table", (t) => {
+  const sandbox = makeSandbox(t);
+  const home = sandbox.root;
+  fs.mkdirSync(path.join(home, ".grok"), { recursive: true });
+  fs.writeFileSync(
+    path.join(home, ".grok", "config.toml"),
+    [
+      "[cli]",
+      'default = "should-not-win"',
+      'default_reasoning_effort = "should-not-win"',
+      "[models]",
+      'default = "grok-from-models"',
+      'default_reasoning_effort = "high"'
+    ].join("\n") + "\n",
+    "utf8",
+  );
+
+  const result = runBench(sandbox, {
+    env: {
+      HOME: home,
+      [claudePluginCacheDirEnv]: path.join(sandbox.root, "empty-plugin-cache")
+    }
+  });
+  assert.strictEqual(result.status, 0, result.stderr);
+
+  const records = readRecords(sandbox);
+  assert.strictEqual(records.length, 1);
+  assert.deepStrictEqual(records[0].peerDefaults.grok, {
+    model: "grok-from-models",
+    effort: "high"
+  });
+});
+
+test("runner captures grok effort alone when [models] default is absent", (t) => {
+  const sandbox = makeSandbox(t);
+  const home = sandbox.root;
+  fs.mkdirSync(path.join(home, ".grok"), { recursive: true });
+  fs.writeFileSync(
+    path.join(home, ".grok", "config.toml"),
+    [
+      "[models]",
+      'default_reasoning_effort = "medium"'
+    ].join("\n") + "\n",
+    "utf8",
+  );
+
+  const result = runBench(sandbox, {
+    env: {
+      HOME: home,
+      [claudePluginCacheDirEnv]: path.join(sandbox.root, "empty-plugin-cache")
+    }
+  });
+  assert.strictEqual(result.status, 0, result.stderr);
+
+  const records = readRecords(sandbox);
+  assert.strictEqual(records.length, 1);
+  assert.deepStrictEqual(records[0].peerDefaults.grok, {
+    model: null,
+    effort: "medium"
+  });
+});
+
 test("runner records null codex plugin version when the plugin cache is empty", (t) => {
   const sandbox = makeSandbox(t);
   const emptyPluginCache = path.join(sandbox.root, "empty-plugin-cache");

@@ -9,6 +9,7 @@ import { fileURLToPath } from "node:url";
 import { parseArgs } from "./lib/args.mjs";
 import {
   buildGrokArgs,
+  formatBlockedPermissionCall,
   resolveGrokBin,
   resolveTimeoutMs,
   runGrok,
@@ -254,9 +255,13 @@ function isPermissionCancelled(result) {
   return Boolean(result) && result.exitCode === 0 && !result.timedOut && result.stopReason === "Cancelled";
 }
 
+function permissionFailureMessage(result) {
+  return PERMISSION_FAILURE_MESSAGE + formatBlockedPermissionCall(result?.blockedPermissionCall ?? null);
+}
+
 function grokFailureMessage(result, timeoutMs, failureKind) {
   if (failureKind === "permission") {
-    return PERMISSION_FAILURE_MESSAGE;
+    return permissionFailureMessage(result);
   }
   if (result.parseError) {
     return result.parseError;

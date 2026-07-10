@@ -153,6 +153,9 @@ function validateRunRecord(schema, record) {
   if (["A", "B1", "B3"].includes(record.condition) && record.peerTokens !== null) {
     errors.push(`record.peerTokens: expected null for condition ${record.condition}`);
   }
+  if (record.condition === "B2" && (record.peerDefaults === null || typeof record.peerDefaults !== "object")) {
+    errors.push("record.peerDefaults: required for condition B2");
+  }
   if (record.verdict === "infra_failure" && record.infraFailure === null) {
     errors.push("record.infraFailure: required when verdict is infra_failure");
   }
