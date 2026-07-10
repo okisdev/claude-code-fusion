@@ -44,6 +44,10 @@ function baseRecord(overrides = {}) {
       byModel: {}
     },
     peerTokens: null,
+    peerDefaults: {
+      grok: { model: null, effort: null },
+      codex: { model: null, effort: null }
+    },
     delegationCount: 1,
     resumeCount: 0,
     escalationCount: 0,
@@ -59,6 +63,12 @@ function baseRecord(overrides = {}) {
   }
   if (!("peerTokens" in overrides)) {
     record.peerTokens = record.condition === "B2" ? { grok: null, codex: null } : null;
+  }
+  if (!("peerDefaults" in overrides)) {
+    record.peerDefaults = {
+      grok: { model: null, effort: null },
+      codex: { model: null, effort: null }
+    };
   }
   if (!("conditionNotes" in overrides) && record.condition === "B3") {
     record.conditionNotes = { ...record.conditionNotes, mainSessionModel: "sonnet" };
@@ -281,4 +291,35 @@ test("summarize rejects schema records with negative numbers and invalid exclusi
   assert.match(result.stdout, /runs\.jsonl:4: record\.peerTokens: required for condition B2/);
   assert.match(result.stdout, /runs\.jsonl:5: record\.peerTokens: expected null for condition B3/);
   assert.match(result.stdout, /runs\.jsonl:6: record\.conditionNotes\.mainSessionModel: missing required property/);
+});
+
+test("summarize rejects B2 records missing peerDefaults", (t) => {
+  const root = makeSandbox(t);
+  const record = baseRecord({ condition: "B2", peerDefaults: undefined });
+  delete record.peerDefaults;
+  const dir = writeResultsDir(root, "run-1", { records: [record] });
+
+  const result = runSummarize([dir]);
+  assert.strictEqual(result.status, 0, result.stderr);
+  assert.match(result.stdout, /runs\.jsonl:1: record\.peerDefaults: (?:required for condition B2|missing required property)/);
+});
+
+test("summarize accepts B2 records with all-null peerDefaults", (t) => {
+  const root = makeSandbox(t);
+  const dir = writeResultsDir(root, "run-1", {
+    records: [
+      baseRecord({
+        condition: "B2",
+        peerDefaults: {
+          grok: { model: null, effort: null },
+          codex: { model: null, effort: null }
+        }
+      })
+    ]
+  });
+
+  const result = runSummarize([dir]);
+  assert.strictEqual(result.status, 0, result.stderr);
+  assert.doesNotMatch(result.stdout, /peerDefaults/);
+  assert.match(result.stdout, /\| T01-first \| B2 \|/);
 });
