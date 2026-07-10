@@ -1,5 +1,25 @@
 # changelog
 
+## 0.0.19
+
+- gpt 5.6 era refresh: the capability table gains gpt-5.6-sol and gpt-5.6-terra rows next to gpt-5.5 (which stays the codex CLI coded default), and the quick scoped and trivial routing rows name the codex terra class fast tier as the explicit alternative when grok is unavailable or codex is preferred
+- routing rules state that the codex CLI coded default can trail the newest generation while user config pins newer, so live listings and /fusion:config stay authoritative; peer implementation packages must verify tests were not deleted, skipped, or weakened to pass
+- /fusion:doctor and /fusion:config enumerate the codex catalog live via codex debug models --bundled and ~/.codex/models_cache.json, mirroring grok models; doctor also flags when the installed codex plugin wrapper accepts a narrower effort set than the CLI catalog, and the hardcoded effort list is gone
+- grok consult mode allowlists WebSearch and WebFetch when the brief requests --web, so read only research digests no longer die on the permission gate; a permission failure on a --web consult now reads as an allow list regression in troubleshooting
+- /fusion:ultra routes facets by peer strengths instead of the retired implementation versus quick turnaround split and no longer names TodoWrite
+- bench run records capture peer default models (peerDefaults) so cross generation results stay comparable
+- the readme peer row points at the /fusion:config capability table instead of naming model generations, and the rules sync warning names the stale render case and says the scored model table is preserved
+- background job monitors announce only detached background jobs on the grok side, deduplicate announcements across restarts on both engines, and exit clean on EPIPE; the recurring exit 144 crash traced to an external signal kill, so restarts are now idempotent
+- the inline delegation guard no longer denies anything: it counts main loop writes and agent dispatches per session and emits at most one advisory line per budget multiple when writing runs ahead of delegation; the allow escape hatch is retired
+- /fusion:stats gains --session (current session lane counts from the guard state plus per engine job counts) and --prune-dead (dry run listing of workspace state dirs whose recorded cwds no longer exist; --yes deletes)
+- peer briefs open with a header line naming the lane, the effort or model tier when the routing row requires one, and the verification command; review shaped work (PR and issue verification, comment triage, reproducing reported bugs) gets a routing row to /grok:review and /codex:adversarial-review
+- troubleshooting gains a session limit failure row (preserve the brief verbatim for re-dispatch after reset) and a collection repair recipe for receipt or invisible finals; grok-rescue's final message contract forbids referencing invisible content
+- /fusion:setup records reconcile decisions per template hash in reconcile-decisions.json so the same overwrite question is never asked twice
+- CONTRIBUTING.md documents the rules release checklist with the load bearing invariants and the 0.0.15 lesson
+- grok consult mode also allowlists the read only test runners node --test and npm test, so reviews of script heavy diffs can verify claims instead of dying on the permission gate
+- the monitor and guard changes went through an adversarial codex review; all ten findings are fixed fail closed: pruning treats unreadable records, missing or relative cwds, and scan to delete races as unsafe, guard state updates serialize under a lock, codex dedup namespaces per workspace, and monitors survive transient snapshot loss and announce the restart backlog
+- the consult permission gate names the blocked tool call when the CLI reports it and says so explicitly when it does not, because the grok CLI currently omits the denied call from every stream the companion can see
+
 ## 0.0.18
 
 - the routing rules upgrade grok from the fast coding lane to a second frontier implementation lane after xAI shipped its flagship as the CLI default on 2026-07-08; quick and trivial briefs now name low effort or the fast SKU explicitly so speed is intentional rather than assumed, and the design decision exclusion becomes a capability table condition instead of a baked weakness claim
