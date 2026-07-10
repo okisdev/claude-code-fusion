@@ -55,6 +55,10 @@ const consultAllows = [
   "Bash(gh release view *)",
   "Bash(gh release list)",
   "Bash(gh release list *)",
+  "Bash(node --test)",
+  "Bash(node --test *)",
+  "Bash(npm test)",
+  "Bash(npm test *)",
 ];
 
 const consultDenies = [
@@ -297,6 +301,35 @@ test("web flag drops the web search disable and stays consult", (t) => {
   assert.ok(!argv.includes("--disable-web-search"));
   assert.ok(hasPair(argv, "--permission-mode", "dontAsk"));
   assert.ok(!argv.includes("--always-approve"));
+});
+
+const consultWebAllows = ["WebSearch", "WebFetch"];
+
+test("consult with web true appends web tool allow rules", (t) => {
+  const sandbox = makeSandbox(t);
+  const result = runCompanion(["task", "research this", "--web"], { cwd: sandbox.workDir, env: envFor(sandbox) });
+  assert.strictEqual(result.status, 0, result.stderr);
+  const argv = singleInvocation(sandbox);
+  assert.deepStrictEqual(flagValues(argv, "--allow"), [...consultAllows, ...consultWebAllows]);
+  assert.ok(!argv.includes("--disable-web-search"));
+});
+
+test("consult with web false omits web tool allow rules", () => {
+  const argv = buildArgv({ mode: "consult", web: false });
+  assert.deepStrictEqual(flagValues(argv, "--allow"), consultAllows);
+  assert.ok(!flagValues(argv, "--allow").includes("WebSearch"));
+  assert.ok(!flagValues(argv, "--allow").includes("WebFetch"));
+  assert.ok(argv.includes("--disable-web-search"));
+});
+
+test("write mode never gains web tool allow rules", () => {
+  for (const web of [true, false, undefined]) {
+    const argv = buildArgv({ mode: "write", web });
+    assert.strictEqual(flagValues(argv, "--allow").length, 0);
+    assert.ok(!argv.includes("WebSearch"));
+    assert.ok(!argv.includes("WebFetch"));
+    assert.ok(argv.includes("--always-approve"));
+  }
 });
 
 const consultAllowEnv = { GROK_CONSULT_ALLOW: "Bash(jq*), Bash(curl -s*)" };

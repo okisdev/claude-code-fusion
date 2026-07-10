@@ -51,8 +51,14 @@ const CONSULT_ALLOW_RULES = [
   "Bash(gh release view)",
   "Bash(gh release view *)",
   "Bash(gh release list)",
-  "Bash(gh release list *)"
+  "Bash(gh release list *)",
+  "Bash(node --test)",
+  "Bash(node --test *)",
+  "Bash(npm test)",
+  "Bash(npm test *)"
 ];
+
+const CONSULT_WEB_ALLOW_RULES = ["WebSearch", "WebFetch"];
 
 export const NESTED_ENGINE_CLI_DENY_NAMES = ["grok", "claude", "codex"];
 
@@ -142,6 +148,11 @@ export function buildGrokArgs(options) {
     for (const rule of CONSULT_ALLOW_RULES) {
       args.push("--allow", rule);
     }
+    if (options.web) {
+      for (const rule of CONSULT_WEB_ALLOW_RULES) {
+        args.push("--allow", rule);
+      }
+    }
     for (const rule of resolveConsultAllowRules(env)) {
       args.push("--allow", rule);
     }
@@ -191,6 +202,182 @@ export function parseGrokOutput(stdout) {
     }
   }
   return null;
+}
+
+function iterJsonObjects(stdout) {
+  const trimmed = String(stdout ?? "").trim();
+  if (!trimmed) {
+    return [];
+  }
+  const whole = tryParseObject(trimmed);
+  if (whole) {
+    return [whole];
+  }
+  const objects = [];
+  for (const line of trimmed.split(/\r?\n/)) {
+    const parsed = tryParseObject(line.trim());
+    if (parsed) {
+      objects.push(parsed);
+    }
+  }
+  return objects;
+}
+
+function sessionUpdatePayload(object) {
+  if (!object || typeof object !== "object") {
+    return null;
+  }
+  if (object.sessionUpdate) {
+    return object;
+  }
+  if (object.update && typeof object.update === "object" && object.update.sessionUpdate) {
+    return object.update;
+  }
+  if (object.params?.update && typeof object.params.update === "object" && object.params.update.sessionUpdate) {
+    return object.params.update;
+  }
+  return null;
+}
+
+function toolNameFromPayload(payload) {
+  if (!payload || typeof payload !== "object") {
+    return null;
+  }
+  const metaTool = payload._meta?.["x.ai/tool"];
+  const candidates = [
+    payload.name,
+    payload.toolName,
+    payload.tool_name,
+    payload.title,
+    payload.rawInput?.variant,
+    metaTool?.label,
+    metaTool?.name
+  ];
+  for (const candidate of candidates) {
+    if (typeof candidate === "string" && candidate.trim()) {
+      return candidate.trim();
+    }
+  }
+  return null;
+}
+
+function toolArgsFromPayload(payload) {
+  if (!payload || typeof payload !== "object") {
+    return null;
+  }
+  if (payload.rawInput != null) {
+    return payload.rawInput;
+  }
+  if (payload.input != null) {
+    return payload.input;
+  }
+  if (payload.args != null) {
+    return payload.args;
+  }
+  if (typeof payload.command === "string") {
+    return payload.command;
+  }
+  if (typeof payload.arguments === "string") {
+    return payload.arguments;
+  }
+  return null;
+}
+
+function stringifyToolArgs(args) {
+  if (args == null) {
+    return "";
+  }
+  if (typeof args === "string") {
+    return args;
+  }
+  try {
+    return JSON.stringify(args);
+  } catch {
+    return String(args);
+  }
+}
+
+function isPermissionFailureUpdate(payload) {
+  if (!payload || payload.sessionUpdate !== "tool_call_update") {
+    return false;
+  }
+  if (payload.status !== "failed") {
+    return false;
+  }
+  const chunks = [];
+  if (Array.isArray(payload.content)) {
+    for (const entry of payload.content) {
+      const text = entry?.content?.text ?? entry?.text;
+      if (typeof text === "string") {
+        chunks.push(text);
+      }
+    }
+  }
+  const joined = chunks.join("\n");
+  return /permission|denied|cancelled|canceled|not allowed|allow list|allowlist/i.test(joined);
+}
+
+export function extractBlockedPermissionCall(stdout, envelope = null) {
+  const objects = iterJsonObjects(stdout);
+  if (envelope && typeof envelope === "object" && !objects.includes(envelope)) {
+    objects.push(envelope);
+  }
+
+  for (const object of objects) {
+    const directName =
+      (typeof object.blockedTool === "string" && object.blockedTool) ||
+      (typeof object.blocked_tool === "string" && object.blocked_tool) ||
+      (typeof object.deniedTool === "string" && object.deniedTool) ||
+      null;
+    if (directName) {
+      return {
+        tool: directName.trim(),
+        args: object.blockedArgs ?? object.blocked_args ?? object.deniedArgs ?? object.input ?? object.args ?? null
+      };
+    }
+  }
+
+  const toolCallsById = new Map();
+  let lastToolCall = null;
+  let deniedToolCall = null;
+
+  for (const object of objects) {
+    const payload = sessionUpdatePayload(object) ?? object;
+    const sessionUpdate = payload.sessionUpdate ?? (object.type === "tool_call" ? "tool_call" : null);
+
+    if (sessionUpdate === "tool_call" || object.type === "tool_call") {
+      const tool = toolNameFromPayload(payload) ?? toolNameFromPayload(object);
+      const args = toolArgsFromPayload(payload) ?? toolArgsFromPayload(object);
+      if (!tool) {
+        continue;
+      }
+      const entry = { tool, args };
+      const id = payload.toolCallId ?? object.toolCallId ?? object.id ?? null;
+      if (id) {
+        toolCallsById.set(id, entry);
+      }
+      lastToolCall = entry;
+      continue;
+    }
+
+    if (isPermissionFailureUpdate(payload)) {
+      const id = payload.toolCallId ?? null;
+      deniedToolCall = (id && toolCallsById.get(id)) || {
+        tool: toolNameFromPayload(payload) || lastToolCall?.tool || "unknown",
+        args: toolArgsFromPayload(payload) ?? lastToolCall?.args ?? null
+      };
+    }
+  }
+
+  return deniedToolCall ?? lastToolCall;
+}
+
+export function formatBlockedPermissionCall(blocked) {
+  if (!blocked || typeof blocked.tool !== "string" || !blocked.tool.trim()) {
+    return "; blocked call not reported by the CLI";
+  }
+  const argsText = stringifyToolArgs(blocked.args).slice(0, 80);
+  return `; blocked call: ${blocked.tool.trim()}(${argsText})`;
 }
 
 function appendBounded(value, chunk, maxBytes) {
@@ -383,15 +570,19 @@ export function runGrok(options) {
         exitCode === 0 && !timedOut && !validEnvelope && expectsJsonOutput(args)
           ? "Grok did not return a valid JSON envelope for --output-format json."
           : null;
+      const stopReason = validEnvelope ? parsed.stopReason : null;
+      const blockedPermissionCall =
+        stopReason === "Cancelled" ? extractBlockedPermissionCall(stdout, validEnvelope ? parsed : null) : null;
       resolve({
         text: validEnvelope ? parsed.text : stdout.trim(),
         sessionId: validEnvelope && typeof parsed.sessionId === "string" && parsed.sessionId ? parsed.sessionId : null,
-        stopReason: validEnvelope ? parsed.stopReason : null,
+        stopReason,
         exitCode,
         timedOut,
         parseError,
         stdoutTail: stdoutTail(stdout),
-        cancelledByCompanion
+        cancelledByCompanion,
+        blockedPermissionCall
       });
     });
   });
