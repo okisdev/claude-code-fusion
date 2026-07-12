@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
 import { spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -8,9 +9,69 @@ import { fileURLToPath } from "node:url";
 import { resolveStateDir as resolveGuardStateDir, stateFile as guardStateFile } from "./inline-delegation-guard.mjs";
 
 const GROK_DATA_DIR_ENV = "GROK_COMPANION_DATA";
+const FUSION_DATA_DIR_ENV = "FUSION_DATA_DIR";
 const CODEX_TERMINAL_STATUSES = new Set(["completed", "failed", "cancelled"]);
 const GROK_TERMINAL_STATUSES = new Set(["done", "error", "cancelled"]);
 const PRUNE_EVIDENCE = Symbol("pruneEvidence");
+
+export function fusionWorkspaceKey(workspaceRoot) {
+  return createHash("sha256").update(workspaceRoot).digest("hex").slice(0, 16);
+}
+
+export function resolveFusionDataDir(env = process.env) {
+  const override = env[FUSION_DATA_DIR_ENV];
+  if (override && String(override).trim()) {
+    return path.resolve(String(override).trim());
+  }
+  return path.join(os.homedir(), ".claude", "plugins", "data", "fusion-claude-code-fusion");
+}
+
+export function modelAuditSidecarPath(workspaceRoot, env = process.env) {
+  return path.join(resolveFusionDataDir(env), "observations", fusionWorkspaceKey(workspaceRoot), "model-audit.jsonl");
+}
+
+export function loadModelAuditObservations(sidecarPath) {
+  const byJobId = new Map();
+  let text;
+  try {
+    text = fs.readFileSync(sidecarPath, "utf8");
+  } catch (error) {
+    if (error?.code !== "ENOENT") {
+      void 0;
+    }
+    return byJobId;
+  }
+  for (const line of text.split("\n")) {
+    if (!line.trim()) {
+      continue;
+    }
+    try {
+      const observation = JSON.parse(line);
+      if (observation?.jobId && typeof observation.jobId === "string" && !byJobId.has(observation.jobId)) {
+        byJobId.set(observation.jobId, observation);
+      }
+    } catch {
+      void 0;
+    }
+  }
+  return byJobId;
+}
+
+function nonEmptyString(value) {
+  if (value == null) {
+    return null;
+  }
+  const text = String(value).trim();
+  return text ? text : null;
+}
+
+export function resolveCodexJobModel(raw, observation) {
+  return nonEmptyString(raw?.request?.model) ?? nonEmptyString(observation?.model) ?? "unknown";
+}
+
+export function resolveCodexJobEffort(raw, observation) {
+  return nonEmptyString(raw?.request?.effort) ?? nonEmptyString(observation?.effort) ?? null;
+}
 
 export function newestGrokCompanion(env = process.env) {
   const override = env.FUSION_GROK_COMPANION;
@@ -99,6 +160,7 @@ export const FILE_ENGINE_DESCRIPTORS = {
     note: "read best effort from the codex plugin's internal job state",
     enumerateJobs: readWorkspaceJobFiles,
     matchesWorkspace: (raw, cwd) => raw.workspaceRoot === cwd,
+    includeByModel: true,
     normalizeJob(raw) {
       const finished = raw.completedAt ?? raw.updatedAt ?? null;
       let durationSeconds = null;
@@ -114,9 +176,27 @@ export const FILE_ENGINE_DESCRIPTORS = {
         createdAt: raw.createdAt ?? null,
         durationSeconds
       };
+    },
+    resolveModel(raw, observation) {
+      return resolveCodexJobModel(raw, observation);
     }
   }
 };
+
+function observationForJob(raw, env, auditCache) {
+  const workspaceRoot = typeof raw?.workspaceRoot === "string" ? raw.workspaceRoot : null;
+  if (!workspaceRoot) {
+    return null;
+  }
+  if (!auditCache.has(workspaceRoot)) {
+    auditCache.set(workspaceRoot, loadModelAuditObservations(modelAuditSidecarPath(workspaceRoot, env)));
+  }
+  const jobId = typeof raw?.id === "string" ? raw.id : null;
+  if (!jobId) {
+    return null;
+  }
+  return auditCache.get(workspaceRoot).get(jobId) ?? null;
+}
 
 export function fileBasedEngineStats(descriptor, { all = false, env = process.env, cwd = process.cwd() } = {}) {
   const root = resolveStateRoot(descriptor, env);
@@ -132,6 +212,8 @@ export function fileBasedEngineStats(descriptor, { all = false, env = process.en
   const scoped = all ? jobs : jobs.filter((job) => descriptor.matchesWorkspace(job, cwd));
   const byStatus = {};
   const byKind = {};
+  const byModel = {};
+  const auditCache = new Map();
   let durationSum = 0;
   let durationCount = 0;
   let earliest = null;
@@ -140,6 +222,9 @@ export function fileBasedEngineStats(descriptor, { all = false, env = process.en
     const job = descriptor.normalizeJob(raw);
     bump(byStatus, job.status);
     bump(byKind, job.kind);
+    if (descriptor.includeByModel && typeof descriptor.resolveModel === "function") {
+      bump(byModel, descriptor.resolveModel(raw, observationForJob(raw, env, auditCache)));
+    }
     if (job.durationSeconds != null) {
       durationSum += job.durationSeconds;
       durationCount += 1;
@@ -160,6 +245,7 @@ export function fileBasedEngineStats(descriptor, { all = false, env = process.en
     totalJobs: scoped.length,
     byStatus,
     byKind,
+    ...(descriptor.includeByModel ? { byModel } : {}),
     meanWallClockSeconds: durationCount > 0 ? Math.round((durationSum / durationCount) * 1000) / 1000 : null,
     earliestCreatedAt: earliest,
     latestCreatedAt: latest,
@@ -474,6 +560,7 @@ function renderEngine(lines, name, stats) {
   renderCounts(lines, "By status", stats.byStatus ?? {});
   renderCounts(lines, "By mode", stats.byMode ?? {});
   renderCounts(lines, "By kind", stats.byKind ?? {});
+  renderCounts(lines, "By model", stats.byModel ?? {});
   renderCounts(lines, "By failure kind", stats.byFailureKind ?? {});
 }
 

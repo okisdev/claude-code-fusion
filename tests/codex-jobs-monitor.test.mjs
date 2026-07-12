@@ -15,9 +15,11 @@ function makeSandbox(t) {
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
   const stateRoot = path.join(root, "state");
   const workDir = path.join(root, "work");
+  const fusionData = path.join(root, "fusion-data");
   fs.mkdirSync(stateRoot, { recursive: true });
   fs.mkdirSync(workDir, { recursive: true });
-  return { root, stateRoot, workDir };
+  fs.mkdirSync(fusionData, { recursive: true });
+  return { root, stateRoot, workDir, fusionData };
 }
 
 function jobsDirFor(sandbox, workspace) {
@@ -490,4 +492,137 @@ test("skips silently when the state root does not exist", async (t) => {
   assert.deepStrictEqual(monitor.lines(), []);
   assert.strictEqual(monitor.stderr(), "");
   assert.strictEqual(fs.existsSync(sandbox.stateRoot), false);
+});
+
+function writeFakePs(sandbox, output) {
+  const script = path.join(sandbox.root, "fake-ps");
+  const defaultArgs = typeof output === "string" ? output : "node codex-companion.mjs task --model gpt-5.4 --effort high do work";
+  fs.writeFileSync(
+    script,
+    `#!/usr/bin/env node
+const fs = require("node:fs");
+const args = process.argv.slice(2);
+const log = process.env.FAKE_PS_LOG;
+if (log) fs.appendFileSync(log, JSON.stringify(args) + "\\n");
+const pidIndex = args.indexOf("-p");
+const pid = pidIndex >= 0 ? args[pidIndex + 1] : "";
+const dead = (process.env.FAKE_PS_DEAD_PIDS || "").split(",").filter(Boolean);
+if (dead.includes(String(pid))) process.exit(1);
+const mode = process.env.FAKE_PS_MODE || "ok";
+if (mode === "dead") process.exit(1);
+if (mode === "empty") { process.stdout.write(""); process.exit(0); }
+if (mode === "unparseable") { process.stdout.write("node /tmp/worker.js --other flag\\n"); process.exit(0); }
+process.stdout.write(${JSON.stringify(defaultArgs)} + "\\n");
+process.exit(0);
+`,
+    "utf8"
+  );
+  fs.chmodSync(script, 0o755);
+  return script;
+}
+
+function modelAuditPath(sandbox, workspaceRoot = sandbox.workDir) {
+  const workspaceKey = createHash("sha256").update(workspaceRoot).digest("hex").slice(0, 16);
+  return path.join(sandbox.fusionData, "observations", workspaceKey, "model-audit.jsonl");
+}
+
+function readModelAuditLines(sandbox, workspaceRoot = sandbox.workDir) {
+  const file = modelAuditPath(sandbox, workspaceRoot);
+  if (!fs.existsSync(file)) {
+    return [];
+  }
+  return fs
+    .readFileSync(file, "utf8")
+    .split("\n")
+    .filter(Boolean)
+    .map((line) => JSON.parse(line));
+}
+
+function envForAudit(sandbox, extra = {}) {
+  const fakePs = writeFakePs(sandbox);
+  return envFor(sandbox, {
+    FUSION_DATA_DIR: sandbox.fusionData,
+    CODEX_JOBS_MONITOR_PS_COMMAND: fakePs,
+    ...extra
+  });
+}
+
+test("argv capture writes exactly one model-audit observation for a running job", async (t) => {
+  const sandbox = makeSandbox(t);
+  const { record } = seedJob(sandbox, { status: "running", pid: process.pid });
+  const monitor = startMonitor(sandbox, envForAudit(sandbox));
+  t.after(() => monitor.child.kill("SIGKILL"));
+
+  const lines = await waitUntil(() => {
+    const observations = readModelAuditLines(sandbox);
+    return observations.length > 0 ? observations : null;
+  });
+
+  assert.strictEqual(lines.length, 1);
+  assert.strictEqual(lines[0].jobId, record.id);
+  assert.strictEqual(lines[0].engine, "codex");
+  assert.strictEqual(lines[0].model, "gpt-5.4");
+  assert.strictEqual(lines[0].effort, "high");
+  assert.strictEqual(lines[0].source, "argv");
+  assert.ok(typeof lines[0].observedAt === "string" && lines[0].observedAt.length > 0);
+  assert.ok(!modelAuditPath(sandbox).includes("codex-openai-codex"));
+  assert.ok(modelAuditPath(sandbox).startsWith(sandbox.fusionData));
+});
+
+test("a second poll does not duplicate a model-audit observation", async (t) => {
+  const sandbox = makeSandbox(t);
+  seedJob(sandbox, { status: "running", pid: process.pid });
+  const monitor = startMonitor(sandbox, envForAudit(sandbox, { CODEX_JOBS_MONITOR_INTERVAL_MS: "150" }));
+  t.after(() => monitor.child.kill("SIGKILL"));
+
+  await waitUntil(() => (readModelAuditLines(sandbox).length > 0 ? true : null));
+  await new Promise((resolve) => setTimeout(resolve, 500));
+  assert.strictEqual(readModelAuditLines(sandbox).length, 1);
+});
+
+test("a job whose record already carries request.model is not probed", async (t) => {
+  const sandbox = makeSandbox(t);
+  const fakePsLog = path.join(sandbox.root, "fake-ps.log");
+  seedJob(sandbox, {
+    status: "running",
+    pid: process.pid,
+    request: { model: "already-set", effort: "medium" }
+  });
+  const monitor = startMonitor(
+    sandbox,
+    envForAudit(sandbox, {
+      FAKE_PS_LOG: fakePsLog,
+      CODEX_JOBS_MONITOR_INTERVAL_MS: "150"
+    })
+  );
+  t.after(() => monitor.child.kill("SIGKILL"));
+
+  await new Promise((resolve) => setTimeout(resolve, 500));
+  assert.deepStrictEqual(readModelAuditLines(sandbox), []);
+  assert.strictEqual(fs.existsSync(fakePsLog), false);
+});
+
+test("dead pid and unparseable argv are skipped without error for model audit", async (t) => {
+  const sandbox = makeSandbox(t);
+  const shortLivedChild = spawn(process.execPath, ["-e", "setTimeout(() => {}, 0)"]);
+  const deadPid = shortLivedChild.pid;
+  await once(shortLivedChild, "exit");
+
+  seedJob(sandbox, { id: "dead-job", status: "running", pid: deadPid });
+  seedJob(sandbox, { id: "bad-argv-job", status: "running", pid: process.pid });
+
+  const monitor = startMonitor(
+    sandbox,
+    envForAudit(sandbox, {
+      FAKE_PS_MODE: "unparseable",
+      FAKE_PS_DEAD_PIDS: String(deadPid),
+      CODEX_JOBS_MONITOR_INTERVAL_MS: "150"
+    })
+  );
+  t.after(() => monitor.child.kill("SIGKILL"));
+
+  await new Promise((resolve) => setTimeout(resolve, 500));
+  assert.deepStrictEqual(readModelAuditLines(sandbox), []);
+  assert.strictEqual(monitor.stderr(), "");
+  assert.strictEqual(monitor.child.exitCode, null);
 });

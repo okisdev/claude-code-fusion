@@ -437,3 +437,59 @@ test("--session explicitly reports unavailable data when the session id is unset
   assert.match(rendered, /Session data unavailable: CLAUDE_CODE_SESSION_ID is unset/);
   assert.doesNotMatch(rendered, /Total jobs: 0/);
 });
+
+function writeModelAudit(fusionData, workspaceRoot, observations) {
+  const workspaceKey = createHash("sha256").update(workspaceRoot).digest("hex").slice(0, 16);
+  const file = path.join(fusionData, "observations", workspaceKey, "model-audit.jsonl");
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.writeFileSync(file, observations.map((entry) => JSON.stringify(entry)).join("\n") + "\n");
+  return file;
+}
+
+test("codex byModel merges request fields first then sidecar and counts unknown", (t) => {
+  const dir = sandbox(t);
+  const stateRoot = path.join(dir, "state");
+  const fusionData = path.join(dir, "fusion-data");
+
+  writeCodexJob(stateRoot, dir, "from-request", {
+    status: "completed",
+    jobClass: "task",
+    createdAt: "2026-07-02T06:00:00.000Z",
+    request: { model: "request-model", effort: "high" }
+  });
+  writeCodexJob(stateRoot, dir, "from-sidecar", {
+    status: "completed",
+    jobClass: "task",
+    createdAt: "2026-07-02T06:01:00.000Z"
+  });
+  writeCodexJob(stateRoot, dir, "unknown-job", {
+    status: "failed",
+    jobClass: "task",
+    createdAt: "2026-07-02T06:02:00.000Z"
+  });
+  writeCodexJob(stateRoot, dir, "request-over-sidecar", {
+    status: "completed",
+    jobClass: "task",
+    createdAt: "2026-07-02T06:03:00.000Z",
+    request: { model: "wins-from-request" }
+  });
+
+  writeModelAudit(fusionData, dir, [
+    { jobId: "from-sidecar", engine: "codex", model: "sidecar-model", effort: "low", source: "argv", observedAt: "2026-07-02T06:01:30.000Z" },
+    { jobId: "request-over-sidecar", engine: "codex", model: "should-lose", effort: "xhigh", source: "argv", observedAt: "2026-07-02T06:03:30.000Z" }
+  ]);
+
+  const result = run({ cwd: dir, codexState: stateRoot }, ["--json"], { FUSION_DATA_DIR: fusionData });
+  assert.strictEqual(result.status, 0, result.stderr);
+  const codex = JSON.parse(result.stdout).codex;
+  assert.strictEqual(codex.totalJobs, 4);
+  assert.deepStrictEqual(codex.byModel, {
+    "request-model": 1,
+    "sidecar-model": 1,
+    unknown: 1,
+    "wins-from-request": 1
+  });
+
+  const viaApi = codexStats({ env: { FUSION_CODEX_STATE: stateRoot, FUSION_DATA_DIR: fusionData }, cwd: dir });
+  assert.deepStrictEqual(viaApi.byModel, codex.byModel);
+});
