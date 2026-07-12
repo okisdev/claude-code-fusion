@@ -5,15 +5,22 @@ import { createHash } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 
-import { FILE_ENGINE_DESCRIPTORS } from "./fusion-stats.mjs";
+import {
+  FILE_ENGINE_DESCRIPTORS,
+  loadModelAuditObservations,
+  resolveFusionDataDir,
+  fusionWorkspaceKey
+} from "./fusion-stats.mjs";
 
 const TERMINAL_STATUSES = new Set(["completed", "failed", "cancelled"]);
 const DEFAULT_POLL_INTERVAL_MS = 15000;
 const INTERVAL_ENV = "CODEX_JOBS_MONITOR_INTERVAL_MS";
+const PS_COMMAND_ENV = "CODEX_JOBS_MONITOR_PS_COMMAND";
 const SESSION_ID_ENV = "CLAUDE_CODE_SESSION_ID";
 const ERROR_MESSAGE_MAX_LENGTH = 80;
 const DEAD_STATUS_KEY = "dead";
 const RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
+const MODEL_AUDIT_FILENAME = "model-audit.jsonl";
 
 function resolvePollIntervalMs(env = process.env) {
   const raw = env[INTERVAL_ENV];
@@ -110,6 +117,125 @@ function isPidAlive(pid) {
     return true;
   } catch (error) {
     return error?.code !== "ESRCH";
+  }
+}
+
+function nonEmptyRequestField(value) {
+  if (value == null) {
+    return false;
+  }
+  return String(value).trim() !== "";
+}
+
+function recordLacksModelOrEffort(record) {
+  const request = record?.request;
+  if (!request || typeof request !== "object") {
+    return true;
+  }
+  return !nonEmptyRequestField(request.model) || !nonEmptyRequestField(request.effort);
+}
+
+function readProcessArgv(pid, env = process.env) {
+  if (!Number.isInteger(pid) || pid <= 0) {
+    return null;
+  }
+  const command = env[PS_COMMAND_ENV] || "ps";
+  try {
+    const result = spawnSync(command, ["-o", "args=", "-p", String(pid)], {
+      encoding: "utf8"
+    });
+    if (result.error || result.status !== 0) {
+      return null;
+    }
+    const args = String(result.stdout ?? "").trim();
+    return args || null;
+  } catch {
+    return null;
+  }
+}
+
+function parseModelAndEffortFromArgv(argvLine) {
+  if (!argvLine || !String(argvLine).trim()) {
+    return null;
+  }
+  const tokens = String(argvLine).trim().split(/\s+/).filter(Boolean);
+  let model = null;
+  let effort = null;
+  for (let index = 0; index < tokens.length; index += 1) {
+    const token = tokens[index];
+    if (token === "--model" || token === "-m") {
+      const value = tokens[index + 1];
+      if (value && !value.startsWith("-")) {
+        model = value;
+        index += 1;
+      }
+      continue;
+    }
+    if (token.startsWith("--model=")) {
+      const value = token.slice("--model=".length);
+      if (value) {
+        model = value;
+      }
+      continue;
+    }
+    if (token === "--effort") {
+      const value = tokens[index + 1];
+      if (value && !value.startsWith("-")) {
+        effort = value;
+        index += 1;
+      }
+      continue;
+    }
+    if (token.startsWith("--effort=")) {
+      const value = token.slice("--effort=".length);
+      if (value) {
+        effort = value;
+      }
+    }
+  }
+  if (model == null && effort == null) {
+    return null;
+  }
+  return { model, effort };
+}
+
+function modelAuditSidecarPath(workspaceRoot, env = process.env) {
+  return path.join(resolveFusionDataDir(env), "observations", fusionWorkspaceKey(workspaceRoot), MODEL_AUDIT_FILENAME);
+}
+
+function appendModelAuditObservation(sidecarPath, observation) {
+  fs.mkdirSync(path.dirname(sidecarPath), { recursive: true });
+  fs.appendFileSync(sidecarPath, `${JSON.stringify(observation)}\n`, "utf8");
+}
+
+function maybeCaptureModelAudit(record, seenJobIds, sidecarPath, env = process.env) {
+  if (!record?.id || seenJobIds.has(record.id)) {
+    return;
+  }
+  if (record.status !== "running" || !recordLacksModelOrEffort(record)) {
+    return;
+  }
+  const argvLine = readProcessArgv(record.pid, env);
+  if (!argvLine) {
+    return;
+  }
+  const parsed = parseModelAndEffortFromArgv(argvLine);
+  if (!parsed) {
+    return;
+  }
+  const observation = {
+    jobId: record.id,
+    engine: "codex",
+    model: parsed.model,
+    effort: parsed.effort,
+    source: "argv",
+    observedAt: new Date().toISOString()
+  };
+  try {
+    appendModelAuditObservation(sidecarPath, observation);
+    seenJobIds.add(record.id);
+  } catch {
+    void 0;
   }
 }
 
@@ -233,6 +359,8 @@ function main() {
   const loaded = loadAnnounced(stateFile);
   const announced = loaded.announced;
   const knownJobDirs = new Set();
+  const auditSidecarPath = modelAuditSidecarPath(workspaceRoot);
+  const seenModelAuditIds = new Set(loadModelAuditObservations(auditSidecarPath).keys());
   let startupPending = true;
 
   pruneOldStateFiles(root, stateFile);
@@ -262,6 +390,7 @@ function main() {
         }
         continue;
       }
+      maybeCaptureModelAudit(record, seenModelAuditIds, auditSidecarPath);
       if (record.status === "running" && !isPidAlive(record.pid)) {
         const key = announcementKey(record.id, DEAD_STATUS_KEY);
         if (startupPending && loaded.malformed) {
