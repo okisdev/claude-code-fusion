@@ -5,6 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import { test } from "node:test";
 
+import { buildRulesManifest } from "../plugins/fusion/scripts/generate-rules-manifest.mjs";
 import { hashRulesTemplate, renderRulesContent } from "../plugins/fusion/scripts/lib/rules-template.mjs";
 
 const repoRoot = path.join(import.meta.dirname, "..");
@@ -22,6 +23,16 @@ canonical routing footer
 `;
 const OLD_VERSION = "# Orchestration policy\n\nold rules content\n";
 const UNKNOWN_VERSION = "# Orchestration policy\n\nhand edited by the user\n";
+
+function runCommand(root, command, args) {
+  const result = spawnSync(command, args, { cwd: root, encoding: "utf8" });
+  assert.strictEqual(result.status, 0, result.stderr);
+  return result.stdout;
+}
+
+function runGit(root, args) {
+  return runCommand(root, "git", args);
+}
 
 function makeSandbox(t) {
   const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "fusion-rules-sync-test-")));
@@ -183,10 +194,10 @@ test("Doctor and setup describe template hash comparison for live rules", () => 
   const doctor = fs.readFileSync(path.join(repoRoot, "plugins", "fusion", "skills", "doctor", "SKILL.md"), "utf8");
   const setup = fs.readFileSync(path.join(repoRoot, "plugins", "fusion", "skills", "setup", "SKILL.md"), "utf8");
   assert.match(doctor, /hashRulesTemplate/);
-  assert.match(doctor, /A scored live model table is expected to differ from the shipped placeholder/);
+  assert.match(doctor, /A user selected live model table may differ from the scored canonical table/);
   assert.match(setup, /hashRulesTemplate/);
   assert.match(setup, /do not compare raw bytes/);
-  assert.match(setup, /A live scored model table is expected to differ from the shipped placeholder/);
+  assert.match(setup, /A live table may differ from the scored canonical table/);
   assert.doesNotMatch(setup, /is identical/);
   assert.doesNotMatch(setup, /write the canonical content/);
 });
@@ -201,4 +212,42 @@ test("The shipped rules manifest contains the current rules file template hash",
     manifest.hashes.includes(currentHash),
     "plugins/fusion/rules-manifest.json is stale, run node plugins/fusion/scripts/generate-rules-manifest.mjs"
   );
+});
+
+test("Rules manifest generator hashes only HEAD history and working tree content", (t) => {
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "fusion-rules-manifest-test-")));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const relativeRulesPath = path.join("plugins", "fusion", "rules", "orchestration.md");
+  const rulesPath = path.join(root, relativeRulesPath);
+  const mainContent = "# Orchestration policy\n\nmain branch release\n";
+  const branchOnlyContent = "# Orchestration policy\n\nnon-main branch only\n";
+  const workingTreeContent = "# Orchestration policy\n\ncurrent working tree\n";
+  const signingKey = path.join(root, "fixture-signing-key");
+
+  fs.mkdirSync(path.dirname(rulesPath), { recursive: true });
+  runCommand(root, "ssh-keygen", ["-q", "-t", "ed25519", "-N", "", "-f", signingKey]);
+  runGit(root, ["init", "--initial-branch=main"]);
+  runGit(root, ["config", "user.name", "Fusion Test"]);
+  runGit(root, ["config", "user.email", "fusion-test@example.com"]);
+  runGit(root, ["config", "gpg.format", "ssh"]);
+  runGit(root, ["config", "gpg.ssh.program", "ssh-keygen"]);
+  runGit(root, ["config", "user.signingkey", signingKey]);
+  runGit(root, ["config", "commit.gpgsign", "true"]);
+  fs.writeFileSync(rulesPath, mainContent, "utf8");
+  runGit(root, ["add", relativeRulesPath]);
+  runGit(root, ["commit", "-m", "main release"]);
+  runGit(root, ["switch", "-c", "unreleased-side-branch"]);
+  fs.writeFileSync(rulesPath, branchOnlyContent, "utf8");
+  runGit(root, ["add", relativeRulesPath]);
+  runGit(root, ["commit", "-m", "unreleased side branch"]);
+  runGit(root, ["switch", "main"]);
+  fs.writeFileSync(rulesPath, workingTreeContent, "utf8");
+
+  const manifest = buildRulesManifest({ root, relativeRulesPath });
+
+  assert.deepStrictEqual(manifest, {
+    format: 2,
+    hashes: [hashRulesTemplate(mainContent), hashRulesTemplate(workingTreeContent)].sort()
+  });
+  assert.ok(!manifest.hashes.includes(hashRulesTemplate(branchOnlyContent)));
 });
