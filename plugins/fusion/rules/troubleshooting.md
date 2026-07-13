@@ -11,18 +11,20 @@ Failure driven escalation applies among the Claude fusion worker tiers; peer fai
 
 ## Failure kinds and the circuit breaker
 
-The grok companion emits these kinds directly; for engines that do not, map the observed failure onto the closest kind before acting.
+The companion emits exactly these ten failure kinds: quota, auth, missing_cli, rate_limited, timeout, error, permission, cancelled, input, and died. The max turns and session limit entries below are orchestrator observed conditions, not companion failure kinds: max turns arrives as an error result with a max-turns message, and session limit is a Claude-side event. The missing agent type and unavailable line are also observed routing conditions. For engines that do not emit the shared kinds, map an observed failure onto the closest companion failure kind before acting.
 
-| Failure kind | Immediate action | Circuit breaker effect |
+| Failure kind or observed condition | Immediate action | Circuit breaker effect |
 |---|---|---|
 | quota, auth, missing_cli | Stop retrying this engine | Breaks the engine for the rest of the session |
 | rate_limited | One retry | Breaks after that one retry fails |
-| timeout, max turns | Timeout: one resume (--resume <uuid>) or one --background rerun, collected through fusion:job-collector before the turn ends. Hitting max turns on the first attempt marks the package as too big for the lane; split the package or reroute it as a spec grade codex brief; never retry the same brief at the same scope | Escalates to a different executor if a timeout retry also times out; does not break the engine |
+| timeout | One resume (--resume <uuid>) or one --background rerun, collected through fusion:job-collector before the turn ends | Escalates to a different executor if the retry also times out; does not break the engine |
 | died | Cancel the stale job, then one resume of the thread with the failure attached | Escalates to a different executor if the resume also dies; does not break the engine |
-| session limit | When the harness quota kills a worker and the Agent failure names a reset time, preserve the package brief verbatim in the visible reply so it can be re-dispatched unchanged after the reset; never rewrite it from memory | Does not break the engine |
 | error | One retry with the failure attached | Escalates after the retry; does not break the engine |
 | permission | Re-dispatch once with --write if repository changes are acceptable, otherwise rewrite the brief to avoid shell commands. A permission failure on a read only --web consult is an allow list regression to report, not a brief to rewrite. A repeated /grok:review permission death on the same diff has no cheap diagnosis while the grok CLI omits the denied call from its output; run that review through /codex:adversarial-review or fusion:deep-reasoner instead | Does not break the engine; this is an allow list gap, not misbehavior |
 | cancelled | Confirm with the user before treating the work as intentionally dropped | An externally killed job can also report cancelled, so verify before trusting it |
+| input | Correct the rejected request before dispatching again | Does not break the engine |
+| max turns message on an error result | Hitting max turns on the first attempt marks the package as too big for the lane; split the package or reroute it as a spec grade codex brief; never retry the same brief at the same scope | Does not break the engine |
+| Claude-side session limit event | When the harness quota kills a worker and the Agent failure names a reset time, preserve the package brief verbatim in the visible reply so it can be re-dispatched unchanged after the reset; never rewrite it from memory | Does not break the engine |
 | missing agent type or a `grok unavailable:` line | Route to the fallback lane | Breaks immediately |
 
 When an engine is broken, use the other peer for second opinions and fusion:deep-reasoner for adversarial review.

@@ -43,6 +43,14 @@ jobs:
             echo 'ERROR: plugin manifest glob matched no files: plugins/*/.claude-plugin/plugin.json' >&2
             exit 1
           fi
+          if [ ${#hooks_files[@]} -eq 0 ]; then
+            echo 'ERROR: hooks glob matched no files: plugins/*/hooks/hooks.json' >&2
+            exit 1
+          fi
+          if [ ${#rules_files[@]} -eq 0 ]; then
+            echo 'ERROR: rules manifest glob matched no files: plugins/*/rules-manifest.json' >&2
+            exit 1
+          fi
           paths=("${marketplace[@]}" "${plugin_manifests[@]}" "${hooks_files[@]}" "${rules_files[@]}" bench/tasks/manifest.json)
           printf 'Validating JSON manifests:\n'
           printf '  %s\n' "${paths[@]}"

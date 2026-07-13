@@ -193,6 +193,43 @@ function sessionRunEnv(dir, extra = {}) {
   });
 }
 
+function writeTraceFixture(dir) {
+  const guardStateDir = path.join(dir, "guard-state");
+  const grokDataDir = path.join(dir, "grok-data");
+  const codexState = path.join(dir, "codex-state");
+  writeGuardState(guardStateDir, "session-trace", {
+    writeCount: 0,
+    dispatches: { grok: 1, codex: 1 },
+    dispatchLog: [
+      { at: "2026-07-10T10:00:00.000Z", lane: "grok", subagentType: "grok:grok-rescue", description: "first dispatch" },
+      { at: "2026-07-10T10:10:00.000Z", lane: "codex", subagentType: "codex:codex-rescue", description: "last dispatch" }
+    ],
+    advisedMultiples: [],
+    createdAt: "2026-07-10T10:00:00.000Z",
+    updatedAt: "2026-07-10T10:10:00.000Z"
+  });
+  writeGrokJob(grokDataDir, dir, "grok-exact", {
+    status: "done",
+    mode: "consult",
+    claudeSessionId: "session-trace",
+    createdAt: "2026-07-10T10:04:00.000Z",
+    request: { model: "grok-model", effort: "high" }
+  });
+  writeCodexJob(codexState, dir, "codex-approximate", {
+    status: "completed",
+    jobClass: "task",
+    createdAt: "2026-07-10T10:06:00.000Z",
+    request: { model: "codex-model", effort: "xhigh" }
+  });
+  writeCodexJob(codexState, dir, "codex-outside-span", {
+    status: "completed",
+    jobClass: "task",
+    createdAt: "2026-07-10T11:11:00.000Z",
+    request: { model: "outside-model", effort: "low" }
+  });
+  return { guardStateDir, grokDataDir, codexState };
+}
+
 test("--session prints a clean line when no guard state is recorded", (t) => {
   const dir = sandbox(t);
   const result = sessionRunEnv(dir, { args: ["--session"], env: { CLAUDE_CODE_SESSION_ID: "" } });
@@ -251,6 +288,69 @@ test("buildSessionReport and renderSessionReport agree on an unset session", () 
   assert.strictEqual(report.sessionId, null);
   assert.strictEqual(report.guard, null);
   assert.match(renderSessionReport(report), /no dispatches recorded/);
+});
+
+test("--trace joins exact Grok and approximate Codex jobs into dispatch time order", (t) => {
+  const dir = sandbox(t);
+  const fixture = writeTraceFixture(dir);
+  const result = run({ cwd: dir, codexState: fixture.codexState }, ["--trace", "--session", "session-trace"], {
+    CLAUDE_CODE_SESSION_ID: "different-session",
+    FUSION_INLINE_GUARD_STATE: fixture.guardStateDir,
+    GROK_COMPANION_DATA: fixture.grokDataDir
+  });
+  assert.strictEqual(result.status, 0, result.stderr);
+  const rows = result.stdout.split("\n").filter((line) => line.startsWith("2026-07-10T"));
+  assert.deepStrictEqual(rows.map((row) => row.split(" | ").slice(0, 3)), [
+    ["2026-07-10T10:00:00.000Z", "dispatch", "grok"],
+    ["2026-07-10T10:04:00.000Z", "engine job", "grok"],
+    ["2026-07-10T10:06:00.000Z", "engine job", "codex (approximate)"],
+    ["2026-07-10T10:10:00.000Z", "dispatch", "codex"]
+  ]);
+  assert.match(result.stdout, /grok-model@high \| done/);
+  assert.match(result.stdout, /codex-model@xhigh \| completed/);
+  assert.match(result.stdout, /codex \(approximate\)/);
+  assert.doesNotMatch(result.stdout, /outside-model/);
+});
+
+test("--trace --json returns the session timeline shape", (t) => {
+  const dir = sandbox(t);
+  const fixture = writeTraceFixture(dir);
+  const result = run({ cwd: dir, codexState: fixture.codexState }, ["--trace", "--session", "session-trace", "--json"], {
+    FUSION_INLINE_GUARD_STATE: fixture.guardStateDir,
+    GROK_COMPANION_DATA: fixture.grokDataDir
+  });
+  assert.strictEqual(result.status, 0, result.stderr);
+  const data = JSON.parse(result.stdout);
+  assert.strictEqual(data.available, true);
+  assert.strictEqual(data.sessionId, "session-trace");
+  assert.strictEqual(data.workspaceRoot, dir);
+  assert.ok(Array.isArray(data.timeline));
+  assert.deepStrictEqual(data.timeline.map((entry) => entry.source), ["dispatch", "engine job", "engine job", "dispatch"]);
+  assert.deepStrictEqual(data.timeline[0], {
+    time: "2026-07-10T10:00:00.000Z",
+    source: "dispatch",
+    lane: "grok",
+    subagentType: "grok:grok-rescue",
+    description: "first dispatch"
+  });
+  assert.deepStrictEqual(data.timeline[1], {
+    time: "2026-07-10T10:04:00.000Z",
+    source: "engine job",
+    engine: "grok",
+    join: "exact",
+    model: "grok-model",
+    effort: "high",
+    status: "done"
+  });
+  assert.deepStrictEqual(data.timeline[2], {
+    time: "2026-07-10T10:06:00.000Z",
+    source: "engine job",
+    engine: "codex",
+    join: "approximate",
+    model: "codex-model",
+    effort: "xhigh",
+    status: "completed"
+  });
 });
 
 test("--prune-dead dry run lists only workspace dirs whose every job cwd is gone", (t) => {
@@ -446,7 +546,7 @@ function writeModelAudit(fusionData, workspaceRoot, observations) {
   return file;
 }
 
-test("codex byModel merges request fields first then sidecar and counts unknown", (t) => {
+test("codex byModel includes effort from request fields first then sidecar in JSON and rendered output", (t) => {
   const dir = sandbox(t);
   const stateRoot = path.join(dir, "state");
   const fusionData = path.join(dir, "fusion-data");
@@ -475,6 +575,7 @@ test("codex byModel merges request fields first then sidecar and counts unknown"
   });
 
   writeModelAudit(fusionData, dir, [
+    { jobId: "from-request", engine: "codex", model: "should-lose", effort: "low", source: "argv", observedAt: "2026-07-02T06:00:30.000Z" },
     { jobId: "from-sidecar", engine: "codex", model: "sidecar-model", effort: "low", source: "argv", observedAt: "2026-07-02T06:01:30.000Z" },
     { jobId: "request-over-sidecar", engine: "codex", model: "should-lose", effort: "xhigh", source: "argv", observedAt: "2026-07-02T06:03:30.000Z" }
   ]);
@@ -484,12 +585,46 @@ test("codex byModel merges request fields first then sidecar and counts unknown"
   const codex = JSON.parse(result.stdout).codex;
   assert.strictEqual(codex.totalJobs, 4);
   assert.deepStrictEqual(codex.byModel, {
-    "request-model": 1,
-    "sidecar-model": 1,
+    "request-model@high": 1,
+    "sidecar-model@low": 1,
     unknown: 1,
-    "wins-from-request": 1
+    "wins-from-request@xhigh": 1
   });
 
   const viaApi = codexStats({ env: { FUSION_CODEX_STATE: stateRoot, FUSION_DATA_DIR: fusionData }, cwd: dir });
   assert.deepStrictEqual(viaApi.byModel, codex.byModel);
+
+  const rendered = run({ cwd: dir, codexState: stateRoot }, [], { FUSION_DATA_DIR: fusionData });
+  assert.strictEqual(rendered.status, 0, rendered.stderr);
+  assert.match(rendered.stdout, /By model:\n- request-model@high: 1/);
+  assert.match(rendered.stdout, /- sidecar-model@low: 1/);
+  assert.match(rendered.stdout, /- wins-from-request@xhigh: 1/);
+});
+
+test("codex stats dedupe mirrored job ids and prefer the terminal workspace copy", (t) => {
+  const dir = sandbox(t);
+  const stateRoot = path.join(dir, "state");
+  const worktreeRoot = path.join(dir, ".claude", "worktrees", "agent-test");
+  fs.mkdirSync(worktreeRoot, { recursive: true });
+  writeCodexJob(stateRoot, dir, "mirrored-job", {
+    status: "running",
+    jobClass: "task",
+    createdAt: "2026-07-02T06:00:00.000Z",
+    updatedAt: "2026-07-02T06:00:05.000Z",
+    request: { model: "stale-model", effort: "low" }
+  });
+  writeCodexJob(stateRoot, worktreeRoot, "mirrored-job", {
+    status: "completed",
+    jobClass: "task",
+    createdAt: "2026-07-02T06:00:00.000Z",
+    completedAt: "2026-07-02T06:01:00.000Z",
+    request: { model: "terminal-model", effort: "high" }
+  });
+
+  const result = run({ cwd: dir, codexState: stateRoot }, ["--json"]);
+  assert.strictEqual(result.status, 0, result.stderr);
+  const codex = JSON.parse(result.stdout).codex;
+  assert.strictEqual(codex.totalJobs, 1);
+  assert.deepStrictEqual(codex.byStatus, { completed: 1 });
+  assert.deepStrictEqual(codex.byModel, { "terminal-model@high": 1 });
 });

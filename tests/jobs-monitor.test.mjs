@@ -118,6 +118,31 @@ test("a background job transitioning to done emits exactly one correctly shaped 
   assert.strictEqual(monitor.lines().length, 1);
 });
 
+test("a corrupt job record does not mute announcements for healthy records", async (t) => {
+  const sandbox = makeSandbox(t);
+  const { file, record } = seedJob(sandbox, { status: "running", background: true });
+  const corruptId = "corrupt-record";
+  fs.writeFileSync(path.join(jobsDir(sandbox.dataDir, sandbox.workDir), `${corruptId}.json`), "{not json\n", "utf8");
+  fs.writeFileSync(announcedPath(sandbox), `${JSON.stringify([`${corruptId}:done`])}\n`, "utf8");
+  const monitor = startMonitor(sandbox, envFor(sandbox));
+  t.after(() => monitor.child.kill("SIGKILL"));
+  await new Promise((resolve) => setTimeout(resolve, 300));
+
+  writeJobRecordFile(file, {
+    ...record,
+    status: "done",
+    finishedAt: new Date().toISOString(),
+    resultText: "ALLOW",
+  });
+
+  const lines = await waitUntil(() => (monitor.lines().length > 0 ? monitor.lines() : null));
+  assert.deepStrictEqual(lines, [
+    `grok job ${record.id} done. collect with /grok:result ${record.id} only if you launched it detached; a job owned by a subagent reports on its own`,
+  ]);
+  const announced = JSON.parse(fs.readFileSync(announcedPath(sandbox), "utf8"));
+  assert.ok(announced.includes(`${corruptId}:done`));
+});
+
 test("a foreground job transitioning to done is not announced", async (t) => {
   const sandbox = makeSandbox(t);
   const { file, record } = seedJob(sandbox, { status: "running", background: false });

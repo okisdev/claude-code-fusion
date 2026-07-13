@@ -14,7 +14,7 @@ Execution rules:
 - Dispatch the run as one background subagent of type `grok:grok-rescue` via the `Agent` tool. Never run the companion in the main loop and never ask the user how to run it; the subagent is harness tracked, so its completion arrives as a notification and nothing blocks.
 - Separate routing flags from the task text: `--write`, `--web`, `--background`, `--resume <uuid>`, `--resume-last`, `--model`, `--effort`, `--max-turns`, and `--best-of-n` are runtime controls. Name them explicitly in the subagent prompt as the flags to pass, and hand over the remaining natural language text as the task text.
 - Do not rewrite the task text beyond stripping routing flags.
-- Pass `--background` through only when the user explicitly included it. It detaches the job with no completion notification, which suits watch style work; collect it with `/grok:status` and `/grok:result` before relying on the outcome.
+- Pass `--background` through only when the user explicitly included it. It detaches the companion job, but grok-rescue still collects it in turn through a `result --wait` chain before returning a final result. The best effort session monitor may also announce completion; neither a receipt nor a monitor line replaces collection.
 - Leave `--model` and `--effort` unset unless the user explicitly asked for them. Grok resolves both from its own config.
 - `--web` re-enables Grok's web tools for research briefs; leave it off for code work.
 - `--best-of-n` implies write mode with auto approval because the tournament applies the winning candidate to the workspace; pass it only when the user accepts edits.

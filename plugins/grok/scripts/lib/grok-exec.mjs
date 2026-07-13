@@ -481,6 +481,36 @@ function waitMs(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+function waitSync(ms) {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
+export function terminateProcessGroupSync(pid, options = {}) {
+  if (!Number.isInteger(pid) || pid <= 0) {
+    return false;
+  }
+  const graceMs = options.graceMs ?? TERMINATION_GRACE_MS;
+  const pollMs = options.pollMs ?? TERMINATION_POLL_MS;
+  signalProcessGroup(pid, "SIGTERM");
+  const deadline = Date.now() + graceMs;
+  while (Date.now() < deadline) {
+    if (!processGroupAlive(pid)) {
+      return true;
+    }
+    waitSync(pollMs);
+  }
+  if (processGroupAlive(pid)) {
+    signalProcessGroup(pid, "SIGKILL");
+  }
+  while (Date.now() < deadline + graceMs) {
+    if (!processGroupAlive(pid)) {
+      return true;
+    }
+    waitSync(pollMs);
+  }
+  return !processGroupAlive(pid);
+}
+
 export async function terminateProcessGroup(pid, options = {}) {
   if (!Number.isInteger(pid) || pid <= 0) {
     return false;

@@ -12,6 +12,7 @@ const STALE_MS = 48 * 60 * 60 * 1000;
 const LOCK_RETRY_MS = 10;
 const LOCK_TIMEOUT_MS = 2000;
 const LOCK_STALE_MS = 10000;
+const DISPATCH_LOG_LIMIT = 200;
 const WRITE_TOOLS = new Set(["Edit", "Write", "NotebookEdit", "MultiEdit"]);
 const DELEGATION_TOOLS = new Set(["Agent", "Task"]);
 const BUILTIN_LANE = "builtin";
@@ -183,6 +184,14 @@ function extractSubagentType(toolInput) {
   return typeof raw === "string" && raw.length > 0 ? raw : null;
 }
 
+function extractDispatchDescription(toolInput) {
+  if (!toolInput || typeof toolInput !== "object") {
+    return null;
+  }
+  const raw = toolInput.description ?? null;
+  return typeof raw === "string" && raw.length > 0 ? raw.slice(0, 120) : null;
+}
+
 function totalDispatches(dispatches) {
   return Object.values(dispatches ?? {}).reduce((sum, value) => sum + (Number.isFinite(value) ? value : 0), 0);
 }
@@ -192,7 +201,7 @@ function budgetMultiple(writeCount, budget) {
 }
 
 function defaultState(now) {
-  return { writeCount: 0, dispatches: {}, advisedMultiples: [], createdAt: now, updatedAt: now };
+  return { writeCount: 0, dispatches: {}, dispatchLog: [], advisedMultiples: [], createdAt: now, updatedAt: now };
 }
 
 function normalizeState(existing, now) {
@@ -202,6 +211,7 @@ function normalizeState(existing, now) {
   return {
     writeCount: Number.isFinite(existing.writeCount) ? existing.writeCount : 0,
     dispatches: existing.dispatches && typeof existing.dispatches === "object" ? { ...existing.dispatches } : {},
+    dispatchLog: Array.isArray(existing.dispatchLog) ? existing.dispatchLog.slice(-DISPATCH_LOG_LIMIT) : [],
     advisedMultiples: Array.isArray(existing.advisedMultiples) ? existing.advisedMultiples.slice() : [],
     createdAt: existing.createdAt ?? now,
     updatedAt: now
@@ -218,8 +228,9 @@ function allowOutput(reason) {
 
 function buildAdvisoryLine(writeCount, dispatchCount) {
   return (
-    `${writeCount} inline write tool calls and ${dispatchCount} agent dispatches this session, ` +
-    "so declare implement posture and dispatch the remaining work as packages."
+    `${writeCount} inline writes happened this session with ${dispatchCount === 0 ? "zero" : dispatchCount} dispatches. ` +
+    "The next package belongs in a lane: quick scoped work goes to the codex quick tier gpt-5.6-terra at effort xhigh; " +
+    "trivial or high-volume work goes to gpt-5.6-luna at effort xhigh; work needing the Claude Code tool surface goes to fusion:fast-worker."
   );
 }
 
@@ -252,8 +263,14 @@ function runHook(env = process.env) {
   if (DELEGATION_TOOLS.has(toolName)) {
     withStateLock(file, () => {
       const state = normalizeState(readState(file), now);
-      const lane = laneForSubagentType(extractSubagentType(input.tool_input));
+      const subagentType = extractSubagentType(input.tool_input);
+      const lane = laneForSubagentType(subagentType);
       state.dispatches[lane] = (state.dispatches[lane] ?? 0) + 1;
+      const description = extractDispatchDescription(input.tool_input);
+      state.dispatchLog.push({ at: now, lane, ...(subagentType ? { subagentType } : {}), ...(description ? { description } : {}) });
+      if (state.dispatchLog.length > DISPATCH_LOG_LIMIT) {
+        state.dispatchLog.splice(0, state.dispatchLog.length - DISPATCH_LOG_LIMIT);
+      }
       writeState(file, state);
     });
     return;
@@ -319,6 +336,7 @@ if (isMain()) {
 export {
   buildAdvisoryLine,
   budgetMultiple,
+  extractDispatchDescription,
   extractWritePath,
   isInsideCwd,
   isSubagentPayload,

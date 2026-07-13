@@ -86,6 +86,13 @@ test("invalid zero exit JSON envelope records an error with a bounded stdout tai
 test("bad cwd is an input error before a job is created", (t) => {
   const sandbox = makeSandbox(t);
   const missing = path.join(sandbox.root, "missing-work");
+  const textResult = runCompanion(["task", "hello", "--cwd", missing], {
+    cwd: sandbox.workDir,
+    env: envFor(sandbox),
+  });
+  assert.notStrictEqual(textResult.status, 0);
+  assert.doesNotMatch(textResult.stderr, /^job: /m);
+  assert.match(textResult.stderr, /state: error\nfailure: input\n$/);
   const result = runCompanion(["task", "hello", "--cwd", missing, "--json"], {
     cwd: sandbox.workDir,
     env: envFor(sandbox),

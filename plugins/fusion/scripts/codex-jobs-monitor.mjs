@@ -45,6 +45,14 @@ function resolveWorkspaceRoot(cwd) {
   return cwd;
 }
 
+function workspaceRootInScope(recordedRoot, workspaceRoot) {
+  if (typeof recordedRoot !== "string" || !recordedRoot) {
+    return false;
+  }
+  const relative = path.relative(workspaceRoot, recordedRoot);
+  return relative === "" || (relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative));
+}
+
 function readWorkspaceJobsSnapshot(root, workspaceRoot, requiredJobDirs = new Set()) {
   try {
     if (!fs.statSync(root).isDirectory()) {
@@ -74,7 +82,7 @@ function readWorkspaceJobsSnapshot(root, workspaceRoot, requiredJobDirs = new Se
       for (const entry of entries) {
         try {
           const record = JSON.parse(fs.readFileSync(path.join(dir, entry), "utf8"));
-          if (record?.workspaceRoot === workspaceRoot) {
+          if (workspaceRootInScope(record?.workspaceRoot, workspaceRoot)) {
             records.push(record);
             sourceDirs.add(dir);
           }
@@ -205,7 +213,26 @@ function modelAuditSidecarPath(workspaceRoot, env = process.env) {
 
 function appendModelAuditObservation(sidecarPath, observation) {
   fs.mkdirSync(path.dirname(sidecarPath), { recursive: true });
-  fs.appendFileSync(sidecarPath, `${JSON.stringify(observation)}\n`, "utf8");
+  const lockPath = `${sidecarPath}.lock`;
+  let lock;
+  try {
+    lock = fs.openSync(lockPath, "wx");
+  } catch (error) {
+    if (error?.code === "EEXIST") {
+      return false;
+    }
+    throw error;
+  }
+  try {
+    if (loadModelAuditObservations(sidecarPath).has(observation.jobId)) {
+      return true;
+    }
+    fs.appendFileSync(sidecarPath, `${JSON.stringify(observation)}\n`, "utf8");
+    return true;
+  } finally {
+    fs.closeSync(lock);
+    fs.rmSync(lockPath, { force: true });
+  }
 }
 
 function maybeCaptureModelAudit(record, seenJobIds, sidecarPath, env = process.env) {
@@ -232,8 +259,9 @@ function maybeCaptureModelAudit(record, seenJobIds, sidecarPath, env = process.e
     observedAt: new Date().toISOString()
   };
   try {
-    appendModelAuditObservation(sidecarPath, observation);
-    seenJobIds.add(record.id);
+    if (appendModelAuditObservation(sidecarPath, observation)) {
+      seenJobIds.add(record.id);
+    }
   } catch {
     void 0;
   }
@@ -359,8 +387,7 @@ function main() {
   const loaded = loadAnnounced(stateFile);
   const announced = loaded.announced;
   const knownJobDirs = new Set();
-  const auditSidecarPath = modelAuditSidecarPath(workspaceRoot);
-  const seenModelAuditIds = new Set(loadModelAuditObservations(auditSidecarPath).keys());
+  const auditStates = new Map();
   let startupPending = true;
 
   pruneOldStateFiles(root, stateFile);
@@ -373,6 +400,7 @@ function main() {
       knownJobDirs.add(sourceDir);
     }
     const liveIds = new Set();
+    const terminalJobIds = new Set(snapshot.records.filter((record) => record?.id && TERMINAL_STATUSES.has(record.status)).map((record) => record.id));
     let dirty = false;
     for (const record of snapshot.records) {
       if (!record?.id) {
@@ -390,8 +418,20 @@ function main() {
         }
         continue;
       }
-      maybeCaptureModelAudit(record, seenModelAuditIds, auditSidecarPath);
+      const recordWorkspaceRoot = record.workspaceRoot;
+      if (!auditStates.has(recordWorkspaceRoot)) {
+        const sidecarPath = modelAuditSidecarPath(recordWorkspaceRoot);
+        auditStates.set(recordWorkspaceRoot, {
+          sidecarPath,
+          seenJobIds: new Set(loadModelAuditObservations(sidecarPath).keys())
+        });
+      }
+      const auditState = auditStates.get(recordWorkspaceRoot);
+      maybeCaptureModelAudit(record, auditState.seenJobIds, auditState.sidecarPath);
       if (record.status === "running" && !isPidAlive(record.pid)) {
+        if (terminalJobIds.has(record.id)) {
+          continue;
+        }
         const key = announcementKey(record.id, DEAD_STATUS_KEY);
         if (startupPending && loaded.malformed) {
           if (!announced.has(key)) {

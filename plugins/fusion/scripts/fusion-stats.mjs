@@ -151,6 +151,44 @@ function readWorkspaceJobFiles(stateRoot) {
   return jobs;
 }
 
+function jobTimestamp(raw) {
+  const parsed = Date.parse(raw?.completedAt ?? raw?.updatedAt ?? raw?.createdAt ?? "");
+  return Number.isFinite(parsed) ? parsed : Number.NEGATIVE_INFINITY;
+}
+
+function preferJobCopy(current, candidate, isTerminal) {
+  const currentTerminal = isTerminal(current);
+  const candidateTerminal = isTerminal(candidate);
+  if (currentTerminal !== candidateTerminal) {
+    return candidateTerminal ? candidate : current;
+  }
+  return jobTimestamp(candidate) > jobTimestamp(current) ? candidate : current;
+}
+
+function selectPreferredJobs(jobs, descriptor, include) {
+  if (!descriptor.dedupeById) {
+    return jobs.filter(include);
+  }
+  const groups = [];
+  const groupsById = new Map();
+  for (const raw of jobs) {
+    const id = typeof raw?.id === "string" && raw.id.trim() ? raw.id : null;
+    if (!id) {
+      groups.push({ records: [raw], preferred: raw });
+      continue;
+    }
+    let group = groupsById.get(id);
+    if (!group) {
+      group = { records: [], preferred: raw };
+      groupsById.set(id, group);
+      groups.push(group);
+    }
+    group.records.push(raw);
+    group.preferred = preferJobCopy(group.preferred, raw, descriptor.isTerminal);
+  }
+  return groups.filter((group) => group.records.some(include)).map((group) => group.preferred);
+}
+
 export const FILE_ENGINE_DESCRIPTORS = {
   codex: {
     id: "codex",
@@ -161,6 +199,8 @@ export const FILE_ENGINE_DESCRIPTORS = {
     enumerateJobs: readWorkspaceJobFiles,
     matchesWorkspace: (raw, cwd) => raw.workspaceRoot === cwd,
     includeByModel: true,
+    dedupeById: true,
+    isTerminal: (raw) => CODEX_TERMINAL_STATUSES.has(raw.status),
     normalizeJob(raw) {
       const finished = raw.completedAt ?? raw.updatedAt ?? null;
       let durationSeconds = null;
@@ -179,6 +219,9 @@ export const FILE_ENGINE_DESCRIPTORS = {
     },
     resolveModel(raw, observation) {
       return resolveCodexJobModel(raw, observation);
+    },
+    resolveEffort(raw, observation) {
+      return resolveCodexJobEffort(raw, observation);
     }
   }
 };
@@ -209,7 +252,7 @@ export function fileBasedEngineStats(descriptor, { all = false, env = process.en
   } catch (error) {
     return { available: false, reason: error instanceof Error ? error.message : String(error) };
   }
-  const scoped = all ? jobs : jobs.filter((job) => descriptor.matchesWorkspace(job, cwd));
+  const scoped = selectPreferredJobs(jobs, descriptor, (job) => all || descriptor.matchesWorkspace(job, cwd));
   const byStatus = {};
   const byKind = {};
   const byModel = {};
@@ -223,7 +266,10 @@ export function fileBasedEngineStats(descriptor, { all = false, env = process.en
     bump(byStatus, job.status);
     bump(byKind, job.kind);
     if (descriptor.includeByModel && typeof descriptor.resolveModel === "function") {
-      bump(byModel, descriptor.resolveModel(raw, observationForJob(raw, env, auditCache)));
+      const observation = observationForJob(raw, env, auditCache);
+      const model = descriptor.resolveModel(raw, observation);
+      const effort = typeof descriptor.resolveEffort === "function" ? descriptor.resolveEffort(raw, observation) : null;
+      bump(byModel, effort ? `${model}@${effort}` : model);
     }
     if (job.durationSeconds != null) {
       durationSum += job.durationSeconds;
@@ -303,7 +349,9 @@ export const WORKSPACE_ENGINE_DESCRIPTORS = [
     resolveRoot: (env) => resolveStateRoot(FILE_ENGINE_DESCRIPTORS.codex, env),
     cwdOf: (raw) => (typeof raw.workspaceRoot === "string" ? raw.workspaceRoot : null),
     sessionOf: (raw) => (typeof raw.sessionId === "string" ? raw.sessionId : null),
-    isLive: (raw) => !CODEX_TERMINAL_STATUSES.has(raw.status)
+    isLive: (raw) => !CODEX_TERMINAL_STATUSES.has(raw.status),
+    dedupeById: true,
+    isTerminal: (raw) => CODEX_TERMINAL_STATUSES.has(raw.status)
   }
 ];
 
@@ -327,6 +375,185 @@ function readGuardSessionState(env, sessionId) {
   }
 }
 
+function readGuardDispatchLog(env, sessionId) {
+  if (!sessionId) {
+    return [];
+  }
+  const stateDir = resolveGuardStateDir(env);
+  const file = guardStateFile(stateDir, sessionId);
+  try {
+    const parsed = JSON.parse(fs.readFileSync(file, "utf8"));
+    return Array.isArray(parsed?.dispatchLog) ? parsed.dispatchLog : [];
+  } catch {
+    return [];
+  }
+}
+
+function traceTimestamp(value) {
+  const timestamp = Date.parse(value ?? "");
+  return Number.isFinite(timestamp) ? timestamp : null;
+}
+
+function truncateTraceDescription(value) {
+  return typeof value === "string" && value.length > 0 ? value.slice(0, 120) : null;
+}
+
+function dispatchTraceEntries(env, sessionId) {
+  const entries = [];
+  for (const entry of readGuardDispatchLog(env, sessionId)) {
+    const timestamp = traceTimestamp(entry?.at);
+    if (timestamp == null) {
+      continue;
+    }
+    const description = truncateTraceDescription(entry.description);
+    entries.push({
+      time: entry.at,
+      timestamp,
+      source: "dispatch",
+      lane: typeof entry.lane === "string" && entry.lane ? entry.lane : "unknown",
+      ...(typeof entry.subagentType === "string" && entry.subagentType ? { subagentType: entry.subagentType } : {}),
+      ...(description ? { description } : {})
+    });
+  }
+  return entries;
+}
+
+function traceWorkspaceJobs(descriptor, env) {
+  if (!descriptor) {
+    return [];
+  }
+  const root = descriptor.resolveRoot(env);
+  if (!fs.existsSync(root)) {
+    return [];
+  }
+  try {
+    const jobs = [];
+    for (const workspace of listWorkspaceEntries(root)) {
+      jobs.push(...readJobFilesInWorkspace(root, workspace));
+    }
+    return jobs;
+  } catch {
+    return [];
+  }
+}
+
+function resolveTraceGitRoot(cwd) {
+  const result = spawnSync("git", ["-C", cwd, "rev-parse", "--show-toplevel"], { encoding: "utf8" });
+  if (!result.error && result.status === 0 && result.stdout.trim()) {
+    return path.resolve(result.stdout.trim());
+  }
+  return path.resolve(cwd);
+}
+
+function isWorkspaceWithinGitRoot(workspaceRoot, gitRoot) {
+  if (typeof workspaceRoot !== "string" || !workspaceRoot) {
+    return false;
+  }
+  const relative = path.relative(gitRoot, path.resolve(workspaceRoot));
+  return relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative));
+}
+
+function formatTraceModel(model, effort) {
+  if (!model) {
+    return effort ? `unknown@${effort}` : null;
+  }
+  return effort ? `${model}@${effort}` : model;
+}
+
+function engineTraceEntry(raw, { engine, join, model, effort }) {
+  const timestamp = traceTimestamp(raw?.createdAt);
+  if (timestamp == null) {
+    return null;
+  }
+  return {
+    time: raw.createdAt,
+    timestamp,
+    source: "engine job",
+    engine,
+    join,
+    ...(model ? { model } : {}),
+    ...(effort ? { effort } : {}),
+    status: raw.status ?? "unknown"
+  };
+}
+
+function traceSpan(entries) {
+  if (entries.length === 0) {
+    return null;
+  }
+  const timestamps = entries.map((entry) => entry.timestamp);
+  return { start: Math.min(...timestamps) - 60 * 1000, end: Math.max(...timestamps) + 60 * 60 * 1000 };
+}
+
+export function buildTraceReport({ env = process.env, cwd = process.cwd(), sessionId = env.CLAUDE_CODE_SESSION_ID || null } = {}) {
+  if (!sessionId) {
+    return { available: false, reason: "CLAUDE_CODE_SESSION_ID is unset", sessionId: null, workspaceRoot: null, timeline: [] };
+  }
+
+  const gitRoot = resolveTraceGitRoot(cwd);
+  const dispatches = dispatchTraceEntries(env, sessionId);
+  const timeline = [...dispatches];
+  const grokDescriptor = WORKSPACE_ENGINE_DESCRIPTORS.find((descriptor) => descriptor.id === "grok");
+  if (grokDescriptor) {
+    for (const raw of traceWorkspaceJobs(grokDescriptor, env)) {
+      if (raw?.claudeSessionId !== sessionId) {
+        continue;
+      }
+      const model = nonEmptyString(raw?.request?.model);
+      const effort = nonEmptyString(raw?.request?.effort);
+      const entry = engineTraceEntry(raw, { engine: "grok", join: "exact", model, effort });
+      if (entry) {
+        timeline.push(entry);
+      }
+    }
+  }
+
+  const span = traceSpan(dispatches);
+  const codexDescriptor = WORKSPACE_ENGINE_DESCRIPTORS.find((descriptor) => descriptor.id === "codex");
+  if (span && codexDescriptor) {
+    const codexJobs = traceWorkspaceJobs(codexDescriptor, env).filter((raw) => {
+      const createdAt = traceTimestamp(raw?.createdAt);
+      return createdAt != null && isWorkspaceWithinGitRoot(raw?.workspaceRoot, gitRoot) && createdAt >= span.start && createdAt <= span.end;
+    });
+    const auditCache = new Map();
+    for (const raw of selectPreferredJobs(codexJobs, FILE_ENGINE_DESCRIPTORS.codex, () => true)) {
+      const observation = observationForJob(raw, env, auditCache);
+      const model = resolveCodexJobModel(raw, observation);
+      const effort = resolveCodexJobEffort(raw, observation);
+      const entry = engineTraceEntry(raw, { engine: "codex", join: "approximate", model, effort });
+      if (entry) {
+        timeline.push(entry);
+      }
+    }
+  }
+
+  timeline.sort((left, right) => left.timestamp - right.timestamp || left.source.localeCompare(right.source));
+  return {
+    available: true,
+    sessionId,
+    workspaceRoot: gitRoot,
+    timeline: timeline.map(({ timestamp, ...entry }) => entry)
+  };
+}
+
+export function renderTraceReport(report) {
+  const lines = ["# Fusion session trace", "", `Session: ${report.sessionId ?? "unset"}`];
+  if (!report.available) {
+    lines.push("", `Session data unavailable: ${report.reason}`);
+    return `${lines.join("\n")}\n`;
+  }
+  lines.push("", `Workspace root: ${report.workspaceRoot}`, "", "Time | Source | Lane or engine | Model@effort | Status | Description");
+  if (report.timeline.length === 0) {
+    lines.push("no dispatches or matching engine jobs recorded");
+  } else {
+    for (const entry of report.timeline) {
+      const subject = entry.source === "dispatch" ? entry.lane : `${entry.engine}${entry.join === "approximate" ? " (approximate)" : ""}`;
+      lines.push(`${entry.time} | ${entry.source} | ${subject} | ${formatTraceModel(entry.model, entry.effort) ?? ""} | ${entry.status ?? ""} | ${entry.description ?? ""}`);
+    }
+  }
+  return `${lines.join("\n")}\n`;
+}
+
 function sessionScopedEngineStats(descriptor, sessionId, env) {
   const root = descriptor.resolveRoot(env);
   if (!fs.existsSync(root)) {
@@ -335,21 +562,22 @@ function sessionScopedEngineStats(descriptor, sessionId, env) {
   const byStatus = {};
   let totalJobs = 0;
   if (sessionId) {
+    const jobs = [];
     for (const workspace of listWorkspaceEntries(root)) {
       for (const raw of readJobFilesInWorkspace(root, workspace)) {
-        if (descriptor.sessionOf(raw) !== sessionId) {
-          continue;
-        }
-        totalJobs += 1;
-        bump(byStatus, raw.status ?? "unknown");
+        jobs.push(raw);
       }
+    }
+    const scoped = selectPreferredJobs(jobs, descriptor, (raw) => descriptor.sessionOf(raw) === sessionId);
+    totalJobs = scoped.length;
+    for (const raw of scoped) {
+      bump(byStatus, raw.status ?? "unknown");
     }
   }
   return { available: true, totalJobs, byStatus };
 }
 
-export function buildSessionReport({ env = process.env } = {}) {
-  const sessionId = env.CLAUDE_CODE_SESSION_ID || null;
+export function buildSessionReport({ env = process.env, sessionId = env.CLAUDE_CODE_SESSION_ID || null } = {}) {
   const engines = {};
   if (!sessionId) {
     const reason = "CLAUDE_CODE_SESSION_ID is unset";
@@ -585,6 +813,12 @@ export function renderFusionStats(report) {
   return `${lines.join("\n")}\n`;
 }
 
+function sessionIdFromArgs(argv, env) {
+  const index = argv.indexOf("--session");
+  const selected = index === -1 ? null : argv[index + 1];
+  return typeof selected === "string" && selected && !selected.startsWith("--") ? selected : env.CLAUDE_CODE_SESSION_ID || null;
+}
+
 export function main(argv = process.argv.slice(2), { env = process.env, cwd = process.cwd(), stdout = process.stdout } = {}) {
   const asJson = argv.includes("--json");
 
@@ -594,8 +828,14 @@ export function main(argv = process.argv.slice(2), { env = process.env, cwd = pr
     return result;
   }
 
+  if (argv.includes("--trace")) {
+    const report = buildTraceReport({ env, cwd, sessionId: sessionIdFromArgs(argv, env) });
+    stdout.write(asJson ? `${JSON.stringify(report, null, 2)}\n` : renderTraceReport(report));
+    return report;
+  }
+
   if (argv.includes("--session")) {
-    const report = buildSessionReport({ env });
+    const report = buildSessionReport({ env, sessionId: sessionIdFromArgs(argv, env) });
     stdout.write(asJson ? `${JSON.stringify(report, null, 2)}\n` : renderSessionReport(report));
     return report;
   }

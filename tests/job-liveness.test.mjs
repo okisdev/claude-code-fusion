@@ -4,7 +4,7 @@ import { once } from "node:events";
 import fs from "node:fs";
 import { test } from "node:test";
 import { pathToFileURL } from "node:url";
-import { companion, envFor as companionEnvFor, makeSandbox, runCompanion, stateModulePath } from "./lib/companion-harness.mjs";
+import { companion, envFor as companionEnvFor, killGroups, makeSandbox, pidAlive, runCompanion, stateModulePath, waitFor } from "./lib/companion-harness.mjs";
 
 const { refreshRunningJobRecord } = await import(pathToFileURL(companion).href);
 const {
@@ -88,6 +88,28 @@ test("status checks grokPid when the driver pid is absent", async (t) => {
   assert.strictEqual(aliveResult.status, 0, aliveResult.stderr);
   assert.match(aliveResult.stdout, /^state: running$/m);
   assert.strictEqual(fs.readFileSync(aliveFile, "utf8"), before);
+});
+
+test("died detection terminates a live grok child before finalizing the record", async (t) => {
+  const sandbox = makeSandbox(t);
+  const deadPid = await makeDeadPid();
+  const grokChild = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], {
+    detached: true,
+    stdio: "ignore",
+  });
+  assert.ok(grokChild.pid, "Expected fake grok child pid.");
+  t.after(() => killGroups(grokChild.pid));
+  const { file, record } = seedJob(sandbox, { pid: deadPid, grokPid: grokChild.pid });
+
+  const result = runCompanion(["status", record.id], { cwd: sandbox.workDir, env: envFor(sandbox) });
+
+  assert.strictEqual(result.status, 0, result.stderr);
+  await waitFor(() => (pidAlive(grokChild.pid) ? null : true), 3000);
+  const updated = readJobRecordFile(file);
+  assert.strictEqual(updated.status, "error");
+  assert.strictEqual(updated.failureKind, "died");
+  assert.strictEqual(updated.pid, null);
+  assert.strictEqual(updated.grokPid, null);
 });
 
 test("result marks a running record whose driver pid died as died", async (t) => {

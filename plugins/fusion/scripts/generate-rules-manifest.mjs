@@ -15,7 +15,7 @@ function git(args, cwd = repoRoot) {
 }
 
 export function buildRulesManifest({ root = repoRoot, relativeRulesPath = rulesPath } = {}) {
-  const commits = git(["log", "--all", "--format=%H", "--", relativeRulesPath], root).split("\n").filter(Boolean);
+  const commits = git(["log", "HEAD", "--format=%H", "--", relativeRulesPath], root).split("\n").filter(Boolean);
   const hashes = new Set();
 
   for (const commit of commits) {

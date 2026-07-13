@@ -73,29 +73,41 @@ test("review --background drives the job to done and result returns the review o
   assert.match(result.stdout, /^state: done$/m);
 });
 
-test("review gives up after one failed retry and renders the raw text with a parse warning", (t) => {
+test("review records an error after one failed corrective retry and preserves the raw output", (t) => {
   const sandbox = makeSandbox(t);
   initFixtureRepo(sandbox.workDir);
   const result = runCompanion(["review"], {
     cwd: sandbox.workDir,
     env: envFor(sandbox, { FAKE_GROK_MODE: "badjson" }),
   });
-  assert.strictEqual(result.status, 0, result.stderr);
+  assert.notStrictEqual(result.status, 0);
   const invocations = readInvocations(sandbox.argsFile);
   assert.strictEqual(invocations.length, 2);
   assert.ok(hasPair(invocations[1], "-r", "44444444-4444-7444-8444-444444444444"));
-  assert.ok(result.stdout.includes("did not return a valid review JSON object"));
-  assert.ok(result.stdout.includes("I still cannot produce the requested object."));
-  const jsonRun = runCompanion(["review", "--json"], {
-    cwd: sandbox.workDir,
-    env: envFor(sandbox, { FAKE_GROK_MODE: "badjson" }),
+  assert.ok(result.stderr.includes("did not return a valid review JSON object"));
+  assert.ok(result.stderr.includes("I still cannot produce the requested object."));
+  const [record] = jobRecords(sandbox.dataDir);
+  assert.strictEqual(record.status, "error");
+  assert.strictEqual(record.failureKind, "error");
+  assert.ok(record.resultText.includes("I still cannot produce the requested object."));
+  assert.match(record.errorMessage, /failed validation after one corrective retry/);
+  assert.doesNotMatch(record.errorMessage, /\r?\n/);
+  assert.match(result.stderr, new RegExp(`job: ${record.id}\\nstate: error\\nfailure: error\\n$`));
+});
+
+test("background review records twice malformed output as an error", async (t) => {
+  const sandbox = makeSandbox(t);
+  initFixtureRepo(sandbox.workDir);
+  const env = envFor(sandbox, { FAKE_GROK_MODE: "badjson" });
+  const launch = runCompanion(["review", "--background"], { cwd: sandbox.workDir, env });
+  assert.strictEqual(launch.status, 0, launch.stderr);
+  const record = await waitFor(() => {
+    const current = jobRecords(sandbox.dataDir)[0];
+    return current?.status === "error" ? current : null;
   });
-  assert.strictEqual(jsonRun.status, 0, jsonRun.stderr);
-  const payload = JSON.parse(jsonRun.stdout);
-  assert.strictEqual(payload.valid, false);
-  assert.ok(payload.parseError, "Expected a parse error in the JSON payload.");
-  assert.strictEqual(payload.review, null);
-  assert.ok(payload.rawText.includes("I still cannot produce the requested object."));
+  assert.strictEqual(record.failureKind, "error");
+  assert.ok(record.resultText.includes("I still cannot produce the requested object."));
+  assert.match(record.errorMessage, /failed validation after one corrective retry/);
 });
 
 test("review output contract is enforced by validateReviewOutput instead of a schema file", () => {
