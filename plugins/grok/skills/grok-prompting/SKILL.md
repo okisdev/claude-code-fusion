@@ -13,7 +13,7 @@ Brief structure:
 - State the goal in one sentence, then the constraints that bound it.
 - Name the exact paths, modules, and commands involved. Grok should not have to guess where to look.
 - Define done criteria: what must be true when the task is finished.
-- Give a verification command Grok can run to prove the work, such as a test command or a build step.
+- Give implementation and change briefs a verification command Grok can run to prove the work, such as a test command or a build step. Consult, research, and review briefs instead need explicit coverage or acceptance criteria, with collection review as their verification.
 
 Context rules:
 
@@ -29,4 +29,4 @@ Output contract:
 Permissions:
 
 - Always state whether Grok has write permission. In write mode, tell it to edit files directly and report the touched paths. In consult mode, tell it to propose changes without editing.
-- Read only (consult) briefs must tell Grok to work by reading files only and must not ask for shell activity (no test runs, no git commands, no build steps). The consult allow list cancels the turn when Grok calls tools outside that narrow read only set. Write capable briefs are exempt.
+- Read only consult briefs must state that Grok may use only the narrow allow list, including `node --test`, `npm test`, and read only `git` and `gh`. They cannot edit files or launch nested engine CLIs. The consult allow list cancels the turn when Grok calls tools outside that set. Write capable briefs are exempt.

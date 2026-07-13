@@ -2,7 +2,7 @@
 
 This repository ships the Claude Code plugins that make multi model orchestration work in practice. The fusion plugin owns routing rules, tier agents, configuration, doctor, panel, ultra, and stats. The grok plugin is the hosted peer companion for the Grok CLI (task, review, best of n, background jobs). Alongside them live a bench harness under `bench/` and a Node test suite under `tests/`.
 
-Plugin behavior is driven by prose rules as much as by code. Files such as `plugins/fusion/rules/orchestration.md` and `plugins/fusion/rules/troubleshooting.md` are loaded into every orchestrated session and decide which lanes fire, when collection is required, and how posture and the question policy gate the main loop. Treat wording changes in those files as production changes.
+Plugin behavior is driven by prose rules as much as by code. `plugins/fusion/rules/orchestration.md` is synced to `~/.claude/rules/` and loaded into every orchestrated session. `plugins/fusion/rules/troubleshooting.md` ships with the fusion plugin and is consulted on demand when delegation fails. Together they decide which lanes fire, when collection is required, and how posture and the question policy gate the main loop. Treat wording changes in those files as production changes.
 
 ## Rules release checklist
 
@@ -17,6 +17,7 @@ Any change to `plugins/fusion/rules/orchestration.md` or `plugins/fusion/rules/t
    - The question policy whitelist still routes questions and problem descriptions to read only main loop work and requested changes into implementation posture.
    - The session execution posture protocol (coordinate, implement, triage) still persists per goal and still forces implement before product edits once accumulation triggers fire.
    - The balance check still routes the next fitting package to an idle peer lane after two eligible Claude worker dispatches, unless that peer's circuit breaker is open.
+   - The capability table between its sentinels remains config generated, and every concrete model ID named by routing prose appears in that table; `/fusion:doctor` checks for orphans.
 3. Regenerate the rules manifest and run the full test suite:
 
    ```bash
@@ -28,7 +29,7 @@ Any change to `plugins/fusion/rules/orchestration.md` or `plugins/fusion/rules/t
 
 ## Code changes
 
-Tests use Node's built in runner (`node --test`) and live under `tests/`. Keep the repository's zero comment default: only retain a comment when it records a non obvious invariant or constraint that the code alone cannot convey. Never hardcode peer model ids in routing, agents, or docs; live model listings and the `/fusion:config` capability table are the source of truth for engine defaults and scores.
+Tests use Node's built in runner (`node --test`) and live under `tests/`. Keep the repository's zero comment default: only retain a comment when it records a non obvious invariant or constraint that the code alone cannot convey. The capability table between the model table sentinels is config generated. Routing prose may name concrete peer model IDs only when every named ID appears in the capability table, and `/fusion:doctor` checks that consistency; live model listings and the `/fusion:config` capability table remain the source of truth for engine defaults and scores.
 
 ## Releases
 

@@ -12,7 +12,7 @@ Decision or question to adjudicate:
 
 Compose the brief:
 
-- Write ONE neutral, self contained brief containing: the decision or question, the constraints that bound the answer, the relevant file paths, and what a good answer must address.
+- Write ONE neutral, self contained brief containing: the decision or question, the constraints that bound the answer, the relevant file paths, and explicit coverage or acceptance criteria for what a good answer must address. Collection review verifies this consultation brief; it does not need a shell verification command.
 - Never include a candidate answer, a leaning, any prior model opinion, or any context from this conversation. The panel is blind; a brief that hints at a preferred answer is invalid.
 - End the brief with: "This is a consultation. Analyze and recommend; do not modify any files."
 - Save the exact brief text to a file with `Write` before launching any track, so the text every engine received is traceable. Save it outside the repository (a temp directory or the session scratchpad); the panel must never dirty the working tree.
@@ -40,7 +40,7 @@ Wait and stay blind:
 Adjudicate with a structured analysis first:
 
 - Before writing any prose verdict, produce a judge analysis as a JSON object with exactly these fields: `consensus` (claims the engines agree on), `contradictions` (disputed claims, each side named), `partial_coverage` (points only one engine addressed), `unique_insights` (per engine), `blind_spots` (questions no engine addressed). Attribute every claim in every field to its engine by name.
-- Never average the verdicts or count them as equal votes. In the standard two track panel, the `codex:codex-rescue` verdict from sol at ultra is the deep lead and carries more weight on long horizon correctness and architecture. The `grok:grok-rescue` verdict at xhigh is an independent cross check weighted on large context factual verification and terminal or operational pragmatics.
+- Never average the verdicts or count them as equal votes. In the standard two track panel, the `codex:codex-rescue` verdict from sol at xhigh is the deep lead and carries more weight on long horizon correctness and architecture. The `grok:grok-rescue` verdict at xhigh is an independent cross check weighted on large context factual verification and terminal or operational pragmatics.
 - Treat agreement as a strong accept signal and consensus as high confidence. Adjudicate each contradiction according to its subject and supporting evidence, applying these weights when both standard tracks return.
 - If a clean analysis is impossible (malformed outputs, irreconcilable framing), skip it and present each engine's verdict verbatim with attribution, stating that adjudication was skipped. Raw verdicts beat a forced synthesis.
 

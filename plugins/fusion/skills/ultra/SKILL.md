@@ -17,7 +17,7 @@ Size gate first (cheap, in the main loop):
 
 Compose one self contained brief per facet:
 
-- Each brief states its facet's goal, the shared context needed to work it alone, the relevant paths, and what a good result must cover. A facet brief never depends on another facet's output.
+- Each brief states its facet's goal, the shared context needed to work it alone, the relevant paths, and what a good result must cover. Implementation facets carry a verification command. Consult and research facets instead carry explicit coverage or acceptance criteria, with collection review as their verification. A facet brief never depends on another facet's output.
 - Research briefs go to grok with `--web` when live sources help; implementation briefs state write permission explicitly.
 
 Launch the fleet in ONE message:
