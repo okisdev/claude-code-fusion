@@ -19,19 +19,21 @@ function resolvePollIntervalMs(env = process.env) {
 function readJobsSnapshot(dir) {
   try {
     if (!fs.statSync(dir).isDirectory()) {
-      return { available: false, records: [] };
+      return { available: false, records: [], unreadableIds: new Set() };
     }
     const records = [];
+    const unreadableIds = new Set();
     for (const entry of fs.readdirSync(dir).filter((name) => name.endsWith(".json"))) {
       const record = readJobRecordFile(path.join(dir, entry));
       if (!record) {
-        return { available: false, records: [] };
+        unreadableIds.add(path.basename(entry, ".json"));
+        continue;
       }
       records.push(record);
     }
-    return { available: true, records };
+    return { available: true, records, unreadableIds };
   } catch {
-    return { available: false, records: [] };
+    return { available: false, records: [], unreadableIds: new Set() };
   }
 }
 
@@ -149,7 +151,7 @@ function main() {
     if (!snapshot.available) {
       return;
     }
-    const liveIds = new Set();
+    const liveIds = new Set(snapshot.unreadableIds);
     let dirty = false;
     for (const record of snapshot.records) {
       if (!record?.id) {

@@ -180,7 +180,6 @@ export function renderJobDetail(job, options = {}) {
     `Job ${job.id}`,
     "",
     `Status: ${job.status}`,
-    `state: ${job.status}`,
     `Mode: ${job.mode}`,
     `Background: ${job.background ? "yes" : "no"}`,
     `Created: ${job.createdAt}`
@@ -190,9 +189,6 @@ export function renderJobDetail(job, options = {}) {
   }
   if (job.exitCode != null) {
     lines.push(`Exit code: ${job.exitCode}`);
-  }
-  if (job.failureKind) {
-    lines.push(`failure: ${job.failureKind}`);
   }
   if (job.sessionId) {
     lines.push(`Grok session: ${job.sessionId}`);
@@ -209,6 +205,10 @@ export function renderJobDetail(job, options = {}) {
   const logTail = options.logTail || job.errorTail || "";
   if (job.status === "error" && logTail) {
     lines.push("", "Log tail:", "", "```text", logTail, "```");
+  }
+  lines.push("", `job: ${job.id}`, `state: ${job.status}`);
+  if (job.failureKind) {
+    lines.push(`failure: ${job.failureKind}`);
   }
   return `${lines.join("\n").trimEnd()}\n`;
 }
@@ -308,13 +308,15 @@ export function renderStatsReport(stats) {
 export function renderCancelReport(job) {
   const lines = [
     `Cancelled job ${job.id}.`,
-    "state: cancelled",
+    "Check /grok:status for the updated list.",
+    "",
+    `job: ${job.id}`,
+    "state: cancelled"
   ];
   if (job.failureKind === "cancelled") {
     lines.push("failure: cancelled");
   }
-  lines.push("Check /grok:status for the updated list.", "");
-  return lines.join("\n");
+  return `${lines.join("\n")}\n`;
 }
 
 export function renderSetupReport(report) {

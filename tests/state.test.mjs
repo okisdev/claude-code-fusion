@@ -118,3 +118,28 @@ test("terminal job records do not regress to another terminal state", async (t) 
   const pidPatch = stateModule.updateJobRecordFile(jobFile, { pid: 999 });
   assert.strictEqual(pidPatch.pid, null);
 });
+
+test("an abandoned record lock older than ten seconds is reaped", async (t) => {
+  const sandbox = makeSandbox(t);
+  const stateModule = await import(stateModulePath);
+  const jobFile = stateModule.jobFilePath(sandbox.dataDir, sandbox.workDir, "stale-lock");
+  const record = stateModule.createJobRecord({
+    id: "stale-lock",
+    pid: process.pid,
+    mode: "consult",
+    cwd: sandbox.workDir,
+    briefFile: path.join(sandbox.dataDir, "brief.md"),
+    background: false,
+  });
+  stateModule.writeJobRecordFile(jobFile, record);
+  const lockDir = `${jobFile}.lock`;
+  fs.mkdirSync(lockDir);
+  const staleTime = new Date(Date.now() - 11000);
+  fs.utimesSync(lockDir, staleTime, staleTime);
+
+  const updated = stateModule.updateJobRecordFile(jobFile, { grokPid: 12345 });
+
+  assert.strictEqual(updated.grokPid, 12345);
+  assert.strictEqual(fs.existsSync(lockDir), false);
+  assert.strictEqual(stateModule.readJobRecordFile(jobFile).grokPid, 12345);
+});

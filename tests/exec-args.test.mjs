@@ -17,6 +17,12 @@ const { parseArgs } = await import(path.join(repoRoot, "plugins", "grok", "scrip
 const { buildGrokArgs, NESTED_ENGINE_CLI_DENY_NAMES } = await import(
   path.join(repoRoot, "plugins", "grok", "scripts", "lib", "grok-exec.mjs"),
 );
+const { resolveLastSessionId } = await import(
+  path.join(repoRoot, "plugins", "grok", "scripts", "grok-companion.mjs"),
+);
+const { createJobRecord, jobFilePath, writeBrief, writeJobRecordFile } = await import(
+  path.join(repoRoot, "plugins", "grok", "scripts", "lib", "state.mjs"),
+);
 
 const consultAllows = [
   "Read",
@@ -95,6 +101,27 @@ function singleInvocation(sandbox) {
   const invocations = readInvocations(sandbox.argsFile);
   assert.strictEqual(invocations.length, 1);
   return invocations[0];
+}
+
+function seedFinishedSessionJob(sandbox, fields) {
+  const briefFile = writeBrief(sandbox.dataDir, sandbox.workDir, fields.id, "seeded session job");
+  const record = {
+    ...createJobRecord({
+      id: fields.id,
+      pid: null,
+      mode: "consult",
+      cwd: sandbox.workDir,
+      briefFile,
+      background: false,
+      claudeSessionId: fields.claudeSessionId,
+      createdAt: fields.createdAt,
+    }),
+    status: "done",
+    finishedAt: fields.finishedAt,
+    sessionId: fields.sessionId,
+    resultText: "done",
+  };
+  writeJobRecordFile(jobFilePath(sandbox.dataDir, sandbox.workDir, fields.id), record);
 }
 
 test("help and runtime skill list cancel and setup flags", (t) => {
@@ -216,6 +243,33 @@ test("resume without a prompt sends the pinned continuation text", (t) => {
       .includes(
         "Continue from the current thread state. Pick the next highest-value step and follow through until the task is resolved.",
       ),
+  );
+});
+
+test("resume last prefers the current Claude session and otherwise falls back to the newest job", (t) => {
+  const sandbox = makeSandbox(t);
+  seedFinishedSessionJob(sandbox, {
+    id: "current-older",
+    claudeSessionId: "claude-current",
+    sessionId: "11111111-1111-7111-8111-111111111111",
+    createdAt: "2026-01-01T00:00:00.000Z",
+    finishedAt: "2026-01-01T00:01:00.000Z",
+  });
+  seedFinishedSessionJob(sandbox, {
+    id: "other-newer",
+    claudeSessionId: "claude-other",
+    sessionId: "22222222-2222-7222-8222-222222222222",
+    createdAt: "2026-01-02T00:00:00.000Z",
+    finishedAt: "2026-01-02T00:01:00.000Z",
+  });
+
+  assert.strictEqual(
+    resolveLastSessionId(sandbox.dataDir, sandbox.workDir, "claude-current"),
+    "11111111-1111-7111-8111-111111111111",
+  );
+  assert.strictEqual(
+    resolveLastSessionId(sandbox.dataDir, sandbox.workDir, "claude-missing"),
+    "22222222-2222-7222-8222-222222222222",
   );
 });
 

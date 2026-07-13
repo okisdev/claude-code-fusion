@@ -29,14 +29,18 @@ Job statuses, liveness, rendered outcome footers, failure kind definitions, back
 ## Process lifecycle
 
 - grok is spawned detached in its own process group, and the child pid is recorded on the job record as `grokPid`. Timeout, cancel, and the SessionEnd hook signal the process group, so descendants are reaped with the leader.
-- Timeouts: foreground runs default to 570000ms (deliberately below the 600000ms Bash timeout the forwarder agent uses, so the companion always reaps first and writes the record); background workers cap at 1800000ms; the stop gate caps its grok call at 240000ms inside the hook's 900 second budget; the `/grok:review` background flow overrides the foreground default with `GROK_COMPANION_TIMEOUT_MS=1800000`. Timeout, cancel, and SessionEnd cleanup send SIGTERM, poll for up to 2000ms, then escalate to SIGKILL when the process group is still alive. Exit codes: 0 ok, 1 error, 130 SIGINT, 137 SIGKILL, 143 SIGTERM, and other signals map to 128 plus the signal number. Interrupted runs keep their file modifications and are resumable via the session uuid when grok reported one before the interruption; a run killed before emitting its JSON envelope leaves no session id on the record.
+- Timeouts: foreground runs default to 570000ms (deliberately below the 600000ms Bash timeout the forwarder agent uses, so the companion always reaps first and writes the record); background workers cap at 1800000ms; the stop gate caps its grok call at 240000ms inside the hook's 900 second budget; the `/grok:review` background flow overrides the foreground default with `GROK_COMPANION_TIMEOUT_MS=1800000`. Timeout, cancel, SessionEnd cleanup, and died detection for an orphaned Grok child send SIGTERM, poll for up to 2000ms, then escalate to SIGKILL when the process group is still alive. Exit codes: 0 ok, 1 error, 130 SIGINT, 137 SIGKILL, 143 SIGTERM, and other signals map to 128 plus the signal number. Interrupted runs keep their file modifications and are resumable via the session uuid when grok reported one before the interruption; a run killed before emitting its JSON envelope leaves no session id on the record.
 - Grok uses `pid` for the driving worker pid and `grokPid` for the Grok CLI child pid. The pidless launcher grace window defaults to 15000ms and can be overridden with `GROK_COMPANION_PIDLESS_RUNNING_GRACE_MS`.
+- Job record writes use a directory lock. A lock whose modification time is at least 10000ms old is treated as abandoned and reaped before the write retries.
+- `errorMessage` is the one line human readable failure summary for every error record. `errorTail` retains the bounded raw diagnostic tail, which may contain multiple lines from stderr, stdout parsing, or review validation output.
 
 ## Background collection
 
 - `result <job-id> --wait` blocks while the job is running, polls the job record every 2000ms by default, refreshes the same liveness check as `status`, and renders the same terminal output as `result` once the job reaches `done`, `error`, or `cancelled`.
 - The wait poll interval is controlled by `GROK_COMPANION_WAIT_POLL_MS`. The wait budget defaults to 570000ms, can be set with `--wait-timeout-ms <ms>` or `GROK_COMPANION_WAIT_TIMEOUT_MS`, and is clamped to 570000ms so each foreground wait call returns under the forwarder Bash cap.
 - If the wait budget elapses while the job is still running, the command prints a compact running render ending in `state: running` and exits 0. Forwarders chain another foreground `result <job-id> --wait` call in the same turn only while the output ends in the line `state: running`; any other output is terminal.
+- `status <job-id>`, `result <job-id>`, and `cancel <job-id>` search all workspace records when `--cwd` is omitted. Passing `--cwd <dir>` restricts each lookup to that workspace's hashed state directory.
+- The interactive jobs monitor skips an unreadable job record and continues announcing healthy records from the same workspace. It retains the unreadable file's id in the live set so existing announcement keys are not pruned while that record is temporarily corrupt or inaccessible.
 
 ## Environment overrides
 
@@ -52,6 +56,7 @@ Job statuses, liveness, rendered outcome footers, failure kind definitions, back
 
 - `/grok:review` uses `plugins/grok/prompts/review.md` for the model contract and `validateReviewOutput` in `plugins/grok/scripts/lib/render.mjs` as the canonical runtime validator. There is no separate JSON schema file in the runtime contract.
 - `review --background` creates the same review job record as the foreground path, spawns a detached `review-worker --job-id <id>` with ignored stdio, and returns the standard background launch render. The review worker runs the existing review flow, including the corrective retry, and writes the same `resultText`, session id, and terminal status that the foreground review path writes.
+- Review output that still fails `validateReviewOutput` after one corrective retry records `status: "error"` with `failureKind: "error"`. The rendered fallback remains in `resultText`, and the raw malformed reply remains available in the diagnostic fields.
 
 ## Degradation
 

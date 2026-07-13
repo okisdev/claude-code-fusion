@@ -43,6 +43,10 @@ test("foreground task exits nonzero when grok fails", (t) => {
   });
   assert.notStrictEqual(result.status, 0);
   assert.ok(result.stderr.trim().length > 0, "Expected an error message on stderr.");
+  const [record] = jobRecords(sandbox.dataDir);
+  assert.ok(record.errorMessage);
+  assert.doesNotMatch(record.errorMessage, /\r?\n/);
+  assert.match(result.stderr, new RegExp(`job: ${record.id}\\nstate: error\\nfailure: error\\n$`));
 });
 
 test("background task creates a job record and result prints the finished output", async (t) => {
@@ -137,6 +141,11 @@ test("background task failure ends in an error record", async (t) => {
     return current && current.status === "error" ? current : null;
   });
   assert.strictEqual(failed.exitCode, 1);
+  assert.ok(failed.errorMessage);
+  assert.doesNotMatch(failed.errorMessage, /\r?\n/);
+  const resultOutput = runCompanion(["result", failed.id], { cwd: sandbox.workDir, env: envFor(sandbox) });
+  assert.strictEqual(resultOutput.status, 0, resultOutput.stderr);
+  assert.match(resultOutput.stdout, new RegExp(`job: ${failed.id}\\nstate: error\\nfailure: error\\n$`));
 });
 
 test("cancel kills a hanging worker and its grok process and marks the record cancelled", async (t) => {
@@ -174,6 +183,10 @@ test("cancel kills a hanging worker and its grok process and marks the record ca
     assert.strictEqual(fs.readFileSync(jobFile, "utf8"), snapshot);
   }
   assert.strictEqual(JSON.parse(snapshot).status, "cancelled");
+  assert.match(
+    cancelOutput.stdout,
+    new RegExp(`Check /grok:status for the updated list\\.\\n\\njob: ${running.id}\\nstate: cancelled\\nfailure: cancelled\\n$`),
+  );
 });
 
 test("cancel kills a foreground grok and the record stays cancelled after the companion exits", async (t) => {
@@ -206,6 +219,7 @@ test("cancel kills a foreground grok and the record stays cancelled after the co
   assert.notStrictEqual(exitCode, 0);
   assert.match(stderr, /^state: cancelled$/m);
   assert.match(stderr, /^failure: cancelled$/m);
+  assert.match(stderr, new RegExp(`job: ${running.id}\\nstate: cancelled\\nfailure: cancelled\\n$`));
   const final = jobRecords(sandbox.dataDir)[0];
   assert.strictEqual(final.status, "cancelled");
   assert.strictEqual(final.pid, null);
@@ -252,6 +266,8 @@ test("background timeout marks the record error and result reports the failure",
     return current && current.status === "error" ? current : null;
   });
   assert.match(failed.errorTail, /timed out after 500ms/);
+  assert.match(failed.errorMessage, /timed out after 500ms/);
+  assert.doesNotMatch(failed.errorMessage, /\r?\n/);
   assert.strictEqual(failed.exitCode, 143);
   const resultOutput = runCompanion(["result", failed.id], { cwd: sandbox.workDir, env });
   assert.strictEqual(resultOutput.status, 0, resultOutput.stderr);
@@ -322,4 +338,47 @@ test("foreground spawn failure records an error instead of leaving the job runni
   const record = jobRecords(sandbox.dataDir)[0];
   assert.strictEqual(record.status, "error");
   assert.ok(record.errorTail, "Expected an error tail on the failed record.");
+  assert.ok(record.errorMessage, "Expected an error summary on the failed record.");
+  assert.doesNotMatch(record.errorMessage, /\r?\n/);
+  assert.match(result.stderr, new RegExp(`job: ${record.id}\\nstate: error\\nfailure: missing_cli\\n$`));
+});
+
+test("background worker failures record a one line error summary", async (t) => {
+  const sandbox = makeSandbox(t);
+  const launch = runCompanion(["task", "unlaunchable", "--background"], {
+    cwd: sandbox.workDir,
+    env: envFor(sandbox, { GROK_BIN: path.join(sandbox.root, "missing-grok") }),
+  });
+  assert.strictEqual(launch.status, 0, launch.stderr);
+  const record = await waitFor(() => {
+    const current = jobRecords(sandbox.dataDir)[0];
+    return current?.status === "error" ? current : null;
+  });
+  assert.strictEqual(record.failureKind, "missing_cli");
+  assert.ok(record.errorMessage);
+  assert.doesNotMatch(record.errorMessage, /\r?\n/);
+  assert.ok(record.errorTail);
+});
+
+test("explicit cwd scopes id lookups while omitted cwd keeps global lookup", (t) => {
+  const sandbox = makeSandbox(t);
+  const otherDir = path.join(sandbox.root, "other-work");
+  fs.mkdirSync(otherDir);
+  const env = envFor(sandbox);
+  const launch = runCompanion(["task", "other workspace job"], { cwd: otherDir, env });
+  assert.strictEqual(launch.status, 0, launch.stderr);
+  const [record] = jobRecords(sandbox.dataDir);
+
+  for (const command of ["status", "result", "cancel"]) {
+    const global = runCompanion([command, record.id], { cwd: sandbox.workDir, env });
+    assert.strictEqual(global.status, 0, global.stderr);
+    const matching = runCompanion([command, record.id, "--cwd", otherDir], { cwd: sandbox.workDir, env });
+    assert.strictEqual(matching.status, 0, matching.stderr);
+    const mismatching = runCompanion([command, record.id, "--cwd", sandbox.workDir], {
+      cwd: sandbox.workDir,
+      env,
+    });
+    assert.notStrictEqual(mismatching.status, 0);
+    assert.match(mismatching.stderr, new RegExp(`No job record found for ${record.id}`));
+  }
 });

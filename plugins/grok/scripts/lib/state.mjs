@@ -8,6 +8,7 @@ const JOB_LOG_MAX_BYTES = 1024 * 1024;
 const LOG_TAIL_MAX_BYTES = 64 * 1024;
 const LOCK_TIMEOUT_MS = 2000;
 const LOCK_RETRY_MS = 20;
+const LOCK_STALE_MS = 10000;
 const TERMINAL_STATUSES = new Set(["done", "error", "cancelled"]);
 
 export const SESSION_ID_ENV = "CLAUDE_CODE_SESSION_ID";
@@ -110,6 +111,16 @@ function withRecordLock(file, fn) {
     } catch (error) {
       if (error?.code !== "EEXIST" || Date.now() >= deadline) {
         throw error;
+      }
+      try {
+        if (Date.now() - fs.statSync(lockDir).mtimeMs >= LOCK_STALE_MS) {
+          fs.rmdirSync(lockDir);
+          continue;
+        }
+      } catch (lockError) {
+        if (lockError?.code === "ENOENT") {
+          continue;
+        }
       }
       sleepMs(LOCK_RETRY_MS);
     }
