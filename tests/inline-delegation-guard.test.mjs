@@ -68,13 +68,13 @@ function writePayload(sandbox, { sessionId = "session-1", toolName = "Edit", fil
   return payload;
 }
 
-function dispatchPayload(sandbox, { sessionId = "session-1", toolName = "Agent", subagentType, agentId } = {}) {
+function dispatchPayload(sandbox, { sessionId = "session-1", toolName = "Agent", subagentType, description = "do the thing", agentId } = {}) {
   const payload = {
     session_id: sessionId,
     transcript_path: path.join(sandbox.root, "transcript.jsonl"),
     cwd: sandbox.workDir,
     tool_name: toolName,
-    tool_input: { description: "do the thing", prompt: "do the thing" }
+    tool_input: { description, prompt: "do the thing" }
   };
   if (subagentType) {
     payload.tool_input.subagent_type = subagentType;
@@ -130,7 +130,7 @@ test("the fifth write under the default budget attaches one advisory naming the 
   assert.strictEqual(output.hookSpecificOutput.permissionDecision, "allow");
   assert.strictEqual(
     output.hookSpecificOutput.permissionDecisionReason,
-    "5 inline write tool calls and 0 agent dispatches this session, so declare implement posture and dispatch the remaining work as packages."
+    "5 inline writes happened this session with zero dispatches. The next package belongs in a lane: quick scoped work goes to the codex quick tier gpt-5.6-terra at effort xhigh; trivial or high-volume work goes to gpt-5.6-luna at effort xhigh; work needing the Claude Code tool surface goes to fusion:fast-worker."
   );
 });
 
@@ -145,7 +145,7 @@ test("no repeat nagging between threshold multiples, a new advisory fires at 2x 
   }
   const tenth = run(sandbox, writePayload(sandbox));
   const tenthReason = JSON.parse(tenth.stdout).hookSpecificOutput.permissionDecisionReason;
-  assert.match(tenthReason, /^10 inline write tool calls and 0 agent dispatches this session/);
+  assert.match(tenthReason, /^10 inline writes happened this session with zero dispatches/);
 
   for (let i = 0; i < 4; i += 1) {
     const result = run(sandbox, writePayload(sandbox));
@@ -153,7 +153,7 @@ test("no repeat nagging between threshold multiples, a new advisory fires at 2x 
   }
   const fifteenth = run(sandbox, writePayload(sandbox));
   const fifteenthReason = JSON.parse(fifteenth.stdout).hookSpecificOutput.permissionDecisionReason;
-  assert.match(fifteenthReason, /^15 inline write tool calls and 0 agent dispatches this session/);
+  assert.match(fifteenthReason, /^15 inline writes happened this session with zero dispatches/);
 
   const state = readState(sandbox, "session-1");
   assert.deepStrictEqual(state.advisedMultiples, [1, 2, 3]);
@@ -201,6 +201,78 @@ test("a Task dispatch is bucketed the same way as an Agent dispatch", (t) => {
   assert.strictEqual(result.stdout, "");
   const state = readState(sandbox, "session-1");
   assert.deepStrictEqual(state.dispatches, { codex: 1 });
+});
+
+test("Agent and Task dispatches append ledger entries with their computed lane", (t) => {
+  const sandbox = makeSandbox(t);
+  run(sandbox, dispatchPayload(sandbox, { subagentType: "grok:grok-rescue", description: "inspect the failure" }));
+  run(sandbox, dispatchPayload(sandbox, { toolName: "Task", subagentType: "codex:codex-rescue", description: "implement the repair" }));
+
+  const state = readState(sandbox, "session-1");
+  assert.strictEqual(state.dispatchLog.length, 2);
+  assert.match(state.dispatchLog[0].at, /^\d{4}-\d{2}-\d{2}T/);
+  assert.deepStrictEqual(state.dispatchLog[0], {
+    at: state.dispatchLog[0].at,
+    lane: "grok",
+    subagentType: "grok:grok-rescue",
+    description: "inspect the failure"
+  });
+  assert.deepStrictEqual(state.dispatchLog[1], {
+    at: state.dispatchLog[1].at,
+    lane: "codex",
+    subagentType: "codex:codex-rescue",
+    description: "implement the repair"
+  });
+});
+
+test("dispatch ledger descriptions are truncated at 120 characters", (t) => {
+  const sandbox = makeSandbox(t);
+  const description = "x".repeat(121);
+  run(sandbox, dispatchPayload(sandbox, { description }));
+
+  const [entry] = readState(sandbox, "session-1").dispatchLog;
+  assert.strictEqual(entry.description, description.slice(0, 120));
+  assert.strictEqual(entry.description.length, 120);
+});
+
+test("dispatch ledger retains only its 200 most recent entries", (t) => {
+  const sandbox = makeSandbox(t);
+  fs.mkdirSync(sandbox.stateDir, { recursive: true });
+  fs.writeFileSync(
+    stateFileFor(sandbox, "session-1"),
+    JSON.stringify({
+      writeCount: 0,
+      dispatches: {},
+      dispatchLog: Array.from({ length: 200 }, (_, index) => ({ at: `2026-07-10T00:00:${String(index % 60).padStart(2, "0")}.000Z`, lane: "builtin", description: String(index) })),
+      advisedMultiples: [],
+      createdAt: "2026-07-10T00:00:00.000Z",
+      updatedAt: "2026-07-10T00:00:00.000Z"
+    }),
+    "utf8"
+  );
+
+  run(sandbox, dispatchPayload(sandbox, { description: "latest" }));
+  const state = readState(sandbox, "session-1");
+  assert.strictEqual(state.dispatchLog.length, 200);
+  assert.strictEqual(state.dispatchLog[0].description, "1");
+  assert.strictEqual(state.dispatchLog.at(-1).description, "latest");
+});
+
+test("dispatch ledger initializes when an existing state file has no dispatchLog", (t) => {
+  const sandbox = makeSandbox(t);
+  fs.mkdirSync(sandbox.stateDir, { recursive: true });
+  fs.writeFileSync(
+    stateFileFor(sandbox, "session-1"),
+    JSON.stringify({ writeCount: 4, dispatches: { grok: 2 }, advisedMultiples: [1], createdAt: "2026-07-10T00:00:00.000Z", updatedAt: "2026-07-10T00:00:00.000Z" }),
+    "utf8"
+  );
+
+  run(sandbox, dispatchPayload(sandbox, { toolName: "Task", subagentType: "fusion:fast-worker" }));
+  const state = readState(sandbox, "session-1");
+  assert.strictEqual(state.writeCount, 4);
+  assert.deepStrictEqual(state.dispatches, { grok: 2, "fusion:fast-worker": 1 });
+  assert.strictEqual(state.dispatchLog.length, 1);
+  assert.strictEqual(state.dispatchLog[0].lane, "fusion:fast-worker");
 });
 
 test("a Skill invocation is ignored and does not touch the counters", (t) => {
@@ -300,7 +372,7 @@ test("FUSION_INLINE_WRITE_BUDGET overrides the default threshold", (t) => {
   const second = run(sandbox, writePayload(sandbox), extraEnv);
   assert.strictEqual(first.stdout, "");
   const secondReason = JSON.parse(second.stdout).hookSpecificOutput.permissionDecisionReason;
-  assert.match(secondReason, /^2 inline write tool calls and 0 agent dispatches this session/);
+  assert.match(secondReason, /^2 inline writes happened this session with zero dispatches/);
 });
 
 test("a nonsense FUSION_INLINE_WRITE_BUDGET value falls back to the default of 5", (t) => {
@@ -312,7 +384,7 @@ test("a nonsense FUSION_INLINE_WRITE_BUDGET value falls back to the default of 5
   }
   const fifth = run(sandbox, writePayload(sandbox), extraEnv);
   const reason = JSON.parse(fifth.stdout).hookSpecificOutput.permissionDecisionReason;
-  assert.match(reason, /^5 inline write tool calls and 0 agent dispatches this session/);
+  assert.match(reason, /^5 inline writes happened this session with zero dispatches/);
 });
 
 test("stale session state is pruned after 48 hours", (t) => {

@@ -269,6 +269,23 @@ test("a monitor started from a subdirectory still matches jobs recorded against 
   );
 });
 
+test("a monitor includes jobs recorded in a worktree beneath the repo root", async (t) => {
+  const sandbox = makeSandbox(t);
+  const worktreeRoot = path.join(sandbox.workDir, ".claude", "worktrees", "agent-test");
+  fs.mkdirSync(worktreeRoot, { recursive: true });
+  const { file, record } = seedJob(sandbox, { status: "running" }, { workspace: "worktree-ws", workspaceRoot: worktreeRoot });
+  const monitor = startMonitor(sandbox, envFor(sandbox));
+  t.after(() => monitor.child.kill("SIGKILL"));
+  await new Promise((resolve) => setTimeout(resolve, 300));
+
+  writeJobRecordFile(file, { ...record, status: "completed", completedAt: new Date().toISOString() });
+
+  const lines = await waitUntil(() => (monitor.lines().length > 0 ? monitor.lines() : null));
+  assert.deepStrictEqual(lines, [
+    `codex job ${record.id} completed. collect with /codex:result ${record.id} only if you launched it detached; a job owned by a subagent reports on its own`
+  ]);
+});
+
 test("a running job whose pid has vanished is reported as dead exactly once", async (t) => {
   const sandbox = makeSandbox(t);
   const shortLivedChild = spawn(process.execPath, ["-e", "setTimeout(() => {}, 0)"]);
@@ -285,6 +302,28 @@ test("a running job whose pid has vanished is reported as dead exactly once", as
 
   await new Promise((resolve) => setTimeout(resolve, 500));
   assert.strictEqual(monitor.lines().length, 1);
+});
+
+test("a terminal worktree copy suppresses a dead alarm for its stale running mirror", async (t) => {
+  const sandbox = makeSandbox(t);
+  const worktreeRoot = path.join(sandbox.workDir, ".claude", "worktrees", "agent-test");
+  fs.mkdirSync(worktreeRoot, { recursive: true });
+  const shortLivedChild = spawn(process.execPath, ["-e", "setTimeout(() => {}, 0)"]);
+  const pid = shortLivedChild.pid;
+  await once(shortLivedChild, "exit");
+  const id = "mirrored-job";
+  seedJob(sandbox, { id, status: "running", pid }, { workspace: "parent-ws", workspaceRoot: sandbox.workDir });
+  seedJob(
+    sandbox,
+    { id, status: "completed", completedAt: new Date().toISOString(), pid: null },
+    { workspace: "worktree-ws", workspaceRoot: worktreeRoot }
+  );
+
+  const monitor = startMonitor(sandbox, envFor(sandbox));
+  t.after(() => monitor.child.kill("SIGKILL"));
+  await new Promise((resolve) => setTimeout(resolve, 700));
+
+  assert.deepStrictEqual(monitor.lines(), []);
 });
 
 test("a running job with a live pid is not reported as dead", async (t) => {
@@ -506,6 +545,16 @@ const log = process.env.FAKE_PS_LOG;
 if (log) fs.appendFileSync(log, JSON.stringify(args) + "\\n");
 const pidIndex = args.indexOf("-p");
 const pid = pidIndex >= 0 ? args[pidIndex + 1] : "";
+const barrier = process.env.FAKE_PS_BARRIER;
+if (barrier) {
+  fs.appendFileSync(barrier, process.pid + "\\n");
+  const sleeper = new Int32Array(new SharedArrayBuffer(4));
+  const deadline = Date.now() + 3000;
+  while (fs.readFileSync(barrier, "utf8").split("\\n").filter(Boolean).length < 2) {
+    if (Date.now() >= deadline) process.exit(2);
+    Atomics.wait(sleeper, 0, 0, 10);
+  }
+}
 const dead = (process.env.FAKE_PS_DEAD_PIDS || "").split(",").filter(Boolean);
 if (dead.includes(String(pid))) process.exit(1);
 const mode = process.env.FAKE_PS_MODE || "ok";
@@ -578,6 +627,24 @@ test("a second poll does not duplicate a model-audit observation", async (t) => 
   await waitUntil(() => (readModelAuditLines(sandbox).length > 0 ? true : null));
   await new Promise((resolve) => setTimeout(resolve, 500));
   assert.strictEqual(readModelAuditLines(sandbox).length, 1);
+});
+
+test("concurrent monitor processes append one model-audit observation per job", async (t) => {
+  const sandbox = makeSandbox(t);
+  const barrier = path.join(sandbox.root, "fake-ps-barrier");
+  seedJob(sandbox, { status: "running", pid: process.pid });
+  const env = envForAudit(sandbox, { FAKE_PS_BARRIER: barrier, CODEX_JOBS_MONITOR_INTERVAL_MS: "150" });
+  const first = startMonitor(sandbox, { ...env, CLAUDE_CODE_SESSION_ID: "session-a" });
+  const second = startMonitor(sandbox, { ...env, CLAUDE_CODE_SESSION_ID: "session-b" });
+  t.after(() => first.child.kill("SIGKILL"));
+  t.after(() => second.child.kill("SIGKILL"));
+
+  await waitUntil(() => (readModelAuditLines(sandbox).length > 0 ? true : null));
+  await new Promise((resolve) => setTimeout(resolve, 500));
+
+  assert.strictEqual(readModelAuditLines(sandbox).length, 1);
+  assert.strictEqual(first.stderr(), "");
+  assert.strictEqual(second.stderr(), "");
 });
 
 test("a job whose record already carries request.model is not probed", async (t) => {
