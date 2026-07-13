@@ -1,5 +1,16 @@
 # changelog
 
+## 0.0.22
+
+- codex worktree observability now scans worktree workspaces, uses mirror aware died detection, deduplicates model audit observations across processes, and reports model@effort stats without double counting terminal copies
+- grok companion hardening reaps stale locks, terminates orphaned processes on the died path, tolerates individual malformed monitor records, records malformed reviews as errors, enforces the footer contract, includes errorMessage on every failure path, scopes lookups with --cwd, and covers resume-last selection
+- background job collection now lives in plugins/fusion/scripts/job-collect.mjs, with fusion:job-collector reduced to a thin forwarder
+- SessionStart now runs a peer lane breaker check, while the inline delegation guard emits an actionable advisory
+- CI JSON validation gains empty glob guards so unmatched patterns do not become literal paths
+- documentation and routing rules now match install troubleshooting reality, xhigh ceiling wording, the consult allow list, split failure taxonomy, stop gate semantics, README uninstall steps and environment variables, doctor consistency checks, codex volume lane adoption nudges, and orchestrator owned worktree lifetime
+- rules manifest generation now hashes only content reachable from the current release lineage plus the current working tree, so unreleased side branch states are not treated as shipped versions
+- the inline guard now records a per-session dispatch ledger, while fusion-stats --trace joins dispatches with exact grok and approximate codex job outcomes
+
 ## 0.0.21
 
 - quick scoped packages now default to gpt-5.6-terra with effort xhigh named explicitly, while same turn grok overflow names low effort or the account's fast coding SKU and retains the max turns guard; motivated by the stated user preference on 2026-07-12 following the 0.0.20 release watch, which measured grok at the overwhelming share of delegated volume
