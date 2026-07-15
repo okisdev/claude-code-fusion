@@ -14,11 +14,16 @@ const BENCH_DIR = path.dirname(SELF_PATH);
 const REPO_ROOT = path.dirname(BENCH_DIR);
 const DEFAULT_TASK_ROOT = path.join(BENCH_DIR, "tasks");
 const CONDITIONS = new Set(["A", "B1", "B2", "B3"]);
+const CONDITION_PLUGIN_IDS = ["codex@claude-code-fusion", "codex@openai-codex", "fusion@claude-code-fusion", "grok@claude-code-fusion"];
+const EXPECTED_CONDITION_PLUGINS = {
+  A: [],
+  B1: ["fusion@claude-code-fusion"],
+  B2: ["codex@claude-code-fusion", "fusion@claude-code-fusion", "grok@claude-code-fusion"],
+  B3: ["fusion@claude-code-fusion"]
+};
 const CLI_VERSION_TIMEOUT_MS = 2000;
-const CLAUDE_PLUGIN_CACHE_DIR_ENV = "CLAUDE_PLUGIN_CACHE_DIR";
-const CODEX_PLUGIN_CACHE_SEGMENTS = ["openai-codex", "codex"];
-const VERSION_NAME_COLLATOR = new Intl.Collator("en", { numeric: true, sensitivity: "base" });
 const PLUGIN_VERSION_FILES = [
+  { name: "codex", file: path.join(REPO_ROOT, "plugins", "codex", ".claude-plugin", "plugin.json") },
   { name: "fusion", file: path.join(REPO_ROOT, "plugins", "fusion", ".claude-plugin", "plugin.json") },
   { name: "grok", file: path.join(REPO_ROOT, "plugins", "grok", ".claude-plugin", "plugin.json") }
 ];
@@ -198,35 +203,6 @@ function readJsonFile(file) {
   }
 }
 
-function claudePluginCacheDir(env = process.env) {
-  const override = env[CLAUDE_PLUGIN_CACHE_DIR_ENV];
-  return override ? path.resolve(override) : path.join(os.homedir(), ".claude", "plugins", "cache");
-}
-
-function codexPluginManifestFile(env = process.env) {
-  const root = path.join(claudePluginCacheDir(env), ...CODEX_PLUGIN_CACHE_SEGMENTS);
-  if (!fs.existsSync(root)) {
-    return null;
-  }
-  let entries;
-  try {
-    entries = fs.readdirSync(root, { withFileTypes: true });
-  } catch {
-    return null;
-  }
-  const versionDirs = entries
-    .filter((entry) => entry.isDirectory())
-    .map((entry) => entry.name)
-    .sort((left, right) => VERSION_NAME_COLLATOR.compare(left, right));
-  for (let index = versionDirs.length - 1; index >= 0; index -= 1) {
-    const manifestFile = path.join(root, versionDirs[index], ".claude-plugin", "plugin.json");
-    if (fs.existsSync(manifestFile)) {
-      return manifestFile;
-    }
-  }
-  return null;
-}
-
 function collectPluginVersions(env = process.env) {
   const versions = {};
   const marketplace = readJsonFile(path.join(REPO_ROOT, ".claude-plugin", "marketplace.json"));
@@ -236,8 +212,6 @@ function collectPluginVersions(env = process.env) {
     const plugin = readJsonFile(source.file);
     versions[source.name] = typeof plugin?.version === "string" ? plugin.version : null;
   }
-  const codexPlugin = readJsonFile(codexPluginManifestFile(env));
-  versions.codex = typeof codexPlugin?.version === "string" ? codexPlugin.version : null;
   return versions;
 }
 
@@ -396,42 +370,42 @@ function collectPeerDefaults(env = process.env) {
   };
 }
 
-function scanConfigNames(root) {
-  if (!fs.existsSync(root)) {
-    return [];
+function pluginIds(value) {
+  if (Array.isArray(value)) {
+    return value.flatMap((entry) => typeof entry === "string" ? [entry] : typeof entry?.id === "string" ? [entry.id] : typeof entry?.plugin === "string" ? [entry.plugin] : []);
   }
-  const names = [];
-  const stack = [{ dir: root, depth: 0 }];
-  while (stack.length > 0) {
-    const current = stack.pop();
-    if (current.depth > 4) {
-      continue;
-    }
-    const entries = fs.readdirSync(current.dir, { withFileTypes: true });
-    for (const entry of entries) {
-      names.push(entry.name);
-      if (entry.isDirectory()) {
-        stack.push({ dir: path.join(current.dir, entry.name), depth: current.depth + 1 });
-      }
-    }
+  if (value && typeof value === "object") {
+    return Object.keys(value);
   }
-  return names;
+  return [];
 }
 
 function detectConditionNotes(claudeConfigDir) {
-  const names = scanConfigNames(claudeConfigDir).map((name) => name.toLowerCase());
-  const installedPlugins = ["claude-code-fusion", "fusion", "grok", "codex"].filter((plugin) => names.some((name) => name.includes(plugin)));
   const settings = readJsonFile(path.join(claudeConfigDir, "settings.json"));
+  const registry = readJsonFile(path.join(claudeConfigDir, "plugins", "installed_plugins.json"));
+  const installedPlugins = [...new Set(pluginIds(registry?.plugins))].sort();
+  const enabledPlugins = [...new Set(Object.entries(settings?.enabledPlugins ?? {}).flatMap(([id, enabled]) => enabled === true ? [id] : []))].sort();
   const mainSessionModel = typeof settings?.model === "string" && settings.model.length > 0 ? settings.model : null;
   return {
-    detection: "filesystem",
+    detection: "configuration",
     installedPlugins,
+    enabledPlugins,
     routingRulesPresent: fs.existsSync(path.join(claudeConfigDir, "rules", "orchestration.md")),
     mainSessionModel
   };
 }
 
 function validateConditionNotes(options, conditionNotes) {
+  const expected = EXPECTED_CONDITION_PLUGINS[options.condition];
+  const relatedInstalled = conditionNotes.installedPlugins.filter((id) => CONDITION_PLUGIN_IDS.includes(id));
+  const relatedEnabled = conditionNotes.enabledPlugins.filter((id) => CONDITION_PLUGIN_IDS.includes(id));
+  if (JSON.stringify(relatedInstalled) !== JSON.stringify(expected) || JSON.stringify(relatedEnabled) !== JSON.stringify(expected)) {
+    throw new Error(`Invalid ${options.condition} configuration: expected installed and enabled benchmark plugin IDs ${JSON.stringify(expected)}; detected installed ${JSON.stringify(relatedInstalled)} and enabled ${JSON.stringify(relatedEnabled)}.`);
+  }
+  const expectsRules = options.condition !== "A";
+  if (conditionNotes.routingRulesPresent !== expectsRules) {
+    throw new Error(`Invalid ${options.condition} configuration: expected routingRulesPresent=${expectsRules}; detected ${conditionNotes.routingRulesPresent}.`);
+  }
   if (options.condition === "B3" && conditionNotes.mainSessionModel !== "sonnet") {
     throw new Error(
       `Invalid B3 configuration: expected ${path.join(options.claudeConfigDir, "settings.json")} to contain {"model": "sonnet"}; detected ${JSON.stringify(conditionNotes.mainSessionModel)}.`

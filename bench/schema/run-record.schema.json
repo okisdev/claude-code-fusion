@@ -169,13 +169,21 @@
     "conditionNotes": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["detection", "installedPlugins", "routingRulesPresent", "mainSessionModel"],
+      "required": ["detection", "installedPlugins", "enabledPlugins", "routingRulesPresent", "mainSessionModel"],
       "properties": {
         "detection": {
           "type": "string",
-          "enum": ["filesystem"]
+          "enum": ["configuration"]
         },
         "installedPlugins": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          },
+          "uniqueItems": true
+        },
+        "enabledPlugins": {
           "type": "array",
           "items": {
             "type": "string",

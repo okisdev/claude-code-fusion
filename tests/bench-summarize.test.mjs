@@ -28,9 +28,10 @@ function baseRecord(overrides = {}) {
     finishedAt: "2026-01-01T00:00:10.000Z",
     taskManifestHash: "a".repeat(64),
     conditionNotes: {
-      detection: "filesystem",
-      installedPlugins: ["fusion"],
-      routingRulesPresent: false,
+      detection: "configuration",
+      installedPlugins: ["fusion@claude-code-fusion"],
+      enabledPlugins: ["fusion@claude-code-fusion"],
+      routingRulesPresent: true,
       mainSessionModel: null
     },
     claudeExit: 0,
@@ -276,9 +277,10 @@ test("summarize rejects schema records with negative numbers and invalid exclusi
     baseRecord({
       repetition: 6,
       conditionNotes: {
-        detection: "filesystem",
-        installedPlugins: ["fusion"],
-        routingRulesPresent: false
+        detection: "configuration",
+        installedPlugins: ["fusion@claude-code-fusion"],
+        enabledPlugins: ["fusion@claude-code-fusion"],
+        routingRulesPresent: true
       }
     })
   ];
