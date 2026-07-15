@@ -30,6 +30,40 @@
     process.stdout.write(JSON.stringify(envelope) + "\n");
   };
 
+  const nextAttempt = () => {
+    const counterFile = (argsFile || "fake-grok") + ".count";
+    let count = 0;
+    try {
+      count = Number(fs.readFileSync(counterFile, "utf8")) || 0;
+    } catch {}
+    fs.writeFileSync(counterFile, String(count + 1));
+    return count;
+  };
+
+  const usage = {
+    input_tokens: 120,
+    cache_read_input_tokens: 30,
+    output_tokens: 20,
+    reasoning_tokens: 5,
+    total_tokens: 170
+  };
+  const modelUsage = {
+    "grok-test-main": {
+      inputTokens: 100,
+      outputTokens: 15,
+      cacheReadInputTokens: 30,
+      modelCalls: 2,
+      costUSD: 0.01
+    },
+    "grok-test-subagent": {
+      inputTokens: 20,
+      outputTokens: 5,
+      cacheReadInputTokens: 0,
+      modelCalls: 1,
+      costUSD: 0.002
+    }
+  };
+
   if (mode === "ok") {
     emit({
       text: "FAKE-OK",
@@ -38,6 +72,48 @@
       requestId: "req-1"
     });
     process.exit(0);
+  }
+
+  if (mode === "usage-ok") {
+    emit({
+      text: "FAKE-USAGE-OK",
+      stopReason: "EndTurn",
+      sessionId: "11111111-1111-7111-8111-111111111112",
+      requestId: "req-usage",
+      usage,
+      modelUsage
+    });
+    process.exit(0);
+  }
+
+  if (mode === "usage-incomplete-ok") {
+    emit({
+      text: "FAKE-USAGE-INCOMPLETE",
+      stopReason: "EndTurn",
+      sessionId: "11111111-1111-7111-8111-111111111113",
+      requestId: "req-usage-incomplete",
+      usage,
+      modelUsage,
+      usage_is_incomplete: true
+    });
+    process.exit(0);
+  }
+
+  if (mode === "sandbox-warning") {
+    process.stderr.write("Sandbox could not be applied, continuing without sandbox\n");
+    setTimeout(() => {
+      if (process.env.FAKE_GROK_SANDBOX_SENTINEL) {
+        fs.writeFileSync(process.env.FAKE_GROK_SANDBOX_SENTINEL, "unsandboxed activity\n", "utf8");
+      }
+      emit({
+        text: "UNSANDBOXED",
+        stopReason: "EndTurn",
+        sessionId: "11111111-1111-7111-8111-111111111114",
+        requestId: "req-sandbox-warning"
+      });
+      process.exit(0);
+    }, 1000);
+    return;
   }
 
   if (mode === "review-ok") {
@@ -51,12 +127,7 @@
   }
 
   if (mode === "badjson-then-ok") {
-    const counterFile = (argsFile || "fake-grok") + ".count";
-    let count = 0;
-    try {
-      count = Number(fs.readFileSync(counterFile, "utf8")) || 0;
-    } catch {}
-    fs.writeFileSync(counterFile, String(count + 1));
+    const count = nextAttempt();
     if (count === 0) {
       emit({
         text: "```markdown\nI could not produce the requested object, sorry.\n```",
@@ -73,6 +144,111 @@
       });
     }
     process.exit(0);
+  }
+
+  const reviewUsageModes = new Set([
+    "review-usage-complete-complete",
+    "review-usage-complete-partial",
+    "review-usage-partial-complete",
+    "review-usage-complementary-partials"
+  ]);
+  if (reviewUsageModes.has(mode)) {
+    const completeUsageA = {
+      input_tokens: 10,
+      cache_read_input_tokens: 2,
+      output_tokens: 3,
+      reasoning_tokens: 1,
+      total_tokens: 15
+    };
+    const completeUsageB = {
+      input_tokens: 20,
+      cache_read_input_tokens: 4,
+      output_tokens: 6,
+      reasoning_tokens: 2,
+      total_tokens: 30
+    };
+    const partialUsageA = { input_tokens: 10, cache_read_input_tokens: 2 };
+    const partialUsageB = { output_tokens: 6, reasoning_tokens: 2, total_tokens: 30 };
+    const sharedPartialUsageB = { input_tokens: 20, output_tokens: 6, total_tokens: 30 };
+    const completeModelA = {
+      inputTokens: 10,
+      cacheReadInputTokens: 2,
+      outputTokens: 3,
+      reasoningTokens: 1,
+      totalTokens: 15,
+      modelCalls: 1,
+      costUSD: 0.001
+    };
+    const completeModelB = {
+      inputTokens: 20,
+      cacheReadInputTokens: 4,
+      outputTokens: 6,
+      reasoningTokens: 2,
+      totalTokens: 30,
+      modelCalls: 2,
+      costUSD: 0.002
+    };
+    const partialModelA = { inputTokens: 10, cacheReadInputTokens: 2 };
+    const partialModelB = { outputTokens: 6, reasoningTokens: 2, totalTokens: 30 };
+    const sharedPartialModelB = { inputTokens: 20, outputTokens: 6, totalTokens: 30 };
+    const scenarios = {
+      "review-usage-complete-complete": [completeUsageA, completeUsageB, completeModelA, completeModelB],
+      "review-usage-complete-partial": [completeUsageA, sharedPartialUsageB, completeModelA, sharedPartialModelB],
+      "review-usage-partial-complete": [partialUsageA, completeUsageB, partialModelA, completeModelB],
+      "review-usage-complementary-partials": [partialUsageA, partialUsageB, partialModelA, partialModelB]
+    };
+    const count = nextAttempt();
+    const [firstUsage, retryUsage, firstModel, retryModel] = scenarios[mode];
+    emit({
+      text:
+        count === 0
+          ? "```markdown\nI could not produce the requested object, sorry.\n```"
+          : "```json\n" + JSON.stringify(reviewObject) + "\n```",
+      stopReason: "EndTurn",
+      sessionId: "23232323-2323-7323-8323-232323232323",
+      requestId: count === 0 ? "req-review-usage-1" : "req-review-usage-2",
+      usage: count === 0 ? firstUsage : retryUsage,
+      modelUsage: { "grok-review": count === 0 ? firstModel : retryModel }
+    });
+    process.exit(0);
+  }
+
+  if (mode === "review-retry-quota-error" || mode === "review-retry-zero-exit-quota-error") {
+    const completeUsage = {
+      input_tokens: 10,
+      cache_read_input_tokens: 2,
+      output_tokens: 3,
+      reasoning_tokens: 1,
+      total_tokens: 15
+    };
+    const completeModel = {
+      inputTokens: 10,
+      cacheReadInputTokens: 2,
+      outputTokens: 3,
+      reasoningTokens: 1,
+      totalTokens: 15
+    };
+    const count = nextAttempt();
+    if (count === 0) {
+      emit({
+        text: "```markdown\nI could not produce the requested object, sorry.\n```",
+        stopReason: "EndTurn",
+        sessionId: "24242424-2424-7424-8424-242424242424",
+        requestId: "req-review-quota-1",
+        usage: completeUsage,
+        modelUsage: { "grok-review": completeModel },
+        usage_is_incomplete: false
+      });
+      process.exit(0);
+    }
+    emit({
+      type: "error",
+      message: "HTTP 402 Payment Required: insufficient account credits",
+      usage: completeUsage,
+      modelUsage: { "grok-review": completeModel },
+      usage_is_incomplete: true
+    });
+    process.exit(mode === "review-retry-zero-exit-quota-error" ? 0 : 42);
   }
 
   if (mode === "badjson") {
@@ -165,6 +341,34 @@
     process.exit(1);
   }
 
+  const quotaErrors = {
+    "http-402-error": "HTTP 402",
+    "payment-required-error": "Payment Required",
+    "balance-exhausted-error": "account balance exhausted",
+    "balance-is-exhausted-error": "account balance is exhausted",
+    "exhausted-balance-error": "exhausted balance",
+    "insufficient-balance-error": "insufficient balance",
+    "insufficient-account-balance-error": "insufficient account balance",
+    "insufficient-account-credit-error": "insufficient account credit",
+    "insufficient-account-credits-error": "insufficient account credits",
+    "insufficient-account-funds-error": "insufficient account funds",
+    "usage-limit-error": "usage limit reached"
+  };
+  if (quotaErrors[mode]) {
+    process.stderr.write(quotaErrors[mode] + "\n");
+    process.exit(1);
+  }
+
+  if (mode === "usage-error") {
+    emit({
+      type: "error",
+      message: "HTTP 402 Payment Required: balance exhausted",
+      usage,
+      modelUsage
+    });
+    process.exit(1);
+  }
+
   if (mode === "rate-limit-error") {
     process.stderr.write("429 too many requests\n");
     process.exit(1);
@@ -194,6 +398,27 @@
 
   if (mode === "hang") {
     process.on("SIGTERM", () => process.exit(143));
+    setTimeout(() => process.exit(0), 120000);
+    return;
+  }
+
+  if (mode === "stderr-hang") {
+    process.stderr.write("runtime log\n");
+    process.on("SIGTERM", () => process.exit(143));
+    setTimeout(() => process.exit(0), 120000);
+    return;
+  }
+
+  if (mode === "delayed-stderr-hang") {
+    process.on("SIGTERM", () => process.exit(143));
+    setTimeout(() => process.stderr.write("delayed runtime log\n"), 500);
+    setTimeout(() => process.exit(0), 120000);
+    return;
+  }
+
+  if (mode === "sandbox-warning-ignore-term") {
+    process.on("SIGTERM", () => {});
+    process.stderr.write("Sandbox could not be applied, continuing without sandbox\n");
     setTimeout(() => process.exit(0), 120000);
     return;
   }

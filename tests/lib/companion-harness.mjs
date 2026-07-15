@@ -13,12 +13,29 @@ export const jobsMonitor = path.join(repoRoot, "plugins", "grok", "scripts", "jo
 
 export function makeSandbox(t) {
   const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "grok-plugin-test-")));
-  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const cleanups = [];
+  t.after(async () => {
+    try {
+      for (const cleanup of cleanups.reverse()) {
+        await cleanup();
+      }
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
   const dataDir = path.join(root, "data");
   const workDir = path.join(root, "work");
   fs.mkdirSync(dataDir);
   fs.mkdirSync(workDir);
-  return { root, dataDir, workDir, argsFile: path.join(root, "args.jsonl") };
+  return {
+    root,
+    dataDir,
+    workDir,
+    argsFile: path.join(root, "args.jsonl"),
+    registerCleanup(cleanup) {
+      cleanups.push(cleanup);
+    },
+  };
 }
 
 export function envFor(sandbox, extra = {}, options = {}) {
@@ -27,6 +44,8 @@ export function envFor(sandbox, extra = {}, options = {}) {
     "FAKE_GROK_MODE",
     "FAKE_GROK_ARGS_FILE",
     "GROK_COMPANION_TIMEOUT_MS",
+    "GROK_COMPANION_BACKGROUND_DELIVERY",
+    "GROK_JOBS_MONITOR_MANAGED_GRACE_MS",
     "CLAUDE_CODE_SESSION_ID",
     ...(options.clearEnv ?? []),
   ]) {

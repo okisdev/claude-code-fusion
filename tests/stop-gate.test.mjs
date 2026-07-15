@@ -107,7 +107,9 @@ test("stop-gate allows the stop when grok replies ALLOW", (t) => {
   const invocations = readInvocations(sandbox.argsFile);
   assert.strictEqual(invocations.length, 1);
   assert.ok(hasPair(invocations[0], "--max-turns", "15"));
-  assert.ok(hasPair(invocations[0], "--permission-mode", "dontAsk"));
+  assert.ok(hasPair(invocations[0], "--permission-mode", "default"));
+  assert.ok(hasPair(invocations[0], "--sandbox", "strict"));
+  assert.ok(hasPair(invocations[0], "--tools", "read_file,grep,list_dir"));
   const brief = fs.readFileSync(
     invocations[0][invocations[0].indexOf("--prompt-file") + 1],
     "utf8"

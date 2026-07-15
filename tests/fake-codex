@@ -1,0 +1,230 @@
+#!/usr/bin/env node
+
+import fs from "node:fs";
+import { spawn } from "node:child_process";
+
+const args = process.argv.slice(2);
+
+if (args.includes("--version")) {
+  process.stdout.write(`${process.env.FAKE_CODEX_VERSION_OUTPUT || `codex-cli ${process.env.FAKE_CODEX_VERSION || "0.144.4"}`}\n`);
+  process.exit(0);
+}
+
+if (args[0] === "login" && args[1] === "status") {
+  if (process.env.FAKE_CODEX_AUTH === "false") {
+    process.stderr.write(`${process.env.FAKE_CODEX_AUTH_DETAIL || "Not logged in"}\n`);
+    process.exit(1);
+  }
+  process.stdout.write(`${process.env.FAKE_CODEX_AUTH_DETAIL || "Logged in"}\n`);
+  process.exit(0);
+}
+
+const delayMs = Number(process.env.FAKE_CODEX_DELAY_MS ?? 0);
+if (Number.isFinite(delayMs) && delayMs > 0) {
+  await new Promise((resolve) => setTimeout(resolve, delayMs));
+}
+
+let prompt = "";
+if (process.env.FAKE_CODEX_CLOSE_STDIN === "true") {
+  process.stdin.destroy();
+  await new Promise((resolve) => setTimeout(resolve, 25));
+} else {
+  for await (const chunk of process.stdin) {
+    prompt += chunk.toString();
+  }
+}
+
+if (process.env.FAKE_CODEX_ARGS_FILE) {
+  fs.writeFileSync(process.env.FAKE_CODEX_ARGS_FILE, JSON.stringify(args));
+}
+if (process.env.FAKE_CODEX_STDIN_FILE) {
+  fs.writeFileSync(process.env.FAKE_CODEX_STDIN_FILE, prompt);
+}
+
+const mode = process.env.FAKE_CODEX_MODE || "completed";
+const threadId = process.env.FAKE_CODEX_THREAD_ID || "thread-123";
+const usage = process.env.FAKE_CODEX_USAGE
+  ? JSON.parse(process.env.FAKE_CODEX_USAGE)
+  : {
+      input_tokens: 120,
+      cached_input_tokens: 40,
+      output_tokens: 30,
+      reasoning_output_tokens: 10
+    };
+
+function emit(value) {
+  process.stdout.write(`${JSON.stringify(value)}\n`);
+}
+
+function resultFile() {
+  for (let index = 0; index < args.length; index += 1) {
+    if (args[index] === "--output-last-message" || args[index] === "-o") {
+      return args[index + 1] || null;
+    }
+  }
+  return null;
+}
+
+function start() {
+  emit({ type: "thread.started", thread_id: threadId });
+  emit({ type: "turn.started" });
+}
+
+function complete({ message = "Codex completed the task.", includeMessage = true } = {}) {
+  message = process.env.FAKE_CODEX_MESSAGE_BYTES ? "x".repeat(Number(process.env.FAKE_CODEX_MESSAGE_BYTES)) : message;
+  if (includeMessage) {
+    emit({ type: "item.completed", item: { id: "item_1", type: "agent_message", text: message } });
+  }
+  const output = resultFile();
+  if (output) {
+    fs.writeFileSync(output, message);
+  }
+  emit({ type: "turn.completed", usage });
+}
+
+if (process.env.FAKE_CODEX_STDERR) {
+  process.stderr.write(process.env.FAKE_CODEX_STDERR);
+}
+if (process.env.FAKE_CODEX_READY_FILE) {
+  fs.writeFileSync(process.env.FAKE_CODEX_READY_FILE, "ready");
+}
+
+switch (mode) {
+  case "completed":
+    start();
+    complete();
+    break;
+  case "fallback":
+    start();
+    complete({ message: "Final response from result file.", includeMessage: false });
+    break;
+  case "failed":
+    start();
+    emit({ type: "turn.failed", error: { message: "model execution failed" } });
+    process.exitCode = 1;
+    break;
+  case "pre-turn-warning-completed":
+    emit({ type: "thread.started", thread_id: threadId });
+    emit({ type: "item.completed", item: { id: "item_warning", type: "error", message: "configuration warning before turn" } });
+    emit({ type: "turn.started" });
+    complete();
+    break;
+  case "retry-error-completed":
+    start();
+    emit({ type: "error", message: "temporary upstream disconnect" });
+    emit({ type: "item.completed", item: { id: "item_warning", type: "error", message: "configuration warning" } });
+    complete();
+    break;
+  case "diagnostic-nonzero":
+    start();
+    emit({ type: "error", message: process.env.FAKE_CODEX_DIAGNOSTIC || "model execution failed" });
+    process.exitCode = 1;
+    break;
+  case "unknown":
+    start();
+    emit({ type: "future.event", payload: { retained: true } });
+    emit({ type: "item.completed", item: { id: "item_future", type: "future_item", payload: 42 } });
+    complete();
+    break;
+  case "oversized-event":
+    start();
+    emit({ type: "future.event", payload: "x".repeat(Number(process.env.FAKE_CODEX_EVENT_BYTES || 4096)) });
+    complete();
+    break;
+  case "malformed":
+    start();
+    process.stdout.write("{not-json}\n");
+    break;
+  case "missing-terminal":
+    start();
+    emit({ type: "item.completed", item: { id: "item_1", type: "agent_message", text: "partial" } });
+    break;
+  case "missing-sequence":
+    emit({ type: "turn.completed", usage });
+    break;
+  case "nonzero":
+    start();
+    complete();
+    process.exitCode = 7;
+    break;
+  case "hang":
+    start();
+    setInterval(() => {}, 1000);
+    break;
+  case "ignore-term":
+    start();
+    process.on("SIGINT", () => {
+      if (process.env.FAKE_CODEX_INT_FILE) {
+        fs.writeFileSync(process.env.FAKE_CODEX_INT_FILE, "received");
+      }
+    });
+    process.on("SIGTERM", () => {
+      if (process.env.FAKE_CODEX_TERM_FILE) {
+        fs.writeFileSync(process.env.FAKE_CODEX_TERM_FILE, "received");
+      }
+    });
+    setInterval(() => {}, 1000);
+    break;
+  case "interrupt-cleanup": {
+    const holder = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], {
+      stdio: "ignore"
+    });
+    if (process.env.FAKE_CODEX_CHILD_PID_FILE) {
+      fs.writeFileSync(process.env.FAKE_CODEX_CHILD_PID_FILE, String(holder.pid));
+    }
+    holder.unref();
+    start();
+    process.on("SIGINT", () => {
+      if (process.env.FAKE_CODEX_INT_FILE) {
+        fs.writeFileSync(process.env.FAKE_CODEX_INT_FILE, "received");
+      }
+      const exit = () => process.exit(0);
+      if (holder.exitCode != null || holder.signalCode != null) {
+        exit();
+        return;
+      }
+      holder.once("close", exit);
+      holder.kill("SIGTERM");
+    });
+    process.on("SIGTERM", () => {
+      if (process.env.FAKE_CODEX_TERM_FILE) {
+        fs.writeFileSync(process.env.FAKE_CODEX_TERM_FILE, "received");
+      }
+    });
+    setInterval(() => {}, 1000);
+    break;
+  }
+  case "inherited-pipe": {
+    const holder = spawn(process.execPath, ["-e", "setTimeout(() => {}, 500)"], {
+      detached: true,
+      stdio: ["ignore", process.stdout, process.stderr]
+    });
+    holder.unref();
+    start();
+    setInterval(() => {}, 1000);
+    break;
+  }
+  case "completed-with-group-child": {
+    const source = process.env.FAKE_CODEX_GROUP_CHILD_IGNORE_TERM === "true"
+      ? `const fs = require("node:fs"); process.on("SIGINT", () => {}); process.on("SIGTERM", () => { if (process.env.FAKE_CODEX_GROUP_CHILD_TERM_FILE) fs.writeFileSync(process.env.FAKE_CODEX_GROUP_CHILD_TERM_FILE, "received"); }); if (process.env.FAKE_CODEX_GROUP_CHILD_READY_FILE) fs.writeFileSync(process.env.FAKE_CODEX_GROUP_CHILD_READY_FILE, "ready"); setInterval(() => {}, 1000)`
+      : "setInterval(() => {}, 1000)";
+    const holder = spawn(process.execPath, ["-e", source], {
+      stdio: "ignore"
+    });
+    if (process.env.FAKE_CODEX_CHILD_PID_FILE) {
+      fs.writeFileSync(process.env.FAKE_CODEX_CHILD_PID_FILE, String(holder.pid));
+    }
+    if (process.env.FAKE_CODEX_GROUP_CHILD_READY_FILE) {
+      while (!fs.existsSync(process.env.FAKE_CODEX_GROUP_CHILD_READY_FILE)) {
+        await new Promise((resolve) => setTimeout(resolve, 5));
+      }
+    }
+    holder.unref();
+    start();
+    complete();
+    break;
+  }
+  default:
+    process.stderr.write(`unknown fake mode: ${mode}\n`);
+    process.exitCode = 2;
+}

@@ -202,6 +202,17 @@ test("Doctor and setup describe template hash comparison for live rules", () => 
   assert.doesNotMatch(setup, /write the canonical content/);
 });
 
+test("background collection distinguishes Fusion receipts, managed Grok jobs, and direct commands", () => {
+  const rules = fs.readFileSync(path.join(repoRoot, "plugins", "fusion", "rules", "orchestration.md"), "utf8");
+  const task = fs.readFileSync(path.join(repoRoot, "plugins", "codex", "commands", "task.md"), "utf8");
+  const rescue = fs.readFileSync(path.join(repoRoot, "plugins", "codex", "commands", "rescue.md"), "utf8");
+  assert.match(rules, /this obligation applies to a manual receipt that crosses into the main session from a detached job launched by Fusion orchestration/);
+  assert.match(rules, /Managed Grok detachment is different: the receipt stays inside the owning background Agent/);
+  assert.match(rules, /Direct Codex and Grok slash commands with explicit `--background` return manual receipts for the user to inspect and collect through their status and result commands/);
+  assert.match(task, /Direct users inspect progress through `\/codex:status` and collect the deliverable through `\/codex:result`; when Fusion is installed, its monitor can notify them of completion/);
+  assert.match(rescue, /Direct users inspect progress through `\/codex:status` and collect the deliverable through `\/codex:result`; when Fusion is installed, its monitor can notify them of completion/);
+});
+
 test("The shipped rules manifest contains the current rules file template hash", () => {
   const rulesPath = path.join(repoRoot, "plugins", "fusion", "rules", "orchestration.md");
   const manifestPath = path.join(repoRoot, "plugins", "fusion", "rules-manifest.json");

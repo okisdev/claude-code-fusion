@@ -50,6 +50,17 @@ test("auth stderr yields failure kind auth", (t) => {
 for (const { name, mode, failureKind } of [
   { name: "quota stderr yields failure kind quota", mode: "quota-error", failureKind: "quota" },
   { name: "mixed quota and auth stderr yields failure kind quota", mode: "quota-auth-error", failureKind: "quota" },
+  { name: "HTTP 402 stderr yields failure kind quota", mode: "http-402-error", failureKind: "quota" },
+  { name: "Payment Required stderr yields failure kind quota", mode: "payment-required-error", failureKind: "quota" },
+  { name: "balance exhausted stderr yields failure kind quota", mode: "balance-exhausted-error", failureKind: "quota" },
+  { name: "balance is exhausted stderr yields failure kind quota", mode: "balance-is-exhausted-error", failureKind: "quota" },
+  { name: "exhausted balance stderr yields failure kind quota", mode: "exhausted-balance-error", failureKind: "quota" },
+  { name: "insufficient balance stderr yields failure kind quota", mode: "insufficient-balance-error", failureKind: "quota" },
+  { name: "insufficient account balance stderr yields failure kind quota", mode: "insufficient-account-balance-error", failureKind: "quota" },
+  { name: "insufficient account credit stderr yields failure kind quota", mode: "insufficient-account-credit-error", failureKind: "quota" },
+  { name: "insufficient account credits stderr yields failure kind quota", mode: "insufficient-account-credits-error", failureKind: "quota" },
+  { name: "insufficient account funds stderr yields failure kind quota", mode: "insufficient-account-funds-error", failureKind: "quota" },
+  { name: "usage limit stderr yields failure kind quota", mode: "usage-limit-error", failureKind: "quota" },
   { name: "generic stderr yields failure kind error", mode: "error", failureKind: "error" },
 ]) {
   test(name, (t) => {
@@ -66,6 +77,26 @@ for (const { name, mode, failureKind } of [
     assert.match(resultOutput.stdout, new RegExp(`^failure: ${failureKind}$`, "m"));
   });
 }
+
+test("structured quota errors retain reported usage", (t) => {
+  const sandbox = makeSandbox(t);
+  const env = envFor(sandbox, { FAKE_GROK_MODE: "usage-error" });
+  const result = runCompanion(["task", "doomed"], { cwd: sandbox.workDir, env });
+  assert.notStrictEqual(result.status, 0);
+  assert.match(result.stderr, /HTTP 402 Payment Required: balance exhausted/);
+  assert.match(result.stderr, /^failure: quota$/m);
+  const record = jobRecords(sandbox.dataDir)[0];
+  assert.strictEqual(record.status, "error");
+  assert.strictEqual(record.failureKind, "quota");
+  assert.deepStrictEqual(record.usage, {
+    input_tokens: 120,
+    cache_read_input_tokens: 30,
+    output_tokens: 20,
+    reasoning_tokens: 5,
+    total_tokens: 170,
+  });
+  assert.deepStrictEqual(Object.keys(record.modelUsage), ["grok-test-main", "grok-test-subagent"]);
+});
 
 test("invalid zero exit JSON envelope records an error with a bounded stdout tail", (t) => {
   const sandbox = makeSandbox(t);

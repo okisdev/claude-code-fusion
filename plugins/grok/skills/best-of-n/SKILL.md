@@ -1,6 +1,6 @@
 ---
 description: Run a Grok best-of-n implementation tournament and apply the winner
-argument-hint: '[--n <2-10>] [task text]'
+argument-hint: '[--n <n>] [task text]'
 allowed-tools: Agent
 ---
 
@@ -13,13 +13,13 @@ Raw slash-command arguments:
 
 Execution rules:
 
-- Dispatch the run as one background subagent of type `grok:grok-rescue` via the `Agent` tool, instructing it to forward the task text with `--best-of-n <n>`. Never run the companion in the main loop and never ask the user how to run it; the subagent is harness tracked, so its completion arrives as a notification and nothing blocks.
-- Parse `--n <2-10>` from the arguments and forward it as `--best-of-n <n>`; default to 2 when absent. The companion rejects values outside 2 to 10. The remaining natural language text passes as one quoted positional prompt.
+- Dispatch the run as one background subagent of type `grok:grok-rescue` via the `Agent` tool, instructing it that this direct user selected Grok lane uses the `best-of-n` protected role and must forward the task text with `--best-of-n <n>`. The rescue agent uses managed detachment when the tournament needs the longer worker timeout and collects it to a terminal result. Never run the companion in the main loop and never ask the user how to run it; the subagent is harness tracked, so its completion arrives as a notification and nothing blocks.
+- Parse `--n <n>` from the arguments and forward it as `--best-of-n <n>`; default to 2 when absent. The companion rejects values outside 2 to 10. The remaining natural language text passes as one quoted positional prompt.
 - Do not rewrite the task text beyond stripping routing flags.
-- The tournament runs in write mode with auto approval: Grok builds n candidate implementations in isolated worktrees, judges them, and applies the winning candidate's edits to the workspace. Only run it when the user accepts edits. The write mode deny list is a minimal exception set, not a sandbox, so recommend a clean branch or a disposable worktree when the tree is dirty.
+- The tournament runs in write mode with auto approval: Grok builds n candidate implementations in isolated worktrees, selects a candidate, and applies that candidate's edits to the workspace. That selection is not semantic acceptance; the main session verifies the combined workspace and makes the final judgment. Only run it when the user accepts edits. The write mode deny list is a minimal exception set, not a sandbox, so recommend a clean branch or a disposable worktree when the tree is dirty.
 - A tournament multiplies xAI usage by roughly n, so keep n at 2 unless the user explicitly asks for more candidates.
 - Grok may leave its candidate worktrees behind next to the workspace after applying the winner; if the user asks about stray `bestofn-candidate-*` directories, point them at `git worktree list` and `git worktree remove <path>`.
-- Relay the subagent's returned companion stdout verbatim, exactly as-is, including the grok-session and job lines.
+- Relay the subagent's returned companion output verbatim, exactly as-is, including the grok-session and job lines.
 - Do not paraphrase, summarize, or add commentary before or after it.
 - For a background run, the companion prints the job id plus `/grok:status` and `/grok:result` usage hints. Preserve them.
 - If the user did not supply a request, ask what Grok should do.

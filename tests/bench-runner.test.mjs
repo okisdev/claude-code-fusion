@@ -9,6 +9,31 @@ const repoRoot = path.join(import.meta.dirname, "..");
 const runner = path.join(repoRoot, "bench", "run.mjs");
 const fakeClaude = path.join(import.meta.dirname, "fake-claude");
 const claudePluginCacheDirEnv = "CLAUDE_PLUGIN_CACHE_DIR";
+const conditionPlugins = {
+  A: [],
+  B1: ["fusion@claude-code-fusion"],
+  B2: ["codex@claude-code-fusion", "fusion@claude-code-fusion", "grok@claude-code-fusion"],
+  B3: ["fusion@claude-code-fusion"]
+};
+
+function configureCondition(sandbox, condition, { model = condition === "B3" ? "sonnet" : null, extraPlugins = [], installedExtra = [], rules = condition !== "A" } = {}) {
+  const enabledPlugins = [...conditionPlugins[condition], ...extraPlugins].sort();
+  const installedPlugins = [...new Set([...enabledPlugins, ...installedExtra])].sort();
+  const settings = { enabledPlugins: Object.fromEntries(enabledPlugins.map((id) => [id, true])) };
+  if (model) {
+    settings.model = model;
+  }
+  fs.writeFileSync(path.join(sandbox.claudeConfigDir, "settings.json"), JSON.stringify(settings), "utf8");
+  const registryFile = path.join(sandbox.claudeConfigDir, "plugins", "installed_plugins.json");
+  fs.mkdirSync(path.dirname(registryFile), { recursive: true });
+  fs.writeFileSync(registryFile, JSON.stringify({ version: 2, plugins: Object.fromEntries(installedPlugins.map((id) => [id, [{}]])) }), "utf8");
+  const rulesFile = path.join(sandbox.claudeConfigDir, "rules", "orchestration.md");
+  fs.rmSync(rulesFile, { force: true });
+  if (rules) {
+    fs.mkdirSync(path.dirname(rulesFile), { recursive: true });
+    fs.writeFileSync(rulesFile, "benchmark routing rules\n", "utf8");
+  }
+}
 
 function makeSandbox(t) {
   const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "bench-runner-test-")));
@@ -39,7 +64,7 @@ function makeSandbox(t) {
   );
   fs.chmodSync(path.join(taskDir, "verify.sh"), 0o755);
   fs.writeFileSync(path.join(fixturesDir, "src", "input.txt"), "fixture\n", "utf8");
-  return {
+  const result = {
     root,
     taskRoot,
     taskId: "T01-test",
@@ -49,6 +74,8 @@ function makeSandbox(t) {
     envFile: path.join(resultsDir, "env.json"),
     fakeRunsFile: path.join(root, "fake-claude.jsonl")
   };
+  configureCondition(result, "B2");
+  return result;
 }
 
 function writeFakeVersionBin(dir, name, version) {
@@ -136,9 +163,10 @@ test("runner appends a valid record with verifier success and split token totals
   assert.doesNotThrow(() => new Date(record.finishedAt).toISOString());
   assert.match(record.taskManifestHash, /^[0-9a-f]{64}$/);
   assert.deepStrictEqual(record.conditionNotes, {
-    detection: "filesystem",
-    installedPlugins: ["fusion"],
-    routingRulesPresent: false,
+    detection: "configuration",
+    installedPlugins: ["codex@claude-code-fusion", "fusion@claude-code-fusion", "grok@claude-code-fusion"],
+    enabledPlugins: ["codex@claude-code-fusion", "fusion@claude-code-fusion", "grok@claude-code-fusion"],
+    routingRulesPresent: true,
     mainSessionModel: null
   });
   assert.strictEqual(record.claudeExit, 0);
@@ -185,7 +213,7 @@ test("runner appends a valid record with verifier success and split token totals
 
 test("runner accepts condition B3 with null peer tokens", (t) => {
   const sandbox = makeSandbox(t);
-  fs.writeFileSync(path.join(sandbox.claudeConfigDir, "settings.json"), JSON.stringify({ model: "sonnet" }), "utf8");
+  configureCondition(sandbox, "B3");
   const result = runBench(sandbox, { condition: "B3", repetition: 1 });
   assert.strictEqual(result.status, 0, result.stderr);
   const records = readRecords(sandbox);
@@ -198,6 +226,7 @@ test("runner accepts condition B3 with null peer tokens", (t) => {
 
 test("runner refuses condition B3 without a sonnet settings pin", (t) => {
   const sandbox = makeSandbox(t);
+  configureCondition(sandbox, "B3", { model: null });
   const result = runBench(sandbox, { condition: "B3", repetition: 1 });
   assert.notStrictEqual(result.status, 0);
   assert.match(result.stderr, /Invalid B3 configuration/);
@@ -229,6 +258,7 @@ test("runner writes an infra failure record when the transcript is missing", (t)
 
 test("runner records verifier failure when the Claude session exits nonzero with a transcript", (t) => {
   const sandbox = makeSandbox(t);
+  configureCondition(sandbox, "A");
   const result = runBench(sandbox, {
     condition: "A",
     repetition: 1,
@@ -243,6 +273,54 @@ test("runner records verifier failure when the Claude session exits nonzero with
   assert.notStrictEqual(records[0].verifyExit, 0);
   assert.strictEqual(records[0].verdict, "fail");
   assert.strictEqual(records[0].peerTokens, null);
+});
+
+test("runner rejects stale routing rules in condition A", (t) => {
+  const sandbox = makeSandbox(t);
+  configureCondition(sandbox, "A", { rules: true });
+  const result = runBench(sandbox, { condition: "A" });
+  assert.notStrictEqual(result.status, 0);
+  assert.match(result.stderr, /expected routingRulesPresent=false/);
+});
+
+test("runner rejects the legacy Codex plugin in condition B1", (t) => {
+  const sandbox = makeSandbox(t);
+  configureCondition(sandbox, "B1", { extraPlugins: ["codex@openai-codex"] });
+  const result = runBench(sandbox, { condition: "B1" });
+  assert.notStrictEqual(result.status, 0);
+  assert.match(result.stderr, /codex@openai-codex/);
+});
+
+test("runner rejects condition B2 when the hosted Codex plugin is missing", (t) => {
+  const sandbox = makeSandbox(t);
+  configureCondition(sandbox, "B1", { extraPlugins: ["grok@claude-code-fusion"] });
+  const result = runBench(sandbox, { condition: "B2" });
+  assert.notStrictEqual(result.status, 0);
+  assert.match(result.stderr, /Invalid B2 configuration/);
+});
+
+test("runner rejects condition B2 when old and new Codex plugins are both enabled", (t) => {
+  const sandbox = makeSandbox(t);
+  configureCondition(sandbox, "B2", { extraPlugins: ["codex@openai-codex"] });
+  const result = runBench(sandbox, { condition: "B2" });
+  assert.notStrictEqual(result.status, 0);
+  assert.match(result.stderr, /codex@openai-codex/);
+});
+
+test("runner rejects a disabled legacy Codex installation in condition B2", (t) => {
+  const sandbox = makeSandbox(t);
+  configureCondition(sandbox, "B2", { installedExtra: ["codex@openai-codex"] });
+  const result = runBench(sandbox, { condition: "B2" });
+  assert.notStrictEqual(result.status, 0);
+  assert.match(result.stderr, /codex@openai-codex/);
+});
+
+test("runner rejects a peer plugin in condition B3", (t) => {
+  const sandbox = makeSandbox(t);
+  configureCondition(sandbox, "B3", { extraPlugins: ["grok@claude-code-fusion"] });
+  const result = runBench(sandbox, { condition: "B3" });
+  assert.notStrictEqual(result.status, 0);
+  assert.match(result.stderr, /grok@claude-code-fusion/);
 });
 
 test("runner writes env.json with manifest and cheap version capture", (t) => {
@@ -275,10 +353,13 @@ test("runner writes env.json with manifest and cheap version capture", (t) => {
   const grokPlugin = JSON.parse(
     fs.readFileSync(path.join(repoRoot, "plugins", "grok", ".claude-plugin", "plugin.json"), "utf8"),
   );
+  const codexPlugin = JSON.parse(
+    fs.readFileSync(path.join(repoRoot, "plugins", "codex", ".claude-plugin", "plugin.json"), "utf8"),
+  );
   assert.strictEqual(env.pluginVersions["claude-code-fusion"], marketplace.version ?? marketplace.metadata?.version);
   assert.strictEqual(env.pluginVersions.fusion, fusionPlugin.version);
   assert.strictEqual(env.pluginVersions.grok, grokPlugin.version);
-  assert.strictEqual(env.pluginVersions.codex, null);
+  assert.strictEqual(env.pluginVersions.codex, codexPlugin.version);
   assert.strictEqual(env.engineCliVersions.claude, null);
   assert.strictEqual(env.engineCliVersions.grok, "grok test 1.2.3");
   assert.strictEqual(env.engineCliVersions.codex, "codex test 4.5.6");
@@ -420,7 +501,7 @@ test("runner captures grok effort alone when [models] default is absent", (t) =>
   });
 });
 
-test("runner records null codex plugin version when the plugin cache is empty", (t) => {
+test("runner records the hosted Codex plugin version without a plugin cache", (t) => {
   const sandbox = makeSandbox(t);
   const emptyPluginCache = path.join(sandbox.root, "empty-plugin-cache");
   fs.mkdirSync(emptyPluginCache);
@@ -433,10 +514,11 @@ test("runner records null codex plugin version when the plugin cache is empty", 
   assert.strictEqual(result.status, 0, result.stderr);
 
   const env = JSON.parse(fs.readFileSync(sandbox.envFile, "utf8"));
-  assert.strictEqual(env.pluginVersions.codex, null);
+  const codexPlugin = JSON.parse(fs.readFileSync(path.join(repoRoot, "plugins", "codex", ".claude-plugin", "plugin.json"), "utf8"));
+  assert.strictEqual(env.pluginVersions.codex, codexPlugin.version);
 });
 
-test("runner records the newest installed codex plugin version from the plugin cache", (t) => {
+test("runner ignores stale external Codex plugin cache entries", (t) => {
   const sandbox = makeSandbox(t);
   const pluginCache = path.join(sandbox.root, "plugin-cache");
   writeCodexPlugin(pluginCache, "1.0.9");
@@ -450,5 +532,6 @@ test("runner records the newest installed codex plugin version from the plugin c
   assert.strictEqual(result.status, 0, result.stderr);
 
   const env = JSON.parse(fs.readFileSync(sandbox.envFile, "utf8"));
-  assert.strictEqual(env.pluginVersions.codex, "1.0.10");
+  const codexPlugin = JSON.parse(fs.readFileSync(path.join(repoRoot, "plugins", "codex", ".claude-plugin", "plugin.json"), "utf8"));
+  assert.strictEqual(env.pluginVersions.codex, codexPlugin.version);
 });

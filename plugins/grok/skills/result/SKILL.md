@@ -1,6 +1,6 @@
 ---
 description: Show the stored result of a finished Grok job in this workspace
-argument-hint: '<job-id> [--json]'
+argument-hint: '<job-id> [--cwd <dir>] [--wait] [--wait-timeout-ms <ms>] [--json]'
 disable-model-invocation: true
 allowed-tools: Bash(node:*)
 ---
@@ -13,3 +13,4 @@ Present the full command output to the user. Do not summarize or condense it. Pr
 - File paths and line numbers exactly as reported
 - Any error messages or log lines
 - The pointer to `/grok:status` when the job is still running
+- Any `phase: cleanup-required` marker and retry guidance when verified process cleanup remains incomplete

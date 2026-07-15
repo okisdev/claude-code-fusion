@@ -21,7 +21,7 @@ Launch:
 
 ```
 Run this review command and return its output:
-GROK_COMPANION_TIMEOUT_MS=1800000 node "<plugin root>/scripts/grok-companion.mjs" review $ARGUMENTS --background
+GROK_COMPANION_BACKGROUND_DELIVERY=managed GROK_COMPANION_TIMEOUT_MS=1800000 node "<plugin root>/scripts/grok-companion.mjs" review $ARGUMENTS --background
 ```
 
 - Tell the user the review is running and end the turn. Do not poll; the runner's completion notification delivers the collected terminal result.

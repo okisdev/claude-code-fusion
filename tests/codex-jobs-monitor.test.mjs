@@ -6,20 +6,36 @@ import os from "node:os";
 import path from "node:path";
 import { once } from "node:events";
 import { test } from "node:test";
+import { inspectCodexRollout } from "../plugins/fusion/scripts/codex-jobs-monitor.mjs";
+import { fusionRepositoryKey } from "../plugins/fusion/scripts/fusion-stats.mjs";
 
 const repoRoot = path.join(import.meta.dirname, "..");
 const monitorScript = path.join(repoRoot, "plugins", "fusion", "scripts", "codex-jobs-monitor.mjs");
 
 function makeSandbox(t) {
   const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "codex-monitor-test-")));
-  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
   const stateRoot = path.join(root, "state");
   const workDir = path.join(root, "work");
   const fusionData = path.join(root, "fusion-data");
+  const sessionsDir = path.join(root, "sessions");
   fs.mkdirSync(stateRoot, { recursive: true });
   fs.mkdirSync(workDir, { recursive: true });
   fs.mkdirSync(fusionData, { recursive: true });
-  return { root, stateRoot, workDir, fusionData };
+  fs.mkdirSync(sessionsDir, { recursive: true });
+  const sandbox = { root, stateRoot, workDir, fusionData, sessionsDir, children: new Set() };
+  t.after(async () => {
+    const closing = [...sandbox.children].map((child) => {
+      if (child.exitCode != null || child.signalCode != null) {
+        return Promise.resolve();
+      }
+      const closed = once(child, "close").then(() => undefined);
+      child.kill("SIGKILL");
+      return closed;
+    });
+    await Promise.all(closing);
+    fs.rmSync(root, { recursive: true, force: true, maxRetries: 3, retryDelay: 20 });
+  });
+  return sandbox;
 }
 
 function jobsDirFor(sandbox, workspace) {
@@ -55,6 +71,8 @@ function envFor(sandbox, extra = {}) {
   return {
     ...env,
     FUSION_CODEX_STATE: sandbox.stateRoot,
+    FUSION_DATA_DIR: sandbox.fusionData,
+    CODEX_JOBS_MONITOR_SESSIONS_DIR: sandbox.sessionsDir,
     CODEX_JOBS_MONITOR_INTERVAL_MS: "200",
     ...extra,
   };
@@ -66,6 +84,8 @@ function startMonitor(sandbox, env, { cwd = sandbox.workDir } = {}) {
     env,
     stdio: ["ignore", "pipe", "pipe"],
   });
+  sandbox.children.add(child);
+  child.once("close", () => sandbox.children.delete(child));
   let stdout = "";
   child.stdout.on("data", (chunk) => {
     stdout += chunk.toString("utf8");
@@ -79,6 +99,13 @@ function startMonitor(sandbox, env, { cwd = sandbox.workDir } = {}) {
     lines: () => stdout.split("\n").filter(Boolean),
     stderr: () => stderr,
   };
+}
+
+function createSiblingWorktree(sandbox) {
+  const sibling = path.join(sandbox.root, "sibling-worktree");
+  execFileSync("git", ["init", "-q"], { cwd: sandbox.workDir });
+  execFileSync("git", ["worktree", "add", "--orphan", sibling], { cwd: sandbox.workDir });
+  return sibling;
 }
 
 async function waitUntil(predicate, { timeoutMs = 5000, intervalMs = 25 } = {}) {
@@ -118,11 +145,26 @@ test("a job transitioning to completed emits exactly one correctly shaped line",
   assert.strictEqual(lines.length, 1);
   assert.strictEqual(
     lines[0],
-    `codex job ${record.id} completed. collect with /codex:result ${record.id} only if you launched it detached; a job owned by a subagent reports on its own`
+    `codex job ${record.id} completed. collect with /codex:result ${record.id}; completion notices do not replace collection.`
   );
 
   await new Promise((resolve) => setTimeout(resolve, 300));
   assert.strictEqual(monitor.lines().length, 1);
+});
+
+test("monitors jobs from a sibling worktree in the same Git repository", async (t) => {
+  const sandbox = makeSandbox(t);
+  const sibling = createSiblingWorktree(sandbox);
+  const { file, record } = seedJob(sandbox, { status: "running" }, { workspaceRoot: sibling });
+  const monitor = startMonitor(sandbox, envFor(sandbox));
+  t.after(() => monitor.child.kill("SIGKILL"));
+  await new Promise((resolve) => setTimeout(resolve, 300));
+
+  writeJobRecordFile(file, { ...record, status: "completed", completedAt: new Date().toISOString() });
+
+  const lines = await waitUntil(() => (monitor.lines().length > 0 ? monitor.lines() : null));
+  assert.strictEqual(lines.length, 1);
+  assert.match(lines[0], new RegExp(`^codex job ${record.id} completed\\.`));
 });
 
 test("a job transitioning to failed reports a truncated error message when present", async (t) => {
@@ -144,7 +186,7 @@ test("a job transitioning to failed reports a truncated error message when prese
   assert.strictEqual(lines.length, 1);
   assert.strictEqual(
     lines[0],
-    `codex job ${record.id} failed (worker process exited with status 1). collect with /codex:result ${record.id} only if you launched it detached; a job owned by a subagent reports on its own`
+    `codex job ${record.id} failed (worker process exited with status 1). collect with /codex:result ${record.id}; completion notices do not replace collection.`
   );
 });
 
@@ -161,7 +203,7 @@ test("a job transitioning to failed with no error message emits no suffix", asyn
   assert.strictEqual(lines.length, 1);
   assert.strictEqual(
     lines[0],
-    `codex job ${record.id} failed. collect with /codex:result ${record.id} only if you launched it detached; a job owned by a subagent reports on its own`
+    `codex job ${record.id} failed. collect with /codex:result ${record.id}; completion notices do not replace collection.`
   );
 });
 
@@ -185,7 +227,7 @@ test("a long error message is truncated to a sane length", async (t) => {
   assert.strictEqual(lines.length, 1);
   assert.strictEqual(
     lines[0],
-    `codex job ${record.id} cancelled (${"x".repeat(80)}...). collect with /codex:result ${record.id} only if you launched it detached; a job owned by a subagent reports on its own`
+    `codex job ${record.id} cancelled (${"x".repeat(80)}...). collect with /codex:result ${record.id}; completion notices do not replace collection.`
   );
 });
 
@@ -207,7 +249,7 @@ test("with a monitor session id set, a matching job emits and a mismatching job 
   assert.strictEqual(lines.length, 1);
   assert.strictEqual(
     lines[0],
-    `codex job ${ownRecord.id} completed. collect with /codex:result ${ownRecord.id} only if you launched it detached; a job owned by a subagent reports on its own`
+    `codex job ${ownRecord.id} completed. collect with /codex:result ${ownRecord.id}; completion notices do not replace collection.`
   );
 
   await new Promise((resolve) => setTimeout(resolve, 300));
@@ -227,7 +269,7 @@ test("with the session id env var unset, a job from a different session still em
   assert.strictEqual(lines.length, 1);
   assert.strictEqual(
     lines[0],
-    `codex job ${record.id} completed. collect with /codex:result ${record.id} only if you launched it detached; a job owned by a subagent reports on its own`
+    `codex job ${record.id} completed. collect with /codex:result ${record.id}; completion notices do not replace collection.`
   );
 });
 
@@ -265,7 +307,7 @@ test("a monitor started from a subdirectory still matches jobs recorded against 
   assert.strictEqual(lines.length, 1);
   assert.strictEqual(
     lines[0],
-    `codex job ${record.id} completed. collect with /codex:result ${record.id} only if you launched it detached; a job owned by a subagent reports on its own`
+    `codex job ${record.id} completed. collect with /codex:result ${record.id}; completion notices do not replace collection.`
   );
 });
 
@@ -282,7 +324,7 @@ test("a monitor includes jobs recorded in a worktree beneath the repo root", asy
 
   const lines = await waitUntil(() => (monitor.lines().length > 0 ? monitor.lines() : null));
   assert.deepStrictEqual(lines, [
-    `codex job ${record.id} completed. collect with /codex:result ${record.id} only if you launched it detached; a job owned by a subagent reports on its own`
+    `codex job ${record.id} completed. collect with /codex:result ${record.id}; completion notices do not replace collection.`
   ]);
 });
 
@@ -302,6 +344,30 @@ test("a running job whose pid has vanished is reported as dead exactly once", as
 
   await new Promise((resolve) => setTimeout(resolve, 500));
   assert.strictEqual(monitor.lines().length, 1);
+});
+
+test("a canonical running job whose owner exits is reported without mutating its record", async (t) => {
+  const sandbox = makeSandbox(t);
+  const worker = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"]);
+  t.after(() => worker.kill("SIGKILL"));
+  const { file, record } = seedJob(sandbox, {
+    schemaVersion: 1,
+    engine: "codex",
+    status: "running",
+    phase: "executing",
+    pid: worker.pid,
+    codexPid: null,
+    finishedAt: null
+  });
+  const monitor = startMonitor(sandbox, envFor(sandbox));
+  t.after(() => monitor.child.kill("SIGKILL"));
+  await new Promise((resolve) => setTimeout(resolve, 300));
+  worker.kill("SIGKILL");
+  await once(worker, "close");
+
+  const lines = await waitUntil(() => (monitor.lines().length > 0 ? monitor.lines() : null));
+  assert.deepStrictEqual(lines, [`codex job ${record.id} appears dead (process gone, status still running)`]);
+  assert.deepStrictEqual(JSON.parse(fs.readFileSync(file, "utf8")), record);
 });
 
 test("a terminal worktree copy suppresses a dead alarm for its stale running mirror", async (t) => {
@@ -357,8 +423,73 @@ test("a vanished state root mid run does not crash the process and a later tick 
   assert.strictEqual(lines.length, 1);
   assert.strictEqual(
     lines[0],
-    `codex job ${record.id} completed. collect with /codex:result ${record.id} only if you launched it detached; a job owned by a subagent reports on its own`
+    `codex job ${record.id} completed. collect with /codex:result ${record.id}; completion notices do not replace collection.`
   );
+});
+
+test("removing an observed workspace state directory does not disable later monitor ticks", async (t) => {
+  const sandbox = makeSandbox(t);
+  seedJob(sandbox, { status: "running", pid: process.pid }, { workspace: "old-workspace" });
+  const monitor = startMonitor(sandbox, envFor(sandbox));
+  t.after(() => monitor.child.kill("SIGKILL"));
+  await new Promise((resolve) => setTimeout(resolve, 300));
+
+  fs.rmSync(path.join(sandbox.stateRoot, "old-workspace"), { recursive: true, force: true });
+  const { file, record } = seedJob(sandbox, { status: "running" }, { workspace: "new-workspace" });
+  await new Promise((resolve) => setTimeout(resolve, 300));
+  writeJobRecordFile(file, { ...record, status: "completed", completedAt: new Date().toISOString() });
+
+  const lines = await waitUntil(() => (monitor.lines().length > 0 ? monitor.lines() : null));
+  assert.deepStrictEqual(lines, [
+    `codex job ${record.id} completed. collect with /codex:result ${record.id}; completion notices do not replace collection.`
+  ]);
+});
+
+test("a malformed job record does not suppress a healthy job transition", async (t) => {
+  const sandbox = makeSandbox(t);
+  const { file, record } = seedJob(sandbox, { status: "running" });
+  fs.writeFileSync(path.join(path.dirname(file), "malformed.json"), "{ malformed\n", "utf8");
+  const monitor = startMonitor(sandbox, envFor(sandbox));
+  t.after(() => monitor.child.kill("SIGKILL"));
+  await new Promise((resolve) => setTimeout(resolve, 300));
+
+  writeJobRecordFile(file, { ...record, status: "completed", completedAt: new Date().toISOString() });
+
+  const lines = await waitUntil(() => (monitor.lines().length > 0 ? monitor.lines() : null));
+  assert.deepStrictEqual(lines, [
+    `codex job ${record.id} completed. collect with /codex:result ${record.id}; completion notices do not replace collection.`
+  ]);
+});
+
+test("a stored repository key keeps a removed sibling worktree in monitor scope", async (t) => {
+  const sandbox = makeSandbox(t);
+  const sibling = createSiblingWorktree(sandbox);
+  const repositoryKey = fusionRepositoryKey(sandbox.workDir);
+  const { file, record } = seedJob(
+    sandbox,
+    { background: true, engine: "codex", finishedAt: null, repositoryKey, schemaVersion: 1, status: "running" },
+    { workspace: "sibling-workspace", workspaceRoot: sibling }
+  );
+  const monitor = startMonitor(sandbox, envFor(sandbox));
+  t.after(() => monitor.child.kill("SIGKILL"));
+  await new Promise((resolve) => setTimeout(resolve, 300));
+
+  execFileSync("git", ["worktree", "remove", "--force", sibling], { cwd: sandbox.workDir });
+  const finishedAt = new Date().toISOString();
+  writeJobRecordFile(file, { ...record, status: "done", finishedAt });
+
+  const lines = await waitUntil(() => (monitor.lines().length > 0 ? monitor.lines() : null));
+  assert.deepStrictEqual(lines, [
+    `codex job ${record.id} done. collect with /codex:result ${record.id}; completion notices do not replace collection.`
+  ]);
+  const terminal = await waitUntil(() => {
+    try {
+      return JSON.parse(fs.readFileSync(announcedPath(sandbox), "utf8")).records.find((entry) => entry.jobId === record.id) ?? null;
+    } catch {
+      return null;
+    }
+  });
+  assert.strictEqual(terminal.repositoryKey, repositoryKey);
 });
 
 function announcedPath(sandbox, sessionId = null, workspaceRoot = sandbox.workDir) {
@@ -383,7 +514,11 @@ test("restart with persisted dedup state does not re-announce a completed job", 
 
   assert.ok(fs.existsSync(announcedPath(sandbox)));
   const persisted = JSON.parse(fs.readFileSync(announcedPath(sandbox), "utf8"));
-  assert.ok(persisted.includes(`${record.id}:completed`));
+  assert.strictEqual(persisted.schemaVersion, 3);
+  assert.strictEqual(persisted.repositoryKey, createHash("sha256").update(sandbox.workDir).digest("hex").slice(0, 16));
+  assert.ok(persisted.keys.includes(`${record.id}:completed`));
+  assert.strictEqual(persisted.records[0].jobId, record.id);
+  assert.strictEqual(persisted.records[0].transportStatus, "completed");
 
   writeJobRecordFile(file, { ...record, status: "running", completedAt: null });
   const second = startMonitor(sandbox, env);
@@ -448,7 +583,7 @@ test("restart catch-up announces an unrecorded terminal job owned by the active 
   t.after(() => monitor.child.kill("SIGKILL"));
   const lines = await waitUntil(() => (monitor.lines().length > 0 ? monitor.lines() : null));
   assert.deepStrictEqual(lines, [
-    `codex job ${record.id} completed. collect with /codex:result ${record.id} only if you launched it detached; a job owned by a subagent reports on its own`
+    `codex job ${record.id} completed. collect with /codex:result ${record.id}; completion notices do not replace collection.`
   ]);
 });
 
@@ -501,7 +636,7 @@ test("malformed dedup state is quarantined and dead running jobs are reconstruct
       return null;
     }
     try {
-      return JSON.parse(fs.readFileSync(stateFile, "utf8")).includes(`${record.id}:dead`) ? true : null;
+      return JSON.parse(fs.readFileSync(stateFile, "utf8")).keys.includes(`${record.id}:dead`) ? true : null;
     } catch {
       return null;
     }
@@ -594,6 +729,41 @@ function envForAudit(sandbox, extra = {}) {
     CODEX_JOBS_MONITOR_PS_COMMAND: fakePs,
     ...extra
   });
+}
+
+function rolloutTokenCount(input, cached, output, reasoning, total) {
+  return {
+    timestamp: "2026-07-14T00:00:02.000Z",
+    type: "event_msg",
+    payload: {
+      type: "token_count",
+      info: {
+        total_token_usage: {
+          input_tokens: input,
+          cached_input_tokens: cached,
+          output_tokens: output,
+          reasoning_output_tokens: reasoning,
+          total_tokens: total
+        }
+      }
+    }
+  };
+}
+
+function writeRollout(sandbox, threadId, entries, sessionsDir = sandbox.sessionsDir) {
+  const dir = path.join(sessionsDir, "2026", "07", "14");
+  fs.mkdirSync(dir, { recursive: true });
+  const file = path.join(dir, `rollout-2026-07-14T00-00-00-${threadId}.jsonl`);
+  fs.writeFileSync(file, `${entries.map((entry) => JSON.stringify(entry)).join("\n")}\n`);
+  return file;
+}
+
+function taskEvent(type, turnId, timestamp) {
+  return { timestamp, type: "event_msg", payload: { type, turn_id: turnId } };
+}
+
+function turnContext(turnId, model, effort) {
+  return { timestamp: "2026-07-14T00:00:01.000Z", type: "turn_context", payload: { turn_id: turnId, model, effort } };
 }
 
 test("argv capture writes exactly one model-audit observation for a running job", async (t) => {
@@ -692,4 +862,244 @@ test("dead pid and unparseable argv are skipped without error for model audit", 
   assert.deepStrictEqual(readModelAuditLines(sandbox), []);
   assert.strictEqual(monitor.stderr(), "");
   assert.strictEqual(monitor.child.exitCode, null);
+});
+
+test("rollout inspection recovers exact turn model and first-turn token usage", (t) => {
+  const sandbox = makeSandbox(t);
+  const threadId = "thread-first";
+  const turnId = "turn-first";
+  writeRollout(sandbox, threadId, [
+    taskEvent("task_started", turnId, "2026-07-14T00:00:00.000Z"),
+    turnContext(turnId, "actual-model", "xhigh"),
+    rolloutTokenCount(120, 70, 30, 11, 150),
+    taskEvent("task_complete", turnId, "2026-07-14T00:00:03.000Z")
+  ]);
+
+  const inspected = inspectCodexRollout({ turnId, result: { threadId } }, envFor(sandbox));
+  assert.strictEqual(inspected.availability, "available");
+  assert.strictEqual(inspected.model, "actual-model");
+  assert.strictEqual(inspected.effort, "xhigh");
+  assert.deepStrictEqual(inspected.tokenUsage, { inputTokens: 120, cachedInputTokens: 70, outputTokens: 30, reasoningOutputTokens: 11, totalTokens: 150 });
+});
+
+test("rollout inspection uses CODEX_HOME sessions when no monitor override is set", (t) => {
+  const sandbox = makeSandbox(t);
+  const codexHome = path.join(sandbox.root, "codex-home");
+  const sessionsDir = path.join(codexHome, "sessions");
+  const threadId = "thread-codex-home";
+  const turnId = "turn-codex-home";
+  writeRollout(sandbox, threadId, [
+    taskEvent("task_started", turnId, "2026-07-14T00:00:00.000Z"),
+    turnContext(turnId, "home-model", "high"),
+    rolloutTokenCount(80, 30, 20, 5, 100),
+    taskEvent("task_complete", turnId, "2026-07-14T00:00:03.000Z")
+  ], sessionsDir);
+
+  const inspected = inspectCodexRollout(
+    { turnId, result: { threadId } },
+    envFor(sandbox, { CODEX_HOME: codexHome, CODEX_JOBS_MONITOR_SESSIONS_DIR: "" })
+  );
+  assert.strictEqual(inspected.availability, "available");
+  assert.strictEqual(inspected.model, "home-model");
+  assert.strictEqual(inspected.effort, "high");
+  assert.deepStrictEqual(inspected.tokenUsage, { inputTokens: 80, cachedInputTokens: 30, outputTokens: 20, reasoningOutputTokens: 5, totalTokens: 100 });
+});
+
+test("rollout inspection computes a resumed turn delta from the previous cumulative count", (t) => {
+  const sandbox = makeSandbox(t);
+  const threadId = "thread-resume";
+  const previousTurn = "turn-previous";
+  const targetTurn = "turn-target";
+  writeRollout(sandbox, threadId, [
+    taskEvent("task_started", previousTurn, "2026-07-14T00:00:00.000Z"),
+    rolloutTokenCount(100, 60, 20, 8, 120),
+    taskEvent("task_complete", previousTurn, "2026-07-14T00:00:01.000Z"),
+    taskEvent("task_started", targetTurn, "2026-07-14T00:01:00.000Z"),
+    turnContext(targetTurn, "resume-model", "high"),
+    rolloutTokenCount(175, 105, 45, 19, 220),
+    taskEvent("task_complete", targetTurn, "2026-07-14T00:01:03.000Z")
+  ]);
+
+  const inspected = inspectCodexRollout({ turnId: targetTurn, result: { threadId } }, envFor(sandbox));
+  assert.strictEqual(inspected.availability, "available");
+  assert.deepStrictEqual(inspected.tokenUsage, { inputTokens: 75, cachedInputTokens: 45, outputTokens: 25, reasoningOutputTokens: 11, totalTokens: 100 });
+});
+
+test("rollout inspection refuses to treat a cumulative resume total as per-job usage without a baseline", (t) => {
+  const sandbox = makeSandbox(t);
+  const threadId = "thread-missing-baseline";
+  const previousTurn = "turn-previous";
+  const targetTurn = "turn-target";
+  writeRollout(sandbox, threadId, [
+    taskEvent("task_started", previousTurn, "2026-07-14T00:00:00.000Z"),
+    taskEvent("task_complete", previousTurn, "2026-07-14T00:00:01.000Z"),
+    taskEvent("task_started", targetTurn, "2026-07-14T00:01:00.000Z"),
+    rolloutTokenCount(175, 105, 45, 19, 220),
+    taskEvent("task_complete", targetTurn, "2026-07-14T00:01:03.000Z")
+  ]);
+
+  const inspected = inspectCodexRollout({ turnId: targetTurn, result: { threadId } }, envFor(sandbox));
+  assert.strictEqual(inspected.availability, "unavailable");
+  assert.strictEqual(inspected.reason, "resume_baseline_not_found");
+  assert.strictEqual(inspected.tokenUsage, null);
+});
+
+test("canonical terminal records use direct model and token evidence without rollout inspection", async (t) => {
+  const sandbox = makeSandbox(t);
+  const threadId = "thread-direct";
+  const turnId = "turn-direct";
+  writeRollout(sandbox, threadId, [
+    taskEvent("task_started", turnId, "2026-07-14T00:00:00.000Z"),
+    turnContext(turnId, "wrong-rollout-model", "low"),
+    rolloutTokenCount(900, 400, 200, 60, 1100),
+    taskEvent("task_complete", turnId, "2026-07-14T00:00:03.000Z")
+  ]);
+  const usage = { inputTokens: 90, cachedInputTokens: 40, outputTokens: 20, reasoningOutputTokens: 6, totalTokens: 110 };
+  const { file, record } = seedJob(sandbox, {
+    background: true,
+    status: "running",
+    threadId,
+    turnId,
+    request: { model: "requested-model", effort: "xhigh" }
+  });
+  const monitor = startMonitor(sandbox, envFor(sandbox));
+  t.after(() => monitor.child.kill("SIGKILL"));
+  await new Promise((resolve) => setTimeout(resolve, 300));
+  const finishedAt = new Date().toISOString();
+  writeJobRecordFile(file, {
+    ...record,
+    status: "done",
+    finishedAt,
+    tokenUsage: usage,
+    cumulativeTokenUsage: usage,
+    tokenUsageAvailability: "available"
+  });
+
+  const lines = await waitUntil(() => (monitor.lines().length > 0 ? monitor.lines() : null));
+  assert.deepStrictEqual(lines, [
+    `codex job ${record.id} done. collect with /codex:result ${record.id}; completion notices do not replace collection.`
+  ]);
+  const terminal = await waitUntil(() => {
+    try {
+      return JSON.parse(fs.readFileSync(announcedPath(sandbox), "utf8")).records.find((entry) => entry.jobId === record.id) ?? null;
+    } catch {
+      return null;
+    }
+  });
+  assert.strictEqual(terminal.transportStatus, "done");
+  assert.strictEqual(terminal.finishedAt, finishedAt);
+  assert.strictEqual(terminal.model, "requested-model");
+  assert.strictEqual(terminal.modelSource, "job-request");
+  assert.strictEqual(terminal.effort, "xhigh");
+  assert.strictEqual(terminal.effortSource, "job-request");
+  assert.deepStrictEqual(terminal.tokenUsage, usage);
+  assert.deepStrictEqual(readModelAuditLines(sandbox), []);
+
+  const tokenPath = path.join(sandbox.fusionData, "observations", createHash("sha256").update(sandbox.workDir).digest("hex").slice(0, 16), "token-usage.jsonl");
+  const tokenAudit = fs.readFileSync(tokenPath, "utf8").trim().split("\n").map((line) => JSON.parse(line));
+  assert.strictEqual(tokenAudit.at(-1).source, "job-record");
+  assert.deepStrictEqual(tokenAudit.at(-1).tokenUsage, usage);
+});
+
+test("canonical foreground jobs are retained for stats without emitting completion notices", async (t) => {
+  const sandbox = makeSandbox(t);
+  const { file, record } = seedJob(sandbox, {
+    schemaVersion: 1,
+    engine: "codex",
+    background: false,
+    status: "running",
+    finishedAt: null
+  });
+  const monitor = startMonitor(sandbox, envFor(sandbox));
+  t.after(() => monitor.child.kill("SIGKILL"));
+  await new Promise((resolve) => setTimeout(resolve, 300));
+  writeJobRecordFile(file, { ...record, status: "done", finishedAt: new Date().toISOString() });
+
+  await waitUntil(() => {
+    try {
+      return JSON.parse(fs.readFileSync(announcedPath(sandbox), "utf8")).records.some((entry) => entry.jobId === record.id);
+    } catch {
+      return false;
+    }
+  });
+  await new Promise((resolve) => setTimeout(resolve, 300));
+  assert.deepStrictEqual(monitor.lines(), []);
+});
+
+test("legacy terminal transition persists a structured ledger and exact rollout sidecars", async (t) => {
+  const sandbox = makeSandbox(t);
+  const threadId = "thread-monitor";
+  const turnId = "turn-monitor";
+  writeRollout(sandbox, threadId, [
+    taskEvent("task_started", turnId, "2026-07-14T00:00:00.000Z"),
+    turnContext(turnId, "actual-model", "xhigh"),
+    rolloutTokenCount(90, 40, 20, 6, 110),
+    taskEvent("task_complete", turnId, "2026-07-14T00:00:03.000Z")
+  ]);
+  const { file, record } = seedJob(sandbox, {
+    status: "running",
+    turnId,
+    result: { threadId },
+    request: { model: "requested-model", effort: "low" }
+  });
+  const monitor = startMonitor(sandbox, envFor(sandbox));
+  t.after(() => monitor.child.kill("SIGKILL"));
+  await new Promise((resolve) => setTimeout(resolve, 300));
+  writeJobRecordFile(file, { ...record, status: "completed", completedAt: new Date().toISOString() });
+  await waitUntil(() => (monitor.lines().length > 0 ? true : null));
+
+  const { state, terminal } = await waitUntil(() => {
+    try {
+      const state = JSON.parse(fs.readFileSync(announcedPath(sandbox), "utf8"));
+      const terminal = state.records.find((entry) => entry.jobId === record.id);
+      return terminal ? { state, terminal } : null;
+    } catch {
+      return null;
+    }
+  });
+  assert.strictEqual(state.schemaVersion, 3);
+  assert.strictEqual(terminal.repositoryKey, state.repositoryKey);
+  assert.strictEqual(terminal.transportStatus, "completed");
+  assert.strictEqual(terminal.model, "actual-model");
+  assert.strictEqual(terminal.modelSource, "rollout-turn-context");
+  assert.strictEqual(terminal.effort, "xhigh");
+  assert.strictEqual(terminal.effortSource, "rollout-turn-context");
+  assert.deepStrictEqual(terminal.tokenUsage, { inputTokens: 90, cachedInputTokens: 40, outputTokens: 20, reasoningOutputTokens: 6, totalTokens: 110 });
+
+  const modelAudit = readModelAuditLines(sandbox);
+  assert.strictEqual(modelAudit.at(-1).source, "rollout-turn-context");
+  assert.strictEqual(modelAudit.at(-1).model, "actual-model");
+  assert.strictEqual(modelAudit.at(-1).workspaceRoot, sandbox.workDir);
+  assert.strictEqual(modelAudit.at(-1).repositoryKey, state.repositoryKey);
+  const tokenPath = path.join(sandbox.fusionData, "observations", createHash("sha256").update(sandbox.workDir).digest("hex").slice(0, 16), "token-usage.jsonl");
+  const tokenAudit = fs.readFileSync(tokenPath, "utf8").trim().split("\n").map((line) => JSON.parse(line));
+  assert.strictEqual(tokenAudit.at(-1).availability, "available");
+  assert.strictEqual(tokenAudit.at(-1).source, "rollout-turn-delta");
+  assert.strictEqual(tokenAudit.at(-1).workspaceRoot, sandbox.workDir);
+  assert.strictEqual(tokenAudit.at(-1).repositoryKey, state.repositoryKey);
+
+  fs.rmSync(file);
+  await new Promise((resolve) => setTimeout(resolve, 500));
+  const retained = JSON.parse(fs.readFileSync(announcedPath(sandbox), "utf8"));
+  assert.ok(retained.records.some((entry) => entry.jobId === record.id));
+});
+
+test("legacy announcement arrays migrate to the structured terminal ledger", async (t) => {
+  const sandbox = makeSandbox(t);
+  const file = announcedPath(sandbox);
+  fs.writeFileSync(file, `${JSON.stringify(["legacy-completed:completed", "legacy-dead:dead"])}\n`);
+  const monitor = startMonitor(sandbox, envFor(sandbox));
+  t.after(() => monitor.child.kill("SIGKILL"));
+
+  const migrated = await waitUntil(() => {
+    try {
+      const state = JSON.parse(fs.readFileSync(file, "utf8"));
+      return state?.schemaVersion === 3 ? state : null;
+    } catch {
+      return null;
+    }
+  });
+  assert.ok(migrated.keys.includes("legacy-completed:completed"));
+  assert.ok(migrated.records.some((entry) => entry.jobId === "legacy-completed" && entry.tokenUsageAvailability === "unavailable"));
+  assert.strictEqual(migrated.records.some((entry) => entry.jobId === "legacy-dead"), false);
 });

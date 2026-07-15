@@ -5,12 +5,14 @@ import { spawn } from "node:child_process";
 class UsageError extends Error {}
 
 const DEFAULT_INTERVAL_MS = 20_000;
-const DEFAULT_CAP_MS = 2_400_000;
+const DEFAULT_CAP_MS = 540_000;
+const MAX_CAP_MS = 540_000;
 const STDERR_TAIL_LINES = 20;
-const TERMINAL_STATES = new Set(["done", "error", "cancelled"]);
+const TERMINAL_STATES = new Set(["done", "error", "cancelled", "completed", "failed"]);
+const FOOTER_FIELD = /^\s*(?:[a-z][a-z0-9_-]*-session|job|state|failure)\s*:\s*/i;
 
 function usage() {
-  return 'Usage: node job-collect.mjs --status-cmd "<shell command>" --result-cmd "<shell command>" [--interval-ms 20000] [--cap-ms 2400000] [--dead-rerun-status]';
+  return 'Usage: node job-collect.mjs --status-cmd "<shell command>" --result-cmd "<shell command>" [--interval-ms 20000] [--cap-ms 540000] [--dead-rerun-status]';
 }
 
 function parseCli(argv) {
@@ -50,11 +52,15 @@ function parseCli(argv) {
   if (!options["result-cmd"]) {
     throw new UsageError("Missing --result-cmd.");
   }
+  const capMs = parseMilliseconds(options["cap-ms"], DEFAULT_CAP_MS, "--cap-ms");
+  if (capMs > MAX_CAP_MS) {
+    throw new UsageError(`--cap-ms cannot exceed ${MAX_CAP_MS}.`);
+  }
   return {
     statusCommand: options["status-cmd"],
     resultCommand: options["result-cmd"],
     intervalMs: parseMilliseconds(options["interval-ms"], DEFAULT_INTERVAL_MS, "--interval-ms"),
-    capMs: parseMilliseconds(options["cap-ms"], DEFAULT_CAP_MS, "--cap-ms"),
+    capMs,
     deadRerunStatus: options["dead-rerun-status"] === true
   };
 }
@@ -69,30 +75,68 @@ function parseMilliseconds(value, fallback, flag) {
   return Number(value);
 }
 
-function runShell(command) {
+function signalShell(child, signal) {
+  try {
+    if (process.platform !== "win32" && child.pid > 1) {
+      process.kill(-child.pid, signal);
+    } else {
+      child.kill(signal);
+    }
+  } catch {}
+}
+
+function runShell(command, timeoutMs) {
   return new Promise((resolve, reject) => {
-    const child = spawn(command, { shell: true, stdio: ["ignore", "pipe", "pipe"] });
+    const child = spawn(command, { detached: process.platform !== "win32", shell: true, stdio: ["ignore", "pipe", "pipe"], windowsHide: true });
     const stdout = [];
     const stderr = [];
+    let timedOut = false;
+    let killTimer = null;
+    const timeout = setTimeout(() => {
+      timedOut = true;
+      signalShell(child, "SIGTERM");
+      killTimer = setTimeout(() => signalShell(child, "SIGKILL"), 100);
+    }, Math.max(1, timeoutMs));
     child.stdout.on("data", (chunk) => stdout.push(chunk));
     child.stderr.on("data", (chunk) => stderr.push(chunk));
-    child.on("error", reject);
+    child.on("error", (error) => {
+      clearTimeout(timeout);
+      if (killTimer) {
+        clearTimeout(killTimer);
+      }
+      reject(error);
+    });
     child.on("close", (code, signal) => {
+      clearTimeout(timeout);
+      if (killTimer) {
+        clearTimeout(killTimer);
+        if (timedOut) {
+          signalShell(child, "SIGKILL");
+        }
+      }
       resolve({
         code: code ?? (signal ? 1 : 0),
         stdout: Buffer.concat(stdout).toString("utf8"),
-        stderr: Buffer.concat(stderr).toString("utf8")
+        stderr: Buffer.concat(stderr).toString("utf8"),
+        timedOut
       });
     });
   });
 }
 
 function terminalState(output) {
-  const stateLines = [...output.matchAll(/^\s*state:\s*([^\s]+).*$/gim)];
-  if (stateLines.length > 0) {
-    return stateLines.map((match) => match[1].toLowerCase()).find((state) => TERMINAL_STATES.has(state)) ?? null;
+  const lines = String(output).trimEnd().split(/\r?\n/);
+  let index = lines.length - 1;
+  const footer = [];
+  while (index >= 0 && FOOTER_FIELD.test(lines[index])) {
+    footer.unshift(lines[index]);
+    index -= 1;
   }
-  return output.match(/\b(completed|failed|cancelled|done|error)\b/i)?.[1]?.toLowerCase() ?? null;
+  const states = footer.flatMap((line) => {
+    const match = line.match(/^\s*state:\s*([^\s]+)\s*$/i);
+    return match ? [match[1].toLowerCase()] : [];
+  });
+  return states.length === 1 && TERMINAL_STATES.has(states[0]) ? states[0] : null;
 }
 
 function reportsDead(output) {
@@ -139,8 +183,19 @@ async function collect(options) {
   let lastStatusOutput = "";
 
   for (;;) {
-    const status = await runShell(options.statusCommand);
-    lastStatusOutput = status.stdout;
+    const remaining = options.capMs - (Date.now() - startedAt);
+    if (remaining <= 0) {
+      writeOutputWithFinalLine(lastStatusOutput, `collector: timeout elapsed=${elapsedSeconds(startedAt)}s`);
+      return 2;
+    }
+    const status = await runShell(options.statusCommand, remaining);
+    if (status.stdout) {
+      lastStatusOutput = status.stdout;
+    }
+    if (status.timedOut) {
+      writeOutputWithFinalLine(lastStatusOutput, `collector: timeout elapsed=${elapsedSeconds(startedAt)}s`);
+      return 2;
+    }
     if (status.code === 0) {
       consecutiveStatusErrors = 0;
     } else {
@@ -153,7 +208,16 @@ async function collect(options) {
 
     if (reportsDead(lastStatusOutput)) {
       if (options.deadRerunStatus) {
-        const refreshed = await runShell(options.statusCommand);
+        const refreshRemaining = options.capMs - (Date.now() - startedAt);
+        if (refreshRemaining <= 0) {
+          writeOutputWithFinalLine(lastStatusOutput, `collector: timeout elapsed=${elapsedSeconds(startedAt)}s`);
+          return 2;
+        }
+        const refreshed = await runShell(options.statusCommand, refreshRemaining);
+        if (refreshed.timedOut) {
+          writeOutputWithFinalLine(refreshed.stdout || lastStatusOutput, `collector: timeout elapsed=${elapsedSeconds(startedAt)}s`);
+          return 2;
+        }
         if (refreshed.stdout) {
           lastStatusOutput = refreshed.stdout;
         }
@@ -164,9 +228,18 @@ async function collect(options) {
 
     const state = terminalState(lastStatusOutput);
     if (state) {
-      const result = await runShell(options.resultCommand);
+      const resultRemaining = options.capMs - (Date.now() - startedAt);
+      if (resultRemaining <= 0) {
+        writeOutputWithFinalLine(lastStatusOutput, `collector: timeout elapsed=${elapsedSeconds(startedAt)}s`);
+        return 2;
+      }
+      const result = await runShell(options.resultCommand, resultRemaining);
+      if (result.timedOut) {
+        writeOutputWithFinalLine(lastStatusOutput, `collector: timeout elapsed=${elapsedSeconds(startedAt)}s`);
+        return 2;
+      }
       writeOutputWithFinalLine(result.stdout, `collector: state=${state} elapsed=${elapsedSeconds(startedAt)}s`);
-      return 0;
+      return result.code;
     }
 
     const elapsed = Date.now() - startedAt;

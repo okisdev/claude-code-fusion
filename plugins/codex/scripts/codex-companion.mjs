@@ -1,0 +1,1894 @@
+#!/usr/bin/env node
+
+import { spawn, spawnSync } from "node:child_process";
+import { createHash, randomBytes } from "node:crypto";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { isatty } from "node:tty";
+import { fileURLToPath } from "node:url";
+
+import { parseArgs, parseRawArgs, splitRawArgumentString } from "./lib/args.mjs";
+import {
+  buildReviewArgs,
+  buildTaskArgs,
+  getCodexAvailability,
+  getProcessIdentity,
+  isProcessAlive,
+  processIdentitiesMatch,
+  processIdentityMatches,
+  runCodex,
+  terminateProcessTree,
+  terminateProcessTreeSync
+} from "./lib/codex-exec.mjs";
+import {
+  renderBackgroundLaunch,
+  renderCancelReport,
+  renderJobDetail,
+  renderRunningResult,
+  renderSetupReport,
+  renderStatusTable,
+  renderTerminalResult
+} from "./lib/render.mjs";
+import {
+  SESSION_ID_ENV,
+  TERMINAL_STATUSES,
+  appendJobLog,
+  canonicalWorkspaceRoot,
+  createJobRecord,
+  findJobRecordById,
+  finishJobRecordFile,
+  generateJobId,
+  jobEventsPath,
+  jobFilePath,
+  jobLogPath,
+  listAllJobRecords,
+  listJobRecords,
+  markJobCollectedFile,
+  nowIso,
+  pruneJobState,
+  readJobRecordFile,
+  readLogTail,
+  resolveDataDir,
+  updateJobRecordFile,
+  updateJobRecordFileWithCurrent,
+  withThreadLock,
+  withWorkspaceLock,
+  writeBrief,
+  writeJobRecordFile
+} from "./lib/state.mjs";
+
+const SELF_PATH = fileURLToPath(import.meta.url);
+const ROOT_DIR = path.resolve(path.dirname(SELF_PATH), "..");
+const ADVERSARIAL_REVIEW_PROMPT_FILE = path.join(ROOT_DIR, "prompts", "adversarial-review.md");
+const FOREGROUND_TIMEOUT_ENV = "CODEX_COMPANION_TIMEOUT_MS";
+const BACKGROUND_TIMEOUT_ENV = "CODEX_COMPANION_BACKGROUND_TIMEOUT_MS";
+const BACKGROUND_LAUNCH_APPROVAL_TIMEOUT_ENV = "CODEX_COMPANION_LAUNCH_APPROVAL_TIMEOUT_MS";
+const PIDLESS_GRACE_ENV = "CODEX_COMPANION_PIDLESS_RUNNING_GRACE_MS";
+const WAIT_POLL_ENV = "CODEX_COMPANION_WAIT_POLL_MS";
+const WAIT_TIMEOUT_ENV = "CODEX_COMPANION_WAIT_TIMEOUT_MS";
+const DEFAULT_FOREGROUND_TIMEOUT_MS = 570000;
+const DEFAULT_BACKGROUND_TIMEOUT_MS = 1800000;
+const DEFAULT_PIDLESS_GRACE_MS = 15000;
+const DEFAULT_WAIT_POLL_MS = 2000;
+const DEFAULT_WAIT_TIMEOUT_MS = 570000;
+const MAX_WAIT_TIMEOUT_MS = 570000;
+const MAX_PROMPT_BYTES = 4 * 1024 * 1024;
+const MAX_RAW_ARGUMENT_BYTES = MAX_PROMPT_BYTES + 64 * 1024;
+const HEARTBEAT_INTERVAL_MS = 5000;
+const BACKGROUND_LAUNCH_APPROVAL_TIMEOUT_MS = 10000;
+const BACKGROUND_LAUNCH_POLL_MS = 20;
+const BACKGROUND_ABORT_CLAIM_WAIT_MS = 2000;
+const BACKGROUND_ABORT_CLEANUP_CONFIRM_MS = 1000;
+const BACKGROUND_ABORT_CLEANUP_POLL_MS = 50;
+const TESTED_VERSION_MIN = [0, 144, 0];
+const TESTED_VERSION_MAX = [0, 145, 0];
+const CONTINUE_PROMPT = "Continue from the current Codex thread state. Complete the next highest value step and continue until the task is resolved.";
+const TRANSPORT_DIRECTORY_PREFIX = "codex-companion-input-";
+const TRANSPORT_TOKEN_PATTERN = /^[a-f0-9]{48}$/;
+const TRANSPORT_OWNER_FILE = "owner.json";
+const TRANSPORT_OWNER_MAX_BYTES = 4096;
+const TRANSPORT_MAX_AGE_MS = 60 * 60 * 1000;
+
+let activeCommandArgv = null;
+
+class CompanionError extends Error {
+  constructor(message, failureKind = "error") {
+    super(message);
+    this.failureKind = failureKind;
+  }
+}
+
+function printUsage() {
+  process.stdout.write(
+    [
+      "Usage:",
+      "  node scripts/codex-companion.mjs task [--prompt-file <path>] [--write] [--background] [--resume <thread-id>] [--resume-last] [--fresh] [--model <id>] [--effort <level>] [--web] [--network] [--cwd <dir>] [--json] [--] [prompt]",
+      "  node scripts/codex-companion.mjs review [--base <ref>] [--scope <auto|working-tree|branch>] [--focus <text>] [--background] [--model <id>] [--effort <level>] [--cwd <dir>] [--json]",
+      "  node scripts/codex-companion.mjs adversarial-review [--base <ref>] [--scope <auto|working-tree|branch>] [--focus <text>] [--background] [--model <id>] [--effort <level>] [--cwd <dir>] [--json]",
+      "  node scripts/codex-companion.mjs status [job-id] [--all] [--cwd <dir>] [--json]",
+      "  node scripts/codex-companion.mjs result <job-id> [--wait] [--wait-timeout-ms <ms>] [--cwd <dir>] [--json]",
+      "  node scripts/codex-companion.mjs cancel <job-id> [--cwd <dir>] [--json]",
+      "  node scripts/codex-companion.mjs setup [--cwd <dir>] [--json]"
+    ].join("\n") + "\n"
+  );
+}
+
+function normalizeArgv(argv) {
+  if (argv.length !== 1) {
+    return argv;
+  }
+  return splitRawArgumentString(argv[0]);
+}
+
+function commandArgs(rawArgv, config) {
+  try {
+    if (rawArgv.length === 1) {
+      return parseRawArgs(rawArgv[0], config);
+    }
+    return { ...parseArgs(rawArgv, config), positionalText: null };
+  } catch (error) {
+    throw new CompanionError(error.message, "input");
+  }
+}
+
+function output(value, asJson = false) {
+  if (asJson) {
+    process.stdout.write(`${JSON.stringify(value, null, 2)}\n`);
+    return;
+  }
+  process.stdout.write(String(value));
+}
+
+function resolveCwd(options = {}) {
+  const cwd = path.resolve(process.cwd(), options.cwd ?? ".");
+  let stats;
+  try {
+    stats = fs.statSync(cwd);
+  } catch {
+    throw new CompanionError(`Working directory does not exist: ${cwd}.`, "input");
+  }
+  if (!stats.isDirectory()) {
+    throw new CompanionError(`Working directory is not a directory: ${cwd}.`, "input");
+  }
+  try {
+    return fs.realpathSync.native(cwd);
+  } catch {
+    return cwd;
+  }
+}
+
+function nonnegativeInteger(value, label) {
+  const number = Number(value);
+  if (!Number.isSafeInteger(number) || number < 0) {
+    throw new CompanionError(`${label} must be a nonnegative integer.`, "input");
+  }
+  return number;
+}
+
+function positiveEnvMs(name, fallback, env = process.env) {
+  const value = env[name];
+  if (value == null || !String(value).trim()) {
+    return fallback;
+  }
+  const number = Number(value);
+  return Number.isSafeInteger(number) && number > 0 ? number : fallback;
+}
+
+function nonnegativeEnvMs(name, fallback, env = process.env) {
+  const value = env[name];
+  if (value == null || !String(value).trim()) {
+    return fallback;
+  }
+  const number = Number(value);
+  return Number.isSafeInteger(number) && number >= 0 ? number : fallback;
+}
+
+function resolveExecutionTimeout(background, env = process.env) {
+  return positiveEnvMs(background ? BACKGROUND_TIMEOUT_ENV : FOREGROUND_TIMEOUT_ENV, background ? DEFAULT_BACKGROUND_TIMEOUT_MS : DEFAULT_FOREGROUND_TIMEOUT_MS, env);
+}
+
+function resolvePidlessGrace(env = process.env) {
+  return nonnegativeEnvMs(PIDLESS_GRACE_ENV, DEFAULT_PIDLESS_GRACE_MS, env);
+}
+
+function resolveWaitPoll(env = process.env) {
+  return positiveEnvMs(WAIT_POLL_ENV, DEFAULT_WAIT_POLL_MS, env);
+}
+
+function resolveWaitTimeout(options, env = process.env) {
+  if (options["wait-timeout-ms"] != null) {
+    return Math.min(nonnegativeInteger(options["wait-timeout-ms"], "--wait-timeout-ms"), MAX_WAIT_TIMEOUT_MS);
+  }
+  const value = env[WAIT_TIMEOUT_ENV];
+  if (value != null && String(value).trim()) {
+    const number = Number(value);
+    if (Number.isSafeInteger(number) && number >= 0) {
+      return Math.min(number, MAX_WAIT_TIMEOUT_MS);
+    }
+  }
+  return DEFAULT_WAIT_TIMEOUT_MS;
+}
+
+function readStdinIfPiped() {
+  if (isatty(0)) {
+    return "";
+  }
+  const chunks = [];
+  let total = 0;
+  try {
+    for (;;) {
+      const buffer = Buffer.alloc(Math.min(64 * 1024, MAX_PROMPT_BYTES + 1 - total));
+      const bytesRead = fs.readSync(0, buffer, 0, buffer.length, null);
+      if (bytesRead === 0) {
+        break;
+      }
+      total += bytesRead;
+      if (total > MAX_PROMPT_BYTES) {
+        throw new CompanionError(`Codex prompt exceeded the ${MAX_PROMPT_BYTES} byte limit.`, "resource");
+      }
+      chunks.push(buffer.subarray(0, bytesRead));
+    }
+    return Buffer.concat(chunks, total).toString("utf8");
+  } catch (error) {
+    if (error instanceof CompanionError) {
+      throw error;
+    }
+    return "";
+  }
+}
+
+function readPromptFile(file) {
+  let descriptor;
+  try {
+    descriptor = fs.openSync(file, "r");
+    const buffer = Buffer.alloc(MAX_PROMPT_BYTES + 1);
+    const bytesRead = fs.readSync(descriptor, buffer, 0, buffer.length, 0);
+    if (bytesRead > MAX_PROMPT_BYTES) {
+      throw new CompanionError(`Codex prompt exceeded the ${MAX_PROMPT_BYTES} byte limit.`, "resource");
+    }
+    return buffer.subarray(0, bytesRead).toString("utf8");
+  } finally {
+    if (descriptor !== undefined) {
+      fs.closeSync(descriptor);
+    }
+  }
+}
+
+function boundedPrompt(value) {
+  const text = String(value ?? "");
+  if (Buffer.byteLength(text) > MAX_PROMPT_BYTES) {
+    throw new CompanionError(`Codex prompt exceeded the ${MAX_PROMPT_BYTES} byte limit.`, "resource");
+  }
+  return text;
+}
+
+function shellSafeTemporaryRoot() {
+  const candidates = [os.tmpdir(), process.platform === "win32" ? "C:\\Windows\\Temp" : "/private/tmp", "/tmp"];
+  for (const candidate of candidates) {
+    if (typeof candidate !== "string" || !path.isAbsolute(candidate) || !/^[A-Za-z0-9_./:\\-]+$/.test(candidate)) {
+      continue;
+    }
+    try {
+      const stats = fs.lstatSync(candidate);
+      if (!stats.isDirectory() || stats.isSymbolicLink()) {
+        continue;
+      }
+      fs.accessSync(candidate, fs.constants.R_OK | fs.constants.W_OK | fs.constants.X_OK);
+      return candidate;
+    } catch {}
+  }
+  throw new CompanionError("No private shell safe temporary directory is available for raw command transport.", "resource");
+}
+
+function transportPaths(token) {
+  if (!TRANSPORT_TOKEN_PATTERN.test(token)) {
+    throw new CompanionError("The raw command transport token is invalid.", "input");
+  }
+  const directory = path.join(shellSafeTemporaryRoot(), `${TRANSPORT_DIRECTORY_PREFIX}${token}`);
+  return { directory, file: path.join(directory, "request"), ownerFile: path.join(directory, TRANSPORT_OWNER_FILE) };
+}
+
+function validateOwnedPath(stats, label) {
+  if (typeof process.getuid === "function" && Number.isInteger(stats.uid) && stats.uid !== process.getuid()) {
+    throw new CompanionError(`${label} is not owned by the current user.`, "permission");
+  }
+}
+
+function createRawCommandTransport() {
+  pruneRawCommandTransports();
+  for (let attempt = 0; attempt < 8; attempt += 1) {
+    const token = randomBytes(24).toString("hex");
+    const { directory, file, ownerFile } = transportPaths(token);
+    let directoryCreated = false;
+    let fileCreated = false;
+    let ownerCreated = false;
+    try {
+      fs.mkdirSync(directory, { mode: 0o700 });
+      directoryCreated = true;
+      fs.chmodSync(directory, 0o700);
+      const descriptor = fs.openSync(file, "wx", 0o600);
+      fileCreated = true;
+      fs.closeSync(descriptor);
+      fs.chmodSync(file, 0o600);
+      fs.writeFileSync(ownerFile, `${JSON.stringify({ createdAt: Date.now(), sessionHash: transportSessionHash(currentClaudeSessionId()) })}\n`, {
+        flag: "wx",
+        mode: 0o600
+      });
+      ownerCreated = true;
+      fs.chmodSync(ownerFile, 0o600);
+      output({ file, token }, true);
+      return;
+    } catch (error) {
+      if (ownerCreated || directoryCreated) {
+        try {
+          fs.unlinkSync(ownerFile);
+        } catch {}
+      }
+      if (fileCreated) {
+        try {
+          fs.unlinkSync(file);
+        } catch {}
+      }
+      if (directoryCreated) {
+        try {
+          fs.rmdirSync(directory);
+        } catch {}
+      }
+      if (error?.code !== "EEXIST") {
+        throw new CompanionError(`Could not create private raw command transport: ${error.message}`, "permission");
+      }
+    }
+  }
+  throw new CompanionError("Could not allocate a unique raw command transport.", "resource");
+}
+
+function sameFileIdentity(left, right) {
+  return left && right && left.dev === right.dev && left.ino === right.ino;
+}
+
+function transportSessionHash(sessionId) {
+  return typeof sessionId === "string" && sessionId.trim() ? createHash("sha256").update(sessionId.trim()).digest("hex") : null;
+}
+
+function readTransportOwner(ownerFile) {
+  let descriptor;
+  try {
+    const pathStats = fs.lstatSync(ownerFile);
+    if (!pathStats.isFile() || pathStats.isSymbolicLink() || pathStats.nlink !== 1 || pathStats.size > TRANSPORT_OWNER_MAX_BYTES) {
+      throw new CompanionError("The raw command transport owner record is invalid.", "permission");
+    }
+    validateOwnedPath(pathStats, "The raw command transport owner record");
+    if (process.platform !== "win32" && (pathStats.mode & 0o077) !== 0) {
+      throw new CompanionError("The raw command transport owner record is not private.", "permission");
+    }
+    descriptor = fs.openSync(ownerFile, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0));
+    const openedStats = fs.fstatSync(descriptor);
+    if (!openedStats.isFile() || openedStats.nlink !== 1 || !sameFileIdentity(openedStats, pathStats)) {
+      throw new CompanionError("The raw command transport owner record changed before it could be read.", "permission");
+    }
+    const buffer = Buffer.alloc(TRANSPORT_OWNER_MAX_BYTES + 1);
+    const bytesRead = fs.readSync(descriptor, buffer, 0, buffer.length, 0);
+    if (bytesRead > TRANSPORT_OWNER_MAX_BYTES) {
+      throw new CompanionError("The raw command transport owner record is invalid.", "permission");
+    }
+    const record = JSON.parse(buffer.subarray(0, bytesRead).toString("utf8"));
+    if (!Number.isSafeInteger(record?.createdAt) || record.createdAt <= 0 || (record.sessionHash !== null && !/^[a-f0-9]{64}$/.test(record.sessionHash))) {
+      throw new CompanionError("The raw command transport owner record is invalid.", "permission");
+    }
+    return { identity: pathStats, record };
+  } catch (error) {
+    if (error instanceof CompanionError) {
+      throw error;
+    }
+    throw new CompanionError(`Could not read raw command transport owner record: ${error.message}`, "permission");
+  } finally {
+    if (descriptor !== undefined) {
+      fs.closeSync(descriptor);
+    }
+  }
+}
+
+function cleanupVerifiedTransport(directory, file, ownerFile, directoryIdentity, fileIdentity, ownerIdentity) {
+  if (!directoryIdentity || !fileIdentity || !ownerIdentity) {
+    return;
+  }
+  try {
+    const currentDirectory = fs.lstatSync(directory);
+    if (!currentDirectory.isDirectory() || currentDirectory.isSymbolicLink() || !sameFileIdentity(currentDirectory, directoryIdentity)) {
+      return;
+    }
+    validateOwnedPath(currentDirectory, "The raw command transport directory");
+    if (process.platform !== "win32" && (currentDirectory.mode & 0o077) !== 0) {
+      return;
+    }
+    const currentFile = fs.lstatSync(file);
+    if (!currentFile.isFile() || currentFile.isSymbolicLink() || currentFile.nlink !== 1 || !sameFileIdentity(currentFile, fileIdentity)) {
+      return;
+    }
+    validateOwnedPath(currentFile, "The raw command transport file");
+    const currentOwner = fs.lstatSync(ownerFile);
+    if (!currentOwner.isFile() || currentOwner.isSymbolicLink() || currentOwner.nlink !== 1 || !sameFileIdentity(currentOwner, ownerIdentity)) {
+      return;
+    }
+    validateOwnedPath(currentOwner, "The raw command transport owner record");
+    if (process.platform !== "win32" && (currentOwner.mode & 0o077) !== 0) {
+      return;
+    }
+    fs.unlinkSync(file);
+    fs.unlinkSync(ownerFile);
+    fs.rmdirSync(directory);
+  } catch {}
+}
+
+function pruneRawCommandTransports(options = {}) {
+  let root;
+  let entries;
+  try {
+    root = shellSafeTemporaryRoot();
+    entries = fs.readdirSync(root, { withFileTypes: true });
+  } catch {
+    return;
+  }
+  const sessionHash = transportSessionHash(options.sessionId);
+  const now = Date.now();
+  for (const entry of entries) {
+    if (!entry.isDirectory() || !entry.name.startsWith(TRANSPORT_DIRECTORY_PREFIX)) {
+      continue;
+    }
+    const token = entry.name.slice(TRANSPORT_DIRECTORY_PREFIX.length);
+    if (!TRANSPORT_TOKEN_PATTERN.test(token)) {
+      continue;
+    }
+    const { directory, file, ownerFile } = transportPaths(token);
+    try {
+      const directoryIdentity = fs.lstatSync(directory);
+      if (!directoryIdentity.isDirectory() || directoryIdentity.isSymbolicLink()) {
+        continue;
+      }
+      validateOwnedPath(directoryIdentity, "The raw command transport directory");
+      if (process.platform !== "win32" && (directoryIdentity.mode & 0o077) !== 0) {
+        continue;
+      }
+      const { identity: ownerIdentity, record } = readTransportOwner(ownerFile);
+      const fileIdentity = fs.lstatSync(file);
+      if (!fileIdentity.isFile() || fileIdentity.isSymbolicLink() || fileIdentity.nlink !== 1) {
+        continue;
+      }
+      validateOwnedPath(fileIdentity, "The raw command transport file");
+      if (sessionHash ? record.sessionHash !== sessionHash : now - record.createdAt < TRANSPORT_MAX_AGE_MS) {
+        continue;
+      }
+      cleanupVerifiedTransport(directory, file, ownerFile, directoryIdentity, fileIdentity, ownerIdentity);
+    } catch {}
+  }
+}
+
+function readBoundedDescriptor(descriptor, limit) {
+  const chunks = [];
+  let total = 0;
+  for (;;) {
+    const buffer = Buffer.alloc(Math.min(64 * 1024, limit + 1 - total));
+    const bytesRead = fs.readSync(descriptor, buffer, 0, buffer.length, null);
+    if (bytesRead === 0) {
+      break;
+    }
+    total += bytesRead;
+    if (total > limit) {
+      throw new CompanionError(`Raw command arguments exceeded the ${limit} byte limit.`, "resource");
+    }
+    chunks.push(buffer.subarray(0, bytesRead));
+  }
+  return Buffer.concat(chunks, total);
+}
+
+function consumeRawCommandTransport(token) {
+  const { directory, file, ownerFile } = transportPaths(token);
+  let descriptor;
+  let directoryIdentity = null;
+  let fileIdentity = null;
+  let ownerIdentity = null;
+  try {
+    const directoryStats = fs.lstatSync(directory);
+    if (!directoryStats.isDirectory() || directoryStats.isSymbolicLink()) {
+      throw new CompanionError("The raw command transport directory is invalid.", "permission");
+    }
+    validateOwnedPath(directoryStats, "The raw command transport directory");
+    if (process.platform !== "win32" && (directoryStats.mode & 0o077) !== 0) {
+      throw new CompanionError("The raw command transport directory is not private.", "permission");
+    }
+    directoryIdentity = directoryStats;
+    ownerIdentity = readTransportOwner(ownerFile).identity;
+    const pathStats = fs.lstatSync(file);
+    if (!pathStats.isFile() || pathStats.isSymbolicLink() || pathStats.nlink !== 1) {
+      throw new CompanionError("The raw command transport must be a regular private file.", "permission");
+    }
+    validateOwnedPath(pathStats, "The raw command transport file");
+    fileIdentity = pathStats;
+    if (process.platform !== "win32" && (pathStats.mode & 0o077) !== 0) {
+      throw new CompanionError("The raw command transport file is not private.", "permission");
+    }
+    if (pathStats.size > MAX_RAW_ARGUMENT_BYTES) {
+      throw new CompanionError(`Raw command arguments exceeded the ${MAX_RAW_ARGUMENT_BYTES} byte limit.`, "resource");
+    }
+    const flags = fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0);
+    descriptor = fs.openSync(file, flags);
+    const openedStats = fs.fstatSync(descriptor);
+    if (!openedStats.isFile() || openedStats.nlink !== 1 || openedStats.dev !== pathStats.dev || openedStats.ino !== pathStats.ino) {
+      throw new CompanionError("The raw command transport changed before it could be read.", "permission");
+    }
+    validateOwnedPath(openedStats, "The raw command transport file");
+    if (process.platform !== "win32" && (openedStats.mode & 0o077) !== 0) {
+      throw new CompanionError("The raw command transport file is not private.", "permission");
+    }
+    const bytes = readBoundedDescriptor(descriptor, MAX_RAW_ARGUMENT_BYTES);
+    try {
+      return new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+    } catch {
+      throw new CompanionError("Raw command arguments must be valid UTF-8.", "input");
+    }
+  } catch (error) {
+    if (error instanceof CompanionError) {
+      throw error;
+    }
+    throw new CompanionError(`Could not read raw command transport: ${error.message}`, error?.code === "ENOENT" ? "input" : "permission");
+  } finally {
+    if (descriptor !== undefined) {
+      fs.closeSync(descriptor);
+    }
+    cleanupVerifiedTransport(directory, file, ownerFile, directoryIdentity, fileIdentity, ownerIdentity);
+  }
+}
+
+function resolveCommandTransport(rawArgv) {
+  const defaultWrite = rawArgv[0] === "--transport-default-write";
+  const transportArgv = defaultWrite ? rawArgv.slice(1) : rawArgv;
+  if (transportArgv[0] !== "--raw-args-token") {
+    if (transportArgv.some((value) => value === "--raw-args-token") || defaultWrite) {
+      throw new CompanionError("Raw command transport options must not be combined with normal arguments.", "input");
+    }
+    return { argv: rawArgv, defaultWrite: false };
+  }
+  if (transportArgv.length !== 2) {
+    throw new CompanionError("Raw command transport requires exactly one token.", "input");
+  }
+  return { argv: [consumeRawCommandTransport(transportArgv[1])], defaultWrite };
+}
+
+function readTaskPrompt(cwd, options, positionals, positionalText) {
+  const positional = positionalText ?? positionals.join(" ").trim();
+  const hasPositional = Boolean(positional.trim());
+  if (hasPositional && options["prompt-file"]) {
+    throw new CompanionError("Use prompt text or --prompt-file, not both.", "input");
+  }
+  if (hasPositional) {
+    return boundedPrompt(positional);
+  }
+  if (options["prompt-file"]) {
+    const file = path.resolve(cwd, options["prompt-file"]);
+    try {
+      return readPromptFile(file);
+    } catch (error) {
+      if (error instanceof CompanionError) {
+        throw error;
+      }
+      throw new CompanionError(`Could not read prompt file ${file}: ${error.message}`, "input");
+    }
+  }
+  return readStdinIfPiped();
+}
+
+function currentClaudeSessionId() {
+  const value = process.env[SESSION_ID_ENV];
+  return typeof value === "string" && value.trim() ? value.trim() : null;
+}
+
+function oneLine(value, fallback) {
+  return String(value ?? "")
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .find(Boolean) ?? fallback;
+}
+
+function boundedTail(value, maxLines = 20) {
+  return String(value ?? "")
+    .slice(-64 * 1024)
+    .trimEnd()
+    .split(/\r?\n/)
+    .slice(-maxLines)
+    .join("\n");
+}
+
+function redactDiagnostic(value) {
+  return String(value ?? "")
+    .replace(/\bBearer\s+[A-Za-z0-9._~+/=-]+/gi, "Bearer [redacted]")
+    .replace(/([a-z][a-z0-9+.-]*:\/\/)[^/\s:@]+:[^/\s@]+@/gi, "$1[redacted]@")
+    .replace(/\b(api[_-]?key|access[_-]?token|authorization|password|passwd|secret|token)\s*[:=]\s*(?:"[^"]*"|'[^']*'|[^\s,;]+)/gi, "$1=[redacted]")
+    .replace(/\b(?:sk-[A-Za-z0-9_-]{8,}|gh[pousr]_[A-Za-z0-9_]{8,}|github_pat_[A-Za-z0-9_]{8,}|xox[baprs]-[A-Za-z0-9-]{8,}|AKIA[A-Z0-9]{12,})\b/g, "[redacted]")
+    .replace(/\b[A-Za-z0-9+/_=-]{64,}\b/g, "[redacted]");
+}
+
+function availabilityFailure(probe) {
+  const missing = probe.exitCode == null && /ENOENT|not found|no such file/i.test(probe.errorMessage ?? "");
+  return new CompanionError(probe.errorMessage || "The Codex CLI is unavailable.", missing ? "missing_cli" : "error");
+}
+
+function preflightCodex(cwd) {
+  const probe = getCodexAvailability({ cwd, env: process.env });
+  if (!probe.available) {
+    throw availabilityFailure(probe);
+  }
+  return probe;
+}
+
+function parseVersion(value) {
+  const match = String(value ?? "").match(/^(\d+)\.(\d+)\.(\d+)/);
+  return match ? match.slice(1).map(Number) : null;
+}
+
+function compareVersion(left, right) {
+  for (let index = 0; index < Math.max(left.length, right.length); index += 1) {
+    const difference = (left[index] ?? 0) - (right[index] ?? 0);
+    if (difference !== 0) {
+      return Math.sign(difference);
+    }
+  }
+  return 0;
+}
+
+function supportedVersion(value) {
+  const parsed = parseVersion(value);
+  return Boolean(parsed) && compareVersion(parsed, TESTED_VERSION_MIN) >= 0 && compareVersion(parsed, TESTED_VERSION_MAX) < 0;
+}
+
+function findRequestedJob(dataDir, jobId, options) {
+  if (options.cwd == null) {
+    return findJobRecordById(dataDir, jobId);
+  }
+  const cwd = resolveCwd(options);
+  const file = jobFilePath(dataDir, cwd, jobId);
+  const record = readJobRecordFile(file);
+  return record?.id === jobId ? { record, file } : null;
+}
+
+function terminalRecord(record) {
+  return TERMINAL_STATUSES.has(record?.status);
+}
+
+function elapsedSince(value) {
+  const timestamp = Date.parse(value ?? "");
+  return Number.isFinite(timestamp) ? Date.now() - timestamp : Number.POSITIVE_INFINITY;
+}
+
+function deadOwnerMessage(record) {
+  const pids = [record.pid, record.codexPid].filter((pid) => Number.isInteger(pid) && pid > 0);
+  if (pids.length === 0) {
+    return "No process id was recorded before the launch grace window elapsed.";
+  }
+  return `Recorded process ${pids.join(", ")} exited without recording a terminal outcome.`;
+}
+
+function recordedProcessState(record, prefix) {
+  const codex = prefix === "codex";
+  const pid = record[codex ? "codexPid" : "pid"];
+  const identity = record[codex ? "codexPidIdentity" : "pidIdentity"];
+  const ownsProcessGroup = Boolean(record[codex ? "codexPidOwnsProcessGroup" : "pidOwnsProcessGroup"]);
+  if (!Number.isInteger(pid) || pid <= 1) {
+    return { identity, ownsProcessGroup, pid, state: "absent" };
+  }
+  const currentIdentity = getProcessIdentity(pid);
+  if (currentIdentity) {
+    if (!identity) {
+      return { identity, ownsProcessGroup, pid, state: "unverified" };
+    }
+    return { identity, ownsProcessGroup, pid, state: processIdentitiesMatch(currentIdentity, identity) ? "owned" : "replaced" };
+  }
+  if (isProcessAlive(pid, null, ownsProcessGroup)) {
+    return { identity, ownsProcessGroup, pid, state: "unverified" };
+  }
+  return { identity, ownsProcessGroup, pid, state: "absent" };
+}
+
+function cleanupComplete(record) {
+  return [recordedProcessState(record, "owner"), recordedProcessState(record, "codex")].every(({ state }) => state === "absent" || state === "replaced");
+}
+
+function codexSpawnCheckpointPending(record) {
+  return Boolean(record?.background && record.startedAt && !record.codexPidIdentity);
+}
+
+function signalRecorded(record, prefix) {
+  const target = recordedProcessState(record, prefix);
+  if (target.state !== "owned" || !target.identity) {
+    return false;
+  }
+  try {
+    process.kill(process.platform !== "win32" && target.ownsProcessGroup ? -target.pid : target.pid, "SIGTERM");
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function cleanupRequired(file, failureKind, message) {
+  return updateJobRecordFile(file, {
+    errorMessage: message,
+    errorTail: message,
+    failureKind,
+    phase: "cleanup-required"
+  });
+}
+
+function terminateRecordedSync(record, prefix, graceMs = 250) {
+  const target = recordedProcessState(record, prefix);
+  if (target.state === "absent" || target.state === "replaced") {
+    return true;
+  }
+  if (target.state !== "owned" || !target.identity) {
+    return false;
+  }
+  return terminateProcessTreeSync(target.pid, {
+    graceMs,
+    identity: target.identity,
+    ownsProcessGroup: target.ownsProcessGroup,
+    requireIdentity: true
+  });
+}
+
+async function terminateRecorded(record, prefix, graceMs = 250) {
+  const target = recordedProcessState(record, prefix);
+  if (target.state === "absent" || target.state === "replaced") {
+    return true;
+  }
+  if (target.state !== "owned" || !target.identity) {
+    return false;
+  }
+  return terminateProcessTree(target.pid, {
+    graceMs,
+    identity: target.identity,
+    ownsProcessGroup: target.ownsProcessGroup,
+    requireIdentity: true
+  });
+}
+
+function currentProcessIdentity() {
+  const identity = getProcessIdentity(process.pid);
+  if (!identity) {
+    throw new CompanionError("The companion process identity could not be verified.", "process");
+  }
+  return identity;
+}
+
+function finishJob(file, patch, env = process.env) {
+  const record = finishJobRecordFile(file, patch);
+  pruneJobState(resolveDataDir(env), { claudeSessionId: record.claudeSessionId, protectedJobFiles: [file], resumeWorkspaceJobFiles: [file] });
+  return record;
+}
+
+function collectRenderedJob(file, record) {
+  if (!TERMINAL_STATUSES.has(record.status)) {
+    return record;
+  }
+  let collected = record;
+  try {
+    collected = markJobCollectedFile(file);
+  } catch {}
+  pruneJobState(resolveDataDir(), { claudeSessionId: collected.claudeSessionId, resumeWorkspaceJobFiles: [file] });
+  return collected;
+}
+
+function repairRunningRecordSync({ record, file }, env = process.env) {
+  const current = readJobRecordFile(file) ?? record;
+  if (current.status !== "running") {
+    return current;
+  }
+  const deadline = Date.parse(current.deadlineAt ?? "");
+  if (Number.isFinite(deadline) && Date.now() > deadline) {
+    if (codexSpawnCheckpointPending(current)) {
+      signalRecorded(current, "owner");
+      return cleanupRequired(file, "timeout", "Codex exceeded its recorded execution deadline while its process identity checkpoint was incomplete. Graceful cleanup was requested without forcing the companion to exit.");
+    }
+    terminateRecordedSync(current, "codex");
+    terminateRecordedSync(current, "owner");
+    const refreshed = readJobRecordFile(file) ?? current;
+    if (!cleanupComplete(refreshed)) {
+      return cleanupRequired(file, "timeout", "Codex exceeded its recorded execution deadline, but verified process cleanup did not complete.");
+    }
+    return finishJob(file, {
+      status: "error",
+      failureKind: "timeout",
+      errorMessage: "Codex exceeded its recorded execution deadline.",
+      errorTail: "Codex exceeded its recorded execution deadline."
+    });
+  }
+  const owner = recordedProcessState(current, "owner");
+  if (owner.state === "owned") {
+    return current;
+  }
+  if (elapsedSince(current.createdAt) <= resolvePidlessGrace(env)) {
+    return current;
+  }
+  if (owner.state === "unverified") {
+    return cleanupRequired(file, "process", "The recorded companion process is live but its identity cannot be verified. No signal was sent.");
+  }
+  if (codexSpawnCheckpointPending(current)) {
+    return cleanupRequired(file, "process", "The companion exited while the Codex process identity checkpoint was incomplete. No terminal state was recorded.");
+  }
+  terminateRecordedSync(current, "owner");
+  terminateRecordedSync(current, "codex");
+  const refreshed = readJobRecordFile(file) ?? current;
+  if (!cleanupComplete(refreshed)) {
+    return cleanupRequired(file, "died", "The companion exited without a terminal outcome, but verified process cleanup did not complete.");
+  }
+  const message = deadOwnerMessage(current);
+  return finishJob(file, {
+    status: "error",
+    failureKind: "died",
+    errorMessage: message,
+    errorTail: message
+  });
+}
+
+export async function refreshRunningJobRecord(found, env = process.env) {
+  const current = readJobRecordFile(found.file) ?? found.record;
+  if (current.status !== "running") {
+    return current;
+  }
+  const deadline = Date.parse(current.deadlineAt ?? "");
+  if (Number.isFinite(deadline) && Date.now() > deadline) {
+    if (codexSpawnCheckpointPending(current)) {
+      signalRecorded(current, "owner");
+      return cleanupRequired(found.file, "timeout", "Codex exceeded its recorded execution deadline while its process identity checkpoint was incomplete. Graceful cleanup was requested without forcing the companion to exit.");
+    }
+    await Promise.all([terminateRecorded(current, "codex"), terminateRecorded(current, "owner")]);
+    const refreshed = readJobRecordFile(found.file) ?? current;
+    if (!cleanupComplete(refreshed)) {
+      return cleanupRequired(found.file, "timeout", "Codex exceeded its recorded execution deadline, but verified process cleanup did not complete.");
+    }
+    return finishJob(found.file, {
+      status: "error",
+      failureKind: "timeout",
+      errorMessage: "Codex exceeded its recorded execution deadline.",
+      errorTail: "Codex exceeded its recorded execution deadline."
+    });
+  }
+  const owner = recordedProcessState(current, "owner");
+  if (owner.state === "owned") {
+    return current;
+  }
+  if (elapsedSince(current.createdAt) <= resolvePidlessGrace(env)) {
+    return current;
+  }
+  if (owner.state === "unverified") {
+    return cleanupRequired(found.file, "process", "The recorded companion process is live but its identity cannot be verified. No signal was sent.");
+  }
+  if (codexSpawnCheckpointPending(current)) {
+    return cleanupRequired(found.file, "process", "The companion exited while the Codex process identity checkpoint was incomplete. No terminal state was recorded.");
+  }
+  await Promise.all([terminateRecorded(current, "owner"), terminateRecorded(current, "codex")]);
+  const refreshed = readJobRecordFile(found.file) ?? current;
+  if (!cleanupComplete(refreshed)) {
+    return cleanupRequired(found.file, "died", "The companion exited without a terminal outcome, but verified process cleanup did not complete.");
+  }
+  const message = deadOwnerMessage(current);
+  return finishJob(found.file, {
+    status: "error",
+    failureKind: "died",
+    errorMessage: message,
+    errorTail: message
+  });
+}
+
+function latestResumeRecord(dataDir, cwd, claudeSessionId) {
+  let candidates = listJobRecords(dataDir, cwd).filter(
+    (record) => terminalRecord(record) && record.jobClass === "task" && typeof record.threadId === "string" && record.threadId.trim()
+  );
+  if (claudeSessionId) {
+    candidates = candidates.filter((record) => record.claudeSessionId === claudeSessionId);
+  }
+  if (candidates.length === 0) {
+    throw new CompanionError("No eligible finished Codex task thread was found for this workspace and Claude session.", "input");
+  }
+  return candidates[0];
+}
+
+function resolveResume(dataDir, cwd, options) {
+  if (options.resume && options["resume-last"]) {
+    throw new CompanionError("Use either --resume or --resume-last, not both.", "input");
+  }
+  if (options.fresh && (options.resume || options["resume-last"])) {
+    throw new CompanionError("--fresh cannot be combined with --resume or --resume-last.", "input");
+  }
+  if (options.fresh) {
+    return { threadId: null, baseline: null, sourceJobId: null };
+  }
+  let threadId = options.resume ?? null;
+  let sourceJobId = null;
+  if (options["resume-last"]) {
+    const candidate = latestResumeRecord(dataDir, cwd, currentClaudeSessionId());
+    threadId = candidate.threadId;
+    sourceJobId = candidate.id;
+  }
+  return {
+    threadId,
+    sourceJobId
+  };
+}
+
+function createReservedJob({ background, brief, codexVersion, cwd, dataDir, jobClass, mode, request }) {
+  brief = boundedPrompt(brief);
+  const ownerIdentity = background ? null : currentProcessIdentity();
+  const reserveWorkspace = (reservedRequest) => withWorkspaceLock(dataDir, cwd, () => {
+    const records = listJobRecords(dataDir, cwd).map((record) => {
+      const file = jobFilePath(dataDir, cwd, record.id);
+      return repairRunningRecordSync({ record, file });
+    });
+    const running = records.find((record) => record.status === "running");
+    if (running) {
+      throw new CompanionError(`Codex job ${running.id} is already running in this workspace.`, "input");
+    }
+    const id = generateJobId();
+    const briefFile = writeBrief(dataDir, cwd, id, brief);
+    const record = createJobRecord({
+      id,
+      background,
+      briefFile,
+      claudeSessionId: currentClaudeSessionId(),
+      codexVersion,
+      cwd,
+      eventsFile: jobEventsPath(dataDir, cwd, id),
+      jobClass,
+      kind: jobClass,
+      logFile: jobLogPath(dataDir, cwd, id),
+      mode,
+      phase: background ? "queued" : "starting",
+      pid: background ? null : process.pid,
+      pidIdentity: ownerIdentity,
+      pidOwnsProcessGroup: false,
+      request: reservedRequest,
+      workspaceRoot: canonicalWorkspaceRoot(cwd)
+    });
+    const file = jobFilePath(dataDir, cwd, id);
+    writeJobRecordFile(file, record);
+    return { record, file };
+  });
+  const threadId = request.resumeThreadId;
+  if (!threadId) {
+    return reserveWorkspace(request);
+  }
+  return withThreadLock(dataDir, threadId, () => {
+    const entries = listAllJobRecords(dataDir);
+    for (const entry of entries) {
+      if (entry.record.status === "running" && (entry.record.threadId === threadId || entry.record.request?.resumeThreadId === threadId)) {
+        entry.record = repairRunningRecordSync(entry);
+      }
+    }
+    const running = entries.find(
+      ({ record }) => record.status === "running" && (record.threadId === threadId || record.request?.resumeThreadId === threadId)
+    );
+    if (running) {
+      const current = repairRunningRecordSync({ file: running.file, record: readJobRecordFile(running.file) ?? running.record });
+      if (current.status === "running") {
+        throw new CompanionError(`Codex thread ${threadId} is already running in job ${current.id}.`, "input");
+      }
+    }
+    return reserveWorkspace(request);
+  });
+}
+
+function executionArgs(record) {
+  const request = record.request ?? {};
+  const common = {
+    cwd: record.cwd,
+    effort: request.effort,
+    model: request.model,
+    network: Boolean(request.network),
+    web: Boolean(request.web)
+  };
+  if (request.transport === "native-review") {
+    return buildReviewArgs({
+      ...common,
+      base: request.base ?? undefined,
+      uncommitted: request.uncommitted === true
+    });
+  }
+  return buildTaskArgs({
+    ...common,
+    resumeThreadId: request.resumeThreadId ?? undefined,
+    write: request.write === true
+  });
+}
+
+function validateExecutionRequest(cwd, request) {
+  try {
+    executionArgs({ cwd, request });
+  } catch (error) {
+    throw new CompanionError(error.message, "input");
+  }
+}
+
+function failureKindForError(error) {
+  if (error?.failureKind) {
+    return error.failureKind;
+  }
+  if (error?.code === "ENOENT") {
+    return "missing_cli";
+  }
+  if (error?.code === "EACCES" || error?.code === "EPERM") {
+    return "permission";
+  }
+  return "error";
+}
+
+function finishExecutionFailure(file, record, error, env = process.env) {
+  const rawMessage = oneLine(error?.message ?? error, "Codex companion execution failed.");
+  appendJobLog(record.logFile, rawMessage);
+  const message = redactDiagnostic(rawMessage);
+  return finishJob(file, {
+    status: "error",
+    failureKind: failureKindForError(error),
+    errorMessage: message,
+    errorTail: redactDiagnostic(readLogTail(record.logFile, 20) || message)
+  }, env);
+}
+
+async function executeRecord(found) {
+  let record = readJobRecordFile(found.file) ?? found.record;
+  if (record.status !== "running") {
+    return record;
+  }
+  if (record.background && (!record.launchApprovedAt || record.launchAbortRequestedAt)) {
+    return finishExecutionFailure(found.file, record, new CompanionError("The background worker did not receive launch approval.", "process"));
+  }
+  let ownerIdentity;
+  try {
+    ownerIdentity = currentProcessIdentity();
+  } catch (error) {
+    return finishExecutionFailure(found.file, record, error);
+  }
+  const timeoutMs = resolveExecutionTimeout(record.background);
+  const startedAt = record.startedAt ?? nowIso();
+  record = updateJobRecordFile(found.file, {
+    deadlineAt: new Date(Date.now() + timeoutMs).toISOString(),
+    heartbeatAt: nowIso(),
+    phase: record.background ? "codex-spawning" : "executing",
+    pid: process.pid,
+    pidIdentity: ownerIdentity,
+    pidOwnsProcessGroup: record.background && process.platform !== "win32",
+    startedAt
+  });
+  let checkpointedThreadId = record.threadId;
+  const cancellation = new AbortController();
+  const heartbeat = setInterval(() => {
+    try {
+      const current = updateJobRecordFile(found.file, { heartbeatAt: nowIso() });
+      if (current.cancelRequestedAt) {
+        cancellation.abort();
+      }
+    } catch {}
+  }, HEARTBEAT_INTERVAL_MS);
+  heartbeat.unref?.();
+  try {
+    const prompt = record.request?.transport === "native-review" ? "" : readPromptFile(record.briefFile);
+    const args = executionArgs(record);
+    const outcome = await runCodex({
+      args,
+      cwd: record.cwd,
+      env: process.env,
+      eventsFile: record.eventsFile,
+      freshThread: !record.request?.resumeThreadId,
+      logFile: record.logFile,
+      onCheckpoint: (checkpoint) => {
+        if (checkpoint.threadId && checkpoint.threadId !== checkpointedThreadId) {
+          checkpointedThreadId = checkpoint.threadId;
+          updateJobRecordFile(found.file, { heartbeatAt: nowIso(), threadId: checkpoint.threadId });
+        }
+      },
+      onSpawnAttempt: (pid) => {
+        updateJobRecordFile(found.file, {
+          codexPid: pid,
+          codexPidIdentity: null,
+          codexPidOwnsProcessGroup: process.platform !== "win32",
+          heartbeatAt: nowIso(),
+          phase: "codex-spawning"
+        });
+      },
+      onSpawn: (pid, identity) => {
+        updateJobRecordFile(found.file, {
+          codexPid: pid,
+          codexPidIdentity: identity,
+          codexPidOwnsProcessGroup: process.platform !== "win32",
+          heartbeatAt: nowIso(),
+          phase: "executing"
+        });
+      },
+      prompt,
+      resumeThreadId: record.request?.resumeThreadId ?? undefined,
+      signal: cancellation.signal,
+      timeoutMs
+    });
+    if (!outcome.cleanupComplete) {
+      const message = outcome.errorMessage || "Codex process cleanup did not complete. The verified process identifiers were retained for retry.";
+      appendJobLog(record.logFile, message);
+      return cleanupRequired(found.file, outcome.failureKind ?? "process", message);
+    }
+    const errorTail = redactDiagnostic(readLogTail(record.logFile, 20) || boundedTail(outcome.stderrTail));
+    return finishJob(found.file, {
+      cumulativeTokenUsage: outcome.cumulativeTokenUsage,
+      diagnostics: outcome.diagnostics.map((diagnostic) => ({ ...diagnostic, message: redactDiagnostic(diagnostic.message) })),
+      errorMessage: outcome.errorMessage ? redactDiagnostic(outcome.errorMessage) : null,
+      errorTail: outcome.status === "done" ? null : errorTail || outcome.errorMessage,
+      eventsTruncated: outcome.eventsTruncated,
+      exitCode: outcome.exitCode,
+      failureKind: outcome.failureKind,
+      protocolError: outcome.protocolError ? redactDiagnostic(outcome.protocolError) : null,
+      result: {
+        eventCount: outcome.eventCount,
+        signal: outcome.signal,
+        terminalEvent: outcome.terminalEvent,
+        timedOut: outcome.timedOut
+      },
+      resultSource: outcome.resultSource,
+      resultText: outcome.finalResponse || null,
+      status: outcome.status,
+      threadId: outcome.threadId,
+      tokenUsage: outcome.tokenUsage,
+      tokenUsageAvailability: outcome.tokenUsageAvailability,
+      tokenUsageUnavailableReason: outcome.tokenUsageUnavailableReason,
+      unknownEventCount: outcome.unknownEventCount
+    });
+  } catch (error) {
+    return finishExecutionFailure(found.file, record, error);
+  } finally {
+    clearInterval(heartbeat);
+  }
+}
+
+function renderRecord(record, asJson, runningReceipt = false) {
+  if (asJson) {
+    output(record, true);
+    return;
+  }
+  if (record.status === "running") {
+    output(runningReceipt ? renderBackgroundLaunch(record) : renderRunningResult(record));
+    return;
+  }
+  output(renderTerminalResult(record));
+}
+
+export async function spawnBackgroundWorker(found, options = {}) {
+  let child;
+  let identity = null;
+  let approvalCommitted = false;
+  try {
+    child = spawn(process.execPath, [SELF_PATH, "worker", "--job-id", found.record.id, "--cwd", found.record.cwd], {
+      cwd: found.record.cwd,
+      detached: true,
+      env: options.env ?? process.env,
+      stdio: "ignore",
+      windowsHide: true
+    });
+    await new Promise((resolve, reject) => {
+      child.once("spawn", resolve);
+      child.once("error", reject);
+    });
+    await options.beforeIdentityProbe?.(child.pid);
+    identity = (options.identityReader ?? getProcessIdentity)(child.pid);
+    if (!identity) {
+      throw new CompanionError("The background worker process identity could not be verified.", "process");
+    }
+    const approved = updateJobRecordFileWithCurrent(found.file, (current) => {
+      if (current.launchAbortRequestedAt || current.cancelRequestedAt) {
+        throw new CompanionError("The background worker launch was cancelled before approval.", "cancelled");
+      }
+      if (current.pid && current.pid !== child.pid) {
+        throw new CompanionError(`Codex job ${current.id} was claimed by another worker.`, "process");
+      }
+      if (current.pidIdentity && !processIdentityMatches(child.pid, current.pidIdentity)) {
+        throw new CompanionError("The background worker claim no longer matches the spawned process.", "process");
+      }
+      return {
+        launchApprovedAt: current.launchApprovedAt ?? nowIso(),
+        phase: "launch-approved",
+        pid: child.pid,
+        pidIdentity: identity,
+        pidOwnsProcessGroup: process.platform !== "win32"
+      };
+    });
+    if (approved.status !== "running" || !approved.launchApprovedAt || approved.launchAbortRequestedAt) {
+      throw new CompanionError("The background worker launch could not be approved.", "process");
+    }
+    approvalCommitted = true;
+    await options.afterLaunchApproval?.(approved);
+    child.unref();
+    return approved;
+  } catch (error) {
+    const env = options.env ?? process.env;
+    let current = readJobRecordFile(found.file) ?? found.record;
+    if (terminalRecord(current)) {
+      return current;
+    }
+    let currentIdentity = null;
+    if (child?.pid && identity) {
+      try {
+        currentIdentity = (options.identityReader ?? getProcessIdentity)(child.pid);
+      } catch {}
+    }
+    const durableApproval = Boolean(
+      child?.pid &&
+        identity &&
+        current.launchApprovedAt &&
+        !current.launchAbortRequestedAt &&
+        current.pid === child.pid &&
+        current.pidIdentity &&
+        processIdentitiesMatch(identity, current.pidIdentity) &&
+        (!currentIdentity || processIdentitiesMatch(currentIdentity, current.pidIdentity))
+    );
+    if (approvalCommitted || durableApproval) {
+      child.unref();
+      return current;
+    }
+    if (!identity && child?.pid && current.pid === child.pid && current.pidIdentity && processIdentityMatches(child.pid, current.pidIdentity)) {
+      identity = current.pidIdentity;
+    }
+    try {
+      current = updateJobRecordFileWithCurrent(found.file, (record) => ({
+        errorMessage: `Background worker launch failed: ${oneLine(error?.message ?? error, "unknown failure")}`,
+        errorTail: `Background worker launch failed: ${oneLine(error?.message ?? error, "unknown failure")}`,
+        failureKind: failureKindForError(error),
+        launchAbortRequestedAt: record.launchAbortRequestedAt ?? nowIso(),
+        phase: "launch-aborted",
+        pid: record.pid ?? child?.pid ?? null,
+        pidIdentity: record.pid === child?.pid && record.pidIdentity ? record.pidIdentity : identity,
+        pidOwnsProcessGroup: record.pidOwnsProcessGroup || Boolean(child?.pid && process.platform !== "win32")
+      }));
+    } catch {}
+    const claimDeadline = Date.now() + BACKGROUND_ABORT_CLAIM_WAIT_MS;
+    while (child?.pid && !identity && Date.now() < claimDeadline && isProcessAlive(child.pid, null, process.platform !== "win32")) {
+      current = readJobRecordFile(found.file) ?? current;
+      if (terminalRecord(current)) {
+        return current;
+      }
+      if (current.pid === child.pid && current.pidIdentity && processIdentityMatches(child.pid, current.pidIdentity)) {
+        identity = current.pidIdentity;
+        break;
+      }
+      await delay(BACKGROUND_LAUNCH_POLL_MS);
+    }
+    current = readJobRecordFile(found.file) ?? current;
+    if (terminalRecord(current)) {
+      return current;
+    }
+    await terminateRecorded(current, "codex", 500);
+    current = readJobRecordFile(found.file) ?? current;
+    if (terminalRecord(current)) {
+      return current;
+    }
+    let workerCleanupComplete = !child?.pid || !isProcessAlive(child.pid, null, process.platform !== "win32");
+    if (!workerCleanupComplete && identity) {
+      workerCleanupComplete = await terminateProcessTree(child.pid, {
+        allowOrphanedGroup: true,
+        graceMs: 500,
+        identity,
+        ownsProcessGroup: process.platform !== "win32",
+        requireIdentity: true
+      });
+    } else if (!workerCleanupComplete) {
+      workerCleanupComplete = await terminateRecorded(current, "owner", 500);
+    }
+    current = readJobRecordFile(found.file) ?? current;
+    if (terminalRecord(current)) {
+      return current;
+    }
+    const cleanupDeadline = Date.now() + BACKGROUND_ABORT_CLEANUP_CONFIRM_MS;
+    while (Date.now() < cleanupDeadline) {
+      workerCleanupComplete = workerCleanupComplete || !child?.pid || !isProcessAlive(child.pid, null, process.platform !== "win32");
+      if (workerCleanupComplete && cleanupComplete(current)) {
+        break;
+      }
+      await delay(BACKGROUND_ABORT_CLEANUP_POLL_MS);
+      current = readJobRecordFile(found.file) ?? current;
+      if (terminalRecord(current)) {
+        return current;
+      }
+    }
+    if (!workerCleanupComplete || !cleanupComplete(current)) {
+      const message = `Background worker launch failed and verified cleanup did not complete: ${oneLine(error?.message ?? error, "unknown failure")}`;
+      updateJobRecordFileWithCurrent(found.file, (current) => ({
+        errorMessage: message,
+        errorTail: message,
+        failureKind: failureKindForError(error),
+        phase: "cleanup-required",
+        pid: current.pid ?? child?.pid ?? null,
+        pidIdentity: current.pid === child?.pid && current.pidIdentity ? current.pidIdentity : identity,
+        pidOwnsProcessGroup: current.pidOwnsProcessGroup || Boolean(child?.pid && process.platform !== "win32")
+      }));
+      return cleanupRequired(found.file, failureKindForError(error), message);
+    }
+    return finishExecutionFailure(found.file, current, error, env);
+  }
+}
+
+async function dispatchJob(found, asJson) {
+  if (found.record.background) {
+    const launched = await spawnBackgroundWorker(found);
+    const launchFailed = launched.status === "error" || launched.status === "cancelled" || launched.phase === "cleanup-required";
+    renderRecord(launched, asJson, !launchFailed);
+    collectRenderedJob(found.file, launched);
+    if (launchFailed) {
+      process.exitCode = 1;
+    }
+    return;
+  }
+  const completed = await executeRecord(found);
+  renderRecord(completed, asJson);
+  collectRenderedJob(found.file, completed);
+  if (completed.status !== "done") {
+    process.exitCode = 1;
+  }
+}
+
+async function handleTask(rawArgv, transport = {}) {
+  const { options, positionals, positionalText } = commandArgs(rawArgv, {
+    booleanOptions: ["background", "fresh", "json", "network", "resume-last", "web", "write"],
+    optionsBeforePositionals: true,
+    valueOptions: ["cwd", "effort", "model", "prompt-file", "resume"]
+  });
+  const cwd = resolveCwd(options);
+  const dataDir = resolveDataDir();
+  const resume = resolveResume(dataDir, cwd, options);
+  const write = options.write ?? Boolean(transport.defaultWrite);
+  let prompt = readTaskPrompt(cwd, options, positionals, positionalText);
+  if (!prompt.trim() && resume.threadId) {
+    prompt = CONTINUE_PROMPT;
+  }
+  if (!prompt.trim()) {
+    throw new CompanionError("Provide a Codex task prompt or --prompt-file.", "input");
+  }
+  if (options.network && !write) {
+    throw new CompanionError("--network requires --write because network access applies to the workspace-write sandbox.", "input");
+  }
+  const probe = preflightCodex(cwd);
+  const request = {
+    effort: options.effort ?? null,
+    fresh: Boolean(options.fresh),
+    model: options.model ?? null,
+    network: Boolean(options.network),
+    resumeSourceJobId: resume.sourceJobId,
+    resumeThreadId: resume.threadId,
+    transport: "task",
+    web: Boolean(options.web),
+    write: Boolean(write)
+  };
+  validateExecutionRequest(cwd, request);
+  const found = createReservedJob({
+    background: Boolean(options.background),
+    brief: prompt,
+    codexVersion: probe.version,
+    cwd,
+    dataDir,
+    jobClass: "task",
+    mode: write ? "write" : "consult",
+    request
+  });
+  await dispatchJob(found, Boolean(options.json));
+}
+
+function reviewTarget(options) {
+  const scope = options.scope ?? "auto";
+  if (!["auto", "working-tree", "branch"].includes(scope)) {
+    throw new CompanionError("--scope must be auto, working-tree, or branch.", "input");
+  }
+  if (scope === "working-tree" && options.base) {
+    throw new CompanionError("--base cannot be combined with --scope working-tree.", "input");
+  }
+  if (scope === "branch" && !options.base) {
+    throw new CompanionError("--scope branch requires --base <ref>.", "input");
+  }
+  const base = scope === "working-tree" ? null : options.base ?? null;
+  return {
+    base,
+    description: base ? `the current branch compared with ${base}` : "the current working tree changes",
+    uncommitted: !base
+  };
+}
+
+function focusedReviewPrompt(target, focus) {
+  return [
+    "Perform a read only software review of the repository.",
+    `Review target: ${target.description}.`,
+    `User focus: ${focus}`,
+    "Inspect the relevant Git state and source directly. Report only material, actionable findings with file paths and line numbers. Do not modify files. If no substantive finding is defensible, say so explicitly."
+  ].join("\n\n");
+}
+
+function adversarialReviewPrompt(target, focus) {
+  let template;
+  try {
+    template = fs.readFileSync(ADVERSARIAL_REVIEW_PROMPT_FILE, "utf8");
+  } catch (error) {
+    throw new CompanionError(`Could not read the adversarial review prompt: ${error.message}`, "input");
+  }
+  return template.replaceAll("{{TARGET}}", target.description).replaceAll("{{FOCUS}}", focus || "No additional focus was supplied.");
+}
+
+async function handleReview(rawArgv, adversarial = false) {
+  const { options, positionals, positionalText } = commandArgs(rawArgv, {
+    booleanOptions: ["background", "json"],
+    valueOptions: ["base", "cwd", "effort", "focus", "model", "scope"]
+  });
+  if (positionals.length > 0 && !options.focus) {
+    throw new CompanionError("Review accepts flags only. Pass custom review instructions with --focus.", "input");
+  }
+  const cwd = resolveCwd(options);
+  const probe = preflightCodex(cwd);
+  const target = reviewTarget(options);
+  const positionalFocus = positionalText ?? positionals.join(" ");
+  const focus = [options.focus, positionalFocus].filter(Boolean).join(" ").trim();
+  const usePromptTransport = adversarial || Boolean(focus);
+  const brief = adversarial
+    ? adversarialReviewPrompt(target, focus)
+    : focus
+      ? focusedReviewPrompt(target, focus)
+      : "";
+  const request = {
+    base: target.base,
+    effort: options.effort ?? null,
+    focus: focus || null,
+    model: options.model ?? null,
+    network: false,
+    transport: usePromptTransport ? (adversarial ? "adversarial-review" : "focused-review") : "native-review",
+    uncommitted: target.uncommitted,
+    web: false,
+    write: false
+  };
+  validateExecutionRequest(cwd, request);
+  const dataDir = resolveDataDir();
+  const found = createReservedJob({
+    background: Boolean(options.background),
+    brief,
+    codexVersion: probe.version,
+    cwd,
+    dataDir,
+    jobClass: adversarial ? "adversarial-review" : "review",
+    mode: "consult",
+    request
+  });
+  await dispatchJob(found, Boolean(options.json));
+}
+
+async function waitForBackgroundLaunchApproval(file, record) {
+  const deadline = Date.now() + positiveEnvMs(BACKGROUND_LAUNCH_APPROVAL_TIMEOUT_ENV, BACKGROUND_LAUNCH_APPROVAL_TIMEOUT_MS);
+  let current = record;
+  for (;;) {
+    current = readJobRecordFile(file) ?? current;
+    if (current.status !== "running" || current.launchAbortRequestedAt || current.cancelRequestedAt || current.phase === "cleanup-required") {
+      return current;
+    }
+    if (current.pid !== process.pid || !current.pidIdentity) {
+      return finishExecutionFailure(file, current, new CompanionError("The background worker lost its launch claim.", "process"));
+    }
+    if (current.launchApprovedAt && current.phase === "launch-approved") {
+      return current;
+    }
+    if (Date.now() >= deadline) {
+      const message = "The background worker launch approval timed out.";
+      let committed = false;
+      const completed = updateJobRecordFileWithCurrent(file, (latest) => {
+        if (latest.launchApprovedAt || latest.launchAbortRequestedAt || latest.cancelRequestedAt) {
+          return null;
+        }
+        committed = true;
+        return {
+          status: "error",
+          failureKind: "timeout",
+          errorMessage: message,
+          errorTail: message
+        };
+      });
+      if (committed) {
+        appendJobLog(record.logFile, message);
+        pruneJobState(resolveDataDir(), { claudeSessionId: completed.claudeSessionId, protectedJobFiles: [file], resumeWorkspaceJobFiles: [file] });
+      }
+      return completed;
+    }
+    await delay(BACKGROUND_LAUNCH_POLL_MS);
+  }
+}
+
+async function handleWorker(rawArgv) {
+  const { options, positionals } = commandArgs(rawArgv, {
+    valueOptions: ["cwd", "job-id"]
+  });
+  if (positionals.length > 0 || !options["job-id"] || !options.cwd) {
+    throw new CompanionError("worker requires --job-id and --cwd.", "input");
+  }
+  const cwd = resolveCwd(options);
+  const dataDir = resolveDataDir();
+  const file = jobFilePath(dataDir, cwd, options["job-id"]);
+  const record = readJobRecordFile(file);
+  if (!record) {
+    throw new CompanionError(`No job record found for ${options["job-id"]}.`, "input");
+  }
+  if (!record.background) {
+    throw new CompanionError("worker can execute only a background job.", "input");
+  }
+  const ownerIdentity = currentProcessIdentity();
+  const claimed = updateJobRecordFileWithCurrent(file, (current) => {
+    if (current.pid && current.pid !== process.pid) {
+      const owner = recordedProcessState(current, "owner");
+      if (owner.state === "owned" || owner.state === "unverified") {
+        throw new CompanionError(`Codex job ${current.id} already has a live worker.`, "input");
+      }
+    }
+    if (current.startedAt && current.pid !== process.pid) {
+      throw new CompanionError(`Codex job ${current.id} has already started.`, "input");
+    }
+    return {
+      phase: current.launchAbortRequestedAt || current.cancelRequestedAt || current.phase === "cleanup-required" ? current.phase : current.launchApprovedAt ? "launch-approved" : "awaiting-launch-approval",
+      pid: process.pid,
+      pidIdentity: ownerIdentity,
+      pidOwnsProcessGroup: process.platform !== "win32"
+    };
+  });
+  if (claimed.status !== "running") {
+    return;
+  }
+  const approved = await waitForBackgroundLaunchApproval(file, claimed);
+  if (approved.status !== "running" || approved.launchAbortRequestedAt || approved.cancelRequestedAt || approved.phase === "cleanup-required") {
+    process.exitCode = 1;
+    return;
+  }
+  const completed = await executeRecord({ record: approved, file });
+  if (completed.status !== "done") {
+    process.exitCode = 1;
+  }
+}
+
+async function handleStatus(rawArgv) {
+  const { options, positionals } = commandArgs(rawArgv, {
+    booleanOptions: ["all", "json"],
+    valueOptions: ["cwd"]
+  });
+  if (positionals.length > 1) {
+    throw new CompanionError("status accepts at most one job id.", "input");
+  }
+  const dataDir = resolveDataDir();
+  if (positionals[0]) {
+    const found = findRequestedJob(dataDir, positionals[0], options);
+    if (!found) {
+      throw new CompanionError(`No job record found for ${positionals[0]}.`, "input");
+    }
+    const record = await refreshRunningJobRecord(found);
+    output(options.json ? record : renderJobDetail(record), Boolean(options.json));
+    return;
+  }
+  if (options.all && options.cwd) {
+    throw new CompanionError("--all cannot be combined with --cwd.", "input");
+  }
+  const cwd = options.all ? null : resolveCwd(options);
+  const entries = options.all
+    ? listAllJobRecords(dataDir)
+    : listJobRecords(dataDir, cwd).map((record) => ({ record, file: jobFilePath(dataDir, cwd, record.id) }));
+  const records = [];
+  for (const entry of entries) {
+    records.push(await refreshRunningJobRecord(entry));
+  }
+  output(options.json ? { jobs: records } : renderStatusTable(records), Boolean(options.json));
+}
+
+function delay(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function waitForResult(found, options) {
+  const deadline = Date.now() + resolveWaitTimeout(options);
+  const pollMs = resolveWaitPoll();
+  let record = found.record;
+  for (;;) {
+    record = await refreshRunningJobRecord({ record, file: found.file });
+    if (record.status !== "running") {
+      return record;
+    }
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) {
+      return record;
+    }
+    await delay(Math.min(pollMs, remaining));
+    record = readJobRecordFile(found.file) ?? record;
+  }
+}
+
+async function handleResult(rawArgv) {
+  const { options, positionals } = commandArgs(rawArgv, {
+    booleanOptions: ["json", "wait"],
+    valueOptions: ["cwd", "wait-timeout-ms"]
+  });
+  if (positionals.length !== 1) {
+    throw new CompanionError("Provide exactly one Codex job id.", "input");
+  }
+  const dataDir = resolveDataDir();
+  const found = findRequestedJob(dataDir, positionals[0], options);
+  if (!found) {
+    throw new CompanionError(`No job record found for ${positionals[0]}.`, "input");
+  }
+  const record = options.wait ? await waitForResult(found, options) : await refreshRunningJobRecord(found);
+  renderRecord(record, Boolean(options.json));
+  collectRenderedJob(found.file, record);
+  if (record.status === "error" || record.status === "cancelled" || record.phase === "cleanup-required") {
+    process.exitCode = 1;
+  }
+}
+
+async function cancelFoundJob(found) {
+  let record = await refreshRunningJobRecord(found);
+  if (record.status !== "running") {
+    return record;
+  }
+  const spawnCheckpointPending = codexSpawnCheckpointPending(record);
+  record = updateJobRecordFileWithCurrent(found.file, (current) => ({
+    cancelRequestedAt: nowIso(),
+    phase: "cancelling"
+  }));
+  if (record.status !== "running") {
+    return record;
+  }
+  if (spawnCheckpointPending) {
+    signalRecorded(record, "owner");
+    return cleanupRequired(found.file, "cancelled", "Cancellation was requested while the Codex process identity checkpoint was incomplete. Graceful cleanup was requested without forcing the companion to exit.");
+  }
+  await Promise.all([terminateRecorded(record, "codex", 500), terminateRecorded(record, "owner", 500)]);
+  const refreshed = readJobRecordFile(found.file) ?? record;
+  if (!cleanupComplete(refreshed)) {
+    return cleanupRequired(found.file, "cancelled", "Cancellation was requested, but verified process cleanup did not complete. The process identifiers were retained for retry.");
+  }
+  return finishJob(found.file, {
+    status: "cancelled",
+    failureKind: "cancelled",
+    errorMessage: "Codex job was cancelled."
+  });
+}
+
+async function handleCancel(rawArgv) {
+  const { options, positionals } = commandArgs(rawArgv, {
+    booleanOptions: ["json"],
+    valueOptions: ["cwd"]
+  });
+  if (positionals.length !== 1) {
+    throw new CompanionError("Provide exactly one Codex job id.", "input");
+  }
+  const dataDir = resolveDataDir();
+  const found = findRequestedJob(dataDir, positionals[0], options);
+  if (!found) {
+    throw new CompanionError(`No job record found for ${positionals[0]}.`, "input");
+  }
+  const record = await cancelFoundJob(found);
+  const rendered = record.status === "cancelled" ? renderCancelReport(record) : record.status === "running" ? renderRunningResult(record) : renderTerminalResult(record);
+  output(options.json ? record : rendered, Boolean(options.json));
+  if (record.status === "running") {
+    process.exitCode = 1;
+  }
+}
+
+function readHookInput() {
+  if (isatty(0)) {
+    return {};
+  }
+  try {
+    const raw = fs.readFileSync(0, "utf8").trim();
+    const parsed = raw ? JSON.parse(raw) : {};
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+async function handleSessionEnd() {
+  const input = readHookInput();
+  const sessionId = input.session_id ?? currentClaudeSessionId();
+  pruneRawCommandTransports({ sessionId });
+  if (!sessionId) {
+    return;
+  }
+  const owned = listAllJobRecords(resolveDataDir()).filter(
+    (found) => found.record.status === "running" && found.record.claudeSessionId === sessionId
+  );
+  const marked = owned.map((found) => {
+    try {
+      const record = updateJobRecordFileWithCurrent(found.file, (current) => ({
+        cancelRequestedAt: current.cancelRequestedAt ?? nowIso(),
+        phase: "cancelling"
+      }));
+      return { ...found, record };
+    } catch {
+      return found;
+    }
+  });
+  await Promise.all(
+    marked.map(async (found) => {
+      try {
+        await cancelFoundJob(found);
+      } catch {}
+    })
+  );
+}
+
+async function handleResumeCandidate(rawArgv) {
+  const { options, positionals } = commandArgs(rawArgv, {
+    booleanOptions: ["json"],
+    valueOptions: ["cwd"]
+  });
+  if (positionals.length > 0) {
+    throw new CompanionError("task-resume-candidate accepts flags only.", "input");
+  }
+  const cwd = resolveCwd(options);
+  const record = latestResumeRecord(resolveDataDir(), cwd, currentClaudeSessionId());
+  if (options.json) {
+    output({ jobId: record.id, threadId: record.threadId }, true);
+    return;
+  }
+  output(`codex-session: ${record.threadId}\njob: ${record.id}\nstate: ${record.status}\n`);
+}
+
+function authenticationStatus(bin, cwd, env = process.env) {
+  const result = spawnSync(bin, ["login", "status"], {
+    cwd,
+    encoding: "utf8",
+    env,
+    timeout: 5000,
+    windowsHide: true
+  });
+  if (!result.error && typeof result.status === "number" && result.status !== 0 && typeof env.CODEX_API_KEY === "string" && env.CODEX_API_KEY.trim()) {
+    return {
+      authenticated: true,
+      detail: "authenticated via CODEX_API_KEY environment variable (login status reports logged out)"
+    };
+  }
+  return {
+    authenticated: !result.error && result.status === 0,
+    detail: String(result.stdout || result.stderr || result.error?.message || "").trim() || null
+  };
+}
+
+function handleSetup(rawArgv) {
+  const { options, positionals } = commandArgs(rawArgv, {
+    booleanOptions: ["json"],
+    valueOptions: ["cwd"]
+  });
+  if (positionals.length > 0) {
+    throw new CompanionError("setup accepts flags only.", "input");
+  }
+  const cwd = resolveCwd(options);
+  const codex = getCodexAvailability({ cwd, env: process.env });
+  const auth = codex.available ? authenticationStatus(codex.bin, cwd, process.env) : { authenticated: false, detail: null };
+  const compatible = codex.available && supportedVersion(codex.version);
+  const dataDir = resolveDataDir();
+  let writable = true;
+  try {
+    fs.mkdirSync(dataDir, { recursive: true, mode: 0o700 });
+    fs.chmodSync(dataDir, 0o700);
+    fs.accessSync(dataDir, fs.constants.W_OK);
+  } catch {
+    writable = false;
+  }
+  const nextSteps = [];
+  if (!codex.available) {
+    nextSteps.push("Install the official OpenAI Codex CLI, then run /codex:setup again.");
+  } else if (!auth.authenticated) {
+    nextSteps.push("Run codex login, then run /codex:setup again.");
+  }
+  if (codex.available && !compatible) {
+    nextSteps.push("Use a Codex CLI version from 0.144.0 to the latest 0.144.x release.");
+  }
+  if (!writable) {
+    nextSteps.push(`Make the adapter data directory writable: ${dataDir}.`);
+  }
+  const report = {
+    authenticated: auth.authenticated,
+    authenticationDetail: auth.detail ? redactDiagnostic(boundedTail(auth.detail, 5)) : null,
+    codex: {
+      ...codex,
+      bin: redactDiagnostic(codex.bin),
+      errorMessage: codex.errorMessage ? redactDiagnostic(boundedTail(codex.errorMessage, 5)) : null,
+      rawVersion: codex.rawVersion ? redactDiagnostic(boundedTail(codex.rawVersion, 5)) : null
+    },
+    compatibility: compatible ? "tested" : codex.available ? "outside the tested 0.144.x interval" : "unknown",
+    dataDir,
+    nextSteps,
+    ready: codex.available && auth.authenticated && compatible && writable,
+    writable
+  };
+  output(options.json ? report : renderSetupReport(report), Boolean(options.json));
+  if (!report.ready) {
+    process.exitCode = 1;
+  }
+}
+
+async function main() {
+  const [subcommand, ...receivedArgv] = process.argv.slice(2);
+  if (!subcommand || subcommand === "help" || subcommand === "--help") {
+    printUsage();
+    return;
+  }
+  if (subcommand === "transport-create") {
+    if (receivedArgv.length > 0) {
+      throw new CompanionError("transport-create accepts no arguments.", "input");
+    }
+    createRawCommandTransport();
+    return;
+  }
+  if (subcommand === "transport-discard") {
+    if (receivedArgv.length !== 2 || receivedArgv[0] !== "--raw-args-token") {
+      throw new CompanionError("transport-discard requires exactly one raw argument token.", "input");
+    }
+    consumeRawCommandTransport(receivedArgv[1]);
+    return;
+  }
+  const transport = resolveCommandTransport(receivedArgv);
+  if (transport.defaultWrite && subcommand !== "task") {
+    throw new CompanionError("The raw command transport write default is valid only for task.", "input");
+  }
+  const rawArgv = transport.argv;
+  activeCommandArgv = rawArgv;
+  switch (subcommand) {
+    case "task":
+      await handleTask(rawArgv, transport);
+      break;
+    case "worker":
+      await handleWorker(rawArgv);
+      break;
+    case "review":
+      await handleReview(rawArgv, false);
+      break;
+    case "adversarial-review":
+      await handleReview(rawArgv, true);
+      break;
+    case "status":
+      await handleStatus(rawArgv);
+      break;
+    case "result":
+      await handleResult(rawArgv);
+      break;
+    case "cancel":
+      await handleCancel(rawArgv);
+      break;
+    case "setup":
+      handleSetup(rawArgv);
+      break;
+    case "task-resume-candidate":
+      await handleResumeCandidate(rawArgv);
+      break;
+    case "session-end":
+      await handleSessionEnd();
+      break;
+    default:
+      throw new CompanionError(`Unknown subcommand: ${subcommand}.`, "input");
+  }
+}
+
+function wantsJsonError() {
+  const raw = activeCommandArgv ?? process.argv.slice(3);
+  try {
+    return normalizeArgv(raw).some((token) => token === "--json" || token === "--json=true");
+  } catch {
+    return raw.some((token) => token.includes("--json"));
+  }
+}
+
+function renderTopLevelError(error) {
+  const message = redactDiagnostic(oneLine(error?.message ?? error, "Codex companion failed."));
+  const failureKind = failureKindForError(error);
+  if (wantsJsonError()) {
+    return `${JSON.stringify({ status: "error", failureKind, message }, null, 2)}\n`;
+  }
+  return `${message}\nstate: error\nfailure: ${failureKind}\n`;
+}
+
+if (process.argv[1] && path.resolve(process.argv[1]) === SELF_PATH) {
+  main().catch((error) => {
+    if (process.argv[2] !== "session-end") {
+      process.stderr.write(renderTopLevelError(error));
+      process.exitCode = 1;
+    }
+  });
+}
