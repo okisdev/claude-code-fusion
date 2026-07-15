@@ -62,22 +62,63 @@ test("collects a terminal state from a state line", (t) => {
   assert.strictEqual(fs.readFileSync(resultCountFile, "utf8"), "1");
 });
 
-test("collects terminal output through fallback word detection", (t) => {
+test("accepts an engine session line in the terminal footer", (t) => {
+  const sandbox = makeSandbox(t);
+  const status = writeScript(sandbox, "status.mjs", 'process.stdout.write("grok-session: session-1\\njob: task-1\\nstate: done\\n");\n');
+  const result = writeScript(sandbox, "result.mjs", 'process.stdout.write("grok result\\n");\n');
+  const output = runCollector(nodeCommand(status), nodeCommand(result));
+  assert.strictEqual(output.status, 0, output.stderr);
+  assert.match(output.stdout, /^grok result\ncollector: state=done elapsed=\d+s\n$/);
+});
+
+test("does not infer terminal state from prose without an explicit footer", (t) => {
   const sandbox = makeSandbox(t);
   const status = writeScript(sandbox, "status.mjs", 'process.stdout.write("Job completed successfully.\\n");\n');
   const result = writeScript(sandbox, "result.mjs", 'process.stdout.write("fallback result\\n");\n');
-  const output = runCollector(nodeCommand(status), nodeCommand(result));
-  assert.strictEqual(output.status, 0, output.stderr);
-  assert.match(output.stdout, /^fallback result\ncollector: state=completed elapsed=\d+s\n$/);
+  const output = runCollector(nodeCommand(status), nodeCommand(result), ["--interval-ms", "1", "--cap-ms", "100"]);
+  assert.strictEqual(output.status, 2, output.stderr);
+  assert.match(output.stdout, /^Job completed successfully\.\ncollector: timeout elapsed=\d+s\n$/);
 });
 
 test("prints the last status output and exits on timeout", (t) => {
   const sandbox = makeSandbox(t);
   const status = writeScript(sandbox, "status.mjs", 'process.stdout.write("Status: running\\npid: 123 alive\\n");\n');
   const result = writeScript(sandbox, "result.mjs", 'process.stdout.write("must not run\\n");\n');
-  const output = runCollector(nodeCommand(status), nodeCommand(result), ["--interval-ms", "2", "--cap-ms", "10"]);
+  const output = runCollector(nodeCommand(status), nodeCommand(result), ["--interval-ms", "2", "--cap-ms", "100"]);
   assert.strictEqual(output.status, 2, output.stderr);
   assert.match(output.stdout, /^Status: running\npid: 123 alive\ncollector: timeout elapsed=\d+s\n$/);
+});
+
+test("rejects a collection cap that cannot fit the Bash tool timeout", (t) => {
+  const sandbox = makeSandbox(t);
+  const status = writeScript(sandbox, "status.mjs", 'process.stdout.write("state: running\\n");\n');
+  const result = writeScript(sandbox, "result.mjs", 'process.stdout.write("must not run\\n");\n');
+  const output = runCollector(nodeCommand(status), nodeCommand(result), ["--cap-ms", "540001"]);
+  assert.strictEqual(output.status, 1);
+  assert.match(output.stderr, /--cap-ms cannot exceed 540000/);
+  assert.match(output.stderr, /--cap-ms 540000/);
+});
+
+test("the wall clock cap terminates a stuck status command", (t) => {
+  const sandbox = makeSandbox(t);
+  const status = writeScript(sandbox, "status.mjs", 'setTimeout(() => process.stdout.write("state: running\\n"), 5000);\n');
+  const result = writeScript(sandbox, "result.mjs", 'process.stdout.write("must not run\\n");\n');
+  const startedAt = Date.now();
+  const output = runCollector(nodeCommand(status), nodeCommand(result), ["--cap-ms", "50"]);
+  assert.strictEqual(output.status, 2, output.stderr);
+  assert.ok(Date.now() - startedAt < 1000);
+  assert.match(output.stdout, /collector: timeout elapsed=0s/);
+});
+
+test("the wall clock cap terminates a stuck result command", (t) => {
+  const sandbox = makeSandbox(t);
+  const status = writeScript(sandbox, "status.mjs", 'process.stdout.write("job: test\\nstate: done\\n");\n');
+  const result = writeScript(sandbox, "result.mjs", 'setTimeout(() => process.stdout.write("too late\\n"), 5000);\n');
+  const startedAt = Date.now();
+  const output = runCollector(nodeCommand(status), nodeCommand(result), ["--cap-ms", "100"]);
+  assert.strictEqual(output.status, 2, output.stderr);
+  assert.ok(Date.now() - startedAt < 1000);
+  assert.match(output.stdout, /^job: test\nstate: done\ncollector: timeout elapsed=0s\n$/);
 });
 
 test("stops when a running process is flagged as dead", (t) => {
@@ -144,4 +185,22 @@ test("preserves result stdout without a trailing newline before the collector li
   const output = runCollector(nodeCommand(status), nodeCommand(result));
   assert.strictEqual(output.status, 0, output.stderr);
   assert.match(output.stdout, /^verbatim result\ncollector: state=cancelled elapsed=\d+s\n$/);
+});
+
+test("propagates a nonzero result command exit code", (t) => {
+  const sandbox = makeSandbox(t);
+  const status = writeScript(sandbox, "status.mjs", 'process.stdout.write("job: test\\nstate: error\\nfailure: quota\\n");\n');
+  const result = writeScript(sandbox, "result.mjs", 'process.stdout.write("quota exhausted\\n");\nprocess.exit(7);\n');
+  const output = runCollector(nodeCommand(status), nodeCommand(result));
+  assert.strictEqual(output.status, 7, output.stderr);
+  assert.match(output.stdout, /^quota exhausted\ncollector: state=error elapsed=\d+s\n$/);
+});
+
+test("ignores a state line outside the final metadata footer", (t) => {
+  const sandbox = makeSandbox(t);
+  const status = writeScript(sandbox, "status.mjs", 'process.stdout.write("state: done\\nstill running\\n");\n');
+  const result = writeScript(sandbox, "result.mjs", 'process.stdout.write("must not run\\n");\n');
+  const output = runCollector(nodeCommand(status), nodeCommand(result), ["--interval-ms", "1", "--cap-ms", "100"]);
+  assert.strictEqual(output.status, 2, output.stderr);
+  assert.match(output.stdout, /^state: done\nstill running\ncollector: timeout elapsed=\d+s\n$/);
 });
