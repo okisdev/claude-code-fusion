@@ -6,14 +6,14 @@
     "email": "hi@okis.dev"
   },
   "description": "Multi-model orchestration marketplace for Claude Code.",
-  "version": "0.0.22",
+  "version": "0.0.23",
   "plugins": [
     {
       "name": "grok",
       "source": "./plugins/grok",
       "displayName": "Grok Companion",
       "description": "Local Grok CLI delegation: task, review, best-of-n tournaments, background jobs, stats, and setup health checks.",
-      "version": "0.0.22",
+      "version": "0.0.23",
       "author": {
         "name": "Harry Yep"
       },
@@ -24,11 +24,26 @@
       "tags": ["grok", "xai", "delegation", "code-review", "orchestration"]
     },
     {
+      "name": "codex",
+      "source": "./plugins/codex",
+      "displayName": "Codex Companion",
+      "description": "First party local Codex CLI delegation for tasks, reviews, resumable threads, and durable background jobs.",
+      "version": "0.0.23",
+      "author": {
+        "name": "Harry Yep"
+      },
+      "homepage": "https://github.com/okisdev/claude-code-fusion",
+      "repository": "https://github.com/okisdev/claude-code-fusion",
+      "license": "MIT",
+      "category": "workflow",
+      "tags": ["codex", "openai", "delegation", "code-review", "orchestration"]
+    },
+    {
       "name": "fusion",
       "source": "./plugins/fusion",
       "displayName": "Fusion Orchestrator",
       "description": "Multi-model orchestration: tier agents, routing rules, blind panel, ultra fleet, model config, and drift doctor.",
-      "version": "0.0.22",
+      "version": "0.0.23",
       "author": {
         "name": "Harry Yep"
       },
