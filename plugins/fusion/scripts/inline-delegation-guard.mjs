@@ -7,15 +7,29 @@ import { fileURLToPath } from "node:url";
 
 const STATE_ENV = "FUSION_INLINE_GUARD_STATE";
 const BUDGET_ENV = "FUSION_INLINE_WRITE_BUDGET";
+const AUDIT_DIR_ENV = "FUSION_INLINE_GUARD_AUDIT_DIR";
+const AUDIT_RETENTION_DAYS_ENV = "FUSION_INLINE_GUARD_AUDIT_RETENTION_DAYS";
+const AUDIT_MAX_BYTES_ENV = "FUSION_INLINE_GUARD_AUDIT_MAX_BYTES";
+const AUDIT_MAX_FILES_ENV = "FUSION_INLINE_GUARD_AUDIT_MAX_FILES";
 const DEFAULT_BUDGET = 5;
+const DEFAULT_AUDIT_RETENTION_DAYS = 180;
+const DEFAULT_AUDIT_MAX_BYTES = 2 * 1024 * 1024;
+const DEFAULT_AUDIT_MAX_FILES = 256;
+const AUDIT_SCHEMA_VERSION = 1;
 const STALE_MS = 48 * 60 * 60 * 1000;
+const DAY_MS = 24 * 60 * 60 * 1000;
 const LOCK_RETRY_MS = 10;
 const LOCK_TIMEOUT_MS = 2000;
 const LOCK_STALE_MS = 10000;
 const DISPATCH_LOG_LIMIT = 200;
+const DESCRIPTION_MAX_LENGTH = 120;
+const AUDIT_PATH_MAX_LENGTH = 240;
+const AUDIT_FILE_PATTERN = /^events-(\d{4}-\d{2}-\d{2})(?:\.(\d+))?\.jsonl$/;
+const SESSION_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 const WRITE_TOOLS = new Set(["Edit", "Write", "NotebookEdit", "MultiEdit"]);
 const DELEGATION_TOOLS = new Set(["Agent", "Task"]);
 const BUILTIN_LANE = "builtin";
+const MAIN_LANE = "main";
 
 function resolveStateDir(env = process.env) {
   const override = env[STATE_ENV];
@@ -28,6 +42,31 @@ function resolveStateDir(env = process.env) {
 function resolveBudget(env = process.env) {
   const parsed = Number.parseInt(String(env[BUDGET_ENV]), 10);
   return Number.isInteger(parsed) && parsed > 0 ? parsed : DEFAULT_BUDGET;
+}
+
+function resolveAuditDir(env = process.env) {
+  const override = env[AUDIT_DIR_ENV];
+  if (override && String(override).trim()) {
+    return path.resolve(String(override).trim());
+  }
+  return path.join(os.homedir(), ".claude", "plugins", "data", "fusion-claude-code-fusion", "inline-guard-audit");
+}
+
+function resolvePositiveInteger(env, name, fallback) {
+  const parsed = Number.parseInt(String(env[name]), 10);
+  return Number.isInteger(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+function resolveAuditRetentionDays(env = process.env) {
+  return resolvePositiveInteger(env, AUDIT_RETENTION_DAYS_ENV, DEFAULT_AUDIT_RETENTION_DAYS);
+}
+
+function resolveAuditMaxBytes(env = process.env) {
+  return resolvePositiveInteger(env, AUDIT_MAX_BYTES_ENV, DEFAULT_AUDIT_MAX_BYTES);
+}
+
+function resolveAuditMaxFiles(env = process.env) {
+  return resolvePositiveInteger(env, AUDIT_MAX_FILES_ENV, DEFAULT_AUDIT_MAX_FILES);
 }
 
 function readHookInput() {
@@ -45,6 +84,10 @@ function readHookInput() {
 
 function isSubagentPayload(input) {
   return typeof input.agent_id === "string" && input.agent_id.length > 0;
+}
+
+function normalizeSessionId(value) {
+  return typeof value === "string" && SESSION_ID_PATTERN.test(value) ? value : null;
 }
 
 function stateFile(stateDir, sessionId) {
@@ -66,9 +109,9 @@ function readState(file) {
 
 function writeState(file, state) {
   const dir = path.dirname(file);
-  fs.mkdirSync(dir, { recursive: true });
+  fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
   const tempFile = path.join(dir, `.${path.basename(file)}.${process.pid}.tmp`);
-  fs.writeFileSync(tempFile, `${JSON.stringify(state, null, 2)}\n`, "utf8");
+  fs.writeFileSync(tempFile, `${JSON.stringify(state, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
   fs.renameSync(tempFile, file);
 }
 
@@ -78,7 +121,7 @@ function waitForLock() {
 
 function acquireStateLock(file) {
   const dir = path.dirname(file);
-  fs.mkdirSync(dir, { recursive: true });
+  fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
   const lockFile = `${file}.lock`;
   const deadline = Date.now() + LOCK_TIMEOUT_MS;
   for (;;) {
@@ -115,6 +158,210 @@ function withStateLock(file, callback) {
     return callback();
   } finally {
     release();
+  }
+}
+
+function auditSegmentName(date, index) {
+  return index === 0 ? `events-${date}.jsonl` : `events-${date}.${index}.jsonl`;
+}
+
+function listAuditSegments(auditDir) {
+  let entries;
+  try {
+    entries = fs.readdirSync(auditDir, { withFileTypes: true });
+  } catch {
+    return [];
+  }
+  const segments = [];
+  for (const entry of entries) {
+    if (!entry.isFile()) {
+      continue;
+    }
+    const match = AUDIT_FILE_PATTERN.exec(entry.name);
+    if (!match) {
+      continue;
+    }
+    const file = path.join(auditDir, entry.name);
+    try {
+      const stat = fs.statSync(file);
+      segments.push({ file, name: entry.name, date: match[1], index: Number.parseInt(match[2] ?? "0", 10), mtimeMs: stat.mtimeMs, size: stat.size });
+    } catch {
+      void 0;
+    }
+  }
+  return segments;
+}
+
+function pruneExpiredAuditSegments(auditDir, nowMs, retentionDays) {
+  const cutoff = nowMs - retentionDays * DAY_MS;
+  for (const segment of listAuditSegments(auditDir)) {
+    if (segment.mtimeMs < cutoff) {
+      try {
+        fs.rmSync(segment.file, { force: true });
+      } catch {
+        void 0;
+      }
+    }
+  }
+}
+
+function fileNeedsLineBreak(file) {
+  let descriptor;
+  try {
+    const stat = fs.statSync(file);
+    if (stat.size === 0) {
+      return false;
+    }
+    descriptor = fs.openSync(file, "r");
+    const buffer = Buffer.allocUnsafe(1);
+    fs.readSync(descriptor, buffer, 0, 1, stat.size - 1);
+    return buffer[0] !== 10;
+  } finally {
+    if (descriptor != null) {
+      fs.closeSync(descriptor);
+    }
+  }
+}
+
+function selectAuditSegment(auditDir, date, maxBytes, lineBytes) {
+  const matching = listAuditSegments(auditDir)
+    .filter((segment) => segment.date === date)
+    .sort((left, right) => left.index - right.index);
+  const latest = matching.at(-1);
+  if (!latest) {
+    return path.join(auditDir, auditSegmentName(date, 0));
+  }
+  const separatorBytes = latest.size > 0 && fileNeedsLineBreak(latest.file) ? 1 : 0;
+  if (latest.size > 0 && latest.size + separatorBytes + lineBytes > maxBytes) {
+    return path.join(auditDir, auditSegmentName(date, latest.index + 1));
+  }
+  return latest.file;
+}
+
+function appendAuditLine(file, line) {
+  const needsLineBreak = fs.existsSync(file) && fileNeedsLineBreak(file);
+  const descriptor = fs.openSync(file, "a", 0o600);
+  try {
+    if (needsLineBreak) {
+      fs.writeSync(descriptor, "\n", null, "utf8");
+    }
+    fs.writeSync(descriptor, line, null, "utf8");
+  } finally {
+    fs.closeSync(descriptor);
+  }
+}
+
+function enforceAuditFileLimit(auditDir, maxFiles, activeFile) {
+  const segments = listAuditSegments(auditDir).sort((left, right) => left.date.localeCompare(right.date) || left.index - right.index);
+  while (segments.length > maxFiles) {
+    const index = segments.findIndex((segment) => segment.file !== activeFile);
+    const [oldest] = segments.splice(index >= 0 ? index : 0, 1);
+    try {
+      fs.rmSync(oldest.file, { force: true });
+    } catch {
+      void 0;
+    }
+  }
+}
+
+function appendAuditEvent(event, env = process.env) {
+  const normalized = normalizeAuditEvent(event);
+  if (!normalized) {
+    return;
+  }
+  const auditDir = resolveAuditDir(env);
+  const line = `${JSON.stringify(normalized)}\n`;
+  const nowMs = Date.parse(normalized.at);
+  const date = normalized.at.slice(0, 10);
+  fs.mkdirSync(auditDir, { recursive: true, mode: 0o700 });
+  withStateLock(path.join(auditDir, ".append"), () => {
+    pruneExpiredAuditSegments(auditDir, Number.isFinite(nowMs) ? nowMs : Date.now(), resolveAuditRetentionDays(env));
+    const file = selectAuditSegment(auditDir, date, resolveAuditMaxBytes(env), Buffer.byteLength(line));
+    appendAuditLine(file, line);
+    enforceAuditFileLimit(auditDir, resolveAuditMaxFiles(env), file);
+  });
+}
+
+function normalizeAuditEvent(event) {
+  if (!event || typeof event !== "object" || Array.isArray(event) || (event.schemaVersion != null && event.schemaVersion !== AUDIT_SCHEMA_VERSION)) {
+    return null;
+  }
+  const atMs = Date.parse(event.at);
+  const session = normalizeSessionId(event.session);
+  if (!Number.isFinite(atMs) || !session) {
+    return null;
+  }
+  if (event.event === "write" && WRITE_TOOLS.has(event.tool) && event.lane === MAIN_LANE) {
+    const safePath = sanitizeAuditPath(event.path);
+    return { schemaVersion: AUDIT_SCHEMA_VERSION, at: new Date(atMs).toISOString(), session, event: "write", lane: MAIN_LANE, tool: event.tool, ...(safePath ? { path: safePath } : {}) };
+  }
+  if (event.event === "dispatch" && DELEGATION_TOOLS.has(event.tool)) {
+    const lane = normalizeLane(event.lane);
+    const description = sanitizeAuditText(event.description);
+    return lane ? { schemaVersion: AUDIT_SCHEMA_VERSION, at: new Date(atMs).toISOString(), session, event: "dispatch", lane, tool: event.tool, ...(description ? { description } : {}) } : null;
+  }
+  return null;
+}
+
+function auditBoundaryMs(value, fallback) {
+  if (value == null) {
+    return fallback;
+  }
+  if (typeof value === "number" && Number.isFinite(value)) {
+    return value;
+  }
+  const parsed = Date.parse(value);
+  return Number.isFinite(parsed) ? parsed : fallback;
+}
+
+function readAuditEvents({ auditDir, env = process.env, sessionId = null, sinceMs = null, untilMs = null, since = null, until = null } = {}) {
+  const root = auditDir ? path.resolve(auditDir) : resolveAuditDir(env);
+  const lowerBound = auditBoundaryMs(sinceMs ?? since, Number.NEGATIVE_INFINITY);
+  const upperBound = auditBoundaryMs(untilMs ?? until, Number.POSITIVE_INFINITY);
+  const session = sessionId == null ? null : normalizeSessionId(sessionId);
+  if (sessionId != null && !session) {
+    return { events: [], malformedCount: 0 };
+  }
+  const events = [];
+  let malformedCount = 0;
+  const segments = listAuditSegments(root).sort((left, right) => left.date.localeCompare(right.date) || left.index - right.index);
+  for (const segment of segments) {
+    let text;
+    try {
+      text = fs.readFileSync(segment.file, "utf8");
+    } catch {
+      malformedCount += 1;
+      continue;
+    }
+    for (const line of text.split("\n")) {
+      if (!line.trim()) {
+        continue;
+      }
+      try {
+        const event = normalizeAuditEvent(JSON.parse(line));
+        const atMs = Date.parse(event?.at);
+        if (!event) {
+          malformedCount += 1;
+          continue;
+        }
+        if (atMs < lowerBound || atMs > upperBound || (session && event.session !== session)) {
+          continue;
+        }
+        events.push(event);
+      } catch {
+        malformedCount += 1;
+      }
+    }
+  }
+  events.sort((left, right) => Date.parse(left.at) - Date.parse(right.at));
+  return { events, malformedCount };
+}
+
+function recordAuditEvent(event, env = process.env) {
+  try {
+    appendAuditEvent(event, env);
+  } catch {
+    void 0;
   }
 }
 
@@ -160,6 +407,14 @@ function isInsideCwd(filePath, cwd) {
   return relative !== "" && !relative.startsWith("..") && !path.isAbsolute(relative);
 }
 
+function extractAuditWritePath(filePath, cwd) {
+  if (!isInsideCwd(filePath, cwd)) {
+    return null;
+  }
+  const relative = path.relative(path.resolve(cwd), path.resolve(cwd, filePath)).split(path.sep).join("/");
+  return sanitizeAuditPath(relative);
+}
+
 function laneForSubagentType(subagentType) {
   if (typeof subagentType !== "string" || subagentType.length === 0) {
     return BUILTIN_LANE;
@@ -171,7 +426,7 @@ function laneForSubagentType(subagentType) {
     return "codex";
   }
   if (subagentType.startsWith("fusion:")) {
-    return subagentType;
+    return normalizeLane(subagentType) ?? BUILTIN_LANE;
   }
   return BUILTIN_LANE;
 }
@@ -184,12 +439,57 @@ function extractSubagentType(toolInput) {
   return typeof raw === "string" && raw.length > 0 ? raw : null;
 }
 
+function sanitizeIdentifier(value, maxLength = DESCRIPTION_MAX_LENGTH) {
+  if (
+    typeof value !== "string" ||
+    value.length === 0 ||
+    value.length > maxLength ||
+    !/^[A-Za-z0-9:_./-]+$/.test(value) ||
+    /(?:^|[:._/-])(?:api[_-]?key|token|secret|password)(?:[:._/-]|$)/i.test(value) ||
+    /(?:sk-|gh[pousr]_|github_pat_|xox[baprs]-|AKIA)[A-Za-z0-9_-]{8,}/.test(value) ||
+    /[A-Za-z0-9_]{48,}/.test(value)
+  ) {
+    return null;
+  }
+  return value;
+}
+
+function normalizeLane(value) {
+  if (value === BUILTIN_LANE || value === "grok" || value === "codex") {
+    return value;
+  }
+  return typeof value === "string" && value.startsWith("fusion:") ? sanitizeIdentifier(value, 80) : null;
+}
+
+function sanitizeAuditText(value, maxLength = DESCRIPTION_MAX_LENGTH) {
+  if (typeof value !== "string" || value.length === 0) {
+    return null;
+  }
+  let sanitized = value.replace(/[\u0000-\u001f\u007f]/g, " ").replace(/\s+/g, " ").trim();
+  sanitized = sanitized.replace(/\bBearer\s+[A-Za-z0-9._~+/=-]+/gi, "Bearer [redacted]");
+  sanitized = sanitized.replace(/([a-z][a-z0-9+.-]*:\/\/)[^/\s:@]+:[^/\s@]+@/gi, "$1[redacted]@");
+  sanitized = sanitized.replace(/\b(api[_-]?key|access[_-]?token|authorization|password|passwd|secret|token)\s*[:=]\s*(?:"[^"]*"|'[^']*'|[^\s,;]+)/gi, "$1=[redacted]");
+  sanitized = sanitized.replace(/\b(?:sk-[A-Za-z0-9_-]{8,}|gh[pousr]_[A-Za-z0-9_]{8,}|github_pat_[A-Za-z0-9_]{8,}|xox[baprs]-[A-Za-z0-9-]{8,}|AKIA[A-Z0-9]{12,})\b/g, "[redacted]");
+  sanitized = sanitized.replace(/\b[A-Za-z0-9+/_=-]{64,}\b/g, "[redacted]");
+  return sanitized ? sanitized.slice(0, maxLength) : null;
+}
+
+function sanitizeAuditPath(value) {
+  if (typeof value !== "string" || /(?:^|[:._/-])(?:api[_-]?key|access[_-]?token|authorization|password|passwd|secret|token)(?:[:._/-]|$)/i.test(value)) {
+    return null;
+  }
+  const sanitized = sanitizeAuditText(value, AUDIT_PATH_MAX_LENGTH)?.replace(/\\/g, "/");
+  if (!sanitized || sanitized.includes("[redacted]") || path.posix.isAbsolute(sanitized) || sanitized.split("/").includes("..")) {
+    return null;
+  }
+  return sanitized;
+}
+
 function extractDispatchDescription(toolInput) {
   if (!toolInput || typeof toolInput !== "object") {
     return null;
   }
-  const raw = toolInput.description ?? null;
-  return typeof raw === "string" && raw.length > 0 ? raw.slice(0, 120) : null;
+  return sanitizeAuditText(toolInput.description ?? null);
 }
 
 function totalDispatches(dispatches) {
@@ -201,19 +501,85 @@ function budgetMultiple(writeCount, budget) {
 }
 
 function defaultState(now) {
-  return { writeCount: 0, dispatches: {}, dispatchLog: [], advisedMultiples: [], createdAt: now, updatedAt: now };
+  return {
+    writeCount: 0,
+    writesSinceDispatch: 0,
+    dispatchEpoch: 0,
+    lastDispatchAt: null,
+    dispatches: {},
+    dispatchLog: [],
+    advisedMultiples: [],
+    createdAt: now,
+    updatedAt: now
+  };
+}
+
+function normalizeDispatches(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return {};
+  }
+  const dispatches = {};
+  for (const [lane, count] of Object.entries(value)) {
+    const safeLane = normalizeLane(lane) ?? BUILTIN_LANE;
+    if (Number.isFinite(count) && count >= 0) {
+      dispatches[safeLane] = (dispatches[safeLane] ?? 0) + Math.floor(count);
+    }
+  }
+  return dispatches;
+}
+
+function normalizeDispatchLog(value) {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+  const entries = [];
+  for (const raw of value.slice(-DISPATCH_LOG_LIMIT)) {
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+      continue;
+    }
+    const atMs = Date.parse(raw.at);
+    const lane = normalizeLane(raw.lane) ?? BUILTIN_LANE;
+    const subagentType = sanitizeIdentifier(raw.subagentType);
+    const description = sanitizeAuditText(raw.description);
+    entries.push({
+      at: Number.isFinite(atMs) ? new Date(atMs).toISOString() : null,
+      lane,
+      ...(subagentType ? { subagentType } : {}),
+      ...(description ? { description } : {})
+    });
+  }
+  return entries;
+}
+
+function normalizeAdvisedMultiples(value) {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+  return [...new Set(value.filter((multiple) => Number.isInteger(multiple) && multiple > 0))];
 }
 
 function normalizeState(existing, now) {
   if (!existing || typeof existing !== "object") {
     return defaultState(now);
   }
+  const writeCount = Number.isFinite(existing.writeCount) && existing.writeCount >= 0 ? Math.floor(existing.writeCount) : 0;
+  const dispatches = normalizeDispatches(existing.dispatches);
+  const dispatchCount = totalDispatches(dispatches);
+  const hasPeriodCounter = Number.isFinite(existing.writesSinceDispatch) && existing.writesSinceDispatch >= 0;
+  const writesSinceDispatch = hasPeriodCounter ? Math.floor(existing.writesSinceDispatch) : dispatchCount === 0 ? writeCount : 0;
+  const advisedMultiples = hasPeriodCounter || dispatchCount === 0 ? normalizeAdvisedMultiples(existing.advisedMultiples) : [];
+  const dispatchLog = normalizeDispatchLog(existing.dispatchLog);
+  const createdAtMs = Date.parse(existing.createdAt);
+  const lastDispatchAtMs = Date.parse(existing.lastDispatchAt);
   return {
-    writeCount: Number.isFinite(existing.writeCount) ? existing.writeCount : 0,
-    dispatches: existing.dispatches && typeof existing.dispatches === "object" ? { ...existing.dispatches } : {},
-    dispatchLog: Array.isArray(existing.dispatchLog) ? existing.dispatchLog.slice(-DISPATCH_LOG_LIMIT) : [],
-    advisedMultiples: Array.isArray(existing.advisedMultiples) ? existing.advisedMultiples.slice() : [],
-    createdAt: existing.createdAt ?? now,
+    writeCount,
+    writesSinceDispatch,
+    dispatchEpoch: Number.isInteger(existing.dispatchEpoch) && existing.dispatchEpoch >= 0 ? existing.dispatchEpoch : dispatchCount,
+    lastDispatchAt: Number.isFinite(lastDispatchAtMs) ? new Date(lastDispatchAtMs).toISOString() : null,
+    dispatches,
+    dispatchLog,
+    advisedMultiples,
+    createdAt: Number.isFinite(createdAtMs) ? new Date(createdAtMs).toISOString() : now,
     updatedAt: now
   };
 }
@@ -227,8 +593,12 @@ function allowOutput(reason) {
 }
 
 function buildAdvisoryLine(writeCount, dispatchCount) {
+  const countSummary =
+    dispatchCount === 0
+      ? `${writeCount} inline writes happened this session with zero dispatches. `
+      : `${writeCount} inline writes happened since the most recent dispatch; this session has ${dispatchCount} dispatch${dispatchCount === 1 ? "" : "es"}. `;
   return (
-    `${writeCount} inline writes happened this session with ${dispatchCount === 0 ? "zero" : dispatchCount} dispatches. ` +
+    countSummary +
     "The next package belongs in a lane: quick scoped work goes to the codex quick tier gpt-5.6-terra at effort xhigh; " +
     "trivial or high-volume work goes to gpt-5.6-luna at effort xhigh; work needing the Claude Code tool surface goes to fusion:fast-worker."
   );
@@ -248,10 +618,10 @@ function runHook(env = process.env) {
   if (isSubagentPayload(input)) {
     return;
   }
-  const sessionId = input.session_id;
+  const sessionId = normalizeSessionId(input.session_id);
   const toolName = input.tool_name;
   const cwd = input.cwd;
-  if (typeof sessionId !== "string" || !sessionId || typeof toolName !== "string" || !toolName) {
+  if (!sessionId || typeof toolName !== "string" || !toolName) {
     return;
   }
 
@@ -261,13 +631,22 @@ function runHook(env = process.env) {
   const now = new Date().toISOString();
 
   if (DELEGATION_TOOLS.has(toolName)) {
+    const subagentType = extractSubagentType(input.tool_input);
+    const safeSubagentType = sanitizeIdentifier(subagentType);
+    const lane = laneForSubagentType(subagentType);
+    const description = extractDispatchDescription(input.tool_input);
+    recordAuditEvent(
+      { at: now, session: sessionId, event: "dispatch", lane, tool: toolName, ...(description ? { description } : {}) },
+      env
+    );
     withStateLock(file, () => {
       const state = normalizeState(readState(file), now);
-      const subagentType = extractSubagentType(input.tool_input);
-      const lane = laneForSubagentType(subagentType);
       state.dispatches[lane] = (state.dispatches[lane] ?? 0) + 1;
-      const description = extractDispatchDescription(input.tool_input);
-      state.dispatchLog.push({ at: now, lane, ...(subagentType ? { subagentType } : {}), ...(description ? { description } : {}) });
+      state.dispatchEpoch += 1;
+      state.lastDispatchAt = now;
+      state.writesSinceDispatch = 0;
+      state.advisedMultiples = [];
+      state.dispatchLog.push({ at: now, lane, ...(safeSubagentType ? { subagentType: safeSubagentType } : {}), ...(description ? { description } : {}) });
       if (state.dispatchLog.length > DISPATCH_LOG_LIMIT) {
         state.dispatchLog.splice(0, state.dispatchLog.length - DISPATCH_LOG_LIMIT);
       }
@@ -285,16 +664,18 @@ function runHook(env = process.env) {
     return;
   }
 
+  const auditPath = extractAuditWritePath(targetPath, cwd);
+  recordAuditEvent({ at: now, session: sessionId, event: "write", lane: MAIN_LANE, tool: toolName, ...(auditPath ? { path: auditPath } : {}) }, env);
   const budget = resolveBudget(env);
   const advisoryCandidate = withStateLock(file, () => {
     const state = normalizeState(readState(file), now);
     state.writeCount += 1;
-    const multiple = budgetMultiple(state.writeCount, budget);
-    const dispatchCount = totalDispatches(state.dispatches);
+    state.writesSinceDispatch += 1;
+    const multiple = budgetMultiple(state.writesSinceDispatch, budget);
     let candidate = null;
-    if (multiple >= 1 && dispatchCount === 0 && !state.advisedMultiples.includes(multiple)) {
+    if (multiple >= 1 && !state.advisedMultiples.includes(multiple)) {
       state.advisedMultiples.push(multiple);
-      candidate = { multiple, writeCount: state.writeCount };
+      candidate = { multiple, writeCount: state.writesSinceDispatch, dispatchEpoch: state.dispatchEpoch };
     }
     writeState(file, state);
     return candidate;
@@ -304,7 +685,7 @@ function runHook(env = process.env) {
     withStateLock(file, () => {
       const latest = normalizeState(readState(file), new Date().toISOString());
       const dispatchCount = totalDispatches(latest.dispatches);
-      if (dispatchCount === 0 && latest.advisedMultiples.includes(advisoryCandidate.multiple)) {
+      if (latest.dispatchEpoch === advisoryCandidate.dispatchEpoch && latest.advisedMultiples.includes(advisoryCandidate.multiple)) {
         const advisory = buildAdvisoryLine(advisoryCandidate.writeCount, dispatchCount);
         process.stdout.write(`${JSON.stringify(allowOutput(advisory))}\n`);
       }
@@ -337,12 +718,23 @@ export {
   buildAdvisoryLine,
   budgetMultiple,
   extractDispatchDescription,
+  extractAuditWritePath,
   extractWritePath,
   isInsideCwd,
   isSubagentPayload,
   laneForSubagentType,
+  listAuditSegments,
+  normalizeAuditEvent,
+  normalizeSessionId,
+  readAuditEvents,
+  resolveAuditDir,
+  resolveAuditMaxBytes,
+  resolveAuditMaxFiles,
+  resolveAuditRetentionDays,
   resolveBudget,
   resolveStateDir,
+  sanitizeAuditPath,
+  sanitizeAuditText,
   stateFile,
   totalDispatches
 };

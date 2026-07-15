@@ -5,6 +5,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { test } from "node:test";
+import { readAuditEvents } from "../plugins/fusion/scripts/inline-delegation-guard.mjs";
 
 const repoRoot = path.join(import.meta.dirname, "..");
 const script = path.join(repoRoot, "plugins", "fusion", "scripts", "inline-delegation-guard.mjs");
@@ -13,15 +14,17 @@ function makeSandbox(t) {
   const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "inline-guard-test-")));
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
   const stateDir = path.join(root, "state");
+  const auditDir = path.join(root, "audit");
   const workDir = path.join(root, "work");
   fs.mkdirSync(workDir, { recursive: true });
-  return { root, stateDir, workDir };
+  return { root, stateDir, auditDir, workDir };
 }
 
 function envFor(sandbox, extra = {}) {
   return {
     ...process.env,
     FUSION_INLINE_GUARD_STATE: sandbox.stateDir,
+    FUSION_INLINE_GUARD_AUDIT_DIR: sandbox.auditDir,
     ...extra
   };
 }
@@ -94,6 +97,29 @@ function readState(sandbox, sessionId) {
   return JSON.parse(fs.readFileSync(stateFileFor(sandbox, sessionId), "utf8"));
 }
 
+function auditFiles(sandbox) {
+  if (!fs.existsSync(sandbox.auditDir)) {
+    return [];
+  }
+  return fs.readdirSync(sandbox.auditDir).filter((entry) => /^events-\d{4}-\d{2}-\d{2}(?:\.\d+)?\.jsonl$/.test(entry)).sort().map((entry) => path.join(sandbox.auditDir, entry));
+}
+
+function readAuditLines(sandbox) {
+  return auditFiles(sandbox).flatMap((file) => fs.readFileSync(file, "utf8").split("\n").filter(Boolean));
+}
+
+function readAuditRecords(sandbox) {
+  const records = [];
+  for (const line of readAuditLines(sandbox)) {
+    try {
+      records.push(JSON.parse(line));
+    } catch {
+      void 0;
+    }
+  }
+  return records;
+}
+
 test("writes below the budget are allowed silently and accumulate", (t) => {
   const sandbox = makeSandbox(t);
   for (let i = 0; i < 4; i += 1) {
@@ -159,19 +185,32 @@ test("no repeat nagging between threshold multiples, a new advisory fires at 2x 
   assert.deepStrictEqual(state.advisedMultiples, [1, 2, 3]);
 });
 
-test("no advisory fires once the session has recorded any agent dispatch", (t) => {
+test("advisories count writes since the most recent dispatch and restart after each dispatch", (t) => {
   const sandbox = makeSandbox(t);
   const dispatchResult = run(sandbox, dispatchPayload(sandbox, { subagentType: "fusion:fast-worker" }));
   assert.strictEqual(dispatchResult.status, 0);
   assert.strictEqual(dispatchResult.stdout, "");
 
-  for (let i = 0; i < 12; i += 1) {
+  for (let i = 0; i < 4; i += 1) {
     const result = run(sandbox, writePayload(sandbox));
-    assert.strictEqual(result.stdout, "", `write ${i + 1} should stay silent once a dispatch is recorded`);
+    assert.strictEqual(result.stdout, "", `write ${i + 1} after the first dispatch should stay silent`);
   }
+  const fifth = run(sandbox, writePayload(sandbox));
+  assert.match(JSON.parse(fifth.stdout).hookSpecificOutput.permissionDecisionReason, /^5 inline writes happened since the most recent dispatch; this session has 1 dispatch\./);
+
+  run(sandbox, dispatchPayload(sandbox, { subagentType: "codex:codex-rescue" }));
+  for (let i = 0; i < 4; i += 1) {
+    const result = run(sandbox, writePayload(sandbox));
+    assert.strictEqual(result.stdout, "", `write ${i + 1} after the second dispatch should stay silent`);
+  }
+  const nextFifth = run(sandbox, writePayload(sandbox));
+  assert.match(JSON.parse(nextFifth.stdout).hookSpecificOutput.permissionDecisionReason, /^5 inline writes happened since the most recent dispatch; this session has 2 dispatches\./);
+
   const state = readState(sandbox, "session-1");
-  assert.strictEqual(state.writeCount, 12);
-  assert.deepStrictEqual(state.advisedMultiples, []);
+  assert.strictEqual(state.writeCount, 10);
+  assert.strictEqual(state.writesSinceDispatch, 5);
+  assert.strictEqual(state.dispatchEpoch, 2);
+  assert.deepStrictEqual(state.advisedMultiples, [1]);
 });
 
 test("agent dispatches are bucketed by lane from the subagent_type prefix", (t) => {
@@ -225,9 +264,127 @@ test("Agent and Task dispatches append ledger entries with their computed lane",
   });
 });
 
+test("writes and dispatches append minimal long-term audit records", (t) => {
+  const sandbox = makeSandbox(t);
+  const target = path.join(sandbox.workDir, "nested", "file.txt");
+  run(sandbox, dispatchPayload(sandbox, { subagentType: "grok:grok-rescue", description: "inspect the failure" }));
+  run(sandbox, dispatchPayload(sandbox, { toolName: "Task", subagentType: "codex:codex-rescue", description: "implement the repair" }));
+  run(sandbox, writePayload(sandbox, { filePath: target }));
+
+  const { events: records, malformedCount } = readAuditEvents({ auditDir: sandbox.auditDir });
+  assert.strictEqual(records.length, 3);
+  assert.strictEqual(malformedCount, 0);
+  assert.deepStrictEqual(records[0], {
+    schemaVersion: 1,
+    at: records[0].at,
+    session: "session-1",
+    event: "dispatch",
+    lane: "grok",
+    tool: "Agent",
+    description: "inspect the failure"
+  });
+  assert.deepStrictEqual(records[1], {
+    schemaVersion: 1,
+    at: records[1].at,
+    session: "session-1",
+    event: "dispatch",
+    lane: "codex",
+    tool: "Task",
+    description: "implement the repair"
+  });
+  assert.deepStrictEqual(records[2], {
+    schemaVersion: 1,
+    at: records[2].at,
+    session: "session-1",
+    event: "write",
+    lane: "main",
+    tool: "Edit",
+    path: "nested/file.txt"
+  });
+  assert.ok(records.every((record) => /^\d{4}-\d{2}-\d{2}T/.test(record.at)));
+});
+
+test("audit reader sorts events, filters by session and time, and degrades on a missing directory", (t) => {
+  const sandbox = makeSandbox(t);
+  const missing = readAuditEvents({ auditDir: path.join(sandbox.root, "missing") });
+  assert.deepStrictEqual(missing, { events: [], malformedCount: 0 });
+
+  fs.mkdirSync(sandbox.auditDir, { recursive: true });
+  const records = [
+    { at: "2026-07-14T00:02:00.000Z", session: "session-1", event: "write", lane: "main", tool: "Edit", path: "two.txt" },
+    { at: "2026-07-14T00:01:00.000Z", session: "session-2", event: "dispatch", lane: "codex", tool: "Task", description: "middle" },
+    { at: "2026-07-14T00:00:00.000Z", session: "session-1", event: "write", lane: "main", tool: "Write", path: "one.txt" }
+  ];
+  fs.writeFileSync(path.join(sandbox.auditDir, "events-2026-07-14.jsonl"), `${records.map((record) => JSON.stringify(record)).join("\n")}\n`, "utf8");
+
+  const all = readAuditEvents({ auditDir: sandbox.auditDir });
+  assert.deepStrictEqual(all.events.map((event) => event.at), ["2026-07-14T00:00:00.000Z", "2026-07-14T00:01:00.000Z", "2026-07-14T00:02:00.000Z"]);
+  const filtered = readAuditEvents({ auditDir: sandbox.auditDir, sessionId: "session-1", sinceMs: Date.parse("2026-07-14T00:00:30.000Z") });
+  assert.deepStrictEqual(filtered.events.map((event) => event.path), ["two.txt"]);
+  assert.strictEqual(filtered.malformedCount, 0);
+});
+
+test("state and audit records omit full tool input and redact sensitive descriptions", (t) => {
+  const sandbox = makeSandbox(t);
+  const writeSecret = "write-secret-value";
+  const promptSecret = "prompt-secret-value";
+  const tokenSecret = "token-secret-value";
+  const pathSecret = `sk-${"z".repeat(40)}`;
+  const write = writePayload(sandbox, { filePath: path.join(sandbox.workDir, "safe", "file.txt") });
+  write.tool_input.old_string = writeSecret;
+  write.tool_input.new_string = writeSecret;
+  write.tool_input.content = writeSecret;
+  run(sandbox, write);
+  run(sandbox, writePayload(sandbox, { filePath: path.join(sandbox.workDir, "safe", pathSecret) }));
+
+  const dispatch = dispatchPayload(sandbox, {
+    subagentType: "fusion:fast-worker",
+    description: `inspect token=${tokenSecret} with Bearer ${"a".repeat(80)}`
+  });
+  dispatch.tool_input.prompt = promptSecret;
+  dispatch.tool_input.password = promptSecret;
+  run(sandbox, dispatch);
+
+  const persisted = `${fs.readFileSync(stateFileFor(sandbox, "session-1"), "utf8")}\n${readAuditLines(sandbox).join("\n")}`;
+  assert.doesNotMatch(persisted, new RegExp(writeSecret));
+  assert.doesNotMatch(persisted, new RegExp(promptSecret));
+  assert.doesNotMatch(persisted, new RegExp(tokenSecret));
+  assert.doesNotMatch(persisted, new RegExp(pathSecret));
+  assert.doesNotMatch(persisted, new RegExp(sandbox.workDir.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+  assert.doesNotMatch(persisted, /old_string|new_string|prompt|password|content/);
+  assert.match(persisted, /\[redacted\]/);
+});
+
+test("audit retains writes whose paths cannot be safely recorded", (t) => {
+  const sandbox = makeSandbox(t);
+  const pathSecret = `sk-${"z".repeat(40)}`;
+  run(sandbox, writePayload(sandbox, { filePath: path.join(sandbox.workDir, pathSecret) }));
+
+  const writes = readAuditRecords(sandbox).filter((record) => record.event === "write");
+  assert.strictEqual(writes.length, 1);
+  assert.ok(!Object.hasOwn(writes[0], "path"));
+  assert.doesNotMatch(readAuditLines(sandbox).join("\n"), new RegExp(pathSecret));
+});
+
+test("malformed or oversized subagent types fall back to builtin without entering state or audit", (t) => {
+  const sandbox = makeSandbox(t);
+  const secrets = ["fusion:bad\nsecret-value", `fusion:${"s".repeat(200)}`, "fusion:token=secret-value", "fusion:api-key-secret-value"];
+  for (const subagentType of secrets) {
+    run(sandbox, dispatchPayload(sandbox, { subagentType, description: "safe description" }));
+  }
+
+  const stateText = fs.readFileSync(stateFileFor(sandbox, "session-1"), "utf8");
+  const auditText = readAuditLines(sandbox).join("\n");
+  assert.deepStrictEqual(readState(sandbox, "session-1").dispatches, { builtin: 4 });
+  assert.ok(readState(sandbox, "session-1").dispatchLog.every((entry) => !Object.hasOwn(entry, "subagentType")));
+  assert.deepStrictEqual(readAuditRecords(sandbox).map((record) => record.lane), ["builtin", "builtin", "builtin", "builtin"]);
+  assert.doesNotMatch(`${stateText}\n${auditText}`, /secret-value/);
+  assert.doesNotMatch(`${stateText}\n${auditText}`, new RegExp("s".repeat(100)));
+});
+
 test("dispatch ledger descriptions are truncated at 120 characters", (t) => {
   const sandbox = makeSandbox(t);
-  const description = "x".repeat(121);
+  const description = "two words ".repeat(20);
   run(sandbox, dispatchPayload(sandbox, { description }));
 
   const [entry] = readState(sandbox, "session-1").dispatchLog;
@@ -273,6 +430,28 @@ test("dispatch ledger initializes when an existing state file has no dispatchLog
   assert.deepStrictEqual(state.dispatches, { grok: 2, "fusion:fast-worker": 1 });
   assert.strictEqual(state.dispatchLog.length, 1);
   assert.strictEqual(state.dispatchLog[0].lane, "fusion:fast-worker");
+});
+
+test("legacy state without a period counter starts counting future writes after its recorded dispatches", (t) => {
+  const sandbox = makeSandbox(t);
+  fs.mkdirSync(sandbox.stateDir, { recursive: true });
+  fs.writeFileSync(
+    stateFileFor(sandbox, "session-1"),
+    JSON.stringify({ writeCount: 7, dispatches: { codex: 1 }, advisedMultiples: [1], createdAt: "2026-07-10T00:00:00.000Z", updatedAt: "2026-07-10T00:00:00.000Z" }),
+    "utf8"
+  );
+
+  for (let index = 0; index < 4; index += 1) {
+    assert.strictEqual(run(sandbox, writePayload(sandbox)).stdout, "");
+  }
+  const fifth = run(sandbox, writePayload(sandbox));
+  assert.match(JSON.parse(fifth.stdout).hookSpecificOutput.permissionDecisionReason, /^5 inline writes happened since the most recent dispatch/);
+
+  const state = readState(sandbox, "session-1");
+  assert.strictEqual(state.writeCount, 12);
+  assert.strictEqual(state.writesSinceDispatch, 5);
+  assert.strictEqual(state.dispatchEpoch, 1);
+  assert.deepStrictEqual(state.advisedMultiples, [1]);
 });
 
 test("a Skill invocation is ignored and does not touch the counters", (t) => {
@@ -399,6 +578,58 @@ test("stale session state is pruned after 48 hours", (t) => {
   assert.strictEqual(fs.existsSync(staleFile), false);
 });
 
+test("audit appends after a malformed trailing line and readers skip only the damaged record", (t) => {
+  const sandbox = makeSandbox(t);
+  fs.mkdirSync(sandbox.auditDir, { recursive: true });
+  const date = new Date().toISOString().slice(0, 10);
+  const file = path.join(sandbox.auditDir, `events-${date}.jsonl`);
+  fs.writeFileSync(file, "{ malformed", "utf8");
+
+  run(sandbox, writePayload(sandbox));
+  const lines = fs.readFileSync(file, "utf8").split("\n").filter(Boolean);
+  assert.strictEqual(lines.length, 2);
+  assert.strictEqual(lines[0], "{ malformed");
+  const audit = readAuditEvents({ auditDir: sandbox.auditDir });
+  assert.strictEqual(audit.events.length, 1);
+  assert.strictEqual(audit.events[0].event, "write");
+  assert.strictEqual(audit.malformedCount, 1);
+});
+
+test("audit rotates by size without losing valid records", (t) => {
+  const sandbox = makeSandbox(t);
+  const extraEnv = { FUSION_INLINE_GUARD_AUDIT_MAX_BYTES: "1", FUSION_INLINE_GUARD_AUDIT_MAX_FILES: "10" };
+  for (let index = 0; index < 4; index += 1) {
+    run(sandbox, writePayload(sandbox), extraEnv);
+  }
+
+  assert.strictEqual(auditFiles(sandbox).length, 4);
+  assert.strictEqual(readAuditEvents({ auditDir: sandbox.auditDir }).events.length, 4);
+});
+
+test("audit enforces its rotated file cap", (t) => {
+  const sandbox = makeSandbox(t);
+  const extraEnv = { FUSION_INLINE_GUARD_AUDIT_MAX_BYTES: "1", FUSION_INLINE_GUARD_AUDIT_MAX_FILES: "2" };
+  for (let index = 0; index < 4; index += 1) {
+    run(sandbox, writePayload(sandbox), extraEnv);
+  }
+
+  assert.strictEqual(auditFiles(sandbox).length, 2);
+  assert.strictEqual(readAuditEvents({ auditDir: sandbox.auditDir }).events.length, 2);
+});
+
+test("audit removes segments older than its retention window", (t) => {
+  const sandbox = makeSandbox(t);
+  fs.mkdirSync(sandbox.auditDir, { recursive: true });
+  const staleFile = path.join(sandbox.auditDir, "events-2020-01-01.jsonl");
+  fs.writeFileSync(staleFile, `${JSON.stringify({ at: "2020-01-01T00:00:00.000Z", session: "old-session", event: "write", lane: "main", tool: "Edit", path: "old.txt" })}\n`, "utf8");
+  const oldTime = new Date(Date.now() - 2 * 24 * 60 * 60 * 1000);
+  fs.utimesSync(staleFile, oldTime, oldTime);
+
+  run(sandbox, writePayload(sandbox), { FUSION_INLINE_GUARD_AUDIT_RETENTION_DAYS: "1" });
+  assert.strictEqual(fs.existsSync(staleFile), false);
+  assert.strictEqual(readAuditEvents({ auditDir: sandbox.auditDir }).events.length, 1);
+});
+
 test("concurrent hook invocations serialize dispatch and write increments", async (t) => {
   const sandbox = makeSandbox(t);
   const extraEnv = { FUSION_INLINE_WRITE_BUDGET: "1000" };
@@ -416,4 +647,10 @@ test("concurrent hook invocations serialize dispatch and write increments", asyn
   assert.strictEqual(state.writeCount, 16);
   assert.deepStrictEqual(state.dispatches, { grok: 16 });
   assert.strictEqual(fs.existsSync(`${stateFileFor(sandbox, "session-1")}.lock`), false);
+  const audit = readAuditEvents({ auditDir: sandbox.auditDir });
+  assert.strictEqual(audit.events.length, 32);
+  assert.strictEqual(audit.malformedCount, 0);
+  assert.strictEqual(audit.events.filter((record) => record.event === "write").length, 16);
+  assert.strictEqual(audit.events.filter((record) => record.event === "dispatch").length, 16);
+  assert.strictEqual(fs.existsSync(path.join(sandbox.auditDir, ".append.lock")), false);
 });
