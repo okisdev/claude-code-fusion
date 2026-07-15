@@ -149,11 +149,14 @@ export function renderTaskResult({ text, sessionId, jobId }) {
   return `${lines.join("\n")}\n`;
 }
 
-export function renderBackgroundLaunch(jobId) {
+export function renderBackgroundLaunch(jobId, delivery) {
   return [
     `Started background job ${jobId}.`,
     `Check progress with /grok:status ${jobId}.`,
     `Fetch the result with /grok:result ${jobId}.`,
+    `job: ${jobId}`,
+    `delivery: ${delivery}`,
+    "state: running",
     ""
   ].join("\n");
 }
@@ -283,6 +286,29 @@ function pushCountSection(lines, heading, counts) {
   }
 }
 
+function pushUsageSection(lines, usage, coverage, totalJobs) {
+  const completeJobs = coverage?.completeJobs ?? usage?.reportedJobs ?? 0;
+  const incompleteJobs = coverage?.incompleteJobs ?? 0;
+  const unreportedJobs = coverage?.unreportedJobs ?? Math.max(0, totalJobs - completeJobs - incompleteJobs);
+  const availability = coverage?.availability ?? (completeJobs === 0 ? "unavailable" : completeJobs === totalJobs ? "available" : "partial");
+  lines.push(
+    "",
+    `Exact token usage coverage: ${availability} (${completeJobs} complete, ${incompleteJobs} incomplete, ${unreportedJobs} unreported)`
+  );
+  if (!usage || completeJobs <= 0) {
+    lines.push("Token totals: unavailable");
+    return;
+  }
+  lines.push(
+    `Observed exact tokens (${completeJobs} complete job${completeJobs === 1 ? "" : "s"}):`,
+    `- input tokens: ${usage.inputTokens}`,
+    `- cache read input tokens: ${usage.cacheReadInputTokens}`,
+    `- output tokens: ${usage.outputTokens}`,
+    `- reasoning tokens: ${usage.reasoningTokens}`,
+    `- total tokens: ${usage.totalTokens}`
+  );
+}
+
 export function renderStatsReport(stats) {
   if (stats.totalJobs === 0) {
     return stats.scope === "all"
@@ -301,7 +327,9 @@ export function renderStatsReport(stats) {
   }
   pushCountSection(lines, "By status", stats.byStatus);
   pushCountSection(lines, "By mode", stats.byMode);
+  pushCountSection(lines, "By model", stats.byModel);
   pushCountSection(lines, "By failure kind", stats.byFailureKind);
+  pushUsageSection(lines, stats.usage, stats.usageCoverage, stats.totalJobs);
   return `${lines.join("\n").trimEnd()}\n`;
 }
 

@@ -29,4 +29,4 @@ Output contract:
 Permissions:
 
 - Always state whether Grok has write permission. In write mode, tell it to edit files directly and report the touched paths. In consult mode, tell it to propose changes without editing.
-- Read only consult briefs must state that Grok may use only the narrow allow list, including `node --test`, `npm test`, and read only `git` and `gh`. They cannot edit files or launch nested engine CLIs. The consult allow list cancels the turn when Grok calls tools outside that set. Write capable briefs are exempt.
+- Read only consult briefs must state that Grok may read, list, and search files only, plus use web search and fetch when `--web` is present. Shell commands, tests, git, builds, edits, MCP tools, and subagents are unavailable. The hard tool filter or permission gate cancels calls outside that set. Write capable briefs are exempt.

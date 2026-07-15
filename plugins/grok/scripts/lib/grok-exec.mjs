@@ -1,6 +1,12 @@
 import { spawn } from "node:child_process";
 import os from "node:os";
 
+import {
+  getProcessIdentity,
+  processIdentityMatches,
+  processIsDirectlyAlive,
+  validProcessIdentity
+} from "./process-identity.mjs";
 import { appendJobLog } from "./state.mjs";
 
 const BIN_ENV = "GROK_BIN";
@@ -13,50 +19,13 @@ const DEFAULT_PIDLESS_RUNNING_GRACE_MS = 15000;
 const TERMINATION_GRACE_MS = 2000;
 const TERMINATION_POLL_MS = 50;
 const STDOUT_CAPTURE_MAX_BYTES = 1024 * 1024;
+const STDERR_CAPTURE_MAX_BYTES = 64 * 1024;
 const DEFAULT_MAX_TURNS = { consult: 25, write: 60 };
+const SANDBOX_FAILURE_PATTERN = /sandbox (?:could not be applied|initialization failed)/i;
 
-const CONSULT_ALLOW_RULES = [
-  "Read",
-  "Grep",
-  "Bash(git diff)",
-  "Bash(git diff *)",
-  "Bash(git log)",
-  "Bash(git log *)",
-  "Bash(git show)",
-  "Bash(git show *)",
-  "Bash(git status)",
-  "Bash(git status *)",
-  "Bash(git blame)",
-  "Bash(git blame *)",
-  "Bash(gh pr view)",
-  "Bash(gh pr view *)",
-  "Bash(gh pr list)",
-  "Bash(gh pr list *)",
-  "Bash(gh pr diff)",
-  "Bash(gh pr diff *)",
-  "Bash(gh pr checks)",
-  "Bash(gh pr checks *)",
-  "Bash(gh issue view)",
-  "Bash(gh issue view *)",
-  "Bash(gh issue list)",
-  "Bash(gh issue list *)",
-  "Bash(gh repo view)",
-  "Bash(gh repo view *)",
-  "Bash(gh search)",
-  "Bash(gh search *)",
-  "Bash(gh run view)",
-  "Bash(gh run view *)",
-  "Bash(gh run list)",
-  "Bash(gh run list *)",
-  "Bash(gh release view)",
-  "Bash(gh release view *)",
-  "Bash(gh release list)",
-  "Bash(gh release list *)",
-  "Bash(node --test)",
-  "Bash(node --test *)",
-  "Bash(npm test)",
-  "Bash(npm test *)"
-];
+const CONSULT_TOOL_IDS = ["read_file", "grep", "list_dir"];
+const CONSULT_WEB_TOOL_IDS = ["web_search", "web_fetch"];
+const CONSULT_ALLOW_RULES = ["Read", "Grep"];
 
 const CONSULT_WEB_ALLOW_RULES = ["WebSearch", "WebFetch"];
 
@@ -64,20 +33,7 @@ export const NESTED_ENGINE_CLI_DENY_NAMES = ["grok", "claude", "codex"];
 
 const NESTED_ENGINE_CLI_DENY_RULES = NESTED_ENGINE_CLI_DENY_NAMES.map((name) => `Bash(${name}*)`);
 
-const CONSULT_DENY_RULES = [
-  "Edit",
-  "Write",
-  "Bash(*;*)",
-  "Bash(*&&*)",
-  "Bash(*||*)",
-  "Bash(*|*)",
-  "Bash(*>*)",
-  "Bash(*<*)",
-  "Bash(*`*)",
-  "Bash(*$*)",
-  ...NESTED_ENGINE_CLI_DENY_RULES,
-  "Bash(node*)"
-];
+const CONSULT_DENY_RULES = ["Edit", "Write", "Bash", "MCPTool(*)"];
 
 const WRITE_DENY_RULES = [
   "Bash(sudo*)",
@@ -105,6 +61,10 @@ export function resolvePidlessRunningGraceMs(env = process.env) {
   return Number.isFinite(raw) && raw >= 0 ? Math.floor(raw) : DEFAULT_PIDLESS_RUNNING_GRACE_MS;
 }
 
+export function sandboxProfileForMode(mode) {
+  return mode === "write" ? "workspace" : "strict";
+}
+
 export function resolveConsultAllowRules(env = process.env) {
   const raw = env[CONSULT_ALLOW_ENV];
   if (raw == null || !String(raw).trim()) {
@@ -113,7 +73,7 @@ export function resolveConsultAllowRules(env = process.env) {
   return String(raw)
     .split(",")
     .map((entry) => entry.trim())
-    .filter(Boolean);
+    .filter((entry) => /^(?:Read|Grep|WebSearch|WebFetch)(?:\([^(),\r\n]*\))?$/.test(entry));
 }
 
 export function buildGrokArgs(options) {
@@ -126,7 +86,14 @@ export function buildGrokArgs(options) {
     args.push("-r", options.resumeSessionId);
   }
 
-  args.push("--prompt-file", options.briefFile, "--output-format", "json", "--sandbox", "workspace");
+  args.push(
+    "--prompt-file",
+    options.briefFile,
+    "--output-format",
+    "json",
+    "--sandbox",
+    sandboxProfileForMode(mode)
+  );
   if (!bestOfN) {
     args.push("--no-subagents");
   }
@@ -143,7 +110,14 @@ export function buildGrokArgs(options) {
   }
 
   if (mode === "consult") {
-    args.push("--permission-mode", "dontAsk");
+    args.push(
+      "--permission-mode",
+      "default",
+      "--tools",
+      [...CONSULT_TOOL_IDS, ...(options.web ? CONSULT_WEB_TOOL_IDS : [])].join(","),
+      "--disallowed-tools",
+      "Agent"
+    );
     const env = options.env ?? process.env;
     for (const rule of CONSULT_ALLOW_RULES) {
       args.push("--allow", rule);
@@ -392,6 +366,13 @@ function stdoutTail(stdout) {
   return String(stdout ?? "").trim().slice(-8192);
 }
 
+function findSandboxFailureLine(stderr) {
+  return String(stderr ?? "")
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .find((line) => SANDBOX_FAILURE_PATTERN.test(line)) ?? null;
+}
+
 function expectsJsonOutput(args) {
   for (let index = 0; index < args.length; index += 1) {
     const token = args[index];
@@ -409,14 +390,31 @@ function isGrokEnvelope(value) {
   return Boolean(value) && typeof value.text === "string" && typeof value.stopReason === "string";
 }
 
-function signalProcessGroup(pid, signal) {
-  if (!Number.isInteger(pid) || pid <= 0) {
+function objectField(value, key) {
+  const field = value?.[key];
+  return field && typeof field === "object" && !Array.isArray(field) ? field : null;
+}
+
+function booleanField(value, ...keys) {
+  for (const key of keys) {
+    if (typeof value?.[key] === "boolean") {
+      return value[key];
+    }
+  }
+  return null;
+}
+
+function signalProcessGroup(pid, signal, identity = null) {
+  if (!Number.isInteger(pid) || pid <= 1 || (identity != null && !processIdentityMatches(pid, identity))) {
     return false;
   }
   try {
     process.kill(-pid, signal);
     return true;
   } catch {
+    if (identity != null && !processIdentityMatches(pid, identity)) {
+      return false;
+    }
     try {
       process.kill(pid, signal);
       return true;
@@ -427,7 +425,7 @@ function signalProcessGroup(pid, signal) {
 }
 
 export function processGroupAlive(pid) {
-  if (!Number.isInteger(pid) || pid <= 0) {
+  if (!Number.isInteger(pid) || pid <= 1) {
     return false;
   }
   try {
@@ -451,7 +449,49 @@ export function processGroupAlive(pid) {
 
 function normalizedPid(value) {
   const pid = Number(value);
-  return Number.isInteger(pid) && pid > 0 ? pid : null;
+  return Number.isInteger(pid) && pid > 1 ? pid : null;
+}
+
+export function recordedProcessState(pid, identity = null) {
+  if (!Number.isInteger(pid) || pid <= 1) {
+    return "absent";
+  }
+  const currentIdentity = getProcessIdentity(pid);
+  if (currentIdentity) {
+    if (identity == null) {
+      return "legacy";
+    }
+    if (!validProcessIdentity(identity)) {
+      return "unverified";
+    }
+    return processIdentityMatches(pid, identity) ? "owned" : "replaced";
+  }
+  if (processIsDirectlyAlive(pid) || processGroupAlive(pid)) {
+    return identity == null ? "legacy" : "unverified";
+  }
+  return "absent";
+}
+
+export function recordedProcessTargets(record) {
+  const targets = new Map();
+  const grokPid = normalizedPid(record?.grokPid);
+  const pid = normalizedPid(record?.pid);
+  if (grokPid) {
+    targets.set(grokPid, { pid: grokPid, identity: record?.grokPidIdentity ?? null });
+  }
+  if (record?.background || !grokPid) {
+    if (pid) {
+      targets.set(pid, { pid, identity: record?.pidIdentity ?? null });
+    }
+  }
+  return [...targets.values()];
+}
+
+export function recordedProcessGroupsClean(record) {
+  return recordedProcessTargets(record).every(({ pid, identity }) => {
+    const state = recordedProcessState(pid, identity);
+    return state === "absent" || state === "replaced";
+  });
 }
 
 function launchTimestampMs(record) {
@@ -466,14 +506,24 @@ export function runningJobLiveness(record, options = {}) {
   }
   const pid = normalizedPid(record.pid);
   const grokPid = normalizedPid(record.grokPid);
-  const pids = pid ? [pid] : grokPid ? [grokPid] : [];
+  const targets = pid
+    ? [{ pid, identity: record.pidIdentity ?? null }]
+    : grokPid
+      ? [{ pid: grokPid, identity: record.grokPidIdentity ?? null }]
+      : [];
+  const pids = targets.map((target) => target.pid);
   if (pids.length === 0) {
     const launchedAt = launchTimestampMs(record);
     const now = options.now ?? Date.now();
     const graceMs = options.pidlessGraceMs ?? resolvePidlessRunningGraceMs(options.env ?? process.env);
     return { alive: launchedAt == null || now - launchedAt <= graceMs, pids, deadPids: [] };
   }
-  const deadPids = pids.filter((processPid) => !processGroupAlive(processPid));
+  const deadPids = targets
+    .filter(({ pid: processPid, identity }) => {
+      const state = recordedProcessState(processPid, identity);
+      return state === "absent" || state === "replaced";
+    })
+    .map((target) => target.pid);
   return { alive: deadPids.length !== pids.length, pids, deadPids };
 }
 
@@ -486,55 +536,123 @@ function waitSync(ms) {
 }
 
 export function terminateProcessGroupSync(pid, options = {}) {
-  if (!Number.isInteger(pid) || pid <= 0) {
+  if (!Number.isInteger(pid) || pid <= 1) {
     return false;
   }
   const graceMs = options.graceMs ?? TERMINATION_GRACE_MS;
   const pollMs = options.pollMs ?? TERMINATION_POLL_MS;
-  signalProcessGroup(pid, "SIGTERM");
+  const identity = options.identity ?? null;
+  const targetAlive = () => {
+    if (identity == null) {
+      return processGroupAlive(pid);
+    }
+    const currentIdentity = getProcessIdentity(pid);
+    if (currentIdentity) {
+      return processIdentityMatches(pid, identity);
+    }
+    return processGroupAlive(pid);
+  };
+  if (!signalProcessGroup(pid, "SIGTERM", identity)) {
+    return !targetAlive();
+  }
   const deadline = Date.now() + graceMs;
   while (Date.now() < deadline) {
-    if (!processGroupAlive(pid)) {
+    if (!targetAlive()) {
       return true;
     }
     waitSync(pollMs);
   }
-  if (processGroupAlive(pid)) {
-    signalProcessGroup(pid, "SIGKILL");
+  if (options.gracefulOnly === true) {
+    return !targetAlive();
+  }
+  if (targetAlive() && !signalProcessGroup(pid, "SIGKILL", identity)) {
+    return !targetAlive();
   }
   while (Date.now() < deadline + graceMs) {
-    if (!processGroupAlive(pid)) {
+    if (!targetAlive()) {
       return true;
     }
     waitSync(pollMs);
   }
-  return !processGroupAlive(pid);
+  return !targetAlive();
 }
 
 export async function terminateProcessGroup(pid, options = {}) {
-  if (!Number.isInteger(pid) || pid <= 0) {
+  if (!Number.isInteger(pid) || pid <= 1) {
     return false;
   }
   const graceMs = options.graceMs ?? TERMINATION_GRACE_MS;
   const pollMs = options.pollMs ?? TERMINATION_POLL_MS;
-  signalProcessGroup(pid, "SIGTERM");
+  const identity = options.identity ?? null;
+  const targetAlive = () => {
+    if (identity == null) {
+      return processGroupAlive(pid);
+    }
+    const currentIdentity = getProcessIdentity(pid);
+    if (currentIdentity) {
+      return processIdentityMatches(pid, identity);
+    }
+    return processGroupAlive(pid);
+  };
+  if (!signalProcessGroup(pid, "SIGTERM", identity)) {
+    return !targetAlive();
+  }
   const deadline = Date.now() + graceMs;
   while (Date.now() < deadline) {
-    if (!processGroupAlive(pid)) {
+    if (!targetAlive()) {
       return true;
     }
     await waitMs(pollMs);
   }
-  if (processGroupAlive(pid)) {
-    signalProcessGroup(pid, "SIGKILL");
+  if (options.gracefulOnly === true) {
+    return !targetAlive();
+  }
+  if (targetAlive() && !signalProcessGroup(pid, "SIGKILL", identity)) {
+    return !targetAlive();
   }
   while (Date.now() < deadline + graceMs) {
-    if (!processGroupAlive(pid)) {
+    if (!targetAlive()) {
       return true;
     }
     await waitMs(pollMs);
   }
-  return !processGroupAlive(pid);
+  return !targetAlive();
+}
+
+export function terminateRecordedProcessGroupsSync(record, options = {}) {
+  const results = recordedProcessTargets(record).map(({ pid, identity }) => {
+    const state = recordedProcessState(pid, identity);
+    if (state === "absent" || state === "replaced") {
+      return true;
+    }
+    if (state === "unverified") {
+      return false;
+    }
+    return terminateProcessGroupSync(pid, {
+      ...options,
+      identity: state === "owned" ? identity : null,
+      gracefulOnly: state === "legacy"
+    });
+  });
+  return results.every(Boolean);
+}
+
+export async function terminateRecordedProcessGroups(record, options = {}) {
+  const results = await Promise.all(recordedProcessTargets(record).map(async ({ pid, identity }) => {
+    const state = recordedProcessState(pid, identity);
+    if (state === "absent" || state === "replaced") {
+      return true;
+    }
+    if (state === "unverified") {
+      return false;
+    }
+    return terminateProcessGroup(pid, {
+      ...options,
+      identity: state === "owned" ? identity : null,
+      gracefulOnly: state === "legacy"
+    });
+  }));
+  return results.every(Boolean);
 }
 
 function exitCodeFromSignal(signal) {
@@ -550,63 +668,169 @@ export function runGrok(options) {
   const bin = options.bin ?? resolveGrokBin(env);
   const args = options.args ?? buildGrokArgs(options);
   const timeoutMs = options.timeoutMs ?? resolveTimeoutMs({ background: Boolean(options.background), env });
+  const captureProcessIdentity = options.captureProcessIdentity ?? getProcessIdentity;
 
   return new Promise((resolve, reject) => {
-    const child = spawn(bin, args, {
-      cwd: options.cwd,
-      env,
-      stdio: ["ignore", "pipe", "pipe"],
-      detached: true
-    });
-    options.onSpawn?.(child.pid ?? null);
+    let child = null;
+    let childIdentity = null;
+    let launchError = null;
+    const spawnChild = () => {
+      child = spawn(bin, args, {
+        cwd: options.cwd,
+        env,
+        stdio: ["ignore", "pipe", "pipe"],
+        detached: true
+      });
+      childIdentity = Number.isInteger(child.pid) ? captureProcessIdentity(child.pid) : null;
+      return { child, pid: child.pid ?? null, identity: childIdentity };
+    };
+    try {
+      if (typeof options.launchProcess === "function") {
+        const launched = options.launchProcess(spawnChild);
+        child = launched?.child ?? child;
+        childIdentity = launched?.identity ?? childIdentity;
+      } else {
+        const launched = spawnChild();
+        const publication = options.onSpawn?.(launched.pid, launched.identity);
+        if (publication?.status && publication.status !== "running") {
+          const error = new Error(`Grok process ownership could not be recorded because job ${publication.id ?? "unknown"} is already ${publication.status}.`);
+          error.failureKind = publication.failureKind ?? (publication.status === "cancelled" ? "cancelled" : "error");
+          throw error;
+        }
+      }
+    } catch (error) {
+      launchError = error;
+    }
+    if (!child) {
+      reject(launchError ?? new Error("Grok process launch did not create a child process."));
+      return;
+    }
 
     let stdout = "";
+    let stderr = "";
+    let sandboxFailureLine = null;
+    let supervisionError = null;
+    let terminationPromise = null;
     let timedOut = false;
     let cancelledByCompanion = false;
-    const forwardTermination = () => {
-      cancelledByCompanion = true;
-      void terminateProcessGroup(child.pid);
-    };
-    process.once("SIGTERM", forwardTermination);
-    process.once("SIGINT", forwardTermination);
-    const timer = setTimeout(() => {
-      timedOut = true;
-      void terminateProcessGroup(child.pid);
-    }, timeoutMs);
-    timer.unref?.();
-
+    let settled = false;
+    let timer = null;
     const cleanup = () => {
-      clearTimeout(timer);
+      if (timer) {
+        clearTimeout(timer);
+      }
       process.removeListener("SIGTERM", forwardTermination);
       process.removeListener("SIGINT", forwardTermination);
     };
+    const cleanupFailure = () => {
+      const error = new Error("Verified Grok process cleanup did not complete after the run was aborted.");
+      error.failureKind = timedOut ? "timeout" : cancelledByCompanion ? "cancelled" : supervisionError?.failureKind ?? "error";
+      error.cleanupRequired = true;
+      error.processRole = "grok";
+      error.pid = child.pid ?? null;
+      error.pidIdentity = childIdentity;
+      return error;
+    };
+    const finishReject = (error) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      cleanup();
+      child.stdout?.destroy();
+      child.stderr?.destroy();
+      child.unref();
+      reject(error);
+    };
+    const terminateChild = () => {
+      if (!Number.isInteger(child.pid) || child.pid <= 1) {
+        terminationPromise ??= Promise.resolve(true);
+        return terminationPromise;
+      }
+      terminationPromise ??= terminateProcessGroup(
+        child.pid,
+        childIdentity ? { identity: childIdentity } : {}
+      ).catch(() => false);
+      void terminationPromise.then((cleaned) => {
+        if (!cleaned) {
+          finishReject(cleanupFailure());
+        }
+      });
+      return terminationPromise;
+    };
+    const forwardTermination = () => {
+      cancelledByCompanion = true;
+      terminateChild();
+    };
+    process.once("SIGTERM", forwardTermination);
+    process.once("SIGINT", forwardTermination);
+    timer = setTimeout(() => {
+      timedOut = true;
+      terminateChild();
+    }, timeoutMs);
+    timer.unref?.();
 
     child.stdout.on("data", (chunk) => {
       stdout = appendBounded(stdout, chunk, STDOUT_CAPTURE_MAX_BYTES);
     });
     child.stderr.on("data", (chunk) => {
-      appendJobLog(options.logFile, chunk.toString());
+      stderr = appendBounded(stderr, chunk, STDERR_CAPTURE_MAX_BYTES);
+      const detectedSandboxFailure = sandboxFailureLine ?? findSandboxFailureLine(stderr);
+      if (!sandboxFailureLine && detectedSandboxFailure) {
+        sandboxFailureLine = detectedSandboxFailure;
+        terminateChild();
+      }
+      if (!supervisionError) {
+        try {
+          appendJobLog(options.logFile, chunk.toString());
+        } catch (error) {
+          supervisionError = error;
+          terminateChild();
+        }
+      }
     });
     child.on("error", (error) => {
-      cleanup();
-      reject(error);
+      finishReject(error);
     });
-    child.on("close", (code, signal) => {
+    child.on("close", async (code, signal) => {
+      if (settled) {
+        return;
+      }
       cleanup();
+      if (terminationPromise && !(await terminationPromise)) {
+        finishReject(cleanupFailure());
+        return;
+      }
+      if (supervisionError) {
+        finishReject(supervisionError);
+        return;
+      }
       const parsed = parseGrokOutput(stdout);
       const exitCode = code ?? exitCodeFromSignal(signal);
       const validEnvelope = isGrokEnvelope(parsed);
+      const structuredErrorMessage =
+        parsed?.type === "error" && typeof parsed.message === "string" && parsed.message.trim()
+          ? parsed.message.trim()
+          : null;
+      const errorMessage = sandboxFailureLine
+        ? `Grok sandbox enforcement failed; refusing the result: ${sandboxFailureLine}`
+        : structuredErrorMessage;
       const parseError =
-        exitCode === 0 && !timedOut && !validEnvelope && expectsJsonOutput(args)
+        exitCode === 0 && !timedOut && !validEnvelope && !errorMessage && expectsJsonOutput(args)
           ? "Grok did not return a valid JSON envelope for --output-format json."
           : null;
       const stopReason = validEnvelope ? parsed.stopReason : null;
       const blockedPermissionCall =
         stopReason === "Cancelled" ? extractBlockedPermissionCall(stdout, validEnvelope ? parsed : null) : null;
+      settled = true;
       resolve({
         text: validEnvelope ? parsed.text : stdout.trim(),
         sessionId: validEnvelope && typeof parsed.sessionId === "string" && parsed.sessionId ? parsed.sessionId : null,
         stopReason,
+        usage: objectField(parsed, "usage"),
+        modelUsage: objectField(parsed, "modelUsage"),
+        usageIsIncomplete: booleanField(parsed, "usage_is_incomplete", "usageIsIncomplete"),
+        errorMessage,
         exitCode,
         timedOut,
         parseError,
@@ -615,5 +839,10 @@ export function runGrok(options) {
         blockedPermissionCall
       });
     });
+
+    if (launchError) {
+      supervisionError = launchError;
+      terminateChild();
+    }
   });
 }

@@ -8,7 +8,10 @@ import { SESSION_ID_ENV, jobsDir, readJobRecordFile, resolveDataDir, workspaceSt
 const TERMINAL_STATUSES = new Set(["done", "error", "cancelled"]);
 const DEFAULT_POLL_INTERVAL_MS = 15000;
 const INTERVAL_ENV = "GROK_JOBS_MONITOR_INTERVAL_MS";
+const MANAGED_GRACE_ENV = "GROK_JOBS_MONITOR_MANAGED_GRACE_MS";
+const DEFAULT_MANAGED_GRACE_MS = 60000;
 const RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
+const ANNOUNCED_LEDGER_VERSION = 2;
 
 function resolvePollIntervalMs(env = process.env) {
   const raw = env[INTERVAL_ENV];
@@ -16,34 +19,117 @@ function resolvePollIntervalMs(env = process.env) {
   return Number.isInteger(parsed) && parsed > 0 ? parsed : DEFAULT_POLL_INTERVAL_MS;
 }
 
+function resolveManagedGraceMs(env = process.env) {
+  const raw = Number.parseInt(String(env[MANAGED_GRACE_ENV]), 10);
+  return Number.isInteger(raw) && raw >= 0 ? raw : DEFAULT_MANAGED_GRACE_MS;
+}
+
+function validMonitorRecord(record) {
+  return Boolean(
+    record &&
+      typeof record.id === "string" &&
+      record.id.length > 0 &&
+      typeof record.status === "string" &&
+      (record.cwd == null || typeof record.cwd === "string")
+  );
+}
+
 function readJobsSnapshot(dir) {
+  let stats;
   try {
-    if (!fs.statSync(dir).isDirectory()) {
-      return { available: false, records: [], unreadableIds: new Set() };
-    }
+    stats = fs.statSync(dir);
+  } catch (error) {
+    return { available: false, complete: error?.code === "ENOENT", records: [], unreadableIds: new Set() };
+  }
+  if (!stats.isDirectory()) {
+    return { available: false, complete: false, records: [], unreadableIds: new Set() };
+  }
+  try {
     const records = [];
     const unreadableIds = new Set();
     for (const entry of fs.readdirSync(dir).filter((name) => name.endsWith(".json"))) {
       const record = readJobRecordFile(path.join(dir, entry));
-      if (!record) {
+      if (!validMonitorRecord(record)) {
         unreadableIds.add(path.basename(entry, ".json"));
         continue;
       }
       records.push(record);
     }
-    return { available: true, records, unreadableIds };
+    return { available: true, complete: true, records, unreadableIds };
   } catch {
-    return { available: false, records: [], unreadableIds: new Set() };
+    return { available: false, complete: false, records: [], unreadableIds: new Set() };
   }
 }
 
-function formatOutcomeLine(record) {
-  const failureSuffix = record.failureKind ? ` (${record.failureKind})` : "";
-  return `grok job ${record.id} ${record.status}${failureSuffix}. collect with /grok:result ${record.id} only if you launched it detached; a job owned by a subagent reports on its own`;
+function readSessionJobsSnapshot(dataDir) {
+  const stateRoot = path.join(dataDir, "state");
+  let workspaces;
+  try {
+    if (!fs.statSync(stateRoot).isDirectory()) {
+      return { available: false, complete: false, records: [], unreadableIds: new Set() };
+    }
+    workspaces = fs.readdirSync(stateRoot);
+  } catch (error) {
+    return { available: false, complete: error?.code === "ENOENT", records: [], unreadableIds: new Set() };
+  }
+
+  const records = [];
+  const unreadableIds = new Set();
+  let available = false;
+  let complete = true;
+  for (const workspace of workspaces) {
+    const snapshot = readJobsSnapshot(path.join(stateRoot, workspace, "jobs"));
+    complete &&= snapshot.complete;
+    if (!snapshot.available) {
+      continue;
+    }
+    available = true;
+    records.push(...snapshot.records);
+    for (const id of snapshot.unreadableIds) {
+      unreadableIds.add(id);
+    }
+  }
+  return { available, complete, records, unreadableIds };
 }
 
-function announcementKey(id, status) {
-  return `${id}:${status}`;
+function formatOutcomeLine(record, monitorCwd, forceCwd = false) {
+  const failureSuffix = record.failureKind ? ` (${record.failureKind})` : "";
+  const cwdSuffix = record.cwd && (forceCwd || path.resolve(record.cwd) !== monitorCwd) ? ` --cwd ${JSON.stringify(record.cwd)}` : "";
+  if (record.delivery === "managed") {
+    return `grok managed job ${record.id} ${record.status}${failureSuffix} without collection by its owning agent. collect with /grok:result ${record.id}${cwdSuffix}`;
+  }
+  return `grok job ${record.id} ${record.status}${failureSuffix}. collect with /grok:result ${record.id}${cwdSuffix} only if you launched it detached; a job owned by a subagent reports on its own`;
+}
+
+function managedDeliveryIsPending(record, graceMs, now = Date.now()) {
+  if (record.delivery !== "managed" || record.deliveryCollectedAt) {
+    return false;
+  }
+  const finishedAt = Date.parse(record.finishedAt ?? "");
+  const createdAt = Date.parse(record.createdAt ?? "");
+  const referenceAt = Number.isFinite(finishedAt) ? finishedAt : createdAt;
+  return Number.isFinite(referenceAt) && now - referenceAt < graceMs;
+}
+
+function workspaceKey(record) {
+  return typeof record.cwd === "string" ? path.resolve(record.cwd) : null;
+}
+
+function liveKey(record) {
+  return JSON.stringify([workspaceKey(record), record.id]);
+}
+
+function announcementKey(record) {
+  return JSON.stringify([workspaceKey(record), record.id, record.status]);
+}
+
+function announcedKeyIsLive(key, liveKeys, unreadableIds) {
+  try {
+    const [cwd, id] = JSON.parse(key);
+    return typeof id === "string" && (liveKeys.has(JSON.stringify([cwd, id])) || unreadableIds.has(id));
+  } catch {
+    return false;
+  }
 }
 
 function announcedStatePath(stateDir, sessionId) {
@@ -54,31 +140,27 @@ function announcedStatePath(stateDir, sessionId) {
 function loadAnnounced(file) {
   try {
     const raw = JSON.parse(fs.readFileSync(file, "utf8"));
-    const keys = Array.isArray(raw) ? raw : Array.isArray(raw?.keys) ? raw.keys : null;
-    if (!keys) {
-      return { exists: true, announced: new Set() };
+    if (raw?.version !== ANNOUNCED_LEDGER_VERSION || !Array.isArray(raw.keys)) {
+      return { exists: true, announced: new Set(), reset: true };
     }
-    return { exists: true, announced: new Set(keys.filter((key) => typeof key === "string")) };
+    return { exists: true, announced: new Set(raw.keys.filter((key) => typeof key === "string")), reset: false };
   } catch (error) {
-    return { exists: error?.code !== "ENOENT", announced: new Set() };
+    return { exists: error?.code !== "ENOENT", announced: new Set(), reset: error?.code !== "ENOENT" };
   }
 }
 
 function saveAnnounced(file, announced) {
   const dir = path.dirname(file);
-  if (!fs.statSync(dir).isDirectory()) {
-    return;
-  }
+  fs.mkdirSync(dir, { recursive: true });
   const temp = `${file}.${process.pid}.tmp`;
-  fs.writeFileSync(temp, `${JSON.stringify([...announced])}\n`, "utf8");
+  fs.writeFileSync(temp, `${JSON.stringify({ version: ANNOUNCED_LEDGER_VERSION, keys: [...announced] })}\n`, "utf8");
   fs.renameSync(temp, file);
 }
 
-function pruneAnnounced(announced, liveIds) {
+function pruneAnnounced(announced, liveKeys, unreadableIds) {
   let dirty = false;
   for (const key of [...announced]) {
-    const id = key.slice(0, key.indexOf(":"));
-    if (!id || !liveIds.has(id)) {
+    if (!announcedKeyIsLive(key, liveKeys, unreadableIds)) {
       announced.delete(key);
       dirty = true;
     }
@@ -109,7 +191,15 @@ function pruneOldStateFiles(stateDir, currentFile) {
 
 function safeWriteLine(line) {
   try {
-    process.stdout.write(`${line}\n`);
+    const buffer = Buffer.from(`${line}\n`);
+    let offset = 0;
+    while (offset < buffer.length) {
+      const written = fs.writeSync(process.stdout.fd, buffer, offset, buffer.length - offset);
+      if (written <= 0) {
+        throw new Error("Unable to write the Grok job notification to stdout.");
+      }
+      offset += written;
+    }
   } catch (error) {
     if (error?.code === "EPIPE") {
       process.exit(0);
@@ -143,6 +233,9 @@ function main() {
   const stateFile = announcedStatePath(stateDir, ownSessionId);
   const loaded = loadAnnounced(stateFile);
   const announced = loaded.announced;
+  let resetPending = loaded.reset;
+  const managedGraceMs = resolveManagedGraceMs();
+  const readSnapshot = ownSessionId ? () => readSessionJobsSnapshot(dataDir) : () => readJobsSnapshot(dir);
   let startupPending = true;
 
   pruneOldStateFiles(stateDir, stateFile);
@@ -151,34 +244,62 @@ function main() {
     if (!snapshot.available) {
       return;
     }
-    const liveIds = new Set(snapshot.unreadableIds);
-    let dirty = false;
+    const liveKeys = new Set();
+    const duplicateWorkspacesById = new Map();
     for (const record of snapshot.records) {
       if (!record?.id) {
         continue;
       }
-      liveIds.add(record.id);
-      if (!TERMINAL_STATUSES.has(record.status)) {
+      const workspace = workspaceKey(record);
+      liveKeys.add(liveKey(record));
+      if (workspace == null) {
         continue;
       }
-      const key = announcementKey(record.id, record.status);
-      if (announced.has(key)) {
-        continue;
-      }
-      announced.add(key);
-      dirty = true;
-      if (startupPending && !loaded.exists) {
+      const workspaces = duplicateWorkspacesById.get(record.id) ?? new Set();
+      workspaces.add(workspace);
+      duplicateWorkspacesById.set(record.id, workspaces);
+    }
+    const duplicateIds = new Set(
+      [...duplicateWorkspacesById].filter(([, workspaces]) => workspaces.size > 1).map(([id]) => id),
+    );
+    let dirty = resetPending;
+    for (const record of snapshot.records) {
+      if (!record?.id) {
         continue;
       }
       if (ownSessionId && record.claudeSessionId !== ownSessionId) {
         continue;
       }
-      if (record.background !== true) {
+      if (!TERMINAL_STATUSES.has(record.status)) {
         continue;
       }
-      safeWriteLine(formatOutcomeLine(record));
+      if (managedDeliveryIsPending(record, managedGraceMs)) {
+        continue;
+      }
+      const key = announcementKey(record);
+      if (announced.has(key)) {
+        continue;
+      }
+      if (startupPending && !loaded.exists && record.delivery !== "managed") {
+        announced.add(key);
+        dirty = true;
+        continue;
+      }
+      if (record.background !== true) {
+        announced.add(key);
+        dirty = true;
+        continue;
+      }
+      if (record.delivery === "managed" && record.deliveryCollectedAt) {
+        announced.add(key);
+        dirty = true;
+        continue;
+      }
+      safeWriteLine(formatOutcomeLine(record, cwd, duplicateIds.has(record.id)));
+      announced.add(key);
+      dirty = true;
     }
-    if (pruneAnnounced(announced, liveIds)) {
+    if (snapshot.complete && pruneAnnounced(announced, liveKeys, snapshot.unreadableIds)) {
       dirty = true;
     }
     if (startupPending && !loaded.exists) {
@@ -186,21 +307,24 @@ function main() {
     }
     if (dirty) {
       saveAnnounced(stateFile, announced);
+      resetPending = false;
     }
-    startupPending = false;
+    if (snapshot.complete) {
+      startupPending = false;
+    }
   };
 
   try {
-    const initialSnapshot = readJobsSnapshot(dir);
+    const initialSnapshot = readSnapshot();
     processSnapshot(initialSnapshot);
-    if (!initialSnapshot.available) {
+    if (!initialSnapshot.available && initialSnapshot.complete) {
       startupPending = false;
     }
   } catch {}
 
   const timer = setInterval(() => {
     try {
-      processSnapshot(readJobsSnapshot(dir));
+      processSnapshot(readSnapshot());
     } catch {}
   }, resolvePollIntervalMs());
 

@@ -17,26 +17,29 @@ const {
   writeJobRecordFile,
 } = await import(pathToFileURL(stateModulePath).href);
 
+const ANNOUNCED_LEDGER_VERSION = 2;
+
 function envFor(sandbox, extra = {}) {
   return companionEnvFor(sandbox, { GROK_JOBS_MONITOR_INTERVAL_MS: "200", ...extra });
 }
 
 function seedJob(sandbox, fields = {}) {
   const id = fields.id ?? generateJobId();
-  const briefFile = writeBrief(sandbox.dataDir, sandbox.workDir, id, "seeded job");
-  const file = jobFilePath(sandbox.dataDir, sandbox.workDir, id);
+  const cwd = fields.cwd ?? sandbox.workDir;
+  const briefFile = writeBrief(sandbox.dataDir, cwd, id, "seeded job");
+  const file = jobFilePath(sandbox.dataDir, cwd, id);
   const record = {
     ...createJobRecord({
       id,
       pid: null,
       mode: "consult",
-      cwd: sandbox.workDir,
+      cwd,
       briefFile,
       background: true,
     }),
     ...fields,
     id,
-    cwd: sandbox.workDir,
+    cwd,
     briefFile,
   };
   writeJobRecordFile(file, record);
@@ -46,6 +49,14 @@ function seedJob(sandbox, fields = {}) {
 function announcedPath(sandbox, sessionId = null) {
   const name = sessionId ? `jobs-monitor-announced.${sessionId}.json` : "jobs-monitor-announced.json";
   return path.join(workspaceStateDir(sandbox.dataDir, sandbox.workDir), name);
+}
+
+function announcedKey(cwd, id, status) {
+  return JSON.stringify([path.resolve(cwd), id, status]);
+}
+
+function announcedLedger(keys = []) {
+  return { version: ANNOUNCED_LEDGER_VERSION, keys };
 }
 
 function startMonitor(sandbox, env) {
@@ -61,6 +72,14 @@ function startMonitor(sandbox, env) {
   let stderr = "";
   child.stderr.on("data", (chunk) => {
     stderr += chunk.toString("utf8");
+  });
+  sandbox.registerCleanup(async () => {
+    if (child.exitCode !== null || child.signalCode !== null) {
+      return;
+    }
+    const closed = once(child, "close");
+    child.kill("SIGKILL");
+    await closed;
   });
   return {
     child,
@@ -87,16 +106,30 @@ test("a pre-existing terminal job emits nothing on startup", async (t) => {
   const sandbox = makeSandbox(t);
   seedJob(sandbox, { status: "done", finishedAt: new Date().toISOString() });
   const monitor = startMonitor(sandbox, envFor(sandbox));
-  t.after(() => monitor.child.kill("SIGKILL"));
   await new Promise((resolve) => setTimeout(resolve, 600));
   assert.deepStrictEqual(monitor.lines(), []);
+});
+
+test("a pre-existing uncollected managed job emits its fallback on startup", async (t) => {
+  const sandbox = makeSandbox(t);
+  const { record } = seedJob(sandbox, {
+    status: "done",
+    delivery: "managed",
+    createdAt: new Date(Date.now() - 1000).toISOString(),
+    finishedAt: null,
+  });
+  const monitor = startMonitor(sandbox, envFor(sandbox, { GROK_JOBS_MONITOR_MANAGED_GRACE_MS: "100" }));
+
+  const lines = await waitUntil(() => (monitor.lines().length > 0 ? monitor.lines() : null));
+  assert.deepStrictEqual(lines, [
+    `grok managed job ${record.id} done without collection by its owning agent. collect with /grok:result ${record.id}`,
+  ]);
 });
 
 test("a background job transitioning to done emits exactly one correctly shaped line", async (t) => {
   const sandbox = makeSandbox(t);
   const { file, record } = seedJob(sandbox, { status: "running", background: true });
   const monitor = startMonitor(sandbox, envFor(sandbox));
-  t.after(() => monitor.child.kill("SIGKILL"));
   await new Promise((resolve) => setTimeout(resolve, 300));
   assert.deepStrictEqual(monitor.lines(), []);
 
@@ -123,9 +156,8 @@ test("a corrupt job record does not mute announcements for healthy records", asy
   const { file, record } = seedJob(sandbox, { status: "running", background: true });
   const corruptId = "corrupt-record";
   fs.writeFileSync(path.join(jobsDir(sandbox.dataDir, sandbox.workDir), `${corruptId}.json`), "{not json\n", "utf8");
-  fs.writeFileSync(announcedPath(sandbox), `${JSON.stringify([`${corruptId}:done`])}\n`, "utf8");
+  fs.writeFileSync(announcedPath(sandbox), `${JSON.stringify(announcedLedger([announcedKey(sandbox.workDir, corruptId, "done")]))}\n`, "utf8");
   const monitor = startMonitor(sandbox, envFor(sandbox));
-  t.after(() => monitor.child.kill("SIGKILL"));
   await new Promise((resolve) => setTimeout(resolve, 300));
 
   writeJobRecordFile(file, {
@@ -140,14 +172,39 @@ test("a corrupt job record does not mute announcements for healthy records", asy
     `grok job ${record.id} done. collect with /grok:result ${record.id} only if you launched it detached; a job owned by a subagent reports on its own`,
   ]);
   const announced = JSON.parse(fs.readFileSync(announcedPath(sandbox), "utf8"));
-  assert.ok(announced.includes(`${corruptId}:done`));
+  assert.strictEqual(announced.version, ANNOUNCED_LEDGER_VERSION);
+  assert.ok(announced.keys.includes(announcedKey(sandbox.workDir, corruptId, "done")));
+});
+
+test("a malformed terminal record does not mute announcements for healthy records", async (t) => {
+  const sandbox = makeSandbox(t);
+  const malformedId = "000-malformed-record";
+  const malformedFile = path.join(jobsDir(sandbox.dataDir, sandbox.workDir), `${malformedId}.json`);
+  fs.mkdirSync(path.dirname(malformedFile), { recursive: true });
+  fs.writeFileSync(malformedFile, `${JSON.stringify({ id: malformedId, status: "done", background: true, cwd: { invalid: true } })}\n`, "utf8");
+  const { file, record } = seedJob(sandbox, { id: "zzzz-healthy-record", status: "running", background: true });
+  fs.writeFileSync(announcedPath(sandbox), `${JSON.stringify(announcedLedger())}\n`, "utf8");
+  const monitor = startMonitor(sandbox, envFor(sandbox));
+  await new Promise((resolve) => setTimeout(resolve, 300));
+
+  writeJobRecordFile(file, {
+    ...record,
+    status: "done",
+    finishedAt: new Date().toISOString(),
+    resultText: "ALLOW",
+  });
+
+  const lines = await waitUntil(() => (monitor.lines().length > 0 ? monitor.lines() : null));
+  assert.deepStrictEqual(lines, [
+    `grok job ${record.id} done. collect with /grok:result ${record.id} only if you launched it detached; a job owned by a subagent reports on its own`,
+  ]);
+  assert.strictEqual(monitor.stderr(), "");
 });
 
 test("a foreground job transitioning to done is not announced", async (t) => {
   const sandbox = makeSandbox(t);
   const { file, record } = seedJob(sandbox, { status: "running", background: false });
   const monitor = startMonitor(sandbox, envFor(sandbox));
-  t.after(() => monitor.child.kill("SIGKILL"));
   await new Promise((resolve) => setTimeout(resolve, 300));
 
   writeJobRecordFile(file, {
@@ -161,11 +218,83 @@ test("a foreground job transitioning to done is not announced", async (t) => {
   assert.deepStrictEqual(monitor.lines(), []);
 });
 
+test("a managed background job stays silent during its owner collection grace", async (t) => {
+  const sandbox = makeSandbox(t);
+  const { file, record } = seedJob(sandbox, { status: "running", background: true, delivery: "managed" });
+  const monitor = startMonitor(sandbox, envFor(sandbox));
+  await new Promise((resolve) => setTimeout(resolve, 300));
+
+  writeJobRecordFile(file, {
+    ...record,
+    status: "done",
+    finishedAt: new Date().toISOString(),
+    resultText: "ALLOW",
+  });
+
+  await new Promise((resolve) => setTimeout(resolve, 600));
+  assert.deepStrictEqual(monitor.lines(), []);
+});
+
+test("an uncollected managed background job is announced after its owner grace", async (t) => {
+  const sandbox = makeSandbox(t);
+  const { file, record } = seedJob(sandbox, { status: "running", background: true, delivery: "managed" });
+  const monitor = startMonitor(sandbox, envFor(sandbox, { GROK_JOBS_MONITOR_MANAGED_GRACE_MS: "100" }));
+  await new Promise((resolve) => setTimeout(resolve, 300));
+
+  writeJobRecordFile(file, {
+    ...record,
+    status: "done",
+    createdAt: new Date(Date.now() - 1000).toISOString(),
+    finishedAt: null,
+    resultText: "ALLOW",
+  });
+
+  const lines = await waitUntil(() => (monitor.lines().length > 0 ? monitor.lines() : null));
+  assert.deepStrictEqual(lines, [
+    `grok managed job ${record.id} done without collection by its owning agent. collect with /grok:result ${record.id}`,
+  ]);
+});
+
+test("an invalid managed completion timestamp falls back to the creation timestamp", async (t) => {
+  const sandbox = makeSandbox(t);
+  const { file, record } = seedJob(sandbox, { status: "running", background: true, delivery: "managed" });
+  const monitor = startMonitor(sandbox, envFor(sandbox, { GROK_JOBS_MONITOR_MANAGED_GRACE_MS: "1000" }));
+  await new Promise((resolve) => setTimeout(resolve, 300));
+
+  writeJobRecordFile(file, {
+    ...record,
+    status: "done",
+    createdAt: new Date().toISOString(),
+    finishedAt: "invalid",
+    resultText: "ALLOW",
+  });
+
+  await new Promise((resolve) => setTimeout(resolve, 600));
+  assert.deepStrictEqual(monitor.lines(), []);
+});
+
+test("a collected managed background job remains silent after its owner grace", async (t) => {
+  const sandbox = makeSandbox(t);
+  const { file, record } = seedJob(sandbox, { status: "running", background: true, delivery: "managed" });
+  const monitor = startMonitor(sandbox, envFor(sandbox, { GROK_JOBS_MONITOR_MANAGED_GRACE_MS: "0" }));
+  await new Promise((resolve) => setTimeout(resolve, 300));
+
+  writeJobRecordFile(file, {
+    ...record,
+    status: "done",
+    finishedAt: new Date(Date.now() - 1000).toISOString(),
+    deliveryCollectedAt: new Date().toISOString(),
+    resultText: "ALLOW",
+  });
+
+  await new Promise((resolve) => setTimeout(resolve, 600));
+  assert.deepStrictEqual(monitor.lines(), []);
+});
+
 test("a foreground job transitioning to error is not announced", async (t) => {
   const sandbox = makeSandbox(t);
   const { file, record } = seedJob(sandbox, { status: "running", background: false });
   const monitor = startMonitor(sandbox, envFor(sandbox));
-  t.after(() => monitor.child.kill("SIGKILL"));
   await new Promise((resolve) => setTimeout(resolve, 300));
 
   writeJobRecordFile(file, {
@@ -183,7 +312,6 @@ test("a job transitioning to error reports the failure kind", async (t) => {
   const sandbox = makeSandbox(t);
   const { file, record } = seedJob(sandbox, { status: "running", background: true });
   const monitor = startMonitor(sandbox, envFor(sandbox));
-  t.after(() => monitor.child.kill("SIGKILL"));
   await new Promise((resolve) => setTimeout(resolve, 300));
 
   writeJobRecordFile(file, {
@@ -214,7 +342,6 @@ test("with a monitor session id set, a matching job emits and a mismatching job 
     claudeSessionId: "session-other",
   });
   const monitor = startMonitor(sandbox, envFor(sandbox, { CLAUDE_CODE_SESSION_ID: "session-own" }));
-  t.after(() => monitor.child.kill("SIGKILL"));
   await new Promise((resolve) => setTimeout(resolve, 300));
 
   writeJobRecordFile(ownFile, { ...ownRecord, status: "done", finishedAt: new Date().toISOString() });
@@ -231,6 +358,128 @@ test("with a monitor session id set, a matching job emits and a mismatching job 
   assert.strictEqual(monitor.lines().length, 1);
 });
 
+test("a session monitor observes a managed job launched in another workspace", async (t) => {
+  const sandbox = makeSandbox(t);
+  const otherCwd = path.join(sandbox.root, "other-workspace");
+  fs.mkdirSync(otherCwd, { recursive: true });
+  const monitor = startMonitor(
+    sandbox,
+    envFor(sandbox, {
+      CLAUDE_CODE_SESSION_ID: "session-own",
+      GROK_JOBS_MONITOR_MANAGED_GRACE_MS: "0",
+    })
+  );
+  await new Promise((resolve) => setTimeout(resolve, 300));
+
+  const { record } = seedJob(sandbox, {
+    cwd: otherCwd,
+    status: "done",
+    background: true,
+    delivery: "managed",
+    claudeSessionId: "session-own",
+    finishedAt: new Date().toISOString(),
+  });
+
+  const lines = await waitUntil(() => (monitor.lines().length > 0 ? monitor.lines() : null));
+  assert.deepStrictEqual(lines, [
+    `grok managed job ${record.id} done without collection by its owning agent. collect with /grok:result ${record.id} --cwd ${JSON.stringify(otherCwd)}`,
+  ]);
+});
+
+test("a session monitor announces duplicate legacy ids in each workspace with explicit cwd values", async (t) => {
+  const sandbox = makeSandbox(t);
+  const otherCwd = path.join(sandbox.root, "other-workspace");
+  fs.mkdirSync(otherCwd, { recursive: true });
+  const id = "duplicate-legacy-id";
+  const { file: ownFile, record: ownRecord } = seedJob(sandbox, {
+    id,
+    status: "running",
+    background: true,
+    claudeSessionId: "session-own",
+  });
+  const { file: otherFile, record: otherRecord } = seedJob(sandbox, {
+    id,
+    cwd: otherCwd,
+    status: "running",
+    background: true,
+    claudeSessionId: "session-own",
+  });
+  const monitor = startMonitor(sandbox, envFor(sandbox, { CLAUDE_CODE_SESSION_ID: "session-own" }));
+  await new Promise((resolve) => setTimeout(resolve, 300));
+
+  writeJobRecordFile(ownFile, { ...ownRecord, status: "done", finishedAt: new Date().toISOString() });
+  writeJobRecordFile(otherFile, { ...otherRecord, status: "done", finishedAt: new Date().toISOString() });
+
+  const lines = await waitUntil(() => (monitor.lines().length === 2 ? monitor.lines() : null));
+  assert.deepStrictEqual(lines.sort(), [
+    `grok job ${id} done. collect with /grok:result ${id} --cwd ${JSON.stringify(sandbox.workDir)} only if you launched it detached; a job owned by a subagent reports on its own`,
+    `grok job ${id} done. collect with /grok:result ${id} --cwd ${JSON.stringify(otherCwd)} only if you launched it detached; a job owned by a subagent reports on its own`,
+  ].sort());
+});
+
+test("a partial session snapshot does not prune another workspace announcement", async (t) => {
+  const sandbox = makeSandbox(t);
+  const otherCwd = path.join(sandbox.root, "other-workspace");
+  fs.mkdirSync(otherCwd, { recursive: true });
+  seedJob(sandbox, {
+    status: "running",
+    background: true,
+    claudeSessionId: "session-own",
+  });
+  const { file, record } = seedJob(sandbox, {
+    cwd: otherCwd,
+    status: "running",
+    background: true,
+    claudeSessionId: "session-own",
+  });
+  const monitor = startMonitor(sandbox, envFor(sandbox, { CLAUDE_CODE_SESSION_ID: "session-own" }));
+  await new Promise((resolve) => setTimeout(resolve, 300));
+
+  writeJobRecordFile(file, { ...record, status: "done", finishedAt: new Date().toISOString() });
+  await waitUntil(() => (monitor.lines().length === 1 ? true : null));
+
+  const dir = jobsDir(sandbox.dataDir, otherCwd);
+  const backup = `${dir}.backup`;
+  fs.renameSync(dir, backup);
+  fs.writeFileSync(dir, "not a directory", "utf8");
+  await new Promise((resolve) => setTimeout(resolve, 500));
+  fs.rmSync(dir, { force: true });
+  fs.renameSync(backup, dir);
+  await new Promise((resolve) => setTimeout(resolve, 600));
+
+  assert.strictEqual(monitor.lines().length, 1);
+});
+
+test("startup suppression waits for a complete cross workspace snapshot", async (t) => {
+  const sandbox = makeSandbox(t);
+  const otherCwd = path.join(sandbox.root, "other-workspace");
+  fs.mkdirSync(otherCwd, { recursive: true });
+  seedJob(sandbox, {
+    status: "running",
+    background: true,
+    claudeSessionId: "session-own",
+  });
+  seedJob(sandbox, {
+    cwd: otherCwd,
+    status: "done",
+    background: true,
+    claudeSessionId: "session-own",
+    finishedAt: new Date().toISOString(),
+  });
+  const dir = jobsDir(sandbox.dataDir, otherCwd);
+  const backup = `${dir}.backup`;
+  fs.renameSync(dir, backup);
+  fs.writeFileSync(dir, "not a directory", "utf8");
+  const monitor = startMonitor(sandbox, envFor(sandbox, { CLAUDE_CODE_SESSION_ID: "session-own" }));
+  await new Promise((resolve) => setTimeout(resolve, 500));
+
+  fs.rmSync(dir, { force: true });
+  fs.renameSync(backup, dir);
+  await new Promise((resolve) => setTimeout(resolve, 600));
+
+  assert.deepStrictEqual(monitor.lines(), []);
+});
+
 test("with the session id env var unset, a job from a different session still emits", async (t) => {
   const sandbox = makeSandbox(t);
   const { file, record } = seedJob(sandbox, {
@@ -239,7 +488,6 @@ test("with the session id env var unset, a job from a different session still em
     claudeSessionId: "session-other",
   });
   const monitor = startMonitor(sandbox, envFor(sandbox));
-  t.after(() => monitor.child.kill("SIGKILL"));
   await new Promise((resolve) => setTimeout(resolve, 300));
 
   writeJobRecordFile(file, { ...record, status: "done", finishedAt: new Date().toISOString() });
@@ -255,7 +503,6 @@ test("with the session id env var unset, a job from a different session still em
 test("a vanished jobs directory mid run does not crash the process and a later tick still emits", async (t) => {
   const sandbox = makeSandbox(t);
   const monitor = startMonitor(sandbox, envFor(sandbox));
-  t.after(() => monitor.child.kill("SIGKILL"));
   await new Promise((resolve) => setTimeout(resolve, 300));
 
   const dir = jobsDir(sandbox.dataDir, sandbox.workDir);
@@ -293,13 +540,13 @@ test("restart with persisted dedup state does not re-announce a background done 
 
   assert.ok(fs.existsSync(announcedPath(sandbox)));
   const persisted = JSON.parse(fs.readFileSync(announcedPath(sandbox), "utf8"));
-  assert.ok(persisted.includes(`${record.id}:done`));
+  assert.strictEqual(persisted.version, ANNOUNCED_LEDGER_VERSION);
+  assert.ok(persisted.keys.includes(announcedKey(sandbox.workDir, record.id, "done")));
 
   // Prove the disk key, not only startup absorption, suppresses re-announce: rewrite
   // the record to running then back to done after restart.
   fs.writeFileSync(file, `${JSON.stringify({ ...record, status: "running", finishedAt: null }, null, 2)}\n`);
   const second = startMonitor(sandbox, env);
-  t.after(() => second.child.kill("SIGKILL"));
   await new Promise((resolve) => setTimeout(resolve, 300));
   fs.writeFileSync(
     file,
@@ -307,6 +554,31 @@ test("restart with persisted dedup state does not re-announce a background done 
   );
   await new Promise((resolve) => setTimeout(resolve, 600));
   assert.deepStrictEqual(second.lines(), []);
+});
+
+test("an old announcement ledger version is reset instead of suppressing a namespaced notification", async (t) => {
+  const sandbox = makeSandbox(t);
+  const { file, record } = seedJob(sandbox, { status: "running", background: true });
+  const stateFile = announcedPath(sandbox);
+  fs.writeFileSync(
+    stateFile,
+    `${JSON.stringify({ version: 1, keys: [announcedKey(sandbox.workDir, record.id, "done")] })}\n`,
+    "utf8",
+  );
+  const monitor = startMonitor(sandbox, envFor(sandbox));
+  await new Promise((resolve) => setTimeout(resolve, 300));
+
+  writeJobRecordFile(file, { ...record, status: "done", finishedAt: new Date().toISOString() });
+
+  const lines = await waitUntil(() => (monitor.lines().length > 0 ? monitor.lines() : null));
+  assert.deepStrictEqual(lines, [
+    `grok job ${record.id} done. collect with /grok:result ${record.id} only if you launched it detached; a job owned by a subagent reports on its own`,
+  ]);
+  const persisted = await waitUntil(() => {
+    const current = JSON.parse(fs.readFileSync(stateFile, "utf8"));
+    return current.keys.includes(announcedKey(sandbox.workDir, record.id, "done")) ? current : null;
+  });
+  assert.strictEqual(persisted.version, ANNOUNCED_LEDGER_VERSION);
 });
 
 test("restart catch-up announces an unrecorded terminal background job owned by the active session", async (t) => {
@@ -317,10 +589,9 @@ test("restart catch-up announces an unrecorded terminal background job owned by 
     claudeSessionId: "session-own",
     finishedAt: new Date().toISOString()
   });
-  fs.writeFileSync(announcedPath(sandbox, "session-own"), "[]\n", "utf8");
+  fs.writeFileSync(announcedPath(sandbox, "session-own"), `${JSON.stringify(announcedLedger())}\n`, "utf8");
 
   const monitor = startMonitor(sandbox, envFor(sandbox, { CLAUDE_CODE_SESSION_ID: "session-own" }));
-  t.after(() => monitor.child.kill("SIGKILL"));
   const lines = await waitUntil(() => (monitor.lines().length > 0 ? monitor.lines() : null));
   assert.deepStrictEqual(lines, [
     `grok job ${record.id} done. collect with /grok:result ${record.id} only if you launched it detached; a job owned by a subagent reports on its own`
@@ -331,9 +602,8 @@ test("an unavailable jobs snapshot neither prunes nor persists announcement stat
   const sandbox = makeSandbox(t);
   const { record } = seedJob(sandbox, { status: "running", background: true });
   const stateFile = announcedPath(sandbox);
-  fs.writeFileSync(stateFile, `${JSON.stringify([`${record.id}:done`])}\n`, "utf8");
+  fs.writeFileSync(stateFile, `${JSON.stringify(announcedLedger([announcedKey(sandbox.workDir, record.id, "done")]))}\n`, "utf8");
   const monitor = startMonitor(sandbox, envFor(sandbox));
-  t.after(() => monitor.child.kill("SIGKILL"));
   await new Promise((resolve) => setTimeout(resolve, 300));
   const before = fs.readFileSync(stateFile, "utf8");
 
@@ -348,7 +618,6 @@ test("a removed state directory is not recreated while the jobs source is unavai
   const sandbox = makeSandbox(t);
   seedJob(sandbox, { status: "running", background: true });
   const monitor = startMonitor(sandbox, envFor(sandbox));
-  t.after(() => monitor.child.kill("SIGKILL"));
   await new Promise((resolve) => setTimeout(resolve, 300));
 
   const stateDir = workspaceStateDir(sandbox.dataDir, sandbox.workDir);
@@ -368,7 +637,6 @@ test("announcement state files older than 30 days are pruned", async (t) => {
   fs.utimesSync(staleFile, staleTime, staleTime);
 
   const monitor = startMonitor(sandbox, envFor(sandbox));
-  t.after(() => monitor.child.kill("SIGKILL"));
   await waitUntil(() => (!fs.existsSync(staleFile) ? true : null));
   assert.strictEqual(fs.existsSync(staleFile), false);
 });
@@ -386,7 +654,6 @@ test("skips silently when the jobs directory does not exist", async (t) => {
   const sandbox = makeSandbox(t);
   fs.rmSync(sandbox.dataDir, { recursive: true, force: true });
   const monitor = startMonitor(sandbox, envFor(sandbox));
-  t.after(() => monitor.child.kill("SIGKILL"));
   await new Promise((resolve) => setTimeout(resolve, 500));
   assert.deepStrictEqual(monitor.lines(), []);
   assert.strictEqual(monitor.stderr(), "");

@@ -3,20 +3,35 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
+import {
+  getProcessIdentity,
+  processIdentitiesMatch,
+  processIdentityMatches,
+  processIsDirectlyAlive,
+  validProcessIdentity
+} from "./process-identity.mjs";
+
 const DATA_DIR_ENV = "GROK_COMPANION_DATA";
 const JOB_LOG_MAX_BYTES = 1024 * 1024;
 const LOG_TAIL_MAX_BYTES = 64 * 1024;
 const LOCK_TIMEOUT_MS = 2000;
 const LOCK_RETRY_MS = 20;
 const LOCK_STALE_MS = 10000;
+const RESUME_OWNER_LAUNCH_GRACE_MS = 15000;
 const TERMINAL_STATUSES = new Set(["done", "error", "cancelled"]);
 
 export const SESSION_ID_ENV = "CLAUDE_CODE_SESSION_ID";
 
 export function resolveDataDir(env = process.env) {
   const override = env[DATA_DIR_ENV];
-  if (override && override.trim()) {
-    return path.resolve(override.trim());
+  if (override && String(override).trim()) {
+    const value = String(override).trim();
+    if (!path.isAbsolute(value)) {
+      const error = new Error(`${DATA_DIR_ENV} must be an absolute path.`);
+      error.failureKind = "input";
+      throw error;
+    }
+    return path.normalize(value);
   }
   return path.join(os.homedir(), ".claude", "plugins", "data", "grok-claude-code-fusion");
 }
@@ -51,8 +66,13 @@ export function briefPath(dataDir, cwd, name) {
   return path.join(briefsDir(dataDir, cwd), `${name}.md`);
 }
 
+export function resumeSessionLeasePath(dataDir, cwd, sessionId) {
+  const hash = createHash("sha256").update(String(sessionId)).digest("hex");
+  return path.join(workspaceStateDir(dataDir, cwd), "session-leases", `${hash}.json`);
+}
+
 export function generateJobId() {
-  return randomBytes(4).toString("hex");
+  return randomBytes(16).toString("hex");
 }
 
 export function nowIso() {
@@ -60,21 +80,32 @@ export function nowIso() {
 }
 
 export function createJobRecord(fields) {
+  const pid = Number.isInteger(fields.pid) && fields.pid > 1 ? fields.pid : null;
   return {
     id: fields.id,
-    pid: fields.pid ?? null,
+    pid,
+    pidIdentity: Object.hasOwn(fields, "pidIdentity") ? fields.pidIdentity : pid ? getProcessIdentity(pid) : null,
     grokPid: null,
+    grokPidIdentity: null,
+    cleanupRequired: false,
     status: fields.status ?? "running",
     mode: fields.mode,
     cwd: fields.cwd,
     briefFile: fields.briefFile,
     background: Boolean(fields.background),
+    delivery: fields.delivery ?? (fields.background ? "manual" : "foreground"),
+    deliveryCollectedAt: null,
     claudeSessionId: fields.claudeSessionId ?? null,
     createdAt: fields.createdAt ?? nowIso(),
     finishedAt: null,
     exitCode: null,
     sessionId: null,
     resultText: null,
+    resultPayload: null,
+    usage: null,
+    modelUsage: null,
+    usageIsIncomplete: null,
+    modelUsageIsIncomplete: null,
     errorMessage: null,
     errorTail: null,
     failureKind: null,
@@ -100,45 +131,367 @@ function atomicWriteFile(file, content) {
   }
 }
 
-function withRecordLock(file, fn) {
-  fs.mkdirSync(path.dirname(file), { recursive: true });
-  const lockDir = `${file}.lock`;
-  const deadline = Date.now() + LOCK_TIMEOUT_MS;
-  for (;;) {
+function lockOwnerDir(lockDir, token) {
+  return `${lockDir}.owner.${token}`;
+}
+
+function validLockRecord(record) {
+  return Boolean(
+    record &&
+      typeof record === "object" &&
+      !Array.isArray(record) &&
+      record.version === 1 &&
+      typeof record.token === "string" &&
+      /^[a-f0-9]{32}$/.test(record.token) &&
+      Number.isInteger(record.ownerPid) &&
+      record.ownerPid > 1 &&
+      validProcessIdentity(record.ownerIdentity)
+  );
+}
+
+function lockOwnerIdentity() {
+  const identity = getProcessIdentity(process.pid);
+  if (!validProcessIdentity(identity)) {
+    throw new Error(`Unable to verify lock owner process ${process.pid}.`);
+  }
+  return identity;
+}
+
+function readLockRecord(lockDir) {
+  try {
+    const record = JSON.parse(fs.readFileSync(path.join(lockDir, "owner.json"), "utf8"));
+    return validLockRecord(record) ? record : null;
+  } catch {
+    return null;
+  }
+}
+
+function lockOwnerWasReplaced(record) {
+  if (processIdentityMatches(record.ownerPid, record.ownerIdentity)) {
+    return false;
+  }
+  const currentIdentity = getProcessIdentity(record.ownerPid);
+  if (currentIdentity) {
+    return !processIdentitiesMatch(currentIdentity, record.ownerIdentity);
+  }
+  return !processIsDirectlyAlive(record.ownerPid);
+}
+
+function lockTargetsToken(lockDir, token) {
+  try {
+    return fs.lstatSync(lockDir).isSymbolicLink() && path.resolve(path.dirname(lockDir), fs.readlinkSync(lockDir)) === lockOwnerDir(lockDir, token);
+  } catch {
+    return false;
+  }
+}
+
+function publishPreparedLock(lockDir, ownerDir) {
+  try {
+    fs.symlinkSync(path.basename(ownerDir), lockDir, "dir");
+    return true;
+  } catch (error) {
+    if (error?.code === "EEXIST") {
+      return false;
+    }
+    throw error;
+  }
+}
+
+function createLinkedOwner(linkPath, record) {
+  const ownerDir = lockOwnerDir(linkPath, record.token);
+  const preparedDir = `${ownerDir}.prepare.${process.pid}.${randomBytes(8).toString("hex")}`;
+  fs.mkdirSync(preparedDir);
+  try {
+    atomicWriteFile(path.join(preparedDir, "owner.json"), `${JSON.stringify(record)}\n`);
+    fs.renameSync(preparedDir, ownerDir);
+    return { ownerDir, published: publishPreparedLock(linkPath, ownerDir) };
+  } catch (error) {
     try {
-      fs.mkdirSync(lockDir);
-      break;
-    } catch (error) {
-      if (error?.code !== "EEXIST" || Date.now() >= deadline) {
+      fs.rmSync(ownerDir, { recursive: true, force: true });
+    } catch {}
+    try {
+      fs.rmSync(preparedDir, { recursive: true, force: true });
+    } catch {}
+    throw error;
+  }
+}
+
+function publishLockCandidate(lockDir, record) {
+  const candidate = createLinkedOwner(lockDir, record);
+  if (candidate.published) {
+    return null;
+  }
+  return candidate.ownerDir;
+}
+
+function linkedPathExists(linkPath) {
+  try {
+    fs.lstatSync(linkPath);
+    return true;
+  } catch (error) {
+    if (error?.code === "ENOENT") {
+      return false;
+    }
+    throw error;
+  }
+}
+
+function acquireReaperClaim(ownerDir) {
+  const claim = {
+    version: 1,
+    token: randomBytes(16).toString("hex"),
+    ownerPid: process.pid,
+    ownerIdentity: lockOwnerIdentity()
+  };
+  let slot = path.join(ownerDir, ".reap");
+  const observedTokens = new Set();
+  for (;;) {
+    const existing = readLockRecord(slot);
+    if (!existing) {
+      if (linkedPathExists(slot)) {
+        return null;
+      }
+      let candidate;
+      try {
+        candidate = createLinkedOwner(slot, claim);
+      } catch (error) {
+        if (error?.code === "ENOENT") {
+          return null;
+        }
         throw error;
       }
-      try {
-        if (Date.now() - fs.statSync(lockDir).mtimeMs >= LOCK_STALE_MS) {
-          fs.rmdirSync(lockDir);
-          continue;
-        }
-      } catch (lockError) {
-        if (lockError?.code === "ENOENT") {
-          continue;
-        }
+      if (candidate.published) {
+        return { slot, token: claim.token };
       }
-      sleepMs(LOCK_RETRY_MS);
+      fs.rmSync(candidate.ownerDir, { recursive: true, force: true });
+      continue;
+    }
+    if (!lockTargetsToken(slot, existing.token) || !lockOwnerWasReplaced(existing)) {
+      return null;
+    }
+    if (observedTokens.has(existing.token)) {
+      return null;
+    }
+    observedTokens.add(existing.token);
+    slot = path.join(ownerDir, `.reap-successor-${existing.token}`);
+  }
+}
+
+function reclaimReplacedLock(lockDir, observed) {
+  if (!observed || !lockOwnerWasReplaced(observed)) {
+    return false;
+  }
+  const claim = acquireReaperClaim(lockOwnerDir(lockDir, observed.token));
+  if (!claim) {
+    return false;
+  }
+  let reaped = false;
+  try {
+    const current = readLockRecord(lockDir);
+    if (current?.token !== observed.token || !lockTargetsToken(lockDir, observed.token) || !lockOwnerWasReplaced(current)) {
+      return false;
+    }
+    fs.unlinkSync(lockDir);
+    reaped = true;
+    try {
+      fs.rmSync(lockOwnerDir(lockDir, observed.token), { recursive: true, force: true });
+    } catch {}
+    return true;
+  } catch (error) {
+    if (error?.code === "ENOENT") {
+      return true;
+    }
+    throw error;
+  } finally {
+    if (!reaped) {
+      releaseLock(claim.slot, claim.token);
     }
   }
+}
+
+function reclaimLegacyLock(lockDir) {
   try {
-    return fn();
-  } finally {
+    const stats = fs.lstatSync(lockDir);
+    if (!stats.isDirectory() || stats.isSymbolicLink() || Date.now() - stats.mtimeMs < LOCK_STALE_MS) {
+      return false;
+    }
+    fs.rmdirSync(lockDir);
+    return true;
+  } catch (error) {
+    return error?.code === "ENOENT";
+  }
+}
+
+function linkedOwnerDir(linkPath) {
+  try {
+    if (!fs.lstatSync(linkPath).isSymbolicLink()) {
+      return null;
+    }
+    const ownerDir = path.resolve(path.dirname(linkPath), fs.readlinkSync(linkPath));
+    if (path.dirname(ownerDir) !== path.dirname(linkPath) || !path.basename(ownerDir).startsWith(`${path.basename(linkPath)}.owner.`)) {
+      return null;
+    }
+    return ownerDir;
+  } catch {
+    return null;
+  }
+}
+
+function scavengeOrphanOwnerDirs(lockDir) {
+  const dir = path.dirname(lockDir);
+  const prefix = `${path.basename(lockDir)}.owner.`;
+  const activeOwner = linkedOwnerDir(lockDir);
+  let entries;
+  try {
+    entries = fs.readdirSync(dir);
+  } catch {
+    return;
+  }
+  for (const entry of entries) {
+    if (!entry.startsWith(prefix)) {
+      continue;
+    }
+    const ownerDir = path.join(dir, entry);
+    if (ownerDir === activeOwner) {
+      continue;
+    }
+    let stats;
     try {
-      fs.rmdirSync(lockDir);
+      stats = fs.lstatSync(ownerDir);
+    } catch {
+      continue;
+    }
+    if (Date.now() - stats.mtimeMs < LOCK_STALE_MS) {
+      continue;
+    }
+    const prepared = entry.includes(".prepare.");
+    const released = fs.existsSync(path.join(ownerDir, ".released"));
+    const record = readLockRecord(ownerDir);
+    if (!prepared && !released && (!record || !lockOwnerWasReplaced(record))) {
+      continue;
+    }
+    if (linkedOwnerDir(lockDir) === ownerDir) {
+      continue;
+    }
+    const claimedDir = `${ownerDir}.scavenged.${randomBytes(8).toString("hex")}`;
+    try {
+      fs.renameSync(ownerDir, claimedDir);
+      fs.rmSync(claimedDir, { recursive: true, force: true });
     } catch {}
   }
 }
 
+function releaseLock(lockDir, token) {
+  const ownerDir = lockOwnerDir(lockDir, token);
+  try {
+    fs.writeFileSync(path.join(ownerDir, ".released"), `${token}\n`, { flag: "wx" });
+  } catch {}
+  if (!lockTargetsToken(lockDir, token)) {
+    try {
+      fs.rmSync(ownerDir, { recursive: true, force: true });
+    } catch {}
+    return false;
+  }
+  try {
+    fs.unlinkSync(lockDir);
+  } catch (error) {
+    if (error?.code === "ENOENT") {
+      return false;
+    }
+    throw error;
+  }
+  try {
+    fs.rmSync(ownerDir, { recursive: true, force: true });
+  } catch {}
+  return true;
+}
+
+function withRecordLock(file, fn) {
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  const lockDir = `${file}.lock`;
+  scavengeOrphanOwnerDirs(lockDir);
+  const deadline = Date.now() + LOCK_TIMEOUT_MS;
+  const token = randomBytes(16).toString("hex");
+  const record = {
+    version: 1,
+    token,
+    ownerPid: process.pid,
+    ownerIdentity: lockOwnerIdentity()
+  };
+  let candidateDir = publishLockCandidate(lockDir, record);
+  try {
+    while (candidateDir) {
+      const observed = readLockRecord(lockDir);
+      if (reclaimReplacedLock(lockDir, observed) || (!observed && reclaimLegacyLock(lockDir))) {
+        if (publishPreparedLock(lockDir, candidateDir)) {
+          candidateDir = null;
+          break;
+        }
+      }
+      if (Date.now() >= deadline) {
+        throw new Error(`Timed out waiting for the job record lock at ${file}.`);
+      }
+      sleepMs(LOCK_RETRY_MS);
+      if (publishPreparedLock(lockDir, candidateDir)) {
+        candidateDir = null;
+      }
+    }
+    let callbackError = null;
+    try {
+      return fn();
+    } catch (error) {
+      callbackError = error;
+      throw error;
+    } finally {
+      try {
+        releaseLock(lockDir, token);
+      } catch (error) {
+        if (!callbackError) {
+          throw error;
+        }
+      }
+    }
+  } finally {
+    if (candidateDir) {
+      try {
+        fs.rmSync(candidateDir, { recursive: true, force: true });
+      } catch {}
+    }
+    scavengeOrphanOwnerDirs(lockDir);
+  }
+}
+
 function preserveTerminalRecord(existing, next) {
-  if (!existing || !TERMINAL_STATUSES.has(existing.status)) {
+  if (existing && TERMINAL_STATUSES.has(existing.status)) {
+    return existing;
+  }
+  if (!TERMINAL_STATUSES.has(next.status)) {
     return next;
   }
-  return existing;
+  return {
+    ...next,
+    pid: null,
+    pidIdentity: null,
+    grokPid: null,
+    grokPidIdentity: null,
+    cleanupRequired: false
+  };
+}
+
+function resourceError(message) {
+  const error = new Error(message);
+  error.failureKind = "resource";
+  return error;
+}
+
+export function createJobRecordFile(file, record) {
+  return withRecordLock(file, () => {
+    if (fs.existsSync(file)) {
+      throw resourceError(`Job record already exists at ${file}.`);
+    }
+    atomicWriteFile(file, `${JSON.stringify(record, null, 2)}\n`);
+    return file;
+  });
 }
 
 export function writeJobRecordFile(file, record) {
@@ -148,6 +501,18 @@ export function writeJobRecordFile(file, record) {
     atomicWriteFile(file, `${JSON.stringify(next, null, 2)}\n`);
   });
   return file;
+}
+
+export function markManagedDeliveryCollectedFile(file, collectedAt = nowIso()) {
+  return withRecordLock(file, () => {
+    const existing = readJobRecordFile(file);
+    if (!existing || existing.delivery !== "managed" || !TERMINAL_STATUSES.has(existing.status) || existing.deliveryCollectedAt) {
+      return existing;
+    }
+    const next = { ...existing, deliveryCollectedAt: collectedAt };
+    atomicWriteFile(file, `${JSON.stringify(next, null, 2)}\n`);
+    return next;
+  });
 }
 
 export function readJobRecordFile(file) {
@@ -169,6 +534,107 @@ export function readJobRecord(dataDir, cwd, jobId) {
   return readJobRecordFile(jobFilePath(dataDir, cwd, jobId));
 }
 
+function recordedResumeOwnerProcessIsAlive(pid, identity) {
+  if (!Number.isInteger(pid) || pid <= 1) {
+    return false;
+  }
+  if (!validProcessIdentity(identity)) {
+    return processIsDirectlyAlive(pid) || processGroupIsDirectlyAlive(pid);
+  }
+  const currentIdentity = getProcessIdentity(pid);
+  if (currentIdentity) {
+    return processIdentitiesMatch(currentIdentity, identity);
+  }
+  return processIsDirectlyAlive(pid) || processGroupIsDirectlyAlive(pid);
+}
+
+function processGroupIsDirectlyAlive(pid) {
+  try {
+    process.kill(-pid, 0);
+    return true;
+  } catch (error) {
+    return error?.code === "EPERM";
+  }
+}
+
+function resumeOwnerMayStillRun(record, now = Date.now()) {
+  const processes = [
+    [record.pid, record.pidIdentity],
+    [record.grokPid, record.grokPidIdentity]
+  ].filter(([pid]) => Number.isInteger(pid) && pid > 1);
+  if (processes.some(([pid, identity]) => recordedResumeOwnerProcessIsAlive(pid, identity))) {
+    return true;
+  }
+  if (processes.length > 0) {
+    return false;
+  }
+  const createdAt = Date.parse(record.createdAt ?? "");
+  return Number.isFinite(createdAt) && now - createdAt < RESUME_OWNER_LAUNCH_GRACE_MS;
+}
+
+function repairDeadResumeOwner(file, sessionId) {
+  return updateJobRecordFileWithCurrent(file, (current) => {
+    if (current.status !== "running" || resumeOwnerMayStillRun(current)) {
+      return current;
+    }
+    const message = `The process that owned Grok session ${sessionId} exited without recording a terminal outcome.`;
+    return {
+      ...current,
+      status: "error",
+      finishedAt: nowIso(),
+      errorMessage: message,
+      errorTail: message,
+      failureKind: "died",
+      cancelRequestedAt: null
+    };
+  });
+}
+
+export function claimResumeSessionLease(dataDir, cwd, sessionId, ownerJobId) {
+  const file = resumeSessionLeasePath(dataDir, cwd, sessionId);
+  return withRecordLock(file, () => {
+    const exists = fs.existsSync(file);
+    const existing = readJobRecordFile(file);
+    if (
+      exists &&
+      (!existing ||
+        existing.version !== 1 ||
+        existing.sessionId !== sessionId ||
+        typeof existing.ownerJobId !== "string" ||
+        typeof existing.claimedAt !== "string")
+    ) {
+      throw resourceError(`The resume session lease for ${sessionId} is invalid.`);
+    }
+    if (existing?.ownerJobId === ownerJobId) {
+      return existing;
+    }
+    if (existing) {
+      const owner = readJobRecord(dataDir, cwd, existing.ownerJobId);
+      if (!owner || owner.id !== existing.ownerJobId || (owner.status !== "running" && !TERMINAL_STATUSES.has(owner.status))) {
+        throw resourceError(`The resume session lease for ${sessionId} has an invalid owner record.`);
+      }
+      if (owner.status === "running") {
+        const repaired = repairDeadResumeOwner(jobFilePath(dataDir, cwd, existing.ownerJobId), sessionId);
+        if (repaired.status === "running") {
+          throw resourceError(`Grok session ${sessionId} is already being resumed by running job ${existing.ownerJobId} in this workspace. Inspect it with /grok:status ${existing.ownerJobId}, then collect or cancel it before retrying.`);
+        }
+      }
+    }
+    const nextOwner = readJobRecord(dataDir, cwd, ownerJobId);
+    if (!nextOwner || nextOwner.id !== ownerJobId || nextOwner.status !== "running") {
+      throw resourceError(`Grok session ${sessionId} cannot be leased to invalid job ${ownerJobId}.`);
+    }
+    const next = {
+      version: 1,
+      sessionId,
+      ownerJobId,
+      claimedAt: nowIso()
+    };
+    atomicWriteFile(file, `${JSON.stringify(next, null, 2)}\n`);
+    return next;
+  });
+}
+
 export function updateJobRecordFile(file, patch) {
   return withRecordLock(file, () => {
     const existing = readJobRecordFile(file);
@@ -181,6 +647,52 @@ export function updateJobRecordFile(file, patch) {
     const next = preserveTerminalRecord(existing, { ...existing, ...patch });
     atomicWriteFile(file, `${JSON.stringify(next, null, 2)}\n`);
     return next;
+  });
+}
+
+export function launchRunningJobProcess(file, launch, options = {}) {
+  return withRecordLock(file, () => {
+    const processRole = options.processRole === "worker" ? "worker" : "grok";
+    const processLabel = processRole === "worker" ? "Background worker" : "Grok process";
+    const existing = readJobRecordFile(file);
+    if (!existing) {
+      throw new Error(`No job record found at ${file}.`);
+    }
+    if (existing.status !== "running" || existing.cancelRequestedAt != null || existing.cleanupRequired) {
+      const cancelled = existing.status === "cancelled" || existing.cancelRequestedAt != null;
+      const reason = cancelled
+        ? "cancellation was already requested"
+        : existing.cleanupRequired
+          ? "process cleanup is still required"
+          : `the job is already ${existing.status}`;
+      const error = new Error(`${processLabel} launch for job ${existing.id ?? "unknown"} was blocked because ${reason}.`);
+      error.failureKind = cancelled ? "cancelled" : existing.failureKind ?? "resource";
+      error.launchPrevented = true;
+      error.processRole = processRole;
+      if (existing.cleanupRequired) {
+        error.cleanupRequired = true;
+        error.pid = processRole === "worker" ? existing.pid ?? null : existing.grokPid ?? null;
+        error.pidIdentity = processRole === "worker" ? existing.pidIdentity ?? null : existing.grokPidIdentity ?? null;
+      }
+      throw error;
+    }
+
+    const launched = launch();
+    const pid = launched?.pid ?? launched?.child?.pid;
+    if (!Number.isInteger(pid) || pid <= 1) {
+      const error = resourceError(`${processLabel} launch for job ${existing.id ?? "unknown"} did not produce a valid PID.`);
+      error.processRole = processRole;
+      throw error;
+    }
+    const pidField = processRole === "worker" ? "pid" : "grokPid";
+    const identityField = processRole === "worker" ? "pidIdentity" : "grokPidIdentity";
+    const next = {
+      ...existing,
+      [pidField]: pid,
+      [identityField]: launched?.identity ?? null
+    };
+    atomicWriteFile(file, `${JSON.stringify(next, null, 2)}\n`);
+    return { ...launched, record: next };
   });
 }
 
@@ -223,6 +735,10 @@ export function finishSuccessfulJobRecordFile(file, successPatch) {
           exitCode: successPatch.exitCode ?? null,
           sessionId: successPatch.sessionId ?? null,
           resultText: successPatch.resultText ?? null,
+          usage: successPatch.usage ?? existing.usage ?? null,
+          modelUsage: successPatch.modelUsage ?? existing.modelUsage ?? null,
+          usageIsIncomplete: successPatch.usageIsIncomplete ?? existing.usageIsIncomplete ?? null,
+          modelUsageIsIncomplete: successPatch.modelUsageIsIncomplete ?? existing.modelUsageIsIncomplete ?? null,
           errorTail: null,
           failureKind: "cancelled",
           cancelRequestedAt: null
@@ -280,14 +796,25 @@ export function listAllJobRecords(dataDir) {
 }
 
 export function findJobRecordById(dataDir, jobId) {
-  return listAllJobRecords(dataDir).find((entry) => entry.record.id === jobId) ?? null;
+  const matches = listAllJobRecords(dataDir).filter((entry) => entry.record.id === jobId);
+  if (matches.length > 1) {
+    throw resourceError(`Job id ${jobId} exists in multiple workspaces. Repeat the command with --cwd.`);
+  }
+  return matches[0] ?? null;
 }
 
 export function writeBrief(dataDir, cwd, name, content) {
   const file = briefPath(dataDir, cwd, name);
   fs.mkdirSync(path.dirname(file), { recursive: true });
   const text = String(content ?? "");
-  fs.writeFileSync(file, text.endsWith("\n") ? text : `${text}\n`, "utf8");
+  try {
+    fs.writeFileSync(file, text.endsWith("\n") ? text : `${text}\n`, { encoding: "utf8", flag: "wx" });
+  } catch (error) {
+    if (error?.code === "EEXIST") {
+      throw resourceError(`Brief already exists at ${file}.`);
+    }
+    throw error;
+  }
   return file;
 }
 

@@ -17,72 +17,18 @@ const { parseArgs } = await import(path.join(repoRoot, "plugins", "grok", "scrip
 const { buildGrokArgs, NESTED_ENGINE_CLI_DENY_NAMES } = await import(
   path.join(repoRoot, "plugins", "grok", "scripts", "lib", "grok-exec.mjs"),
 );
-const { resolveLastSessionId } = await import(
+const { resolveLastSessionId, validateResumeSessionId } = await import(
   path.join(repoRoot, "plugins", "grok", "scripts", "grok-companion.mjs"),
 );
 const { createJobRecord, jobFilePath, writeBrief, writeJobRecordFile } = await import(
   path.join(repoRoot, "plugins", "grok", "scripts", "lib", "state.mjs"),
 );
 
-const consultAllows = [
-  "Read",
-  "Grep",
-  "Bash(git diff)",
-  "Bash(git diff *)",
-  "Bash(git log)",
-  "Bash(git log *)",
-  "Bash(git show)",
-  "Bash(git show *)",
-  "Bash(git status)",
-  "Bash(git status *)",
-  "Bash(git blame)",
-  "Bash(git blame *)",
-  "Bash(gh pr view)",
-  "Bash(gh pr view *)",
-  "Bash(gh pr list)",
-  "Bash(gh pr list *)",
-  "Bash(gh pr diff)",
-  "Bash(gh pr diff *)",
-  "Bash(gh pr checks)",
-  "Bash(gh pr checks *)",
-  "Bash(gh issue view)",
-  "Bash(gh issue view *)",
-  "Bash(gh issue list)",
-  "Bash(gh issue list *)",
-  "Bash(gh repo view)",
-  "Bash(gh repo view *)",
-  "Bash(gh search)",
-  "Bash(gh search *)",
-  "Bash(gh run view)",
-  "Bash(gh run view *)",
-  "Bash(gh run list)",
-  "Bash(gh run list *)",
-  "Bash(gh release view)",
-  "Bash(gh release view *)",
-  "Bash(gh release list)",
-  "Bash(gh release list *)",
-  "Bash(node --test)",
-  "Bash(node --test *)",
-  "Bash(npm test)",
-  "Bash(npm test *)",
-];
+const consultAllows = ["Read", "Grep"];
+const consultTools = "read_file,grep,list_dir";
+const consultWebTools = "read_file,grep,list_dir,web_search,web_fetch";
 
-const consultDenies = [
-  "Edit",
-  "Write",
-  "Bash(*;*)",
-  "Bash(*&&*)",
-  "Bash(*||*)",
-  "Bash(*|*)",
-  "Bash(*>*)",
-  "Bash(*<*)",
-  "Bash(*`*)",
-  "Bash(*$*)",
-  "Bash(grok*)",
-  "Bash(claude*)",
-  "Bash(codex*)",
-  "Bash(node*)",
-];
+const consultDenies = ["Edit", "Write", "Bash", "MCPTool(*)"];
 
 const writeDenies = [
   "Bash(sudo*)",
@@ -109,7 +55,7 @@ function seedFinishedSessionJob(sandbox, fields) {
     ...createJobRecord({
       id: fields.id,
       pid: null,
-      mode: "consult",
+      mode: fields.mode ?? "consult",
       cwd: sandbox.workDir,
       briefFile,
       background: false,
@@ -120,6 +66,13 @@ function seedFinishedSessionJob(sandbox, fields) {
     finishedAt: fields.finishedAt,
     sessionId: fields.sessionId,
     resultText: "done",
+    request: {
+      sandboxProfile: Object.hasOwn(fields, "sandboxProfile")
+        ? fields.sandboxProfile
+        : fields.mode === "write"
+          ? "workspace"
+          : "strict",
+    },
   };
   writeJobRecordFile(jobFilePath(sandbox.dataDir, sandbox.workDir, fields.id), record);
 }
@@ -136,7 +89,7 @@ test("help and runtime skill list cancel and setup flags", (t) => {
   assert.ok(skill.includes("setup [--enable-stop-gate] [--disable-stop-gate] [--json]"));
 });
 
-test("consult task argv carries the pinned base flags and allow and deny set", (t) => {
+test("consult task argv pins the strict sandbox and hard read-only tool surface", (t) => {
   const sandbox = makeSandbox(t);
   const result = runCompanion(["task", "hello there"], { cwd: sandbox.workDir, env: envFor(sandbox) });
   assert.strictEqual(result.status, 0, result.stderr);
@@ -146,11 +99,13 @@ test("consult task argv carries the pinned base flags and allow and deny set", (
   assert.ok(briefFile.startsWith(sandbox.dataDir), "Expected the brief to live under the data dir.");
   assert.ok(fs.readFileSync(briefFile, "utf8").includes("hello there"));
   assert.ok(hasPair(argv, "--output-format", "json"));
-  assert.ok(hasPair(argv, "--sandbox", "workspace"));
+  assert.ok(hasPair(argv, "--sandbox", "strict"));
   assert.ok(argv.includes("--no-subagents"));
   assert.ok(argv.includes("--disable-web-search"));
   assert.ok(hasPair(argv, "--max-turns", "25"));
-  assert.ok(hasPair(argv, "--permission-mode", "dontAsk"));
+  assert.ok(hasPair(argv, "--permission-mode", "default"));
+  assert.ok(hasPair(argv, "--tools", consultTools));
+  assert.ok(hasPair(argv, "--disallowed-tools", "Agent"));
   assert.deepStrictEqual([...flagValues(argv, "--allow")].sort(), [...consultAllows].sort());
   assert.deepStrictEqual([...flagValues(argv, "--deny")].sort(), [...consultDenies].sort());
   assert.ok(!argv.includes("-m"), "Model must not be passed by default.");
@@ -160,6 +115,7 @@ test("consult task argv carries the pinned base flags and allow and deny set", (
   assert.ok(!argv.includes("-r"));
   assert.ok(!argv.includes("Bash(gh pr view*)"));
   assert.ok(!argv.includes("Bash(git diff*)"));
+  assert.ok(!argv.some((entry) => /node --test|npm test/.test(entry)));
 });
 
 test("model and effort are forwarded only when explicitly provided", (t) => {
@@ -194,6 +150,8 @@ test("write task argv includes always-approve and the six deny rules", (t) => {
   assert.strictEqual(result.status, 0, result.stderr);
   const argv = singleInvocation(sandbox);
   assert.ok(argv.includes("--always-approve"));
+  assert.ok(hasPair(argv, "--sandbox", "workspace"));
+  assert.ok(!argv.includes("--tools"));
   assert.deepStrictEqual([...flagValues(argv, "--deny")].sort(), [...writeDenies].sort());
   assert.ok(hasPair(argv, "--max-turns", "60"));
   assert.ok(argv.includes("--no-subagents"));
@@ -218,9 +176,16 @@ test("best-of-n argv drops no-subagents, implies write mode, and keeps the denie
 test("resume maps to -r with the given session uuid", (t) => {
   const sandbox = makeSandbox(t);
   const uuid = "aaaaaaaa-aaaa-7aaa-8aaa-aaaaaaaaaaaa";
+  seedFinishedSessionJob(sandbox, {
+    id: "explicit-resume",
+    claudeSessionId: "claude-current",
+    sessionId: uuid,
+    createdAt: "2026-01-01T00:00:00.000Z",
+    finishedAt: "2026-01-01T00:01:00.000Z",
+  });
   const result = runCompanion(["task", "continue with the plan", "--resume", uuid], {
     cwd: sandbox.workDir,
-    env: envFor(sandbox),
+    env: envFor(sandbox, { CLAUDE_CODE_SESSION_ID: "claude-current" }),
   });
   assert.strictEqual(result.status, 0, result.stderr);
   const argv = singleInvocation(sandbox);
@@ -232,7 +197,17 @@ test("resume maps to -r with the given session uuid", (t) => {
 test("resume without a prompt sends the pinned continuation text", (t) => {
   const sandbox = makeSandbox(t);
   const uuid = "bbbbbbbb-bbbb-7bbb-8bbb-bbbbbbbbbbbb";
-  const result = runCompanion(["task", "--resume", uuid], { cwd: sandbox.workDir, env: envFor(sandbox) });
+  seedFinishedSessionJob(sandbox, {
+    id: "promptless-resume",
+    claudeSessionId: "claude-current",
+    sessionId: uuid,
+    createdAt: "2026-01-01T00:00:00.000Z",
+    finishedAt: "2026-01-01T00:01:00.000Z",
+  });
+  const result = runCompanion(["task", "--resume", uuid], {
+    cwd: sandbox.workDir,
+    env: envFor(sandbox, { CLAUDE_CODE_SESSION_ID: "claude-current" }),
+  });
   assert.strictEqual(result.status, 0, result.stderr);
   const argv = singleInvocation(sandbox);
   assert.ok(hasPair(argv, "-r", uuid));
@@ -246,7 +221,7 @@ test("resume without a prompt sends the pinned continuation text", (t) => {
   );
 });
 
-test("resume last prefers the current Claude session and otherwise falls back to the newest job", (t) => {
+test("resume last stays within the current Claude session and falls back only without one", (t) => {
   const sandbox = makeSandbox(t);
   seedFinishedSessionJob(sandbox, {
     id: "current-older",
@@ -267,9 +242,64 @@ test("resume last prefers the current Claude session and otherwise falls back to
     resolveLastSessionId(sandbox.dataDir, sandbox.workDir, "claude-current"),
     "11111111-1111-7111-8111-111111111111",
   );
+  assert.throws(
+    () => resolveLastSessionId(sandbox.dataDir, sandbox.workDir, "claude-missing"),
+    /No finished consult grok job with a compatible sandbox was found for Claude session claude-missing/,
+  );
   assert.strictEqual(
-    resolveLastSessionId(sandbox.dataDir, sandbox.workDir, "claude-missing"),
+    resolveLastSessionId(sandbox.dataDir, sandbox.workDir, null),
     "22222222-2222-7222-8222-222222222222",
+  );
+});
+
+test("resume selection is mode and sandbox compatible", (t) => {
+  const sandbox = makeSandbox(t);
+  const consultSession = "33333333-3333-7333-8333-333333333333";
+  const writeSession = "44444444-4444-7444-8444-444444444444";
+  seedFinishedSessionJob(sandbox, {
+    id: "compatible-consult",
+    claudeSessionId: "claude-current",
+    sessionId: consultSession,
+    createdAt: "2026-01-01T00:00:00.000Z",
+    finishedAt: "2026-01-01T00:01:00.000Z",
+  });
+  seedFinishedSessionJob(sandbox, {
+    id: "compatible-write",
+    claudeSessionId: "claude-current",
+    sessionId: writeSession,
+    mode: "write",
+    createdAt: "2026-01-02T00:00:00.000Z",
+    finishedAt: "2026-01-02T00:01:00.000Z",
+  });
+
+  assert.strictEqual(resolveLastSessionId(sandbox.dataDir, sandbox.workDir, "claude-current", "consult"), consultSession);
+  assert.strictEqual(resolveLastSessionId(sandbox.dataDir, sandbox.workDir, "claude-current", "write"), writeSession);
+  assert.strictEqual(validateResumeSessionId(sandbox.dataDir, sandbox.workDir, consultSession, "consult"), consultSession);
+  assert.throws(
+    () => validateResumeSessionId(sandbox.dataDir, sandbox.workDir, consultSession, "write"),
+    /recorded sandbox profile is incompatible/,
+  );
+});
+
+test("legacy sessions without a recorded sandbox profile fail closed", (t) => {
+  const sandbox = makeSandbox(t);
+  const sessionId = "55555555-5555-7555-8555-555555555555";
+  seedFinishedSessionJob(sandbox, {
+    id: "legacy-session",
+    claudeSessionId: "claude-current",
+    sessionId,
+    createdAt: "2026-01-01T00:00:00.000Z",
+    finishedAt: "2026-01-01T00:01:00.000Z",
+    sandboxProfile: null,
+  });
+
+  assert.throws(
+    () => validateResumeSessionId(sandbox.dataDir, sandbox.workDir, sessionId, "consult"),
+    /recorded sandbox profile is incompatible/,
+  );
+  assert.throws(
+    () => resolveLastSessionId(sandbox.dataDir, sandbox.workDir, "claude-current", "consult"),
+    /compatible sandbox/,
   );
 });
 
@@ -322,14 +352,12 @@ test("write task argv omits the gh read-only allow rules", (t) => {
   assert.ok(!argv.includes("Bash(gh api*)"));
 });
 
-test("NESTED_ENGINE_CLI_DENY_NAMES expands into consult and write Bash denies", () => {
+test("NESTED_ENGINE_CLI_DENY_NAMES expands into write Bash denies", () => {
   const nestedEngineCliDenyRules = (names) => names.map((name) => `Bash(${name}*)`);
   const hypothetical = "peer-engine";
   const extended = nestedEngineCliDenyRules([...NESTED_ENGINE_CLI_DENY_NAMES, hypothetical]);
-  const consultDeny = flagValues(buildArgv({ mode: "consult" }), "--deny");
   const writeDeny = flagValues(buildArgv({ mode: "write" }), "--deny");
   for (const rule of nestedEngineCliDenyRules(NESTED_ENGINE_CLI_DENY_NAMES)) {
-    assert.ok(consultDeny.includes(rule));
     assert.ok(writeDeny.includes(rule));
   }
   assert.strictEqual(extended.at(-1), `Bash(${hypothetical}*)`);
@@ -339,12 +367,13 @@ test("NESTED_ENGINE_CLI_DENY_NAMES expands into consult and write Bash denies", 
   );
 });
 
-test("consult deny rules block shell compound command metacharacters", () => {
+test("consult denies every shell, MCP, and edit surface and removes subagents", () => {
   const argv = buildArgv({ mode: "consult" });
   const denies = flagValues(argv, "--deny");
-  for (const rule of ["Bash(*;*)", "Bash(*&&*)", "Bash(*||*)", "Bash(*|*)", "Bash(*>*)", "Bash(*<*)", "Bash(*`*)", "Bash(*$*)"]) {
+  for (const rule of ["Edit", "Write", "Bash", "MCPTool(*)"]) {
     assert.ok(denies.includes(rule), `Expected ${rule} in consult deny rules.`);
   }
+  assert.ok(hasPair(argv, "--disallowed-tools", "Agent"));
 });
 
 test("web flag drops the web search disable and stays consult", (t) => {
@@ -353,7 +382,8 @@ test("web flag drops the web search disable and stays consult", (t) => {
   assert.strictEqual(result.status, 0, result.stderr);
   const argv = singleInvocation(sandbox);
   assert.ok(!argv.includes("--disable-web-search"));
-  assert.ok(hasPair(argv, "--permission-mode", "dontAsk"));
+  assert.ok(hasPair(argv, "--permission-mode", "default"));
+  assert.ok(hasPair(argv, "--tools", consultWebTools));
   assert.ok(!argv.includes("--always-approve"));
 });
 
@@ -365,12 +395,14 @@ test("consult with web true appends web tool allow rules", (t) => {
   assert.strictEqual(result.status, 0, result.stderr);
   const argv = singleInvocation(sandbox);
   assert.deepStrictEqual(flagValues(argv, "--allow"), [...consultAllows, ...consultWebAllows]);
+  assert.ok(hasPair(argv, "--tools", consultWebTools));
   assert.ok(!argv.includes("--disable-web-search"));
 });
 
 test("consult with web false omits web tool allow rules", () => {
   const argv = buildArgv({ mode: "consult", web: false });
   assert.deepStrictEqual(flagValues(argv, "--allow"), consultAllows);
+  assert.ok(hasPair(argv, "--tools", consultTools));
   assert.ok(!flagValues(argv, "--allow").includes("WebSearch"));
   assert.ok(!flagValues(argv, "--allow").includes("WebFetch"));
   assert.ok(argv.includes("--disable-web-search"));
@@ -386,24 +418,30 @@ test("write mode never gains web tool allow rules", () => {
   }
 });
 
-const consultAllowEnv = { GROK_CONSULT_ALLOW: "Bash(jq*), Bash(curl -s*)" };
+const consultAllowEnv = { GROK_CONSULT_ALLOW: "Read(src/**), Bash(jq*), WebFetch(example.com)" };
 
 function buildArgv(overrides = {}) {
   return buildGrokArgs({ briefFile: "/tmp/grok-brief.txt", ...overrides });
 }
 
-test("GROK_CONSULT_ALLOW appends extra consult allows after the built in list", () => {
-  const argv = buildArgv({ mode: "consult", env: consultAllowEnv });
+test("GROK_CONSULT_ALLOW retains only complete read and web permissions and cannot add shell capability", () => {
+  const argv = buildArgv({
+    mode: "consult",
+    env: { GROK_CONSULT_ALLOW: `${consultAllowEnv.GROK_CONSULT_ALLOW}, Read(src/**) Bash(*)` },
+  });
   const allows = flagValues(argv, "--allow");
   assert.deepStrictEqual(allows.slice(0, consultAllows.length), consultAllows);
-  assert.deepStrictEqual(allows.slice(consultAllows.length), ["Bash(jq*)", "Bash(curl -s*)"]);
+  assert.deepStrictEqual(allows.slice(consultAllows.length), ["Read(src/**)", "WebFetch(example.com)"]);
+  assert.ok(!allows.includes("Bash(jq*)"));
+  assert.ok(!allows.includes("Read(src/**) Bash(*)"));
+  assert.ok(hasPair(argv, "--tools", consultTools));
 });
 
 test("GROK_CONSULT_ALLOW is ignored in write mode", () => {
   const argv = buildArgv({ mode: "write", env: consultAllowEnv });
   assert.strictEqual(flagValues(argv, "--allow").length, 0);
-  assert.ok(!argv.includes("Bash(jq*)"));
-  assert.ok(!argv.includes("Bash(curl -s*)"));
+  assert.ok(!argv.includes("Read(src/**)"));
+  assert.ok(!argv.includes("WebFetch(example.com)"));
 });
 
 test("GROK_CONSULT_ALLOW treats unset, empty, and whitespace only entries as no extra allows", () => {
@@ -411,6 +449,6 @@ test("GROK_CONSULT_ALLOW treats unset, empty, and whitespace only entries as no 
     const argv = buildArgv({ mode: "consult", env });
     assert.deepStrictEqual(flagValues(argv, "--allow"), consultAllows);
   }
-  const argv = buildArgv({ mode: "consult", env: { GROK_CONSULT_ALLOW: "  ,  , Bash(jq*)  " } });
-  assert.deepStrictEqual(flagValues(argv, "--allow"), [...consultAllows, "Bash(jq*)"]);
+  const argv = buildArgv({ mode: "consult", env: { GROK_CONSULT_ALLOW: "  ,  , Read(src/**), Bash(jq*)  " } });
+  assert.deepStrictEqual(flagValues(argv, "--allow"), [...consultAllows, "Read(src/**)"]);
 });

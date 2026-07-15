@@ -12,11 +12,15 @@ import {
   formatBlockedPermissionCall,
   resolveGrokBin,
   resolveTimeoutMs,
+  sandboxProfileForMode,
+  recordedProcessGroupsClean,
   runGrok,
   runningJobLiveness,
   terminateProcessGroup,
-  terminateProcessGroupSync
+  terminateRecordedProcessGroups,
+  terminateRecordedProcessGroupsSync
 } from "./lib/grok-exec.mjs";
+import { getProcessIdentity } from "./lib/process-identity.mjs";
 import {
   extractFirstJsonObject,
   renderBackgroundLaunch,
@@ -32,13 +36,18 @@ import {
 } from "./lib/render.mjs";
 import {
   SESSION_ID_ENV,
+  briefPath,
+  claimResumeSessionLease,
   createJobRecord,
+  createJobRecordFile,
   findJobRecordById,
   generateJobId,
   jobFilePath,
   jobLogPath,
+  launchRunningJobProcess,
   listAllJobRecords,
   listJobRecords,
+  markManagedDeliveryCollectedFile,
   nowIso,
   readJobRecordFile,
   readLogTail,
@@ -47,7 +56,6 @@ import {
   updateJobRecordFileWithCurrent,
   finishSuccessfulJobRecordFile,
   writeBrief,
-  writeJobRecordFile,
   appendJobLog
 } from "./lib/state.mjs";
 
@@ -60,6 +68,7 @@ const STOP_GATE_TIMEOUT_MS = 240000;
 const STOP_GATE_MAX_TURNS = 15;
 const WAIT_POLL_ENV = "GROK_COMPANION_WAIT_POLL_MS";
 const WAIT_TIMEOUT_ENV = "GROK_COMPANION_WAIT_TIMEOUT_MS";
+const BACKGROUND_DELIVERY_ENV = "GROK_COMPANION_BACKGROUND_DELIVERY";
 const DEFAULT_WAIT_POLL_MS = 2000;
 const DEFAULT_WAIT_TIMEOUT_MS = 570000;
 const MAX_WAIT_TIMEOUT_MS = 570000;
@@ -83,10 +92,15 @@ function printUsage() {
 }
 
 function output(value, asJson) {
-  if (asJson) {
-    console.log(JSON.stringify(value, null, 2));
-  } else {
-    process.stdout.write(value);
+  const text = asJson ? `${JSON.stringify(value, null, 2)}\n` : String(value);
+  const buffer = Buffer.from(text);
+  let offset = 0;
+  while (offset < buffer.length) {
+    const written = fs.writeSync(process.stdout.fd, buffer, offset, buffer.length - offset);
+    if (written <= 0) {
+      throw new Error("Unable to write the Grok companion result to stdout.");
+    }
+    offset += written;
   }
 }
 
@@ -274,23 +288,111 @@ function readTaskPrompt(cwd, options, positionals) {
   return readStdinIfPiped().trim();
 }
 
-export function resolveLastSessionId(dataDir, cwd, claudeSessionId) {
-  const finished = listJobRecords(dataDir, cwd)
-    .filter((job) => job.status !== "running" && job.sessionId)
+function backgroundDelivery(env = process.env) {
+  return env[BACKGROUND_DELIVERY_ENV] === "managed" ? "managed" : "manual";
+}
+
+function waitForChildSpawn(child) {
+  return new Promise((resolve, reject) => {
+    child.once("spawn", resolve);
+    child.once("error", reject);
+  });
+}
+
+async function spawnBackgroundWorker(args, jobFile) {
+  let child = null;
+  let identity = null;
+  try {
+    const launched = launchRunningJobProcess(
+      jobFile,
+      () => {
+        child = spawn(process.execPath, args, {
+          detached: true,
+          stdio: "ignore"
+        });
+        identity = Number.isInteger(child.pid) ? getProcessIdentity(child.pid) : null;
+        return { child, pid: child.pid ?? null, identity };
+      },
+      { processRole: "worker" }
+    );
+    child = launched.child ?? child;
+    identity = launched.identity ?? identity;
+    await waitForChildSpawn(child);
+    child.unref();
+    return child;
+  } catch (error) {
+    if (Number.isInteger(child?.pid) && child.pid > 1) {
+      const cleaned = await terminateProcessGroup(
+        child.pid,
+        identity ? { identity } : {}
+      ).catch(() => false);
+      if (!cleaned) {
+        const cleanupError = new Error("Verified background worker cleanup did not complete after launch failed.");
+        cleanupError.failureKind = error?.failureKind ?? "error";
+        cleanupError.cleanupRequired = true;
+        cleanupError.processRole = "worker";
+        cleanupError.pid = child.pid;
+        cleanupError.pidIdentity = identity;
+        child.unref();
+        throw cleanupError;
+      }
+    }
+    throw error;
+  }
+}
+
+function inputError(message) {
+  const error = new Error(message);
+  error.failureKind = "input";
+  return error;
+}
+
+function resumableJobs(dataDir, cwd, mode) {
+  const sandboxProfile = sandboxProfileForMode(mode);
+  return listJobRecords(dataDir, cwd).filter(
+    (job) =>
+      job.status !== "running" &&
+      job.sessionId &&
+      job.mode === mode &&
+      job.request?.sandboxProfile === sandboxProfile
+  );
+}
+
+export function resolveLastSessionId(dataDir, cwd, claudeSessionId, mode = "consult") {
+  const finished = resumableJobs(dataDir, cwd, mode)
     .sort((left, right) =>
       String(right.finishedAt ?? right.createdAt ?? "").localeCompare(
         String(left.finishedAt ?? left.createdAt ?? "")
       )
     );
-  if (finished.length === 0) {
-    throw new Error("No finished grok job with a session id was found for this workspace.");
+  if (claudeSessionId) {
+    const owned = finished.filter((job) => job.claudeSessionId === claudeSessionId);
+    if (owned.length === 0) {
+      throw inputError(`No finished ${mode} grok job with a compatible sandbox was found for Claude session ${claudeSessionId} in this workspace.`);
+    }
+    return owned[0].sessionId;
   }
-  const owned = finished.find((job) => claudeSessionId && job.claudeSessionId === claudeSessionId);
-  return (owned ?? finished[0]).sessionId;
+  if (finished.length === 0) {
+    throw inputError(`No finished ${mode} grok job with a compatible sandbox was found for this workspace.`);
+  }
+  return finished[0].sessionId;
+}
+
+export function validateResumeSessionId(dataDir, cwd, sessionId, mode) {
+  const jobs = listJobRecords(dataDir, cwd).filter(
+    (job) => job.status !== "running" && job.sessionId === sessionId
+  );
+  if (jobs.some((job) => job.mode === mode && job.request?.sandboxProfile === sandboxProfileForMode(mode))) {
+    return sessionId;
+  }
+  if (jobs.length > 0) {
+    throw inputError(`Grok session ${sessionId} cannot resume in ${mode} mode because its recorded sandbox profile is incompatible. Start a fresh task.`);
+  }
+  throw inputError(`No finished companion job owns Grok session ${sessionId} in this workspace.`);
 }
 
 const PERMISSION_FAILURE_MESSAGE =
-  "Grok's turn was cancelled by the consult-mode permission gate (a tool call outside the read-only allow list). Re-dispatch with --write if repository changes are acceptable, or rewrite the brief to avoid shell commands.";
+  "Grok's turn was cancelled by the consult-mode permission gate (a tool call outside the hard read-only tool set). Re-dispatch with --write if repository changes or command execution are acceptable, or rewrite the brief to use file reading and search only.";
 
 function isPermissionCancelled(result) {
   return Boolean(result) && result.exitCode === 0 && !result.timedOut && result.stopReason === "Cancelled";
@@ -307,13 +409,19 @@ function grokFailureMessage(result, timeoutMs, failureKind) {
   if (result.parseError) {
     return result.parseError;
   }
+  if (result.errorMessage) {
+    return result.errorMessage;
+  }
   return result.timedOut
     ? `Grok timed out after ${timeoutMs}ms and was terminated.`
     : `Grok exited with code ${result.exitCode}.`;
 }
 
 const STDERR_FAILURE_KINDS = [
-  ["quota", /quota|insufficient credit|usage limit/i],
+  [
+    "quota",
+    /quota|insufficient (?:account )?(?:balance|credit|credits|funds)|balance (?:is )?exhausted|exhausted (?:account )?balance|payment required|usage limit|billing|credit limit|http(?:\/\d(?:\.\d)?)?\s+402|status(?: code)?\s*[:=]?\s*402/i
+  ],
   ["rate_limited", /rate.?limit|429|too many requests/i],
   ["auth", /auth|unauthori[sz]ed|forbidden|login required/i]
 ];
@@ -359,28 +467,56 @@ function deadProcessMessage(deadPids) {
   return `Recorded ${label} ${deadPids.join(", ")} exited without recording an outcome.`;
 }
 
+function cleanupRequiredPatch(current, failureKind, message) {
+  return {
+    ...current,
+    cleanupRequired: true,
+    errorMessage: message,
+    errorTail: message,
+    failureKind
+  };
+}
+
 function finishDiedJobRecord(file) {
+  const observed = readJobRecordFile(file);
+  if (!observed || observed.status !== "running") {
+    return observed;
+  }
+  const observedLiveness = runningJobLiveness(observed);
+  if (observedLiveness.alive && !observed.cleanupRequired) {
+    return observed;
+  }
+  const terminated = terminateRecordedProcessGroupsSync(observed);
   return updateJobRecordFileWithCurrent(file, (current) => {
     if (current.status !== "running") {
       return current;
     }
     const liveness = runningJobLiveness(current);
-    if (liveness.alive) {
+    if (liveness.alive && !current.cleanupRequired) {
       return current;
     }
-    if (current.grokPid) {
-      terminateProcessGroupSync(current.grokPid);
+    if (!terminated || !recordedProcessGroupsClean(current)) {
+      return cleanupRequiredPatch(current, current.cancelRequestedAt ? "cancelled" : "died", "The recorded processes exited without a terminal outcome, but verified process cleanup did not complete.");
     }
-    const message = deadProcessMessage(liveness.deadPids);
+    const cancelled = current.cancelRequestedAt != null;
+    const message = cancelled ? current.errorMessage ?? "The Grok job was cancelled." : deadProcessMessage(liveness.deadPids);
+    const status = cancelled ? "cancelled" : "error";
+    const failureKind = cancelled ? "cancelled" : "died";
     return {
       ...current,
-      status: "error",
-      pid: null,
-      grokPid: null,
+      status,
       finishedAt: nowIso(),
+      resultPayload: retainedResultPayload(
+        current,
+        failureResultPayload(current, {
+          status,
+          failureKind,
+          message: failureOutcomeMessage({ message, jobId: current.id, status, failureKind })
+        })
+      ),
       errorMessage: message,
       errorTail: message,
-      failureKind: "died",
+      failureKind,
       cancelRequestedAt: null
     };
   });
@@ -393,19 +529,242 @@ export function refreshRunningJobRecord({ record, file }) {
     return { record: current, changed: false };
   }
   const next = finishDiedJobRecord(file);
-  return { record: next, changed: next.status === "error" && next.failureKind === "died" };
+  return { record: next, changed: next?.status !== "running" };
 }
 
 function resultFailed(result) {
-  return Boolean(result.parseError) || result.exitCode !== 0 || result.timedOut || isPermissionCancelled(result);
+  return Boolean(result.parseError) || Boolean(result.errorMessage) || result.exitCode !== 0 || result.timedOut || isPermissionCancelled(result);
 }
 
 function failureTail(logFile, result) {
   const tail = readLogTail(logFile, 20);
-  if (!result?.parseError || !result.stdoutTail) {
+  const stdoutDiagnostic = result?.errorMessage || (result?.parseError ? result.stdoutTail : "");
+  if (!stdoutDiagnostic) {
     return tail;
   }
-  return [tail, "Stdout tail:", result.stdoutTail].filter(Boolean).join("\n");
+  return [tail, result?.parseError ? "Stdout tail:" : "", stdoutDiagnostic].filter(Boolean).join("\n");
+}
+
+const TOKEN_USAGE_FIELDS = {
+  inputTokens: ["input_tokens", "inputTokens"],
+  cacheReadInputTokens: ["cache_read_input_tokens", "cacheReadInputTokens", "cachedReadTokens", "cacheReadTokens"],
+  outputTokens: ["output_tokens", "outputTokens"],
+  reasoningTokens: ["reasoning_tokens", "reasoningTokens"],
+  totalTokens: ["total_tokens", "totalTokens"]
+};
+const TOKEN_USAGE_METRICS = Object.keys(TOKEN_USAGE_FIELDS);
+const TOKEN_USAGE_ALIASES = new Set(Object.values(TOKEN_USAGE_FIELDS).flat());
+const TOKEN_USAGE_OUTPUT_FIELDS = {
+  snake: {
+    inputTokens: "input_tokens",
+    cacheReadInputTokens: "cache_read_input_tokens",
+    outputTokens: "output_tokens",
+    reasoningTokens: "reasoning_tokens",
+    totalTokens: "total_tokens"
+  },
+  camel: {
+    inputTokens: "inputTokens",
+    cacheReadInputTokens: "cacheReadInputTokens",
+    outputTokens: "outputTokens",
+    reasoningTokens: "reasoningTokens",
+    totalTokens: "totalTokens"
+  }
+};
+
+function optionalBoolean(value) {
+  return typeof value === "boolean" ? value : null;
+}
+
+function finiteTokenField(value, names) {
+  for (const name of names) {
+    const candidate = value?.[name];
+    if (Number.isFinite(candidate) && candidate >= 0) {
+      return candidate;
+    }
+  }
+  return null;
+}
+
+function tokenUsageObservation(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return { coverage: "unreported", usage: null };
+  }
+  const usage = {};
+  let observedFields = 0;
+  for (const [metric, names] of Object.entries(TOKEN_USAGE_FIELDS)) {
+    const field = finiteTokenField(value, names);
+    if (field != null) {
+      usage[metric] = field;
+      observedFields += 1;
+    }
+  }
+  if (observedFields === 0) {
+    return { coverage: "unreported", usage: null };
+  }
+  return {
+    coverage: observedFields === TOKEN_USAGE_METRICS.length ? "complete" : "incomplete",
+    usage
+  };
+}
+
+function spendObject(value) {
+  return value && typeof value === "object" && !Array.isArray(value) && Object.keys(value).length > 0;
+}
+
+function formattedTokenUsage(usage, style) {
+  const formatted = {};
+  for (const metric of TOKEN_USAGE_METRICS) {
+    if (Object.hasOwn(usage, metric)) {
+      formatted[TOKEN_USAGE_OUTPUT_FIELDS[style][metric]] = usage[metric];
+    }
+  }
+  return formatted;
+}
+
+function mergeSharedSpendFields(left, right, target) {
+  if (!spendObject(left) || !spendObject(right)) {
+    return;
+  }
+  for (const [key, leftValue] of Object.entries(left)) {
+    if (TOKEN_USAGE_ALIASES.has(key) || !Object.hasOwn(right, key)) {
+      continue;
+    }
+    const rightValue = right[key];
+    if (Number.isFinite(leftValue) && Number.isFinite(rightValue)) {
+      target[key] = leftValue + rightValue;
+    } else if (Object.is(leftValue, rightValue)) {
+      target[key] = leftValue;
+    }
+  }
+}
+
+function mergeTokenUsageValues(left, right, style) {
+  const leftObserved = tokenUsageObservation(left);
+  const rightObserved = tokenUsageObservation(right);
+  const shared = {};
+  for (const metric of TOKEN_USAGE_METRICS) {
+    if (Object.hasOwn(leftObserved.usage ?? {}, metric) && Object.hasOwn(rightObserved.usage ?? {}, metric)) {
+      shared[metric] = leftObserved.usage[metric] + rightObserved.usage[metric];
+    }
+  }
+  const merged = formattedTokenUsage(shared, style);
+  mergeSharedSpendFields(left, right, merged);
+  return Object.keys(merged).length > 0 ? merged : null;
+}
+
+function modelUsageObservation(value) {
+  if (!spendObject(value)) {
+    return { coverage: "unreported" };
+  }
+  const entries = Object.values(value);
+  return {
+    coverage: entries.every((entry) => tokenUsageObservation(entry).coverage === "complete")
+      ? "complete"
+      : "incomplete"
+  };
+}
+
+function mergeModelUsageValues(left, right) {
+  const leftModels = spendObject(left) ? left : {};
+  const rightModels = spendObject(right) ? right : {};
+  const merged = {};
+  for (const model of new Set([...Object.keys(leftModels), ...Object.keys(rightModels)])) {
+    if (Object.hasOwn(leftModels, model) && Object.hasOwn(rightModels, model)) {
+      const usage = mergeTokenUsageValues(leftModels[model], rightModels[model], "camel");
+      if (usage) {
+        merged[model] = usage;
+      }
+    } else {
+      const usage = leftModels[model] ?? rightModels[model];
+      if (usage && typeof usage === "object" && !Array.isArray(usage)) {
+        merged[model] = { ...usage };
+      }
+    }
+  }
+  return Object.keys(merged).length > 0 ? merged : null;
+}
+
+function mergedExplicitIncomplete(left, right) {
+  if (left === true || right === true) {
+    return true;
+  }
+  if (left === false || right === false) {
+    return false;
+  }
+  return null;
+}
+
+function channelIncompleteFlag(explicitIncomplete, observed, exact) {
+  if (explicitIncomplete === true) {
+    return true;
+  }
+  if (observed) {
+    return !exact;
+  }
+  return explicitIncomplete;
+}
+
+function mergeReviewSpend(first, retry) {
+  const explicitIncomplete = mergedExplicitIncomplete(first.usageIsIncomplete, retry.usageIsIncomplete);
+  const usageObserved = spendObject(first.usage) || spendObject(retry.usage);
+  const usageExact =
+    explicitIncomplete !== true &&
+    tokenUsageObservation(first.usage).coverage === "complete" &&
+    tokenUsageObservation(retry.usage).coverage === "complete";
+  const modelUsageObserved = spendObject(first.modelUsage) || spendObject(retry.modelUsage);
+  const modelUsageExact =
+    explicitIncomplete !== true &&
+    modelUsageObservation(first.modelUsage).coverage === "complete" &&
+    modelUsageObservation(retry.modelUsage).coverage === "complete";
+  return {
+    usage: mergeTokenUsageValues(first.usage, retry.usage, "snake"),
+    modelUsage: mergeModelUsageValues(first.modelUsage, retry.modelUsage),
+    usageIsIncomplete: channelIncompleteFlag(explicitIncomplete, usageObserved, usageExact),
+    modelUsageIsIncomplete: channelIncompleteFlag(explicitIncomplete, modelUsageObserved, modelUsageExact)
+  };
+}
+
+function resultSpendPatch(result) {
+  const usageIsIncomplete = optionalBoolean(result?.usageIsIncomplete);
+  return {
+    usage: result?.usage ?? null,
+    modelUsage: result?.modelUsage ?? null,
+    usageIsIncomplete,
+    modelUsageIsIncomplete: optionalBoolean(result?.modelUsageIsIncomplete) ?? usageIsIncomplete
+  };
+}
+
+function taskSuccessPayload(record, result) {
+  return {
+    jobId: record.id,
+    status: "done",
+    mode: record.mode,
+    background: record.background,
+    exitCode: result.exitCode,
+    sessionId: result.sessionId,
+    stopReason: result.stopReason,
+    ...resultSpendPatch(result),
+    failureKind: null,
+    text: result.text
+  };
+}
+
+function failureResultPayload(record, { status, failureKind, message, result = null }) {
+  return {
+    jobId: record?.id ?? null,
+    status,
+    mode: record?.mode ?? null,
+    background: Boolean(record?.background),
+    exitCode: result?.exitCode ?? null,
+    sessionId: result?.sessionId ?? null,
+    ...(result ? resultSpendPatch(result) : {}),
+    failureKind,
+    message
+  };
+}
+
+function retainedResultPayload(record, payload) {
+  return record?.request?.outputJson ? payload : null;
 }
 
 function failJob(jobFile, logFile, result, timeoutMs) {
@@ -417,6 +776,7 @@ function failJob(jobFile, logFile, result, timeoutMs) {
       : classifyFailure({ result, logTail: tail });
   const message = grokFailureMessage(result, timeoutMs, failureKind);
   const status = failureKind === "cancelled" ? "cancelled" : "error";
+  const renderedMessage = failureOutcomeMessage({ message, detail: tail, jobId: current?.id, status, failureKind });
   finishJobRecord(jobFile, {
     status,
     pid: null,
@@ -425,20 +785,17 @@ function failJob(jobFile, logFile, result, timeoutMs) {
     exitCode: result.exitCode,
     sessionId: result.sessionId,
     resultText: result.text || null,
+    resultPayload: retainedResultPayload(
+      current,
+      failureResultPayload(current, { status, failureKind, message: renderedMessage, result })
+    ),
+    ...resultSpendPatch(result),
     errorMessage: oneLineSummary(message),
     errorTail: tail || message,
     failureKind,
     cancelRequestedAt: null
   });
-  throw new Error(
-    failureOutcomeMessage({
-      message,
-      detail: tail,
-      jobId: current?.id,
-      status,
-      failureKind
-    })
-  );
+  throw new Error(renderedMessage);
 }
 
 function describeLaunchFailure(error) {
@@ -449,26 +806,69 @@ function describeLaunchFailure(error) {
 }
 
 function launchFailureError(error, jobId) {
-  return new Error(
+  const failureKind = classifyFailure({ spawnError: error });
+  const status = error?.cleanupRequired ? "running" : failureKind === "cancelled" ? "cancelled" : "error";
+  const wrapped = errorWithFailure(
     failureOutcomeMessage({
       message: describeLaunchFailure(error),
       jobId,
-      failureKind: classifyFailure({ spawnError: error })
-    })
+      status,
+      failureKind
+    }),
+    failureKind
   );
+  if (error?.cleanupRequired) {
+    wrapped.cleanupRequired = true;
+    wrapped.processRole = error.processRole ?? null;
+    wrapped.pid = error.pid ?? null;
+    wrapped.pidIdentity = error.pidIdentity ?? null;
+  }
+  return wrapped;
 }
 
-function recordSpawnFailure(jobFile, error) {
+function appendFailureLog(logFile, message) {
+  try {
+    appendJobLog(logFile, message);
+    return readLogTail(logFile, 20) || message;
+  } catch {
+    return message;
+  }
+}
+
+function recordSpawnFailure(jobFile, error, context = {}) {
   const message = describeLaunchFailure(error);
   try {
+    const current = readJobRecordFile(jobFile);
+    const failureKind = classifyFailure({ spawnError: error });
+    if (error?.cleanupRequired || current?.cleanupRequired) {
+      const processPatch = error.processRole === "worker"
+        ? { pid: error.pid ?? current?.pid ?? null, pidIdentity: error.pidIdentity ?? current?.pidIdentity ?? null }
+        : { grokPid: error.pid ?? current?.grokPid ?? null, grokPidIdentity: error.pidIdentity ?? current?.grokPidIdentity ?? null };
+      updateJobRecordFile(jobFile, {
+        ...context,
+        ...processPatch,
+        cleanupRequired: true,
+        errorMessage: oneLineSummary(message),
+        errorTail: message,
+        failureKind
+      });
+      return;
+    }
+    const status = failureKind === "cancelled" ? "cancelled" : "error";
     finishJobRecord(jobFile, {
-      status: "error",
+      ...context,
+      status,
       pid: null,
       grokPid: null,
       finishedAt: nowIso(),
+      resultPayload: retainedResultPayload(
+        current,
+        failureResultPayload(current, { status, failureKind, message })
+      ),
       errorMessage: oneLineSummary(message),
       errorTail: message,
-      failureKind: classifyFailure({ spawnError: error })
+      failureKind,
+      cancelRequestedAt: null
     });
   } catch {
     return;
@@ -485,9 +885,16 @@ async function handleTask(argv) {
   const dataDir = resolveDataDir();
   const claudeSessionId = currentClaudeSessionId();
 
+  const bestOfN = options["best-of-n"] ? parseBestOfN(options["best-of-n"]) : null;
+  const maxTurns = options["max-turns"] ? parsePositiveInteger(options["max-turns"], "--max-turns") : null;
+  const mode = options.write || bestOfN ? "write" : "consult";
+
   let resumeSessionId = options.resume ?? null;
+  if (resumeSessionId) {
+    resumeSessionId = validateResumeSessionId(dataDir, cwd, resumeSessionId, mode);
+  }
   if (!resumeSessionId && options["resume-last"]) {
-    resumeSessionId = resolveLastSessionId(dataDir, cwd, claudeSessionId);
+    resumeSessionId = resolveLastSessionId(dataDir, cwd, claudeSessionId, mode);
   }
 
   let prompt = readTaskPrompt(cwd, options, positionals);
@@ -498,12 +905,8 @@ async function handleTask(argv) {
     prompt = CONTINUE_PROMPT;
   }
 
-  const bestOfN = options["best-of-n"] ? parseBestOfN(options["best-of-n"]) : null;
-  const maxTurns = options["max-turns"] ? parsePositiveInteger(options["max-turns"], "--max-turns") : null;
-  const mode = options.write || bestOfN ? "write" : "consult";
-
   const jobId = generateJobId();
-  const briefFile = writeBrief(dataDir, cwd, jobId, prompt);
+  const briefFile = briefPath(dataDir, cwd, jobId);
   const jobFile = jobFilePath(dataDir, cwd, jobId);
   const record = createJobRecord({
     id: jobId,
@@ -512,6 +915,7 @@ async function handleTask(argv) {
     cwd,
     briefFile,
     background: Boolean(options.background),
+    delivery: options.background ? backgroundDelivery() : "foreground",
     claudeSessionId,
     request: {
       model: options.model ?? null,
@@ -519,20 +923,31 @@ async function handleTask(argv) {
       maxTurns,
       bestOfN,
       web: Boolean(options.web),
-      resumeSessionId
+      sandboxProfile: sandboxProfileForMode(mode),
+      resumeSessionId,
+      outputJson: Boolean(options.json)
     }
   });
-  writeJobRecordFile(jobFile, record);
+  createJobRecordFile(jobFile, record);
+  try {
+    writeBrief(dataDir, cwd, jobId, prompt);
+    if (resumeSessionId) {
+      claimResumeSessionLease(dataDir, cwd, resumeSessionId, jobId);
+    }
+  } catch (error) {
+    recordSpawnFailure(jobFile, error);
+    throw launchFailureError(error, jobId);
+  }
 
   if (options.background) {
-    const child = spawn(process.execPath, [SELF_PATH, "task-worker", "--job-id", jobId], {
-      detached: true,
-      stdio: "ignore"
-    });
-    child.unref();
-    updateJobRecordFile(jobFile, { pid: child.pid ?? null });
-    const payload = { jobId, status: "running", mode, background: true, failureKind: null };
-    output(options.json ? payload : renderBackgroundLaunch(jobId), options.json);
+    try {
+      await spawnBackgroundWorker([SELF_PATH, "task-worker", "--job-id", jobId, "--cwd", cwd], jobFile);
+    } catch (error) {
+      recordSpawnFailure(jobFile, error);
+      throw launchFailureError(error, jobId);
+    }
+    const payload = { jobId, status: "running", mode, background: true, delivery: record.delivery, failureKind: null };
+    output(options.json ? payload : renderBackgroundLaunch(jobId, record.delivery), options.json);
     return;
   }
 
@@ -552,7 +967,7 @@ async function handleTask(argv) {
       cwd,
       logFile,
       timeoutMs,
-      onSpawn: (pid) => updateJobRecordFile(jobFile, { grokPid: pid ?? null })
+      launchProcess: (launch) => launchRunningJobProcess(jobFile, launch)
     });
   } catch (error) {
     recordSpawnFailure(jobFile, error);
@@ -563,6 +978,7 @@ async function handleTask(argv) {
     failJob(jobFile, logFile, result, timeoutMs);
   }
 
+  const payload = taskSuccessPayload(record, result);
   const finishedAt = nowIso();
   const final = finishSuccessfulJobRecordFile(jobFile, {
     status: "done",
@@ -572,6 +988,8 @@ async function handleTask(argv) {
     exitCode: result.exitCode,
     sessionId: result.sessionId,
     resultText: result.text,
+    resultPayload: retainedResultPayload(record, payload),
+    ...resultSpendPatch(result),
     failureKind: null
   });
 
@@ -586,17 +1004,6 @@ async function handleTask(argv) {
     );
   }
 
-  const payload = {
-    jobId,
-    status: "done",
-    mode,
-    background: false,
-    exitCode: result.exitCode,
-    sessionId: result.sessionId,
-    stopReason: result.stopReason,
-    failureKind: null,
-    text: result.text
-  };
   output(
     options.json ? payload : renderTaskResult({ text: result.text, sessionId: result.sessionId, jobId }),
     options.json
@@ -604,14 +1011,14 @@ async function handleTask(argv) {
 }
 
 async function handleTaskWorker(argv) {
-  const { options } = parseArgs(argv, { valueOptions: ["job-id"] });
+  const { options } = parseArgs(argv, { valueOptions: ["job-id", "cwd"] });
   const jobId = options["job-id"];
   if (!jobId) {
     throw new Error("Missing required --job-id for task-worker.");
   }
 
   const dataDir = resolveDataDir();
-  const found = findJobRecordById(dataDir, jobId);
+  const found = findRequestedJobRecord(dataDir, jobId, options);
   if (!found) {
     throw new Error(`No job record found for ${jobId}.`);
   }
@@ -621,7 +1028,7 @@ async function handleTaskWorker(argv) {
     return;
   }
   const logFile = jobLogPath(dataDir, record.cwd, record.id);
-  updateJobRecordFile(found.file, { pid: process.pid });
+  updateJobRecordFile(found.file, { pid: process.pid, pidIdentity: getProcessIdentity(process.pid) });
 
   const request = record.request ?? {};
   const timeoutMs = resolveTimeoutMs({ background: true, env: process.env });
@@ -639,11 +1046,12 @@ async function handleTaskWorker(argv) {
       cwd: record.cwd,
       logFile,
       timeoutMs,
-      onSpawn: (pid) => updateJobRecordFile(found.file, { grokPid: pid ?? null })
+      launchProcess: (launch) => launchRunningJobProcess(found.file, launch)
     });
 
     const finishedAt = nowIso();
     if (!resultFailed(result)) {
+      const payload = taskSuccessPayload(record, result);
       finishSuccessfulJobRecordFile(found.file, {
         status: "done",
         pid: null,
@@ -652,6 +1060,8 @@ async function handleTaskWorker(argv) {
         exitCode: result.exitCode,
         sessionId: result.sessionId,
         resultText: result.text,
+        resultPayload: retainedResultPayload(record, payload),
+        ...resultSpendPatch(result),
         failureKind: null
       });
       return;
@@ -664,14 +1074,21 @@ async function handleTaskWorker(argv) {
         ? "cancelled"
         : classifyFailure({ result, logTail: tail });
     const message = grokFailureMessage(result, timeoutMs, failureKind);
+    const status = failureKind === "cancelled" ? "cancelled" : "error";
+    const renderedMessage = failureOutcomeMessage({ message, detail: tail, jobId: record.id, status, failureKind });
     finishJobRecord(found.file, {
-      status: failureKind === "cancelled" ? "cancelled" : "error",
+      status,
       pid: null,
       grokPid: null,
       finishedAt,
       exitCode: result.exitCode,
       sessionId: result.sessionId,
       resultText: result.text || null,
+      resultPayload: retainedResultPayload(
+        record,
+        failureResultPayload(record, { status, failureKind, message: renderedMessage, result })
+      ),
+      ...resultSpendPatch(result),
       errorMessage: oneLineSummary(message),
       errorTail: tail || message,
       failureKind,
@@ -679,16 +1096,8 @@ async function handleTaskWorker(argv) {
     });
   } catch (error) {
     const message = describeLaunchFailure(error);
-    appendJobLog(logFile, message);
-    finishJobRecord(found.file, {
-      status: "error",
-      pid: null,
-      grokPid: null,
-      finishedAt: nowIso(),
-      errorMessage: oneLineSummary(message),
-      errorTail: readLogTail(logFile, 20),
-      failureKind: classifyFailure({ spawnError: error })
-    });
+    appendFailureLog(logFile, message);
+    recordSpawnFailure(found.file, error);
   }
 }
 
@@ -769,7 +1178,6 @@ function buildCorrectivePrompt(error) {
 async function runReviewJob(record, jobFile, options = {}) {
   const logFile = jobLogPath(resolveDataDir(), record.cwd, record.id);
   const timeoutMs = resolveTimeoutMs({ background: Boolean(options.background), env: process.env });
-  const recordGrokPid = (pid) => updateJobRecordFile(jobFile, { grokPid: pid ?? null });
   let first;
   try {
     first = await runGrok({
@@ -778,7 +1186,7 @@ async function runReviewJob(record, jobFile, options = {}) {
       cwd: record.cwd,
       logFile,
       timeoutMs,
-      onSpawn: recordGrokPid
+      launchProcess: (launch) => launchRunningJobProcess(jobFile, launch)
     });
   } catch (error) {
     recordSpawnFailure(jobFile, error);
@@ -791,6 +1199,7 @@ async function runReviewJob(record, jobFile, options = {}) {
   let review = evaluateReviewText(first.text);
   let sessionId = first.sessionId;
   let finalText = first.text;
+  let spend = resultSpendPatch(first);
 
   if (!review.valid && first.sessionId) {
     const retryBrief = writeBrief(resolveDataDir(), record.cwd, `${record.id}-retry`, buildCorrectivePrompt(review.error));
@@ -803,19 +1212,34 @@ async function runReviewJob(record, jobFile, options = {}) {
         cwd: record.cwd,
         logFile,
         timeoutMs,
-        onSpawn: recordGrokPid
+        launchProcess: (launch) => launchRunningJobProcess(jobFile, launch)
       });
     } catch (error) {
-      recordSpawnFailure(jobFile, error);
+      recordSpawnFailure(jobFile, error, {
+        sessionId,
+        resultText: first.text || null,
+        ...spend
+      });
       throw launchFailureError(error, record.id);
     }
-    if (!resultFailed(retry)) {
-      review = evaluateReviewText(retry.text);
-      if (retry.text) {
-        finalText = retry.text;
-      }
-      sessionId = retry.sessionId ?? sessionId;
+    spend = mergeReviewSpend(first, retry);
+    if (resultFailed(retry)) {
+      failJob(
+        jobFile,
+        logFile,
+        {
+          ...retry,
+          sessionId: retry.sessionId ?? sessionId,
+          ...spend
+        },
+        timeoutMs
+      );
     }
+    review = evaluateReviewText(retry.text);
+    if (retry.text) {
+      finalText = retry.text;
+    }
+    sessionId = retry.sessionId ?? sessionId;
   }
 
   const targetLabel = record.request?.reviewTargetLabel ?? "working tree changes";
@@ -826,6 +1250,21 @@ async function runReviewJob(record, jobFile, options = {}) {
     ? null
     : `Grok review output failed validation after one corrective retry: ${review.error}`;
 
+  const payload = {
+    jobId: record.id,
+    status: review.valid ? "done" : "error",
+    mode: "consult",
+    background: record.background,
+    sessionId,
+    valid: review.valid,
+    review: review.valid ? review.value : null,
+    parseError: review.valid ? null : review.error,
+    ...spend,
+    failureKind: review.valid ? null : "error",
+    rawText: finalText,
+    rendered: body
+  };
+
   finishJobRecord(jobFile, {
     status: review.valid ? "done" : "error",
     pid: null,
@@ -834,22 +1273,13 @@ async function runReviewJob(record, jobFile, options = {}) {
     exitCode: 0,
     sessionId,
     resultText: body,
+    resultPayload: retainedResultPayload(record, payload),
+    ...spend,
     errorMessage: validationMessage,
     errorTail: review.valid ? null : boundedTextTail(finalText) || validationMessage,
     failureKind: review.valid ? null : "error",
     cancelRequestedAt: null
   });
-
-  const payload = {
-    jobId: record.id,
-    sessionId,
-    valid: review.valid,
-    review: review.valid ? review.value : null,
-    parseError: review.valid ? null : review.error,
-    failureKind: review.valid ? null : "error",
-    rawText: finalText,
-    rendered: body
-  };
   return payload;
 }
 
@@ -876,7 +1306,7 @@ async function handleReview(argv) {
   });
 
   const jobId = generateJobId();
-  const briefFile = writeBrief(dataDir, cwd, jobId, prompt);
+  const briefFile = briefPath(dataDir, cwd, jobId);
   const jobFile = jobFilePath(dataDir, cwd, jobId);
   const record = createJobRecord({
     id: jobId,
@@ -885,20 +1315,31 @@ async function handleReview(argv) {
     cwd,
     briefFile,
     background: Boolean(options.background),
+    delivery: options.background ? backgroundDelivery() : "foreground",
     claudeSessionId: currentClaudeSessionId(),
-    request: { reviewTargetLabel: target.label }
+    request: {
+      reviewTargetLabel: target.label,
+      sandboxProfile: sandboxProfileForMode("consult"),
+      outputJson: Boolean(options.json)
+    }
   });
-  writeJobRecordFile(jobFile, record);
+  createJobRecordFile(jobFile, record);
+  try {
+    writeBrief(dataDir, cwd, jobId, prompt);
+  } catch (error) {
+    recordSpawnFailure(jobFile, error);
+    throw launchFailureError(error, jobId);
+  }
 
   if (options.background) {
-    const child = spawn(process.execPath, [SELF_PATH, "review-worker", "--job-id", jobId], {
-      detached: true,
-      stdio: "ignore"
-    });
-    child.unref();
-    updateJobRecordFile(jobFile, { pid: child.pid ?? null });
-    const payload = { jobId, status: "running", mode: "consult", background: true, failureKind: null };
-    output(options.json ? payload : renderBackgroundLaunch(jobId), options.json);
+    try {
+      await spawnBackgroundWorker([SELF_PATH, "review-worker", "--job-id", jobId, "--cwd", cwd], jobFile);
+    } catch (error) {
+      recordSpawnFailure(jobFile, error);
+      throw launchFailureError(error, jobId);
+    }
+    const payload = { jobId, status: "running", mode: "consult", background: true, delivery: record.delivery, failureKind: null };
+    output(options.json ? payload : renderBackgroundLaunch(jobId, record.delivery), options.json);
     return;
   }
 
@@ -922,14 +1363,14 @@ async function handleReview(argv) {
 }
 
 async function handleReviewWorker(argv) {
-  const { options } = parseArgs(argv, { valueOptions: ["job-id"] });
+  const { options } = parseArgs(argv, { valueOptions: ["job-id", "cwd"] });
   const jobId = options["job-id"];
   if (!jobId) {
     throw new Error("Missing required --job-id for review-worker.");
   }
 
   const dataDir = resolveDataDir();
-  const found = findJobRecordById(dataDir, jobId);
+  const found = findRequestedJobRecord(dataDir, jobId, options);
   if (!found) {
     throw new Error(`No job record found for ${jobId}.`);
   }
@@ -938,7 +1379,7 @@ async function handleReviewWorker(argv) {
     return;
   }
 
-  const record = updateJobRecordFile(found.file, { pid: process.pid });
+  const record = updateJobRecordFile(found.file, { pid: process.pid, pidIdentity: getProcessIdentity(process.pid) });
   const logFile = jobLogPath(dataDir, record.cwd, record.id);
   try {
     await runReviewJob(record, found.file, { background: true });
@@ -947,16 +1388,25 @@ async function handleReviewWorker(argv) {
     if (current?.status !== "running") {
       return;
     }
+    if (error?.cleanupRequired || current.cleanupRequired) {
+      recordSpawnFailure(found.file, error);
+      return;
+    }
     const message = describeLaunchFailure(error);
-    appendJobLog(logFile, message);
+    const failureKind = classifyFailure({ spawnError: error });
+    const errorTail = appendFailureLog(logFile, message);
     finishJobRecord(found.file, {
       status: "error",
       pid: null,
       grokPid: null,
       finishedAt: nowIso(),
+      resultPayload: retainedResultPayload(
+        record,
+        failureResultPayload(record, { status: "error", failureKind, message })
+      ),
       errorMessage: oneLineSummary(message),
-      errorTail: readLogTail(logFile, 20),
-      failureKind: classifyFailure({ spawnError: error })
+      errorTail,
+      failureKind
     });
   }
 }
@@ -978,6 +1428,9 @@ function handleStatus(argv) {
     const logTail =
       record.status === "error" ? readLogTail(jobLogPath(dataDir, record.cwd, record.id), 20) : "";
     output(options.json ? record : renderJobDetail(record, { logTail }), options.json);
+    if (record.cleanupRequired) {
+      process.exitCode = 1;
+    }
     return;
   }
 
@@ -985,6 +1438,9 @@ function handleStatus(argv) {
     refreshRunningJobRecord({ record, file: jobFilePath(dataDir, record.cwd, record.id) }).record
   );
   output(options.json ? { jobs } : renderStatusTable(jobs, currentClaudeSessionId()), options.json);
+  if (jobs.some((record) => record.cleanupRequired)) {
+    process.exitCode = 1;
+  }
 }
 
 function renderFailedResult(record, dataDir) {
@@ -1001,6 +1457,18 @@ function renderFailedResult(record, dataDir) {
 }
 
 function renderRunningWaitResult(record) {
+  if (record.cleanupRequired) {
+    const lines = [`Job ${record.id}`, "", "Status: cleanup required"];
+    if (record.errorMessage) {
+      lines.push("", record.errorMessage);
+    }
+    lines.push("", `job: ${record.id}`, "state: running");
+    if (record.failureKind) {
+      lines.push(`failure: ${record.failureKind}`);
+    }
+    lines.push("phase: cleanup-required");
+    return `${lines.join("\n")}\n`;
+  }
   return [`Job ${record.id}`, "", "Status: running", "", `job: ${record.id}`, "state: running"].join("\n") + "\n";
 }
 
@@ -1019,6 +1487,9 @@ function renderNotRunningReport(record) {
 
 function renderResultRecord(record, dataDir) {
   if (record.status === "running") {
+    if (record.cleanupRequired) {
+      return renderRunningWaitResult(record);
+    }
     return `Job ${record.id} is still running. Check /grok:status ${record.id} for progress.\n`;
   }
 
@@ -1037,6 +1508,34 @@ function renderResultRecord(record, dataDir) {
   return renderTaskResult({ text: record.resultText ?? "", sessionId: record.sessionId, jobId: record.id });
 }
 
+function jsonResultPayload(record, dataDir) {
+  if (!record.request?.outputJson || record.status === "running") {
+    return record;
+  }
+  if (record.resultPayload) {
+    return record.resultPayload;
+  }
+  if (record.status === "done") {
+    return taskSuccessPayload(record, {
+      exitCode: record.exitCode,
+      sessionId: record.sessionId,
+      stopReason: record.stopReason ?? null,
+      usage: record.usage,
+      modelUsage: record.modelUsage,
+      usageIsIncomplete: record.usageIsIncomplete,
+      modelUsageIsIncomplete: record.modelUsageIsIncomplete,
+      text: record.resultText ?? ""
+    });
+  }
+  const failureKind = record.failureKind ?? (record.status === "cancelled" ? "cancelled" : "error");
+  return failureResultPayload(record, {
+    status: record.status,
+    failureKind,
+    message: renderResultRecord(record, dataDir).trimEnd(),
+    result: record
+  });
+}
+
 async function waitForResultRecord(found, options) {
   const timeoutMs = resolveWaitTimeoutMs(options);
   const pollMs = resolveWaitPollMs();
@@ -1046,7 +1545,7 @@ async function waitForResultRecord(found, options) {
   for (;;) {
     const current = readJobRecordFile(found.file) ?? record;
     record = refreshRunningJobRecord({ record: current, file: found.file }).record;
-    if (record.status !== "running") {
+    if (record.status !== "running" || record.cleanupRequired) {
       return record;
     }
     const remaining = deadline - Date.now();
@@ -1075,8 +1574,15 @@ async function handleResult(argv) {
   }
 
   const record = options.wait ? await waitForResultRecord(found, options) : refreshRunningJobRecord(found).record;
+  const markCollected = record.status !== "running" && record.delivery === "managed";
+  if (record.cleanupRequired) {
+    process.exitCode = 1;
+  }
   if (options.json) {
-    output(record, true);
+    output(jsonResultPayload(record, dataDir), true);
+    if (markCollected) {
+      markManagedDeliveryCollectedFile(found.file);
+    }
     return;
   }
 
@@ -1086,6 +1592,9 @@ async function handleResult(argv) {
   }
 
   output(renderResultRecord(record, dataDir), false);
+  if (markCollected) {
+    markManagedDeliveryCollectedFile(found.file);
+  }
 }
 
 async function handleCancel(argv) {
@@ -1105,17 +1614,9 @@ async function handleCancel(argv) {
     throw new Error(`No job record found for ${jobId}.`);
   }
 
-  const refreshed = refreshRunningJobRecord(found);
-  const record = refreshed.record;
+  const record = readJobRecordFile(found.file) ?? found.record;
   if (record.status !== "running") {
-    output(
-      options.json
-        ? record
-        : refreshed.changed && record.status === "error"
-          ? renderFailedResult(record, dataDir)
-          : renderNotRunningReport(record),
-      options.json
-    );
+    output(options.json ? record : renderNotRunningReport(record), options.json);
     return;
   }
   const requested = updateJobRecordFile(found.file, { cancelRequestedAt: nowIso() });
@@ -1127,22 +1628,39 @@ async function handleCancel(argv) {
     return;
   }
 
-  const pids = new Set();
-  if (record.grokPid) {
-    pids.add(record.grokPid);
-  }
-  if (record.background || !record.grokPid) {
-    pids.add(record.pid);
-  }
-  await Promise.all([...pids].map((pid) => terminateProcessGroup(pid)));
-  const next = updateJobRecordFile(found.file, {
-    status: "cancelled",
-    pid: null,
-    grokPid: null,
-    finishedAt: nowIso(),
-    failureKind: "cancelled",
-    cancelRequestedAt: null
+  const terminated = await terminateRecordedProcessGroups(requested);
+  const cleanupMessage = "Cancellation was requested, but verified process cleanup did not complete. The process identifiers were retained for retry.";
+  const next = updateJobRecordFileWithCurrent(found.file, (current) => {
+    if (current.status !== "running") {
+      return current;
+    }
+    if (!terminated || !recordedProcessGroupsClean(current)) {
+      return cleanupRequiredPatch(current, "cancelled", cleanupMessage);
+    }
+    return {
+      ...current,
+      status: "cancelled",
+      finishedAt: nowIso(),
+      resultPayload: retainedResultPayload(
+        current,
+        failureResultPayload(current, {
+          status: "cancelled",
+          failureKind: "cancelled",
+          message: failureOutcomeMessage({
+            message: "The Grok job was cancelled.",
+            jobId: current.id,
+            status: "cancelled",
+            failureKind: "cancelled"
+          })
+        })
+      ),
+      failureKind: "cancelled",
+      cancelRequestedAt: null
+    };
   });
+  if (next.status === "running" && next.cleanupRequired) {
+    throw errorWithFailure(failureOutcomeMessage({ message: cleanupMessage, jobId: next.id, status: "running", failureKind: "cancelled" }), "cancelled");
+  }
   if (next.status !== "cancelled") {
     output(options.json ? next : renderNotRunningReport(next), options.json);
     return;
@@ -1154,10 +1672,110 @@ function increment(counts, key) {
   counts[key] = (counts[key] ?? 0) + 1;
 }
 
-function aggregateJobStats(records) {
+function addTokenUsage(target, usage) {
+  for (const metric of TOKEN_USAGE_METRICS) {
+    target[metric] += usage[metric];
+  }
+}
+
+function tokenUsageFromModels(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return { coverage: "unreported", usage: null };
+  }
+  const entries = Object.values(value);
+  if (entries.length === 0) {
+    return { coverage: "unreported", usage: null };
+  }
+  const combined = {
+    inputTokens: 0,
+    cacheReadInputTokens: 0,
+    outputTokens: 0,
+    reasoningTokens: 0,
+    totalTokens: 0
+  };
+  let completeEntries = 0;
+  let incompleteEntry = false;
+  for (const entry of entries) {
+    const observed = tokenUsageObservation(entry);
+    if (observed.coverage === "complete") {
+      addTokenUsage(combined, observed.usage);
+      completeEntries += 1;
+    } else if (observed.coverage === "incomplete") {
+      incompleteEntry = true;
+    }
+  }
+  if (completeEntries === entries.length) {
+    return { coverage: "complete", usage: combined };
+  }
+  if (completeEntries > 0 || incompleteEntry) {
+    return { coverage: "incomplete", usage: null };
+  }
+  return { coverage: "unreported", usage: null };
+}
+
+function tokenUsageForRecord(record) {
+  const usageIsIncomplete = record.usageIsIncomplete === true || record.usage_is_incomplete === true;
+  const modelUsageIsIncomplete = optionalBoolean(record.modelUsageIsIncomplete);
+  const direct = tokenUsageObservation(record.usage);
+  if (direct.coverage === "complete" && !usageIsIncomplete) {
+    return direct;
+  }
+  const byModel = tokenUsageFromModels(record.modelUsage);
+  const modelBlocked = modelUsageIsIncomplete === true || (usageIsIncomplete && modelUsageIsIncomplete == null);
+  if (byModel.coverage === "complete" && !modelBlocked) {
+    return byModel;
+  }
+  return usageIsIncomplete || modelUsageIsIncomplete === true || direct.coverage === "incomplete" || byModel.coverage === "incomplete"
+    ? { coverage: "incomplete", usage: null }
+    : { coverage: "unreported", usage: null };
+}
+
+function modelNamesForRecord(record) {
+  if (record.modelUsage && typeof record.modelUsage === "object" && !Array.isArray(record.modelUsage)) {
+    const names = Object.keys(record.modelUsage).filter((name) => name.trim());
+    if (names.length > 0) {
+      return names;
+    }
+  }
+  const requested = record.request?.model;
+  return typeof requested === "string" && requested.trim() ? [requested.trim()] : ["unknown"];
+}
+
+function historicalFailureKind(record, dataDir) {
+  const stored = typeof record.failureKind === "string" ? record.failureKind.trim() : "";
+  if (stored && stored !== "error") {
+    return stored;
+  }
+  const recordSummary = [record.errorMessage, record.errorTail]
+    .filter((value) => typeof value === "string" && value.trim())
+    .join("\n");
+  const recordClassification = classifyFailure({ logTail: recordSummary });
+  if (recordClassification !== "error") {
+    return recordClassification;
+  }
+  const logTail = record?.cwd && record?.id ? readLogTail(jobLogPath(dataDir, record.cwd, record.id), Number.MAX_SAFE_INTEGER) : "";
+  const classified = classifyFailure({ logTail });
+  return classified === "error" ? stored || "error" : classified;
+}
+
+function aggregateJobStats(records, dataDir) {
   const byStatus = {};
   const byMode = {};
   const byFailureKind = {};
+  const byModel = {};
+  const usage = {
+    reportedJobs: 0,
+    inputTokens: 0,
+    cacheReadInputTokens: 0,
+    outputTokens: 0,
+    reasoningTokens: 0,
+    totalTokens: 0
+  };
+  const usageCoverage = {
+    completeJobs: 0,
+    incompleteJobs: 0,
+    unreportedJobs: 0
+  };
   const doneDurations = [];
   let earliest = null;
   let latest = null;
@@ -1165,8 +1783,21 @@ function aggregateJobStats(records) {
   for (const record of records) {
     increment(byStatus, record.status ?? "unknown");
     increment(byMode, record.mode ?? "unknown");
+    for (const model of modelNamesForRecord(record)) {
+      increment(byModel, model);
+    }
+    const recordUsage = tokenUsageForRecord(record);
+    if (recordUsage.coverage === "complete") {
+      addTokenUsage(usage, recordUsage.usage);
+      usage.reportedJobs += 1;
+      usageCoverage.completeJobs += 1;
+    } else if (recordUsage.coverage === "incomplete") {
+      usageCoverage.incompleteJobs += 1;
+    } else {
+      usageCoverage.unreportedJobs += 1;
+    }
     if (record.status === "error" || record.status === "cancelled") {
-      increment(byFailureKind, record.failureKind ?? (record.status === "cancelled" ? "cancelled" : "error"));
+      increment(byFailureKind, record.status === "cancelled" ? record.failureKind ?? "cancelled" : historicalFailureKind(record, dataDir));
     }
     const created = Date.parse(record.createdAt ?? "");
     if (Number.isFinite(created)) {
@@ -1195,6 +1826,17 @@ function aggregateJobStats(records) {
     byStatus,
     byMode,
     byFailureKind,
+    byModel,
+    usage: usage.reportedJobs > 0 ? usage : null,
+    usageCoverage: {
+      availability:
+        usageCoverage.completeJobs === 0
+          ? "unavailable"
+          : usageCoverage.completeJobs === records.length
+            ? "available"
+            : "partial",
+      ...usageCoverage
+    },
     meanWallClockSeconds,
     earliestCreatedAt: earliest,
     latestCreatedAt: latest
@@ -1217,7 +1859,7 @@ function handleStats(argv) {
   const stats = {
     scope: options.all ? "all" : "workspace",
     cwd: options.all ? null : cwd,
-    ...aggregateJobStats(records)
+    ...aggregateJobStats(records, dataDir)
   };
   output(options.json ? stats : renderStatsReport(stats), options.json);
 }
@@ -1321,9 +1963,9 @@ async function handleStopGate() {
   });
 
   const jobId = generateJobId();
-  const briefFile = writeBrief(dataDir, cwd, jobId, prompt);
+  const briefFile = briefPath(dataDir, cwd, jobId);
   const jobFile = jobFilePath(dataDir, cwd, jobId);
-  writeJobRecordFile(
+  createJobRecordFile(
     jobFile,
     createJobRecord({
       id: jobId,
@@ -1333,9 +1975,15 @@ async function handleStopGate() {
       briefFile,
       background: false,
       claudeSessionId: input.session_id ?? currentClaudeSessionId(),
-      request: { maxTurns: STOP_GATE_MAX_TURNS }
+      request: { maxTurns: STOP_GATE_MAX_TURNS, sandboxProfile: sandboxProfileForMode("consult") }
     })
   );
+  try {
+    writeBrief(dataDir, cwd, jobId, prompt);
+  } catch (error) {
+    recordSpawnFailure(jobFile, error);
+    return;
+  }
 
   const logFile = jobLogPath(dataDir, cwd, jobId);
   let result;
@@ -1347,7 +1995,7 @@ async function handleStopGate() {
       cwd,
       logFile,
       timeoutMs: STOP_GATE_TIMEOUT_MS,
-      onSpawn: (pid) => updateJobRecordFile(jobFile, { grokPid: pid ?? null })
+      launchProcess: (launch) => launchRunningJobProcess(jobFile, launch)
     });
   } catch (error) {
     recordSpawnFailure(jobFile, error);
@@ -1366,6 +2014,7 @@ async function handleStopGate() {
       exitCode: result.exitCode,
       sessionId: result.sessionId,
       resultText: result.text || null,
+      ...resultSpendPatch(result),
       errorMessage: oneLineSummary(message),
       errorTail: tail || message,
       failureKind
@@ -1381,6 +2030,7 @@ async function handleStopGate() {
     exitCode: result.exitCode,
     sessionId: result.sessionId,
     resultText: result.text,
+    ...resultSpendPatch(result),
     failureKind: null,
     cancelRequestedAt: null
   });

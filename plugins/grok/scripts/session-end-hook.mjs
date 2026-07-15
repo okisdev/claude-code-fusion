@@ -2,8 +2,8 @@
 
 import fs from "node:fs";
 
-import { terminateProcessGroup } from "./lib/grok-exec.mjs";
-import { SESSION_ID_ENV, listAllJobRecords, nowIso, resolveDataDir, updateJobRecordFile } from "./lib/state.mjs";
+import { recordedProcessGroupsClean, terminateRecordedProcessGroups } from "./lib/grok-exec.mjs";
+import { SESSION_ID_ENV, listAllJobRecords, nowIso, resolveDataDir, updateJobRecordFileWithCurrent } from "./lib/state.mjs";
 
 function readHookInput() {
   try {
@@ -27,21 +27,37 @@ async function main() {
       continue;
     }
     try {
-      const pids = new Set();
-      if (record.grokPid) {
-        pids.add(record.grokPid);
+      const requested = updateJobRecordFileWithCurrent(file, (current) => {
+        if (current.status !== "running" || current.claudeSessionId !== sessionId) {
+          return current;
+        }
+        return { ...current, cancelRequestedAt: nowIso() };
+      });
+      if (requested.status !== "running") {
+        continue;
       }
-      if (record.background || !record.grokPid) {
-        pids.add(record.pid);
-      }
-      await Promise.all([...pids].map((pid) => terminateProcessGroup(pid)));
-      updateJobRecordFile(file, {
-        status: "cancelled",
-        pid: null,
-        grokPid: null,
-        finishedAt: nowIso(),
-        failureKind: "cancelled",
-        cancelRequestedAt: null
+      const terminated = await terminateRecordedProcessGroups(requested);
+      updateJobRecordFileWithCurrent(file, (current) => {
+        if (current.status !== "running") {
+          return current;
+        }
+        if (!terminated || !recordedProcessGroupsClean(current)) {
+          const message = "Session cleanup was requested, but verified process cleanup did not complete. The process identifiers were retained for retry.";
+          return {
+            ...current,
+            cleanupRequired: true,
+            errorMessage: message,
+            errorTail: message,
+            failureKind: "cancelled"
+          };
+        }
+        return {
+          ...current,
+          status: "cancelled",
+          finishedAt: nowIso(),
+          failureKind: "cancelled",
+          cancelRequestedAt: null
+        };
       });
     } catch {
       continue;
