@@ -21,7 +21,7 @@ const EXPECTED_CONDITION_PLUGINS = {
   B2: ["codex@claude-code-fusion", "fusion@claude-code-fusion", "grok@claude-code-fusion"],
   B3: ["fusion@claude-code-fusion"]
 };
-const CLI_VERSION_TIMEOUT_MS = 2000;
+const CLI_VERSION_TIMEOUT_MS = 5000;
 const PLUGIN_VERSION_FILES = [
   { name: "codex", file: path.join(REPO_ROOT, "plugins", "codex", ".claude-plugin", "plugin.json") },
   { name: "fusion", file: path.join(REPO_ROOT, "plugins", "fusion", ".claude-plugin", "plugin.json") },
