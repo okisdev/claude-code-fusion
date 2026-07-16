@@ -12,7 +12,7 @@
       "name": "grok",
       "source": "./plugins/grok",
       "displayName": "Grok Companion",
-      "description": "Local Grok CLI delegation: task, review, best-of-n tournaments, background jobs, stats, and setup health checks.",
+      "description": "Local Grok CLI delegation: task, review, resumable history, best-of-n tournaments, background jobs, stats, and setup health checks.",
       "version": "0.0.23",
       "author": {
         "name": "Harry Yep"

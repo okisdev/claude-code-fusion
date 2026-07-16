@@ -1,16 +1,20 @@
 #!/usr/bin/env node
 
 import { spawn, spawnSync } from "node:child_process";
+import { createHash, randomBytes } from "node:crypto";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { isatty } from "node:tty";
 import { fileURLToPath } from "node:url";
 
-import { parseArgs } from "./lib/args.mjs";
+import { parseArgs, parseRawArgs, rawBooleanOptionRequested } from "./lib/args.mjs";
 import {
   buildGrokArgs,
   formatBlockedPermissionCall,
+  normalizeGrokSessionId,
   resolveGrokBin,
+  resolveGrokCapabilities,
   resolveTimeoutMs,
   sandboxProfileForMode,
   recordedProcessGroupsClean,
@@ -25,6 +29,7 @@ import {
   extractFirstJsonObject,
   renderBackgroundLaunch,
   renderCancelReport,
+  renderHistoryReport,
   renderJobDetail,
   renderReviewFallback,
   renderReviewResult,
@@ -40,6 +45,7 @@ import {
   claimResumeSessionLease,
   createJobRecord,
   createJobRecordFile,
+  ensurePrivateDataDir,
   findJobRecordById,
   generateJobId,
   jobFilePath,
@@ -47,7 +53,7 @@ import {
   launchRunningJobProcess,
   listAllJobRecords,
   listJobRecords,
-  markManagedDeliveryCollectedFile,
+  markDeliveryCollectedFile,
   nowIso,
   readJobRecordFile,
   readLogTail,
@@ -56,6 +62,7 @@ import {
   updateJobRecordFileWithCurrent,
   finishSuccessfulJobRecordFile,
   writeBrief,
+  writePrivateDataFile,
   appendJobLog
 } from "./lib/state.mjs";
 
@@ -64,6 +71,7 @@ const ROOT_DIR = path.resolve(path.dirname(SELF_PATH), "..");
 const REVIEW_PROMPT_FILE = path.join(ROOT_DIR, "prompts", "review.md");
 const STOP_GATE_PROMPT_FILE = path.join(ROOT_DIR, "prompts", "stop-gate.md");
 const STOP_GATE_OPTION_ENV = "CLAUDE_PLUGIN_OPTION_STOP_GATE";
+const CONTINUITY_POLICY_ENV = "GROK_COMPANION_CONTINUITY_POLICY";
 const STOP_GATE_TIMEOUT_MS = 240000;
 const STOP_GATE_MAX_TURNS = 15;
 const WAIT_POLL_ENV = "GROK_COMPANION_WAIT_POLL_MS";
@@ -74,18 +82,83 @@ const DEFAULT_WAIT_TIMEOUT_MS = 570000;
 const MAX_WAIT_TIMEOUT_MS = 570000;
 const CONTINUE_PROMPT =
   "Continue from the current thread state. Pick the next highest-value step and follow through until the task is resolved.";
+const MAX_RAW_ARGUMENT_BYTES = 4 * 1024 * 1024 + 64 * 1024;
+const TRANSPORT_DIRECTORY_PREFIX = "grok-companion-input-";
+const TRANSPORT_TOKEN_PATTERN = /^[a-f0-9]{48}$/;
+const TRANSPORT_OWNER_FILE = "owner.json";
+const TRANSPORT_OWNER_MAX_BYTES = 4096;
+const TRANSPORT_MAX_AGE_MS = 60 * 60 * 1000;
+const JOB_ID_PATTERN = /^[a-f0-9]{32}$/;
+const DEFAULT_HISTORY_LIMIT = 50;
+const MAX_HISTORY_LIMIT = 500;
+const CONTINUITY_POLICIES = new Set(["manual", "claude-session"]);
+const HISTORY_STATUSES = new Set(["running", "done", "error", "cancelled"]);
+const HISTORY_MODES = new Set(["consult", "write"]);
+const HISTORY_DELIVERIES = new Set(["foreground", "manual", "managed"]);
+const HISTORY_DELIVERY_STATUSES = new Set(["pending", "delivered", "collected"]);
+const HISTORY_SEMANTIC_STATUSES = new Set(["unverified", "accepted", "rejected"]);
+const HISTORY_FAILURE_KINDS = new Set([
+  "quota",
+  "auth",
+  "missing_cli",
+  "setup",
+  "rate_limited",
+  "timeout",
+  "error",
+  "permission",
+  "cancelled",
+  "input",
+  "died",
+  "resource",
+  "sandbox",
+  "transport",
+  "policy"
+]);
+const REVIEW_OUTPUT_SCHEMA = {
+  type: "object",
+  additionalProperties: false,
+  required: ["verdict", "findings", "next_steps"],
+  properties: {
+    verdict: { type: "string", enum: ["approve", "needs-attention"] },
+    findings: {
+      type: "array",
+      items: {
+        type: "object",
+        additionalProperties: false,
+        required: ["severity", "title", "body"],
+        properties: {
+          severity: { type: "string", enum: ["high", "medium", "low"] },
+          title: { type: "string", minLength: 1 },
+          body: { type: "string", minLength: 1 },
+          file: { type: "string" },
+          line_start: { type: "integer", minimum: 1 },
+          line_end: { type: "integer", minimum: 1 },
+          confidence: { type: "number", minimum: 0, maximum: 1 },
+          recommendation: { type: "string" }
+        }
+      }
+    },
+    next_steps: { type: "array", items: { type: "string" } }
+  }
+};
+
+let activeCommandArgv = null;
+let activeCommandConfig = null;
+let activeCommandIngress = "argv";
+let activeCommandOptions = null;
 
 function printUsage() {
   console.log(
     [
       "Usage:",
-      "  node scripts/grok-companion.mjs task [prompt] [--prompt-file <path>] [--write] [--web] [--background] [--resume <uuid>] [--resume-last] [--model <id>] [--effort <level>] [--max-turns <n>] [--best-of-n <n>] [--cwd <dir>] [--json]",
+      "  node scripts/grok-companion.mjs task [--prompt-file <path>] [--write] [--web] [--memory] [--background] [--resume <uuid>] [--resume-last] [--fresh] [--model <id>] [--effort <level>] [--max-turns <n>] [--best-of-n <n>] [--cwd <dir>] [--json] [--] [prompt]",
       "  node scripts/grok-companion.mjs review [--base <ref>] [--focus <text>] [--cwd <dir>] [--background] [--json]",
       "  node scripts/grok-companion.mjs status [job-id] [--cwd <dir>] [--json]",
+      "  node scripts/grok-companion.mjs history [--all] [--limit <n>] [--cwd <dir>] [--json]",
       "  node scripts/grok-companion.mjs result <job-id> [--cwd <dir>] [--wait] [--wait-timeout-ms <ms>] [--json]",
       "  node scripts/grok-companion.mjs cancel <job-id> [--cwd <dir>] [--json]",
       "  node scripts/grok-companion.mjs stats [--all] [--cwd <dir>] [--json]",
-      "  node scripts/grok-companion.mjs setup [--enable-stop-gate] [--disable-stop-gate] [--json]",
+      "  node scripts/grok-companion.mjs setup [--continuity <manual|claude-session>] [--enable-stop-gate] [--disable-stop-gate] [--json]",
       "  node scripts/grok-companion.mjs stop-gate"
     ].join("\n")
   );
@@ -108,6 +181,350 @@ function errorWithFailure(message, failureKind) {
   const error = new Error(message);
   error.failureKind = failureKind;
   return error;
+}
+
+function shellSafeTemporaryRoot() {
+  const candidates = [os.tmpdir(), process.platform === "win32" ? "C:\\Windows\\Temp" : "/private/tmp", "/tmp"];
+  for (const candidate of candidates) {
+    if (typeof candidate !== "string" || !path.isAbsolute(candidate) || !/^[A-Za-z0-9_./:\\-]+$/.test(candidate)) {
+      continue;
+    }
+    try {
+      const stats = fs.lstatSync(candidate);
+      if (!stats.isDirectory() || stats.isSymbolicLink()) {
+        continue;
+      }
+      fs.accessSync(candidate, fs.constants.R_OK | fs.constants.W_OK | fs.constants.X_OK);
+      return candidate;
+    } catch {}
+  }
+  throw errorWithFailure("No private shell safe temporary directory is available for raw command transport.", "resource");
+}
+
+function transportPaths(token) {
+  if (!TRANSPORT_TOKEN_PATTERN.test(token)) {
+    throw errorWithFailure("The raw command transport token is invalid.", "input");
+  }
+  const directory = path.join(shellSafeTemporaryRoot(), `${TRANSPORT_DIRECTORY_PREFIX}${token}`);
+  return { directory, file: path.join(directory, "request"), ownerFile: path.join(directory, TRANSPORT_OWNER_FILE) };
+}
+
+function validateOwnedPath(stats, label) {
+  if (typeof process.getuid === "function" && Number.isInteger(stats.uid) && stats.uid !== process.getuid()) {
+    throw errorWithFailure(`${label} is not owned by the current user.`, "permission");
+  }
+}
+
+function transportSessionHash(sessionId) {
+  return typeof sessionId === "string" && sessionId.trim()
+    ? createHash("sha256").update(sessionId.trim()).digest("hex")
+    : null;
+}
+
+function sameFileIdentity(left, right) {
+  return left && right && left.dev === right.dev && left.ino === right.ino;
+}
+
+function readTransportOwner(ownerFile) {
+  let descriptor;
+  try {
+    const pathStats = fs.lstatSync(ownerFile);
+    if (!pathStats.isFile() || pathStats.isSymbolicLink() || pathStats.nlink !== 1 || pathStats.size > TRANSPORT_OWNER_MAX_BYTES) {
+      throw errorWithFailure("The raw command transport owner record is invalid.", "permission");
+    }
+    validateOwnedPath(pathStats, "The raw command transport owner record");
+    if (process.platform !== "win32" && (pathStats.mode & 0o077) !== 0) {
+      throw errorWithFailure("The raw command transport owner record is not private.", "permission");
+    }
+    descriptor = fs.openSync(ownerFile, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0));
+    const openedStats = fs.fstatSync(descriptor);
+    if (!openedStats.isFile() || openedStats.nlink !== 1 || !sameFileIdentity(openedStats, pathStats)) {
+      throw errorWithFailure("The raw command transport owner record changed before it could be read.", "permission");
+    }
+    const buffer = Buffer.alloc(TRANSPORT_OWNER_MAX_BYTES + 1);
+    const bytesRead = fs.readSync(descriptor, buffer, 0, buffer.length, 0);
+    if (bytesRead > TRANSPORT_OWNER_MAX_BYTES) {
+      throw errorWithFailure("The raw command transport owner record is invalid.", "permission");
+    }
+    const record = JSON.parse(buffer.subarray(0, bytesRead).toString("utf8"));
+    if (!Number.isSafeInteger(record?.createdAt) || record.createdAt <= 0 || (record.sessionHash !== null && !/^[a-f0-9]{64}$/.test(record.sessionHash))) {
+      throw errorWithFailure("The raw command transport owner record is invalid.", "permission");
+    }
+    return { identity: pathStats, record };
+  } catch (error) {
+    if (error?.failureKind) {
+      throw error;
+    }
+    throw errorWithFailure(`Could not read raw command transport owner record: ${error.message}`, "permission");
+  } finally {
+    if (descriptor !== undefined) {
+      fs.closeSync(descriptor);
+    }
+  }
+}
+
+function cleanupVerifiedTransport(directory, file, ownerFile, directoryIdentity, fileIdentity, ownerIdentity, options = {}) {
+  if (!directoryIdentity || !fileIdentity || !ownerIdentity) {
+    return;
+  }
+  try {
+    const currentDirectory = fs.lstatSync(directory);
+    if (!currentDirectory.isDirectory() || currentDirectory.isSymbolicLink() || !sameFileIdentity(currentDirectory, directoryIdentity)) {
+      return;
+    }
+    validateOwnedPath(currentDirectory, "The raw command transport directory");
+    if (process.platform !== "win32" && (currentDirectory.mode & 0o077) !== 0) {
+      return;
+    }
+    const currentFile = fs.lstatSync(file);
+    if (!currentFile.isFile() || currentFile.isSymbolicLink() || currentFile.nlink !== 1 || !sameFileIdentity(currentFile, fileIdentity)) {
+      return;
+    }
+    validateOwnedPath(currentFile, "The raw command transport file");
+    if (options.requirePrivateFile && process.platform !== "win32" && (currentFile.mode & 0o077) !== 0) {
+      return;
+    }
+    const currentOwner = fs.lstatSync(ownerFile);
+    if (!currentOwner.isFile() || currentOwner.isSymbolicLink() || currentOwner.nlink !== 1 || !sameFileIdentity(currentOwner, ownerIdentity)) {
+      return;
+    }
+    validateOwnedPath(currentOwner, "The raw command transport owner record");
+    if (process.platform !== "win32" && (currentOwner.mode & 0o077) !== 0) {
+      return;
+    }
+    fs.unlinkSync(file);
+    fs.unlinkSync(ownerFile);
+    fs.rmdirSync(directory);
+  } catch {}
+}
+
+function cleanupRawCommandTransports(options = {}) {
+  let root;
+  let entries;
+  try {
+    root = shellSafeTemporaryRoot();
+    entries = fs.readdirSync(root, { withFileTypes: true });
+  } catch {
+    return;
+  }
+  const sessionHash = options.sessionHash ?? null;
+  const now = Date.now();
+  for (const entry of entries) {
+    if (!entry.isDirectory() || !entry.name.startsWith(TRANSPORT_DIRECTORY_PREFIX)) {
+      continue;
+    }
+    const token = entry.name.slice(TRANSPORT_DIRECTORY_PREFIX.length);
+    if (!TRANSPORT_TOKEN_PATTERN.test(token)) {
+      continue;
+    }
+    const { directory, file, ownerFile } = transportPaths(token);
+    try {
+      const directoryIdentity = fs.lstatSync(directory);
+      if (!directoryIdentity.isDirectory() || directoryIdentity.isSymbolicLink()) {
+        continue;
+      }
+      validateOwnedPath(directoryIdentity, "The raw command transport directory");
+      if (process.platform !== "win32" && (directoryIdentity.mode & 0o077) !== 0) {
+        continue;
+      }
+      const { identity: ownerIdentity, record } = readTransportOwner(ownerFile);
+      const fileIdentity = fs.lstatSync(file);
+      if (!fileIdentity.isFile() || fileIdentity.isSymbolicLink() || fileIdentity.nlink !== 1) {
+        continue;
+      }
+      validateOwnedPath(fileIdentity, "The raw command transport file");
+      if (process.platform !== "win32" && (fileIdentity.mode & 0o077) !== 0) {
+        continue;
+      }
+      if (options.expiredOnly) {
+        const ageMs = now - record.createdAt;
+        if (ageMs < 0 || ageMs <= TRANSPORT_MAX_AGE_MS) {
+          continue;
+        }
+      } else if (!sessionHash || record.sessionHash !== sessionHash) {
+        continue;
+      }
+      cleanupVerifiedTransport(directory, file, ownerFile, directoryIdentity, fileIdentity, ownerIdentity, {
+        requirePrivateFile: true
+      });
+    } catch {}
+  }
+}
+
+export function cleanupRawCommandTransportsForSession(sessionId) {
+  const sessionHash = transportSessionHash(sessionId);
+  if (!sessionHash) {
+    return;
+  }
+  cleanupRawCommandTransports({ sessionHash });
+}
+
+function createRawCommandTransport() {
+  cleanupRawCommandTransports({ expiredOnly: true });
+  for (let attempt = 0; attempt < 8; attempt += 1) {
+    const token = randomBytes(24).toString("hex");
+    const { directory, file, ownerFile } = transportPaths(token);
+    let directoryCreated = false;
+    let fileCreated = false;
+    let ownerCreated = false;
+    try {
+      fs.mkdirSync(directory, { mode: 0o700 });
+      directoryCreated = true;
+      fs.chmodSync(directory, 0o700);
+      const descriptor = fs.openSync(file, "wx", 0o600);
+      fileCreated = true;
+      fs.closeSync(descriptor);
+      fs.chmodSync(file, 0o600);
+      fs.writeFileSync(ownerFile, `${JSON.stringify({ createdAt: Date.now(), sessionHash: transportSessionHash(currentClaudeSessionId()) })}\n`, {
+        flag: "wx",
+        mode: 0o600
+      });
+      ownerCreated = true;
+      fs.chmodSync(ownerFile, 0o600);
+      output({ file, token }, true);
+      return;
+    } catch (error) {
+      if (ownerCreated || directoryCreated) {
+        try {
+          fs.unlinkSync(ownerFile);
+        } catch {}
+      }
+      if (fileCreated) {
+        try {
+          fs.unlinkSync(file);
+        } catch {}
+      }
+      if (directoryCreated) {
+        try {
+          fs.rmdirSync(directory);
+        } catch {}
+      }
+      if (error?.code !== "EEXIST") {
+        throw errorWithFailure(`Could not create private raw command transport: ${error.message}`, "permission");
+      }
+    }
+  }
+  throw errorWithFailure("Could not allocate a unique raw command transport.", "resource");
+}
+
+function readBoundedDescriptor(descriptor, limit) {
+  const chunks = [];
+  let total = 0;
+  for (;;) {
+    const buffer = Buffer.alloc(Math.min(64 * 1024, limit + 1 - total));
+    const bytesRead = fs.readSync(descriptor, buffer, 0, buffer.length, null);
+    if (bytesRead === 0) {
+      break;
+    }
+    total += bytesRead;
+    if (total > limit) {
+      throw errorWithFailure(`Raw command arguments exceeded the ${limit} byte limit.`, "resource");
+    }
+    chunks.push(buffer.subarray(0, bytesRead));
+  }
+  return Buffer.concat(chunks, total);
+}
+
+function consumeRawCommandTransport(token) {
+  const { directory, file, ownerFile } = transportPaths(token);
+  let descriptor;
+  let directoryIdentity = null;
+  let fileIdentity = null;
+  let ownerIdentity = null;
+  try {
+    const directoryStats = fs.lstatSync(directory);
+    if (!directoryStats.isDirectory() || directoryStats.isSymbolicLink()) {
+      throw errorWithFailure("The raw command transport directory is invalid.", "permission");
+    }
+    validateOwnedPath(directoryStats, "The raw command transport directory");
+    if (process.platform !== "win32" && (directoryStats.mode & 0o077) !== 0) {
+      throw errorWithFailure("The raw command transport directory is not private.", "permission");
+    }
+    directoryIdentity = directoryStats;
+    const owner = readTransportOwner(ownerFile);
+    ownerIdentity = owner.identity;
+    if (owner.record.sessionHash !== transportSessionHash(currentClaudeSessionId())) {
+      throw errorWithFailure("The raw command transport belongs to another Claude session.", "permission");
+    }
+    const pathStats = fs.lstatSync(file);
+    if (!pathStats.isFile() || pathStats.isSymbolicLink() || pathStats.nlink !== 1) {
+      throw errorWithFailure("The raw command transport must be a regular private file.", "permission");
+    }
+    validateOwnedPath(pathStats, "The raw command transport file");
+    fileIdentity = pathStats;
+    const transportAgeMs = Date.now() - owner.record.createdAt;
+    if (transportAgeMs < 0 || transportAgeMs > TRANSPORT_MAX_AGE_MS) {
+      throw errorWithFailure("The raw command transport has expired.", "input");
+    }
+    if (process.platform !== "win32" && (pathStats.mode & 0o077) !== 0) {
+      throw errorWithFailure("The raw command transport file is not private.", "permission");
+    }
+    if (pathStats.size > MAX_RAW_ARGUMENT_BYTES) {
+      throw errorWithFailure(`Raw command arguments exceeded the ${MAX_RAW_ARGUMENT_BYTES} byte limit.`, "resource");
+    }
+    descriptor = fs.openSync(file, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0));
+    const openedStats = fs.fstatSync(descriptor);
+    if (!openedStats.isFile() || openedStats.nlink !== 1 || !sameFileIdentity(openedStats, pathStats)) {
+      throw errorWithFailure("The raw command transport changed before it could be read.", "permission");
+    }
+    validateOwnedPath(openedStats, "The raw command transport file");
+    if (process.platform !== "win32" && (openedStats.mode & 0o077) !== 0) {
+      throw errorWithFailure("The raw command transport file is not private.", "permission");
+    }
+    const bytes = readBoundedDescriptor(descriptor, MAX_RAW_ARGUMENT_BYTES);
+    try {
+      return new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+    } catch {
+      throw errorWithFailure("Raw command arguments must be valid UTF-8.", "input");
+    }
+  } catch (error) {
+    if (error?.failureKind) {
+      throw error;
+    }
+    throw errorWithFailure(`Could not read raw command transport: ${error.message}`, error?.code === "ENOENT" ? "input" : "permission");
+  } finally {
+    if (descriptor !== undefined) {
+      fs.closeSync(descriptor);
+    }
+    cleanupVerifiedTransport(directory, file, ownerFile, directoryIdentity, fileIdentity, ownerIdentity);
+  }
+}
+
+function resolveCommandTransport(rawArgv) {
+  const defaults = { defaultBackground: false, defaultBestOfN: false, defaultWrite: false };
+  const transportArgv = [...rawArgv];
+  while (
+    transportArgv[0] === "--transport-default-write" ||
+    transportArgv[0] === "--transport-default-background" ||
+    transportArgv[0] === "--transport-default-best-of-n"
+  ) {
+    const option = transportArgv.shift();
+    const key = option === "--transport-default-write"
+      ? "defaultWrite"
+      : option === "--transport-default-background"
+        ? "defaultBackground"
+        : "defaultBestOfN";
+    defaults[key] = true;
+  }
+  if (transportArgv[0] !== "--raw-args-token") {
+    if (
+      transportArgv.some((value) => value === "--raw-args-token") ||
+      defaults.defaultWrite ||
+      defaults.defaultBackground ||
+      defaults.defaultBestOfN
+    ) {
+      throw errorWithFailure("Raw command transport options must not be combined with normal arguments.", "input");
+    }
+    return { argv: rawArgv, defaultBackground: false, defaultBestOfN: false, defaultWrite: false, ingress: "argv" };
+  }
+  if (transportArgv.length !== 2) {
+    throw errorWithFailure("Raw command transport requires exactly one token.", "input");
+  }
+  return {
+    argv: [consumeRawCommandTransport(transportArgv[1])],
+    ...defaults,
+    ingress: "staged_file"
+  };
 }
 
 function oneLineSummary(value, fallback = "Grok companion failed.") {
@@ -155,6 +572,9 @@ function resolveCwd(options) {
 }
 
 function findRequestedJobRecord(dataDir, jobId, options) {
+  if (!JOB_ID_PATTERN.test(String(jobId ?? ""))) {
+    throw inputError("Grok job ids must be exactly 32 lowercase hexadecimal characters.");
+  }
   if (options.cwd === undefined) {
     return findJobRecordById(dataDir, jobId);
   }
@@ -183,8 +603,7 @@ function readConfig(dataDir) {
 
 function writeConfig(dataDir, patch) {
   const next = { ...readConfig(dataDir), ...patch };
-  fs.mkdirSync(dataDir, { recursive: true });
-  fs.writeFileSync(configFilePath(dataDir), `${JSON.stringify(next, null, 2)}\n`, "utf8");
+  writePrivateDataFile(dataDir, "config.json", `${JSON.stringify(next, null, 2)}\n`);
   return next;
 }
 
@@ -202,10 +621,39 @@ function isStopGateEnabled(dataDir, env = process.env) {
   return Boolean(readConfig(dataDir).stopGate);
 }
 
+function continuityPolicy(dataDir, env = process.env) {
+  const overridden = String(env[CONTINUITY_POLICY_ENV] ?? "").trim();
+  if (CONTINUITY_POLICIES.has(overridden)) {
+    return overridden;
+  }
+  const configured = String(readConfig(dataDir).continuityPolicy ?? "").trim();
+  return CONTINUITY_POLICIES.has(configured) ? configured : "manual";
+}
+
+function parseContinuityPolicy(value) {
+  const normalized = String(value ?? "").trim();
+  if (!CONTINUITY_POLICIES.has(normalized)) {
+    throw inputError("Expected --continuity to be manual or claude-session.");
+  }
+  return normalized;
+}
+
 function parsePositiveInteger(value, flag) {
   const parsed = Number.parseInt(String(value), 10);
   if (!Number.isInteger(parsed) || parsed <= 0) {
-    throw new Error(`Expected a positive integer for ${flag}.`);
+    throw inputError(`Expected a positive integer for ${flag}.`);
+  }
+  return parsed;
+}
+
+function parseHistoryLimit(value) {
+  const normalized = String(value ?? "");
+  if (!/^[1-9]\d*$/.test(normalized)) {
+    throw inputError("Expected a positive integer for --limit.");
+  }
+  const parsed = Number(normalized);
+  if (!Number.isSafeInteger(parsed) || parsed > MAX_HISTORY_LIMIT) {
+    throw inputError(`Expected --limit between 1 and ${MAX_HISTORY_LIMIT}.`);
   }
   return parsed;
 }
@@ -213,7 +661,7 @@ function parsePositiveInteger(value, flag) {
 function parseNonnegativeInteger(value, flag) {
   const parsed = Number.parseInt(String(value), 10);
   if (!Number.isInteger(parsed) || parsed < 0) {
-    throw new Error(`Expected a non-negative integer for ${flag}.`);
+    throw inputError(`Expected a non-negative integer for ${flag}.`);
   }
   return parsed;
 }
@@ -221,9 +669,24 @@ function parseNonnegativeInteger(value, flag) {
 function parseBestOfN(value) {
   const parsed = parsePositiveInteger(value, "--best-of-n");
   if (parsed < 2 || parsed > 10) {
-    throw new Error("Expected --best-of-n between 2 and 10.");
+    throw inputError("Expected --best-of-n between 2 and 10.");
   }
   return parsed;
+}
+
+function commandArgs(argv, config, transport) {
+  activeCommandConfig = config;
+  activeCommandOptions = null;
+  try {
+    const parsed = transport?.ingress === "staged_file" ? parseRawArgs(argv[0] ?? "", config) : { ...parseArgs(argv, config), positionalText: null };
+    activeCommandOptions = parsed.options;
+    return parsed;
+  } catch (error) {
+    if (error?.failureKind) {
+      throw error;
+    }
+    throw inputError(error instanceof Error ? error.message : String(error));
+  }
 }
 
 function resolveWaitPollMs(env = process.env) {
@@ -277,15 +740,28 @@ function readStdinIfPiped() {
   return Buffer.concat(chunks).toString("utf8");
 }
 
-function readTaskPrompt(cwd, options, positionals) {
-  const positionalPrompt = positionals.join(" ").trim();
-  if (positionalPrompt) {
+function readTaskPrompt(cwd, options, positionals, positionalText = null) {
+  const positionalPrompt = positionalText ?? positionals.join(" ").trim();
+  if (positionalPrompt.trim()) {
     return positionalPrompt;
   }
   if (options["prompt-file"]) {
-    return fs.readFileSync(path.resolve(cwd, options["prompt-file"]), "utf8").trim();
+    const promptFile = path.resolve(cwd, options["prompt-file"]);
+    try {
+      return fs.readFileSync(promptFile, "utf8").trim();
+    } catch (error) {
+      const failureKind = error?.code === "EACCES" || error?.code === "EPERM" ? "permission" : "input";
+      throw errorWithFailure(`Could not read prompt file ${promptFile}: ${error.message}`, failureKind);
+    }
   }
   return readStdinIfPiped().trim();
+}
+
+function isFusionRoutedPrompt(prompt) {
+  return String(prompt ?? "")
+    .split(/\r?\n/)
+    .slice(0, 12)
+    .some((line) => /^\s*(?:fusion-brief:\s*v1|grok-role:|lane:\s*panel\b)/i.test(line));
 }
 
 function backgroundDelivery(env = process.env) {
@@ -347,48 +823,149 @@ function inputError(message) {
   return error;
 }
 
-function resumableJobs(dataDir, cwd, mode) {
-  const sandboxProfile = sandboxProfileForMode(mode);
-  return listJobRecords(dataDir, cwd).filter(
-    (job) =>
-      job.status !== "running" &&
-      job.sessionId &&
-      job.mode === mode &&
-      job.request?.sandboxProfile === sandboxProfile
+function ordinaryTaskRequest(request) {
+  return (
+    request &&
+    typeof request === "object" &&
+    !Array.isArray(request) &&
+    Object.hasOwn(request, "model") &&
+    Object.hasOwn(request, "effort") &&
+    Object.hasOwn(request, "web") &&
+    Object.hasOwn(request, "resumeSessionId")
   );
 }
 
-export function resolveLastSessionId(dataDir, cwd, claudeSessionId, mode = "consult") {
-  const finished = resumableJobs(dataDir, cwd, mode)
-    .sort((left, right) =>
-      String(right.finishedAt ?? right.createdAt ?? "").localeCompare(
-        String(left.finishedAt ?? left.createdAt ?? "")
-      )
-    );
+function jobClassForRecord(job) {
+  const request = job?.request;
+  if (request && typeof request === "object" && !Array.isArray(request) && typeof request.reviewTargetLabel === "string") {
+    return "review";
+  }
+  if (request && typeof request === "object" && !Array.isArray(request) && request.bestOfN != null) {
+    return "best_of_n";
+  }
+  if (job?.jobClass === "review" || job?.jobClass === "best_of_n" || job?.jobClass === "stop_gate") {
+    return job.jobClass;
+  }
+  if ((job?.jobClass === "task" || job?.jobClass == null) && ordinaryTaskRequest(request)) {
+    return "task";
+  }
+  return "unknown";
+}
+
+function memoryEnabledForRecord(job) {
+  return job?.request?.memory === true;
+}
+
+function terminalJob(job) {
+  return job?.status === "done" || job?.status === "error" || job?.status === "cancelled";
+}
+
+function resumeCompatible(job, mode, memory) {
+  return (
+    terminalJob(job) &&
+    jobClassForRecord(job) === "task" &&
+    normalizeGrokSessionId(job.sessionId) &&
+    job.mode === mode &&
+    job.request?.sandboxProfile === sandboxProfileForMode(mode) &&
+    memoryEnabledForRecord(job) === memory
+  );
+}
+
+function newestFirst(left, right) {
+  return (
+    String(right.finishedAt ?? right.createdAt ?? "").localeCompare(
+      String(left.finishedAt ?? left.createdAt ?? "")
+    ) || String(right.id ?? "").localeCompare(String(left.id ?? ""))
+  );
+}
+
+function sessionMemoryModes(jobs) {
+  const memoryModesBySession = new Map();
+  for (const job of jobs) {
+    const sessionId = normalizeGrokSessionId(job.sessionId);
+    if (!sessionId || !terminalJob(job) || jobClassForRecord(job) !== "task") {
+      continue;
+    }
+    const modes = memoryModesBySession.get(sessionId) ?? new Set();
+    modes.add(memoryEnabledForRecord(job));
+    memoryModesBySession.set(sessionId, modes);
+  }
+  return memoryModesBySession;
+}
+
+function resumableJobs(dataDir, cwd, mode, memory, options = {}) {
+  const jobs = listJobRecords(dataDir, cwd);
+  const memoryModesBySession = sessionMemoryModes(jobs);
+  return jobs
+    .filter((job) => resumeCompatible(job, mode, memory))
+    .filter((job) => memoryModesBySession.get(normalizeGrokSessionId(job.sessionId))?.size === 1)
+    .filter((job) => !options.doneOnly || job.status === "done")
+    .sort(newestFirst);
+}
+
+function resolveLastSessionJob(dataDir, cwd, claudeSessionId, mode, memory, options = {}) {
+  const finished = resumableJobs(dataDir, cwd, mode, memory, options);
   if (claudeSessionId) {
     const owned = finished.filter((job) => job.claudeSessionId === claudeSessionId);
     if (owned.length === 0) {
-      throw inputError(`No finished ${mode} grok job with a compatible sandbox was found for Claude session ${claudeSessionId} in this workspace.`);
+      if (options.optional) {
+        return null;
+      }
+      throw inputError(`No finished ${mode} grok task with a compatible sandbox and memory mode was found for Claude session ${claudeSessionId} in this workspace.`);
     }
-    return owned[0].sessionId;
+    return owned[0];
   }
   if (finished.length === 0) {
-    throw inputError(`No finished ${mode} grok job with a compatible sandbox was found for this workspace.`);
+    if (options.optional) {
+      return null;
+    }
+    throw inputError(`No finished ${mode} grok task with a compatible sandbox and memory mode was found for this workspace.`);
   }
-  return finished[0].sessionId;
+  return finished[0];
 }
 
-export function validateResumeSessionId(dataDir, cwd, sessionId, mode) {
-  const jobs = listJobRecords(dataDir, cwd).filter(
-    (job) => job.status !== "running" && job.sessionId === sessionId
+export function resolveLastSessionId(dataDir, cwd, claudeSessionId, mode = "consult", memory = false) {
+  return normalizeGrokSessionId(resolveLastSessionJob(dataDir, cwd, claudeSessionId, mode, memory).sessionId);
+}
+
+function validateResumeSession(dataDir, cwd, sessionId, mode, memory) {
+  const normalizedSessionId = normalizeGrokSessionId(sessionId);
+  if (!normalizedSessionId) {
+    throw inputError("Grok session ids must be UUIDs returned by the companion.");
+  }
+  const allSessionJobs = listJobRecords(dataDir, cwd).filter(
+    (job) => terminalJob(job) && normalizeGrokSessionId(job.sessionId) === normalizedSessionId
   );
-  if (jobs.some((job) => job.mode === mode && job.request?.sandboxProfile === sandboxProfileForMode(mode))) {
-    return sessionId;
+  const taskJobs = allSessionJobs.filter((job) => jobClassForRecord(job) === "task");
+  const memoryModes = new Set(taskJobs.map(memoryEnabledForRecord));
+  if (memoryModes.size > 1) {
+    throw inputError(`Grok session ${normalizedSessionId} has inconsistent recorded memory modes and cannot be resumed safely.`);
   }
-  if (jobs.length > 0) {
-    throw inputError(`Grok session ${sessionId} cannot resume in ${mode} mode because its recorded sandbox profile is incompatible. Start a fresh task.`);
+  const compatible = taskJobs
+    .filter(
+      (job) =>
+        job.mode === mode &&
+        job.request?.sandboxProfile === sandboxProfileForMode(mode)
+    )
+    .sort(newestFirst);
+  if (compatible.length > 0) {
+    if (memoryEnabledForRecord(compatible[0]) !== memory) {
+      const requiredFlag = memoryEnabledForRecord(compatible[0]) ? " with --memory" : " without --memory";
+      throw inputError(`Grok session ${normalizedSessionId} must be resumed${requiredFlag} to preserve its recorded memory boundary.`);
+    }
+    return compatible[0];
   }
-  throw inputError(`No finished companion job owns Grok session ${sessionId} in this workspace.`);
+  if (taskJobs.length > 0) {
+    throw inputError(`Grok session ${normalizedSessionId} cannot resume in ${mode} mode because its recorded sandbox profile is incompatible. Start a fresh task.`);
+  }
+  if (allSessionJobs.length > 0) {
+    throw inputError(`Grok session ${normalizedSessionId} belongs to a non-task job and cannot be resumed.`);
+  }
+  throw inputError(`No finished companion task owns Grok session ${normalizedSessionId} in this workspace.`);
+}
+
+export function validateResumeSessionId(dataDir, cwd, sessionId, mode, memory = false) {
+  return normalizeGrokSessionId(validateResumeSession(dataDir, cwd, sessionId, mode, memory).sessionId);
 }
 
 const PERMISSION_FAILURE_MESSAGE =
@@ -418,6 +995,9 @@ function grokFailureMessage(result, timeoutMs, failureKind) {
 }
 
 const STDERR_FAILURE_KINDS = [
+  ["sandbox", /sandbox (?:enforcement failed|could not be applied|initialization failed)/i],
+  ["permission", /operation not permitted|permission denied|\bEACCES\b|\bEPERM\b|os error 1/i],
+  ["transport", /prompt transport failed|closed stdin|broken pipe|\bEPIPE\b|valid JSON envelope/i],
   [
     "quota",
     /quota|insufficient (?:account )?(?:balance|credit|credits|funds)|balance (?:is )?exhausted|exhausted (?:account )?balance|payment required|usage limit|billing|credit limit|http(?:\/\d(?:\.\d)?)?\s+402|status(?: code)?\s*[:=]?\s*402/i
@@ -430,8 +1010,14 @@ function classifyFailure({ spawnError = null, result = null, logTail = "" } = {}
   if (spawnError?.failureKind) {
     return spawnError.failureKind;
   }
+  if (result?.securityFailureKind) {
+    return result.securityFailureKind;
+  }
   if (spawnError?.code === "ENOENT") {
     return "missing_cli";
+  }
+  if (spawnError?.code === "EACCES" || spawnError?.code === "EPERM") {
+    return "permission";
   }
   if (result?.timedOut) {
     return "timeout";
@@ -441,6 +1027,9 @@ function classifyFailure({ spawnError = null, result = null, logTail = "" } = {}
   }
   if (isPermissionCancelled(result)) {
     return "permission";
+  }
+  if (result?.promptTransportError || result?.parseError) {
+    return "transport";
   }
   const tail = String(logTail ?? "");
   for (const [kind, pattern] of STDERR_FAILURE_KINDS) {
@@ -553,22 +1142,11 @@ const TOKEN_USAGE_FIELDS = {
   totalTokens: ["total_tokens", "totalTokens"]
 };
 const TOKEN_USAGE_METRICS = Object.keys(TOKEN_USAGE_FIELDS);
-const TOKEN_USAGE_ALIASES = new Set(Object.values(TOKEN_USAGE_FIELDS).flat());
-const TOKEN_USAGE_OUTPUT_FIELDS = {
-  snake: {
-    inputTokens: "input_tokens",
-    cacheReadInputTokens: "cache_read_input_tokens",
-    outputTokens: "output_tokens",
-    reasoningTokens: "reasoning_tokens",
-    totalTokens: "total_tokens"
-  },
-  camel: {
-    inputTokens: "inputTokens",
-    cacheReadInputTokens: "cacheReadInputTokens",
-    outputTokens: "outputTokens",
-    reasoningTokens: "reasoningTokens",
-    totalTokens: "totalTokens"
-  }
+const MODEL_USAGE_FIELDS = {
+  inputTokens: ["inputTokens", "input_tokens"],
+  cacheReadInputTokens: ["cacheReadInputTokens", "cachedReadTokens", "cache_read_input_tokens"],
+  outputTokens: ["outputTokens", "output_tokens"],
+  modelCalls: ["modelCalls", "model_calls"]
 };
 
 function optionalBoolean(value) {
@@ -576,16 +1154,19 @@ function optionalBoolean(value) {
 }
 
 function finiteTokenField(value, names) {
+  const observed = [];
   for (const name of names) {
-    const candidate = value?.[name];
-    if (Number.isFinite(candidate) && candidate >= 0) {
-      return candidate;
+    if (value && Object.hasOwn(value, name)) {
+      observed.push(value[name]);
     }
   }
-  return null;
+  if (observed.length === 0 || observed.slice(1).some((candidate) => candidate !== observed[0])) {
+    return null;
+  }
+  return Number.isSafeInteger(observed[0]) && observed[0] >= 0 ? observed[0] : null;
 }
 
-function tokenUsageObservation(value) {
+function tokenUsageObservation(value, { allowFullInput = false } = {}) {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
     return { coverage: "unreported", usage: null };
   }
@@ -601,6 +1182,17 @@ function tokenUsageObservation(value) {
   if (observedFields === 0) {
     return { coverage: "unreported", usage: null };
   }
+  if (usage.reasoningTokens != null && usage.outputTokens != null && usage.reasoningTokens > usage.outputTokens) {
+    return { coverage: "incomplete", usage };
+  }
+  if (observedFields === TOKEN_USAGE_METRICS.length) {
+    const uncachedTotal = BigInt(usage.inputTokens) + BigInt(usage.cacheReadInputTokens) + BigInt(usage.outputTokens);
+    const fullInputTotal = BigInt(usage.inputTokens) + BigInt(usage.outputTokens);
+    const reportedTotal = BigInt(usage.totalTokens);
+    if (reportedTotal !== uncachedTotal && (!allowFullInput || reportedTotal !== fullInputTotal)) {
+      return { coverage: "incomplete", usage };
+    }
+  }
   return {
     coverage: observedFields === TOKEN_USAGE_METRICS.length ? "complete" : "incomplete",
     usage
@@ -611,126 +1203,81 @@ function spendObject(value) {
   return value && typeof value === "object" && !Array.isArray(value) && Object.keys(value).length > 0;
 }
 
-function formattedTokenUsage(usage, style) {
-  const formatted = {};
-  for (const metric of TOKEN_USAGE_METRICS) {
-    if (Object.hasOwn(usage, metric)) {
-      formatted[TOKEN_USAGE_OUTPUT_FIELDS[style][metric]] = usage[metric];
-    }
-  }
-  return formatted;
-}
-
-function mergeSharedSpendFields(left, right, target) {
-  if (!spendObject(left) || !spendObject(right)) {
-    return;
-  }
-  for (const [key, leftValue] of Object.entries(left)) {
-    if (TOKEN_USAGE_ALIASES.has(key) || !Object.hasOwn(right, key)) {
-      continue;
-    }
-    const rightValue = right[key];
-    if (Number.isFinite(leftValue) && Number.isFinite(rightValue)) {
-      target[key] = leftValue + rightValue;
-    } else if (Object.is(leftValue, rightValue)) {
-      target[key] = leftValue;
-    }
-  }
-}
-
-function mergeTokenUsageValues(left, right, style) {
-  const leftObserved = tokenUsageObservation(left);
-  const rightObserved = tokenUsageObservation(right);
-  const shared = {};
-  for (const metric of TOKEN_USAGE_METRICS) {
-    if (Object.hasOwn(leftObserved.usage ?? {}, metric) && Object.hasOwn(rightObserved.usage ?? {}, metric)) {
-      shared[metric] = leftObserved.usage[metric] + rightObserved.usage[metric];
-    }
-  }
-  const merged = formattedTokenUsage(shared, style);
-  mergeSharedSpendFields(left, right, merged);
-  return Object.keys(merged).length > 0 ? merged : null;
-}
-
 function modelUsageObservation(value) {
   if (!spendObject(value)) {
     return { coverage: "unreported" };
   }
   const entries = Object.values(value);
   return {
-    coverage: entries.every((entry) => tokenUsageObservation(entry).coverage === "complete")
+    coverage: entries.every(
+      (entry) =>
+        entry &&
+        typeof entry === "object" &&
+        !Array.isArray(entry) &&
+        Object.values(MODEL_USAGE_FIELDS).every((names) => finiteTokenField(entry, names) != null)
+    )
       ? "complete"
       : "incomplete"
   };
 }
 
-function mergeModelUsageValues(left, right) {
-  const leftModels = spendObject(left) ? left : {};
-  const rightModels = spendObject(right) ? right : {};
-  const merged = {};
-  for (const model of new Set([...Object.keys(leftModels), ...Object.keys(rightModels)])) {
-    if (Object.hasOwn(leftModels, model) && Object.hasOwn(rightModels, model)) {
-      const usage = mergeTokenUsageValues(leftModels[model], rightModels[model], "camel");
-      if (usage) {
-        merged[model] = usage;
-      }
-    } else {
-      const usage = leftModels[model] ?? rightModels[model];
-      if (usage && typeof usage === "object" && !Array.isArray(usage)) {
-        merged[model] = { ...usage };
-      }
-    }
-  }
-  return Object.keys(merged).length > 0 ? merged : null;
-}
-
-function mergedExplicitIncomplete(left, right) {
-  if (left === true || right === true) {
+function observedChannelIncomplete(explicitIncomplete, coverage) {
+  if (explicitIncomplete === true || coverage === "incomplete") {
     return true;
   }
-  if (left === false || right === false) {
+  if (coverage === "complete") {
     return false;
-  }
-  return null;
-}
-
-function channelIncompleteFlag(explicitIncomplete, observed, exact) {
-  if (explicitIncomplete === true) {
-    return true;
-  }
-  if (observed) {
-    return !exact;
   }
   return explicitIncomplete;
 }
 
-function mergeReviewSpend(first, retry) {
-  const explicitIncomplete = mergedExplicitIncomplete(first.usageIsIncomplete, retry.usageIsIncomplete);
-  const usageObserved = spendObject(first.usage) || spendObject(retry.usage);
-  const usageExact =
-    explicitIncomplete !== true &&
-    tokenUsageObservation(first.usage).coverage === "complete" &&
-    tokenUsageObservation(retry.usage).coverage === "complete";
-  const modelUsageObserved = spendObject(first.modelUsage) || spendObject(retry.modelUsage);
-  const modelUsageExact =
-    explicitIncomplete !== true &&
-    modelUsageObservation(first.modelUsage).coverage === "complete" &&
-    modelUsageObservation(retry.modelUsage).coverage === "complete";
-  return {
-    usage: mergeTokenUsageValues(first.usage, retry.usage, "snake"),
-    modelUsage: mergeModelUsageValues(first.modelUsage, retry.modelUsage),
-    usageIsIncomplete: channelIncompleteFlag(explicitIncomplete, usageObserved, usageExact),
-    modelUsageIsIncomplete: channelIncompleteFlag(explicitIncomplete, modelUsageObserved, modelUsageExact)
-  };
-}
-
 function resultSpendPatch(result) {
-  const usageIsIncomplete = optionalBoolean(result?.usageIsIncomplete);
+  const explicitUsageIncomplete = optionalBoolean(result?.usageIsIncomplete);
+  const usageIsIncomplete = observedChannelIncomplete(
+    explicitUsageIncomplete,
+    tokenUsageObservation(result?.usage).coverage
+  );
+  const modelUsageIsIncomplete = observedChannelIncomplete(
+    null,
+    modelUsageObservation(result?.modelUsage).coverage
+  );
   return {
+    requestId: result?.requestId ?? null,
+    stopReason: result?.stopReason ?? null,
+    numTurns: result?.numTurns ?? null,
+    totalCostUsd: result?.totalCostUsd ?? null,
+    totalCostUsdTicks: result?.totalCostUsdTicks ?? null,
+    costIsPartial: optionalBoolean(result?.costIsPartial),
+    resolvedModel: result?.resolvedModel ?? null,
+    resolvedEffort: result?.resolvedEffort ?? null,
     usage: result?.usage ?? null,
     modelUsage: result?.modelUsage ?? null,
     usageIsIncomplete,
-    modelUsageIsIncomplete: optionalBoolean(result?.modelUsageIsIncomplete) ?? usageIsIncomplete
+    modelUsageIsIncomplete,
+    structuredOutput: result?.structuredOutput,
+    structuredOutputError: result?.structuredOutputError
+  };
+}
+
+function outcomeFields(record, status) {
+  const deliveryStatus = record?.deliveryCollectedAt
+    ? "collected"
+    : record?.delivery === "foreground" && status !== "running"
+      ? "delivered"
+      : "pending";
+  return {
+    transportStatus: status,
+    semanticStatus: record?.semanticStatus ?? "unverified",
+    delivery: record?.delivery ?? (record?.background ? "manual" : "foreground"),
+    deliveryStatus
+  };
+}
+
+function observableRecord(record) {
+  return {
+    ...record,
+    jobClass: jobClassForRecord(record),
+    memoryEnabled: memoryEnabledForRecord(record)
   };
 }
 
@@ -738,8 +1285,11 @@ function taskSuccessPayload(record, result) {
   return {
     jobId: record.id,
     status: "done",
+    ...outcomeFields(record, "done"),
+    jobClass: jobClassForRecord(record),
     mode: record.mode,
     background: record.background,
+    memoryEnabled: memoryEnabledForRecord(record),
     exitCode: result.exitCode,
     sessionId: result.sessionId,
     stopReason: result.stopReason,
@@ -753,8 +1303,11 @@ function failureResultPayload(record, { status, failureKind, message, result = n
   return {
     jobId: record?.id ?? null,
     status,
+    ...outcomeFields(record, status),
+    jobClass: jobClassForRecord(record),
     mode: record?.mode ?? null,
     background: Boolean(record?.background),
+    memoryEnabled: memoryEnabledForRecord(record),
     exitCode: result?.exitCode ?? null,
     sessionId: result?.sessionId ?? null,
     ...(result ? resultSpendPatch(result) : {}),
@@ -875,29 +1428,74 @@ function recordSpawnFailure(jobFile, error, context = {}) {
   }
 }
 
-async function handleTask(argv) {
-  const { options, positionals } = parseArgs(argv, {
+async function handleTask(argv, transport = {}) {
+  const { options, positionals, positionalText } = commandArgs(argv, {
     valueOptions: ["prompt-file", "resume", "model", "effort", "max-turns", "best-of-n", "cwd"],
-    booleanOptions: ["write", "background", "resume-last", "web", "json"]
-  });
+    booleanOptions: ["write", "background", "resume-last", "fresh", "memory", "web", "json"],
+    aliasMap: transport.defaultBestOfN ? { n: "best-of-n" } : {},
+    optionsBeforePositionals: true
+  }, transport);
 
   const cwd = resolveCwd(options);
   const dataDir = resolveDataDir();
   const claudeSessionId = currentClaudeSessionId();
 
-  const bestOfN = options["best-of-n"] ? parseBestOfN(options["best-of-n"]) : null;
+  const bestOfN = options["best-of-n"]
+    ? parseBestOfN(options["best-of-n"])
+    : transport.defaultBestOfN
+      ? 2
+      : null;
   const maxTurns = options["max-turns"] ? parsePositiveInteger(options["max-turns"], "--max-turns") : null;
-  const mode = options.write || bestOfN ? "write" : "consult";
+  const write = options.write === undefined ? Boolean(transport.defaultWrite) : Boolean(options.write);
+  const background = Boolean(options.background);
+  const mode = write || bestOfN ? "write" : "consult";
+  const memory = Boolean(options.memory);
+  const selectedContinuityPolicy = continuityPolicy(dataDir);
+  const explicitResume = options.resume != null;
+  const resumeLast = Boolean(options["resume-last"]);
+  const fresh = Boolean(options.fresh);
 
-  let resumeSessionId = options.resume ?? null;
-  if (resumeSessionId) {
-    resumeSessionId = validateResumeSessionId(dataDir, cwd, resumeSessionId, mode);
+  if (explicitResume && resumeLast) {
+    throw inputError("Use only one of --resume or --resume-last.");
   }
-  if (!resumeSessionId && options["resume-last"]) {
-    resumeSessionId = resolveLastSessionId(dataDir, cwd, claudeSessionId, mode);
+  if (fresh && (explicitResume || resumeLast)) {
+    throw inputError("--fresh cannot be combined with --resume or --resume-last.");
+  }
+  if (bestOfN && (explicitResume || resumeLast)) {
+    throw inputError("--best-of-n always starts fresh and cannot be combined with resume options.");
+  }
+  if (bestOfN && memory) {
+    throw inputError("--best-of-n always disables cross-session memory and cannot be combined with --memory.");
   }
 
-  let prompt = readTaskPrompt(cwd, options, positionals);
+  let prompt = readTaskPrompt(cwd, options, positionals, positionalText);
+  const fusionRouted = isFusionRoutedPrompt(prompt);
+  if (memory && fusionRouted) {
+    throw inputError("--memory is available only for direct ordinary tasks, not Fusion routed briefs.");
+  }
+  let resumeSource = null;
+  let resumeReason = null;
+  if (explicitResume) {
+    resumeSource = validateResumeSession(dataDir, cwd, options.resume, mode, memory);
+    resumeReason = "explicit";
+  } else if (resumeLast) {
+    resumeSource = resolveLastSessionJob(dataDir, cwd, claudeSessionId, mode, memory);
+    resumeReason = "last";
+  } else if (
+    prompt &&
+    !fresh &&
+    !bestOfN &&
+    selectedContinuityPolicy === "claude-session" &&
+    claudeSessionId &&
+    !fusionRouted
+  ) {
+    resumeSource = resolveLastSessionJob(dataDir, cwd, claudeSessionId, mode, memory, {
+      doneOnly: true,
+      optional: true
+    });
+    resumeReason = resumeSource ? "affinity" : null;
+  }
+  const resumeSessionId = resumeSource ? normalizeGrokSessionId(resumeSource.sessionId) : null;
   if (!prompt) {
     if (!resumeSessionId) {
       throw new Error("Provide a prompt, a prompt file, piped stdin, or a session to resume.");
@@ -910,22 +1508,28 @@ async function handleTask(argv) {
   const jobFile = jobFilePath(dataDir, cwd, jobId);
   const record = createJobRecord({
     id: jobId,
-    pid: options.background ? null : process.pid,
+    pid: background ? null : process.pid,
     mode,
     cwd,
     briefFile,
-    background: Boolean(options.background),
-    delivery: options.background ? backgroundDelivery() : "foreground",
+    background,
+    delivery: background ? backgroundDelivery() : "foreground",
     claudeSessionId,
+    jobClass: bestOfN ? "best_of_n" : "task",
     request: {
       model: options.model ?? null,
       effort: options.effort ?? null,
       maxTurns,
       bestOfN,
       web: Boolean(options.web),
+      memory,
       sandboxProfile: sandboxProfileForMode(mode),
       resumeSessionId,
-      outputJson: Boolean(options.json)
+      resumeSourceJobId: resumeSource?.id ?? null,
+      resumeReason,
+      continuityPolicy: selectedContinuityPolicy,
+      outputJson: Boolean(options.json),
+      ingress: transport.ingress ?? "argv"
     }
   });
   createJobRecordFile(jobFile, record);
@@ -939,14 +1543,25 @@ async function handleTask(argv) {
     throw launchFailureError(error, jobId);
   }
 
-  if (options.background) {
+  if (background) {
     try {
       await spawnBackgroundWorker([SELF_PATH, "task-worker", "--job-id", jobId, "--cwd", cwd], jobFile);
     } catch (error) {
       recordSpawnFailure(jobFile, error);
       throw launchFailureError(error, jobId);
     }
-    const payload = { jobId, status: "running", mode, background: true, delivery: record.delivery, failureKind: null };
+    const payload = {
+      jobId,
+      status: "running",
+      ...outcomeFields(record, "running"),
+      jobClass: record.jobClass,
+      mode,
+      background: true,
+      memoryEnabled: memory,
+      resolvedModel: null,
+      resolvedEffort: null,
+      failureKind: null
+    };
     output(options.json ? payload : renderBackgroundLaunch(jobId, record.delivery), options.json);
     return;
   }
@@ -957,6 +1572,7 @@ async function handleTask(argv) {
   try {
     result = await runGrok({
       briefFile,
+      prompt,
       mode,
       resumeSessionId,
       model: options.model ?? null,
@@ -964,6 +1580,7 @@ async function handleTask(argv) {
       maxTurns,
       bestOfN,
       web: Boolean(options.web),
+      memory,
       cwd,
       logFile,
       timeoutMs,
@@ -1034,8 +1651,10 @@ async function handleTaskWorker(argv) {
   const timeoutMs = resolveTimeoutMs({ background: true, env: process.env });
 
   try {
+    const prompt = fs.readFileSync(record.briefFile, "utf8");
     const result = await runGrok({
       briefFile: record.briefFile,
+      prompt,
       mode: record.mode,
       resumeSessionId: request.resumeSessionId ?? null,
       model: request.model ?? null,
@@ -1043,6 +1662,7 @@ async function handleTaskWorker(argv) {
       maxTurns: request.maxTurns ?? null,
       bestOfN: request.bestOfN ?? null,
       web: Boolean(request.web),
+      memory: request.memory === true,
       cwd: record.cwd,
       logFile,
       timeoutMs,
@@ -1167,12 +1787,17 @@ function evaluateReviewText(text) {
   return { valid: true, value: validation.value };
 }
 
-function buildCorrectivePrompt(error) {
-  return [
-    `Your previous reply was not a single valid JSON review object (${error}).`,
-    'Reply with only one JSON object and nothing else: {"verdict": "approve" or "needs-attention", "findings": array of objects with required severity (high, medium, or low), title, body and optional file, line_start, line_end, confidence, recommendation, "next_steps": array of strings}.',
-    "No markdown fences, no prose before or after the object."
-  ].join(" ");
+function evaluateReviewResult(result) {
+  if (typeof result?.structuredOutputError === "string" && result.structuredOutputError.trim()) {
+    return { valid: false, error: oneLineSummary(result.structuredOutputError) };
+  }
+  if (result?.structuredOutput !== undefined) {
+    const validation = validateReviewOutput(result.structuredOutput);
+    return validation.valid
+      ? { valid: true, value: validation.value }
+      : { valid: false, error: validation.error };
+  }
+  return evaluateReviewText(result?.text);
 }
 
 async function runReviewJob(record, jobFile, options = {}) {
@@ -1180,9 +1805,12 @@ async function runReviewJob(record, jobFile, options = {}) {
   const timeoutMs = resolveTimeoutMs({ background: Boolean(options.background), env: process.env });
   let first;
   try {
+    const prompt = fs.readFileSync(record.briefFile, "utf8");
     first = await runGrok({
       briefFile: record.briefFile,
+      prompt,
       mode: "consult",
+      jsonSchema: REVIEW_OUTPUT_SCHEMA,
       cwd: record.cwd,
       logFile,
       timeoutMs,
@@ -1196,51 +1824,10 @@ async function runReviewJob(record, jobFile, options = {}) {
     failJob(jobFile, logFile, first, timeoutMs);
   }
 
-  let review = evaluateReviewText(first.text);
-  let sessionId = first.sessionId;
-  let finalText = first.text;
-  let spend = resultSpendPatch(first);
-
-  if (!review.valid && first.sessionId) {
-    const retryBrief = writeBrief(resolveDataDir(), record.cwd, `${record.id}-retry`, buildCorrectivePrompt(review.error));
-    let retry;
-    try {
-      retry = await runGrok({
-        briefFile: retryBrief,
-        mode: "consult",
-        resumeSessionId: first.sessionId,
-        cwd: record.cwd,
-        logFile,
-        timeoutMs,
-        launchProcess: (launch) => launchRunningJobProcess(jobFile, launch)
-      });
-    } catch (error) {
-      recordSpawnFailure(jobFile, error, {
-        sessionId,
-        resultText: first.text || null,
-        ...spend
-      });
-      throw launchFailureError(error, record.id);
-    }
-    spend = mergeReviewSpend(first, retry);
-    if (resultFailed(retry)) {
-      failJob(
-        jobFile,
-        logFile,
-        {
-          ...retry,
-          sessionId: retry.sessionId ?? sessionId,
-          ...spend
-        },
-        timeoutMs
-      );
-    }
-    review = evaluateReviewText(retry.text);
-    if (retry.text) {
-      finalText = retry.text;
-    }
-    sessionId = retry.sessionId ?? sessionId;
-  }
+  const review = evaluateReviewResult(first);
+  const sessionId = first.sessionId;
+  const finalText = first.text;
+  const spend = resultSpendPatch(first);
 
   const targetLabel = record.request?.reviewTargetLabel ?? "working tree changes";
   const body = review.valid
@@ -1248,13 +1835,16 @@ async function runReviewJob(record, jobFile, options = {}) {
     : renderReviewFallback(finalText, { parseError: review.error });
   const validationMessage = review.valid
     ? null
-    : `Grok review output failed validation after one corrective retry: ${review.error}`;
+    : `Grok review output failed validation: ${review.error}`;
 
   const payload = {
     jobId: record.id,
     status: review.valid ? "done" : "error",
+    ...outcomeFields(record, review.valid ? "done" : "error"),
+    jobClass: "review",
     mode: "consult",
     background: record.background,
+    memoryEnabled: false,
     sessionId,
     valid: review.valid,
     review: review.valid ? review.value : null,
@@ -1283,14 +1873,16 @@ async function runReviewJob(record, jobFile, options = {}) {
   return payload;
 }
 
-async function handleReview(argv) {
-  const { options, positionals } = parseArgs(argv, {
+async function handleReview(argv, transport = {}) {
+  const { options, positionals, positionalText } = commandArgs(argv, {
     valueOptions: ["base", "focus", "cwd"],
-    booleanOptions: ["background", "json"]
-  });
+    booleanOptions: ["background", "json"],
+    optionsBeforePositionals: true
+  }, transport);
 
   const cwd = resolveCwd(options);
   const dataDir = resolveDataDir();
+  const background = transport.defaultBackground ? true : Boolean(options.background);
   ensureGitRepository(cwd);
 
   const target = collectReviewTarget(cwd, options.base);
@@ -1298,7 +1890,7 @@ async function handleReview(argv) {
     throw new Error("No changes found to review.");
   }
 
-  const focus = [options.focus ?? "", positionals.join(" ")].join(" ").trim();
+  const focus = [options.focus ?? "", positionalText ?? positionals.join(" ")].join(" ").trim();
   const prompt = interpolateTemplate(loadReviewTemplate(), {
     TARGET_LABEL: target.label,
     USER_FOCUS: focus || "No extra focus provided.",
@@ -1310,17 +1902,20 @@ async function handleReview(argv) {
   const jobFile = jobFilePath(dataDir, cwd, jobId);
   const record = createJobRecord({
     id: jobId,
-    pid: options.background ? null : process.pid,
+    pid: background ? null : process.pid,
     mode: "consult",
     cwd,
     briefFile,
-    background: Boolean(options.background),
-    delivery: options.background ? backgroundDelivery() : "foreground",
+    background,
+    delivery: background ? backgroundDelivery() : "foreground",
     claudeSessionId: currentClaudeSessionId(),
+    jobClass: "review",
     request: {
       reviewTargetLabel: target.label,
+      memory: false,
       sandboxProfile: sandboxProfileForMode("consult"),
-      outputJson: Boolean(options.json)
+      outputJson: Boolean(options.json),
+      ingress: transport.ingress ?? "argv"
     }
   });
   createJobRecordFile(jobFile, record);
@@ -1331,14 +1926,25 @@ async function handleReview(argv) {
     throw launchFailureError(error, jobId);
   }
 
-  if (options.background) {
+  if (background) {
     try {
       await spawnBackgroundWorker([SELF_PATH, "review-worker", "--job-id", jobId, "--cwd", cwd], jobFile);
     } catch (error) {
       recordSpawnFailure(jobFile, error);
       throw launchFailureError(error, jobId);
     }
-    const payload = { jobId, status: "running", mode: "consult", background: true, delivery: record.delivery, failureKind: null };
+    const payload = {
+      jobId,
+      status: "running",
+      ...outcomeFields(record, "running"),
+      jobClass: "review",
+      mode: "consult",
+      background: true,
+      memoryEnabled: false,
+      resolvedModel: null,
+      resolvedEffort: null,
+      failureKind: null
+    };
     output(options.json ? payload : renderBackgroundLaunch(jobId, record.delivery), options.json);
     return;
   }
@@ -1347,7 +1953,7 @@ async function handleReview(argv) {
   if (!payload.valid) {
     throw new Error(
       failureOutcomeMessage({
-        message: `Grok review output failed validation after one corrective retry: ${payload.parseError}`,
+        message: `Grok review output failed validation: ${payload.parseError}`,
         detail: payload.rendered,
         jobId,
         failureKind: "error"
@@ -1411,11 +2017,11 @@ async function handleReviewWorker(argv) {
   }
 }
 
-function handleStatus(argv) {
-  const { options, positionals } = parseArgs(argv, {
+function handleStatus(argv, transport = {}) {
+  const { options, positionals } = commandArgs(argv, {
     valueOptions: ["cwd"],
     booleanOptions: ["json"]
-  });
+  }, transport);
 
   const dataDir = resolveDataDir();
   const jobId = positionals[0];
@@ -1427,20 +2033,112 @@ function handleStatus(argv) {
     const { record } = refreshRunningJobRecord(found);
     const logTail =
       record.status === "error" ? readLogTail(jobLogPath(dataDir, record.cwd, record.id), 20) : "";
-    output(options.json ? record : renderJobDetail(record, { logTail }), options.json);
+    const observed = observableRecord(record);
+    output(options.json ? observed : renderJobDetail(observed, { logTail }), options.json);
     if (record.cleanupRequired) {
       process.exitCode = 1;
     }
     return;
   }
 
-  const jobs = listJobRecords(dataDir, resolveCwd(options)).map((record) =>
-    refreshRunningJobRecord({ record, file: jobFilePath(dataDir, record.cwd, record.id) }).record
+  const cwd = resolveCwd(options);
+  const jobs = listJobRecords(dataDir, cwd).map((record) =>
+    refreshRunningJobRecord({ record, file: jobFilePath(dataDir, cwd, record.id) }).record
   );
-  output(options.json ? { jobs } : renderStatusTable(jobs, currentClaudeSessionId()), options.json);
+  output(options.json ? { jobs: jobs.map(observableRecord) } : renderStatusTable(jobs, currentClaudeSessionId()), options.json);
   if (jobs.some((record) => record.cleanupRequired)) {
     process.exitCode = 1;
   }
+}
+
+function historyString(value) {
+  return typeof value === "string" && value.trim() ? value.trim() : null;
+}
+
+function historyTimestamp(value) {
+  const normalized = historyString(value);
+  return normalized && Number.isFinite(Date.parse(normalized)) ? normalized : null;
+}
+
+function historyEnum(value, allowed, fallback = "unknown") {
+  return allowed.has(value) ? value : fallback;
+}
+
+function historyJob(record, claudeSessionId, mixedMemorySessions) {
+  const mode = historyEnum(record?.mode, HISTORY_MODES);
+  const sessionId = normalizeGrokSessionId(record?.sessionId);
+  const jobClass = jobClassForRecord(record);
+  const resumable =
+    terminalJob(record) &&
+    jobClass === "task" &&
+    sessionId != null &&
+    mode !== "unknown" &&
+    record?.request?.sandboxProfile === sandboxProfileForMode(mode) &&
+    !mixedMemorySessions.has(sessionId);
+  return {
+    jobId: JOB_ID_PATTERN.test(String(record?.id ?? "")) ? record.id : null,
+    sessionId,
+    cwd: typeof record?.cwd === "string" && path.isAbsolute(record.cwd) ? path.normalize(record.cwd) : null,
+    status: historyEnum(record?.status, HISTORY_STATUSES),
+    jobClass,
+    mode,
+    background: record?.background === true,
+    delivery: historyEnum(record?.delivery, HISTORY_DELIVERIES),
+    deliveryStatus: historyEnum(record?.deliveryStatus, HISTORY_DELIVERY_STATUSES),
+    semanticStatus: historyEnum(record?.semanticStatus, HISTORY_SEMANTIC_STATUSES),
+    cleanupRequired: record?.cleanupRequired === true,
+    failureKind: historyEnum(record?.failureKind, HISTORY_FAILURE_KINDS, null),
+    resolvedModel: historyString(record?.resolvedModel),
+    resolvedEffort: historyString(record?.resolvedEffort),
+    memoryEnabled: memoryEnabledForRecord(record),
+    createdAt: historyTimestamp(record?.createdAt),
+    finishedAt: historyTimestamp(record?.finishedAt),
+    resumable,
+    resumeMode: resumable ? mode : null,
+    ownedByCurrentSession: claudeSessionId == null ? null : record?.claudeSessionId === claudeSessionId
+  };
+}
+
+function handleHistory(argv, transport = {}) {
+  const { options, positionals } = commandArgs(argv, {
+    valueOptions: ["limit", "cwd"],
+    booleanOptions: ["all", "json"]
+  }, transport);
+  if (positionals.length > 0) {
+    throw inputError("History accepts only --all, --limit, --cwd, and --json.");
+  }
+
+  const dataDir = resolveDataDir();
+  const cwd = options.all ? null : resolveCwd(options);
+  const limit = options.limit === undefined ? DEFAULT_HISTORY_LIMIT : parseHistoryLimit(options.limit);
+  const entries = options.all
+    ? listAllJobRecords(dataDir)
+    : listJobRecords(dataDir, cwd).map((record) => ({
+        record,
+        file: jobFilePath(dataDir, cwd, record.id)
+      }));
+  const totalJobs = entries.length;
+  const selected = entries.slice(0, limit);
+  const claudeSessionId = currentClaudeSessionId();
+  const mixedMemorySessions = new Set(
+    [...sessionMemoryModes(entries.map((entry) => entry.record))]
+      .filter(([, modes]) => modes.size > 1)
+      .map(([sessionId]) => sessionId)
+  );
+  const jobs = selected.map((entry) =>
+    historyJob(refreshRunningJobRecord(entry).record, claudeSessionId, mixedMemorySessions)
+  );
+  const report = {
+    source: "canonical",
+    scope: options.all ? "all" : "workspace",
+    cwd,
+    limit,
+    totalJobs,
+    returnedJobs: jobs.length,
+    truncated: totalJobs > jobs.length,
+    jobs
+  };
+  output(options.json ? report : renderHistoryReport(report), options.json);
 }
 
 function renderFailedResult(record, dataDir) {
@@ -1508,18 +2206,30 @@ function renderResultRecord(record, dataDir) {
   return renderTaskResult({ text: record.resultText ?? "", sessionId: record.sessionId, jobId: record.id });
 }
 
-function jsonResultPayload(record, dataDir) {
+function jsonResultPayload(record, dataDir, options = {}) {
+  const deliveryView = observableRecord(
+    options.collecting ? { ...record, deliveryCollectedAt: nowIso() } : record
+  );
   if (!record.request?.outputJson || record.status === "running") {
-    return record;
+    return deliveryView;
   }
   if (record.resultPayload) {
-    return record.resultPayload;
+    return {
+      ...record.resultPayload,
+      ...outcomeFields(deliveryView, record.status),
+      jobClass: deliveryView.jobClass,
+      memoryEnabled: deliveryView.memoryEnabled,
+      resolvedModel: record.resolvedModel ?? record.resultPayload.resolvedModel ?? null,
+      resolvedEffort: record.resolvedEffort ?? record.resultPayload.resolvedEffort ?? null
+    };
   }
   if (record.status === "done") {
-    return taskSuccessPayload(record, {
+    return taskSuccessPayload(deliveryView, {
       exitCode: record.exitCode,
       sessionId: record.sessionId,
       stopReason: record.stopReason ?? null,
+      resolvedModel: record.resolvedModel ?? null,
+      resolvedEffort: record.resolvedEffort ?? null,
       usage: record.usage,
       modelUsage: record.modelUsage,
       usageIsIncomplete: record.usageIsIncomplete,
@@ -1528,7 +2238,7 @@ function jsonResultPayload(record, dataDir) {
     });
   }
   const failureKind = record.failureKind ?? (record.status === "cancelled" ? "cancelled" : "error");
-  return failureResultPayload(record, {
+  return failureResultPayload(deliveryView, {
     status: record.status,
     failureKind,
     message: renderResultRecord(record, dataDir).trimEnd(),
@@ -1556,11 +2266,11 @@ async function waitForResultRecord(found, options) {
   }
 }
 
-async function handleResult(argv) {
-  const { options, positionals } = parseArgs(argv, {
+async function handleResult(argv, transport = {}) {
+  const { options, positionals } = commandArgs(argv, {
     valueOptions: ["cwd", "wait-timeout-ms"],
     booleanOptions: ["json", "wait"]
-  });
+  }, transport);
 
   const jobId = positionals[0];
   if (!jobId) {
@@ -1574,14 +2284,14 @@ async function handleResult(argv) {
   }
 
   const record = options.wait ? await waitForResultRecord(found, options) : refreshRunningJobRecord(found).record;
-  const markCollected = record.status !== "running" && record.delivery === "managed";
+  const markCollected = record.status !== "running" && record.delivery !== "foreground";
   if (record.cleanupRequired) {
     process.exitCode = 1;
   }
   if (options.json) {
-    output(jsonResultPayload(record, dataDir), true);
+    output(jsonResultPayload(record, dataDir, { collecting: markCollected }), true);
     if (markCollected) {
-      markManagedDeliveryCollectedFile(found.file);
+      markDeliveryCollectedFile(found.file);
     }
     return;
   }
@@ -1593,15 +2303,15 @@ async function handleResult(argv) {
 
   output(renderResultRecord(record, dataDir), false);
   if (markCollected) {
-    markManagedDeliveryCollectedFile(found.file);
+    markDeliveryCollectedFile(found.file);
   }
 }
 
-async function handleCancel(argv) {
-  const { options, positionals } = parseArgs(argv, {
+async function handleCancel(argv, transport = {}) {
+  const { options, positionals } = commandArgs(argv, {
     valueOptions: ["cwd"],
     booleanOptions: ["json"]
-  });
+  }, transport);
 
   const jobId = positionals[0];
   if (!jobId) {
@@ -1673,9 +2383,17 @@ function increment(counts, key) {
 }
 
 function addTokenUsage(target, usage) {
+  const next = {};
   for (const metric of TOKEN_USAGE_METRICS) {
-    target[metric] += usage[metric];
+    next[metric] = target[metric] + usage[metric];
+    if (!Number.isSafeInteger(next[metric])) {
+      return false;
+    }
   }
+  for (const metric of TOKEN_USAGE_METRICS) {
+    target[metric] = next[metric];
+  }
+  return true;
 }
 
 function tokenUsageFromModels(value) {
@@ -1696,9 +2414,11 @@ function tokenUsageFromModels(value) {
   let completeEntries = 0;
   let incompleteEntry = false;
   for (const entry of entries) {
-    const observed = tokenUsageObservation(entry);
+    const observed = tokenUsageObservation(entry, { allowFullInput: true });
     if (observed.coverage === "complete") {
-      addTokenUsage(combined, observed.usage);
+      if (!addTokenUsage(combined, observed.usage)) {
+        return { coverage: "incomplete", usage: null };
+      }
       completeEntries += 1;
     } else if (observed.coverage === "incomplete") {
       incompleteEntry = true;
@@ -1716,12 +2436,14 @@ function tokenUsageFromModels(value) {
 function tokenUsageForRecord(record) {
   const usageIsIncomplete = record.usageIsIncomplete === true || record.usage_is_incomplete === true;
   const modelUsageIsIncomplete = optionalBoolean(record.modelUsageIsIncomplete);
-  const direct = tokenUsageObservation(record.usage);
+  const direct = tokenUsageObservation(record.usage, {
+    allowFullInput: Boolean(record.usage) && !Object.hasOwn(record.usage, "input_tokens") && Object.hasOwn(record.usage, "inputTokens")
+  });
   if (direct.coverage === "complete" && !usageIsIncomplete) {
     return direct;
   }
   const byModel = tokenUsageFromModels(record.modelUsage);
-  const modelBlocked = modelUsageIsIncomplete === true || (usageIsIncomplete && modelUsageIsIncomplete == null);
+  const modelBlocked = usageIsIncomplete || modelUsageIsIncomplete === true;
   if (byModel.coverage === "complete" && !modelBlocked) {
     return byModel;
   }
@@ -1737,8 +2459,24 @@ function modelNamesForRecord(record) {
       return names;
     }
   }
+  if (typeof record.resolvedModel === "string" && record.resolvedModel.trim()) {
+    return [record.resolvedModel.trim()];
+  }
   const requested = record.request?.model;
   return typeof requested === "string" && requested.trim() ? [requested.trim()] : ["unknown"];
+}
+
+function resolvedModelForRecord(record) {
+  if (typeof record.resolvedModel === "string" && record.resolvedModel.trim()) {
+    return record.resolvedModel.trim();
+  }
+  if (record.modelUsage && typeof record.modelUsage === "object" && !Array.isArray(record.modelUsage)) {
+    const names = Object.keys(record.modelUsage).filter((name) => name.trim());
+    if (names.length === 1) {
+      return names[0];
+    }
+  }
+  return "unknown";
 }
 
 function historicalFailureKind(record, dataDir) {
@@ -1758,11 +2496,37 @@ function historicalFailureKind(record, dataDir) {
   return classified === "error" ? stored || "error" : classified;
 }
 
+const USD_TICKS = 10_000_000_000;
+
+function exactCostTicksForRecord(record) {
+  const costIsPartial = record.costIsPartial === true || record.cost_is_partial === true;
+  const usageIsIncomplete = record.usageIsIncomplete === true || record.usage_is_incomplete === true;
+  const modelUsageIsIncomplete = record.modelUsageIsIncomplete === true;
+  const totalCostUsdTicks = record.totalCostUsdTicks ?? record.total_cost_usd_ticks;
+  const totalCostUsd = record.totalCostUsd ?? record.total_cost_usd;
+  if (
+    costIsPartial ||
+    usageIsIncomplete ||
+    modelUsageIsIncomplete ||
+    !Number.isSafeInteger(totalCostUsdTicks) ||
+    totalCostUsdTicks <= 0 ||
+    !Number.isFinite(totalCostUsd) ||
+    totalCostUsd <= 0
+  ) {
+    return null;
+  }
+  const derivedUsd = totalCostUsdTicks / USD_TICKS;
+  const tolerance = Math.max(1e-12, Math.abs(derivedUsd) * Number.EPSILON * 8);
+  return Math.abs(totalCostUsd - derivedUsd) <= tolerance ? totalCostUsdTicks : null;
+}
+
 function aggregateJobStats(records, dataDir) {
   const byStatus = {};
   const byMode = {};
   const byFailureKind = {};
   const byModel = {};
+  const byResolvedModel = {};
+  const byResolvedEffort = {};
   const usage = {
     reportedJobs: 0,
     inputTokens: 0,
@@ -1776,6 +2540,17 @@ function aggregateJobStats(records, dataDir) {
     incompleteJobs: 0,
     unreportedJobs: 0
   };
+  const headlessMetrics = {
+    turnsReportedJobs: 0,
+    totalTurns: 0,
+    exactCostJobs: 0,
+    partialCostJobs: 0,
+    unreportedCostJobs: 0,
+    totalCostUsdTicks: 0
+  };
+  let usageAggregationOverflow = false;
+  let turnAggregationOverflow = false;
+  let costAggregationOverflow = false;
   const doneDurations = [];
   let earliest = null;
   let latest = null;
@@ -1786,15 +2561,47 @@ function aggregateJobStats(records, dataDir) {
     for (const model of modelNamesForRecord(record)) {
       increment(byModel, model);
     }
+    increment(byResolvedModel, resolvedModelForRecord(record));
+    increment(byResolvedEffort, typeof record.resolvedEffort === "string" && record.resolvedEffort.trim() ? record.resolvedEffort.trim() : "unknown");
     const recordUsage = tokenUsageForRecord(record);
     if (recordUsage.coverage === "complete") {
-      addTokenUsage(usage, recordUsage.usage);
+      if (!usageAggregationOverflow && !addTokenUsage(usage, recordUsage.usage)) {
+        usageAggregationOverflow = true;
+      }
       usage.reportedJobs += 1;
       usageCoverage.completeJobs += 1;
     } else if (recordUsage.coverage === "incomplete") {
       usageCoverage.incompleteJobs += 1;
     } else {
       usageCoverage.unreportedJobs += 1;
+    }
+    const numTurns = record.numTurns ?? record.num_turns;
+    if (Number.isSafeInteger(numTurns) && numTurns >= 0) {
+      headlessMetrics.turnsReportedJobs += 1;
+      const totalTurns = headlessMetrics.totalTurns + numTurns;
+      if (Number.isSafeInteger(totalTurns)) {
+        headlessMetrics.totalTurns = totalTurns;
+      } else {
+        turnAggregationOverflow = true;
+      }
+    }
+    const costTicks = exactCostTicksForRecord(record);
+    const costIsPartial = record.costIsPartial === true || record.cost_is_partial === true;
+    const usageIsIncomplete = record.usageIsIncomplete === true || record.usage_is_incomplete === true;
+    const modelUsageIsIncomplete = record.modelUsageIsIncomplete === true;
+    const hasAnyCost = record.totalCostUsd != null || record.totalCostUsdTicks != null || record.total_cost_usd != null || record.total_cost_usd_ticks != null;
+    if (costTicks != null) {
+      headlessMetrics.exactCostJobs += 1;
+      const totalCostUsdTicks = headlessMetrics.totalCostUsdTicks + costTicks;
+      if (Number.isSafeInteger(totalCostUsdTicks)) {
+        headlessMetrics.totalCostUsdTicks = totalCostUsdTicks;
+      } else {
+        costAggregationOverflow = true;
+      }
+    } else if (costIsPartial || usageIsIncomplete || modelUsageIsIncomplete || hasAnyCost) {
+      headlessMetrics.partialCostJobs += 1;
+    } else {
+      headlessMetrics.unreportedCostJobs += 1;
     }
     if (record.status === "error" || record.status === "cancelled") {
       increment(byFailureKind, record.status === "cancelled" ? record.failureKind ?? "cancelled" : historicalFailureKind(record, dataDir));
@@ -1827,15 +2634,27 @@ function aggregateJobStats(records, dataDir) {
     byMode,
     byFailureKind,
     byModel,
-    usage: usage.reportedJobs > 0 ? usage : null,
+    byResolvedModel,
+    byResolvedEffort,
+    usage: usage.reportedJobs > 0 && !usageAggregationOverflow ? usage : null,
     usageCoverage: {
       availability:
-        usageCoverage.completeJobs === 0
+        usageAggregationOverflow
+          ? "overflow"
+          : usageCoverage.completeJobs === 0
           ? "unavailable"
           : usageCoverage.completeJobs === records.length
             ? "available"
             : "partial",
-      ...usageCoverage
+      ...usageCoverage,
+      ...(usageAggregationOverflow ? { aggregationOverflow: true } : {})
+    },
+    headlessMetrics: {
+      ...headlessMetrics,
+      ...(turnAggregationOverflow ? { totalTurns: null, turnAggregationOverflow: true } : {}),
+      ...(costAggregationOverflow
+        ? { totalCostUsd: null, totalCostUsdTicks: null, costAggregationOverflow: true }
+        : { totalCostUsd: Math.round((headlessMetrics.totalCostUsdTicks / USD_TICKS) * 1e12) / 1e12 })
     },
     meanWallClockSeconds,
     earliestCreatedAt: earliest,
@@ -1843,18 +2662,18 @@ function aggregateJobStats(records, dataDir) {
   };
 }
 
-function handleStats(argv) {
-  const { options } = parseArgs(argv, {
+function handleStats(argv, transport = {}) {
+  const { options } = commandArgs(argv, {
     valueOptions: ["cwd"],
     booleanOptions: ["all", "json"]
-  });
+  }, transport);
 
   const dataDir = resolveDataDir();
   const cwd = resolveCwd(options);
   const records = options.all
     ? listAllJobRecords(dataDir).map((entry) => refreshRunningJobRecord(entry).record)
     : listJobRecords(dataDir, cwd).map((record) =>
-        refreshRunningJobRecord({ record, file: jobFilePath(dataDir, record.cwd, record.id) }).record
+        refreshRunningJobRecord({ record, file: jobFilePath(dataDir, cwd, record.id) }).record
       );
   const stats = {
     scope: options.all ? "all" : "workspace",
@@ -1864,13 +2683,16 @@ function handleStats(argv) {
   output(options.json ? stats : renderStatsReport(stats), options.json);
 }
 
-function handleSetup(argv) {
-  const { options } = parseArgs(argv, {
+function handleSetup(argv, transport = {}) {
+  const { options } = commandArgs(argv, {
+    valueOptions: ["continuity"],
     booleanOptions: ["json", "enable-stop-gate", "disable-stop-gate"]
-  });
+  }, transport);
   if (options["enable-stop-gate"] && options["disable-stop-gate"]) {
     throw new Error("Use either --enable-stop-gate or --disable-stop-gate, not both.");
   }
+  const configuredContinuity =
+    options.continuity === undefined ? null : parseContinuityPolicy(options.continuity);
 
   const bin = resolveGrokBin();
   const probe = spawnSync(bin, ["--version"], { encoding: "utf8" });
@@ -1881,11 +2703,49 @@ function handleSetup(argv) {
       ? "not found on PATH"
       : (probe.stderr || probe.stdout || probe.error?.message || `exit ${probe.status}`).trim();
 
+  const capabilityFlags = [
+    "--prompt-file",
+    "--output-format",
+    "--sandbox",
+    "--tools",
+    "--disallowed-tools",
+    "--deny",
+    "--max-turns",
+    "--no-auto-update",
+    "--permission-mode",
+    "--allow",
+    "--disable-web-search",
+    "--always-approve",
+    "--json-schema",
+    "--best-of-n",
+    "--no-subagents",
+    "--no-wait-for-background",
+    "--background-wait-timeout"
+  ];
+  let capabilities = { ready: false, detail: available ? "capability probe did not run" : "grok is unavailable", flags: {} };
+  if (available) {
+    try {
+      const supported = resolveGrokCapabilities(bin, process.env);
+      const flags = Object.fromEntries(capabilityFlags.map((flag) => [flag, supported.has(flag)]));
+      const critical = capabilityFlags.filter(
+        (flag) => !["--no-subagents", "--no-wait-for-background"].includes(flag)
+      );
+      const missing = critical.filter((flag) => !flags[flag]);
+      capabilities = {
+        ready: missing.length === 0,
+        detail: missing.length === 0 ? "required headless safety capabilities are available" : `missing ${missing.join(", ")}`,
+        flags
+      };
+    } catch (error) {
+      capabilities = { ready: false, detail: error instanceof Error ? error.message : String(error), flags: {} };
+    }
+  }
+
   const dataDir = resolveDataDir();
   let writable = true;
   let writeDetail = dataDir;
   try {
-    fs.mkdirSync(dataDir, { recursive: true });
+    ensurePrivateDataDir(dataDir);
     fs.accessSync(dataDir, fs.constants.W_OK);
   } catch (error) {
     writable = false;
@@ -1897,12 +2757,17 @@ function handleSetup(argv) {
   } else if (options["disable-stop-gate"]) {
     writeConfig(dataDir, { stopGate: false });
   }
+  if (configuredContinuity) {
+    writeConfig(dataDir, { continuityPolicy: configuredContinuity });
+  }
 
   const report = {
-    ready: available && writable,
+    ready: available && capabilities.ready && writable,
     grok: { available, detail, bin },
+    capabilities,
     dataDir: { path: dataDir, writable, detail: writeDetail },
-    stopGate: Boolean(readConfig(dataDir).stopGate)
+    stopGate: Boolean(readConfig(dataDir).stopGate),
+    continuityPolicy: continuityPolicy(dataDir)
   };
   output(options.json ? report : renderSetupReport(report), options.json);
 }
@@ -1975,7 +2840,12 @@ async function handleStopGate() {
       briefFile,
       background: false,
       claudeSessionId: input.session_id ?? currentClaudeSessionId(),
-      request: { maxTurns: STOP_GATE_MAX_TURNS, sandboxProfile: sandboxProfileForMode("consult") }
+      jobClass: "stop_gate",
+      request: {
+        maxTurns: STOP_GATE_MAX_TURNS,
+        memory: false,
+        sandboxProfile: sandboxProfileForMode("consult")
+      }
     })
   );
   try {
@@ -1990,6 +2860,7 @@ async function handleStopGate() {
   try {
     result = await runGrok({
       briefFile,
+      prompt,
       mode: "consult",
       maxTurns: STOP_GATE_MAX_TURNS,
       cwd,
@@ -2046,39 +2917,69 @@ async function handleStopGate() {
 }
 
 async function main() {
-  const [subcommand, ...argv] = process.argv.slice(2);
+  const [subcommand, ...receivedArgv] = process.argv.slice(2);
   if (!subcommand || subcommand === "help" || subcommand === "--help") {
     printUsage();
     return;
   }
+  if (subcommand === "transport-create") {
+    if (receivedArgv.length > 0) {
+      throw errorWithFailure("transport-create accepts no arguments.", "input");
+    }
+    createRawCommandTransport();
+    return;
+  }
+  if (subcommand === "transport-discard") {
+    if (receivedArgv.length !== 2 || receivedArgv[0] !== "--raw-args-token") {
+      throw errorWithFailure("transport-discard requires exactly one raw argument token.", "input");
+    }
+    consumeRawCommandTransport(receivedArgv[1]);
+    return;
+  }
+  const transport = resolveCommandTransport(receivedArgv);
+  activeCommandArgv = transport.argv;
+  activeCommandIngress = transport.ingress;
+  if (transport.defaultWrite && subcommand !== "task") {
+    throw errorWithFailure("The raw command transport write default is valid only for task.", "input");
+  }
+  if (transport.defaultBackground && subcommand !== "review") {
+    throw errorWithFailure("The raw command transport background default is valid only for review.", "input");
+  }
+  if (transport.defaultBestOfN && subcommand !== "task") {
+    throw errorWithFailure("The raw command transport best-of-n default is valid only for task.", "input");
+  }
+  const argv = transport.argv;
 
   switch (subcommand) {
     case "task":
-      await handleTask(argv);
+      await handleTask(argv, transport);
       break;
     case "task-worker":
       await handleTaskWorker(argv);
       break;
     case "review":
-      await handleReview(argv);
+      await handleReview(argv, transport);
       break;
     case "review-worker":
       await handleReviewWorker(argv);
       break;
     case "status":
-      handleStatus(argv);
+      handleStatus(argv, transport);
+      break;
+    case "history":
+      handleHistory(argv, transport);
       break;
     case "result":
-      await handleResult(argv);
+      await handleResult(argv, transport);
       break;
     case "cancel":
-      await handleCancel(argv);
+      await handleCancel(argv, transport);
       break;
     case "stats":
-      handleStats(argv);
+      handleStats(argv, transport);
       break;
     case "setup":
-      handleSetup(argv);
+      handleSetup(argv, transport);
       break;
     case "stop-gate":
       try {
@@ -2093,7 +2994,14 @@ async function main() {
 }
 
 function wantsJsonError() {
-  return process.argv.slice(3).some((token) => token === "--json" || token === "--json=true");
+  if (activeCommandOptions) {
+    return activeCommandOptions.json === true;
+  }
+  const argv = activeCommandArgv ?? process.argv.slice(3);
+  if (activeCommandIngress === "staged_file") {
+    return rawBooleanOptionRequested(argv[0] ?? "", "json", activeCommandConfig ?? {});
+  }
+  return argv.some((token) => token === "--json" || token === "--json=true");
 }
 
 function errorMessage(error) {
@@ -2118,7 +3026,7 @@ function renderTopLevelError(error) {
   const failureKind = errorFailureKind(error, message);
   const status = errorStatus(message);
   if (wantsJsonError()) {
-    return `${JSON.stringify({ status, failureKind, message }, null, 2)}\n`;
+    return `${JSON.stringify({ status, transportStatus: status, semanticStatus: "unverified", delivery: "foreground", deliveryStatus: "delivered", resolvedModel: null, resolvedEffort: null, failureKind, message }, null, 2)}\n`;
   }
   const lines = [message || "Grok companion failed."];
   if (!/^state: /m.test(message)) {

@@ -18,6 +18,8 @@ const LOCK_TIMEOUT_MS = 2000;
 const LOCK_RETRY_MS = 20;
 const LOCK_STALE_MS = 10000;
 const RESUME_OWNER_LAUNCH_GRACE_MS = 15000;
+const PRIVATE_DIR_MODE = 0o700;
+const PRIVATE_FILE_MODE = 0o600;
 const TERMINAL_STATUSES = new Set(["done", "error", "cancelled"]);
 
 export const SESSION_ID_ENV = "CLAUDE_CODE_SESSION_ID";
@@ -81,7 +83,9 @@ export function nowIso() {
 
 export function createJobRecord(fields) {
   const pid = Number.isInteger(fields.pid) && fields.pid > 1 ? fields.pid : null;
-  return {
+  return withStructuredStatuses({
+    schemaVersion: 1,
+    engine: "grok",
     id: fields.id,
     pid,
     pidIdentity: Object.hasOwn(fields, "pidIdentity") ? fields.pidIdentity : pid ? getProcessIdentity(pid) : null,
@@ -94,6 +98,7 @@ export function createJobRecord(fields) {
     briefFile: fields.briefFile,
     background: Boolean(fields.background),
     delivery: fields.delivery ?? (fields.background ? "manual" : "foreground"),
+    deliveryStatus: "pending",
     deliveryCollectedAt: null,
     claudeSessionId: fields.claudeSessionId ?? null,
     createdAt: fields.createdAt ?? nowIso(),
@@ -102,6 +107,8 @@ export function createJobRecord(fields) {
     sessionId: null,
     resultText: null,
     resultPayload: null,
+    resolvedModel: null,
+    resolvedEffort: null,
     usage: null,
     modelUsage: null,
     usageIsIncomplete: null,
@@ -109,26 +116,93 @@ export function createJobRecord(fields) {
     errorMessage: null,
     errorTail: null,
     failureKind: null,
+    semanticStatus: "unverified",
+    transportStatus: fields.status ?? "running",
     cancelRequestedAt: null,
+    jobClass: fields.jobClass ?? "unknown",
     request: fields.request ?? null
-  };
+  });
 }
 
 function sleepMs(ms) {
   Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
 }
 
+function ensurePrivateDir(dir) {
+  const missing = [];
+  let current = path.resolve(dir);
+  while (!fs.existsSync(current)) {
+    missing.push(current);
+    const parent = path.dirname(current);
+    if (parent === current) {
+      break;
+    }
+    current = parent;
+  }
+  fs.mkdirSync(dir, { recursive: true, mode: PRIVATE_DIR_MODE });
+  for (const created of missing) {
+    fs.chmodSync(created, PRIVATE_DIR_MODE);
+  }
+  fs.chmodSync(dir, PRIVATE_DIR_MODE);
+}
+
+export function ensurePrivateDataDir(dataDir) {
+  ensurePrivateDir(dataDir);
+  return dataDir;
+}
+
+function ensurePrivateStatePath(target) {
+  const absolute = path.resolve(target);
+  const parts = absolute.split(path.sep);
+  const stateIndex = parts.lastIndexOf("state");
+  if (stateIndex > 0) {
+    const prefix = absolute.startsWith(path.sep) ? path.sep : "";
+    for (let index = stateIndex; index < parts.length; index += 1) {
+      const dir = path.join(prefix, ...parts.slice(0, index + 1));
+      ensurePrivateDir(dir);
+    }
+    const dataDir = path.join(prefix, ...parts.slice(0, stateIndex));
+    ensurePrivateDir(dataDir);
+    return;
+  }
+  ensurePrivateDir(absolute);
+}
+
 function atomicWriteFile(file, content) {
-  fs.mkdirSync(path.dirname(file), { recursive: true });
+  ensurePrivateStatePath(path.dirname(file));
   const temp = `${file}.${process.pid}.${randomBytes(6).toString("hex")}.tmp`;
+  let descriptor;
   try {
-    fs.writeFileSync(temp, content, "utf8");
+    descriptor = fs.openSync(temp, "wx", PRIVATE_FILE_MODE);
+    fs.writeFileSync(descriptor, content, "utf8");
+    fs.chmodSync(temp, PRIVATE_FILE_MODE);
+    fs.closeSync(descriptor);
+    descriptor = undefined;
     fs.renameSync(temp, file);
   } finally {
+    if (descriptor !== undefined) {
+      try {
+        fs.closeSync(descriptor);
+      } catch {}
+    }
     try {
       fs.rmSync(temp, { force: true });
     } catch {}
   }
+}
+
+export function writePrivateStateFile(file, content) {
+  atomicWriteFile(file, String(content ?? ""));
+  return file;
+}
+
+export function hardenPrivateStateFile(file) {
+  if (!fs.existsSync(file)) {
+    return file;
+  }
+  ensurePrivateStatePath(path.dirname(file));
+  fs.chmodSync(file, PRIVATE_FILE_MODE);
+  return file;
 }
 
 function lockOwnerDir(lockDir, token) {
@@ -200,7 +274,7 @@ function publishPreparedLock(lockDir, ownerDir) {
 function createLinkedOwner(linkPath, record) {
   const ownerDir = lockOwnerDir(linkPath, record.token);
   const preparedDir = `${ownerDir}.prepare.${process.pid}.${randomBytes(8).toString("hex")}`;
-  fs.mkdirSync(preparedDir);
+  ensurePrivateDir(preparedDir);
   try {
     atomicWriteFile(path.join(preparedDir, "owner.json"), `${JSON.stringify(record)}\n`);
     fs.renameSync(preparedDir, ownerDir);
@@ -384,7 +458,7 @@ function scavengeOrphanOwnerDirs(lockDir) {
 function releaseLock(lockDir, token) {
   const ownerDir = lockOwnerDir(lockDir, token);
   try {
-    fs.writeFileSync(path.join(ownerDir, ".released"), `${token}\n`, { flag: "wx" });
+    fs.writeFileSync(path.join(ownerDir, ".released"), `${token}\n`, { flag: "wx", mode: PRIVATE_FILE_MODE });
   } catch {}
   if (!lockTargetsToken(lockDir, token)) {
     try {
@@ -407,7 +481,7 @@ function releaseLock(lockDir, token) {
 }
 
 function withRecordLock(file, fn) {
-  fs.mkdirSync(path.dirname(file), { recursive: true });
+  ensurePrivateStatePath(path.dirname(file));
   const lockDir = `${file}.lock`;
   scavengeOrphanOwnerDirs(lockDir);
   const deadline = Date.now() + LOCK_TIMEOUT_MS;
@@ -461,21 +535,53 @@ function withRecordLock(file, fn) {
   }
 }
 
+function deliveryStatusFor(record) {
+  if (record.deliveryCollectedAt) {
+    return "collected";
+  }
+  if (record.delivery === "foreground" && TERMINAL_STATUSES.has(record.status)) {
+    return "delivered";
+  }
+  return "pending";
+}
+
+function withStructuredStatuses(record) {
+  const transportStatus = record.status;
+  const semanticStatus = record.semanticStatus ?? "unverified";
+  const deliveryStatus = deliveryStatusFor(record);
+  const resultPayload = record.resultPayload && typeof record.resultPayload === "object" && !Array.isArray(record.resultPayload)
+    ? {
+        ...record.resultPayload,
+        transportStatus,
+        semanticStatus,
+        delivery: record.delivery,
+        deliveryStatus
+      }
+    : record.resultPayload;
+  return {
+    ...record,
+    resultPayload,
+    transportStatus,
+    semanticStatus,
+    deliveryStatus
+  };
+}
+
 function preserveTerminalRecord(existing, next) {
   if (existing && TERMINAL_STATUSES.has(existing.status)) {
-    return existing;
+    return withStructuredStatuses(existing);
   }
   if (!TERMINAL_STATUSES.has(next.status)) {
-    return next;
+    return withStructuredStatuses(next);
   }
-  return {
+  return withStructuredStatuses({
     ...next,
     pid: null,
     pidIdentity: null,
     grokPid: null,
     grokPidIdentity: null,
     cleanupRequired: false
-  };
+  });
 }
 
 function resourceError(message) {
@@ -509,7 +615,19 @@ export function markManagedDeliveryCollectedFile(file, collectedAt = nowIso()) {
     if (!existing || existing.delivery !== "managed" || !TERMINAL_STATUSES.has(existing.status) || existing.deliveryCollectedAt) {
       return existing;
     }
-    const next = { ...existing, deliveryCollectedAt: collectedAt };
+    const next = withStructuredStatuses({ ...existing, deliveryCollectedAt: collectedAt });
+    atomicWriteFile(file, `${JSON.stringify(next, null, 2)}\n`);
+    return next;
+  });
+}
+
+export function markDeliveryCollectedFile(file, collectedAt = nowIso()) {
+  return withRecordLock(file, () => {
+    const existing = readJobRecordFile(file);
+    if (!existing || existing.delivery === "foreground" || !TERMINAL_STATUSES.has(existing.status) || existing.deliveryCollectedAt) {
+      return existing;
+    }
+    const next = withStructuredStatuses({ ...existing, deliveryCollectedAt: collectedAt });
     atomicWriteFile(file, `${JSON.stringify(next, null, 2)}\n`);
     return next;
   });
@@ -752,47 +870,73 @@ export function finishSuccessfulJobRecordFile(file, successPatch) {
 
 export function listJobRecords(dataDir, cwd) {
   const dir = jobsDir(dataDir, cwd);
-  if (!fs.existsSync(dir)) {
+  try {
+    const stats = fs.lstatSync(dir);
+    if (!stats.isDirectory() || stats.isSymbolicLink()) {
+      return [];
+    }
+  } catch {
     return [];
   }
   const records = [];
-  for (const entry of fs.readdirSync(dir)) {
-    if (!entry.endsWith(".json")) {
+  for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+    if (!entry.isFile() || !entry.name.endsWith(".json")) {
       continue;
     }
-    const record = readJobRecordFile(path.join(dir, entry));
-    if (record?.id) {
+    const expectedId = entry.name.slice(0, -".json".length);
+    const record = readJobRecordFile(path.join(dir, entry.name));
+    if (record?.id === expectedId) {
       records.push(record);
     }
   }
   return records.sort((left, right) =>
-    String(right.createdAt ?? "").localeCompare(String(left.createdAt ?? ""))
+    String(right.createdAt ?? "").localeCompare(String(left.createdAt ?? "")) ||
+    String(right.id ?? "").localeCompare(String(left.id ?? ""))
   );
 }
 
 export function listAllJobRecords(dataDir) {
   const stateRoot = path.join(dataDir, "state");
-  if (!fs.existsSync(stateRoot)) {
+  try {
+    const stats = fs.lstatSync(stateRoot);
+    if (!stats.isDirectory() || stats.isSymbolicLink()) {
+      return [];
+    }
+  } catch {
     return [];
   }
   const results = [];
-  for (const workspace of fs.readdirSync(stateRoot)) {
-    const dir = path.join(stateRoot, workspace, "jobs");
-    if (!fs.existsSync(dir)) {
+  for (const workspace of fs.readdirSync(stateRoot, { withFileTypes: true })) {
+    if (!workspace.isDirectory()) {
       continue;
     }
-    for (const entry of fs.readdirSync(dir)) {
-      if (!entry.endsWith(".json")) {
+    const dir = path.join(stateRoot, workspace.name, "jobs");
+    try {
+      const stats = fs.lstatSync(dir);
+      if (!stats.isDirectory() || stats.isSymbolicLink()) {
         continue;
       }
-      const file = path.join(dir, entry);
+    } catch {
+      continue;
+    }
+    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+      if (!entry.isFile() || !entry.name.endsWith(".json")) {
+        continue;
+      }
+      const file = path.join(dir, entry.name);
+      const expectedId = entry.name.slice(0, -".json".length);
       const record = readJobRecordFile(file);
-      if (record?.id) {
+      if (record?.id === expectedId) {
         results.push({ record, file });
       }
     }
   }
-  return results;
+  return results.sort(
+    (left, right) =>
+      String(right.record.createdAt ?? "").localeCompare(String(left.record.createdAt ?? "")) ||
+      String(right.record.id ?? "").localeCompare(String(left.record.id ?? "")) ||
+      String(left.file).localeCompare(String(right.file))
+  );
 }
 
 export function findJobRecordById(dataDir, jobId) {
@@ -805,10 +949,15 @@ export function findJobRecordById(dataDir, jobId) {
 
 export function writeBrief(dataDir, cwd, name, content) {
   const file = briefPath(dataDir, cwd, name);
-  fs.mkdirSync(path.dirname(file), { recursive: true });
+  ensurePrivateStatePath(path.dirname(file));
   const text = String(content ?? "");
   try {
-    fs.writeFileSync(file, text.endsWith("\n") ? text : `${text}\n`, { encoding: "utf8", flag: "wx" });
+    fs.writeFileSync(file, text, {
+      encoding: "utf8",
+      flag: "wx",
+      mode: PRIVATE_FILE_MODE
+    });
+    fs.chmodSync(file, PRIVATE_FILE_MODE);
   } catch (error) {
     if (error?.code === "EEXIST") {
       throw resourceError(`Brief already exists at ${file}.`);
@@ -818,14 +967,22 @@ export function writeBrief(dataDir, cwd, name, content) {
   return file;
 }
 
+export function writePrivateDataFile(dataDir, name, content) {
+  ensurePrivateDir(dataDir);
+  const file = path.join(dataDir, name);
+  atomicWriteFile(file, String(content ?? ""));
+  return file;
+}
+
 export function appendJobLog(logFile, text) {
   if (!logFile) {
     return;
   }
-  fs.mkdirSync(path.dirname(logFile), { recursive: true });
+  ensurePrivateStatePath(path.dirname(logFile));
   const raw = String(text ?? "");
   const value = raw.endsWith("\n") ? raw : `${raw}\n`;
-  fs.appendFileSync(logFile, value.slice(-JOB_LOG_MAX_BYTES), "utf8");
+  fs.appendFileSync(logFile, value.slice(-JOB_LOG_MAX_BYTES), { encoding: "utf8", mode: PRIVATE_FILE_MODE });
+  fs.chmodSync(logFile, PRIVATE_FILE_MODE);
   const size = fs.statSync(logFile).size;
   if (size > JOB_LOG_MAX_BYTES) {
     const fd = fs.openSync(logFile, "r");

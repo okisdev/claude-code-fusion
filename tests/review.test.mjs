@@ -2,7 +2,7 @@ import assert from "node:assert";
 import fs from "node:fs";
 import path from "node:path";
 import { test } from "node:test";
-import { envFor as companionEnvFor, flagValues, hasPair, jobRecords, makeSandbox, readInvocations, repoRoot, runCompanion, stateModulePath, waitFor } from "./lib/companion-harness.mjs";
+import { envFor as companionEnvFor, flagValues, grokCompanionCapabilities, jobRecords, makeSandbox, readInvocations, runCompanion, stateModulePath, waitFor } from "./lib/companion-harness.mjs";
 import { initFixtureRepo } from "./lib/git-fixture.mjs";
 
 const { createJobRecord, generateJobId, jobFilePath, writeBrief, writeJobRecordFile } = await import(stateModulePath);
@@ -11,19 +11,53 @@ function envFor(sandbox, extra = {}) {
   return companionEnvFor(sandbox, extra, { git: true });
 }
 
-test("review builds a prompt from the working tree and renders the extracted JSON", (t) => {
+const reviewObject = {
+  verdict: "needs-attention",
+  findings: [
+    {
+      severity: "high",
+      title: "Example finding",
+      body: "Example body describing the defect.",
+      file: "src/app.mjs",
+      line_start: 10,
+      line_end: 12,
+      confidence: 0.9,
+      recommendation: "Fix the defect before merging."
+    }
+  ],
+  next_steps: ["Run the tests."]
+};
+
+function writeEnvelopeGrok(sandbox, name, envelope, exitCode = 0) {
+  const file = path.join(sandbox.root, `${name}.mjs`);
+  fs.writeFileSync(
+    file,
+    `#!/usr/bin/env node\nimport fs from "node:fs";\nimport os from "node:os";\nimport path from "node:path";\nif (process.env.FAKE_GROK_ARGS_FILE) fs.appendFileSync(process.env.FAKE_GROK_ARGS_FILE, JSON.stringify(process.argv.slice(2)) + "\\n");\nconst sandboxIndex = process.argv.indexOf("--sandbox");\nif (sandboxIndex >= 0) {\n  const profile = process.argv[sandboxIndex + 1];\n  const grokHome = Object.hasOwn(process.env, "GROK_HOME") ? path.resolve(process.cwd(), process.env.GROK_HOME) : path.join(os.homedir(), ".grok");\n  fs.mkdirSync(grokHome, { recursive: true });\n  fs.appendFileSync(path.join(grokHome, "sandbox-events.jsonl"), JSON.stringify({ event_type: "ProfileApplied", profile, workspace: fs.realpathSync(process.cwd()), enforced: true, restrict_network: profile !== "workspace", read_write_paths: [fs.realpathSync(process.cwd()), grokHome, process.env.TMPDIR].filter(Boolean) }) + "\\n");\n  process.stderr.write("DEBUG xai_grok_agent::builder: tools allowlist applied\\n");\n}\nfor await (const chunk of process.stdin) void chunk;\nprocess.stdout.write(${JSON.stringify(`${JSON.stringify(envelope)}\n`)});\nprocess.exit(${exitCode});\n`,
+    "utf8"
+  );
+  fs.chmodSync(file, 0o755);
+  return file;
+}
+
+test("review passes the output contract as an inline JSON schema and renders the structured result", (t) => {
   const sandbox = makeSandbox(t);
+  const stdinFile = path.join(sandbox.root, "review-stdin.txt");
   initFixtureRepo(sandbox.workDir);
   const result = runCompanion(["review", "--focus", "check the error handling"], {
     cwd: sandbox.workDir,
-    env: envFor(sandbox, { FAKE_GROK_MODE: "review-ok" }),
+    env: envFor(sandbox, { FAKE_GROK_MODE: "review-ok", FAKE_GROK_STDIN_FILE: stdinFile }),
   });
   assert.strictEqual(result.status, 0, result.stderr);
   const invocations = readInvocations(sandbox.argsFile);
   assert.strictEqual(invocations.length, 1);
   const briefFile = flagValues(invocations[0], "--prompt-file")[0];
-  assert.ok(briefFile, "Expected a --prompt-file argument.");
-  const brief = fs.readFileSync(briefFile, "utf8");
+  assert.strictEqual(briefFile, "/dev/stdin");
+  const schema = JSON.parse(flagValues(invocations[0], "--json-schema")[0]);
+  assert.deepStrictEqual(schema.required, ["verdict", "findings", "next_steps"]);
+  assert.deepStrictEqual(schema.properties.verdict.enum, ["approve", "needs-attention"]);
+  assert.strictEqual(schema.properties.findings.items.additionalProperties, false);
+  assert.deepStrictEqual(schema.properties.findings.items.required, ["severity", "title", "body"]);
+  const brief = fs.readFileSync(stdinFile, "utf8");
   assert.ok(brief.includes("export const other = 2;"));
   assert.ok(brief.includes("untracked.txt"));
   assert.ok(brief.includes("check the error handling"));
@@ -33,90 +67,112 @@ test("review builds a prompt from the working tree and renders the extracted JSO
   assert.ok(result.stdout.includes("Run the tests."));
 });
 
-test("review retries once by resuming the session when the output is not valid JSON", (t) => {
+test("review fails closed before launch without structured output support", (t) => {
   const sandbox = makeSandbox(t);
   initFixtureRepo(sandbox.workDir);
+  const capabilities = grokCompanionCapabilities
+    .split(",")
+    .filter((capability) => capability !== "--json-schema")
+    .join(",");
   const result = runCompanion(["review"], {
     cwd: sandbox.workDir,
-    env: envFor(sandbox, { FAKE_GROK_MODE: "badjson-then-ok" }),
+    env: envFor(sandbox, { GROK_COMPANION_CAPABILITIES: capabilities })
+  });
+
+  assert.notStrictEqual(result.status, 0);
+  assert.match(result.stderr, /--json-schema/);
+  assert.deepStrictEqual(readInvocations(sandbox.argsFile), []);
+});
+
+test("review trusts validated structured output without resuming when the text is not JSON", (t) => {
+  const sandbox = makeSandbox(t);
+  initFixtureRepo(sandbox.workDir);
+  const grokBin = writeEnvelopeGrok(sandbox, "structured-review", {
+    text: "The validated review is attached outside this prose.",
+    structuredOutput: reviewObject,
+    stopReason: "EndTurn",
+    sessionId: "22222222-2222-7222-8222-222222222222",
+    requestId: "req-structured"
+  });
+  const result = runCompanion(["review"], {
+    cwd: sandbox.workDir,
+    env: envFor(sandbox, { GROK_BIN: grokBin }),
   });
   assert.strictEqual(result.status, 0, result.stderr);
   const invocations = readInvocations(sandbox.argsFile);
-  assert.strictEqual(invocations.length, 2);
+  assert.strictEqual(invocations.length, 1);
   assert.ok(!invocations[0].includes("-r"));
-  assert.ok(hasPair(invocations[1], "-r", "22222222-2222-7222-8222-222222222222"));
   assert.ok(result.stdout.includes("needs-attention"));
   assert.ok(result.stdout.includes("Example finding"));
 });
 
-test("review merges two complete usage reports without changing token semantics", (t) => {
+test("review records one structured turn's usage without a corrective model call", (t) => {
   const sandbox = makeSandbox(t);
   initFixtureRepo(sandbox.workDir);
-  const env = envFor(sandbox, { FAKE_GROK_MODE: "review-usage-complete-complete" });
+  const usage = {
+    input_tokens: 10,
+    cache_read_input_tokens: 2,
+    output_tokens: 3,
+    reasoning_tokens: 1,
+    total_tokens: 15
+  };
+  const modelUsage = {
+    "grok-review": {
+      inputTokens: 10,
+      cacheReadInputTokens: 2,
+      outputTokens: 3,
+      reasoningTokens: 1,
+      totalTokens: 15,
+      modelCalls: 1,
+      costUSD: 0.001
+    }
+  };
+  const grokBin = writeEnvelopeGrok(sandbox, "usage-review", {
+    text: "structured review",
+    structuredOutput: reviewObject,
+    stopReason: "EndTurn",
+    sessionId: "23232323-2323-7323-8323-232323232323",
+    requestId: "req-review-usage",
+    usage,
+    modelUsage,
+    usage_is_incomplete: false
+  });
+  const env = envFor(sandbox, { GROK_BIN: grokBin });
   const result = runCompanion(["review"], { cwd: sandbox.workDir, env });
   assert.strictEqual(result.status, 0, result.stderr);
+  assert.strictEqual(readInvocations(sandbox.argsFile).length, 1);
   const [record] = jobRecords(sandbox.dataDir);
   assert.strictEqual(record.status, "done");
   assert.strictEqual(record.usageIsIncomplete, false);
   assert.strictEqual(record.modelUsageIsIncomplete, false);
-  assert.deepStrictEqual(record.usage, {
-    input_tokens: 30,
-    cache_read_input_tokens: 6,
-    output_tokens: 9,
-    reasoning_tokens: 3,
-    total_tokens: 45,
-  });
-  assert.deepStrictEqual(record.modelUsage["grok-review"], {
-    inputTokens: 30,
-    cacheReadInputTokens: 6,
-    outputTokens: 9,
-    reasoningTokens: 3,
-    totalTokens: 45,
-    modelCalls: 3,
-    costUSD: 0.003,
-  });
+  assert.deepStrictEqual(record.usage, usage);
+  assert.deepStrictEqual(record.modelUsage, modelUsage);
 
   const statsResult = runCompanion(["stats", "--json"], { cwd: sandbox.workDir, env });
   assert.strictEqual(statsResult.status, 0, statsResult.stderr);
   const stats = JSON.parse(statsResult.stdout);
   assert.strictEqual(stats.usage.reportedJobs, 1);
-  assert.strictEqual(stats.usage.totalTokens, 45);
+  assert.strictEqual(stats.usage.totalTokens, 15);
   assert.strictEqual(stats.usageCoverage.completeJobs, 1);
 });
 
-for (const [name, mode] of [
-  ["complete then partial", "review-usage-complete-partial"],
-  ["partial then complete", "review-usage-partial-complete"],
-  ["complementary partial reports", "review-usage-complementary-partials"],
-]) {
-  test(`review keeps ${name} usage incomplete after the corrective retry`, (t) => {
-    const sandbox = makeSandbox(t);
-    initFixtureRepo(sandbox.workDir);
-    const env = envFor(sandbox, { FAKE_GROK_MODE: mode });
-    const result = runCompanion(["review"], { cwd: sandbox.workDir, env });
-    assert.strictEqual(result.status, 0, result.stderr);
-    const [record] = jobRecords(sandbox.dataDir);
-    assert.strictEqual(record.status, "done");
-    assert.strictEqual(record.usageIsIncomplete, true);
-    assert.strictEqual(record.modelUsageIsIncomplete, true);
-    const aggregateFields = ["input_tokens", "cache_read_input_tokens", "output_tokens", "reasoning_tokens", "total_tokens"];
-    assert.ok(record.usage == null || aggregateFields.some((field) => !Object.hasOwn(record.usage, field)));
-    const modelUsage = record.modelUsage?.["grok-review"];
-    const modelFields = ["inputTokens", "cacheReadInputTokens", "outputTokens", "reasoningTokens", "totalTokens"];
-    assert.ok(modelUsage == null || modelFields.some((field) => !Object.hasOwn(modelUsage, field)));
-
-    const statsResult = runCompanion(["stats", "--json"], { cwd: sandbox.workDir, env });
-    assert.strictEqual(statsResult.status, 0, statsResult.stderr);
-    const stats = JSON.parse(statsResult.stdout);
-    assert.strictEqual(stats.usage, null);
-    assert.deepStrictEqual(stats.usageCoverage, {
-      availability: "unavailable",
-      completeJobs: 0,
-      incompleteJobs: 1,
-      unreportedJobs: 0,
-    });
+test("review falls back to local text parsing for an older Grok envelope", (t) => {
+  const sandbox = makeSandbox(t);
+  initFixtureRepo(sandbox.workDir);
+  const grokBin = writeEnvelopeGrok(sandbox, "legacy-review", {
+    text: `\`\`\`json\n${JSON.stringify(reviewObject)}\n\`\`\``,
+    stopReason: "EndTurn",
+    sessionId: "24242424-2424-7424-8424-242424242424",
+    requestId: "req-legacy"
   });
-}
+  const result = runCompanion(["review"], {
+    cwd: sandbox.workDir,
+    env: envFor(sandbox, { GROK_BIN: grokBin })
+  });
+  assert.strictEqual(result.status, 0, result.stderr);
+  assert.strictEqual(readInvocations(sandbox.argsFile).length, 1);
+  assert.match(result.stdout, /Example finding/);
+});
 
 test("review --background drives the job to done and result returns the review output", async (t) => {
   const sandbox = makeSandbox(t);
@@ -181,150 +237,58 @@ test("managed JSON review collection preserves the terminal review envelope", as
   assert.ok(record.deliveryCollectedAt);
 });
 
-test("review records an error after one failed corrective retry and preserves the raw output", (t) => {
+test("review records a structured validation error without resuming or trusting valid-looking text", (t) => {
   const sandbox = makeSandbox(t);
   initFixtureRepo(sandbox.workDir);
+  const grokBin = writeEnvelopeGrok(sandbox, "invalid-structured-review", {
+    text: JSON.stringify(reviewObject),
+    structuredOutput: null,
+    structuredOutputError: "output does not match the required schema",
+    stopReason: "EndTurn",
+    sessionId: "44444444-4444-7444-8444-444444444444",
+    requestId: "req-invalid-structured"
+  });
   const result = runCompanion(["review"], {
     cwd: sandbox.workDir,
-    env: envFor(sandbox, { FAKE_GROK_MODE: "badjson" }),
+    env: envFor(sandbox, { GROK_BIN: grokBin }),
   });
   assert.notStrictEqual(result.status, 0);
   const invocations = readInvocations(sandbox.argsFile);
-  assert.strictEqual(invocations.length, 2);
-  assert.ok(hasPair(invocations[1], "-r", "44444444-4444-7444-8444-444444444444"));
+  assert.strictEqual(invocations.length, 1);
+  assert.ok(!invocations[0].includes("-r"));
   assert.ok(result.stderr.includes("did not return a valid review JSON object"));
-  assert.ok(result.stderr.includes("I still cannot produce the requested object."));
+  assert.ok(result.stderr.includes("output does not match the required schema"));
   const [record] = jobRecords(sandbox.dataDir);
   assert.strictEqual(record.status, "error");
   assert.strictEqual(record.failureKind, "error");
-  assert.ok(record.resultText.includes("I still cannot produce the requested object."));
-  assert.match(record.errorMessage, /failed validation after one corrective retry/);
+  assert.ok(record.resultText.includes(JSON.stringify(reviewObject)));
+  assert.match(record.errorMessage, /failed validation: output does not match the required schema/);
   assert.doesNotMatch(record.errorMessage, /\r?\n/);
   assert.match(result.stderr, new RegExp(`job: ${record.id}\\nstate: error\\nfailure: error\\n$`));
 });
 
-test("review preserves a structured quota failure from the corrective retry", (t) => {
+test("background review records a structured validation failure after one model call", async (t) => {
   const sandbox = makeSandbox(t);
   initFixtureRepo(sandbox.workDir);
-  const env = envFor(sandbox, { FAKE_GROK_MODE: "review-retry-quota-error" });
-  const result = runCompanion(["review"], { cwd: sandbox.workDir, env });
-  assert.notStrictEqual(result.status, 0);
-  assert.match(result.stderr, /HTTP 402 Payment Required: insufficient account credits/);
-  assert.match(result.stderr, /^state: error$/m);
-  assert.match(result.stderr, /^failure: quota$/m);
-  assert.strictEqual(readInvocations(sandbox.argsFile).length, 2);
-
-  const [record] = jobRecords(sandbox.dataDir);
-  assert.strictEqual(record.status, "error");
-  assert.strictEqual(record.exitCode, 42);
-  assert.strictEqual(record.failureKind, "quota");
-  assert.strictEqual(record.sessionId, "24242424-2424-7424-8424-242424242424");
-  assert.strictEqual(record.errorMessage, "HTTP 402 Payment Required: insufficient account credits");
-  assert.match(record.errorTail, /HTTP 402 Payment Required: insufficient account credits/);
-  assert.strictEqual(record.usageIsIncomplete, true);
-  assert.strictEqual(record.modelUsageIsIncomplete, true);
-  assert.strictEqual(record.usage.total_tokens, 30);
-
-  const statsResult = runCompanion(["stats", "--json"], { cwd: sandbox.workDir, env });
-  assert.strictEqual(statsResult.status, 0, statsResult.stderr);
-  const stats = JSON.parse(statsResult.stdout);
-  assert.deepStrictEqual(stats.byFailureKind, { quota: 1 });
-  assert.strictEqual(stats.usage, null);
-  assert.strictEqual(stats.usageCoverage.incompleteJobs, 1);
-});
-
-test("review treats a zero exit structured quota response as a corrective retry failure", (t) => {
-  const sandbox = makeSandbox(t);
-  initFixtureRepo(sandbox.workDir);
-  const env = envFor(sandbox, { FAKE_GROK_MODE: "review-retry-zero-exit-quota-error" });
-  const result = runCompanion(["review"], { cwd: sandbox.workDir, env });
-  assert.notStrictEqual(result.status, 0);
-  assert.match(result.stderr, /HTTP 402 Payment Required: insufficient account credits/);
-  assert.match(result.stderr, /^state: error$/m);
-  assert.match(result.stderr, /^failure: quota$/m);
-  assert.strictEqual(readInvocations(sandbox.argsFile).length, 2);
-
-  const [record] = jobRecords(sandbox.dataDir);
-  assert.strictEqual(record.status, "error");
-  assert.strictEqual(record.exitCode, 0);
-  assert.strictEqual(record.failureKind, "quota");
-  assert.strictEqual(record.sessionId, "24242424-2424-7424-8424-242424242424");
-  assert.strictEqual(record.errorMessage, "HTTP 402 Payment Required: insufficient account credits");
-  assert.match(record.errorTail, /HTTP 402 Payment Required: insufficient account credits/);
-  assert.strictEqual(record.usageIsIncomplete, true);
-  assert.strictEqual(record.modelUsageIsIncomplete, true);
-  assert.strictEqual(record.usage.total_tokens, 30);
-});
-
-test("review preserves first attempt usage when the corrective retry cannot spawn", (t) => {
-  const sandbox = makeSandbox(t);
-  initFixtureRepo(sandbox.workDir);
-  const grokBin = path.join(sandbox.root, "self-deleting-grok.mjs");
-  const usage = {
-    input_tokens: 10,
-    cache_read_input_tokens: 2,
-    output_tokens: 3,
-    reasoning_tokens: 1,
-    total_tokens: 15,
-  };
-  const modelUsage = {
-    "grok-review": {
-      inputTokens: 10,
-      cacheReadInputTokens: 2,
-      outputTokens: 3,
-      reasoningTokens: 1,
-      totalTokens: 15,
-    },
-  };
-  const response = `${JSON.stringify({
-    text: "```markdown\nI could not produce the requested object, sorry.\n```",
+  const grokBin = writeEnvelopeGrok(sandbox, "background-invalid-review", {
+    text: "I could not produce the requested object.",
+    structuredOutput: null,
+    structuredOutputError: "output does not match the required schema",
     stopReason: "EndTurn",
-    sessionId: "25252525-2525-7525-8525-252525252525",
-    usage,
-    modelUsage,
-    usage_is_incomplete: true,
-  })}\n`;
-  fs.writeFileSync(
-    grokBin,
-    `#!/usr/bin/env node\nimport fs from "node:fs";\nfs.unlinkSync(process.argv[1]);\nprocess.stdout.write(${JSON.stringify(response)});\n`,
-    "utf8",
-  );
-  fs.chmodSync(grokBin, 0o755);
-
+    sessionId: "45454545-4545-7545-8545-454545454545",
+    requestId: "req-background-invalid"
+  });
   const env = envFor(sandbox, { GROK_BIN: grokBin });
-  const result = runCompanion(["review"], { cwd: sandbox.workDir, env });
-  assert.notStrictEqual(result.status, 0);
-  assert.match(result.stderr, /^failure: missing_cli$/m);
-
-  const [record] = jobRecords(sandbox.dataDir);
-  assert.strictEqual(record.status, "error");
-  assert.strictEqual(record.failureKind, "missing_cli");
-  assert.strictEqual(record.sessionId, "25252525-2525-7525-8525-252525252525");
-  assert.deepStrictEqual(record.usage, usage);
-  assert.deepStrictEqual(record.modelUsage, modelUsage);
-  assert.strictEqual(record.usageIsIncomplete, true);
-  assert.strictEqual(record.modelUsageIsIncomplete, true);
-
-  const statsResult = runCompanion(["stats", "--json"], { cwd: sandbox.workDir, env });
-  assert.strictEqual(statsResult.status, 0, statsResult.stderr);
-  const stats = JSON.parse(statsResult.stdout);
-  assert.strictEqual(stats.usage, null);
-  assert.strictEqual(stats.usageCoverage.incompleteJobs, 1);
-});
-
-test("background review records twice malformed output as an error", async (t) => {
-  const sandbox = makeSandbox(t);
-  initFixtureRepo(sandbox.workDir);
-  const env = envFor(sandbox, { FAKE_GROK_MODE: "badjson" });
   const launch = runCompanion(["review", "--background"], { cwd: sandbox.workDir, env });
   assert.strictEqual(launch.status, 0, launch.stderr);
   const record = await waitFor(() => {
     const current = jobRecords(sandbox.dataDir)[0];
     return current?.status === "error" ? current : null;
   });
+  assert.strictEqual(readInvocations(sandbox.argsFile).length, 1);
   assert.strictEqual(record.failureKind, "error");
-  assert.ok(record.resultText.includes("I still cannot produce the requested object."));
-  assert.match(record.errorMessage, /failed validation after one corrective retry/);
+  assert.ok(record.resultText.includes("I could not produce the requested object."));
+  assert.match(record.errorMessage, /failed validation: output does not match the required schema/);
 });
 
 test("review worker preserves a running cleanup-required record without launching Grok", (t) => {
@@ -356,8 +320,4 @@ test("review worker preserves a running cleanup-required record without launchin
   assert.strictEqual(record.cleanupRequired, true);
   assert.strictEqual(record.grokPid, 987654);
   assert.strictEqual(fs.existsSync(sandbox.argsFile), false);
-});
-
-test("review output contract is enforced by validateReviewOutput instead of a schema file", () => {
-  assert.ok(!fs.existsSync(path.join(repoRoot, "plugins", "grok", "schemas", "review-output.schema.json")));
 });

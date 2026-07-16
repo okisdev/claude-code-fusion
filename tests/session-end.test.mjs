@@ -1,6 +1,7 @@
 import assert from "node:assert";
 import { spawn, spawnSync } from "node:child_process";
 import { once } from "node:events";
+import fs from "node:fs";
 import path from "node:path";
 import { test } from "node:test";
 import { envFor, jobRecords, killGroups, makeSandbox, pidAlive, repoRoot, runCompanion, stateModulePath, waitFor } from "./lib/companion-harness.mjs";
@@ -8,14 +9,58 @@ import { envFor, jobRecords, killGroups, makeSandbox, pidAlive, repoRoot, runCom
 const sessionEndHook = path.join(repoRoot, "plugins", "grok", "scripts", "session-end-hook.mjs");
 const { createJobRecord, generateJobId, jobFilePath, writeBrief, writeJobRecordFile } = await import(stateModulePath);
 
+function createRawTransport(t, sandbox, sessionId) {
+  const created = runCompanion(["transport-create"], {
+    cwd: sandbox.workDir,
+    env: envFor(sandbox, { CLAUDE_CODE_SESSION_ID: sessionId }),
+  });
+  assert.strictEqual(created.status, 0, created.stderr);
+  const transport = JSON.parse(created.stdout);
+  const directory = path.dirname(transport.file);
+  fs.writeFileSync(transport.file, `pending request for ${sessionId}`);
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+  return { ...transport, directory };
+}
+
+function runSessionEnd(sandbox, sessionId) {
+  return spawnSync(process.execPath, [sessionEndHook], {
+    input: JSON.stringify({ session_id: sessionId }),
+    env: { ...process.env, GROK_COMPANION_DATA: sandbox.dataDir },
+    encoding: "utf8",
+    timeout: 60000,
+  });
+}
+
+test("session end immediately removes fresh verified transports for the ending session", (t) => {
+  const sandbox = makeSandbox(t);
+  const transport = createRawTransport(t, sandbox, "session-ending");
+
+  const hook = runSessionEnd(sandbox, "session-ending");
+
+  assert.strictEqual(hook.status, 0, hook.stderr);
+  assert.strictEqual(fs.existsSync(transport.directory), false);
+});
+
+test("session end never removes verified transports owned by another session", (t) => {
+  const sandbox = makeSandbox(t);
+  const ending = createRawTransport(t, sandbox, "session-ending");
+  const other = createRawTransport(t, sandbox, "session-other");
+
+  const hook = runSessionEnd(sandbox, "session-ending");
+
+  assert.strictEqual(hook.status, 0, hook.stderr);
+  assert.strictEqual(fs.existsSync(ending.directory), false);
+  assert.strictEqual(fs.existsSync(other.directory), true);
+});
+
 test("session end hook cancels only running jobs owned by the exiting session", async (t) => {
   const sandbox = makeSandbox(t);
-  const launchA = runCompanion(["task", "hang for session a", "--background"], {
+  const launchA = runCompanion(["task", "--background", "hang for session a"], {
     cwd: sandbox.workDir,
     env: envFor(sandbox, { FAKE_GROK_MODE: "hang", CLAUDE_CODE_SESSION_ID: "session-A" }),
   });
   assert.strictEqual(launchA.status, 0, launchA.stderr);
-  const launchB = runCompanion(["task", "hang for session b", "--background"], {
+  const launchB = runCompanion(["task", "--background", "hang for session b"], {
     cwd: sandbox.workDir,
     env: envFor(sandbox, { FAKE_GROK_MODE: "hang", CLAUDE_CODE_SESSION_ID: "session-B" }),
   });

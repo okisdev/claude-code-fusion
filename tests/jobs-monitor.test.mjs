@@ -108,6 +108,9 @@ test("a pre-existing terminal job emits nothing on startup", async (t) => {
   const monitor = startMonitor(sandbox, envFor(sandbox));
   await new Promise((resolve) => setTimeout(resolve, 600));
   assert.deepStrictEqual(monitor.lines(), []);
+  const ledger = announcedPath(sandbox);
+  assert.strictEqual(fs.statSync(ledger).mode & 0o777, 0o600);
+  assert.strictEqual(fs.statSync(path.dirname(ledger)).mode & 0o777, 0o700);
 });
 
 test("a pre-existing uncollected managed job emits its fallback on startup", async (t) => {
@@ -129,7 +132,7 @@ test("a pre-existing uncollected managed job emits its fallback on startup", asy
 test("a background job transitioning to done emits exactly one correctly shaped line", async (t) => {
   const sandbox = makeSandbox(t);
   const { file, record } = seedJob(sandbox, { status: "running", background: true });
-  const monitor = startMonitor(sandbox, envFor(sandbox));
+  const monitor = startMonitor(sandbox, envFor(sandbox, { GROK_JOBS_MONITOR_INTERVAL_MS: "100" }));
   await new Promise((resolve) => setTimeout(resolve, 300));
   assert.deepStrictEqual(monitor.lines(), []);
 
@@ -140,7 +143,7 @@ test("a background job transitioning to done emits exactly one correctly shaped 
     resultText: "ALLOW",
   });
 
-  const lines = await waitUntil(() => (monitor.lines().length > 0 ? monitor.lines() : null));
+  const lines = await waitUntil(() => (monitor.lines().length > 0 ? monitor.lines() : null), { timeoutMs: 15000 });
   assert.strictEqual(lines.length, 1);
   assert.strictEqual(
     lines[0],

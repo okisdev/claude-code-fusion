@@ -57,7 +57,7 @@ test("a sandbox downgrade warning fails closed even with a valid result envelope
   assert.match(result.stderr, /sandbox enforcement failed/i);
   const [record] = jobRecords(sandbox.dataDir);
   assert.strictEqual(record.status, "error");
-  assert.strictEqual(record.failureKind, "error");
+  assert.strictEqual(record.failureKind, "sandbox");
   assert.strictEqual(fs.existsSync(sentinel), false);
 });
 
@@ -74,7 +74,14 @@ test("resume last rejects another Claude session's finished job", (t) => {
       briefFile,
       background: false,
       claudeSessionId: "claude-other",
-      request: { sandboxProfile: "strict" },
+      jobClass: "task",
+      request: {
+        model: null,
+        effort: null,
+        web: false,
+        resumeSessionId: null,
+        sandboxProfile: "strict",
+      },
     }),
     status: "done",
     finishedAt: nowIso(),
@@ -89,7 +96,7 @@ test("resume last rejects another Claude session's finished job", (t) => {
   });
 
   assert.notStrictEqual(result.status, 0);
-  assert.match(result.stderr, /No finished consult grok job with a compatible sandbox was found for Claude session claude-current/);
+  assert.match(result.stderr, /No finished consult grok task with a compatible sandbox and memory mode was found for Claude session claude-current/);
   assert.strictEqual(jobRecords(sandbox.dataDir).length, 1);
 });
 
@@ -106,7 +113,14 @@ test("a running resume owns the workspace session lease and a terminal owner can
       cwd: sandbox.workDir,
       briefFile: sourceBrief,
       background: false,
-      request: { sandboxProfile: "strict" },
+      jobClass: "task",
+      request: {
+        model: null,
+        effort: null,
+        web: false,
+        resumeSessionId: null,
+        sandboxProfile: "strict",
+      },
     }),
     status: "done",
     finishedAt: nowIso(),
@@ -116,7 +130,7 @@ test("a running resume owns the workspace session lease and a terminal owner can
   });
 
   const hangingEnv = envFor(sandbox, { FAKE_GROK_MODE: "hang" });
-  const launch = runCompanion(["task", "first resume", "--resume", sessionId, "--background"], {
+  const launch = runCompanion(["task", "--resume", sessionId, "--background", "first resume"], {
     cwd: sandbox.workDir,
     env: hangingEnv,
   });
@@ -131,7 +145,7 @@ test("a running resume owns the workspace session lease and a terminal owner can
     killGroups(running.pid);
   });
 
-  const blocked = runCompanion(["task", "second resume", "--resume", sessionId], {
+  const blocked = runCompanion(["task", "--resume", sessionId, "second resume"], {
     cwd: sandbox.workDir,
     env: envFor(sandbox, { FAKE_GROK_MODE: "hang", GROK_COMPANION_TIMEOUT_MS: "1000" }),
   });
@@ -147,7 +161,7 @@ test("a running resume owns the workspace session lease and a terminal owner can
   assert.strictEqual(cancel.status, 0, cancel.stderr);
   await waitFor(() => jobRecords(sandbox.dataDir).find((record) => record.id === running.id && record.status === "cancelled"));
 
-  const resumed = runCompanion(["task", "third resume", "--resume", sessionId], {
+  const resumed = runCompanion(["task", "--resume", sessionId, "third resume"], {
     cwd: sandbox.workDir,
     env: envFor(sandbox),
   });
@@ -172,7 +186,7 @@ test("foreground task exits nonzero when grok fails", (t) => {
 test("background task creates a job record and result prints the finished output", async (t) => {
   const sandbox = makeSandbox(t);
   const env = envFor(sandbox, { CLAUDE_CODE_SESSION_ID: "claude-session-test" });
-  const result = runCompanion(["task", "background work", "--background"], {
+  const result = runCompanion(["task", "--background", "background work"], {
     cwd: sandbox.workDir,
     env,
   });
@@ -209,7 +223,7 @@ test("background task creates a job record and result prints the finished output
 test("result --wait on a background task returns the terminal output", async (t) => {
   const sandbox = makeSandbox(t);
   const env = envFor(sandbox, { GROK_COMPANION_WAIT_POLL_MS: "10" });
-  const launch = runCompanion(["task", "background wait work", "--background"], {
+  const launch = runCompanion(["task", "--background", "background wait work"], {
     cwd: sandbox.workDir,
     env,
   });
@@ -231,7 +245,7 @@ test("collecting a managed background result records owner delivery", async (t) 
     GROK_COMPANION_BACKGROUND_DELIVERY: "managed",
     GROK_COMPANION_WAIT_POLL_MS: "10",
   });
-  const launch = runCompanion(["task", "managed background work", "--background"], {
+  const launch = runCompanion(["task", "--background", "managed background work"], {
     cwd: sandbox.workDir,
     env,
   });
@@ -255,7 +269,7 @@ test("managed JSON task collection preserves the terminal task envelope", async 
     GROK_COMPANION_BACKGROUND_DELIVERY: "managed",
     GROK_COMPANION_WAIT_POLL_MS: "10",
   });
-  const launch = runCompanion(["task", "managed JSON work", "--background", "--json"], {
+  const launch = runCompanion(["task", "--background", "--json", "managed JSON work"], {
     cwd: sandbox.workDir,
     env,
   });
@@ -272,16 +286,29 @@ test("managed JSON task collection preserves the terminal task envelope", async 
   const payload = JSON.parse(result.stdout);
   assert.deepStrictEqual(Object.keys(payload).sort(), [
     "background",
+    "costIsPartial",
+    "delivery",
+    "deliveryStatus",
     "exitCode",
     "failureKind",
+    "jobClass",
     "jobId",
+    "memoryEnabled",
     "mode",
     "modelUsage",
     "modelUsageIsIncomplete",
+    "numTurns",
+    "requestId",
+    "resolvedEffort",
+    "resolvedModel",
+    "semanticStatus",
     "sessionId",
     "status",
     "stopReason",
     "text",
+    "totalCostUsd",
+    "totalCostUsdTicks",
+    "transportStatus",
     "usage",
     "usageIsIncomplete",
   ]);
@@ -294,6 +321,53 @@ test("managed JSON task collection preserves the terminal task envelope", async 
   assert.ok(record.deliveryCollectedAt);
 });
 
+test("legacy stored JSON results receive current derived class and memory fields", (t) => {
+  const sandbox = makeSandbox(t);
+  const jobId = generateJobId();
+  const briefFile = writeBrief(sandbox.dataDir, sandbox.workDir, jobId, "legacy stored result");
+  writeJobRecordFile(jobFilePath(sandbox.dataDir, sandbox.workDir, jobId), {
+    ...createJobRecord({
+      id: jobId,
+      pid: null,
+      mode: "consult",
+      cwd: sandbox.workDir,
+      briefFile,
+      background: false,
+      jobClass: "task",
+      request: {
+        model: null,
+        effort: null,
+        web: false,
+        memory: false,
+        resumeSessionId: null,
+        sandboxProfile: "strict",
+        outputJson: true,
+      },
+    }),
+    status: "done",
+    finishedAt: nowIso(),
+    exitCode: 0,
+    sessionId: "21212121-2121-7121-8121-212121212121",
+    resultText: "legacy result",
+    resultPayload: {
+      jobId,
+      status: "done",
+      jobClass: "review",
+      memoryEnabled: true,
+      text: "legacy result",
+    },
+  });
+
+  const result = runCompanion(["result", jobId, "--json"], {
+    cwd: sandbox.workDir,
+    env: envFor(sandbox),
+  });
+  assert.strictEqual(result.status, 0, result.stderr);
+  const payload = JSON.parse(result.stdout);
+  assert.strictEqual(payload.jobClass, "task");
+  assert.strictEqual(payload.memoryEnabled, false);
+});
+
 test("managed JSON task failure preserves a typed terminal envelope", async (t) => {
   const sandbox = makeSandbox(t);
   const env = envFor(sandbox, {
@@ -301,7 +375,7 @@ test("managed JSON task failure preserves a typed terminal envelope", async (t) 
     GROK_COMPANION_BACKGROUND_DELIVERY: "managed",
     GROK_COMPANION_WAIT_POLL_MS: "10",
   });
-  const launch = runCompanion(["task", "managed JSON failure", "--background", "--json"], {
+  const launch = runCompanion(["task", "--background", "--json", "managed JSON failure"], {
     cwd: sandbox.workDir,
     env,
   });
@@ -330,7 +404,7 @@ test("managed JSON cancellation preserves a typed terminal envelope", async (t) 
     GROK_COMPANION_BACKGROUND_DELIVERY: "managed",
     GROK_COMPANION_WAIT_POLL_MS: "10",
   });
-  const launch = runCompanion(["task", "managed JSON cancellation", "--background", "--json"], {
+  const launch = runCompanion(["task", "--background", "--json", "managed JSON cancellation"], {
     cwd: sandbox.workDir,
     env,
   });
@@ -366,7 +440,7 @@ test("managed JSON process death preserves a typed terminal envelope", async (t)
     GROK_COMPANION_BACKGROUND_DELIVERY: "managed",
     GROK_COMPANION_WAIT_POLL_MS: "10",
   });
-  const launch = runCompanion(["task", "managed JSON process death", "--background", "--json"], {
+  const launch = runCompanion(["task", "--background", "--json", "managed JSON process death"], {
     cwd: sandbox.workDir,
     env,
   });
@@ -395,7 +469,7 @@ test("managed JSON process death preserves a typed terminal envelope", async (t)
 test("result --wait exits zero with a running state when its wait budget elapses", async (t) => {
   const sandbox = makeSandbox(t);
   const env = envFor(sandbox, { FAKE_GROK_MODE: "hang", GROK_COMPANION_WAIT_POLL_MS: "10" });
-  const launch = runCompanion(["task", "slow background wait", "--background"], {
+  const launch = runCompanion(["task", "--background", "slow background wait"], {
     cwd: sandbox.workDir,
     env,
   });
@@ -422,7 +496,7 @@ test("result --wait exits zero with a running state when its wait budget elapses
 
 test("background task failure ends in an error record", async (t) => {
   const sandbox = makeSandbox(t);
-  const result = runCompanion(["task", "doomed", "--background"], {
+  const result = runCompanion(["task", "--background", "doomed"], {
     cwd: sandbox.workDir,
     env: envFor(sandbox, { FAKE_GROK_MODE: "error" }),
   });
@@ -442,7 +516,7 @@ test("background task failure ends in an error record", async (t) => {
 test("a background task records its terminal failure when the job log is unwritable", async (t) => {
   const sandbox = makeSandbox(t);
   const env = envFor(sandbox, { FAKE_GROK_MODE: "delayed-stderr-hang" });
-  const launch = runCompanion(["task", "unwritable log", "--background"], {
+  const launch = runCompanion(["task", "--background", "unwritable log"], {
     cwd: sandbox.workDir,
     env,
   });
@@ -469,8 +543,10 @@ test("a background task records its terminal failure when the job log is unwrita
 
 test("cancel kills a hanging worker and its grok process and marks the record cancelled", async (t) => {
   const sandbox = makeSandbox(t);
-  const env = envFor(sandbox, { FAKE_GROK_MODE: "hang" });
-  const result = runCompanion(["task", "long running", "--background"], {
+  const tempDir = path.join(sandbox.root, "tmp");
+  fs.mkdirSync(tempDir);
+  const env = envFor(sandbox, { FAKE_GROK_MODE: "hang", TMPDIR: tempDir });
+  const result = runCompanion(["task", "--background", "long running"], {
     cwd: sandbox.workDir,
     env,
   });
@@ -505,6 +581,7 @@ test("cancel kills a hanging worker and its grok process and marks the record ca
     assert.strictEqual(fs.readFileSync(jobFile, "utf8"), snapshot);
   }
   assert.strictEqual(JSON.parse(snapshot).status, "cancelled");
+  assert.deepStrictEqual(fs.readdirSync(tempDir).filter((entry) => entry.startsWith("grok-companion-stdout-")), []);
   assert.match(
     cancelOutput.stdout,
     new RegExp(`Check /grok:status for the updated list\\.\\n\\njob: ${running.id}\\nstate: cancelled\\nfailure: cancelled\\n$`),
@@ -551,7 +628,7 @@ test("cancel kills a foreground grok and the record stays cancelled after the co
 test("cancel escalates to SIGKILL when grok ignores SIGTERM", async (t) => {
   const sandbox = makeSandbox(t);
   const env = envFor(sandbox, { FAKE_GROK_MODE: "hang-ignore-term" });
-  const result = runCompanion(["task", "stubborn work", "--background"], {
+  const result = runCompanion(["task", "--background", "stubborn work"], {
     cwd: sandbox.workDir,
     env,
   });
@@ -643,7 +720,7 @@ test("cancel keeps a legacy record running when graceful cleanup cannot be verif
 test("background timeout marks the record error and result reports the failure", async (t) => {
   const sandbox = makeSandbox(t);
   const env = envFor(sandbox, { FAKE_GROK_MODE: "hang", GROK_COMPANION_TIMEOUT_MS: "500" });
-  const result = runCompanion(["task", "slow work", "--background"], {
+  const result = runCompanion(["task", "--background", "slow work"], {
     cwd: sandbox.workDir,
     env,
   });
@@ -733,7 +810,7 @@ test("foreground spawn failure records an error instead of leaving the job runni
 
 test("background worker failures record a one line error summary", async (t) => {
   const sandbox = makeSandbox(t);
-  const launch = runCompanion(["task", "unlaunchable", "--background"], {
+  const launch = runCompanion(["task", "--background", "unlaunchable"], {
     cwd: sandbox.workDir,
     env: envFor(sandbox, { GROK_BIN: path.join(sandbox.root, "missing-grok") }),
   });
@@ -807,4 +884,18 @@ test("global id lookup rejects an ambiguous legacy collision", (t) => {
   });
   assert.strictEqual(scoped.status, 0, scoped.stderr);
   assert.match(scoped.stdout, /^state: done$/m);
+});
+
+test("job lookups reject identifiers outside the 128-bit lowercase hexadecimal format", (t) => {
+  const sandbox = makeSandbox(t);
+  for (const command of ["status", "result", "cancel"]) {
+    const result = runCompanion([command, "../../attacker", "--json"], {
+      cwd: sandbox.workDir,
+      env: envFor(sandbox),
+    });
+    assert.notStrictEqual(result.status, 0);
+    const payload = JSON.parse(result.stderr);
+    assert.strictEqual(payload.failureKind, "input");
+    assert.match(payload.message, /exactly 32 lowercase hexadecimal characters/);
+  }
 });

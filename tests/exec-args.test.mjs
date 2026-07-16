@@ -27,6 +27,10 @@ const { createJobRecord, jobFilePath, writeBrief, writeJobRecordFile } = await i
 const consultAllows = ["Read", "Grep"];
 const consultTools = "read_file,grep,list_dir";
 const consultWebTools = "read_file,grep,list_dir,web_search,web_fetch";
+const writeTools = "read_file,grep,list_dir,search_replace,run_terminal_cmd";
+const tournamentTools = `${writeTools},Agent`;
+const nonTournamentDisallowedTools = "Agent,search_tool,use_tool,ask_user_question";
+const tournamentDisallowedTools = "search_tool,use_tool,ask_user_question";
 
 const consultDenies = ["Edit", "Write", "Bash", "MCPTool(*)"];
 
@@ -34,6 +38,8 @@ const writeDenies = [
   "Bash(sudo*)",
   "Bash(rm -rf*)",
   "Bash(git push*)",
+  "Bash(gh*)",
+  "MCPTool(*)",
   "Bash(grok*)",
   "Bash(claude*)",
   "Bash(codex*)",
@@ -61,53 +67,67 @@ function seedFinishedSessionJob(sandbox, fields) {
       background: false,
       claudeSessionId: fields.claudeSessionId,
       createdAt: fields.createdAt,
+      jobClass: "task",
     }),
     status: "done",
     finishedAt: fields.finishedAt,
     sessionId: fields.sessionId,
     resultText: "done",
     request: {
+      model: null,
+      effort: null,
+      web: false,
+      resumeSessionId: null,
       sandboxProfile: Object.hasOwn(fields, "sandboxProfile")
         ? fields.sandboxProfile
-        : fields.mode === "write"
-          ? "workspace"
-          : "strict",
+        : "strict",
     },
   };
   writeJobRecordFile(jobFilePath(sandbox.dataDir, sandbox.workDir, fields.id), record);
 }
 
-test("help and runtime skill list cancel and setup flags", (t) => {
+test("help and runtime skill list history, cancel, and setup flags", (t) => {
   const sandbox = makeSandbox(t);
   const help = runCompanion(["--help"], { cwd: sandbox.workDir, env: envFor(sandbox) });
   assert.strictEqual(help.status, 0, help.stderr);
   assert.ok(help.stdout.includes("cancel <job-id> [--cwd <dir>] [--json]"));
-  assert.ok(help.stdout.includes("setup [--enable-stop-gate] [--disable-stop-gate] [--json]"));
+  assert.ok(help.stdout.includes("history [--all] [--limit <n>] [--cwd <dir>] [--json]"));
+  assert.ok(help.stdout.includes("setup [--continuity <manual|claude-session>] [--enable-stop-gate] [--disable-stop-gate] [--json]"));
   const skill = fs.readFileSync(cliRuntimeSkill, "utf8");
   assert.ok(skill.includes("status [job-id] [--cwd <dir>] [--json]"));
   assert.ok(skill.includes("cancel <job-id> [--cwd <dir>] [--json]"));
-  assert.ok(skill.includes("setup [--enable-stop-gate] [--disable-stop-gate] [--json]"));
+  assert.ok(skill.includes("history [--all] [--limit <n>] [--cwd <dir>] [--json]"));
+  assert.ok(skill.includes("setup [--continuity <manual|claude-session>] [--enable-stop-gate] [--disable-stop-gate] [--json]"));
 });
 
 test("consult task argv pins the strict sandbox and hard read-only tool surface", (t) => {
   const sandbox = makeSandbox(t);
-  const result = runCompanion(["task", "hello there"], { cwd: sandbox.workDir, env: envFor(sandbox) });
+  const stdinFile = path.join(sandbox.root, "consult-stdin.txt");
+  const result = runCompanion(["task", "hello there"], {
+    cwd: sandbox.workDir,
+    env: envFor(sandbox, { FAKE_GROK_STDIN_FILE: stdinFile }),
+  });
   assert.strictEqual(result.status, 0, result.stderr);
   const argv = singleInvocation(sandbox);
   const briefFile = flagValues(argv, "--prompt-file")[0];
-  assert.ok(briefFile, "Expected a --prompt-file argument.");
-  assert.ok(briefFile.startsWith(sandbox.dataDir), "Expected the brief to live under the data dir.");
-  assert.ok(fs.readFileSync(briefFile, "utf8").includes("hello there"));
+  assert.strictEqual(briefFile, "/dev/stdin");
+  assert.strictEqual(fs.readFileSync(stdinFile, "utf8"), "hello there");
   assert.ok(hasPair(argv, "--output-format", "json"));
   assert.ok(hasPair(argv, "--sandbox", "strict"));
+  assert.ok(argv.includes("--no-auto-update"));
   assert.ok(argv.includes("--no-subagents"));
   assert.ok(argv.includes("--disable-web-search"));
   assert.ok(hasPair(argv, "--max-turns", "25"));
   assert.ok(hasPair(argv, "--permission-mode", "default"));
   assert.ok(hasPair(argv, "--tools", consultTools));
-  assert.ok(hasPair(argv, "--disallowed-tools", "Agent"));
+  assert.ok(hasPair(argv, "--disallowed-tools", nonTournamentDisallowedTools));
   assert.deepStrictEqual([...flagValues(argv, "--allow")].sort(), [...consultAllows].sort());
-  assert.deepStrictEqual([...flagValues(argv, "--deny")].sort(), [...consultDenies].sort());
+  const denyRules = flagValues(argv, "--deny");
+  for (const rule of consultDenies) {
+    assert.ok(denyRules.includes(rule), rule);
+  }
+  assert.ok(denyRules.some((rule) => /Read\(.+\/auth\.json\)$/.test(rule)));
+  assert.ok(denyRules.includes("Read(**/.grok/sessions/**)"));
   assert.ok(!argv.includes("-m"), "Model must not be passed by default.");
   assert.ok(!argv.includes("--effort"), "Effort must not be passed by default.");
   assert.ok(!argv.includes("--always-approve"));
@@ -120,7 +140,7 @@ test("consult task argv pins the strict sandbox and hard read-only tool surface"
 
 test("model and effort are forwarded only when explicitly provided", (t) => {
   const sandbox = makeSandbox(t);
-  const result = runCompanion(["task", "hello", "--model", "grok-4-fast", "--effort", "high"], {
+  const result = runCompanion(["task", "--model", "grok-4-fast", "--effort", "high", "hello"], {
     cwd: sandbox.workDir,
     env: envFor(sandbox),
   });
@@ -132,7 +152,7 @@ test("model and effort are forwarded only when explicitly provided", (t) => {
 
 test("inline values split at the first equals sign", (t) => {
   const sandbox = makeSandbox(t);
-  const result = runCompanion(["task", "hello", "--model=grok=custom=latest"], {
+  const result = runCompanion(["task", "--model=grok=custom=latest", "hello"], {
     cwd: sandbox.workDir,
     env: envFor(sandbox),
   });
@@ -141,27 +161,52 @@ test("inline values split at the first equals sign", (t) => {
   assert.ok(hasPair(argv, "-m", "grok=custom=latest"));
 });
 
-test("write task argv includes always-approve and the six deny rules", (t) => {
+test("custom Grok homes with glob metacharacters fail before unsafe deny rules are built", () => {
+  assert.throws(
+    () => buildGrokArgs({ mode: "consult", cwd: "/tmp", env: { GROK_HOME: "/tmp/grok[prod" } }),
+    (error) => error?.failureKind === "setup" && /glob metacharacters/.test(error.message)
+  );
+});
+
+test("custom Grok homes with commas fail before unsafe deny rules are built", () => {
+  assert.throws(
+    () => buildGrokArgs({ mode: "consult", cwd: "/tmp", env: { GROK_HOME: "/tmp/grok,prod" } }),
+    (error) => error?.failureKind === "setup" && /cannot be denied safely/.test(error.message)
+  );
+});
+
+test("direct Grok argument construction omits unsupported no-auto-update", () => {
+  const argv = buildGrokArgs({ mode: "consult", cwd: "/tmp", capabilities: new Set() });
+  assert.ok(!argv.includes("--no-auto-update"));
+});
+
+test("write task argv includes its explicit tool surface, always-approve, and safety deny rules", (t) => {
   const sandbox = makeSandbox(t);
-  const result = runCompanion(["task", "change the code", "--write"], {
+  const result = runCompanion(["task", "--write", "change the code"], {
     cwd: sandbox.workDir,
     env: envFor(sandbox),
   });
   assert.strictEqual(result.status, 0, result.stderr);
   const argv = singleInvocation(sandbox);
   assert.ok(argv.includes("--always-approve"));
-  assert.ok(hasPair(argv, "--sandbox", "workspace"));
-  assert.ok(!argv.includes("--tools"));
-  assert.deepStrictEqual([...flagValues(argv, "--deny")].sort(), [...writeDenies].sort());
+  assert.ok(hasPair(argv, "--sandbox", "strict"));
+  assert.ok(hasPair(argv, "--tools", writeTools));
+  assert.ok(hasPair(argv, "--disallowed-tools", nonTournamentDisallowedTools));
+  const denyRules = flagValues(argv, "--deny");
+  for (const rule of writeDenies) {
+    assert.ok(denyRules.includes(rule), rule);
+  }
+  assert.ok(denyRules.some((rule) => /Read\(.+\/auth\.json\)$/.test(rule)));
+  assert.ok(denyRules.includes("Read(**/.grok/sessions/**)"));
   assert.ok(hasPair(argv, "--max-turns", "60"));
   assert.ok(argv.includes("--no-subagents"));
   assert.ok(!argv.includes("-m"));
   assert.ok(!argv.includes("--effort"));
 });
 
-test("best-of-n argv drops no-subagents, implies write mode, and keeps the denies", (t) => {
+test("best-of-n argv enables Agent, keeps meta tools disabled, implies write mode, and keeps the denies", (t) => {
   const sandbox = makeSandbox(t);
-  const result = runCompanion(["task", "compete on this", "--best-of-n", "2"], {
+  const result = runCompanion(["task", "--best-of-n", "2", "compete on this"], {
     cwd: sandbox.workDir,
     env: envFor(sandbox),
   });
@@ -169,12 +214,19 @@ test("best-of-n argv drops no-subagents, implies write mode, and keeps the denie
   const argv = singleInvocation(sandbox);
   assert.ok(hasPair(argv, "--best-of-n", "2"));
   assert.ok(!argv.includes("--no-subagents"));
+  assert.ok(hasPair(argv, "--tools", tournamentTools));
+  assert.ok(hasPair(argv, "--disallowed-tools", tournamentDisallowedTools));
   assert.ok(argv.includes("--always-approve"));
-  assert.deepStrictEqual([...flagValues(argv, "--deny")].sort(), [...writeDenies].sort());
+  const denyRules = flagValues(argv, "--deny");
+  for (const rule of writeDenies) {
+    assert.ok(denyRules.includes(rule), rule);
+  }
+  assert.ok(denyRules.includes("Read(**/.grok/auth.json)"));
 });
 
 test("resume maps to -r with the given session uuid", (t) => {
   const sandbox = makeSandbox(t);
+  const stdinFile = path.join(sandbox.root, "resume-stdin.txt");
   const uuid = "aaaaaaaa-aaaa-7aaa-8aaa-aaaaaaaaaaaa";
   seedFinishedSessionJob(sandbox, {
     id: "explicit-resume",
@@ -183,19 +235,23 @@ test("resume maps to -r with the given session uuid", (t) => {
     createdAt: "2026-01-01T00:00:00.000Z",
     finishedAt: "2026-01-01T00:01:00.000Z",
   });
-  const result = runCompanion(["task", "continue with the plan", "--resume", uuid], {
+  const result = runCompanion(["task", "--resume", uuid, "continue with the plan"], {
     cwd: sandbox.workDir,
-    env: envFor(sandbox, { CLAUDE_CODE_SESSION_ID: "claude-current" }),
+    env: envFor(sandbox, {
+      CLAUDE_CODE_SESSION_ID: "claude-current",
+      FAKE_GROK_STDIN_FILE: stdinFile,
+    }),
   });
   assert.strictEqual(result.status, 0, result.stderr);
   const argv = singleInvocation(sandbox);
   assert.ok(hasPair(argv, "-r", uuid));
-  const briefFile = flagValues(argv, "--prompt-file")[0];
-  assert.ok(fs.readFileSync(briefFile, "utf8").includes("continue with the plan"));
+  assert.strictEqual(flagValues(argv, "--prompt-file")[0], "/dev/stdin");
+  assert.strictEqual(fs.readFileSync(stdinFile, "utf8"), "continue with the plan");
 });
 
 test("resume without a prompt sends the pinned continuation text", (t) => {
   const sandbox = makeSandbox(t);
+  const stdinFile = path.join(sandbox.root, "promptless-resume-stdin.txt");
   const uuid = "bbbbbbbb-bbbb-7bbb-8bbb-bbbbbbbbbbbb";
   seedFinishedSessionJob(sandbox, {
     id: "promptless-resume",
@@ -206,18 +262,18 @@ test("resume without a prompt sends the pinned continuation text", (t) => {
   });
   const result = runCompanion(["task", "--resume", uuid], {
     cwd: sandbox.workDir,
-    env: envFor(sandbox, { CLAUDE_CODE_SESSION_ID: "claude-current" }),
+    env: envFor(sandbox, {
+      CLAUDE_CODE_SESSION_ID: "claude-current",
+      FAKE_GROK_STDIN_FILE: stdinFile,
+    }),
   });
   assert.strictEqual(result.status, 0, result.stderr);
   const argv = singleInvocation(sandbox);
   assert.ok(hasPair(argv, "-r", uuid));
-  const briefFile = flagValues(argv, "--prompt-file")[0];
-  assert.ok(
-    fs
-      .readFileSync(briefFile, "utf8")
-      .includes(
-        "Continue from the current thread state. Pick the next highest-value step and follow through until the task is resolved.",
-      ),
+  assert.strictEqual(flagValues(argv, "--prompt-file")[0], "/dev/stdin");
+  assert.strictEqual(
+    fs.readFileSync(stdinFile, "utf8"),
+    "Continue from the current thread state. Pick the next highest-value step and follow through until the task is resolved.",
   );
 });
 
@@ -244,7 +300,7 @@ test("resume last stays within the current Claude session and falls back only wi
   );
   assert.throws(
     () => resolveLastSessionId(sandbox.dataDir, sandbox.workDir, "claude-missing"),
-    /No finished consult grok job with a compatible sandbox was found for Claude session claude-missing/,
+    /No finished consult grok task with a compatible sandbox and memory mode was found for Claude session claude-missing/,
   );
   assert.strictEqual(
     resolveLastSessionId(sandbox.dataDir, sandbox.workDir, null),
@@ -316,13 +372,58 @@ test("known option tokens are rejected where a value is expected", (t) => {
   const result = runCompanion(["task", "--resume", "--resume-last"], { cwd: sandbox.workDir, env: envFor(sandbox) });
   assert.notStrictEqual(result.status, 0);
   assert.match(result.stderr, /^state: error$/m);
-  assert.match(result.stderr, /^failure: error$/m);
+  assert.match(result.stderr, /^failure: input$/m);
   assert.strictEqual(readInvocations(sandbox.argsFile).length, 0);
+});
+
+test("normal task arguments reject invalid booleans and unknown leading options", (t) => {
+  const invalidBoolean = makeSandbox(t);
+  const invalidBooleanResult = runCompanion(["task", "--background=maybe", "hello"], {
+    cwd: invalidBoolean.workDir,
+    env: envFor(invalidBoolean),
+  });
+  assert.notStrictEqual(invalidBooleanResult.status, 0);
+  assert.match(invalidBooleanResult.stderr, /Invalid boolean value for --background: maybe/);
+  assert.match(invalidBooleanResult.stderr, /^failure: input$/m);
+  assert.strictEqual(readInvocations(invalidBoolean.argsFile).length, 0);
+
+  const unknownOption = makeSandbox(t);
+  const unknownOptionResult = runCompanion(["task", "--backgroun", "hello"], {
+    cwd: unknownOption.workDir,
+    env: envFor(unknownOption),
+  });
+  assert.notStrictEqual(unknownOptionResult.status, 0);
+  assert.match(unknownOptionResult.stderr, /Unknown option --backgroun/);
+  assert.match(unknownOptionResult.stderr, /Use -- before prompt text that begins with a dash/);
+  assert.match(unknownOptionResult.stderr, /^failure: input$/m);
+  assert.strictEqual(readInvocations(unknownOption.argsFile).length, 0);
+});
+
+test("normal task option parsing stops at the prompt or an explicit delimiter", (t) => {
+  const suffix = makeSandbox(t);
+  const suffixStdin = path.join(suffix.root, "suffix-stdin.txt");
+  const suffixResult = runCompanion(["task", "explain", "--background", "without detaching"], {
+    cwd: suffix.workDir,
+    env: envFor(suffix, { FAKE_GROK_STDIN_FILE: suffixStdin }),
+  });
+  assert.strictEqual(suffixResult.status, 0, suffixResult.stderr);
+  assert.strictEqual(fs.readFileSync(suffixStdin, "utf8"), "explain --background without detaching");
+  assert.match(suffixResult.stdout, /^state: done$/m);
+
+  const delimited = makeSandbox(t);
+  const delimitedStdin = path.join(delimited.root, "delimited-stdin.txt");
+  const delimitedResult = runCompanion(["task", "--", "--background", "is prompt text"], {
+    cwd: delimited.workDir,
+    env: envFor(delimited, { FAKE_GROK_STDIN_FILE: delimitedStdin }),
+  });
+  assert.strictEqual(delimitedResult.status, 0, delimitedResult.stderr);
+  assert.strictEqual(fs.readFileSync(delimitedStdin, "utf8"), "--background is prompt text");
+  assert.match(delimitedResult.stdout, /^state: done$/m);
 });
 
 test("max-turns is overridable from the command line", (t) => {
   const sandbox = makeSandbox(t);
-  const result = runCompanion(["task", "hello", "--max-turns", "7"], {
+  const result = runCompanion(["task", "--max-turns", "7", "hello"], {
     cwd: sandbox.workDir,
     env: envFor(sandbox),
   });
@@ -333,7 +434,7 @@ test("max-turns is overridable from the command line", (t) => {
 
 test("best-of-n outside 2 to 10 is rejected", (t) => {
   const sandbox = makeSandbox(t);
-  const result = runCompanion(["task", "hello", "--best-of-n", "11"], { cwd: sandbox.workDir, env: envFor(sandbox) });
+  const result = runCompanion(["task", "--best-of-n", "11", "hello"], { cwd: sandbox.workDir, env: envFor(sandbox) });
   assert.notStrictEqual(result.status, 0);
   assert.match(result.stderr, /between 2 and 10/);
   assert.strictEqual(readInvocations(sandbox.argsFile).length, 0);
@@ -341,7 +442,7 @@ test("best-of-n outside 2 to 10 is rejected", (t) => {
 
 test("write task argv omits the gh read-only allow rules", (t) => {
   const sandbox = makeSandbox(t);
-  const result = runCompanion(["task", "change the code", "--write"], {
+  const result = runCompanion(["task", "--write", "change the code"], {
     cwd: sandbox.workDir,
     env: envFor(sandbox),
   });
@@ -367,18 +468,18 @@ test("NESTED_ENGINE_CLI_DENY_NAMES expands into write Bash denies", () => {
   );
 });
 
-test("consult denies every shell, MCP, and edit surface and removes subagents", () => {
+test("consult denies every shell, MCP, edit, delegation, and meta-tool surface", () => {
   const argv = buildArgv({ mode: "consult" });
   const denies = flagValues(argv, "--deny");
   for (const rule of ["Edit", "Write", "Bash", "MCPTool(*)"]) {
     assert.ok(denies.includes(rule), `Expected ${rule} in consult deny rules.`);
   }
-  assert.ok(hasPair(argv, "--disallowed-tools", "Agent"));
+  assert.ok(hasPair(argv, "--disallowed-tools", nonTournamentDisallowedTools));
 });
 
 test("web flag drops the web search disable and stays consult", (t) => {
   const sandbox = makeSandbox(t);
-  const result = runCompanion(["task", "research this", "--web"], { cwd: sandbox.workDir, env: envFor(sandbox) });
+  const result = runCompanion(["task", "--web", "research this"], { cwd: sandbox.workDir, env: envFor(sandbox) });
   assert.strictEqual(result.status, 0, result.stderr);
   const argv = singleInvocation(sandbox);
   assert.ok(!argv.includes("--disable-web-search"));
@@ -391,7 +492,7 @@ const consultWebAllows = ["WebSearch", "WebFetch"];
 
 test("consult with web true appends web tool allow rules", (t) => {
   const sandbox = makeSandbox(t);
-  const result = runCompanion(["task", "research this", "--web"], { cwd: sandbox.workDir, env: envFor(sandbox) });
+  const result = runCompanion(["task", "--web", "research this"], { cwd: sandbox.workDir, env: envFor(sandbox) });
   assert.strictEqual(result.status, 0, result.stderr);
   const argv = singleInvocation(sandbox);
   assert.deepStrictEqual(flagValues(argv, "--allow"), [...consultAllows, ...consultWebAllows]);
@@ -412,6 +513,8 @@ test("write mode never gains web tool allow rules", () => {
   for (const web of [true, false, undefined]) {
     const argv = buildArgv({ mode: "write", web });
     assert.strictEqual(flagValues(argv, "--allow").length, 0);
+    assert.ok(hasPair(argv, "--tools", web ? `${writeTools},web_search,web_fetch` : writeTools));
+    assert.ok(hasPair(argv, "--disallowed-tools", nonTournamentDisallowedTools));
     assert.ok(!argv.includes("WebSearch"));
     assert.ok(!argv.includes("WebFetch"));
     assert.ok(argv.includes("--always-approve"));

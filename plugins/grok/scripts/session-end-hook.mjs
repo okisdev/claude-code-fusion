@@ -2,6 +2,7 @@
 
 import fs from "node:fs";
 
+import { cleanupRawCommandTransportsForSession } from "./grok-companion.mjs";
 import { recordedProcessGroupsClean, terminateRecordedProcessGroups } from "./lib/grok-exec.mjs";
 import { SESSION_ID_ENV, listAllJobRecords, nowIso, resolveDataDir, updateJobRecordFileWithCurrent } from "./lib/state.mjs";
 
@@ -21,6 +22,7 @@ async function main() {
     return;
   }
 
+  cleanupRawCommandTransportsForSession(sessionId);
   const dataDir = resolveDataDir();
   for (const { record, file } of listAllJobRecords(dataDir)) {
     if (record.status !== "running" || record.claudeSessionId !== sessionId) {

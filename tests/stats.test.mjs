@@ -12,7 +12,7 @@ test("stats aggregates the workspace jobs as markdown and json", (t) => {
   const sandbox = makeSandbox(t);
   const env = envFor(sandbox);
   assert.strictEqual(seedJob(sandbox, sandbox.workDir, ["first job"], { FAKE_GROK_MODE: "usage-ok" }).status, 0);
-  assert.strictEqual(seedJob(sandbox, sandbox.workDir, ["second job", "--write"]).status, 0);
+  assert.strictEqual(seedJob(sandbox, sandbox.workDir, ["--write", "second job"]).status, 0);
   const rateLimited = seedJob(sandbox, sandbox.workDir, ["doomed"], { FAKE_GROK_MODE: "rate-limit-error" });
   assert.notStrictEqual(rateLimited.status, 0);
   const authFailed = seedJob(sandbox, sandbox.workDir, ["doomed too"], { FAKE_GROK_MODE: "auth-error" });
@@ -77,6 +77,7 @@ test("stats aggregates the workspace jobs as markdown and json", (t) => {
     total_tokens: 170,
   });
   assert.deepStrictEqual(Object.keys(usageRecord.modelUsage), ["grok-test-main", "grok-test-subagent"]);
+  assert.strictEqual(usageRecord.modelUsageIsIncomplete, false);
   assert.ok(typeof stats.meanWallClockSeconds === "number" && stats.meanWallClockSeconds >= 0);
   assert.ok(stats.earliestCreatedAt, "Expected earliestCreatedAt to be set.");
   assert.ok(stats.latestCreatedAt, "Expected latestCreatedAt to be set.");
@@ -109,6 +110,24 @@ test("stats --all spans every workspace while the default stays scoped", (t) => 
   assert.match(allReport.stdout, /Total jobs: 2/);
   assert.match(allReport.stdout, /Exact token usage coverage: unavailable \(0 complete, 0 incomplete, 2 unreported\)/);
   assert.match(allReport.stdout, /Token totals: unavailable/);
+});
+
+test("workspace stats never trusts a recorded cwd when refreshing jobs", (t) => {
+  const sandbox = makeSandbox(t);
+  const env = envFor(sandbox);
+  const seeded = seedJob(sandbox, sandbox.workDir, ["malformed cwd record"]);
+  assert.strictEqual(seeded.status, 0, seeded.stderr);
+  const [record] = jobRecords(sandbox.dataDir);
+  const file = jobFileFor(sandbox.dataDir, record.id);
+  fs.writeFileSync(file, `${JSON.stringify({ ...record, cwd: 42 }, null, 2)}\n`, "utf8");
+
+  const result = runCompanion(["stats", "--json"], {
+    cwd: sandbox.workDir,
+    env,
+  });
+  assert.strictEqual(result.status, 0, result.stderr);
+  assert.strictEqual(JSON.parse(result.stdout).totalJobs, 1);
+  assert.strictEqual(JSON.parse(fs.readFileSync(file, "utf8")).cwd, 42);
 });
 
 test("stats reclassifies legacy quota summaries without changing their records", (t) => {
@@ -223,6 +242,109 @@ test("stats excludes partial direct usage from exact totals", (t) => {
   assert.doesNotMatch(rendered.stdout, /total tokens: 15/);
 });
 
+test("stats excludes fractional and inconsistent token reports from exact totals", (t) => {
+  for (const [label, usage] of [
+    ["fractional", { input_tokens: 120, cache_read_input_tokens: 30, output_tokens: 20.5, reasoning_tokens: 5, total_tokens: 170.5 }],
+    ["inconsistent", { input_tokens: 120, cache_read_input_tokens: 30, output_tokens: 20, reasoning_tokens: 5, total_tokens: 169 }],
+    ["conflicting aliases", { input_tokens: 120, cache_read_input_tokens: 30, output_tokens: 20, outputTokens: 21, reasoning_tokens: 5, total_tokens: 170 }],
+    ["reasoning exceeds output", { input_tokens: 120, cache_read_input_tokens: 30, output_tokens: 20, reasoning_tokens: 21, total_tokens: 170 }]
+  ]) {
+    const sandbox = makeSandbox(t);
+    const env = envFor(sandbox);
+    assert.strictEqual(seedJob(sandbox, sandbox.workDir, [`${label} token usage`]).status, 0);
+    const [record] = jobRecords(sandbox.dataDir);
+    record.usage = usage;
+    record.modelUsage = null;
+    fs.writeFileSync(jobFileFor(sandbox.dataDir, record.id), `${JSON.stringify(record, null, 2)}\n`, "utf8");
+
+    const result = runCompanion(["stats", "--json"], { cwd: sandbox.workDir, env });
+    assert.strictEqual(result.status, 0, result.stderr);
+    const stats = JSON.parse(result.stdout);
+    assert.strictEqual(stats.usage, null);
+    assert.deepStrictEqual(stats.usageCoverage, {
+      availability: "unavailable",
+      completeJobs: 0,
+      incompleteJobs: 1,
+      unreportedJobs: 0
+    });
+  }
+});
+
+test("stats fail closed when individually safe token totals overflow during aggregation", (t) => {
+  const sandbox = makeSandbox(t);
+  const env = envFor(sandbox);
+  assert.strictEqual(seedJob(sandbox, sandbox.workDir, ["first large token report"]).status, 0);
+  assert.strictEqual(seedJob(sandbox, sandbox.workDir, ["second large token report"]).status, 0);
+  for (const record of jobRecords(sandbox.dataDir)) {
+    record.usage = {
+      input_tokens: 4_000_000_000_000_000,
+      cache_read_input_tokens: 0,
+      output_tokens: 1_000_000_000_000_000,
+      reasoning_tokens: 0,
+      total_tokens: 5_000_000_000_000_000
+    };
+    record.modelUsage = null;
+    fs.writeFileSync(jobFileFor(sandbox.dataDir, record.id), `${JSON.stringify(record, null, 2)}\n`, "utf8");
+  }
+
+  const json = runCompanion(["stats", "--json"], { cwd: sandbox.workDir, env });
+  assert.strictEqual(json.status, 0, json.stderr);
+  const stats = JSON.parse(json.stdout);
+  assert.strictEqual(stats.usage, null);
+  assert.strictEqual(stats.usageCoverage.availability, "overflow");
+  assert.strictEqual(stats.usageCoverage.aggregationOverflow, true);
+
+  const text = runCompanion(["stats"], { cwd: sandbox.workDir, env });
+  assert.strictEqual(text.status, 0, text.stderr);
+  assert.match(text.stdout, /Exact token usage coverage: overflow/);
+  assert.match(text.stdout, /Token totals: unavailable/);
+});
+
+test("stats fail closed when individually safe cost ticks overflow during aggregation", (t) => {
+  const sandbox = makeSandbox(t);
+  const env = envFor(sandbox);
+  assert.strictEqual(seedJob(sandbox, sandbox.workDir, ["first large cost"], { FAKE_GROK_MODE: "metrics-complete" }).status, 0);
+  assert.strictEqual(seedJob(sandbox, sandbox.workDir, ["second large cost"], { FAKE_GROK_MODE: "metrics-complete" }).status, 0);
+  for (const record of jobRecords(sandbox.dataDir)) {
+    record.totalCostUsdTicks = 5_000_000_000_000_000;
+    record.totalCostUsd = 500_000;
+    fs.writeFileSync(jobFileFor(sandbox.dataDir, record.id), `${JSON.stringify(record, null, 2)}\n`, "utf8");
+  }
+
+  const json = runCompanion(["stats", "--json"], { cwd: sandbox.workDir, env });
+  assert.strictEqual(json.status, 0, json.stderr);
+  const stats = JSON.parse(json.stdout);
+  assert.strictEqual(stats.headlessMetrics.exactCostJobs, 2);
+  assert.strictEqual(stats.headlessMetrics.costAggregationOverflow, true);
+  assert.strictEqual(stats.headlessMetrics.totalCostUsdTicks, null);
+  assert.strictEqual(stats.headlessMetrics.totalCostUsd, null);
+
+  const text = runCompanion(["stats"], { cwd: sandbox.workDir, env });
+  assert.strictEqual(text.status, 0, text.stderr);
+  assert.match(text.stdout, /Observed exact cost: unavailable \(aggregate ticks exceed the safe integer range\)/);
+});
+
+test("stats excludes exact cost when model usage is explicitly incomplete", (t) => {
+  const sandbox = makeSandbox(t);
+  const env = envFor(sandbox);
+  assert.strictEqual(seedJob(sandbox, sandbox.workDir, ["incomplete model usage cost"], { FAKE_GROK_MODE: "metrics-complete" }).status, 0);
+  const [record] = jobRecords(sandbox.dataDir);
+  record.modelUsageIsIncomplete = true;
+  fs.writeFileSync(jobFileFor(sandbox.dataDir, record.id), `${JSON.stringify(record, null, 2)}\n`, "utf8");
+
+  const result = runCompanion(["stats", "--json"], { cwd: sandbox.workDir, env });
+  assert.strictEqual(result.status, 0, result.stderr);
+  assert.deepStrictEqual(JSON.parse(result.stdout).headlessMetrics, {
+    turnsReportedJobs: 1,
+    totalTurns: 3,
+    exactCostJobs: 0,
+    partialCostJobs: 1,
+    unreportedCostJobs: 0,
+    totalCostUsd: 0,
+    totalCostUsdTicks: 0,
+  });
+});
+
 test("stats treats a full-shaped CLI usage report marked incomplete as incomplete", (t) => {
   const sandbox = makeSandbox(t);
   const env = envFor(sandbox);
@@ -232,8 +354,31 @@ test("stats treats a full-shaped CLI usage report marked incomplete as incomplet
   );
   const [record] = jobRecords(sandbox.dataDir);
   assert.strictEqual(record.usageIsIncomplete, true);
-  assert.strictEqual(record.modelUsageIsIncomplete, true);
+  assert.strictEqual(record.modelUsageIsIncomplete, false);
   assert.strictEqual(record.usage.total_tokens, 170);
+
+  const result = runCompanion(["stats", "--json"], { cwd: sandbox.workDir, env });
+  assert.strictEqual(result.status, 0, result.stderr);
+  const stats = JSON.parse(result.stdout);
+  assert.strictEqual(stats.usage, null);
+  assert.deepStrictEqual(stats.usageCoverage, {
+    availability: "unavailable",
+    completeJobs: 0,
+    incompleteJobs: 1,
+    unreportedJobs: 0,
+  });
+});
+
+test("partial unflagged CLI usage is recorded as incomplete", (t) => {
+  const sandbox = makeSandbox(t);
+  const env = envFor(sandbox);
+  assert.strictEqual(
+    seedJob(sandbox, sandbox.workDir, ["partial unflagged usage"], { FAKE_GROK_MODE: "usage-partial-unflagged" }).status,
+    0
+  );
+  const [record] = jobRecords(sandbox.dataDir);
+  assert.strictEqual(record.usageIsIncomplete, true);
+  assert.strictEqual(record.modelUsageIsIncomplete, true);
 
   const result = runCompanion(["stats", "--json"], { cwd: sandbox.workDir, env });
   assert.strictEqual(result.status, 0, result.stderr);
