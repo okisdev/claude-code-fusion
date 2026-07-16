@@ -4,7 +4,7 @@ This document is the canonical engine agnostic contract for companion plugins th
 
 ## Job records and lifecycle
 
-Every job record has exactly one lifecycle status: `running`, `done`, `error`, or `cancelled`. `running` means the companion accepted work and has not yet recorded a terminal outcome. `done` means the engine returned a successful result. `error` means the run failed with a typed `failureKind`. `cancelled` means cancellation was requested through the plugin, companion signal forwarding, or session cleanup and the companion recorded that as the terminal outcome. These are transport outcomes, not semantic acceptance. Fusion currently records semantic acceptance only for first party Codex companion jobs after the orchestrator collects and verifies a result; a terminal Codex job without that observation remains `unverified`. Grok lifecycle stats expose transport outcomes only and never imply semantic acceptance from `done`.
+Every job record has exactly one lifecycle status: `running`, `done`, `error`, or `cancelled`. `running` means the companion accepted work and has not yet recorded a terminal outcome. `done` means the engine returned a successful transport result. `error` means the run failed with a typed `failureKind`. `cancelled` means cancellation was requested through the plugin, companion signal forwarding, or session cleanup and the companion recorded that as the terminal outcome. Transport status, semantic acceptance, and delivery are independent dimensions. `semanticStatus` is `accepted`, `rejected`, or `unverified`; only the orchestrator can mark a deliverable accepted after checking its completion criteria. `delivery` identifies foreground, manual background, or managed background ownership, while `deliveryStatus` or a collection timestamp records whether the result crossed the companion boundary. A terminal job without explicit semantic evidence remains `unverified`.
 
 Terminal transport outcomes are immutable: once a record is `done`, `error`, or `cancelled`, later writes must preserve that outcome rather than replacing it with a racing worker result. An adapter may set a delivery or collection acknowledgement timestamp once after a successful result read, but that metadata update cannot change the terminal status, result, diagnostics, usage, or process evidence. Records carry the driving worker pid and the engine CLI child pid when those processes exist, so status and result commands can verify liveness and target cleanup at both layers. A companion that signals persisted process identifiers must also persist and verify process ownership identity, reject unsafe identifiers such as PID 1, and retain a retryable running cleanup state whenever verified termination does not complete. When the engine reports actual model or token usage, the companion may retain those structured fields and their upstream incompleteness marker on both successful and failed terminal records; aggregation must disclose complete, incomplete, and unreported coverage and must not estimate it. A partial usage object cannot enter exact totals through zero filling, a total derived from other fields, or a multi-attempt merge that fills one attempt's missing fields from another attempt. Record locks are recoverable. A lock that carries a verifiable owner identity is reclaimed only after the owner exits or its PID identity changes, and release must prove ownership so an earlier holder cannot remove a successor. An engine without verifiable process identity may retain a bounded stale age fallback in its own contract.
 
@@ -21,11 +21,13 @@ Foreground command output and completed background result output end with a cont
 ```text
 <engine>-session: <session>
 job: <id>
+delivery: foreground|manual|managed
+semantic: accepted|rejected|unverified
 state: done|error|cancelled
 failure: <kind>
 ```
 
-Successful outcomes include `state: done`. Failed outcomes include `state: error` and `failure: <kind>`. Cancelled outcomes include `state: cancelled` and `failure: cancelled`. A session line uses the lowercase engine id as the prefix, for example `<engine>-session: <session>`, and appears when the engine returned a resumable session id. A `job: <id>` line appears when a job record exists. Input validation failures that happen before job creation report `state: error` and `failure: input` without a job line. Other preflight failures retain their typed failure kind, such as `missing_cli`.
+Successful transport outcomes include `state: done`. Failed outcomes include `state: error` and `failure: <kind>`. Cancelled outcomes include `state: cancelled` and `failure: cancelled`. A session line uses the lowercase engine id as the prefix, for example `<engine>-session: <session>`, and appears when the engine returned a resumable session id. A `job: <id>` line appears when a job record exists. Adapters include `delivery` and `semantic` when those dimensions are available in their text protocol; structured JSON always keeps them separate from transport status. Input validation failures that happen before job creation report `state: error` and `failure: input` without a job line. Other preflight failures retain their typed failure kind, such as `missing_cli` or `setup`.
 
 ## Failure kinds
 
@@ -34,16 +36,17 @@ The shared failure kinds are:
 - `quota`: The engine reports quota exhaustion, insufficient credits or balance, a usage limit, or HTTP 402 Payment Required.
 - `auth`: The engine reports authentication or authorization failure, including login required failures that are not classified as quota.
 - `missing_cli`: The engine CLI cannot be found or launched.
+- `setup`: The installed CLI version or installation lacks a required adapter capability and fails capability preflight. Upgrade or repair the CLI and rerun the companion setup command; do not retry the unchanged task against the same incompatible surface.
 - `rate_limited`: The engine reports a rate limit, HTTP 429, or too many requests.
 - `timeout`: The companion timeout elapsed and the engine process group was terminated.
-- `error`: The engine or companion failed without a more specific classification, including invalid or missing engine output after a zero exit and structured output that remains invalid after its corrective retry.
+- `error`: The engine or companion failed without a more specific classification, including invalid or missing engine output after a zero exit and structured output that fails its adapter validation.
 - `permission`: A permission gate or sandbox rejected an engine action that the selected read only or write mode did not allow.
 - `cancelled`: The plugin cancel command, companion signal forwarding, or session cleanup intentionally marked the job cancelled.
 - `input`: The request was rejected before job creation, for example because the working directory was invalid.
 - `died`: The driving process exited without recording an outcome, or no driving pid or engine child pid was recorded before the pidless launcher grace window elapsed.
 - `resource`: The adapter rejected an artifact that exceeded a bounded resource limit or could not acquire an exclusive runtime resource, including because of an active session lease or an ambiguous legacy id.
 
-Engine adapters may define additional typed failure kinds beyond this shared set. The current Codex instance adds `protocol`, for a required structured lifecycle stream that was malformed, incomplete, or incompatible with the adapter, and `process`, for an engine process that exited because of an unexpected signal or other unrequested process termination.
+Engine adapters may define additional typed failure kinds beyond this shared set. The current Codex instance adds `protocol`, for a required structured lifecycle stream that was malformed, incomplete, or incompatible with the adapter, `process`, for an engine process that exited because of an unexpected signal or other unrequested process termination, and `policy`, for a forbidden Codex collaboration tool call. The Grok instance adds `sandbox`, for sandbox initialization or enforcement failure, `transport`, for prompt delivery or structured envelope failure, and `policy`, for missing positive tool-policy evidence or a fallback, unmappable, or unmatched tool-policy warning.
 
 ## Background jobs
 
