@@ -12,9 +12,13 @@ const DEFAULT_EVENTS_MAX_BYTES = 8 * 1024 * 1024;
 const DEFAULT_EVENT_LINE_MAX_BYTES = 1024 * 1024;
 const DEFAULT_PROMPT_MAX_BYTES = 4 * 1024 * 1024;
 const DEFAULT_RESULT_MAX_BYTES = 1024 * 1024;
+const DEFAULT_ROLLOUT_HEAD_MAX_BYTES = 8 * 1024 * 1024;
+const DEFAULT_ROLLOUT_TAIL_MAX_BYTES = 16 * 1024 * 1024;
+const MAX_ROLLOUT_SCAN_ENTRIES = 50000;
 const MAX_DIAGNOSTICS = 64;
 const MAX_DIAGNOSTIC_MESSAGE_BYTES = 4096;
 const EFFORT_PATTERN = /^[a-z][a-z0-9_-]{0,31}$/;
+const THREAD_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 const WEB_SEARCH_MODES = new Set(["disabled", "cached", "live"]);
 const PRIVATE_DIR_MODE = 0o700;
 const PRIVATE_FILE_MODE = 0o600;
@@ -149,7 +153,19 @@ function appendExplicitSettings(args, options, sandbox) {
 }
 
 function baseExecArgs(sandbox, options) {
-  const args = ["exec", "--json", "--sandbox", sandbox, "--config", 'approval_policy="never"'];
+  const args = [
+    "exec",
+    "--strict-config",
+    "--json",
+    "--sandbox",
+    sandbox,
+    "--config",
+    'approval_policy="never"',
+    "--disable",
+    "multi_agent",
+    "--disable",
+    "multi_agent_v2"
+  ];
   appendExplicitSettings(args, options, sandbox);
   return args;
 }
@@ -248,6 +264,203 @@ export function subtractUsage(endValue, startValue) {
   return result;
 }
 
+function observedString(value) {
+  return typeof value === "string" && value.trim() ? value.trim() : null;
+}
+
+function codexHome(env) {
+  const configured = observedString(env?.CODEX_HOME);
+  return path.resolve(configured ?? path.join(os.homedir(), ".codex"));
+}
+
+function recentRolloutDirectories(env) {
+  const sessions = path.join(codexHome(env), "sessions");
+  const directories = new Set([sessions, path.join(codexHome(env), "archived_sessions")]);
+  for (let offset = -2; offset <= 1; offset += 1) {
+    const date = new Date(Date.now() + offset * 24 * 60 * 60 * 1000);
+    directories.add(path.join(sessions, String(date.getFullYear()).padStart(4, "0"), String(date.getMonth() + 1).padStart(2, "0"), String(date.getDate()).padStart(2, "0")));
+    directories.add(path.join(sessions, String(date.getUTCFullYear()).padStart(4, "0"), String(date.getUTCMonth() + 1).padStart(2, "0"), String(date.getUTCDate()).padStart(2, "0")));
+  }
+  return [...directories];
+}
+
+function matchingRolloutInDirectory(directory, suffix) {
+  let latest = null;
+  try {
+    for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
+      if (!entry.isFile() || !entry.name.endsWith(suffix)) {
+        continue;
+      }
+      const file = path.join(directory, entry.name);
+      const stats = fs.statSync(file);
+      if (!latest || stats.mtimeMs > latest.mtimeMs) {
+        latest = { file, mtimeMs: stats.mtimeMs };
+      }
+    }
+  } catch {}
+  return latest;
+}
+
+function findRolloutPath(threadId, env, allowHistoricalScan = false) {
+  if (!THREAD_ID_PATTERN.test(threadId)) {
+    return null;
+  }
+  const suffix = `-${threadId}.jsonl`;
+  let latest = null;
+  for (const directory of recentRolloutDirectories(env)) {
+    const candidate = matchingRolloutInDirectory(directory, suffix);
+    if (candidate && (!latest || candidate.mtimeMs > latest.mtimeMs)) {
+      latest = candidate;
+    }
+  }
+  if (latest || !allowHistoricalScan) {
+    return latest?.file ?? null;
+  }
+  let scanned = 0;
+  for (const root of [path.join(codexHome(env), "sessions"), path.join(codexHome(env), "archived_sessions")]) {
+    const stack = [root];
+    while (stack.length > 0 && scanned < MAX_ROLLOUT_SCAN_ENTRIES) {
+      const directory = stack.pop();
+      let entries;
+      try {
+        entries = fs.readdirSync(directory, { withFileTypes: true }).sort((left, right) => right.name.localeCompare(left.name));
+      } catch {
+        continue;
+      }
+      for (const entry of entries) {
+        scanned += 1;
+        if (scanned > MAX_ROLLOUT_SCAN_ENTRIES) {
+          break;
+        }
+        const candidate = path.join(directory, entry.name);
+        if (entry.isDirectory()) {
+          stack.push(candidate);
+          continue;
+        }
+        if (!entry.isFile() || !entry.name.endsWith(suffix)) {
+          continue;
+        }
+        try {
+          const stats = fs.statSync(candidate);
+          if (!latest || stats.mtimeMs > latest.mtimeMs) {
+            latest = { file: candidate, mtimeMs: stats.mtimeMs };
+          }
+        } catch {}
+      }
+    }
+  }
+  return latest?.file ?? null;
+}
+
+function readFileSlice(descriptor, start, length) {
+  const buffer = Buffer.alloc(length);
+  const bytesRead = fs.readSync(descriptor, buffer, 0, length, start);
+  return buffer.subarray(0, bytesRead);
+}
+
+function completeJsonlLines(buffer, { dropLeading = false, dropTrailing = false } = {}) {
+  let start = 0;
+  let end = buffer.length;
+  if (dropLeading) {
+    const newline = buffer.indexOf(10);
+    start = newline === -1 ? buffer.length : newline + 1;
+  }
+  if (dropTrailing) {
+    const newline = buffer.lastIndexOf(10);
+    end = newline === -1 ? 0 : newline;
+  }
+  return buffer.subarray(start, Math.max(start, end)).toString("utf8").split("\n").filter(Boolean);
+}
+
+function boundedObservedText(value, maxBytes) {
+  const buffer = Buffer.from(String(value ?? ""));
+  return (buffer.length <= maxBytes ? buffer : buffer.subarray(0, maxBytes)).toString("utf8");
+}
+
+function rolloutLines(file, options = {}) {
+  const headMaxBytes = options.headMaxBytes ?? DEFAULT_ROLLOUT_HEAD_MAX_BYTES;
+  const tailMaxBytes = options.tailMaxBytes ?? DEFAULT_ROLLOUT_TAIL_MAX_BYTES;
+  let descriptor;
+  try {
+    descriptor = fs.openSync(file, "r");
+    const size = fs.fstatSync(descriptor).size;
+    if (size <= headMaxBytes + tailMaxBytes) {
+      return completeJsonlLines(readFileSlice(descriptor, 0, size));
+    }
+    const head = readFileSlice(descriptor, 0, headMaxBytes);
+    const tailStart = Math.max(headMaxBytes, size - tailMaxBytes);
+    const tail = readFileSlice(descriptor, tailStart, size - tailStart);
+    return [
+      ...completeJsonlLines(head, { dropTrailing: true }),
+      ...completeJsonlLines(tail, { dropLeading: true })
+    ];
+  } catch {
+    return [];
+  } finally {
+    if (descriptor !== undefined) {
+      fs.closeSync(descriptor);
+    }
+  }
+}
+
+export function recoverRolloutObservation(threadId, options = {}) {
+  const result = {
+    collaborationTool: null,
+    cumulativeTokenUsage: null,
+    found: false,
+    matchedTurn: false,
+    partialResultText: null,
+    resolvedEffort: null,
+    resolvedModel: null,
+    source: null
+  };
+  const file = options.file ?? findRolloutPath(threadId, options.env ?? process.env, options.allowHistoricalScan === true);
+  if (!file) {
+    return result;
+  }
+  result.found = true;
+  result.source = "local_rollout";
+  for (const line of rolloutLines(file, options)) {
+    let entry;
+    try {
+      entry = JSON.parse(line);
+    } catch {
+      continue;
+    }
+    const payload = entry?.payload;
+    const timestamp = Date.parse(entry?.timestamp ?? "");
+    const belongsToExecution = options.notBeforeMs == null || (Number.isFinite(timestamp) && timestamp >= options.notBeforeMs - 5000);
+    if (!belongsToExecution) {
+      continue;
+    }
+    if (entry?.type === "turn_context" && payload && typeof payload === "object") {
+      result.matchedTurn = true;
+      result.resolvedModel = observedString(payload.model) ?? result.resolvedModel;
+      result.resolvedEffort = observedString(payload.collaboration_mode?.settings?.reasoning_effort ?? payload.reasoning_effort ?? payload.model_reasoning_effort) ?? result.resolvedEffort;
+    }
+    if (entry?.type === "event_msg" && payload?.type === "token_count") {
+      result.matchedTurn = true;
+      result.cumulativeTokenUsage = normalizeCumulativeUsage(payload.info?.total_token_usage) ?? result.cumulativeTokenUsage;
+    }
+    if (entry?.type === "event_msg" && payload?.type === "agent_message" && typeof payload.message === "string") {
+      result.matchedTurn = true;
+      result.partialResultText = boundedObservedText(payload.message, options.resultMaxBytes ?? DEFAULT_RESULT_MAX_BYTES);
+    }
+    if (entry?.type === "response_item" && payload?.type === "message" && payload.role === "assistant" && Array.isArray(payload.content)) {
+      const text = payload.content.filter((item) => item?.type === "output_text" && typeof item.text === "string").map((item) => item.text).join("");
+      if (text) {
+        result.matchedTurn = true;
+        result.partialResultText = boundedObservedText(text, options.resultMaxBytes ?? DEFAULT_RESULT_MAX_BYTES);
+      }
+    }
+    if (entry?.type === "response_item" && ["custom_tool_call", "function_call"].includes(payload?.type) && ["spawn_agent", "spawn_agents_on_csv"].includes(payload?.name)) {
+      result.matchedTurn = true;
+      result.collaborationTool = payload.name;
+    }
+  }
+  return result;
+}
+
 function signalProcessTree(pid, signal, ownsProcessGroup) {
   if (!Number.isInteger(pid) || pid <= 1) {
     return false;
@@ -274,28 +487,69 @@ function signalProcessTree(pid, signal, ownsProcessGroup) {
   }
 }
 
+function linuxProcessState(pid) {
+  try {
+    const stat = fs.readFileSync(`/proc/${pid}/stat`, "utf8");
+    const commandEnd = stat.lastIndexOf(")");
+    if (commandEnd === -1) {
+      return null;
+    }
+    const fields = stat.slice(commandEnd + 2).trim().split(/\s+/);
+    return { state: fields[0] ?? null, pgrp: fields[2] ?? null };
+  } catch {
+    return null;
+  }
+}
+
+function linuxProcessGroupHasLiveMember(pgid) {
+  let entries;
+  try {
+    entries = fs.readdirSync("/proc");
+  } catch {
+    return true;
+  }
+  for (const entry of entries) {
+    if (!/^\d+$/.test(entry)) {
+      continue;
+    }
+    const info = linuxProcessState(Number(entry));
+    if (info && Number(info.pgrp) === pgid && info.state !== "Z") {
+      return true;
+    }
+  }
+  return false;
+}
+
 function directProcessAlive(pid) {
   if (!Number.isInteger(pid) || pid <= 1) {
     return false;
   }
   try {
     process.kill(pid, 0);
-    return true;
   } catch (error) {
     return error?.code === "EPERM";
   }
+  return process.platform !== "linux" || linuxProcessState(pid)?.state !== "Z";
 }
 
 function processGroupAlive(pid) {
   if (process.platform === "win32" || !Number.isInteger(pid) || pid <= 1) {
     return false;
   }
+  let groupSignalable;
   try {
     process.kill(-pid, 0);
-    return true;
+    groupSignalable = true;
   } catch (error) {
-    return error?.code === "EPERM";
+    if (error?.code === "EPERM") {
+      return true;
+    }
+    groupSignalable = false;
   }
+  if (!groupSignalable || process.platform !== "linux") {
+    return groupSignalable;
+  }
+  return linuxProcessGroupHasLiveMember(pid);
 }
 
 function digest(value) {
@@ -412,18 +666,10 @@ export function isProcessAlive(pid, identity = null, ownsProcessGroup = true) {
   if (identity != null) {
     return processIdentityMatches(pid, identity);
   }
-  const targets = process.platform === "win32" || !ownsProcessGroup ? [pid] : [-pid, pid];
-  for (const target of targets) {
-    try {
-      process.kill(target, 0);
-      return true;
-    } catch (error) {
-      if (error?.code === "EPERM") {
-        return true;
-      }
-    }
+  if (process.platform === "win32" || !ownsProcessGroup) {
+    return directProcessAlive(pid);
   }
-  return false;
+  return directProcessAlive(pid) || processGroupAlive(pid);
 }
 
 function processTargetAlive(pid, identity, ownsProcessGroup) {
@@ -443,6 +689,27 @@ function wait(ms) {
 
 function waitSync(ms) {
   Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
+async function settleProcessIdentity(pid, options = {}) {
+  const retries = options.retries ?? 40;
+  const intervalMs = options.intervalMs ?? 4;
+  let previous = getProcessIdentity(pid);
+  if (!previous) {
+    return previous;
+  }
+  for (let attempt = 0; attempt < retries; attempt += 1) {
+    await wait(intervalMs);
+    const current = getProcessIdentity(pid);
+    if (!current) {
+      return current;
+    }
+    if (identitiesMatch(current, previous)) {
+      return current;
+    }
+    previous = current;
+  }
+  return previous;
 }
 
 export async function terminateProcessTree(pid, options = {}) {
@@ -639,6 +906,7 @@ function outputPaths(options) {
 
 function checkpointState(state, event = null) {
   return {
+    collaborationViolation: state.collaborationViolation,
     event,
     eventCount: state.eventCount,
     threadId: state.threadId,
@@ -748,6 +1016,10 @@ function validateEvent(state, event) {
         recordProtocolError(state, `Codex ${event.type} contained an invalid item.`);
         break;
       }
+      if (event.item.type === "collab_tool_call") {
+        const tool = observedString(event.item.tool) ?? "unknown collaboration tool";
+        state.collaborationViolation = `Delegated Codex execution attempted the disabled ${tool} tool.`;
+      }
       if (event.type === "item.completed" && event.item.type === "agent_message" && typeof event.item.text === "string") {
         if (Buffer.byteLength(event.item.text) > state.resultMaxBytes) {
           recordResourceError(state, `Codex final response exceeded the ${state.resultMaxBytes} byte limit.`);
@@ -825,6 +1097,9 @@ function failureOutcome(state, processOutcome, stderrTail) {
       errorMessage: processOutcome.spawnError.message
     };
   }
+  if (state.collaborationViolation) {
+    return { status: "error", failureKind: "policy", errorMessage: state.collaborationViolation };
+  }
   if (state.timedOut) {
     return { status: "error", failureKind: "timeout", errorMessage: `Codex timed out after ${state.timeoutMs}ms.` };
   }
@@ -860,6 +1135,7 @@ function failureOutcome(state, processOutcome, stderrTail) {
 }
 
 export async function runCodex(options = {}) {
+  const executionStartedAtMs = Date.now();
   const env = options.env ?? process.env;
   const bin = resolveCodexBin({ ...options, env });
   const args = [...(options.args ?? buildTaskArgs(options))];
@@ -900,6 +1176,7 @@ export async function runCodex(options = {}) {
     callbackError: null,
     cancelled: false,
     cleanupComplete: true,
+    collaborationViolation: null,
     cumulativeTokenUsage: null,
     cumulativeUsageUnavailableReason: null,
     diagnostics: [],
@@ -912,6 +1189,9 @@ export async function runCodex(options = {}) {
     resumeThreadMismatch: false,
     resultSource: null,
     resultMaxBytes,
+    resolvedEffort: null,
+    resolvedModel: null,
+    rolloutRecoveryStatus: "not_attempted",
     terminalEvent: null,
     threadId: null,
     threadStarted: false,
@@ -998,6 +1278,19 @@ export async function runCodex(options = {}) {
   } else if (state.cancelled) {
     void requestTermination();
   }
+  const identitySettlePromise = childIdentity
+    ? settleProcessIdentity(child.pid).then(async (settled) => {
+        if (settled) {
+          childIdentity = settled;
+        }
+        try {
+          await options.onIdentitySettled?.(child.pid ?? null, childIdentity);
+        } catch (error) {
+          state.callbackError = error instanceof Error ? error : new Error(String(error));
+          void requestTermination();
+        }
+      })
+    : Promise.resolve();
   child.once("error", (error) => {
     spawnError = error;
   });
@@ -1103,7 +1396,7 @@ export async function runCodex(options = {}) {
       return;
     }
     validateEvent(state, event);
-    if (state.protocolError || state.resourceError) {
+    if (state.protocolError || state.resourceError || state.collaborationViolation) {
       void requestTermination();
     }
     try {
@@ -1165,6 +1458,7 @@ export async function runCodex(options = {}) {
   try {
     await stdinSettled;
     await parsePromise;
+    await identitySettlePromise;
     if (terminationPromise) {
       await terminationPromise;
     }
@@ -1187,7 +1481,33 @@ export async function runCodex(options = {}) {
       recordProtocolError(state, "Codex reached EOF without a terminal turn event.");
     }
   }
+  if (state.threadId) {
+    const recovered = recoverRolloutObservation(state.threadId, {
+      allowHistoricalScan: options.resumeThreadId != null,
+      env,
+      notBeforeMs: executionStartedAtMs,
+      resultMaxBytes
+    });
+    state.rolloutRecoveryStatus = recovered.matchedTurn ? "recovered" : recovered.found ? "stale" : "not_found";
+    state.resolvedModel = recovered.resolvedModel;
+    state.resolvedEffort = recovered.resolvedEffort;
+    if (recovered.cumulativeTokenUsage && (!state.cumulativeTokenUsage || state.timedOut || state.cancelled)) {
+      state.cumulativeTokenUsage = recovered.cumulativeTokenUsage;
+      state.cumulativeUsageUnavailableReason = null;
+    }
+    if (!state.finalResponse && (state.timedOut || state.cancelled) && recovered.partialResultText) {
+      state.finalResponse = recovered.partialResultText;
+      state.resultSource = "rollout_partial";
+    }
+    if (!state.collaborationViolation && recovered.collaborationTool) {
+      state.collaborationViolation = `Delegated Codex execution attempted the disabled ${recovered.collaborationTool} tool.`;
+    }
+  }
   const usage = usageOutcome(state, { ...options, args });
+  if ((state.timedOut || state.cancelled) && usage.tokenUsage) {
+    usage.tokenUsageAvailability = "partial";
+    usage.tokenUsageUnavailableReason = null;
+  }
   const stderrTail = stderr.toString("utf8");
   const failure = failureOutcome(state, { ...processOutcome, spawnError }, stderrTail);
   const rawErrorMessage = failure.errorMessage;
@@ -1206,11 +1526,18 @@ export async function runCodex(options = {}) {
     timedOut: state.timedOut,
     cancelled: state.cancelled,
     cleanupComplete: state.cleanupComplete,
+    collaborationViolation: state.collaborationViolation,
     threadId: state.threadId,
     terminalEvent: state.terminalEvent?.type ?? null,
     finalResponse: state.finalResponse,
+    partialResultText: state.timedOut || state.cancelled ? state.finalResponse || null : null,
     resultSource: state.resultSource,
     cumulativeTokenUsage: state.cumulativeTokenUsage,
+    resolvedEffort: state.resolvedEffort,
+    resolvedModel: state.resolvedModel,
+    rolloutRecoveryStatus: state.rolloutRecoveryStatus,
+    semanticStatus: state.collaborationViolation ? "rejected" : "unverified",
+    usageIsIncomplete: state.timedOut || state.cancelled || state.terminalEvent?.type !== "turn.completed",
     ...usage,
     eventCount: state.eventCount,
     eventsTruncated: state.eventsTruncated,

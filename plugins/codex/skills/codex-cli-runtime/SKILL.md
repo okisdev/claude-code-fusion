@@ -16,11 +16,14 @@ Subcommand surface:
 - `review [--scope <auto|working-tree|branch>] [--base <ref>] [--focus <text>] [--background] [--model <id>] [--effort <level>] [--cwd <dir>] [--json]`
 - `adversarial-review [--scope <auto|working-tree|branch>] [--base <ref>] [--focus <text>] [--background] [--model <id>] [--effort <level>] [--cwd <dir>] [--json]`
 - `status [job-id] [--all] [--cwd <dir>] [--json]`
+- `history [--json]`
 - `result <job-id> [--wait] [--wait-timeout-ms <ms>] [--cwd <dir>] [--json]`
 - `cancel <job-id> [--cwd <dir>] [--json]`
 - `setup [--cwd <dir>] [--json]`
 
 Execution rules:
+
+- Programmatic orchestrators pass the complete opaque raw request through stdin with `node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-companion.mjs" task --request-stdin`. A write default uses `task --transport-default-write --request-stdin`. The fixed argv contains no request bytes, and stdin must close after the complete request is written. The same ingress option works with review, status, result, cancel, history, and setup. Slash commands whose Bash tool has no stdin field keep using the private token staging compatibility path: `transport-create`, one Read of the allocated empty file, Write to that same file, then a fixed `--raw-args-token` invocation. Never delete, rename, recreate, or change the permissions of the transport file; use `transport-discard` when Read or Write fails or when the allocated file is not empty.
 
 - Invoke the helper only through foreground `Bash` with `timeout: 600000`.
 - Place every task option before the first prompt token. Use `--` before a prompt that begins with an option shaped token.
@@ -34,4 +37,6 @@ Execution rules:
 - Use `--web` only when explicitly requested. Use `--network` only with `--write` and only when explicitly requested.
 - `result --wait` performs a bounded wait. When the wait budget expires while the job is still active, it leaves the job unchanged and returns output ending in `job: <id>` and `state: running`.
 - Terminal output ends with the Codex thread identifier when available, the job identifier, and `state: done`, `state: error`, or `state: cancelled`. Error and cancelled outcomes also include a failure kind.
+- Every companion invocation disables Codex `multi_agent` and `multi_agent_v2` features. A collaboration tool event fails the job even if an upstream configuration bypasses those flags.
+- `history` reads only the current canonical state root and exposes thread, transport, delivery, semantic, resolved model, and resolved effort fields. Exec sessions remain persisted and resumable locally, but Codex Desktop does not guarantee sidebar visibility for them.
 - Return helper stdout exactly as received. Do not interpret it or replace a failed run with Claude-side work.

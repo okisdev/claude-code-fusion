@@ -82,6 +82,29 @@ function complete({ message = "Codex completed the task.", includeMessage = true
   emit({ type: "turn.completed", usage });
 }
 
+function writeRollout({ message = "Recovered partial Codex output." } = {}) {
+  if (!process.env.CODEX_HOME) {
+    return;
+  }
+  const now = new Date();
+  const directory = `${process.env.CODEX_HOME}/sessions/${String(now.getFullYear()).padStart(4, "0")}/${String(now.getMonth() + 1).padStart(2, "0")}/${String(now.getDate()).padStart(2, "0")}`;
+  fs.mkdirSync(directory, { recursive: true });
+  const file = `${directory}/rollout-test-${threadId}.jsonl`;
+  const entries = [
+    {
+      timestamp: now.toISOString(),
+      type: "turn_context",
+      payload: {
+        model: process.env.FAKE_CODEX_RESOLVED_MODEL || "gpt-resolved",
+        collaboration_mode: { settings: { reasoning_effort: process.env.FAKE_CODEX_RESOLVED_EFFORT || "xhigh" } }
+      }
+    },
+    { timestamp: now.toISOString(), type: "event_msg", payload: { type: "agent_message", message, phase: "commentary" } },
+    { timestamp: now.toISOString(), type: "event_msg", payload: { type: "token_count", info: { total_token_usage: usage } } }
+  ];
+  fs.writeFileSync(file, `${entries.map((entry) => JSON.stringify(entry)).join("\n")}\n`);
+}
+
 if (process.env.FAKE_CODEX_STDERR) {
   process.stderr.write(process.env.FAKE_CODEX_STDERR);
 }
@@ -92,6 +115,20 @@ if (process.env.FAKE_CODEX_READY_FILE) {
 switch (mode) {
   case "completed":
     start();
+    complete();
+    break;
+  case "rollout-completed":
+    start();
+    complete();
+    writeRollout({ message: "Codex completed the task." });
+    break;
+  case "transport-failure-completed":
+    start();
+    complete({ message: "The Codex companion could not start because its job log was blocked by EPERM: operation not permitted. No implementation result was produced." });
+    break;
+  case "collab-completed":
+    start();
+    emit({ type: "item.started", item: { id: "collab_1", type: "collab_tool_call", tool: "spawn_agent" } });
     complete();
     break;
   case "fallback":
@@ -151,6 +188,14 @@ switch (mode) {
     start();
     setInterval(() => {}, 1000);
     break;
+  case "rollout-timeout":
+    start();
+    process.on("SIGINT", () => {
+      writeRollout();
+      process.exit(0);
+    });
+    setInterval(() => {}, 1000);
+    break;
   case "ignore-term":
     start();
     process.on("SIGINT", () => {
@@ -163,6 +208,9 @@ switch (mode) {
         fs.writeFileSync(process.env.FAKE_CODEX_TERM_FILE, "received");
       }
     });
+    if (process.env.FAKE_CODEX_READY_FILE) {
+      fs.writeFileSync(process.env.FAKE_CODEX_READY_FILE, "ready");
+    }
     setInterval(() => {}, 1000);
     break;
   case "interrupt-cleanup": {
@@ -191,6 +239,9 @@ switch (mode) {
         fs.writeFileSync(process.env.FAKE_CODEX_TERM_FILE, "received");
       }
     });
+    if (process.env.FAKE_CODEX_READY_FILE) {
+      fs.writeFileSync(process.env.FAKE_CODEX_READY_FILE, "ready");
+    }
     setInterval(() => {}, 1000);
     break;
   }

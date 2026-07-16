@@ -182,11 +182,16 @@ test("task arguments enforce safe headless execution and put global flags before
   });
   assert.deepEqual(args, [
     "exec",
+    "--strict-config",
     "--json",
     "--sandbox",
     "workspace-write",
     "--config",
     'approval_policy="never"',
+    "--disable",
+    "multi_agent",
+    "--disable",
+    "multi_agent_v2",
     "--model",
     "gpt-test",
     "--config",
@@ -205,8 +210,22 @@ test("task arguments enforce safe headless execution and put global flags before
   assert.throws(() => buildTaskArgs({ approvalPolicy: "on-request" }), /must be never/);
 });
 
-test("task arguments leave model and effort unset while pinning networked tools off by default", () => {
-  assert.deepEqual(buildTaskArgs(), ["exec", "--json", "--sandbox", "read-only", "--config", 'approval_policy="never"', "--config", 'web_search="disabled"']);
+test("task arguments leave model and effort unset while pinning networked tools and internal agents off by default", () => {
+  assert.deepEqual(buildTaskArgs(), [
+    "exec",
+    "--strict-config",
+    "--json",
+    "--sandbox",
+    "read-only",
+    "--config",
+    'approval_policy="never"',
+    "--disable",
+    "multi_agent",
+    "--disable",
+    "multi_agent_v2",
+    "--config",
+    'web_search="disabled"'
+  ]);
   assert.match(buildTaskArgs({ effort: "ultra" }).join(" "), /model_reasoning_effort="ultra"/);
   assert.match(buildTaskArgs({ effort: "max" }).join(" "), /model_reasoning_effort="max"/);
   assert.match(buildTaskArgs({ write: true }).join(" "), /sandbox_workspace_write\.network_access=false/);
@@ -216,11 +235,16 @@ test("task arguments leave model and effort unset while pinning networked tools 
 test("native review is read-only and maps review targets", () => {
   assert.deepEqual(buildReviewArgs({ base: "main" }), [
     "exec",
+    "--strict-config",
     "--json",
     "--sandbox",
     "read-only",
     "--config",
     'approval_policy="never"',
+    "--disable",
+    "multi_agent",
+    "--disable",
+    "multi_agent_v2",
     "--config",
     'web_search="disabled"',
     "review",
@@ -229,11 +253,16 @@ test("native review is read-only and maps review targets", () => {
   ]);
   assert.deepEqual(buildReviewArgs(), [
     "exec",
+    "--strict-config",
     "--json",
     "--sandbox",
     "read-only",
     "--config",
     'approval_policy="never"',
+    "--disable",
+    "multi_agent",
+    "--disable",
+    "multi_agent_v2",
     "--config",
     'web_search="disabled"',
     "review",
@@ -307,6 +336,30 @@ test("completed execution persists raw JSONL, keeps the prompt on stdin, and che
   assert.equal(isProcessAlive(outcome.pid), false);
   assert.equal(await terminateProcessTree(outcome.pid, { identity: outcome.pidIdentity, ownsProcessGroup: true, requireIdentity: true }), true);
   assert.equal(terminateProcessTreeSync(outcome.pid, { identity: outcome.pidIdentity, ownsProcessGroup: true, requireIdentity: true }), true);
+});
+
+test("rollout observation records resolved model and effort without treating request overrides as observations", async (t) => {
+  const files = fixture(t);
+  const { outcome } = await runFixture(t, "rollout-completed", {
+    argOptions: { effort: "requested", model: "requested-model" },
+    env: {
+      CODEX_HOME: path.join(files.dir, "codex-home"),
+      FAKE_CODEX_RESOLVED_EFFORT: "xhigh",
+      FAKE_CODEX_RESOLVED_MODEL: "gpt-resolved"
+    }
+  });
+  assert.equal(outcome.status, "done");
+  assert.equal(outcome.resolvedModel, "gpt-resolved");
+  assert.equal(outcome.resolvedEffort, "xhigh");
+  assert.equal(outcome.rolloutRecoveryStatus, "recovered");
+});
+
+test("a collaboration tool event fails closed even when Codex emits a completed turn", async (t) => {
+  const { outcome } = await runFixture(t, "collab-completed");
+  assert.equal(outcome.status, "error");
+  assert.equal(outcome.failureKind, "policy");
+  assert.equal(outcome.semanticStatus, "rejected");
+  assert.match(outcome.collaborationViolation, /disabled spawn_agent tool/);
 });
 
 test("a successful leader exit cleans every remaining process in its owned group", async (t) => {
@@ -488,6 +541,31 @@ test("timeout terminates the process group", async (t) => {
   assert.equal(outcome.failureKind, "timeout");
   assert.equal(outcome.timedOut, true);
   assert.equal(isProcessAlive(outcome.pid), false);
+});
+
+test("timeout recovers partial output, cumulative usage, and resolved runtime fields from the local rollout", async (t) => {
+  const files = fixture(t);
+  const { outcome } = await runFixture(t, "rollout-timeout", {
+    env: { CODEX_HOME: path.join(files.dir, "codex-home") },
+    timeoutMs: 50,
+    terminationGraceMs: 200
+  });
+  assert.equal(outcome.status, "error");
+  assert.equal(outcome.failureKind, "timeout");
+  assert.equal(outcome.rolloutRecoveryStatus, "recovered");
+  assert.equal(outcome.partialResultText, "Recovered partial Codex output.");
+  assert.equal(outcome.resultSource, "rollout_partial");
+  assert.equal(outcome.resolvedModel, "gpt-resolved");
+  assert.equal(outcome.resolvedEffort, "xhigh");
+  assert.equal(outcome.tokenUsageAvailability, "partial");
+  assert.equal(outcome.usageIsIncomplete, true);
+  assert.deepEqual(outcome.cumulativeTokenUsage, {
+    inputTokens: 120,
+    cachedInputTokens: 40,
+    outputTokens: 30,
+    reasoningOutputTokens: 10,
+    totalTokens: 150
+  });
 });
 
 test("timeout stops after INT when Codex gracefully reaps its group child", async (t) => {

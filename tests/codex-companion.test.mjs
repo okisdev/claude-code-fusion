@@ -70,7 +70,21 @@ test("task stays foreground by default and persists the complete terminal record
   assert.equal(result.stderr, "");
   assert.equal(fs.readFileSync(sandbox.stdinFile, "utf8").trim(), "implement this safely");
   const args = readArgs(sandbox);
-  assert.deepEqual(args.slice(0, 6), ["exec", "--json", "--sandbox", "workspace-write", "--config", 'approval_policy="never"']);
+  assert.deepEqual(args.slice(0, 13), [
+    "exec",
+    "--strict-config",
+    "--json",
+    "--sandbox",
+    "workspace-write",
+    "--config",
+    'approval_policy="never"',
+    "--disable",
+    "multi_agent",
+    "--disable",
+    "multi_agent_v2",
+    "--model",
+    "gpt-test"
+  ]);
   assert.ok(args.includes('web_search="live"'));
   assert.ok(args.includes("sandbox_workspace_write.network_access=true"));
   assert.ok(args.includes("gpt-test"));
@@ -81,6 +95,8 @@ test("task stays foreground by default and persists the complete terminal record
   assert.equal(entry.record.status, "done");
   assert.equal(entry.record.mode, "write");
   assert.equal(entry.record.resultText, "Codex completed the task.");
+  assert.equal(entry.record.resolvedModel, null);
+  assert.equal(entry.record.resolvedEffort, null);
   assert.equal(entry.record.tokenUsageAvailability, "available");
   assert.equal(entry.record.codexVersion, "0.144.4");
   assert.equal(fs.statSync(entry.file).mode & 0o777, 0o600);
@@ -131,6 +147,50 @@ test("structured raw transport preserves shell syntax without evaluating it", (t
   assert.equal(fs.existsSync(path.dirname(transport.file)), false);
 });
 
+test("a staged Fusion worktree request selects the Codex cwd and workspace root", (t) => {
+  const sandbox = makeSandbox(t);
+  const sibling = path.join(sandbox.root, "sibling worktree");
+  execFileSync("git", ["init", "-q"], { cwd: sandbox.workDir });
+  execFileSync(
+    "git",
+    ["-c", "user.email=fusion-test@example.com", "-c", "user.name=fusion-test", "commit", "--allow-empty", "-q", "-m", "init"],
+    { cwd: sandbox.workDir }
+  );
+  execFileSync("git", ["worktree", "add", "-q", "-b", "fusion-sibling", sibling], { cwd: sandbox.workDir });
+  const prompt = "Implement the isolated package and run its verification.";
+  const transport = createTransport(sandbox, `--write --cwd ${JSON.stringify(sibling)} -- ${prompt}`);
+  const result = runCompanion(["task", "--transport-default-write", "--raw-args-token", transport.token], {
+    cwd: sandbox.workDir,
+    env: envFor(sandbox)
+  });
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(fs.readFileSync(sandbox.stdinFile, "utf8"), prompt);
+  const [record] = jobRecords(sandbox);
+  const canonicalSibling = fs.realpathSync(sibling);
+  assert.equal(record.mode, "write");
+  assert.equal(record.cwd, canonicalSibling);
+  assert.equal(record.workspaceRoot, canonicalSibling);
+  assert.equal(fs.existsSync(transport.file), false);
+});
+
+test("a staged request rejects cwd outside the opaque raw prompt", (t) => {
+  const sandbox = makeSandbox(t);
+  const transport = createTransport(sandbox, "--write -- implement the package");
+  const result = runCompanion(["task", "--transport-default-write", "--cwd", sandbox.workDir, "--raw-args-token", transport.token], {
+    cwd: sandbox.workDir,
+    env: envFor(sandbox)
+  });
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /Raw command transport options must not be combined with normal arguments\./);
+  assert.equal(jobRecords(sandbox).length, 0);
+  const discarded = runCompanion(["transport-discard", "--raw-args-token", transport.token], {
+    cwd: sandbox.workDir,
+    env: envFor(sandbox)
+  });
+  assert.equal(discarded.status, 0, discarded.stderr);
+  assert.equal(fs.existsSync(transport.file), false);
+});
+
 test("raw transport discard removes an unused private transport", (t) => {
   const sandbox = makeSandbox(t);
   const transport = createTransport(sandbox, "unused");
@@ -142,6 +202,68 @@ test("raw transport discard removes an unused private transport", (t) => {
   assert.equal(discarded.stdout, "");
   assert.equal(fs.existsSync(transport.file), false);
   assert.equal(fs.existsSync(path.dirname(transport.file)), false);
+});
+
+test("raw transport rejects another Claude session and removes the verified transport", (t) => {
+  const sandbox = makeSandbox(t);
+  const transport = createTransport(sandbox, "private request", envFor(sandbox, { CLAUDE_CODE_SESSION_ID: "session-a" }));
+  const result = runCompanion(["task", "--raw-args-token", transport.token], {
+    cwd: sandbox.workDir,
+    env: envFor(sandbox, { CLAUDE_CODE_SESSION_ID: "session-b" })
+  });
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /belongs to another Claude session/);
+  assert.equal(jobRecords(sandbox).length, 0);
+  assert.equal(fs.existsSync(transport.file), false);
+  assert.equal(fs.existsSync(transport.ownerFile), false);
+  assert.equal(fs.existsSync(path.dirname(transport.file)), false);
+});
+
+test("raw transport rejects expired input and removes the verified transport", (t) => {
+  const sandbox = makeSandbox(t);
+  const env = envFor(sandbox);
+  const transport = createTransport(sandbox, "expired private request", env);
+  const owner = JSON.parse(fs.readFileSync(transport.ownerFile, "utf8"));
+  fs.writeFileSync(transport.ownerFile, `${JSON.stringify({ ...owner, createdAt: Date.now() - 2 * 60 * 60 * 1000 })}\n`, { mode: 0o600 });
+  const result = runCompanion(["task", "--raw-args-token", transport.token], {
+    cwd: sandbox.workDir,
+    env
+  });
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /transport has expired/);
+  assert.equal(jobRecords(sandbox).length, 0);
+  assert.equal(fs.existsSync(transport.file), false);
+  assert.equal(fs.existsSync(transport.ownerFile), false);
+  assert.equal(fs.existsSync(path.dirname(transport.file)), false);
+});
+
+test("programmatic stdin ingress preserves opaque raw arguments without a staging file", (t) => {
+  const sandbox = makeSandbox(t);
+  const marker = path.join(sandbox.root, "stdin-command-substitution-ran");
+  const prompt = `  inspect $(touch ${marker})\nkeep quotes ' " and \\ exactly  `;
+  const result = runCompanion(["task", "--transport-default-write", "--request-stdin"], {
+    cwd: sandbox.workDir,
+    env: envFor(sandbox),
+    input: `-- ${prompt}`
+  });
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(fs.readFileSync(sandbox.stdinFile, "utf8"), prompt);
+  assert.equal(fs.existsSync(marker), false);
+  const [record] = jobRecords(sandbox);
+  assert.equal(record.mode, "write");
+  assert.equal(record.request.ingress, "stdin");
+});
+
+test("stdin ingress cannot be mixed with argv request bytes", (t) => {
+  const sandbox = makeSandbox(t);
+  const result = runCompanion(["task", "--request-stdin", "unexpected"], {
+    cwd: sandbox.workDir,
+    env: envFor(sandbox),
+    input: "request"
+  });
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /must not be combined/);
+  assert.equal(jobRecords(sandbox).length, 0);
 });
 
 test("session end removes unused transports owned by that Claude session", (t) => {
@@ -294,6 +416,46 @@ test("missing Codex CLI fails before a job is reserved", (t) => {
   assert.deepEqual(jobRecords(sandbox), []);
 });
 
+test("task rejects an outdated Codex CLI before execution", (t) => {
+  const outdated = makeSandbox(t);
+  const outdatedResult = runCompanion(["task", "--json", "do work"], {
+    cwd: outdated.workDir,
+    env: envFor(outdated, { FAKE_CODEX_VERSION: "0.143.9" })
+  });
+  assert.equal(outdatedResult.status, 1);
+  assert.equal(outdatedResult.stdout, "");
+  const outdatedFailure = JSON.parse(outdatedResult.stderr);
+  assert.equal(outdatedFailure.status, "error");
+  assert.equal(outdatedFailure.failureKind, "setup");
+  assert.match(outdatedFailure.message, /Upgrade the Codex CLI to version 0\.144\.0 or later\./);
+  assert.equal(fs.existsSync(outdated.argsFile), false);
+  assert.deepEqual(jobRecords(outdated), []);
+
+  const text = makeSandbox(t);
+  const textResult = runCompanion(["task", "do work"], {
+    cwd: text.workDir,
+    env: envFor(text, { FAKE_CODEX_VERSION: "0.143.9" })
+  });
+  assert.equal(textResult.status, 1);
+  assert.equal(textResult.stdout, "");
+  assert.match(textResult.stderr, /Upgrade the Codex CLI to version 0\.144\.0 or later\./);
+  assert.match(textResult.stderr, /failure: setup/);
+  assert.equal(fs.existsSync(text.argsFile), false);
+  assert.deepEqual(jobRecords(text), []);
+});
+
+test("task proceeds with tested and newer Codex CLI versions", (t) => {
+  for (const version of ["0.144.0", "0.145.0"]) {
+    const sandbox = makeSandbox(t);
+    const result = runCompanion(["task", "--json", "do work"], {
+      cwd: sandbox.workDir,
+      env: envFor(sandbox, { FAKE_CODEX_VERSION: version })
+    });
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(readArgs(sandbox)[0], "exec");
+  }
+});
+
 test("structured nonzero diagnostics persist typed auth, quota, and rate limit failures", (t) => {
   const sandbox = makeSandbox(t);
   const cases = [
@@ -319,6 +481,80 @@ test("structured nonzero diagnostics persist typed auth, quota, and rate limit f
   }
 });
 
+test("final response prose cannot promote or reject semantic acceptance", (t) => {
+  const sandbox = makeSandbox(t);
+  const result = runCompanion(["task", "--json", "implement the change"], {
+    cwd: sandbox.workDir,
+    env: envFor(sandbox, { FAKE_CODEX_MODE: "transport-failure-completed" })
+  });
+  assert.equal(result.status, 0, result.stderr);
+  const record = JSON.parse(result.stdout);
+  assert.equal(record.status, "done");
+  assert.equal(record.semanticStatus, "unverified");
+  assert.equal(record.semanticFailureKind, null);
+  assert.equal(record.semanticFailureMessage, null);
+});
+
+test("job records persist only rollout-observed model and effort as resolved fields", (t) => {
+  const sandbox = makeSandbox(t);
+  const result = runCompanion(["task", "--json", "--model", "requested-model", "--effort", "high", "inspect"], {
+    cwd: sandbox.workDir,
+    env: envFor(sandbox, {
+      CODEX_HOME: path.join(sandbox.root, "codex-home"),
+      FAKE_CODEX_MODE: "rollout-completed",
+      FAKE_CODEX_RESOLVED_EFFORT: "xhigh",
+      FAKE_CODEX_RESOLVED_MODEL: "gpt-resolved"
+    })
+  });
+  assert.equal(result.status, 0, result.stderr);
+  const record = JSON.parse(result.stdout);
+  assert.equal(record.request.model, "requested-model");
+  assert.equal(record.request.effort, "high");
+  assert.equal(record.resolvedModel, "gpt-resolved");
+  assert.equal(record.resolvedEffort, "xhigh");
+  assert.equal(record.rolloutRecoveryStatus, "recovered");
+});
+
+test("foreground timeout persists recovered partial delivery and incomplete cumulative usage", (t) => {
+  const sandbox = makeSandbox(t);
+  const result = runCompanion(["task", "--json", "implement until timeout"], {
+    cwd: sandbox.workDir,
+    env: envFor(sandbox, {
+      CODEX_COMPANION_TIMEOUT_MS: "50",
+      CODEX_HOME: path.join(sandbox.root, "codex-home"),
+      FAKE_CODEX_MODE: "rollout-timeout"
+    })
+  });
+  assert.equal(result.status, 1, result.stderr);
+  const record = JSON.parse(result.stdout);
+  assert.equal(record.status, "error");
+  assert.equal(record.failureKind, "timeout");
+  assert.equal(record.resultText, null);
+  assert.equal(record.partialResultText, "Recovered partial Codex output.");
+  assert.equal(record.tokenUsageAvailability, "partial");
+  assert.equal(record.usageIsIncomplete, true);
+  assert.equal(record.resolvedModel, "gpt-resolved");
+  assert.equal(record.resolvedEffort, "xhigh");
+});
+
+test("history lists canonical jobs across workspaces with local thread and delivery metadata", (t) => {
+  const sandbox = makeSandbox(t);
+  const sibling = path.join(sandbox.root, "sibling");
+  fs.mkdirSync(sibling);
+  const env = envFor(sandbox);
+  assert.equal(runCompanion(["task", "first"], { cwd: sandbox.workDir, env }).status, 0);
+  assert.equal(runCompanion(["task", "second"], { cwd: sibling, env }).status, 0);
+  const history = runCompanion(["history", "--request-stdin"], { cwd: sandbox.workDir, env, input: "--json" });
+  assert.equal(history.status, 0, history.stderr);
+  const payload = JSON.parse(history.stdout);
+  assert.equal(payload.source, "canonical");
+  assert.equal(payload.sidebarVisibility, "not_guaranteed_for_exec_sessions");
+  assert.equal(payload.jobs.length, 2);
+  assert.ok(payload.jobs.every((record) => record.threadId === "thread-123"));
+  assert.ok(payload.jobs.every((record) => record.delivery === "foreground"));
+  assert.ok(payload.jobs.every((record) => record.semanticStatus === "unverified"));
+});
+
 test("explicit background launch returns a durable receipt and result wait collects it", async (t) => {
   const sandbox = makeSandbox(t);
   const env = envFor(sandbox, { FAKE_CODEX_DELAY_MS: "250" });
@@ -329,6 +565,7 @@ test("explicit background launch returns a durable receipt and result wait colle
   const [running] = jobRecords(sandbox);
   assert.equal(running.status, "running");
   assert.equal(running.background, true);
+  assert.equal(running.delivery, "manual");
   assert.ok(running.launchApprovedAt);
   assert.equal(running.launchAbortRequestedAt, null);
   assert.ok(Number.isInteger(running.pid));
@@ -340,7 +577,28 @@ test("explicit background launch returns a durable receipt and result wait colle
   assert.equal(collected.status, 0, collected.stderr);
   assert.match(collected.stdout, /Codex completed the task/);
   assert.match(collected.stdout, /state: done\n$/);
-  await waitFor(() => jobRecords(sandbox)[0]?.status === "done");
+  const delivered = await waitFor(() => jobRecords(sandbox)[0]?.status === "done" ? jobRecords(sandbox)[0] : null);
+  assert.ok(delivered.deliveryCollectedAt);
+});
+
+test("managed background delivery remains pending until result collection", async (t) => {
+  const sandbox = makeSandbox(t);
+  const env = envFor(sandbox, {
+    CODEX_COMPANION_BACKGROUND_DELIVERY: "managed",
+    FAKE_CODEX_DELAY_MS: "100"
+  });
+  const launched = runCompanion(["task", "--background managed work"], { cwd: sandbox.workDir, env });
+  assert.equal(launched.status, 0, launched.stderr);
+  assert.match(launched.stdout, /delivery: managed/);
+  const completed = await waitFor(() => {
+    const record = jobRecords(sandbox)[0];
+    return record?.status === "done" ? record : null;
+  });
+  assert.equal(completed.delivery, "managed");
+  assert.equal(completed.deliveryCollectedAt, null);
+  const collected = runCompanion(["result", completed.id, "--cwd", sandbox.workDir], { cwd: sandbox.workDir, env });
+  assert.equal(collected.status, 0, collected.stderr);
+  assert.ok(jobRecords(sandbox)[0].deliveryCollectedAt);
 });
 
 test("tight history quotas retain a completed background review until result collects it", async (t) => {
@@ -417,7 +675,12 @@ test("main workspace and a sibling worktree admit concurrent tasks for the same 
   const sandbox = makeSandbox(t);
   const sibling = path.join(sandbox.root, "sibling-worktree");
   execFileSync("git", ["init", "-q"], { cwd: sandbox.workDir });
-  execFileSync("git", ["worktree", "add", "--orphan", sibling], { cwd: sandbox.workDir });
+  execFileSync(
+    "git",
+    ["-c", "user.email=fusion-test@example.com", "-c", "user.name=fusion-test", "commit", "--allow-empty", "-q", "-m", "init"],
+    { cwd: sandbox.workDir }
+  );
+  execFileSync("git", ["worktree", "add", "-q", "-b", "sibling-worktree", sibling], { cwd: sandbox.workDir });
   const env = envFor(sandbox, { FAKE_CODEX_DELAY_MS: "250" });
   const mainTask = spawnCompanion(["task", "main workspace task"], { cwd: sandbox.workDir, env });
   const siblingTask = spawnCompanion(["task", "sibling worktree task"], { cwd: sibling, env });
@@ -639,12 +902,14 @@ test("a second interrupt cannot bypass foreground cleanup", async (t) => {
     return;
   }
   const sandbox = makeSandbox(t);
-  const env = envFor(sandbox, { FAKE_CODEX_MODE: "ignore-term" });
+  const readyFile = path.join(sandbox.root, "codex-ready");
+  const env = envFor(sandbox, { FAKE_CODEX_MODE: "ignore-term", FAKE_CODEX_READY_FILE: readyFile });
   const companionProcess = spawnCompanion(["task", "wait for interrupts"], { cwd: sandbox.workDir, env });
   const running = await waitFor(() => {
     const record = jobRecords(sandbox)[0];
     return record?.codexPid ? record : null;
   });
+  await waitFor(() => (fs.existsSync(readyFile) ? true : null));
   process.kill(companionProcess.pid, "SIGINT");
   await new Promise((resolve) => setTimeout(resolve, 100));
   process.kill(companionProcess.pid, "SIGINT");

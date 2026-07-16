@@ -10,6 +10,25 @@ export const companion = path.join(repoRoot, "plugins", "grok", "scripts", "grok
 export const fakeGrok = path.join(repoRoot, "tests", "fake-grok");
 export const stateModulePath = path.join(repoRoot, "plugins", "grok", "scripts", "lib", "state.mjs");
 export const jobsMonitor = path.join(repoRoot, "plugins", "grok", "scripts", "jobs-monitor.mjs");
+export const grokCompanionCapabilities = [
+  "--prompt-file",
+  "--output-format",
+  "--sandbox",
+  "--tools",
+  "--disallowed-tools",
+  "--deny",
+  "--max-turns",
+  "--no-auto-update",
+  "--permission-mode",
+  "--allow",
+  "--disable-web-search",
+  "--always-approve",
+  "--best-of-n",
+  "--no-subagents",
+  "--no-wait-for-background",
+  "--background-wait-timeout",
+  "--json-schema",
+].join(",");
 
 export function makeSandbox(t) {
   const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "grok-plugin-test-")));
@@ -43,10 +62,44 @@ export function envFor(sandbox, extra = {}, options = {}) {
   for (const key of [
     "FAKE_GROK_MODE",
     "FAKE_GROK_ARGS_FILE",
+    "FAKE_GROK_REJECT_EXTERNAL_PROMPT",
+    "FAKE_GROK_RESOLVED_EFFORT",
+    "FAKE_GROK_RESOLVED_MODEL",
+    "FAKE_GROK_ENV_FILE",
+    "FAKE_GROK_DESCENDANT_PID_FILE",
+    "FAKE_GROK_SANDBOX_SENTINEL",
+    "FAKE_GROK_SANDBOX_EVENT_DELAY_MS",
+    "FAKE_GROK_STDIN_FILE",
+    "FAKE_GROK_STDIN_LOG",
+    "GROK_COMPANION_CAPABILITIES",
+    "GROK_COMPANION_SANDBOX_HANDSHAKE_MS",
     "GROK_COMPANION_TIMEOUT_MS",
     "GROK_COMPANION_BACKGROUND_DELIVERY",
+    "GROK_COMPANION_CONTINUITY_POLICY",
+    "GROK_COMPANION_PIDLESS_RUNNING_GRACE_MS",
+    "GROK_COMPANION_WAIT_POLL_MS",
+    "GROK_COMPANION_WAIT_TIMEOUT_MS",
+    "GROK_CONSULT_ALLOW",
+    "GROK_JOBS_MONITOR_INTERVAL_MS",
     "GROK_JOBS_MONITOR_MANAGED_GRACE_MS",
+    "GROK_MEMORY",
+    "GROK_SUBAGENTS",
+    "GROK_CLAUDE_SKILLS_ENABLED",
+    "GROK_CLAUDE_RULES_ENABLED",
+    "GROK_CLAUDE_AGENTS_ENABLED",
+    "GROK_CLAUDE_MCPS_ENABLED",
+    "GROK_CLAUDE_HOOKS_ENABLED",
+    "GROK_CLAUDE_SESSIONS_ENABLED",
+    "GROK_CURSOR_SKILLS_ENABLED",
+    "GROK_CURSOR_RULES_ENABLED",
+    "GROK_CURSOR_AGENTS_ENABLED",
+    "GROK_CURSOR_MCPS_ENABLED",
+    "GROK_CURSOR_HOOKS_ENABLED",
+    "GROK_CURSOR_SESSIONS_ENABLED",
+    "GROK_HOME",
+    "RUST_LOG",
     "CLAUDE_CODE_SESSION_ID",
+    "CLAUDE_PLUGIN_OPTION_STOP_GATE",
     ...(options.clearEnv ?? []),
   ]) {
     delete env[key];
@@ -56,6 +109,8 @@ export function envFor(sandbox, extra = {}, options = {}) {
     ...(options.git ? gitIsolation : {}),
     GROK_BIN: fakeGrok,
     GROK_COMPANION_DATA: sandbox.dataDir,
+    GROK_COMPANION_CAPABILITIES: grokCompanionCapabilities,
+    GROK_HOME: path.join(sandbox.root, "grok-home"),
     FAKE_GROK_ARGS_FILE: sandbox.argsFile,
     ...extra,
   };
@@ -122,13 +177,26 @@ export function jobFileFor(dataDir, jobId) {
   return null;
 }
 
-export function pidAlive(pid) {
+function linuxProcessIsZombie(pid) {
   try {
-    process.kill(pid, 0);
-    return true;
+    const stat = fs.readFileSync(`/proc/${pid}/stat`, "utf8");
+    const commandEnd = stat.lastIndexOf(")");
+    if (commandEnd === -1) {
+      return false;
+    }
+    return stat.slice(commandEnd + 2).trim().split(/\s+/)[0] === "Z";
   } catch {
     return false;
   }
+}
+
+export function pidAlive(pid) {
+  try {
+    process.kill(pid, 0);
+  } catch {
+    return false;
+  }
+  return process.platform !== "linux" || !linuxProcessIsZombie(pid);
 }
 
 export function killGroups(pid) {

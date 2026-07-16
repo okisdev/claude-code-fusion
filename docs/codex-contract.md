@@ -4,7 +4,7 @@ This document defines the Codex instance of the shared companion contract. The a
 
 ## Runtime boundary
 
-The companion invokes the user-installed `codex` binary through `codex exec --json`. It consumes JSONL from stdout, keeps stderr separate, and stores the raw event stream for diagnosis. It does not depend on `codex-plugin-cc`, parse human-readable Codex output, inspect Codex rollout files for primary state, or copy Codex authentication material.
+The companion invokes the user-installed `codex` binary through `codex exec --strict-config --json`. It consumes JSONL from stdout, keeps stderr separate, and stores the raw event stream for diagnosis. It does not depend on `codex-plugin-cc`, parse human-readable Codex output, or copy Codex authentication material. The JSONL stream remains the primary transport authority. A bounded read of the matching locally persisted Codex rollout may recover partial output, cumulative usage, and the actual model and effort after timeout or cancellation, but it cannot turn a failed transport into success. Codex configuration parse failures under `--strict-config`, for example an unknown `mcp_servers` field, currently surface as `failureKind: "process"` with the configuration error in the job log.
 
 The adapter accepts protocol extensions by retaining unknown events. A run succeeds only after a valid `turn.completed` event and a zero process exit. A `turn.failed` event, nonzero exit, signal, timeout, malformed required event, or exit without a terminal turn event fails the job. Top-level `error` events and error items remain diagnostics because Codex can emit them for recoverable retries and configuration warnings.
 
@@ -25,7 +25,7 @@ Every record has one transport status: `running`, `done`, `error`, or `cancelled
 
 Terminal transport outcomes are immutable. Racing completion, cancellation, liveness repair, and worker failure may enrich diagnostics only when they do not change an existing terminal outcome. A successful `result` read may set `collectedAt` once so retention can distinguish an uncollected detached deliverable from ordinary history.
 
-Each record contains the companion PID and ownership identity, Codex PID and ownership identity, Claude session ID, Codex thread ID when known, workspace root, repository identity, request settings, timestamps including collection state, result text, exact reported token usage when available, failure kind, bounded diagnostic text, and paths to its brief, log, and raw event ledger.
+Each record contains the companion PID and ownership identity, Codex PID and ownership identity, Claude session ID, Codex thread ID when known, workspace root, repository identity, request settings, transport status, semantic status, delivery mode and collection state, resolved model and effort when observable, result or bounded partial result text, exact reported token usage when available, failure kind, bounded diagnostic text, and paths to its brief, log, and raw event ledger.
 
 ## Process supervision
 
@@ -47,17 +47,19 @@ The companion permits one active Codex job per canonical workspace. Admission is
 
 The record stores both the canonical workspace path and a repository key derived from the Git common directory. This preserves worktree separation while allowing Fusion to aggregate jobs belonging to the same repository. Fusion treats the stored repository key as authoritative, including after a disposable worktree path has been removed.
 
-`turn.completed.usage` is cumulative for the Codex thread. A fresh thread uses a zero baseline. A resumed thread stores the reported cumulative value but marks per-turn usage unavailable because the adapter cannot prove that another Codex surface did not resume the same thread between its own jobs. It never reports cumulative usage as one turn, attributes out of band turns to the current job, or fills missing fields with zero. Fusion may independently recover a turn delta from a matching local rollout boundary, but that observation is not canonical adapter state.
+`turn.completed.usage` is cumulative for the Codex thread. A fresh thread uses a zero baseline. A resumed thread stores the reported cumulative value but marks per-turn usage unavailable because the adapter cannot prove that another Codex surface did not resume the same thread between its own jobs. It never reports cumulative usage as one turn, attributes out of band turns to the current job, or fills missing fields with zero. On timeout or cancellation, a matching local rollout may provide partial cumulative usage and output. The record marks that usage incomplete and keeps the transport failure terminal. Fusion may independently recover a per-turn delta from an exact local rollout boundary for reporting; that observation remains separate from the canonical companion token delta.
 
 ## Task execution
 
 Consult tasks use the Codex read-only sandbox. Write tasks require `--write` and use the workspace-write sandbox. Both modes use noninteractive approval policy so an unattended exec run cannot hang on an approval request. Danger full access is not exposed by the companion.
 
+Every Codex exec invocation disables `multi_agent` and `multi_agent_v2`. The adapter also fails the job with `failureKind: "policy"` if the event stream or matching rollout still shows a collaboration tool call. Delegated Codex therefore remains one owned engine execution instead of recursively creating Codex agents.
+
 The companion does not add a shell command allow list and does not rewrite the user's configured MCP servers or other Codex tools. Those integrations remain a separate Codex configuration trust boundary and may carry capabilities beyond the filesystem sandbox.
 
 Model and reasoning effort remain unset unless explicitly requested. The Codex configuration remains authoritative for defaults. The companion explicitly sets web search to disabled and workspace-write network access to false by default. `--web` opts a read-only or write task into live Codex web search. `--network` requires `--write` and opts the workspace-write sandbox into network access.
 
-The companion writes the prompt to Codex stdin. Prompts are never interpolated into a shell command. Slash-command ingress allocates a private token-named staging file, and the command model writes the raw request through its Write tool before invoking a fixed companion command containing only that token. Once the staging write has landed, the parser preserves positional whitespace, newlines, quotes, and backslashes byte for byte while removing recognized adapter options. This is not an end-to-end byte-exact transport because a model performs the Write step. SessionEnd removes verified staging files owned by that Claude session, and later transport creation prunes other verified staging files after one hour. Final response text comes from the bounded JSONL stream, so Codex never receives an unbounded fallback output path. Prompts, individual JSONL events, final responses, raw event ledgers, logs, and rendered diagnostics have explicit byte limits. Oversized input or output fails as `resource` before it can inflate durable state. Resume accepts only a persisted Codex thread ID or a companion-selected terminal task record. `--resume-last` is restricted to the current Claude session when its id is available and otherwise selects the newest eligible workspace task. Active jobs are never resume candidates. `--fresh` rejects combination with either resume form and forces a new thread.
+The companion writes the final prompt to Codex stdin. Prompts are never interpolated into a shell command. Programmatic callers use `--request-stdin` and pipe the complete raw companion request through stdin, leaving fixed argv free of request bytes. Claude Code's Bash tool does not expose stdin, so slash commands and wrapper Agents retain a private token-named staging compatibility path: the command model writes the raw request through its Write tool before invoking a fixed companion command containing only that token. Once the staging write has landed, the parser preserves positional whitespace, newlines, quotes, and backslashes byte for byte while removing recognized adapter options. The staged compatibility path is not an end-to-end byte-exact transport because a model performs the Write step. SessionEnd removes verified staging files owned by that Claude session, and later transport creation prunes other verified staging files after one hour. Final response text comes from the bounded JSONL stream, so Codex never receives an unbounded fallback output path. Prompts, individual JSONL events, final responses, raw event ledgers, logs, and rendered diagnostics have explicit byte limits. Oversized input or output fails as `resource` before it can inflate durable state. Resume accepts only a persisted Codex thread ID or a companion-selected terminal task record. `--resume-last` is restricted to the current Claude session when its id is available and otherwise selects the newest eligible workspace task. Active jobs are never resume candidates. `--fresh` rejects combination with either resume form and forces a new thread.
 
 ## Review execution
 
@@ -72,23 +74,25 @@ Human-readable terminal output ends with a contiguous footer block:
 ```text
 codex-session: <thread-id>
 job: <job-id>
+delivery: foreground|manual|managed
+semantic: accepted|rejected|unverified
 state: done|error|cancelled
 failure: <kind>
 ```
 
-Successful output includes `state: done`. Error and cancelled output includes the corresponding `failure` line. JSON output exposes the complete persisted record without converting absent fields into zero values.
+Successful transport output includes `state: done`. Error and cancelled output includes the corresponding `failure` line. Final response prose cannot mark its own result accepted or rejected, so successful Codex transport remains `semantic: unverified` until the orchestrator verifies it. The adapter uses `semantic: rejected` only for structured policy evidence such as a forbidden collaboration tool call. Later verification judgments are recorded independently by Fusion and do not rewrite the companion footer. JSON output exposes the complete persisted record without converting absent fields into zero values.
 
 `result --wait` may wait for an explicitly detached job. If its bounded wait period expires, it returns `state: running` without claiming completion. Foreground task and review calls do not use collector polling.
 
 ## Failure kinds
 
-The adapter uses the shared failure categories `quota`, `auth`, `missing_cli`, `rate_limited`, `timeout`, `error`, `permission`, `cancelled`, `input`, `died`, and `resource`. Protocol violations use `protocol`. A process exit caused by an unrequested signal uses `process`.
+The adapter uses the shared failure categories `quota`, `auth`, `missing_cli`, `setup`, `rate_limited`, `timeout`, `error`, `permission`, `cancelled`, `input`, `died`, and `resource`. Protocol violations use `protocol`. A process exit caused by an unrequested signal uses `process`. A forbidden collaboration tool call uses `policy`.
 
 Classification uses structured Codex events first, then the process error and bounded stderr tail. Logs may retain more detail, but rendered failures expose only bounded diagnostics and never expose environment variables or authentication data.
 
 ## Compatibility
 
-The companion checks the installed Codex version during setup and records it on every job when available. This adapter supports Codex CLI 0.144.x, which means versions greater than or equal to 0.144.0 and lower than 0.145.0. Setup also verifies CLI authentication and a writable adapter data directory. A nonempty `CODEX_API_KEY` is accepted as exec authentication when `codex login status` reports logged out because that probe does not inspect environment based authentication. Unknown JSONL event types are retained and ignored unless they affect terminal correctness. Missing or changed required lifecycle events fail closed as protocol errors.
+The companion checks the installed Codex version during setup and records it on every job when available. Preflight hard-fails with `failureKind: "setup"` when the installed Codex CLI version parses below the tested minimum 0.144.0 and tells the user to upgrade. Versions above the tested 0.144.x window remain allowed with the setup compatibility advisory. Setup also verifies CLI authentication and a writable adapter data directory. A nonempty `CODEX_API_KEY` is accepted as exec authentication when `codex login status` reports logged out because that probe does not inspect environment based authentication. Unknown JSONL event types are retained and ignored unless they affect terminal correctness. Missing or changed required lifecycle events fail closed as protocol errors.
 
 Protocol fixtures cover every supported event type, unknown extensions, malformed JSON, failure events, missing terminal events, nonzero exits, signals, aborts, timeouts, resume, native review, cancellation, worker death, lock recovery, worktrees, and concurrent terminal writes.
 
@@ -98,13 +102,17 @@ Protocol fixtures cover every supported event type, unknown extensions, malforme
 - `CODEX_COMPANION_DATA` overrides the data root. The value must be an absolute path, since the companion fails closed on a relative value and Fusion treats a non-absolute state-root override as unset rather than throwing.
 - `CODEX_COMPANION_TIMEOUT_MS` overrides the foreground execution timeout.
 - `CODEX_COMPANION_BACKGROUND_TIMEOUT_MS` overrides the detached worker timeout.
+- `CODEX_COMPANION_BACKGROUND_DELIVERY=managed` marks a detached job as owned by an internal collector. Unset explicit background jobs use manual delivery.
 - `CODEX_COMPANION_LAUNCH_APPROVAL_TIMEOUT_MS` overrides how long an unapproved background worker waits before failing without starting Codex.
 - `CODEX_COMPANION_PIDLESS_RUNNING_GRACE_MS` overrides the launch grace period.
 - `CODEX_COMPANION_WAIT_POLL_MS` and `CODEX_COMPANION_WAIT_TIMEOUT_MS` control bounded result waiting.
 - `CODEX_COMPANION_HISTORY_MAX_RECORDS` and `CODEX_COMPANION_HISTORY_MAX_BYTES` control managed terminal history retention.
 - `CODEX_JOBS_MONITOR_SESSIONS_DIR` overrides the Codex rollout tree used by Fusion's monitor for best effort model, effort, and token observations. When it is unset, the monitor uses `$CODEX_HOME/sessions` if `CODEX_HOME` is nonempty, then `~/.codex/sessions`.
-- `FUSION_CODEX_STATE` selects one Codex state root for Fusion. The compatibility alias `FUSION_CODEX_STATE_DIR` also selects one root. Either override disables default dual-root aggregation.
+- `FUSION_CODEX_STATE` selects one Codex state root for Fusion. The compatibility alias `FUSION_CODEX_STATE_DIR` also selects one root.
+- `FUSION_CODEX_INCLUDE_LEGACY=1` explicitly adds the preserved `codex-openai-codex/state` root to Fusion reporting. Current canonical state is the default.
 
 ## Fusion integration
 
-Codex records are the primary source for transport status, model request, reasoning effort, token usage, thread identity, Claude session identity, repository identity, and job duration. Without a state override, Fusion reads the canonical `codex-claude-code-fusion/state` root plus the old `codex-openai-codex/state` root as a read only compatibility source, then deduplicates lifecycle mirrors. It never copies or mutates the old records, and the new `/codex:result` command cannot collect an old plugin deliverable. `CODEX_COMPANION_DATA` selects only its own state root, just as the Fusion state overrides select only one root. Fusion observes those records without taking ownership of their lifecycle. Fusion keeps semantic acceptance separate. A `done` Codex job remains `unverified` until the orchestrator checks its completion criteria or verification command and records `accepted` or `rejected`.
+Codex records are the primary source for transport status, delivery, semantic status, model request, resolved model and effort, token usage, thread identity, Claude session identity, repository identity, and job duration. Without a state override, Fusion reads only the canonical `codex-claude-code-fusion/state` root. The old `codex-openai-codex/state` root is included only through `/fusion:stats --include-legacy` or `FUSION_CODEX_INCLUDE_LEGACY=1`, is always read only, and is never copied or mutated. The new `/codex:result` command cannot collect an old plugin deliverable. `CODEX_COMPANION_DATA` selects only its own state root, just as the Fusion state overrides select only one root. Fusion observes those records without taking ownership of their lifecycle. A `done` Codex job remains `unverified` until the orchestrator checks its completion criteria or verification command and records `accepted` or `rejected`.
+
+`/codex:history` reads all workspaces from the canonical companion state root and shows job ids, thread ids, transport, delivery, semantic status, and resolved model and effort. Codex exec threads are also persisted in the local Codex session store and remain resumable by thread id. Codex Desktop filters its normal task list by interactive source kinds, so exec sourced threads are not guaranteed to appear in its sidebar.
