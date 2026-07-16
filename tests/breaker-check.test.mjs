@@ -211,7 +211,7 @@ test("a consecutive second Codex rate limit opens the breaker", (t) => {
 
   const result = run(sandbox);
   assert.strictEqual(result.status, 0);
-  assert.match(result.stdout, /^fusion breaker advisory: treat the codex breaker as open unless verified recovered; last failure rate_limited \d+ minutes? ago\.\n$/);
+  assert.match(result.stdout, /^fusion breaker advisory: treat the codex breaker as open unless verified recovered; last failure rate_limited \d+ minutes? ago\. Route new work to another eligible healthy lane\.\n$/);
   assert.strictEqual(result.stderr, "");
 });
 
@@ -296,7 +296,7 @@ test("two Grok rate limits inside the configured window open only the Grok break
 
   const result = run(sandbox);
   assert.strictEqual(result.status, 0);
-  assert.match(result.stdout, /^fusion breaker advisory: treat the grok breaker as open unless verified recovered; last failure rate_limited \d+ minutes? ago\.\n$/);
+  assert.match(result.stdout, /^fusion breaker advisory: treat the grok breaker as open unless verified recovered; last failure rate_limited \d+ minutes? ago\. Route new work to another eligible healthy lane\.\n$/);
   assert.strictEqual(result.stderr, "");
 });
 
@@ -330,7 +330,7 @@ test("a typed Codex adapter error uses the canonical status and finished timesta
 
   const result = run(sandbox);
   assert.strictEqual(result.status, 0);
-  assert.match(result.stdout, /^fusion breaker advisory: treat the codex breaker as open unless verified recovered; last failure auth \d+ minutes? ago\.\n$/);
+  assert.match(result.stdout, /^fusion breaker advisory: treat the codex breaker as open unless verified recovered; last failure auth \d+ minutes? ago\. Route new work to another eligible healthy lane\.\n$/);
 });
 
 test("a typed Codex protocol failure opens the compatibility breaker", (t) => {
@@ -344,7 +344,99 @@ test("a typed Codex protocol failure opens the compatibility breaker", (t) => {
 
   const result = run(sandbox);
   assert.strictEqual(result.status, 0);
-  assert.match(result.stdout, /^fusion breaker advisory: treat the codex breaker as open unless verified recovered; last failure protocol \d+ minutes? ago\.\n$/);
+  assert.match(result.stdout, /^fusion breaker advisory: treat the codex breaker as open unless verified recovered; last failure protocol \d+ minutes? ago\. Route new work to another eligible healthy lane\.\n$/);
+});
+
+test("a collaboration policy violation is treated as a protocol breaker but an ordinary policy denial is not", (t) => {
+  const sandbox = makeSandbox(t);
+  writeRecord(jobFile(sandbox.codexState, "workspace", "ordinary-policy"), {
+    status: "error",
+    failureKind: "policy",
+    errorMessage: "tool policy denied this request",
+    finishedAt: new Date(Date.now() - 3 * 60000).toISOString()
+  });
+  assert.strictEqual(run(sandbox).stdout, "");
+  writeRecord(jobFile(sandbox.codexState, "workspace", "collaboration-policy"), {
+    status: "error",
+    failureKind: "policy",
+    errorMessage: "collaboration policy violation",
+    finishedAt: new Date(Date.now() - 2 * 60000).toISOString()
+  });
+  assert.match(run(sandbox).stdout, /last failure protocol/);
+});
+
+test("the actual disabled collaboration tool diagnostic opens the Codex breaker", (t) => {
+  const sandbox = makeSandbox(t);
+  writeRecord(jobFile(sandbox.codexState, "workspace", "disabled-collaboration-tool"), {
+    status: "error",
+    failureKind: "policy",
+    errorMessage: "Delegated Codex execution attempted the disabled spawn_agent tool.",
+    finishedAt: new Date(Date.now() - 2 * 60000).toISOString()
+  });
+  assert.match(run(sandbox).stdout, /codex breaker.*last failure protocol/);
+});
+
+test("sandbox initialization is an immediate hard breaker", (t) => {
+  const sandbox = makeSandbox(t);
+  writeRecord(jobFile(path.join(sandbox.grokData, "state"), "workspace", "sandbox"), {
+    status: "error",
+    failureKind: "sandbox",
+    errorTail: "sandbox initialization failed",
+    finishedAt: new Date(Date.now() - 2 * 60000).toISOString()
+  });
+  assert.match(run(sandbox).stdout, /grok breaker.*last failure sandbox/);
+});
+
+test("ordinary permission denial stays local while transport permission failure opens immediately", (t) => {
+  const sandbox = makeSandbox(t);
+  writeRecord(jobFile(sandbox.codexState, "workspace", "tool-denial"), {
+    status: "error",
+    failureKind: "permission",
+    errorMessage: "permission denied for tool invocation",
+    finishedAt: new Date(Date.now() - 3 * 60000).toISOString()
+  });
+  assert.strictEqual(run(sandbox).stdout, "");
+  writeRecord(jobFile(sandbox.codexState, "workspace", "transport-denial"), {
+    status: "error",
+    failureKind: "permission",
+    errorMessage: "permission denied while initializing prompt transport",
+    finishedAt: new Date(Date.now() - 2 * 60000).toISOString()
+  });
+  assert.match(run(sandbox).stdout, /codex breaker.*last failure permission/);
+});
+
+test("two consecutive timeouts open the breaker and a later success closes it", (t) => {
+  const sandbox = makeSandbox(t);
+  writeRecord(jobFile(sandbox.codexState, "workspace", "timeout-one"), {
+    status: "error",
+    failureKind: "timeout",
+    finishedAt: new Date(Date.now() - 4 * 60000).toISOString()
+  });
+  writeRecord(jobFile(sandbox.codexState, "workspace", "timeout-two"), {
+    status: "error",
+    failureKind: "timeout",
+    finishedAt: new Date(Date.now() - 3 * 60000).toISOString()
+  });
+  assert.match(run(sandbox).stdout, /codex breaker.*last failure timeout/);
+  writeRecord(jobFile(sandbox.codexState, "workspace", "recovered"), {
+    status: "done",
+    finishedAt: new Date(Date.now() - 2 * 60000).toISOString()
+  });
+  assert.strictEqual(run(sandbox).stdout, "");
+});
+
+test("a successful terminal job closes a previously hard breaker", (t) => {
+  const sandbox = makeSandbox(t);
+  writeRecord(jobFile(sandbox.codexState, "workspace", "auth-failure"), {
+    status: "error",
+    failureKind: "auth",
+    finishedAt: new Date(Date.now() - 3 * 60000).toISOString()
+  });
+  writeRecord(jobFile(sandbox.codexState, "workspace", "auth-recovered"), {
+    status: "done",
+    finishedAt: new Date(Date.now() - 2 * 60000).toISOString()
+  });
+  assert.strictEqual(run(sandbox).stdout, "");
 });
 
 test("a successful Codex job does not open the breaker from diagnostic text", (t) => {
@@ -381,24 +473,19 @@ test("Codex state resolution prefers the canonical override and keeps the legacy
   assert.strictEqual(resolveCodexStateDir({}), path.join(os.homedir(), ".claude", "plugins", "data", "codex-claude-code-fusion", "state"));
 });
 
-test("default Codex state resolution reads canonical and legacy roots in priority order", () => {
-  assert.deepStrictEqual(resolveCodexStateRoots({ HOME: "/test-home" }), [
+test("default Codex state resolution reads only canonical state unless legacy inclusion is explicit", () => {
+  assert.deepStrictEqual(resolveCodexStateRoots({ HOME: "/test-home" }), ["/test-home/.claude/plugins/data/codex-claude-code-fusion/state"]);
+  assert.deepStrictEqual(resolveCodexStateRoots({ HOME: "/test-home", FUSION_CODEX_INCLUDE_LEGACY: "1" }), [
     "/test-home/.claude/plugins/data/codex-claude-code-fusion/state",
     "/test-home/.claude/plugins/data/codex-openai-codex/state"
   ]);
   assert.deepStrictEqual(resolveCodexStateRoots({ HOME: "/test-home", FUSION_CODEX_STATE: "/override" }), ["/override"]);
   assert.deepStrictEqual(resolveCodexStateRoots({ HOME: "/test-home", CODEX_COMPANION_DATA: "/adapter" }), ["/adapter/state"]);
-  assert.deepStrictEqual(resolveCodexStateRoots({ HOME: "/test-home", FUSION_CODEX_STATE: "relative-override" }), [
-    "/test-home/.claude/plugins/data/codex-claude-code-fusion/state",
-    "/test-home/.claude/plugins/data/codex-openai-codex/state"
-  ]);
-  assert.deepStrictEqual(resolveCodexStateRoots({ HOME: "/test-home", CODEX_COMPANION_DATA: "relative-adapter" }), [
-    "/test-home/.claude/plugins/data/codex-claude-code-fusion/state",
-    "/test-home/.claude/plugins/data/codex-openai-codex/state"
-  ]);
+  assert.deepStrictEqual(resolveCodexStateRoots({ HOME: "/test-home", FUSION_CODEX_STATE: "relative-override" }), ["/test-home/.claude/plugins/data/codex-claude-code-fusion/state"]);
+  assert.deepStrictEqual(resolveCodexStateRoots({ HOME: "/test-home", CODEX_COMPANION_DATA: "relative-adapter" }), ["/test-home/.claude/plugins/data/codex-claude-code-fusion/state"]);
 });
 
-test("the breaker reads legacy Codex state when the canonical root is absent", (t) => {
+test("the breaker ignores legacy Codex state by default and reads it only when explicitly enabled", (t) => {
   const sandbox = makeSandbox(t);
   writeRecord(jobFile(homeCodexState(sandbox, "codex-openai-codex"), "workspace", "legacy-auth"), {
     id: "legacy-auth",
@@ -406,9 +493,12 @@ test("the breaker reads legacy Codex state when the canonical root is absent", (
     errorMessage: "Authentication failed",
     completedAt: new Date(Date.now() - 2 * 60000).toISOString()
   });
-  const result = runWithHome(sandbox);
-  assert.strictEqual(result.status, 0);
-  assert.match(result.stdout, /codex breaker as open.*last failure auth/);
+  const defaultResult = runWithHome(sandbox);
+  assert.strictEqual(defaultResult.status, 0);
+  assert.strictEqual(defaultResult.stdout, "");
+  const legacyResult = runWithHome(sandbox, { FUSION_CODEX_INCLUDE_LEGACY: "1" });
+  assert.strictEqual(legacyResult.status, 0);
+  assert.match(legacyResult.stdout, /codex breaker as open.*last failure auth/);
 });
 
 test("a mirrored Codex rate limit is deduplicated across canonical and legacy roots", (t) => {
@@ -421,7 +511,7 @@ test("a mirrored Codex rate limit is deduplicated across canonical and legacy ro
   };
   writeRecord(jobFile(homeCodexState(sandbox, "codex-claude-code-fusion"), "workspace", record.id), record);
   writeRecord(jobFile(homeCodexState(sandbox, "codex-openai-codex"), "workspace", record.id), record);
-  const result = runWithHome(sandbox);
+  const result = runWithHome(sandbox, { FUSION_CODEX_INCLUDE_LEGACY: "1" });
   assert.strictEqual(result.status, 0);
   assert.doesNotMatch(result.stdout, /codex breaker/);
 });
@@ -440,7 +530,7 @@ test("a terminal Codex copy supersedes a stale running mirror with the same id",
     errorMessage: "Authentication failed before recovery",
     completedAt: new Date(Date.now() - 2 * 60000).toISOString()
   });
-  const result = runWithHome(sandbox);
+  const result = runWithHome(sandbox, { FUSION_CODEX_INCLUDE_LEGACY: "1" });
   assert.strictEqual(result.status, 0);
   assert.doesNotMatch(result.stdout, /codex breaker/);
 });
@@ -453,7 +543,7 @@ test("an explicit Codex state override excludes legacy home state", (t) => {
     errorMessage: "Authentication failed",
     completedAt: new Date(Date.now() - 2 * 60000).toISOString()
   });
-  const result = runWithHome(sandbox, { FUSION_CODEX_STATE: path.join(sandbox.root, "isolated-state") });
+  const result = runWithHome(sandbox, { FUSION_CODEX_STATE: path.join(sandbox.root, "isolated-state"), FUSION_CODEX_INCLUDE_LEGACY: "1" });
   assert.strictEqual(result.status, 0);
   assert.doesNotMatch(result.stdout, /codex breaker/);
 });

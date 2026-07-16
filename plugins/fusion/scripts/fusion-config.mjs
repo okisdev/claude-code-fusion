@@ -122,14 +122,24 @@ function loadEditableData(filePath) {
   return result.data;
 }
 
+function ensurePrivateDirectory(directory) {
+  fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
+  try {
+    fs.chmodSync(directory, 0o700);
+  } catch {
+    void 0;
+  }
+}
+
 function writeModelRoutingData(filePath, data) {
   data.updatedAt = new Date().toISOString();
   const validation = validateModelRoutingData(data);
   if (!validation.ok) {
     throw new UsageError(`Cannot write model routing file: ${validation.reason}`);
   }
-  fs.mkdirSync(path.dirname(filePath), { recursive: true });
-  fs.writeFileSync(filePath, `${JSON.stringify(validation.data, null, 2)}\n`, "utf8");
+  ensurePrivateDirectory(path.dirname(filePath));
+  fs.writeFileSync(filePath, `${JSON.stringify(validation.data, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
+  fs.chmodSync(filePath, 0o600);
   return validation.data;
 }
 

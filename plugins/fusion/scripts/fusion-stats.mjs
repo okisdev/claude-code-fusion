@@ -8,6 +8,8 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { readAuditEvents as readGuardAuditEvents, resolveStateDir as resolveGuardStateDir, stateFile as guardStateFile } from "./inline-delegation-guard.mjs";
 import { resolveCodexStateDir, resolveCodexStateRoots } from "./lib/codex-state-roots.mjs";
+import { consumeRawArgsTransport, createRawArgsTransport, resolveRawArgsTransport } from "./lib/raw-args-transport.mjs";
+import { canonicalWorkerAgentType, isTerminalWorkerStatus, readWorkerRecords, recordCodexCollectorAcceptance, recordWorkerAcceptance } from "./lib/worker-state.mjs";
 
 const GROK_DATA_DIR_ENV = "GROK_COMPANION_DATA";
 const FUSION_DATA_DIR_ENV = "FUSION_DATA_DIR";
@@ -99,6 +101,10 @@ function nonEmptyString(value) {
 }
 
 export function resolveCodexJobModel(raw, observation) {
+  const resolved = nonEmptyString(raw?.resolvedModel);
+  if (resolved) {
+    return resolved;
+  }
   if (observation?.source === "rollout-turn-context") {
     return nonEmptyString(observation?.model) ?? nonEmptyString(raw?.request?.model) ?? "unknown";
   }
@@ -106,6 +112,10 @@ export function resolveCodexJobModel(raw, observation) {
 }
 
 export function resolveCodexJobEffort(raw, observation) {
+  const resolved = nonEmptyString(raw?.resolvedEffort);
+  if (resolved) {
+    return resolved;
+  }
   if (observation?.source === "rollout-turn-context") {
     return nonEmptyString(observation?.effort) ?? nonEmptyString(raw?.request?.effort) ?? null;
   }
@@ -156,10 +166,21 @@ function waitForObservationLock() {
   Atomics.wait(signal, 0, 0, 10);
 }
 
+function ensurePrivateDirectory(directory) {
+  fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
+  try {
+    fs.chmodSync(directory, 0o700);
+  } catch {
+    void 0;
+  }
+}
+
 function acquireObservationLock(lockPath) {
   for (let attempt = 0; attempt < OBSERVATION_LOCK_ATTEMPTS; attempt += 1) {
     try {
-      return fs.openSync(lockPath, "wx");
+      const descriptor = fs.openSync(lockPath, fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_WRONLY, 0o600);
+      fs.fchmodSync(descriptor, 0o600);
+      return descriptor;
     } catch (error) {
       if (error?.code !== "EEXIST") {
         throw error;
@@ -183,17 +204,21 @@ function acquireObservationLock(lockPath) {
 }
 
 function appendJsonlObservation(sidecarPath, observation, shouldAppend = () => true) {
-  fs.mkdirSync(path.dirname(sidecarPath), { recursive: true });
+  ensurePrivateDirectory(path.dirname(sidecarPath));
   const lockPath = `${sidecarPath}.lock`;
   const lock = acquireObservationLock(lockPath);
   if (lock == null) {
     return false;
   }
   try {
+    if (fs.existsSync(sidecarPath)) {
+      fs.chmodSync(sidecarPath, 0o600);
+    }
     if (!shouldAppend()) {
       return true;
     }
-    fs.appendFileSync(sidecarPath, `${JSON.stringify(observation)}\n`, "utf8");
+    fs.appendFileSync(sidecarPath, `${JSON.stringify(observation)}\n`, { encoding: "utf8", mode: 0o600 });
+    fs.chmodSync(sidecarPath, 0o600);
     return true;
   } finally {
     fs.closeSync(lock);
@@ -205,6 +230,13 @@ export function appendTokenUsageObservation(sidecarPath, observation) {
   return appendJsonlObservation(sidecarPath, observation, () => {
     const current = loadTokenUsageObservations(sidecarPath).get(observation.jobId);
     return !current || (current.availability !== "available" && current.availability !== observation.availability);
+  });
+}
+
+function appendAcceptanceObservation(sidecarPath, observation) {
+  return appendJsonlObservation(sidecarPath, observation, () => {
+    const current = loadAcceptanceObservations(sidecarPath).get(observation.jobId);
+    return !current || ["acceptance", "workspaceRoot", "repositoryKey", "sessionId", "source", "reason"].some((field) => (current[field] ?? null) !== (observation[field] ?? null));
   });
 }
 
@@ -323,8 +355,11 @@ export function recordCodexAcceptance({ jobId, acceptance, workspaceRoot = proce
     recordedAt: validatedIsoTimestamp(recordedAt),
     ...(normalizedReason ? { reason: normalizedReason } : {})
   };
-  if (!appendJsonlObservation(acceptanceSidecarPath(normalizedRoot, env), observation)) {
+  if (!appendAcceptanceObservation(acceptanceSidecarPath(normalizedRoot, env), observation)) {
     throw new Error("Codex acceptance ledger is busy; retry the write.");
+  }
+  for (const record of normalizedSessionId == null ? [] : readWorkerRecords(env).filter((candidate) => candidate.sessionId === normalizedSessionId && canonicalWorkerAgentType(candidate.agentType) === "fusion:job-collector" && candidate.completionContract === "collector" && candidate.peerEngine === "codex" && candidate.peerJobId === normalizedJobId && isTerminalWorkerStatus(candidate.transportStatus))) {
+    recordCodexCollectorAcceptance({ taskId: record.taskId, jobId: normalizedJobId, sessionId: normalizedSessionId, acceptance, env, source: normalizedSource, reason: normalizedReason });
   }
   return observation;
 }
@@ -801,6 +836,18 @@ function integerTokenField(value) {
   return Number.isSafeInteger(value) && value >= 0 ? value : null;
 }
 
+function checkedUsageAddition(totals, usage) {
+  const next = {};
+  for (const key of Object.keys(totals)) {
+    const total = totals[key] + usage[key];
+    if (!Number.isSafeInteger(total)) {
+      return null;
+    }
+    next[key] = total;
+  }
+  return next;
+}
+
 export function normalizeCodexTokenUsage(value) {
   const raw = value?.total_token_usage ?? value?.totalTokenUsage ?? value;
   if (!raw || typeof raw !== "object") {
@@ -819,18 +866,58 @@ export function normalizeCodexTokenUsage(value) {
   if (usage.cachedInputTokens > usage.inputTokens || usage.reasoningOutputTokens > usage.outputTokens) {
     return null;
   }
-  return usage.totalTokens === usage.inputTokens + usage.outputTokens ? usage : null;
+  return BigInt(usage.totalTokens) === BigInt(usage.inputTokens) + BigInt(usage.outputTokens) ? usage : null;
+}
+
+function normalizeClaudeWorkerUsage(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return null;
+  }
+  const usage = {
+    inputTokens: integerTokenField(value.inputTokens),
+    cacheCreationInputTokens: integerTokenField(value.cacheCreationInputTokens),
+    cacheReadInputTokens: integerTokenField(value.cacheReadInputTokens),
+    outputTokens: integerTokenField(value.outputTokens),
+    totalTokens: integerTokenField(value.totalTokens),
+    uncachedTokens: integerTokenField(value.uncachedTokens)
+  };
+  if (Object.values(usage).some((field) => field == null)) {
+    return null;
+  }
+  const totalTokens = BigInt(usage.inputTokens) + BigInt(usage.cacheCreationInputTokens) + BigInt(usage.cacheReadInputTokens) + BigInt(usage.outputTokens);
+  const uncachedTokens = BigInt(usage.inputTokens) + BigInt(usage.cacheCreationInputTokens) + BigInt(usage.outputTokens);
+  return BigInt(usage.totalTokens) === totalTokens && BigInt(usage.uncachedTokens) === uncachedTokens ? usage : null;
 }
 
 function tokenUsageForJob(raw, observation) {
-  const candidates = [raw?.tokenUsage, raw?.usage, raw?.result?.tokenUsage, raw?.result?.usage, observation?.tokenUsage, observation?.usage];
+  const candidates = [
+    { value: raw?.tokenUsage, availability: raw?.tokenUsageAvailability },
+    { value: raw?.usage, availability: raw?.tokenUsageAvailability ?? raw?.usageAvailability },
+    { value: raw?.result?.tokenUsage, availability: raw?.result?.tokenUsageAvailability ?? raw?.result?.usageAvailability },
+    { value: raw?.result?.usage, availability: raw?.result?.tokenUsageAvailability ?? raw?.result?.usageAvailability },
+    { value: observation?.tokenUsage, availability: observation?.availability },
+    { value: observation?.usage, availability: observation?.availability }
+  ];
+  let incomplete = false;
   for (const candidate of candidates) {
-    const normalized = normalizeCodexTokenUsage(candidate);
-    if (normalized) {
-      return normalized;
+    if (candidate.availability === "partial" || candidate.availability === "incomplete") {
+      incomplete = true;
+      continue;
     }
+    const normalized = normalizeCodexTokenUsage(candidate.value);
+    if (!normalized) {
+      incomplete ||= candidate.value != null || candidate.availability === "available";
+      continue;
+    }
+    if (candidate.availability === "unavailable" || candidate.availability === "unreported") {
+      continue;
+    }
+    if (candidate.availability != null && candidate.availability !== "available") {
+      continue;
+    }
+    return { availability: "available", usage: normalized };
   }
-  return null;
+  return { availability: incomplete ? "partial" : "unavailable", usage: null };
 }
 
 export function fileBasedEngineStats(descriptor, { all = false, env = process.env, cwd = process.cwd() } = {}) {
@@ -862,9 +949,12 @@ export function fileBasedEngineStats(descriptor, { all = false, env = process.en
   const tokenObservations = descriptor.id === "codex" ? loadAllObservationCandidates(env, TOKEN_USAGE_FILENAME, loadTokenUsageObservations) : new Map();
   const acceptanceObservations = descriptor.id === "codex" ? loadAllObservationCandidates(env, ACCEPTANCE_FILENAME, loadAcceptanceObservations) : new Map();
   const observationRepositoryCache = new Map();
-  const tokenTotals = { inputTokens: 0, cachedInputTokens: 0, outputTokens: 0, reasoningOutputTokens: 0, totalTokens: 0 };
+  let tokenTotals = { inputTokens: 0, cachedInputTokens: 0, outputTokens: 0, reasoningOutputTokens: 0, totalTokens: 0 };
+  let tokenAggregationOverflow = false;
   let jobsWithTokenUsage = 0;
+  let jobsWithIncompleteTokenUsage = 0;
   let jobsWithoutTokenUsage = 0;
+  let jobsWithUnreportedTokenUsage = 0;
   let pendingTransportJobs = 0;
   let durationSum = 0;
   let durationCount = 0;
@@ -891,14 +981,24 @@ export function fileBasedEngineStats(descriptor, { all = false, env = process.en
         pendingTransportJobs += 1;
       }
       if (CODEX_TERMINAL_STATUSES.has(job.status)) {
-        const usage = tokenUsageForJob(raw, jobId ? scopedObservationForJob(tokenObservations, raw, observationRepositoryCache) : null);
-        if (usage) {
+        const usageResult = tokenUsageForJob(raw, jobId ? scopedObservationForJob(tokenObservations, raw, observationRepositoryCache) : null);
+        if (usageResult.usage) {
           jobsWithTokenUsage += 1;
-          for (const key of Object.keys(tokenTotals)) {
-            tokenTotals[key] += usage[key];
+          if (!tokenAggregationOverflow) {
+            const nextTotals = checkedUsageAddition(tokenTotals, usageResult.usage);
+            if (nextTotals) {
+              tokenTotals = nextTotals;
+            } else {
+              tokenAggregationOverflow = true;
+            }
           }
         } else {
           jobsWithoutTokenUsage += 1;
+          if (usageResult.availability === "partial") {
+            jobsWithIncompleteTokenUsage += 1;
+          } else {
+            jobsWithUnreportedTokenUsage += 1;
+          }
         }
       }
     }
@@ -927,11 +1027,14 @@ export function fileBasedEngineStats(descriptor, { all = false, env = process.en
     ...(descriptor.id === "codex"
       ? {
           tokenUsage: {
-            availability: jobsWithTokenUsage === 0 ? "unavailable" : jobsWithoutTokenUsage === 0 ? "available" : "partial",
+            availability: tokenAggregationOverflow ? "overflow" : jobsWithTokenUsage === 0 ? "unavailable" : jobsWithoutTokenUsage === 0 ? "available" : "partial",
             scope: "terminal transport jobs only",
             jobsWithUsage: jobsWithTokenUsage,
+            jobsWithIncompleteUsage: jobsWithIncompleteTokenUsage,
             jobsWithoutUsage: jobsWithoutTokenUsage,
-            totals: jobsWithTokenUsage > 0 ? tokenTotals : null
+            jobsWithUnreportedUsage: jobsWithUnreportedTokenUsage,
+            totals: jobsWithTokenUsage > 0 && !tokenAggregationOverflow ? tokenTotals : null,
+            ...(tokenAggregationOverflow ? { aggregationOverflow: true } : {})
           },
           evidence: {
             bySource: byEvidence,
@@ -950,6 +1053,122 @@ export function fileBasedEngineStats(descriptor, { all = false, env = process.en
 
 export function codexStats(options = {}) {
   return fileBasedEngineStats(FILE_ENGINE_DESCRIPTORS.codex, options);
+}
+
+export function claudeWorkerStats({ all = false, env = process.env, cwd = process.cwd(), sessionId = null } = {}) {
+  const workspaceRoot = resolveGitWorkspaceRoot(cwd);
+  const repositoryCache = new Map();
+  const records = readWorkerRecords(env).filter((record) => {
+    const agentType = canonicalWorkerAgentType(record.agentType);
+    if (!agentType || agentType === "fusion:job-collector") {
+      return false;
+    }
+    if (sessionId && record.sessionId !== sessionId) {
+      return false;
+    }
+    return all || workspaceRootsShareRepository(record.workspaceRoot, workspaceRoot, repositoryCache);
+  });
+  const byStatus = {};
+  const byAcceptance = {};
+  const byAgent = {};
+  const byFailureKind = {};
+  const byDelivery = {};
+  const byModel = {};
+  let usage = { inputTokens: 0, cacheCreationInputTokens: 0, cacheReadInputTokens: 0, outputTokens: 0, totalTokens: 0, uncachedTokens: 0 };
+  let usageAggregationOverflow = false;
+  let pendingTransportJobs = 0;
+  let completeUsage = 0;
+  let partialUsage = 0;
+  let unreportedUsage = 0;
+  let durationSum = 0;
+  let durationCount = 0;
+  let earliest = null;
+  let latest = null;
+  for (const record of records) {
+    const status = nonEmptyString(record.transportStatus) ?? "unknown";
+    bump(byStatus, status);
+    bump(byAgent, nonEmptyString(record.agentType) ?? "unknown");
+    bump(byDelivery, nonEmptyString(record.expectedDelivery) ?? "unknown");
+    if (record.resolvedModel) {
+      bump(byModel, record.resolvedModel);
+    }
+    if (record.failureKind) {
+      bump(byFailureKind, record.failureKind);
+    }
+    if (isTerminalWorkerStatus(status)) {
+      bump(byAcceptance, CODEX_ACCEPTANCE_STATES.has(record.acceptance) ? record.acceptance : "unverified");
+    } else {
+      pendingTransportJobs += 1;
+    }
+    if (record.usageAvailability === "available") {
+      const normalizedUsage = normalizeClaudeWorkerUsage(record.usage);
+      if (normalizedUsage) {
+        completeUsage += 1;
+        if (!usageAggregationOverflow) {
+          const nextUsage = checkedUsageAddition(usage, normalizedUsage);
+          if (nextUsage) {
+            usage = nextUsage;
+          } else {
+            usageAggregationOverflow = true;
+          }
+        }
+      } else {
+        partialUsage += 1;
+      }
+    } else if (record.usageAvailability === "partial") {
+      partialUsage += 1;
+    } else {
+      unreportedUsage += 1;
+    }
+    const started = Date.parse(record.startedAt ?? "");
+    const finished = Date.parse(record.finishedAt ?? "");
+    if (Number.isFinite(started) && Number.isFinite(finished) && finished >= started) {
+      durationSum += (finished - started) / 1000;
+      durationCount += 1;
+    }
+    const created = Date.parse(record.createdAt ?? "");
+    if (Number.isFinite(created)) {
+      earliest = earliest == null || created < earliest ? created : earliest;
+      latest = latest == null || created > latest ? created : latest;
+    }
+  }
+  const identities = records
+    .slice()
+    .sort((left, right) => Date.parse(right.createdAt ?? "") - Date.parse(left.createdAt ?? ""))
+    .slice(0, 100)
+    .map((record) => ({
+      taskId: record.taskId,
+      sessionId: record.sessionId ?? null,
+      agentId: record.agentId ?? null,
+      backgroundTaskId: record.backgroundTaskId ?? null,
+      agentType: record.agentType,
+      transportStatus: record.transportStatus,
+      acceptance: record.acceptance ?? "unverified"
+    }));
+  return {
+    available: true,
+    totalJobs: records.length,
+    byTransportStatus: byStatus,
+    byAcceptance,
+    acceptanceScope: "terminal transport jobs only",
+    pendingTransportJobs,
+    byAgent,
+    byFailureKind,
+    byDelivery,
+    byModel,
+    usage: usageAggregationOverflow ? null : usage,
+    usageCoverage: {
+      availability: usageAggregationOverflow ? "overflow" : records.length > 0 && completeUsage === records.length ? "available" : completeUsage > 0 ? "partial" : "unavailable",
+      completeJobs: completeUsage,
+      incompleteJobs: partialUsage,
+      unreportedJobs: unreportedUsage,
+      ...(usageAggregationOverflow ? { aggregationOverflow: true } : {})
+    },
+    meanWallClockSeconds: durationCount > 0 ? Math.round((durationSum / durationCount) * 1000) / 1000 : null,
+    earliestCreatedAt: earliest == null ? null : new Date(earliest).toISOString(),
+    latestCreatedAt: latest == null ? null : new Date(latest).toISOString(),
+    identities
+  };
 }
 
 function listWorkspaceEntries(stateRoot) {
@@ -1194,6 +1413,7 @@ function engineTraceEntry(raw, { engine, join, model, effort }) {
     source: "engine job",
     engine,
     join,
+    ...(nonEmptyString(raw?.id) ? { jobId: raw.id } : {}),
     ...(model ? { model } : {}),
     ...(effort ? { effort } : {}),
     status: raw.status ?? "unknown"
@@ -1216,6 +1436,28 @@ export function buildTraceReport({ env = process.env, cwd = process.cwd(), sessi
   const gitRoot = resolveTraceGitRoot(cwd);
   const dispatches = dispatchTraceEntries(env, sessionId);
   const timeline = [...dispatches];
+  for (const record of readWorkerRecords(env)) {
+    const agentType = canonicalWorkerAgentType(record.agentType);
+    if (record.sessionId !== sessionId || !agentType || agentType === "fusion:job-collector") {
+      continue;
+    }
+    const timestamp = traceTimestamp(record.createdAt);
+    if (timestamp == null) {
+      continue;
+    }
+    timeline.push({
+      time: record.createdAt,
+      timestamp,
+      source: "Claude worker",
+      engine: "claude",
+      join: "exact",
+      taskId: record.taskId,
+      agentId: record.agentId ?? null,
+      backgroundTaskId: record.backgroundTaskId ?? null,
+      model: record.resolvedModel ?? null,
+      status: record.transportStatus ?? "unknown"
+    });
+  }
   const grokDescriptor = WORKSPACE_ENGINE_DESCRIPTORS.find((descriptor) => descriptor.id === "grok");
   if (grokDescriptor) {
     for (const raw of traceWorkspaceJobs(grokDescriptor, env)) {
@@ -1270,13 +1512,13 @@ export function renderTraceReport(report) {
     lines.push("", `Session data unavailable: ${report.reason}`);
     return `${lines.join("\n")}\n`;
   }
-  lines.push("", `Workspace root: ${report.workspaceRoot}`, "", "Time | Source | Lane or engine | Model@effort | Status | Description");
+  lines.push("", `Workspace root: ${report.workspaceRoot}`, "", "Time | Source | Lane or engine | Task or job | Model@effort | Status | Description");
   if (report.timeline.length === 0) {
     lines.push("no dispatches or matching engine jobs recorded");
   } else {
     for (const entry of report.timeline) {
       const subject = entry.source === "dispatch" ? entry.lane : `${entry.engine}${entry.join === "approximate" ? " (approximate)" : ""}`;
-      lines.push(`${entry.time} | ${entry.source} | ${subject} | ${formatTraceModel(entry.model, entry.effort) ?? ""} | ${entry.status ?? ""} | ${entry.description ?? ""}`);
+      lines.push(`${entry.time} | ${entry.source} | ${subject} | ${entry.taskId ?? entry.jobId ?? ""} | ${formatTraceModel(entry.model, entry.effort) ?? ""} | ${entry.status ?? ""} | ${entry.description ?? ""}`);
     }
   }
   return `${lines.join("\n")}\n`;
@@ -1336,12 +1578,12 @@ export function buildSessionReport({ env = process.env, sessionId = env.CLAUDE_C
     for (const descriptor of WORKSPACE_ENGINE_DESCRIPTORS) {
       engines[descriptor.id] = { available: false, reason };
     }
-    return { available: false, reason, sessionId, guard: null, engines };
+    return { available: false, reason, sessionId, guard: null, workers: null, engines };
   }
   for (const descriptor of WORKSPACE_ENGINE_DESCRIPTORS) {
     engines[descriptor.id] = sessionScopedEngineStats(descriptor, sessionId, env);
   }
-  return { available: true, sessionId, guard: readGuardSessionState(env, sessionId), engines };
+  return { available: true, sessionId, guard: readGuardSessionState(env, sessionId), workers: claudeWorkerStats({ all: true, env, sessionId }), engines };
 }
 
 export function renderSessionReport(report) {
@@ -1359,6 +1601,13 @@ export function renderSessionReport(report) {
     if (report.guard.malformedCount > 0) {
       lines.push(`Malformed audit entries skipped: ${report.guard.malformedCount}`);
     }
+  }
+  if (report.workers) {
+    lines.push("", "## Claude workers (session scope)", "", `Total jobs: ${report.workers.totalJobs}`);
+    renderCounts(lines, "By transport status", report.workers.byTransportStatus);
+    renderCounts(lines, "By semantic acceptance", report.workers.byAcceptance);
+    lines.push("", `Semantic acceptance scope: ${report.workers.acceptanceScope}; ${report.workers.pendingTransportJobs} non-terminal job${report.workers.pendingTransportJobs === 1 ? "" : "s"} excluded`);
+    renderWorkerIdentities(lines, report.workers.identities);
   }
   for (const descriptor of WORKSPACE_ENGINE_DESCRIPTORS) {
     const stats = report.engines[descriptor.id];
@@ -1512,6 +1761,11 @@ export function renderPruneReport(result) {
 
 export const STATS_PROVIDER_REGISTRY = [
   {
+    id: "claudeWorkers",
+    displayName: "Claude workers",
+    collect: (options) => claudeWorkerStats(options)
+  },
+  {
     id: "grok",
     displayName: "Grok",
     collect: (options) => grokStats(options)
@@ -1545,7 +1799,7 @@ function renderEngine(lines, name, stats) {
     lines.push(`Created between ${stats.earliestCreatedAt} and ${stats.latestCreatedAt}`);
   }
   if (stats.meanWallClockSeconds != null) {
-    lines.push(`Mean wall clock for successful transport completions: ${stats.meanWallClockSeconds}s`);
+    lines.push(`Mean wall clock for finished jobs: ${stats.meanWallClockSeconds}s`);
   }
   renderCounts(lines, stats.byTransportStatus ? "By transport status" : "By status", stats.byTransportStatus ?? stats.byStatus ?? {});
   renderCounts(lines, "By semantic acceptance", stats.byAcceptance ?? {});
@@ -1553,13 +1807,17 @@ function renderEngine(lines, name, stats) {
     lines.push("", `Semantic acceptance scope: ${stats.acceptanceScope}; ${stats.pendingTransportJobs} non-terminal job${stats.pendingTransportJobs === 1 ? "" : "s"} excluded`);
   }
   renderCounts(lines, "By mode", stats.byMode ?? {});
+  renderCounts(lines, "By agent", stats.byAgent ?? {});
+  renderCounts(lines, "By delivery", stats.byDelivery ?? {});
   renderCounts(lines, "By kind", stats.byKind ?? {});
   renderCounts(lines, "By model", stats.byModel ?? {});
   renderCounts(lines, "By effort", stats.byEffort ?? {});
   renderCounts(lines, "By failure kind", stats.byFailureKind ?? {});
   if (stats.tokenUsage) {
     const scope = stats.tokenUsage.scope ? `, ${stats.tokenUsage.scope}` : "";
-    lines.push("", `Exact token usage coverage${scope}: ${stats.tokenUsage.availability} (${stats.tokenUsage.jobsWithUsage} available, ${stats.tokenUsage.jobsWithoutUsage} unavailable)`);
+    const incomplete = stats.tokenUsage.jobsWithIncompleteUsage ?? 0;
+    const unreported = stats.tokenUsage.jobsWithUnreportedUsage ?? Math.max(0, stats.tokenUsage.jobsWithoutUsage - incomplete);
+    lines.push("", `Exact token usage coverage${scope}: ${stats.tokenUsage.availability} (${stats.tokenUsage.jobsWithUsage} complete, ${incomplete} incomplete, ${unreported} unreported)`);
     if (stats.tokenUsage.totals) {
       lines.push(`Observed tokens: ${stats.tokenUsage.totals.totalTokens} total, ${stats.tokenUsage.totals.inputTokens} input, ${stats.tokenUsage.totals.cachedInputTokens} cached input, ${stats.tokenUsage.totals.outputTokens} output, ${stats.tokenUsage.totals.reasoningOutputTokens} reasoning output`);
     }
@@ -1571,11 +1829,23 @@ function renderEngine(lines, name, stats) {
     const availability = stats.usageCoverage?.availability ?? (completeJobs === 0 ? "unavailable" : completeJobs === (stats.totalJobs ?? 0) ? "available" : "partial");
     lines.push("", `Exact token usage coverage: ${availability} (${completeJobs} complete, ${incompleteJobs} incomplete, ${unreportedJobs} unreported)`);
     if (stats.usage && completeJobs > 0) {
-      lines.push(`Observed tokens: ${stats.usage.totalTokens} total, ${stats.usage.inputTokens} input, ${stats.usage.cacheReadInputTokens} cached input, ${stats.usage.outputTokens} output, ${stats.usage.reasoningTokens} reasoning output`);
+      const reasoning = Number.isSafeInteger(stats.usage.reasoningTokens) ? `, ${stats.usage.reasoningTokens} reasoning output` : "";
+      lines.push(`Observed tokens: ${stats.usage.totalTokens} total, ${stats.usage.inputTokens} input, ${stats.usage.cacheReadInputTokens} cached input, ${stats.usage.outputTokens} output${reasoning}`);
     }
   }
   if (stats.evidence?.recoveredTerminalJobs || stats.evidence?.recoveredLegacyTerminalJobs) {
     lines.push("", `Recovered from retained terminal ledgers: ${stats.evidence.recoveredTerminalJobs + stats.evidence.recoveredLegacyTerminalJobs}`);
+  }
+  renderWorkerIdentities(lines, stats.identities);
+}
+
+function renderWorkerIdentities(lines, identities) {
+  if (!Array.isArray(identities) || identities.length === 0) {
+    return;
+  }
+  lines.push("", "Task identity map:", "task | session | agent | background task | transport | acceptance");
+  for (const identity of identities) {
+    lines.push(`${identity.taskId} | ${identity.sessionId ?? ""} | ${identity.agentId ?? ""} | ${identity.backgroundTaskId ?? ""} | ${identity.transportStatus} | ${identity.acceptance}`);
   }
 }
 
@@ -1594,7 +1864,9 @@ export function buildFusionStats({ all = false, env = process.env, cwd = process
 export function renderFusionStats(report) {
   const lines = ["# Fusion stats", "", `Scope: ${report.scope === "all" ? "all workspaces" : `workspace ${report.scope}`}`];
   for (const provider of STATS_PROVIDER_REGISTRY) {
-    renderEngine(lines, provider.displayName, report[provider.id]);
+    if (report[provider.id]) {
+      renderEngine(lines, provider.displayName, report[provider.id]);
+    }
   }
   lines.push("", "Peer token totals include only jobs with exact reported usage. Unavailable jobs are never estimated.");
   return `${lines.join("\n")}\n`;
@@ -1617,12 +1889,13 @@ function sessionIdFromArgs(argv, env) {
 
 export function main(argv = process.argv.slice(2), { env = process.env, cwd = process.cwd(), stdout = process.stdout } = {}) {
   const asJson = argv.includes("--json");
+  const effectiveEnv = argv.includes("--include-legacy") ? { ...env, FUSION_CODEX_INCLUDE_LEGACY: "1" } : env;
 
   if (argv.includes("--audit")) {
     const all = argv.includes("--all");
     const report = buildAuditReport({
-      env,
-      sessionId: argv.includes("--session") ? sessionIdFromArgs(argv, env) : null,
+      env: effectiveEnv,
+      sessionId: argv.includes("--session") ? sessionIdFromArgs(argv, effectiveEnv) : null,
       days: all ? null : positiveAuditDays(argumentValue(argv, "--days")),
       all
     });
@@ -1631,13 +1904,16 @@ export function main(argv = process.argv.slice(2), { env = process.env, cwd = pr
   }
 
   if (argv.includes("--record-acceptance")) {
+    if (argv.includes("--session")) {
+      throw new TypeError("--session cannot be used with --record-acceptance; acceptance is bound to the current Claude session.");
+    }
     const index = argv.indexOf("--record-acceptance");
     const observation = recordCodexAcceptance({
       jobId: argv[index + 1],
       acceptance: argv[index + 2],
       workspaceRoot: argumentValue(argv, "--workspace") ?? cwd,
-      env,
-      sessionId: sessionIdFromArgs(argv, env),
+      env: effectiveEnv,
+      sessionId: effectiveEnv.CLAUDE_CODE_SESSION_ID || null,
       reason: argumentValue(argv, "--reason"),
       source: argumentValue(argv, "--source") ?? "collector"
     });
@@ -1645,26 +1921,39 @@ export function main(argv = process.argv.slice(2), { env = process.env, cwd = pr
     return observation;
   }
 
+  if (argv.includes("--record-worker-acceptance")) {
+    const index = argv.indexOf("--record-worker-acceptance");
+    const observation = recordWorkerAcceptance({
+      taskId: argv[index + 1],
+      acceptance: argv[index + 2],
+      env: effectiveEnv,
+      reason: argumentValue(argv, "--reason"),
+      source: argumentValue(argv, "--source") ?? "main-loop"
+    });
+    stdout.write(asJson ? `${JSON.stringify(observation, null, 2)}\n` : `Recorded ${observation.acceptance} for Fusion worker task ${observation.taskId}.\n`);
+    return observation;
+  }
+
   if (argv.includes("--prune-dead")) {
-    const result = pruneDeadWorkspaces({ env, yes: argv.includes("--yes") });
+    const result = pruneDeadWorkspaces({ env: effectiveEnv, yes: argv.includes("--yes") });
     stdout.write(asJson ? `${JSON.stringify(result, null, 2)}\n` : renderPruneReport(result));
     return result;
   }
 
   if (argv.includes("--trace")) {
-    const report = buildTraceReport({ env, cwd, sessionId: sessionIdFromArgs(argv, env) });
+    const report = buildTraceReport({ env: effectiveEnv, cwd, sessionId: sessionIdFromArgs(argv, effectiveEnv) });
     stdout.write(asJson ? `${JSON.stringify(report, null, 2)}\n` : renderTraceReport(report));
     return report;
   }
 
   if (argv.includes("--session")) {
-    const report = buildSessionReport({ env, sessionId: sessionIdFromArgs(argv, env) });
+    const report = buildSessionReport({ env: effectiveEnv, sessionId: sessionIdFromArgs(argv, effectiveEnv) });
     stdout.write(asJson ? `${JSON.stringify(report, null, 2)}\n` : renderSessionReport(report));
     return report;
   }
 
   const all = argv.includes("--all");
-  const report = buildFusionStats({ all, env, cwd });
+  const report = buildFusionStats({ all, env: effectiveEnv, cwd });
   if (asJson) {
     stdout.write(`${JSON.stringify(report, null, 2)}\n`);
   } else {
@@ -1677,6 +1966,25 @@ function isMain() {
   return process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url);
 }
 
+function runCli(argv = process.argv.slice(2)) {
+  if (argv[0] === "transport-create") {
+    if (argv.length !== 1) {
+      throw new TypeError("transport-create does not accept arguments.");
+    }
+    process.stdout.write(`${JSON.stringify(createRawArgsTransport())}\n`);
+    return;
+  }
+  if (argv[0] === "transport-discard") {
+    if (argv.length !== 3 || argv[1] !== "--raw-args-token") {
+      throw new TypeError("transport-discard requires --raw-args-token TOKEN.");
+    }
+    consumeRawArgsTransport(argv[2]);
+    return;
+  }
+  const transport = resolveRawArgsTransport(argv);
+  main(transport.argv);
+}
+
 if (isMain()) {
-  main();
+  runCli();
 }
