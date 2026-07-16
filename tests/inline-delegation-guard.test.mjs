@@ -58,6 +58,7 @@ async function runAsync(sandbox, payload, extraEnv = {}) {
 function writePayload(sandbox, { sessionId = "session-1", toolName = "Edit", filePath, cwd, agentId } = {}) {
   const targetPath = filePath ?? path.join(sandbox.workDir, "file.txt");
   const payload = {
+    hook_event_name: "PreToolUse",
     session_id: sessionId,
     transcript_path: path.join(sandbox.root, "transcript.jsonl"),
     cwd: cwd ?? sandbox.workDir,
@@ -73,6 +74,7 @@ function writePayload(sandbox, { sessionId = "session-1", toolName = "Edit", fil
 
 function dispatchPayload(sandbox, { sessionId = "session-1", toolName = "Agent", subagentType, description = "do the thing", agentId } = {}) {
   const payload = {
+    hook_event_name: "PostToolUse",
     session_id: sessionId,
     transcript_path: path.join(sandbox.root, "transcript.jsonl"),
     cwd: sandbox.workDir,
@@ -131,15 +133,74 @@ test("writes below the budget are allowed silently and accumulate", (t) => {
   assert.strictEqual(state.writeCount, 4);
 });
 
-test("no call is ever denied, even far past the budget", (t) => {
+test("advisory compatibility mode never denies, even far past the budget", (t) => {
   const sandbox = makeSandbox(t);
   for (let i = 0; i < 30; i += 1) {
-    const result = run(sandbox, writePayload(sandbox));
+    const result = run(sandbox, writePayload(sandbox), { FUSION_INLINE_GUARD_MODE: "advisory" });
     assert.strictEqual(result.status, 0);
     if (result.stdout) {
       const output = JSON.parse(result.stdout);
       assert.strictEqual(output.hookSpecificOutput.permissionDecision, "allow");
     }
+  }
+});
+
+test("the default mode denies writes after the dispatch window budget until an Agent dispatch", (t) => {
+  const sandbox = makeSandbox(t);
+  for (let i = 0; i < 5; i += 1) {
+    const result = run(sandbox, writePayload(sandbox));
+    assert.notStrictEqual(JSON.parse(result.stdout || '{"hookSpecificOutput":{"permissionDecision":"allow"}}').hookSpecificOutput.permissionDecision, "deny");
+  }
+
+  for (let i = 0; i < 2; i += 1) {
+    const denied = run(sandbox, writePayload(sandbox));
+    const output = JSON.parse(denied.stdout);
+    assert.strictEqual(output.hookSpecificOutput.permissionDecision, "deny");
+    assert.match(output.hookSpecificOutput.permissionDecisionReason, /inline write budget is exhausted/i);
+  }
+  assert.strictEqual(readState(sandbox, "session-1").writesSinceDispatch, 5);
+  assert.strictEqual(readAuditRecords(sandbox).filter((record) => record.event === "write").length, 5);
+
+  run(sandbox, dispatchPayload(sandbox, { subagentType: "fusion:fast-worker" }));
+  const allowed = run(sandbox, writePayload(sandbox));
+  assert.strictEqual(allowed.stdout, "");
+  assert.strictEqual(readState(sandbox, "session-1").writesSinceDispatch, 1);
+});
+
+test("enforcement fails closed when guard state is unavailable while advisory compatibility remains fail open", (t) => {
+  const sandbox = makeSandbox(t);
+  fs.writeFileSync(sandbox.stateDir, "not a directory", "utf8");
+  const denied = run(sandbox, writePayload(sandbox));
+  assert.strictEqual(JSON.parse(denied.stdout).hookSpecificOutput.permissionDecision, "deny");
+  assert.match(JSON.parse(denied.stdout).hookSpecificOutput.permissionDecisionReason, /state is unavailable/);
+
+  const advisory = run(sandbox, writePayload(sandbox), { FUSION_INLINE_GUARD_MODE: "advisory" });
+  assert.strictEqual(advisory.stdout, "");
+});
+
+test("enforcement rejects malformed, truncated, and array state without resetting the write budget", (t) => {
+  const cases = [
+    ["malformed", "not json"],
+    ["truncated", '{"writeCount":'],
+    ["array", '[{"writeCount":5}]']
+  ];
+  for (const [name, contents] of cases) {
+    const sandbox = makeSandbox(t);
+    fs.mkdirSync(sandbox.stateDir, { recursive: true });
+    const file = stateFileFor(sandbox, "session-1");
+    fs.writeFileSync(file, contents, "utf8");
+
+    const denied = run(sandbox, writePayload(sandbox));
+    assert.strictEqual(denied.status, 0, name);
+    assert.strictEqual(JSON.parse(denied.stdout).hookSpecificOutput.permissionDecision, "deny", name);
+    assert.match(JSON.parse(denied.stdout).hookSpecificOutput.permissionDecisionReason, /state is unavailable/, name);
+    assert.strictEqual(fs.readFileSync(file, "utf8"), contents, name);
+    assert.deepStrictEqual(readAuditRecords(sandbox), [], name);
+
+    const advisory = run(sandbox, writePayload(sandbox), { FUSION_INLINE_GUARD_MODE: "advisory" });
+    assert.strictEqual(advisory.status, 0, name);
+    assert.strictEqual(advisory.stdout, "", name);
+    assert.strictEqual(fs.readFileSync(file, "utf8"), contents, name);
   }
 });
 
@@ -162,22 +223,23 @@ test("the fifth write under the default budget attaches one advisory naming the 
 
 test("no repeat nagging between threshold multiples, a new advisory fires at 2x and 3x the budget", (t) => {
   const sandbox = makeSandbox(t);
+  const extraEnv = { FUSION_INLINE_GUARD_MODE: "advisory" };
   for (let i = 0; i < 5; i += 1) {
-    run(sandbox, writePayload(sandbox));
+    run(sandbox, writePayload(sandbox), extraEnv);
   }
   for (let i = 0; i < 4; i += 1) {
-    const result = run(sandbox, writePayload(sandbox));
+    const result = run(sandbox, writePayload(sandbox), extraEnv);
     assert.strictEqual(result.stdout, "", `write ${i + 6} should stay silent`);
   }
-  const tenth = run(sandbox, writePayload(sandbox));
+  const tenth = run(sandbox, writePayload(sandbox), extraEnv);
   const tenthReason = JSON.parse(tenth.stdout).hookSpecificOutput.permissionDecisionReason;
   assert.match(tenthReason, /^10 inline writes happened this session with zero dispatches/);
 
   for (let i = 0; i < 4; i += 1) {
-    const result = run(sandbox, writePayload(sandbox));
+    const result = run(sandbox, writePayload(sandbox), extraEnv);
     assert.strictEqual(result.stdout, "", `write ${i + 11} should stay silent`);
   }
-  const fifteenth = run(sandbox, writePayload(sandbox));
+  const fifteenth = run(sandbox, writePayload(sandbox), extraEnv);
   const fifteenthReason = JSON.parse(fifteenth.stdout).hookSpecificOutput.permissionDecisionReason;
   assert.match(fifteenthReason, /^15 inline writes happened this session with zero dispatches/);
 
@@ -240,6 +302,20 @@ test("a Task dispatch is bucketed the same way as an Agent dispatch", (t) => {
   assert.strictEqual(result.stdout, "");
   const state = readState(sandbox, "session-1");
   assert.deepStrictEqual(state.dispatches, { codex: 1 });
+});
+
+test("an Agent PreToolUse attempt does not reset the write window before dispatch succeeds", (t) => {
+  const sandbox = makeSandbox(t);
+  for (let index = 0; index < 5; index += 1) {
+    run(sandbox, writePayload(sandbox));
+  }
+  const attempted = dispatchPayload(sandbox, { subagentType: "fusion:fast-worker" });
+  attempted.hook_event_name = "PreToolUse";
+  run(sandbox, attempted);
+
+  assert.deepStrictEqual(readState(sandbox, "session-1").dispatches, {});
+  const denied = run(sandbox, writePayload(sandbox));
+  assert.strictEqual(JSON.parse(denied.stdout).hookSpecificOutput.permissionDecision, "deny");
 });
 
 test("Agent and Task dispatches append ledger entries with their computed lane", (t) => {

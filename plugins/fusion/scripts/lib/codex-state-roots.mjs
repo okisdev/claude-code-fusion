@@ -4,6 +4,7 @@ import path from "node:path";
 const CANONICAL_STATE_ENV = "FUSION_CODEX_STATE";
 const COMPATIBILITY_STATE_ENV = "FUSION_CODEX_STATE_DIR";
 const DATA_ENV = "CODEX_COMPANION_DATA";
+const INCLUDE_LEGACY_ENV = "FUSION_CODEX_INCLUDE_LEGACY";
 
 function configuredPath(value) {
   if (typeof value !== "string" || !value.trim()) {
@@ -27,7 +28,9 @@ export function resolveCodexStateRoots(env = process.env) {
     return [path.join(dataOverride, "state")];
   }
   const dataRoot = path.join(homeDir(env), ".claude", "plugins", "data");
-  return [path.join(dataRoot, "codex-claude-code-fusion", "state"), path.join(dataRoot, "codex-openai-codex", "state")];
+  const canonical = path.join(dataRoot, "codex-claude-code-fusion", "state");
+  const includeLegacy = /^(?:1|true|yes|on)$/i.test(String(env[INCLUDE_LEGACY_ENV] ?? ""));
+  return includeLegacy ? [canonical, path.join(dataRoot, "codex-openai-codex", "state")] : [canonical];
 }
 
 export function resolveCodexStateDir(env = process.env) {

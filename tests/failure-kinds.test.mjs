@@ -96,6 +96,31 @@ test("structured quota errors retain reported usage", (t) => {
     total_tokens: 170,
   });
   assert.deepStrictEqual(Object.keys(record.modelUsage), ["grok-test-main", "grok-test-subagent"]);
+  assert.strictEqual(record.numTurns, 2);
+  assert.strictEqual(record.usageIsIncomplete, true);
+  assert.strictEqual(record.modelUsageIsIncomplete, false);
+
+  const stats = runCompanion(["stats", "--json"], { cwd: sandbox.workDir, env });
+  assert.strictEqual(stats.status, 0, stats.stderr);
+  assert.deepStrictEqual(JSON.parse(stats.stdout).usageCoverage, {
+    availability: "unavailable",
+    completeJobs: 0,
+    incompleteJobs: 1,
+    unreportedJobs: 0,
+  });
+});
+
+test("malformed spend fields in a structured error fail as transport", (t) => {
+  const sandbox = makeSandbox(t);
+  const env = envFor(sandbox, { FAKE_GROK_MODE: "usage-error-malformed" });
+  const result = runCompanion(["task", "doomed"], { cwd: sandbox.workDir, env });
+  assert.notStrictEqual(result.status, 0);
+  assert.match(result.stderr, /invalid usage\.output_tokens/);
+  assert.match(result.stderr, /^failure: transport$/m);
+  const [record] = jobRecords(sandbox.dataDir);
+  assert.strictEqual(record.status, "error");
+  assert.strictEqual(record.failureKind, "transport");
+  assert.strictEqual(record.usageIsIncomplete, true);
 });
 
 test("invalid zero exit JSON envelope records an error with a bounded stdout tail", (t) => {
@@ -104,12 +129,12 @@ test("invalid zero exit JSON envelope records an error with a bounded stdout tai
   const result = runCompanion(["task", "bad output"], { cwd: sandbox.workDir, env });
   assert.notStrictEqual(result.status, 0);
   assert.match(result.stderr, /^state: error$/m);
-  assert.match(result.stderr, /^failure: error$/m);
+  assert.match(result.stderr, /^failure: transport$/m);
   assert.ok(result.stderr.includes("valid JSON envelope"));
   assert.ok(result.stderr.includes("not a JSON envelope"));
   const record = jobRecords(sandbox.dataDir)[0];
   assert.strictEqual(record.status, "error");
-  assert.strictEqual(record.failureKind, "error");
+  assert.strictEqual(record.failureKind, "transport");
   assert.strictEqual(record.sessionId, null);
   assert.ok(record.errorTail.includes("not a JSON envelope"));
 });
@@ -117,14 +142,14 @@ test("invalid zero exit JSON envelope records an error with a bounded stdout tai
 test("bad cwd is an input error before a job is created", (t) => {
   const sandbox = makeSandbox(t);
   const missing = path.join(sandbox.root, "missing-work");
-  const textResult = runCompanion(["task", "hello", "--cwd", missing], {
+  const textResult = runCompanion(["task", "--cwd", missing, "hello"], {
     cwd: sandbox.workDir,
     env: envFor(sandbox),
   });
   assert.notStrictEqual(textResult.status, 0);
   assert.doesNotMatch(textResult.stderr, /^job: /m);
   assert.match(textResult.stderr, /state: error\nfailure: input\n$/);
-  const result = runCompanion(["task", "hello", "--cwd", missing, "--json"], {
+  const result = runCompanion(["task", "--cwd", missing, "--json", "hello"], {
     cwd: sandbox.workDir,
     env: envFor(sandbox),
   });
@@ -144,7 +169,7 @@ test("prompt file preflight errors are parseable in text and JSON modes", (t) =>
   });
   assert.notStrictEqual(textResult.status, 0);
   assert.match(textResult.stderr, /^state: error$/m);
-  assert.match(textResult.stderr, /^failure: error$/m);
+  assert.match(textResult.stderr, /^failure: input$/m);
   const jsonResult = runCompanion(["task", "--prompt-file", "missing.md", "--json"], {
     cwd: sandbox.workDir,
     env: envFor(sandbox),
@@ -152,7 +177,7 @@ test("prompt file preflight errors are parseable in text and JSON modes", (t) =>
   assert.notStrictEqual(jsonResult.status, 0);
   const payload = JSON.parse(jsonResult.stderr);
   assert.strictEqual(payload.status, "error");
-  assert.strictEqual(payload.failureKind, "error");
+  assert.strictEqual(payload.failureKind, "input");
   assert.match(payload.message, /missing\.md/);
   assert.deepStrictEqual(jobRecords(sandbox.dataDir), []);
 });
@@ -249,7 +274,7 @@ test("permission-cancelled turn reports explicit absence when the CLI omits the 
 test("cancelled background job yields failure kind cancelled", async (t) => {
   const sandbox = makeSandbox(t);
   const env = envFor(sandbox, { FAKE_GROK_MODE: "hang" });
-  const launch = runCompanion(["task", "long running", "--background"], {
+  const launch = runCompanion(["task", "--background", "long running"], {
     cwd: sandbox.workDir,
     env,
   });

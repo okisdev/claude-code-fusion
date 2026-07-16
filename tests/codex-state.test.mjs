@@ -159,6 +159,11 @@ test("job ids contain 128 bits and records expose the canonical Codex fields", (
   assert.strictEqual(record.schemaVersion, 1);
   assert.strictEqual(record.engine, "codex");
   assert.strictEqual(record.status, "running");
+  assert.strictEqual(record.delivery, "foreground");
+  assert.strictEqual(record.deliveryCollectedAt, null);
+  assert.strictEqual(record.semanticStatus, "unverified");
+  assert.strictEqual(record.resolvedModel, null);
+  assert.strictEqual(record.resolvedEffort, null);
   assert.strictEqual(record.collectedAt, null);
   assert.strictEqual(record.sessionId, "session-one");
   assert.strictEqual(record.claudeSessionId, "session-one");
@@ -293,6 +298,11 @@ test("terminal collection is an atomic idempotent lifecycle transition", (t) => 
   const collected = markJobCollectedFile(terminal.file, "2025-01-01T00:00:00.000Z");
   assert.strictEqual(collected.collectedAt, "2025-01-01T00:00:00.000Z");
   assert.deepStrictEqual(markJobCollectedFile(terminal.file, "2025-01-02T00:00:00.000Z"), collected);
+
+  const managed = makeRecord(sandbox, { background: true, delivery: "managed", id: "managed-collection" });
+  finishJobRecordFile(managed.file, { status: "done", resultText: "finished" });
+  const managedCollected = markJobCollectedFile(managed.file, "2025-01-01T00:00:00.000Z");
+  assert.strictEqual(managedCollected.deliveryCollectedAt, "2025-01-01T00:00:00.000Z");
 });
 
 test("a cancellation request wins a racing successful completion", (t) => {

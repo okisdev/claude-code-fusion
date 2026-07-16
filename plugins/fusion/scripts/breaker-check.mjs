@@ -6,12 +6,14 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { resolveCodexStateDir, resolveCodexStateRoots } from "./lib/codex-state-roots.mjs";
+import { readWorkerRecords } from "./lib/worker-state.mjs";
 
 const GROK_DATA_ENV = "GROK_COMPANION_DATA";
 const LOOKBACK_ENV = "FUSION_BREAKER_LOOKBACK_HOURS";
 const DEFAULT_LOOKBACK_HOURS = 12;
-const GROK_FAILURE_KINDS = new Set(["quota", "auth", "missing_cli", "rate_limited"]);
-const CODEX_BREAKER_FAILURE_KINDS = new Set([...GROK_FAILURE_KINDS, "protocol"]);
+const HARD_FAILURE_KINDS = new Set(["quota", "auth", "missing_cli", "protocol", "transport", "sandbox"]);
+const REPEATED_FAILURE_KINDS = new Set(["rate_limited", "timeout", "stall", "process", "died"]);
+const BREAKER_FAILURE_KINDS = new Set([...HARD_FAILURE_KINDS, ...REPEATED_FAILURE_KINDS, "permission"]);
 const GROK_FAILURE_STATUSES = new Set(["error", "failed"]);
 const CODEX_FAILURE_STATUSES = new Set(["error", "failed"]);
 const SUCCESS_STATUSES = new Set(["done", "completed"]);
@@ -23,8 +25,14 @@ const CODEX_FAILURE_PATTERNS = [
   ],
   ["auth", /unauthori[sz]ed|unauthenticated|authentication|auth(?:entication)? failed|invalid api key|api key/i],
   ["missing_cli", /missing[ _-]?cli|command not found|cli not found|no such file/i],
-  ["rate_limited", /rate[ _-]?limit|too many requests|\b429\b/i]
+  ["rate_limited", /rate[ _-]?limit|too many requests|\b429\b/i],
+  ["timeout", /timed?\s*out|timeout/i],
+  ["stall", /\bstall(?:ed|ing)?\b|no[- ]progress/i],
+  ["protocol", /collaboration policy violation|companion protocol violation|transport protocol violation/i],
+  ["transport", /transport (?:preflight|initialization|handshake|failed)|broken pipe|\bEPIPE\b|failed to (?:spawn|launch)|protocol stream closed/i],
+  ["permission", /\b(?:EACCES|EPERM)\b|operation not permitted|permission denied/i]
 ];
+const TRANSPORT_PERMISSION_PATTERN = /(?:sandbox|seatbelt|landlock).*(?:init|initializ|profile|policy)|(?:operation not permitted|\bEACCES\b|\bEPERM\b|permission denied).*(?:brief|prompt|transport|state|plugin|sandbox)|(?:brief|prompt|transport|state|plugin|sandbox).*(?:operation not permitted|\bEACCES\b|\bEPERM\b|permission denied)/i;
 
 function resolveGrokDataDir(env = process.env) {
   const override = env[GROK_DATA_ENV];
@@ -110,17 +118,40 @@ function isWithinLookback(timestamp, now, lookbackMs) {
   return ageMs >= 0 && ageMs <= lookbackMs;
 }
 
+function recordFailureText(record) {
+  return [record?.errorMessage, record?.errorTail, record?.cancelReason].filter((value) => typeof value === "string").join("\n");
+}
+
+function permissionBreaksTransport(record, failureKind) {
+  return failureKind === "permission" && TRANSPORT_PERMISSION_PATTERN.test(recordFailureText(record));
+}
+
+function supportedBreakerFailure(record, failureKind) {
+  if (failureKind === "permission") {
+    return permissionBreaksTransport(record, failureKind);
+  }
+  return BREAKER_FAILURE_KINDS.has(failureKind);
+}
+
+function normalizedRecordedFailureKind(record, value) {
+  const failureKind = typeof value === "string" ? value.trim().toLowerCase() : "";
+  if (failureKind === "policy" && /collaboration policy violation|companion protocol violation|transport protocol violation|delegated Codex execution attempted the disabled \w+ tool/i.test(recordFailureText(record))) {
+    return "protocol";
+  }
+  return failureKind;
+}
+
 function grokFailure(record, now, lookbackMs) {
   if (!GROK_FAILURE_STATUSES.has(record.status)) {
     return null;
   }
-  const recordedFailureKind = typeof record.failureKind === "string" ? record.failureKind.trim().toLowerCase() : "";
+  const recordedFailureKind = normalizedRecordedFailureKind(record, record.failureKind);
   let failureKind = recordedFailureKind;
   const recoverLegacyFailure = !recordedFailureKind || recordedFailureKind === "error";
   if (recoverLegacyFailure) {
-    failureKind = codexFailureKind([record.errorMessage, record.errorTail].filter((value) => typeof value === "string").join("\n"));
+    failureKind = codexFailureKind(recordFailureText(record));
   }
-  if (recoverLegacyFailure && !GROK_FAILURE_KINDS.has(failureKind) && typeof record._fusionRecordFile === "string") {
+  if (recoverLegacyFailure && !supportedBreakerFailure(record, failureKind) && typeof record._fusionRecordFile === "string") {
     try {
       const log = fs.readFileSync(record._fusionRecordFile.replace(/\.json$/, ".log"), "utf8");
       failureKind = codexFailureKind(log.slice(-64 * 1024));
@@ -129,7 +160,7 @@ function grokFailure(record, now, lookbackMs) {
     }
   }
   const timestamp = finishedAtMs(record.finishedAt);
-  if (!GROK_FAILURE_KINDS.has(failureKind) || timestamp == null || !isWithinLookback(timestamp, now, lookbackMs)) {
+  if (!supportedBreakerFailure(record, failureKind) || timestamp == null || !isWithinLookback(timestamp, now, lookbackMs)) {
     return null;
   }
   return { failureKind, timestamp };
@@ -151,13 +182,13 @@ function codexFailure(record, now, lookbackMs) {
   if (!CODEX_FAILURE_STATUSES.has(record.status)) {
     return null;
   }
-  const recordedFailureKind = typeof record.failureKind === "string" ? record.failureKind.trim().toLowerCase() : "";
+  const recordedFailureKind = normalizedRecordedFailureKind(record, record.failureKind);
   const recoverLegacyFailure = !recordedFailureKind || recordedFailureKind === "error";
   const failureKind = recoverLegacyFailure
-    ? codexFailureKind([record.errorMessage, record.errorTail].filter((value) => typeof value === "string").join("\n"))
+    ? codexFailureKind(recordFailureText(record))
     : recordedFailureKind;
   const timestamp = finishedAtMs(record.finishedAt ?? record.completedAt ?? record.updatedAt);
-  if (!CODEX_BREAKER_FAILURE_KINDS.has(failureKind) || timestamp == null || !isWithinLookback(timestamp, now, lookbackMs)) {
+  if (!supportedBreakerFailure(record, failureKind) || timestamp == null || !isWithinLookback(timestamp, now, lookbackMs)) {
     return null;
   }
   return { failureKind, timestamp };
@@ -178,7 +209,6 @@ function newerFailure(left, right) {
 }
 
 function latestBreakerFailure(records, failureReader, now, lookbackMs) {
-  let immediate = null;
   const outcomes = [];
   for (const record of records) {
     const timestamp = recordTimestamp(record);
@@ -186,9 +216,6 @@ function latestBreakerFailure(records, failureReader, now, lookbackMs) {
       continue;
     }
     const failure = failureReader(record, now, lookbackMs);
-    if (failure?.failureKind !== "rate_limited") {
-      immediate = newerFailure(immediate, failure);
-    }
     if (TERMINAL_STATUSES.has(record.status)) {
       outcomes.push({
         failureKind: failure?.failureKind ?? null,
@@ -198,23 +225,33 @@ function latestBreakerFailure(records, failureReader, now, lookbackMs) {
     }
   }
   outcomes.sort((left, right) => left.timestamp - right.timestamp);
-  let previousRateLimit = null;
-  let repeatedRateLimit = null;
+  let immediate = null;
+  let previousTransientFailure = null;
+  let repeatedTransientFailure = null;
   for (const outcome of outcomes) {
     if (SUCCESS_STATUSES.has(outcome.status)) {
-      previousRateLimit = null;
-      repeatedRateLimit = null;
+      immediate = null;
+      previousTransientFailure = null;
+      repeatedTransientFailure = null;
       continue;
     }
-    if (outcome.failureKind !== "rate_limited") {
+    if (HARD_FAILURE_KINDS.has(outcome.failureKind) || outcome.failureKind === "permission") {
+      immediate = { failureKind: outcome.failureKind, timestamp: outcome.timestamp };
+      previousTransientFailure = null;
+      repeatedTransientFailure = null;
       continue;
     }
-    if (previousRateLimit && outcome.timestamp - previousRateLimit.timestamp <= lookbackMs) {
-      repeatedRateLimit = { failureKind: "rate_limited", timestamp: outcome.timestamp };
+    if (!REPEATED_FAILURE_KINDS.has(outcome.failureKind)) {
+      previousTransientFailure = null;
+      repeatedTransientFailure = null;
+      continue;
     }
-    previousRateLimit = outcome;
+    if (previousTransientFailure && previousTransientFailure.failureKind === outcome.failureKind && outcome.timestamp - previousTransientFailure.timestamp <= lookbackMs) {
+      repeatedTransientFailure = { failureKind: outcome.failureKind, timestamp: outcome.timestamp };
+    }
+    previousTransientFailure = outcome;
   }
-  return newerFailure(immediate, repeatedRateLimit);
+  return newerFailure(immediate, repeatedTransientFailure);
 }
 
 function formatAge(timestamp, now) {
@@ -234,7 +271,25 @@ function formatAge(timestamp, now) {
 }
 
 function advisoryLine(engine, failure, now) {
-  return `fusion breaker advisory: treat the ${engine} breaker as open unless verified recovered; last failure ${failure.failureKind} ${formatAge(failure.timestamp, now)}.`;
+  return `fusion breaker advisory: treat the ${engine} breaker as open unless verified recovered; last failure ${failure.failureKind} ${formatAge(failure.timestamp, now)}. Route new work to another eligible healthy lane.`;
+}
+
+function workerFailure(record, now, lookbackMs) {
+  if (!new Set(["failed", "incomplete", "owner_ended"]).has(record.transportStatus)) {
+    return null;
+  }
+  const failureKind = typeof record.failureKind === "string" ? record.failureKind.trim().toLowerCase() : "";
+  const timestamp = finishedAtMs(record.finishedAt ?? record.updatedAt);
+  if (!REPEATED_FAILURE_KINDS.has(failureKind) || timestamp == null || !isWithinLookback(timestamp, now, lookbackMs)) {
+    return null;
+  }
+  return { failureKind, timestamp };
+}
+
+function workerBreakerRecords(env) {
+  return readWorkerRecords(env)
+    .filter((record) => record.agentType === "fusion:fast-worker")
+    .map((record) => ({ ...record, status: record.transportStatus === "done" ? "done" : ["failed", "incomplete", "owner_ended"].includes(record.transportStatus) ? "failed" : record.transportStatus }));
 }
 
 function run(env = process.env, now = Date.now()) {
@@ -247,6 +302,10 @@ function run(env = process.env, now = Date.now()) {
   }
   if (codex) {
     lines.push(advisoryLine("codex", codex, now));
+  }
+  const fastWorker = latestBreakerFailure(workerBreakerRecords(env), workerFailure, now, lookbackMs);
+  if (fastWorker) {
+    lines.push(advisoryLine("fusion:fast-worker", fastWorker, now));
   }
   if (lines.length > 0) {
     process.stdout.write(`${lines.join("\n")}\n`);

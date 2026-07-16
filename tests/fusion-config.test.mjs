@@ -86,6 +86,8 @@ test("Rescore writes the data file and refreshes the live rules", (t) => {
     cost: 5,
     notes: "primary implementation lane"
   });
+  assert.strictEqual(fs.statSync(path.dirname(box.modelRoutingFile)).mode & 0o777, 0o700);
+  assert.strictEqual(fs.statSync(box.modelRoutingFile).mode & 0o777, 0o600);
   const live = fs.readFileSync(box.rulesFile, "utf8");
   assert.match(live, /^\| codex \| codex \| 5 \| 4 \| 5 \| primary implementation lane \|$/m);
 });

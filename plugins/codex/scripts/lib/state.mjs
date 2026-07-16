@@ -19,6 +19,8 @@ const PRIVATE_FILE_MODE = 0o600;
 const STATE_MAX_BYTES_ENV = "CODEX_COMPANION_HISTORY_MAX_BYTES";
 const STATE_MAX_RECORDS_ENV = "CODEX_COMPANION_HISTORY_MAX_RECORDS";
 const JOB_STATUSES = new Set(["running", "done", "error", "cancelled"]);
+const DELIVERY_MODES = new Set(["foreground", "manual", "managed"]);
+const SEMANTIC_STATUSES = new Set(["accepted", "rejected", "unverified"]);
 const JOB_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 const WORKSPACE_SLUG_PATTERN = /^.+-[a-f0-9]{16}$/;
 
@@ -415,6 +417,12 @@ function assertJobRecord(record) {
   if (!JOB_STATUSES.has(record.status)) {
     throw new TypeError("Job status is invalid.");
   }
+  if (record.delivery != null && !DELIVERY_MODES.has(record.delivery)) {
+    throw new TypeError("Job delivery mode is invalid.");
+  }
+  if (record.semanticStatus != null && !SEMANTIC_STATUSES.has(record.semanticStatus)) {
+    throw new TypeError("Job semantic status is invalid.");
+  }
 }
 
 function ownerSessionId(record) {
@@ -426,7 +434,14 @@ function normalizeRecord(record) {
   const sessionId = ownerSessionId(record);
   return {
     ...record,
+    delivery: record.delivery ?? (record.background ? "manual" : "foreground"),
+    deliveryCollectedAt: record.deliveryCollectedAt ?? null,
     schemaVersion: record.schemaVersion ?? JOB_SCHEMA_VERSION,
+    semanticStatus: record.semanticStatus ?? "unverified",
+    semanticFailureKind: record.semanticFailureKind ?? null,
+    semanticFailureMessage: record.semanticFailureMessage ?? null,
+    resolvedModel: record.resolvedModel ?? null,
+    resolvedEffort: record.resolvedEffort ?? null,
     sessionId,
     claudeSessionId: sessionId
   };
@@ -628,6 +643,8 @@ export function createJobRecord(fields) {
     jobClass: fields.jobClass ?? fields.kind ?? "task",
     mode: fields.mode ?? "consult",
     background: Boolean(fields.background),
+    delivery: fields.delivery ?? (fields.background ? "manual" : "foreground"),
+    deliveryCollectedAt: fields.deliveryCollectedAt ?? null,
     cwd,
     workspaceRoot,
     repositoryIdentity: identity,
@@ -639,6 +656,7 @@ export function createJobRecord(fields) {
     pidOwnsProcessGroup: Boolean(fields.pidOwnsProcessGroup),
     codexPid: fields.codexPid ?? null,
     codexPidIdentity: fields.codexPidIdentity ?? null,
+    codexPidIdentitySettled: Boolean(fields.codexPidIdentitySettled),
     codexPidOwnsProcessGroup: Boolean(fields.codexPidOwnsProcessGroup),
     threadId: fields.threadId ?? null,
     turnId: fields.turnId ?? null,
@@ -656,11 +674,18 @@ export function createJobRecord(fields) {
     collectedAt: fields.collectedAt ?? null,
     exitCode: fields.exitCode ?? null,
     resultText: fields.resultText ?? null,
+    partialResultText: fields.partialResultText ?? null,
     tokenUsage: fields.tokenUsage ?? null,
     cumulativeTokenUsage: fields.cumulativeTokenUsage ?? null,
     tokenUsageAvailability: fields.tokenUsageAvailability ?? "unreported",
     tokenUsageUnavailableReason: fields.tokenUsageUnavailableReason ?? null,
     usageIsIncomplete: fields.usageIsIncomplete ?? null,
+    resolvedModel: fields.resolvedModel ?? null,
+    resolvedEffort: fields.resolvedEffort ?? null,
+    rolloutRecoveryStatus: fields.rolloutRecoveryStatus ?? null,
+    semanticStatus: fields.semanticStatus ?? "unverified",
+    semanticFailureKind: fields.semanticFailureKind ?? null,
+    semanticFailureMessage: fields.semanticFailureMessage ?? null,
     diagnostics: fields.diagnostics ?? [],
     protocolError: fields.protocolError ?? null,
     resultSource: fields.resultSource ?? null,
@@ -789,7 +814,11 @@ export function markJobCollectedFile(file, collectedAt = nowIso()) {
     if (!TERMINAL_STATUSES.has(existing.status) || existing.collectedAt) {
       return existing;
     }
-    const next = normalizeRecord({ ...existing, collectedAt });
+    const next = normalizeRecord({
+      ...existing,
+      collectedAt,
+      deliveryCollectedAt: existing.delivery === "foreground" ? existing.deliveryCollectedAt ?? null : existing.deliveryCollectedAt ?? collectedAt
+    });
     assertJobRecord(next);
     atomicWriteFile(file, `${JSON.stringify(next, null, 2)}\n`);
     return next;

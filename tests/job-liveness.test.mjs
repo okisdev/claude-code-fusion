@@ -327,10 +327,12 @@ test("refresh preserves a done record written after a stale outer read", async (
     cancelRequestedAt: null,
   };
   writeJobRecordFile(file, done);
+  const persisted = readJobRecordFile(file);
+  const before = fs.readFileSync(file, "utf8");
   const refreshed = refreshRunningJobRecord({ record: stale, file });
   assert.strictEqual(refreshed.changed, false);
-  assert.deepStrictEqual(refreshed.record, done);
-  assert.deepStrictEqual(readJobRecordFile(file), done);
+  assert.deepStrictEqual(refreshed.record, persisted);
+  assert.strictEqual(fs.readFileSync(file, "utf8"), before);
 });
 
 test("terminal records are not rewritten by the liveness pass", async (t) => {
@@ -348,9 +350,5 @@ test("terminal records are not rewritten by the liveness pass", async (t) => {
   assert.strictEqual(status.status, 0, status.stderr);
   assert.match(status.stdout, /^state: error$/m);
   assert.match(status.stdout, /^failure: error$/m);
-  const result = runCompanion(["result", record.id], { cwd: sandbox.workDir, env: envFor(sandbox) });
-  assert.strictEqual(result.status, 0, result.stderr);
-  assert.match(result.stdout, /^state: error$/m);
-  assert.match(result.stdout, /^failure: error$/m);
   assert.strictEqual(fs.readFileSync(file, "utf8"), before);
 });

@@ -1,26 +1,27 @@
 ---
 description: Delegate a coding or consultation task to the local Grok CLI through the companion runtime
-argument-hint: '[--write] [--web] [--background] [--resume <uuid>|--resume-last] [--model <id>] [--effort <level>] [--max-turns <n>] [--best-of-n <n>] [--cwd <dir>] [--json] [what Grok should do]'
+argument-hint: '[--write] [--web] [--memory] [--background] [--resume <uuid>|--resume-last|--fresh] [--model <id>] [--effort <level>] [--max-turns <n>] [--best-of-n <n>] [--cwd <dir>] [--json] [what Grok should do]'
 allowed-tools: Agent
 ---
 
 Forward the request to the Grok companion task runtime.
 
-Raw slash-command arguments:
-`$ARGUMENTS`
-
 Execution rules:
 
-- Dispatch the run as one background subagent of type `grok:grok-rescue` via the `Agent` tool. Tell the rescue agent this is a direct user selected Grok lane. Never run the companion in the main loop and never ask the user how to run it; the subagent is harness tracked, so its completion arrives as a notification and nothing blocks.
-- Separate routing flags from the task text: `--write`, `--web`, `--background`, `--resume <uuid>`, `--resume-last`, `--model`, `--effort`, `--max-turns`, `--best-of-n`, `--cwd`, and `--json` are runtime controls. Name them explicitly in the subagent prompt as the flags to pass, and hand over the remaining natural language text as the task text.
-- Do not rewrite the task text beyond stripping routing flags.
-- Pass `--background` through only when the user explicitly included it. It creates a manual detached job: grok-rescue returns the durable receipt without collecting, the best effort session monitor may announce completion, and the user inspects or collects it through `/grok:status` and `/grok:result`. Without an explicit flag, grok-rescue may use managed detachment only as an internal timeout bridge and must collect that job to a terminal result before returning.
-- Leave `--model` and `--effort` unset unless the user explicitly asked for them. Grok resolves both from its own config.
-- `--web` re-enables Grok's web tools for research briefs; leave it off for code work.
-- `--best-of-n` implies write mode with auto approval because the tournament applies the winning candidate to the workspace; pass it only when the user accepts edits.
-- Never invent a session uuid for `--resume`. Only pass a uuid that Grok previously returned; for continuing the most recent thread use `--resume-last`.
+- Treat the complete raw slash command request as opaque data. Do not parse, strip, quote, escape, normalize, or place any part of it in Bash.
+- Dispatch the run as one foreground subagent of type `grok:grok-rescue` via the `Agent` tool with `run_in_background: false`. Tell the rescue agent this is a direct user selected Grok lane and that the raw request begins after a fixed delimiter and continues to the end of the Agent prompt. Parallel work uses multiple foreground Agent calls in one message. Never run the companion in the main loop and never ask the user how to run it.
+- The rescue agent stages the raw request through the private one time transport. Runtime flags such as `--write`, `--web`, `--memory`, `--background`, resume, `--fresh`, model, effort, max turns, best of n, cwd, and JSON stay inside that raw request and are parsed only by the companion.
+- Cross-session memory is off by default and can be enabled only for an ordinary task through an explicit `--memory`. Relevant Grok memory may then be injected internally into the model context sent to xAI. `--best-of-n`, review, and stop gate runs always keep memory off. Upstream automatic saving usually requires at least three real user prompts in the same resumed session, so a single Fusion task usually only reads existing memory and does not guarantee that new memory is saved.
+- Session continuity defaults to manual. When `/grok:setup --continuity claude-session` is selected, an ordinary direct task may automatically resume the newest compatible completed task from the same Claude session, exact resolved working directory, mode, and memory setting. `--fresh` bypasses that affinity and starts a new Grok session. Fusion routed briefs do not receive automatic affinity and stay fresh unless explicitly resumed.
+- Explicit and automatic resume preserve the recorded memory boundary. A session created with `--memory` must be resumed with `--memory`, and a session created without it must be resumed without it.
+- An explicit raw `--background` creates a manual detached job. Without that flag, the companion remains foreground regardless of task size or expected duration.
+- Ordinary runs hard disable native Agent and suppress or explicitly bound native background tool waiting. Best-of-n is the only task mode that retains native Agent, and its bounded native wait remains inside the foreground companion deadline. Neither behavior creates a detached receipt.
 - Relay the subagent's returned companion output verbatim, exactly as-is, including the grok-session and job lines.
 - Do not paraphrase, summarize, or add commentary before or after it.
 - For a background run, the companion prints the job id plus `/grok:status` and `/grok:result` usage hints. Preserve them.
+- Preserve structured output, request id, turn count, usage, cost, partial-cost, and incomplete-usage-ledger fields when the companion reports them. Per-model rows expose input, output, cache-read, and model-call counts plus optional cost; do not synthesize reasoning or total tokens. When `usage_is_incomplete` is true, present counts are observed lower bounds and job-total token and cost coverage are incomplete. They are observability data, not proof that the result is semantically accepted.
 - If the user did not supply a request, ask what Grok should do.
 - If the companion reports that Grok is missing, point the user at `/grok:setup`.
+
+The opaque raw request begins after the next newline and continues to the end of this command prompt:
+$ARGUMENTS

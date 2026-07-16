@@ -63,6 +63,7 @@ const ROOT_DIR = path.resolve(path.dirname(SELF_PATH), "..");
 const ADVERSARIAL_REVIEW_PROMPT_FILE = path.join(ROOT_DIR, "prompts", "adversarial-review.md");
 const FOREGROUND_TIMEOUT_ENV = "CODEX_COMPANION_TIMEOUT_MS";
 const BACKGROUND_TIMEOUT_ENV = "CODEX_COMPANION_BACKGROUND_TIMEOUT_MS";
+const BACKGROUND_DELIVERY_ENV = "CODEX_COMPANION_BACKGROUND_DELIVERY";
 const BACKGROUND_LAUNCH_APPROVAL_TIMEOUT_ENV = "CODEX_COMPANION_LAUNCH_APPROVAL_TIMEOUT_MS";
 const PIDLESS_GRACE_ENV = "CODEX_COMPANION_PIDLESS_RUNNING_GRACE_MS";
 const WAIT_POLL_ENV = "CODEX_COMPANION_WAIT_POLL_MS";
@@ -109,6 +110,7 @@ function printUsage() {
       "  node scripts/codex-companion.mjs status [job-id] [--all] [--cwd <dir>] [--json]",
       "  node scripts/codex-companion.mjs result <job-id> [--wait] [--wait-timeout-ms <ms>] [--cwd <dir>] [--json]",
       "  node scripts/codex-companion.mjs cancel <job-id> [--cwd <dir>] [--json]",
+      "  node scripts/codex-companion.mjs history [--json]",
       "  node scripts/codex-companion.mjs setup [--cwd <dir>] [--json]"
     ].join("\n") + "\n"
   );
@@ -186,6 +188,10 @@ function nonnegativeEnvMs(name, fallback, env = process.env) {
 
 function resolveExecutionTimeout(background, env = process.env) {
   return positiveEnvMs(background ? BACKGROUND_TIMEOUT_ENV : FOREGROUND_TIMEOUT_ENV, background ? DEFAULT_BACKGROUND_TIMEOUT_MS : DEFAULT_FOREGROUND_TIMEOUT_MS, env);
+}
+
+function backgroundDelivery(env = process.env) {
+  return env[BACKGROUND_DELIVERY_ENV] === "managed" ? "managed" : "manual";
 }
 
 function resolvePidlessGrace(env = process.env) {
@@ -482,6 +488,18 @@ function readBoundedDescriptor(descriptor, limit) {
   return Buffer.concat(chunks, total);
 }
 
+function consumeRawCommandStdin() {
+  if (isatty(0)) {
+    throw new CompanionError("Raw command stdin requires a piped request.", "input");
+  }
+  const bytes = readBoundedDescriptor(0, MAX_RAW_ARGUMENT_BYTES);
+  try {
+    return new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+  } catch {
+    throw new CompanionError("Raw command arguments must be valid UTF-8.", "input");
+  }
+}
+
 function consumeRawCommandTransport(token) {
   const { directory, file, ownerFile } = transportPaths(token);
   let descriptor;
@@ -498,13 +516,21 @@ function consumeRawCommandTransport(token) {
       throw new CompanionError("The raw command transport directory is not private.", "permission");
     }
     directoryIdentity = directoryStats;
-    ownerIdentity = readTransportOwner(ownerFile).identity;
+    const owner = readTransportOwner(ownerFile);
+    ownerIdentity = owner.identity;
     const pathStats = fs.lstatSync(file);
     if (!pathStats.isFile() || pathStats.isSymbolicLink() || pathStats.nlink !== 1) {
       throw new CompanionError("The raw command transport must be a regular private file.", "permission");
     }
     validateOwnedPath(pathStats, "The raw command transport file");
     fileIdentity = pathStats;
+    if (owner.record.sessionHash !== transportSessionHash(currentClaudeSessionId())) {
+      throw new CompanionError("The raw command transport belongs to another Claude session.", "permission");
+    }
+    const transportAgeMs = Date.now() - owner.record.createdAt;
+    if (transportAgeMs < 0 || transportAgeMs > TRANSPORT_MAX_AGE_MS) {
+      throw new CompanionError("The raw command transport has expired.", "input");
+    }
     if (process.platform !== "win32" && (pathStats.mode & 0o077) !== 0) {
       throw new CompanionError("The raw command transport file is not private.", "permission");
     }
@@ -543,16 +569,22 @@ function consumeRawCommandTransport(token) {
 function resolveCommandTransport(rawArgv) {
   const defaultWrite = rawArgv[0] === "--transport-default-write";
   const transportArgv = defaultWrite ? rawArgv.slice(1) : rawArgv;
+  if (transportArgv[0] === "--request-stdin") {
+    if (transportArgv.length !== 1) {
+      throw new CompanionError("Raw command stdin must not be combined with normal arguments.", "input");
+    }
+    return { argv: [consumeRawCommandStdin()], defaultWrite, ingress: "stdin" };
+  }
   if (transportArgv[0] !== "--raw-args-token") {
-    if (transportArgv.some((value) => value === "--raw-args-token") || defaultWrite) {
+    if (transportArgv.some((value) => value === "--raw-args-token" || value === "--request-stdin") || defaultWrite) {
       throw new CompanionError("Raw command transport options must not be combined with normal arguments.", "input");
     }
-    return { argv: rawArgv, defaultWrite: false };
+    return { argv: rawArgv, defaultWrite: false, ingress: "argv" };
   }
   if (transportArgv.length !== 2) {
     throw new CompanionError("Raw command transport requires exactly one token.", "input");
   }
-  return { argv: [consumeRawCommandTransport(transportArgv[1])], defaultWrite };
+  return { argv: [consumeRawCommandTransport(transportArgv[1])], defaultWrite, ingress: "staged_file" };
 }
 
 function readTaskPrompt(cwd, options, positionals, positionalText) {
@@ -618,6 +650,10 @@ function preflightCodex(cwd) {
   if (!probe.available) {
     throw availabilityFailure(probe);
   }
+  const version = parseVersion(probe.version);
+  if (version && compareVersion(version, TESTED_VERSION_MIN) < 0) {
+    throw new CompanionError(`Codex CLI version ${probe.version} is unsupported. Upgrade the Codex CLI to version 0.144.0 or later.`, "setup");
+  }
   return probe;
 }
 
@@ -672,6 +708,7 @@ function recordedProcessState(record, prefix) {
   const codex = prefix === "codex";
   const pid = record[codex ? "codexPid" : "pid"];
   const identity = record[codex ? "codexPidIdentity" : "pidIdentity"];
+  const identitySettled = codex ? Boolean(record.codexPidIdentitySettled) : true;
   const ownsProcessGroup = Boolean(record[codex ? "codexPidOwnsProcessGroup" : "pidOwnsProcessGroup"]);
   if (!Number.isInteger(pid) || pid <= 1) {
     return { identity, ownsProcessGroup, pid, state: "absent" };
@@ -681,7 +718,10 @@ function recordedProcessState(record, prefix) {
     if (!identity) {
       return { identity, ownsProcessGroup, pid, state: "unverified" };
     }
-    return { identity, ownsProcessGroup, pid, state: processIdentitiesMatch(currentIdentity, identity) ? "owned" : "replaced" };
+    if (processIdentitiesMatch(currentIdentity, identity)) {
+      return { identity, ownsProcessGroup, pid, state: "owned" };
+    }
+    return { identity, ownsProcessGroup, pid, state: identitySettled ? "replaced" : "unverified" };
   }
   if (isProcessAlive(pid, null, ownsProcessGroup)) {
     return { identity, ownsProcessGroup, pid, state: "unverified" };
@@ -694,7 +734,34 @@ function cleanupComplete(record) {
 }
 
 function codexSpawnCheckpointPending(record) {
-  return Boolean(record?.background && record.startedAt && !record.codexPidIdentity);
+  return Boolean(record?.background && record.startedAt && !record.codexPidIdentitySettled);
+}
+
+const SPAWN_CHECKPOINT_SETTLE_TIMEOUT_MS = 1000;
+const SPAWN_CHECKPOINT_SETTLE_POLL_MS = 25;
+
+function sleepSync(ms) {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
+function awaitCodexSpawnCheckpointSettledSync(file, record) {
+  const deadline = Date.now() + SPAWN_CHECKPOINT_SETTLE_TIMEOUT_MS;
+  let current = record;
+  while (codexSpawnCheckpointPending(current) && current.status === "running" && Date.now() < deadline) {
+    sleepSync(SPAWN_CHECKPOINT_SETTLE_POLL_MS);
+    current = readJobRecordFile(file) ?? current;
+  }
+  return current;
+}
+
+async function awaitCodexSpawnCheckpointSettled(file, record) {
+  const deadline = Date.now() + SPAWN_CHECKPOINT_SETTLE_TIMEOUT_MS;
+  let current = record;
+  while (codexSpawnCheckpointPending(current) && current.status === "running" && Date.now() < deadline) {
+    await delay(SPAWN_CHECKPOINT_SETTLE_POLL_MS);
+    current = readJobRecordFile(file) ?? current;
+  }
+  return current;
 }
 
 function signalRecorded(record, prefix) {
@@ -778,10 +845,11 @@ function collectRenderedJob(file, record) {
 }
 
 function repairRunningRecordSync({ record, file }, env = process.env) {
-  const current = readJobRecordFile(file) ?? record;
+  let current = readJobRecordFile(file) ?? record;
   if (current.status !== "running") {
     return current;
   }
+  current = awaitCodexSpawnCheckpointSettledSync(file, current);
   const deadline = Date.parse(current.deadlineAt ?? "");
   if (Number.isFinite(deadline) && Date.now() > deadline) {
     if (codexSpawnCheckpointPending(current)) {
@@ -830,10 +898,11 @@ function repairRunningRecordSync({ record, file }, env = process.env) {
 }
 
 export async function refreshRunningJobRecord(found, env = process.env) {
-  const current = readJobRecordFile(found.file) ?? found.record;
+  let current = readJobRecordFile(found.file) ?? found.record;
   if (current.status !== "running") {
     return current;
   }
+  current = await awaitCodexSpawnCheckpointSettled(found.file, current);
   const deadline = Date.parse(current.deadlineAt ?? "");
   if (Number.isFinite(deadline) && Date.now() > deadline) {
     if (codexSpawnCheckpointPending(current)) {
@@ -936,6 +1005,7 @@ function createReservedJob({ background, brief, codexVersion, cwd, dataDir, jobC
       claudeSessionId: currentClaudeSessionId(),
       codexVersion,
       cwd,
+      delivery: background ? backgroundDelivery() : "foreground",
       eventsFile: jobEventsPath(dataDir, cwd, id),
       jobClass,
       kind: jobClass,
@@ -1020,6 +1090,17 @@ function failureKindForError(error) {
   return "error";
 }
 
+function semanticOutcome(outcome) {
+  if (outcome.collaborationViolation) {
+    return {
+      semanticFailureKind: "policy",
+      semanticFailureMessage: redactDiagnostic(outcome.collaborationViolation),
+      semanticStatus: "rejected"
+    };
+  }
+  return { semanticFailureKind: null, semanticFailureMessage: null, semanticStatus: "unverified" };
+}
+
 function finishExecutionFailure(file, record, error, env = process.env) {
   const rawMessage = oneLine(error?.message ?? error, "Codex companion execution failed.");
   appendJobLog(record.logFile, rawMessage);
@@ -1088,6 +1169,7 @@ async function executeRecord(found) {
         updateJobRecordFile(found.file, {
           codexPid: pid,
           codexPidIdentity: null,
+          codexPidIdentitySettled: false,
           codexPidOwnsProcessGroup: process.platform !== "win32",
           heartbeatAt: nowIso(),
           phase: "codex-spawning"
@@ -1097,9 +1179,18 @@ async function executeRecord(found) {
         updateJobRecordFile(found.file, {
           codexPid: pid,
           codexPidIdentity: identity,
+          codexPidIdentitySettled: false,
           codexPidOwnsProcessGroup: process.platform !== "win32",
           heartbeatAt: nowIso(),
           phase: "executing"
+        });
+      },
+      onIdentitySettled: (pid, identity) => {
+        updateJobRecordFile(found.file, {
+          codexPid: pid,
+          codexPidIdentity: identity,
+          codexPidIdentitySettled: true,
+          codexPidOwnsProcessGroup: process.platform !== "win32"
         });
       },
       prompt,
@@ -1113,6 +1204,7 @@ async function executeRecord(found) {
       return cleanupRequired(found.file, outcome.failureKind ?? "process", message);
     }
     const errorTail = redactDiagnostic(readLogTail(record.logFile, 20) || boundedTail(outcome.stderrTail));
+    const semantic = semanticOutcome(outcome);
     return finishJob(found.file, {
       cumulativeTokenUsage: outcome.cumulativeTokenUsage,
       diagnostics: outcome.diagnostics.map((diagnostic) => ({ ...diagnostic, message: redactDiagnostic(diagnostic.message) })),
@@ -1122,6 +1214,10 @@ async function executeRecord(found) {
       exitCode: outcome.exitCode,
       failureKind: outcome.failureKind,
       protocolError: outcome.protocolError ? redactDiagnostic(outcome.protocolError) : null,
+      partialResultText: outcome.partialResultText ? redactDiagnostic(outcome.partialResultText) : null,
+      resolvedEffort: outcome.resolvedEffort,
+      resolvedModel: outcome.resolvedModel,
+      rolloutRecoveryStatus: outcome.rolloutRecoveryStatus,
       result: {
         eventCount: outcome.eventCount,
         signal: outcome.signal,
@@ -1129,12 +1225,16 @@ async function executeRecord(found) {
         timedOut: outcome.timedOut
       },
       resultSource: outcome.resultSource,
-      resultText: outcome.finalResponse || null,
+      resultText: outcome.status === "done" ? outcome.finalResponse || null : null,
+      semanticFailureKind: semantic.semanticFailureKind,
+      semanticFailureMessage: semantic.semanticFailureMessage,
+      semanticStatus: semantic.semanticStatus,
       status: outcome.status,
       threadId: outcome.threadId,
       tokenUsage: outcome.tokenUsage,
       tokenUsageAvailability: outcome.tokenUsageAvailability,
       tokenUsageUnavailableReason: outcome.tokenUsageUnavailableReason,
+      usageIsIncomplete: outcome.usageIsIncomplete,
       unknownEventCount: outcome.unknownEventCount
     });
   } catch (error) {
@@ -1352,6 +1452,7 @@ async function handleTask(rawArgv, transport = {}) {
   const request = {
     effort: options.effort ?? null,
     fresh: Boolean(options.fresh),
+    ingress: transport.ingress ?? "argv",
     model: options.model ?? null,
     network: Boolean(options.network),
     resumeSourceJobId: resume.sourceJobId,
@@ -1412,7 +1513,7 @@ function adversarialReviewPrompt(target, focus) {
   return template.replaceAll("{{TARGET}}", target.description).replaceAll("{{FOCUS}}", focus || "No additional focus was supplied.");
 }
 
-async function handleReview(rawArgv, adversarial = false) {
+async function handleReview(rawArgv, adversarial = false, transport = {}) {
   const { options, positionals, positionalText } = commandArgs(rawArgv, {
     booleanOptions: ["background", "json"],
     valueOptions: ["base", "cwd", "effort", "focus", "model", "scope"]
@@ -1435,6 +1536,7 @@ async function handleReview(rawArgv, adversarial = false) {
     base: target.base,
     effort: options.effort ?? null,
     focus: focus || null,
+    ingress: transport.ingress ?? "argv",
     model: options.model ?? null,
     network: false,
     transport: usePromptTransport ? (adversarial ? "adversarial-review" : "focused-review") : "native-review",
@@ -1575,6 +1677,25 @@ async function handleStatus(rawArgv) {
     records.push(await refreshRunningJobRecord(entry));
   }
   output(options.json ? { jobs: records } : renderStatusTable(records), Boolean(options.json));
+}
+
+async function handleHistory(rawArgv) {
+  const { options, positionals } = commandArgs(rawArgv, {
+    booleanOptions: ["json"]
+  });
+  if (positionals.length > 0) {
+    throw new CompanionError("history accepts only --json.", "input");
+  }
+  const records = [];
+  for (const entry of listAllJobRecords(resolveDataDir())) {
+    records.push(await refreshRunningJobRecord(entry));
+  }
+  output(
+    options.json
+      ? { jobs: records, sidebarVisibility: "not_guaranteed_for_exec_sessions", source: "canonical" }
+      : renderStatusTable(records),
+    Boolean(options.json)
+  );
 }
 
 function delay(ms) {
@@ -1838,13 +1959,16 @@ async function main() {
       await handleWorker(rawArgv);
       break;
     case "review":
-      await handleReview(rawArgv, false);
+      await handleReview(rawArgv, false, transport);
       break;
     case "adversarial-review":
-      await handleReview(rawArgv, true);
+      await handleReview(rawArgv, true, transport);
       break;
     case "status":
       await handleStatus(rawArgv);
+      break;
+    case "history":
+      await handleHistory(rawArgv);
       break;
     case "result":
       await handleResult(rawArgv);

@@ -3,7 +3,15 @@
 import fs from "node:fs";
 import path from "node:path";
 
-import { SESSION_ID_ENV, jobsDir, readJobRecordFile, resolveDataDir, workspaceStateDir } from "./lib/state.mjs";
+import {
+  SESSION_ID_ENV,
+  hardenPrivateStateFile,
+  jobsDir,
+  readJobRecordFile,
+  resolveDataDir,
+  workspaceStateDir,
+  writePrivateStateFile
+} from "./lib/state.mjs";
 
 const TERMINAL_STATUSES = new Set(["done", "error", "cancelled"]);
 const DEFAULT_POLL_INTERVAL_MS = 15000;
@@ -139,6 +147,7 @@ function announcedStatePath(stateDir, sessionId) {
 
 function loadAnnounced(file) {
   try {
+    hardenPrivateStateFile(file);
     const raw = JSON.parse(fs.readFileSync(file, "utf8"));
     if (raw?.version !== ANNOUNCED_LEDGER_VERSION || !Array.isArray(raw.keys)) {
       return { exists: true, announced: new Set(), reset: true };
@@ -150,11 +159,7 @@ function loadAnnounced(file) {
 }
 
 function saveAnnounced(file, announced) {
-  const dir = path.dirname(file);
-  fs.mkdirSync(dir, { recursive: true });
-  const temp = `${file}.${process.pid}.tmp`;
-  fs.writeFileSync(temp, `${JSON.stringify({ version: ANNOUNCED_LEDGER_VERSION, keys: [...announced] })}\n`, "utf8");
-  fs.renameSync(temp, file);
+  writePrivateStateFile(file, `${JSON.stringify({ version: ANNOUNCED_LEDGER_VERSION, keys: [...announced] })}\n`);
 }
 
 function pruneAnnounced(announced, liveKeys, unreadableIds) {

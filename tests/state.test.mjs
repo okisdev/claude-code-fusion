@@ -264,6 +264,10 @@ test("a live resume owner blocks lease repair when its identity probe is unavail
     t.skip("POSIX process paths are required.");
     return;
   }
+  if (process.platform === "linux") {
+    t.skip("Linux identity probing reads /proc directly and does not consult PATH-based ps/sysctl overrides, so this darwin/bsd probe-failure simulation cannot apply here.");
+    return;
+  }
   const sandbox = makeSandbox(t);
   const child = spawn("/bin/sleep", ["30"], { stdio: "ignore" });
   const identity = getProcessIdentity(child.pid);

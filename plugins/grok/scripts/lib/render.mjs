@@ -136,6 +136,118 @@ export function formatAge(iso, now = Date.now()) {
   return `${Math.floor(hours / 24)}d`;
 }
 
+function historyCell(value, fallback = "unknown") {
+  const text =
+    typeof value === "string"
+      ? value
+      : typeof value === "number" || typeof value === "boolean"
+        ? String(value)
+        : "";
+  const normalized = text.trim() || fallback;
+  return normalized
+    .replace(/[\u0000-\u001f\u007f]/g, " ")
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll("|", "&#124;");
+}
+
+function historyBooleanLabel(value) {
+  if (value === true) {
+    return "yes";
+  }
+  if (value === false) {
+    return "no";
+  }
+  return "unknown";
+}
+
+function historyDeliveryLabel(job) {
+  const delivery = typeof job?.delivery === "string" && job.delivery.trim() ? job.delivery.trim() : "unknown";
+  const status =
+    typeof job?.deliveryStatus === "string" && job.deliveryStatus.trim()
+      ? job.deliveryStatus.trim()
+      : "unknown";
+  return `${delivery}/${status}`;
+}
+
+function historyModelLabel(job) {
+  const model =
+    typeof job?.resolvedModel === "string" && job.resolvedModel.trim()
+      ? job.resolvedModel.trim()
+      : "unknown";
+  const effort =
+    typeof job?.resolvedEffort === "string" && job.resolvedEffort.trim()
+      ? job.resolvedEffort.trim()
+      : null;
+  return effort ? `${model} (${effort})` : model;
+}
+
+export function renderHistoryReport(history, now = Date.now()) {
+  const jobs = Array.isArray(history?.jobs) ? history.jobs : [];
+  const allWorkspaces = history?.scope === "all";
+  if (jobs.length === 0) {
+    return allWorkspaces
+      ? "No Grok jobs recorded across workspaces.\n"
+      : "No Grok jobs recorded for this workspace.\n";
+  }
+
+  const totalJobs =
+    Number.isSafeInteger(history?.totalJobs) && history.totalJobs >= jobs.length
+      ? history.totalJobs
+      : jobs.length;
+  const lines = [
+    "# Grok history",
+    "",
+    `Scope: ${allWorkspaces ? "all workspaces" : "current workspace"}`,
+    `Showing ${jobs.length} of ${totalJobs} jobs, newest first.`,
+    ""
+  ];
+  const headings = [
+    "age",
+    "job",
+    "class",
+    "status",
+    "mode",
+    "delivery",
+    "model",
+    "memory",
+    "session",
+    "resumable",
+    "owned"
+  ];
+  if (allWorkspaces) {
+    headings.push("workspace");
+  }
+  lines.push(
+    `| ${headings.join(" | ")} |`,
+    `| ${headings.map(() => "---").join(" | ")} |`
+  );
+  for (const job of jobs) {
+    const status = job?.cleanupRequired
+      ? `${typeof job?.status === "string" ? job.status : "unknown"} (cleanup required)`
+      : job?.status;
+    const cells = [
+      historyCell(formatAge(job?.createdAt, now)),
+      historyCell(job?.jobId),
+      historyCell(job?.jobClass),
+      historyCell(status),
+      historyCell(job?.mode),
+      historyCell(historyDeliveryLabel(job)),
+      historyCell(historyModelLabel(job)),
+      historyBooleanLabel(job?.memoryEnabled),
+      historyCell(job?.sessionId, "none"),
+      job?.resumable === true ? "yes" : "no",
+      historyBooleanLabel(job?.ownedByCurrentSession)
+    ];
+    if (allWorkspaces) {
+      cells.push(historyCell(job?.cwd));
+    }
+    lines.push(`| ${cells.join(" | ")} |`);
+  }
+  return `${lines.join("\n")}\n`;
+}
+
 export function renderTaskResult({ text, sessionId, jobId }) {
   const lines = [String(text ?? "").trimEnd() || "Grok returned no output."];
   lines.push("");
@@ -183,7 +295,9 @@ export function renderJobDetail(job, options = {}) {
     `Job ${job.id}`,
     "",
     `Status: ${job.status}`,
+    `Class: ${job.jobClass ?? "unknown"}`,
     `Mode: ${job.mode}`,
+    `Cross-session memory: ${job.request?.memory === true || job.memoryEnabled === true ? "enabled" : "disabled"}`,
     `Background: ${job.background ? "yes" : "no"}`,
     `Created: ${job.createdAt}`
   ];
@@ -309,6 +423,28 @@ function pushUsageSection(lines, usage, coverage, totalJobs) {
   );
 }
 
+function pushHeadlessMetricsSection(lines, metrics, totalJobs) {
+  if (!metrics) {
+    return;
+  }
+  lines.push(
+    "",
+    `Turn count coverage: ${metrics.turnsReportedJobs}/${totalJobs} jobs`,
+    metrics.turnAggregationOverflow ? "Observed turns: unavailable (aggregate exceeds the safe integer range)" : `Observed turns: ${metrics.totalTurns}`,
+    `Exact cost coverage: ${metrics.exactCostJobs} exact, ${metrics.partialCostJobs} partial, ${metrics.unreportedCostJobs} unreported`
+  );
+  if (metrics.exactCostJobs > 0) {
+    if (metrics.costAggregationOverflow) {
+      lines.push("Observed exact cost: unavailable (aggregate ticks exceed the safe integer range)");
+      return;
+    }
+    lines.push(
+      `Observed exact cost: $${metrics.totalCostUsd}`,
+      `Observed exact cost ticks: ${metrics.totalCostUsdTicks}`
+    );
+  }
+}
+
 export function renderStatsReport(stats) {
   if (stats.totalJobs === 0) {
     return stats.scope === "all"
@@ -327,9 +463,12 @@ export function renderStatsReport(stats) {
   }
   pushCountSection(lines, "By status", stats.byStatus);
   pushCountSection(lines, "By mode", stats.byMode);
+  pushCountSection(lines, "By resolved model", stats.byResolvedModel);
   pushCountSection(lines, "By model", stats.byModel);
+  pushCountSection(lines, "By resolved effort", stats.byResolvedEffort);
   pushCountSection(lines, "By failure kind", stats.byFailureKind);
   pushUsageSection(lines, stats.usage, stats.usageCoverage, stats.totalJobs);
+  pushHeadlessMetricsSection(lines, stats.headlessMetrics, stats.totalJobs);
   return `${lines.join("\n").trimEnd()}\n`;
 }
 
@@ -355,13 +494,18 @@ export function renderSetupReport(report) {
     "",
     "Checks:",
     `- grok binary (${report.grok.bin}): ${report.grok.available ? report.grok.detail : `unavailable, ${report.grok.detail}`}`,
+    `- headless safety capabilities: ${report.capabilities?.ready ? "ready" : `not ready, ${report.capabilities?.detail ?? "not checked"}`}`,
     `- data dir: ${report.dataDir.writable ? `writable (${report.dataDir.path})` : `not writable (${report.dataDir.detail})`}`,
-    `- stop gate: ${report.stopGate ? "enabled" : "disabled"}`
+    `- stop gate: ${report.stopGate ? "enabled" : "disabled"}`,
+    `- continuity: ${report.continuityPolicy ?? "manual"}`
   ];
 
   const nextSteps = [];
   if (!report.grok.available) {
     nextSteps.push("Install the grok CLI and make sure `grok --version` works, or point GROK_BIN at the binary.");
+  }
+  if (report.grok.available && !report.capabilities?.ready) {
+    nextSteps.push("Upgrade the grok CLI to a build that exposes the required headless safety capabilities.");
   }
   if (!report.dataDir.writable) {
     nextSteps.push(`Fix permissions on ${report.dataDir.path}.`);
@@ -376,6 +520,8 @@ export function renderSetupReport(report) {
   lines.push(
     "",
     "Model and effort defaults live in ~/.grok/config.toml; the companion never passes -m or --effort unless explicitly requested.",
+    "Cross-session memory stays disabled unless a task explicitly passes --memory.",
+    "Continuity defaults to manual; use /grok:setup --continuity claude-session to enable same-session task affinity.",
     "Toggle the stop-time review gate from the plugin's Stop gate review setting; /grok:setup --enable-stop-gate or --disable-stop-gate is the scripting fallback."
   );
 

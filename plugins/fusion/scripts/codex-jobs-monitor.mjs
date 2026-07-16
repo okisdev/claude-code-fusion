@@ -218,12 +218,22 @@ function modelAuditSidecarPath(workspaceRoot, env = process.env) {
   return path.join(resolveFusionDataDir(env), "observations", fusionWorkspaceKey(workspaceRoot), MODEL_AUDIT_FILENAME);
 }
 
+function ensurePrivateDirectory(directory) {
+  fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
+  try {
+    fs.chmodSync(directory, 0o700);
+  } catch {
+    void 0;
+  }
+}
+
 function appendModelAuditObservation(sidecarPath, observation) {
-  fs.mkdirSync(path.dirname(sidecarPath), { recursive: true });
+  ensurePrivateDirectory(path.dirname(sidecarPath));
   const lockPath = `${sidecarPath}.lock`;
   let lock;
   try {
-    lock = fs.openSync(lockPath, "wx");
+    lock = fs.openSync(lockPath, fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_WRONLY, 0o600);
+    fs.fchmodSync(lock, 0o600);
   } catch (error) {
     if (error?.code === "EEXIST") {
       return false;
@@ -231,11 +241,15 @@ function appendModelAuditObservation(sidecarPath, observation) {
     throw error;
   }
   try {
+    if (fs.existsSync(sidecarPath)) {
+      fs.chmodSync(sidecarPath, 0o600);
+    }
     const current = loadModelAuditObservations(sidecarPath).get(observation.jobId);
     if (current && (current.source === "rollout-turn-context" || observation.source !== "rollout-turn-context")) {
       return true;
     }
-    fs.appendFileSync(sidecarPath, `${JSON.stringify(observation)}\n`, "utf8");
+    fs.appendFileSync(sidecarPath, `${JSON.stringify(observation)}\n`, { encoding: "utf8", mode: 0o600 });
+    fs.chmodSync(sidecarPath, 0o600);
     return true;
   } finally {
     fs.closeSync(lock);
@@ -625,6 +639,7 @@ function saveAnnounced(file, announced, records, workspaceRoot) {
   if (!fs.statSync(dir).isDirectory()) {
     return;
   }
+  ensurePrivateDirectory(dir);
   const temp = `${file}.${process.pid}.tmp`;
   const state = {
     schemaVersion: TERMINAL_LEDGER_SCHEMA_VERSION,
@@ -635,8 +650,10 @@ function saveAnnounced(file, announced, records, workspaceRoot) {
     keys: [...announced].sort(),
     records: [...records.values()].sort((left, right) => `${left.jobId}:${left.transportStatus}`.localeCompare(`${right.jobId}:${right.transportStatus}`))
   };
-  fs.writeFileSync(temp, `${JSON.stringify(state)}\n`, "utf8");
+  fs.writeFileSync(temp, `${JSON.stringify(state)}\n`, { encoding: "utf8", mode: 0o600 });
+  fs.chmodSync(temp, 0o600);
   fs.renameSync(temp, file);
+  fs.chmodSync(file, 0o600);
 }
 
 function pruneAnnounced(announced, liveIds) {

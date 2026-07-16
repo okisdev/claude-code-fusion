@@ -1,81 +1,149 @@
 #!/usr/bin/env node
 
 import { spawn } from "node:child_process";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
 
-class UsageError extends Error {}
+import { consumeRawArgsTransport, createRawArgsTransport } from "./lib/raw-args-transport.mjs";
 
+export class UsageError extends Error {}
+
+const SELF_PATH = fileURLToPath(import.meta.url);
 const DEFAULT_INTERVAL_MS = 20_000;
 const DEFAULT_CAP_MS = 540_000;
 const MAX_CAP_MS = 540_000;
 const STDERR_TAIL_LINES = 20;
+const JOB_ID_PATTERN = /^[a-f0-9]{32}$/;
+const TOKEN_PATTERN = /^[a-f0-9]{48}$/;
+const ENGINES = new Set(["codex", "grok"]);
 const TERMINAL_STATES = new Set(["done", "error", "cancelled", "completed", "failed"]);
-const FOOTER_FIELD = /^\s*(?:[a-z][a-z0-9_-]*-session|job|state|failure)\s*:\s*/i;
+const SEMANTIC_STATES = new Set(["accepted", "rejected", "unverified"]);
+const FOOTER_FIELD = /^\s*(?:[a-z][a-z0-9_-]*-session|job|delivery|semantic|state|failure)\s*:\s*/i;
+const REQUEST_FIELDS = new Set(["engine", "jobId", "json", "intervalMs", "capMs", "deadRerunStatus"]);
 
 function usage() {
-  return 'Usage: node job-collect.mjs --status-cmd "<shell command>" --result-cmd "<shell command>" [--interval-ms 20000] [--cap-ms 540000] [--dead-rerun-status]';
+  return "Usage: node job-collect.mjs transport-create | transport-discard --raw-args-token <token> | --raw-args-token <token>";
 }
 
-function parseCli(argv) {
-  const options = {};
-  const valueOptions = new Set(["status-cmd", "result-cmd", "interval-ms", "cap-ms"]);
-  for (let index = 0; index < argv.length; index += 1) {
-    const arg = argv[index];
-    if (!arg.startsWith("--")) {
-      throw new UsageError(`Unexpected argument ${arg}.`);
-    }
-    const separator = arg.indexOf("=");
-    const name = arg.slice(2, separator === -1 ? undefined : separator);
-    const inlineValue = separator === -1 ? null : arg.slice(separator + 1);
-    if (name === "dead-rerun-status") {
-      if (inlineValue != null) {
-        throw new UsageError("Option --dead-rerun-status does not take a value.");
-      }
-      options[name] = true;
-      continue;
-    }
-    if (!valueOptions.has(name)) {
-      throw new UsageError(`Unknown option --${name}.`);
-    }
-    if (inlineValue != null) {
-      options[name] = inlineValue;
-      continue;
-    }
-    index += 1;
-    if (index >= argv.length) {
-      throw new UsageError(`Expected a value after --${name}.`);
-    }
-    options[name] = argv[index];
+function regularFile(file) {
+  try {
+    return fs.statSync(file).isFile();
+  } catch {
+    return false;
   }
-  if (!options["status-cmd"]) {
-    throw new UsageError("Missing --status-cmd.");
+}
+
+function companionMetadata(engine) {
+  if (!ENGINES.has(engine)) {
+    throw new UsageError("The collection engine must be codex or grok.");
   }
-  if (!options["result-cmd"]) {
-    throw new UsageError("Missing --result-cmd.");
-  }
-  const capMs = parseMilliseconds(options["cap-ms"], DEFAULT_CAP_MS, "--cap-ms");
-  if (capMs > MAX_CAP_MS) {
-    throw new UsageError(`--cap-ms cannot exceed ${MAX_CAP_MS}.`);
-  }
+  const upper = engine.toUpperCase();
   return {
-    statusCommand: options["status-cmd"],
-    resultCommand: options["result-cmd"],
-    intervalMs: parseMilliseconds(options["interval-ms"], DEFAULT_INTERVAL_MS, "--interval-ms"),
-    capMs,
-    deadRerunStatus: options["dead-rerun-status"] === true
+    environmentKey: `FUSION_${upper}_COMPANION`,
+    filename: `${engine}-companion.mjs`
   };
 }
 
-function parseMilliseconds(value, fallback, flag) {
+function configuredHome(env) {
+  const candidate = typeof env.HOME === "string" ? env.HOME.trim() : "";
+  return candidate && path.isAbsolute(candidate) ? candidate : os.homedir();
+}
+
+export function resolveCompanion(engine, { env = process.env, selfPath = SELF_PATH } = {}) {
+  const { environmentKey, filename } = companionMetadata(engine);
+  const override = typeof env[environmentKey] === "string" ? env[environmentKey].trim() : "";
+  if (override) {
+    if (!path.isAbsolute(override) || !regularFile(override)) {
+      throw new UsageError(`${environmentKey} must name an absolute companion file.`);
+    }
+    return override;
+  }
+
+  const cacheBase = path.join(configuredHome(env), ".claude", "plugins", "cache", "claude-code-fusion", engine);
+  try {
+    const candidates = fs
+      .readdirSync(cacheBase)
+      .map((version) => path.join(cacheBase, version, "scripts", filename))
+      .filter(regularFile)
+      .map((candidate) => ({ candidate, modifiedAt: fs.statSync(candidate).mtimeMs }))
+      .sort((left, right) => right.modifiedAt - left.modifiedAt || left.candidate.localeCompare(right.candidate));
+    if (candidates.length > 0) {
+      return candidates[0].candidate;
+    }
+  } catch {}
+
+  const sibling = path.resolve(path.dirname(selfPath), "..", "..", engine, "scripts", filename);
+  if (regularFile(sibling)) {
+    return sibling;
+  }
+  throw new UsageError(`No ${engine} companion was found in the plugin cache or repository plugins.`);
+}
+
+function parseInteger(value, fallback, field) {
   if (value == null) {
     return fallback;
   }
-  if (!/^\d+$/.test(value) || !Number.isSafeInteger(Number(value))) {
-    throw new UsageError(`${flag} must be a non-negative integer.`);
+  if (!Number.isSafeInteger(value) || value < 0) {
+    throw new UsageError(`${field} must be a non-negative safe integer.`);
   }
-  return Number(value);
+  return value;
 }
 
-function signalShell(child, signal) {
+function parseBoolean(value, fallback, field) {
+  if (value == null) {
+    return fallback;
+  }
+  if (typeof value !== "boolean") {
+    throw new UsageError(`${field} must be a boolean.`);
+  }
+  return value;
+}
+
+export function parseCollectionRequest(raw) {
+  let request;
+  try {
+    request = JSON.parse(raw);
+  } catch {
+    throw new UsageError("The collection request must be valid JSON.");
+  }
+  if (!request || typeof request !== "object" || Array.isArray(request)) {
+    throw new UsageError("The collection request must be a JSON object.");
+  }
+  for (const field of Object.keys(request)) {
+    if (!REQUEST_FIELDS.has(field)) {
+      throw new UsageError(`Unknown collection request field ${field}.`);
+    }
+  }
+  if (!ENGINES.has(request.engine)) {
+    throw new UsageError("The collection request engine must be codex or grok.");
+  }
+  if (typeof request.jobId !== "string" || !JOB_ID_PATTERN.test(request.jobId)) {
+    throw new UsageError("The collection request jobId must be exactly 32 lowercase hexadecimal characters.");
+  }
+  const capMs = parseInteger(request.capMs, DEFAULT_CAP_MS, "capMs");
+  if (capMs > MAX_CAP_MS) {
+    throw new UsageError(`capMs cannot exceed ${MAX_CAP_MS}.`);
+  }
+  return {
+    engine: request.engine,
+    jobId: request.jobId,
+    json: parseBoolean(request.json, false, "json"),
+    intervalMs: parseInteger(request.intervalMs, DEFAULT_INTERVAL_MS, "intervalMs"),
+    capMs,
+    deadRerunStatus: parseBoolean(request.deadRerunStatus, false, "deadRerunStatus")
+  };
+}
+
+function tokenFromArgv(argv) {
+  if (argv.length !== 2 || argv[0] !== "--raw-args-token" || !TOKEN_PATTERN.test(argv[1])) {
+    throw new UsageError("Collection requires exactly one valid raw argument token.");
+  }
+  return argv[1];
+}
+
+function signalChild(child, signal) {
   try {
     if (process.platform !== "win32" && child.pid > 1) {
       process.kill(-child.pid, signal);
@@ -85,21 +153,33 @@ function signalShell(child, signal) {
   } catch {}
 }
 
-function runShell(command, timeoutMs) {
+export function runCompanion(companion, command, options, timeoutMs) {
+  const args = [companion, command, options.jobId];
+  if (command === "result") {
+    args.push("--wait");
+  }
+  if (options.json) {
+    args.push("--json");
+  }
   return new Promise((resolve, reject) => {
-    const child = spawn(command, { detached: process.platform !== "win32", shell: true, stdio: ["ignore", "pipe", "pipe"], windowsHide: true });
+    const child = spawn(process.execPath, args, { detached: process.platform !== "win32", shell: false, stdio: ["ignore", "pipe", "pipe"], windowsHide: true });
     const stdout = [];
     const stderr = [];
     let timedOut = false;
     let killTimer = null;
+    let settled = false;
     const timeout = setTimeout(() => {
       timedOut = true;
-      signalShell(child, "SIGTERM");
-      killTimer = setTimeout(() => signalShell(child, "SIGKILL"), 100);
+      signalChild(child, "SIGTERM");
+      killTimer = setTimeout(() => signalChild(child, "SIGKILL"), 100);
     }, Math.max(1, timeoutMs));
     child.stdout.on("data", (chunk) => stdout.push(chunk));
     child.stderr.on("data", (chunk) => stderr.push(chunk));
     child.on("error", (error) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
       clearTimeout(timeout);
       if (killTimer) {
         clearTimeout(killTimer);
@@ -107,11 +187,15 @@ function runShell(command, timeoutMs) {
       reject(error);
     });
     child.on("close", (code, signal) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
       clearTimeout(timeout);
       if (killTimer) {
         clearTimeout(killTimer);
         if (timedOut) {
-          signalShell(child, "SIGKILL");
+          signalChild(child, "SIGKILL");
         }
       }
       resolve({
@@ -124,7 +208,25 @@ function runShell(command, timeoutMs) {
   });
 }
 
-function terminalState(output) {
+function parsedJson(output) {
+  try {
+    const value = JSON.parse(String(output));
+    return value && typeof value === "object" && !Array.isArray(value) ? value : null;
+  } catch {
+    return null;
+  }
+}
+
+export function terminalMetadata(output, json = false) {
+  if (json) {
+    const record = parsedJson(output);
+    const state = typeof record?.status === "string" ? record.status.toLowerCase() : typeof record?.transportStatus === "string" ? record.transportStatus.toLowerCase() : null;
+    if (!state || !TERMINAL_STATES.has(state)) {
+      return null;
+    }
+    const semantic = typeof record?.semanticStatus === "string" ? record.semanticStatus.toLowerCase() : null;
+    return { state, semantic: semantic && SEMANTIC_STATES.has(semantic) ? semantic : "unverified" };
+  }
   const lines = String(output).trimEnd().split(/\r?\n/);
   let index = lines.length - 1;
   const footer = [];
@@ -136,10 +238,26 @@ function terminalState(output) {
     const match = line.match(/^\s*state:\s*([^\s]+)\s*$/i);
     return match ? [match[1].toLowerCase()] : [];
   });
-  return states.length === 1 && TERMINAL_STATES.has(states[0]) ? states[0] : null;
+  if (states.length !== 1 || !TERMINAL_STATES.has(states[0])) {
+    return null;
+  }
+  const semantics = footer.flatMap((line) => {
+    const match = line.match(/^\s*semantic:\s*([^\s]+)\s*$/i);
+    return match ? [match[1].toLowerCase()] : [];
+  });
+  const semantic = semantics.length === 1 && SEMANTIC_STATES.has(semantics[0]) ? semantics[0] : "unverified";
+  return { state: states[0], semantic };
 }
 
-function reportsDead(output) {
+export function terminalState(output, json = false) {
+  return terminalMetadata(output, json)?.state ?? null;
+}
+
+export function reportsDead(output, json = false) {
+  if (json) {
+    const record = parsedJson(output);
+    return record?.failureKind === "died" || record?.failure === "died";
+  }
   if (/^\s*(?:failure(?:\s+kind)?|failureKind)\s*:\s*died\b/im.test(output)) {
     return true;
   }
@@ -177,7 +295,16 @@ function writeOutputWithFinalLine(output, line) {
   process.stdout.write(`${line}\n`);
 }
 
-async function collect(options) {
+function collectorTerminalLine(options, metadata, startedAt) {
+  return `collector: state=${metadata.state} semantic=${metadata.semantic} engine=${options.engine} job=${options.jobId} elapsed=${elapsedSeconds(startedAt)}s`;
+}
+
+function collectorOutcomeLine(options, outcome, startedAt) {
+  return `collector: ${outcome} engine=${options.engine} job=${options.jobId} elapsed=${elapsedSeconds(startedAt)}s`;
+}
+
+export async function collect(options, { env = process.env } = {}) {
+  const companion = resolveCompanion(options.engine, { env });
   const startedAt = Date.now();
   let consecutiveStatusErrors = 0;
   let lastStatusOutput = "";
@@ -185,15 +312,15 @@ async function collect(options) {
   for (;;) {
     const remaining = options.capMs - (Date.now() - startedAt);
     if (remaining <= 0) {
-      writeOutputWithFinalLine(lastStatusOutput, `collector: timeout elapsed=${elapsedSeconds(startedAt)}s`);
+      writeOutputWithFinalLine(lastStatusOutput, collectorOutcomeLine(options, "timeout", startedAt));
       return 2;
     }
-    const status = await runShell(options.statusCommand, remaining);
+    const status = await runCompanion(companion, "status", options, remaining);
     if (status.stdout) {
       lastStatusOutput = status.stdout;
     }
     if (status.timedOut) {
-      writeOutputWithFinalLine(lastStatusOutput, `collector: timeout elapsed=${elapsedSeconds(startedAt)}s`);
+      writeOutputWithFinalLine(lastStatusOutput, collectorOutcomeLine(options, "timeout", startedAt));
       return 2;
     }
     if (status.code === 0) {
@@ -201,61 +328,80 @@ async function collect(options) {
     } else {
       consecutiveStatusErrors += 1;
       if (consecutiveStatusErrors >= 2) {
-        writeOutputWithFinalLine(stderrTail(status.stderr), `collector: status-error elapsed=${elapsedSeconds(startedAt)}s`);
+        writeOutputWithFinalLine(stderrTail(status.stderr), collectorOutcomeLine(options, "status-error", startedAt));
         return 4;
       }
     }
 
-    if (reportsDead(lastStatusOutput)) {
+    if (reportsDead(lastStatusOutput, options.json)) {
       if (options.deadRerunStatus) {
         const refreshRemaining = options.capMs - (Date.now() - startedAt);
         if (refreshRemaining <= 0) {
-          writeOutputWithFinalLine(lastStatusOutput, `collector: timeout elapsed=${elapsedSeconds(startedAt)}s`);
+          writeOutputWithFinalLine(lastStatusOutput, collectorOutcomeLine(options, "timeout", startedAt));
           return 2;
         }
-        const refreshed = await runShell(options.statusCommand, refreshRemaining);
+        const refreshed = await runCompanion(companion, "status", options, refreshRemaining);
         if (refreshed.timedOut) {
-          writeOutputWithFinalLine(refreshed.stdout || lastStatusOutput, `collector: timeout elapsed=${elapsedSeconds(startedAt)}s`);
+          writeOutputWithFinalLine(refreshed.stdout || lastStatusOutput, collectorOutcomeLine(options, "timeout", startedAt));
           return 2;
         }
         if (refreshed.stdout) {
           lastStatusOutput = refreshed.stdout;
         }
       }
-      writeOutputWithFinalLine(lastStatusOutput, `collector: dead elapsed=${elapsedSeconds(startedAt)}s`);
+      writeOutputWithFinalLine(lastStatusOutput, collectorOutcomeLine(options, "dead", startedAt));
       return 3;
     }
 
-    const state = terminalState(lastStatusOutput);
-    if (state) {
+    const terminal = terminalMetadata(lastStatusOutput, options.json);
+    if (terminal) {
       const resultRemaining = options.capMs - (Date.now() - startedAt);
       if (resultRemaining <= 0) {
-        writeOutputWithFinalLine(lastStatusOutput, `collector: timeout elapsed=${elapsedSeconds(startedAt)}s`);
+        writeOutputWithFinalLine(lastStatusOutput, collectorOutcomeLine(options, "timeout", startedAt));
         return 2;
       }
-      const result = await runShell(options.resultCommand, resultRemaining);
+      const result = await runCompanion(companion, "result", options, resultRemaining);
       if (result.timedOut) {
-        writeOutputWithFinalLine(lastStatusOutput, `collector: timeout elapsed=${elapsedSeconds(startedAt)}s`);
+        writeOutputWithFinalLine(lastStatusOutput, collectorOutcomeLine(options, "timeout", startedAt));
         return 2;
       }
-      writeOutputWithFinalLine(result.stdout, `collector: state=${state} elapsed=${elapsedSeconds(startedAt)}s`);
+      writeOutputWithFinalLine(result.stdout, collectorTerminalLine(options, terminal, startedAt));
       return result.code;
     }
 
     const elapsed = Date.now() - startedAt;
     if (elapsed >= options.capMs) {
-      writeOutputWithFinalLine(lastStatusOutput, `collector: timeout elapsed=${elapsedSeconds(startedAt)}s`);
+      writeOutputWithFinalLine(lastStatusOutput, collectorOutcomeLine(options, "timeout", startedAt));
       return 2;
     }
     await sleep(Math.min(options.intervalMs, options.capMs - elapsed));
   }
 }
 
-try {
-  const exitCode = await collect(parseCli(process.argv.slice(2)));
-  process.exitCode = exitCode;
-} catch (error) {
-  const message = error instanceof Error ? error.message : String(error);
-  process.stderr.write(`${message}\n${usage()}\n`);
-  process.exitCode = 1;
+export async function runCli(argv, { env = process.env } = {}) {
+  if (argv[0] === "transport-create") {
+    if (argv.length !== 1) {
+      throw new UsageError("transport-create accepts no arguments.");
+    }
+    process.stdout.write(`${JSON.stringify(createRawArgsTransport({ sessionId: env.CLAUDE_CODE_SESSION_ID }))}\n`);
+    return 0;
+  }
+  if (argv[0] === "transport-discard") {
+    const token = tokenFromArgv(argv.slice(1));
+    consumeRawArgsTransport(token, { sessionId: env.CLAUDE_CODE_SESSION_ID });
+    return 0;
+  }
+  const token = tokenFromArgv(argv);
+  const request = parseCollectionRequest(consumeRawArgsTransport(token, { sessionId: env.CLAUDE_CODE_SESSION_ID }));
+  return collect(request, { env });
+}
+
+if (process.argv[1] && path.resolve(process.argv[1]) === SELF_PATH) {
+  try {
+    process.exitCode = await runCli(process.argv.slice(2));
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    process.stderr.write(`${message}\n${usage()}\n`);
+    process.exitCode = 1;
+  }
 }

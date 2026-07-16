@@ -98,10 +98,13 @@ test("stop-gate exits silently when the working tree is clean", (t) => {
 
 test("stop-gate allows the stop when grok replies ALLOW", (t) => {
   const sandbox = makeSandbox(t);
+  const stdinFile = path.join(sandbox.root, "stop-gate-stdin.txt");
   initCleanRepo(sandbox.workDir);
   dirtyRepo(sandbox.workDir);
   enableGate(sandbox);
-  const result = runStopGate(sandbox, { env: envFor(sandbox, { FAKE_GROK_MODE: "gate-allow" }) });
+  const result = runStopGate(sandbox, {
+    env: envFor(sandbox, { FAKE_GROK_MODE: "gate-allow", FAKE_GROK_STDIN_FILE: stdinFile }),
+  });
   assert.strictEqual(result.status, 0, result.stderr);
   assert.strictEqual(result.stdout, "");
   const invocations = readInvocations(sandbox.argsFile);
@@ -110,10 +113,8 @@ test("stop-gate allows the stop when grok replies ALLOW", (t) => {
   assert.ok(hasPair(invocations[0], "--permission-mode", "default"));
   assert.ok(hasPair(invocations[0], "--sandbox", "strict"));
   assert.ok(hasPair(invocations[0], "--tools", "read_file,grep,list_dir"));
-  const brief = fs.readFileSync(
-    invocations[0][invocations[0].indexOf("--prompt-file") + 1],
-    "utf8"
-  );
+  assert.ok(hasPair(invocations[0], "--prompt-file", "/dev/stdin"));
+  const brief = fs.readFileSync(stdinFile, "utf8");
   assert.ok(brief.includes("export const other = 2;"));
   assert.ok(brief.includes("untracked.txt"));
   const records = jobRecords(sandbox.dataDir);

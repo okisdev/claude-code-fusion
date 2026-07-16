@@ -1,13 +1,124 @@
 #!/usr/bin/env node
 (async () => {
   const fs = await import("node:fs");
+  const os = await import("node:os");
+  const path = await import("node:path");
+  const childProcess = await import("node:child_process");
 
   const argsFile = process.env.FAKE_GROK_ARGS_FILE;
   if (argsFile) {
     fs.appendFileSync(argsFile, JSON.stringify(process.argv.slice(2)) + "\n");
   }
+  if (process.env.FAKE_GROK_ENV_FILE) {
+    const trackedEnv = Object.fromEntries(
+      Object.entries(process.env)
+        .filter(([key]) =>
+          key.startsWith("CLAUDE_CODE_") ||
+          key.startsWith("CLAUDE_PLUGIN_") ||
+          key === "ANTHROPIC_API_KEY" ||
+          key === "CODEX_API_KEY" ||
+          key === "OPENAI_API_KEY" ||
+          key === "XAI_API_KEY" ||
+          key === "DATABASE_URL" ||
+          key === "REDIS_URL" ||
+          key === "SENTRY_DSN" ||
+          key === "SSH_AUTH_SOCK" ||
+          key === "GROK_CLAUDE_MARKER_OVERRIDE" ||
+          key === "_GROK_CLAUDE_MARKER_OVERRIDE" ||
+          key === "GROK_DISABLE_AUTOUPDATER" ||
+          key === "GROK_MANAGED_MCPS_ENABLED" ||
+          key === "GROK_COMPANION_CONTINUITY_POLICY" ||
+          key === "GROK_MEMORY" ||
+          key === "GROK_SUBAGENTS" ||
+          key === "RUST_LOG" ||
+          key === "TMPDIR" ||
+          /^GROK_(?:CLAUDE|CURSOR|CODEX)_(?:SKILLS|RULES|AGENTS|MCPS|HOOKS|SESSIONS)_ENABLED$/.test(key)
+        )
+        .sort(([left], [right]) => left.localeCompare(right))
+    );
+    fs.writeFileSync(process.env.FAKE_GROK_ENV_FILE, `${JSON.stringify(trackedEnv, null, 2)}\n`, "utf8");
+  }
 
   const mode = process.env.FAKE_GROK_MODE || "ok";
+  if (mode === "sandbox-warning-ignore-term") {
+    process.on("SIGTERM", () => {});
+  }
+  const sandboxIndex = process.argv.indexOf("--sandbox");
+  const sandboxProfile = sandboxIndex >= 0 ? process.argv[sandboxIndex + 1] : null;
+  if (sandboxProfile) {
+    const sandboxEventDelayMs = Number(process.env.FAKE_GROK_SANDBOX_EVENT_DELAY_MS);
+    if (Number.isFinite(sandboxEventDelayMs) && sandboxEventDelayMs > 0) {
+      await new Promise((resolve) => setTimeout(resolve, sandboxEventDelayMs));
+    }
+    const grokHome = Object.hasOwn(process.env, "GROK_HOME")
+      ? path.resolve(process.cwd(), process.env.GROK_HOME)
+      : path.join(os.homedir(), ".grok");
+    const eventFile = path.join(grokHome, "sandbox-events.jsonl");
+    fs.mkdirSync(grokHome, { recursive: true });
+    if (mode === "sandbox-log-rotate" && fs.existsSync(eventFile)) {
+      fs.renameSync(eventFile, `${eventFile}.rotated`);
+    }
+    if (mode === "sandbox-log-truncate" && fs.existsSync(eventFile)) {
+      fs.truncateSync(eventFile, 0);
+      await new Promise((resolve) => setTimeout(resolve, 60));
+    }
+    const sandboxFailures = {
+      "sandbox-warning": "Sandbox could not be applied, continuing without sandbox",
+      "sandbox-unsupported-warning": "Sandbox not supported on this platform, continuing without sandbox",
+      "sandbox-built-without-enforce-warning": "Sandbox enforcement unavailable (built without 'enforce' feature)",
+      "sandbox-warning-ignore-term": "Sandbox could not be applied, continuing without sandbox"
+    };
+    let event = null;
+    if (sandboxFailures[mode]) {
+      event = {
+        timestamp: new Date().toISOString(),
+        event_type: "ApplyFailed",
+        profile: sandboxProfile,
+        workspace: fs.realpathSync(process.cwd()),
+        enforced: false,
+        error: sandboxFailures[mode]
+      };
+    } else if (mode !== "sandbox-no-event") {
+      event = {
+        timestamp: new Date().toISOString(),
+        event_type: "ProfileApplied",
+        profile: mode === "sandbox-event-wrong-profile" ? "workspace" : sandboxProfile,
+        workspace: mode === "sandbox-event-wrong-workspace" ? path.dirname(fs.realpathSync(process.cwd())) : fs.realpathSync(process.cwd()),
+        enforced: mode !== "sandbox-event-unenforced",
+        restrict_network: mode === "sandbox-event-wrong-network" ? sandboxProfile === "workspace" : sandboxProfile !== "workspace",
+        read_write_paths: mode === "sandbox-event-missing-tmpdir"
+          ? [fs.realpathSync(process.cwd()), grokHome]
+          : [fs.realpathSync(process.cwd()), grokHome, process.env.TMPDIR].filter(Boolean)
+      };
+    }
+    if (event) {
+      fs.appendFileSync(eventFile, `${JSON.stringify(event)}\n`, "utf8");
+    }
+    if (sandboxFailures[mode]) {
+      process.stderr.write(`${sandboxFailures[mode]}\n`);
+    }
+  }
+  let stdin = "";
+  for await (const chunk of process.stdin) {
+    stdin += chunk.toString();
+  }
+  if (process.env.FAKE_GROK_STDIN_FILE) {
+    fs.writeFileSync(process.env.FAKE_GROK_STDIN_FILE, stdin, "utf8");
+  }
+  if (process.env.FAKE_GROK_STDIN_LOG) {
+    fs.appendFileSync(process.env.FAKE_GROK_STDIN_LOG, `${JSON.stringify(stdin)}\n`, "utf8");
+  }
+  if (process.env.FAKE_GROK_REJECT_EXTERNAL_PROMPT === "1") {
+    const index = process.argv.indexOf("--prompt-file");
+    const promptFile = index >= 0 ? process.argv[index + 1] : null;
+    if (promptFile !== "/dev/stdin") {
+      process.stderr.write(`Error:\nFailed to read '${promptFile}': Operation not permitted (os error 1)\n`);
+      process.exit(1);
+    }
+  }
+  if (sandboxProfile && !new Set(["tool-allowlist-warning", "tool-disallowed-warning", "tool-policy-no-evidence"]).has(mode)) {
+    process.stderr.write("DEBUG xai_grok_agent::builder: tools allowlist applied\n");
+  }
 
   const reviewObject = {
     verdict: "needs-attention",
@@ -27,7 +138,37 @@
   };
 
   const emit = (envelope) => {
+    if (envelope.sessionId && process.env.GROK_HOME && (process.env.FAKE_GROK_RESOLVED_MODEL || process.env.FAKE_GROK_RESOLVED_EFFORT)) {
+      const encodedCwd = encodeURIComponent(process.cwd()).replace(/[!'()*]/g, (character) => `%${character.charCodeAt(0).toString(16).toUpperCase()}`);
+      const sessionsRoot = path.join(process.env.GROK_HOME, "sessions");
+      const cwdDirectory = Buffer.byteLength(encodedCwd) <= 255
+        ? encodedCwd
+        : `fixture-${envelope.sessionId.slice(0, 16)}`;
+      if (cwdDirectory !== encodedCwd) {
+        fs.mkdirSync(path.join(sessionsRoot, cwdDirectory), { recursive: true });
+        fs.writeFileSync(path.join(sessionsRoot, cwdDirectory, ".cwd"), process.cwd(), "utf8");
+      }
+      const summaryDir = path.join(sessionsRoot, cwdDirectory, envelope.sessionId);
+      fs.mkdirSync(summaryDir, { recursive: true });
+      fs.writeFileSync(path.join(summaryDir, "summary.json"), JSON.stringify({
+        current_model_id: process.env.FAKE_GROK_RESOLVED_MODEL ?? null,
+        reasoning_effort: process.env.FAKE_GROK_RESOLVED_EFFORT ?? null
+      }));
+    }
     process.stdout.write(JSON.stringify(envelope) + "\n");
+  };
+
+  const writeAllSync = (descriptor, value) => {
+    const bytes = Buffer.from(value);
+    let offset = 0;
+    while (offset < bytes.length) {
+      try {
+        offset += fs.writeSync(descriptor, bytes, offset, bytes.length - offset);
+      } catch (error) {
+        if (error.code !== "EAGAIN") throw error;
+        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10);
+      }
+    }
   };
 
   const nextAttempt = () => {
@@ -74,6 +215,36 @@
     process.exit(0);
   }
 
+  if (mode === "residual-process-group") {
+    const descendant = childProcess.spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], {
+      stdio: "ignore"
+    });
+    if (process.env.FAKE_GROK_DESCENDANT_PID_FILE) {
+      fs.writeFileSync(process.env.FAKE_GROK_DESCENDANT_PID_FILE, JSON.stringify({ leader: process.pid, descendant: descendant.pid }), "utf8");
+    }
+    emit({
+      text: "FAKE-RESIDUAL-PROCESS-GROUP",
+      stopReason: "EndTurn",
+      sessionId: "11111111-1111-7111-8111-111111111120",
+      requestId: "req-residual-process-group"
+    });
+    process.exit(0);
+  }
+
+  if (mode === "malicious-session-id") {
+    emit({
+      text: "FAKE-MALICIOUS-SESSION",
+      stopReason: "EndTurn",
+      sessionId: "../../attacker",
+      requestId: "req-malicious-session",
+      usage,
+      modelUsage,
+      num_turns: 2,
+      usage_is_incomplete: true
+    });
+    process.exit(0);
+  }
+
   if (mode === "usage-ok") {
     emit({
       text: "FAKE-USAGE-OK",
@@ -99,6 +270,100 @@
     process.exit(0);
   }
 
+  if (mode === "usage-partial-unflagged") {
+    emit({
+      text: "FAKE-USAGE-PARTIAL",
+      stopReason: "EndTurn",
+      sessionId: "11111111-1111-7111-8111-111111111115",
+      requestId: "req-usage-partial",
+      usage: { input_tokens: 120, output_tokens: 20 },
+      modelUsage: { "grok-partial": { inputTokens: 120, outputTokens: 20 } }
+    });
+    process.exit(0);
+  }
+
+  if (mode === "metrics-complete") {
+    emit({
+      text: "FAKE-METRICS-COMPLETE",
+      stopReason: "EndTurn",
+      sessionId: "11111111-1111-7111-8111-111111111116",
+      requestId: "req-metrics-complete",
+      usage,
+      modelUsage: {
+        "grok-test-main": {
+          inputTokens: 120,
+          outputTokens: 20,
+          cacheReadInputTokens: 30,
+          reasoningTokens: 5,
+          totalTokens: 170,
+          modelCalls: 3,
+          costUSD: 0.012
+        }
+      },
+      num_turns: 3,
+      total_cost_usd: 0.012,
+      total_cost_usd_ticks: 120000000,
+      cost_is_partial: false,
+      usage_is_incomplete: false,
+      structuredOutput: {
+        status: "completed",
+        summary: "The requested work completed.",
+        changedFiles: [],
+        verification: ["fake verification"],
+        blockers: []
+      }
+    });
+    process.exit(0);
+  }
+
+  const invalidMetricEnvelopes = {
+    "metrics-fractional-turns": { num_turns: 1.5 },
+    "metrics-lone-cost": { total_cost_usd_ticks: 120000000 },
+    "metrics-inconsistent-cost": { total_cost_usd: 0.013, total_cost_usd_ticks: 120000000 },
+    "metrics-incomplete-cost": { total_cost_usd: 0.012, total_cost_usd_ticks: 120000000, usage_is_incomplete: true }
+  };
+  if (invalidMetricEnvelopes[mode]) {
+    emit({
+      text: "FAKE-INVALID-METRICS",
+      stopReason: "EndTurn",
+      sessionId: "11111111-1111-7111-8111-111111111119",
+      requestId: `req-${mode}`,
+      ...invalidMetricEnvelopes[mode]
+    });
+    process.exit(0);
+  }
+
+  const malformedSpendEnvelopes = {
+    "metrics-usage-array": { usage: [], modelUsage, total_cost_usd: 0.012, total_cost_usd_ticks: 120000000 },
+    "metrics-negative-token": { usage: { ...usage, output_tokens: -1 }, modelUsage, total_cost_usd: 0.012, total_cost_usd_ticks: 120000000 },
+    "metrics-fractional-token": { usage: { ...usage, output_tokens: 20.5, total_tokens: 170.5 }, modelUsage, total_cost_usd: 0.012, total_cost_usd_ticks: 120000000 },
+    "metrics-unsafe-token": { usage: { ...usage, input_tokens: 9007199254740992 }, modelUsage, total_cost_usd: 0.012, total_cost_usd_ticks: 120000000 },
+    "metrics-conflicting-flags": { usage, modelUsage, total_cost_usd: 0.012, total_cost_usd_ticks: 120000000, usage_is_incomplete: false, usageIsIncomplete: true },
+    "metrics-conflicting-token-aliases": { usage: { ...usage, outputTokens: 21 }, modelUsage, total_cost_usd: 0.012, total_cost_usd_ticks: 120000000 },
+    "metrics-reasoning-exceeds-output": { usage: { ...usage, reasoning_tokens: 21 }, modelUsage, total_cost_usd: 0.012, total_cost_usd_ticks: 120000000 },
+    "metrics-malformed-model": { usage, modelUsage: { "grok-test-main": { inputTokens: 120, outputTokens: "20", cacheReadInputTokens: 30, modelCalls: 3 } }, total_cost_usd: 0.012, total_cost_usd_ticks: 120000000 }
+  };
+  if (malformedSpendEnvelopes[mode]) {
+    emit({
+      text: "FAKE-MALFORMED-SPEND",
+      stopReason: "EndTurn",
+      sessionId: "11111111-1111-7111-8111-111111111121",
+      requestId: `req-${mode}`,
+      ...malformedSpendEnvelopes[mode]
+    });
+    process.exit(0);
+  }
+
+  if (mode === "large-stdout-json") {
+    writeAllSync(1, `${JSON.stringify({
+      text: `large-output-begins:${"x".repeat(1536 * 1024)}:large-output-ends`,
+      stopReason: "EndTurn",
+      sessionId: "11111111-1111-7111-8111-111111111117",
+      requestId: "req-large-stdout"
+    })}\n`);
+    process.exit(0);
+  }
+
   if (mode === "sandbox-warning") {
     process.stderr.write("Sandbox could not be applied, continuing without sandbox\n");
     setTimeout(() => {
@@ -116,9 +381,43 @@
     return;
   }
 
+  const safetyWarnings = {
+    "sandbox-unsupported-warning": "Sandbox not supported on this platform, continuing without sandbox",
+    "sandbox-built-without-enforce-warning": "Sandbox enforcement unavailable (built without 'enforce' feature)",
+    "tool-allowlist-warning": "tools allowlist had unmappable entries; keeping full grok toolset",
+    "tool-disallowed-warning": "disallowedTools entry matched nothing"
+  };
+  if (safetyWarnings[mode]) {
+    process.stderr.write(`${safetyWarnings[mode]}\n`);
+    setTimeout(() => {
+      if (process.env.FAKE_GROK_SANDBOX_SENTINEL) {
+        fs.writeFileSync(process.env.FAKE_GROK_SANDBOX_SENTINEL, "unsafe activity\n", "utf8");
+      }
+      emit({
+        text: "UNSAFE",
+        stopReason: "EndTurn",
+        sessionId: "11111111-1111-7111-8111-111111111118",
+        requestId: "req-safety-warning"
+      });
+      process.exit(0);
+    }, 1000);
+    return;
+  }
+
+  if (mode === "tool-policy-no-evidence") {
+    emit({
+      text: "UNVERIFIED-POLICY",
+      stopReason: "EndTurn",
+      sessionId: "11111111-1111-7111-8111-111111111119",
+      requestId: "req-unverified-policy"
+    });
+    process.exit(0);
+  }
+
   if (mode === "review-ok") {
     emit({
       text: "```json\n" + JSON.stringify(reviewObject) + "\n```",
+      ...(process.argv.includes("--json-schema") ? { structuredOutput: reviewObject } : {}),
       stopReason: "EndTurn",
       sessionId: "33333333-3333-7333-8333-333333333333",
       requestId: "req-1"
@@ -331,6 +630,11 @@
     process.exit(1);
   }
 
+  if (mode === "operation-not-permitted") {
+    process.stderr.write("Error:\nOperation not permitted (os error 1)\n");
+    process.exit(1);
+  }
+
   if (mode === "quota-error") {
     process.stderr.write("quota exceeded\n");
     process.exit(1);
@@ -364,7 +668,20 @@
       type: "error",
       message: "HTTP 402 Payment Required: balance exhausted",
       usage,
-      modelUsage
+      modelUsage,
+      num_turns: 2,
+      usage_is_incomplete: true
+    });
+    process.exit(1);
+  }
+
+  if (mode === "usage-error-malformed") {
+    emit({
+      type: "error",
+      message: "upstream failed after malformed accounting",
+      usage: { ...usage, output_tokens: -1 },
+      modelUsage,
+      usage_is_incomplete: true
     });
     process.exit(1);
   }
@@ -385,9 +702,9 @@
   }
 
   if (mode === "large-stderr-error") {
-    fs.writeSync(2, "large stderr begins\n");
-    fs.writeSync(2, "x".repeat(2 * 1024 * 1024));
-    fs.writeSync(2, "\nlarge stderr ends\n");
+    writeAllSync(2, "large stderr begins\n");
+    writeAllSync(2, "x".repeat(2 * 1024 * 1024));
+    writeAllSync(2, "\nlarge stderr ends\n");
     process.exit(1);
   }
 

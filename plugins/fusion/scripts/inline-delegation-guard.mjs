@@ -7,6 +7,7 @@ import { fileURLToPath } from "node:url";
 
 const STATE_ENV = "FUSION_INLINE_GUARD_STATE";
 const BUDGET_ENV = "FUSION_INLINE_WRITE_BUDGET";
+const MODE_ENV = "FUSION_INLINE_GUARD_MODE";
 const AUDIT_DIR_ENV = "FUSION_INLINE_GUARD_AUDIT_DIR";
 const AUDIT_RETENTION_DAYS_ENV = "FUSION_INLINE_GUARD_AUDIT_RETENTION_DAYS";
 const AUDIT_MAX_BYTES_ENV = "FUSION_INLINE_GUARD_AUDIT_MAX_BYTES";
@@ -42,6 +43,10 @@ function resolveStateDir(env = process.env) {
 function resolveBudget(env = process.env) {
   const parsed = Number.parseInt(String(env[BUDGET_ENV]), 10);
   return Number.isInteger(parsed) && parsed > 0 ? parsed : DEFAULT_BUDGET;
+}
+
+function resolveMode(env = process.env) {
+  return String(env[MODE_ENV] ?? "").trim().toLowerCase() === "advisory" ? "advisory" : "enforce";
 }
 
 function resolveAuditDir(env = process.env) {
@@ -95,24 +100,44 @@ function stateFile(stateDir, sessionId) {
 }
 
 function readState(file) {
+  let raw;
   try {
-    const raw = fs.readFileSync(file, "utf8");
-    const parsed = JSON.parse(raw);
-    if (parsed && typeof parsed === "object") {
-      return parsed;
+    raw = fs.readFileSync(file, "utf8");
+  } catch (error) {
+    if (error?.code !== "ENOENT") {
+      throw error;
     }
-  } catch {
-    void 0;
+    try {
+      fs.lstatSync(file);
+    } catch (statError) {
+      if (statError?.code === "ENOENT") {
+        return null;
+      }
+      throw statError;
+    }
+    throw error;
   }
-  return null;
+  const parsed = JSON.parse(raw);
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new TypeError("Fusion inline write state must be a JSON object.");
+  }
+  return parsed;
 }
 
 function writeState(file, state) {
   const dir = path.dirname(file);
   fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+  fs.chmodSync(dir, 0o700);
   const tempFile = path.join(dir, `.${path.basename(file)}.${process.pid}.tmp`);
-  fs.writeFileSync(tempFile, `${JSON.stringify(state, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
+  const descriptor = fs.openSync(tempFile, fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_WRONLY, 0o600);
+  try {
+    fs.writeFileSync(descriptor, `${JSON.stringify(state, null, 2)}\n`, "utf8");
+    fs.fchmodSync(descriptor, 0o600);
+  } finally {
+    fs.closeSync(descriptor);
+  }
   fs.renameSync(tempFile, file);
+  fs.chmodSync(file, 0o600);
 }
 
 function waitForLock() {
@@ -122,12 +147,14 @@ function waitForLock() {
 function acquireStateLock(file) {
   const dir = path.dirname(file);
   fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+  fs.chmodSync(dir, 0o700);
   const lockFile = `${file}.lock`;
   const deadline = Date.now() + LOCK_TIMEOUT_MS;
   for (;;) {
     try {
-      const descriptor = fs.openSync(lockFile, "wx");
+      const descriptor = fs.openSync(lockFile, fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_WRONLY, 0o600);
       fs.writeFileSync(descriptor, String(process.pid));
+      fs.fchmodSync(descriptor, 0o600);
       return () => {
         fs.closeSync(descriptor);
         fs.rmSync(lockFile, { force: true });
@@ -141,8 +168,10 @@ function acquireStateLock(file) {
           fs.rmSync(lockFile, { force: true });
           continue;
         }
-      } catch {
-        continue;
+      } catch (statError) {
+        if (statError?.code === "ENOENT") {
+          continue;
+        }
       }
       if (Date.now() >= deadline) {
         throw new Error("timed out waiting for inline guard state lock");
@@ -242,6 +271,7 @@ function appendAuditLine(file, line) {
   const needsLineBreak = fs.existsSync(file) && fileNeedsLineBreak(file);
   const descriptor = fs.openSync(file, "a", 0o600);
   try {
+    fs.fchmodSync(descriptor, 0o600);
     if (needsLineBreak) {
       fs.writeSync(descriptor, "\n", null, "utf8");
     }
@@ -274,6 +304,7 @@ function appendAuditEvent(event, env = process.env) {
   const nowMs = Date.parse(normalized.at);
   const date = normalized.at.slice(0, 10);
   fs.mkdirSync(auditDir, { recursive: true, mode: 0o700 });
+  fs.chmodSync(auditDir, 0o700);
   withStateLock(path.join(auditDir, ".append"), () => {
     pruneExpiredAuditSegments(auditDir, Number.isFinite(nowMs) ? nowMs : Date.now(), resolveAuditRetentionDays(env));
     const file = selectAuditSegment(auditDir, date, resolveAuditMaxBytes(env), Buffer.byteLength(line));
@@ -592,6 +623,10 @@ function allowOutput(reason) {
   return { hookSpecificOutput };
 }
 
+function denyOutput(reason) {
+  return { hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision: "deny", permissionDecisionReason: reason } };
+}
+
 function buildAdvisoryLine(writeCount, dispatchCount) {
   const countSummary =
     dispatchCount === 0
@@ -605,13 +640,10 @@ function buildAdvisoryLine(writeCount, dispatchCount) {
 }
 
 function runAllowCommand() {
-  process.stdout.write(
-    "fusion inline delegation guard: the allow escape hatch is retired, the guard only advises now and never denies\n"
-  );
+  process.stdout.write("fusion inline delegation guard: the allow escape hatch is retired; dispatch an Agent or Task to open a new write window, or set FUSION_INLINE_GUARD_MODE=advisory for compatibility\n");
 }
 
-function runHook(env = process.env) {
-  const input = readHookInput();
+function runHook(env = process.env, input = readHookInput()) {
   if (!input) {
     return;
   }
@@ -631,6 +663,9 @@ function runHook(env = process.env) {
   const now = new Date().toISOString();
 
   if (DELEGATION_TOOLS.has(toolName)) {
+    if (input.hook_event_name && input.hook_event_name !== "PostToolUse") {
+      return;
+    }
     const subagentType = extractSubagentType(input.tool_input);
     const safeSubagentType = sanitizeIdentifier(subagentType);
     const lane = laneForSubagentType(subagentType);
@@ -664,11 +699,13 @@ function runHook(env = process.env) {
     return;
   }
 
-  const auditPath = extractAuditWritePath(targetPath, cwd);
-  recordAuditEvent({ at: now, session: sessionId, event: "write", lane: MAIN_LANE, tool: toolName, ...(auditPath ? { path: auditPath } : {}) }, env);
   const budget = resolveBudget(env);
-  const advisoryCandidate = withStateLock(file, () => {
+  const mode = resolveMode(env);
+  const decision = withStateLock(file, () => {
     const state = normalizeState(readState(file), now);
+    if (mode === "enforce" && state.writesSinceDispatch >= budget) {
+      return { denied: true, writeCount: state.writesSinceDispatch, dispatchCount: totalDispatches(state.dispatches) };
+    }
     state.writeCount += 1;
     state.writesSinceDispatch += 1;
     const multiple = budgetMultiple(state.writesSinceDispatch, budget);
@@ -678,15 +715,23 @@ function runHook(env = process.env) {
       candidate = { multiple, writeCount: state.writesSinceDispatch, dispatchEpoch: state.dispatchEpoch };
     }
     writeState(file, state);
-    return candidate;
+    return { denied: false, candidate };
   });
 
-  if (advisoryCandidate) {
+  if (decision.denied) {
+    const advisory = buildAdvisoryLine(decision.writeCount, decision.dispatchCount);
+    process.stdout.write(`${JSON.stringify(denyOutput(`${advisory} The inline write budget is exhausted. Dispatch an Agent or Task before another main-loop write.`))}\n`);
+    return;
+  }
+
+  const auditPath = extractAuditWritePath(targetPath, cwd);
+  recordAuditEvent({ at: now, session: sessionId, event: "write", lane: MAIN_LANE, tool: toolName, ...(auditPath ? { path: auditPath } : {}) }, env);
+  if (decision.candidate) {
     withStateLock(file, () => {
       const latest = normalizeState(readState(file), new Date().toISOString());
       const dispatchCount = totalDispatches(latest.dispatches);
-      if (latest.dispatchEpoch === advisoryCandidate.dispatchEpoch && latest.advisedMultiples.includes(advisoryCandidate.multiple)) {
-        const advisory = buildAdvisoryLine(advisoryCandidate.writeCount, dispatchCount);
+      if (latest.dispatchEpoch === decision.candidate.dispatchEpoch && latest.advisedMultiples.includes(decision.candidate.multiple)) {
+        const advisory = buildAdvisoryLine(decision.candidate.writeCount, dispatchCount);
         process.stdout.write(`${JSON.stringify(allowOutput(advisory))}\n`);
       }
     });
@@ -699,10 +744,14 @@ function main() {
     runAllowCommand();
     return;
   }
+  const input = readHookInput();
   try {
-    runHook();
+    runHook(process.env, input);
   } catch {
-    void 0;
+    const targetPath = extractWritePath(input?.tool_input);
+    if (resolveMode(process.env) === "enforce" && input && !isSubagentPayload(input) && WRITE_TOOLS.has(input.tool_name) && isInsideCwd(targetPath, input.cwd)) {
+      process.stdout.write(`${JSON.stringify(denyOutput("Fusion inline write state is unavailable. Retry after restoring private guard state access."))}\n`);
+    }
   }
 }
 
@@ -732,6 +781,7 @@ export {
   resolveAuditMaxFiles,
   resolveAuditRetentionDays,
   resolveBudget,
+  resolveMode,
   resolveStateDir,
   sanitizeAuditPath,
   sanitizeAuditText,
