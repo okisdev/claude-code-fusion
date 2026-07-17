@@ -11,6 +11,7 @@ import {
   findWorkerRecord,
   isFusionWorkerAgent,
   isTerminalWorkerStatus,
+  markWorkerCollected,
   readWorkerRecords,
   refreshWorkerTranscript,
   updateWorkerRecord
@@ -60,7 +61,7 @@ export function workerLimits(agentType, env = process.env) {
       ? { wallClockMs: 540_000, stallMs: 540_000, maxTurns: 6, maxOutputTokens: 8_000, maxUncachedTokens: 30_000 }
       : canonical === "fusion:deep-reasoner"
         ? { wallClockMs: 480_000, stallMs: 300_000, maxTurns: 30, maxOutputTokens: 24_000, maxUncachedTokens: 120_000 }
-        : { wallClockMs: 480_000, stallMs: 180_000, maxTurns: 40, maxOutputTokens: 24_000, maxUncachedTokens: 120_000 };
+        : { wallClockMs: 1_200_000, stallMs: 300_000, maxTurns: 60, maxOutputTokens: 24_000, maxUncachedTokens: 240_000 };
   return {
     wallClockMs: positiveInteger(env, WALL_CLOCK_MS_ENV, defaults.wallClockMs),
     stallMs: positiveInteger(env, STALL_MS_ENV, defaults.stallMs),
@@ -487,16 +488,17 @@ function handlePostToolUse(input, env, failed = false) {
     if (!failed) {
       const now = new Date().toISOString();
       for (const record of matches) {
-        updateWorkerRecord(record.taskId, env, (current) => ({
-          ...current,
-          transportStatus: input.tool_name === "TaskStop" ? "cancelled" : "done",
-          acceptance: "unverified",
-          failureKind: input.tool_name === "TaskStop" ? current.failureKind ?? "cancelled" : current.failureKind,
-          collectionMethod: input.tool_name,
-          collectedAt: input.tool_name === "TaskStop" ? current.collectedAt : now,
-          finishedAt: current.finishedAt ?? now,
-          lastActivityAt: now
-        }));
+        updateWorkerRecord(record.taskId, env, (current) => {
+          const worker = current ?? record;
+          return {
+            ...markWorkerCollected(worker, input.tool_name, now),
+            transportStatus: input.tool_name === "TaskStop" ? "cancelled" : "done",
+            acceptance: "unverified",
+            failureKind: input.tool_name === "TaskStop" ? worker.failureKind ?? "cancelled" : worker.failureKind,
+            finishedAt: worker.finishedAt ?? now,
+            lastActivityAt: now
+          };
+        });
       }
     }
     return;
@@ -541,20 +543,24 @@ function handlePostToolUse(input, env, failed = false) {
       const directUsage = canonicalToolResponseUsage(usageResponse);
       const completed = response.status === "completed" || nested.status === "completed";
       const totalToolUseCount = response.totalToolUseCount ?? nested.totalToolUseCount;
-      updateWorkerRecord(pending.taskId, env, (current) => ({
-        ...current,
-        ...(agentId ? { agentId, backgroundTaskId: isAsync ? agentId : current.backgroundTaskId } : {}),
-        ...(outputFile && path.isAbsolute(outputFile) && (!agentId || path.basename(outputFile).includes(agentId)) ? { outputFile, transcriptPath: outputFile } : {}),
-        ...(resolvedModel ? { resolvedModel } : {}),
-        ...(directUsage?.usage ? { usage: directUsage.usage, usageSource: "tool-response" } : {}),
-        ...(directUsage ? { usageAvailability: directUsage.availability, reportedTotalTokens: directUsage.reportedTotalTokens } : {}),
-        ...(Number.isFinite(response.totalDurationMs ?? nested.totalDurationMs) ? { durationMs: response.totalDurationMs ?? nested.totalDurationMs } : {}),
-        ...(Number.isSafeInteger(totalToolUseCount) ? { toolCalls: totalToolUseCount, toolCallsSource: "tool-response" } : {}),
-        transportStatus: failed ? "failed" : isAsync ? "pending_async" : completed && !isTerminalWorkerStatus(current.transportStatus) ? "done" : current.transportStatus === "dispatching" ? "running" : current.transportStatus,
-        failureKind: failed ? "launch" : current.failureKind,
-        finishedAt: failed || completed ? new Date().toISOString() : current.finishedAt,
-        runtimeAsync: isAsync
-      }));
+      const now = new Date().toISOString();
+      updateWorkerRecord(pending.taskId, env, (current) => {
+        const worker = current ?? pending;
+        return {
+          ...(!failed && completed ? markWorkerCollected(worker, input.tool_name, now) : worker),
+          ...(agentId ? { agentId, backgroundTaskId: isAsync ? agentId : worker.backgroundTaskId } : {}),
+          ...(outputFile && path.isAbsolute(outputFile) && (!agentId || path.basename(outputFile).includes(agentId)) ? { outputFile, transcriptPath: outputFile } : {}),
+          ...(resolvedModel ? { resolvedModel } : {}),
+          ...(directUsage?.usage ? { usage: directUsage.usage, usageSource: "tool-response" } : {}),
+          ...(directUsage ? { usageAvailability: directUsage.availability, reportedTotalTokens: directUsage.reportedTotalTokens } : {}),
+          ...(Number.isFinite(response.totalDurationMs ?? nested.totalDurationMs) ? { durationMs: response.totalDurationMs ?? nested.totalDurationMs } : {}),
+          ...(Number.isSafeInteger(totalToolUseCount) ? { toolCalls: totalToolUseCount, toolCallsSource: "tool-response" } : {}),
+          transportStatus: failed ? "failed" : isAsync ? "pending_async" : completed && !isTerminalWorkerStatus(worker.transportStatus) ? "done" : worker.transportStatus === "dispatching" ? "running" : worker.transportStatus,
+          failureKind: failed ? "launch" : worker.failureKind,
+          finishedAt: failed || completed ? now : worker.finishedAt,
+          runtimeAsync: isAsync
+        };
+      });
     }
     return;
   }
@@ -637,7 +643,7 @@ function handleSubagentStop(input, env) {
   }
   const now = new Date().toISOString();
   updateWorkerRecord(refreshed.taskId, env, (current) => ({
-    ...current,
+    ...markWorkerCollected(current ?? refreshed, "SubagentStop", now),
     transportStatus: complete && (trustedCollectorReport?.kind === "outcome" || collectorProtocolFailure) ? "incomplete" : complete ? current.runtimeAsync ? current.userBackgroundAuthorized ? "ready_background" : "ready_uncollected" : "done" : failure ? "failed" : "incomplete",
     acceptance: "unverified",
     failureKind: failure?.failureKind ?? (trustedCollectorReport?.kind === "outcome" ? `collection_${trustedCollectorReport.collectionOutcome}` : collectorProtocolFailure ? "collection_protocol" : complete ? null : "delivery"),
@@ -716,6 +722,22 @@ function collectorStopGate(input, env) {
   return false;
 }
 
+function unverifiedCollectedWorkers(sessionId, env) {
+  const records = readWorkerRecords(env, { strict: true }).filter((record) => record.sessionId === sessionId);
+  if (records.length === 0 || records.some((record) => !isTerminalWorkerStatus(record.transportStatus) || !record.collectedAt)) {
+    return [];
+  }
+  return records.filter((record) => record.completionContract !== "collector" && record.acceptance === "unverified");
+}
+
+function writeAcceptanceAdvisory(sessionId, env) {
+  const unverified = unverifiedCollectedWorkers(sessionId, env);
+  if (unverified.length === 0) {
+    return;
+  }
+  writeOutput(hookOutput("Stop", `Acceptance remains unverified for ${unverified.length} collected Fusion worker${unverified.length === 1 ? "" : "s"}. Record the main-loop judgment with /fusion:stats --record-worker-acceptance <task-id> accepted --source main-loop.`));
+}
+
 function handleStop(input, env) {
   if (collectorStopGate(input, env)) {
     return;
@@ -738,6 +760,7 @@ function handleStop(input, env) {
   }
   const finalMessage = typeof input.last_assistant_message === "string" ? input.last_assistant_message : "";
   if (pending.length === 0) {
+    writeAcceptanceAdvisory(input.session_id, env);
     return;
   }
   const unauthorized = pending.filter((record) => !record.userBackgroundAuthorized);
@@ -776,8 +799,9 @@ function handleStop(input, env) {
     return;
   }
   for (const record of pending.filter((candidate) => candidate.transportStatus === "ready_background")) {
-    updateWorkerRecord(record.taskId, env, (current) => ({ ...current, transportStatus: "done" }));
+    updateWorkerRecord(record.taskId, env, (current) => ({ ...markWorkerCollected(current ?? record, "Stop"), transportStatus: "done" }));
   }
+  writeAcceptanceAdvisory(input.session_id, env);
 }
 
 function handleSessionEnd(input, env) {

@@ -27,6 +27,8 @@ Execution rules:
 
 - Invoke the helper only through foreground `Bash` with `timeout: 600000`.
 - Place every task option before the first prompt token. Use `--` before a prompt that begins with an option shaped token.
+- The companion forwards `--skip-git-repo-check` to Codex exec. Without that flag or the dangerous bypass flag, Codex refuses to start unless the working directory has an ancestor `.git` entry; the projects trust map in `config.toml` is not consulted by exec. A gate failure names `--skip-git-repo-check` as the remedy.
+- Codex CLI 0.144.4 requires `supports_reasoning_summaries` in `models_cache.json`, while 0.145.0 alpha releases use `supports_reasoning_summary_parameter` with a default. A newer Codex binary sharing `CODEX_HOME` can rewrite the cache in the new schema, causing 0.144.4 sessions to log non-fatal `failed to renew cache TTL: missing field` messages on etag renewal. Startup refetch self-heals the cache; align the versions of all Codex binaries sharing the same home.
 - Never use Bash background mode. Complexity, duration, and model choice never justify implicit background execution.
 - Pass `--background` only when the received request explicitly contains it. The companion owns detachment and returns a durable job receipt.
 - A direct slash command invocation returns that receipt without automatic collection. Direct users inspect progress through status and collect the deliverable through result; when Fusion is installed, its monitor can notify them of completion. Fusion orchestration separately owns one same turn collection attempt capped at 540000ms for jobs it creates. A timeout remains explicitly uncollected.

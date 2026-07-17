@@ -231,29 +231,53 @@ test("a long error message is truncated to a sane length", async (t) => {
   );
 });
 
-test("with a monitor session id set, a matching job emits and a mismatching job stays silent", async (t) => {
+test("session monitors announce their own Claude jobs once and still surface orphans", async (t) => {
   const sandbox = makeSandbox(t);
-  const { file: ownFile, record: ownRecord } = seedJob(sandbox, { status: "running", sessionId: "session-own" });
+  const { file: ownFile, record: ownRecord } = seedJob(sandbox, {
+    status: "running",
+    sessionId: "codex-own",
+    claudeSessionId: "session-own"
+  });
   const { file: otherFile, record: otherRecord } = seedJob(sandbox, {
     status: "running",
-    sessionId: "session-other",
+    sessionId: "codex-other",
+    claudeSessionId: "session-other"
   });
-  const monitor = startMonitor(sandbox, envFor(sandbox, { CLAUDE_CODE_SESSION_ID: "session-own" }));
-  t.after(() => monitor.child.kill("SIGKILL"));
+  const { file: orphanFile, record: orphanRecord } = seedJob(sandbox, { status: "running", sessionId: "codex-orphan" });
+  const ownMonitor = startMonitor(sandbox, envFor(sandbox, { CLAUDE_CODE_SESSION_ID: "session-own" }));
+  const otherMonitor = startMonitor(sandbox, envFor(sandbox, { CLAUDE_CODE_SESSION_ID: "session-other" }));
+  t.after(() => ownMonitor.child.kill("SIGKILL"));
+  t.after(() => otherMonitor.child.kill("SIGKILL"));
   await new Promise((resolve) => setTimeout(resolve, 300));
 
   writeJobRecordFile(ownFile, { ...ownRecord, status: "completed", completedAt: new Date().toISOString() });
   writeJobRecordFile(otherFile, { ...otherRecord, status: "completed", completedAt: new Date().toISOString() });
+  writeJobRecordFile(orphanFile, { ...orphanRecord, status: "completed", completedAt: new Date().toISOString() });
 
-  const lines = await waitUntil(() => (monitor.lines().length > 0 ? monitor.lines() : null));
-  assert.strictEqual(lines.length, 1);
-  assert.strictEqual(
-    lines[0],
+  await waitUntil(() => (ownMonitor.lines().length === 2 && otherMonitor.lines().length === 2 ? true : null));
+  assert.deepStrictEqual(ownMonitor.lines().sort(), [
+    `codex job ${orphanRecord.id} completed. collect with /codex:result ${orphanRecord.id}; completion notices do not replace collection.`,
     `codex job ${ownRecord.id} completed. collect with /codex:result ${ownRecord.id}; completion notices do not replace collection.`
-  );
+  ].sort());
+  assert.deepStrictEqual(otherMonitor.lines().sort(), [
+    `codex job ${orphanRecord.id} completed. collect with /codex:result ${orphanRecord.id}; completion notices do not replace collection.`,
+    `codex job ${otherRecord.id} completed. collect with /codex:result ${otherRecord.id}; completion notices do not replace collection.`
+  ].sort());
 
-  await new Promise((resolve) => setTimeout(resolve, 300));
-  assert.strictEqual(monitor.lines().length, 1);
+  const { ownLedger, otherLedger } = await waitUntil(() => {
+    try {
+      const ownLedger = JSON.parse(fs.readFileSync(announcedPath(sandbox, "session-own"), "utf8"));
+      const otherLedger = JSON.parse(fs.readFileSync(announcedPath(sandbox, "session-other"), "utf8"));
+      return ownLedger.records.length === 2 && otherLedger.records.length === 2 ? { ownLedger, otherLedger } : null;
+    } catch {
+      return null;
+    }
+  });
+  assert.deepStrictEqual(ownLedger.records.map((record) => record.jobId).sort(), [orphanRecord.id, ownRecord.id].sort());
+  assert.deepStrictEqual(otherLedger.records.map((record) => record.jobId).sort(), [orphanRecord.id, otherRecord.id].sort());
+  assert.strictEqual(ownLedger.records.find((record) => record.jobId === ownRecord.id).sessionId, "session-own");
+  assert.strictEqual(otherLedger.records.find((record) => record.jobId === otherRecord.id).sessionId, "session-other");
+  assert.strictEqual(ownLedger.records.find((record) => record.jobId === orphanRecord.id).sessionId, null);
 });
 
 test("with the session id env var unset, a job from a different session still emits", async (t) => {
@@ -519,10 +543,14 @@ test("restart with persisted dedup state does not re-announce a completed job", 
   assert.ok(persisted.keys.includes(`${record.id}:completed`));
   assert.strictEqual(persisted.records[0].jobId, record.id);
   assert.strictEqual(persisted.records[0].transportStatus, "completed");
+  const observedAt = persisted.records[0].observedAt;
 
-  writeJobRecordFile(file, { ...record, status: "running", completedAt: null });
   const second = startMonitor(sandbox, env);
   t.after(() => second.child.kill("SIGKILL"));
+  await new Promise((resolve) => setTimeout(resolve, 500));
+  assert.strictEqual(JSON.parse(fs.readFileSync(announcedPath(sandbox), "utf8")).records[0].observedAt, observedAt);
+
+  writeJobRecordFile(file, { ...record, status: "running", completedAt: null });
   await new Promise((resolve) => setTimeout(resolve, 300));
   writeJobRecordFile(file, { ...record, status: "completed", completedAt: new Date().toISOString() });
   await new Promise((resolve) => setTimeout(resolve, 600));
@@ -960,7 +988,9 @@ test("canonical terminal records use direct model and token evidence without rol
     status: "running",
     threadId,
     turnId,
-    request: { model: "requested-model", effort: "xhigh" }
+    request: { model: "requested-model", effort: "low" },
+    resolvedModel: "actual-model",
+    resolvedEffort: "xhigh"
   });
   const monitor = startMonitor(sandbox, envFor(sandbox));
   t.after(() => monitor.child.kill("SIGKILL"));
@@ -988,12 +1018,19 @@ test("canonical terminal records use direct model and token evidence without rol
   });
   assert.strictEqual(terminal.transportStatus, "done");
   assert.strictEqual(terminal.finishedAt, finishedAt);
-  assert.strictEqual(terminal.model, "requested-model");
-  assert.strictEqual(terminal.modelSource, "job-request");
+  assert.strictEqual(terminal.model, "actual-model");
+  assert.strictEqual(terminal.modelSource, "job-record");
   assert.strictEqual(terminal.effort, "xhigh");
-  assert.strictEqual(terminal.effortSource, "job-request");
+  assert.strictEqual(terminal.effortSource, "job-record");
   assert.deepStrictEqual(terminal.tokenUsage, usage);
-  assert.deepStrictEqual(readModelAuditLines(sandbox), []);
+  const modelAudit = readModelAuditLines(sandbox);
+  assert.strictEqual(modelAudit.length, 1);
+  assert.strictEqual(modelAudit[0].jobId, record.id);
+  assert.strictEqual(modelAudit[0].model, "actual-model");
+  assert.strictEqual(modelAudit[0].effort, "xhigh");
+  assert.strictEqual(modelAudit[0].source, "job-record");
+  await new Promise((resolve) => setTimeout(resolve, 500));
+  assert.strictEqual(readModelAuditLines(sandbox).length, 1);
 
   const tokenPath = path.join(sandbox.fusionData, "observations", createHash("sha256").update(sandbox.workDir).digest("hex").slice(0, 16), "token-usage.jsonl");
   const tokenAudit = fs.readFileSync(tokenPath, "utf8").trim().split("\n").map((line) => JSON.parse(line));

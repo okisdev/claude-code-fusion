@@ -625,6 +625,30 @@
     process.exit(0);
   }
 
+  if (mode === "max-turns") {
+    emit({
+      text: "FAKE-TURN-LIMIT-PARTIAL",
+      stopReason: "Cancelled",
+      sessionId: "99999999-9999-7999-8999-999999999999",
+      requestId: "req-max-turns",
+      thought: "The partial result is still useful.",
+      usage,
+      modelUsage,
+      num_turns: 60,
+      total_cost_usd: 0.012,
+      total_cost_usd_ticks: 120000000,
+      cost_is_partial: false,
+      usage_is_incomplete: false,
+      structuredOutput: {
+        status: "partial",
+        summary: "The turn limit stopped further work."
+      }
+    });
+    process.stdout.write(JSON.stringify({ type: "max_turns_reached" }) + "\n");
+    process.stderr.write("Error: max turns reached\n");
+    process.exit(1);
+  }
+
   if (mode === "error") {
     process.stderr.write("Fake grok failed on purpose.\n");
     process.exit(1);

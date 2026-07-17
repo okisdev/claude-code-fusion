@@ -1,5 +1,15 @@
 # changelog
 
+## 0.0.25
+
+- grok turn limits are salvageable: the consult default rises from 25 to 60 turns, a max turns death is classified as the new `turn_limit` failure kind outside every breaker table, and the final json envelope printed before exit 1 is preserved so partial text, usage, model usage, and structured output survive into the job record
+- codex acceptance closes the loop: a new `record-acceptance` subcommand writes semantic verdicts into the job record under state locking, recording accepted on a failed transport requires an explicit `--accept-failed-transport` override, `/fusion:stats --record-acceptance` routes through it with a ledger only fallback for older companions, and the stats report gains an acceptance anomalies block for verdicts that contradict transport status
+- codex jobs carry their requested model and effort from creation so never finished jobs stop reporting null, task mode forwards `--skip-git-repo-check`, and the trusted directory startup refusal names that remedy
+- monitor announcements are session owned: a completion is announced only by the Claude session that dispatched it while records without an owner keep cross session visibility, snapshot carry forward stops rewriting observedAt, and the model audit sidecar resumes appending for directly observed terminal jobs after previously being fed only by the legacy rollout path
+- worker budgets match the observed workload: wall clock 480000 to 1200000ms, stall 180000 to 300000ms, uncached tokens 120000 to 240000, turns 40 to 60, every collection path stamps `collectedAt` idempotently, and Stop adds a non blocking advisory when collected workers remain acceptance unverified
+- verified peer versions are recorded: `plugins/fusion/verified-versions.json` is the single source (codex-cli 0.144.4, grok 0.2.101), the readme prerequisites quote it, doctor check 17 compares installed cli versions against it, and a test keeps the readme and the json in sync
+- docs: troubleshooting covers the turn limit family, the models cache schema fight between codex generations sharing one `CODEX_HOME`, acceptance integrity, and the raised worker budgets, with the grok and codex contracts updated to match
+
 ## 0.0.24
 
 - raw request transport now keeps every slash command and wrapper agent argument out of Bash: companions mint one-time private staging files (session bound, owner only modes, one hour expiry, consumed before parsing) behind a Read verify Write handshake, Codex adds a `--request-stdin` ingress for programmatic orchestrators, Grok prompts travel through `/dev/stdin`, and a repository wide surface test enforces the handshake on every transport command

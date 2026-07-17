@@ -75,6 +75,30 @@ function run(env, extraArgs = [], extraEnv = {}) {
   });
 }
 
+function writeCodexAcceptanceCompanion(directory) {
+  const companion = path.join(directory, "codex-companion.mjs");
+  fs.writeFileSync(
+    companion,
+    [
+      'import fs from "node:fs";',
+      "const argv = process.argv.slice(2);",
+      'if (process.env.FUSION_TEST_CODEX_COMPANION_MODE === "absent") {',
+      '  process.stderr.write("Unknown subcommand: record-acceptance.\\n");',
+      "  process.exitCode = 1;",
+      "} else if (process.env.FUSION_TEST_CODEX_COMPANION_MODE === \"gate\") {",
+      '  process.stderr.write("Accepted Codex jobs must have done transport status.\\n");',
+      "  process.exitCode = 1;",
+      "} else {",
+      "  if (process.env.FUSION_TEST_CODEX_COMPANION_ARGS) {",
+      "    fs.writeFileSync(process.env.FUSION_TEST_CODEX_COMPANION_ARGS, JSON.stringify(argv));",
+      "  }",
+      '  process.stdout.write("Recorded Codex acceptance.\\n");',
+      "}"
+    ].join("\n")
+  );
+  return companion;
+}
+
 function createSiblingWorktree(root) {
   const main = path.join(root, "main");
   const sibling = path.join(root, "sibling");
@@ -1245,6 +1269,8 @@ test("acceptance CLI validates fields, redacts short reasons, and recovers stale
   const dir = sandbox(t);
   const stateRoot = path.join(dir, "state");
   const fusionData = path.join(dir, "fusion");
+  const jobId = "0123456789abcdef0123456789abcdef";
+  const companion = writeCodexAcceptanceCompanion(dir);
   fs.mkdirSync(stateRoot, { recursive: true });
   const sidecar = acceptanceSidecarPath(dir, { FUSION_DATA_DIR: fusionData });
   fs.mkdirSync(path.dirname(sidecar), { recursive: true });
@@ -1255,8 +1281,8 @@ test("acceptance CLI validates fields, redacts short reasons, and recovers stale
 
   const result = run(
     { cwd: dir, codexState: stateRoot },
-    ["--record-acceptance", "task-safe", "rejected", "--reason", `verification failed ${secret}`, "--source", "main-loop", "--json"],
-    { FUSION_DATA_DIR: fusionData, CLAUDE_CODE_SESSION_ID: "session-safe" }
+    ["--record-acceptance", jobId, "rejected", "--reason", `verification failed ${secret}`, "--source", "main-loop", "--json"],
+    { FUSION_DATA_DIR: fusionData, FUSION_CODEX_COMPANION: companion, CLAUDE_CODE_SESSION_ID: "session-safe" }
   );
   assert.strictEqual(result.status, 0, result.stderr);
   const observation = JSON.parse(result.stdout);
@@ -1272,9 +1298,108 @@ test("acceptance CLI validates fields, redacts short reasons, and recovers stale
     /job id is invalid/
   );
   assert.throws(
-    () => recordCodexAcceptance({ jobId: "task-safe", acceptance: "accepted", workspaceRoot: dir, env: { FUSION_DATA_DIR: fusionData }, reason: "line one\nline two" }),
+    () => recordCodexAcceptance({ jobId, acceptance: "accepted", workspaceRoot: dir, env: { FUSION_DATA_DIR: fusionData }, reason: "line one\nline two" }),
     /single non-sensitive line/
   );
+});
+
+test("--record-acceptance updates the Codex job record before appending the ledger", (t) => {
+  const dir = sandbox(t);
+  const stateRoot = path.join(dir, "state");
+  const fusionData = path.join(dir, "fusion");
+  const jobId = "a".repeat(32);
+  const companion = writeCodexAcceptanceCompanion(dir);
+  const argsFile = path.join(dir, "companion-args.json");
+  writeCodexJob(stateRoot, dir, jobId, { status: "done", jobClass: "task" });
+
+  const result = run(
+    { cwd: dir, codexState: stateRoot },
+    ["--record-acceptance", jobId, "accepted", "--reason", "verification passed", "--source", "main-loop"],
+    { FUSION_DATA_DIR: fusionData, FUSION_CODEX_COMPANION: companion, FUSION_TEST_CODEX_COMPANION_ARGS: argsFile }
+  );
+
+  assert.strictEqual(result.status, 0, result.stderr);
+  assert.strictEqual(result.stdout, `Recorded accepted for Codex job ${jobId}.\n`);
+  assert.strictEqual(result.stderr, "");
+  assert.deepStrictEqual(JSON.parse(fs.readFileSync(argsFile, "utf8")), ["record-acceptance", "--job-id", jobId, "--acceptance", "accepted", "--reason", "verification passed"]);
+  assert.strictEqual(fs.readFileSync(acceptanceSidecarPath(dir, { FUSION_DATA_DIR: fusionData }), "utf8").trim().split("\n").length, 1);
+});
+
+test("--record-acceptance surfaces the Codex transport gate without appending the ledger", (t) => {
+  const dir = sandbox(t);
+  const stateRoot = path.join(dir, "state");
+  const fusionData = path.join(dir, "fusion");
+  const jobId = "b".repeat(32);
+  const companion = writeCodexAcceptanceCompanion(dir);
+  writeCodexJob(stateRoot, dir, jobId, { status: "error", jobClass: "task" });
+
+  const result = run(
+    { cwd: dir, codexState: stateRoot },
+    ["--record-acceptance", jobId, "accepted"],
+    { FUSION_DATA_DIR: fusionData, FUSION_CODEX_COMPANION: companion, FUSION_TEST_CODEX_COMPANION_MODE: "gate" }
+  );
+
+  assert.notStrictEqual(result.status, 0);
+  assert.match(result.stderr, /Accepted Codex jobs must have done transport status/);
+  assert.strictEqual(fs.existsSync(acceptanceSidecarPath(dir, { FUSION_DATA_DIR: fusionData })), false);
+});
+
+test("--record-acceptance keeps the ledger compatible with companions lacking the subcommand", (t) => {
+  const dir = sandbox(t);
+  const stateRoot = path.join(dir, "state");
+  const fusionData = path.join(dir, "fusion");
+  const jobId = "c".repeat(32);
+  const companion = writeCodexAcceptanceCompanion(dir);
+  writeCodexJob(stateRoot, dir, jobId, { status: "done", jobClass: "task" });
+
+  const result = run(
+    { cwd: dir, codexState: stateRoot },
+    ["--record-acceptance", jobId, "rejected", "--json"],
+    { FUSION_DATA_DIR: fusionData, FUSION_CODEX_COMPANION: companion, FUSION_TEST_CODEX_COMPANION_MODE: "absent" }
+  );
+
+  assert.strictEqual(result.status, 0, result.stderr);
+  assert.strictEqual(JSON.parse(result.stdout).acceptance, "rejected");
+  assert.match(result.stderr, /Warning: Codex job record was not updated/);
+  assert.strictEqual(fs.readFileSync(acceptanceSidecarPath(dir, { FUSION_DATA_DIR: fusionData }), "utf8").trim().split("\n").length, 1);
+});
+
+test("--record-acceptance forwards --accept-failed-transport unchanged", (t) => {
+  const dir = sandbox(t);
+  const stateRoot = path.join(dir, "state");
+  const fusionData = path.join(dir, "fusion");
+  const jobId = "d".repeat(32);
+  const companion = writeCodexAcceptanceCompanion(dir);
+  const argsFile = path.join(dir, "companion-args.json");
+  writeCodexJob(stateRoot, dir, jobId, { status: "error", jobClass: "task" });
+
+  const result = run(
+    { cwd: dir, codexState: stateRoot },
+    ["--record-acceptance", jobId, "accepted", "--accept-failed-transport"],
+    { FUSION_DATA_DIR: fusionData, FUSION_CODEX_COMPANION: companion, FUSION_TEST_CODEX_COMPANION_ARGS: argsFile }
+  );
+
+  assert.strictEqual(result.status, 0, result.stderr);
+  assert.deepStrictEqual(JSON.parse(fs.readFileSync(argsFile, "utf8")), ["record-acceptance", "--job-id", jobId, "--acceptance", "accepted", "--accept-failed-transport"]);
+});
+
+test("Codex reports acceptance anomalies only when the ledger and transport state diverge", (t) => {
+  const dir = sandbox(t);
+  const stateRoot = path.join(dir, "state");
+  const fusionData = path.join(dir, "fusion");
+  const acceptedErrorId = "e".repeat(32);
+  const doneWithoutAcceptanceId = "f".repeat(32);
+  writeCodexJob(stateRoot, dir, acceptedErrorId, { status: "error", jobClass: "task" });
+  writeCodexJob(stateRoot, dir, doneWithoutAcceptanceId, { status: "done", jobClass: "task" });
+  recordCodexAcceptance({ jobId: acceptedErrorId, acceptance: "accepted", workspaceRoot: dir, env: { FUSION_DATA_DIR: fusionData }, recordedAt: "2026-07-17T00:00:00.000Z" });
+
+  const stats = codexStats({ env: { FUSION_CODEX_STATE: stateRoot, FUSION_DATA_DIR: fusionData }, cwd: dir });
+  assert.deepStrictEqual(stats.acceptanceAnomalies, {
+    acceptedWithErrorTransport: [acceptedErrorId],
+    doneWithoutAcceptance: [doneWithoutAcceptanceId]
+  });
+  const rendered = renderFusionStats({ scope: dir, codex: stats });
+  assert.match(rendered, /Acceptance anomalies:\n- Accepted ledger entries with error transport: 1 \(eeeeeeee\)\n- Done jobs without acceptance records: 1 \(ffffffffffffffffffffffffffffffff\)/);
 });
 
 test("Codex acceptance updates only the matching session collector after its worktree disappears", (t) => {

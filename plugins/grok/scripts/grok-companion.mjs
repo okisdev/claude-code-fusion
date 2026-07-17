@@ -996,6 +996,7 @@ function grokFailureMessage(result, timeoutMs, failureKind) {
 
 const STDERR_FAILURE_KINDS = [
   ["sandbox", /sandbox (?:enforcement failed|could not be applied|initialization failed)/i],
+  ["turn_limit", /max turns reached/i],
   ["permission", /operation not permitted|permission denied|\bEACCES\b|\bEPERM\b|os error 1/i],
   ["transport", /prompt transport failed|closed stdin|broken pipe|\bEPIPE\b|valid JSON envelope/i],
   [
@@ -1024,6 +1025,9 @@ function classifyFailure({ spawnError = null, result = null, logTail = "" } = {}
   }
   if (result?.cancelledByCompanion) {
     return "cancelled";
+  }
+  if (result?.turnLimitReached) {
+    return "turn_limit";
   }
   if (isPermissionCancelled(result)) {
     return "permission";
@@ -1337,7 +1341,7 @@ function failJob(jobFile, logFile, result, timeoutMs) {
     finishedAt: nowIso(),
     exitCode: result.exitCode,
     sessionId: result.sessionId,
-    resultText: result.text || null,
+    resultText: result.text ?? null,
     resultPayload: retainedResultPayload(
       current,
       failureResultPayload(current, { status, failureKind, message: renderedMessage, result })
@@ -1703,7 +1707,7 @@ async function handleTaskWorker(argv) {
       finishedAt,
       exitCode: result.exitCode,
       sessionId: result.sessionId,
-      resultText: result.text || null,
+      resultText: result.text ?? null,
       resultPayload: retainedResultPayload(
         record,
         failureResultPayload(record, { status, failureKind, message: renderedMessage, result })

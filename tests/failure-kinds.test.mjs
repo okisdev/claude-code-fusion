@@ -110,6 +110,61 @@ test("structured quota errors retain reported usage", (t) => {
   });
 });
 
+test("turn-limit failures retain the final envelope and reported spend", (t) => {
+  const sandbox = makeSandbox(t);
+  const env = envFor(sandbox, {
+    FAKE_GROK_MODE: "max-turns",
+    FAKE_GROK_RESOLVED_MODEL: "grok-turn-limit",
+    FAKE_GROK_RESOLVED_EFFORT: "xhigh"
+  });
+  const result = runCompanion(["task", "doomed"], { cwd: sandbox.workDir, env });
+  assert.notStrictEqual(result.status, 0);
+  assert.match(result.stderr, /^failure: turn_limit$/m);
+  assert.match(result.stderr, /Error: max turns reached/);
+  const [record] = jobRecords(sandbox.dataDir);
+  assert.strictEqual(record.status, "error");
+  assert.strictEqual(record.failureKind, "turn_limit");
+  assert.strictEqual(record.errorMessage, "Error: max turns reached");
+  assert.strictEqual(record.resultText, "FAKE-TURN-LIMIT-PARTIAL");
+  assert.strictEqual(record.requestId, "req-max-turns");
+  assert.strictEqual(record.stopReason, "Cancelled");
+  assert.strictEqual(record.resolvedModel, "grok-turn-limit");
+  assert.strictEqual(record.resolvedEffort, "xhigh");
+  assert.deepStrictEqual(record.usage, {
+    input_tokens: 120,
+    cache_read_input_tokens: 30,
+    output_tokens: 20,
+    reasoning_tokens: 5,
+    total_tokens: 170
+  });
+  assert.deepStrictEqual(record.modelUsage, {
+    "grok-test-main": {
+      inputTokens: 100,
+      outputTokens: 15,
+      cacheReadInputTokens: 30,
+      modelCalls: 2,
+      costUSD: 0.01
+    },
+    "grok-test-subagent": {
+      inputTokens: 20,
+      outputTokens: 5,
+      cacheReadInputTokens: 0,
+      modelCalls: 1,
+      costUSD: 0.002
+    }
+  });
+  assert.strictEqual(record.numTurns, 60);
+  assert.strictEqual(record.totalCostUsd, 0.012);
+  assert.strictEqual(record.totalCostUsdTicks, 120000000);
+  assert.strictEqual(record.costIsPartial, false);
+  assert.strictEqual(record.usageIsIncomplete, false);
+  assert.strictEqual(record.modelUsageIsIncomplete, false);
+  assert.deepStrictEqual(record.structuredOutput, {
+    status: "partial",
+    summary: "The turn limit stopped further work."
+  });
+});
+
 test("malformed spend fields in a structured error fail as transport", (t) => {
   const sandbox = makeSandbox(t);
   const env = envFor(sandbox, { FAKE_GROK_MODE: "usage-error-malformed" });
