@@ -95,8 +95,8 @@ test("task stays foreground by default and persists the complete terminal record
   assert.equal(entry.record.status, "done");
   assert.equal(entry.record.mode, "write");
   assert.equal(entry.record.resultText, "Codex completed the task.");
-  assert.equal(entry.record.resolvedModel, null);
-  assert.equal(entry.record.resolvedEffort, null);
+  assert.equal(entry.record.resolvedModel, "gpt-test");
+  assert.equal(entry.record.resolvedEffort, "max");
   assert.equal(entry.record.tokenUsageAvailability, "available");
   assert.equal(entry.record.codexVersion, "0.144.4");
   assert.equal(fs.statSync(entry.file).mode & 0o777, 0o600);
@@ -495,7 +495,21 @@ test("final response prose cannot promote or reject semantic acceptance", (t) =>
   assert.equal(record.semanticFailureMessage, null);
 });
 
-test("job records persist only rollout-observed model and effort as resolved fields", (t) => {
+test("job records retain request-seeded model and effort without runtime observations", (t) => {
+  const sandbox = makeSandbox(t);
+  const result = runCompanion(["task", "--json", "--model", "requested-model", "--effort", "high", "inspect"], {
+    cwd: sandbox.workDir,
+    env: envFor(sandbox)
+  });
+  assert.equal(result.status, 0, result.stderr);
+  const record = JSON.parse(result.stdout);
+  assert.equal(record.request.model, "requested-model");
+  assert.equal(record.request.effort, "high");
+  assert.equal(record.resolvedModel, "requested-model");
+  assert.equal(record.resolvedEffort, "high");
+});
+
+test("rollout observations replace request-seeded model and effort", (t) => {
   const sandbox = makeSandbox(t);
   const result = runCompanion(["task", "--json", "--model", "requested-model", "--effort", "high", "inspect"], {
     cwd: sandbox.workDir,
@@ -513,6 +527,107 @@ test("job records persist only rollout-observed model and effort as resolved fie
   assert.equal(record.resolvedModel, "gpt-resolved");
   assert.equal(record.resolvedEffort, "xhigh");
   assert.equal(record.rolloutRecoveryStatus, "recovered");
+});
+
+test("task forwards --skip-git-repo-check to Codex", (t) => {
+  const sandbox = makeSandbox(t);
+  const result = runCompanion(["task", "--skip-git-repo-check", "inspect this directory"], {
+    cwd: sandbox.workDir,
+    env: envFor(sandbox)
+  });
+  assert.equal(result.status, 0, result.stderr);
+  assert.ok(readArgs(sandbox).includes("--skip-git-repo-check"));
+  assert.equal(jobRecords(sandbox)[0].request.skipGitRepoCheck, true);
+});
+
+test("trusted-directory failures store and render the skip-git remedy", (t) => {
+  const sandbox = makeSandbox(t);
+  const result = runCompanion(["task", "inspect this directory"], {
+    cwd: sandbox.workDir,
+    env: envFor(sandbox, {
+      FAKE_CODEX_MODE: "nonzero",
+      FAKE_CODEX_STDERR: "Not inside a trusted directory and --skip-git-repo-check was not specified.\n"
+    })
+  });
+  assert.equal(result.status, 1);
+  const [record] = jobRecords(sandbox);
+  assert.equal(record.status, "error");
+  assert.match(record.errorMessage, /--skip-git-repo-check/);
+  assert.match(result.stdout, /--skip-git-repo-check/);
+});
+
+function seedTerminalJob(sandbox, { id, status }) {
+  const record = createJobRecord({
+    id,
+    cwd: sandbox.workDir,
+    finishedAt: "2026-01-01T00:00:00.000Z",
+    request: { effort: "high", model: "gpt-test" },
+    status
+  });
+  writeJobRecordFile(jobFilePath(sandbox.dataDir, sandbox.workDir, id), record);
+}
+
+test("record-acceptance stores accepted and rejected semantic verdicts", (t) => {
+  const sandbox = makeSandbox(t);
+  const id = "a".repeat(32);
+  seedTerminalJob(sandbox, { id, status: "done" });
+  const accepted = runCompanion(["record-acceptance", "--job-id", id, "--acceptance", "accepted"], {
+    cwd: sandbox.workDir,
+    env: envFor(sandbox)
+  });
+  assert.equal(accepted.status, 0, accepted.stderr);
+  assert.equal(accepted.stdout, `Recorded verdict for Codex job ${id}: accepted.\n`);
+  let [record] = jobRecords(sandbox);
+  assert.equal(record.semanticStatus, "accepted");
+
+  const rejected = runCompanion(["record-acceptance", "--job-id", id, "--acceptance", "rejected", "--reason", "Verification did not pass."], {
+    cwd: sandbox.workDir,
+    env: envFor(sandbox)
+  });
+  assert.equal(rejected.status, 0, rejected.stderr);
+  [record] = jobRecords(sandbox);
+  assert.equal(record.semanticStatus, "rejected");
+  assert.equal(record.semanticFailureMessage, "Verification did not pass.");
+});
+
+test("record-acceptance blocks accepted verdicts on failed transport by default", (t) => {
+  const sandbox = makeSandbox(t);
+  const id = "b".repeat(32);
+  seedTerminalJob(sandbox, { id, status: "error" });
+  const result = runCompanion(["record-acceptance", "--job-id", id, "--acceptance", "accepted"], {
+    cwd: sandbox.workDir,
+    env: envFor(sandbox)
+  });
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /--accept-failed-transport/);
+  assert.equal(jobRecords(sandbox)[0].semanticStatus, "unverified");
+});
+
+test("record-acceptance permits explicit acceptance of failed transport", (t) => {
+  const sandbox = makeSandbox(t);
+  const id = "c".repeat(32);
+  seedTerminalJob(sandbox, { id, status: "error" });
+  const result = runCompanion(["record-acceptance", "--job-id", id, "--acceptance", "accepted", "--accept-failed-transport"], {
+    cwd: sandbox.workDir,
+    env: envFor(sandbox)
+  });
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(result.stdout, `Recorded verdict for Codex job ${id}: accepted.\n`);
+  const [record] = jobRecords(sandbox);
+  assert.equal(record.status, "error");
+  assert.equal(record.semanticStatus, "accepted");
+});
+
+test("record-acceptance rejects unknown job ids", (t) => {
+  const sandbox = makeSandbox(t);
+  const id = "d".repeat(32);
+  const result = runCompanion(["record-acceptance", "--job-id", id, "--acceptance", "accepted"], {
+    cwd: sandbox.workDir,
+    env: envFor(sandbox)
+  });
+  assert.equal(result.status, 1);
+  assert.equal(result.stdout, "");
+  assert.match(result.stderr, new RegExp(`No job record found for ${id}`));
 });
 
 test("foreground timeout persists recovered partial delivery and incomplete cumulative usage", (t) => {

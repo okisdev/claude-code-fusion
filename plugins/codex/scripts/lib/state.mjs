@@ -474,7 +474,7 @@ function terminalPatch(existing, patch, timestamp) {
     codexPidOwnsProcessGroup: false,
     finishedAt: patch.finishedAt ?? timestamp,
     updatedAt: patch.updatedAt ?? timestamp,
-    failureKind: status === "cancelled" ? "cancelled" : patch.failureKind ?? null,
+    failureKind: status === "cancelled" ? "cancelled" : patch.failureKind ?? existing.failureKind ?? null,
     cancelRequestedAt: null
   };
 }
@@ -680,8 +680,8 @@ export function createJobRecord(fields) {
     tokenUsageAvailability: fields.tokenUsageAvailability ?? "unreported",
     tokenUsageUnavailableReason: fields.tokenUsageUnavailableReason ?? null,
     usageIsIncomplete: fields.usageIsIncomplete ?? null,
-    resolvedModel: fields.resolvedModel ?? null,
-    resolvedEffort: fields.resolvedEffort ?? null,
+    resolvedModel: fields.resolvedModel ?? fields.request?.model ?? null,
+    resolvedEffort: fields.resolvedEffort ?? fields.request?.effort ?? null,
     rolloutRecoveryStatus: fields.rolloutRecoveryStatus ?? null,
     semanticStatus: fields.semanticStatus ?? "unverified",
     semanticFailureKind: fields.semanticFailureKind ?? null,
@@ -759,16 +759,17 @@ export function updateJobRecordFile(file, patch) {
   });
 }
 
-export function updateJobRecordFileWithCurrent(file, updater) {
+export function updateJobRecordFileWithCurrent(file, updater, options = {}) {
   if (typeof updater !== "function") {
     throw new TypeError("Job record updater must be a function.");
   }
+  const allowTerminal = options.allowTerminal === true;
   return withRecordLock(file, () => {
     const existing = readJobRecordFile(file);
     if (!existing) {
       throw new Error(`No job record found at ${file}.`);
     }
-    if (TERMINAL_STATUSES.has(existing.status)) {
+    if (TERMINAL_STATUSES.has(existing.status) && !allowTerminal) {
       return existing;
     }
     const patch = updater({ ...existing });

@@ -90,6 +90,8 @@ const TRANSPORT_TOKEN_PATTERN = /^[a-f0-9]{48}$/;
 const TRANSPORT_OWNER_FILE = "owner.json";
 const TRANSPORT_OWNER_MAX_BYTES = 4096;
 const TRANSPORT_MAX_AGE_MS = 60 * 60 * 1000;
+const RECORD_ACCEPTANCE_JOB_ID_PATTERN = /^[a-f0-9]{32}$/;
+const RECORD_ACCEPTANCE_VALUES = new Set(["accepted", "rejected", "unverified"]);
 
 let activeCommandArgv = null;
 
@@ -104,12 +106,13 @@ function printUsage() {
   process.stdout.write(
     [
       "Usage:",
-      "  node scripts/codex-companion.mjs task [--prompt-file <path>] [--write] [--background] [--resume <thread-id>] [--resume-last] [--fresh] [--model <id>] [--effort <level>] [--web] [--network] [--cwd <dir>] [--json] [--] [prompt]",
+      "  node scripts/codex-companion.mjs task [--prompt-file <path>] [--write] [--background] [--resume <thread-id>] [--resume-last] [--fresh] [--model <id>] [--effort <level>] [--web] [--network] [--skip-git-repo-check] [--cwd <dir>] [--json] [--] [prompt]",
       "  node scripts/codex-companion.mjs review [--base <ref>] [--scope <auto|working-tree|branch>] [--focus <text>] [--background] [--model <id>] [--effort <level>] [--cwd <dir>] [--json]",
       "  node scripts/codex-companion.mjs adversarial-review [--base <ref>] [--scope <auto|working-tree|branch>] [--focus <text>] [--background] [--model <id>] [--effort <level>] [--cwd <dir>] [--json]",
       "  node scripts/codex-companion.mjs status [job-id] [--all] [--cwd <dir>] [--json]",
       "  node scripts/codex-companion.mjs result <job-id> [--wait] [--wait-timeout-ms <ms>] [--cwd <dir>] [--json]",
       "  node scripts/codex-companion.mjs cancel <job-id> [--cwd <dir>] [--json]",
+      "  node scripts/codex-companion.mjs record-acceptance --job-id <32 lowercase hex> --acceptance <accepted|rejected|unverified> [--reason <text>] [--accept-failed-transport]",
       "  node scripts/codex-companion.mjs history [--json]",
       "  node scripts/codex-companion.mjs setup [--cwd <dir>] [--json]"
     ].join("\n") + "\n"
@@ -132,6 +135,40 @@ function commandArgs(rawArgv, config) {
   } catch (error) {
     throw new CompanionError(error.message, "input");
   }
+}
+
+function recordAcceptanceArgs(argv) {
+  const options = {};
+  for (let index = 0; index < argv.length; index += 1) {
+    const token = argv[index];
+    if (token === "--accept-failed-transport") {
+      if (options.acceptFailedTransport) {
+        throw new CompanionError("The --accept-failed-transport option may be provided only once.", "input");
+      }
+      options.acceptFailedTransport = true;
+      continue;
+    }
+    const key = token === "--job-id" ? "jobId" : token === "--acceptance" ? "acceptance" : token === "--reason" ? "reason" : null;
+    if (!key) {
+      throw new CompanionError("The record-acceptance command accepts only --job-id, --acceptance, --reason, and --accept-failed-transport.", "input");
+    }
+    if (Object.hasOwn(options, key)) {
+      throw new CompanionError(`${token} may be provided only once.`, "input");
+    }
+    const value = argv[index + 1];
+    if (value === undefined) {
+      throw new CompanionError(`${token} requires a value.`, "input");
+    }
+    options[key] = value;
+    index += 1;
+  }
+  if (!RECORD_ACCEPTANCE_JOB_ID_PATTERN.test(options.jobId ?? "")) {
+    throw new CompanionError("The --job-id option must be a 32 character lowercase hexadecimal job id.", "input");
+  }
+  if (!RECORD_ACCEPTANCE_VALUES.has(options.acceptance)) {
+    throw new CompanionError("The --acceptance option must be accepted, rejected, or unverified.", "input");
+  }
+  return options;
 }
 
 function output(value, asJson = false) {
@@ -1053,6 +1090,7 @@ function executionArgs(record) {
     effort: request.effort,
     model: request.model,
     network: Boolean(request.network),
+    skipGitRepoCheck: Boolean(request.skipGitRepoCheck),
     web: Boolean(request.web)
   };
   if (request.transport === "native-review") {
@@ -1215,8 +1253,8 @@ async function executeRecord(found) {
       failureKind: outcome.failureKind,
       protocolError: outcome.protocolError ? redactDiagnostic(outcome.protocolError) : null,
       partialResultText: outcome.partialResultText ? redactDiagnostic(outcome.partialResultText) : null,
-      resolvedEffort: outcome.resolvedEffort,
-      resolvedModel: outcome.resolvedModel,
+      resolvedEffort: outcome.resolvedEffort ?? record.resolvedEffort,
+      resolvedModel: outcome.resolvedModel ?? record.resolvedModel,
       rolloutRecoveryStatus: outcome.rolloutRecoveryStatus,
       result: {
         eventCount: outcome.eventCount,
@@ -1430,7 +1468,7 @@ async function dispatchJob(found, asJson) {
 
 async function handleTask(rawArgv, transport = {}) {
   const { options, positionals, positionalText } = commandArgs(rawArgv, {
-    booleanOptions: ["background", "fresh", "json", "network", "resume-last", "web", "write"],
+    booleanOptions: ["background", "fresh", "json", "network", "resume-last", "skip-git-repo-check", "web", "write"],
     optionsBeforePositionals: true,
     valueOptions: ["cwd", "effort", "model", "prompt-file", "resume"]
   });
@@ -1457,6 +1495,7 @@ async function handleTask(rawArgv, transport = {}) {
     network: Boolean(options.network),
     resumeSourceJobId: resume.sourceJobId,
     resumeThreadId: resume.threadId,
+    skipGitRepoCheck: Boolean(options["skip-git-repo-check"]),
     transport: "task",
     web: Boolean(options.web),
     write: Boolean(write)
@@ -1791,6 +1830,31 @@ async function handleCancel(rawArgv) {
   }
 }
 
+async function handleRecordAcceptance(argv) {
+  const { acceptance, acceptFailedTransport, jobId, reason } = recordAcceptanceArgs(argv);
+  const found = findJobRecordById(resolveDataDir(), jobId);
+  if (!found) {
+    throw new CompanionError(`No job record found for ${jobId}.`, "input");
+  }
+  const record = updateJobRecordFileWithCurrent(found.file, (current) => {
+    if (acceptance === "accepted" && current.status !== "done" && !acceptFailedTransport) {
+      throw new CompanionError(`Codex job ${current.id} has transport status ${current.status}. Pass --accept-failed-transport to record accepted.`, "input");
+    }
+    if (acceptance !== "rejected") {
+      return {
+        semanticFailureKind: null,
+        semanticFailureMessage: null,
+        semanticStatus: acceptance
+      };
+    }
+    return {
+      ...(reason === undefined ? {} : { semanticFailureMessage: reason }),
+      semanticStatus: acceptance
+    };
+  }, { allowTerminal: true });
+  output(`Recorded verdict for Codex job ${record.id}: ${record.semanticStatus}.\n`);
+}
+
 function readHookInput() {
   if (isatty(0)) {
     return {};
@@ -1943,6 +2007,11 @@ async function main() {
       throw new CompanionError("transport-discard requires exactly one raw argument token.", "input");
     }
     consumeRawCommandTransport(receivedArgv[1]);
+    return;
+  }
+  if (subcommand === "record-acceptance") {
+    activeCommandArgv = receivedArgv;
+    await handleRecordAcceptance(receivedArgv);
     return;
   }
   const transport = resolveCommandTransport(receivedArgv);

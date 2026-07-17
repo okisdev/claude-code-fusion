@@ -1086,6 +1086,13 @@ function classifiedFailureKind(message, fallback = "error") {
   return fallback;
 }
 
+function withTrustedDirectoryRemedy(message, stderrTail) {
+  if (!/Not inside a trusted directory and --skip-git-repo-check was not specified\./i.test(stderrTail)) {
+    return message;
+  }
+  return `${message} Re-run the task with --skip-git-repo-check to allow execution outside a Git repository.`;
+}
+
 function failureOutcome(state, processOutcome, stderrTail) {
   if (state.callbackError) {
     return { status: "error", failureKind: "error", errorMessage: state.callbackError.message };
@@ -1128,7 +1135,7 @@ function failureOutcome(state, processOutcome, stderrTail) {
     return {
       status: "error",
       failureKind,
-      errorMessage: failureKind === "process" || !diagnosticMessage ? processMessage : diagnosticMessage
+      errorMessage: withTrustedDirectoryRemedy(failureKind === "process" || !diagnosticMessage ? processMessage : diagnosticMessage, stderrTail)
     };
   }
   return { status: "done", failureKind: null, errorMessage: null };
