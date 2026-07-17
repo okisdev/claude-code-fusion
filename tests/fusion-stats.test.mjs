@@ -1269,6 +1269,8 @@ test("acceptance CLI validates fields, redacts short reasons, and recovers stale
   const dir = sandbox(t);
   const stateRoot = path.join(dir, "state");
   const fusionData = path.join(dir, "fusion");
+  const jobId = "0123456789abcdef0123456789abcdef";
+  const companion = writeCodexAcceptanceCompanion(dir);
   fs.mkdirSync(stateRoot, { recursive: true });
   const sidecar = acceptanceSidecarPath(dir, { FUSION_DATA_DIR: fusionData });
   fs.mkdirSync(path.dirname(sidecar), { recursive: true });
@@ -1279,8 +1281,8 @@ test("acceptance CLI validates fields, redacts short reasons, and recovers stale
 
   const result = run(
     { cwd: dir, codexState: stateRoot },
-    ["--record-acceptance", "task-safe", "rejected", "--reason", `verification failed ${secret}`, "--source", "main-loop", "--json"],
-    { FUSION_DATA_DIR: fusionData, CLAUDE_CODE_SESSION_ID: "session-safe" }
+    ["--record-acceptance", jobId, "rejected", "--reason", `verification failed ${secret}`, "--source", "main-loop", "--json"],
+    { FUSION_DATA_DIR: fusionData, FUSION_CODEX_COMPANION: companion, CLAUDE_CODE_SESSION_ID: "session-safe" }
   );
   assert.strictEqual(result.status, 0, result.stderr);
   const observation = JSON.parse(result.stdout);
@@ -1296,7 +1298,7 @@ test("acceptance CLI validates fields, redacts short reasons, and recovers stale
     /job id is invalid/
   );
   assert.throws(
-    () => recordCodexAcceptance({ jobId: "task-safe", acceptance: "accepted", workspaceRoot: dir, env: { FUSION_DATA_DIR: fusionData }, reason: "line one\nline two" }),
+    () => recordCodexAcceptance({ jobId, acceptance: "accepted", workspaceRoot: dir, env: { FUSION_DATA_DIR: fusionData }, reason: "line one\nline two" }),
     /single non-sensitive line/
   );
 });
