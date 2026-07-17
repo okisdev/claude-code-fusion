@@ -95,3 +95,29 @@ test("the stats CLI consumes staged arguments without invoking embedded shell sy
   assert.strictEqual(fs.existsSync(marker), false);
   assert.strictEqual(fs.existsSync(path.dirname(transport.file)), false);
 });
+
+test("the stats CLI forwards --accept-failed-transport from staged arguments unchanged", (t) => {
+  const directory = sandbox(t);
+  const companion = path.join(directory, "codex-companion.mjs");
+  const argsFile = path.join(directory, "companion-args.json");
+  const jobId = "a".repeat(32);
+  fs.writeFileSync(companion, 'import fs from "node:fs";\nfs.writeFileSync(process.env.FUSION_TEST_CODEX_COMPANION_ARGS, JSON.stringify(process.argv.slice(2)));\n');
+  const env = {
+    ...process.env,
+    CLAUDE_CODE_SESSION_ID: "fusion-stats-transport-acceptance-test",
+    FUSION_CODEX_STATE: path.join(directory, "missing-codex"),
+    FUSION_CODEX_COMPANION: companion,
+    FUSION_GROK_COMPANION: path.join(directory, "missing-grok.mjs"),
+    FUSION_DATA_DIR: path.join(directory, "fusion"),
+    FUSION_TEST_CODEX_COMPANION_ARGS: argsFile,
+    FUSION_WORKER_STATE_DIR: path.join(directory, "missing-workers")
+  };
+  const created = spawnSync(process.execPath, [SCRIPT, "transport-create"], { cwd: directory, env, encoding: "utf8" });
+  assert.strictEqual(created.status, 0, created.stderr);
+  const transport = JSON.parse(created.stdout);
+  fs.writeFileSync(transport.file, `--record-acceptance ${jobId} accepted --accept-failed-transport`);
+
+  const result = spawnSync(process.execPath, [SCRIPT, "--raw-args-token", transport.token], { cwd: directory, env, encoding: "utf8" });
+  assert.strictEqual(result.status, 0, result.stderr);
+  assert.deepStrictEqual(JSON.parse(fs.readFileSync(argsFile, "utf8")), ["record-acceptance", "--job-id", jobId, "--acceptance", "accepted", "--accept-failed-transport"]);
+});

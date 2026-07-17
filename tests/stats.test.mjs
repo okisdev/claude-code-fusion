@@ -1,8 +1,21 @@
 import assert from "node:assert";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { test } from "node:test";
 import { envFor, jobFileFor, jobRecords, makeSandbox, runCompanion } from "./lib/companion-harness.mjs";
+
+const processIdentityBin = fs.mkdtempSync(path.join(os.tmpdir(), "grok-process-identity-"));
+const originalPath = process.env.PATH;
+fs.writeFileSync(path.join(processIdentityBin, "ps"), '#!/bin/sh\npid=""\nwhile [ "$#" -gt 0 ]; do\n  if [ "$1" = "-p" ]; then\n    pid="$2"\n    shift 2\n  else\n    shift\n  fi\ndone\nprintf "process-%s\\n" "$pid"\n');
+fs.writeFileSync(path.join(processIdentityBin, "sysctl"), '#!/bin/sh\nprintf "{ sec = 1, usec = 0 }\\n"\n');
+fs.chmodSync(path.join(processIdentityBin, "ps"), 0o755);
+fs.chmodSync(path.join(processIdentityBin, "sysctl"), 0o755);
+process.env.PATH = `${processIdentityBin}${path.delimiter}${originalPath}`;
+test.after(() => {
+  process.env.PATH = originalPath;
+  fs.rmSync(processIdentityBin, { recursive: true, force: true });
+});
 
 function seedJob(sandbox, cwd, args, extraEnv = {}) {
   return runCompanion(["task", ...args], { cwd, env: envFor(sandbox, extraEnv) });

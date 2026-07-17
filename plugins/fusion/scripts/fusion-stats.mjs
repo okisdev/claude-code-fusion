@@ -334,7 +334,7 @@ function sanitizedAcceptanceReason(value) {
     .replace(/Bearer\s+\S{20,}/gi, "Bearer [redacted]");
 }
 
-export function recordCodexAcceptance({ jobId, acceptance, workspaceRoot = process.cwd(), env = process.env, sessionId = env.CLAUDE_CODE_SESSION_ID || null, reason = null, source = "collector", recordedAt = new Date().toISOString() }) {
+function prepareCodexAcceptance({ jobId, acceptance, workspaceRoot = process.cwd(), env = process.env, sessionId = env.CLAUDE_CODE_SESSION_ID || null, reason = null, source = "collector", recordedAt = new Date().toISOString() }) {
   const normalizedJobId = validatedIdentifier(jobId, "Codex job id", /^[A-Za-z0-9][A-Za-z0-9._:-]*$/, 128);
   if (!CODEX_ACCEPTANCE_STATES.has(acceptance)) {
     throw new TypeError(`Codex acceptance must be one of ${[...CODEX_ACCEPTANCE_STATES].join(", ")}.`);
@@ -355,11 +355,16 @@ export function recordCodexAcceptance({ jobId, acceptance, workspaceRoot = proce
     recordedAt: validatedIsoTimestamp(recordedAt),
     ...(normalizedReason ? { reason: normalizedReason } : {})
   };
+  return { observation, normalizedRoot, normalizedSessionId, normalizedSource, normalizedReason, env };
+}
+
+export function recordCodexAcceptance(options) {
+  const { observation, normalizedRoot, normalizedSessionId, normalizedSource, normalizedReason, env } = prepareCodexAcceptance(options);
   if (!appendAcceptanceObservation(acceptanceSidecarPath(normalizedRoot, env), observation)) {
     throw new Error("Codex acceptance ledger is busy; retry the write.");
   }
-  for (const record of normalizedSessionId == null ? [] : readWorkerRecords(env).filter((candidate) => candidate.sessionId === normalizedSessionId && canonicalWorkerAgentType(candidate.agentType) === "fusion:job-collector" && candidate.completionContract === "collector" && candidate.peerEngine === "codex" && candidate.peerJobId === normalizedJobId && isTerminalWorkerStatus(candidate.transportStatus))) {
-    recordCodexCollectorAcceptance({ taskId: record.taskId, jobId: normalizedJobId, sessionId: normalizedSessionId, acceptance, env, source: normalizedSource, reason: normalizedReason });
+  for (const record of normalizedSessionId == null ? [] : readWorkerRecords(env).filter((candidate) => candidate.sessionId === normalizedSessionId && canonicalWorkerAgentType(candidate.agentType) === "fusion:job-collector" && candidate.completionContract === "collector" && candidate.peerEngine === "codex" && candidate.peerJobId === observation.jobId && isTerminalWorkerStatus(candidate.transportStatus))) {
+    recordCodexCollectorAcceptance({ taskId: record.taskId, jobId: observation.jobId, sessionId: normalizedSessionId, acceptance: observation.acceptance, env, source: normalizedSource, reason: normalizedReason });
   }
   return observation;
 }
@@ -385,6 +390,62 @@ export function newestGrokCompanion(env = process.env) {
   }
   const sibling = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..", "grok", "scripts", "grok-companion.mjs");
   return fs.existsSync(sibling) ? sibling : null;
+}
+
+function configuredHome(env = process.env) {
+  const candidate = typeof env.HOME === "string" ? env.HOME.trim() : "";
+  return candidate && path.isAbsolute(candidate) ? candidate : os.homedir();
+}
+
+export function newestCodexCompanion(env = process.env) {
+  const override = typeof env.FUSION_CODEX_COMPANION === "string" ? env.FUSION_CODEX_COMPANION.trim() : "";
+  if (override) {
+    return fs.existsSync(override) ? override : null;
+  }
+  const base = path.join(configuredHome(env), ".claude", "plugins", "cache", "claude-code-fusion", "codex");
+  try {
+    const candidates = fs
+      .readdirSync(base)
+      .map((version) => path.join(base, version, "scripts", "codex-companion.mjs"))
+      .filter((candidate) => fs.existsSync(candidate))
+      .map((candidate) => ({ candidate, mtime: fs.statSync(candidate).mtimeMs }))
+      .sort((left, right) => right.mtime - left.mtime || left.candidate.localeCompare(right.candidate));
+    if (candidates.length > 0) {
+      return candidates[0].candidate;
+    }
+  } catch {
+    void 0;
+  }
+  const sibling = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..", "codex", "scripts", "codex-companion.mjs");
+  return fs.existsSync(sibling) ? sibling : null;
+}
+
+function companionFailureMessage(result) {
+  return [result.stderr, result.stdout, result.error?.message].filter((value) => typeof value === "string" && value.trim()).join("\n").trim();
+}
+
+function codexAcceptanceSubcommandUnavailable(result) {
+  if (result.error) {
+    return true;
+  }
+  const message = companionFailureMessage(result);
+  return /\b(?:unknown|unsupported|unrecognized)\s+(?:subcommand|command)\b/i.test(message) || /\brecord-acceptance\b.*\b(?:unknown|unsupported|unavailable|not found|not supported)\b/i.test(message) || /\b(?:cannot find module|ERR_MODULE_NOT_FOUND)\b/i.test(message);
+}
+
+function recordCodexCompanionAcceptance({ jobId, acceptance, reason, acceptFailedTransport, workspaceRoot, env }) {
+  const bin = newestCodexCompanion(env);
+  if (!bin) {
+    return { updated: false };
+  }
+  const argv = [bin, "record-acceptance", "--job-id", jobId, "--acceptance", acceptance, ...(reason ? ["--reason", reason] : []), ...(acceptFailedTransport ? ["--accept-failed-transport"] : [])];
+  const result = spawnSync(process.execPath, argv, { cwd: workspaceRoot, encoding: "utf8", env });
+  if (!result.error && result.status === 0) {
+    return { updated: true };
+  }
+  if (codexAcceptanceSubcommandUnavailable(result)) {
+    return { updated: false };
+  }
+  throw new Error(companionFailureMessage(result) || "Codex acceptance record update failed.");
 }
 
 export function grokStats({ all = false, env = process.env, cwd = process.cwd() } = {}) {
@@ -956,6 +1017,8 @@ export function fileBasedEngineStats(descriptor, { all = false, env = process.en
   let jobsWithoutTokenUsage = 0;
   let jobsWithUnreportedTokenUsage = 0;
   let pendingTransportJobs = 0;
+  const acceptedWithErrorTransport = [];
+  const doneWithoutAcceptance = [];
   let durationSum = 0;
   let durationCount = 0;
   let earliest = null;
@@ -974,11 +1037,18 @@ export function fileBasedEngineStats(descriptor, { all = false, env = process.en
     }
     if (descriptor.id === "codex") {
       const jobId = nonEmptyString(raw?.id);
+      const acceptanceObservation = jobId ? scopedObservationForJob(acceptanceObservations, raw, observationRepositoryCache) : null;
       if (CODEX_TERMINAL_STATUSES.has(job.status)) {
-        const acceptance = jobId ? scopedObservationForJob(acceptanceObservations, raw, observationRepositoryCache)?.acceptance : null;
+        const acceptance = acceptanceObservation?.acceptance;
         bump(byAcceptance, CODEX_ACCEPTANCE_STATES.has(acceptance) ? acceptance : "unverified");
       } else {
         pendingTransportJobs += 1;
+      }
+      if (jobId && job.status === "error" && acceptanceObservation?.acceptance === "accepted") {
+        acceptedWithErrorTransport.push(jobId);
+      }
+      if (jobId && job.status === "done" && !acceptanceObservation) {
+        doneWithoutAcceptance.push(jobId);
       }
       if (CODEX_TERMINAL_STATUSES.has(job.status)) {
         const usageResult = tokenUsageForJob(raw, jobId ? scopedObservationForJob(tokenObservations, raw, observationRepositoryCache) : null);
@@ -1021,7 +1091,19 @@ export function fileBasedEngineStats(descriptor, { all = false, env = process.en
     scope: all ? "all" : workspaceRoot,
     totalJobs: scoped.length,
     byStatus,
-    ...(descriptor.id === "codex" ? { byTransportStatus: { ...byStatus }, byAcceptance, acceptanceScope: "terminal transport jobs only", pendingTransportJobs, byEffort } : {}),
+    ...(descriptor.id === "codex"
+      ? {
+          byTransportStatus: { ...byStatus },
+          byAcceptance,
+          acceptanceScope: "terminal transport jobs only",
+          pendingTransportJobs,
+          byEffort,
+          acceptanceAnomalies: {
+            acceptedWithErrorTransport,
+            doneWithoutAcceptance
+          }
+        }
+      : {}),
     byKind,
     ...(descriptor.includeByModel ? { byModel } : {}),
     ...(descriptor.id === "codex"
@@ -1788,6 +1870,21 @@ function renderCounts(lines, title, map) {
   }
 }
 
+function renderAcceptanceAnomalies(lines, anomalies) {
+  const acceptedWithErrorTransport = anomalies?.acceptedWithErrorTransport ?? [];
+  const doneWithoutAcceptance = anomalies?.doneWithoutAcceptance ?? [];
+  if (acceptedWithErrorTransport.length === 0 && doneWithoutAcceptance.length === 0) {
+    return;
+  }
+  lines.push("", "Acceptance anomalies:");
+  if (acceptedWithErrorTransport.length > 0) {
+    lines.push(`- Accepted ledger entries with error transport: ${acceptedWithErrorTransport.length} (${acceptedWithErrorTransport.map((jobId) => jobId.slice(0, 8)).join(", ")})`);
+  }
+  if (doneWithoutAcceptance.length > 0) {
+    lines.push(`- Done jobs without acceptance records: ${doneWithoutAcceptance.length} (${doneWithoutAcceptance.join(", ")})`);
+  }
+}
+
 function renderEngine(lines, name, stats) {
   lines.push("", `## ${name}`);
   if (!stats.available) {
@@ -1806,6 +1903,7 @@ function renderEngine(lines, name, stats) {
   if (stats.acceptanceScope) {
     lines.push("", `Semantic acceptance scope: ${stats.acceptanceScope}; ${stats.pendingTransportJobs} non-terminal job${stats.pendingTransportJobs === 1 ? "" : "s"} excluded`);
   }
+  renderAcceptanceAnomalies(lines, stats.acceptanceAnomalies);
   renderCounts(lines, "By mode", stats.byMode ?? {});
   renderCounts(lines, "By agent", stats.byAgent ?? {});
   renderCounts(lines, "By delivery", stats.byDelivery ?? {});
@@ -1887,7 +1985,7 @@ function sessionIdFromArgs(argv, env) {
   return typeof selected === "string" && selected && !selected.startsWith("--") ? selected : env.CLAUDE_CODE_SESSION_ID || null;
 }
 
-export function main(argv = process.argv.slice(2), { env = process.env, cwd = process.cwd(), stdout = process.stdout } = {}) {
+export function main(argv = process.argv.slice(2), { env = process.env, cwd = process.cwd(), stdout = process.stdout, stderr = process.stderr } = {}) {
   const asJson = argv.includes("--json");
   const effectiveEnv = argv.includes("--include-legacy") ? { ...env, FUSION_CODEX_INCLUDE_LEGACY: "1" } : env;
 
@@ -1908,15 +2006,29 @@ export function main(argv = process.argv.slice(2), { env = process.env, cwd = pr
       throw new TypeError("--session cannot be used with --record-acceptance; acceptance is bound to the current Claude session.");
     }
     const index = argv.indexOf("--record-acceptance");
-    const observation = recordCodexAcceptance({
+    const workspaceRoot = argumentValue(argv, "--workspace") ?? cwd;
+    const acceptanceRequest = {
       jobId: argv[index + 1],
       acceptance: argv[index + 2],
-      workspaceRoot: argumentValue(argv, "--workspace") ?? cwd,
+      workspaceRoot,
       env: effectiveEnv,
       sessionId: effectiveEnv.CLAUDE_CODE_SESSION_ID || null,
       reason: argumentValue(argv, "--reason"),
       source: argumentValue(argv, "--source") ?? "collector"
+    };
+    const preparedAcceptance = prepareCodexAcceptance(acceptanceRequest);
+    const companion = recordCodexCompanionAcceptance({
+      jobId: preparedAcceptance.observation.jobId,
+      acceptance: preparedAcceptance.observation.acceptance,
+      reason: preparedAcceptance.normalizedReason,
+      acceptFailedTransport: argv.includes("--accept-failed-transport"),
+      workspaceRoot: preparedAcceptance.normalizedRoot,
+      env: effectiveEnv
     });
+    const observation = recordCodexAcceptance(acceptanceRequest);
+    if (!companion.updated) {
+      stderr.write("Warning: Codex job record was not updated because the companion or subcommand is unavailable.\n");
+    }
     stdout.write(asJson ? `${JSON.stringify(observation, null, 2)}\n` : `Recorded ${observation.acceptance} for Codex job ${observation.jobId}.\n`);
     return observation;
   }
