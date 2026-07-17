@@ -117,7 +117,7 @@ test("consult task argv pins the strict sandbox and hard read-only tool surface"
   assert.ok(argv.includes("--no-auto-update"));
   assert.ok(argv.includes("--no-subagents"));
   assert.ok(argv.includes("--disable-web-search"));
-  assert.ok(hasPair(argv, "--max-turns", "25"));
+  assert.ok(hasPair(argv, "--max-turns", "60"));
   assert.ok(hasPair(argv, "--permission-mode", "default"));
   assert.ok(hasPair(argv, "--tools", consultTools));
   assert.ok(hasPair(argv, "--disallowed-tools", nonTournamentDisallowedTools));

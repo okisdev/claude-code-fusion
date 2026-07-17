@@ -35,7 +35,8 @@ const SANDBOX_EVENT_MARKER_MAX_BYTES = 4096;
 const SANDBOX_HANDSHAKE_TIMEOUT_MS = 15000;
 const SANDBOX_HANDSHAKE_TIMEOUT_ENV = "GROK_COMPANION_SANDBOX_HANDSHAKE_MS";
 const SANDBOX_HANDSHAKE_POLL_MS = 20;
-const DEFAULT_MAX_TURNS = { consult: 25, write: 60 };
+const DEFAULT_MAX_TURNS = { consult: 60, write: 60 };
+const MAX_TURNS_REACHED_PATTERN = /\bmax turns reached\b/i;
 const SANDBOX_FAILURE_PATTERN = /(?:sandbox (?:could not be applied|initialization failed|not supported on this platform)|sandbox enforcement unavailable \(built without ['"]?enforce['"]? feature\)|failed to parse sandbox config)/i;
 const TOOL_POLICY_FAILURE_PATTERN = /(?:tools allowlist had unmappable entries; keeping full grok toolset|disallowedTools entry matched nothing)/i;
 const TOOL_POLICY_APPLIED_PATTERN = /tools? allowlist applied/i;
@@ -398,10 +399,28 @@ export function parseGrokOutput(stdout) {
     return whole;
   }
   const lines = trimmed.split(/\r?\n/);
+  let lastObject = null;
   for (let index = lines.length - 1; index >= 0; index -= 1) {
     const parsed = tryParseObject(lines[index].trim());
     if (parsed) {
-      return parsed;
+      lastObject ??= parsed;
+      if (isGrokEnvelope(parsed)) {
+        return parsed;
+      }
+    }
+  }
+  return lastObject;
+}
+
+function maxTurnsReachedEvent(stdout) {
+  return iterJsonObjects(stdout).some((object) => object.type === "max_turns_reached");
+}
+
+function maxTurnsReachedError(stderr) {
+  const lines = String(stderr ?? "").split(/\r?\n/);
+  for (let index = lines.length - 1; index >= 0; index -= 1) {
+    if (MAX_TURNS_REACHED_PATTERN.test(lines[index])) {
+      return lines[index].trim();
     }
   }
   return null;
@@ -1989,6 +2008,7 @@ export function runGrok(options) {
       }
       const parsed = parseGrokOutput(stdout);
       const exitCode = code ?? exitCodeFromSignal(signal);
+      const turnLimitReached = MAX_TURNS_REACHED_PATTERN.test(stderr) || maxTurnsReachedEvent(stdout);
       const envelopeShapeIsValid = isGrokEnvelope(parsed);
       const reportedSessionValue = parsed?.sessionId ?? parsed?.session_id;
       const sessionId = normalizeGrokSessionId(reportedSessionValue);
@@ -2012,7 +2032,7 @@ export function runGrok(options) {
           ? `Grok tool policy enforcement failed; refusing the result: ${securityFailure.line}`
         : promptTransportError
           ? `Grok prompt transport failed before stdin was accepted: ${promptTransportError.message}`
-          : structuredErrorMessage;
+          : structuredErrorMessage ?? maxTurnsReachedError(stderr);
       const parseError = metrics.error ?? (
         exitCode === 0 && !timedOut && !errorMessage && expectsJsonOutput(args) && !validEnvelope
           ? invalidSessionId
@@ -2051,6 +2071,7 @@ export function runGrok(options) {
         securityFailureKind: securityFailure?.kind ?? null,
         exitCode,
         timedOut,
+        turnLimitReached,
         parseError,
         stdoutTail: stdoutTail(stdoutTailBuffer),
         cancelledByCompanion,
