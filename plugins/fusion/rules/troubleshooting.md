@@ -11,7 +11,7 @@ Failure driven implementation escalation among Claude workers runs only from `fu
 
 ## Failure kinds and the circuit breaker
 
-The shared companion failure kinds are quota, auth, missing_cli, setup, rate_limited, timeout, stall, transport, sandbox, error, permission, cancelled, input, died, and resource. Codex additionally emits protocol when the required JSONL lifecycle is incompatible or malformed, and process for an unexpected process signal. Codex and Grok emit policy for engine-specific enforced-boundary failures; Grok uses it when positive tool-policy evidence is missing or a fallback, unmappable, or unmatched warning appears. The max turns and session limit entries below are orchestrator observed conditions, not companion failure kinds: max turns arrives as an error result with a max turns message, and session limit is a Claude side event. The missing agent type and unavailable line are also observed routing conditions. For engines that do not emit the shared kinds, map an observed failure onto the closest companion failure kind before acting.
+The shared companion failure kinds are quota, auth, missing_cli, setup, rate_limited, timeout, stall, transport, sandbox, error, permission, cancelled, input, died, and resource. Codex additionally emits protocol when the required JSONL lifecycle is incompatible or malformed, and process for an unexpected process signal. Codex and Grok emit policy for engine-specific enforced-boundary failures; Grok uses it when positive tool-policy evidence is missing or a fallback, unmappable, or unmatched warning appears. Grok also emits `turn_limit` when its CLI reaches the forwarded max turns value after the companion salvages the final envelope. A Claude session limit remains a Claude side event. The missing agent type and unavailable line are also observed routing conditions. For engines that do not emit the shared kinds, map an observed failure onto the closest companion failure kind before acting.
 
 | Failure kind or observed condition | Immediate action | Circuit breaker effect |
 |---|---|---|
@@ -28,11 +28,29 @@ The shared companion failure kinds are quota, auth, missing_cli, setup, rate_lim
 | permission | Re-dispatch once with `--write` only when repository changes or command execution are acceptable. Otherwise rewrite the Grok consult brief to use file read, list, and search tools only, plus web search and fetch when explicitly enabled. A sandbox or operating system denial while initializing prompt, state, or transport storage routes elsewhere until repaired | An ordinary tool denial stays local and does not open the breaker. A sandbox or operating system transport initialization denial opens immediately |
 | cancelled | Confirm with the user before treating the work as intentionally dropped | An externally killed job can also report cancelled, so verify before trusting it |
 | input | Correct the rejected request before dispatching again | Does not break the engine |
-| max turns message on an error result | Hitting max turns on the first attempt marks the package as too big for the lane; split the package or reroute it as a spec grade codex brief; never retry the same brief at the same scope | Does not break the engine |
+| Grok `turn_limit` | Grok prints the complete final JSON envelope to stdout, including partial text, usage, `num_turns`, and `modelUsage`, then exits 1 with stderr `Error: max turns reached`. The companion salvages that envelope and records `failureKind: "turn_limit"`. Treat the package as too large for the lane, split or reroute it, and never retry the same brief at the same scope | Does not affect any circuit breaker |
 | Claude-side session limit event | When the harness quota kills a worker and the Agent failure names a reset time, preserve the package brief verbatim in the visible reply so it can be re-dispatched unchanged after the reset; never rewrite it from memory | Does not break the engine |
 | missing agent type or a `grok unavailable:` line | Route to the fallback lane | Breaks immediately |
 
 When an engine is broken, use the other peer only where its lane ownership or a protected role fits. Codex failure may send bounded, isolated work to Grok under `burst`; Grok failure sends ordinary implementation back through the Codex admission ladder. Use fusion:fast-worker for Claude-only tools, privacy, or packages outside the remaining peer's safety boundary, and fusion:deep-reasoner for read only adversarial advice.
+
+## Grok turn limits and observability
+
+The upstream Grok CLI has no default turn limit. An unset limit is unlimited. One turn is one main-agent model call plus its tool cycle; subagent calls are excluded. The companion now supplies `--max-turns 60` for both consult and write. Consult previously defaulted to 25 turns. When Grok reaches this limit, it writes the complete final JSON envelope to stdout before exiting 1 and writes `Error: max turns reached` to stderr. The companion salvages the stdout envelope, preserves partial text and usage fields, and classifies the terminal outcome as `failureKind: "turn_limit"`.
+
+The Grok headless JSON has no top-level `model` field. A model name appears only as a key in `modelUsage` when usage attaches, so model capture depends on that map. Error-path capture also depends on salvaging the envelope before classifying the turn limit failure. Missing `modelUsage` means that the resolved model remains unavailable.
+
+## Codex startup and cache compatibility
+
+Codex exec refuses to start outside a directory with an ancestor `.git` entry. The `projects` trust map in `config.toml` is not consulted by exec. Only `--skip-git-repo-check` or the dangerous bypass flag skips this gate. The companion forwards `--skip-git-repo-check`, and its failure output names that remedy. A directory that is trusted in configuration is not therefore a valid exec directory without an ancestor Git entry.
+
+Codex CLI 0.144.4 requires `supports_reasoning_summaries` in `models_cache.json` without a serde default. Codex 0.145.0 alpha releases renamed the field to `supports_reasoning_summary_parameter` and added a default. A newer generation binary that shares `CODEX_HOME`, including ChatGPT.app's bundled codex-cli 0.145.0-alpha.18 at `Contents/Resources/codex`, can rewrite the cache in the new schema. A 0.144.4 exec session then logs non-fatal `failed to renew cache TTL: missing field` messages on each etag renewal. Startup refetch self-heals the file. The durable fix is version alignment among all Codex binaries sharing the same `CODEX_HOME`.
+
+## Acceptance and worker lifecycle
+
+`/fusion:stats --record-acceptance` writes the verdict back to the Codex job record through the companion's `record-acceptance` subcommand. Recording `accepted` for a job whose transport failed requires the explicit `--accept-failed-transport` override. The stats report includes an acceptance anomalies block when transport and acceptance evidence conflict or when other acceptance integrity checks find a problem.
+
+Worker lifecycle defaults are 1200000ms of wall clock, 300000ms of stall time, 240000 uncached tokens, and 60 turns. The output token budget is unchanged. The Stop hook adds a non-blocking advisory when collected workers remain acceptance unverified.
 
 ## Grok headless guardrails
 
