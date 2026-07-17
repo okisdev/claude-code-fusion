@@ -150,6 +150,16 @@ function recordLacksModelOrEffort(record) {
   return !nonEmptyRequestField(request.model) || !nonEmptyRequestField(request.effort);
 }
 
+function claudeSessionId(record) {
+  const value = record?.claudeSessionId;
+  return typeof value === "string" && value.trim() ? value.trim() : null;
+}
+
+function belongsToMonitorSession(record, ownSessionId) {
+  const ownerSessionId = claudeSessionId(record);
+  return !ownSessionId || !ownerSessionId || ownerSessionId === ownSessionId;
+}
+
 function readProcessArgv(pid, env = process.env) {
   if (!Number.isInteger(pid) || pid <= 0) {
     return null;
@@ -466,19 +476,26 @@ function terminalObservations(record, env = process.env, rolloutIndex = null) {
         effort: null,
         tokenUsage: null
       };
-  if (workspaceRoot && (rollout.model || rollout.effort)) {
+  const resolvedModel = nonEmptyRequestField(record?.resolvedModel) ? String(record.resolvedModel).trim() : null;
+  const resolvedEffort = nonEmptyRequestField(record?.resolvedEffort) ? String(record.resolvedEffort).trim() : null;
+  const requestedModel = nonEmptyRequestField(record?.request?.model) ? String(record.request.model).trim() : null;
+  const requestedEffort = nonEmptyRequestField(record?.request?.effort) ? String(record.request.effort).trim() : null;
+  const model = rollout.model ?? resolvedModel ?? requestedModel;
+  const effort = rollout.effort ?? resolvedEffort ?? requestedEffort;
+  const source = rollout.model || rollout.effort ? "rollout-turn-context" : resolvedModel || resolvedEffort ? "job-record" : "job-request";
+  if (workspaceRoot && (model || effort)) {
     try {
       appendModelAuditObservation(modelAuditSidecarPath(workspaceRoot, env), {
         schemaVersion: 1,
         jobId: record.id,
         engine: "codex",
-        model: rollout.model,
-        effort: rollout.effort,
+        model,
+        effort,
         threadId: rollout.threadId,
         turnId: rollout.turnId,
         workspaceRoot,
         repositoryKey: record.repositoryKey ?? fusionRepositoryKey(workspaceRoot),
-        source: "rollout-turn-context",
+        source,
         observedAt: new Date().toISOString()
       });
     } catch {
@@ -509,13 +526,11 @@ function terminalObservations(record, env = process.env, rolloutIndex = null) {
     }
   }
   const existingModel = workspaceRoot ? loadModelAuditObservations(modelAuditSidecarPath(workspaceRoot, env)).get(record.id) : null;
-  const requestedModel = nonEmptyRequestField(record?.request?.model) ? String(record.request.model).trim() : null;
-  const requestedEffort = nonEmptyRequestField(record?.request?.effort) ? String(record.request.effort).trim() : null;
   return {
-    model: rollout.model ?? requestedModel ?? existingModel?.model ?? null,
-    modelSource: rollout.model ? "rollout-turn-context" : requestedModel ? "job-request" : existingModel?.source ?? null,
-    effort: rollout.effort ?? requestedEffort ?? existingModel?.effort ?? null,
-    effortSource: rollout.effort ? "rollout-turn-context" : requestedEffort ? "job-request" : existingModel?.source ?? null,
+    model: model ?? existingModel?.model ?? null,
+    modelSource: rollout.model ? "rollout-turn-context" : resolvedModel ? "job-record" : requestedModel ? "job-request" : existingModel?.source ?? null,
+    effort: effort ?? existingModel?.effort ?? null,
+    effortSource: rollout.effort ? "rollout-turn-context" : resolvedEffort ? "job-record" : requestedEffort ? "job-request" : existingModel?.source ?? null,
     tokenUsage,
     tokenUsageAvailability: availability
   };
@@ -529,7 +544,7 @@ function terminalLedgerRecord(record, observations, scopeRoot) {
     transportStatus: record.status,
     workspaceRoot,
     repositoryKey: record.repositoryKey ?? fusionRepositoryKey(workspaceRoot),
-    sessionId: record.sessionId ?? null,
+    sessionId: claudeSessionId(record),
     kind: record.jobClass ?? record.kind ?? "unknown",
     createdAt: record.createdAt ?? null,
     startedAt: record.startedAt ?? null,
@@ -722,12 +737,11 @@ function main() {
   const root = resolveStateRoot();
   const cwd = process.cwd();
   const workspaceRoot = resolveWorkspaceRoot(cwd);
-  const ownSessionId = process.env[SESSION_ID_ENV] || null;
+  const ownSessionId = claudeSessionId({ claudeSessionId: process.env[SESSION_ID_ENV] });
   const stateFile = announcedStatePath(root, ownSessionId, workspaceRoot);
   const loaded = loadAnnounced(stateFile, workspaceRoot);
   const announced = loaded.announced;
   const terminalRecords = loaded.records;
-  const inspectedTerminalKeys = new Set();
   const rolloutIndex = { files: [], scannedAt: 0 };
   const repositoryCache = new Map();
   const auditStates = new Map();
@@ -750,16 +764,24 @@ function main() {
       liveIds.add(record.id);
       if (TERMINAL_STATUSES.has(record.status)) {
         const key = announcementKey(record.id, record.status);
-        if (!inspectedTerminalKeys.has(key)) {
+        if (!belongsToMonitorSession(record, ownSessionId)) {
+          if (announced.delete(key)) {
+            dirty = true;
+          }
+          if (terminalRecords.delete(key)) {
+            dirty = true;
+          }
+          continue;
+        }
+        if (!terminalRecords.has(key)) {
           const observations = terminalObservations(record, process.env, rolloutIndex);
           terminalRecords.set(key, terminalLedgerRecord(record, observations, workspaceRoot));
-          inspectedTerminalKeys.add(key);
           dirty = true;
         }
         if (!announced.has(key)) {
           announced.add(key);
           dirty = true;
-          if (shouldAnnounceTerminal(record) && !(startupPending && !loaded.exists) && (!ownSessionId || record.sessionId === ownSessionId)) {
+          if (shouldAnnounceTerminal(record) && !(startupPending && !loaded.exists)) {
             safeWriteLine(formatOutcomeLine(record));
           }
         }
@@ -776,6 +798,9 @@ function main() {
       const auditState = auditStates.get(recordWorkspaceRoot);
       maybeCaptureModelAudit(record, auditState.seenJobIds, auditState.sidecarPath);
       if (record.status === "running" && !isPidAlive(record.pid)) {
+        if (!belongsToMonitorSession(record, ownSessionId)) {
+          continue;
+        }
         if (terminalJobIds.has(record.id)) {
           continue;
         }
@@ -793,9 +818,7 @@ function main() {
         if (!announced.has(key)) {
           announced.add(key);
           dirty = true;
-          if (!ownSessionId || record.sessionId === ownSessionId) {
-            safeWriteLine(`codex job ${record.id} appears dead (process gone, status still running)`);
-          }
+          safeWriteLine(`codex job ${record.id} appears dead (process gone, status still running)`);
         }
       }
     }
