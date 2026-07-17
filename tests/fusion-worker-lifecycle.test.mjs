@@ -7,6 +7,7 @@ import { test } from "node:test";
 
 import { recordCodexAcceptance } from "../plugins/fusion/scripts/fusion-stats.mjs";
 import { readWorkerRecords, recordWorkerAcceptance, updateWorkerRecord } from "../plugins/fusion/scripts/lib/worker-state.mjs";
+import { workerLimits } from "../plugins/fusion/scripts/worker-lifecycle.mjs";
 
 const repoRoot = path.join(import.meta.dirname, "..");
 const script = path.join(repoRoot, "plugins", "fusion", "scripts", "worker-lifecycle.mjs");
@@ -55,6 +56,29 @@ function record(box) {
   assert.strictEqual(records.length, 1);
   return records[0];
 }
+
+test("fast worker limits raise the default budgets and retain environment overrides", () => {
+  assert.deepStrictEqual(workerLimits("fusion:fast-worker", {}), {
+    wallClockMs: 1_200_000,
+    stallMs: 300_000,
+    maxTurns: 60,
+    maxOutputTokens: 24_000,
+    maxUncachedTokens: 240_000
+  });
+  assert.deepStrictEqual(workerLimits("fusion:fast-worker", {
+    FUSION_WORKER_WALL_CLOCK_MS: "120",
+    FUSION_WORKER_STALL_MS: "60",
+    FUSION_WORKER_MAX_TURNS: "12",
+    FUSION_WORKER_MAX_OUTPUT_TOKENS: "8000",
+    FUSION_WORKER_MAX_UNCACHED_TOKENS: "6000"
+  }), {
+    wallClockMs: 120,
+    stallMs: 60,
+    maxTurns: 12,
+    maxOutputTokens: 8_000,
+    maxUncachedTokens: 6_000
+  });
+});
 
 test("the dispatch guard requires a minimal isolated brief and explicit user background authorization", (t) => {
   const box = sandbox(t);
@@ -167,6 +191,21 @@ test("an unexpected async peer wrapper remains owned until TaskOutput collects i
     tool_response: { status: "completed", content: "peer result" }
   });
   assert.strictEqual(record(box).transportStatus, "done");
+  assert.strictEqual(record(box).collectionMethod, "TaskOutput");
+  assert.ok(record(box).collectedAt);
+  const collectedAt = record(box).collectedAt;
+
+  run(box, {
+    hook_event_name: "PostToolUse",
+    session_id: "session-1",
+    cwd: box.cwd,
+    transcript_path: box.transcript,
+    tool_name: "TaskOutput",
+    tool_input: { task_id: "peer-async", block: true },
+    tool_response: { status: "completed", content: "peer result" }
+  });
+  assert.strictEqual(record(box).collectionMethod, "TaskOutput");
+  assert.strictEqual(record(box).collectedAt, collectedAt);
 });
 
 test("lifecycle enforcement fails closed when private worker state is unavailable", (t) => {
@@ -323,7 +362,7 @@ test("a completed async worker remains owned after it leaves the runtime registr
     last_assistant_message: "done",
     background_tasks: []
   });
-  assert.strictEqual(allowed.stdout, "");
+  assert.match(JSON.parse(allowed.stdout).hookSpecificOutput.additionalContext, /Acceptance remains unverified for 1 collected Fusion worker/);
 });
 
 test("foreground structured usage is canonical and transport completion remains unverified", (t) => {
@@ -355,6 +394,41 @@ test("foreground structured usage is canonical and transport completion remains 
     uncachedTokens: 36
   });
   assert.strictEqual(completed.toolCalls, 3);
+});
+
+test("Stop advises on collected unverified workers without blocking and stays quiet after acceptance", (t) => {
+  const box = sandbox(t);
+  run(box, dispatch(box));
+  run(box, {
+    ...dispatch(box),
+    hook_event_name: "PostToolUse",
+    tool_response: { status: "completed", agentId: "advisory-1" }
+  });
+  const completed = record(box);
+  assert.ok(completed.collectedAt);
+  assert.strictEqual(completed.collectionMethod, "Agent");
+
+  const advisory = run(box, {
+    hook_event_name: "Stop",
+    session_id: "session-1",
+    cwd: box.cwd,
+    transcript_path: box.transcript,
+    background_tasks: []
+  });
+  const output = JSON.parse(advisory.stdout);
+  assert.strictEqual(output.decision, undefined);
+  assert.match(output.hookSpecificOutput.additionalContext, /Acceptance remains unverified for 1 collected Fusion worker/);
+  assert.match(output.hookSpecificOutput.additionalContext, /\/fusion:stats --record-worker-acceptance <task-id> accepted --source main-loop/);
+
+  recordWorkerAcceptance({ taskId: completed.taskId, acceptance: "accepted", env: envFor(box), source: "main-loop" });
+  const quiet = run(box, {
+    hook_event_name: "Stop",
+    session_id: "session-1",
+    cwd: box.cwd,
+    transcript_path: box.transcript,
+    background_tasks: []
+  });
+  assert.strictEqual(quiet.stdout, "");
 });
 
 test("nested structured Agent responses retain their canonical usage", (t) => {
@@ -418,6 +492,22 @@ test("SubagentStop blocks one incomplete report and then records a verified tran
   assert.strictEqual(second.stdout, "");
   assert.strictEqual(record(box).transportStatus, "done");
   assert.strictEqual(record(box).acceptance, "unverified");
+  assert.strictEqual(record(box).collectionMethod, "SubagentStop");
+  assert.ok(record(box).collectedAt);
+  const collectedAt = record(box).collectedAt;
+  run(box, {
+    hook_event_name: "SubagentStop",
+    session_id: "session-1",
+    cwd: box.cwd,
+    transcript_path: box.transcript,
+    agent_transcript_path: path.join(box.root, "subagents", "agent-agent-1.jsonl"),
+    agent_id: "agent-1",
+    agent_type: "fusion:fast-worker",
+    stop_hook_active: true,
+    last_assistant_message: "summary\ndelivery: complete\nverification: passed"
+  });
+  assert.strictEqual(record(box).collectionMethod, "SubagentStop");
+  assert.strictEqual(record(box).collectedAt, collectedAt);
 });
 
 test("an acceptance brief uses the analysis completion contract", (t) => {
@@ -1028,7 +1118,7 @@ test("an explicitly authorized completed worker stays ready until Stop records i
     last_assistant_message: `Background task ${taskId} completed as manual-ready.`,
     background_tasks: []
   });
-  assert.strictEqual(stop.stdout, "");
+  assert.match(JSON.parse(stop.stdout).hookSpecificOutput.additionalContext, /Acceptance remains unverified for 1 collected Fusion worker/);
   assert.strictEqual(record(box).transportStatus, "done");
 });
 

@@ -174,6 +174,14 @@ export function updateWorkerRecord(taskId, env, updater) {
   });
 }
 
+export function markWorkerCollected(record, method, collectedAt = new Date().toISOString()) {
+  return {
+    ...record,
+    collectionMethod: record.collectionMethod ?? method,
+    collectedAt: record.collectedAt ?? collectedAt
+  };
+}
+
 export function createWorkerTaskId(sessionId, toolUseId) {
   const entropy = `${sessionId ?? "unknown"}\0${toolUseId ?? randomUUID()}\0${Date.now()}\0${randomUUID()}`;
   return `fusion-${createHash("sha256").update(entropy).digest("hex").slice(0, 24)}`;
@@ -202,6 +210,8 @@ export function createWorkerRecord(record, env = process.env) {
       transportStatus: "dispatching",
       acceptance: "unverified",
       failureKind: null,
+      collectionMethod: null,
+      collectedAt: null,
       retryCount: 0,
       stopBlockCount: 0,
       turns: 0,
