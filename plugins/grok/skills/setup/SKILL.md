@@ -1,5 +1,6 @@
 ---
-description: Check whether the local Grok CLI is ready for the companion runtime
+name: setup
+description: Check whether the local Grok CLI is ready for the companion runtime. Use when validating or changing the local companion setup.
 argument-hint: '[--continuity <manual|claude-session>] [--enable-stop-gate | --disable-stop-gate] [--json]'
 disable-model-invocation: true
 allowed-tools: Bash(node:*), Read, Write

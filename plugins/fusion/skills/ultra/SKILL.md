@@ -1,4 +1,5 @@
 ---
+name: ultra
 description: "Fans the work out as a fleet of parallel Grok and Codex agents billed to their own subscriptions, then synthesizes one result. The peer engine equivalent of ultracode, adding intensity without spending Claude quota on the fleet."
 when_to_use: "Proactively use when the user asks to go deep, be thorough, or exhaustive. Deep research on a topic, a comprehensive audit, an exhaustive bug hunt, mapping a whole subsystem, or implementing a large multi part feature."
 argument-hint: '[the task to pursue exhaustively]'

@@ -1,5 +1,6 @@
 ---
-description: Run a Grok best-of-n implementation tournament and apply the winner
+name: best-of-n
+description: Runs a Grok best-of-n implementation tournament and applies the winner. Use when several independent candidates and an automatic pick are wanted.
 argument-hint: '[--n <n>] [task text]'
 allowed-tools: Agent
 ---

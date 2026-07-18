@@ -1,5 +1,6 @@
 ---
-description: Show the stored result of a finished Grok job in this workspace
+name: result
+description: Show the stored result of a finished Grok job in this workspace. Use when retrieving a completed job's output.
 argument-hint: '<job-id> [--cwd <dir>] [--wait] [--wait-timeout-ms <ms>] [--json]'
 disable-model-invocation: true
 allowed-tools: Bash(node:*), Read, Write

@@ -1,5 +1,6 @@
 ---
-description: Cancel an active Grok job in this workspace
+name: cancel
+description: Cancel an active Grok job in this workspace. Use when a running job should stop.
 argument-hint: '<job-id> [--cwd <dir>] [--json]'
 disable-model-invocation: true
 allowed-tools: Bash(node:*), Read, Write

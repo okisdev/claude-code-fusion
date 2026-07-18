@@ -1,5 +1,7 @@
 ---
-description: Configure model defaults and capability scores across the Claude, Grok, and Codex orchestration surfaces
+name: config
+description: Configures model defaults and capability scores across the Claude, Grok, and Codex orchestration surfaces. Use when changing model defaults, capability scores, or lane SKUs after the model lineup changes.
+argument-hint: '[propose]'
 allowed-tools: Read, Glob, Edit, Bash(grok models:*), Bash(codex debug models:*), Bash(rg:*), Bash(node:*), AskUserQuestion, WebSearch, WebFetch
 ---
 

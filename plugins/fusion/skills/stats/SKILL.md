@@ -1,5 +1,6 @@
 ---
-description: Aggregate Claude worker and peer delegation statistics or record semantic acceptance after collection and verification
+name: stats
+description: Aggregates delegation statistics and records semantic acceptance. Use after collecting and verifying a delegated result to record it as accepted or rejected, or when asked how the lanes are performing.
 argument-hint: '[--all] [--session [id]] [--trace] [--audit [--days <n>]] [--include-legacy] [--record-acceptance <job-id> <accepted|rejected|unverified>] [--accept-failed-transport] [--record-worker-acceptance <task-id> <accepted|rejected|unverified>] [--json]'
 allowed-tools: Bash(node:*), Read, Write
 ---
