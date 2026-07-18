@@ -1,5 +1,6 @@
 ---
-description: Delegate a coding or consultation task to the local Grok CLI through the companion runtime
+name: task
+description: Delegates a coding or consultation task to the local Grok CLI. Use under a protected Grok role (burst, independence, live-web, large-context, best-of-n) or on explicit user request for Grok.
 argument-hint: '[--write] [--web] [--memory] [--background] [--resume <uuid>|--resume-last|--fresh] [--model <id>] [--effort <level>] [--max-turns <n>] [--best-of-n <n>] [--cwd <dir>] [--json] [what Grok should do]'
 allowed-tools: Agent
 ---

@@ -1,5 +1,6 @@
 ---
-description: Run a Codex task through the companion runtime.
+name: task
+description: Runs a Codex task through the companion runtime. Use when delegating a bounded implementation, investigation, or consultation to Codex.
 argument-hint: '[--write] [--background] [--resume <thread-id>|--resume-last|--fresh] [--model <id>] [--effort <level>] [--web] [--network] [--prompt-file <path>] [--cwd <dir>] [--json] [what Codex should do]'
 allowed-tools: Bash(node:*), Read, Write
 ---

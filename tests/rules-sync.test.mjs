@@ -204,8 +204,8 @@ test("Doctor and setup describe template hash comparison for live rules", () => 
 
 test("background collection distinguishes explicit Fusion receipts from foreground peer delivery", () => {
   const rules = fs.readFileSync(path.join(repoRoot, "plugins", "fusion", "rules", "orchestration.md"), "utf8");
-  const task = fs.readFileSync(path.join(repoRoot, "plugins", "codex", "commands", "task.md"), "utf8");
-  const rescue = fs.readFileSync(path.join(repoRoot, "plugins", "codex", "commands", "rescue.md"), "utf8");
+  const task = fs.readFileSync(path.join(repoRoot, "plugins", "codex", "skills", "task", "SKILL.md"), "utf8");
+  const rescue = fs.readFileSync(path.join(repoRoot, "plugins", "codex", "skills", "rescue", "SKILL.md"), "utf8");
   assert.match(rules, /this obligation applies to a manual receipt that crosses into the main session from a detached job launched by Fusion orchestration/);
   assert.match(rules, /closed direct prompt containing exactly one standalone `engine: codex\|grok` line and one standalone `job: <32 lowercase hexadecimal characters>` line/);
   assert.match(rules, /The lifecycle binds the collected marker to this dispatch identity\./);

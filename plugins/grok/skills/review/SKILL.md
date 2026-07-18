@@ -1,5 +1,6 @@
 ---
-description: Run an adversarial Grok review against local git state
+name: review
+description: Runs an adversarial Grok review of local git state. Use for a fast mechanical review sweep before merge, complementing deeper Codex review.
 argument-hint: '[--base <ref>] [--focus <text>] [--cwd <dir>] [--json]'
 allowed-tools: Read, Glob, Grep, Bash(git:*), Agent
 ---

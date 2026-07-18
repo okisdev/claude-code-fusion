@@ -1,5 +1,6 @@
 ---
-description: List canonical local Grok companion history and resumable sessions
+name: history
+description: List canonical local Grok companion history and resumable sessions. Use when checking prior jobs or resumable sessions.
 argument-hint: '[--all] [--limit <n>] [--cwd <dir>] [--json]'
 disable-model-invocation: true
 allowed-tools: Bash(node:*), Read, Write

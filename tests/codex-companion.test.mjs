@@ -20,6 +20,7 @@ import {
   jobRecords,
   makeSandbox,
   readArgs,
+  repoRoot,
   runCompanion,
   spawnCompanion,
   waitFor
@@ -369,13 +370,10 @@ test("raw transport never follows or cleans an unverified directory symlink", (t
   }
 });
 
-test("Codex slash commands never interpolate raw arguments into shell source", () => {
-  const commandsDirectory = path.join(path.dirname(companion), "..", "commands");
-  for (const name of fs.readdirSync(commandsDirectory)) {
-    if (!name.endsWith(".md")) {
-      continue;
-    }
-    const content = fs.readFileSync(path.join(commandsDirectory, name), "utf8");
+test("Codex slash skills never interpolate raw arguments into shell source", () => {
+  const skillNames = ["adversarial-review", "cancel", "history", "rescue", "result", "review", "setup", "status", "task"];
+  for (const name of skillNames) {
+    const content = fs.readFileSync(path.join(repoRoot, "plugins", "codex", "skills", name, "SKILL.md"), "utf8");
     assert.equal(content.match(/\$ARGUMENTS/g)?.length, 1);
     assert.match(content, /\n\$ARGUMENTS\n?$/);
     assert.doesNotMatch(content, /<<-?\s*['"]?[A-Za-z_]/);

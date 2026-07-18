@@ -1,5 +1,6 @@
 ---
-description: Show active and recent Grok jobs for this workspace
+name: status
+description: Show active and recent Grok jobs for this workspace. Use when checking a job's progress or recent activity.
 argument-hint: '[job-id] [--cwd <dir>] [--json]'
 disable-model-invocation: true
 allowed-tools: Bash(node:*), Read, Write

@@ -1,5 +1,6 @@
 ---
-description: Audit the orchestration setup for model drift, stale pins, and environment overrides
+name: doctor
+description: Audits the orchestration setup without changes for model drift, stale pins, and environment overrides. Use when routing behaves oddly, after a CLI upgrade, or when model drift is suspected.
 allowed-tools: Read, Glob, Bash(rg:*), Bash(node:*), Bash(codex --version:*), Bash(grok --version:*), Bash(codex debug models:*), Bash(grok models:*), Bash(grok inspect:*), Bash(grok --help:*), Bash(grok agent --help:*)
 ---
 

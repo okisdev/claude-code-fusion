@@ -1,5 +1,6 @@
 ---
-description: Show active and recent Codex jobs.
+name: status
+description: Shows active and recent Codex jobs. Use when asked what Codex is doing or whether a job is still running.
 argument-hint: '[job-id] [--all] [--cwd <dir>] [--json]'
 allowed-tools: Bash(node:*), Read, Write
 ---

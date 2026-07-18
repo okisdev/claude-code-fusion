@@ -1,5 +1,6 @@
 ---
-description: Show aggregate stats for Grok jobs in this workspace
+name: stats
+description: Show aggregate stats for Grok jobs in this workspace. Use when checking Grok job activity over time.
 argument-hint: '[--all] [--cwd <dir>] [--json]'
 disable-model-invocation: true
 allowed-tools: Bash(node:*), Read, Write

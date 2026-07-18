@@ -1,5 +1,6 @@
 ---
-description: Install or update the orchestration routing rules into ~/.claude and check the optional permission allow
+name: setup
+description: Installs or updates the orchestration rules in ~/.claude and checks the optional permission allow. Use on first install or after a plugin update changes the rules template.
 argument-hint: ''
 allowed-tools: Read, Write, Edit, AskUserQuestion, Bash(node:*)
 ---

@@ -1,5 +1,12 @@
 # changelog
 
+## 0.0.26
+
+- the codex plugin moves to the skills surface: all nine legacy `commands/*.md` become `skills/<name>/SKILL.md` with byte identical bodies and unchanged `/codex:*` invocation names, matching current Agent Skills guidance that marks plugin `commands/` directories as legacy
+- every skill carries open standard frontmatter: an explicit `name` matching its directory across all three plugins, an `argument-hint` for `/fusion:config`, and descriptions rewritten to the what plus when formula with trigger contexts aligned to the routing policy, while `panel` and `ultra` keep their test asserted description and `when_to_use`
+- reaped async wrappers reach a terminal state: a `TaskOutput` or `TaskStop` no task error for a session owned non terminal worker record flips it to `failed` with the new `task_reaped` failure kind and `reaped` collection method, the Stop gate stops demanding collection for reaped records, and recording accepted on a failed worker transport requires the same `--accept-failed-transport` override as the codex path
+- grok-prompting documents the wrapper dispatch grammar: companion options lead the raw request and are separated from the brief by a standalone `--`, so a live web consult begins with `--web --` and prose inside a brief never enables web tools
+
 ## 0.0.25
 
 - grok turn limits are salvageable: the consult default rises from 25 to 60 turns, a max turns death is classified as the new `turn_limit` failure kind outside every breaker table, and the final json envelope printed before exit 1 is preserved so partial text, usage, model usage, and structured output survive into the job record

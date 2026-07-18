@@ -1,5 +1,6 @@
 ---
-description: List canonical local Codex companion history, including resumable thread ids and delivery state.
+name: history
+description: Lists canonical local Codex companion history with resumable thread IDs. Use when resuming or auditing past Codex work.
 argument-hint: '[--json]'
 allowed-tools: Bash(node:*), Read, Write
 ---

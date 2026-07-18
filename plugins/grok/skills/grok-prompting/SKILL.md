@@ -8,6 +8,8 @@ user-invocable: false
 
 Grok runs each brief in a new process and never receives the Claude conversation automatically. An explicit resume or direct-task continuity affinity may restore a compatible Grok session, and `--memory` may inject relevant cross-session Grok memory, but every brief must remain self contained. Fusion routed briefs do not receive automatic affinity and stay fresh unless explicitly resumed.
 
+Companion options must lead the raw request and be separated from the brief by a standalone `--`. For example, a live web research consult must begin with `--web -- ` followed by the brief. Prose inside the brief, such as `consult --web`, or a header line never enables web tools. A consult that needs file writes or web access without the leading options will run without them.
+
 Brief structure:
 
 - State the goal in one sentence, then the constraints that bound it.

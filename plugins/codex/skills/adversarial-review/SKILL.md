@@ -1,5 +1,6 @@
 ---
-description: Run a read only Codex review that challenges implementation and design decisions.
+name: adversarial-review
+description: Runs a read only Codex review that challenges implementation and design decisions. Use when preparing to merge a substantial change or when a hostile second pass is wanted.
 argument-hint: '[--scope <auto|working-tree|branch>] [--base <ref>] [--focus <text>] [--background] [--model <id>] [--effort <level>] [--cwd <dir>] [--json]'
 allowed-tools: Bash(node:*), Read, Write
 ---
