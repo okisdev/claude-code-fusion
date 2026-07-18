@@ -208,6 +208,137 @@ test("an unexpected async peer wrapper remains owned until TaskOutput collects i
   assert.strictEqual(record(box).collectedAt, collectedAt);
 });
 
+test("a TaskOutput no-task error marks a matching unexpected async peer wrapper as reaped", (t) => {
+  const box = sandbox(t);
+  const peerDispatch = dispatch(box, { subagent_type: "codex:codex-rescue", prompt: "bounded peer brief" });
+  run(box, peerDispatch);
+  run(box, {
+    ...peerDispatch,
+    hook_event_name: "PostToolUse",
+    tool_response: { isAsync: true, status: "async_launched", agentId: "peer-reaped-output" }
+  });
+
+  run(box, {
+    hook_event_name: "PostToolUseFailure",
+    session_id: "session-1",
+    cwd: box.cwd,
+    transcript_path: box.transcript,
+    tool_name: "TaskOutput",
+    tool_input: { task_id: "peer-reaped-output", block: true },
+    tool_response: { is_error: true, content: "No task found with ID: peer-reaped-output" }
+  });
+
+  const reaped = record(box);
+  assert.strictEqual(reaped.transportStatus, "failed");
+  assert.strictEqual(reaped.failureKind, "task_reaped");
+  assert.strictEqual(reaped.collectionMethod, "reaped");
+  assert.ok(reaped.finishedAt);
+  assert.ok(reaped.collectedAt);
+  assert.strictEqual(reaped.agentId, "peer-reaped-output");
+  assert.strictEqual(reaped.backgroundTaskId, "peer-reaped-output");
+});
+
+test("a TaskStop no-task error marks a matching unexpected async peer wrapper as reaped", (t) => {
+  const box = sandbox(t);
+  const peerDispatch = dispatch(box, { subagent_type: "grok:grok-rescue", prompt: "bounded peer brief" });
+  run(box, peerDispatch);
+  run(box, {
+    ...peerDispatch,
+    hook_event_name: "PostToolUse",
+    tool_response: { isAsync: true, status: "async_launched", agentId: "peer-reaped-stop" }
+  });
+
+  run(box, {
+    hook_event_name: "PostToolUseFailure",
+    session_id: "session-1",
+    cwd: box.cwd,
+    transcript_path: box.transcript,
+    tool_name: "TaskStop",
+    tool_input: { task_id: "peer-reaped-stop" },
+    error: "No task found with ID: peer-reaped-stop"
+  });
+
+  const reaped = record(box);
+  assert.strictEqual(reaped.transportStatus, "failed");
+  assert.strictEqual(reaped.failureKind, "task_reaped");
+  assert.strictEqual(reaped.collectionMethod, "reaped");
+  assert.ok(reaped.finishedAt);
+  assert.ok(reaped.collectedAt);
+});
+
+test("no-task errors ignore unmatched task ids and terminal worker records", (t) => {
+  const box = sandbox(t);
+  const peerDispatch = dispatch(box, { subagent_type: "codex:codex-rescue", prompt: "bounded peer brief" });
+  run(box, peerDispatch);
+  run(box, {
+    ...peerDispatch,
+    hook_event_name: "PostToolUse",
+    tool_response: { isAsync: true, status: "async_launched", agentId: "peer-terminal" }
+  });
+
+  run(box, {
+    hook_event_name: "PostToolUseFailure",
+    session_id: "session-1",
+    cwd: box.cwd,
+    transcript_path: box.transcript,
+    tool_name: "TaskOutput",
+    tool_input: { task_id: "unknown-peer", block: true },
+    error: "No task found with ID: unknown-peer"
+  });
+  assert.strictEqual(record(box).transportStatus, "pending_async");
+  assert.strictEqual(record(box).failureKind, "unexpected_async");
+
+  const terminal = updateWorkerRecord(record(box).taskId, envFor(box), (current) => ({
+    ...current,
+    transportStatus: "done",
+    finishedAt: "2026-07-19T00:00:00.000Z",
+    collectedAt: "2026-07-19T00:00:01.000Z",
+    collectionMethod: "TaskOutput"
+  }));
+  run(box, {
+    hook_event_name: "PostToolUseFailure",
+    session_id: "session-1",
+    cwd: box.cwd,
+    transcript_path: box.transcript,
+    tool_name: "TaskStop",
+    tool_input: { task_id: "peer-terminal" },
+    error: "No task found with ID: peer-terminal"
+  });
+  assert.deepStrictEqual(record(box), terminal);
+});
+
+test("Stop does not demand collection for a reaped peer wrapper", (t) => {
+  const box = sandbox(t);
+  const peerDispatch = dispatch(box, { subagent_type: "codex:codex-rescue", prompt: "bounded peer brief" });
+  run(box, peerDispatch);
+  run(box, {
+    ...peerDispatch,
+    hook_event_name: "PostToolUse",
+    tool_response: { isAsync: true, status: "async_launched", agentId: "peer-reaped-stop-gate" }
+  });
+  run(box, {
+    hook_event_name: "PostToolUseFailure",
+    session_id: "session-1",
+    cwd: box.cwd,
+    transcript_path: box.transcript,
+    tool_name: "TaskOutput",
+    tool_input: { task_id: "peer-reaped-stop-gate", block: true },
+    error: "No task found with ID: peer-reaped-stop-gate"
+  });
+
+  const stop = run(box, {
+    hook_event_name: "Stop",
+    session_id: "session-1",
+    cwd: box.cwd,
+    transcript_path: box.transcript,
+    background_tasks: []
+  });
+  const output = JSON.parse(stop.stdout);
+  assert.strictEqual(output.decision, undefined);
+  assert.doesNotMatch(JSON.stringify(output), /TaskOutput|collect the terminal result/);
+  assert.match(output.hookSpecificOutput.additionalContext, /Acceptance remains unverified/);
+});
+
 test("lifecycle enforcement fails closed when private worker state is unavailable", (t) => {
   const box = sandbox(t);
   fs.writeFileSync(box.state, "not a directory", "utf8");

@@ -468,11 +468,53 @@ function handlePreToolUse(input, env) {
   updateWorkerRecord(refreshed.taskId, env, (current) => ({ ...current, lastActivityAt: new Date().toISOString() }));
 }
 
+function noTaskFoundError(input, failed) {
+  const response = input.tool_response;
+  const isError = failed || response?.is_error === true || response?.isError === true || response?.status === "error" || typeof response?.error === "string";
+  if (!isError) {
+    return false;
+  }
+  const text = [input.error, response].flatMap((value) => {
+    if (typeof value === "string") {
+      return [value];
+    }
+    if (!value) {
+      return [];
+    }
+    try {
+      return [JSON.stringify(value)];
+    } catch {
+      return [];
+    }
+  }).join("\n");
+  return /No task found/i.test(text);
+}
+
 function handlePostToolUse(input, env, failed = false) {
   if (!input.agent_id && ["Read", "TaskOutput", "TaskStop"].includes(input.tool_name)) {
     const taskId = typeof input.tool_input?.task_id === "string" ? input.tool_input.task_id : null;
     const readPath = typeof input.tool_input?.file_path === "string" ? path.resolve(input.cwd, input.tool_input.file_path) : null;
-    const matches = readWorkerRecords(env, { strict: true }).filter((record) => {
+    const records = readWorkerRecords(env, { strict: true });
+    if (["TaskOutput", "TaskStop"].includes(input.tool_name) && taskId && noTaskFoundError(input, failed)) {
+      const now = new Date().toISOString();
+      for (const record of records.filter((candidate) => candidate.sessionId === input.session_id && !isTerminalWorkerStatus(candidate.transportStatus) && [candidate.backgroundTaskId, candidate.agentId].includes(taskId))) {
+        updateWorkerRecord(record.taskId, env, (current) => {
+          if (!current || current.sessionId !== input.session_id || isTerminalWorkerStatus(current.transportStatus) || ![current.backgroundTaskId, current.agentId].includes(taskId)) {
+            return null;
+          }
+          return {
+            ...current,
+            transportStatus: "failed",
+            failureKind: "task_reaped",
+            finishedAt: now,
+            collectedAt: now,
+            collectionMethod: "reaped"
+          };
+        });
+      }
+      return;
+    }
+    const matches = records.filter((record) => {
       if (record.sessionId !== input.session_id) {
         return false;
       }

@@ -481,7 +481,7 @@ function updateWorkerAcceptance({ taskId, acceptance, env, source, safeReason, v
   return updated;
 }
 
-export function recordWorkerAcceptance({ taskId, acceptance, env = process.env, source = "main-loop", reason = null }) {
+export function recordWorkerAcceptance({ taskId, acceptance, env = process.env, source = "main-loop", reason = null, acceptFailedTransport = process.argv.includes("--record-worker-acceptance") && process.argv.includes("--accept-failed-transport") }) {
   const { safeReason } = validatedAcceptanceFields(acceptance, source, reason);
   return updateWorkerAcceptance({
     taskId,
@@ -496,6 +496,9 @@ export function recordWorkerAcceptance({ taskId, acceptance, env = process.env, 
       }
       if (collector && (record.peerEngine !== "grok" || !/^[a-f0-9]{32}$/.test(record.peerJobId ?? "") || !record.peerTransportStatus)) {
         throw new Error(`Fusion collector task ${taskId} does not contain a verified Grok collection identity.`);
+      }
+      if (acceptance === "accepted" && record.transportStatus === "failed" && !acceptFailedTransport) {
+        throw new Error(`Fusion worker task ${taskId} has transport status failed. Pass --accept-failed-transport to record accepted.`);
       }
     }
   });

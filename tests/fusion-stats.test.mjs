@@ -1623,6 +1623,62 @@ test("generic worker acceptance records a terminal Grok collector judgment", (t)
   assert.ok(updated.acceptanceRecordedAt);
 });
 
+test("worker acceptance requires --accept-failed-transport only for accepted failed records", (t) => {
+  const dir = sandbox(t);
+  const stateDir = path.join(dir, "worker-state");
+  const env = { FUSION_WORKER_STATE_DIR: stateDir };
+  const taskId = "fusion-reaped-acceptance";
+  createWorkerRecord({
+    taskId,
+    sessionId: "session-reaped",
+    dispatchToolUseId: "tool-reaped",
+    agentType: "fusion:fast-worker",
+    workspaceRoot: dir,
+    limits: {}
+  }, env);
+  updateWorkerRecord(taskId, env, (record) => ({
+    ...record,
+    transportStatus: "failed",
+    failureKind: "task_reaped",
+    collectionMethod: "reaped",
+    finishedAt: "2026-07-19T00:00:00.000Z",
+    collectedAt: "2026-07-19T00:00:00.000Z"
+  }));
+
+  const blocked = run(
+    { cwd: dir, codexState: path.join(dir, "missing") },
+    ["--record-worker-acceptance", taskId, "accepted", "--json"],
+    env
+  );
+  assert.notStrictEqual(blocked.status, 0);
+  assert.match(blocked.stderr, /Pass --accept-failed-transport to record accepted/);
+  assert.strictEqual(readWorkerRecord(taskId, env).acceptance, "unverified");
+
+  const rejected = run(
+    { cwd: dir, codexState: path.join(dir, "missing") },
+    ["--record-worker-acceptance", taskId, "rejected", "--json"],
+    env
+  );
+  assert.strictEqual(rejected.status, 0, rejected.stderr);
+  assert.strictEqual(JSON.parse(rejected.stdout).acceptance, "rejected");
+
+  const unverified = run(
+    { cwd: dir, codexState: path.join(dir, "missing") },
+    ["--record-worker-acceptance", taskId, "unverified", "--json"],
+    env
+  );
+  assert.strictEqual(unverified.status, 0, unverified.stderr);
+  assert.strictEqual(JSON.parse(unverified.stdout).acceptance, "unverified");
+
+  const accepted = run(
+    { cwd: dir, codexState: path.join(dir, "missing") },
+    ["--record-worker-acceptance", taskId, "accepted", "--accept-failed-transport", "--json"],
+    env
+  );
+  assert.strictEqual(accepted.status, 0, accepted.stderr);
+  assert.strictEqual(JSON.parse(accepted.stdout).acceptance, "accepted");
+});
+
 test("exact rollout model observations override request and argv values", (t) => {
   const dir = sandbox(t);
   const stateRoot = path.join(dir, "state");
