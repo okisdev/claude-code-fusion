@@ -1,5 +1,6 @@
 ---
-description: Cancel an active Codex job.
+name: cancel
+description: Cancels an active Codex job. Use when a running job must be stopped.
 argument-hint: '<job-id> [--cwd <dir>] [--json]'
 allowed-tools: Bash(node:*), Read, Write
 ---

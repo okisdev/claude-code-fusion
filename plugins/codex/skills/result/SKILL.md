@@ -1,5 +1,6 @@
 ---
-description: Show or wait for the stored result of a Codex job.
+name: result
+description: Shows or waits for a stored Codex job result. Use when collecting a background Codex job named by ID.
 argument-hint: '<job-id> [--wait] [--wait-timeout-ms <ms>] [--cwd <dir>] [--json]'
 allowed-tools: Bash(node:*), Read, Write
 ---

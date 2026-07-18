@@ -1,5 +1,6 @@
 ---
-description: Run a read only Codex review against local Git state.
+name: review
+description: Runs a read only Codex review of local Git state. Use when the user wants Codex to review uncommitted or branch changes.
 argument-hint: '[--scope <auto|working-tree|branch>] [--base <ref>] [--focus <text>] [--background] [--model <id>] [--effort <level>] [--cwd <dir>] [--json]'
 allowed-tools: Bash(node:*), Read, Write
 ---

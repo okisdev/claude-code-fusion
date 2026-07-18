@@ -1,5 +1,6 @@
 ---
-description: Delegate an implementation, investigation, diagnosis, or consultation request to the Codex rescue agent.
+name: rescue
+description: Forwards a request to the Codex rescue agent without exposing arguments to a shell. Use when Fusion routing or the user delegates work to Codex.
 argument-hint: '[--write] [--background] [--resume <thread-id>|--resume-last|--fresh] [--model <id>] [--effort <level>] [--web] [--network] [what Codex should do]'
 allowed-tools: Agent
 ---

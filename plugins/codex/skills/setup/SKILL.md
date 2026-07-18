@@ -1,5 +1,6 @@
 ---
-description: Check whether the local Codex runtime is ready.
+name: setup
+description: Checks whether the local Codex runtime is ready. Use when installing for the first time, after a CLI upgrade, or after a setup class failure.
 argument-hint: '[--cwd <dir>] [--json]'
 allowed-tools: Bash(node:*), Read, Write
 ---
