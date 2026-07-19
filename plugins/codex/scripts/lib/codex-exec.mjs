@@ -4,9 +4,20 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
-const DEFAULT_TIMEOUT_MS = 570000;
-const DEFAULT_TERMINATION_GRACE_MS = 2000;
-const DEFAULT_TERMINATION_POLL_MS = 25;
+export const DEFAULT_TIMEOUT_MS = 570000;
+export const DEFAULT_TERMINATION_GRACE_MS = 2000;
+export const DEFAULT_TERMINATION_POLL_MS = 25;
+export const BASH_TOOL_TIMEOUT_MS = 600000;
+export const TIMEOUT_PATH_MARGIN_MS = 15000;
+const FORCED_CLOSE_MS = 50;
+const DEFAULT_TIMEOUT_ESCALATION_MS =
+  DEFAULT_TERMINATION_GRACE_MS * 2 + DEFAULT_TERMINATION_POLL_MS * 3 + FORCED_CLOSE_MS;
+export const DEFAULT_TIMEOUT_PATH_MAX_MS = DEFAULT_TIMEOUT_MS + DEFAULT_TIMEOUT_ESCALATION_MS;
+export const DEFAULT_TIMEOUT_PATH_WITH_MARGIN_MS = DEFAULT_TIMEOUT_PATH_MAX_MS + TIMEOUT_PATH_MARGIN_MS;
+
+if (DEFAULT_TIMEOUT_PATH_WITH_MARGIN_MS > BASH_TOOL_TIMEOUT_MS) {
+  throw new Error("The default Codex timeout path exceeds the Bash tool deadline.");
+}
 const DEFAULT_STDERR_MAX_BYTES = 256 * 1024;
 const DEFAULT_EVENTS_MAX_BYTES = 8 * 1024 * 1024;
 const DEFAULT_EVENT_LINE_MAX_BYTES = 1024 * 1024;
@@ -18,6 +29,7 @@ const MAX_ROLLOUT_SCAN_ENTRIES = 50000;
 const MAX_DIAGNOSTICS = 64;
 const MAX_DIAGNOSTIC_MESSAGE_BYTES = 4096;
 const EFFORT_PATTERN = /^[a-z][a-z0-9_-]{0,31}$/;
+const SERVICE_TIER_PATTERN = /^[a-z][a-z0-9_-]{0,31}$/;
 const THREAD_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 const WEB_SEARCH_MODES = new Set(["disabled", "cached", "live"]);
 const PRIVATE_DIR_MODE = 0o700;
@@ -101,6 +113,14 @@ function appendExplicitSettings(args, options, sandbox) {
   }
   if (options.model != null) {
     args.push("--model", nonemptyString(options.model, "model"));
+  }
+  const configuredServiceTier = hasOwn(options, "serviceTier") ? options.serviceTier : "priority";
+  const serviceTier = configuredServiceTier === "none" ? null : configuredServiceTier;
+  if (serviceTier != null) {
+    if (typeof serviceTier !== "string" || !SERVICE_TIER_PATTERN.test(serviceTier)) {
+      throw new TypeError(`Unsupported Codex service tier: ${serviceTier}`);
+    }
+    args.push("-c", `service_tier=${serviceTier}`);
   }
   const effort = options.effort ?? options.modelReasoningEffort;
   if (effort != null) {
@@ -266,6 +286,20 @@ export function subtractUsage(endValue, startValue) {
 
 function observedString(value) {
   return typeof value === "string" && value.trim() ? value.trim() : null;
+}
+
+function sessionConfiguredServiceTier(event) {
+  if (!["session.configured", "session_configured", "session-configured"].includes(event.type)) {
+    return null;
+  }
+  const metadata = [event, event.config, event.metadata, event.session, event.session_config, event.sessionConfig, event.session_configured, event.sessionConfigured];
+  for (const value of metadata) {
+    const serviceTier = observedString(value?.service_tier ?? value?.serviceTier);
+    if (serviceTier && SERVICE_TIER_PATTERN.test(serviceTier)) {
+      return serviceTier;
+    }
+  }
+  return null;
 }
 
 function codexHome(env) {
@@ -906,6 +940,7 @@ function outputPaths(options) {
 
 function checkpointState(state, event = null) {
   return {
+    appliedServiceTier: state.appliedServiceTier,
     collaborationViolation: state.collaborationViolation,
     event,
     eventCount: state.eventCount,
@@ -954,6 +989,11 @@ function validateEvent(state, event) {
   state.eventCount += 1;
   classifyDiagnostic(state, event);
   switch (event.type) {
+    case "session.configured":
+    case "session_configured":
+    case "session-configured":
+      state.appliedServiceTier = sessionConfiguredServiceTier(event) ?? state.appliedServiceTier;
+      break;
     case "thread.started": {
       if (state.threadStarted || state.turnStarted || state.terminalEvent) {
         recordProtocolError(state, "Codex emitted thread.started outside the initial lifecycle position.");
@@ -1107,9 +1147,6 @@ function failureOutcome(state, processOutcome, stderrTail) {
   if (state.collaborationViolation) {
     return { status: "error", failureKind: "policy", errorMessage: state.collaborationViolation };
   }
-  if (state.timedOut) {
-    return { status: "error", failureKind: "timeout", errorMessage: `Codex timed out after ${state.timeoutMs}ms.` };
-  }
   if (state.cancelled) {
     return { status: "cancelled", failureKind: "cancelled", errorMessage: "Codex execution was cancelled." };
   }
@@ -1139,6 +1176,14 @@ function failureOutcome(state, processOutcome, stderrTail) {
     };
   }
   return { status: "done", failureKind: null, errorMessage: null };
+}
+
+function timeoutOutcome(state) {
+  return {
+    status: state.cleanupComplete ? "error" : "running",
+    failureKind: "timeout",
+    errorMessage: `Codex timed out after ${state.timeoutMs}ms.`
+  };
 }
 
 export async function runCodex(options = {}) {
@@ -1180,6 +1225,7 @@ export async function runCodex(options = {}) {
     fs.chmodSync(options.eventsFile, PRIVATE_FILE_MODE);
   }
   const state = {
+    appliedServiceTier: null,
     callbackError: null,
     cancelled: false,
     cleanupComplete: true,
@@ -1266,7 +1312,7 @@ export async function runCodex(options = {}) {
             child.unref();
             resolveForcedClose({ code: null, exitCode: null, forced: true, signal: null });
           }
-        }, 50);
+        }, FORCED_CLOSE_MS);
         return terminated;
       });
     }
@@ -1337,6 +1383,11 @@ export async function runCodex(options = {}) {
     child.stdin.once("close", settle);
     child.stdin.end(prompt);
   });
+  const timer = setTimeout(() => {
+    state.timedOut = true;
+    void requestTermination();
+  }, timeoutMs);
+  timer.unref?.();
   child.stderr?.on("data", (chunk) => {
     stderr = boundedBuffer(stderr, chunk, stderrMaxBytes);
     if (options.logFile) {
@@ -1368,11 +1419,6 @@ export async function runCodex(options = {}) {
   } else {
     options.signal?.addEventListener("abort", abort, { once: true });
   }
-  const timer = setTimeout(() => {
-    state.timedOut = true;
-    void requestTermination();
-  }, timeoutMs);
-  timer.unref?.();
   const processLine = async (lineBuffer) => {
     const line = (lineBuffer.at(-1) === 13 ? lineBuffer.subarray(0, -1) : lineBuffer).toString("utf8");
     if (eventsFd != null && !state.eventsTruncated) {
@@ -1516,7 +1562,9 @@ export async function runCodex(options = {}) {
     usage.tokenUsageUnavailableReason = null;
   }
   const stderrTail = stderr.toString("utf8");
-  const failure = failureOutcome(state, { ...processOutcome, spawnError }, stderrTail);
+  const failure = state.timedOut
+    ? timeoutOutcome(state)
+    : failureOutcome(state, { ...processOutcome, spawnError }, stderrTail);
   const rawErrorMessage = failure.errorMessage;
   const errorMessage = rawErrorMessage == null ? null : safeDiagnosticMessage(rawErrorMessage);
   return {
@@ -1540,6 +1588,7 @@ export async function runCodex(options = {}) {
     partialResultText: state.timedOut || state.cancelled ? state.finalResponse || null : null,
     resultSource: state.resultSource,
     cumulativeTokenUsage: state.cumulativeTokenUsage,
+    appliedServiceTier: state.appliedServiceTier,
     resolvedEffort: state.resolvedEffort,
     resolvedModel: state.resolvedModel,
     rolloutRecoveryStatus: state.rolloutRecoveryStatus,
