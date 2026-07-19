@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 
@@ -15,6 +16,36 @@ import {
 import { makeSandbox, stateModulePath } from "./lib/companion-harness.mjs";
 
 const processIdentityModuleUrl = new URL("../plugins/grok/scripts/lib/process-identity.mjs", import.meta.url).href;
+
+// Module-scoped fast identity probes (same pattern as tests/stats.test.mjs).
+// Real Darwin `ps` is both slow under parallel suite load and can fail (EPERM /
+// timeout); state.mjs's lock path calls getProcessIdentity on every acquire, and
+// LOCK_TIMEOUT_MS is only 2s — so reaper children lose the race without this.
+const processIdentityBin = fs.mkdtempSync(path.join(os.tmpdir(), "grok-state-lock-identity-"));
+const originalPath = process.env.PATH;
+fs.writeFileSync(
+  path.join(processIdentityBin, "ps"),
+  `#!/bin/sh
+pid=""
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = "-p" ]; then
+    pid="$2"
+    shift 2
+  else
+    shift
+  fi
+done
+printf "process-%s\\n" "$pid"
+`
+);
+fs.writeFileSync(path.join(processIdentityBin, "sysctl"), '#!/bin/sh\nprintf "{ sec = 1, usec = 0 }\\n"\n');
+fs.chmodSync(path.join(processIdentityBin, "ps"), 0o755);
+fs.chmodSync(path.join(processIdentityBin, "sysctl"), 0o755);
+process.env.PATH = `${processIdentityBin}${path.delimiter}${originalPath}`;
+test.after(() => {
+  process.env.PATH = originalPath;
+  fs.rmSync(processIdentityBin, { recursive: true, force: true });
+});
 
 const heldLockChild = `
 import fs from "node:fs";
@@ -51,8 +82,17 @@ function makeRecord(sandbox, id) {
   return file;
 }
 
-function runChild(source, args) {
-  const child = spawn(process.execPath, ["--input-type=module", "--eval", source, ...args], { stdio: ["ignore", "pipe", "pipe"] });
+function childEnv(extra = {}) {
+  // Inherit the module PATH (fake ps/sysctl first) so forked reapers never block
+  // on real process-table probes under suite load.
+  return { ...process.env, LANG: "C", LC_ALL: "C", TZ: "UTC", ...extra };
+}
+
+function runChild(source, args, env = childEnv()) {
+  const child = spawn(process.execPath, ["--input-type=module", "--eval", source, ...args], {
+    stdio: ["ignore", "pipe", "pipe"],
+    env
+  });
   let stderr = "";
   child.stderr.setEncoding("utf8");
   child.stderr.on("data", (chunk) => {
@@ -65,11 +105,21 @@ function runChild(source, args) {
   return { child, completion };
 }
 
-async function waitForPath(file, timeoutMs = 3000) {
+async function waitForPath(file, timeoutMs = 15000) {
   const deadline = Date.now() + timeoutMs;
   while (!fs.existsSync(file)) {
     if (Date.now() >= deadline) {
       throw new Error(`Timed out waiting for ${file}.`);
+    }
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+}
+
+async function waitFor(predicate, label, timeoutMs = 15000) {
+  const deadline = Date.now() + timeoutMs;
+  while (!predicate()) {
+    if (Date.now() >= deadline) {
+      throw new Error(`Timed out waiting for ${label}.`);
     }
     await new Promise((resolve) => setTimeout(resolve, 10));
   }
@@ -105,17 +155,35 @@ test("concurrent reapers serialize after a lock owner is killed", async (t) => {
   const readyFile = path.join(sandbox.root, "holder-ready");
   const releaseFile = path.join(sandbox.root, "holder-release");
   const holder = runChild(heldLockChild, [stateModulePath, jobFile, readyFile, releaseFile]);
-  t.after(() => holder.child.kill("SIGKILL"));
+  t.after(() => {
+    try {
+      holder.child.kill("SIGKILL");
+    } catch {}
+  });
+  // Ready is written only while the holder owns the linked lock — wait for both.
   await waitForPath(readyFile);
+  await waitFor(() => fs.existsSync(`${jobFile}.lock`), `lock for ${jobFile}`);
+  const { owner } = lockPaths(jobFile);
+  assert.equal(owner.ownerPid, holder.child.pid);
+
   holder.child.kill("SIGKILL");
   const holderResult = await holder.completion;
   assert.equal(holderResult.signal, "SIGKILL", holderResult.stderr);
+  // Do not start reapers until the dead owner is observable: under load, kill/reap
+  // of the holder process can lag behind the close event.
+  await waitFor(
+    () => !processIdentityMatches(owner.ownerPid, owner.ownerIdentity),
+    `dead owner identity for pid ${owner.ownerPid}`
+  );
 
   const guardFile = path.join(sandbox.root, "record.guard");
+  // Four concurrent reapers still race; identity probes stay cheap via PATH fakes.
   const updaters = Array.from({ length: 4 }, () => runChild(incrementChild, [stateModulePath, jobFile, guardFile]));
   t.after(() => {
     for (const updater of updaters) {
-      updater.child.kill("SIGKILL");
+      try {
+        updater.child.kill("SIGKILL");
+      } catch {}
     }
   });
   const results = await Promise.all(updaters.map((updater) => updater.completion));
