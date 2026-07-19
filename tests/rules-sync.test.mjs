@@ -320,7 +320,7 @@ test("Grok rules document source verified headless boundaries", () => {
   assert.match(rules, /sandbox still permits consult `read_file` to reach `~\/\.grok\/auth\.json`/i);
   assert.match(rules, /native MCP servers, plugins, or hooks/);
   assert.match(rules, /bridge variables disable compatibility imports, not native Grok configuration/);
-  assert.match(rules, /--record-worker-acceptance <fusion-task-id>/);
+  assert.match(rules, /After collecting and verifying any delegated result, settle its verdict in one call with `\/fusion:stats --record <id>=<accepted\|rejected\|unverified>`, where the id is the fusion task id or the engine job id; one settle writes the worker ledger and the linked engine record together, strict record forms may pass as direct arguments, and anything carrying free text still uses the raw-args transport\. Record accepted only when the verification command or explicit acceptance criteria pass\./);
   assert.match(rules, /literal state `uncollected`/);
   assert.match(rules, /one process pool per canonical cwd and sandbox profile/);
   assert.match(rules, /agent --no-leader stdio/);

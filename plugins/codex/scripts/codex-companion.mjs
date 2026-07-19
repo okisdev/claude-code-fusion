@@ -8,7 +8,7 @@ import path from "node:path";
 import { isatty } from "node:tty";
 import { fileURLToPath } from "node:url";
 
-import { parseArgs, parseRawArgs, splitRawArgumentString } from "./lib/args.mjs";
+import { parseArgs, parseRawArgs, parseServiceTier, splitRawArgumentString } from "./lib/args.mjs";
 import {
   buildReviewArgs,
   buildTaskArgs,
@@ -42,8 +42,10 @@ import {
   jobEventsPath,
   jobFilePath,
   jobLogPath,
+  jobsDir,
   listAllJobRecords,
   listJobRecords,
+  latestJobRecordForThread,
   markJobCollectedFile,
   nowIso,
   pruneJobState,
@@ -92,6 +94,9 @@ const TRANSPORT_OWNER_MAX_BYTES = 4096;
 const TRANSPORT_MAX_AGE_MS = 60 * 60 * 1000;
 const RECORD_ACCEPTANCE_JOB_ID_PATTERN = /^[a-f0-9]{32}$/;
 const RECORD_ACCEPTANCE_VALUES = new Set(["accepted", "rejected", "unverified"]);
+const MODELS_CACHE_SCHEMA_DRIFT_NEXT_STEP = "Codex CLI cannot parse the current models cache (schema drift). Upgrade the Codex CLI, then run /codex:setup again.";
+const SETUP_LOG_PROBE_BYTES = 64 * 1024;
+const SETUP_LOG_PROBE_LIMIT = 5;
 
 let activeCommandArgv = null;
 
@@ -106,8 +111,8 @@ function printUsage() {
   process.stdout.write(
     [
       "Usage:",
-      "  node scripts/codex-companion.mjs task [--prompt-file <path>] [--write] [--background] [--resume <thread-id>] [--resume-last] [--fresh] [--model <id>] [--effort <level>] [--web] [--network] [--skip-git-repo-check] [--cwd <dir>] [--json] [--] [prompt]",
-      "  node scripts/codex-companion.mjs review [--base <ref>] [--scope <auto|working-tree|branch>] [--focus <text>] [--background] [--model <id>] [--effort <level>] [--cwd <dir>] [--json]",
+      "  node scripts/codex-companion.mjs task [--prompt-file <path>] [--write] [--background] [--resume <thread-id>] [--resume-last] [--fresh] [--model <id>] [--effort <level>] [--service-tier <id|none>] [--web] [--network] [--skip-git-repo-check] [--cwd <dir>] [--json] [--] [prompt]",
+      "  node scripts/codex-companion.mjs review [--base <ref>] [--scope <auto|working-tree|branch>] [--focus <text>] [--background] [--model <id>] [--effort <level>] [--service-tier <id|none>] [--cwd <dir>] [--json]",
       "  node scripts/codex-companion.mjs adversarial-review [--base <ref>] [--scope <auto|working-tree|branch>] [--focus <text>] [--background] [--model <id>] [--effort <level>] [--cwd <dir>] [--json]",
       "  node scripts/codex-companion.mjs status [job-id] [--all] [--cwd <dir>] [--json]",
       "  node scripts/codex-companion.mjs result <job-id> [--wait] [--wait-timeout-ms <ms>] [--cwd <dir>] [--json]",
@@ -132,6 +137,14 @@ function commandArgs(rawArgv, config) {
       return parseRawArgs(rawArgv[0], config);
     }
     return { ...parseArgs(rawArgv, config), positionalText: null };
+  } catch (error) {
+    throw new CompanionError(error.message, "input");
+  }
+}
+
+function serviceTierOption(value) {
+  try {
+    return parseServiceTier(value);
   } catch (error) {
     throw new CompanionError(error.message, "input");
   }
@@ -647,6 +660,38 @@ function readTaskPrompt(cwd, options, positionals, positionalText) {
   return readStdinIfPiped();
 }
 
+export function parseTaskHeader(prompt) {
+  const line = String(prompt ?? "").split(/\r?\n/).find((candidate) => candidate.trim());
+  if (!line || !line.includes("|")) {
+    return { headerModel: null, headerEffort: null };
+  }
+  let headerModel = null;
+  let headerEffort = null;
+  for (const segment of line.split("|")) {
+    const model = segment.match(/^\s*model\s*:\s*(\S+)\s*$/i);
+    if (model && !headerModel) {
+      headerModel = model[1];
+      continue;
+    }
+    const effort = segment.match(/^\s*effort\s*:\s*(\S+)\s*$/i);
+    if (effort && !headerEffort) {
+      headerEffort = effort[1];
+    }
+  }
+  return { headerModel, headerEffort };
+}
+
+function taskModelDrift(record, prompt, resolvedModel) {
+  if (record.jobClass !== "task" || record.request?.model != null || typeof resolvedModel !== "string" || !resolvedModel.trim()) {
+    return null;
+  }
+  const { headerModel, headerEffort } = parseTaskHeader(prompt);
+  if (!headerModel || headerModel === resolvedModel) {
+    return null;
+  }
+  return { headerModel, headerEffort, resolvedModel };
+}
+
 function currentClaudeSessionId() {
   const value = process.env[SESSION_ID_ENV];
   return typeof value === "string" && value.trim() ? value.trim() : null;
@@ -712,6 +757,56 @@ function compareVersion(left, right) {
 function supportedVersion(value) {
   const parsed = parseVersion(value);
   return Boolean(parsed) && compareVersion(parsed, TESTED_VERSION_MIN) >= 0 && compareVersion(parsed, TESTED_VERSION_MAX) < 0;
+}
+
+function setupLogTailContainsSchemaDrift(file) {
+  let descriptor;
+  try {
+    const stat = fs.statSync(file);
+    if (!stat.isFile()) {
+      return false;
+    }
+    const bytes = Math.min(stat.size, SETUP_LOG_PROBE_BYTES);
+    if (bytes === 0) {
+      return false;
+    }
+    const buffer = Buffer.alloc(bytes);
+    descriptor = fs.openSync(file, "r");
+    const read = fs.readSync(descriptor, buffer, 0, bytes, stat.size - bytes);
+    const tail = buffer.subarray(0, read).toString("utf8");
+    return tail.includes("failed to renew cache TTL") || (tail.includes("missing field `") && tail.includes("codex_models_manager"));
+  } catch {
+    return false;
+  } finally {
+    if (descriptor !== undefined) {
+      try {
+        fs.closeSync(descriptor);
+      } catch {}
+    }
+  }
+}
+
+function hasRecentModelsCacheSchemaDrift(dataDir, cwd) {
+  let entries;
+  try {
+    entries = fs.readdirSync(jobsDir(dataDir, cwd), { withFileTypes: true });
+  } catch {
+    return false;
+  }
+  const recentLogs = entries
+    .filter((entry) => entry.isFile() && entry.name.endsWith(".log"))
+    .map((entry) => {
+      const file = path.join(jobsDir(dataDir, cwd), entry.name);
+      try {
+        return { file, modifiedAt: fs.statSync(file).mtimeMs };
+      } catch {
+        return null;
+      }
+    })
+    .filter(Boolean)
+    .sort((left, right) => right.modifiedAt - left.modifiedAt || left.file.localeCompare(right.file))
+    .slice(0, SETUP_LOG_PROBE_LIMIT);
+  return recentLogs.some(({ file }) => setupLogTailContainsSchemaDrift(file));
 }
 
 function findRequestedJob(dataDir, jobId, options) {
@@ -1021,6 +1116,39 @@ function resolveResume(dataDir, cwd, options) {
   };
 }
 
+function inheritedRouting(record, options, defaultServiceTier) {
+  const source = record?.request && typeof record.request === "object" && !Array.isArray(record.request) ? record.request : {};
+  const explicitModel = Object.hasOwn(options, "model");
+  const explicitEffort = Object.hasOwn(options, "effort");
+  const explicitServiceTier = Object.hasOwn(options, "service-tier");
+  let model = explicitModel ? options.model : null;
+  let effort = explicitEffort ? options.effort : null;
+  let serviceTier = defaultServiceTier;
+  let inherited = false;
+
+  const sourceModel = typeof source.model === "string" && source.model.trim() ? source.model : record?.resolvedModel;
+  if (!explicitModel && typeof sourceModel === "string" && sourceModel.trim()) {
+    model = sourceModel;
+    inherited = true;
+  }
+  const sourceEffort = typeof source.effort === "string" && source.effort.trim() ? source.effort : record?.resolvedEffort;
+  if (!explicitEffort && typeof sourceEffort === "string" && sourceEffort.trim()) {
+    effort = sourceEffort;
+    inherited = true;
+  }
+  const hasSourceServiceTier = Object.hasOwn(source, "serviceTier") || typeof record?.serviceTier === "string" || typeof record?.appliedServiceTier === "string";
+  const sourceServiceTier = Object.hasOwn(source, "serviceTier")
+    ? source.serviceTier
+    : typeof record?.serviceTier === "string"
+      ? record.serviceTier
+      : record?.appliedServiceTier;
+  if (!explicitServiceTier && hasSourceServiceTier) {
+    serviceTier = sourceServiceTier === null ? null : serviceTierOption(sourceServiceTier);
+    inherited = true;
+  }
+  return { effort, inherited, model, serviceTier };
+}
+
 function createReservedJob({ background, brief, codexVersion, cwd, dataDir, jobClass, mode, request }) {
   brief = boundedPrompt(brief);
   const ownerIdentity = background ? null : currentProcessIdentity();
@@ -1089,6 +1217,7 @@ function executionArgs(record) {
     cwd: record.cwd,
     effort: request.effort,
     model: request.model,
+    serviceTier: Object.hasOwn(request, "serviceTier") ? request.serviceTier : "priority",
     network: Boolean(request.network),
     skipGitRepoCheck: Boolean(request.skipGitRepoCheck),
     web: Boolean(request.web)
@@ -1167,10 +1296,12 @@ async function executeRecord(found) {
   }
   const timeoutMs = resolveExecutionTimeout(record.background);
   const startedAt = record.startedAt ?? nowIso();
+  const serviceTier = Object.hasOwn(record.request ?? {}, "serviceTier") ? record.request.serviceTier : "priority";
   record = updateJobRecordFile(found.file, {
     deadlineAt: new Date(Date.now() + timeoutMs).toISOString(),
     heartbeatAt: nowIso(),
     phase: record.background ? "codex-spawning" : "executing",
+    serviceTier,
     pid: process.pid,
     pidIdentity: ownerIdentity,
     pidOwnsProcessGroup: record.background && process.platform !== "win32",
@@ -1198,9 +1329,16 @@ async function executeRecord(found) {
       freshThread: !record.request?.resumeThreadId,
       logFile: record.logFile,
       onCheckpoint: (checkpoint) => {
+        const patch = {};
         if (checkpoint.threadId && checkpoint.threadId !== checkpointedThreadId) {
           checkpointedThreadId = checkpoint.threadId;
-          updateJobRecordFile(found.file, { heartbeatAt: nowIso(), threadId: checkpoint.threadId });
+          patch.threadId = checkpoint.threadId;
+        }
+        if (checkpoint.appliedServiceTier) {
+          patch.appliedServiceTier = checkpoint.appliedServiceTier;
+        }
+        if (Object.keys(patch).length > 0) {
+          updateJobRecordFile(found.file, { heartbeatAt: nowIso(), ...patch });
         }
       },
       onSpawnAttempt: (pid) => {
@@ -1243,6 +1381,8 @@ async function executeRecord(found) {
     }
     const errorTail = redactDiagnostic(readLogTail(record.logFile, 20) || boundedTail(outcome.stderrTail));
     const semantic = semanticOutcome(outcome);
+    const resolvedModel = outcome.resolvedModel ?? record.resolvedModel;
+    const modelDrift = taskModelDrift(record, prompt, resolvedModel);
     return finishJob(found.file, {
       cumulativeTokenUsage: outcome.cumulativeTokenUsage,
       diagnostics: outcome.diagnostics.map((diagnostic) => ({ ...diagnostic, message: redactDiagnostic(diagnostic.message) })),
@@ -1253,8 +1393,10 @@ async function executeRecord(found) {
       failureKind: outcome.failureKind,
       protocolError: outcome.protocolError ? redactDiagnostic(outcome.protocolError) : null,
       partialResultText: outcome.partialResultText ? redactDiagnostic(outcome.partialResultText) : null,
+      appliedServiceTier: outcome.appliedServiceTier ?? record.appliedServiceTier,
       resolvedEffort: outcome.resolvedEffort ?? record.resolvedEffort,
-      resolvedModel: outcome.resolvedModel ?? record.resolvedModel,
+      resolvedModel,
+      ...(modelDrift ? { modelDrift } : {}),
       rolloutRecoveryStatus: outcome.rolloutRecoveryStatus,
       result: {
         eventCount: outcome.eventCount,
@@ -1470,11 +1612,13 @@ async function handleTask(rawArgv, transport = {}) {
   const { options, positionals, positionalText } = commandArgs(rawArgv, {
     booleanOptions: ["background", "fresh", "json", "network", "resume-last", "skip-git-repo-check", "web", "write"],
     optionsBeforePositionals: true,
-    valueOptions: ["cwd", "effort", "model", "prompt-file", "resume"]
+    valueOptions: ["cwd", "effort", "model", "prompt-file", "resume", "service-tier"]
   });
+  const serviceTier = serviceTierOption(options["service-tier"]);
   const cwd = resolveCwd(options);
   const dataDir = resolveDataDir();
   const resume = resolveResume(dataDir, cwd, options);
+  const routing = resume.threadId ? inheritedRouting(latestJobRecordForThread(dataDir, resume.threadId), options, serviceTier) : inheritedRouting(null, options, serviceTier);
   const write = options.write ?? Boolean(transport.defaultWrite);
   let prompt = readTaskPrompt(cwd, options, positionals, positionalText);
   if (!prompt.trim() && resume.threadId) {
@@ -1488,17 +1632,19 @@ async function handleTask(rawArgv, transport = {}) {
   }
   const probe = preflightCodex(cwd);
   const request = {
-    effort: options.effort ?? null,
+    effort: routing.effort,
     fresh: Boolean(options.fresh),
     ingress: transport.ingress ?? "argv",
-    model: options.model ?? null,
+    model: routing.model,
     network: Boolean(options.network),
     resumeSourceJobId: resume.sourceJobId,
     resumeThreadId: resume.threadId,
     skipGitRepoCheck: Boolean(options["skip-git-repo-check"]),
+    serviceTier: routing.serviceTier,
     transport: "task",
     web: Boolean(options.web),
-    write: Boolean(write)
+    write: Boolean(write),
+    ...(routing.inherited ? { inheritedFromThread: true } : {})
   };
   validateExecutionRequest(cwd, request);
   const found = createReservedJob({
@@ -1555,12 +1701,13 @@ function adversarialReviewPrompt(target, focus) {
 async function handleReview(rawArgv, adversarial = false, transport = {}) {
   const { options, positionals, positionalText } = commandArgs(rawArgv, {
     booleanOptions: ["background", "json"],
-    valueOptions: ["base", "cwd", "effort", "focus", "model", "scope"]
+    valueOptions: ["base", "cwd", "effort", "focus", "model", "scope", "service-tier"]
   });
   if (positionals.length > 0 && !options.focus) {
     throw new CompanionError("Review accepts flags only. Pass custom review instructions with --focus.", "input");
   }
   const cwd = resolveCwd(options);
+  const serviceTier = serviceTierOption(options["service-tier"]);
   const probe = preflightCodex(cwd);
   const target = reviewTarget(options);
   const positionalFocus = positionalText ?? positionals.join(" ");
@@ -1578,6 +1725,7 @@ async function handleReview(rawArgv, adversarial = false, transport = {}) {
     ingress: transport.ingress ?? "argv",
     model: options.model ?? null,
     network: false,
+    serviceTier,
     transport: usePromptTransport ? (adversarial ? "adversarial-review" : "focused-review") : "native-review",
     uncommitted: target.uncommitted,
     web: false,
@@ -1967,6 +2115,9 @@ function handleSetup(rawArgv) {
   }
   if (!writable) {
     nextSteps.push(`Make the adapter data directory writable: ${dataDir}.`);
+  }
+  if (hasRecentModelsCacheSchemaDrift(dataDir, cwd)) {
+    nextSteps.push(MODELS_CACHE_SCHEMA_DRIFT_NEXT_STEP);
   }
   const report = {
     authenticated: auth.authenticated,

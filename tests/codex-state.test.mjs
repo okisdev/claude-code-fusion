@@ -162,6 +162,8 @@ test("job ids contain 128 bits and records expose the canonical Codex fields", (
   assert.strictEqual(record.delivery, "foreground");
   assert.strictEqual(record.deliveryCollectedAt, null);
   assert.strictEqual(record.semanticStatus, "unverified");
+  assert.strictEqual(record.serviceTier, null);
+  assert.strictEqual(record.appliedServiceTier, null);
   assert.strictEqual(record.resolvedModel, "gpt-test");
   assert.strictEqual(record.resolvedEffort, "high");
   assert.strictEqual(record.collectedAt, null);
@@ -179,6 +181,20 @@ test("job ids contain 128 bits and records expose the canonical Codex fields", (
   assert.deepStrictEqual(record.request, { model: "gpt-test", effort: "high" });
   assert.match(record.repositoryKey, /^[a-f0-9]{16}$/);
   assert.deepStrictEqual([...TERMINAL_STATUSES].sort(), ["cancelled", "done", "error"]);
+});
+
+test("model drift round-trips as optional job record metadata", (t) => {
+  const sandbox = makeSandbox(t);
+  const modelDrift = {
+    headerModel: "gpt-header",
+    headerEffort: "xhigh",
+    resolvedModel: "gpt-resolved"
+  };
+  const { file, record } = makeRecord(sandbox, { modelDrift });
+  assert.deepStrictEqual(record.modelDrift, modelDrift);
+  assert.deepStrictEqual(readJobRecordFile(file).modelDrift, modelDrift);
+  const { record: withoutDrift } = makeRecord(sandbox);
+  assert.strictEqual(Object.hasOwn(withoutDrift, "modelDrift"), false);
 });
 
 test("the data directory override and all artifact paths are deterministic", (t) => {
@@ -286,6 +302,18 @@ test("terminal records never regress or accept later enrichment", (t) => {
   writeJobRecordFile(file, { ...finished, status: "cancelled", resultText: "late cancel" });
   assert.deepStrictEqual(readJobRecordFile(file), finished);
   assert.deepStrictEqual(finishJobRecordFile(file, { status: "error", failureKind: "error" }), finished);
+});
+
+test("terminal finalization preserves the first finished timestamp", (t) => {
+  const sandbox = makeSandbox(t);
+  const { file } = makeRecord(sandbox);
+  const firstFinishedAt = "2026-07-19T07:50:39.000Z";
+  const laterFinishedAt = "2026-07-19T08:11:28.000Z";
+  const first = finishJobRecordFile(file, { finishedAt: firstFinishedAt, status: "done" });
+  const second = updateJobRecordFileWithCurrent(file, () => ({ finishedAt: laterFinishedAt, status: "done" }), { allowTerminal: true });
+
+  assert.equal(first.finishedAt, firstFinishedAt);
+  assert.equal(second.finishedAt, firstFinishedAt);
 });
 
 test("terminal collection is an atomic idempotent lifecycle transition", (t) => {

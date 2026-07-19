@@ -14,6 +14,9 @@ import {
 
 const cliRuntimeSkill = path.join(repoRoot, "plugins", "grok", "skills", "grok-cli-runtime", "SKILL.md");
 const { parseArgs } = await import(path.join(repoRoot, "plugins", "grok", "scripts", "lib", "args.mjs"));
+const codexHarness = await import("./lib/codex-companion-harness.mjs");
+const { parseServiceTier } = await import(path.join(repoRoot, "plugins", "codex", "scripts", "lib", "args.mjs"));
+const { buildTaskArgs: buildCodexTaskArgs } = await import(path.join(repoRoot, "plugins", "codex", "scripts", "lib", "codex-exec.mjs"));
 const { buildGrokArgs, NESTED_ENGINE_CLI_DENY_NAMES } = await import(
   path.join(repoRoot, "plugins", "grok", "scripts", "lib", "grok-exec.mjs"),
 );
@@ -85,6 +88,24 @@ function seedFinishedSessionJob(sandbox, fields) {
   };
   writeJobRecordFile(jobFilePath(sandbox.dataDir, sandbox.workDir, fields.id), record);
 }
+
+test("Codex service tiers default to priority, accept an explicit id, and omit none", () => {
+  assert.ok(hasPair(buildCodexTaskArgs(), "-c", "service_tier=priority"));
+  assert.ok(hasPair(buildCodexTaskArgs({ serviceTier: "flex" }), "-c", "service_tier=flex"));
+  assert.ok(!buildCodexTaskArgs({ serviceTier: parseServiceTier("none") }).includes("-c"));
+});
+
+test("Codex rejects invalid service tiers as typed input", (t) => {
+  const invalidSandbox = codexHarness.makeSandbox(t);
+  const invalidResult = codexHarness.runCompanion(["task", "--json", "--service-tier", "Priority", "reject this"], {
+    cwd: invalidSandbox.workDir,
+    env: codexHarness.envFor(invalidSandbox)
+  });
+  assert.strictEqual(invalidResult.status, 1);
+  const failure = JSON.parse(invalidResult.stderr);
+  assert.strictEqual(failure.failureKind, "input");
+  assert.match(failure.message, /--service-tier option must be a lowercase id or none/);
+});
 
 test("help and runtime skill list history, cancel, and setup flags", (t) => {
   const sandbox = makeSandbox(t);
