@@ -11,8 +11,12 @@ const LOCK_TIMEOUT_MS = 2_000;
 const TRANSCRIPT_CHUNK_BYTES = 1024 * 1024;
 const TRANSCRIPT_REFRESH_BYTES = 8 * TRANSCRIPT_CHUNK_BYTES;
 const TRANSCRIPT_CARRY_BYTES = 256 * 1024;
+const TASK_OUTPUT_TRANSCRIPT_MAX_BYTES = 50 * 1024 * 1024;
+const TASK_OUTPUT_TRANSCRIPT_CHUNK_BYTES = 64 * 1024;
+const TASK_OUTPUT_TRANSCRIPT_MAX_LINE_BYTES = 1024 * 1024;
 const TERMINAL_STATUSES = new Set(["done", "incomplete", "failed", "cancelled", "owner_ended"]);
 const ACCEPTANCE_STATES = new Set(["accepted", "rejected", "unverified"]);
+const PEER_JOB_FOOTER_AGENT_TYPES = new Set(["codex:codex-rescue", "grok:grok-rescue", "grok:grok-review-runner"]);
 const AGENT_TYPES = new Map([
   ["fusion:fast-worker", "fusion:fast-worker"],
   ["fast-worker", "fusion:fast-worker"],
@@ -175,10 +179,17 @@ export function updateWorkerRecord(taskId, env, updater) {
 }
 
 export function markWorkerCollected(record, method, collectedAt = new Date().toISOString()) {
+  const awaitingVerdict = !record.collectedAt && record.acceptance === "unverified";
   return {
     ...record,
     collectionMethod: record.collectionMethod ?? method,
-    collectedAt: record.collectedAt ?? collectedAt
+    collectedAt: record.collectedAt ?? collectedAt,
+    awaitingCollection: false,
+    awaitingCollectionArmedAt: null,
+    ...(awaitingVerdict ? {
+      awaitingVerdict: true,
+      awaitingVerdictArmedAt: collectedAt
+    } : {})
   };
 }
 
@@ -209,9 +220,15 @@ export function createWorkerRecord(record, env = process.env) {
       userBackgroundAuthorized: record.userBackgroundAuthorized === true,
       transportStatus: "dispatching",
       acceptance: "unverified",
+      ...(PEER_JOB_FOOTER_AGENT_TYPES.has(record.agentType) ? { peerJobId: null } : {}),
       failureKind: null,
+      deliveryMode: null,
       collectionMethod: null,
       collectedAt: null,
+      awaitingCollection: false,
+      awaitingCollectionArmedAt: null,
+      awaitingVerdict: false,
+      awaitingVerdictArmedAt: null,
       retryCount: 0,
       stopBlockCount: 0,
       turns: 0,
@@ -441,6 +458,145 @@ export function refreshWorkerTranscript(record, transcriptPath) {
   return snapshot;
 }
 
+const USAGE_KEYS = ["inputTokens", "cacheCreationInputTokens", "cacheReadInputTokens", "outputTokens", "totalTokens", "uncachedTokens"];
+
+function emptyWorkerUsage() {
+  return { inputTokens: 0, cacheCreationInputTokens: 0, cacheReadInputTokens: 0, outputTokens: 0, totalTokens: 0, uncachedTokens: 0 };
+}
+
+function hasZeroWorkerUsage(record) {
+  return USAGE_KEYS.every((key) => {
+    const value = record?.usage?.[key];
+    return value == null || (Number.isSafeInteger(value) && value === 0);
+  });
+}
+
+function taskOutputMessageUsage(value) {
+  if (value == null) {
+    return emptyWorkerUsage();
+  }
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return null;
+  }
+  const fields = [
+    value.input_tokens ?? value.inputTokens,
+    value.cache_creation_input_tokens ?? value.cacheCreationInputTokens,
+    value.cache_read_input_tokens ?? value.cacheReadInputTokens,
+    value.output_tokens ?? value.outputTokens
+  ];
+  if (fields.some((field) => field != null && (!Number.isSafeInteger(field) || field < 0))) {
+    return null;
+  }
+  const [inputTokens = 0, cacheCreationInputTokens = 0, cacheReadInputTokens = 0, outputTokens = 0] = fields;
+  const totalTokens = inputTokens + cacheCreationInputTokens + cacheReadInputTokens + outputTokens;
+  const uncachedTokens = inputTokens + cacheCreationInputTokens + outputTokens;
+  return Number.isSafeInteger(totalTokens) && Number.isSafeInteger(uncachedTokens)
+    ? { inputTokens, cacheCreationInputTokens, cacheReadInputTokens, outputTokens, totalTokens, uncachedTokens }
+    : null;
+}
+
+function addWorkerUsage(totals, usage) {
+  const next = {};
+  for (const key of USAGE_KEYS) {
+    const value = totals[key] + usage[key];
+    if (!Number.isSafeInteger(value)) {
+      return null;
+    }
+    next[key] = value;
+  }
+  return next;
+}
+
+function taskOutputTelemetryLine(line, telemetry) {
+  const entry = JSON.parse(line);
+  if (entry?.type !== "assistant" || !entry.message || typeof entry.message !== "object") {
+    return telemetry;
+  }
+  const usage = taskOutputMessageUsage(entry.message.usage);
+  if (!usage) {
+    return null;
+  }
+  const nextUsage = addWorkerUsage(telemetry.usage, usage);
+  if (!nextUsage) {
+    return null;
+  }
+  const content = Array.isArray(entry.message.content) ? entry.message.content : [];
+  const toolCalls = content.filter((block) => block?.type === "tool_use").length;
+  if (!Number.isSafeInteger(telemetry.turns + 1) || !Number.isSafeInteger(telemetry.toolCalls + toolCalls)) {
+    return null;
+  }
+  return { turns: telemetry.turns + 1, toolCalls: telemetry.toolCalls + toolCalls, usage: nextUsage };
+}
+
+export function taskOutputTelemetry(transcriptPath) {
+  if (typeof transcriptPath !== "string" || !path.isAbsolute(transcriptPath)) {
+    return null;
+  }
+  let descriptor;
+  try {
+    const stat = fs.statSync(transcriptPath);
+    if (!stat.isFile() || stat.size > TASK_OUTPUT_TRANSCRIPT_MAX_BYTES) {
+      return null;
+    }
+    descriptor = fs.openSync(transcriptPath, "r");
+    let offset = 0;
+    let carry = "";
+    let telemetry = { turns: 0, toolCalls: 0, usage: emptyWorkerUsage() };
+    while (offset < stat.size) {
+      const buffer = Buffer.allocUnsafe(Math.min(TASK_OUTPUT_TRANSCRIPT_CHUNK_BYTES, stat.size - offset));
+      const read = fs.readSync(descriptor, buffer, 0, buffer.length, offset);
+      if (read === 0) {
+        break;
+      }
+      offset += read;
+      const text = `${carry}${buffer.subarray(0, read).toString("utf8")}`;
+      const lines = text.split("\n");
+      carry = lines.pop() ?? "";
+      if (Buffer.byteLength(carry) > TASK_OUTPUT_TRANSCRIPT_MAX_LINE_BYTES) {
+        return null;
+      }
+      for (const line of lines) {
+        if (!line.trim()) {
+          continue;
+        }
+        telemetry = taskOutputTelemetryLine(line, telemetry);
+        if (!telemetry) {
+          return null;
+        }
+      }
+    }
+    if (carry.trim()) {
+      telemetry = taskOutputTelemetryLine(carry, telemetry);
+    }
+    return telemetry;
+  } catch {
+    return null;
+  } finally {
+    if (descriptor != null) {
+      fs.closeSync(descriptor);
+    }
+  }
+}
+
+export function backfillWorkerTaskOutputTelemetry(record, transcriptPath) {
+  if (!hasZeroWorkerUsage(record)) {
+    return record;
+  }
+  const telemetry = taskOutputTelemetry(transcriptPath);
+  if (!telemetry) {
+    return record;
+  }
+  return {
+    ...record,
+    turns: telemetry.turns,
+    toolCalls: telemetry.toolCalls,
+    toolCallsSource: "harness-task-transcript",
+    usage: telemetry.usage,
+    usageSource: "harness-task-transcript",
+    usageAvailability: "available"
+  };
+}
+
 function validatedAcceptanceFields(acceptance, source, reason) {
   if (!ACCEPTANCE_STATES.has(acceptance)) {
     throw new TypeError("Fusion worker acceptance must be accepted, rejected, or unverified.");
@@ -475,7 +631,9 @@ function updateWorkerAcceptance({ taskId, acceptance, env, source, safeReason, v
       acceptance,
       acceptanceSource: source,
       acceptanceReason: safeReason,
-      acceptanceRecordedAt: new Date().toISOString()
+      acceptanceRecordedAt: new Date().toISOString(),
+      awaitingVerdict: false,
+      awaitingVerdictArmedAt: null
     };
   });
   return updated;

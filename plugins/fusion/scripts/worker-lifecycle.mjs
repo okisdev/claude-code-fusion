@@ -5,6 +5,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 import {
+  backfillWorkerTaskOutputTelemetry,
   canonicalWorkerAgentType,
   createWorkerRecord,
   createWorkerTaskId,
@@ -34,6 +35,8 @@ const EXECUTION_AGENTS = new Set(["fusion:fast-worker", "fusion:trivial-worker"]
 const BRIEF_AGENTS = new Set(["fusion:fast-worker", "fusion:trivial-worker", "fusion:deep-reasoner"]);
 const PEER_WRAPPER_AGENTS = new Set(["codex:codex-rescue", "codex-rescue", "grok:grok-rescue", "grok-rescue"]);
 const MANAGED_PEER_AGENTS = new Set(["grok:grok-review-runner", "grok-review-runner"]);
+const PEER_JOB_FOOTER_AGENTS = new Set(["codex:codex-rescue", "grok:grok-rescue", "grok:grok-review-runner"]);
+const TERMINAL_RUNTIME_TASK_STATUSES = new Set(["completed", "complete", "done", "failed", "error", "cancelled", "canceled", "stopped", "terminated", "timed_out", "timeout"]);
 
 function readHookInput() {
   try {
@@ -490,6 +493,88 @@ function noTaskFoundError(input, failed) {
   return /No task found/i.test(text);
 }
 
+function taskOutputTranscriptPaths(input, record) {
+  const response = input.tool_response && typeof input.tool_response === "object" ? input.tool_response : {};
+  const nested = response.toolUseResult && typeof response.toolUseResult === "object" ? response.toolUseResult : {};
+  const runtimeId = typeof record.backgroundTaskId === "string" && record.backgroundTaskId
+    ? record.backgroundTaskId
+    : typeof record.agentId === "string" && record.agentId
+      ? record.agentId
+      : null;
+  const direct = [
+    input.agent_transcript_path,
+    input.task_output_path,
+    input.task_output_file,
+    input.output_file,
+    response.agentTranscriptPath,
+    response.agent_transcript_path,
+    response.transcriptPath,
+    response.transcript_path,
+    response.outputFile,
+    nested.agentTranscriptPath,
+    nested.agent_transcript_path,
+    nested.transcriptPath,
+    nested.transcript_path,
+    nested.outputFile,
+    record.transcriptPath
+  ];
+  const parents = [input.transcript_path, record.parentTranscriptPath]
+    .filter((value) => typeof value === "string" && path.isAbsolute(value));
+  if (runtimeId) {
+    const safeRuntimeId = path.basename(runtimeId);
+    for (const parent of parents) {
+      direct.push(path.join(path.dirname(parent), "subagents", `agent-${safeRuntimeId}.jsonl`));
+      direct.push(path.join(path.dirname(parent), "subagents", `${safeRuntimeId}.jsonl`));
+      const sessionDirectory = path.join(path.dirname(parent), path.basename(parent, path.extname(parent)));
+      direct.push(path.join(sessionDirectory, "subagents", `agent-${safeRuntimeId}.jsonl`));
+      direct.push(path.join(sessionDirectory, "subagents", `${safeRuntimeId}.jsonl`));
+    }
+  }
+  return [...new Set(direct.filter((value) => typeof value === "string" && path.isAbsolute(value) && path.extname(value) === ".jsonl").map((value) => path.resolve(value)))];
+}
+
+function collectedHarnessAsyncDelivery(record, transportStatus) {
+  return record.runtimeAsync === true && record.failureKind === "unexpected_async" && transportStatus === "done";
+}
+
+function resultText(value) {
+  if (typeof value === "string") {
+    return value;
+  }
+  if (Array.isArray(value)) {
+    const text = value.flatMap((item) => typeof item === "string" ? [item] : typeof item?.text === "string" ? [item.text] : []);
+    return text.length > 0 ? text.join("\n") : null;
+  }
+  return typeof value?.text === "string" ? value.text : null;
+}
+
+function taskOutputResultText(input) {
+  if (typeof input.tool_response === "string" || Array.isArray(input.tool_response)) {
+    return resultText(input.tool_response);
+  }
+  const response = input.tool_response && typeof input.tool_response === "object" ? input.tool_response : null;
+  const nested = response?.toolUseResult && typeof response.toolUseResult === "object" ? response.toolUseResult : null;
+  return resultText(response?.content) ?? resultText(nested?.content);
+}
+
+function peerJobIdFromCollectedResult(text) {
+  let peerJobId = null;
+  for (const match of String(text ?? "").matchAll(/^job: ([0-9a-f]{32})$/gm)) {
+    peerJobId = match[1];
+  }
+  return peerJobId;
+}
+
+function backfillCollectedTaskOutput(record, input) {
+  for (const transcriptPath of taskOutputTranscriptPaths(input, record)) {
+    const backfilled = backfillWorkerTaskOutputTelemetry(record, transcriptPath);
+    if (backfilled !== record) {
+      return backfilled;
+    }
+  }
+  return record;
+}
+
 function handlePostToolUse(input, env, failed = false) {
   if (!input.agent_id && ["Read", "TaskOutput", "TaskStop"].includes(input.tool_name)) {
     const taskId = typeof input.tool_input?.task_id === "string" ? input.tool_input.task_id : null;
@@ -505,10 +590,13 @@ function handlePostToolUse(input, env, failed = false) {
           return {
             ...current,
             transportStatus: "failed",
+            acceptance: "unverified",
             failureKind: "task_reaped",
             finishedAt: now,
             collectedAt: now,
-            collectionMethod: "reaped"
+            collectionMethod: "reaped",
+            awaitingVerdict: true,
+            awaitingVerdictArmedAt: now
           };
         });
       }
@@ -529,17 +617,23 @@ function handlePostToolUse(input, env, failed = false) {
     });
     if (!failed) {
       const now = new Date().toISOString();
+      const collectedResultText = input.tool_name === "TaskOutput" ? taskOutputResultText(input) : null;
       for (const record of matches) {
         updateWorkerRecord(record.taskId, env, (current) => {
           const worker = current ?? record;
-          return {
-            ...markWorkerCollected(worker, input.tool_name, now),
-            transportStatus: input.tool_name === "TaskStop" ? "cancelled" : "done",
+          const transportStatus = input.tool_name === "TaskStop" ? "cancelled" : "done";
+          const harnessAsyncDelivery = collectedHarnessAsyncDelivery(worker, transportStatus);
+          const updated = {
+            ...markWorkerCollected({ ...worker, acceptance: "unverified" }, input.tool_name, now),
+            transportStatus,
             acceptance: "unverified",
-            failureKind: input.tool_name === "TaskStop" ? worker.failureKind ?? "cancelled" : worker.failureKind,
+            failureKind: input.tool_name === "TaskStop" ? worker.failureKind ?? "cancelled" : harnessAsyncDelivery ? null : worker.failureKind,
+            ...(harnessAsyncDelivery ? { deliveryMode: "harness_async" } : {}),
+            ...(input.tool_name === "TaskOutput" && PEER_JOB_FOOTER_AGENTS.has(worker.agentType) ? { peerJobId: peerJobIdFromCollectedResult(collectedResultText) } : {}),
             finishedAt: worker.finishedAt ?? now,
             lastActivityAt: now
           };
+          return input.tool_name === "TaskOutput" ? backfillCollectedTaskOutput(updated, input) : updated;
         });
       }
     }
@@ -653,7 +747,7 @@ function handleSubagentStart(input, env) {
 }
 
 function handleSubagentStop(input, env) {
-  if (!isFusionWorkerAgent(input.agent_type)) {
+  if (!isFusionWorkerAgent(input.agent_type) && !PEER_JOB_FOOTER_AGENTS.has(input.agent_type)) {
     return;
   }
   const record = recordForAgent(input, env);
@@ -684,24 +778,70 @@ function handleSubagentStop(input, env) {
     return;
   }
   const now = new Date().toISOString();
-  updateWorkerRecord(refreshed.taskId, env, (current) => ({
-    ...markWorkerCollected(current ?? refreshed, "SubagentStop", now),
-    transportStatus: complete && (trustedCollectorReport?.kind === "outcome" || collectorProtocolFailure) ? "incomplete" : complete ? current.runtimeAsync ? current.userBackgroundAuthorized ? "ready_background" : "ready_uncollected" : "done" : failure ? "failed" : "incomplete",
-    acceptance: "unverified",
-    failureKind: failure?.failureKind ?? (trustedCollectorReport?.kind === "outcome" ? `collection_${trustedCollectorReport.collectionOutcome}` : collectorProtocolFailure ? "collection_protocol" : complete ? null : "delivery"),
-    ...(trustedCollectorReport?.peerEngine ? { peerEngine: trustedCollectorReport.peerEngine } : {}),
-    ...(trustedCollectorReport?.peerJobId ? { peerJobId: trustedCollectorReport.peerJobId } : {}),
-    ...(trustedCollectorReport?.peerTransportStatus ? { peerTransportStatus: trustedCollectorReport.peerTransportStatus } : {}),
-    ...(trustedCollectorReport?.peerSemanticStatus ? { peerSemanticStatus: trustedCollectorReport.peerSemanticStatus } : {}),
-    ...(trustedCollectorReport?.collectionOutcome ? { collectionOutcome: trustedCollectorReport.collectionOutcome } : {}),
-    ...(Number.isSafeInteger(trustedCollectorReport?.elapsedSeconds) ? { collectionElapsedSeconds: trustedCollectorReport.elapsedSeconds } : {}),
-    finishedAt: now,
-    lastActivityAt: now
-  }));
+  updateWorkerRecord(refreshed.taskId, env, (current) => {
+    const worker = current ?? refreshed;
+    const runtimeAsync = worker.runtimeAsync === true;
+    return {
+      ...(runtimeAsync ? worker : markWorkerCollected({ ...worker, acceptance: "unverified" }, "SubagentStop", now)),
+      transportStatus: complete && (trustedCollectorReport?.kind === "outcome" || collectorProtocolFailure) ? "incomplete" : complete ? runtimeAsync ? "ready_uncollected" : "done" : failure ? "failed" : "incomplete",
+      acceptance: "unverified",
+      failureKind: failure?.failureKind ?? (trustedCollectorReport?.kind === "outcome" ? `collection_${trustedCollectorReport.collectionOutcome}` : collectorProtocolFailure ? "collection_protocol" : complete ? worker.failureKind === "unexpected_async" ? null : worker.failureKind ?? null : "delivery"),
+      ...(complete && !failure && !collectorProtocolFailure && runtimeAsync && worker.failureKind === "unexpected_async" ? { deliveryMode: "harness_async" } : {}),
+      ...(!runtimeAsync && PEER_JOB_FOOTER_AGENTS.has(worker.agentType) ? { peerJobId: peerJobIdFromCollectedResult(message) } : {}),
+      ...(trustedCollectorReport?.peerEngine ? { peerEngine: trustedCollectorReport.peerEngine } : {}),
+      ...(trustedCollectorReport?.peerJobId ? { peerJobId: trustedCollectorReport.peerJobId } : {}),
+      ...(trustedCollectorReport?.peerTransportStatus ? { peerTransportStatus: trustedCollectorReport.peerTransportStatus } : {}),
+      ...(trustedCollectorReport?.peerSemanticStatus ? { peerSemanticStatus: trustedCollectorReport.peerSemanticStatus } : {}),
+      ...(trustedCollectorReport?.collectionOutcome ? { collectionOutcome: trustedCollectorReport.collectionOutcome } : {}),
+      ...(Number.isSafeInteger(trustedCollectorReport?.elapsedSeconds) ? { collectionElapsedSeconds: trustedCollectorReport.elapsedSeconds } : {}),
+      finishedAt: now,
+      lastActivityAt: now
+    };
+  });
 }
 
 function activeSessionRecords(sessionId, env) {
   return readWorkerRecords(env, { strict: true }).filter((record) => record.sessionId === sessionId && !isTerminalWorkerStatus(record.transportStatus));
+}
+
+function sessionRecords(sessionId, env) {
+  return readWorkerRecords(env, { strict: true }).filter((record) => record.sessionId === sessionId);
+}
+
+function runtimeTaskForRecord(record, tasks) {
+  const runtimeIds = [record.backgroundTaskId, record.agentId].filter(Boolean);
+  return tasks.find((task) => runtimeIds.includes(task?.id))
+    ?? (!record.backgroundTaskId && !record.agentId
+      ? tasks.find((task) => task?.type === "subagent" && canonicalWorkerAgentType(task.agent_type) === canonicalWorkerAgentType(record.agentType))
+      : null);
+}
+
+function runtimeTaskIsTerminal(task) {
+  return typeof task?.status === "string" && TERMINAL_RUNTIME_TASK_STATUSES.has(task.status.trim().toLowerCase());
+}
+
+function terminalTransportObserved(record, task) {
+  return isTerminalWorkerStatus(record.transportStatus)
+    || ["ready_uncollected", "ready_background"].includes(record.transportStatus)
+    || runtimeTaskIsTerminal(task);
+}
+
+function terminalCollectionPending(record) {
+  return ["ready_uncollected", "ready_background"].includes(record.transportStatus)
+    || (record.runtimeAsync === true && isTerminalWorkerStatus(record.transportStatus) && !record.collectedAt);
+}
+
+function armInFlightRecords(records, tasks, env) {
+  const inFlight = records.filter((record) => !terminalTransportObserved(record, runtimeTaskForRecord(record, tasks)));
+  const armedAt = new Date().toISOString();
+  for (const record of inFlight) {
+    updateWorkerRecord(record.taskId, env, (current) => ({
+      ...(current ?? record),
+      awaitingCollection: true,
+      awaitingCollectionArmedAt: current?.awaitingCollectionArmedAt ?? armedAt
+    }));
+  }
+  return inFlight;
 }
 
 function unjudgedPeerCollections(sessionId, env) {
@@ -769,7 +909,7 @@ function unverifiedCollectedWorkers(sessionId, env) {
   if (records.length === 0 || records.some((record) => !isTerminalWorkerStatus(record.transportStatus) || !record.collectedAt)) {
     return [];
   }
-  return records.filter((record) => record.completionContract !== "collector" && record.acceptance === "unverified");
+  return records.filter((record) => record.completionContract !== "collector" && record.awaitingVerdict === true);
 }
 
 function writeAcceptanceAdvisory(sessionId, env) {
@@ -777,35 +917,35 @@ function writeAcceptanceAdvisory(sessionId, env) {
   if (unverified.length === 0) {
     return;
   }
-  writeOutput(hookOutput("Stop", `Acceptance remains unverified for ${unverified.length} collected Fusion worker${unverified.length === 1 ? "" : "s"}. Record the main-loop judgment with /fusion:stats --record-worker-acceptance <task-id> accepted --source main-loop.`));
+  const commands = unverified.map((record) => `/fusion:stats --record ${record.taskId}=accepted|rejected|unverified`);
+  writeOutput(hookOutput("Stop", `Acceptance remains unverified for ${unverified.length} collected Fusion worker${unverified.length === 1 ? "" : "s"}. Settle each row with exactly one command: ${commands.join("; ")}. pairs are <id>=<verdict> with id either a fusion task id (fusion- plus 24 lowercase hex) or an engine job id (32 lowercase hex), verdict one of accepted|rejected|unverified.`));
 }
 
 function handleStop(input, env) {
-  if (collectorStopGate(input, env)) {
+  const tasks = Array.isArray(input.background_tasks) ? input.background_tasks : [];
+  const initialRecords = sessionRecords(input.session_id, env);
+  if (initialRecords.every((record) => !terminalCollectionPending(record)) && collectorStopGate(input, env)) {
+    armInFlightRecords(initialRecords, tasks, env);
     return;
   }
-  const tasks = Array.isArray(input.background_tasks) ? input.background_tasks : [];
-  const workerTasks = tasks.filter((task) => task?.type === "subagent" && isFusionWorkerAgent(task.agent_type));
   const pending = [];
   for (const record of activeSessionRecords(input.session_id, env)) {
-    const task = workerTasks.find((candidate) => [record.backgroundTaskId, record.agentId].filter(Boolean).includes(candidate.id) || (!record.backgroundTaskId && canonicalWorkerAgentType(candidate.agent_type) === canonicalWorkerAgentType(record.agentType)));
-    const failure = ["ready_uncollected", "ready_background"].includes(record.transportStatus) ? null : workerBudgetFailure(record);
-    const updated = updateWorkerRecord(record.taskId, env, (current) => ({
-      ...current,
-      ...(task?.id ? { backgroundTaskId: task.id } : {}),
-      transportStatus: failure ? "cancel_requested" : ["ready_uncollected", "ready_background"].includes(current.transportStatus) ? current.transportStatus : "pending_async",
-      failureKind: failure?.failureKind ?? current.failureKind,
-      cancelReason: failure?.reason ?? current.cancelReason,
-      stopBlockCount: (current.stopBlockCount ?? 0) + 1
-    }));
+    const task = runtimeTaskForRecord(record, tasks);
+    const observedTerminal = terminalTransportObserved(record, task);
+    const failure = observedTerminal ? null : workerBudgetFailure(record);
+    const updated = updateWorkerRecord(record.taskId, env, (current) => {
+      const worker = current ?? record;
+      return {
+        ...worker,
+        ...(task?.id ? { backgroundTaskId: task.id } : {}),
+        transportStatus: failure ? "cancel_requested" : runtimeTaskIsTerminal(task) ? "ready_uncollected" : ["ready_uncollected", "ready_background", "cancel_requested"].includes(worker.transportStatus) ? worker.transportStatus : "pending_async",
+        failureKind: failure?.failureKind ?? worker.failureKind,
+        cancelReason: failure?.reason ?? worker.cancelReason,
+        stopBlockCount: (worker.stopBlockCount ?? 0) + 1
+      };
+    });
     pending.push(updated);
   }
-  const finalMessage = typeof input.last_assistant_message === "string" ? input.last_assistant_message : "";
-  if (pending.length === 0) {
-    writeAcceptanceAdvisory(input.session_id, env);
-    return;
-  }
-  const unauthorized = pending.filter((record) => !record.userBackgroundAuthorized);
   const cancellations = pending.filter((record) => record.transportStatus === "cancel_requested" || (!record.userBackgroundAuthorized && !["ready_uncollected", "ready_background"].includes(record.transportStatus) && (record.stopBlockCount ?? 0) >= 6));
   if (cancellations.length > 0) {
     const now = new Date().toISOString();
@@ -821,13 +961,13 @@ function handleStop(input, env) {
     writeOutput(blockStop(`Call TaskStop for over-budget task${cancelIds.length === 1 ? "" : "s"} ${cancelIds.join(", ")} and report the cancellation before finishing.`));
     return;
   }
-  if (unauthorized.length > 0) {
-    const instructions = unauthorized.map((record) => {
-      if (record.transportStatus === "ready_uncollected" && record.outputFile) {
-        return `Read the completed output file ${record.outputFile} for owned task ${record.taskId} before finishing.`;
-      }
+  const currentRecords = sessionRecords(input.session_id, env);
+  const inFlight = armInFlightRecords(currentRecords, tasks, env);
+  const terminalUncollected = currentRecords.filter(terminalCollectionPending);
+  if (terminalUncollected.length > 0) {
+    const instructions = terminalUncollected.map((record) => {
       const collectId = record.backgroundTaskId ?? record.agentId;
-      return collectId ? `Call TaskOutput with block=true for owned task ${collectId} and collect the terminal result before finishing.` : `Collect owned task ${record.taskId} before finishing.`;
+      return collectId ? `Call TaskOutput with block=true for terminal owned task ${collectId} and collect the result before finishing.` : `Collect terminal owned task ${record.taskId} before finishing.`;
     });
     instructions.push(
       "Transport completion remains unverified until the result and verification evidence are reviewed. Record accepted or rejected explicitly through /fusion:stats."
@@ -835,13 +975,9 @@ function handleStop(input, env) {
     writeOutput(blockStop(instructions.join(" ")));
     return;
   }
-  const missingReceipts = pending.filter((record) => !finalMessage.includes(record.taskId) && !finalMessage.includes(record.backgroundTaskId ?? "__missing__"));
-  if (missingReceipts.length > 0 && !input.stop_hook_active) {
-    writeOutput(blockStop(`The user explicitly authorized background delivery, but the final response must name each pending Fusion task id and its collection path. Pending: ${missingReceipts.map((record) => `${record.taskId}${record.backgroundTaskId ? ` (${record.backgroundTaskId})` : ""}`).join(", ")}.`));
+  if (inFlight.length > 0) {
+    writeOutput(hookOutput("Stop", `Fusion task${inFlight.length === 1 ? "" : "s"} ${inFlight.map((record) => record.taskId).join(", ")} ${inFlight.length === 1 ? "is" : "are"} still in flight. Collection is armed and will be required after terminal notification.`));
     return;
-  }
-  for (const record of pending.filter((candidate) => candidate.transportStatus === "ready_background")) {
-    updateWorkerRecord(record.taskId, env, (current) => ({ ...markWorkerCollected(current ?? record, "Stop"), transportStatus: "done" }));
   }
   writeAcceptanceAdvisory(input.session_id, env);
 }
