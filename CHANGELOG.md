@@ -1,5 +1,14 @@
 # changelog
 
+## 0.0.27
+
+- model selection is a real flag, not prose: the routing rules require quick and volume dispatches to pass `--model` and `--effort` as leading companion options (gpt-5.6-terra and gpt-5.6-luna at xhigh), the peer brief header line is downgraded to audit prose, grok burst dispatches pass `--effort low`, and the codex companion warns with an additive `modelDrift` record field plus a footer line on every terminal render when a brief header names a model the job did not run
+- codex threads keep their routing on resume: `--resume` and `--resume-last` inherit model, effort, and service tier from the thread's latest job unless explicitly overridden (marked `inheritedFromThread`), and every task and review spawn pins `-c service_tier=priority` by default with a `--service-tier <id|none>` override plus `serviceTier` and `appliedServiceTier` record fields
+- the foreground timeout path fits the Bash cap: the timer arms after stdin delivery, rollout recovery and cumulative usage finalize before the timeout verdict, an incomplete cleanup stays nonterminal as `cleanup-required` with process evidence retained, and `finishedAt` is written once so later finalization passes can no longer restamp terminal times
+- the Stop gate stops blocking on in flight work: still running owned tasks let the turn end with a one line armed collection notice and an `awaitingCollection` marker, only terminal uncollected results block (new `ready_uncollected` status), collected harness async deliveries clear `unexpected_async` into `deliveryMode: harness_async`, and TaskOutput collection backfills turns, tool calls, and usage from the task transcript
+- verdict settlement is one call: `/fusion:stats --record <id>=<accepted|rejected|unverified>` accepts fusion task ids or engine job ids and writes the worker ledger and the linked engine record together via the collection captured `peerJobId`, strict record forms pass as direct arguments while free text still rides the raw-args transport, the grok companion gains a `record-acceptance` subcommand mirroring codex, and worker rows arm `awaitingVerdict` until settled
+- codex setup probes recent job logs for models cache schema drift (the missing field match requires the `codex_models_manager` marker), and the two known load flaky suites (grok state lock concurrent reapers, codex exec timeout reaping) are stabilized with deterministic identity fakes, explicit synchronization, and load tolerant harness budgets without weakening any assertion
+
 ## 0.0.26
 
 - the codex plugin moves to the skills surface: all nine legacy `commands/*.md` become `skills/<name>/SKILL.md` with byte identical bodies and unchanged `/codex:*` invocation names, matching current Agent Skills guidance that marks plugin `commands/` directories as legacy

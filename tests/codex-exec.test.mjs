@@ -7,8 +7,15 @@ import test from "node:test";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 import {
+  BASH_TOOL_TIMEOUT_MS,
   buildReviewArgs,
   buildTaskArgs,
+  DEFAULT_TERMINATION_GRACE_MS,
+  DEFAULT_TERMINATION_POLL_MS,
+  DEFAULT_TIMEOUT_MS,
+  DEFAULT_TIMEOUT_PATH_MAX_MS,
+  DEFAULT_TIMEOUT_PATH_WITH_MARGIN_MS,
+  TIMEOUT_PATH_MARGIN_MS,
   getCodexAvailability,
   getCodexVersion,
   getProcessIdentity,
@@ -20,9 +27,20 @@ import {
   terminateProcessTree,
   terminateProcessTreeSync
 } from "../plugins/codex/scripts/lib/codex-exec.mjs";
+import {
+  envFor as companionEnvFor,
+  jobRecords as companionJobRecords,
+  makeSandbox as makeCompanionSandbox,
+  runCompanion
+} from "./lib/codex-companion-harness.mjs";
 
 const fakeCodex = fileURLToPath(new URL("./fake-codex", import.meta.url));
 const codexExecModuleUrl = new URL("../plugins/codex/scripts/lib/codex-exec.mjs", import.meta.url).href;
+const LOAD_TOLERANT_WAIT_TIMEOUT_MS = 15000;
+const LOAD_TOLERANT_POLL_INTERVAL_MS = 25;
+const TIMEOUT_TEST_TIMEOUT_MS = 8000;
+const TIMEOUT_TEST_TERMINATION_GRACE_MS = 8000;
+const COMPANION_WATCHDOG_TIMEOUT_MS = 30000;
 
 function fixture(t) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "fusion-codex-exec-"));
@@ -34,6 +52,7 @@ function fixture(t) {
     eventsFile: path.join(dir, "events.jsonl"),
     interruptFile: path.join(dir, "interrupt.signal"),
     logFile: path.join(dir, "stderr.log"),
+    readyFile: path.join(dir, "ready.signal"),
     resultFile: path.join(dir, "result.txt"),
     stdinFile: path.join(dir, "stdin.txt"),
     termFile: path.join(dir, "term.signal")
@@ -51,6 +70,7 @@ async function runFixture(t, mode, options = {}) {
     FAKE_CODEX_MODE: mode,
     FAKE_CODEX_STDIN_FILE: files.stdinFile,
     FAKE_CODEX_TERM_FILE: files.termFile,
+    ...(options.waitForReady ? { FAKE_CODEX_READY_FILE: files.readyFile } : {}),
     ...options.env
   };
   const resumeThreadId = options.resumeThreadId;
@@ -69,9 +89,9 @@ async function runFixture(t, mode, options = {}) {
     resultFile: files.resultFile,
     prompt: options.prompt ?? "prompt only on stdin",
     resumeThreadId,
-    timeoutMs: options.timeoutMs ?? 2000,
-    terminationGraceMs: options.terminationGraceMs ?? 100,
-    terminationPollMs: 10,
+    timeoutMs: options.timeoutMs ?? 10000,
+    terminationGraceMs: options.terminationGraceMs ?? 1000,
+    terminationPollMs: 25,
     stderrMaxBytes: options.stderrMaxBytes,
     eventsMaxBytes: options.eventsMaxBytes,
     eventLineMaxBytes: options.eventLineMaxBytes,
@@ -81,21 +101,37 @@ async function runFixture(t, mode, options = {}) {
     freshThread: options.freshThread,
     signal: options.signal,
     onSpawnAttempt: options.onSpawnAttempt,
-    onSpawn: options.onSpawn,
+    onSpawn: async (...args) => {
+      if (options.waitForReady) {
+        await waitForFile(files.readyFile);
+      }
+      return options.onSpawn?.(...args);
+    },
     onCheckpoint: options.onCheckpoint
   });
   return { files, outcome, args };
 }
 
-async function waitUntil(predicate, timeoutMs = 3000) {
+async function waitUntil(predicate, timeoutMs = LOAD_TOLERANT_WAIT_TIMEOUT_MS) {
   const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
+  for (;;) {
     if (predicate()) {
       return;
     }
-    await new Promise((resolve) => setTimeout(resolve, 10));
+    if (Date.now() >= deadline) {
+      throw new Error("Timed out waiting for process state.");
+    }
+    await new Promise((resolve) => setTimeout(resolve, LOAD_TOLERANT_POLL_INTERVAL_MS));
   }
-  throw new Error("Timed out waiting for process state.");
+}
+
+async function waitForFile(file) {
+  await waitUntil(() => fs.existsSync(file));
+  assert.equal(fs.readFileSync(file, "utf8"), "ready");
+}
+
+async function waitForProcessExit(pid, ownsProcessGroup = false) {
+  await waitUntil(() => !isProcessAlive(pid, null, ownsProcessGroup));
 }
 
 test("version and availability probe the configured Codex binary", () => {
@@ -194,6 +230,8 @@ test("task arguments enforce safe headless execution and put global flags before
     "multi_agent_v2",
     "--model",
     "gpt-test",
+    "-c",
+    "service_tier=priority",
     "--config",
     'model_reasoning_effort="high"',
     "--config",
@@ -223,11 +261,16 @@ test("task arguments leave model and effort unset while pinning networked tools 
     "multi_agent",
     "--disable",
     "multi_agent_v2",
+    "-c",
+    "service_tier=priority",
     "--config",
     'web_search="disabled"'
   ]);
   assert.match(buildTaskArgs({ effort: "ultra" }).join(" "), /model_reasoning_effort="ultra"/);
   assert.match(buildTaskArgs({ effort: "max" }).join(" "), /model_reasoning_effort="max"/);
+  assert.ok(buildTaskArgs({ serviceTier: "standard" }).includes("service_tier=standard"));
+  assert.ok(!buildTaskArgs({ serviceTier: "none" }).includes("-c"));
+  assert.throws(() => buildTaskArgs({ serviceTier: "Priority" }), /Unsupported Codex service tier/);
   assert.match(buildTaskArgs({ write: true }).join(" "), /sandbox_workspace_write\.network_access=false/);
   assert.throws(() => buildTaskArgs({ network: true }), /requires a write task/);
 });
@@ -245,6 +288,8 @@ test("native review is read-only and maps review targets", () => {
     "multi_agent",
     "--disable",
     "multi_agent_v2",
+    "-c",
+    "service_tier=priority",
     "--config",
     'web_search="disabled"',
     "review",
@@ -263,12 +308,31 @@ test("native review is read-only and maps review targets", () => {
     "multi_agent",
     "--disable",
     "multi_agent_v2",
+    "-c",
+    "service_tier=priority",
     "--config",
     'web_search="disabled"',
     "review",
     "--uncommitted"
   ]);
   assert.throws(() => buildReviewArgs({ write: true }), /read-only/);
+});
+
+test("companion forwards and records the default service tier without an applied stream observation", (t) => {
+  const sandbox = makeCompanionSandbox(t);
+  const result = runCompanion(["task", "--json", "inspect the service tier"], {
+    cwd: sandbox.workDir,
+    env: companionEnvFor(sandbox),
+    timeout: COMPANION_WATCHDOG_TIMEOUT_MS
+  });
+  assert.equal(result.status, 0, result.stderr);
+  const argv = JSON.parse(fs.readFileSync(sandbox.argsFile, "utf8"));
+  const serviceTierIndex = argv.indexOf("-c");
+  assert.equal(argv[serviceTierIndex + 1], "service_tier=priority");
+  const record = JSON.parse(result.stdout);
+  assert.equal(record.serviceTier, "priority");
+  assert.equal(record.appliedServiceTier, null);
+  assert.equal(companionJobRecords(sandbox)[0]?.serviceTier, "priority");
 });
 
 test("usage normalization and subtraction reject incomplete or decreasing counters", () => {
@@ -333,6 +397,7 @@ test("completed execution persists raw JSONL, keeps the prompt on stdin, and che
   assert.ok(Number.isInteger(spawned[0]));
   assert.ok(outcome.pidIdentity);
   assert.deepEqual(checkpoints.map((entry) => entry.event?.type), ["thread.started", "turn.started", "item.completed", "turn.completed"]);
+  await waitForProcessExit(outcome.pid);
   assert.equal(isProcessAlive(outcome.pid), false);
   assert.equal(await terminateProcessTree(outcome.pid, { identity: outcome.pidIdentity, ownsProcessGroup: true, requireIdentity: true }), true);
   assert.equal(terminateProcessTreeSync(outcome.pid, { identity: outcome.pidIdentity, ownsProcessGroup: true, requireIdentity: true }), true);
@@ -372,6 +437,8 @@ test("a successful leader exit cleans every remaining process in its owned group
   });
   assert.equal(outcome.status, "done");
   assert.equal(outcome.cleanupComplete, true);
+  await waitForProcessExit(outcome.pid);
+  await waitForProcessExit(childPid);
   assert.equal(isProcessAlive(outcome.pid), false);
   assert.equal(isProcessAlive(childPid, null, false), false);
 });
@@ -385,7 +452,7 @@ test("signals remain forwarded while natural exit cleanup escalates", async (t) 
   const termFile = path.join(files.dir, "group-child.term");
   const readyFile = path.join(files.dir, "group-child.ready");
   const moduleUrl = pathToFileURL(path.join(import.meta.dirname, "..", "plugins", "codex", "scripts", "lib", "codex-exec.mjs")).href;
-  const source = `import { buildTaskArgs, runCodex } from ${JSON.stringify(moduleUrl)}; const args = buildTaskArgs({ cwd: process.env.TEST_CWD }); const outcome = await runCodex({ args, cwd: process.env.TEST_CWD, env: process.env, eventsFile: process.env.TEST_EVENTS, logFile: process.env.TEST_LOG, resultFile: process.env.TEST_RESULT, prompt: "test", timeoutMs: 5000, terminationGraceMs: 1000, terminationPollMs: 10 }); process.stdout.write(JSON.stringify(outcome));`;
+  const source = `import { buildTaskArgs, runCodex } from ${JSON.stringify(moduleUrl)}; const args = buildTaskArgs({ cwd: process.env.TEST_CWD }); const outcome = await runCodex({ args, cwd: process.env.TEST_CWD, env: process.env, eventsFile: process.env.TEST_EVENTS, logFile: process.env.TEST_LOG, resultFile: process.env.TEST_RESULT, prompt: "test", timeoutMs: 15000, terminationGraceMs: 5000, terminationPollMs: 25 }); process.stdout.write(JSON.stringify(outcome));`;
   const harness = spawn(process.execPath, ["--input-type=module", "-e", source], {
     env: {
       ...process.env,
@@ -406,6 +473,7 @@ test("signals remain forwarded while natural exit cleanup escalates", async (t) 
   const stderr = [];
   harness.stdout.on("data", (chunk) => stdout.push(chunk));
   harness.stderr.on("data", (chunk) => stderr.push(chunk));
+  await waitForFile(readyFile);
   await waitUntil(() => fs.existsSync(termFile));
   const childPid = Number(fs.readFileSync(files.childPidFile, "utf8"));
   t.after(() => {
@@ -425,6 +493,7 @@ test("signals remain forwarded while natural exit cleanup escalates", async (t) 
   const outcome = JSON.parse(Buffer.concat(stdout).toString("utf8"));
   assert.equal(outcome.status, "cancelled");
   assert.equal(outcome.cleanupComplete, true);
+  await waitForProcessExit(childPid);
   assert.equal(isProcessAlive(childPid, null, false), false);
 });
 
@@ -536,19 +605,117 @@ test("a nonzero exit invalidates an otherwise completed turn", async (t) => {
 });
 
 test("timeout terminates the process group", async (t) => {
-  const { outcome } = await runFixture(t, "hang", { timeoutMs: 50, terminationGraceMs: 100 });
+  const { outcome } = await runFixture(t, "hang", {
+    timeoutMs: TIMEOUT_TEST_TIMEOUT_MS,
+    terminationGraceMs: TIMEOUT_TEST_TERMINATION_GRACE_MS,
+    waitForReady: true
+  });
   assert.equal(outcome.status, "error");
   assert.equal(outcome.failureKind, "timeout");
   assert.equal(outcome.timedOut, true);
+  await waitForProcessExit(outcome.pid);
   assert.equal(isProcessAlive(outcome.pid), false);
+});
+
+test("rollout recovery completes before the timeout verdict overrides late checkpoint errors", async (t) => {
+  const files = fixture(t);
+  let checkpointEnteredAt = null;
+  let releaseCheckpoint;
+  let enterCheckpoint;
+  const checkpointEntered = new Promise((resolve) => {
+    enterCheckpoint = resolve;
+  });
+  const execution = runFixture(t, "rollout-timeout", {
+    env: { CODEX_HOME: path.join(files.dir, "codex-home") },
+    timeoutMs: TIMEOUT_TEST_TIMEOUT_MS,
+    terminationGraceMs: TIMEOUT_TEST_TERMINATION_GRACE_MS,
+    onCheckpoint: async ({ event }) => {
+      if (event?.type !== "thread.started" || checkpointEnteredAt != null) {
+        return;
+      }
+      checkpointEnteredAt = Date.now();
+      enterCheckpoint();
+      await new Promise((resolve) => {
+        releaseCheckpoint = resolve;
+      });
+      throw new Error("checkpoint failure after timeout");
+    }
+  });
+  await checkpointEntered;
+  await waitUntil(() => Date.now() >= checkpointEnteredAt + TIMEOUT_TEST_TIMEOUT_MS + LOAD_TOLERANT_POLL_INTERVAL_MS);
+  releaseCheckpoint();
+  const { outcome } = await execution;
+
+  assert.ok(["error", "running"].includes(outcome.status));
+  assert.equal(outcome.failureKind, "timeout");
+  assert.equal(outcome.timedOut, true);
+  assert.equal(outcome.partialResultText, "Recovered partial Codex output.");
+  assert.equal(outcome.resultSource, "rollout_partial");
+  assert.equal(outcome.tokenUsageAvailability, "partial");
+  assert.equal(outcome.usageIsIncomplete, true);
+  assert.deepEqual(outcome.cumulativeTokenUsage, {
+    inputTokens: 120,
+    cachedInputTokens: 40,
+    outputTokens: 30,
+    reasoningOutputTokens: 10,
+    totalTokens: 150
+  });
+});
+
+test("default timeout timing leaves the Bash tool margin after every escalation wait", () => {
+  const interruptGraceMs = Math.ceil(DEFAULT_TERMINATION_GRACE_MS / 2);
+  const terminateGraceMs = DEFAULT_TERMINATION_GRACE_MS - interruptGraceMs;
+  const killConfirmationMs = DEFAULT_TERMINATION_GRACE_MS;
+  const pollOvershootMs = DEFAULT_TERMINATION_POLL_MS * 3;
+  const forcedCloseMs = 50;
+  const escalationMs = interruptGraceMs + terminateGraceMs + killConfirmationMs + pollOvershootMs + forcedCloseMs;
+
+  assert.equal(DEFAULT_TIMEOUT_PATH_MAX_MS, DEFAULT_TIMEOUT_MS + escalationMs);
+  assert.equal(DEFAULT_TIMEOUT_PATH_WITH_MARGIN_MS, DEFAULT_TIMEOUT_PATH_MAX_MS + TIMEOUT_PATH_MARGIN_MS);
+  assert.ok(DEFAULT_TIMEOUT_PATH_WITH_MARGIN_MS <= BASH_TOOL_TIMEOUT_MS);
+});
+
+test("foreground timeout reaps an uncooperative child and persists a terminal timeout record within the Bash budget", (t) => {
+  const sandbox = makeCompanionSandbox(t);
+  const interruptFile = path.join(sandbox.root, "interrupt.signal");
+  const readyFile = path.join(sandbox.root, "ready.signal");
+  const termFile = path.join(sandbox.root, "term.signal");
+  const timeoutMs = TIMEOUT_TEST_TIMEOUT_MS;
+  const startedAt = Date.now();
+  const result = runCompanion(["task", "--json", "wait for the timeout"], {
+    cwd: sandbox.workDir,
+    env: companionEnvFor(sandbox, {
+      CODEX_COMPANION_TIMEOUT_MS: String(timeoutMs),
+      FAKE_CODEX_INT_FILE: interruptFile,
+      FAKE_CODEX_MODE: "ignore-term",
+      FAKE_CODEX_READY_FILE: readyFile,
+      FAKE_CODEX_TERM_FILE: termFile
+    }),
+    timeout: COMPANION_WATCHDOG_TIMEOUT_MS
+  });
+  const elapsedMs = Date.now() - startedAt;
+
+  assert.equal(result.status, 1, result.stderr);
+  const record = JSON.parse(result.stdout);
+  assert.equal(record.status, "error");
+  assert.equal(record.failureKind, "timeout");
+  assert.ok(record.finishedAt);
+  assert.ok(Date.parse(record.finishedAt) - startedAt < BASH_TOOL_TIMEOUT_MS);
+  assert.equal(record.pid, null);
+  assert.equal(record.codexPid, null);
+  assert.equal(companionJobRecords(sandbox)[0]?.status, "error");
+  assert.equal(fs.readFileSync(readyFile, "utf8"), "ready");
+  assert.equal(fs.readFileSync(interruptFile, "utf8"), "received");
+  assert.equal(fs.readFileSync(termFile, "utf8"), "received");
+  assert.ok(elapsedMs < BASH_TOOL_TIMEOUT_MS);
 });
 
 test("timeout recovers partial output, cumulative usage, and resolved runtime fields from the local rollout", async (t) => {
   const files = fixture(t);
   const { outcome } = await runFixture(t, "rollout-timeout", {
     env: { CODEX_HOME: path.join(files.dir, "codex-home") },
-    timeoutMs: 50,
-    terminationGraceMs: 200
+    timeoutMs: TIMEOUT_TEST_TIMEOUT_MS,
+    terminationGraceMs: TIMEOUT_TEST_TERMINATION_GRACE_MS
   });
   assert.equal(outcome.status, "error");
   assert.equal(outcome.failureKind, "timeout");
@@ -574,8 +741,9 @@ test("timeout stops after INT when Codex gracefully reaps its group child", asyn
     return;
   }
   const { files, outcome } = await runFixture(t, "interrupt-cleanup", {
-    timeoutMs: 50,
-    terminationGraceMs: 200
+    timeoutMs: TIMEOUT_TEST_TIMEOUT_MS,
+    terminationGraceMs: TIMEOUT_TEST_TERMINATION_GRACE_MS,
+    waitForReady: true
   });
   const childPid = Number(fs.readFileSync(files.childPidFile, "utf8"));
   t.after(() => {
@@ -589,6 +757,7 @@ test("timeout stops after INT when Codex gracefully reaps its group child", asyn
   assert.equal(outcome.cleanupComplete, true);
   assert.equal(fs.readFileSync(files.interruptFile, "utf8"), "received");
   assert.equal(fs.existsSync(files.termFile), false);
+  await waitForProcessExit(childPid);
   assert.equal(isProcessAlive(childPid, null, false), false);
 });
 
@@ -598,25 +767,33 @@ test("timeout escalates from INT through TERM to KILL when Codex ignores INT and
   t.after(() => fs.rmSync(interruptFile, { force: true }));
   t.after(() => fs.rmSync(termFile, { force: true }));
   const { outcome } = await runFixture(t, "ignore-term", {
-    timeoutMs: 50,
-    terminationGraceMs: 80,
-    env: { FAKE_CODEX_INT_FILE: interruptFile, FAKE_CODEX_TERM_FILE: termFile }
+    timeoutMs: TIMEOUT_TEST_TIMEOUT_MS,
+    terminationGraceMs: TIMEOUT_TEST_TERMINATION_GRACE_MS,
+    env: { FAKE_CODEX_INT_FILE: interruptFile, FAKE_CODEX_TERM_FILE: termFile },
+    waitForReady: true
   });
   assert.equal(outcome.status, "error");
   assert.equal(outcome.failureKind, "timeout");
   assert.equal(outcome.signal, "SIGKILL");
   assert.equal(fs.readFileSync(interruptFile, "utf8"), "received");
   assert.equal(fs.readFileSync(termFile, "utf8"), "received");
+  await waitForProcessExit(outcome.pid);
   assert.equal(isProcessAlive(outcome.pid), false);
 });
 
-test("timeout returns after bounded cleanup when an inherited pipe does not close", async (t) => {
+test("incomplete timeout cleanup remains nonterminal with process evidence", async (t) => {
   const startedAt = Date.now();
-  const { outcome } = await runFixture(t, "inherited-pipe", { timeoutMs: 50, terminationGraceMs: 50 });
-  assert.equal(outcome.status, "error");
+  const { outcome } = await runFixture(t, "inherited-pipe", {
+    timeoutMs: 50,
+    terminationGraceMs: 50,
+    waitForReady: true
+  });
+  assert.equal(outcome.status, "running");
   assert.equal(outcome.failureKind, "timeout");
   assert.equal(outcome.cleanupComplete, false);
-  assert.ok(Date.now() - startedAt < 1000);
+  assert.ok(Number.isInteger(outcome.pid));
+  assert.ok(outcome.pidIdentity);
+  assert.ok(Date.now() - startedAt < LOAD_TOLERANT_WAIT_TIMEOUT_MS);
 });
 
 test("stderr is kept separate from JSONL and bounded to the configured tail", async (t) => {

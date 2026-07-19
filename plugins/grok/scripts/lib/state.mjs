@@ -117,6 +117,8 @@ export function createJobRecord(fields) {
     errorTail: null,
     failureKind: null,
     semanticStatus: "unverified",
+    semanticFailureKind: null,
+    semanticFailureMessage: null,
     transportStatus: fields.status ?? "running",
     cancelRequestedAt: null,
     jobClass: fields.jobClass ?? "unknown",
@@ -814,17 +816,27 @@ export function launchRunningJobProcess(file, launch, options = {}) {
   });
 }
 
-export function updateJobRecordFileWithCurrent(file, updater) {
+export function updateJobRecordFileWithCurrent(file, updater, options = {}) {
   return withRecordLock(file, () => {
     const existing = readJobRecordFile(file);
     if (!existing) {
       throw new Error(`No job record found at ${file}.`);
     }
+    const allowTerminal = options.allowTerminal === true;
+    if (TERMINAL_STATUSES.has(existing.status) && !allowTerminal) {
+      return withStructuredStatuses(existing);
+    }
     const updated = updater(existing);
     if (!updated || updated === existing) {
       return existing;
     }
-    const next = preserveTerminalRecord(existing, updated);
+    const next = allowTerminal && TERMINAL_STATUSES.has(existing.status)
+      ? withStructuredStatuses({
+          ...existing,
+          ...updated,
+          status: existing.status
+        })
+      : preserveTerminalRecord(existing, updated);
     if (next === existing) {
       return existing;
     }

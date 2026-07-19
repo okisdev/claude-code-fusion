@@ -440,6 +440,8 @@ function normalizeRecord(record) {
     semanticStatus: record.semanticStatus ?? "unverified",
     semanticFailureKind: record.semanticFailureKind ?? null,
     semanticFailureMessage: record.semanticFailureMessage ?? null,
+    serviceTier: record.serviceTier ?? record.request?.serviceTier ?? null,
+    appliedServiceTier: record.appliedServiceTier ?? null,
     resolvedModel: record.resolvedModel ?? null,
     resolvedEffort: record.resolvedEffort ?? null,
     sessionId,
@@ -472,7 +474,7 @@ function terminalPatch(existing, patch, timestamp) {
     codexPid: null,
     codexPidIdentity: null,
     codexPidOwnsProcessGroup: false,
-    finishedAt: patch.finishedAt ?? timestamp,
+    finishedAt: existing.finishedAt ?? patch.finishedAt ?? timestamp,
     updatedAt: patch.updatedAt ?? timestamp,
     failureKind: status === "cancelled" ? "cancelled" : patch.failureKind ?? existing.failureKind ?? null,
     cancelRequestedAt: null
@@ -680,8 +682,11 @@ export function createJobRecord(fields) {
     tokenUsageAvailability: fields.tokenUsageAvailability ?? "unreported",
     tokenUsageUnavailableReason: fields.tokenUsageUnavailableReason ?? null,
     usageIsIncomplete: fields.usageIsIncomplete ?? null,
+    serviceTier: Object.hasOwn(fields, "serviceTier") ? fields.serviceTier : fields.request?.serviceTier ?? null,
+    appliedServiceTier: fields.appliedServiceTier ?? null,
     resolvedModel: fields.resolvedModel ?? fields.request?.model ?? null,
     resolvedEffort: fields.resolvedEffort ?? fields.request?.effort ?? null,
+    ...(fields.modelDrift ? { modelDrift: fields.modelDrift } : {}),
     rolloutRecoveryStatus: fields.rolloutRecoveryStatus ?? null,
     semanticStatus: fields.semanticStatus ?? "unverified",
     semanticFailureKind: fields.semanticFailureKind ?? null,
@@ -885,6 +890,18 @@ export function listAllJobRecords(dataDir) {
     const timestamp = String(right.record.createdAt ?? "").localeCompare(String(left.record.createdAt ?? ""));
     return timestamp || left.file.localeCompare(right.file);
   });
+}
+
+export function latestJobRecordForThread(dataDir, threadId) {
+  if (typeof threadId !== "string" || !threadId.trim()) {
+    return null;
+  }
+  const candidates = listAllJobRecords(dataDir).map(({ record }) => record).filter((record) => record.jobClass === "task" && (record.threadId === threadId || record.request?.resumeThreadId === threadId));
+  candidates.sort((left, right) => {
+    const timestamp = String(right.finishedAt ?? right.updatedAt ?? right.createdAt ?? "").localeCompare(String(left.finishedAt ?? left.updatedAt ?? left.createdAt ?? ""));
+    return timestamp || String(right.createdAt ?? "").localeCompare(String(left.createdAt ?? "")) || String(left.id ?? "").localeCompare(String(right.id ?? ""));
+  });
+  return candidates[0] ?? null;
 }
 
 function retentionLimit(value, fallback) {

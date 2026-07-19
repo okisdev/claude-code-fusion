@@ -31,6 +31,7 @@ import {
   renderCancelReport,
   renderHistoryReport,
   renderJobDetail,
+  renderRecordAcceptance,
   renderReviewFallback,
   renderReviewResult,
   renderSetupReport,
@@ -79,6 +80,8 @@ const WAIT_TIMEOUT_ENV = "GROK_COMPANION_WAIT_TIMEOUT_MS";
 const BACKGROUND_DELIVERY_ENV = "GROK_COMPANION_BACKGROUND_DELIVERY";
 const DEFAULT_WAIT_POLL_MS = 2000;
 const DEFAULT_WAIT_TIMEOUT_MS = 570000;
+const RECORD_ACCEPTANCE_JOB_ID_PATTERN = /^[a-f0-9]{32}$/;
+const RECORD_ACCEPTANCE_VALUES = new Set(["accepted", "rejected", "unverified"]);
 const MAX_WAIT_TIMEOUT_MS = 570000;
 const CONTINUE_PROMPT =
   "Continue from the current thread state. Pick the next highest-value step and follow through until the task is resolved.";
@@ -157,11 +160,46 @@ function printUsage() {
       "  node scripts/grok-companion.mjs history [--all] [--limit <n>] [--cwd <dir>] [--json]",
       "  node scripts/grok-companion.mjs result <job-id> [--cwd <dir>] [--wait] [--wait-timeout-ms <ms>] [--json]",
       "  node scripts/grok-companion.mjs cancel <job-id> [--cwd <dir>] [--json]",
+      "  node scripts/grok-companion.mjs record-acceptance --job-id <32 lowercase hex> --acceptance <accepted|rejected|unverified> [--reason <text>] [--accept-failed-transport]",
       "  node scripts/grok-companion.mjs stats [--all] [--cwd <dir>] [--json]",
       "  node scripts/grok-companion.mjs setup [--continuity <manual|claude-session>] [--enable-stop-gate] [--disable-stop-gate] [--json]",
       "  node scripts/grok-companion.mjs stop-gate"
     ].join("\n")
   );
+}
+
+function recordAcceptanceArgs(argv) {
+  const options = {};
+  for (let index = 0; index < argv.length; index += 1) {
+    const token = argv[index];
+    if (token === "--accept-failed-transport") {
+      if (options.acceptFailedTransport) {
+        throw errorWithFailure("The --accept-failed-transport option may be provided only once.", "input");
+      }
+      options.acceptFailedTransport = true;
+      continue;
+    }
+    const key = token === "--job-id" ? "jobId" : token === "--acceptance" ? "acceptance" : token === "--reason" ? "reason" : null;
+    if (!key) {
+      throw errorWithFailure("The record-acceptance command accepts only --job-id, --acceptance, --reason, and --accept-failed-transport.", "input");
+    }
+    if (Object.hasOwn(options, key)) {
+      throw errorWithFailure(`${token} may be provided only once.`, "input");
+    }
+    const value = argv[index + 1];
+    if (value === undefined) {
+      throw errorWithFailure(`${token} requires a value.`, "input");
+    }
+    options[key] = value;
+    index += 1;
+  }
+  if (!RECORD_ACCEPTANCE_JOB_ID_PATTERN.test(options.jobId ?? "")) {
+    throw errorWithFailure("The --job-id option must be a 32 character lowercase hexadecimal job id.", "input");
+  }
+  if (!RECORD_ACCEPTANCE_VALUES.has(options.acceptance)) {
+    throw errorWithFailure("The --acceptance option must be accepted, rejected, or unverified.", "input");
+  }
+  return options;
 }
 
 function output(value, asJson) {
@@ -2920,6 +2958,36 @@ async function handleStopGate() {
   }
 }
 
+function handleRecordAcceptance(argv) {
+  const { acceptance, acceptFailedTransport, jobId, reason } = recordAcceptanceArgs(argv);
+  const found = findJobRecordById(resolveDataDir(), jobId);
+  if (!found) {
+    throw errorWithFailure(`No job record found for ${jobId}.`, "input");
+  }
+  const record = updateJobRecordFileWithCurrent(found.file, (current) => {
+    if (acceptance === "accepted" && current.status !== "done" && !acceptFailedTransport) {
+      throw errorWithFailure(
+        `Grok job ${current.id} has transport status ${current.status}. Pass --accept-failed-transport to record accepted.`,
+        "input"
+      );
+    }
+    if (acceptance !== "rejected") {
+      return {
+        ...current,
+        semanticFailureKind: null,
+        semanticFailureMessage: null,
+        semanticStatus: acceptance
+      };
+    }
+    return {
+      ...current,
+      ...(reason === undefined ? {} : { semanticFailureMessage: reason }),
+      semanticStatus: acceptance
+    };
+  }, { allowTerminal: true });
+  output(renderRecordAcceptance(record), false);
+}
+
 async function main() {
   const [subcommand, ...receivedArgv] = process.argv.slice(2);
   if (!subcommand || subcommand === "help" || subcommand === "--help") {
@@ -2938,6 +3006,11 @@ async function main() {
       throw errorWithFailure("transport-discard requires exactly one raw argument token.", "input");
     }
     consumeRawCommandTransport(receivedArgv[1]);
+    return;
+  }
+  if (subcommand === "record-acceptance") {
+    activeCommandArgv = receivedArgv;
+    handleRecordAcceptance(receivedArgv);
     return;
   }
   const transport = resolveCommandTransport(receivedArgv);

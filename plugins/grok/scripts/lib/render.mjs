@@ -486,6 +486,10 @@ export function renderCancelReport(job) {
   return `${lines.join("\n")}\n`;
 }
 
+export function renderRecordAcceptance(record) {
+  return `Recorded verdict for Grok job ${record.id}: ${record.semanticStatus ?? "unverified"}.\n`;
+}
+
 export function renderSetupReport(report) {
   const lines = [
     "# Grok setup",

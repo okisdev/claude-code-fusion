@@ -10,9 +10,11 @@ import { pathToFileURL } from "node:url";
 import {
   createJobRecord,
   jobFilePath,
+  jobLogPath,
   resolveDataDir,
   writeJobRecordFile
 } from "../plugins/codex/scripts/lib/state.mjs";
+import { parseTaskHeader } from "../plugins/codex/scripts/codex-companion.mjs";
 import {
   companion,
   envFor,
@@ -58,6 +60,16 @@ function createTransport(sandbox, raw, env = envFor(sandbox)) {
   fs.writeFileSync(transport.file, raw, "utf8");
   return { ...transport, ownerFile: path.join(path.dirname(transport.file), "owner.json") };
 }
+
+test("task header parsing captures model and effort only from a pipe-separated header", () => {
+  assert.deepEqual(
+    parseTaskHeader("\n  lane: codex | MODEL: gpt-5.6-terra | Effort: xhigh | verification: node --test\nImplement the change."),
+    { headerModel: "gpt-5.6-terra", headerEffort: "xhigh" }
+  );
+  assert.deepEqual(parseTaskHeader("Implement the change."), { headerModel: null, headerEffort: null });
+  assert.deepEqual(parseTaskHeader("model: gpt-5.6-terra"), { headerModel: null, headerEffort: null });
+  assert.deepEqual(parseTaskHeader("lane: codex | model: gpt-5.6-terra"), { headerModel: "gpt-5.6-terra", headerEffort: null });
+});
 
 test("task stays foreground by default and persists the complete terminal record", (t) => {
   const sandbox = makeSandbox(t);
@@ -527,6 +539,75 @@ test("rollout observations replace request-seeded model and effort", (t) => {
   assert.equal(record.rolloutRecoveryStatus, "recovered");
 });
 
+test("task records and renders model drift from a brief header", (t) => {
+  const sandbox = makeSandbox(t);
+  const result = runCompanion(["task", "lane: codex | model: gpt-header | effort: xhigh\nImplement the change."], {
+    cwd: sandbox.workDir,
+    env: envFor(sandbox, {
+      CODEX_HOME: path.join(sandbox.root, "codex-home"),
+      FAKE_CODEX_MODE: "rollout-completed",
+      FAKE_CODEX_RESOLVED_MODEL: "gpt-resolved"
+    })
+  });
+  assert.equal(result.status, 0, result.stderr);
+  const warning = "warning: brief header names gpt-header but the job ran gpt-resolved; pass --model to select the model.";
+  assert.equal(result.stdout.split(warning).length - 1, 1);
+  const [record] = jobRecords(sandbox);
+  assert.deepEqual(record.modelDrift, {
+    headerModel: "gpt-header",
+    headerEffort: "xhigh",
+    resolvedModel: "gpt-resolved"
+  });
+  const rerendered = runCompanion(["result", record.id], { cwd: sandbox.workDir, env: envFor(sandbox) });
+  assert.equal(rerendered.status, 0, rerendered.stderr);
+  assert.equal(rerendered.stdout.split(warning).length - 1, 1);
+});
+
+test("an explicit task model suppresses header model drift", (t) => {
+  const sandbox = makeSandbox(t);
+  const result = runCompanion(["task", "--model", "gpt-explicit", "lane: codex | model: gpt-header | effort: xhigh\nImplement the change."], {
+    cwd: sandbox.workDir,
+    env: envFor(sandbox, {
+      CODEX_HOME: path.join(sandbox.root, "codex-home"),
+      FAKE_CODEX_MODE: "rollout-completed",
+      FAKE_CODEX_RESOLVED_MODEL: "gpt-resolved"
+    })
+  });
+  assert.equal(result.status, 0, result.stderr);
+  assert.doesNotMatch(result.stdout, /warning: brief header names/);
+  assert.equal(Object.hasOwn(jobRecords(sandbox)[0], "modelDrift"), false);
+});
+
+test("a matching task header model does not create model drift", (t) => {
+  const sandbox = makeSandbox(t);
+  const result = runCompanion(["task", "lane: codex | model: gpt-resolved\nImplement the change."], {
+    cwd: sandbox.workDir,
+    env: envFor(sandbox, {
+      CODEX_HOME: path.join(sandbox.root, "codex-home"),
+      FAKE_CODEX_MODE: "rollout-completed",
+      FAKE_CODEX_RESOLVED_MODEL: "gpt-resolved"
+    })
+  });
+  assert.equal(result.status, 0, result.stderr);
+  assert.doesNotMatch(result.stdout, /warning: brief header names/);
+  assert.equal(Object.hasOwn(jobRecords(sandbox)[0], "modelDrift"), false);
+});
+
+test("a task without a header does not create model drift", (t) => {
+  const sandbox = makeSandbox(t);
+  const result = runCompanion(["task", "Implement the change."], {
+    cwd: sandbox.workDir,
+    env: envFor(sandbox, {
+      CODEX_HOME: path.join(sandbox.root, "codex-home"),
+      FAKE_CODEX_MODE: "rollout-completed",
+      FAKE_CODEX_RESOLVED_MODEL: "gpt-resolved"
+    })
+  });
+  assert.equal(result.status, 0, result.stderr);
+  assert.doesNotMatch(result.stdout, /warning: brief header names/);
+  assert.equal(Object.hasOwn(jobRecords(sandbox)[0], "modelDrift"), false);
+});
+
 test("task forwards --skip-git-repo-check to Codex", (t) => {
   const sandbox = makeSandbox(t);
   const result = runCompanion(["task", "--skip-git-repo-check", "inspect this directory"], {
@@ -835,6 +916,98 @@ test("resume-last uses the current Claude session without claiming an unverifiab
   assert.equal(resumed.tokenUsage, null);
   assert.equal(resumed.tokenUsageAvailability, "unavailable");
   assert.equal(resumed.tokenUsageUnavailableReason, "resume_continuity_unverifiable");
+});
+
+function seedThreadRoutingRecord(sandbox, overrides = {}) {
+  const id = randomBytes(16).toString("hex");
+  const record = createJobRecord({
+    claudeSessionId: "claude-session-1",
+    cwd: sandbox.workDir,
+    finishedAt: "2026-07-19T07:50:39.000Z",
+    id,
+    request: {
+      effort: "xhigh",
+      model: "gpt-5.6-terra",
+      serviceTier: "flex"
+    },
+    serviceTier: "flex",
+    status: "done",
+    threadId: "thread-routing",
+    ...overrides
+  });
+  writeJobRecordFile(jobFilePath(sandbox.dataDir, sandbox.workDir, id), record);
+  return record;
+}
+
+test("resume-last inherits model, effort, and service tier from its thread", (t) => {
+  const sandbox = makeSandbox(t);
+  const source = seedThreadRoutingRecord(sandbox);
+  const result = runCompanion(["task", "--resume-last", "continue routing"], {
+    cwd: sandbox.workDir,
+    env: envFor(sandbox, { FAKE_CODEX_THREAD_ID: "thread-routing" })
+  });
+  assert.equal(result.status, 0, result.stderr);
+  const args = readArgs(sandbox);
+  assert.deepEqual(args.slice(-2), ["resume", "thread-routing"]);
+  assert.ok(args.some((value, index) => value === "--model" && args[index + 1] === "gpt-5.6-terra"));
+  assert.ok(args.some((value, index) => value === "--config" && args[index + 1] === 'model_reasoning_effort="xhigh"'));
+  assert.ok(args.some((value, index) => value === "-c" && args[index + 1] === "service_tier=flex"));
+  const resumed = jobRecords(sandbox).find((record) => record.id !== source.id);
+  assert.deepEqual(resumed.request, {
+    effort: "xhigh",
+    fresh: false,
+    inheritedFromThread: true,
+    ingress: "argv",
+    model: "gpt-5.6-terra",
+    network: false,
+    resumeSourceJobId: source.id,
+    resumeThreadId: "thread-routing",
+    serviceTier: "flex",
+    skipGitRepoCheck: false,
+    transport: "task",
+    web: false,
+    write: false
+  });
+});
+
+test("resume applies explicit routing flags per field while inheriting the remaining fields", (t) => {
+  const cases = [
+    { expected: { effort: "xhigh", model: "gpt-5.6-sol", serviceTier: "flex" }, flags: ["--model", "gpt-5.6-sol"] },
+    { expected: { effort: "high", model: "gpt-5.6-terra", serviceTier: "flex" }, flags: ["--effort", "high"] },
+    { expected: { effort: "xhigh", model: "gpt-5.6-terra", serviceTier: "priority" }, flags: ["--service-tier", "priority"] }
+  ];
+  for (const { expected, flags } of cases) {
+    const sandbox = makeSandbox(t);
+    const source = seedThreadRoutingRecord(sandbox);
+    const result = runCompanion(["task", "--resume", "thread-routing", ...flags, "continue routing"], {
+      cwd: sandbox.workDir,
+      env: envFor(sandbox, { FAKE_CODEX_THREAD_ID: "thread-routing" })
+    });
+    assert.equal(result.status, 0, result.stderr);
+    const resumed = jobRecords(sandbox).find((record) => record.id !== source.id);
+    assert.equal(resumed.request.model, expected.model);
+    assert.equal(resumed.request.effort, expected.effort);
+    assert.equal(resumed.request.serviceTier, expected.serviceTier);
+    assert.equal(resumed.request.inheritedFromThread, true);
+  }
+});
+
+test("fresh tasks do not inherit routing from prior threads", (t) => {
+  const sandbox = makeSandbox(t);
+  const source = seedThreadRoutingRecord(sandbox);
+  const result = runCompanion(["task", "--fresh", "start fresh"], {
+    cwd: sandbox.workDir,
+    env: envFor(sandbox, { FAKE_CODEX_THREAD_ID: "fresh-thread" })
+  });
+  assert.equal(result.status, 0, result.stderr);
+  const args = readArgs(sandbox);
+  assert.ok(!args.includes("gpt-5.6-terra"));
+  assert.ok(!args.includes('model_reasoning_effort="xhigh"'));
+  const fresh = jobRecords(sandbox).find((record) => record.id !== source.id);
+  assert.equal(fresh.request.model, null);
+  assert.equal(fresh.request.effort, null);
+  assert.equal(fresh.request.serviceTier, "priority");
+  assert.equal(Object.hasOwn(fresh.request, "inheritedFromThread"), false);
 });
 
 test("completed tasks enforce configured history quotas without breaking resume-last", (t) => {
@@ -1154,6 +1327,35 @@ test("setup verifies authentication and the tested Codex version interval", (t) 
   const unsupportedReport = JSON.parse(unsupported.stdout);
   assert.equal(unsupportedReport.ready, false);
   assert.match(unsupportedReport.compatibility, /outside the tested/);
+});
+
+test("setup reports recent models cache schema drift from job logs without failing", (t) => {
+  const sandbox = makeSandbox(t);
+  const logFile = jobLogPath(sandbox.dataDir, sandbox.workDir, "models-cache-drift");
+  fs.mkdirSync(path.dirname(logFile), { recursive: true });
+  fs.writeFileSync(logFile, "error: failed to renew cache TTL\n");
+  const result = runCompanion(["setup", "--json"], { cwd: sandbox.workDir, env: envFor(sandbox) });
+  assert.equal(result.status, 0, result.stderr);
+  const report = JSON.parse(result.stdout);
+  assert.equal(report.ready, true);
+  assert.ok(report.nextSteps.includes("Codex CLI cannot parse the current models cache (schema drift). Upgrade the Codex CLI, then run /codex:setup again."));
+});
+
+test("setup only treats a missing field as models cache drift when its log tail names codex_models_manager", (t) => {
+  const sandbox = makeSandbox(t);
+  const logFile = jobLogPath(sandbox.dataDir, sandbox.workDir, "models-cache-missing-field");
+  const nextStep = "Codex CLI cannot parse the current models cache (schema drift). Upgrade the Codex CLI, then run /codex:setup again.";
+  fs.mkdirSync(path.dirname(logFile), { recursive: true });
+  fs.writeFileSync(logFile, "error: missing field `models`\n");
+
+  const unrelated = runCompanion(["setup", "--json"], { cwd: sandbox.workDir, env: envFor(sandbox) });
+  assert.equal(unrelated.status, 0, unrelated.stderr);
+  assert.ok(!JSON.parse(unrelated.stdout).nextSteps.includes(nextStep));
+
+  fs.writeFileSync(logFile, "error: missing field `models` in codex_models_manager\n");
+  const related = runCompanion(["setup", "--json"], { cwd: sandbox.workDir, env: envFor(sandbox) });
+  assert.equal(related.status, 0, related.stderr);
+  assert.ok(JSON.parse(related.stdout).nextSteps.includes(nextStep));
 });
 
 test("the companion module can be imported without executing its CLI", async () => {

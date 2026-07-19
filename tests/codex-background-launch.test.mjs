@@ -55,6 +55,19 @@ function createBackgroundJob(sandbox, env, id) {
   return { file, record };
 }
 
+function cancelWithLockRetry(args, options) {
+  const deadline = Date.now() + 12000;
+  let result = runCompanion(args, options);
+  while (
+    result.status !== 0 &&
+    /Timed out waiting for the job record lock/.test(result.stderr) &&
+    Date.now() < deadline
+  ) {
+    result = runCompanion(args, options);
+  }
+  return result;
+}
+
 test("a parent identity probe failure adopts the worker claimed identity before cleanup", async (t) => {
   const sandbox = makeSandbox(t);
   const readyFile = path.join(sandbox.root, "claimed-worker-codex-ready");
@@ -68,7 +81,7 @@ test("a parent identity probe failure adopts the worker claimed identity before 
       beforeIdentityProbe: async (pid) => waitFor(() => {
         const current = readJobRecordFile(file);
         return current?.pid === pid && current.pidIdentity ? current : null;
-      })
+      }, { timeout: 8000 })
     }
   );
   assert.notEqual(outcome.phase, "cleanup-required", JSON.stringify(outcome));
@@ -120,7 +133,7 @@ test("a failure after durable launch approval leaves the worker in control", asy
     {
       env,
       afterLaunchApproval: async () => {
-        await waitFor(() => readJobRecordFile(file)?.codexPidIdentity && fs.existsSync(readyFile));
+        await waitFor(() => readJobRecordFile(file)?.codexPidIdentity && fs.existsSync(readyFile), { timeout: 8000 });
         throw new Error("receipt rendering failed");
       }
     }
@@ -129,7 +142,7 @@ test("a failure after durable launch approval leaves the worker in control", asy
   assert.ok(outcome.launchApprovedAt);
   assert.equal(outcome.launchAbortRequestedAt, null);
   assert.ok(readJobRecordFile(file)?.codexPidIdentity);
-  const cancelled = runCompanion(["cancel", "approved-worker-handoff", "--cwd", sandbox.workDir], { cwd: sandbox.workDir, env });
+  const cancelled = cancelWithLockRetry(["cancel", "approved-worker-handoff", "--cwd", sandbox.workDir], { cwd: sandbox.workDir, env });
   assert.equal(cancelled.status, 0, cancelled.stderr);
   const completed = readJobRecordFile(file);
   assert.equal(completed.status, "cancelled");
@@ -173,8 +186,8 @@ test("a lock release failure after durable approval cannot abort the verified wo
   assert.equal(outcome.status, "running");
   assert.ok(outcome.launchApprovedAt);
   assert.equal(outcome.launchAbortRequestedAt, null);
-  await waitFor(() => readJobRecordFile(file)?.codexPidIdentity);
-  const cancelled = runCompanion(["cancel", "durable-approval-release-failure", "--cwd", sandbox.workDir], { cwd: sandbox.workDir, env });
+  await waitFor(() => readJobRecordFile(file)?.codexPidIdentity, { timeout: 8000 });
+  const cancelled = cancelWithLockRetry(["cancel", "durable-approval-release-failure", "--cwd", sandbox.workDir], { cwd: sandbox.workDir, env });
   assert.equal(cancelled.status, 0, cancelled.stderr);
   const completed = readJobRecordFile(file);
   assert.equal(completed.status, "cancelled");

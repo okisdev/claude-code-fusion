@@ -74,6 +74,11 @@ test("every executable private transport surface performs the Read before Write 
     assert.match(content, /Read(?: call)? fails/, file);
     assert.match(content, /file is not empty/, file);
     assert.match(content, /Write(?: call)? fails/, file);
+    if (file === "plugins/fusion/skills/stats/SKILL.md") {
+      assert.match(content, /sole carve-out is a strict verdict settlement/, file);
+      assert.match(content, /repeatable `--record <id>=<accepted\|rejected\|unverified>` pairs, optional `--source collector\|main-loop`, and optional `--json`/, file);
+      assert.match(content, /Anything else, including every `--reason` text value, still uses the raw-args transport exactly as described above\./, file);
+    }
   }
 });
 

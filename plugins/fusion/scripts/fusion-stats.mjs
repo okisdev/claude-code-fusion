@@ -22,6 +22,18 @@ const TERMINAL_LEDGER_PREFIX = "codex-jobs-monitor-announced";
 const OBSERVATION_LOCK_STALE_MS = 30000;
 const OBSERVATION_LOCK_ATTEMPTS = 8;
 const PRUNE_EVIDENCE = Symbol("pruneEvidence");
+const FUSION_TASK_ID_PATTERN = /^fusion-[0-9a-f]{24}$/;
+const ENGINE_JOB_ID_PATTERN = /^[0-9a-f]{32}$/;
+const RECORD_VERDICTS = new Set(["accepted", "rejected", "unverified"]);
+const RECORD_SOURCES = new Set(["collector", "main-loop"]);
+
+export class GrokPluginUpgradeRequiredError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = "GrokPluginUpgradeRequiredError";
+    this.code = "GROK_PLUGIN_UPGRADE_REQUIRED";
+  }
+}
 
 export function fusionWorkspaceKey(workspaceRoot) {
   return createHash("sha256").update(workspaceRoot).digest("hex").slice(0, 16);
@@ -432,6 +444,14 @@ function codexAcceptanceSubcommandUnavailable(result) {
   return /\b(?:unknown|unsupported|unrecognized)\s+(?:subcommand|command)\b/i.test(message) || /\brecord-acceptance\b.*\b(?:unknown|unsupported|unavailable|not found|not supported)\b/i.test(message) || /\b(?:cannot find module|ERR_MODULE_NOT_FOUND)\b/i.test(message);
 }
 
+function grokAcceptanceSubcommandUnavailable(result) {
+  if (result.error) {
+    return false;
+  }
+  const message = companionFailureMessage(result);
+  return /\b(?:unknown|unsupported|unrecognized)\s+(?:subcommand|command)\b/i.test(message) || /\brecord-acceptance\b.*\b(?:unknown|unsupported|unavailable|not found|not supported)\b/i.test(message) || /\b(?:cannot find module|ERR_MODULE_NOT_FOUND)\b/i.test(message);
+}
+
 function recordCodexCompanionAcceptance({ jobId, acceptance, reason, acceptFailedTransport, workspaceRoot, env }) {
   const bin = newestCodexCompanion(env);
   if (!bin) {
@@ -446,6 +466,22 @@ function recordCodexCompanionAcceptance({ jobId, acceptance, reason, acceptFaile
     return { updated: false };
   }
   throw new Error(companionFailureMessage(result) || "Codex acceptance record update failed.");
+}
+
+function recordGrokCompanionAcceptance({ jobId, acceptance, reason, acceptFailedTransport, workspaceRoot, asJson, env }) {
+  const bin = newestGrokCompanion(env);
+  if (!bin) {
+    throw new GrokPluginUpgradeRequiredError("The Grok job was found, but its companion is unavailable. Upgrade the Grok plugin and retry.");
+  }
+  const argv = [bin, "record-acceptance", "--job-id", jobId, "--acceptance", acceptance, ...(reason ? ["--reason", reason] : []), ...(acceptFailedTransport ? ["--accept-failed-transport"] : []), ...(asJson ? ["--json"] : [])];
+  const result = spawnSync(process.execPath, argv, { cwd: workspaceRoot, encoding: "utf8", env });
+  if (!result.error && result.status === 0) {
+    return;
+  }
+  if (grokAcceptanceSubcommandUnavailable(result)) {
+    throw new GrokPluginUpgradeRequiredError("The installed Grok plugin does not support record-acceptance. Upgrade the Grok plugin and retry.");
+  }
+  throw new Error(companionFailureMessage(result) || "Grok acceptance record update failed.");
 }
 
 export function grokStats({ all = false, env = process.env, cwd = process.cwd() } = {}) {
@@ -471,6 +507,40 @@ function resolveGrokDataDir(env = process.env) {
     return path.resolve(override.trim());
   }
   return path.join(os.homedir(), ".claude", "plugins", "data", "grok-claude-code-fusion");
+}
+
+function grokStateRoots(env = process.env) {
+  return [path.join(resolveGrokDataDir(env), "state")];
+}
+
+function grokJobById(jobId, env) {
+  for (const stateRoot of grokStateRoots(env)) {
+    for (const job of readWorkspaceJobFiles(stateRoot)) {
+      if (nonEmptyString(job?.id) === jobId) {
+        return job;
+      }
+    }
+  }
+  return null;
+}
+
+function codexJobExists(jobId, env) {
+  return readCodexJobEvidence(resolveCodexStateDir(env), { env }).some((job) => nonEmptyString(job?.id) === jobId);
+}
+
+function resolveEngineJob(jobId, env) {
+  const codexFound = codexJobExists(jobId, env);
+  const grokFound = grokJobById(jobId, env) !== null;
+  if (codexFound && grokFound) {
+    throw new Error(`Engine job ${jobId} exists in both Codex and Grok state.`);
+  }
+  if (codexFound) {
+    return "codex";
+  }
+  if (grokFound) {
+    return "grok";
+  }
+  throw new Error(`Engine job ${jobId} was not found in Codex or Grok state.`);
 }
 
 function bump(map, key) {
@@ -1159,6 +1229,7 @@ export function claudeWorkerStats({ all = false, env = process.env, cwd = proces
   let usage = { inputTokens: 0, cacheCreationInputTokens: 0, cacheReadInputTokens: 0, outputTokens: 0, totalTokens: 0, uncachedTokens: 0 };
   let usageAggregationOverflow = false;
   let pendingTransportJobs = 0;
+  let harnessAsyncDeliveries = 0;
   let completeUsage = 0;
   let partialUsage = 0;
   let unreportedUsage = 0;
@@ -1174,7 +1245,11 @@ export function claudeWorkerStats({ all = false, env = process.env, cwd = proces
     if (record.resolvedModel) {
       bump(byModel, record.resolvedModel);
     }
-    if (record.failureKind) {
+    const legacyHarnessAsyncDelivery = record.failureKind === "unexpected_async" && status === "done";
+    if (record.deliveryMode === "harness_async" || legacyHarnessAsyncDelivery) {
+      harnessAsyncDeliveries += 1;
+    }
+    if (record.failureKind && !legacyHarnessAsyncDelivery) {
       bump(byFailureKind, record.failureKind);
     }
     if (isTerminalWorkerStatus(status)) {
@@ -1236,6 +1311,7 @@ export function claudeWorkerStats({ all = false, env = process.env, cwd = proces
     pendingTransportJobs,
     byAgent,
     byFailureKind,
+    harnessAsyncDeliveries,
     byDelivery,
     byModel,
     usage: usageAggregationOverflow ? null : usage,
@@ -1911,6 +1987,9 @@ function renderEngine(lines, name, stats) {
   renderCounts(lines, "By model", stats.byModel ?? {});
   renderCounts(lines, "By effort", stats.byEffort ?? {});
   renderCounts(lines, "By failure kind", stats.byFailureKind ?? {});
+  if (Number.isSafeInteger(stats.harnessAsyncDeliveries)) {
+    lines.push("", `Harness async deliveries: ${stats.harnessAsyncDeliveries}`);
+  }
   if (stats.tokenUsage) {
     const scope = stats.tokenUsage.scope ? `, ${stats.tokenUsage.scope}` : "";
     const incomplete = stats.tokenUsage.jobsWithIncompleteUsage ?? 0;
@@ -1985,6 +2064,158 @@ function sessionIdFromArgs(argv, env) {
   return typeof selected === "string" && selected && !selected.startsWith("--") ? selected : env.CLAUDE_CODE_SESSION_ID || null;
 }
 
+function parseRecordPair(value) {
+  if (typeof value !== "string") {
+    throw new TypeError("--record requires an <id>=<verdict> pair.");
+  }
+  const separator = value.indexOf("=");
+  if (separator <= 0 || separator !== value.lastIndexOf("=")) {
+    throw new TypeError("--record requires an <id>=<verdict> pair.");
+  }
+  const id = value.slice(0, separator);
+  const verdict = value.slice(separator + 1);
+  if (!FUSION_TASK_ID_PATTERN.test(id) && !ENGINE_JOB_ID_PATTERN.test(id)) {
+    throw new TypeError("--record id must be a Fusion task id or a 32 character engine job id.");
+  }
+  if (!RECORD_VERDICTS.has(verdict)) {
+    throw new TypeError("--record verdict must be accepted, rejected, or unverified.");
+  }
+  return { id, verdict };
+}
+
+function parseRecordArguments(argv) {
+  const records = [];
+  let source = null;
+  let reason = null;
+  let asJson = false;
+  for (let index = 0; index < argv.length; index += 1) {
+    const token = argv[index];
+    if (token === "--record") {
+      records.push(parseRecordPair(argv[index + 1]));
+      index += 1;
+      continue;
+    }
+    if (token === "--source") {
+      if (source !== null || !RECORD_SOURCES.has(argv[index + 1])) {
+        throw new TypeError("--source must be collector or main-loop.");
+      }
+      source = argv[index + 1];
+      index += 1;
+      continue;
+    }
+    if (token === "--reason") {
+      if (reason !== null || typeof argv[index + 1] !== "string" || !argv[index + 1]) {
+        throw new TypeError("--reason requires text.");
+      }
+      reason = argv[index + 1];
+      index += 1;
+      continue;
+    }
+    if (token === "--json" && !asJson) {
+      asJson = true;
+      continue;
+    }
+    throw new TypeError(`Unsupported --record argument: ${String(token)}.`);
+  }
+  if (records.length === 0) {
+    throw new TypeError("At least one --record <id>=<verdict> pair is required.");
+  }
+  if (reason !== null && records.length !== 1) {
+    throw new TypeError("--reason can be used only when exactly one --record pair is present.");
+  }
+  return { records, source: source ?? "main-loop", reason, asJson };
+}
+
+function isStrictDirectRecordArguments(argv) {
+  if (!argv.includes("--record") || argv.includes("--reason")) {
+    return false;
+  }
+  try {
+    parseRecordArguments(argv);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function recordEngineAcceptance({ engine, jobId, verdict, reason, workspaceRoot, asJson, env }) {
+  if (engine === "grok") {
+    recordGrokCompanionAcceptance({
+      jobId,
+      acceptance: verdict,
+      reason,
+      acceptFailedTransport: false,
+      workspaceRoot,
+      asJson,
+      env
+    });
+    return true;
+  }
+  const companion = recordCodexCompanionAcceptance({
+    jobId,
+    acceptance: verdict,
+    reason,
+    acceptFailedTransport: false,
+    workspaceRoot,
+    env
+  });
+  if (!companion.updated) {
+    throw new Error("Codex job record was not updated because the companion or subcommand is unavailable.");
+  }
+  return true;
+}
+
+function writeRecordConfirmation({ kind, engine = null, jobId = null, worker = null, asJson, stdout }) {
+  if (asJson) {
+    stdout.write(`${JSON.stringify(kind === "engine" ? { kind, engine, jobId, acceptance: worker?.acceptance } : { kind, taskId: worker.taskId, acceptance: worker.acceptance })}\n`);
+    return;
+  }
+  if (kind === "engine") {
+    stdout.write(`Recorded ${worker.acceptance} for ${engine === "codex" ? "Codex" : "Grok"} job ${jobId}.\n`);
+    return;
+  }
+  stdout.write(`Recorded ${worker.acceptance} for Fusion worker task ${worker.taskId}.\n`);
+}
+
+function settleWorkerRecord({ taskId, verdict, source, reason, asJson, workspaceRoot, env, stdout }) {
+  const worker = recordWorkerAcceptance({ taskId, acceptance: verdict, env, source, reason, acceptFailedTransport: false });
+  writeRecordConfirmation({ kind: "worker", worker, asJson, stdout });
+  const peerJobId = typeof worker.peerJobId === "string" && ENGINE_JOB_ID_PATTERN.test(worker.peerJobId) ? worker.peerJobId : null;
+  if (!peerJobId) {
+    return [worker];
+  }
+  const engine = worker.peerEngine === "codex" || worker.peerEngine === "grok" ? worker.peerEngine : resolveEngineJob(peerJobId, env);
+  recordEngineAcceptance({ engine, jobId: peerJobId, verdict, reason, workspaceRoot, asJson, env });
+  writeRecordConfirmation({ kind: "engine", engine, jobId: peerJobId, worker, asJson, stdout });
+  return [worker, { engine, jobId: peerJobId, acceptance: verdict }];
+}
+
+function settleEngineRecord({ jobId, verdict, source, reason, asJson, workspaceRoot, env, stdout }) {
+  const engine = resolveEngineJob(jobId, env);
+  const confirmation = { engine, jobId, acceptance: verdict };
+  recordEngineAcceptance({ engine, jobId, verdict, reason, workspaceRoot, asJson, env });
+  writeRecordConfirmation({ kind: "engine", engine, jobId, worker: confirmation, asJson, stdout });
+  const writes = [confirmation];
+  for (const record of readWorkerRecords(env).filter((candidate) => candidate.peerJobId === jobId)) {
+    const worker = recordWorkerAcceptance({ taskId: record.taskId, acceptance: verdict, env, source, reason, acceptFailedTransport: false });
+    writeRecordConfirmation({ kind: "worker", worker, asJson, stdout });
+    writes.push(worker);
+  }
+  return writes;
+}
+
+function settleRecords({ records, source, reason, asJson, workspaceRoot, env, stdout }) {
+  const writes = [];
+  for (const { id, verdict } of records) {
+    if (FUSION_TASK_ID_PATTERN.test(id)) {
+      writes.push(...settleWorkerRecord({ taskId: id, verdict, source, reason, asJson, workspaceRoot, env, stdout }));
+    } else {
+      writes.push(...settleEngineRecord({ jobId: id, verdict, source, reason, asJson, workspaceRoot, env, stdout }));
+    }
+  }
+  return writes;
+}
+
 export function main(argv = process.argv.slice(2), { env = process.env, cwd = process.cwd(), stdout = process.stdout, stderr = process.stderr } = {}) {
   const asJson = argv.includes("--json");
   const effectiveEnv = argv.includes("--include-legacy") ? { ...env, FUSION_CODEX_INCLUDE_LEGACY: "1" } : env;
@@ -1999,6 +2230,11 @@ export function main(argv = process.argv.slice(2), { env = process.env, cwd = pr
     });
     stdout.write(asJson ? `${JSON.stringify(report, null, 2)}\n` : renderAuditReport(report));
     return report;
+  }
+
+  if (argv.includes("--record")) {
+    const request = parseRecordArguments(argv);
+    return settleRecords({ ...request, workspaceRoot: cwd, env: effectiveEnv, stdout });
   }
 
   if (argv.includes("--record-acceptance")) {
@@ -2017,6 +2253,22 @@ export function main(argv = process.argv.slice(2), { env = process.env, cwd = pr
       source: argumentValue(argv, "--source") ?? "collector"
     };
     const preparedAcceptance = prepareCodexAcceptance(acceptanceRequest);
+    const codexFound = codexJobExists(preparedAcceptance.observation.jobId, effectiveEnv);
+    const grokJob = codexFound ? null : grokJobById(preparedAcceptance.observation.jobId, effectiveEnv);
+    if (grokJob) {
+      recordGrokCompanionAcceptance({
+        jobId: preparedAcceptance.observation.jobId,
+        acceptance: preparedAcceptance.observation.acceptance,
+        reason: preparedAcceptance.normalizedReason,
+        acceptFailedTransport: argv.includes("--accept-failed-transport"),
+        workspaceRoot: preparedAcceptance.normalizedRoot,
+        asJson,
+        env: effectiveEnv
+      });
+      const observation = { ...preparedAcceptance.observation, engine: "grok" };
+      stdout.write(asJson ? `${JSON.stringify(observation, null, 2)}\n` : `Recorded ${observation.acceptance} for Grok job ${observation.jobId}.\n`);
+      return observation;
+    }
     const companion = recordCodexCompanionAcceptance({
       jobId: preparedAcceptance.observation.jobId,
       acceptance: preparedAcceptance.observation.acceptance,
@@ -2040,7 +2292,8 @@ export function main(argv = process.argv.slice(2), { env = process.env, cwd = pr
       acceptance: argv[index + 2],
       env: effectiveEnv,
       reason: argumentValue(argv, "--reason"),
-      source: argumentValue(argv, "--source") ?? "main-loop"
+      source: argumentValue(argv, "--source") ?? "main-loop",
+      acceptFailedTransport: argv.includes("--accept-failed-transport")
     });
     stdout.write(asJson ? `${JSON.stringify(observation, null, 2)}\n` : `Recorded ${observation.acceptance} for Fusion worker task ${observation.taskId}.\n`);
     return observation;
@@ -2092,6 +2345,13 @@ function runCli(argv = process.argv.slice(2)) {
     }
     consumeRawArgsTransport(argv[2]);
     return;
+  }
+  if (isStrictDirectRecordArguments(argv)) {
+    main(argv);
+    return;
+  }
+  if (argv[0] !== "--raw-args-token") {
+    throw new TypeError("Fusion stats requests must be supplied through --raw-args-token.");
   }
   const transport = resolveRawArgsTransport(argv);
   main(transport.argv);
