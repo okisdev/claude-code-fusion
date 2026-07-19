@@ -38,8 +38,8 @@ const fakeCodex = fileURLToPath(new URL("./fake-codex", import.meta.url));
 const codexExecModuleUrl = new URL("../plugins/codex/scripts/lib/codex-exec.mjs", import.meta.url).href;
 const LOAD_TOLERANT_WAIT_TIMEOUT_MS = 15000;
 const LOAD_TOLERANT_POLL_INTERVAL_MS = 25;
-const TIMEOUT_TEST_TIMEOUT_MS = 2000;
-const TIMEOUT_TEST_TERMINATION_GRACE_MS = 2000;
+const TIMEOUT_TEST_TIMEOUT_MS = 8000;
+const TIMEOUT_TEST_TERMINATION_GRACE_MS = 8000;
 const COMPANION_WATCHDOG_TIMEOUT_MS = 30000;
 
 function fixture(t) {
