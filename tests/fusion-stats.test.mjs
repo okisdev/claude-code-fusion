@@ -34,6 +34,7 @@ import {
 } from "../plugins/fusion/scripts/fusion-stats.mjs";
 import { resolveStateDir as guardResolveStateDir, stateFile as guardStateFile } from "../plugins/fusion/scripts/inline-delegation-guard.mjs";
 import { resolveCodexStateRoots } from "../plugins/fusion/scripts/lib/codex-state-roots.mjs";
+import { createRawArgsTransport } from "../plugins/fusion/scripts/lib/raw-args-transport.mjs";
 import { createWorkerRecord, readWorkerRecord, recordWorkerAcceptance, updateWorkerRecord, workerRecordFile } from "../plugins/fusion/scripts/lib/worker-state.mjs";
 
 const SCRIPT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "plugins", "fusion", "scripts", "fusion-stats.mjs");
@@ -68,6 +69,17 @@ function writeGrokJob(dataDir, cwd, id, fields) {
 }
 
 function run(env, extraArgs = [], extraEnv = {}) {
+  const runtimeEnv = { ...process.env, FUSION_GROK_COMPANION: "/nonexistent/grok-companion.mjs", FUSION_CODEX_STATE: env.codexState, ...extraEnv };
+  const transport = createRawArgsTransport({ sessionId: runtimeEnv.CLAUDE_CODE_SESSION_ID });
+  fs.writeFileSync(transport.file, extraArgs.map((argument) => JSON.stringify(argument)).join(" "), "utf8");
+  return spawnSync(process.execPath, [SCRIPT, "--raw-args-token", transport.token], {
+    cwd: env.cwd,
+    encoding: "utf8",
+    env: runtimeEnv
+  });
+}
+
+function runDirect(env, extraArgs = [], extraEnv = {}) {
   return spawnSync(process.execPath, [SCRIPT, ...extraArgs], {
     cwd: env.cwd,
     encoding: "utf8",
@@ -93,6 +105,27 @@ function writeCodexAcceptanceCompanion(directory) {
       "    fs.writeFileSync(process.env.FUSION_TEST_CODEX_COMPANION_ARGS, JSON.stringify(argv));",
       "  }",
       '  process.stdout.write("Recorded Codex acceptance.\\n");',
+      "}"
+    ].join("\n")
+  );
+  return companion;
+}
+
+function writeGrokAcceptanceCompanion(directory) {
+  const companion = path.join(directory, "grok-companion.mjs");
+  fs.writeFileSync(
+    companion,
+    [
+      'import fs from "node:fs";',
+      "const argv = process.argv.slice(2);",
+      'if (process.env.FUSION_TEST_GROK_COMPANION_MODE === "absent") {',
+      '  process.stderr.write("Unknown subcommand: record-acceptance.\\n");',
+      "  process.exitCode = 1;",
+      "} else {",
+      "  if (process.env.FUSION_TEST_GROK_COMPANION_ARGS) {",
+      "    fs.writeFileSync(process.env.FUSION_TEST_GROK_COMPANION_ARGS, JSON.stringify(argv));",
+      "  }",
+      '  process.stdout.write("Recorded Grok acceptance.\\n");',
       "}"
     ].join("\n")
   );
@@ -1383,6 +1416,208 @@ test("--record-acceptance forwards --accept-failed-transport unchanged", (t) => 
   assert.deepStrictEqual(JSON.parse(fs.readFileSync(argsFile, "utf8")), ["record-acceptance", "--job-id", jobId, "--acceptance", "accepted", "--accept-failed-transport"]);
 });
 
+test("--record-acceptance resolves a Grok job after a Codex lookup miss", (t) => {
+  const dir = sandbox(t);
+  const grokData = path.join(dir, "grok-data");
+  const jobId = "e".repeat(32);
+  const companion = writeGrokAcceptanceCompanion(dir);
+  const argsFile = path.join(dir, "grok-companion-args.json");
+  writeGrokJob(grokData, dir, jobId, { status: "done", mode: "consult" });
+
+  const result = run(
+    { cwd: dir, codexState: path.join(dir, "missing") },
+    ["--record-acceptance", jobId, "accepted", "--reason", "verification passed", "--accept-failed-transport", "--json"],
+    { GROK_COMPANION_DATA: grokData, FUSION_GROK_COMPANION: companion, FUSION_TEST_GROK_COMPANION_ARGS: argsFile }
+  );
+
+  assert.strictEqual(result.status, 0, result.stderr);
+  assert.deepStrictEqual(JSON.parse(fs.readFileSync(argsFile, "utf8")), ["record-acceptance", "--job-id", jobId, "--acceptance", "accepted", "--reason", "verification passed", "--accept-failed-transport", "--json"]);
+  assert.strictEqual(JSON.parse(result.stdout).engine, "grok");
+  assert.strictEqual(fs.existsSync(acceptanceSidecarPath(dir, { FUSION_DATA_DIR: path.join(dir, "fusion") })), false);
+});
+
+test("--record-acceptance requires a Grok plugin upgrade when its companion lacks the subcommand", (t) => {
+  const dir = sandbox(t);
+  const grokData = path.join(dir, "grok-data");
+  const jobId = "f".repeat(32);
+  const companion = writeGrokAcceptanceCompanion(dir);
+  writeGrokJob(grokData, dir, jobId, { status: "done", mode: "consult" });
+
+  const result = run(
+    { cwd: dir, codexState: path.join(dir, "missing") },
+    ["--record-acceptance", jobId, "rejected"],
+    { GROK_COMPANION_DATA: grokData, FUSION_GROK_COMPANION: companion, FUSION_TEST_GROK_COMPANION_MODE: "absent" }
+  );
+
+  assert.notStrictEqual(result.status, 0);
+  assert.match(result.stderr, /Grok plugin does not support record-acceptance.*Upgrade the Grok plugin/);
+});
+
+function createTerminalWorker({ taskId, env, workspaceRoot, peerEngine = null, peerJobId = null }) {
+  createWorkerRecord({ taskId, sessionId: "session-settlement", dispatchToolUseId: `tool-${taskId}`, agentType: "fusion:fast-worker", workspaceRoot, limits: {} }, env);
+  updateWorkerRecord(taskId, env, (record) => ({
+    ...record,
+    transportStatus: "done",
+    ...(peerEngine ? { peerEngine } : {}),
+    ...(peerJobId ? { peerJobId, peerTransportStatus: "done" } : {})
+  }));
+}
+
+test("--record settles a Fusion task and its Codex peer with direct strict argv", (t) => {
+  const dir = sandbox(t);
+  const stateRoot = path.join(dir, "codex-state");
+  const stateDir = path.join(dir, "worker-state");
+  const taskId = `fusion-${"a".repeat(24)}`;
+  const jobId = "b".repeat(32);
+  const argsFile = path.join(dir, "codex-companion-args.json");
+  const companion = writeCodexAcceptanceCompanion(dir);
+  const env = { FUSION_WORKER_STATE_DIR: stateDir };
+  createTerminalWorker({ taskId, env, workspaceRoot: dir, peerEngine: "codex", peerJobId: jobId });
+
+  const result = runDirect(
+    { cwd: dir, codexState: stateRoot },
+    ["--record", `${taskId}=accepted`, "--source", "main-loop"],
+    { ...env, FUSION_CODEX_COMPANION: companion, FUSION_TEST_CODEX_COMPANION_ARGS: argsFile }
+  );
+
+  assert.strictEqual(result.status, 0, result.stderr);
+  assert.strictEqual(result.stdout, `Recorded accepted for Fusion worker task ${taskId}.\nRecorded accepted for Codex job ${jobId}.\n`);
+  assert.deepStrictEqual(JSON.parse(fs.readFileSync(argsFile, "utf8")), ["record-acceptance", "--job-id", jobId, "--acceptance", "accepted"]);
+  assert.strictEqual(readWorkerRecord(taskId, env).acceptance, "accepted");
+});
+
+test("--record resolves a bare Codex job and settles matching worker rows", (t) => {
+  const dir = sandbox(t);
+  const stateRoot = path.join(dir, "codex-state");
+  const stateDir = path.join(dir, "worker-state");
+  const taskId = `fusion-${"c".repeat(24)}`;
+  const jobId = "d".repeat(32);
+  const argsFile = path.join(dir, "codex-companion-args.json");
+  const companion = writeCodexAcceptanceCompanion(dir);
+  const env = { FUSION_WORKER_STATE_DIR: stateDir };
+  writeCodexJob(stateRoot, dir, jobId, { status: "done", jobClass: "task" });
+  createTerminalWorker({ taskId, env, workspaceRoot: dir, peerEngine: "codex", peerJobId: jobId });
+
+  const result = runDirect(
+    { cwd: dir, codexState: stateRoot },
+    ["--record", `${jobId}=rejected`, "--json"],
+    { ...env, FUSION_CODEX_COMPANION: companion, FUSION_TEST_CODEX_COMPANION_ARGS: argsFile }
+  );
+
+  assert.strictEqual(result.status, 0, result.stderr);
+  assert.deepStrictEqual(result.stdout.trim().split("\n").map((line) => JSON.parse(line)), [
+    { kind: "engine", engine: "codex", jobId, acceptance: "rejected" },
+    { kind: "worker", taskId, acceptance: "rejected" }
+  ]);
+  assert.deepStrictEqual(JSON.parse(fs.readFileSync(argsFile, "utf8")), ["record-acceptance", "--job-id", jobId, "--acceptance", "rejected"]);
+  assert.strictEqual(readWorkerRecord(taskId, env).acceptance, "rejected");
+});
+
+test("--record resolves a bare Grok job and settles matching worker rows", (t) => {
+  const dir = sandbox(t);
+  const grokData = path.join(dir, "grok-data");
+  const stateDir = path.join(dir, "worker-state");
+  const taskId = `fusion-${"e".repeat(24)}`;
+  const jobId = "f".repeat(32);
+  const argsFile = path.join(dir, "grok-companion-args.json");
+  const companion = writeGrokAcceptanceCompanion(dir);
+  const env = { FUSION_WORKER_STATE_DIR: stateDir };
+  writeGrokJob(grokData, dir, jobId, { status: "done", mode: "consult" });
+  createTerminalWorker({ taskId, env, workspaceRoot: dir, peerEngine: "grok", peerJobId: jobId });
+
+  const result = runDirect(
+    { cwd: dir, codexState: path.join(dir, "missing") },
+    ["--record", `${jobId}=unverified`],
+    { ...env, GROK_COMPANION_DATA: grokData, FUSION_GROK_COMPANION: companion, FUSION_TEST_GROK_COMPANION_ARGS: argsFile }
+  );
+
+  assert.strictEqual(result.status, 0, result.stderr);
+  assert.strictEqual(result.stdout, `Recorded unverified for Grok job ${jobId}.\nRecorded unverified for Fusion worker task ${taskId}.\n`);
+  assert.deepStrictEqual(JSON.parse(fs.readFileSync(argsFile, "utf8")), ["record-acceptance", "--job-id", jobId, "--acceptance", "unverified"]);
+  assert.strictEqual(readWorkerRecord(taskId, env).acceptance, "unverified");
+});
+
+test("--record rejects an engine id that exists in both peer states", (t) => {
+  const dir = sandbox(t);
+  const stateRoot = path.join(dir, "codex-state");
+  const grokData = path.join(dir, "grok-data");
+  const jobId = "1".repeat(32);
+  writeCodexJob(stateRoot, dir, jobId, { status: "done", jobClass: "task" });
+  writeGrokJob(grokData, dir, jobId, { status: "done", mode: "consult" });
+
+  const result = runDirect(
+    { cwd: dir, codexState: stateRoot },
+    ["--record", `${jobId}=accepted`],
+    { GROK_COMPANION_DATA: grokData, FUSION_CODEX_COMPANION: writeCodexAcceptanceCompanion(dir), FUSION_GROK_COMPANION: writeGrokAcceptanceCompanion(dir) }
+  );
+
+  assert.notStrictEqual(result.status, 0);
+  assert.match(result.stderr, /exists in both Codex and Grok state/);
+});
+
+test("--record batches mixed verdicts", (t) => {
+  const dir = sandbox(t);
+  const stateDir = path.join(dir, "worker-state");
+  const firstTaskId = `fusion-${"2".repeat(24)}`;
+  const secondTaskId = `fusion-${"3".repeat(24)}`;
+  const env = { FUSION_WORKER_STATE_DIR: stateDir };
+  createTerminalWorker({ taskId: firstTaskId, env, workspaceRoot: dir });
+  createTerminalWorker({ taskId: secondTaskId, env, workspaceRoot: dir });
+
+  const result = runDirect(
+    { cwd: dir, codexState: path.join(dir, "missing") },
+    ["--record", `${firstTaskId}=accepted`, "--record", `${secondTaskId}=rejected`],
+    env
+  );
+
+  assert.strictEqual(result.status, 0, result.stderr);
+  assert.strictEqual(result.stdout, `Recorded accepted for Fusion worker task ${firstTaskId}.\nRecorded rejected for Fusion worker task ${secondTaskId}.\n`);
+  assert.strictEqual(readWorkerRecord(firstTaskId, env).acceptance, "accepted");
+  assert.strictEqual(readWorkerRecord(secondTaskId, env).acceptance, "rejected");
+});
+
+test("--record rejects a reason attached to multiple pairs and requires transport outside the strict carve-out", (t) => {
+  const dir = sandbox(t);
+  const stateDir = path.join(dir, "worker-state");
+  const firstTaskId = `fusion-${"4".repeat(24)}`;
+  const secondTaskId = `fusion-${"5".repeat(24)}`;
+  const env = { FUSION_WORKER_STATE_DIR: stateDir };
+  createTerminalWorker({ taskId: firstTaskId, env, workspaceRoot: dir });
+  createTerminalWorker({ taskId: secondTaskId, env, workspaceRoot: dir });
+  const args = ["--record", `${firstTaskId}=accepted`, "--record", `${secondTaskId}=rejected`, "--reason", "mixed verdicts"];
+
+  const direct = runDirect({ cwd: dir, codexState: path.join(dir, "missing") }, args, env);
+  assert.notStrictEqual(direct.status, 0);
+  assert.match(direct.stderr, /must be supplied through --raw-args-token/);
+
+  const staged = run({ cwd: dir, codexState: path.join(dir, "missing") }, args, env);
+  assert.notStrictEqual(staged.status, 0);
+  assert.match(staged.stderr, /--reason can be used only when exactly one --record pair is present/);
+  assert.strictEqual(readWorkerRecord(firstTaskId, env).acceptance, "unverified");
+  assert.strictEqual(readWorkerRecord(secondTaskId, env).acceptance, "unverified");
+});
+
+test("legacy acceptance aliases continue to work through the raw-args transport", (t) => {
+  const dir = sandbox(t);
+  const stateRoot = path.join(dir, "codex-state");
+  const stateDir = path.join(dir, "worker-state");
+  const fusionData = path.join(dir, "fusion-data");
+  const taskId = `fusion-${"6".repeat(24)}`;
+  const jobId = "7".repeat(32);
+  const companion = writeCodexAcceptanceCompanion(dir);
+  const env = { FUSION_WORKER_STATE_DIR: stateDir, FUSION_DATA_DIR: fusionData, FUSION_CODEX_COMPANION: companion };
+  writeCodexJob(stateRoot, dir, jobId, { status: "done", jobClass: "task" });
+  createTerminalWorker({ taskId, env, workspaceRoot: dir });
+
+  const jobAlias = run({ cwd: dir, codexState: stateRoot }, ["--record-acceptance", jobId, "accepted"], env);
+  const workerAlias = run({ cwd: dir, codexState: stateRoot }, ["--record-worker-acceptance", taskId, "rejected"], env);
+
+  assert.strictEqual(jobAlias.status, 0, jobAlias.stderr);
+  assert.strictEqual(workerAlias.status, 0, workerAlias.stderr);
+  assert.strictEqual(readWorkerRecord(taskId, env).acceptance, "rejected");
+  assert.strictEqual(fs.readFileSync(acceptanceSidecarPath(dir, env), "utf8").trim().split("\n").length, 1);
+});
+
 test("Codex reports acceptance anomalies only when the ledger and transport state diverge", (t) => {
   const dir = sandbox(t);
   const stateRoot = path.join(dir, "state");
@@ -1960,6 +2195,23 @@ test("Claude worker stats expose lifecycle, exact usage, acceptance, and the uni
   assert.strictEqual(fs.statSync(stateDir).mode & 0o777, 0o700);
   assert.strictEqual(fs.statSync(path.dirname(jobFile)).mode & 0o777, 0o700);
   assert.strictEqual(fs.statSync(jobFile).mode & 0o777, 0o600);
+});
+
+test("Claude worker stats report completed harness async deliveries separately from failures", (t) => {
+  const dir = sandbox(t);
+  const stateDir = path.join(dir, "worker-state");
+  const env = { FUSION_WORKER_STATE_DIR: stateDir };
+  for (const [taskId, dispatchToolUseId] of [["fusion-async-legacy", "tool-legacy"], ["fusion-async-modern", "tool-modern"], ["fusion-async-pending", "tool-pending"]]) {
+    createWorkerRecord({ taskId, sessionId: "session-workers", dispatchToolUseId, agentType: "fusion:fast-worker", workspaceRoot: dir, limits: {} }, env);
+  }
+  updateWorkerRecord("fusion-async-legacy", env, (record) => ({ ...record, transportStatus: "done", failureKind: "unexpected_async" }));
+  updateWorkerRecord("fusion-async-modern", env, (record) => ({ ...record, transportStatus: "done", deliveryMode: "harness_async" }));
+  updateWorkerRecord("fusion-async-pending", env, (record) => ({ ...record, transportStatus: "pending_async", failureKind: "unexpected_async" }));
+
+  const stats = claudeWorkerStats({ all: true, env, cwd: dir });
+  assert.strictEqual(stats.harnessAsyncDeliveries, 2);
+  assert.deepStrictEqual(stats.byFailureKind, { unexpected_async: 1 });
+  assert.match(renderFusionStats({ scope: dir, claudeWorkers: stats }), /Harness async deliveries: 2/);
 });
 
 test("Claude worker stats fail closed on malformed complete usage and aggregate overflow", (t) => {
