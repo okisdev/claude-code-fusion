@@ -154,6 +154,7 @@ function auditModelDrift(env) {
   const routing = readModelRoutingFile(modelRoutingFile);
   const listing = readCodexModelListing(resolveCodexModelsCachePath(env));
   const configuredModelIds = routing.ok ? [...new Set(routing.data.models.map((model) => model.id))] : [];
+  const configuredCodexModelIds = routing.ok ? [...new Set(routing.data.models.filter((model) => model.lane === "codex").map((model) => model.id))] : [];
   const listedModelIds = new Set(listing.available ? listing.modelIds : []);
   return {
     modelRoutingFile,
@@ -161,7 +162,7 @@ function auditModelDrift(env) {
     valid: Boolean(routing.ok),
     error: routing.ok || routing.missing ? null : routing.reason,
     listing,
-    configuredButAbsent: listing.available && routing.ok ? configuredModelIds.filter((id) => !listedModelIds.has(id)) : [],
+    configuredButAbsent: listing.available && routing.ok ? configuredCodexModelIds.filter((id) => !listedModelIds.has(id)) : [],
     unconfiguredGptModels: listing.available && routing.ok ? listing.modelIds.filter((id) => id.startsWith("gpt-") && !configuredModelIds.includes(id)) : []
   };
 }
