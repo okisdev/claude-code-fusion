@@ -49,6 +49,36 @@ test("private argument transports are session bound and consumed once", (t) => {
   assert.throws(() => consumeRawArgsTransport(transport.token, { sessionId: "session-a", temporaryRoot }), /Could not read Fusion input transport/);
 });
 
+test("private argument transport accepts an empty payload as empty argv and removes it", (t) => {
+  const temporaryRoot = sandbox(t);
+  const transport = createRawArgsTransport({ sessionId: "session-a", temporaryRoot });
+  const directory = path.dirname(transport.file);
+  assert.strictEqual(fs.readFileSync(transport.file, "utf8"), "");
+
+  assert.strictEqual(consumeRawArgsTransport(transport.token, { sessionId: "session-a", temporaryRoot }), "");
+  assert.strictEqual(fs.existsSync(transport.file), false);
+  assert.strictEqual(fs.existsSync(path.join(directory, "owner.json")), false);
+  assert.strictEqual(fs.existsSync(directory), false);
+
+  const emptyTransport = createRawArgsTransport({ sessionId: "session-a", temporaryRoot });
+  const emptyDirectory = path.dirname(emptyTransport.file);
+  const resolved = resolveRawArgsTransport(["--raw-args-token", emptyTransport.token], { sessionId: "session-a", temporaryRoot });
+  assert.deepStrictEqual(resolved, { argv: [], ingress: "staged_file" });
+  assert.strictEqual(fs.existsSync(emptyDirectory), false);
+});
+
+test("private argument transport discard removes an unwritten input silently", (t) => {
+  const temporaryRoot = sandbox(t);
+  const transport = createRawArgsTransport({ sessionId: "session-a", temporaryRoot });
+  const directory = path.dirname(transport.file);
+  assert.strictEqual(fs.readFileSync(transport.file, "utf8"), "");
+
+  assert.strictEqual(consumeRawArgsTransport(transport.token, { sessionId: "session-a", temporaryRoot }), "");
+  assert.strictEqual(fs.existsSync(transport.file), false);
+  assert.strictEqual(fs.existsSync(path.join(directory, "owner.json")), false);
+  assert.strictEqual(fs.existsSync(directory), false);
+});
+
 test("a transport cannot cross Claude sessions", (t) => {
   const temporaryRoot = sandbox(t);
   const transport = createRawArgsTransport({ sessionId: "session-a", temporaryRoot });

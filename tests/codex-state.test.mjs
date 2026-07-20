@@ -11,6 +11,7 @@ import { getProcessIdentity, processIdentityMatches } from "../plugins/codex/scr
 import {
   DEFAULT_JOB_HISTORY_MAX_BYTES,
   DEFAULT_JOB_HISTORY_MAX_RECORDS,
+  DEFAULT_LOCK_TIMEOUT_MS,
   TERMINAL_STATUSES,
   appendJobEvent,
   appendJobLog,
@@ -33,6 +34,7 @@ import {
   repositoryKey,
   resolveDataDir,
   resolveJobHistoryLimits,
+  resolveLockTimeoutMs,
   updateJobRecordFile,
   updateJobRecordFileWithCurrent,
   withThreadLock,
@@ -43,6 +45,27 @@ import {
 } from "../plugins/codex/scripts/lib/state.mjs";
 
 const stateModuleUrl = new URL("../plugins/codex/scripts/lib/state.mjs", import.meta.url).href;
+
+const processIdentityBin = fs.mkdtempSync(path.join(os.tmpdir(), "codex-state-identity-"));
+fs.writeFileSync(
+  path.join(processIdentityBin, "ps"),
+  `#!/bin/sh
+pid=""
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = "-p" ]; then
+    pid="$2"
+    shift 2
+  else
+    shift
+  fi
+done
+printf "process-%s\\n" "$pid"
+`
+);
+fs.writeFileSync(path.join(processIdentityBin, "sysctl"), '#!/bin/sh\nprintf "{ sec = 1, usec = 0 }\\n"\n');
+fs.chmodSync(path.join(processIdentityBin, "ps"), 0o755);
+fs.chmodSync(path.join(processIdentityBin, "sysctl"), 0o755);
+test.after(() => fs.rmSync(processIdentityBin, { recursive: true, force: true }));
 
 const serialLockChild = `
 import fs from "node:fs";
@@ -76,6 +99,20 @@ withThreadLock(dataDir, threadId, () => {
 });
 `;
 
+const lockTimeoutChild = `
+import fs from "node:fs";
+const [stateUrl, dataDir, threadId, readyFile] = process.argv.slice(1);
+const { withThreadLock } = await import(stateUrl);
+fs.writeFileSync(readyFile, "ready\\n");
+const startedAt = Date.now();
+try {
+  withThreadLock(dataDir, threadId, () => null);
+  process.stdout.write(JSON.stringify({ elapsedMs: Date.now() - startedAt, message: null }));
+} catch (error) {
+  process.stdout.write(JSON.stringify({ elapsedMs: Date.now() - startedAt, message: error.message }));
+}
+`;
+
 function makeSandbox(t) {
   const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "codex-state-test-")));
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
@@ -95,9 +132,10 @@ function threadLockDir(dataDir, threadId) {
   return path.join(dataDir, "locks", "threads", `${key}.lock`);
 }
 
-function runLockChild(source, args) {
+function runLockChild(source, args, env = process.env) {
   const child = spawn(process.execPath, ["--input-type=module", "--eval", source, ...args], {
-    stdio: ["ignore", "pipe", "pipe"]
+    stdio: ["ignore", "pipe", "pipe"],
+    env
   });
   let stdout = "";
   let stderr = "";
@@ -116,6 +154,10 @@ function runLockChild(source, args) {
   return { child, completion };
 }
 
+function identityChildEnv(extra = {}) {
+  return { ...process.env, PATH: `${processIdentityBin}${path.delimiter}${process.env.PATH}`, ...extra };
+}
+
 async function waitForPath(file, timeoutMs = 3000) {
   const deadline = Date.now() + timeoutMs;
   while (!fs.existsSync(file)) {
@@ -123,6 +165,20 @@ async function waitForPath(file, timeoutMs = 3000) {
       throw new Error(`Timed out waiting for ${file}.`);
     }
     await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+}
+
+async function waitForCompletion(completion, timeoutMs) {
+  let timer;
+  try {
+    return await Promise.race([
+      completion,
+      new Promise((_, reject) => {
+        timer = setTimeout(() => reject(new Error(`Lock waiter exceeded ${timeoutMs}ms.`)), timeoutMs);
+      })
+    ]);
+  } finally {
+    clearTimeout(timer);
   }
 }
 
@@ -404,6 +460,37 @@ test("three processes serialize on the same thread lock", async (t) => {
   assert.strictEqual(fs.existsSync(`${traceFile}.guard`), false);
 });
 
+test("a held thread lock times out a second acquirer within the configured ceiling", async (t) => {
+  const sandbox = makeSandbox(t);
+  const threadId = "contended-thread";
+  const readyFile = path.join(sandbox.root, "contention-ready");
+  const releaseFile = path.join(sandbox.root, "contention-release");
+  const waiterReadyFile = path.join(sandbox.root, "contention-waiter-ready");
+  const timeoutMs = 150;
+  const holder = runLockChild(heldLockChild, [stateModuleUrl, sandbox.dataDir, threadId, readyFile, releaseFile], identityChildEnv());
+  t.after(() => {
+    if (holder.child.exitCode === null && holder.child.signalCode === null) {
+      holder.child.kill("SIGKILL");
+    }
+  });
+
+  await waitForPath(readyFile);
+  const waiter = runLockChild(lockTimeoutChild, [stateModuleUrl, sandbox.dataDir, threadId, waiterReadyFile], identityChildEnv({
+    CODEX_COMPANION_LOCK_TIMEOUT_MS: String(timeoutMs)
+  }));
+  await waitForPath(waiterReadyFile);
+  const result = await waitForCompletion(waiter.completion, timeoutMs + 500);
+  assert.strictEqual(result.exitCode, 0, result.stderr);
+  const outcome = JSON.parse(result.stdout);
+  assert.match(outcome.message, /Timed out waiting for the job record lock at/);
+  assert.ok(outcome.elapsedMs >= timeoutMs, `Expected the waiter to wait for at least ${timeoutMs}ms, took ${outcome.elapsedMs}ms.`);
+  assert.ok(outcome.elapsedMs <= timeoutMs + 500, `Expected the waiter to finish near ${timeoutMs}ms, took ${outcome.elapsedMs}ms.`);
+
+  fs.writeFileSync(releaseFile, "release\n");
+  const holderResult = await holder.completion;
+  assert.strictEqual(holderResult.exitCode, 0, holderResult.stderr);
+});
+
 test("a lock owned by a dead process is reclaimed without an age heuristic", async (t) => {
   const sandbox = makeSandbox(t);
   const threadId = "abandoned-thread";
@@ -566,6 +653,19 @@ test("job history limits have bounded defaults and accept explicit quotas", () =
     maxBytes: DEFAULT_JOB_HISTORY_MAX_BYTES,
     maxRecords: DEFAULT_JOB_HISTORY_MAX_RECORDS
   });
+});
+
+test("CODEX_COMPANION_LOCK_TIMEOUT_MS overrides the default lock timeout", () => {
+  assert.strictEqual(resolveLockTimeoutMs({ CODEX_COMPANION_LOCK_TIMEOUT_MS: "1" }), 1);
+  assert.strictEqual(resolveLockTimeoutMs({ CODEX_COMPANION_LOCK_TIMEOUT_MS: "7500" }), 7500);
+});
+
+test("an invalid CODEX_COMPANION_LOCK_TIMEOUT_MS falls back to the default", () => {
+  assert.strictEqual(resolveLockTimeoutMs({}), DEFAULT_LOCK_TIMEOUT_MS);
+  assert.strictEqual(resolveLockTimeoutMs({ CODEX_COMPANION_LOCK_TIMEOUT_MS: "invalid" }), DEFAULT_LOCK_TIMEOUT_MS);
+  assert.strictEqual(resolveLockTimeoutMs({ CODEX_COMPANION_LOCK_TIMEOUT_MS: "0" }), DEFAULT_LOCK_TIMEOUT_MS);
+  assert.strictEqual(resolveLockTimeoutMs({ CODEX_COMPANION_LOCK_TIMEOUT_MS: "-5" }), DEFAULT_LOCK_TIMEOUT_MS);
+  assert.strictEqual(resolveLockTimeoutMs({ CODEX_COMPANION_LOCK_TIMEOUT_MS: "1.5" }), DEFAULT_LOCK_TIMEOUT_MS);
 });
 
 test("job history collection removes oldest records while preserving running jobs, the current resume head, and its predecessor", (t) => {

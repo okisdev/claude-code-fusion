@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
@@ -14,7 +14,8 @@ import {
   resolveDataDir,
   writeJobRecordFile
 } from "../plugins/codex/scripts/lib/state.mjs";
-import { parseTaskHeader } from "../plugins/codex/scripts/codex-companion.mjs";
+import { getProcessIdentity } from "../plugins/codex/scripts/lib/codex-exec.mjs";
+import { parseTaskHeader, repairRunningRecordSync, runningRecordNeedsReconciliation } from "../plugins/codex/scripts/codex-companion.mjs";
 import {
   companion,
   envFor,
@@ -69,6 +70,109 @@ test("task header parsing captures model and effort only from a pipe-separated h
   assert.deepEqual(parseTaskHeader("Implement the change."), { headerModel: null, headerEffort: null });
   assert.deepEqual(parseTaskHeader("model: gpt-5.6-terra"), { headerModel: null, headerEffort: null });
   assert.deepEqual(parseTaskHeader("lane: codex | model: gpt-5.6-terra"), { headerModel: "gpt-5.6-terra", headerEffort: null });
+});
+
+test("running record reconciliation waits for the pidless grace window", () => {
+  const createdAt = new Date(Date.now() - 1000).toISOString();
+  assert.equal(runningRecordNeedsReconciliation({ createdAt, pid: null, status: "running" }, { CODEX_COMPANION_PIDLESS_RUNNING_GRACE_MS: "0" }), true);
+  assert.equal(runningRecordNeedsReconciliation({ createdAt: new Date().toISOString(), pid: null, status: "running" }, { CODEX_COMPANION_PIDLESS_RUNNING_GRACE_MS: "60000" }), false);
+  assert.equal(runningRecordNeedsReconciliation({ createdAt, pid: 99999999, status: "running" }, { CODEX_COMPANION_PIDLESS_RUNNING_GRACE_MS: "0" }), true);
+  assert.equal(runningRecordNeedsReconciliation({ createdAt, pid: process.pid, pidIdentity: null, status: "running" }, { CODEX_COMPANION_PIDLESS_RUNNING_GRACE_MS: "0" }), false);
+});
+
+test("pidless cleanup-required records reconcile only after the grace boundary", () => {
+  const originalNow = Date.now;
+  const now = Date.parse("2026-07-20T00:00:00.000Z");
+  Date.now = () => now;
+  try {
+    const env = { CODEX_COMPANION_PIDLESS_RUNNING_GRACE_MS: "500" };
+    const record = (elapsed) => ({
+      createdAt: new Date(now - elapsed).toISOString(),
+      phase: "cleanup-required",
+      pid: null,
+      status: "running"
+    });
+    assert.equal(runningRecordNeedsReconciliation(record(499), env), false);
+    assert.equal(runningRecordNeedsReconciliation(record(500), env), false);
+    assert.equal(runningRecordNeedsReconciliation(record(501), env), true);
+  } finally {
+    Date.now = originalNow;
+  }
+});
+
+test("future createdAt values do not bypass pidless reconciliation grace", () => {
+  const originalNow = Date.now;
+  const now = Date.parse("2026-07-20T00:00:00.000Z");
+  Date.now = () => now;
+  try {
+    assert.equal(
+      runningRecordNeedsReconciliation(
+        {
+          createdAt: new Date(now + 60_000).toISOString(),
+          phase: "cleanup-required",
+          pid: null,
+          status: "running"
+        },
+        { CODEX_COMPANION_PIDLESS_RUNNING_GRACE_MS: "0" }
+      ),
+      false
+    );
+  } finally {
+    Date.now = originalNow;
+  }
+});
+
+test("identity-replaced owners are terminalized without signaling the live replacement", async (t) => {
+  const sandbox = makeSandbox(t);
+  const signalFile = path.join(sandbox.root, "replacement-signals");
+  const readyFile = path.join(sandbox.root, "replacement-ready");
+  const replacement = spawn(
+    process.execPath,
+    [
+      "--input-type=module",
+      "--eval",
+      `import fs from "node:fs";
+const [signalFile, readyFile] = process.argv.slice(1);
+for (const signal of ["SIGINT", "SIGTERM"]) {
+  process.on(signal, () => fs.appendFileSync(signalFile, signal + "\\n"));
+}
+fs.writeFileSync(readyFile, "ready");
+setInterval(() => {}, 1000);`,
+      signalFile,
+      readyFile
+    ],
+    { stdio: "ignore" }
+  );
+  t.after(() => replacement.kill("SIGKILL"));
+  await waitFor(() => (fs.existsSync(readyFile) ? true : null));
+  const identity = getProcessIdentity(replacement.pid);
+  assert.ok(identity, "Process identity probing is unavailable for the tracked replacement.");
+  const pidIdentity = {
+    ...identity,
+    commandHash: identity.commandHash === "0".repeat(64) ? "1".repeat(64) : "0".repeat(64)
+  };
+  const env = envFor(sandbox, { CODEX_COMPANION_PIDLESS_RUNNING_GRACE_MS: "0" });
+  const id = "identity-replaced-owner";
+  const record = createJobRecord({
+    createdAt: new Date(Date.now() - 1000).toISOString(),
+    cwd: sandbox.workDir,
+    errorMessage: "Unable to verify lock owner process.",
+    failureKind: "process",
+    id,
+    phase: "cleanup-required",
+    pid: replacement.pid,
+    pidIdentity
+  });
+  const file = jobFilePath(resolveDataDir(env), sandbox.workDir, id);
+  writeJobRecordFile(file, record);
+
+  const repaired = repairRunningRecordSync({ file, record }, env);
+
+  assert.equal(repaired.status, "error");
+  assert.equal(repaired.failureKind, "died");
+  assert.equal(repaired.phase, null);
+  assert.doesNotThrow(() => process.kill(replacement.pid, 0));
+  assert.equal(fs.existsSync(signalFile), false);
 });
 
 test("task stays foreground by default and persists the complete terminal record", (t) => {
@@ -160,6 +264,23 @@ test("structured raw transport preserves shell syntax without evaluating it", (t
   assert.equal(fs.existsSync(path.dirname(transport.file)), false);
 });
 
+test("raw transport rejects an unwritten input and removes the verified transport", (t) => {
+  const sandbox = makeSandbox(t);
+  const env = envFor(sandbox);
+  const created = runCompanion(["transport-create"], { cwd: sandbox.workDir, env });
+  assert.equal(created.status, 0, created.stderr);
+  const transport = JSON.parse(created.stdout);
+  const ownerFile = path.join(path.dirname(transport.file), "owner.json");
+
+  const result = runCompanion(["task", "--raw-args-token", transport.token], { cwd: sandbox.workDir, env });
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /raw command transport is unwritten/);
+  assert.equal(jobRecords(sandbox).length, 0);
+  assert.equal(fs.existsSync(transport.file), false);
+  assert.equal(fs.existsSync(ownerFile), false);
+  assert.equal(fs.existsSync(path.dirname(transport.file)), false);
+});
+
 test("a staged Fusion worktree request selects the Codex cwd and workspace root", (t) => {
   const sandbox = makeSandbox(t);
   const sibling = path.join(sandbox.root, "sibling worktree");
@@ -214,6 +335,27 @@ test("raw transport discard removes an unused private transport", (t) => {
   assert.equal(discarded.status, 0, discarded.stderr);
   assert.equal(discarded.stdout, "");
   assert.equal(fs.existsSync(transport.file), false);
+  assert.equal(fs.existsSync(path.dirname(transport.file)), false);
+});
+
+test("raw transport discard removes an unwritten private transport silently", (t) => {
+  const sandbox = makeSandbox(t);
+  const env = envFor(sandbox);
+  const created = runCompanion(["transport-create"], { cwd: sandbox.workDir, env });
+  assert.equal(created.status, 0, created.stderr);
+  const transport = JSON.parse(created.stdout);
+  const ownerFile = path.join(path.dirname(transport.file), "owner.json");
+  assert.equal(fs.readFileSync(transport.file, "utf8"), "");
+
+  const discarded = runCompanion(["transport-discard", "--raw-args-token", transport.token], {
+    cwd: sandbox.workDir,
+    env
+  });
+  assert.equal(discarded.status, 0, discarded.stderr);
+  assert.equal(discarded.stdout, "");
+  assert.equal(discarded.stderr, "");
+  assert.equal(fs.existsSync(transport.file), false);
+  assert.equal(fs.existsSync(ownerFile), false);
   assert.equal(fs.existsSync(path.dirname(transport.file)), false);
 });
 
@@ -364,7 +506,7 @@ test("raw transport never follows or cleans an unverified directory symlink", (t
   const token = randomBytes(24).toString("hex");
   const target = path.join(sandbox.root, "target");
   const targetFile = path.join(target, "request");
-  const transportDirectory = path.join(os.tmpdir(), `codex-companion-input-${token}`);
+  const transportDirectory = path.join(sandbox.tmpDir, `codex-companion-input-${token}`);
   fs.mkdirSync(target);
   fs.writeFileSync(targetFile, "do not delete", "utf8");
   try {
@@ -1360,5 +1502,7 @@ test("setup only treats a missing field as models cache drift when its log tail 
 
 test("the companion module can be imported without executing its CLI", async () => {
   const module = await import(`${pathToFileURL(companion).href}?test=${Date.now()}`);
+  assert.equal(typeof module.repairRunningRecordSync, "function");
   assert.equal(typeof module.refreshRunningJobRecord, "function");
+  assert.equal(typeof module.runningRecordNeedsReconciliation, "function");
 });
