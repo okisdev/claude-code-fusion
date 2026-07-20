@@ -64,7 +64,7 @@ function observationTimestamp(observation) {
   return Number.isFinite(parsed) ? parsed : Number.NEGATIVE_INFINITY;
 }
 
-function modelObservationRank(observation) {
+export function modelObservationRank(observation) {
   if (observation?.source === "rollout-turn-context") {
     return 2;
   }
@@ -485,20 +485,7 @@ function recordGrokCompanionAcceptance({ jobId, acceptance, reason, acceptFailed
 }
 
 export function grokStats({ all = false, env = process.env, cwd = process.cwd() } = {}) {
-  const bin = newestGrokCompanion(env);
-  if (!bin) {
-    return { available: false, reason: "grok companion not found in the plugin cache or the sibling plugin" };
-  }
-  const result = spawnSync(process.execPath, [bin, "stats", ...(all ? ["--all"] : ["--cwd", cwd]), "--json"], { encoding: "utf8", env });
-  if (result.error || result.status !== 0) {
-    const reason = (result.stderr || result.error?.message || "grok stats failed").trim().split("\n")[0];
-    return { available: false, reason };
-  }
-  try {
-    return { available: true, ...JSON.parse(result.stdout) };
-  } catch {
-    return { available: false, reason: "grok stats returned unparseable output" };
-  }
+  return fileBasedEngineStats(FILE_ENGINE_DESCRIPTORS.grok, { all, env, cwd });
 }
 
 function resolveGrokDataDir(env = process.env) {
@@ -511,6 +498,10 @@ function resolveGrokDataDir(env = process.env) {
 
 function grokStateRoots(env = process.env) {
   return [path.join(resolveGrokDataDir(env), "state")];
+}
+
+function resolveGrokStateRoot(env = process.env) {
+  return grokStateRoots(env)[0];
 }
 
 function grokJobById(jobId, env) {
@@ -686,6 +677,10 @@ function readCodexJobEvidence(stateRoot, options = {}) {
   });
 }
 
+function readGrokJobEvidence(stateRoot) {
+  return readWorkspaceJobFiles(stateRoot);
+}
+
 function jobTimestamp(raw) {
   const parsed = Date.parse(raw?.finishedAt ?? raw?.completedAt ?? raw?.updatedAt ?? raw?.createdAt ?? "");
   return Number.isFinite(parsed) ? parsed : Number.NEGATIVE_INFINITY;
@@ -831,6 +826,55 @@ function selectPreferredJobs(jobs, descriptor, include) {
 }
 
 export const FILE_ENGINE_DESCRIPTORS = {
+  grok: {
+    id: "grok",
+    defaultStateRoot: resolveGrokStateRoot,
+    unavailableReason: "grok plugin job state not found; the grok plugin may not be installed",
+    note: "read best effort from Grok job state; totals are lower bounds",
+    enumerateJobs: readGrokJobEvidence,
+    resolveScope: resolveGitWorkspaceRoot,
+    matchesWorkspace(raw, cwd, workspaceRoot, repositoryCache) {
+      return workspaceRootsShareRepository(raw?.cwd, workspaceRoot, repositoryCache);
+    },
+    includeByModel: true,
+    includeTokenUsage: true,
+    dedupeById: true,
+    isTerminal: (raw) => GROK_TERMINAL_STATUSES.has(raw.status),
+    normalizeJob(raw) {
+      const finished = raw.finishedAt ?? raw.completedAt ?? raw.updatedAt ?? null;
+      let durationSeconds = null;
+      if (raw.status === "done" && raw.createdAt && finished) {
+        const span = (Date.parse(finished) - Date.parse(raw.createdAt)) / 1000;
+        if (Number.isFinite(span) && span >= 0) {
+          durationSeconds = span;
+        }
+      }
+      return {
+        status: raw.status ?? "unknown",
+        kind: raw.role ?? raw.mode ?? raw.jobClass ?? "unknown",
+        createdAt: raw.createdAt ?? null,
+        durationSeconds,
+        evidence: "state"
+      };
+    },
+    resolveModel(raw) {
+      return nonEmptyString(raw?.resolvedModel) ?? "unknown";
+    },
+    resolveEffort(raw) {
+      return nonEmptyString(raw?.resolvedEffort);
+    },
+    resolveMode(raw) {
+      return nonEmptyString(raw?.mode) ?? "unknown";
+    },
+    resolveFailureKind(raw) {
+      if (raw?.status !== "error" && raw?.status !== "cancelled") {
+        return null;
+      }
+      return nonEmptyString(raw?.failureKind) ?? (raw.status === "cancelled" ? "cancelled" : "error");
+    },
+    resolveTokenUsage: grokTokenUsageForJob,
+    tokenUsageScope: "terminal jobs only"
+  },
   codex: {
     id: "codex",
     stateEnvVar: "FUSION_CODEX_STATE",
@@ -849,6 +893,10 @@ export const FILE_ENGINE_DESCRIPTORS = {
       return raw?._fusionScopeKey && workspaceKeyMatchesRepository(raw._fusionScopeKey, workspaceRoot, repositoryCache);
     },
     includeByModel: true,
+    includeTokenUsage: true,
+    usesModelAudit: true,
+    usesTokenUsageObservations: true,
+    tokenUsageScope: "terminal transport jobs only",
     dedupeById: true,
     isTerminal: (raw) => CODEX_TERMINAL_STATUSES.has(raw.status),
     normalizeJob(raw) {
@@ -1000,6 +1048,94 @@ export function normalizeCodexTokenUsage(value) {
   return BigInt(usage.totalTokens) === BigInt(usage.inputTokens) + BigInt(usage.outputTokens) ? usage : null;
 }
 
+function grokTokenField(value, names) {
+  const observed = names.filter((name) => Object.hasOwn(value, name)).map((name) => value[name]);
+  if (observed.length === 0 || observed.some((candidate) => candidate !== observed[0])) {
+    return null;
+  }
+  return integerTokenField(observed[0]);
+}
+
+function normalizeGrokTokenUsage(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return null;
+  }
+  const inputTokens = grokTokenField(value, ["input_tokens", "inputTokens"]);
+  const cachedInputTokens = grokTokenField(value, ["cache_read_input_tokens", "cacheReadInputTokens", "cachedReadTokens", "cacheReadTokens"]);
+  const outputTokens = grokTokenField(value, ["output_tokens", "outputTokens"]);
+  const reasoningOutputTokens = grokTokenField(value, ["reasoning_tokens", "reasoningTokens"]);
+  const totalTokens = grokTokenField(value, ["total_tokens", "totalTokens"]);
+  if ([inputTokens, cachedInputTokens, outputTokens, reasoningOutputTokens, totalTokens].some((field) => field == null) || reasoningOutputTokens > outputTokens) {
+    return null;
+  }
+  const uncachedTotal = BigInt(inputTokens) + BigInt(cachedInputTokens) + BigInt(outputTokens);
+  const fullInputTotal = BigInt(inputTokens) + BigInt(outputTokens);
+  if (BigInt(totalTokens) !== uncachedTotal && BigInt(totalTokens) !== fullInputTotal) {
+    return null;
+  }
+  return {
+    inputTokens: Number(BigInt(totalTokens) === fullInputTotal ? BigInt(inputTokens) : BigInt(inputTokens) + BigInt(cachedInputTokens)),
+    cachedInputTokens,
+    outputTokens,
+    reasoningOutputTokens,
+    totalTokens
+  };
+}
+
+function grokTokenUsageFromModels(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return null;
+  }
+  const entries = Object.values(value);
+  if (entries.length === 0) {
+    return null;
+  }
+  let inputTokens = 0;
+  let cachedInputTokens = 0;
+  let outputTokens = 0;
+  for (const entry of entries) {
+    if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
+      return null;
+    }
+    const input = grokTokenField(entry, ["input_tokens", "inputTokens"]);
+    const cached = grokTokenField(entry, ["cache_read_input_tokens", "cacheReadInputTokens", "cachedReadTokens", "cacheReadTokens"]);
+    const output = grokTokenField(entry, ["output_tokens", "outputTokens"]);
+    if (input == null || cached == null || output == null) {
+      return null;
+    }
+    const next = checkedUsageAddition(
+      { inputTokens, cachedInputTokens, outputTokens, reasoningOutputTokens: 0, totalTokens: inputTokens + outputTokens },
+      { inputTokens: input + cached, cachedInputTokens: cached, outputTokens: output, reasoningOutputTokens: 0, totalTokens: input + cached + output }
+    );
+    if (!next) {
+      return null;
+    }
+    ({ inputTokens, cachedInputTokens, outputTokens } = next);
+  }
+  return {
+    inputTokens,
+    cachedInputTokens,
+    outputTokens,
+    reasoningOutputTokens: 0,
+    totalTokens: inputTokens + outputTokens
+  };
+}
+
+function grokTokenUsageForJob(raw) {
+  if (raw?.usageIsIncomplete === true || raw?.usage_is_incomplete === true || raw?.modelUsageIsIncomplete === true) {
+    return { availability: "partial", usage: null };
+  }
+  const direct = normalizeGrokTokenUsage(raw?.usage);
+  if (direct) {
+    return { availability: "available", usage: direct };
+  }
+  const byModel = grokTokenUsageFromModels(raw?.modelUsage);
+  if (byModel) {
+    return { availability: "available", usage: byModel };
+  }
+  return { availability: raw?.usage != null || raw?.modelUsage != null ? "partial" : "unavailable", usage: null };
+}
+
 function normalizeClaudeWorkerUsage(value) {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
     return null;
@@ -1063,6 +1199,9 @@ export function fileBasedEngineStats(descriptor, { all = false, env = process.en
   } catch (error) {
     return { available: false, reason: error instanceof Error ? error.message : String(error) };
   }
+  if (descriptor.id === "grok" && jobs.length === 0) {
+    return { available: false, reason: descriptor.unavailableReason };
+  }
   const workspaceRoot = typeof descriptor.resolveScope === "function" ? descriptor.resolveScope(cwd) : cwd;
   const repositoryCache = new Map();
   const include = (job) => all || descriptor.matchesWorkspace(job, cwd, workspaceRoot, repositoryCache);
@@ -1070,14 +1209,19 @@ export function fileBasedEngineStats(descriptor, { all = false, env = process.en
     ? jobs
     : jobs.map((job) => include(job) && !job?._fusionScopeKey ? { ...job, _fusionScopeKey: fusionWorkspaceKey(workspaceRoot) } : job);
   const scoped = selectPreferredJobs(candidates, descriptor, include);
+  if (descriptor.id === "grok" && !all && scoped.length === 0) {
+    return { available: false, reason: descriptor.unavailableReason };
+  }
   const byStatus = {};
   const byKind = {};
   const byModel = {};
   const byEffort = {};
+  const byMode = {};
+  const byFailureKind = {};
   const byAcceptance = {};
   const byEvidence = {};
   const auditCache = new Map();
-  const tokenObservations = descriptor.id === "codex" ? loadAllObservationCandidates(env, TOKEN_USAGE_FILENAME, loadTokenUsageObservations) : new Map();
+  const tokenObservations = descriptor.usesTokenUsageObservations ? loadAllObservationCandidates(env, TOKEN_USAGE_FILENAME, loadTokenUsageObservations) : new Map();
   const acceptanceObservations = descriptor.id === "codex" ? loadAllObservationCandidates(env, ACCEPTANCE_FILENAME, loadAcceptanceObservations) : new Map();
   const observationRepositoryCache = new Map();
   let tokenTotals = { inputTokens: 0, cachedInputTokens: 0, outputTokens: 0, reasoningOutputTokens: 0, totalTokens: 0 };
@@ -1098,8 +1242,17 @@ export function fileBasedEngineStats(descriptor, { all = false, env = process.en
     bump(byStatus, job.status);
     bump(byKind, job.kind);
     bump(byEvidence, job.evidence ?? "state");
+    if (typeof descriptor.resolveMode === "function") {
+      bump(byMode, descriptor.resolveMode(raw, job));
+    }
+    if (typeof descriptor.resolveFailureKind === "function") {
+      const failureKind = descriptor.resolveFailureKind(raw, job);
+      if (failureKind) {
+        bump(byFailureKind, failureKind);
+      }
+    }
     if (descriptor.includeByModel && typeof descriptor.resolveModel === "function") {
-      const observation = observationForJob(raw, env, auditCache);
+      const observation = descriptor.usesModelAudit ? observationForJob(raw, env, auditCache) : null;
       const model = descriptor.resolveModel(raw, observation);
       const effort = typeof descriptor.resolveEffort === "function" ? descriptor.resolveEffort(raw, observation) : null;
       bump(byModel, effort ? `${model}@${effort}` : model);
@@ -1120,8 +1273,10 @@ export function fileBasedEngineStats(descriptor, { all = false, env = process.en
       if (jobId && job.status === "done" && !acceptanceObservation) {
         doneWithoutAcceptance.push(jobId);
       }
-      if (CODEX_TERMINAL_STATUSES.has(job.status)) {
-        const usageResult = tokenUsageForJob(raw, jobId ? scopedObservationForJob(tokenObservations, raw, observationRepositoryCache) : null);
+    }
+    if (descriptor.includeTokenUsage && descriptor.isTerminal(raw)) {
+      const observation = descriptor.usesTokenUsageObservations && raw?.id ? scopedObservationForJob(tokenObservations, raw, observationRepositoryCache) : null;
+      const usageResult = typeof descriptor.resolveTokenUsage === "function" ? descriptor.resolveTokenUsage(raw) : tokenUsageForJob(raw, observation);
         if (usageResult.usage) {
           jobsWithTokenUsage += 1;
           if (!tokenAggregationOverflow) {
@@ -1140,7 +1295,6 @@ export function fileBasedEngineStats(descriptor, { all = false, env = process.en
             jobsWithUnreportedTokenUsage += 1;
           }
         }
-      }
     }
     if (job.durationSeconds != null) {
       durationSum += job.durationSeconds;
@@ -1167,7 +1321,6 @@ export function fileBasedEngineStats(descriptor, { all = false, env = process.en
           byAcceptance,
           acceptanceScope: "terminal transport jobs only",
           pendingTransportJobs,
-          byEffort,
           acceptanceAnomalies: {
             acceptedWithErrorTransport,
             doneWithoutAcceptance
@@ -1175,12 +1328,15 @@ export function fileBasedEngineStats(descriptor, { all = false, env = process.en
         }
       : {}),
     byKind,
+    ...(typeof descriptor.resolveMode === "function" ? { byMode } : {}),
+    ...(typeof descriptor.resolveFailureKind === "function" ? { byFailureKind } : {}),
     ...(descriptor.includeByModel ? { byModel } : {}),
-    ...(descriptor.id === "codex"
+    ...(descriptor.includeByModel ? { byEffort } : {}),
+    ...(descriptor.includeTokenUsage
       ? {
           tokenUsage: {
             availability: tokenAggregationOverflow ? "overflow" : jobsWithTokenUsage === 0 ? "unavailable" : jobsWithoutTokenUsage === 0 ? "available" : "partial",
-            scope: "terminal transport jobs only",
+            scope: descriptor.tokenUsageScope ?? "terminal jobs only",
             jobsWithUsage: jobsWithTokenUsage,
             jobsWithIncompleteUsage: jobsWithIncompleteTokenUsage,
             jobsWithoutUsage: jobsWithoutTokenUsage,
@@ -1188,12 +1344,16 @@ export function fileBasedEngineStats(descriptor, { all = false, env = process.en
             totals: jobsWithTokenUsage > 0 && !tokenAggregationOverflow ? tokenTotals : null,
             ...(tokenAggregationOverflow ? { aggregationOverflow: true } : {})
           },
-          evidence: {
-            bySource: byEvidence,
-            recoveredTerminalJobs: byEvidence["terminal-ledger"] ?? 0,
-            recoveredLegacyTerminalJobs: byEvidence["legacy-terminal-ledger"] ?? 0,
-            isLowerBound: true
-          }
+          ...(descriptor.id === "codex"
+            ? {
+                evidence: {
+                  bySource: byEvidence,
+                  recoveredTerminalJobs: byEvidence["terminal-ledger"] ?? 0,
+                  recoveredLegacyTerminalJobs: byEvidence["legacy-terminal-ledger"] ?? 0,
+                  isLowerBound: true
+                }
+              }
+            : {})
         }
       : {}),
     meanWallClockSeconds: durationCount > 0 ? Math.round((durationSum / durationCount) * 1000) / 1000 : null,
@@ -1457,10 +1617,15 @@ export function buildAuditReport({ env = process.env, sessionId = null, days = 7
   const { events, malformedCount } = readGuardAuditEvents({ env, sessionId, sinceMs, untilMs: now });
   const windowLabel = all ? "all retained audit events" : `last ${windowDays} ${windowDays === 1 ? "day" : "days"}`;
   const byEvent = {};
+  const eventsByDay = {};
   const dispatchesByLane = {};
   const sessions = new Set();
   for (const event of events) {
     bump(byEvent, event.event);
+    const day = event.at.slice(0, 10);
+    const counts = eventsByDay[day] ?? { dispatch: 0, write: 0, deny: 0, warn: 0 };
+    counts[event.event] += 1;
+    eventsByDay[day] = counts;
     sessions.add(event.session);
     if (event.event === "dispatch") {
       bump(dispatchesByLane, event.lane);
@@ -1473,6 +1638,7 @@ export function buildAuditReport({ env = process.env, sessionId = null, days = 7
     totalEvents: events.length,
     sessionCount: sessions.size,
     byEvent,
+    eventsByDay,
     dispatchesByLane,
     earliestAt: events[0]?.at ?? null,
     latestAt: events.at(-1)?.at ?? null,
@@ -1486,6 +1652,14 @@ export function renderAuditReport(report) {
     lines.push(`Recorded between ${report.earliestAt} and ${report.latestAt}`);
   }
   renderCounts(lines, "By event", report.byEvent);
+  const days = Object.keys(report.eventsByDay ?? {}).sort();
+  if (days.length > 0) {
+    lines.push("", "Events by day:");
+    for (const day of days) {
+      const { dispatch = 0, write = 0, deny = 0, warn = 0 } = report.eventsByDay[day];
+      lines.push(`- ${day}: dispatch ${dispatch}, write ${write}, deny ${deny}, warn ${warn}`);
+    }
+  }
   renderCounts(lines, "Dispatches by lane", report.dispatchesByLane);
   if (report.malformedCount > 0) {
     lines.push("", `Malformed audit entries skipped: ${report.malformedCount}`);
@@ -1926,7 +2100,7 @@ export const STATS_PROVIDER_REGISTRY = [
   {
     id: "grok",
     displayName: "Grok",
-    collect: (options) => grokStats(options)
+    collect: (options) => fileBasedEngineStats(FILE_ENGINE_DESCRIPTORS.grok, options)
   },
   {
     id: "codex",
@@ -2026,6 +2200,147 @@ function renderWorkerIdentities(lines, identities) {
   }
 }
 
+/** Dispatches from one session that land within this gap form one burst (ultra fleet fan-out). */
+const FLEET_BURST_GAP_MS = 5000;
+const FLEET_SHAPED_MIN_WIDTH = 3;
+
+function emptyFleetUsageStats() {
+  return {
+    surface: "ultra",
+    totalDispatches: 0,
+    totalBursts: 0,
+    fleetShapedBursts: 0,
+    widthDistribution: {},
+    byDay: {},
+    widest: null
+  };
+}
+
+function clusterDispatchBursts(dispatchEvents, gapMs = FLEET_BURST_GAP_MS) {
+  const bySession = new Map();
+  for (const event of dispatchEvents) {
+    const session = nonEmptyString(event?.session);
+    const at = nonEmptyString(event?.at);
+    const atMs = at ? Date.parse(at) : Number.NaN;
+    if (!session || !Number.isFinite(atMs)) {
+      continue;
+    }
+    const list = bySession.get(session) ?? [];
+    list.push({ at, atMs, session, day: at.slice(0, 10) });
+    bySession.set(session, list);
+  }
+  const bursts = [];
+  for (const [session, events] of bySession) {
+    events.sort((left, right) => left.atMs - right.atMs || left.at.localeCompare(right.at));
+    let current = null;
+    for (const event of events) {
+      if (!current || event.atMs - current.lastAtMs > gapMs) {
+        current = {
+          session,
+          day: event.day,
+          width: 1,
+          firstAt: event.at,
+          lastAt: event.at,
+          lastAtMs: event.atMs
+        };
+        bursts.push(current);
+        continue;
+      }
+      current.width += 1;
+      current.lastAt = event.at;
+      current.lastAtMs = event.atMs;
+    }
+  }
+  return bursts;
+}
+
+function summarizeFleetBursts(bursts) {
+  const widthDistribution = {};
+  const byDay = {};
+  let fleetShapedBursts = 0;
+  let widest = null;
+  for (const burst of bursts) {
+    bump(widthDistribution, String(burst.width));
+    if (burst.width >= FLEET_SHAPED_MIN_WIDTH) {
+      fleetShapedBursts += 1;
+    }
+    if (!widest || burst.width > widest.width || (burst.width === widest.width && (burst.firstAt < widest.at || (burst.firstAt === widest.at && burst.session < widest.session)))) {
+      widest = { width: burst.width, session: burst.session, day: burst.day, at: burst.firstAt };
+    }
+    const dayStats = byDay[burst.day] ?? {
+      bursts: 0,
+      fleetShapedBursts: 0,
+      widthDistribution: {},
+      widest: null
+    };
+    dayStats.bursts += 1;
+    bump(dayStats.widthDistribution, String(burst.width));
+    if (burst.width >= FLEET_SHAPED_MIN_WIDTH) {
+      dayStats.fleetShapedBursts += 1;
+    }
+    if (!dayStats.widest || burst.width > dayStats.widest.width || (burst.width === dayStats.widest.width && (burst.firstAt < dayStats.widest.at || (burst.firstAt === dayStats.widest.at && burst.session < dayStats.widest.session)))) {
+      dayStats.widest = { width: burst.width, session: burst.session, at: burst.firstAt };
+    }
+    byDay[burst.day] = dayStats;
+  }
+  return {
+    surface: "ultra",
+    totalDispatches: bursts.reduce((sum, burst) => sum + burst.width, 0),
+    totalBursts: bursts.length,
+    fleetShapedBursts,
+    widthDistribution,
+    byDay,
+    widest: widest ? { width: widest.width, session: widest.session, day: widest.day } : null
+  };
+}
+
+/**
+ * Derive ultra / fleet visibility from inline-guard audit dispatch events.
+ * Pure read-side: clusters same-session dispatches within a short window into bursts.
+ */
+export function buildFleetUsageStats({ env = process.env } = {}) {
+  let events;
+  try {
+    ({ events } = readGuardAuditEvents({ env }));
+  } catch {
+    return emptyFleetUsageStats();
+  }
+  const dispatches = events.filter((event) => event?.event === "dispatch");
+  if (dispatches.length === 0) {
+    return emptyFleetUsageStats();
+  }
+  return summarizeFleetBursts(clusterDispatchBursts(dispatches));
+}
+
+function renderFleetUsageStats(lines, fleet) {
+  if (!fleet || typeof fleet !== "object") {
+    return;
+  }
+  lines.push("", "## Ultra usage surface", "", "Fleet visibility derived from inline-guard audit dispatches (same-session bursts within a short window).");
+  lines.push(`Total dispatches: ${fleet.totalDispatches ?? 0}`);
+  lines.push(`Dispatch bursts: ${fleet.totalBursts ?? 0}`);
+  lines.push(`Fleet-shaped bursts (width ≥ ${FLEET_SHAPED_MIN_WIDTH}): ${fleet.fleetShapedBursts ?? 0}`);
+  renderCounts(lines, "Burst width distribution", fleet.widthDistribution ?? {});
+  if (fleet.widest) {
+    lines.push("", `Widest burst: width ${fleet.widest.width}, session ${fleet.widest.session}${fleet.widest.day ? `, day ${fleet.widest.day}` : ""}`);
+  } else {
+    lines.push("", "Widest burst: none");
+  }
+  const days = Object.keys(fleet.byDay ?? {}).sort();
+  if (days.length > 0) {
+    lines.push("", "By day:");
+    for (const day of days) {
+      const dayStats = fleet.byDay[day];
+      const widths = Object.keys(dayStats.widthDistribution ?? {})
+        .sort((left, right) => Number(left) - Number(right))
+        .map((width) => `${width}×${dayStats.widthDistribution[width]}`)
+        .join(", ");
+      const widest = dayStats.widest ? `; widest ${dayStats.widest.width} (session ${dayStats.widest.session})` : "";
+      lines.push(`- ${day}: ${dayStats.bursts} burst${dayStats.bursts === 1 ? "" : "s"}, ${dayStats.fleetShapedBursts} fleet-shaped${widths ? ` [${widths}]` : ""}${widest}`);
+    }
+  }
+}
+
 export function buildFusionStats({ all = false, env = process.env, cwd = process.cwd() } = {}) {
   const options = { all, env, cwd };
   const engines = {};
@@ -2034,7 +2349,8 @@ export function buildFusionStats({ all = false, env = process.env, cwd = process
   }
   return {
     scope: all ? "all" : resolveGitWorkspaceRoot(cwd),
-    ...engines
+    ...engines,
+    fleet: buildFleetUsageStats({ env })
   };
 }
 
@@ -2045,6 +2361,7 @@ export function renderFusionStats(report) {
       renderEngine(lines, provider.displayName, report[provider.id]);
     }
   }
+  renderFleetUsageStats(lines, report.fleet);
   lines.push("", "Peer token totals include only jobs with exact reported usage. Unavailable jobs are never estimated.");
   return `${lines.join("\n")}\n`;
 }
@@ -2088,6 +2405,7 @@ function parseRecordArguments(argv) {
   let source = null;
   let reason = null;
   let asJson = false;
+  let acceptFailedTransport = false;
   for (let index = 0; index < argv.length; index += 1) {
     const token = argv[index];
     if (token === "--record") {
@@ -2115,6 +2433,13 @@ function parseRecordArguments(argv) {
       asJson = true;
       continue;
     }
+    if (token === "--accept-failed-transport") {
+      if (acceptFailedTransport) {
+        throw new TypeError("Duplicate --accept-failed-transport.");
+      }
+      acceptFailedTransport = true;
+      continue;
+    }
     throw new TypeError(`Unsupported --record argument: ${String(token)}.`);
   }
   if (records.length === 0) {
@@ -2123,7 +2448,7 @@ function parseRecordArguments(argv) {
   if (reason !== null && records.length !== 1) {
     throw new TypeError("--reason can be used only when exactly one --record pair is present.");
   }
-  return { records, source: source ?? "main-loop", reason, asJson };
+  return { records, source: source ?? "main-loop", reason, asJson, acceptFailedTransport };
 }
 
 function isStrictDirectRecordArguments(argv) {
@@ -2138,13 +2463,13 @@ function isStrictDirectRecordArguments(argv) {
   }
 }
 
-function recordEngineAcceptance({ engine, jobId, verdict, reason, workspaceRoot, asJson, env }) {
+function recordEngineAcceptance({ engine, jobId, verdict, reason, acceptFailedTransport = false, workspaceRoot, asJson, env }) {
   if (engine === "grok") {
     recordGrokCompanionAcceptance({
       jobId,
       acceptance: verdict,
       reason,
-      acceptFailedTransport: false,
+      acceptFailedTransport,
       workspaceRoot,
       asJson,
       env
@@ -2155,7 +2480,7 @@ function recordEngineAcceptance({ engine, jobId, verdict, reason, workspaceRoot,
     jobId,
     acceptance: verdict,
     reason,
-    acceptFailedTransport: false,
+    acceptFailedTransport,
     workspaceRoot,
     env
   });
@@ -2177,40 +2502,40 @@ function writeRecordConfirmation({ kind, engine = null, jobId = null, worker = n
   stdout.write(`Recorded ${worker.acceptance} for Fusion worker task ${worker.taskId}.\n`);
 }
 
-function settleWorkerRecord({ taskId, verdict, source, reason, asJson, workspaceRoot, env, stdout }) {
-  const worker = recordWorkerAcceptance({ taskId, acceptance: verdict, env, source, reason, acceptFailedTransport: false });
+function settleWorkerRecord({ taskId, verdict, source, reason, acceptFailedTransport = false, asJson, workspaceRoot, env, stdout }) {
+  const worker = recordWorkerAcceptance({ taskId, acceptance: verdict, env, source, reason, acceptFailedTransport });
   writeRecordConfirmation({ kind: "worker", worker, asJson, stdout });
   const peerJobId = typeof worker.peerJobId === "string" && ENGINE_JOB_ID_PATTERN.test(worker.peerJobId) ? worker.peerJobId : null;
   if (!peerJobId) {
     return [worker];
   }
   const engine = worker.peerEngine === "codex" || worker.peerEngine === "grok" ? worker.peerEngine : resolveEngineJob(peerJobId, env);
-  recordEngineAcceptance({ engine, jobId: peerJobId, verdict, reason, workspaceRoot, asJson, env });
+  recordEngineAcceptance({ engine, jobId: peerJobId, verdict, reason, acceptFailedTransport, workspaceRoot, asJson, env });
   writeRecordConfirmation({ kind: "engine", engine, jobId: peerJobId, worker, asJson, stdout });
   return [worker, { engine, jobId: peerJobId, acceptance: verdict }];
 }
 
-function settleEngineRecord({ jobId, verdict, source, reason, asJson, workspaceRoot, env, stdout }) {
+function settleEngineRecord({ jobId, verdict, source, reason, acceptFailedTransport = false, asJson, workspaceRoot, env, stdout }) {
   const engine = resolveEngineJob(jobId, env);
   const confirmation = { engine, jobId, acceptance: verdict };
-  recordEngineAcceptance({ engine, jobId, verdict, reason, workspaceRoot, asJson, env });
+  recordEngineAcceptance({ engine, jobId, verdict, reason, acceptFailedTransport, workspaceRoot, asJson, env });
   writeRecordConfirmation({ kind: "engine", engine, jobId, worker: confirmation, asJson, stdout });
   const writes = [confirmation];
   for (const record of readWorkerRecords(env).filter((candidate) => candidate.peerJobId === jobId)) {
-    const worker = recordWorkerAcceptance({ taskId: record.taskId, acceptance: verdict, env, source, reason, acceptFailedTransport: false });
+    const worker = recordWorkerAcceptance({ taskId: record.taskId, acceptance: verdict, env, source, reason, acceptFailedTransport });
     writeRecordConfirmation({ kind: "worker", worker, asJson, stdout });
     writes.push(worker);
   }
   return writes;
 }
 
-function settleRecords({ records, source, reason, asJson, workspaceRoot, env, stdout }) {
+function settleRecords({ records, source, reason, acceptFailedTransport = false, asJson, workspaceRoot, env, stdout }) {
   const writes = [];
   for (const { id, verdict } of records) {
     if (FUSION_TASK_ID_PATTERN.test(id)) {
-      writes.push(...settleWorkerRecord({ taskId: id, verdict, source, reason, asJson, workspaceRoot, env, stdout }));
+      writes.push(...settleWorkerRecord({ taskId: id, verdict, source, reason, acceptFailedTransport, asJson, workspaceRoot, env, stdout }));
     } else {
-      writes.push(...settleEngineRecord({ jobId: id, verdict, source, reason, asJson, workspaceRoot, env, stdout }));
+      writes.push(...settleEngineRecord({ jobId: id, verdict, source, reason, acceptFailedTransport, asJson, workspaceRoot, env, stdout }));
     }
   }
   return writes;
