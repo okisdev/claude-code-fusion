@@ -1,7 +1,7 @@
 ---
 name: ultra
-description: "Fans the work out as a fleet of parallel Grok and Codex agents billed to their own subscriptions, then synthesizes one result. The peer engine equivalent of ultracode, adding intensity without spending Claude quota on the fleet."
-when_to_use: "Proactively use when the user asks to go deep, be thorough, or exhaustive. Deep research on a topic, a comprehensive audit, an exhaustive bug hunt, mapping a whole subsystem, or implementing a large multi part feature."
+description: "Fans the work out as a fleet of parallel Grok and Codex agents billed to their own subscriptions, then synthesizes one result. The peer engine equivalent of ultracode, adding intensity without spending Claude quota on the fleet. The default execution posture for any goal that decomposes into three or more independent work packages, not only an intensity booster for explicit asks."
+when_to_use: "Proactively convene whenever the goal decomposes into three or more independent work packages once bootstrap dependencies are resolved; this is the default posture, not an escalation. Also convene on any explicit ask to go deep, be thorough, or exhaustive: deep research on a topic, a comprehensive audit, an exhaustive bug hunt, mapping a whole subsystem, or implementing a large multi part feature. Declining a fleet shaped goal requires a visible fleet-decline: <reason> line."
 argument-hint: '[the task to pursue exhaustively]'
 allowed-tools: Agent, Read, Bash, AskUserQuestion
 ---
@@ -14,7 +14,8 @@ Task:
 Size gate first (cheap, in the main loop):
 
 - If the task is small, a single question, or a one file change, do NOT convene a fleet. Return it to the normal routing policy: questions stay in the main session, and requested changes normally use the Codex primary lane. Say you skipped the fleet because the task did not warrant it.
-- Otherwise decompose the task into independent facets. Research decomposes by angle or source (different subsystems, different questions, different documents). Implementation decomposes by work package. Aim for 6 to 8 facets by default; go lower if the task has fewer natural seams, higher (up to about 12) only when the user asked for maximum coverage and the facets are truly independent.
+- Skipping a goal that decomposes into three or more independent packages is a decline: state a visible `fleet-decline: <reason>` line in the reply. Decline reasons are premises, and when one expires (a lane recovers, the goal enters implement, packages accrete to three) the fleet question reopens.
+- Otherwise decompose the task into independent facets. Research decomposes by angle or source (different subsystems, different questions, different documents). Implementation decomposes by work package. Facet count follows the goal's natural package count with a floor of three: 6 to 8 facets when the seams allow it; up to about 12 only when the user asked for maximum coverage and the facets are truly independent. A three package goal is fleet shaped even though it sits below six.
 
 Compose one self contained brief per facet:
 
@@ -24,6 +25,7 @@ Compose one self contained brief per facet:
 
 Launch the fleet in one message:
 
+- The convening ceremony runs inside this skill, not prepaid by the main loop before invoking it: record the checkpoint or staged patch baseline when the tree is uncommitted, create the orchestrator owned worktrees for eligible independent Codex facets, and generate each brief's sibling declaration list mechanically from the decomposition so every facet's files appear in every other facet's forbidden list. The main loop's job is the decomposition decision and final judgment, not the staging ritual.
 - The fleet changes capacity, not lane ownership. Codex remains the primary builder and deep reviewer. Grok supplies breadth under its `burst`, `live-web`, `large-context`, and `independence` protected roles.
 - Invoke all independent Grok, Claude, and Codex facets together as parallel foreground-delivery Agent calls in one tool message. Do not set `run_in_background`. If the runtime still returns an async launch receipt, retain ownership and collect it before synthesis; Fusion's lifecycle hook blocks a turn that tries to abandon a Claude worker. Additional independent Codex implementation facets may use distinct orchestrator owned worktrees when their files are disjoint and verification needs no heavy setup. For each such facet, use `--write --cwd "<absolute worktree path>" -- <brief>` as the complete direct prompt to `codex:codex-rescue`. A natural language `Working directory:` line does not select the Codex sandbox, and `--cwd` must never be appended to the Agent call, wrapper Bash command, or `--raw-args-token` invocation. Grok carries the remaining burst breadth, research digests, large context reads, and isolated scoped fixes. Packages that overlap files or require ordering are consolidated or sequenced, never fanned out as parallel overflow.
 - Never set background mode on the Codex Agent or add `--background` to its brief. Complexity, expected duration, and model choice do not authorize detachment inside a fleet.

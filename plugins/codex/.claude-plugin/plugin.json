@@ -2,7 +2,7 @@
   "$schema": "https://json.schemastore.org/claude-code-plugin-manifest.json",
   "name": "codex",
   "displayName": "Codex Companion",
-  "version": "0.0.30",
+  "version": "0.0.31",
   "description": "First party local Codex CLI delegation for tasks, reviews, resumable threads, and durable background jobs.",
   "author": {
     "name": "Harry Yep"

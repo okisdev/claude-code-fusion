@@ -6,7 +6,7 @@ import path from "node:path";
 import { test } from "node:test";
 
 import { recordCodexAcceptance } from "../plugins/fusion/scripts/fusion-stats.mjs";
-import { createWorkerRecord, readWorkerRecords, recordWorkerAcceptance, updateWorkerRecord } from "../plugins/fusion/scripts/lib/worker-state.mjs";
+import { createWorkerRecord, readWorkerSessionState, readWorkerRecords, recordWorkerAcceptance, updateWorkerRecord } from "../plugins/fusion/scripts/lib/worker-state.mjs";
 import { validateWorkerBrief, workerBudgetFailure, workerLimits } from "../plugins/fusion/scripts/worker-lifecycle.mjs";
 
 const repoRoot = path.join(import.meta.dirname, "..");
@@ -976,7 +976,7 @@ test("an armed async worker is collected by SubagentStop and remains verdict gat
     last_assistant_message: "done",
     background_tasks: [{ id: "a1", type: "subagent", status: "running", agent_type: "fusion:fast-worker" }]
   });
-  assert.strictEqual(JSON.parse(secondStop.stdout).decision, undefined);
+  assert.strictEqual(secondStop.stdout, "");
   assert.strictEqual(record(box).awaitingCollectionArmedAt, armedAt);
 
   const finalMessage = "completed result\ndelivery: complete\nverification: passed";
@@ -1260,7 +1260,7 @@ test("Stop advises on collected unverified workers without blocking and stays qu
   assert.strictEqual(quiet.stdout, "");
 });
 
-test("Stop in-flight advisory emits once then stays silent while stop_hook_active", (t) => {
+test("Stop in-flight advisory emits only when the in-flight set changes", (t) => {
   const box = sandbox(t);
   run(box, dispatch(box));
   run(box, {
@@ -1287,6 +1287,17 @@ test("Stop in-flight advisory emits once then stays silent while stop_hook_activ
   const armedAt = record(box).awaitingCollectionArmedAt;
   assert.ok(armedAt);
 
+  const unchanged = run(box, {
+    hook_event_name: "Stop",
+    session_id: "session-1",
+    cwd: box.cwd,
+    transcript_path: box.transcript,
+    stop_hook_active: false,
+    last_assistant_message: "done",
+    background_tasks: backgroundTasks
+  });
+  assert.strictEqual(unchanged.stdout, "");
+
   const reentered = run(box, {
     hook_event_name: "Stop",
     session_id: "session-1",
@@ -1299,6 +1310,65 @@ test("Stop in-flight advisory emits once then stays silent while stop_hook_activ
   assert.strictEqual(reentered.stdout, "");
   assert.strictEqual(record(box).awaitingCollection, true);
   assert.strictEqual(record(box).awaitingCollectionArmedAt, armedAt);
+
+  const secondDispatch = { ...dispatch(box, { description: "fix b" }), tool_use_id: "tool-2" };
+  run(box, secondDispatch);
+  run(box, {
+    ...secondDispatch,
+    hook_event_name: "PostToolUse",
+    tool_response: { isAsync: true, status: "async_launched", agentId: "a2", resolvedModel: "claude-sonnet-5" }
+  });
+  const expandedBackgroundTasks = [...backgroundTasks, { id: "a2", type: "subagent", status: "running", agent_type: "fusion:fast-worker" }];
+  const changed = run(box, {
+    hook_event_name: "Stop",
+    session_id: "session-1",
+    cwd: box.cwd,
+    transcript_path: box.transcript,
+    stop_hook_active: false,
+    last_assistant_message: "done",
+    background_tasks: expandedBackgroundTasks
+  });
+  assert.match(JSON.parse(changed.stdout).hookSpecificOutput.additionalContext, /Collection is armed/);
+
+  const emptied = run(box, {
+    hook_event_name: "Stop",
+    session_id: "session-1",
+    cwd: box.cwd,
+    transcript_path: box.transcript,
+    stop_hook_active: false,
+    last_assistant_message: "done",
+    background_tasks: expandedBackgroundTasks.map((task) => ({ ...task, status: "completed" }))
+  });
+  assert.strictEqual(JSON.parse(emptied.stdout).decision, "block");
+  for (const worker of readWorkerRecords(envFor(box))) {
+    updateWorkerRecord(worker.taskId, envFor(box), (current) => ({
+      ...current,
+      transportStatus: "done",
+      collectedAt: new Date().toISOString(),
+      awaitingCollection: false,
+      awaitingCollectionArmedAt: null,
+      awaitingVerdict: false,
+      awaitingVerdictArmedAt: null
+    }));
+  }
+
+  const thirdDispatch = { ...dispatch(box, { description: "fix c" }), tool_use_id: "tool-3" };
+  run(box, thirdDispatch);
+  run(box, {
+    ...thirdDispatch,
+    hook_event_name: "PostToolUse",
+    tool_response: { isAsync: true, status: "async_launched", agentId: "a3", resolvedModel: "claude-sonnet-5" }
+  });
+  const newWave = run(box, {
+    hook_event_name: "Stop",
+    session_id: "session-1",
+    cwd: box.cwd,
+    transcript_path: box.transcript,
+    stop_hook_active: false,
+    last_assistant_message: "done",
+    background_tasks: [{ id: "a3", type: "subagent", status: "running", agent_type: "fusion:fast-worker" }]
+  });
+  assert.match(JSON.parse(newWave.stdout).hookSpecificOutput.additionalContext, /Collection is armed/);
 });
 
 test("a successfully terminal async worker without a final-text artifact demands TaskOutput", (t) => {
@@ -2647,9 +2717,13 @@ test("advisory in-flight stop rounds do not consume the cancellation budget for 
       last_assistant_message: `Fusion task ${taskId} is still in flight.`,
       background_tasks: [{ id: "harness-async-1", type: "subagent", status: "running", agent_type: "fusion:fast-worker" }]
     });
-    const output = JSON.parse(stop.stdout);
-    assert.strictEqual(output.decision, undefined);
-    assert.match(output.hookSpecificOutput.additionalContext, /still in flight/);
+    if (count === 0) {
+      const output = JSON.parse(stop.stdout);
+      assert.strictEqual(output.decision, undefined);
+      assert.match(output.hookSpecificOutput.additionalContext, /still in flight/);
+    } else {
+      assert.strictEqual(stop.stdout, "");
+    }
   }
   const worker = record(box);
   assert.strictEqual(worker.stopBlockCount, 0);
@@ -2741,8 +2815,12 @@ test("an explicitly authorized running worker is not cancelled by repeated Stop 
       last_assistant_message: `Background task ${taskId} is running as manual-running.`,
       background_tasks: [{ id: "manual-running", type: "subagent", status: "running", agent_type: "fusion:fast-worker" }]
     });
-    assert.strictEqual(JSON.parse(stop.stdout).decision, undefined);
-    assert.match(JSON.parse(stop.stdout).hookSpecificOutput.additionalContext, /still in flight/);
+    if (count === 0) {
+      assert.strictEqual(JSON.parse(stop.stdout).decision, undefined);
+      assert.match(JSON.parse(stop.stdout).hookSpecificOutput.additionalContext, /still in flight/);
+    } else {
+      assert.strictEqual(stop.stdout, "");
+    }
   }
   const running = record(box);
   assert.strictEqual(running.transportStatus, "pending_async");
@@ -2879,6 +2957,113 @@ test("an explicitly authorized completed worker is collected by SubagentStop bef
   });
   assert.strictEqual(allowed.stdout, "");
   assert.strictEqual(record(box).transportStatus, "done");
+});
+
+test("Stop settles a delivered task notification once without a TaskOutput probe", (t) => {
+  const box = sandbox(t);
+  const workerDispatch = dispatch(box);
+  run(box, workerDispatch);
+  run(box, {
+    ...workerDispatch,
+    hook_event_name: "PostToolUse",
+    tool_response: { isAsync: true, status: "async_launched", agentId: "notification-worker" }
+  });
+  const before = record(box);
+  fs.appendFileSync(box.transcript, `${JSON.stringify({ type: "user", message: { content: `<task-notification>\n<task-id>${before.agentId}</task-id>\n<status>completed</status>\n</task-notification>` } })}\n`, "utf8");
+
+  const stopped = run(box, {
+    hook_event_name: "Stop",
+    session_id: "session-1",
+    cwd: box.cwd,
+    transcript_path: box.transcript,
+    stop_hook_active: true,
+    background_tasks: []
+  });
+  assert.strictEqual(stopped.status, 0);
+  assert.strictEqual(stopped.stdout, "");
+  const collected = record(box);
+  assert.strictEqual(collected.transportStatus, "done");
+  assert.strictEqual(collected.collectionMethod, "task_notification");
+  assert.ok(collected.collectedAt);
+  assert.strictEqual(collected.failureKind, null);
+  assert.strictEqual(collected.deliveryMode, null);
+  assert.strictEqual(collected.awaitingVerdict, true);
+
+  const scanState = readWorkerSessionState("session-1", envFor(box));
+  assert.strictEqual(scanState.taskNotificationTranscriptPath, box.transcript);
+  assert.strictEqual(scanState.taskNotificationScanOffset, fs.statSync(box.transcript).size);
+
+  const repeated = run(box, {
+    hook_event_name: "Stop",
+    session_id: "session-1",
+    cwd: box.cwd,
+    transcript_path: box.transcript,
+    stop_hook_active: true,
+    background_tasks: []
+  });
+  assert.strictEqual(repeated.status, 0);
+  assert.strictEqual(repeated.stdout, "");
+  assert.deepStrictEqual(readWorkerSessionState("session-1", envFor(box)), scanState);
+
+  const settled = recordWorkerAcceptance({ taskId: collected.taskId, acceptance: "accepted", env: envFor(box), source: "main-loop" });
+  assert.strictEqual(settled.acceptance, "accepted");
+});
+
+test("a delivered completion notification prevents Stop from demanding TaskStop for an expired worker", (t) => {
+  const box = sandbox(t);
+  const limits = { FUSION_WORKER_WALL_CLOCK_MS: "1", FUSION_WORKER_STALL_MS: "999999" };
+  const workerDispatch = dispatch(box);
+  run(box, workerDispatch, limits);
+  run(box, {
+    ...workerDispatch,
+    hook_event_name: "PostToolUse",
+    tool_response: { isAsync: true, status: "async_launched", agentId: "notification-expired" }
+  }, limits);
+  const before = record(box);
+  updateWorkerRecord(before.taskId, envFor(box, limits), (current) => ({ ...current, startedAt: new Date(Date.now() - 1_000).toISOString() }));
+  fs.appendFileSync(box.transcript, `${JSON.stringify({ type: "user", message: { content: `<task-notification>\n<task-id>${before.agentId}</task-id>\n<status>completed</status>\n</task-notification>` } })}\n`, "utf8");
+
+  const stopped = run(box, {
+    hook_event_name: "Stop",
+    session_id: "session-1",
+    cwd: box.cwd,
+    transcript_path: box.transcript,
+    stop_hook_active: false,
+    background_tasks: []
+  }, limits);
+  assert.strictEqual(stopped.status, 0);
+  assert.doesNotMatch(stopped.stdout, /TaskStop/);
+  assert.strictEqual(record(box).transportStatus, "done");
+  assert.notStrictEqual(record(box).transportStatus, "cancel_requested");
+});
+
+test("malformed parent transcript content does not transition a worker during Stop", (t) => {
+  const box = sandbox(t);
+  const workerDispatch = dispatch(box);
+  run(box, workerDispatch);
+  run(box, {
+    ...workerDispatch,
+    hook_event_name: "PostToolUse",
+    tool_response: { isAsync: true, status: "async_launched", agentId: "notification-malformed" }
+  });
+  const before = record(box);
+  fs.appendFileSync(box.transcript, "{not valid json}\n", "utf8");
+
+  const stopped = run(box, {
+    hook_event_name: "Stop",
+    session_id: "session-1",
+    cwd: box.cwd,
+    transcript_path: box.transcript,
+    stop_hook_active: true,
+    background_tasks: [{ id: before.agentId, type: "subagent", status: "running", agent_type: "fusion:fast-worker" }]
+  });
+  assert.strictEqual(stopped.status, 0);
+  const unchanged = record(box);
+  assert.strictEqual(unchanged.transportStatus, "pending_async");
+  assert.strictEqual(unchanged.collectionMethod, null);
+  assert.strictEqual(unchanged.collectedAt, null);
+  assert.strictEqual(unchanged.failureKind, null);
+  assert.strictEqual(readWorkerSessionState("session-1", envFor(box)).taskNotificationScanOffset, fs.statSync(box.transcript).size);
 });
 
 test("hooks configuration wires lifecycle events through an executable shell command", () => {

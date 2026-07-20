@@ -103,6 +103,13 @@ function readState(sandbox, sessionId) {
   return JSON.parse(fs.readFileSync(stateFileFor(sandbox, sessionId), "utf8"));
 }
 
+function completeActiveWave(sandbox, gapMs) {
+  const file = stateFileFor(sandbox, "session-1");
+  const state = readState(sandbox, "session-1");
+  state.lastDispatchAt = new Date(Date.now() - gapMs - 1000).toISOString();
+  fs.writeFileSync(file, JSON.stringify(state), "utf8");
+}
+
 function auditFiles(sandbox) {
   if (!fs.existsSync(sandbox.auditDir)) {
     return [];
@@ -339,6 +346,50 @@ test("a Task dispatch is bucketed the same way as an Agent dispatch", (t) => {
   assert.strictEqual(result.stdout, "");
   const state = readState(sandbox, "session-1");
   assert.deepStrictEqual(state.dispatches, { codex: 1 });
+});
+
+test("two narrow dispatch waves attach the fleet advisory to the following dispatch", (t) => {
+  const sandbox = makeSandbox(t);
+  const gapMs = 10000;
+  const extraEnv = { FUSION_FLEET_WAVE_GAP_MS: String(gapMs) };
+
+  assert.strictEqual(run(sandbox, dispatchPayload(sandbox), extraEnv).stdout, "");
+  assert.strictEqual(run(sandbox, dispatchPayload(sandbox), extraEnv).stdout, "");
+  completeActiveWave(sandbox, gapMs);
+  assert.strictEqual(run(sandbox, dispatchPayload(sandbox), extraEnv).stdout, "");
+  assert.strictEqual(run(sandbox, dispatchPayload(sandbox), extraEnv).stdout, "");
+  completeActiveWave(sandbox, gapMs);
+
+  const revealed = run(sandbox, dispatchPayload(sandbox), extraEnv);
+  const output = JSON.parse(revealed.stdout);
+  assert.strictEqual(output.hookSpecificOutput.hookEventName, "PostToolUse");
+  assert.strictEqual(output.hookSpecificOutput.permissionDecision, undefined);
+  assert.strictEqual(
+    output.hookSpecificOutput.additionalContext,
+    "second consecutive narrow wave; fleet default applies: consider /fusion:ultra for the remaining packages or state fleet-decline: <reason>."
+  );
+  assert.strictEqual(readState(sandbox, "session-1").consecutiveNarrowWaves, 2);
+});
+
+test("a wide dispatch wave resets the narrow-wave advisory run", (t) => {
+  const sandbox = makeSandbox(t);
+  const gapMs = 10000;
+  const extraEnv = { FUSION_FLEET_WAVE_GAP_MS: String(gapMs) };
+
+  run(sandbox, dispatchPayload(sandbox), extraEnv);
+  run(sandbox, dispatchPayload(sandbox), extraEnv);
+  completeActiveWave(sandbox, gapMs);
+  assert.strictEqual(run(sandbox, dispatchPayload(sandbox), extraEnv).stdout, "");
+  run(sandbox, dispatchPayload(sandbox), extraEnv);
+  run(sandbox, dispatchPayload(sandbox), extraEnv);
+  completeActiveWave(sandbox, gapMs);
+  assert.strictEqual(run(sandbox, dispatchPayload(sandbox), extraEnv).stdout, "");
+  run(sandbox, dispatchPayload(sandbox), extraEnv);
+  completeActiveWave(sandbox, gapMs);
+
+  const afterReset = run(sandbox, dispatchPayload(sandbox), extraEnv);
+  assert.strictEqual(afterReset.stdout, "");
+  assert.strictEqual(readState(sandbox, "session-1").consecutiveNarrowWaves, 1);
 });
 
 test("an Agent PreToolUse attempt does not reset the write window before dispatch succeeds", (t) => {

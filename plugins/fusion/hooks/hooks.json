@@ -26,8 +26,19 @@
         "hooks": [
           {
             "type": "command",
-            "command": "echo 'Context was compacted. Restate the session execution posture (coordinate, implement, or triage) in your next message. If the main loop has made five or more file edits since the last collected delegate result, posture is implement: package and dispatch before further product edits. Reassess routing for the remaining work: does anything now belong to fusion:deep-reasoner, a peer engine, or the panel?'",
+            "command": "echo 'Context was compacted. Restate the session execution posture (coordinate, implement, or triage) in your next message. If the main loop has made five or more file edits since the last collected delegate result, posture is implement: package and dispatch before further product edits. Reassess routing for the remaining work: does anything now belong to fusion:deep-reasoner, a peer engine, or the panel? If the remaining work decomposes into three or more independent packages, the fleet default applies: convene /fusion:ultra or state fleet-decline: <reason>.'",
             "timeout": 5
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/fleet-posture.mjs\"",
+            "timeout": 10
           }
         ]
       }

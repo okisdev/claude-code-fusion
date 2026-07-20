@@ -14,10 +14,12 @@ const AUDIT_MAX_BYTES_ENV = "FUSION_INLINE_GUARD_AUDIT_MAX_BYTES";
 const AUDIT_MAX_FILES_ENV = "FUSION_INLINE_GUARD_AUDIT_MAX_FILES";
 const FUSION_DATA_DIR_ENV = "FUSION_DATA_DIR";
 const WORKER_STATE_DIR_ENV = "FUSION_WORKER_STATE_DIR";
+const FLEET_WAVE_GAP_ENV = "FUSION_FLEET_WAVE_GAP_MS";
 const DEFAULT_BUDGET = 5;
 const DEFAULT_AUDIT_RETENTION_DAYS = 180;
 const DEFAULT_AUDIT_MAX_BYTES = 2 * 1024 * 1024;
 const DEFAULT_AUDIT_MAX_FILES = 256;
+const DEFAULT_FLEET_WAVE_GAP_MS = 120000;
 const AUDIT_SCHEMA_VERSION = 1;
 const STALE_MS = 48 * 60 * 60 * 1000;
 const DAY_MS = 24 * 60 * 60 * 1000;
@@ -39,6 +41,7 @@ const MAIN_LANE = "main";
 const WORKER_TERMINAL_STATUSES = new Set(["done", "incomplete", "failed", "cancelled", "owner_ended"]);
 const NO_OP_BASH_COMMANDS = new Set(["", "true", ":"]);
 const NO_OP_HEARTBEAT_REASON = "Fusion tasks are in flight for this session, so emit a text-only heartbeat instead of this no-op Bash command.";
+const NARROW_WAVE_ADVISORY_LINE = "second consecutive narrow wave; fleet default applies: consider /fusion:ultra for the remaining packages or state fleet-decline: <reason>.";
 
 function resolveStateDir(env = process.env) {
   const override = env[STATE_ENV];
@@ -143,6 +146,10 @@ function resolveAuditMaxBytes(env = process.env) {
 
 function resolveAuditMaxFiles(env = process.env) {
   return resolvePositiveInteger(env, AUDIT_MAX_FILES_ENV, DEFAULT_AUDIT_MAX_FILES);
+}
+
+function resolveFleetWaveGapMs(env = process.env) {
+  return resolvePositiveInteger(env, FLEET_WAVE_GAP_ENV, DEFAULT_FLEET_WAVE_GAP_MS);
 }
 
 function readHookInput() {
@@ -635,6 +642,8 @@ function defaultState(now) {
     writesSinceDispatch: 0,
     dispatchEpoch: 0,
     lastDispatchAt: null,
+    fleetWaveWidth: 0,
+    consecutiveNarrowWaves: 0,
     dispatches: {},
     dispatchLog: [],
     advisedMultiples: [],
@@ -687,7 +696,29 @@ function normalizeAdvisedMultiples(value) {
   return [...new Set(value.filter((multiple) => Number.isInteger(multiple) && multiple > 0))];
 }
 
-function normalizeState(existing, now) {
+function deriveFleetWaveState(dispatchLog, waveGapMs) {
+  let fleetWaveWidth = 0;
+  let consecutiveNarrowWaves = 0;
+  let previousDispatchAtMs = null;
+  for (const entry of dispatchLog) {
+    const dispatchAtMs = Date.parse(entry.at);
+    if (!Number.isFinite(dispatchAtMs)) {
+      continue;
+    }
+    if (previousDispatchAtMs !== null && Math.abs(dispatchAtMs - previousDispatchAtMs) <= waveGapMs) {
+      fleetWaveWidth += 1;
+    } else {
+      if (fleetWaveWidth > 0) {
+        consecutiveNarrowWaves = fleetWaveWidth <= 2 ? consecutiveNarrowWaves + 1 : 0;
+      }
+      fleetWaveWidth = 1;
+    }
+    previousDispatchAtMs = dispatchAtMs;
+  }
+  return { fleetWaveWidth, consecutiveNarrowWaves };
+}
+
+function normalizeState(existing, now, waveGapMs = DEFAULT_FLEET_WAVE_GAP_MS) {
   if (!existing || typeof existing !== "object") {
     return defaultState(now);
   }
@@ -700,11 +731,17 @@ function normalizeState(existing, now) {
   const dispatchLog = normalizeDispatchLog(existing.dispatchLog);
   const createdAtMs = Date.parse(existing.createdAt);
   const lastDispatchAtMs = Date.parse(existing.lastDispatchAt);
+  const derivedFleetWaveState = deriveFleetWaveState(dispatchLog, waveGapMs);
+  const fleetWaveWidth = Number.isInteger(existing.fleetWaveWidth) && existing.fleetWaveWidth >= 0 ? existing.fleetWaveWidth : derivedFleetWaveState.fleetWaveWidth;
+  const consecutiveNarrowWaves =
+    Number.isInteger(existing.consecutiveNarrowWaves) && existing.consecutiveNarrowWaves >= 0 ? existing.consecutiveNarrowWaves : derivedFleetWaveState.consecutiveNarrowWaves;
   return {
     writeCount,
     writesSinceDispatch,
     dispatchEpoch: Number.isInteger(existing.dispatchEpoch) && existing.dispatchEpoch >= 0 ? existing.dispatchEpoch : dispatchCount,
     lastDispatchAt: Number.isFinite(lastDispatchAtMs) ? new Date(lastDispatchAtMs).toISOString() : null,
+    fleetWaveWidth,
+    consecutiveNarrowWaves,
     dispatches,
     dispatchLog,
     advisedMultiples,
@@ -723,6 +760,10 @@ function allowOutput(reason) {
 
 function denyOutput(reason) {
   return { hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision: "deny", permissionDecisionReason: reason } };
+}
+
+function postToolAdvisoryOutput(additionalContext) {
+  return { hookSpecificOutput: { hookEventName: "PostToolUse", additionalContext } };
 }
 
 function buildAdvisoryLine(writeCount, dispatchCount) {
@@ -768,12 +809,26 @@ function runHook(env = process.env, input = readHookInput()) {
     const safeSubagentType = sanitizeIdentifier(subagentType);
     const lane = laneForSubagentType(subagentType);
     const description = extractDispatchDescription(input.tool_input);
+    const waveGapMs = resolveFleetWaveGapMs(env);
     recordAuditEvent(
       { at: now, session: sessionId, event: "dispatch", lane, tool: toolName, ...(description ? { description } : {}) },
       env
     );
-    withStateLock(file, () => {
-      const state = normalizeState(readState(file), now);
+    const waveAdvisory = withStateLock(file, () => {
+      const state = normalizeState(readState(file), now, waveGapMs);
+      const previousDispatchAtMs = Date.parse(state.lastDispatchAt);
+      const nowMs = Date.parse(now);
+      const isSameWave = Number.isFinite(previousDispatchAtMs) && Number.isFinite(nowMs) && Math.abs(nowMs - previousDispatchAtMs) <= waveGapMs;
+      let shouldAdvise = false;
+      if (isSameWave) {
+        state.fleetWaveWidth += 1;
+      } else if (state.fleetWaveWidth > 0) {
+        state.consecutiveNarrowWaves = state.fleetWaveWidth <= 2 ? state.consecutiveNarrowWaves + 1 : 0;
+        shouldAdvise = state.consecutiveNarrowWaves === 2;
+        state.fleetWaveWidth = 1;
+      } else {
+        state.fleetWaveWidth = 1;
+      }
       state.dispatches[lane] = (state.dispatches[lane] ?? 0) + 1;
       state.dispatchEpoch += 1;
       state.lastDispatchAt = now;
@@ -784,7 +839,11 @@ function runHook(env = process.env, input = readHookInput()) {
         state.dispatchLog.splice(0, state.dispatchLog.length - DISPATCH_LOG_LIMIT);
       }
       writeState(file, state);
+      return shouldAdvise;
     });
+    if (waveAdvisory) {
+      process.stdout.write(`${JSON.stringify(postToolAdvisoryOutput(NARROW_WAVE_ADVISORY_LINE))}\n`);
+    }
     return;
   }
 
@@ -801,7 +860,7 @@ function runHook(env = process.env, input = readHookInput()) {
     let writeCount = 0;
     let dispatchCount = 0;
     try {
-      const snapshot = withStateLock(file, () => normalizeState(readState(file), now));
+      const snapshot = withStateLock(file, () => normalizeState(readState(file), now, resolveFleetWaveGapMs(env)));
       writeCount = snapshot.writesSinceDispatch;
       dispatchCount = totalDispatches(snapshot.dispatches);
     } catch {
@@ -840,7 +899,7 @@ function runHook(env = process.env, input = readHookInput()) {
   const budget = resolveBudget(env);
   const mode = resolveMode(env);
   const decision = withStateLock(file, () => {
-    const state = normalizeState(readState(file), now);
+    const state = normalizeState(readState(file), now, resolveFleetWaveGapMs(env));
     if (mode === "enforce" && state.writesSinceDispatch >= budget) {
       return { denied: true, writeCount: state.writesSinceDispatch, dispatchCount: totalDispatches(state.dispatches) };
     }
@@ -881,7 +940,7 @@ function runHook(env = process.env, input = readHookInput()) {
   recordAuditEvent({ at: now, session: sessionId, event: "write", lane: MAIN_LANE, tool: toolName, ...(auditPath ? { path: auditPath } : {}) }, env);
   if (decision.candidate) {
     withStateLock(file, () => {
-      const latest = normalizeState(readState(file), new Date().toISOString());
+      const latest = normalizeState(readState(file), new Date().toISOString(), resolveFleetWaveGapMs(env));
       if (latest.dispatchEpoch === decision.candidate.dispatchEpoch && latest.advisedMultiples.includes(decision.candidate.multiple)) {
         recordAuditEvent(
           {
