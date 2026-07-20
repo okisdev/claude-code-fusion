@@ -83,20 +83,12 @@ test("every executable private transport surface follows its declared Write tran
     assert.ok(invokeIndex > writeIndex, `${file} must invoke the consumer only after writing`);
     assert.match(content, /Never delete, rename, recreate, or change the permissions of the transport file\./, file);
     assert.match(content, /Write(?: call)? fails/, file);
-    if (file === "plugins/codex/agents/codex-rescue.md") {
-      assert.doesNotMatch(toolDeclaration, /(?:^|, )Read(?:,|$)/, file);
-      assert.doesNotMatch(content.slice(createIndex, writeIndex), /`Read`/, file);
-      assert.match(content, /Do not read the transport file before or after writing it\./, file);
-      assert.match(content, /raw request bytes still travel only through the Write tool, and the validated token is the only variable Bash argument\./, file);
-      assert.match(content, /Because Write fully replaces file content, any bytes staged before the Write call cannot survive into the payload\./, file);
-    } else {
-      const readIndex = content.indexOf("`Read`", createIndex);
-      assert.match(toolDeclaration, /(?:^|, )Read(?:,|$)/, file);
-      assert.ok(readIndex > createIndex && writeIndex > readIndex, `${file} must read the allocated file before writing`);
-      assert.match(content.slice(createIndex, writeIndex), /Read[^\n.]*once/, file);
-      assert.match(content, /Read(?: call)? fails/, file);
-      assert.match(content, /file is not empty/, file);
-    }
+    const readIndex = content.indexOf("`Read`", createIndex);
+    assert.match(toolDeclaration, /(?:^|, )Read(?:,|$)/, file);
+    assert.ok(readIndex > createIndex && writeIndex > readIndex, `${file} must read the allocated file before writing`);
+    assert.match(content.slice(createIndex, writeIndex), /Read[^\n.]*once/, file);
+    assert.match(content, /Read(?: call)? fails/, file);
+    assert.match(content, /file is not empty/, file);
     if (file === "plugins/fusion/skills/stats/SKILL.md") {
       assert.match(content, /sole carve-out is a strict verdict settlement/, file);
       assert.match(content, /repeatable `--record <id>=<accepted\|rejected\|unverified>` pairs, optional `--source collector\|main-loop`, and optional `--json`/, file);
