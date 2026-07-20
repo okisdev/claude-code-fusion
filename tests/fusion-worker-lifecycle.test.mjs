@@ -162,8 +162,9 @@ test("a worker with no tool call history stalls exactly as it did before in-flig
 });
 
 test("an in-flight tool call suspends the stall budget but not the wall clock, and stalling resumes once it completes or fails", (t) => {
+  const STALL_BUDGET_MS = 600_000;
   const box = sandbox(t);
-  const limits = { FUSION_WORKER_WALL_CLOCK_MS: "999999", FUSION_WORKER_STALL_MS: "60" };
+  const limits = { FUSION_WORKER_WALL_CLOCK_MS: "999999", FUSION_WORKER_STALL_MS: String(STALL_BUDGET_MS) };
   run(box, dispatch(box), limits);
   run(box, {
     hook_event_name: "SubagentStart",
@@ -186,7 +187,7 @@ test("an in-flight tool call suspends the stall budget but not the wall clock, a
   }, limits);
   const admitted = record(box);
   assert.ok(admitted.inFlightSince);
-  assert.strictEqual(workerBudgetFailure(admitted, Date.parse(admitted.inFlightSince) + 600_000), null);
+  assert.strictEqual(workerBudgetFailure(admitted, Date.parse(admitted.inFlightSince) + STALL_BUDGET_MS + 300_000), null);
   assert.strictEqual(workerBudgetFailure(admitted, Date.parse(admitted.startedAt) + 999_999).failureKind, "timeout");
 
   run(box, {
@@ -203,8 +204,8 @@ test("an in-flight tool call suspends the stall budget but not the wall clock, a
   const completedCall = record(box);
   assert.strictEqual(completedCall.inFlightSince, undefined);
   assert.ok(completedCall.lastLivenessAt);
-  assert.strictEqual(workerBudgetFailure(completedCall, Date.parse(completedCall.lastLivenessAt) + 59), null);
-  assert.strictEqual(workerBudgetFailure(completedCall, Date.parse(completedCall.lastLivenessAt) + 60).failureKind, "stall");
+  assert.strictEqual(workerBudgetFailure(completedCall, Date.parse(completedCall.lastLivenessAt) + STALL_BUDGET_MS - 1), null);
+  assert.strictEqual(workerBudgetFailure(completedCall, Date.parse(completedCall.lastLivenessAt) + STALL_BUDGET_MS).failureKind, "stall");
 
   run(box, {
     hook_event_name: "PreToolUse",
@@ -232,7 +233,7 @@ test("an in-flight tool call suspends the stall budget but not the wall clock, a
   const afterFailedCall = record(box);
   assert.strictEqual(afterFailedCall.inFlightSince, undefined);
   assert.strictEqual(afterFailedCall.lastLivenessAt, completedCall.lastLivenessAt);
-  assert.strictEqual(workerBudgetFailure(afterFailedCall, Date.parse(afterFailedCall.lastLivenessAt) + 60).failureKind, "stall");
+  assert.strictEqual(workerBudgetFailure(afterFailedCall, Date.parse(afterFailedCall.lastLivenessAt) + STALL_BUDGET_MS).failureKind, "stall");
 });
 
 test("brief sizing hints scale dispatch limits", (t) => {
