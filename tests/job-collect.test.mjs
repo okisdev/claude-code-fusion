@@ -62,6 +62,27 @@ function runCollector(t, companion, request = {}, { extraEnv = {}, timeout = 10_
   return spawnSync(process.execPath, [collector, "--raw-args-token", transport.token], { encoding: "utf8", env, timeout });
 }
 
+async function waitForPath(file, timeoutMs) {
+  const deadline = Date.now() + timeoutMs;
+  while (!fs.existsSync(file)) {
+    if (Date.now() >= deadline) {
+      throw new Error(`Timed out waiting for ${file}.`);
+    }
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+}
+
+async function staysAlive(pid, windowMs) {
+  const deadline = Date.now() + windowMs;
+  for (;;) {
+    process.kill(pid, 0);
+    if (Date.now() >= deadline) {
+      return;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+}
+
 test("collects through fixed companion status and result argv", (t) => {
   const root = makeSandbox(t);
   const countFile = path.join(root, "status-count");
@@ -165,6 +186,8 @@ test("the wall clock cap terminates a stuck result process", (t) => {
 });
 
 test("does not signal a companion group after its direct child exits", async (t) => {
+  const COMPANION_TIMEOUT_MS = 5_000;
+  const KILL_ESCALATION_GRACE_MS = 1_000;
   const root = makeSandbox(t);
   const descendantPidFile = path.join(root, "descendant.pid");
   const companion = path.join(root, "exiting-companion.mjs");
@@ -181,10 +204,12 @@ test("does not signal a companion group after its direct child exits", async (t)
       } catch {}
     }
   });
-  const outcome = await runCompanion(companion, "status", { jobId, json: false }, 200);
+  const outcomePromise = runCompanion(companion, "status", { jobId, json: false }, COMPANION_TIMEOUT_MS);
+  await waitForPath(descendantPidFile, COMPANION_TIMEOUT_MS);
   descendantPid = Number(fs.readFileSync(descendantPidFile, "utf8"));
+  const outcome = await outcomePromise;
   assert.equal(outcome.timedOut, true);
-  await new Promise((resolve) => setTimeout(resolve, 150));
+  await staysAlive(descendantPid, KILL_ESCALATION_GRACE_MS);
   assert.doesNotThrow(() => process.kill(descendantPid, 0));
 });
 
