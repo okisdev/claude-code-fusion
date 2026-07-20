@@ -7,7 +7,7 @@ import { test } from "node:test";
 
 import { recordCodexAcceptance } from "../plugins/fusion/scripts/fusion-stats.mjs";
 import { createWorkerRecord, readWorkerRecords, recordWorkerAcceptance, updateWorkerRecord } from "../plugins/fusion/scripts/lib/worker-state.mjs";
-import { workerLimits } from "../plugins/fusion/scripts/worker-lifecycle.mjs";
+import { validateWorkerBrief, workerBudgetFailure, workerLimits } from "../plugins/fusion/scripts/worker-lifecycle.mjs";
 
 const repoRoot = path.join(import.meta.dirname, "..");
 const script = path.join(repoRoot, "plugins", "fusion", "scripts", "worker-lifecycle.mjs");
@@ -62,7 +62,7 @@ function record(box) {
   return records[0];
 }
 
-test("fast worker limits raise the default budgets and retain environment overrides", () => {
+test("worker limits preserve the default budgets without a sizing hint and retain environment overrides", () => {
   assert.deepStrictEqual(workerLimits("fusion:fast-worker", {}), {
     wallClockMs: 1_200_000,
     stallMs: 300_000,
@@ -77,6 +77,201 @@ test("fast worker limits raise the default budgets and retain environment overri
     FUSION_WORKER_MAX_OUTPUT_TOKENS: "8000",
     FUSION_WORKER_MAX_UNCACHED_TOKENS: "6000"
   }), {
+    wallClockMs: 120,
+    stallMs: 60,
+    maxTurns: 12,
+    maxOutputTokens: 8_000,
+    maxUncachedTokens: 6_000
+  });
+});
+
+test("the stall budget uses successful-call liveness without changing execution progress telemetry", (t) => {
+  const box = sandbox(t);
+  const limits = { FUSION_WORKER_WALL_CLOCK_MS: "999999", FUSION_WORKER_STALL_MS: "60" };
+  run(box, dispatch(box), limits);
+  run(box, {
+    hook_event_name: "SubagentStart",
+    session_id: "session-1",
+    cwd: box.cwd,
+    transcript_path: box.transcript,
+    agent_id: "liveness-1",
+    agent_type: "fusion:fast-worker"
+  }, limits);
+
+  const withoutCalls = record(box);
+  assert.strictEqual(workerBudgetFailure(withoutCalls, Date.parse(withoutCalls.startedAt) + 60).failureKind, "stall");
+
+  run(box, {
+    hook_event_name: "PostToolUse",
+    session_id: "session-1",
+    cwd: box.cwd,
+    transcript_path: box.transcript,
+    agent_id: "liveness-1",
+    agent_type: "fusion:fast-worker",
+    tool_name: "Read",
+    tool_input: { file_path: "src/a.ts" }
+  }, limits);
+  const afterRead = record(box);
+  assert.ok(afterRead.lastLivenessAt);
+  assert.strictEqual(afterRead.progressEvents, 0);
+  assert.strictEqual(workerBudgetFailure(afterRead, Date.parse(afterRead.lastLivenessAt) + 59), null);
+
+  run(box, {
+    hook_event_name: "PostToolUseFailure",
+    session_id: "session-1",
+    cwd: box.cwd,
+    transcript_path: box.transcript,
+    agent_id: "liveness-1",
+    agent_type: "fusion:fast-worker",
+    tool_name: "Write",
+    tool_input: { file_path: "src/a.ts" }
+  }, limits);
+  const afterFailure = record(box);
+  assert.strictEqual(afterFailure.lastLivenessAt, afterRead.lastLivenessAt);
+  assert.strictEqual(afterFailure.progressEvents, 0);
+  assert.strictEqual(workerBudgetFailure(afterFailure, Date.parse(afterFailure.lastLivenessAt) + 60).failureKind, "stall");
+
+  run(box, {
+    hook_event_name: "PostToolUse",
+    session_id: "session-1",
+    cwd: box.cwd,
+    transcript_path: box.transcript,
+    agent_id: "liveness-1",
+    agent_type: "fusion:fast-worker",
+    tool_name: "Write",
+    tool_input: { file_path: "src/a.ts" }
+  }, limits);
+  assert.strictEqual(record(box).progressEvents, 1);
+});
+
+test("a worker with no tool call history stalls exactly as it did before in-flight tracking existed", (t) => {
+  const box = sandbox(t);
+  const limits = { FUSION_WORKER_WALL_CLOCK_MS: "999999", FUSION_WORKER_STALL_MS: "60" };
+  run(box, dispatch(box), limits);
+  run(box, {
+    hook_event_name: "SubagentStart",
+    session_id: "session-1",
+    cwd: box.cwd,
+    transcript_path: box.transcript,
+    agent_id: "never-called",
+    agent_type: "fusion:fast-worker"
+  }, limits);
+  const neverCalled = record(box);
+  assert.strictEqual(neverCalled.inFlightSince, undefined);
+  assert.strictEqual(workerBudgetFailure(neverCalled, Date.parse(neverCalled.startedAt) + 60).failureKind, "stall");
+});
+
+test("an in-flight tool call suspends the stall budget but not the wall clock, and stalling resumes once it completes or fails", (t) => {
+  const box = sandbox(t);
+  const limits = { FUSION_WORKER_WALL_CLOCK_MS: "999999", FUSION_WORKER_STALL_MS: "60" };
+  run(box, dispatch(box), limits);
+  run(box, {
+    hook_event_name: "SubagentStart",
+    session_id: "session-1",
+    cwd: box.cwd,
+    transcript_path: box.transcript,
+    agent_id: "inflight-1",
+    agent_type: "fusion:fast-worker"
+  }, limits);
+
+  run(box, {
+    hook_event_name: "PreToolUse",
+    session_id: "session-1",
+    cwd: box.cwd,
+    transcript_path: box.transcript,
+    agent_id: "inflight-1",
+    agent_type: "fusion:fast-worker",
+    tool_name: "Bash",
+    tool_input: { command: "sleep 600" }
+  }, limits);
+  const admitted = record(box);
+  assert.ok(admitted.inFlightSince);
+  assert.strictEqual(workerBudgetFailure(admitted, Date.parse(admitted.inFlightSince) + 600_000), null);
+  assert.strictEqual(workerBudgetFailure(admitted, Date.parse(admitted.startedAt) + 999_999).failureKind, "timeout");
+
+  run(box, {
+    hook_event_name: "PostToolUse",
+    session_id: "session-1",
+    cwd: box.cwd,
+    transcript_path: box.transcript,
+    agent_id: "inflight-1",
+    agent_type: "fusion:fast-worker",
+    tool_name: "Bash",
+    tool_input: { command: "sleep 600" },
+    tool_response: { content: "done" }
+  }, limits);
+  const completedCall = record(box);
+  assert.strictEqual(completedCall.inFlightSince, undefined);
+  assert.ok(completedCall.lastLivenessAt);
+  assert.strictEqual(workerBudgetFailure(completedCall, Date.parse(completedCall.lastLivenessAt) + 59), null);
+  assert.strictEqual(workerBudgetFailure(completedCall, Date.parse(completedCall.lastLivenessAt) + 60).failureKind, "stall");
+
+  run(box, {
+    hook_event_name: "PreToolUse",
+    session_id: "session-1",
+    cwd: box.cwd,
+    transcript_path: box.transcript,
+    agent_id: "inflight-1",
+    agent_type: "fusion:fast-worker",
+    tool_name: "Bash",
+    tool_input: { command: "false" }
+  }, limits);
+  assert.ok(record(box).inFlightSince);
+
+  run(box, {
+    hook_event_name: "PostToolUseFailure",
+    session_id: "session-1",
+    cwd: box.cwd,
+    transcript_path: box.transcript,
+    agent_id: "inflight-1",
+    agent_type: "fusion:fast-worker",
+    tool_name: "Bash",
+    tool_input: { command: "false" },
+    tool_response: { is_error: true }
+  }, limits);
+  const afterFailedCall = record(box);
+  assert.strictEqual(afterFailedCall.inFlightSince, undefined);
+  assert.strictEqual(afterFailedCall.lastLivenessAt, completedCall.lastLivenessAt);
+  assert.strictEqual(workerBudgetFailure(afterFailedCall, Date.parse(afterFailedCall.lastLivenessAt) + 60).failureKind, "stall");
+});
+
+test("brief sizing hints scale dispatch limits", (t) => {
+  const cases = [
+    ["SMALL", { wallClockMs: 600_000, stallMs: 150_000, maxTurns: 30, maxOutputTokens: 24_000, maxUncachedTokens: 180_000 }],
+    ["StAnDaRd", { wallClockMs: 1_200_000, stallMs: 300_000, maxTurns: 60, maxOutputTokens: 48_000, maxUncachedTokens: 360_000 }],
+    ["large", { wallClockMs: 2_400_000, stallMs: 600_000, maxTurns: 120, maxOutputTokens: 96_000, maxUncachedTokens: 720_000 }]
+  ];
+
+  for (const [sizing, limits] of cases) {
+    const box = sandbox(t);
+    const launch = run(box, dispatch(box, { prompt: `${brief()}sizing: ${sizing}\n` }));
+    assert.strictEqual(JSON.parse(launch.stdout).hookSpecificOutput.permissionDecision, "allow");
+    assert.deepStrictEqual(record(box).limits, limits);
+  }
+});
+
+test("brief sizing validation rejects invalid and repeated values", () => {
+  const invalid = validateWorkerBrief(`${brief()}sizing: extra-large\n`, "fusion:fast-worker");
+  assert.strictEqual(invalid.ok, false);
+  assert.match(invalid.reason, /small.*standard.*large/);
+
+  const repeated = validateWorkerBrief(`${brief()}sizing: small\nsizing: large\n`, "fusion:fast-worker");
+  assert.strictEqual(repeated.ok, false);
+  assert.match(repeated.reason, /may appear once/);
+});
+
+test("environment overrides take precedence over brief sizing hints", (t) => {
+  const box = sandbox(t);
+  const overrides = {
+    FUSION_WORKER_WALL_CLOCK_MS: "120",
+    FUSION_WORKER_STALL_MS: "60",
+    FUSION_WORKER_MAX_TURNS: "12",
+    FUSION_WORKER_MAX_OUTPUT_TOKENS: "8000",
+    FUSION_WORKER_MAX_UNCACHED_TOKENS: "6000"
+  };
+  const launch = run(box, dispatch(box, { prompt: `${brief()}sizing: large\n` }), overrides);
+  assert.strictEqual(JSON.parse(launch.stdout).hookSpecificOutput.permissionDecision, "allow");
+  assert.deepStrictEqual(record(box).limits, {
     wallClockMs: 120,
     stallMs: 60,
     maxTurns: 12,
@@ -128,6 +323,58 @@ test("the dispatch guard requires a minimal isolated brief and explicit user bac
   assert.strictEqual(record(box).expectedDelivery, "manual-background");
 });
 
+test("SubagentStart requires verdict envelopes for execution and coverage workers but not collectors", (t) => {
+  const execution = sandbox(t);
+  run(execution, dispatch(execution));
+  const executionStart = run(execution, {
+    hook_event_name: "SubagentStart",
+    session_id: "session-1",
+    cwd: execution.cwd,
+    transcript_path: execution.transcript,
+    agent_id: "execution-envelope",
+    agent_type: "fusion:fast-worker"
+  });
+  const executionInstruction = JSON.parse(executionStart.stdout).hookSpecificOutput.additionalContext;
+  assert.match(executionInstruction, /End a successful execution report with separate lines `delivery: complete` and `verification: passed`/);
+  assert.match(executionInstruction, /compact verdict envelope/);
+  assert.match(executionInstruction, /changed file paths without diffs/);
+  assert.match(executionInstruction, /pass and fail counts/);
+  assert.match(executionInstruction, /environment findings/);
+  assert.match(executionInstruction, /long unified diffs, full test logs, and long quoted file contents/);
+
+  const coverage = sandbox(t);
+  run(coverage, dispatch(coverage, {
+    subagent_type: "fusion:trivial-worker",
+    prompt: "fusion-brief: v1\ncontext-mode: isolated\ngoal: inspect one file\nscope: src/a.ts\nacceptance: identify the behavior\n"
+  }));
+  const coverageStart = run(coverage, {
+    hook_event_name: "SubagentStart",
+    session_id: "session-1",
+    cwd: coverage.cwd,
+    transcript_path: coverage.transcript,
+    agent_id: "coverage-envelope",
+    agent_type: "fusion:trivial-worker"
+  });
+  const coverageInstruction = JSON.parse(coverageStart.stdout).hookSpecificOutput.additionalContext;
+  assert.match(coverageInstruction, /End the completed analysis with separate lines `delivery: complete` and `coverage: complete`/);
+  assert.match(coverageInstruction, /compact verdict envelope/);
+
+  const collector = sandbox(t);
+  const peerJobId = "a".repeat(32);
+  run(collector, dispatch(collector, { subagent_type: "fusion:job-collector", prompt: collectorPrompt("codex", peerJobId) }));
+  const collectorStart = run(collector, {
+    hook_event_name: "SubagentStart",
+    session_id: "session-1",
+    cwd: collector.cwd,
+    transcript_path: collector.transcript,
+    agent_id: "collector-envelope",
+    agent_type: "fusion:job-collector"
+  });
+  const collectorInstruction = JSON.parse(collectorStart.stdout).hookSpecificOutput.additionalContext;
+  assert.match(collectorInstruction, /Return the collector command output exactly, including its terminal `collector:` marker/);
+  assert.doesNotMatch(collectorInstruction, /compact verdict envelope|changed file paths without diffs/);
+});
+
 test("parallel same-type workers correlate by their injected task ids even when they start out of order", (t) => {
   const box = sandbox(t);
   const firstDispatch = dispatch(box);
@@ -161,7 +408,7 @@ test("parallel same-type workers correlate by their injected task ids even when 
   assert.strictEqual(byDispatch.get("tool-second").agentId, "agent-second");
 });
 
-test("an async launch receipt persists its output file and starts the worker budget", (t) => {
+test("an async launch receipt persists its transcript path and starts the worker budget", (t) => {
   const box = sandbox(t);
   const outputFile = path.join(box.root, "tasks", "launch-receipt.output");
   fs.mkdirSync(path.dirname(outputFile), { recursive: true });
@@ -179,7 +426,8 @@ test("an async launch receipt persists its output file and starts the worker bud
   });
   assert.strictEqual(launch.status, 0, launch.stderr);
   const launched = record(box);
-  assert.strictEqual(launched.outputFile, outputFile);
+  assert.strictEqual(launched.transcriptPath, outputFile);
+  assert.strictEqual(launched.outputFile, null);
   assert.ok(Number.isFinite(Date.parse(launched.startedAt)));
 });
 
@@ -339,7 +587,7 @@ test("TaskOutput skips an oversized harness task transcript without interrupting
   });
 });
 
-test("SubagentStop reclassifies only the unexpected async marker after transport completion", (t) => {
+test("SubagentStop collects a persisted async result and reclassifies the unexpected async marker", (t) => {
   const box = sandbox(t);
   run(box, dispatch(box));
   run(box, {
@@ -366,10 +614,15 @@ test("SubagentStop reclassifies only the unexpected async marker after transport
     stop_hook_active: false,
     last_assistant_message: "summary\ndelivery: complete\nverification: passed"
   });
-  assert.strictEqual(record(box).transportStatus, "ready_uncollected");
-  assert.strictEqual(record(box).collectedAt, null);
+  assert.strictEqual(record(box).transportStatus, "done");
+  assert.strictEqual(record(box).collectionMethod, "subagent_stop");
+  assert.ok(record(box).collectedAt);
+  assert.strictEqual(record(box).awaitingVerdict, true);
   assert.strictEqual(record(box).failureKind, null);
+  assert.strictEqual(record(box).recoveredFailureKind, "unexpected_async");
   assert.strictEqual(record(box).deliveryMode, "harness_async");
+  const finalTextFile = record(box).outputFile;
+  assert.ok(finalTextFile);
 
   const blocked = run(box, {
     hook_event_name: "Stop",
@@ -378,8 +631,129 @@ test("SubagentStop reclassifies only the unexpected async marker after transport
     transcript_path: box.transcript,
     background_tasks: []
   });
-  assert.strictEqual(JSON.parse(blocked.stdout).decision, "block");
-  assert.match(JSON.parse(blocked.stdout).reason, /TaskOutput with block=true.*agent-stop-async/);
+  const output = JSON.parse(blocked.stdout);
+  assert.strictEqual(output.decision, undefined);
+  assert.match(output.hookSpecificOutput.additionalContext, /Acceptance remains unverified for 1 collected Fusion worker/);
+  assert.doesNotMatch(output.hookSpecificOutput.additionalContext, /Call Read with file_path=|TaskOutput/);
+});
+
+test("SubagentStop clears stale budget failures after successful completion", (t) => {
+  for (const failureKind of ["stall", "timeout", "token_limit", "turn_limit"]) {
+    const box = sandbox(t);
+    run(box, dispatch(box));
+    run(box, {
+      hook_event_name: "SubagentStart",
+      session_id: "session-1",
+      cwd: box.cwd,
+      transcript_path: box.transcript,
+      agent_id: `recovered-${failureKind}`,
+      agent_type: "fusion:fast-worker"
+    });
+    updateWorkerRecord(record(box).taskId, envFor(box), (current) => ({ ...current, failureKind }));
+    run(box, {
+      hook_event_name: "SubagentStop",
+      session_id: "session-1",
+      cwd: box.cwd,
+      transcript_path: box.transcript,
+      agent_id: `recovered-${failureKind}`,
+      agent_type: "fusion:fast-worker",
+      stop_hook_active: false,
+      last_assistant_message: "summary\ndelivery: complete\nverification: passed"
+    });
+    const completed = record(box);
+    assert.strictEqual(completed.transportStatus, "done");
+    assert.strictEqual(completed.failureKind, null);
+    assert.strictEqual(completed.recoveredFailureKind, failureKind);
+  }
+});
+
+test("SubagentStop keeps a newly evaluated budget failure instead of recovering a stale one", (t) => {
+  const box = sandbox(t);
+  const limits = { FUSION_WORKER_WALL_CLOCK_MS: "1", FUSION_WORKER_STALL_MS: "999999" };
+  run(box, dispatch(box), limits);
+  run(box, {
+    hook_event_name: "SubagentStart",
+    session_id: "session-1",
+    cwd: box.cwd,
+    transcript_path: box.transcript,
+    agent_id: "fresh-budget-failure",
+    agent_type: "fusion:fast-worker"
+  }, limits);
+  updateWorkerRecord(record(box).taskId, envFor(box), (current) => ({
+    ...current,
+    failureKind: "stall",
+    startedAt: new Date(Date.now() - 1_000).toISOString()
+  }));
+  run(box, {
+    hook_event_name: "SubagentStop",
+    session_id: "session-1",
+    cwd: box.cwd,
+    transcript_path: box.transcript,
+    agent_id: "fresh-budget-failure",
+    agent_type: "fusion:fast-worker",
+    stop_hook_active: false,
+    last_assistant_message: "summary\ndelivery: complete\nverification: passed"
+  }, limits);
+  const completed = record(box);
+  assert.strictEqual(completed.transportStatus, "done");
+  assert.strictEqual(completed.failureKind, "timeout");
+  assert.strictEqual(completed.collectionMethod, "SubagentStop");
+  assert.ok(completed.collectedAt);
+  assert.strictEqual(completed.recoveredFailureKind, undefined);
+});
+
+test("SubagentStop retains failed and incomplete workers on their existing collection path", (t) => {
+  const failed = sandbox(t);
+  const limits = { FUSION_WORKER_WALL_CLOCK_MS: "1", FUSION_WORKER_STALL_MS: "999999" };
+  run(failed, dispatch(failed), limits);
+  run(failed, {
+    hook_event_name: "SubagentStart",
+    session_id: "session-1",
+    cwd: failed.cwd,
+    transcript_path: failed.transcript,
+    agent_id: "failed-terminal",
+    agent_type: "fusion:fast-worker"
+  }, limits);
+  updateWorkerRecord(record(failed).taskId, envFor(failed), (current) => ({ ...current, startedAt: new Date(Date.now() - 1_000).toISOString() }));
+  run(failed, {
+    hook_event_name: "SubagentStop",
+    session_id: "session-1",
+    cwd: failed.cwd,
+    transcript_path: failed.transcript,
+    agent_id: "failed-terminal",
+    agent_type: "fusion:fast-worker",
+    stop_hook_active: true,
+    last_assistant_message: "partial result"
+  }, limits);
+  assert.strictEqual(record(failed).transportStatus, "failed");
+  assert.strictEqual(record(failed).failureKind, "timeout");
+  assert.strictEqual(record(failed).collectionMethod, "SubagentStop");
+  assert.ok(record(failed).collectedAt);
+
+  const incomplete = sandbox(t);
+  run(incomplete, dispatch(incomplete));
+  run(incomplete, {
+    hook_event_name: "SubagentStart",
+    session_id: "session-1",
+    cwd: incomplete.cwd,
+    transcript_path: incomplete.transcript,
+    agent_id: "incomplete-terminal",
+    agent_type: "fusion:fast-worker"
+  });
+  run(incomplete, {
+    hook_event_name: "SubagentStop",
+    session_id: "session-1",
+    cwd: incomplete.cwd,
+    transcript_path: incomplete.transcript,
+    agent_id: "incomplete-terminal",
+    agent_type: "fusion:fast-worker",
+    stop_hook_active: true,
+    last_assistant_message: "partial result"
+  });
+  assert.strictEqual(record(incomplete).transportStatus, "incomplete");
+  assert.strictEqual(record(incomplete).failureKind, "delivery");
+  assert.strictEqual(record(incomplete).collectionMethod, "SubagentStop");
+  assert.ok(record(incomplete).collectedAt);
 });
 
 test("a TaskOutput no-task error marks a matching unexpected async peer wrapper as reaped", (t) => {
@@ -557,17 +931,17 @@ test("lifecycle enforcement fails closed when private worker state is unavailabl
   assert.match(JSON.parse(corruptWorkerTool.stdout).hookSpecificOutput.permissionDecisionReason, /state is unavailable/);
 });
 
-test("an armed async worker blocks only after terminal state is observed and unblocks after Read collection", (t) => {
+test("an armed async worker is collected by SubagentStop and remains verdict gated", (t) => {
   const box = sandbox(t);
   run(box, dispatch(box));
   const task = record(box);
-  const outputFile = path.join(box.root, "tasks", "agent-a1.output");
-  fs.mkdirSync(path.dirname(outputFile), { recursive: true });
-  fs.writeFileSync(outputFile, "", "utf8");
+  const transcriptPath = path.join(box.root, "tasks", "agent-a1.output");
+  fs.mkdirSync(path.dirname(transcriptPath), { recursive: true });
+  fs.writeFileSync(transcriptPath, "", "utf8");
   run(box, {
     ...dispatch(box),
     hook_event_name: "PostToolUse",
-    tool_response: { isAsync: true, status: "async_launched", agentId: "a1", outputFile, resolvedModel: "claude-sonnet-5" }
+    tool_response: { isAsync: true, status: "async_launched", agentId: "a1", outputFile: transcriptPath, resolvedModel: "claude-sonnet-5" }
   });
   const pending = record(box);
   assert.strictEqual(pending.taskId, task.taskId);
@@ -575,6 +949,8 @@ test("an armed async worker blocks only after terminal state is observed and unb
   assert.strictEqual(pending.backgroundTaskId, "a1");
   assert.strictEqual(pending.transportStatus, "pending_async");
   assert.strictEqual(pending.resolvedModel, "claude-sonnet-5");
+  assert.strictEqual(pending.transcriptPath, transcriptPath);
+  assert.strictEqual(pending.outputFile, null);
 
   const firstStop = run(box, {
     hook_event_name: "Stop",
@@ -602,6 +978,29 @@ test("an armed async worker blocks only after terminal state is observed and unb
   assert.strictEqual(JSON.parse(secondStop.stdout).decision, undefined);
   assert.strictEqual(record(box).awaitingCollectionArmedAt, armedAt);
 
+  const finalMessage = "completed result\ndelivery: complete\nverification: passed";
+  updateWorkerRecord(record(box).taskId, envFor(box), (current) => ({ ...current, failureKind: "turn_limit" }));
+  run(box, {
+    hook_event_name: "SubagentStop",
+    session_id: "session-1",
+    cwd: box.cwd,
+    transcript_path: box.transcript,
+    agent_transcript_path: transcriptPath,
+    agent_id: "a1",
+    agent_type: "fusion:fast-worker",
+    stop_hook_active: false,
+    last_assistant_message: finalMessage
+  });
+  const finalTextFile = record(box).outputFile;
+  assert.ok(finalTextFile);
+  assert.notStrictEqual(finalTextFile, transcriptPath);
+  assert.strictEqual(record(box).transportStatus, "done");
+  assert.strictEqual(record(box).collectionMethod, "subagent_stop");
+  assert.ok(record(box).collectedAt);
+  assert.strictEqual(record(box).awaitingCollection, false);
+  assert.strictEqual(record(box).awaitingCollectionArmedAt, null);
+  assert.strictEqual(record(box).awaitingVerdict, true);
+
   const terminalStop = run(box, {
     hook_event_name: "Stop",
     session_id: "session-1",
@@ -612,24 +1011,12 @@ test("an armed async worker blocks only after terminal state is observed and unb
     background_tasks: [{ id: "a1", type: "subagent", status: "completed", agent_type: "fusion:fast-worker" }]
   });
   const decision = JSON.parse(terminalStop.stdout);
-  assert.strictEqual(decision.decision, "block");
-  assert.match(decision.reason, /Call Read with file_path=/);
-  assert.match(decision.reason, new RegExp(outputFile));
-  assert.doesNotMatch(decision.reason, /TaskOutput/);
-  assert.match(decision.reason, /unverified/);
-
-  run(box, {
-    hook_event_name: "PostToolUse",
-    session_id: "session-1",
-    cwd: box.cwd,
-    transcript_path: box.transcript,
-    tool_name: "Read",
-    tool_input: { file_path: outputFile },
-    tool_response: { status: "completed", content: "completed" }
-  });
-  assert.strictEqual(record(box).transportStatus, "done");
-  assert.strictEqual(record(box).awaitingCollection, false);
-  assert.strictEqual(record(box).awaitingCollectionArmedAt, null);
+  assert.strictEqual(decision.decision, undefined);
+  assert.match(decision.hookSpecificOutput.additionalContext, /Acceptance remains unverified for 1 collected Fusion worker/);
+  assert.doesNotMatch(decision.hookSpecificOutput.additionalContext, /Call Read with file_path=|TaskOutput/);
+  assert.match(decision.hookSpecificOutput.additionalContext, /unverified/);
+  assert.strictEqual(record(box).failureKind, null);
+  assert.strictEqual(record(box).recoveredFailureKind, "turn_limit");
 
   const collectedStop = run(box, {
     hook_event_name: "Stop",
@@ -640,18 +1027,29 @@ test("an armed async worker blocks only after terminal state is observed and unb
   });
   assert.strictEqual(JSON.parse(collectedStop.stdout).decision, undefined);
   assert.match(JSON.parse(collectedStop.stdout).hookSpecificOutput.additionalContext, /Acceptance remains unverified/);
+
+  recordWorkerAcceptance({ taskId: record(box).taskId, acceptance: "accepted", env: envFor(box), source: "main-loop" });
+  const settledStop = run(box, {
+    hook_event_name: "Stop",
+    session_id: "session-1",
+    cwd: box.cwd,
+    transcript_path: box.transcript,
+    background_tasks: []
+  });
+  assert.strictEqual(settledStop.stdout, "");
 });
 
-test("a completed async worker blocks on its first Stop until a full Read collects it", (t) => {
+test("a completed async worker is collected at SubagentStop and remains verdict gated", (t) => {
   const box = sandbox(t);
   run(box, dispatch(box));
-  const outputFile = path.join(box.root, "tasks", "agent-collected.output");
-  fs.mkdirSync(path.dirname(outputFile), { recursive: true });
-  fs.writeFileSync(outputFile, "completed result\ndelivery: complete\nverification: passed\n", "utf8");
+  const transcriptPath = path.join(box.root, "tasks", "agent-collected.output");
+  const finalMessage = "completed result\ndelivery: complete\nverification: passed";
+  fs.mkdirSync(path.dirname(transcriptPath), { recursive: true });
+  fs.writeFileSync(transcriptPath, `${finalMessage}\n`, "utf8");
   run(box, {
     ...dispatch(box),
     hook_event_name: "PostToolUse",
-    tool_response: { isAsync: true, status: "async_launched", agentId: "agent-collected", outputFile }
+    tool_response: { isAsync: true, status: "async_launched", agentId: "agent-collected", outputFile: transcriptPath }
   });
   run(box, {
     hook_event_name: "SubagentStart",
@@ -666,14 +1064,23 @@ test("a completed async worker blocks on its first Stop until a full Read collec
     session_id: "session-1",
     cwd: box.cwd,
     transcript_path: box.transcript,
-    agent_transcript_path: outputFile,
+    agent_transcript_path: transcriptPath,
     agent_id: "agent-collected",
     agent_type: "fusion:fast-worker",
     stop_hook_active: false,
-    last_assistant_message: "completed result\ndelivery: complete\nverification: passed"
+    last_assistant_message: finalMessage
   });
-  assert.strictEqual(record(box).transportStatus, "ready_uncollected");
-  assert.strictEqual(record(box).collectedAt, null);
+  const stopped = record(box);
+  const taskId = stopped.taskId;
+  const finalTextFile = stopped.outputFile;
+  assert.strictEqual(stopped.transportStatus, "done");
+  assert.strictEqual(stopped.collectionMethod, "subagent_stop");
+  assert.ok(stopped.collectedAt);
+  assert.strictEqual(stopped.awaitingVerdict, true);
+  assert.strictEqual(stopped.transcriptPath, transcriptPath);
+  assert.strictEqual(finalTextFile, path.join(box.state, "jobs", `${stopped.taskId}.final.txt`));
+  assert.strictEqual(fs.readFileSync(finalTextFile, "utf8"), finalMessage);
+  assert.strictEqual(fs.statSync(finalTextFile).mode & 0o777, 0o600);
 
   const blocked = run(box, {
     hook_event_name: "Stop",
@@ -684,10 +1091,10 @@ test("a completed async worker blocks on its first Stop until a full Read collec
     last_assistant_message: "done",
     background_tasks: []
   });
-  assert.strictEqual(JSON.parse(blocked.stdout).decision, "block");
-  assert.match(JSON.parse(blocked.stdout).reason, /Call Read with file_path=/);
-  assert.match(JSON.parse(blocked.stdout).reason, new RegExp(outputFile));
-  assert.doesNotMatch(JSON.parse(blocked.stdout).reason, /TaskOutput/);
+  const blockedOutput = JSON.parse(blocked.stdout);
+  assert.strictEqual(blockedOutput.decision, undefined);
+  assert.match(blockedOutput.hookSpecificOutput.additionalContext, /Acceptance remains unverified for 1 collected Fusion worker/);
+  assert.doesNotMatch(blockedOutput.hookSpecificOutput.additionalContext, /Call Read with file_path=|TaskOutput/);
 
   for (const block of [false, false]) {
     run(box, {
@@ -699,19 +1106,11 @@ test("a completed async worker blocks on its first Stop until a full Read collec
       tool_input: { task_id: "agent-collected", block },
       tool_response: { content: "completed" }
     });
-    assert.strictEqual(record(box).transportStatus, "ready_uncollected");
+    assert.strictEqual(record(box).transportStatus, "done");
+    assert.strictEqual(record(box).collectionMethod, "subagent_stop");
   }
 
-  run(box, {
-    hook_event_name: "PostToolUse",
-    session_id: "session-1",
-    cwd: box.cwd,
-    transcript_path: box.transcript,
-    tool_name: "Read",
-    tool_input: { file_path: outputFile },
-    tool_response: { content: "completed result" }
-  });
-  assert.strictEqual(record(box).transportStatus, "done");
+  recordWorkerAcceptance({ taskId, acceptance: "accepted", env: envFor(box), source: "main-loop" });
   const allowed = run(box, {
     hook_event_name: "Stop",
     session_id: "session-1",
@@ -721,7 +1120,38 @@ test("a completed async worker blocks on its first Stop until a full Read collec
     last_assistant_message: "done",
     background_tasks: []
   });
-  assert.match(JSON.parse(allowed.stdout).hookSpecificOutput.additionalContext, /Acceptance remains unverified for 1 collected Fusion worker/);
+  assert.strictEqual(allowed.stdout, "");
+});
+
+test("SubagentStop bounds an oversized final-text artifact with a truncation marker", (t) => {
+  const box = sandbox(t);
+  run(box, dispatch(box));
+  run(box, {
+    hook_event_name: "SubagentStart",
+    session_id: "session-1",
+    cwd: box.cwd,
+    transcript_path: box.transcript,
+    agent_id: "oversized-final",
+    agent_type: "fusion:fast-worker"
+  });
+  const finalMessage = `${"h".repeat(65_536)}${"m".repeat(200_000)}${"t".repeat(130_000)}\ndelivery: complete\nverification: passed`;
+  run(box, {
+    hook_event_name: "SubagentStop",
+    session_id: "session-1",
+    cwd: box.cwd,
+    transcript_path: box.transcript,
+    agent_id: "oversized-final",
+    agent_type: "fusion:fast-worker",
+    stop_hook_active: false,
+    last_assistant_message: finalMessage
+  });
+
+  const artifact = fs.readFileSync(record(box).outputFile);
+  const source = Buffer.from(finalMessage, "utf8");
+  const omitted = source.length - 65_536 - 131_072;
+  const marker = Buffer.from(`\n[fusion: truncated ${omitted} bytes]\n`, "utf8");
+  assert.deepStrictEqual(artifact, Buffer.concat([source.subarray(0, 65_536), marker, source.subarray(source.length - 131_072)]));
+  assert.ok(artifact.length < 256 * 1024);
 });
 
 test("foreground structured usage is canonical and transport completion remains unverified", (t) => {
@@ -836,17 +1266,19 @@ test("Stop in-flight advisory emits once then stays silent while stop_hook_activ
   assert.strictEqual(record(box).awaitingCollectionArmedAt, armedAt);
 });
 
-test("Stop terminal-uncollected still blocks when stop_hook_active is true", (t) => {
+test("a successfully terminal async worker without a final-text artifact demands TaskOutput", (t) => {
   const box = sandbox(t);
   run(box, dispatch(box));
-  const outputFile = path.join(box.root, "tasks", "agent-a1.output");
-  fs.mkdirSync(path.dirname(outputFile), { recursive: true });
-  fs.writeFileSync(outputFile, "", "utf8");
+  const transcriptPath = path.join(box.root, "tasks", "agent-a1.output");
+  fs.mkdirSync(path.dirname(transcriptPath), { recursive: true });
+  fs.writeFileSync(transcriptPath, "", "utf8");
   run(box, {
     ...dispatch(box),
     hook_event_name: "PostToolUse",
-    tool_response: { isAsync: true, status: "async_launched", agentId: "a1", outputFile, resolvedModel: "claude-sonnet-5" }
+    tool_response: { isAsync: true, status: "async_launched", agentId: "a1", outputFile: transcriptPath, resolvedModel: "claude-sonnet-5" }
   });
+  assert.strictEqual(record(box).outputFile, null);
+  assert.strictEqual(record(box).transcriptPath, transcriptPath);
 
   const terminalStop = run(box, {
     hook_event_name: "Stop",
@@ -859,8 +1291,10 @@ test("Stop terminal-uncollected still blocks when stop_hook_active is true", (t)
   });
   const decision = JSON.parse(terminalStop.stdout);
   assert.strictEqual(decision.decision, "block");
-  assert.match(decision.reason, /Call Read with file_path=/);
-  assert.match(decision.reason, new RegExp(outputFile));
+  assert.strictEqual(record(box).transportStatus, "ready_uncollected");
+  assert.strictEqual(record(box).collectedAt, null);
+  assert.match(decision.reason, /TaskOutput with block=true.*a1/);
+  assert.doesNotMatch(decision.reason, /Call Read with file_path=/);
 });
 
 test("collection captures peer job footers and leaves absent or malformed footers null", (t) => {
@@ -1003,17 +1437,35 @@ test("a full Read collects terminal output and captures its peer job footer", (t
 
 test("Read collection debug capture writes the raw response when enabled", (t) => {
   const box = sandbox(t);
-  const outputFile = path.join(box.root, "tasks", "debug-read.output");
   const toolResponse = { type: "text", text: "worker final message", diagnostics: { source: "Read" } };
-  fs.mkdirSync(path.dirname(outputFile), { recursive: true });
-  fs.writeFileSync(outputFile, toolResponse.text, "utf8");
-  run(box, dispatch(box));
+  const peerJobId = "c".repeat(32);
+  const collectorDispatch = dispatch(box, { subagent_type: "fusion:job-collector", prompt: collectorPrompt("codex", peerJobId) });
+  run(box, collectorDispatch);
   run(box, {
-    ...dispatch(box),
+    ...collectorDispatch,
     hook_event_name: "PostToolUse",
-    tool_response: { isAsync: true, status: "async_launched", agentId: "debug-read", outputFile }
+    tool_response: { isAsync: true, status: "async_launched", agentId: "debug-read" }
   });
-  updateWorkerRecord(record(box).taskId, envFor(box), (current) => ({ ...current, transportStatus: "ready_uncollected" }));
+  run(box, {
+    hook_event_name: "SubagentStart",
+    session_id: "session-1",
+    cwd: box.cwd,
+    transcript_path: box.transcript,
+    agent_id: "debug-read",
+    agent_type: "fusion:job-collector"
+  });
+  run(box, {
+    hook_event_name: "SubagentStop",
+    session_id: "session-1",
+    cwd: box.cwd,
+    transcript_path: box.transcript,
+    agent_id: "debug-read",
+    agent_type: "fusion:job-collector",
+    stop_hook_active: false,
+    last_assistant_message: `collector: state=done semantic=unverified engine=codex job=${peerJobId} elapsed=1s`
+  });
+  const finalTextFile = record(box).outputFile;
+  assert.strictEqual(record(box).transportStatus, "ready_uncollected");
 
   const collected = run(box, {
     hook_event_name: "PostToolUse",
@@ -1021,12 +1473,302 @@ test("Read collection debug capture writes the raw response when enabled", (t) =
     cwd: box.cwd,
     transcript_path: box.transcript,
     tool_name: "Read",
-    tool_input: { file_path: outputFile },
+    tool_input: { file_path: finalTextFile },
     tool_response: toolResponse
   }, { FUSION_WORKER_DEBUG_COLLECTION_RESPONSE: "1" });
   assert.strictEqual(collected.status, 0, collected.stderr);
   const debugFile = path.join(box.root, "fusion-data", "worker-collection-response.json");
   assert.deepStrictEqual(JSON.parse(fs.readFileSync(debugFile, "utf8")), toolResponse);
+});
+
+test("a terminal failed runtimeAsync worker is demanded by Stop and collected by a full Read", (t) => {
+  const box = sandbox(t);
+  const outputFile = path.join(box.root, "tasks", "terminal-failed.output");
+  const output = "worker final message before it failed\n";
+  fs.mkdirSync(path.dirname(outputFile), { recursive: true });
+  fs.writeFileSync(outputFile, output, "utf8");
+  run(box, dispatch(box));
+  run(box, {
+    ...dispatch(box),
+    hook_event_name: "PostToolUse",
+    tool_response: { isAsync: true, status: "async_launched", agentId: "terminal-failed" }
+  });
+  assert.strictEqual(record(box).runtimeAsync, true);
+  updateWorkerRecord(record(box).taskId, envFor(box), (current) => ({
+    ...current,
+    transportStatus: "failed",
+    failureKind: "task_reaped",
+    outputFile
+  }));
+
+  const blocked = run(box, {
+    hook_event_name: "Stop",
+    session_id: "session-1",
+    cwd: box.cwd,
+    transcript_path: box.transcript,
+    background_tasks: []
+  });
+  const blockedOutput = JSON.parse(blocked.stdout);
+  assert.strictEqual(blockedOutput.decision, "block");
+  assert.match(blockedOutput.reason, /Call Read with file_path=/);
+  assert.match(blockedOutput.reason, new RegExp(outputFile));
+
+  run(box, {
+    hook_event_name: "PostToolUse",
+    session_id: "session-1",
+    cwd: box.cwd,
+    transcript_path: box.transcript,
+    tool_name: "Read",
+    tool_input: { file_path: outputFile },
+    tool_response: { type: "text", text: output }
+  });
+
+  const collected = record(box);
+  assert.strictEqual(collected.collectionMethod, "Read");
+  assert.ok(collected.collectedAt);
+  assert.strictEqual(collected.transportStatus, "done");
+  assert.strictEqual(collected.failureKind, "task_reaped");
+
+  const cleared = run(box, {
+    hook_event_name: "Stop",
+    session_id: "session-1",
+    cwd: box.cwd,
+    transcript_path: box.transcript,
+    background_tasks: []
+  });
+  const clearedOutput = JSON.parse(cleared.stdout);
+  assert.strictEqual(clearedOutput.decision, undefined);
+  assert.match(clearedOutput.hookSpecificOutput.additionalContext, /Acceptance remains unverified for 1 collected Fusion worker/);
+  assert.doesNotMatch(clearedOutput.hookSpecificOutput.additionalContext, /Call Read with file_path=|TaskOutput/);
+});
+
+test("a terminal cancelled runtimeAsync worker is demanded by Stop and collected by a full Read", (t) => {
+  const box = sandbox(t);
+  const outputFile = path.join(box.root, "tasks", "terminal-cancelled.output");
+  const output = "worker final message before it was cancelled\n";
+  fs.mkdirSync(path.dirname(outputFile), { recursive: true });
+  fs.writeFileSync(outputFile, output, "utf8");
+  run(box, dispatch(box));
+  run(box, {
+    ...dispatch(box),
+    hook_event_name: "PostToolUse",
+    tool_response: { isAsync: true, status: "async_launched", agentId: "terminal-cancelled" }
+  });
+  assert.strictEqual(record(box).runtimeAsync, true);
+  updateWorkerRecord(record(box).taskId, envFor(box), (current) => ({
+    ...current,
+    transportStatus: "cancelled",
+    failureKind: "cancelled",
+    outputFile
+  }));
+
+  const blocked = run(box, {
+    hook_event_name: "Stop",
+    session_id: "session-1",
+    cwd: box.cwd,
+    transcript_path: box.transcript,
+    background_tasks: []
+  });
+  const blockedOutput = JSON.parse(blocked.stdout);
+  assert.strictEqual(blockedOutput.decision, "block");
+  assert.match(blockedOutput.reason, /Call Read with file_path=/);
+  assert.match(blockedOutput.reason, new RegExp(outputFile));
+
+  run(box, {
+    hook_event_name: "PostToolUse",
+    session_id: "session-1",
+    cwd: box.cwd,
+    transcript_path: box.transcript,
+    tool_name: "Read",
+    tool_input: { file_path: outputFile },
+    tool_response: { type: "text", text: output }
+  });
+
+  const collected = record(box);
+  assert.strictEqual(collected.collectionMethod, "Read");
+  assert.ok(collected.collectedAt);
+  assert.strictEqual(collected.transportStatus, "done");
+  assert.strictEqual(collected.failureKind, "cancelled");
+
+  const cleared = run(box, {
+    hook_event_name: "Stop",
+    session_id: "session-1",
+    cwd: box.cwd,
+    transcript_path: box.transcript,
+    background_tasks: []
+  });
+  const clearedOutput = JSON.parse(cleared.stdout);
+  assert.strictEqual(clearedOutput.decision, undefined);
+  assert.match(clearedOutput.hookSpecificOutput.additionalContext, /Acceptance remains unverified for 1 collected Fusion worker/);
+  assert.doesNotMatch(clearedOutput.hookSpecificOutput.additionalContext, /Call Read with file_path=|TaskOutput/);
+});
+
+test("a partial Read of a terminal runtimeAsync record's output file does not collect it", (t) => {
+  const box = sandbox(t);
+  const outputFile = path.join(box.root, "tasks", "terminal-partial.output");
+  const output = "worker final message\n";
+  fs.mkdirSync(path.dirname(outputFile), { recursive: true });
+  fs.writeFileSync(outputFile, output, "utf8");
+  run(box, dispatch(box));
+  run(box, {
+    ...dispatch(box),
+    hook_event_name: "PostToolUse",
+    tool_response: { isAsync: true, status: "async_launched", agentId: "terminal-partial" }
+  });
+  updateWorkerRecord(record(box).taskId, envFor(box), (current) => ({
+    ...current,
+    transportStatus: "failed",
+    failureKind: "task_reaped",
+    outputFile
+  }));
+
+  for (const partialInput of [{ offset: 1 }, { limit: 1 }]) {
+    run(box, {
+      hook_event_name: "PostToolUse",
+      session_id: "session-1",
+      cwd: box.cwd,
+      transcript_path: box.transcript,
+      tool_name: "Read",
+      tool_input: { file_path: outputFile, ...partialInput },
+      tool_response: { type: "text", text: output }
+    });
+    const untouched = record(box);
+    assert.strictEqual(untouched.collectedAt, null);
+    assert.strictEqual(untouched.collectionMethod, null);
+    assert.strictEqual(untouched.transportStatus, "failed");
+  }
+
+  const blocked = run(box, {
+    hook_event_name: "Stop",
+    session_id: "session-1",
+    cwd: box.cwd,
+    transcript_path: box.transcript,
+    background_tasks: []
+  });
+  const blockedOutput = JSON.parse(blocked.stdout);
+  assert.strictEqual(blockedOutput.decision, "block");
+  assert.match(blockedOutput.reason, /Call Read with file_path=/);
+});
+
+test("a Read of an unrelated file does not collect a terminal runtimeAsync record", (t) => {
+  const box = sandbox(t);
+  const outputFile = path.join(box.root, "tasks", "terminal-unrelated-target.output");
+  const unrelatedFile = path.join(box.root, "tasks", "terminal-unrelated-other.output");
+  const output = "worker final message\n";
+  fs.mkdirSync(path.dirname(outputFile), { recursive: true });
+  fs.writeFileSync(outputFile, output, "utf8");
+  fs.writeFileSync(unrelatedFile, "some other file", "utf8");
+  run(box, dispatch(box));
+  run(box, {
+    ...dispatch(box),
+    hook_event_name: "PostToolUse",
+    tool_response: { isAsync: true, status: "async_launched", agentId: "terminal-unrelated" }
+  });
+  updateWorkerRecord(record(box).taskId, envFor(box), (current) => ({
+    ...current,
+    transportStatus: "cancelled",
+    failureKind: "cancelled",
+    outputFile
+  }));
+
+  run(box, {
+    hook_event_name: "PostToolUse",
+    session_id: "session-1",
+    cwd: box.cwd,
+    transcript_path: box.transcript,
+    tool_name: "Read",
+    tool_input: { file_path: unrelatedFile },
+    tool_response: { type: "text", text: "some other file" }
+  });
+
+  const untouched = record(box);
+  assert.strictEqual(untouched.collectedAt, null);
+  assert.strictEqual(untouched.collectionMethod, null);
+  assert.strictEqual(untouched.transportStatus, "cancelled");
+
+  const blocked = run(box, {
+    hook_event_name: "Stop",
+    session_id: "session-1",
+    cwd: box.cwd,
+    transcript_path: box.transcript,
+    background_tasks: []
+  });
+  const blockedOutput = JSON.parse(blocked.stdout);
+  assert.strictEqual(blockedOutput.decision, "block");
+  assert.match(blockedOutput.reason, /Call Read with file_path=/);
+});
+
+test("a ready_uncollected record still collects through a full Read", (t) => {
+  const box = sandbox(t);
+  const outputFile = path.join(box.root, "tasks", "ready-uncollected-unchanged.output");
+  const output = "worker final message\ndelivery: complete\nverification: passed\n";
+  fs.mkdirSync(path.dirname(outputFile), { recursive: true });
+  fs.writeFileSync(outputFile, output, "utf8");
+  run(box, dispatch(box));
+  updateWorkerRecord(record(box).taskId, envFor(box), (current) => ({
+    ...current,
+    transportStatus: "ready_uncollected",
+    outputFile
+  }));
+
+  run(box, {
+    hook_event_name: "PostToolUse",
+    session_id: "session-1",
+    cwd: box.cwd,
+    transcript_path: box.transcript,
+    tool_name: "Read",
+    tool_input: { file_path: outputFile },
+    tool_response: { type: "text", text: output }
+  });
+
+  const collected = record(box);
+  assert.strictEqual(collected.transportStatus, "done");
+  assert.strictEqual(collected.collectionMethod, "Read");
+  assert.ok(collected.collectedAt);
+});
+
+test("a terminal record with collectedAt already set is not demanded again and a further Read leaves it unchanged", (t) => {
+  const box = sandbox(t);
+  const outputFile = path.join(box.root, "tasks", "terminal-already-collected.output");
+  const output = "worker final message\n";
+  fs.mkdirSync(path.dirname(outputFile), { recursive: true });
+  fs.writeFileSync(outputFile, output, "utf8");
+  run(box, dispatch(box));
+  run(box, {
+    ...dispatch(box),
+    hook_event_name: "PostToolUse",
+    tool_response: { isAsync: true, status: "async_launched", agentId: "already-collected" }
+  });
+  const already = updateWorkerRecord(record(box).taskId, envFor(box), (current) => ({
+    ...current,
+    transportStatus: "failed",
+    failureKind: "task_reaped",
+    outputFile,
+    collectionMethod: "reaped",
+    collectedAt: "2026-07-19T00:00:01.000Z",
+    finishedAt: "2026-07-19T00:00:01.000Z"
+  }));
+
+  const quiet = run(box, {
+    hook_event_name: "Stop",
+    session_id: "session-1",
+    cwd: box.cwd,
+    transcript_path: box.transcript,
+    background_tasks: []
+  });
+  assert.strictEqual(quiet.stdout, "");
+
+  run(box, {
+    hook_event_name: "PostToolUse",
+    session_id: "session-1",
+    cwd: box.cwd,
+    transcript_path: box.transcript,
+    tool_name: "Read",
+    tool_input: { file_path: outputFile },
+    tool_response: { type: "text", text: output }
+  });
+
+  assert.deepStrictEqual(record(box), already);
 });
 
 test("TaskOutput captures a peer job footer from the documented text response", (t) => {
@@ -1227,7 +1969,7 @@ test("SubagentStop blocks one incomplete report and then records a verified tran
   assert.strictEqual(second.stdout, "");
   assert.strictEqual(record(box).transportStatus, "done");
   assert.strictEqual(record(box).acceptance, "unverified");
-  assert.strictEqual(record(box).collectionMethod, "SubagentStop");
+  assert.strictEqual(record(box).collectionMethod, "subagent_stop");
   assert.ok(record(box).collectedAt);
   const collectedAt = record(box).collectedAt;
   run(box, {
@@ -1241,7 +1983,7 @@ test("SubagentStop blocks one incomplete report and then records a verified tran
     stop_hook_active: true,
     last_assistant_message: "summary\ndelivery: complete\nverification: passed"
   });
-  assert.strictEqual(record(box).collectionMethod, "SubagentStop");
+  assert.strictEqual(record(box).collectionMethod, "subagent_stop");
   assert.strictEqual(record(box).collectedAt, collectedAt);
 });
 
@@ -1311,6 +2053,7 @@ test("job collector completion requires a terminal marker and fails closed on th
   assert.strictEqual(stopped.stdout, "");
   assert.strictEqual(record(box).transportStatus, "incomplete");
   assert.strictEqual(record(box).failureKind, "collection_protocol");
+  assert.strictEqual(record(box).collectionMethod, "SubagentStop");
   assert.strictEqual(record(box).peerJobId, undefined);
   assert.strictEqual(record(box).retryCount, 1);
 });
@@ -1398,7 +2141,70 @@ test("a collector marker for a different peer identity fails closed", (t) => {
   assert.ok(record(box).protocolReportedAt);
 });
 
-test("a structured Codex collection remains gated until the main loop records a semantic judgment", (t) => {
+test("an async collector keeps its Read collection requirement", (t) => {
+  const box = sandbox(t);
+  const peerJobId = "b".repeat(32);
+  const collectorDispatch = dispatch(box, { subagent_type: "fusion:job-collector", prompt: collectorPrompt("codex", peerJobId) });
+  run(box, collectorDispatch);
+  run(box, {
+    ...collectorDispatch,
+    hook_event_name: "PostToolUse",
+    tool_response: { isAsync: true, status: "async_launched", agentId: "collector-async" }
+  });
+  run(box, {
+    hook_event_name: "SubagentStart",
+    session_id: "session-1",
+    cwd: box.cwd,
+    transcript_path: box.transcript,
+    agent_id: "collector-async",
+    agent_type: "fusion:job-collector"
+  });
+  const finalMessage = `Codex transport completed.\ncollector: state=done semantic=unverified engine=codex job=${peerJobId} elapsed=3s`;
+  run(box, {
+    hook_event_name: "SubagentStop",
+    session_id: "session-1",
+    cwd: box.cwd,
+    transcript_path: box.transcript,
+    agent_id: "collector-async",
+    agent_type: "fusion:job-collector",
+    stop_hook_active: false,
+    last_assistant_message: finalMessage
+  });
+
+  const stopped = record(box);
+  const finalTextFile = stopped.outputFile;
+  assert.strictEqual(stopped.transportStatus, "ready_uncollected");
+  assert.strictEqual(stopped.collectionMethod, null);
+  assert.strictEqual(stopped.collectedAt, null);
+  assert.ok(finalTextFile);
+
+  const blocked = run(box, {
+    hook_event_name: "Stop",
+    session_id: "session-1",
+    cwd: box.cwd,
+    transcript_path: box.transcript,
+    background_tasks: []
+  });
+  assert.strictEqual(JSON.parse(blocked.stdout).decision, "block");
+  assert.match(JSON.parse(blocked.stdout).reason, /Call Read with file_path=/);
+  assert.match(JSON.parse(blocked.stdout).reason, new RegExp(finalTextFile));
+
+  run(box, {
+    hook_event_name: "PostToolUse",
+    session_id: "session-1",
+    cwd: box.cwd,
+    transcript_path: box.transcript,
+    tool_name: "Read",
+    tool_input: { file_path: finalTextFile },
+    tool_response: { type: "text", text: finalMessage }
+  });
+  const collected = record(box);
+  assert.strictEqual(collected.transportStatus, "done");
+  assert.strictEqual(collected.collectionMethod, "Read");
+  assert.ok(collected.collectedAt);
+});
+
+test("a structured Codex collection persists final text and remains gated until semantic judgment", (t) => {
   const box = sandbox(t);
   const peerJobId = "c".repeat(32);
   run(box, dispatch(box, { subagent_type: "fusion:job-collector", prompt: collectorPrompt("codex", peerJobId) }));
@@ -1410,6 +2216,7 @@ test("a structured Codex collection remains gated until the main loop records a 
     agent_id: "collector-semantic",
     agent_type: "fusion:job-collector"
   });
+  const finalMessage = `Codex transport completed, but the task still needs verification.\ncollector: state=done semantic=unverified engine=codex job=${peerJobId} elapsed=3s`;
   const stopped = run(box, {
     hook_event_name: "SubagentStop",
     session_id: "session-1",
@@ -1418,14 +2225,16 @@ test("a structured Codex collection remains gated until the main loop records a 
     agent_id: "collector-semantic",
     agent_type: "fusion:job-collector",
     stop_hook_active: false,
-    last_assistant_message: `Codex transport completed, but the task still needs verification.\ncollector: state=done semantic=unverified engine=codex job=${peerJobId} elapsed=3s`
+    last_assistant_message: finalMessage
   });
   assert.strictEqual(stopped.stdout, "");
-  assert.strictEqual(record(box).transportStatus, "done");
-  assert.strictEqual(record(box).peerJobId, peerJobId);
-  assert.strictEqual(record(box).peerTransportStatus, "done");
-  assert.strictEqual(record(box).peerSemanticStatus, "unverified");
-  assert.strictEqual(record(box).acceptanceRecordedAt, undefined);
+  const collector = record(box);
+  assert.strictEqual(collector.transportStatus, "done");
+  assert.strictEqual(collector.peerJobId, peerJobId);
+  assert.strictEqual(collector.peerTransportStatus, "done");
+  assert.strictEqual(collector.peerSemanticStatus, "unverified");
+  assert.strictEqual(collector.acceptanceRecordedAt, undefined);
+  assert.strictEqual(fs.readFileSync(collector.outputFile, "utf8"), finalMessage);
 
   const blocked = run(box, {
     hook_event_name: "Stop",
@@ -1870,7 +2679,67 @@ test("an explicitly authorized running worker is not cancelled by repeated Stop 
   assert.strictEqual(record(box).transportStatus, "owner_ended");
 });
 
-test("an explicitly authorized completed worker requires TaskOutput before Stop can finish", (t) => {
+test("a completed background worker is not timed out while awaiting verdict settlement", (t) => {
+  const box = sandbox(t);
+  const limits = { FUSION_WORKER_WALL_CLOCK_MS: "1", FUSION_WORKER_STALL_MS: "999999" };
+  fs.writeFileSync(box.transcript, `${JSON.stringify({ type: "user", message: { content: "do it --background" } })}\n`, "utf8");
+  run(box, dispatch(box, { run_in_background: true }), limits);
+  run(box, {
+    ...dispatch(box, { run_in_background: true }),
+    hook_event_name: "PostToolUse",
+    tool_response: { isAsync: true, status: "async_launched", agentId: "completed-budget" }
+  }, limits);
+  run(box, {
+    hook_event_name: "SubagentStart",
+    session_id: "session-1",
+    cwd: box.cwd,
+    transcript_path: box.transcript,
+    agent_id: "completed-budget",
+    agent_type: "fusion:fast-worker"
+  }, limits);
+  updateWorkerRecord(record(box).taskId, envFor(box), (current) => ({
+    ...current,
+    startedAt: new Date(Date.now() + 60_000).toISOString()
+  }));
+  run(box, {
+    hook_event_name: "SubagentStop",
+    session_id: "session-1",
+    cwd: box.cwd,
+    transcript_path: box.transcript,
+    agent_id: "completed-budget",
+    agent_type: "fusion:fast-worker",
+    stop_hook_active: false,
+    last_assistant_message: "summary\ndelivery: complete\nverification: passed"
+  }, limits);
+  const taskId = record(box).taskId;
+  assert.strictEqual(record(box).transportStatus, "done");
+  assert.strictEqual(record(box).collectionMethod, "subagent_stop");
+  assert.strictEqual(record(box).awaitingVerdict, true);
+  updateWorkerRecord(taskId, envFor(box), (current) => ({
+    ...current,
+    startedAt: new Date(Date.now() - 2_000).toISOString()
+  }));
+
+  const stopped = run(box, {
+    hook_event_name: "Stop",
+    session_id: "session-1",
+    cwd: box.cwd,
+    transcript_path: box.transcript,
+    stop_hook_active: false,
+    last_assistant_message: `Background task ${taskId} completed as completed-budget.`,
+    background_tasks: []
+  }, limits);
+  const worker = record(box);
+  const stoppedOutput = JSON.parse(stopped.stdout);
+  assert.strictEqual(stoppedOutput.decision, undefined);
+  assert.match(stoppedOutput.hookSpecificOutput.additionalContext, /Acceptance remains unverified for 1 collected Fusion worker/);
+  assert.doesNotMatch(stoppedOutput.hookSpecificOutput.additionalContext, /TaskStop/);
+  assert.strictEqual(worker.transportStatus, "done");
+  assert.notStrictEqual(worker.failureKind, "timeout");
+  assert.notStrictEqual(worker.transportStatus, "cancel_requested");
+});
+
+test("an explicitly authorized completed worker is collected by SubagentStop before verdict settlement", (t) => {
   const box = sandbox(t);
   fs.writeFileSync(box.transcript, `${JSON.stringify({ type: "user", message: { content: "do it --background" } })}\n`, "utf8");
   run(box, dispatch(box, { run_in_background: true }));
@@ -1897,8 +2766,14 @@ test("an explicitly authorized completed worker requires TaskOutput before Stop 
     stop_hook_active: false,
     last_assistant_message: "summary\ndelivery: complete\nverification: passed"
   });
-  const taskId = record(box).taskId;
-  assert.strictEqual(record(box).transportStatus, "ready_uncollected");
+  const stopped = record(box);
+  const taskId = stopped.taskId;
+  const finalTextFile = stopped.outputFile;
+  assert.strictEqual(stopped.transportStatus, "done");
+  assert.strictEqual(stopped.collectionMethod, "subagent_stop");
+  assert.ok(stopped.collectedAt);
+  assert.strictEqual(stopped.awaitingVerdict, true);
+  assert.ok(fs.existsSync(finalTextFile));
 
   const blocked = run(box, {
     hook_event_name: "Stop",
@@ -1909,18 +2784,12 @@ test("an explicitly authorized completed worker requires TaskOutput before Stop 
     last_assistant_message: `Background task ${taskId} completed as manual-ready.`,
     background_tasks: []
   });
-  assert.strictEqual(JSON.parse(blocked.stdout).decision, "block");
-  assert.match(JSON.parse(blocked.stdout).reason, /TaskOutput with block=true.*manual-ready/);
+  const blockedOutput = JSON.parse(blocked.stdout);
+  assert.strictEqual(blockedOutput.decision, undefined);
+  assert.match(blockedOutput.hookSpecificOutput.additionalContext, /Acceptance remains unverified for 1 collected Fusion worker/);
+  assert.doesNotMatch(blockedOutput.hookSpecificOutput.additionalContext, /Call Read with file_path=|TaskOutput/);
 
-  run(box, {
-    hook_event_name: "PostToolUse",
-    session_id: "session-1",
-    cwd: box.cwd,
-    transcript_path: box.transcript,
-    tool_name: "TaskOutput",
-    tool_input: { task_id: "manual-ready", block: true },
-    tool_response: { status: "completed", content: "completed result" }
-  });
+  recordWorkerAcceptance({ taskId, acceptance: "accepted", env: envFor(box), source: "main-loop" });
 
   const allowed = run(box, {
     hook_event_name: "Stop",
@@ -1929,7 +2798,7 @@ test("an explicitly authorized completed worker requires TaskOutput before Stop 
     transcript_path: box.transcript,
     background_tasks: []
   });
-  assert.match(JSON.parse(allowed.stdout).hookSpecificOutput.additionalContext, /Acceptance remains unverified for 1 collected Fusion worker/);
+  assert.strictEqual(allowed.stdout, "");
   assert.strictEqual(record(box).transportStatus, "done");
 });
 

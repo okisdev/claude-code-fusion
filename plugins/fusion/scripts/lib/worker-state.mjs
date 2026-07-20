@@ -143,12 +143,12 @@ function ensurePrivateDirectory(directory) {
   }
 }
 
-export function writePrivateJson(file, value) {
+function writePrivateFile(file, content) {
   ensurePrivateDirectory(path.dirname(file));
   const temporary = path.join(path.dirname(file), `.${path.basename(file)}.${process.pid}.${randomUUID()}.tmp`);
   const descriptor = fs.openSync(temporary, fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_WRONLY, 0o600);
   try {
-    fs.writeFileSync(descriptor, `${JSON.stringify(value, null, 2)}\n`, "utf8");
+    fs.writeFileSync(descriptor, content);
     fs.fchmodSync(descriptor, 0o600);
   } finally {
     fs.closeSync(descriptor);
@@ -159,6 +159,14 @@ export function writePrivateJson(file, value) {
   } catch {
     void 0;
   }
+}
+
+export function writePrivateText(file, text) {
+  writePrivateFile(file, text);
+}
+
+export function writePrivateJson(file, value) {
+  writePrivateFile(file, `${JSON.stringify(value, null, 2)}\n`);
 }
 
 export function readWorkerRecordFile(file) {

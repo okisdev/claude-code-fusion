@@ -17,7 +17,9 @@ import {
   refreshWorkerTranscript,
   resolveFusionDataDir,
   updateWorkerRecord,
-  writePrivateJson
+  workerRecordFile,
+  writePrivateJson,
+  writePrivateText
 } from "./lib/worker-state.mjs";
 
 const BRIEF_MAX_BYTES_ENV = "FUSION_WORKER_BRIEF_MAX_BYTES";
@@ -29,6 +31,9 @@ const MAX_UNCACHED_TOKENS_ENV = "FUSION_WORKER_MAX_UNCACHED_TOKENS";
 const COLLECTION_RESPONSE_DEBUG_ENV = "FUSION_WORKER_DEBUG_COLLECTION_RESPONSE";
 const COLLECTION_RESPONSE_DEBUG_FILE = "worker-collection-response.json";
 const DEFAULT_BRIEF_MAX_BYTES = 16 * 1024;
+const FINAL_TEXT_MAX_BYTES = 192 * 1024;
+const FINAL_TEXT_HEAD_BYTES = 64 * 1024;
+const FINAL_TEXT_TAIL_BYTES = 128 * 1024;
 const EXECUTION_END_MARKER = /(?:^|\n)delivery:\s*complete\s*\r?\nverification:\s*passed\s*$/i;
 const COVERAGE_END_MARKER = /(?:^|\n)delivery:\s*complete\s*\r?\ncoverage:\s*complete\s*$/i;
 const COLLECTOR_END_MARKER = /(?:^|\n)collector:\s*(?:state=|timeout\b|dead\b|status-error\b).*$/i;
@@ -60,7 +65,7 @@ function positiveInteger(env, name, fallback) {
   return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : fallback;
 }
 
-export function workerLimits(agentType, env = process.env) {
+export function workerLimits(agentType, env = process.env, sizing) {
   const canonical = canonicalWorkerAgentType(agentType);
   const defaults = canonical === "fusion:trivial-worker"
     ? { wallClockMs: 180_000, stallMs: 90_000, maxTurns: 12, maxOutputTokens: 16_000, maxUncachedTokens: 80_000 }
@@ -69,12 +74,14 @@ export function workerLimits(agentType, env = process.env) {
       : canonical === "fusion:deep-reasoner"
         ? { wallClockMs: 480_000, stallMs: 300_000, maxTurns: 30, maxOutputTokens: 24_000, maxUncachedTokens: 120_000 }
         : { wallClockMs: 1_200_000, stallMs: 300_000, maxTurns: 60, maxOutputTokens: 48_000, maxUncachedTokens: 360_000 };
+  const multiplier = sizing === "small" ? 0.5 : sizing === "large" ? 2 : 1;
+  const scaled = Object.fromEntries(Object.entries(defaults).map(([name, value]) => [name, Math.round(value * multiplier)]));
   return {
-    wallClockMs: positiveInteger(env, WALL_CLOCK_MS_ENV, defaults.wallClockMs),
-    stallMs: positiveInteger(env, STALL_MS_ENV, defaults.stallMs),
-    maxTurns: positiveInteger(env, MAX_TURNS_ENV, defaults.maxTurns),
-    maxOutputTokens: positiveInteger(env, MAX_OUTPUT_TOKENS_ENV, defaults.maxOutputTokens),
-    maxUncachedTokens: positiveInteger(env, MAX_UNCACHED_TOKENS_ENV, defaults.maxUncachedTokens)
+    wallClockMs: positiveInteger(env, WALL_CLOCK_MS_ENV, scaled.wallClockMs),
+    stallMs: positiveInteger(env, STALL_MS_ENV, scaled.stallMs),
+    maxTurns: positiveInteger(env, MAX_TURNS_ENV, scaled.maxTurns),
+    maxOutputTokens: positiveInteger(env, MAX_OUTPUT_TOKENS_ENV, scaled.maxOutputTokens),
+    maxUncachedTokens: positiveInteger(env, MAX_UNCACHED_TOKENS_ENV, scaled.maxUncachedTokens)
   };
 }
 
@@ -137,6 +144,17 @@ export function validateWorkerBrief(prompt, agentType, env = process.env) {
   }
   if (/^fusion-task-id:\s*/im.test(prompt)) {
     return { ok: false, reason: "`fusion-task-id` is reserved for the lifecycle guard." };
+  }
+  const sizingLines = prompt.split(/\r?\n/).filter((line) => /^sizing\s*:/i.test(line.trim()));
+  if (sizingLines.length > 1) {
+    return { ok: false, reason: "Fusion worker brief `sizing:` may appear once and must be one of `small`, `standard`, or `large`." };
+  }
+  if (sizingLines.length === 1) {
+    const sizing = sizingLines[0].match(/^sizing\s*:\s*(small|standard|large)\s*$/i)?.[1]?.toLowerCase();
+    if (!sizing) {
+      return { ok: false, reason: "Fusion worker brief `sizing:` must be one of `small`, `standard`, or `large`." };
+    }
+    return { ok: true, sizing };
   }
   return { ok: true };
 }
@@ -229,7 +247,7 @@ function collectorRequestIdentity(prompt) {
   return engine && jobId ? { expectedPeerEngine: engine, expectedPeerJobId: jobId } : null;
 }
 
-function createDispatch(input, agentType, userBackgroundAuthorized, env) {
+function createDispatch(input, agentType, userBackgroundAuthorized, env, sizing) {
   const taskId = createWorkerTaskId(input.session_id, input.tool_use_id);
   const collectorIdentity = canonicalWorkerAgentType(agentType) === "fusion:job-collector" ? collectorRequestIdentity(promptText(input.tool_input)) : null;
   let parentTranscriptBytesAtDispatch = null;
@@ -251,7 +269,7 @@ function createDispatch(input, agentType, userBackgroundAuthorized, env) {
     parentTranscriptBytesAtDispatch,
     completionContract: completionContract(agentType, promptText(input.tool_input)),
     ...collectorIdentity,
-    limits: workerLimits(agentType, env)
+    limits: workerLimits(agentType, env, sizing)
   }, env);
 }
 
@@ -320,10 +338,10 @@ export function workerBudgetFailure(record, now = Date.now()) {
   if (Number.isFinite(startedAt) && now - startedAt >= limits.wallClockMs) {
     return { failureKind: "timeout", reason: `wall clock budget reached (${limits.wallClockMs}ms)` };
   }
-  if (EXECUTION_AGENTS.has(canonicalWorkerAgentType(record.agentType))) {
-    const progressAt = Date.parse(record.lastProgressAt ?? record.startedAt ?? record.createdAt ?? "");
-    if (Number.isFinite(progressAt) && now - progressAt >= limits.stallMs) {
-      return { failureKind: "stall", reason: `no-progress budget reached (${limits.stallMs}ms)` };
+  if (EXECUTION_AGENTS.has(canonicalWorkerAgentType(record.agentType)) && !record.inFlightSince) {
+    const livenessAt = Date.parse(record.lastLivenessAt ?? record.startedAt ?? record.createdAt ?? "");
+    if (Number.isFinite(livenessAt) && now - livenessAt >= limits.stallMs) {
+      return { failureKind: "stall", reason: `no-activity budget reached (${limits.stallMs}ms)` };
     }
   }
   if ((record.turns ?? 0) >= limits.maxTurns) {
@@ -454,7 +472,7 @@ function handlePreToolUse(input, env) {
       writeOutput(denyTool("Fusion workers may detach only when the latest user message explicitly contains `--background`. Remove background mode and collect the result in this turn."));
       return;
     }
-    const record = createDispatch(input, agentType, userBackgroundAuthorized, env);
+    const record = createDispatch(input, agentType, userBackgroundAuthorized, env, validation.sizing);
     writeOutput(allowAgentWithTaskId(input.tool_input, record.taskId));
     return;
   }
@@ -472,7 +490,8 @@ function handlePreToolUse(input, env) {
     writeOutput(denyTool(`Fusion worker ${refreshed.taskId} must stop: ${failure.reason}. Return a concise partial result now; do not retry or call more tools.`));
     return;
   }
-  updateWorkerRecord(refreshed.taskId, env, (current) => ({ ...current, lastActivityAt: new Date().toISOString() }));
+  const now = new Date().toISOString();
+  updateWorkerRecord(refreshed.taskId, env, (current) => ({ ...current, lastActivityAt: now, inFlightSince: now }));
 }
 
 function noTaskFoundError(input, failed) {
@@ -597,6 +616,23 @@ function outputFileFromLaunchResponse(response, nested) {
   return null;
 }
 
+function finalTextArtifactPath(record, env) {
+  return path.join(path.dirname(workerRecordFile(record.taskId, env)), `${record.taskId}.final.txt`);
+}
+
+function boundedFinalText(message) {
+  const text = Buffer.from(message, "utf8");
+  if (text.length <= FINAL_TEXT_MAX_BYTES) {
+    return text;
+  }
+  const omitted = text.length - FINAL_TEXT_HEAD_BYTES - FINAL_TEXT_TAIL_BYTES;
+  return Buffer.concat([
+    text.subarray(0, FINAL_TEXT_HEAD_BYTES),
+    Buffer.from(`\n[fusion: truncated ${omitted} bytes]\n`, "utf8"),
+    text.subarray(text.length - FINAL_TEXT_TAIL_BYTES)
+  ]);
+}
+
 function collectionResponseDebugEnabled(env) {
   return /^(?:1|true|yes)$/i.test(String(env[COLLECTION_RESPONSE_DEBUG_ENV] ?? "").trim());
 }
@@ -683,7 +719,7 @@ function handlePostToolUse(input, env, failed = false) {
       }
       if (input.tool_name === "Read") {
         const partialRead = Object.hasOwn(input.tool_input ?? {}, "offset") || Object.hasOwn(input.tool_input ?? {}, "limit");
-        return !partialRead && record.transportStatus === "ready_uncollected" && record.outputFile && path.resolve(record.outputFile) === readPath;
+        return !partialRead && terminalCollectionPending(record) && record.outputFile && path.resolve(record.outputFile) === readPath;
       }
       if (input.tool_name === "TaskOutput" && input.tool_input?.block !== true) {
         return false;
@@ -765,7 +801,7 @@ function handlePostToolUse(input, env, failed = false) {
         return {
           ...(!failed && completed ? markWorkerCollected(worker, input.tool_name, now) : worker),
           ...(agentId ? { agentId, backgroundTaskId: isAsync ? agentId : worker.backgroundTaskId } : {}),
-          ...(outputFile ? { outputFile, transcriptPath: outputFile } : {}),
+          ...(outputFile ? { transcriptPath: outputFile } : {}),
           ...(resolvedModel ? { resolvedModel } : {}),
           ...(directUsage?.usage ? { usage: directUsage.usage, usageSource: "tool-response" } : {}),
           ...(directUsage ? { usageAvailability: directUsage.availability, reportedTotalTokens: directUsage.reportedTotalTokens } : {}),
@@ -796,6 +832,8 @@ function handlePostToolUse(input, env, failed = false) {
     return {
       ...refreshed,
       lastActivityAt: now,
+      inFlightSince: undefined,
+      ...(!failed ? { lastLivenessAt: now } : {}),
       ...(progress ? { lastProgressAt: now, progressEvents: (refreshed.progressEvents ?? 0) + 1 } : {})
     };
   });
@@ -819,12 +857,13 @@ function handleSubagentStart(input, env) {
     lastProgressAt: now
   }));
   const limits = record.limits;
+  const verdictEnvelope = "Keep the final message to a compact verdict envelope that states changed file paths without diffs, the verification command with pass and fail counts, any environment findings, and the path of a file holding the full report when one is written. Write long unified diffs, full test logs, and long quoted file contents to that file instead of inlining them.";
   const delivery = record.completionContract === "collector"
     ? "Return the collector command output exactly, including its terminal `collector:` marker."
     : record.completionContract === "coverage"
-      ? "End the completed analysis with separate lines `delivery: complete` and `coverage: complete`."
-      : "End a successful execution report with separate lines `delivery: complete` and `verification: passed`.";
-  writeOutput(hookOutput("SubagentStart", `Fusion task id: ${record.taskId}. Work only from the supplied isolated brief. Do not request or reconstruct the parent transcript. Budgets: ${limits.wallClockMs}ms wall clock, ${limits.stallMs}ms without execution progress, ${limits.maxTurns} turns, ${limits.maxOutputTokens} output tokens, ${limits.maxUncachedTokens} uncached tokens. Retry at most once. ${delivery}`));
+      ? `End the completed analysis with separate lines \`delivery: complete\` and \`coverage: complete\`. ${verdictEnvelope}`
+      : `End a successful execution report with separate lines \`delivery: complete\` and \`verification: passed\`. ${verdictEnvelope}`;
+  writeOutput(hookOutput("SubagentStart", `Fusion task id: ${record.taskId}. Work only from the supplied isolated brief. Do not request or reconstruct the parent transcript. Budgets: ${limits.wallClockMs}ms wall clock, ${limits.stallMs}ms without successful tool activity, ${limits.maxTurns} turns, ${limits.maxOutputTokens} output tokens, ${limits.maxUncachedTokens} uncached tokens. Retry at most once. ${delivery}`));
 }
 
 function handleSubagentStop(input, env) {
@@ -838,6 +877,11 @@ function handleSubagentStop(input, env) {
   const refreshed = refreshRecord(record, input, env);
   const failure = workerBudgetFailure(refreshed);
   const message = typeof input.last_assistant_message === "string" ? input.last_assistant_message : "";
+  const finalTextFile = isFusionWorkerAgent(refreshed.agentType) && message.length > 0 ? finalTextArtifactPath(refreshed, env) : null;
+  if (finalTextFile) {
+    writePrivateText(finalTextFile, boundedFinalText(message));
+    updateWorkerRecord(refreshed.taskId, env, (current) => ({ ...(current ?? refreshed), outputFile: finalTextFile }));
+  }
   const complete = completedReport(refreshed, message);
   const collectorContract = refreshed.completionContract === "collector" || canonicalWorkerAgentType(refreshed.agentType) === "fusion:job-collector";
   const collectorReport = collectorContract ? structuredCollectorReport(message) : null;
@@ -862,12 +906,17 @@ function handleSubagentStop(input, env) {
   updateWorkerRecord(refreshed.taskId, env, (current) => {
     const worker = current ?? refreshed;
     const runtimeAsync = worker.runtimeAsync === true;
+    const successfulCompletion = complete && !failure && trustedCollectorReport?.kind !== "outcome" && !collectorProtocolFailure;
+    const subagentStopCollected = successfulCompletion && finalTextFile != null && !collectorContract;
     return {
-      ...(runtimeAsync ? worker : markWorkerCollected({ ...worker, acceptance: "unverified" }, "SubagentStop", now)),
-      transportStatus: complete && (trustedCollectorReport?.kind === "outcome" || collectorProtocolFailure) ? "incomplete" : complete ? runtimeAsync ? "ready_uncollected" : "done" : failure ? "failed" : "incomplete",
+      ...(runtimeAsync && !subagentStopCollected ? worker : markWorkerCollected({ ...worker, acceptance: "unverified" }, subagentStopCollected ? "subagent_stop" : "SubagentStop", now)),
+      transportStatus: complete && (trustedCollectorReport?.kind === "outcome" || collectorProtocolFailure) ? "incomplete" : complete ? runtimeAsync && !subagentStopCollected ? "ready_uncollected" : "done" : failure ? "failed" : "incomplete",
       acceptance: "unverified",
-      failureKind: failure?.failureKind ?? (trustedCollectorReport?.kind === "outcome" ? `collection_${trustedCollectorReport.collectionOutcome}` : collectorProtocolFailure ? "collection_protocol" : complete ? worker.failureKind === "unexpected_async" ? null : worker.failureKind ?? null : "delivery"),
+      failureKind: failure?.failureKind ?? (trustedCollectorReport?.kind === "outcome" ? `collection_${trustedCollectorReport.collectionOutcome}` : collectorProtocolFailure ? "collection_protocol" : complete ? null : "delivery"),
+      inFlightSince: undefined,
+      ...(successfulCompletion && worker.failureKind ? { recoveredFailureKind: worker.failureKind } : {}),
       ...(complete && !failure && !collectorProtocolFailure && runtimeAsync && worker.failureKind === "unexpected_async" ? { deliveryMode: "harness_async" } : {}),
+      ...(finalTextFile ? { outputFile: finalTextFile } : {}),
       ...(PEER_JOB_FOOTER_AGENTS.has(worker.agentType) ? capturedPeerIdentity(worker.agentType, message, worker.peerEngine) : {}),
       ...(trustedCollectorReport?.peerEngine ? { peerEngine: trustedCollectorReport.peerEngine } : {}),
       ...(trustedCollectorReport?.peerJobId ? { peerJobId: trustedCollectorReport.peerJobId } : {}),
@@ -899,6 +948,10 @@ function runtimeTaskForRecord(record, tasks) {
 
 function runtimeTaskIsTerminal(task) {
   return typeof task?.status === "string" && TERMINAL_RUNTIME_TASK_STATUSES.has(task.status.trim().toLowerCase());
+}
+
+function runtimeTaskSucceeded(task) {
+  return typeof task?.status === "string" && ["completed", "complete", "done"].includes(task.status.trim().toLowerCase());
 }
 
 function terminalTransportObserved(record, task) {
@@ -1018,11 +1071,13 @@ function handleStop(input, env) {
       const worker = current ?? record;
       const transportStatus = failure ? "cancel_requested" : runtimeTaskIsTerminal(task) ? "ready_uncollected" : ["ready_uncollected", "ready_background", "cancel_requested"].includes(worker.transportStatus) ? worker.transportStatus : "pending_async";
       const advisoryRound = !failure && transportStatus === "pending_async";
+      const successfulTerminal = !failure && worker.failureKind !== "unexpected_async" && (runtimeTaskSucceeded(task) || ["ready_uncollected", "ready_background"].includes(worker.transportStatus));
       return {
         ...worker,
         ...(task?.id ? { backgroundTaskId: task.id } : {}),
         transportStatus,
-        failureKind: failure?.failureKind ?? worker.failureKind,
+        failureKind: failure?.failureKind ?? (successfulTerminal ? null : worker.failureKind),
+        ...(successfulTerminal && worker.failureKind ? { recoveredFailureKind: worker.failureKind } : {}),
         cancelReason: failure?.reason ?? worker.cancelReason,
         stopBlockCount: advisoryRound ? worker.stopBlockCount ?? 0 : (worker.stopBlockCount ?? 0) + 1
       };
