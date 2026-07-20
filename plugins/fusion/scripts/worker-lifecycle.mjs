@@ -13,10 +13,12 @@ import {
   isFusionWorkerAgent,
   isTerminalWorkerStatus,
   markWorkerCollected,
+  readWorkerSessionState,
   readWorkerRecords,
   refreshWorkerTranscript,
   resolveFusionDataDir,
   updateWorkerRecord,
+  updateWorkerSessionState,
   workerRecordFile,
   writePrivateJson,
   writePrivateText
@@ -31,6 +33,9 @@ const MAX_UNCACHED_TOKENS_ENV = "FUSION_WORKER_MAX_UNCACHED_TOKENS";
 const COLLECTION_RESPONSE_DEBUG_ENV = "FUSION_WORKER_DEBUG_COLLECTION_RESPONSE";
 const COLLECTION_RESPONSE_DEBUG_FILE = "worker-collection-response.json";
 const DEFAULT_BRIEF_MAX_BYTES = 16 * 1024;
+const TASK_NOTIFICATION_SCAN_MAX_BYTES = 4 * 1024 * 1024;
+const TASK_NOTIFICATION_SCAN_CHUNK_BYTES = 64 * 1024;
+const TASK_NOTIFICATION_MAX_LINE_BYTES = 1024 * 1024;
 const FINAL_TEXT_MAX_BYTES = 192 * 1024;
 const FINAL_TEXT_HEAD_BYTES = 64 * 1024;
 const FINAL_TEXT_TAIL_BYTES = 128 * 1024;
@@ -46,6 +51,9 @@ const PEER_WRAPPER_AGENTS = new Set(["codex:codex-rescue", "codex-rescue", "grok
 const MANAGED_PEER_AGENTS = new Set(["grok:grok-review-runner", "grok-review-runner"]);
 const PEER_JOB_FOOTER_AGENTS = new Set(["codex:codex-rescue", "grok:grok-rescue", "grok:grok-review-runner"]);
 const TERMINAL_RUNTIME_TASK_STATUSES = new Set(["completed", "complete", "done", "failed", "error", "cancelled", "canceled", "stopped", "terminated", "timed_out", "timeout"]);
+const SUCCESSFUL_TASK_NOTIFICATION_STATUSES = new Set(["completed", "complete", "done"]);
+const CANCELLED_TASK_NOTIFICATION_STATUSES = new Set(["killed", "cancelled", "canceled", "stopped", "terminated"]);
+const FAILED_TASK_NOTIFICATION_STATUSES = new Set(["failed", "error", "timed_out", "timeout"]);
 
 function readHookInput() {
   try {
@@ -969,6 +977,193 @@ function terminalCollectionPending(record) {
     || (record.runtimeAsync === true && isTerminalWorkerStatus(record.transportStatus) && !record.collectedAt);
 }
 
+function taskNotificationTextParts(value) {
+  if (typeof value === "string") {
+    return [value];
+  }
+  if (Array.isArray(value)) {
+    return value.flatMap(taskNotificationTextParts);
+  }
+  if (value && typeof value === "object" && value.type === "text" && typeof value.text === "string") {
+    return [value.text];
+  }
+  return [];
+}
+
+function taskNotificationsFromTranscriptLine(line) {
+  let entry;
+  try {
+    entry = JSON.parse(line);
+  } catch {
+    return [];
+  }
+  if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
+    return [];
+  }
+  const texts = taskNotificationTextParts(entry.message?.content).concat(taskNotificationTextParts(entry.content));
+  const notifications = [];
+  for (const text of texts) {
+    const blocks = text.matchAll(/<task-notification(?:\s[^>]*)?\s*>([\s\S]*?)<\/task-notification\s*>/gi);
+    for (const block of blocks) {
+      const taskId = /<task-id\s*>\s*([^<\s]+)\s*<\/task-id\s*>/i.exec(block[1])?.[1] ?? null;
+      const status = /<status\s*>\s*([^<]+?)\s*<\/status\s*>/i.exec(block[1])?.[1]?.trim().toLowerCase() ?? null;
+      if (taskId && status && (SUCCESSFUL_TASK_NOTIFICATION_STATUSES.has(status) || CANCELLED_TASK_NOTIFICATION_STATUSES.has(status) || FAILED_TASK_NOTIFICATION_STATUSES.has(status))) {
+        notifications.push({ taskId, status });
+      }
+    }
+  }
+  return notifications;
+}
+
+function taskNotificationScanOffset(value) {
+  return Number.isSafeInteger(value) && value >= 0 ? value : null;
+}
+
+function initialTaskNotificationScanOffset(records) {
+  const offsets = records.map((record) => taskNotificationScanOffset(record.parentTranscriptBytesAtDispatch)).filter((offset) => offset != null);
+  return offsets.length > 0 ? Math.min(...offsets) : 0;
+}
+
+function parentTranscriptPathForTaskNotifications(records, input) {
+  const configured = records.map((record) => record.parentTranscriptPath).find((transcriptPath) => typeof transcriptPath === "string" && path.isAbsolute(transcriptPath));
+  if (configured) {
+    return path.resolve(configured);
+  }
+  return typeof input.transcript_path === "string" && path.isAbsolute(input.transcript_path) ? path.resolve(input.transcript_path) : null;
+}
+
+function scanTaskNotifications(transcriptPath, requestedOffset) {
+  let descriptor;
+  try {
+    descriptor = fs.openSync(transcriptPath, "r");
+    const size = fs.fstatSync(descriptor).size;
+    const startOffset = Math.min(taskNotificationScanOffset(requestedOffset) ?? 0, size);
+    const bytesToScan = Math.min(TASK_NOTIFICATION_SCAN_MAX_BYTES, size - startOffset);
+    const statuses = new Map();
+    let cursor = startOffset;
+    let safeOffset = startOffset;
+    let pending = Buffer.alloc(0);
+    let skippingLongLine = false;
+    let remaining = bytesToScan;
+
+    while (remaining > 0) {
+      const chunk = Buffer.allocUnsafe(Math.min(TASK_NOTIFICATION_SCAN_CHUNK_BYTES, remaining));
+      const bytesRead = fs.readSync(descriptor, chunk, 0, chunk.length, cursor);
+      if (bytesRead === 0) {
+        break;
+      }
+      const data = chunk.subarray(0, bytesRead);
+      const chunkStart = cursor;
+      let segmentStart = 0;
+      while (segmentStart < data.length) {
+        const lineEnd = data.indexOf(0x0a, segmentStart);
+        const segmentEnd = lineEnd === -1 ? data.length : lineEnd;
+        const segment = data.subarray(segmentStart, segmentEnd);
+        if (!skippingLongLine) {
+          if (pending.length + segment.length > TASK_NOTIFICATION_MAX_LINE_BYTES) {
+            pending = Buffer.alloc(0);
+            skippingLongLine = true;
+          } else if (segment.length > 0) {
+            pending = pending.length === 0 ? Buffer.from(segment) : Buffer.concat([pending, segment]);
+          }
+        }
+        if (lineEnd === -1) {
+          break;
+        }
+        if (!skippingLongLine && pending.length > 0) {
+          for (const notification of taskNotificationsFromTranscriptLine(pending.toString("utf8").replace(/\r$/, ""))) {
+            statuses.set(notification.taskId, notification.status);
+          }
+        }
+        pending = Buffer.alloc(0);
+        skippingLongLine = false;
+        safeOffset = chunkStart + lineEnd + 1;
+        segmentStart = lineEnd + 1;
+      }
+      cursor += bytesRead;
+      remaining -= bytesRead;
+      if (skippingLongLine) {
+        safeOffset = cursor;
+      }
+    }
+    return { statuses, offset: safeOffset };
+  } catch {
+    return null;
+  } finally {
+    if (descriptor != null) {
+      try {
+        fs.closeSync(descriptor);
+      } catch {
+        void 0;
+      }
+    }
+  }
+}
+
+function taskNotificationTransition(record, status, now) {
+  if (SUCCESSFUL_TASK_NOTIFICATION_STATUSES.has(status)) {
+    const harnessAsyncDelivery = collectedHarnessAsyncDelivery(record, "done");
+    return {
+      ...markWorkerCollected({ ...record, acceptance: "unverified" }, "task_notification", now),
+      transportStatus: "done",
+      acceptance: "unverified",
+      failureKind: harnessAsyncDelivery ? null : record.failureKind,
+      ...(harnessAsyncDelivery ? { deliveryMode: "harness_async" } : {}),
+      finishedAt: record.finishedAt ?? now,
+      lastActivityAt: now
+    };
+  }
+  const cancelled = CANCELLED_TASK_NOTIFICATION_STATUSES.has(status);
+  const fallbackFailureKind = cancelled ? "cancelled" : "task_failed";
+  return {
+    ...markWorkerCollected({ ...record, acceptance: "unverified" }, "task_notification", now),
+    transportStatus: cancelled ? "cancelled" : "failed",
+    acceptance: "unverified",
+    failureKind: record.failureKind && record.failureKind !== "unexpected_async" ? record.failureKind : fallbackFailureKind,
+    finishedAt: record.finishedAt ?? now,
+    lastActivityAt: now
+  };
+}
+
+function reconcileTaskNotifications(input, env) {
+  try {
+    const candidates = sessionRecords(input.session_id, env).filter((record) => !isTerminalWorkerStatus(record.transportStatus) && [record.backgroundTaskId, record.agentId].some((taskId) => typeof taskId === "string" && taskId));
+    if (candidates.length === 0) {
+      return;
+    }
+    const transcriptPath = parentTranscriptPathForTaskNotifications(candidates, input);
+    if (!transcriptPath) {
+      return;
+    }
+    const sessionState = readWorkerSessionState(input.session_id, env);
+    const scanOffset = sessionState?.taskNotificationTranscriptPath === transcriptPath
+      ? taskNotificationScanOffset(sessionState.taskNotificationScanOffset) ?? initialTaskNotificationScanOffset(candidates)
+      : initialTaskNotificationScanOffset(candidates);
+    const scanned = scanTaskNotifications(transcriptPath, scanOffset);
+    if (!scanned) {
+      return;
+    }
+    const now = new Date().toISOString();
+    for (const [taskId, status] of scanned.statuses) {
+      for (const record of candidates.filter((candidate) => [candidate.backgroundTaskId, candidate.agentId].includes(taskId))) {
+        updateWorkerRecord(record.taskId, env, (current) => {
+          if (!current || current.sessionId !== input.session_id || isTerminalWorkerStatus(current.transportStatus) || ![current.backgroundTaskId, current.agentId].includes(taskId)) {
+            return null;
+          }
+          return taskNotificationTransition(current, status, now);
+        });
+      }
+    }
+    updateWorkerSessionState(input.session_id, env, (current) => ({
+      ...(current ?? {}),
+      taskNotificationTranscriptPath: transcriptPath,
+      taskNotificationScanOffset: scanned.offset
+    }));
+  } catch {
+    void 0;
+  }
+}
+
 function armInFlightRecords(records, tasks, env) {
   const inFlight = records.filter((record) => !terminalTransportObserved(record, runtimeTaskForRecord(record, tasks)));
   const armedAt = new Date().toISOString();
@@ -1059,8 +1254,31 @@ function writeAcceptanceAdvisory(sessionId, env) {
   writeOutput(hookOutput("Stop", `Acceptance remains unverified for ${unverified.length} collected Fusion worker${unverified.length === 1 ? "" : "s"}. Settle each row with exactly one command: ${commands.join("; ")}. pairs are <id>=<verdict> with id either a fusion task id (fusion- plus 24 lowercase hex) or an engine job id (32 lowercase hex), verdict one of accepted|rejected|unverified.`));
 }
 
+function inFlightSignature(records) {
+  return records.map((record) => record.taskId).sort().join(",");
+}
+
+function shouldWriteInFlightAdvisory(sessionId, signature, env) {
+  return readWorkerSessionState(sessionId, env)?.inFlightAdvisorySignature !== signature;
+}
+
+function recordInFlightAdvisory(sessionId, signature, env) {
+  updateWorkerSessionState(sessionId, env, (current) => ({ ...(current ?? {}), inFlightAdvisorySignature: signature }));
+}
+
+function clearInFlightAdvisory(sessionId, env) {
+  updateWorkerSessionState(sessionId, env, (current) => {
+    if (!current || !("inFlightAdvisorySignature" in current)) {
+      return null;
+    }
+    const { inFlightAdvisorySignature, ...next } = current;
+    return next;
+  });
+}
+
 function handleStop(input, env) {
   const tasks = Array.isArray(input.background_tasks) ? input.background_tasks : [];
+  reconcileTaskNotifications(input, env);
   const initialRecords = sessionRecords(input.session_id, env);
   if (initialRecords.every((record) => !terminalCollectionPending(record)) && collectorStopGate(input, env)) {
     armInFlightRecords(initialRecords, tasks, env);
@@ -1105,6 +1323,9 @@ function handleStop(input, env) {
   }
   const currentRecords = sessionRecords(input.session_id, env);
   const inFlight = armInFlightRecords(currentRecords, tasks, env);
+  if (inFlight.length === 0) {
+    clearInFlightAdvisory(input.session_id, env);
+  }
   const terminalUncollected = currentRecords.filter(terminalCollectionPending);
   if (terminalUncollected.length > 0) {
     const instructions = terminalUncollected.map((record) => {
@@ -1120,8 +1341,10 @@ function handleStop(input, env) {
     return;
   }
   if (inFlight.length > 0) {
-    if (!input.stop_hook_active) {
+    const signature = inFlightSignature(inFlight);
+    if (!input.stop_hook_active && shouldWriteInFlightAdvisory(input.session_id, signature, env)) {
       writeOutput(hookOutput("Stop", `Fusion task${inFlight.length === 1 ? "" : "s"} ${inFlight.map((record) => record.taskId).join(", ")} ${inFlight.length === 1 ? "is" : "are"} still in flight. Collection is armed and will be required after terminal notification.`));
+      recordInFlightAdvisory(input.session_id, signature, env);
     }
     return;
   }

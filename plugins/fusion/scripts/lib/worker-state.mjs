@@ -134,6 +134,13 @@ export function workerRecordFile(taskId, env = process.env) {
   return path.join(resolveWorkerStateDir(env), "jobs", `${taskId}.json`);
 }
 
+export function workerSessionStateFile(sessionId, env = process.env) {
+  if (typeof sessionId !== "string" || !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(sessionId)) {
+    throw new TypeError("Fusion worker session id is invalid.");
+  }
+  return path.join(resolveWorkerStateDir(env), "sessions", `${sessionId}.json`);
+}
+
 function ensurePrivateDirectory(directory) {
   fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
   try {
@@ -180,6 +187,23 @@ export function readWorkerRecordFile(file) {
 
 export function readWorkerRecord(taskId, env = process.env) {
   return readWorkerRecordFile(workerRecordFile(taskId, env));
+}
+
+export function readWorkerSessionState(sessionId, env = process.env) {
+  return readWorkerRecordFile(workerSessionStateFile(sessionId, env));
+}
+
+export function updateWorkerSessionState(sessionId, env, updater) {
+  const file = workerSessionStateFile(sessionId, env);
+  return withLock(file, () => {
+    const current = readWorkerRecordFile(file);
+    const next = updater(current);
+    if (!next || typeof next !== "object" || Array.isArray(next)) {
+      return current;
+    }
+    writePrivateJson(file, next);
+    return next;
+  });
 }
 
 export function updateWorkerRecord(taskId, env, updater) {
