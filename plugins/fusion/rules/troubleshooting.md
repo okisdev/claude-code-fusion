@@ -38,6 +38,8 @@ When an engine is broken, use the other peer only where its lane ownership or a 
 
 The upstream Grok CLI has no default turn limit. An unset limit is unlimited. One turn is one main-agent model call plus its tool cycle; subagent calls are excluded. The companion now supplies `--max-turns 60` for both consult and write. Consult previously defaulted to 25 turns. When Grok reaches this limit, it writes the complete final JSON envelope to stdout before exiting 1 and writes `Error: max turns reached` to stderr. The companion salvages the stdout envelope, preserves partial text and usage fields, and classifies the terminal outcome as `failureKind: "turn_limit"`.
 
+Fixture heavy test authoring briefs are the dominant `turn_limit` and 570 second timeout failure family on the Grok lane. Route them to Codex or `fusion:fast-worker`, or pre build the fixtures into the brief.
+
 The Grok headless JSON has no top-level `model` field. A model name appears only as a key in `modelUsage` when usage attaches, so model capture depends on that map. Error-path capture also depends on salvaging the envelope before classifying the turn limit failure. Missing `modelUsage` means that the resolved model remains unavailable.
 
 ## Codex startup and cache compatibility

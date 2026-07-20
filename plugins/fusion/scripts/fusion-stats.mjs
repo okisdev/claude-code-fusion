@@ -382,11 +382,11 @@ export function recordCodexAcceptance(options) {
 }
 
 export function newestGrokCompanion(env = process.env) {
-  const override = env.FUSION_GROK_COMPANION;
-  if (override) {
-    return fs.existsSync(override) ? override : null;
+  const override = typeof env.FUSION_GROK_COMPANION === "string" ? env.FUSION_GROK_COMPANION.trim() : "";
+  if (override && path.isAbsolute(override) && regularFile(override)) {
+    return override;
   }
-  const base = path.join(os.homedir(), ".claude", "plugins", "cache", "claude-code-fusion", "grok");
+  const base = path.join(configuredHome(env), ".claude", "plugins", "cache", "claude-code-fusion", "grok");
   try {
     const candidates = fs
       .readdirSync(base)
@@ -409,10 +409,18 @@ function configuredHome(env = process.env) {
   return candidate && path.isAbsolute(candidate) ? candidate : os.homedir();
 }
 
+function regularFile(file) {
+  try {
+    return fs.statSync(file).isFile();
+  } catch {
+    return false;
+  }
+}
+
 export function newestCodexCompanion(env = process.env) {
   const override = typeof env.FUSION_CODEX_COMPANION === "string" ? env.FUSION_CODEX_COMPANION.trim() : "";
-  if (override) {
-    return fs.existsSync(override) ? override : null;
+  if (override && path.isAbsolute(override) && regularFile(override)) {
+    return override;
   }
   const base = path.join(configuredHome(env), ".claude", "plugins", "cache", "claude-code-fusion", "codex");
   try {

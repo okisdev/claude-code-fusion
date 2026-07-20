@@ -4,6 +4,8 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 
+import { getProcessIdentity } from "../plugins/grok/scripts/lib/process-identity.mjs";
+
 import {
   envFor,
   flagValues,
@@ -19,10 +21,10 @@ const { buildGrokArgs, processGroupAlive, runGrok, terminateExitedLeaderProcessG
   path.join(repoRoot, "plugins", "grok", "scripts", "lib", "grok-exec.mjs")
 );
 
-test("exited leader cleanup signals only the original process group", async () => {
+test("exited leader cleanup with no identity signals only the original process group", async () => {
   const calls = [];
   let alive = true;
-  const cleaned = await terminateExitedLeaderProcessGroup(424242, {
+  const cleaned = await terminateExitedLeaderProcessGroup(424242, null, {
     graceMs: 5,
     pollMs: 1,
     kill(target, signal) {
@@ -42,6 +44,25 @@ test("exited leader cleanup signals only the original process group", async () =
   });
   assert.equal(cleaned, true);
   assert.deepEqual(calls, [[-424242, 0], [-424242, "SIGTERM"], [-424242, 0]]);
+});
+
+test("exited leader cleanup does not signal a reused pid group", async () => {
+  const identity = getProcessIdentity(process.pid);
+  assert.ok(identity);
+  const calls = [];
+  const cleaned = await terminateExitedLeaderProcessGroup(process.pid, { ...identity, commandHash: `${identity.commandHash}replaced` }, {
+    graceMs: 5,
+    pollMs: 1,
+    kill(target, signal) {
+      calls.push([target, signal]);
+      if (target === -process.pid && signal === 0) {
+        return;
+      }
+      throw new Error("unexpected signal");
+    }
+  });
+  assert.equal(cleaned, false);
+  assert.deepEqual(calls, [[-process.pid, 0], [-process.pid, 0]]);
 });
 
 const bridgeEnvironmentKeys = [

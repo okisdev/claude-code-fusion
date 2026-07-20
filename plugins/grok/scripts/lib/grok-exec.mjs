@@ -1344,19 +1344,23 @@ export function terminalRecordAttribution(record, patch = {}, env = process.env)
   };
 }
 
-function signalProcessGroup(pid, signal, identity = null) {
-  if (!Number.isInteger(pid) || pid <= 1 || (identity != null && !processIdentityMatches(pid, identity))) {
+function signalProcessGroup(pid, signal, identity = null, options = {}) {
+  const allowExitedLeader = options.allowExitedLeader === true;
+  const fallbackToPid = options.fallbackToPid !== false;
+  const kill = options.kill ?? process.kill.bind(process);
+  const canSignal = () => identity == null || processIdentityMatches(pid, identity) || (allowExitedLeader && !processIsDirectlyAlive(pid));
+  if (!Number.isInteger(pid) || pid <= 1 || !canSignal()) {
     return false;
   }
   try {
-    process.kill(-pid, signal);
+    kill(-pid, signal);
     return true;
   } catch {
-    if (identity != null && !processIdentityMatches(pid, identity)) {
+    if (!canSignal() || !fallbackToPid) {
       return false;
     }
     try {
-      process.kill(pid, signal);
+      kill(pid, signal);
       return true;
     } catch {
       return false;
@@ -1399,7 +1403,7 @@ function exitedLeaderProcessGroupAlive(pid, kill = process.kill.bind(process)) {
   }
 }
 
-export async function terminateExitedLeaderProcessGroup(pid, options = {}) {
+export async function terminateExitedLeaderProcessGroup(pid, identity = null, options = {}) {
   if (!Number.isInteger(pid) || pid <= 1) {
     return false;
   }
@@ -1407,14 +1411,11 @@ export async function terminateExitedLeaderProcessGroup(pid, options = {}) {
   const pollMs = options.pollMs ?? TERMINATION_POLL_MS;
   const kill = options.kill ?? process.kill.bind(process);
   const targetAlive = () => exitedLeaderProcessGroupAlive(pid, kill);
-  const signalGroup = (signal) => {
-    try {
-      kill(-pid, signal);
-      return true;
-    } catch {
-      return false;
-    }
-  };
+  const signalGroup = (signal) => signalProcessGroup(pid, signal, identity, {
+    allowExitedLeader: true,
+    fallbackToPid: false,
+    kill
+  });
   if (!targetAlive()) {
     return true;
   }
@@ -2015,7 +2016,7 @@ export function runGrok(options) {
         return;
       }
       if (!terminationPromise && Number.isInteger(child.pid) && child.pid > 1) {
-        const cleaned = await terminateExitedLeaderProcessGroup(child.pid).catch(() => false);
+        const cleaned = await terminateExitedLeaderProcessGroup(child.pid, childIdentity).catch(() => false);
         if (!cleaned) {
           finishReject(cleanupFailure({ residual: true }));
           return;

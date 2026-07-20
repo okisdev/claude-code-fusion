@@ -5,7 +5,7 @@ import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import {
   FILE_ENGINE_DESCRIPTORS,
   STATS_PROVIDER_REGISTRY,
@@ -21,6 +21,8 @@ import {
   fileBasedEngineStats,
   findDeadWorkspaces,
   fusionRepositoryKey,
+  newestCodexCompanion,
+  newestGrokCompanion,
   normalizeCodexTokenUsage,
   pruneDeadWorkspaces,
   recordCodexAcceptance,
@@ -158,6 +160,79 @@ function writeGrokAcceptanceCompanion(directory) {
   );
   return companion;
 }
+
+function writeCacheCompanion(home, engine, version, modifiedAt) {
+  const companion = path.join(home, ".claude", "plugins", "cache", "claude-code-fusion", engine, version, "scripts", `${engine}-companion.mjs`);
+  fs.mkdirSync(path.dirname(companion), { recursive: true });
+  fs.writeFileSync(companion, "export {};\n");
+  fs.utimesSync(companion, modifiedAt, modifiedAt);
+  return companion;
+}
+
+function fusionStatsWithoutSiblings(root) {
+  const scripts = path.join(root, "fixture", "plugins", "fusion", "scripts");
+  fs.cpSync(path.dirname(SCRIPT), scripts, { recursive: true });
+  return path.join(scripts, "fusion-stats.mjs");
+}
+
+test("acceptance companion resolvers use the newest cache entry and ignore invalid overrides", (t) => {
+  const dir = sandbox(t);
+  const home = path.join(dir, "home");
+  const older = new Date("2026-07-01T00:00:00.000Z");
+  const newer = new Date("2026-07-02T00:00:00.000Z");
+  const olderGrok = writeCacheCompanion(home, "grok", "older", older);
+  const newerGrok = writeCacheCompanion(home, "grok", "newer", newer);
+  const olderCodex = writeCacheCompanion(home, "codex", "older", older);
+  const newerCodex = writeCacheCompanion(home, "codex", "newer", newer);
+  const grokDirectory = path.join(dir, "grok-override");
+  const codexDirectory = path.join(dir, "codex-override");
+  fs.mkdirSync(grokDirectory);
+  fs.mkdirSync(codexDirectory);
+
+  assert.strictEqual(newestGrokCompanion({ HOME: home }), newerGrok);
+  assert.strictEqual(newestCodexCompanion({ HOME: home }), newerCodex);
+  assert.notStrictEqual(olderGrok, newerGrok);
+  assert.notStrictEqual(olderCodex, newerCodex);
+  assert.strictEqual(newestGrokCompanion({ HOME: home, FUSION_GROK_COMPANION: "grok-companion.mjs" }), newerGrok);
+  assert.strictEqual(newestGrokCompanion({ HOME: home, FUSION_GROK_COMPANION: grokDirectory }), newerGrok);
+  assert.strictEqual(newestCodexCompanion({ HOME: home, FUSION_CODEX_COMPANION: "codex-companion.mjs" }), newerCodex);
+  assert.strictEqual(newestCodexCompanion({ HOME: home, FUSION_CODEX_COMPANION: codexDirectory }), newerCodex);
+});
+
+test("acceptance recording preserves unavailable companion behavior without repository siblings", async (t) => {
+  const dir = sandbox(t);
+  const fixture = await import(`${pathToFileURL(fusionStatsWithoutSiblings(dir)).href}?fixture=${Date.now()}`);
+  const home = path.join(dir, "home");
+  const grokData = path.join(dir, "grok-data");
+  const grokJobId = "a".repeat(32);
+  writeGrokJob(grokData, dir, grokJobId, { status: "done", mode: "consult" });
+
+  assert.strictEqual(fixture.newestGrokCompanion({ HOME: home }), null);
+  assert.strictEqual(fixture.newestCodexCompanion({ HOME: home }), null);
+  assert.throws(
+    () => fixture.main(["--record-acceptance", grokJobId, "accepted"], { cwd: dir, env: { HOME: home, FUSION_CODEX_STATE: path.join(dir, "missing-codex"), GROK_COMPANION_DATA: grokData } }),
+    fixture.GrokPluginUpgradeRequiredError
+  );
+
+  const codexState = path.join(dir, "codex-state");
+  const fusionData = path.join(dir, "fusion-data");
+  const codexJobId = "b".repeat(32);
+  let stdout = "";
+  let stderr = "";
+  writeCodexJob(codexState, dir, codexJobId, { status: "done", jobClass: "task" });
+  const observation = fixture.main(
+    ["--record-acceptance", codexJobId, "accepted"],
+    {
+      cwd: dir,
+      env: { HOME: home, FUSION_CODEX_STATE: codexState, FUSION_DATA_DIR: fusionData, GROK_COMPANION_DATA: path.join(dir, "missing-grok") },
+      stdout: { write(chunk) { stdout += chunk; } },
+      stderr: { write(chunk) { stderr += chunk; } }
+    }
+  );
+  assert.strictEqual(observation.jobId, codexJobId);
+  assert.match(stdout, new RegExp(`Recorded accepted for Codex job ${codexJobId}`));
+  assert.match(stderr, /Warning: Codex job record was not updated because the companion or subcommand is unavailable/);
+});
 
 function createSiblingWorktree(root) {
   const main = path.join(root, "main");

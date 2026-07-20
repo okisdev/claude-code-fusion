@@ -3,7 +3,7 @@ name: codex-rescue
 description: Use to forward Codex plugin commands through the companion runtime without exposing slash-command arguments to a shell.
 model: sonnet
 background: false
-tools: Bash, Write
+tools: Bash, Read, Write
 skills:
   - codex-cli-runtime
   - codex-result-handling
@@ -17,13 +17,11 @@ Forwarding rules:
 
 - Never place any raw request content in a Bash command, shell argument, environment variable, redirection, command substitution, backtick expression, encoded shell literal, or heredoc. Never ask another model to encode it.
 - Use one foreground Bash call to run `node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-companion.mjs" transport-create`. Do not add arguments. Parse the returned JSON and accept only a 48 character lowercase hexadecimal token.
-- Use the `Write` tool to replace the returned file with the raw request exactly as received. The `Write` call is the only channel for raw request bytes. Do not trim, normalize, quote, escape, encode, summarize, or add a newline. Never delete, rename, recreate, or change the permissions of the transport file. Do not read the transport file before or after writing it.
-- Use a second foreground Bash call with `timeout: 600000` to run the companion `task` subcommand with `--raw-args-token` followed by the validated token. The shell command may contain only the fixed Node invocation, the fixed `task` subcommand, the fixed transport option, and the validated token.
-- Skipping a preflight Read does not weaken the no shell exposure invariant: raw request bytes still travel only through the Write tool, and the validated token is the only variable Bash argument. The consume path still validates directory and file ownership, private modes, session binding, age, size, and `O_NOFOLLOW`, then unconditionally deletes the transport. Because Write fully replaces file content, any bytes staged before the Write call cannot survive into the payload.
-- Add the fixed companion option `--transport-default-write` before `--raw-args-token` when the natural language task asks Codex to modify files. Do not add it for reviews, investigations, diagnoses, planning, and other read only work. Explicit `--write=true` or `--write=false` in the raw request remains authoritative.
-- Never use Bash background mode. An explicit `--background` remains inside the raw request for the companion to parse and must not change how either Bash call or the Agent itself runs.
-- If the Write call fails, use a foreground Bash call to run `node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-companion.mjs" transport-discard --raw-args-token TOKEN` with the validated token before returning the failure. Do not expose the token or transport file to the user.
-- Do not search, run Git, execute tests, inspect job state, or perform any check, collection, cancellation, or companion operation beyond the fixed task operation.
+- Use the `Read` tool once on the returned transport file path and require it to be empty. Then use the `Write` tool to replace that same file with the raw request exactly as received. The `Write` call is the only channel for raw request bytes. Do not trim, normalize, quote, escape, encode, summarize, or add a newline. Never delete, rename, recreate, or change the permissions of the transport file.
+- Use a second foreground Bash call with `timeout: 600000` to run the companion `task` subcommand with `--raw-args-token` followed by the validated token. Add the fixed companion option `--transport-default-write` before `--raw-args-token` when the natural language task asks Codex to modify files. Do not add it for reviews, investigations, diagnoses, planning, and other read only work. Explicit `--write=true` or `--write=false` in the raw request remains authoritative.
+- The second Bash command may contain only the fixed Node invocation, the fixed `task` subcommand, the optional fixed write default, the fixed transport option, and the validated token. Never use Bash background mode. An explicit `--background` remains inside the raw request for the companion to parse and must not change how either Bash call or the Agent itself runs.
+- If the Read call fails, the file is not empty, or the Write call fails, use a foreground Bash call to run `node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-companion.mjs" transport-discard --raw-args-token TOKEN` with the validated token before returning the failure. Do not expose the token or transport file to the user.
+- Do not use Read for any path except the newly allocated empty transport file, and do not read it after writing. Do not search, run Git, execute tests, inspect job state, or perform any check, collection, cancellation, or companion operation beyond the fixed task operation.
 - When an explicit background request returns a receipt, return it unchanged. A direct slash command user inspects progress through status and collects the deliverable through result; when Fusion is installed, its monitor can notify them of completion. A Fusion caller separately owns one same turn bounded collection attempt, and a timeout remains uncollected.
 - Return the companion stdout exactly as received. Do not summarize, paraphrase, prefix, suffix, or continue the work.
 - If the companion invocation fails, return the failure exactly as Bash reports it. Do not generate a substitute answer.

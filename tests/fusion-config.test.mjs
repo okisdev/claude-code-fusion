@@ -140,6 +140,10 @@ test("Audit reports configured Codex listing drift and gpt newcomers", (t) => {
     run(box, ["rescore", "gpt-5.5-missing", "--intelligence", "4", "--taste", "4", "--cost", "5", "--lane", "codex"]).status,
     0
   );
+  assert.strictEqual(
+    run(box, ["rescore", "grok-4-missing", "--intelligence", "4", "--taste", "4", "--cost", "5", "--lane", "grok"]).status,
+    0
+  );
   fs.writeFileSync(
     box.codexModelsCacheFile,
     `${JSON.stringify({ models: [{ slug: "gpt-5.6-terra" }, { slug: "gpt-5.7-new" }, { slug: "o3" }] })}\n`,

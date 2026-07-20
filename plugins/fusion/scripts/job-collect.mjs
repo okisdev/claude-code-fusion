@@ -144,13 +144,18 @@ function tokenFromArgv(argv) {
 }
 
 function signalChild(child, signal) {
+  if (child.exitCode !== null || child.signalCode !== null) {
+    return false;
+  }
   try {
     if (process.platform !== "win32" && child.pid > 1) {
       process.kill(-child.pid, signal);
     } else {
       child.kill(signal);
     }
+    return true;
   } catch {}
+  return false;
 }
 
 export function runCompanion(companion, command, options, timeoutMs) {
@@ -170,11 +175,18 @@ export function runCompanion(companion, command, options, timeoutMs) {
     let settled = false;
     const timeout = setTimeout(() => {
       timedOut = true;
-      signalChild(child, "SIGTERM");
-      killTimer = setTimeout(() => signalChild(child, "SIGKILL"), 100);
+      if (signalChild(child, "SIGTERM")) {
+        killTimer = setTimeout(() => signalChild(child, "SIGKILL"), 100);
+      }
     }, Math.max(1, timeoutMs));
     child.stdout.on("data", (chunk) => stdout.push(chunk));
     child.stderr.on("data", (chunk) => stderr.push(chunk));
+    child.once("exit", () => {
+      if (killTimer) {
+        clearTimeout(killTimer);
+        killTimer = null;
+      }
+    });
     child.on("error", (error) => {
       if (settled) {
         return;
@@ -194,9 +206,6 @@ export function runCompanion(companion, command, options, timeoutMs) {
       clearTimeout(timeout);
       if (killTimer) {
         clearTimeout(killTimer);
-        if (timedOut) {
-          signalChild(child, "SIGKILL");
-        }
       }
       resolve({
         code: code ?? (signal ? 1 : 0),
