@@ -5,7 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import { test } from "node:test";
 
-import { resolveCompanion, terminalMetadata } from "../plugins/fusion/scripts/job-collect.mjs";
+import { resolveCompanion, runCompanion, terminalMetadata } from "../plugins/fusion/scripts/job-collect.mjs";
 
 const repoRoot = path.join(import.meta.dirname, "..");
 const collector = path.join(repoRoot, "plugins", "fusion", "scripts", "job-collect.mjs");
@@ -162,6 +162,30 @@ test("the wall clock cap terminates a stuck result process", (t) => {
   assert.strictEqual(output.status, 2, output.stderr);
   assert.ok(Date.now() - startedAt < 2_000);
   assert.match(output.stdout, /^job: test\nstate: done\ncollector: timeout engine=codex job=[a-f0-9]{32} elapsed=0s\n$/);
+});
+
+test("does not signal a companion group after its direct child exits", async (t) => {
+  const root = makeSandbox(t);
+  const descendantPidFile = path.join(root, "descendant.pid");
+  const companion = path.join(root, "exiting-companion.mjs");
+  fs.writeFileSync(
+    companion,
+    `import { spawn } from "node:child_process";\nimport fs from "node:fs";\nconst descendant = spawn(process.execPath, ["-e", "process.on('SIGTERM', () => {}); setInterval(() => {}, 1_000);"], { stdio: "ignore" });\nfs.writeFileSync(${JSON.stringify(descendantPidFile)}, String(descendant.pid));\nprocess.on("SIGTERM", () => process.exit(0));\nsetInterval(() => {}, 1_000);\n`,
+    "utf8"
+  );
+  let descendantPid = null;
+  t.after(() => {
+    if (descendantPid) {
+      try {
+        process.kill(descendantPid, "SIGKILL");
+      } catch {}
+    }
+  });
+  const outcome = await runCompanion(companion, "status", { jobId, json: false }, 200);
+  descendantPid = Number(fs.readFileSync(descendantPidFile, "utf8"));
+  assert.equal(outcome.timedOut, true);
+  await new Promise((resolve) => setTimeout(resolve, 150));
+  assert.doesNotThrow(() => process.kill(descendantPid, 0));
 });
 
 test("stops when a running process is flagged as dead", (t) => {

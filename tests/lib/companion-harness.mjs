@@ -217,8 +217,8 @@ export function pidAlive(pid, expectedIdentity = null) {
   return process.platform !== "linux" || !linuxProcessIsZombie(pid);
 }
 
-export function killGroups(pid) {
-  if (!pid) return;
+export function killGroups(pid, expectedIdentity = null) {
+  if (!pid || (expectedIdentity && !pidAlive(pid, expectedIdentity))) return;
   try {
     process.kill(-pid, "SIGKILL");
   } catch {}
