@@ -12,7 +12,7 @@ const JOB_LOG_MAX_BYTES = 1024 * 1024;
 const JOB_EVENTS_MAX_BYTES = 8 * 1024 * 1024;
 const JOB_RECORD_SCAN_MAX_BYTES = 16 * 1024 * 1024;
 const LOG_TAIL_MAX_BYTES = 64 * 1024;
-const LOCK_TIMEOUT_MS = 2000;
+const LOCK_TIMEOUT_ENV = "CODEX_COMPANION_LOCK_TIMEOUT_MS";
 const LOCK_RETRY_MS = 20;
 const PRIVATE_DIR_MODE = 0o700;
 const PRIVATE_FILE_MODE = 0o600;
@@ -26,8 +26,18 @@ const WORKSPACE_SLUG_PATTERN = /^.+-[a-f0-9]{16}$/;
 
 export const DEFAULT_JOB_HISTORY_MAX_BYTES = 512 * 1024 * 1024;
 export const DEFAULT_JOB_HISTORY_MAX_RECORDS = 256;
+export const DEFAULT_LOCK_TIMEOUT_MS = 5000;
 export const TERMINAL_STATUSES = new Set(["done", "error", "cancelled"]);
 export const SESSION_ID_ENV = "CLAUDE_CODE_SESSION_ID";
+
+export function resolveLockTimeoutMs(env = process.env) {
+  const raw = env[LOCK_TIMEOUT_ENV];
+  if (raw === undefined || raw === null || (typeof raw === "string" && !String(raw).trim())) {
+    return DEFAULT_LOCK_TIMEOUT_MS;
+  }
+  const parsed = typeof raw === "number" ? raw : Number(String(raw).trim());
+  return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : DEFAULT_LOCK_TIMEOUT_MS;
+}
 
 function requiredPath(value, label) {
   if (typeof value !== "string" || !value.trim()) {
@@ -86,7 +96,7 @@ function fsyncDirectory(dir) {
 function atomicWriteFile(file, content) {
   const dir = path.dirname(file);
   const temp = `${file}.${process.pid}.${randomBytes(8).toString("hex")}.tmp`;
-  const deadline = Date.now() + LOCK_TIMEOUT_MS;
+  const deadline = Date.now() + resolveLockTimeoutMs();
   let descriptor;
   try {
     while (descriptor === undefined) {
@@ -344,7 +354,7 @@ function releaseLock(lockDir, token) {
   return true;
 }
 
-function withRecordLock(file, callback, timeoutMs = LOCK_TIMEOUT_MS) {
+function withRecordLock(file, callback, timeoutMs = resolveLockTimeoutMs()) {
   ensurePrivateDir(path.dirname(file));
   const lockDir = `${file}.lock`;
   const deadline = Date.now() + timeoutMs;

@@ -550,7 +550,7 @@ function consumeRawCommandStdin() {
   }
 }
 
-function consumeRawCommandTransport(token) {
+function consumeRawCommandTransport(token, { allowUnwritten = false } = {}) {
   const { directory, file, ownerFile } = transportPaths(token);
   let descriptor;
   let directoryIdentity = null;
@@ -598,6 +598,12 @@ function consumeRawCommandTransport(token) {
       throw new CompanionError("The raw command transport file is not private.", "permission");
     }
     const bytes = readBoundedDescriptor(descriptor, MAX_RAW_ARGUMENT_BYTES);
+    if (bytes.length === 0) {
+      if (allowUnwritten) {
+        return "";
+      }
+      throw new CompanionError("The raw command transport is unwritten.", "input");
+    }
     try {
       return new TextDecoder("utf-8", { fatal: true }).decode(bytes);
     } catch {
@@ -865,6 +871,14 @@ function cleanupComplete(record) {
   return [recordedProcessState(record, "owner"), recordedProcessState(record, "codex")].every(({ state }) => state === "absent" || state === "replaced");
 }
 
+export function runningRecordNeedsReconciliation(record, env = process.env) {
+  if (record?.status !== "running") {
+    return false;
+  }
+  const owner = recordedProcessState(record, "owner");
+  return (owner.state === "absent" || owner.state === "replaced") && elapsedSince(record.createdAt) > resolvePidlessGrace(env);
+}
+
 function codexSpawnCheckpointPending(record) {
   return Boolean(record?.background && record.startedAt && !record.codexPidIdentitySettled);
 }
@@ -976,7 +990,7 @@ function collectRenderedJob(file, record) {
   return collected;
 }
 
-function repairRunningRecordSync({ record, file }, env = process.env) {
+export function repairRunningRecordSync({ record, file }, env = process.env) {
   let current = readJobRecordFile(file) ?? record;
   if (current.status !== "running") {
     return current;
@@ -2157,7 +2171,7 @@ async function main() {
     if (receivedArgv.length !== 2 || receivedArgv[0] !== "--raw-args-token") {
       throw new CompanionError("transport-discard requires exactly one raw argument token.", "input");
     }
-    consumeRawCommandTransport(receivedArgv[1]);
+    consumeRawCommandTransport(receivedArgv[1], { allowUnwritten: true });
     return;
   }
   if (subcommand === "record-acceptance") {

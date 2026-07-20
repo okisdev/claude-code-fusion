@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 
@@ -45,7 +46,21 @@ function relative(file) {
   return path.relative(repoRoot, file).split(path.sep).join("/");
 }
 
-test("every executable private transport surface performs the Read before Write handshake", () => {
+function transportEnv(t, sessionId) {
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "raw-transport-surface-test-")));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  return {
+    ...process.env,
+    HOME: path.join(root, "home"),
+    CODEX_COMPANION_DATA: path.join(root, "codex-data"),
+    CLAUDE_CODE_SESSION_ID: sessionId,
+    TEMP: root,
+    TMP: root,
+    TMPDIR: root
+  };
+}
+
+test("every executable private transport surface follows its declared Write transport ritual", () => {
   const discovered = markdownFiles(path.join(repoRoot, "plugins"))
     .filter((file) => {
       const content = fs.readFileSync(file, "utf8");
@@ -60,20 +75,28 @@ test("every executable private transport surface performs the Read before Write 
     const content = fs.readFileSync(path.join(repoRoot, file), "utf8");
     const toolDeclaration = content.match(/^(?:tools|allowed-tools): (.+)$/m)?.[1] ?? "";
     const createIndex = content.indexOf("transport-create");
-    const readIndex = content.indexOf("`Read`", createIndex);
-    const writeIndex = content.indexOf("`Write`", readIndex);
+    const writeIndex = content.indexOf("`Write`", createIndex);
     const invokeIndex = content.indexOf("--raw-args-token", writeIndex);
 
-    assert.match(toolDeclaration, /(?:^|, )Read(?:,|$)/, file);
     assert.match(toolDeclaration, /(?:^|, )Write(?:,|$)/, file);
-    assert.ok(createIndex >= 0 && readIndex > createIndex, `${file} must read the allocated file after transport-create`);
-    assert.ok(writeIndex > readIndex, `${file} must write only after the preflight read`);
+    assert.ok(createIndex >= 0 && writeIndex > createIndex, `${file} must write the allocated file after transport-create`);
     assert.ok(invokeIndex > writeIndex, `${file} must invoke the consumer only after writing`);
-    assert.match(content.slice(createIndex, writeIndex), /Read[^\n.]*once/, file);
     assert.match(content, /Never delete, rename, recreate, or change the permissions of the transport file\./, file);
-    assert.match(content, /Read(?: call)? fails/, file);
-    assert.match(content, /file is not empty/, file);
     assert.match(content, /Write(?: call)? fails/, file);
+    if (file === "plugins/codex/agents/codex-rescue.md") {
+      assert.doesNotMatch(toolDeclaration, /(?:^|, )Read(?:,|$)/, file);
+      assert.doesNotMatch(content.slice(createIndex, writeIndex), /`Read`/, file);
+      assert.match(content, /Do not read the transport file before or after writing it\./, file);
+      assert.match(content, /raw request bytes still travel only through the Write tool, and the validated token is the only variable Bash argument\./, file);
+      assert.match(content, /Because Write fully replaces file content, any bytes staged before the Write call cannot survive into the payload\./, file);
+    } else {
+      const readIndex = content.indexOf("`Read`", createIndex);
+      assert.match(toolDeclaration, /(?:^|, )Read(?:,|$)/, file);
+      assert.ok(readIndex > createIndex && writeIndex > readIndex, `${file} must read the allocated file before writing`);
+      assert.match(content.slice(createIndex, writeIndex), /Read[^\n.]*once/, file);
+      assert.match(content, /Read(?: call)? fails/, file);
+      assert.match(content, /file is not empty/, file);
+    }
     if (file === "plugins/fusion/skills/stats/SKILL.md") {
       assert.match(content, /sole carve-out is a strict verdict settlement/, file);
       assert.match(content, /repeatable `--record <id>=<accepted\|rejected\|unverified>` pairs, optional `--source collector\|main-loop`, and optional `--json`/, file);
@@ -91,9 +114,9 @@ test("runtime guidance preserves the same private transport handshake", () => {
   }
 });
 
-test("Codex preallocated transport stays private across the Read before Write handshake", (t) => {
+test("Codex preallocated transport stays private when Write replaces staged content", (t) => {
   const companion = path.join(repoRoot, "plugins/codex/scripts/codex-companion.mjs");
-  const env = { ...process.env, CLAUDE_CODE_SESSION_ID: `raw-transport-surface-${process.pid}` };
+  const env = transportEnv(t, `raw-transport-surface-${process.pid}`);
   const created = spawnSync(process.execPath, [companion, "transport-create"], { encoding: "utf8", env });
   assert.equal(created.status, 0, created.stderr);
   const transport = JSON.parse(created.stdout);
@@ -102,7 +125,7 @@ test("Codex preallocated transport stays private across the Read before Write ha
 
   const before = fs.statSync(transport.file);
   assert.equal(before.mode & 0o777, 0o600);
-  assert.equal(fs.readFileSync(transport.file, "utf8"), "");
+  fs.writeFileSync(transport.file, "pre-staged bytes", "utf8");
   fs.writeFileSync(transport.file, "opaque request bytes", "utf8");
   const after = fs.statSync(transport.file);
 
@@ -113,5 +136,21 @@ test("Codex preallocated transport stays private across the Read before Write ha
 
   const discarded = spawnSync(process.execPath, [companion, "transport-discard", "--raw-args-token", transport.token], { encoding: "utf8", env });
   assert.equal(discarded.status, 0, discarded.stderr);
+  assert.equal(fs.existsSync(directory), false);
+});
+
+test("Codex transport-discard removes an unwritten staged request without error", (t) => {
+  const companion = path.join(repoRoot, "plugins/codex/scripts/codex-companion.mjs");
+  const env = transportEnv(t, `raw-transport-discard-empty-${process.pid}`);
+  const created = spawnSync(process.execPath, [companion, "transport-create"], { encoding: "utf8", env });
+  assert.equal(created.status, 0, created.stderr);
+  const transport = JSON.parse(created.stdout);
+  const directory = path.dirname(transport.file);
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+  assert.equal(fs.readFileSync(transport.file, "utf8"), "");
+
+  const discarded = spawnSync(process.execPath, [companion, "transport-discard", "--raw-args-token", transport.token], { encoding: "utf8", env });
+  assert.equal(discarded.status, 0, discarded.stderr);
+  assert.equal(discarded.stdout, "");
   assert.equal(fs.existsSync(directory), false);
 });

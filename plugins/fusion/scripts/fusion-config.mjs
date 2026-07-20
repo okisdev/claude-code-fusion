@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -26,6 +27,7 @@ function usage() {
   return [
     "Usage:",
     "  node scripts/fusion-config.mjs show [--json]",
+    "  node scripts/fusion-config.mjs audit [--json]",
     "  node scripts/fusion-config.mjs rescore <id> --intelligence N --taste N --cost N [--lane L] [--notes S]",
     "  node scripts/fusion-config.mjs remove <id>",
     "  node scripts/fusion-config.mjs set-cost-profile <text>",
@@ -100,6 +102,68 @@ function resolvePluginRoot(env) {
     return path.resolve(env.CLAUDE_PLUGIN_ROOT.trim());
   }
   return path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+}
+
+function resolveCodexModelsCachePath(env) {
+  const override = env.FUSION_CODEX_MODELS_CACHE;
+  if (override && override.trim()) {
+    return path.resolve(override.trim());
+  }
+  return path.join(os.homedir(), ".codex", "models_cache.json");
+}
+
+function listedModelId(value) {
+  if (typeof value === "string") {
+    return value.trim() || null;
+  }
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return null;
+  }
+  for (const key of ["slug", "id"]) {
+    if (typeof value[key] === "string" && value[key].trim()) {
+      return value[key].trim();
+    }
+  }
+  return null;
+}
+
+function readCodexModelListing(filePath) {
+  try {
+    const stats = fs.statSync(filePath);
+    const data = JSON.parse(fs.readFileSync(filePath, "utf8"));
+    if (!data || typeof data !== "object" || Array.isArray(data) || !Array.isArray(data.models)) {
+      throw new Error("Expected a JSON object with a models array.");
+    }
+    return {
+      available: true,
+      path: filePath,
+      mtime: stats.mtime.toISOString(),
+      modelIds: [...new Set(data.models.map(listedModelId).filter(Boolean))]
+    };
+  } catch (error) {
+    return {
+      available: false,
+      path: filePath,
+      reason: error instanceof Error ? error.message : String(error)
+    };
+  }
+}
+
+function auditModelDrift(env) {
+  const modelRoutingFile = resolveModelRoutingPath(env);
+  const routing = readModelRoutingFile(modelRoutingFile);
+  const listing = readCodexModelListing(resolveCodexModelsCachePath(env));
+  const configuredModelIds = routing.ok ? [...new Set(routing.data.models.map((model) => model.id))] : [];
+  const listedModelIds = new Set(listing.available ? listing.modelIds : []);
+  return {
+    modelRoutingFile,
+    configured: !routing.missing,
+    valid: Boolean(routing.ok),
+    error: routing.ok || routing.missing ? null : routing.reason,
+    listing,
+    configuredButAbsent: listing.available && routing.ok ? configuredModelIds.filter((id) => !listedModelIds.has(id)) : [],
+    unconfiguredGptModels: listing.available && routing.ok ? listing.modelIds.filter((id) => id.startsWith("gpt-") && !configuredModelIds.includes(id)) : []
+  };
 }
 
 function defaultData() {
@@ -187,6 +251,33 @@ function showCommand(options, env, stdout) {
     lines.push(`Invalid model routing file: ${result.reason}`);
   }
   lines.push("", table);
+  stdout.write(`${lines.join("\n")}\n`);
+}
+
+function auditCommand(options, env, stdout) {
+  ensureOnlyOptions(options, new Set(["json"]), "audit");
+  const report = auditModelDrift(env);
+  if (options.json) {
+    stdout.write(`${JSON.stringify(report, null, 2)}\n`);
+    return;
+  }
+  const lines = [`Model routing file: ${report.modelRoutingFile}`];
+  if (!report.configured) {
+    lines.push("Model routing is not configured.");
+  } else if (!report.valid) {
+    lines.push(`Invalid model routing file: ${report.error}`);
+  }
+  if (!report.listing.available) {
+    lines.push(`Codex model listing: listing unavailable (${report.listing.reason})`);
+    stdout.write(`${lines.join("\n")}\n`);
+    return;
+  }
+  lines.push(
+    `Codex model listing: ${report.listing.path}`,
+    `Listing mtime: ${report.listing.mtime}`,
+    `Configured but absent: ${report.configuredButAbsent.length ? report.configuredButAbsent.join(", ") : "none"}`,
+    `Unconfigured gpt-* newcomers: ${report.unconfiguredGptModels.length ? report.unconfiguredGptModels.join(", ") : "none"}`
+  );
   stdout.write(`${lines.join("\n")}\n`);
 }
 
@@ -295,6 +386,12 @@ export function main(argv = process.argv.slice(2), { env = process.env, stdout =
           throw new UsageError("show does not accept positional arguments.");
         }
         showCommand(options, env, stdout);
+        return 0;
+      case "audit":
+        if (positionals.length !== 0) {
+          throw new UsageError("audit does not accept positional arguments.");
+        }
+        auditCommand(options, env, stdout);
         return 0;
       case "rescore":
         rescoreCommand(positionals, options, env, stdout);

@@ -14,7 +14,7 @@ import {
 const DATA_DIR_ENV = "GROK_COMPANION_DATA";
 const JOB_LOG_MAX_BYTES = 1024 * 1024;
 const LOG_TAIL_MAX_BYTES = 64 * 1024;
-const LOCK_TIMEOUT_MS = 2000;
+const LOCK_TIMEOUT_ENV = "GROK_COMPANION_LOCK_TIMEOUT_MS";
 const LOCK_RETRY_MS = 20;
 const LOCK_STALE_MS = 10000;
 const RESUME_OWNER_LAUNCH_GRACE_MS = 15000;
@@ -23,6 +23,16 @@ const PRIVATE_FILE_MODE = 0o600;
 const TERMINAL_STATUSES = new Set(["done", "error", "cancelled"]);
 
 export const SESSION_ID_ENV = "CLAUDE_CODE_SESSION_ID";
+export const DEFAULT_LOCK_TIMEOUT_MS = 5000;
+
+export function resolveLockTimeoutMs(env = process.env) {
+  const raw = env[LOCK_TIMEOUT_ENV];
+  if (raw === undefined || raw === null || (typeof raw === "string" && !String(raw).trim())) {
+    return DEFAULT_LOCK_TIMEOUT_MS;
+  }
+  const parsed = typeof raw === "number" ? raw : Number(String(raw).trim());
+  return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : DEFAULT_LOCK_TIMEOUT_MS;
+}
 
 export function resolveDataDir(env = process.env) {
   const override = env[DATA_DIR_ENV];
@@ -109,6 +119,7 @@ export function createJobRecord(fields) {
     resultPayload: null,
     resolvedModel: null,
     resolvedEffort: null,
+    role: fields.role ?? null,
     usage: null,
     modelUsage: null,
     usageIsIncomplete: null,
@@ -486,7 +497,7 @@ function withRecordLock(file, fn) {
   ensurePrivateStatePath(path.dirname(file));
   const lockDir = `${file}.lock`;
   scavengeOrphanOwnerDirs(lockDir);
-  const deadline = Date.now() + LOCK_TIMEOUT_MS;
+  const deadline = Date.now() + resolveLockTimeoutMs();
   const token = randomBytes(16).toString("hex");
   const record = {
     version: 1,
@@ -856,24 +867,27 @@ export function finishSuccessfulJobRecordFile(file, successPatch) {
     }
     const treatAsCancelled =
       existing.status === "cancelled" || existing.cancelRequestedAt != null;
+    const { terminalAttribution = {}, ...success } = successPatch;
     const patch = treatAsCancelled
       ? {
           status: "cancelled",
           pid: null,
           grokPid: null,
-          finishedAt: successPatch.finishedAt ?? nowIso(),
-          exitCode: successPatch.exitCode ?? null,
-          sessionId: successPatch.sessionId ?? null,
-          resultText: successPatch.resultText ?? null,
-          usage: successPatch.usage ?? existing.usage ?? null,
-          modelUsage: successPatch.modelUsage ?? existing.modelUsage ?? null,
-          usageIsIncomplete: successPatch.usageIsIncomplete ?? existing.usageIsIncomplete ?? null,
-          modelUsageIsIncomplete: successPatch.modelUsageIsIncomplete ?? existing.modelUsageIsIncomplete ?? null,
+          finishedAt: success.finishedAt ?? nowIso(),
+          exitCode: success.exitCode ?? null,
+          sessionId: success.sessionId ?? null,
+          resolvedModel: terminalAttribution.resolvedModel ?? success.resolvedModel ?? existing.resolvedModel ?? existing.request?.model ?? null,
+          resolvedEffort: terminalAttribution.resolvedEffort ?? success.resolvedEffort ?? existing.resolvedEffort ?? existing.request?.effort ?? null,
+          resultText: success.resultText ?? null,
+          usage: success.usage ?? existing.usage ?? null,
+          modelUsage: success.modelUsage ?? existing.modelUsage ?? null,
+          usageIsIncomplete: success.usageIsIncomplete ?? existing.usageIsIncomplete ?? null,
+          modelUsageIsIncomplete: success.modelUsageIsIncomplete ?? existing.modelUsageIsIncomplete ?? null,
           errorTail: null,
           failureKind: "cancelled",
           cancelRequestedAt: null
         }
-      : { ...successPatch, cancelRequestedAt: null };
+      : { ...success, cancelRequestedAt: null };
     const next = preserveTerminalRecord(existing, { ...existing, ...patch });
     atomicWriteFile(file, `${JSON.stringify(next, null, 2)}\n`);
     return next;

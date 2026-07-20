@@ -11,6 +11,7 @@ import {
   STATS_PROVIDER_REGISTRY,
   WORKSPACE_ENGINE_DESCRIPTORS,
   buildAuditReport,
+  buildFleetUsageStats,
   buildFusionStats,
   buildSessionReport,
   buildTraceReport,
@@ -36,6 +37,7 @@ import { resolveStateDir as guardResolveStateDir, stateFile as guardStateFile } 
 import { resolveCodexStateRoots } from "../plugins/fusion/scripts/lib/codex-state-roots.mjs";
 import { createRawArgsTransport } from "../plugins/fusion/scripts/lib/raw-args-transport.mjs";
 import { createWorkerRecord, readWorkerRecord, recordWorkerAcceptance, updateWorkerRecord, workerRecordFile } from "../plugins/fusion/scripts/lib/worker-state.mjs";
+import { gitIsolation } from "./lib/git-fixture.mjs";
 
 const SCRIPT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "plugins", "fusion", "scripts", "fusion-stats.mjs");
 
@@ -68,14 +70,39 @@ function writeGrokJob(dataDir, cwd, id, fields) {
   fs.writeFileSync(path.join(dir, `${id}.json`), JSON.stringify({ id, cwd, ...fields }));
 }
 
+function runtimeEnv(env, extraEnv = {}) {
+  const inherited = Object.fromEntries(
+    Object.entries(process.env).filter(([key]) => key !== "HOME" && key !== "CLAUDE_CODE_SESSION_ID" && !/^(?:FUSION|GROK|CODEX)_/.test(key))
+  );
+  const root = path.join(path.resolve(env.cwd), ".fusion-stats-runtime");
+  return {
+    ...inherited,
+    HOME: path.join(root, "home"),
+    CLAUDE_CODE_SESSION_ID: "fusion-stats-test-session",
+    FUSION_DATA_DIR: path.join(root, "fusion-data"),
+    FUSION_WORKER_STATE_DIR: path.join(root, "worker-state"),
+    FUSION_INLINE_GUARD_STATE: path.join(root, "guard-state"),
+    FUSION_INLINE_GUARD_AUDIT_DIR: path.join(root, "guard-audit"),
+    FUSION_CODEX_STATE: env.codexState,
+    FUSION_CODEX_STATE_DIR: path.join(root, "codex-state-compat"),
+    FUSION_GROK_COMPANION: "/nonexistent/grok-companion.mjs",
+    GROK_COMPANION_DATA: path.join(root, "grok-data"),
+    GROK_HOME: path.join(root, "grok-home"),
+    CODEX_COMPANION_DATA: path.join(root, "codex-data"),
+    CODEX_HOME: path.join(root, "codex-home"),
+    CODEX_JOBS_MONITOR_SESSIONS_DIR: path.join(root, "codex-sessions"),
+    ...extraEnv
+  };
+}
+
 function run(env, extraArgs = [], extraEnv = {}) {
-  const runtimeEnv = { ...process.env, FUSION_GROK_COMPANION: "/nonexistent/grok-companion.mjs", FUSION_CODEX_STATE: env.codexState, ...extraEnv };
-  const transport = createRawArgsTransport({ sessionId: runtimeEnv.CLAUDE_CODE_SESSION_ID });
+  const childEnv = runtimeEnv(env, extraEnv);
+  const transport = createRawArgsTransport({ sessionId: childEnv.CLAUDE_CODE_SESSION_ID });
   fs.writeFileSync(transport.file, extraArgs.map((argument) => JSON.stringify(argument)).join(" "), "utf8");
   return spawnSync(process.execPath, [SCRIPT, "--raw-args-token", transport.token], {
     cwd: env.cwd,
     encoding: "utf8",
-    env: runtimeEnv
+    env: childEnv
   });
 }
 
@@ -83,7 +110,7 @@ function runDirect(env, extraArgs = [], extraEnv = {}) {
   return spawnSync(process.execPath, [SCRIPT, ...extraArgs], {
     cwd: env.cwd,
     encoding: "utf8",
-    env: { ...process.env, FUSION_GROK_COMPANION: "/nonexistent/grok-companion.mjs", FUSION_CODEX_STATE: env.codexState, ...extraEnv }
+    env: runtimeEnv(env, extraEnv)
   });
 }
 
@@ -136,9 +163,9 @@ function createSiblingWorktree(root) {
   const main = path.join(root, "main");
   const sibling = path.join(root, "sibling");
   fs.mkdirSync(main, { recursive: true });
-  const initialized = spawnSync("git", ["init", "-q"], { cwd: main, encoding: "utf8" });
+  const initialized = spawnSync("git", ["init", "-q"], { cwd: main, encoding: "utf8", env: { ...process.env, ...gitIsolation } });
   assert.strictEqual(initialized.status, 0, initialized.stderr);
-  const added = spawnSync("git", ["worktree", "add", "--orphan", sibling], { cwd: main, encoding: "utf8" });
+  const added = spawnSync("git", ["worktree", "add", "--orphan", sibling], { cwd: main, encoding: "utf8", env: { ...process.env, ...gitIsolation } });
   assert.strictEqual(added.status, 0, added.stderr);
   return { main, sibling };
 }
@@ -195,8 +222,8 @@ test("default Codex stats ignore legacy history unless explicitly opted in", (t)
   const legacyState = path.join(dir, ".claude", "plugins", "data", "codex-openai-codex", "state");
   writeCodexJob(legacyState, dir, "old", { status: "completed", jobClass: "task", createdAt: "2026-07-13T01:00:00.000Z", completedAt: "2026-07-13T01:00:01.000Z" });
   assert.deepStrictEqual(resolveCodexStateRoots({ HOME: dir }), [path.join(dir, ".claude", "plugins", "data", "codex-claude-code-fusion", "state")]);
-  assert.strictEqual(codexStats({ all: true, env: { HOME: dir }, cwd: dir }).available, false);
-  assert.strictEqual(codexStats({ all: true, env: { HOME: dir, FUSION_CODEX_INCLUDE_LEGACY: "1" }, cwd: dir }).totalJobs, 1);
+  assert.strictEqual(codexStats({ all: true, env: { HOME: dir, FUSION_DATA_DIR: path.join(dir, "fusion-data") }, cwd: dir }).available, false);
+  assert.strictEqual(codexStats({ all: true, env: { HOME: dir, FUSION_DATA_DIR: path.join(dir, "fusion-data"), FUSION_CODEX_INCLUDE_LEGACY: "1" }, cwd: dir }).totalJobs, 1);
 });
 
 test("Codex stats deduplicate a job mirrored across canonical and legacy roots", (t) => {
@@ -205,7 +232,7 @@ test("Codex stats deduplicate a job mirrored across canonical and legacy roots",
   const fields = { status: "completed", jobClass: "task", createdAt: "2026-07-14T01:00:00.000Z", completedAt: "2026-07-14T01:00:01.000Z" };
   writeCodexJob(canonicalState, dir, "mirrored", fields);
   writeCodexJob(legacyState, dir, "mirrored", fields);
-  const result = codexStats({ all: true, env: { HOME: dir, FUSION_CODEX_INCLUDE_LEGACY: "1" }, cwd: dir });
+  const result = codexStats({ all: true, env: { HOME: dir, FUSION_DATA_DIR: path.join(dir, "fusion-data"), FUSION_CODEX_INCLUDE_LEGACY: "1" }, cwd: dir });
   assert.strictEqual(result.available, true);
   assert.strictEqual(result.totalJobs, 1);
 });
@@ -216,7 +243,7 @@ test("Codex stats collapse stale legacy running mirrors for a deleted workspace"
   const deletedWorkspace = path.join(dir, "deleted-worktree");
   writeCodexJob(legacyState, deletedWorkspace, "legacy-mirror", { status: "running", jobClass: "task", createdAt: "2026-07-14T01:00:00.000Z" });
   writeCodexJob(legacyState, deletedWorkspace, "legacy-mirror", { status: "completed", jobClass: "task", createdAt: "2026-07-14T01:00:00.000Z", completedAt: "2026-07-14T01:00:01.000Z" });
-  const result = codexStats({ all: true, env: { HOME: dir, FUSION_CODEX_INCLUDE_LEGACY: "1" }, cwd: dir });
+  const result = codexStats({ all: true, env: { HOME: dir, FUSION_DATA_DIR: path.join(dir, "fusion-data"), FUSION_CODEX_INCLUDE_LEGACY: "1" }, cwd: dir });
   assert.strictEqual(result.available, true);
   assert.strictEqual(result.totalJobs, 1);
   assert.strictEqual(result.byStatus.completed, 1);
@@ -229,7 +256,7 @@ test("the compatibility state override retains legacy stale mirror semantics", (
   const deletedWorkspace = path.join(dir, "deleted-worktree");
   writeCodexJob(stateRoot, deletedWorkspace, "legacy-mirror", { status: "running", jobClass: "task", createdAt: "2026-07-14T01:00:00.000Z" });
   writeCodexJob(stateRoot, deletedWorkspace, "legacy-mirror", { status: "completed", jobClass: "task", createdAt: "2026-07-14T01:00:00.000Z", completedAt: "2026-07-14T01:00:01.000Z" });
-  const result = codexStats({ all: true, env: { HOME: dir, FUSION_CODEX_STATE_DIR: stateRoot }, cwd: dir });
+  const result = codexStats({ all: true, env: { HOME: dir, FUSION_DATA_DIR: path.join(dir, "fusion-data"), FUSION_CODEX_STATE_DIR: stateRoot }, cwd: dir });
   assert.strictEqual(result.totalJobs, 1);
   assert.strictEqual(result.byStatus.completed, 1);
   assert.strictEqual(result.pendingTransportJobs, 0);
@@ -239,7 +266,7 @@ test("an explicit Codex state override excludes legacy home stats", (t) => {
   const dir = sandbox(t);
   const [, legacyState] = resolveCodexStateRoots({ HOME: dir, FUSION_CODEX_INCLUDE_LEGACY: "1" });
   writeCodexJob(legacyState, dir, "legacy", { status: "completed", jobClass: "task", createdAt: "2026-07-14T01:00:00.000Z" });
-  const result = codexStats({ all: true, env: { HOME: dir, FUSION_CODEX_STATE: path.join(dir, "isolated-state") }, cwd: dir });
+  const result = codexStats({ all: true, env: { HOME: dir, FUSION_DATA_DIR: path.join(dir, "fusion-data"), FUSION_CODEX_STATE: path.join(dir, "isolated-state") }, cwd: dir });
   assert.strictEqual(result.available, false);
 });
 
@@ -297,7 +324,7 @@ test("Codex stats fail closed when exact token aggregation exceeds the safe inte
     });
   }
 
-  const stats = codexStats({ all: true, env: { FUSION_CODEX_STATE: stateRoot }, cwd: dir });
+  const stats = codexStats({ all: true, env: { FUSION_CODEX_STATE: stateRoot, FUSION_DATA_DIR: path.join(dir, "fusion-data") }, cwd: dir });
   assert.strictEqual(stats.tokenUsage.availability, "overflow");
   assert.strictEqual(stats.tokenUsage.jobsWithUsage, 2);
   assert.strictEqual(stats.tokenUsage.jobsWithoutUsage, 0);
@@ -361,7 +388,7 @@ test("counts canonical running records without repairing or signalling them", (t
 
   const files = [staleFile, liveFile, timeoutFile, cancelledFile];
   const before = files.map((file) => fs.readFileSync(file, "utf8"));
-  const stats = codexStats({ env: { FUSION_CODEX_STATE: stateRoot }, cwd: dir });
+  const stats = codexStats({ env: { FUSION_CODEX_STATE: stateRoot, FUSION_DATA_DIR: path.join(dir, "fusion-data") }, cwd: dir });
   assert.deepStrictEqual(stats.byTransportStatus, { running: 4 });
   assert.strictEqual(stats.pendingTransportJobs, 4);
   assert.deepStrictEqual(files.map((file) => fs.readFileSync(file, "utf8")), before);
@@ -439,7 +466,60 @@ test("Aggregates available Grok companion stats into the merged output", (t) => 
   assert.deepStrictEqual(data.grok.byFailureKind, { quota: 1 });
 });
 
+test("Grok job records contribute resolved and unknown models without a companion", (t) => {
+  const dir = sandbox(t);
+  const dataDir = path.join(dir, "grok-data");
+  writeGrokJob(dataDir, dir, "grok-resolved-model", {
+    status: "done",
+    mode: "consult",
+    role: "large-context",
+    resolvedModel: "grok-4.1",
+    resolvedEffort: "high",
+    usage: {
+      inputTokens: 50,
+      cacheReadInputTokens: 20,
+      outputTokens: 10,
+      reasoningTokens: 4,
+      totalTokens: 80
+    }
+  });
+  writeGrokJob(dataDir, dir, "grok-unknown-model", {
+    status: "done",
+    mode: "consult",
+    role: "burst",
+    resolvedModel: null,
+    resolvedEffort: null
+  });
+
+  const result = run(
+    { cwd: dir, codexState: path.join(dir, "missing-codex") },
+    ["--json"],
+    { FUSION_GROK_COMPANION: "/nonexistent/grok-companion.mjs", GROK_COMPANION_DATA: dataDir }
+  );
+  assert.strictEqual(result.status, 0, result.stderr);
+  const stats = JSON.parse(result.stdout).grok;
+  assert.strictEqual(stats.available, true);
+  assert.deepStrictEqual(stats.byModel, { "grok-4.1@high": 1, unknown: 1 });
+  assert.deepStrictEqual(stats.byEffort, { high: 1, unavailable: 1 });
+  assert.deepStrictEqual(stats.tokenUsage, {
+    availability: "partial",
+    scope: "terminal jobs only",
+    jobsWithUsage: 1,
+    jobsWithIncompleteUsage: 0,
+    jobsWithoutUsage: 1,
+    jobsWithUnreportedUsage: 1,
+    totals: {
+      inputTokens: 70,
+      cachedInputTokens: 20,
+      outputTokens: 10,
+      reasoningOutputTokens: 4,
+      totalTokens: 80
+    }
+  });
+});
+
 test("file-based engine stats use the descriptor registry", () => {
+  assert.ok(FILE_ENGINE_DESCRIPTORS.grok);
   assert.ok(FILE_ENGINE_DESCRIPTORS.codex);
   assert.strictEqual(FILE_ENGINE_DESCRIPTORS.codex.stateEnvVar, "FUSION_CODEX_STATE");
   assert.strictEqual(FILE_ENGINE_DESCRIPTORS.codex.defaultStateRoot({}), path.join(os.homedir(), ".claude", "plugins", "data", "codex-claude-code-fusion", "state"));
@@ -463,13 +543,14 @@ test("codexStats matches fileBasedEngineStats with the codex descriptor", (t) =>
     startedAt: "2026-07-02T06:00:00.000Z",
     completedAt: "2026-07-02T06:00:05.000Z"
   });
-  const env = { FUSION_CODEX_STATE: stateRoot };
+  const env = { FUSION_CODEX_STATE: stateRoot, FUSION_DATA_DIR: path.join(dir, "fusion-data") };
   const viaCodex = codexStats({ env, cwd: dir });
   const viaDescriptor = fileBasedEngineStats(FILE_ENGINE_DESCRIPTORS.codex, { env, cwd: dir });
   assert.deepStrictEqual(viaCodex, viaDescriptor);
 });
 
 test("report sections follow the stats provider registry order", (t) => {
+  const dir = sandbox(t);
   const saved = STATS_PROVIDER_REGISTRY.slice();
   t.after(() => {
     STATS_PROVIDER_REGISTRY.length = 0;
@@ -481,7 +562,7 @@ test("report sections follow the stats provider registry order", (t) => {
     displayName: "StubEngine",
     collect: () => ({ available: false, reason: "stub unavailable" })
   });
-  const report = buildFusionStats({ cwd: "/tmp/stub-scope", env: process.env });
+  const report = buildFusionStats({ cwd: dir, env: runtimeEnv({ cwd: dir, codexState: path.join(dir, "missing-codex") }) });
   const text = renderFusionStats(report);
   assert.match(text, /## StubEngine\n\nUnavailable: stub unavailable/);
   assert.doesNotMatch(text, /## Grok/);
@@ -590,8 +671,9 @@ test("--session scopes per-engine job counts to the current session where availa
   assert.deepStrictEqual(data.engines.grok.byStatus, { done: 1 });
 });
 
-test("buildSessionReport and renderSessionReport agree on an unset session", () => {
-  const report = buildSessionReport({ env: { ...process.env, CLAUDE_CODE_SESSION_ID: "", FUSION_INLINE_GUARD_STATE: "/nonexistent" } });
+test("buildSessionReport and renderSessionReport agree on an unset session", (t) => {
+  const dir = sandbox(t);
+  const report = buildSessionReport({ env: runtimeEnv({ cwd: dir, codexState: path.join(dir, "missing-codex") }, { CLAUDE_CODE_SESSION_ID: "", FUSION_INLINE_GUARD_STATE: path.join(dir, "missing-guard") }) });
   assert.strictEqual(report.sessionId, null);
   assert.strictEqual(report.guard, null);
   assert.match(renderSessionReport(report), /no dispatches recorded/);
@@ -889,6 +971,7 @@ test("--session explicitly reports unavailable data when the session id is unset
   const report = buildSessionReport({
     env: {
       CLAUDE_CODE_SESSION_ID: "",
+      FUSION_DATA_DIR: path.join(dir, "fusion-data"),
       FUSION_INLINE_GUARD_STATE: path.join(dir, "guard"),
       FUSION_CODEX_STATE: path.join(dir, "codex"),
       GROK_COMPANION_DATA: path.join(dir, "grok")
@@ -1914,6 +1997,69 @@ test("worker acceptance requires --accept-failed-transport only for accepted fai
   assert.strictEqual(JSON.parse(accepted.stdout).acceptance, "accepted");
 });
 
+test("--record settles accepted failed-transport with --accept-failed-transport", (t) => {
+  const dir = sandbox(t);
+  const stateDir = path.join(dir, "worker-state");
+  const env = { FUSION_WORKER_STATE_DIR: stateDir };
+  const taskId = `fusion-${"a8".repeat(12)}`;
+  createWorkerRecord({
+    taskId,
+    sessionId: "session-record-reaped",
+    dispatchToolUseId: "tool-record-reaped",
+    agentType: "fusion:fast-worker",
+    workspaceRoot: dir,
+    limits: {}
+  }, env);
+  updateWorkerRecord(taskId, env, (record) => ({
+    ...record,
+    transportStatus: "failed",
+    failureKind: "task_reaped",
+    collectionMethod: "reaped",
+    finishedAt: "2026-07-19T00:00:00.000Z",
+    collectedAt: "2026-07-19T00:00:00.000Z"
+  }));
+
+  const blocked = runDirect(
+    { cwd: dir, codexState: path.join(dir, "missing") },
+    ["--record", `${taskId}=accepted`, "--json"],
+    env
+  );
+  assert.notStrictEqual(blocked.status, 0);
+  assert.match(blocked.stderr, /Pass --accept-failed-transport to record accepted/);
+  assert.strictEqual(readWorkerRecord(taskId, env).acceptance, "unverified");
+
+  const accepted = runDirect(
+    { cwd: dir, codexState: path.join(dir, "missing") },
+    ["--record", `${taskId}=accepted`, "--accept-failed-transport", "--json"],
+    env
+  );
+  assert.strictEqual(accepted.status, 0, accepted.stderr);
+  assert.deepStrictEqual(JSON.parse(accepted.stdout.trim().split("\n")[0]), {
+    kind: "worker",
+    taskId,
+    acceptance: "accepted"
+  });
+  assert.strictEqual(readWorkerRecord(taskId, env).acceptance, "accepted");
+});
+
+test("--record rejects duplicate --accept-failed-transport", (t) => {
+  const dir = sandbox(t);
+  const stateDir = path.join(dir, "worker-state");
+  const env = { FUSION_WORKER_STATE_DIR: stateDir };
+  const taskId = `fusion-${"b9".repeat(12)}`;
+  createTerminalWorker({ taskId, env, workspaceRoot: dir });
+  const args = ["--record", `${taskId}=accepted`, "--accept-failed-transport", "--accept-failed-transport"];
+
+  const direct = runDirect({ cwd: dir, codexState: path.join(dir, "missing") }, args, env);
+  assert.notStrictEqual(direct.status, 0);
+  assert.match(direct.stderr, /must be supplied through --raw-args-token/);
+
+  const staged = run({ cwd: dir, codexState: path.join(dir, "missing") }, args, env);
+  assert.notStrictEqual(staged.status, 0);
+  assert.match(staged.stderr, /Duplicate --accept-failed-transport/);
+  assert.strictEqual(readWorkerRecord(taskId, env).acceptance, "unverified");
+});
+
 test("exact rollout model observations override request and argv values", (t) => {
   const dir = sandbox(t);
   const stateRoot = path.join(dir, "state");
@@ -2016,7 +2162,7 @@ test("Codex token coverage classifies malformed available usage as incomplete", 
     tokenUsage: { inputTokens: 10, cachedInputTokens: 3, outputTokens: 2, reasoningOutputTokens: 1, totalTokens: 13 }
   });
 
-  const stats = codexStats({ env: { FUSION_CODEX_STATE: stateRoot }, cwd: dir });
+  const stats = codexStats({ env: { FUSION_CODEX_STATE: stateRoot, FUSION_DATA_DIR: path.join(dir, "fusion-data") }, cwd: dir });
   assert.deepStrictEqual(stats.tokenUsage, {
     availability: "unavailable",
     scope: "terminal transport jobs only",
@@ -2077,18 +2223,26 @@ test("long-term guard audit aggregates recent events without exposing event deta
   const events = [
     { schemaVersion: 1, at: "2026-07-13T00:00:00.000Z", session: "session-a", event: "write", lane: "main", tool: "Edit", path: "src/a.mjs" },
     { schemaVersion: 1, at: "2026-07-13T00:01:00.000Z", session: "session-a", event: "dispatch", lane: "codex", tool: "Agent", description: "implement repair" },
-    { schemaVersion: 1, at: "2026-07-13T00:02:00.000Z", session: "session-b", event: "dispatch", lane: "grok", tool: "Task", description: "review repair" }
+    { schemaVersion: 1, at: "2026-07-13T00:02:00.000Z", session: "session-b", event: "dispatch", lane: "grok", tool: "Task", description: "review repair" },
+    { schemaVersion: 1, at: "2026-07-13T00:03:00.000Z", session: "session-a", event: "warn", lane: "main", tool: "Edit", path: "src/a.mjs", writeCount: 5, dispatchCount: 1, budget: 5, mode: "enforce" },
+    { schemaVersion: 1, at: "2026-07-14T00:00:00.000Z", session: "session-b", event: "deny", lane: "main", tool: "Write", path: "src/b.mjs", writeCount: 5, dispatchCount: 1, budget: 5, mode: "enforce" }
   ];
   fs.writeFileSync(path.join(auditDir, "events-2026-07-13.jsonl"), `${events.map((event) => JSON.stringify(event)).join("\n")}\n{ malformed\n`, "utf8");
   const env = { FUSION_INLINE_GUARD_AUDIT_DIR: auditDir };
   const report = buildAuditReport({ env, days: 7, now: Date.parse("2026-07-14T00:00:00.000Z") });
-  assert.deepStrictEqual(report.byEvent, { write: 1, dispatch: 2 });
+  assert.deepStrictEqual(report.byEvent, { write: 1, dispatch: 2, warn: 1, deny: 1 });
+  assert.deepStrictEqual(report.eventsByDay, {
+    "2026-07-13": { dispatch: 2, write: 1, deny: 0, warn: 1 },
+    "2026-07-14": { dispatch: 0, write: 0, deny: 1, warn: 0 }
+  });
   assert.deepStrictEqual(report.dispatchesByLane, { codex: 1, grok: 1 });
-  assert.strictEqual(report.totalEvents, 3);
+  assert.strictEqual(report.totalEvents, 5);
   assert.strictEqual(report.sessionCount, 2);
   assert.strictEqual(report.malformedCount, 1);
   const rendered = renderAuditReport(report);
-  assert.match(rendered, /Total events: 3/);
+  assert.match(rendered, /Total events: 5/);
+  assert.match(rendered, /2026-07-13: dispatch 2, write 1, deny 0, warn 1/);
+  assert.match(rendered, /2026-07-14: dispatch 0, write 0, deny 1, warn 0/);
   assert.match(rendered, /Malformed audit entries skipped: 1/);
   assert.doesNotMatch(rendered, /src\/a\.mjs|implement repair|review repair/);
 });
@@ -2103,6 +2257,7 @@ test("session stats and trace fall back to the long-term audit after short-lived
     "utf8"
   );
   const env = {
+    FUSION_DATA_DIR: path.join(dir, "fusion-data"),
     FUSION_INLINE_GUARD_STATE: path.join(dir, "missing-state"),
     FUSION_INLINE_GUARD_AUDIT_DIR: auditDir,
     GROK_COMPANION_DATA: path.join(dir, "missing-grok"),
@@ -2289,4 +2444,98 @@ test("canonical Codex resolved model and effort override requested and sidecar v
   const observation = { source: "rollout-turn-context", model: "gpt-rollout", effort: "high" };
   assert.strictEqual(resolveCodexJobModel(raw, observation), "gpt-resolved");
   assert.strictEqual(resolveCodexJobEffort(raw, observation), "xhigh");
+});
+
+function writeGuardAuditEvents(auditDir, date, events) {
+  fs.mkdirSync(auditDir, { recursive: true });
+  fs.writeFileSync(
+    path.join(auditDir, `events-${date}.jsonl`),
+    `${events.map((event) => JSON.stringify(event)).join("\n")}\n`,
+    "utf8"
+  );
+}
+
+test("fleet usage surface counts a width-4 burst and scattered singles from the guard audit log", (t) => {
+  const dir = sandbox(t);
+  const auditDir = path.join(dir, "inline-guard-audit");
+  const day = "2026-07-15";
+  const fleetSession = "session-ultra-fleet";
+  const singleSession = "session-single";
+  writeGuardAuditEvents(auditDir, day, [
+    { schemaVersion: 1, at: "2026-07-15T10:00:00.000Z", session: fleetSession, event: "dispatch", lane: "grok", tool: "Agent" },
+    { schemaVersion: 1, at: "2026-07-15T10:00:00.100Z", session: fleetSession, event: "dispatch", lane: "codex", tool: "Agent" },
+    { schemaVersion: 1, at: "2026-07-15T10:00:00.200Z", session: fleetSession, event: "dispatch", lane: "grok", tool: "Agent" },
+    { schemaVersion: 1, at: "2026-07-15T10:00:00.300Z", session: fleetSession, event: "dispatch", lane: "codex", tool: "Agent" },
+    { schemaVersion: 1, at: "2026-07-15T11:00:00.000Z", session: singleSession, event: "dispatch", lane: "codex", tool: "Agent" },
+    { schemaVersion: 1, at: "2026-07-15T12:00:00.000Z", session: fleetSession, event: "dispatch", lane: "grok", tool: "Agent" },
+    { schemaVersion: 1, at: "2026-07-15T13:00:00.000Z", session: singleSession, event: "write", lane: "main", tool: "Edit", path: "src/a.mjs" },
+    { schemaVersion: 1, at: "2026-07-15T14:00:00.000Z", session: "session-other", event: "dispatch", lane: "grok", tool: "Task" }
+  ]);
+
+  const fleet = buildFleetUsageStats({ env: { FUSION_INLINE_GUARD_AUDIT_DIR: auditDir } });
+  assert.strictEqual(fleet.surface, "ultra");
+  assert.strictEqual(fleet.totalDispatches, 7);
+  assert.strictEqual(fleet.totalBursts, 4);
+  assert.strictEqual(fleet.fleetShapedBursts, 1);
+  assert.deepStrictEqual(fleet.widthDistribution, { "1": 3, "4": 1 });
+  assert.deepStrictEqual(fleet.widest, { width: 4, session: fleetSession, day });
+  assert.strictEqual(fleet.byDay[day].bursts, 4);
+  assert.strictEqual(fleet.byDay[day].fleetShapedBursts, 1);
+  assert.deepStrictEqual(fleet.byDay[day].widthDistribution, { "1": 3, "4": 1 });
+  assert.deepStrictEqual(fleet.byDay[day].widest, { width: 4, session: fleetSession, at: "2026-07-15T10:00:00.000Z" });
+
+  const report = buildFusionStats({
+    env: {
+      FUSION_DATA_DIR: path.join(dir, "fusion-data"),
+      FUSION_INLINE_GUARD_AUDIT_DIR: auditDir,
+      FUSION_CODEX_STATE: path.join(dir, "missing-codex"),
+      GROK_COMPANION_DATA: path.join(dir, "missing-grok"),
+      FUSION_WORKER_STATE_DIR: path.join(dir, "missing-workers")
+    },
+    cwd: dir
+  });
+  assert.deepStrictEqual(report.fleet.widthDistribution, { "1": 3, "4": 1 });
+  const rendered = renderFusionStats(report);
+  assert.match(rendered, /## Ultra usage surface/);
+  assert.match(rendered, /Fleet-shaped bursts \(width ≥ 3\): 1/);
+  assert.match(rendered, /Widest burst: width 4, session session-ultra-fleet/);
+  assert.match(rendered, /Burst width distribution:/);
+  assert.match(rendered, /- 1: 3/);
+  assert.match(rendered, /- 4: 1/);
+});
+
+test("fleet usage surface reports zeros without error when the audit dir is empty or missing", (t) => {
+  const dir = sandbox(t);
+  const emptyAuditDir = path.join(dir, "empty-audit");
+  fs.mkdirSync(emptyAuditDir, { recursive: true });
+  const empty = buildFleetUsageStats({ env: { FUSION_INLINE_GUARD_AUDIT_DIR: emptyAuditDir } });
+  assert.deepStrictEqual(empty, {
+    surface: "ultra",
+    totalDispatches: 0,
+    totalBursts: 0,
+    fleetShapedBursts: 0,
+    widthDistribution: {},
+    byDay: {},
+    widest: null
+  });
+
+  const missing = buildFleetUsageStats({ env: { FUSION_INLINE_GUARD_AUDIT_DIR: path.join(dir, "missing-audit") } });
+  assert.deepStrictEqual(missing, empty);
+
+  const report = buildFusionStats({
+    env: {
+      FUSION_DATA_DIR: path.join(dir, "fusion-data"),
+      FUSION_INLINE_GUARD_AUDIT_DIR: emptyAuditDir,
+      FUSION_CODEX_STATE: path.join(dir, "missing-codex"),
+      GROK_COMPANION_DATA: path.join(dir, "missing-grok"),
+      FUSION_WORKER_STATE_DIR: path.join(dir, "missing-workers")
+    },
+    cwd: dir
+  });
+  assert.deepStrictEqual(report.fleet.totalBursts, 0);
+  const rendered = renderFusionStats(report);
+  assert.match(rendered, /## Ultra usage surface/);
+  assert.match(rendered, /Dispatch bursts: 0/);
+  assert.match(rendered, /Fleet-shaped bursts \(width ≥ 3\): 0/);
+  assert.match(rendered, /Widest burst: none/);
 });

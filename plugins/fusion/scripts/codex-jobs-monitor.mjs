@@ -12,12 +12,14 @@ import {
   appendTokenUsageObservation,
   fusionRepositoryKey,
   loadModelAuditObservations,
+  modelObservationRank,
   normalizeCodexTokenUsage,
   resolveFusionDataDir,
   fusionWorkspaceKey,
   tokenUsageSidecarPath,
   workspaceRootsShareRepository
 } from "./fusion-stats.mjs";
+import { repairRunningRecordSync, runningRecordNeedsReconciliation } from "../../codex/scripts/codex-companion.mjs";
 
 const CURRENT_TERMINAL_STATUSES = new Set(["done", "error", "cancelled"]);
 const LEGACY_TERMINAL_STATUSES = new Set(["completed", "failed"]);
@@ -85,7 +87,7 @@ function readWorkspaceJobsSnapshot(root, workspaceRoot, repositoryCache = new Ma
           const record = JSON.parse(fs.readFileSync(recordFile, "utf8"));
           const storedRepositoryKey = typeof record?.repositoryKey === "string" && record.repositoryKey.trim() ? record.repositoryKey.trim() : null;
           if ((storedRepositoryKey && storedRepositoryKey === scopeRepositoryKey) || (!storedRepositoryKey && workspaceRootsShareRepository(record?.workspaceRoot, workspaceRoot, repositoryCache))) {
-            records.push(record);
+            records.push({ file: recordFile, record });
             if (record?.id) {
               recordIds.add(record.id);
             }
@@ -121,18 +123,6 @@ function formatOutcomeLine(record) {
 
 function shouldAnnounceTerminal(record) {
   return !Object.hasOwn(record, "background") || record.background === true;
-}
-
-function isPidAlive(pid) {
-  if (!Number.isInteger(pid) || pid <= 0) {
-    return true;
-  }
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (error) {
-    return error?.code !== "ESRCH";
-  }
 }
 
 function nonEmptyRequestField(value) {
@@ -254,12 +244,19 @@ function appendModelAuditObservation(sidecarPath, observation) {
     if (fs.existsSync(sidecarPath)) {
       fs.chmodSync(sidecarPath, 0o600);
     }
-    const current = loadModelAuditObservations(sidecarPath).get(observation.jobId);
-    if (current && (current.source === "rollout-turn-context" || observation.source !== "rollout-turn-context")) {
-      return true;
+    const observations = loadModelAuditObservations(sidecarPath);
+    const current = observations.get(observation.jobId);
+    if (!current || modelObservationRank(observation) > modelObservationRank(current)) {
+      observations.set(observation.jobId, observation);
     }
-    fs.appendFileSync(sidecarPath, `${JSON.stringify(observation)}\n`, { encoding: "utf8", mode: 0o600 });
-    fs.chmodSync(sidecarPath, 0o600);
+    const replacementPath = `${sidecarPath}.${process.pid}.${Date.now()}.tmp`;
+    try {
+      fs.writeFileSync(replacementPath, `${[...observations.values()].map((entry) => JSON.stringify(entry)).join("\n")}\n`, { encoding: "utf8", mode: 0o600 });
+      fs.chmodSync(replacementPath, 0o600);
+      fs.renameSync(replacementPath, sidecarPath);
+    } finally {
+      fs.rmSync(replacementPath, { force: true });
+    }
     return true;
   } finally {
     fs.closeSync(lock);
@@ -755,13 +752,29 @@ function main() {
     }
     const records = snapshot.records;
     const liveIds = new Set(snapshot.recordIds);
-    const terminalJobIds = new Set(records.filter((record) => record?.id && TERMINAL_STATUSES.has(record.status)).map((record) => record.id));
+    const terminalJobIds = new Set(records.filter(({ record }) => record?.id && TERMINAL_STATUSES.has(record.status)).map(({ record }) => record.id));
     let dirty = false;
-    for (const record of records) {
+    for (const entry of records) {
+      let record = entry.record;
       if (!record?.id) {
         continue;
       }
       liveIds.add(record.id);
+      let reconciled = false;
+      if (!TERMINAL_STATUSES.has(record.status) && runningRecordNeedsReconciliation(record)) {
+        if (!belongsToMonitorSession(record, ownSessionId) || terminalJobIds.has(record.id)) {
+          continue;
+        }
+        try {
+          record = repairRunningRecordSync({ record, file: entry.file });
+        } catch {
+          continue;
+        }
+        reconciled = TERMINAL_STATUSES.has(record.status);
+        if (reconciled) {
+          terminalJobIds.add(record.id);
+        }
+      }
       if (TERMINAL_STATUSES.has(record.status)) {
         const key = announcementKey(record.id, record.status);
         if (!belongsToMonitorSession(record, ownSessionId)) {
@@ -781,7 +794,7 @@ function main() {
         if (!announced.has(key)) {
           announced.add(key);
           dirty = true;
-          if (shouldAnnounceTerminal(record) && !(startupPending && !loaded.exists)) {
+          if (shouldAnnounceTerminal(record) && !(startupPending && (loaded.malformed || (!loaded.exists && !reconciled)))) {
             safeWriteLine(formatOutcomeLine(record));
           }
         }
@@ -797,30 +810,6 @@ function main() {
       }
       const auditState = auditStates.get(recordWorkspaceRoot);
       maybeCaptureModelAudit(record, auditState.seenJobIds, auditState.sidecarPath);
-      if (record.status === "running" && !isPidAlive(record.pid)) {
-        if (!belongsToMonitorSession(record, ownSessionId)) {
-          continue;
-        }
-        if (terminalJobIds.has(record.id)) {
-          continue;
-        }
-        const key = announcementKey(record.id, DEAD_STATUS_KEY);
-        if (startupPending && loaded.malformed) {
-          if (!announced.has(key)) {
-            announced.add(key);
-            dirty = true;
-          }
-          continue;
-        }
-        if (startupPending && !loaded.exists) {
-          continue;
-        }
-        if (!announced.has(key)) {
-          announced.add(key);
-          dirty = true;
-          safeWriteLine(`codex job ${record.id} appears dead (process gone, status still running)`);
-        }
-      }
     }
     if (pruneAnnounced(announced, liveIds)) {
       dirty = true;

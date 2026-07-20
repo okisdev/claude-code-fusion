@@ -3,7 +3,7 @@
 import fs from "node:fs";
 
 import { cleanupRawCommandTransportsForSession } from "./grok-companion.mjs";
-import { recordedProcessGroupsClean, terminateRecordedProcessGroups } from "./lib/grok-exec.mjs";
+import { recordedProcessGroupsClean, terminalRecordAttribution, terminateRecordedProcessGroups } from "./lib/grok-exec.mjs";
 import { SESSION_ID_ENV, listAllJobRecords, nowIso, resolveDataDir, updateJobRecordFileWithCurrent } from "./lib/state.mjs";
 
 function readHookInput() {
@@ -47,6 +47,7 @@ async function main() {
           const message = "Session cleanup was requested, but verified process cleanup did not complete. The process identifiers were retained for retry.";
           return {
             ...current,
+            ...terminalRecordAttribution(current),
             cleanupRequired: true,
             errorMessage: message,
             errorTail: message,
@@ -55,6 +56,7 @@ async function main() {
         }
         return {
           ...current,
+          ...terminalRecordAttribution(current),
           status: "cancelled",
           finishedAt: nowIso(),
           failureKind: "cancelled",

@@ -24,7 +24,12 @@ function sandbox(t) {
 }
 
 function envFor(box, extra = {}) {
-  return { ...process.env, FUSION_WORKER_STATE_DIR: box.state, ...extra };
+  return {
+    ...process.env,
+    FUSION_WORKER_STATE_DIR: box.state,
+    FUSION_DATA_DIR: path.join(box.root, "fusion-data"),
+    ...extra,
+  };
 }
 
 function run(box, payload, extra = {}) {
@@ -62,8 +67,8 @@ test("fast worker limits raise the default budgets and retain environment overri
     wallClockMs: 1_200_000,
     stallMs: 300_000,
     maxTurns: 60,
-    maxOutputTokens: 24_000,
-    maxUncachedTokens: 240_000
+    maxOutputTokens: 48_000,
+    maxUncachedTokens: 360_000
   });
   assert.deepStrictEqual(workerLimits("fusion:fast-worker", {
     FUSION_WORKER_WALL_CLOCK_MS: "120",
@@ -77,6 +82,26 @@ test("fast worker limits raise the default budgets and retain environment overri
     maxTurns: 12,
     maxOutputTokens: 8_000,
     maxUncachedTokens: 6_000
+  });
+});
+
+test("trivial worker limits raise token budgets and retain environment overrides", () => {
+  assert.deepStrictEqual(workerLimits("fusion:trivial-worker", {}), {
+    wallClockMs: 180_000,
+    stallMs: 90_000,
+    maxTurns: 12,
+    maxOutputTokens: 16_000,
+    maxUncachedTokens: 80_000
+  });
+  assert.deepStrictEqual(workerLimits("fusion:trivial-worker", {
+    FUSION_WORKER_MAX_OUTPUT_TOKENS: "17000",
+    FUSION_WORKER_MAX_UNCACHED_TOKENS: "90000"
+  }), {
+    wallClockMs: 180_000,
+    stallMs: 90_000,
+    maxTurns: 12,
+    maxOutputTokens: 17_000,
+    maxUncachedTokens: 90_000
   });
 });
 
@@ -134,6 +159,28 @@ test("parallel same-type workers correlate by their injected task ids even when 
   const byDispatch = new Map(readWorkerRecords(envFor(box)).map((worker) => [worker.dispatchToolUseId, worker]));
   assert.strictEqual(byDispatch.get("tool-first").agentId, "agent-first");
   assert.strictEqual(byDispatch.get("tool-second").agentId, "agent-second");
+});
+
+test("an async launch receipt persists its output file and starts the worker budget", (t) => {
+  const box = sandbox(t);
+  const outputFile = path.join(box.root, "tasks", "launch-receipt.output");
+  fs.mkdirSync(path.dirname(outputFile), { recursive: true });
+  fs.writeFileSync(outputFile, "", "utf8");
+  run(box, dispatch(box));
+  const launch = run(box, {
+    ...dispatch(box),
+    hook_event_name: "PostToolUse",
+    tool_response: {
+      isAsync: true,
+      status: "async_launched",
+      agentId: "launch-receipt",
+      content: `task started\noutput_file: ${outputFile}\n`
+    }
+  });
+  assert.strictEqual(launch.status, 0, launch.stderr);
+  const launched = record(box);
+  assert.strictEqual(launched.outputFile, outputFile);
+  assert.ok(Number.isFinite(Date.parse(launched.startedAt)));
 });
 
 test("peer wrapper Agents reject runtime background mode while the managed review runner remains exempt", (t) => {
@@ -510,7 +557,7 @@ test("lifecycle enforcement fails closed when private worker state is unavailabl
   assert.match(JSON.parse(corruptWorkerTool.stdout).hookSpecificOutput.permissionDecisionReason, /state is unavailable/);
 });
 
-test("an armed async worker blocks only after terminal state is observed and unblocks after collection", (t) => {
+test("an armed async worker blocks only after terminal state is observed and unblocks after Read collection", (t) => {
   const box = sandbox(t);
   run(box, dispatch(box));
   const task = record(box);
@@ -566,7 +613,9 @@ test("an armed async worker blocks only after terminal state is observed and unb
   });
   const decision = JSON.parse(terminalStop.stdout);
   assert.strictEqual(decision.decision, "block");
-  assert.match(decision.reason, /TaskOutput with block=true.*a1/);
+  assert.match(decision.reason, /Call Read with file_path=/);
+  assert.match(decision.reason, new RegExp(outputFile));
+  assert.doesNotMatch(decision.reason, /TaskOutput/);
   assert.match(decision.reason, /unverified/);
 
   run(box, {
@@ -574,8 +623,8 @@ test("an armed async worker blocks only after terminal state is observed and unb
     session_id: "session-1",
     cwd: box.cwd,
     transcript_path: box.transcript,
-    tool_name: "TaskOutput",
-    tool_input: { task_id: "a1", block: true },
+    tool_name: "Read",
+    tool_input: { file_path: outputFile },
     tool_response: { status: "completed", content: "completed" }
   });
   assert.strictEqual(record(box).transportStatus, "done");
@@ -593,7 +642,7 @@ test("an armed async worker blocks only after terminal state is observed and unb
   assert.match(JSON.parse(collectedStop.stdout).hookSpecificOutput.additionalContext, /Acceptance remains unverified/);
 });
 
-test("a completed async worker blocks on its first Stop until TaskOutput collects it", (t) => {
+test("a completed async worker blocks on its first Stop until a full Read collects it", (t) => {
   const box = sandbox(t);
   run(box, dispatch(box));
   const outputFile = path.join(box.root, "tasks", "agent-collected.output");
@@ -636,7 +685,9 @@ test("a completed async worker blocks on its first Stop until TaskOutput collect
     background_tasks: []
   });
   assert.strictEqual(JSON.parse(blocked.stdout).decision, "block");
-  assert.match(JSON.parse(blocked.stdout).reason, /TaskOutput with block=true.*agent-collected/);
+  assert.match(JSON.parse(blocked.stdout).reason, /Call Read with file_path=/);
+  assert.match(JSON.parse(blocked.stdout).reason, new RegExp(outputFile));
+  assert.doesNotMatch(JSON.parse(blocked.stdout).reason, /TaskOutput/);
 
   for (const block of [false, false]) {
     run(box, {
@@ -656,8 +707,8 @@ test("a completed async worker blocks on its first Stop until TaskOutput collect
     session_id: "session-1",
     cwd: box.cwd,
     transcript_path: box.transcript,
-    tool_name: "TaskOutput",
-    tool_input: { task_id: "agent-collected", block: true },
+    tool_name: "Read",
+    tool_input: { file_path: outputFile },
     tool_response: { content: "completed result" }
   });
   assert.strictEqual(record(box).transportStatus, "done");
@@ -750,19 +801,22 @@ test("collection captures peer job footers and leaves absent or malformed footer
       agentType: "codex:codex-rescue",
       taskId: "peer-job-last",
       content: `result\njob: ${"a".repeat(32)}\njob: ${"b".repeat(32)}`,
-      peerJobId: "b".repeat(32)
+      peerJobId: "b".repeat(32),
+      peerEngine: "codex"
     },
     {
       agentType: "grok:grok-rescue",
       taskId: "peer-job-absent",
       content: "result without a job footer",
-      peerJobId: null
+      peerJobId: null,
+      peerEngine: undefined
     },
     {
       agentType: "grok:grok-rescue",
       taskId: "peer-job-malformed",
       content: `result\njob: ${"A".repeat(32)}`,
-      peerJobId: null
+      peerJobId: null,
+      peerEngine: undefined
     }
   ];
 
@@ -787,9 +841,205 @@ test("collection captures peer job footers and leaves absent or malformed footer
 
     const collected = record(box);
     assert.strictEqual(collected.peerJobId, testCase.peerJobId);
+    assert.strictEqual(collected.peerEngine, testCase.peerEngine);
     assert.strictEqual(collected.awaitingVerdict, true);
     assert.ok(collected.awaitingVerdictArmedAt);
   }
+});
+
+test("TaskOutput captures a peer job footer from a tagged response", (t) => {
+  const box = sandbox(t);
+  const peerDispatch = dispatch(box, { subagent_type: "codex:codex-rescue", prompt: "bounded peer brief" });
+  run(box, peerDispatch);
+  run(box, {
+    ...peerDispatch,
+    hook_event_name: "PostToolUse",
+    tool_response: { isAsync: true, status: "async_launched", agentId: "a7e7bb81fdd99c53a" }
+  });
+  run(box, {
+    hook_event_name: "PostToolUse",
+    session_id: "session-1",
+    cwd: box.cwd,
+    transcript_path: box.transcript,
+    tool_name: "TaskOutput",
+    tool_input: { task_id: "a7e7bb81fdd99c53a", block: true },
+    tool_response: `<retrieval_status>success</retrieval_status>
+<task_id>a7e7bb81fdd99c53a</task_id>
+<task_type>local_agent</task_type>
+<status>completed</status>
+<output>
+worker final message text
+codex-session: 019f
+job: 87254fcdc09d390bc321881d9be3e8b8
+delivery: foreground
+</output>`
+  });
+
+  const collected = record(box);
+  assert.strictEqual(collected.peerJobId, "87254fcdc09d390bc321881d9be3e8b8");
+  assert.strictEqual(collected.peerEngine, "codex");
+});
+
+test("a full Read collects terminal output and captures its peer job footer", (t) => {
+  const box = sandbox(t);
+  const peerJobId = "b".repeat(32);
+  const outputFile = path.join(box.root, "tasks", "peer-read.output");
+  const output = `worker final message\njob: ${peerJobId}\ndelivery: foreground\n`;
+  fs.mkdirSync(path.dirname(outputFile), { recursive: true });
+  fs.writeFileSync(outputFile, output, "utf8");
+  const peerDispatch = dispatch(box, { subagent_type: "codex:codex-rescue", prompt: "bounded peer brief" });
+  run(box, peerDispatch);
+  run(box, {
+    ...peerDispatch,
+    hook_event_name: "PostToolUse",
+    tool_response: {
+      isAsync: true,
+      status: "async_launched",
+      agentId: "peer-read",
+      content: `task started\noutput_file: ${outputFile}\n`
+    }
+  });
+  updateWorkerRecord(record(box).taskId, envFor(box), (current) => ({ ...current, transportStatus: "ready_uncollected" }));
+
+  const blocked = run(box, {
+    hook_event_name: "Stop",
+    session_id: "session-1",
+    cwd: box.cwd,
+    transcript_path: box.transcript,
+    background_tasks: []
+  });
+  const instruction = JSON.parse(blocked.stdout).reason;
+  assert.match(instruction, /Call Read with file_path=/);
+  assert.match(instruction, new RegExp(outputFile));
+  assert.doesNotMatch(instruction, /TaskOutput/);
+
+  run(box, {
+    hook_event_name: "PostToolUse",
+    session_id: "session-1",
+    cwd: box.cwd,
+    transcript_path: box.transcript,
+    tool_name: "Read",
+    tool_input: { file_path: outputFile },
+    tool_response: { type: "text", text: output }
+  });
+
+  const collected = record(box);
+  assert.strictEqual(collected.collectionMethod, "Read");
+  assert.ok(collected.collectedAt);
+  assert.strictEqual(collected.transportStatus, "done");
+  assert.strictEqual(collected.failureKind, null);
+  assert.strictEqual(collected.deliveryMode, "harness_async");
+  assert.strictEqual(collected.peerJobId, peerJobId);
+  assert.strictEqual(collected.peerEngine, "codex");
+});
+
+test("Read collection debug capture writes the raw response when enabled", (t) => {
+  const box = sandbox(t);
+  const outputFile = path.join(box.root, "tasks", "debug-read.output");
+  const toolResponse = { type: "text", text: "worker final message", diagnostics: { source: "Read" } };
+  fs.mkdirSync(path.dirname(outputFile), { recursive: true });
+  fs.writeFileSync(outputFile, toolResponse.text, "utf8");
+  run(box, dispatch(box));
+  run(box, {
+    ...dispatch(box),
+    hook_event_name: "PostToolUse",
+    tool_response: { isAsync: true, status: "async_launched", agentId: "debug-read", outputFile }
+  });
+  updateWorkerRecord(record(box).taskId, envFor(box), (current) => ({ ...current, transportStatus: "ready_uncollected" }));
+
+  const collected = run(box, {
+    hook_event_name: "PostToolUse",
+    session_id: "session-1",
+    cwd: box.cwd,
+    transcript_path: box.transcript,
+    tool_name: "Read",
+    tool_input: { file_path: outputFile },
+    tool_response: toolResponse
+  }, { FUSION_WORKER_DEBUG_COLLECTION_RESPONSE: "1" });
+  assert.strictEqual(collected.status, 0, collected.stderr);
+  const debugFile = path.join(box.root, "fusion-data", "worker-collection-response.json");
+  assert.deepStrictEqual(JSON.parse(fs.readFileSync(debugFile, "utf8")), toolResponse);
+});
+
+test("TaskOutput captures a peer job footer from the documented text response", (t) => {
+  const box = sandbox(t);
+  const peerJobId = "d".repeat(32);
+  const peerDispatch = dispatch(box, { subagent_type: "codex:codex-rescue", prompt: "bounded peer brief" });
+  run(box, peerDispatch);
+  run(box, {
+    ...peerDispatch,
+    hook_event_name: "PostToolUse",
+    tool_response: { isAsync: true, status: "async_launched", agentId: "peer-documented-text" }
+  });
+  run(box, {
+    hook_event_name: "PostToolUse",
+    session_id: "session-1",
+    cwd: box.cwd,
+    transcript_path: box.transcript,
+    tool_name: "TaskOutput",
+    tool_input: { task_id: "peer-documented-text", block: true },
+    tool_response: { type: "text", text: `worker final message\njob: ${peerJobId}\ndelivery: foreground\n`, isError: false }
+  });
+
+  const collected = record(box);
+  assert.strictEqual(collected.peerJobId, peerJobId);
+  assert.strictEqual(collected.peerEngine, "codex");
+});
+
+test("TaskOutput captures a peer job footer from text content blocks", (t) => {
+  const box = sandbox(t);
+  const peerJobId = "e".repeat(32);
+  const peerDispatch = dispatch(box, { subagent_type: "grok:grok-rescue", prompt: "bounded peer brief" });
+  run(box, peerDispatch);
+  run(box, {
+    ...peerDispatch,
+    hook_event_name: "PostToolUse",
+    tool_response: { isAsync: true, status: "async_launched", agentId: "peer-content-blocks" }
+  });
+  run(box, {
+    hook_event_name: "PostToolUse",
+    session_id: "session-1",
+    cwd: box.cwd,
+    transcript_path: box.transcript,
+    tool_name: "TaskOutput",
+    tool_input: { task_id: "peer-content-blocks", block: true },
+    tool_response: [
+      { type: "text", text: "worker final message" },
+      { type: "image", source: { type: "base64", media_type: "image/png", data: "ignored" } },
+      { type: "text", text: `job: ${peerJobId}\ndelivery: foreground` }
+    ]
+  });
+
+  const collected = record(box);
+  assert.strictEqual(collected.peerJobId, peerJobId);
+  assert.strictEqual(collected.peerEngine, "grok");
+});
+
+test("an async SubagentStop captures a peer job footer", (t) => {
+  const box = sandbox(t);
+  const peerJobId = "c".repeat(32);
+  const peerDispatch = dispatch(box, { subagent_type: "grok:grok-rescue", prompt: "bounded peer brief" });
+  run(box, peerDispatch);
+  run(box, {
+    ...peerDispatch,
+    hook_event_name: "PostToolUse",
+    tool_response: { isAsync: true, status: "async_launched", agentId: "peer-async-stop" }
+  });
+  run(box, {
+    hook_event_name: "SubagentStop",
+    session_id: "session-1",
+    cwd: box.cwd,
+    transcript_path: box.transcript,
+    agent_id: "peer-async-stop",
+    agent_type: "grok:grok-rescue",
+    stop_hook_active: false,
+    last_assistant_message: `worker final message\njob: ${peerJobId}\ndelivery: complete\nverification: passed`
+  });
+
+  const stopped = record(box);
+  assert.strictEqual(stopped.runtimeAsync, true);
+  assert.strictEqual(stopped.peerJobId, peerJobId);
+  assert.strictEqual(stopped.peerEngine, "grok");
 });
 
 test("SubagentStop leaves a malformed peer footer null while arming its verdict", (t) => {
@@ -1125,7 +1375,7 @@ test("a structured Codex collection remains gated until the main loop records a 
     jobId: peerJobId,
     acceptance: "rejected",
     workspaceRoot: box.cwd,
-    env: envFor(box, { FUSION_DATA_DIR: path.join(box.root, "fusion-data") }),
+    env: envFor(box),
     sessionId: "session-1",
     source: "main-loop",
     reason: "verification did not pass"
@@ -1461,6 +1711,56 @@ test("an explicitly authorized background worker still requires TaskStop after i
   const decision = JSON.parse(stop.stdout);
   assert.strictEqual(decision.decision, "block");
   assert.match(decision.reason, /TaskStop/);
+  assert.strictEqual(record(box).transportStatus, "cancel_requested");
+});
+
+test("advisory in-flight stop rounds do not consume the cancellation budget for a harness-async worker", (t) => {
+  const box = sandbox(t);
+  run(box, dispatch(box));
+  run(box, {
+    ...dispatch(box),
+    hook_event_name: "PostToolUse",
+    tool_response: { isAsync: true, status: "async_launched", agentId: "harness-async-1" }
+  });
+  const taskId = record(box).taskId;
+  assert.notStrictEqual(record(box).userBackgroundAuthorized, true);
+
+  for (let count = 0; count < 12; count += 1) {
+    const stop = run(box, {
+      hook_event_name: "Stop",
+      session_id: "session-1",
+      cwd: box.cwd,
+      transcript_path: box.transcript,
+      stop_hook_active: false,
+      last_assistant_message: `Fusion task ${taskId} is still in flight.`,
+      background_tasks: [{ id: "harness-async-1", type: "subagent", status: "running", agent_type: "fusion:fast-worker" }]
+    });
+    const output = JSON.parse(stop.stdout);
+    assert.strictEqual(output.decision, undefined);
+    assert.match(output.hookSpecificOutput.additionalContext, /still in flight/);
+  }
+  const worker = record(box);
+  assert.strictEqual(worker.stopBlockCount, 0);
+  assert.strictEqual(worker.transportStatus, "pending_async");
+  assert.strictEqual(worker.awaitingCollection, true);
+
+  updateWorkerRecord(taskId, envFor(box), (current) => ({
+    ...current,
+    startedAt: new Date(Date.now() - 2_000_000).toISOString(),
+    limits: { ...current.limits, wallClockMs: 1000 }
+  }));
+  const expired = run(box, {
+    hook_event_name: "Stop",
+    session_id: "session-1",
+    cwd: box.cwd,
+    transcript_path: box.transcript,
+    stop_hook_active: false,
+    last_assistant_message: `Fusion task ${taskId} is still in flight.`,
+    background_tasks: [{ id: "harness-async-1", type: "subagent", status: "running", agent_type: "fusion:fast-worker" }]
+  });
+  const expiredOutput = JSON.parse(expired.stdout);
+  assert.strictEqual(expiredOutput.decision, "block");
+  assert.match(expiredOutput.reason, /TaskStop/);
   assert.strictEqual(record(box).transportStatus, "cancel_requested");
 });
 

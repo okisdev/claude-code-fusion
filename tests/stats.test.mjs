@@ -6,24 +6,28 @@ import { test } from "node:test";
 import { envFor, jobFileFor, jobRecords, makeSandbox, runCompanion } from "./lib/companion-harness.mjs";
 
 const processIdentityBin = fs.mkdtempSync(path.join(os.tmpdir(), "grok-process-identity-"));
-const originalPath = process.env.PATH;
 fs.writeFileSync(path.join(processIdentityBin, "ps"), '#!/bin/sh\npid=""\nwhile [ "$#" -gt 0 ]; do\n  if [ "$1" = "-p" ]; then\n    pid="$2"\n    shift 2\n  else\n    shift\n  fi\ndone\nprintf "process-%s\\n" "$pid"\n');
 fs.writeFileSync(path.join(processIdentityBin, "sysctl"), '#!/bin/sh\nprintf "{ sec = 1, usec = 0 }\\n"\n');
 fs.chmodSync(path.join(processIdentityBin, "ps"), 0o755);
 fs.chmodSync(path.join(processIdentityBin, "sysctl"), 0o755);
-process.env.PATH = `${processIdentityBin}${path.delimiter}${originalPath}`;
 test.after(() => {
-  process.env.PATH = originalPath;
   fs.rmSync(processIdentityBin, { recursive: true, force: true });
 });
 
+function childEnv(sandbox, extraEnv = {}) {
+  return envFor(sandbox, {
+    ...extraEnv,
+    PATH: [processIdentityBin, process.env.PATH].filter(Boolean).join(path.delimiter),
+  });
+}
+
 function seedJob(sandbox, cwd, args, extraEnv = {}) {
-  return runCompanion(["task", ...args], { cwd, env: envFor(sandbox, extraEnv) });
+  return runCompanion(["task", ...args], { cwd, env: childEnv(sandbox, extraEnv) });
 }
 
 test("stats aggregates the workspace jobs as markdown and json", (t) => {
   const sandbox = makeSandbox(t);
-  const env = envFor(sandbox);
+  const env = childEnv(sandbox);
   assert.strictEqual(seedJob(sandbox, sandbox.workDir, ["first job"], { FAKE_GROK_MODE: "usage-ok" }).status, 0);
   assert.strictEqual(seedJob(sandbox, sandbox.workDir, ["--write", "second job"]).status, 0);
   const rateLimited = seedJob(sandbox, sandbox.workDir, ["doomed"], { FAKE_GROK_MODE: "rate-limit-error" });
@@ -101,7 +105,7 @@ test("stats --all spans every workspace while the default stays scoped", (t) => 
   const sandbox = makeSandbox(t);
   const otherDir = path.join(sandbox.root, "other");
   fs.mkdirSync(otherDir);
-  const env = envFor(sandbox);
+  const env = childEnv(sandbox);
   assert.strictEqual(seedJob(sandbox, sandbox.workDir, ["work job"]).status, 0);
   assert.strictEqual(seedJob(sandbox, otherDir, ["other job"]).status, 0);
 
@@ -127,7 +131,7 @@ test("stats --all spans every workspace while the default stays scoped", (t) => 
 
 test("workspace stats never trusts a recorded cwd when refreshing jobs", (t) => {
   const sandbox = makeSandbox(t);
-  const env = envFor(sandbox);
+  const env = childEnv(sandbox);
   const seeded = seedJob(sandbox, sandbox.workDir, ["malformed cwd record"]);
   assert.strictEqual(seeded.status, 0, seeded.stderr);
   const [record] = jobRecords(sandbox.dataDir);
@@ -145,7 +149,7 @@ test("workspace stats never trusts a recorded cwd when refreshing jobs", (t) => 
 
 test("stats reclassifies legacy quota summaries without changing their records", (t) => {
   const sandbox = makeSandbox(t);
-  const env = envFor(sandbox);
+  const env = childEnv(sandbox);
   const summaries = ["HTTP 402", "Payment Required", "account balance exhausted", "insufficient balance"];
 
   for (const summary of summaries) {
@@ -173,7 +177,7 @@ test("stats reclassifies legacy quota summaries without changing their records",
 
 test("stats reclassifies a legacy quota failure from its bounded job log", (t) => {
   const sandbox = makeSandbox(t);
-  const env = envFor(sandbox);
+  const env = childEnv(sandbox);
   const failed = seedJob(sandbox, sandbox.workDir, ["legacy log failure"], { FAKE_GROK_MODE: "error" });
   assert.notStrictEqual(failed.status, 0);
   const [record] = jobRecords(sandbox.dataDir);
@@ -192,7 +196,7 @@ test("stats reclassifies a legacy quota failure from its bounded job log", (t) =
 
 test("stats aggregates legacy camelCase model usage without double counting cached input", (t) => {
   const sandbox = makeSandbox(t);
-  const env = envFor(sandbox);
+  const env = childEnv(sandbox);
   assert.strictEqual(seedJob(sandbox, sandbox.workDir, ["legacy usage"]).status, 0);
   const [record] = jobRecords(sandbox.dataDir);
   delete record.usage;
@@ -229,7 +233,7 @@ test("stats aggregates legacy camelCase model usage without double counting cach
 
 test("stats excludes partial direct usage from exact totals", (t) => {
   const sandbox = makeSandbox(t);
-  const env = envFor(sandbox);
+  const env = childEnv(sandbox);
   assert.strictEqual(seedJob(sandbox, sandbox.workDir, ["partial direct usage"]).status, 0);
   const [record] = jobRecords(sandbox.dataDir);
   record.usage = { input_tokens: 12, output_tokens: 3 };
@@ -263,7 +267,7 @@ test("stats excludes fractional and inconsistent token reports from exact totals
     ["reasoning exceeds output", { input_tokens: 120, cache_read_input_tokens: 30, output_tokens: 20, reasoning_tokens: 21, total_tokens: 170 }]
   ]) {
     const sandbox = makeSandbox(t);
-    const env = envFor(sandbox);
+    const env = childEnv(sandbox);
     assert.strictEqual(seedJob(sandbox, sandbox.workDir, [`${label} token usage`]).status, 0);
     const [record] = jobRecords(sandbox.dataDir);
     record.usage = usage;
@@ -285,7 +289,7 @@ test("stats excludes fractional and inconsistent token reports from exact totals
 
 test("stats fail closed when individually safe token totals overflow during aggregation", (t) => {
   const sandbox = makeSandbox(t);
-  const env = envFor(sandbox);
+  const env = childEnv(sandbox);
   assert.strictEqual(seedJob(sandbox, sandbox.workDir, ["first large token report"]).status, 0);
   assert.strictEqual(seedJob(sandbox, sandbox.workDir, ["second large token report"]).status, 0);
   for (const record of jobRecords(sandbox.dataDir)) {
@@ -315,7 +319,7 @@ test("stats fail closed when individually safe token totals overflow during aggr
 
 test("stats fail closed when individually safe cost ticks overflow during aggregation", (t) => {
   const sandbox = makeSandbox(t);
-  const env = envFor(sandbox);
+  const env = childEnv(sandbox);
   assert.strictEqual(seedJob(sandbox, sandbox.workDir, ["first large cost"], { FAKE_GROK_MODE: "metrics-complete" }).status, 0);
   assert.strictEqual(seedJob(sandbox, sandbox.workDir, ["second large cost"], { FAKE_GROK_MODE: "metrics-complete" }).status, 0);
   for (const record of jobRecords(sandbox.dataDir)) {
@@ -339,7 +343,7 @@ test("stats fail closed when individually safe cost ticks overflow during aggreg
 
 test("stats excludes exact cost when model usage is explicitly incomplete", (t) => {
   const sandbox = makeSandbox(t);
-  const env = envFor(sandbox);
+  const env = childEnv(sandbox);
   assert.strictEqual(seedJob(sandbox, sandbox.workDir, ["incomplete model usage cost"], { FAKE_GROK_MODE: "metrics-complete" }).status, 0);
   const [record] = jobRecords(sandbox.dataDir);
   record.modelUsageIsIncomplete = true;
@@ -360,7 +364,7 @@ test("stats excludes exact cost when model usage is explicitly incomplete", (t) 
 
 test("stats treats a full-shaped CLI usage report marked incomplete as incomplete", (t) => {
   const sandbox = makeSandbox(t);
-  const env = envFor(sandbox);
+  const env = childEnv(sandbox);
   assert.strictEqual(
     seedJob(sandbox, sandbox.workDir, ["flagged incomplete usage"], { FAKE_GROK_MODE: "usage-incomplete-ok" }).status,
     0
@@ -384,7 +388,7 @@ test("stats treats a full-shaped CLI usage report marked incomplete as incomplet
 
 test("partial unflagged CLI usage is recorded as incomplete", (t) => {
   const sandbox = makeSandbox(t);
-  const env = envFor(sandbox);
+  const env = childEnv(sandbox);
   assert.strictEqual(
     seedJob(sandbox, sandbox.workDir, ["partial unflagged usage"], { FAKE_GROK_MODE: "usage-partial-unflagged" }).status,
     0
@@ -407,7 +411,7 @@ test("partial unflagged CLI usage is recorded as incomplete", (t) => {
 
 test("stats excludes all per-model totals when any reported model is incomplete", (t) => {
   const sandbox = makeSandbox(t);
-  const env = envFor(sandbox);
+  const env = childEnv(sandbox);
   assert.strictEqual(seedJob(sandbox, sandbox.workDir, ["partial model usage"]).status, 0);
   const [record] = jobRecords(sandbox.dataDir);
   record.usage = null;

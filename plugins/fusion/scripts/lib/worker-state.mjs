@@ -7,7 +7,8 @@ const DATA_DIR_ENV = "FUSION_DATA_DIR";
 const WORKER_STATE_ENV = "FUSION_WORKER_STATE_DIR";
 const LOCK_STALE_MS = 30_000;
 const LOCK_WAIT_MS = 10;
-const LOCK_TIMEOUT_MS = 2_000;
+export const DEFAULT_LOCK_TIMEOUT_MS = 5_000;
+const LOCK_TIMEOUT_ENV = "FUSION_LOCK_TIMEOUT_MS";
 const TRANSCRIPT_CHUNK_BYTES = 1024 * 1024;
 const TRANSCRIPT_REFRESH_BYTES = 8 * TRANSCRIPT_CHUNK_BYTES;
 const TRANSCRIPT_CARRY_BYTES = 256 * 1024;
@@ -28,6 +29,15 @@ const AGENT_TYPES = new Map([
   ["job-collector", "fusion:job-collector"]
 ]);
 
+export function resolveLockTimeoutMs(env = process.env) {
+  const raw = env[LOCK_TIMEOUT_ENV];
+  if (raw === undefined || raw === null || (typeof raw === "string" && !String(raw).trim())) {
+    return DEFAULT_LOCK_TIMEOUT_MS;
+  }
+  const parsed = typeof raw === "number" ? raw : Number(String(raw).trim());
+  return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : DEFAULT_LOCK_TIMEOUT_MS;
+}
+
 function waitForLock() {
   Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, LOCK_WAIT_MS);
 }
@@ -40,7 +50,7 @@ function acquireLock(file) {
     void 0;
   }
   const lockFile = `${file}.lock`;
-  const deadline = Date.now() + LOCK_TIMEOUT_MS;
+  const deadline = Date.now() + resolveLockTimeoutMs();
   for (;;) {
     try {
       const descriptor = fs.openSync(lockFile, fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_WRONLY, 0o600);
@@ -246,6 +256,7 @@ export function createWorkerRecord(record, env = process.env) {
       turnIds: [],
       toolUseIds: [],
       transcriptPath: null,
+      outputFile: record.outputFile ?? null,
       transcriptOffset: 0,
       transcriptCarry: "",
       transcriptSkippingLine: false,

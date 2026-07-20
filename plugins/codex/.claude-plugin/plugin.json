@@ -2,7 +2,7 @@
   "$schema": "https://json.schemastore.org/claude-code-plugin-manifest.json",
   "name": "codex",
   "displayName": "Codex Companion",
-  "version": "0.0.27",
+  "version": "0.0.28",
   "description": "First party local Codex CLI delegation for tasks, reviews, resumable threads, and durable background jobs.",
   "author": {
     "name": "Harry Yep"
@@ -10,5 +10,11 @@
   "homepage": "https://github.com/okisdev/claude-code-fusion",
   "repository": "https://github.com/okisdev/claude-code-fusion",
   "license": "MIT",
-  "keywords": ["codex", "openai", "delegation", "code-review", "orchestration"]
+  "keywords": [
+    "codex",
+    "openai",
+    "delegation",
+    "code-review",
+    "orchestration"
+  ]
 }

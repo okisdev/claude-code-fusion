@@ -1297,7 +1297,7 @@ function readResolvedSessionMetadata(cwd, sessionId, env) {
   return matching.length === 1 ? readSessionSummary(matching[0]) : null;
 }
 
-function resolvedOutputMetadata(parsed, cwd, env) {
+export function resolvedOutputMetadata(parsed, cwd, env = process.env) {
   const sessionId = normalizeGrokSessionId(stringField(parsed, "sessionId", "session_id"));
   const summary = readResolvedSessionMetadata(cwd, sessionId, env);
   const modelUsage = objectField(parsed, "modelUsage", "model_usage");
@@ -1312,6 +1312,35 @@ function resolvedOutputMetadata(parsed, cwd, env) {
       stringField(parsed, "effort", "reasoningEffort", "reasoning_effort") ??
       stringField(parsed?._meta, "effort", "reasoningEffort", "reasoning_effort") ??
       summary?.effort
+  };
+}
+
+export function terminalRecordAttribution(record, patch = {}, env = process.env) {
+  const resultPayload = patch?.resultPayload ?? record?.resultPayload;
+  const partialEnvelope =
+    patch?.parsedEnvelope ??
+    patch?.partialEnvelope ??
+    (resultPayload && typeof resultPayload === "object" && !Array.isArray(resultPayload) ? resultPayload : null);
+  const sessionId =
+    patch?.sessionId ??
+    partialEnvelope?.sessionId ??
+    partialEnvelope?.session_id ??
+    record?.sessionId ??
+    record?.request?.resumeSessionId ??
+    null;
+  const resolved = resolvedOutputMetadata(
+    {
+      ...partialEnvelope,
+      sessionId,
+      model: patch?.resolvedModel ?? partialEnvelope?.model ?? partialEnvelope?.resolvedModel ?? record?.resolvedModel ?? undefined,
+      effort: patch?.resolvedEffort ?? partialEnvelope?.effort ?? partialEnvelope?.resolvedEffort ?? record?.resolvedEffort ?? undefined
+    },
+    record?.cwd,
+    env
+  );
+  return {
+    resolvedModel: patch?.resolvedModel ?? record?.resolvedModel ?? resolved.model ?? record?.request?.model ?? null,
+    resolvedEffort: patch?.resolvedEffort ?? record?.resolvedEffort ?? resolved.effort ?? record?.request?.effort ?? null
   };
 }
 
