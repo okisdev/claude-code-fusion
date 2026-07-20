@@ -1061,10 +1061,14 @@ function handleStop(input, env) {
     return;
   }
   if (inFlight.length > 0) {
-    writeOutput(hookOutput("Stop", `Fusion task${inFlight.length === 1 ? "" : "s"} ${inFlight.map((record) => record.taskId).join(", ")} ${inFlight.length === 1 ? "is" : "are"} still in flight. Collection is armed and will be required after terminal notification.`));
+    if (!input.stop_hook_active) {
+      writeOutput(hookOutput("Stop", `Fusion task${inFlight.length === 1 ? "" : "s"} ${inFlight.map((record) => record.taskId).join(", ")} ${inFlight.length === 1 ? "is" : "are"} still in flight. Collection is armed and will be required after terminal notification.`));
+    }
     return;
   }
-  writeAcceptanceAdvisory(input.session_id, env);
+  if (!input.stop_hook_active) {
+    writeAcceptanceAdvisory(input.session_id, env);
+  }
 }
 
 function handleSessionEnd(input, env) {

@@ -5,7 +5,7 @@ import { createHash } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 import {
   FILE_ENGINE_DESCRIPTORS,
@@ -19,7 +19,6 @@ import {
   tokenUsageSidecarPath,
   workspaceRootsShareRepository
 } from "./fusion-stats.mjs";
-import { repairRunningRecordSync, runningRecordNeedsReconciliation } from "../../codex/scripts/codex-companion.mjs";
 
 const CURRENT_TERMINAL_STATUSES = new Set(["done", "error", "cancelled"]);
 const LEGACY_TERMINAL_STATUSES = new Set(["completed", "failed"]);
@@ -29,11 +28,95 @@ const INTERVAL_ENV = "CODEX_JOBS_MONITOR_INTERVAL_MS";
 const PS_COMMAND_ENV = "CODEX_JOBS_MONITOR_PS_COMMAND";
 const SESSIONS_DIR_ENV = "CODEX_JOBS_MONITOR_SESSIONS_DIR";
 const SESSION_ID_ENV = "CLAUDE_CODE_SESSION_ID";
+const CODEX_COMPANION_ENV = "FUSION_CODEX_COMPANION";
 const ERROR_MESSAGE_MAX_LENGTH = 80;
 const DEAD_STATUS_KEY = "dead";
 const RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
 const MODEL_AUDIT_FILENAME = "model-audit.jsonl";
 const TERMINAL_LEDGER_SCHEMA_VERSION = 3;
+const REPAIR_UNAVAILABLE_LINE =
+  "codex jobs monitor: companion repair unavailable; running in announce-only mode";
+
+function isRegularFile(candidate) {
+  try {
+    return fs.statSync(candidate).isFile();
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Resolve codex-companion.mjs for running-record repair.
+ * Order: (a) FUSION_CODEX_COMPANION when set to an absolute regular file,
+ * (b) repo-relative sibling ../../codex/scripts/codex-companion.mjs,
+ * (c) installed-cache ../../../codex/<version>/scripts/codex-companion.mjs
+ *     preferring the fusion plugin version directory name, else lex-latest.
+ */
+export function resolveCodexCompanionPath(env = process.env, selfPath = fileURLToPath(import.meta.url)) {
+  const override = typeof env[CODEX_COMPANION_ENV] === "string" ? env[CODEX_COMPANION_ENV].trim() : "";
+  if (override) {
+    // Same semantics as job-collect: when set, only an absolute regular file is accepted.
+    // Invalid overrides do not fall through; the monitor degrades to announce-only instead of throwing.
+    return path.isAbsolute(override) && isRegularFile(override) ? override : null;
+  }
+
+  const scriptsDir = path.dirname(selfPath);
+  const sibling = path.resolve(scriptsDir, "..", "..", "codex", "scripts", "codex-companion.mjs");
+  if (isRegularFile(sibling)) {
+    return sibling;
+  }
+
+  // Installed cache: .../claude-code-fusion/fusion/<version>/scripts/<this>
+  //               -> .../claude-code-fusion/codex/<version>/scripts/codex-companion.mjs
+  const fusionVersionDir = path.dirname(scriptsDir);
+  const fusionVersion = path.basename(fusionVersionDir);
+  const cacheRoot = path.dirname(path.dirname(fusionVersionDir));
+  const codexBase = path.join(cacheRoot, "codex");
+
+  const preferred = path.join(codexBase, fusionVersion, "scripts", "codex-companion.mjs");
+  if (isRegularFile(preferred)) {
+    return preferred;
+  }
+
+  try {
+    const versions = fs
+      .readdirSync(codexBase, { withFileTypes: true })
+      .filter((entry) => entry.isDirectory())
+      .map((entry) => entry.name)
+      .sort((left, right) => right.localeCompare(left));
+    for (const version of versions) {
+      const candidate = path.join(codexBase, version, "scripts", "codex-companion.mjs");
+      if (isRegularFile(candidate)) {
+        return candidate;
+      }
+    }
+  } catch {
+    void 0;
+  }
+  return null;
+}
+
+async function loadCompanionRepair(env = process.env, selfPath = fileURLToPath(import.meta.url)) {
+  const companionPath = resolveCodexCompanionPath(env, selfPath);
+  if (!companionPath) {
+    return null;
+  }
+  try {
+    const mod = await import(pathToFileURL(companionPath).href);
+    if (
+      typeof mod.repairRunningRecordSync !== "function" ||
+      typeof mod.runningRecordNeedsReconciliation !== "function"
+    ) {
+      return null;
+    }
+    return {
+      repairRunningRecordSync: mod.repairRunningRecordSync,
+      runningRecordNeedsReconciliation: mod.runningRecordNeedsReconciliation
+    };
+  } catch {
+    return null;
+  }
+}
 
 function resolvePollIntervalMs(env = process.env) {
   const raw = env[INTERVAL_ENV];
@@ -730,7 +813,11 @@ function installExitHandlers(timer) {
   });
 }
 
-function main() {
+async function main() {
+  const repair = await loadCompanionRepair();
+  if (!repair) {
+    safeWriteLine(REPAIR_UNAVAILABLE_LINE);
+  }
   const root = resolveStateRoot();
   const cwd = process.cwd();
   const workspaceRoot = resolveWorkspaceRoot(cwd);
@@ -761,12 +848,12 @@ function main() {
       }
       liveIds.add(record.id);
       let reconciled = false;
-      if (!TERMINAL_STATUSES.has(record.status) && runningRecordNeedsReconciliation(record)) {
+      if (repair && !TERMINAL_STATUSES.has(record.status) && repair.runningRecordNeedsReconciliation(record)) {
         if (!belongsToMonitorSession(record, ownSessionId) || terminalJobIds.has(record.id)) {
           continue;
         }
         try {
-          record = repairRunningRecordSync({ record, file: entry.file });
+          record = repair.repairRunningRecordSync({ record, file: entry.file });
         } catch {
           continue;
         }
@@ -841,5 +928,12 @@ function main() {
 }
 
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
-  main();
+  main().catch((error) => {
+    try {
+      process.stderr.write(`${error?.stack || error}\n`);
+    } catch {
+      void 0;
+    }
+    process.exit(1);
+  });
 }

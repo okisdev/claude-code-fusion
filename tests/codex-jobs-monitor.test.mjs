@@ -69,6 +69,7 @@ function seedJob(sandbox, fields = {}, { workspace = "ws", workspaceRoot } = {})
 function envFor(sandbox, extra = {}) {
   const env = { ...process.env };
   delete env.CLAUDE_CODE_SESSION_ID;
+  delete env.FUSION_CODEX_COMPANION;
   return {
     ...env,
     FUSION_CODEX_STATE: sandbox.stateRoot,
@@ -79,8 +80,8 @@ function envFor(sandbox, extra = {}) {
   };
 }
 
-function startMonitor(sandbox, env, { cwd = sandbox.workDir } = {}) {
-  const child = spawn(process.execPath, [monitorScript], {
+function startMonitor(sandbox, env, { cwd = sandbox.workDir, script = monitorScript } = {}) {
+  const child = spawn(process.execPath, [script], {
     cwd,
     env,
     stdio: ["ignore", "pipe", "pipe"],
@@ -1321,4 +1322,54 @@ test("legacy announcement arrays migrate to the structured terminal ledger", asy
   assert.ok(migrated.keys.includes("legacy-completed:completed"));
   assert.ok(migrated.records.some((entry) => entry.jobId === "legacy-completed" && entry.tokenUsageAvailability === "unavailable"));
   assert.strictEqual(migrated.records.some((entry) => entry.jobId === "legacy-dead"), false);
+});
+
+const REPAIR_UNAVAILABLE_LINE =
+  "codex jobs monitor: companion repair unavailable; running in announce-only mode";
+
+function installCacheShapedMonitor(sandbox, { version = "0.0.28", includeCodex = true } = {}) {
+  const cacheRoot = path.join(sandbox.root, "cache", "claude-code-fusion");
+  const fusionScriptsSrc = path.join(repoRoot, "plugins", "fusion", "scripts");
+  const fusionScriptsDst = path.join(cacheRoot, "fusion", version, "scripts");
+  fs.cpSync(fusionScriptsSrc, fusionScriptsDst, { recursive: true });
+  if (includeCodex) {
+    const codexScriptsSrc = path.join(repoRoot, "plugins", "codex", "scripts");
+    const codexScriptsDst = path.join(cacheRoot, "codex", version, "scripts");
+    fs.cpSync(codexScriptsSrc, codexScriptsDst, { recursive: true });
+  }
+  return path.join(fusionScriptsDst, "codex-jobs-monitor.mjs");
+}
+
+async function assertMonitorStaysAlive(monitor, { windowMs = 400 } = {}) {
+  await new Promise((resolve) => setTimeout(resolve, windowMs));
+  assert.strictEqual(monitor.child.exitCode, null, `monitor exited early: ${monitor.stderr() || monitor.lines().join("\n")}`);
+  assert.strictEqual(monitor.child.signalCode, null);
+}
+
+test("installed cache layout resolves companion repair and stays alive", async (t) => {
+  const sandbox = makeSandbox(t);
+  const script = installCacheShapedMonitor(sandbox, { version: "0.0.28", includeCodex: true });
+  seedJob(sandbox, { status: "running" });
+  const monitor = startMonitor(sandbox, envFor(sandbox), { script });
+  t.after(() => monitor.child.kill("SIGKILL"));
+
+  await waitUntil(() => (monitor.started() ? true : null));
+  await assertMonitorStaysAlive(monitor);
+  assert.ok(
+    !monitor.lines().includes(REPAIR_UNAVAILABLE_LINE),
+    `expected repair to resolve; lines=${JSON.stringify(monitor.lines())} stderr=${monitor.stderr()}`
+  );
+});
+
+test("installed cache layout without codex companion starts in announce-only mode", async (t) => {
+  const sandbox = makeSandbox(t);
+  const script = installCacheShapedMonitor(sandbox, { version: "0.0.28", includeCodex: false });
+  seedJob(sandbox, { status: "running" });
+  const monitor = startMonitor(sandbox, envFor(sandbox), { script });
+  t.after(() => monitor.child.kill("SIGKILL"));
+
+  await waitUntil(() => (monitor.lines().includes(REPAIR_UNAVAILABLE_LINE) ? true : null));
+  await assertMonitorStaysAlive(monitor);
+  assert.strictEqual(monitor.child.exitCode, null);
+  assert.ok(monitor.lines().includes(REPAIR_UNAVAILABLE_LINE));
 });

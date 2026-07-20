@@ -1,5 +1,10 @@
 # changelog
 
+## 0.0.29
+
+- the codex jobs monitor survives the installed plugin layout: the static cross plugin import of the codex companion (valid only in the repo checkout) becomes a startup time resolution that tries the `FUSION_CODEX_COMPANION` override, the repo relative sibling, then the installed cache's versioned codex directories, and a failed resolution degrades the monitor to announce only mode instead of crashing every new session; a cache layout hermeticity test reproduces the installed shape so this defect family cannot land silently again
+- the Stop gate advisory honors `stop_hook_active`: the in flight armed collection advisory and the acceptance advisory emit once per stop chain and then return silent success on hook driven continuations, ending the advisory ping pong that re woke the model until the harness's nine block override cap fired; blocking outcomes (cancel demands, terminal uncollected collection, collector gates) are unchanged
+
 ## 0.0.28
 
 - advisory stop rounds stop consuming the cancellation budget: a healthy in flight worker survives any number of armed collection wakeups while real budget failures and terminal uncollected results still escalate, and collection retires the reaping race by making a full file `Read` of the persisted `outputFile` the primary path with footer capture, async launch receipts stamping `startedAt` and the output file location, and an env gated raw response debug capture
