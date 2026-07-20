@@ -1,9 +1,14 @@
 #!/usr/bin/env node
 (async () => {
   const fs = await import("node:fs");
-  const os = await import("node:os");
   const path = await import("node:path");
   const childProcess = await import("node:child_process");
+
+  if (!process.env.GROK_HOME) {
+    process.stderr.write("FAKE_GROK requires GROK_HOME under test.\n");
+    process.exit(2);
+  }
+  const grokHome = path.resolve(process.cwd(), process.env.GROK_HOME);
 
   const argsFile = process.env.FAKE_GROK_ARGS_FILE;
   if (argsFile) {
@@ -50,9 +55,6 @@
     if (Number.isFinite(sandboxEventDelayMs) && sandboxEventDelayMs > 0) {
       await new Promise((resolve) => setTimeout(resolve, sandboxEventDelayMs));
     }
-    const grokHome = Object.hasOwn(process.env, "GROK_HOME")
-      ? path.resolve(process.cwd(), process.env.GROK_HOME)
-      : path.join(os.homedir(), ".grok");
     const eventFile = path.join(grokHome, "sandbox-events.jsonl");
     fs.mkdirSync(grokHome, { recursive: true });
     if (mode === "sandbox-log-rotate" && fs.existsSync(eventFile)) {
@@ -99,8 +101,32 @@
     }
   }
   let stdin = "";
-  for await (const chunk of process.stdin) {
-    stdin += chunk.toString();
+  let stdinDrainTimedOut = false;
+  let stdinDrainTimer = null;
+  const stdinDrain = (async () => {
+    try {
+      for await (const chunk of process.stdin) {
+        stdin += chunk.toString();
+      }
+    } catch (error) {
+      if (!stdinDrainTimedOut) throw error;
+    }
+  })();
+  let stdinClosed;
+  try {
+    stdinClosed = await Promise.race([
+      stdinDrain.then(() => true),
+      new Promise((resolve) => {
+        stdinDrainTimer = setTimeout(() => resolve(false), 3000);
+      }),
+    ]);
+  } finally {
+    clearTimeout(stdinDrainTimer);
+  }
+  if (!stdinClosed) {
+    stdinDrainTimedOut = true;
+    process.stdin.destroy();
+    await stdinDrain;
   }
   if (process.env.FAKE_GROK_STDIN_FILE) {
     fs.writeFileSync(process.env.FAKE_GROK_STDIN_FILE, stdin, "utf8");
@@ -138,9 +164,9 @@
   };
 
   const emit = (envelope) => {
-    if (envelope.sessionId && process.env.GROK_HOME && (process.env.FAKE_GROK_RESOLVED_MODEL || process.env.FAKE_GROK_RESOLVED_EFFORT)) {
+    if (envelope.sessionId && (process.env.FAKE_GROK_RESOLVED_MODEL || process.env.FAKE_GROK_RESOLVED_EFFORT)) {
       const encodedCwd = encodeURIComponent(process.cwd()).replace(/[!'()*]/g, (character) => `%${character.charCodeAt(0).toString(16).toUpperCase()}`);
-      const sessionsRoot = path.join(process.env.GROK_HOME, "sessions");
+      const sessionsRoot = path.join(grokHome, "sessions");
       const cwdDirectory = Buffer.byteLength(encodedCwd) <= 255
         ? encodedCwd
         : `fixture-${envelope.sessionId.slice(0, 16)}`;
@@ -654,6 +680,11 @@
     process.exit(1);
   }
 
+  if (mode === "result-text-402-error") {
+    process.stdout.write("API error (status 402 Payment Required): Grok Build usage balance exhausted\n");
+    process.exit(1);
+  }
+
   if (mode === "operation-not-permitted") {
     process.stderr.write("Error:\nOperation not permitted (os error 1)\n");
     process.exit(1);
@@ -752,7 +783,19 @@
 
   if (mode === "delayed-stderr-hang") {
     process.on("SIGTERM", () => process.exit(143));
-    setTimeout(() => process.stderr.write("delayed runtime log\n"), 500);
+    const stderrGateFile = process.env.FAKE_GROK_STDERR_GATE_FILE;
+    if (stderrGateFile) {
+      const emitStderrWhenReleased = () => {
+        if (!fs.existsSync(stderrGateFile)) {
+          setTimeout(emitStderrWhenReleased, 10);
+          return;
+        }
+        process.stderr.write("delayed runtime log\n");
+      };
+      emitStderrWhenReleased();
+    } else {
+      setTimeout(() => process.stderr.write("delayed runtime log\n"), 500);
+    }
     setTimeout(() => process.exit(0), 120000);
     return;
   }

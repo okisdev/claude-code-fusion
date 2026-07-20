@@ -200,7 +200,10 @@ test("a persisted leader identity cannot authorize signaling a leaderless proces
   const identity = getProcessIdentity(leader.pid);
   assert.ok(identity);
   process.kill(leader.pid, "SIGKILL");
-  await waitUntil(() => getProcessIdentity(leader.pid) === null && isProcessAlive(leader.pid));
+  await waitForProcessExit(leader.pid, false);
+  assert.equal(isProcessAlive(leader.pid, null, false), false);
+  assert.equal(isProcessAlive(leader.pid), true);
+  assert.equal(isProcessAlive(childPid, null, false), true);
   assert.equal(await terminateProcessTree(leader.pid, { identity, ownsProcessGroup: true, requireIdentity: true, graceMs: 20 }), false);
   assert.equal(isProcessAlive(childPid, null, false), true);
 });

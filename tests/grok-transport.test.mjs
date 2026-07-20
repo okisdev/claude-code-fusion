@@ -353,6 +353,29 @@ test("status, history, result, cancel, stats, and setup parse staged raw argumen
   }
 });
 
+test("task records valid Fusion roles and rejects invalid role values", (t) => {
+  const sandbox = makeSandbox(t);
+  const env = envFor(sandbox);
+  const valid = runCompanion(["task", "--json", "fusion-brief: v1\ngrok-role: live-web\nResearch the current API."], {
+    cwd: sandbox.workDir,
+    env
+  });
+  const invalid = runCompanion(["task", "--json", "fusion-brief: v1\ngrok-role: unsupported\nResearch the current API."], {
+    cwd: sandbox.workDir,
+    env
+  });
+
+  assert.equal(valid.status, 0, valid.stderr);
+  assert.equal(invalid.status, 0, invalid.stderr);
+  const recordsById = new Map(jobRecords(sandbox.dataDir).map((record) => [record.id, record]));
+  const validRecord = recordsById.get(JSON.parse(valid.stdout).jobId);
+  const invalidRecord = recordsById.get(JSON.parse(invalid.stdout).jobId);
+  assert.equal(validRecord.role, "live-web");
+  assert.equal(validRecord.request.role, "live-web");
+  assert.equal(invalidRecord.role, null);
+  assert.equal(invalidRecord.request.role, null);
+});
+
 test("fixed best-of-n transport defaults preserve opaque prompts and accept the slash command n alias", (t) => {
   const sandbox = makeSandbox(t);
   const stdinLog = path.join(sandbox.root, "best-of-n-stdin.jsonl");

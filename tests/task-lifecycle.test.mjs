@@ -515,7 +515,11 @@ test("background task failure ends in an error record", async (t) => {
 
 test("a background task records its terminal failure when the job log is unwritable", async (t) => {
   const sandbox = makeSandbox(t);
-  const env = envFor(sandbox, { FAKE_GROK_MODE: "delayed-stderr-hang" });
+  const stderrGateFile = path.join(sandbox.root, "release-stderr");
+  const env = envFor(sandbox, {
+    FAKE_GROK_MODE: "delayed-stderr-hang",
+    FAKE_GROK_STDERR_GATE_FILE: stderrGateFile,
+  });
   const launch = runCompanion(["task", "--background", "unwritable log"], {
     cwd: sandbox.workDir,
     env,
@@ -530,6 +534,7 @@ test("a background task records its terminal failure when the job log is unwrita
     killGroups(running.pid);
   });
   fs.mkdirSync(jobLogPath(sandbox.dataDir, sandbox.workDir, running.id));
+  fs.writeFileSync(stderrGateFile, "");
 
   const failed = await waitFor(() => {
     const current = jobRecords(sandbox.dataDir)[0];

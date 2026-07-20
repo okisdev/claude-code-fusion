@@ -65,6 +65,10 @@ function startMonitor(sandbox, env) {
     env,
     stdio: ["ignore", "pipe", "pipe"],
   });
+  let started = false;
+  child.once("spawn", () => {
+    started = true;
+  });
   let stdout = "";
   child.stdout.on("data", (chunk) => {
     stdout += chunk.toString("utf8");
@@ -83,12 +87,13 @@ function startMonitor(sandbox, env) {
   });
   return {
     child,
+    started: () => started,
     lines: () => stdout.split("\n").filter(Boolean),
     stderr: () => stderr,
   };
 }
 
-async function waitUntil(predicate, { timeoutMs = 5000, intervalMs = 25 } = {}) {
+async function waitUntil(predicate, { timeoutMs = 5000, pollMs = 25 } = {}) {
   const deadline = Date.now() + timeoutMs;
   for (;;) {
     const value = predicate();
@@ -98,15 +103,34 @@ async function waitUntil(predicate, { timeoutMs = 5000, intervalMs = 25 } = {}) 
     if (Date.now() >= deadline) {
       throw new Error("Timed out waiting for condition.");
     }
-    await new Promise((resolve) => setTimeout(resolve, intervalMs));
+    await new Promise((resolve) => setTimeout(resolve, pollMs));
   }
 }
 
+function readAnnouncedLedger(sandbox, sessionId = null) {
+  try {
+    return JSON.parse(fs.readFileSync(announcedPath(sandbox, sessionId), "utf8"));
+  } catch {
+    return null;
+  }
+}
+
+async function waitForAnnouncement(sandbox, key, sessionId = null) {
+  return waitUntil(() => {
+    const ledger = readAnnouncedLedger(sandbox, sessionId);
+    return ledger?.keys.includes(key) ? ledger : null;
+  });
+}
+
 test("a pre-existing terminal job emits nothing on startup", async (t) => {
+  if (process.platform === "win32") {
+    t.skip("POSIX file mode assertions are unsupported on Windows.");
+    return;
+  }
   const sandbox = makeSandbox(t);
-  seedJob(sandbox, { status: "done", finishedAt: new Date().toISOString() });
+  const { record } = seedJob(sandbox, { status: "done", finishedAt: new Date().toISOString() });
   const monitor = startMonitor(sandbox, envFor(sandbox));
-  await new Promise((resolve) => setTimeout(resolve, 600));
+  await waitForAnnouncement(sandbox, announcedKey(sandbox.workDir, record.id, "done"));
   assert.deepStrictEqual(monitor.lines(), []);
   const ledger = announcedPath(sandbox);
   assert.strictEqual(fs.statSync(ledger).mode & 0o777, 0o600);
@@ -133,7 +157,7 @@ test("a background job transitioning to done emits exactly one correctly shaped 
   const sandbox = makeSandbox(t);
   const { file, record } = seedJob(sandbox, { status: "running", background: true });
   const monitor = startMonitor(sandbox, envFor(sandbox, { GROK_JOBS_MONITOR_INTERVAL_MS: "100" }));
-  await new Promise((resolve) => setTimeout(resolve, 300));
+  await waitUntil(() => readAnnouncedLedger(sandbox));
   assert.deepStrictEqual(monitor.lines(), []);
 
   writeJobRecordFile(file, {
@@ -150,7 +174,7 @@ test("a background job transitioning to done emits exactly one correctly shaped 
     `grok job ${record.id} done. collect with /grok:result ${record.id} only if you launched it detached; a job owned by a subagent reports on its own`
   );
 
-  await new Promise((resolve) => setTimeout(resolve, 300));
+  await waitForAnnouncement(sandbox, announcedKey(sandbox.workDir, record.id, "done"));
   assert.strictEqual(monitor.lines().length, 1);
 });
 
@@ -161,7 +185,7 @@ test("a corrupt job record does not mute announcements for healthy records", asy
   fs.writeFileSync(path.join(jobsDir(sandbox.dataDir, sandbox.workDir), `${corruptId}.json`), "{not json\n", "utf8");
   fs.writeFileSync(announcedPath(sandbox), `${JSON.stringify(announcedLedger([announcedKey(sandbox.workDir, corruptId, "done")]))}\n`, "utf8");
   const monitor = startMonitor(sandbox, envFor(sandbox));
-  await new Promise((resolve) => setTimeout(resolve, 300));
+  await waitForAnnouncement(sandbox, announcedKey(sandbox.workDir, corruptId, "done"));
 
   writeJobRecordFile(file, {
     ...record,
@@ -188,7 +212,7 @@ test("a malformed terminal record does not mute announcements for healthy record
   const { file, record } = seedJob(sandbox, { id: "zzzz-healthy-record", status: "running", background: true });
   fs.writeFileSync(announcedPath(sandbox), `${JSON.stringify(announcedLedger())}\n`, "utf8");
   const monitor = startMonitor(sandbox, envFor(sandbox));
-  await new Promise((resolve) => setTimeout(resolve, 300));
+  await waitUntil(() => readAnnouncedLedger(sandbox)?.version === ANNOUNCED_LEDGER_VERSION);
 
   writeJobRecordFile(file, {
     ...record,
@@ -208,7 +232,7 @@ test("a foreground job transitioning to done is not announced", async (t) => {
   const sandbox = makeSandbox(t);
   const { file, record } = seedJob(sandbox, { status: "running", background: false });
   const monitor = startMonitor(sandbox, envFor(sandbox));
-  await new Promise((resolve) => setTimeout(resolve, 300));
+  await waitUntil(() => readAnnouncedLedger(sandbox));
 
   writeJobRecordFile(file, {
     ...record,
@@ -217,7 +241,7 @@ test("a foreground job transitioning to done is not announced", async (t) => {
     resultText: "ALLOW",
   });
 
-  await new Promise((resolve) => setTimeout(resolve, 600));
+  await waitForAnnouncement(sandbox, announcedKey(sandbox.workDir, record.id, "done"));
   assert.deepStrictEqual(monitor.lines(), []);
 });
 
@@ -225,7 +249,7 @@ test("a managed background job stays silent during its owner collection grace", 
   const sandbox = makeSandbox(t);
   const { file, record } = seedJob(sandbox, { status: "running", background: true, delivery: "managed" });
   const monitor = startMonitor(sandbox, envFor(sandbox));
-  await new Promise((resolve) => setTimeout(resolve, 300));
+  await waitUntil(() => readAnnouncedLedger(sandbox));
 
   writeJobRecordFile(file, {
     ...record,
@@ -242,7 +266,7 @@ test("an uncollected managed background job is announced after its owner grace",
   const sandbox = makeSandbox(t);
   const { file, record } = seedJob(sandbox, { status: "running", background: true, delivery: "managed" });
   const monitor = startMonitor(sandbox, envFor(sandbox, { GROK_JOBS_MONITOR_MANAGED_GRACE_MS: "100" }));
-  await new Promise((resolve) => setTimeout(resolve, 300));
+  await waitUntil(() => readAnnouncedLedger(sandbox));
 
   writeJobRecordFile(file, {
     ...record,
@@ -262,7 +286,7 @@ test("an invalid managed completion timestamp falls back to the creation timesta
   const sandbox = makeSandbox(t);
   const { file, record } = seedJob(sandbox, { status: "running", background: true, delivery: "managed" });
   const monitor = startMonitor(sandbox, envFor(sandbox, { GROK_JOBS_MONITOR_MANAGED_GRACE_MS: "1000" }));
-  await new Promise((resolve) => setTimeout(resolve, 300));
+  await waitUntil(() => readAnnouncedLedger(sandbox));
 
   writeJobRecordFile(file, {
     ...record,
@@ -280,7 +304,7 @@ test("a collected managed background job remains silent after its owner grace", 
   const sandbox = makeSandbox(t);
   const { file, record } = seedJob(sandbox, { status: "running", background: true, delivery: "managed" });
   const monitor = startMonitor(sandbox, envFor(sandbox, { GROK_JOBS_MONITOR_MANAGED_GRACE_MS: "0" }));
-  await new Promise((resolve) => setTimeout(resolve, 300));
+  await waitUntil(() => readAnnouncedLedger(sandbox));
 
   writeJobRecordFile(file, {
     ...record,
@@ -290,7 +314,7 @@ test("a collected managed background job remains silent after its owner grace", 
     resultText: "ALLOW",
   });
 
-  await new Promise((resolve) => setTimeout(resolve, 600));
+  await waitForAnnouncement(sandbox, announcedKey(sandbox.workDir, record.id, "done"));
   assert.deepStrictEqual(monitor.lines(), []);
 });
 
@@ -298,7 +322,7 @@ test("a foreground job transitioning to error is not announced", async (t) => {
   const sandbox = makeSandbox(t);
   const { file, record } = seedJob(sandbox, { status: "running", background: false });
   const monitor = startMonitor(sandbox, envFor(sandbox));
-  await new Promise((resolve) => setTimeout(resolve, 300));
+  await waitUntil(() => readAnnouncedLedger(sandbox));
 
   writeJobRecordFile(file, {
     ...record,
@@ -307,7 +331,7 @@ test("a foreground job transitioning to error is not announced", async (t) => {
     failureKind: "died",
   });
 
-  await new Promise((resolve) => setTimeout(resolve, 600));
+  await waitForAnnouncement(sandbox, announcedKey(sandbox.workDir, record.id, "error"));
   assert.deepStrictEqual(monitor.lines(), []);
 });
 
@@ -315,7 +339,7 @@ test("a job transitioning to error reports the failure kind", async (t) => {
   const sandbox = makeSandbox(t);
   const { file, record } = seedJob(sandbox, { status: "running", background: true });
   const monitor = startMonitor(sandbox, envFor(sandbox));
-  await new Promise((resolve) => setTimeout(resolve, 300));
+  await waitUntil(() => readAnnouncedLedger(sandbox));
 
   writeJobRecordFile(file, {
     ...record,
@@ -345,7 +369,7 @@ test("with a monitor session id set, a matching job emits and a mismatching job 
     claudeSessionId: "session-other",
   });
   const monitor = startMonitor(sandbox, envFor(sandbox, { CLAUDE_CODE_SESSION_ID: "session-own" }));
-  await new Promise((resolve) => setTimeout(resolve, 300));
+  await waitUntil(() => readAnnouncedLedger(sandbox, "session-own"));
 
   writeJobRecordFile(ownFile, { ...ownRecord, status: "done", finishedAt: new Date().toISOString() });
   writeJobRecordFile(otherFile, { ...otherRecord, status: "done", finishedAt: new Date().toISOString() });
@@ -357,7 +381,7 @@ test("with a monitor session id set, a matching job emits and a mismatching job 
     `grok job ${ownRecord.id} done. collect with /grok:result ${ownRecord.id} only if you launched it detached; a job owned by a subagent reports on its own`
   );
 
-  await new Promise((resolve) => setTimeout(resolve, 300));
+  await waitForAnnouncement(sandbox, announcedKey(sandbox.workDir, ownRecord.id, "done"), "session-own");
   assert.strictEqual(monitor.lines().length, 1);
 });
 
@@ -372,7 +396,7 @@ test("a session monitor observes a managed job launched in another workspace", a
       GROK_JOBS_MONITOR_MANAGED_GRACE_MS: "0",
     })
   );
-  await new Promise((resolve) => setTimeout(resolve, 300));
+  await waitUntil(() => monitor.started());
 
   const { record } = seedJob(sandbox, {
     cwd: otherCwd,
@@ -408,7 +432,7 @@ test("a session monitor announces duplicate legacy ids in each workspace with ex
     claudeSessionId: "session-own",
   });
   const monitor = startMonitor(sandbox, envFor(sandbox, { CLAUDE_CODE_SESSION_ID: "session-own" }));
-  await new Promise((resolve) => setTimeout(resolve, 300));
+  await waitUntil(() => readAnnouncedLedger(sandbox, "session-own"));
 
   writeJobRecordFile(ownFile, { ...ownRecord, status: "done", finishedAt: new Date().toISOString() });
   writeJobRecordFile(otherFile, { ...otherRecord, status: "done", finishedAt: new Date().toISOString() });
@@ -436,7 +460,7 @@ test("a partial session snapshot does not prune another workspace announcement",
     claudeSessionId: "session-own",
   });
   const monitor = startMonitor(sandbox, envFor(sandbox, { CLAUDE_CODE_SESSION_ID: "session-own" }));
-  await new Promise((resolve) => setTimeout(resolve, 300));
+  await waitUntil(() => readAnnouncedLedger(sandbox, "session-own"));
 
   writeJobRecordFile(file, { ...record, status: "done", finishedAt: new Date().toISOString() });
   await waitUntil(() => (monitor.lines().length === 1 ? true : null));
@@ -445,10 +469,10 @@ test("a partial session snapshot does not prune another workspace announcement",
   const backup = `${dir}.backup`;
   fs.renameSync(dir, backup);
   fs.writeFileSync(dir, "not a directory", "utf8");
-  await new Promise((resolve) => setTimeout(resolve, 500));
+  await waitUntil(() => !fs.statSync(dir).isDirectory());
   fs.rmSync(dir, { force: true });
   fs.renameSync(backup, dir);
-  await new Promise((resolve) => setTimeout(resolve, 600));
+  await waitForAnnouncement(sandbox, announcedKey(otherCwd, record.id, "done"), "session-own");
 
   assert.strictEqual(monitor.lines().length, 1);
 });
@@ -462,7 +486,7 @@ test("startup suppression waits for a complete cross workspace snapshot", async 
     background: true,
     claudeSessionId: "session-own",
   });
-  seedJob(sandbox, {
+  const { record } = seedJob(sandbox, {
     cwd: otherCwd,
     status: "done",
     background: true,
@@ -474,11 +498,11 @@ test("startup suppression waits for a complete cross workspace snapshot", async 
   fs.renameSync(dir, backup);
   fs.writeFileSync(dir, "not a directory", "utf8");
   const monitor = startMonitor(sandbox, envFor(sandbox, { CLAUDE_CODE_SESSION_ID: "session-own" }));
-  await new Promise((resolve) => setTimeout(resolve, 500));
+  await waitUntil(() => !fs.statSync(dir).isDirectory());
 
   fs.rmSync(dir, { force: true });
   fs.renameSync(backup, dir);
-  await new Promise((resolve) => setTimeout(resolve, 600));
+  await waitForAnnouncement(sandbox, announcedKey(otherCwd, record.id, "done"), "session-own");
 
   assert.deepStrictEqual(monitor.lines(), []);
 });
@@ -491,7 +515,7 @@ test("with the session id env var unset, a job from a different session still em
     claudeSessionId: "session-other",
   });
   const monitor = startMonitor(sandbox, envFor(sandbox));
-  await new Promise((resolve) => setTimeout(resolve, 300));
+  await waitUntil(() => readAnnouncedLedger(sandbox));
 
   writeJobRecordFile(file, { ...record, status: "done", finishedAt: new Date().toISOString() });
 
@@ -512,7 +536,7 @@ test("a vanished jobs directory mid run does not crash the process and a later t
   fs.rmSync(dir, { recursive: true, force: true });
   fs.mkdirSync(path.dirname(dir), { recursive: true });
   fs.writeFileSync(dir, "not a directory");
-  await new Promise((resolve) => setTimeout(resolve, 500));
+  await waitUntil(() => !fs.statSync(dir).isDirectory());
   assert.strictEqual(monitor.child.exitCode, null);
   assert.deepStrictEqual(monitor.lines(), []);
 
@@ -520,7 +544,7 @@ test("a vanished jobs directory mid run does not crash the process and a later t
   const { file, record } = seedJob(sandbox, { status: "running", background: true });
   writeJobRecordFile(file, { ...record, status: "done", finishedAt: new Date().toISOString() });
 
-  const lines = await waitUntil(() => (monitor.lines().length > 0 ? monitor.lines() : null));
+  const lines = await waitUntil(() => (monitor.lines().length > 0 ? monitor.lines() : null), { timeoutMs: 15000 });
   assert.strictEqual(lines.length, 1);
   assert.strictEqual(
     lines[0],
@@ -534,7 +558,7 @@ test("restart with persisted dedup state does not re-announce a background done 
   const env = envFor(sandbox);
 
   const first = startMonitor(sandbox, env);
-  await new Promise((resolve) => setTimeout(resolve, 300));
+  await waitUntil(() => readAnnouncedLedger(sandbox));
   writeJobRecordFile(file, { ...record, status: "done", finishedAt: new Date().toISOString() });
   await waitUntil(() => (first.lines().length > 0 ? first.lines() : null));
   assert.strictEqual(first.lines().length, 1);
@@ -546,16 +570,14 @@ test("restart with persisted dedup state does not re-announce a background done 
   assert.strictEqual(persisted.version, ANNOUNCED_LEDGER_VERSION);
   assert.ok(persisted.keys.includes(announcedKey(sandbox.workDir, record.id, "done")));
 
-  // Prove the disk key, not only startup absorption, suppresses re-announce: rewrite
-  // the record to running then back to done after restart.
   fs.writeFileSync(file, `${JSON.stringify({ ...record, status: "running", finishedAt: null }, null, 2)}\n`);
   const second = startMonitor(sandbox, env);
-  await new Promise((resolve) => setTimeout(resolve, 300));
+  await waitForAnnouncement(sandbox, announcedKey(sandbox.workDir, record.id, "done"));
   fs.writeFileSync(
     file,
     `${JSON.stringify({ ...record, status: "done", finishedAt: new Date().toISOString() }, null, 2)}\n`
   );
-  await new Promise((resolve) => setTimeout(resolve, 600));
+  await waitForAnnouncement(sandbox, announcedKey(sandbox.workDir, record.id, "done"));
   assert.deepStrictEqual(second.lines(), []);
 });
 
@@ -569,7 +591,7 @@ test("an old announcement ledger version is reset instead of suppressing a names
     "utf8",
   );
   const monitor = startMonitor(sandbox, envFor(sandbox));
-  await new Promise((resolve) => setTimeout(resolve, 300));
+  await waitUntil(() => readAnnouncedLedger(sandbox)?.version === ANNOUNCED_LEDGER_VERSION);
 
   writeJobRecordFile(file, { ...record, status: "done", finishedAt: new Date().toISOString() });
 
@@ -607,11 +629,11 @@ test("an unavailable jobs snapshot neither prunes nor persists announcement stat
   const stateFile = announcedPath(sandbox);
   fs.writeFileSync(stateFile, `${JSON.stringify(announcedLedger([announcedKey(sandbox.workDir, record.id, "done")]))}\n`, "utf8");
   const monitor = startMonitor(sandbox, envFor(sandbox));
-  await new Promise((resolve) => setTimeout(resolve, 300));
+  await waitForAnnouncement(sandbox, announcedKey(sandbox.workDir, record.id, "done"));
   const before = fs.readFileSync(stateFile, "utf8");
 
   fs.rmSync(jobsDir(sandbox.dataDir, sandbox.workDir), { recursive: true, force: true });
-  await new Promise((resolve) => setTimeout(resolve, 500));
+  await waitUntil(() => !fs.existsSync(jobsDir(sandbox.dataDir, sandbox.workDir)));
 
   assert.strictEqual(fs.readFileSync(stateFile, "utf8"), before);
   assert.deepStrictEqual(monitor.lines(), []);
@@ -621,11 +643,11 @@ test("a removed state directory is not recreated while the jobs source is unavai
   const sandbox = makeSandbox(t);
   seedJob(sandbox, { status: "running", background: true });
   const monitor = startMonitor(sandbox, envFor(sandbox));
-  await new Promise((resolve) => setTimeout(resolve, 300));
+  await waitUntil(() => readAnnouncedLedger(sandbox));
 
   const stateDir = workspaceStateDir(sandbox.dataDir, sandbox.workDir);
   fs.rmSync(stateDir, { recursive: true, force: true });
-  await new Promise((resolve) => setTimeout(resolve, 500));
+  await waitUntil(() => !fs.existsSync(stateDir));
 
   assert.strictEqual(fs.existsSync(stateDir), false);
   assert.deepStrictEqual(monitor.lines(), []);
@@ -657,7 +679,7 @@ test("skips silently when the jobs directory does not exist", async (t) => {
   const sandbox = makeSandbox(t);
   fs.rmSync(sandbox.dataDir, { recursive: true, force: true });
   const monitor = startMonitor(sandbox, envFor(sandbox));
-  await new Promise((resolve) => setTimeout(resolve, 500));
+  await waitUntil(() => monitor.started());
   assert.deepStrictEqual(monitor.lines(), []);
   assert.strictEqual(monitor.stderr(), "");
   assert.strictEqual(fs.existsSync(sandbox.dataDir), false);

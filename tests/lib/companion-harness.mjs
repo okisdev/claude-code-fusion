@@ -4,6 +4,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { gitIsolation } from "./git-fixture.mjs";
+import { getProcessIdentity, processIdentitiesMatch } from "../../plugins/grok/scripts/lib/process-identity.mjs";
 
 export const repoRoot = path.join(import.meta.dirname, "..", "..");
 export const companion = path.join(repoRoot, "plugins", "grok", "scripts", "grok-companion.mjs");
@@ -58,7 +59,18 @@ export function makeSandbox(t) {
 }
 
 export function envFor(sandbox, extra = {}, options = {}) {
-  const env = { ...process.env };
+  const homeDir = path.join(sandbox.root, "home");
+  const tempDir = path.join(sandbox.root, "tmpdir");
+  fs.mkdirSync(homeDir, { recursive: true });
+  fs.mkdirSync(tempDir, { recursive: true });
+  const env = Object.fromEntries(
+    [
+      "PATH",
+      ...(process.platform === "win32" ? ["ComSpec", "PATHEXT", "SystemRoot", "SYSTEMROOT"] : []),
+    ]
+      .filter((key) => process.env[key] !== undefined)
+      .map((key) => [key, process.env[key]]),
+  );
   for (const key of [
     "FAKE_GROK_MODE",
     "FAKE_GROK_ARGS_FILE",
@@ -69,6 +81,7 @@ export function envFor(sandbox, extra = {}, options = {}) {
     "FAKE_GROK_DESCENDANT_PID_FILE",
     "FAKE_GROK_SANDBOX_SENTINEL",
     "FAKE_GROK_SANDBOX_EVENT_DELAY_MS",
+    "FAKE_GROK_STDERR_GATE_FILE",
     "FAKE_GROK_STDIN_FILE",
     "FAKE_GROK_STDIN_LOG",
     "GROK_COMPANION_CAPABILITIES",
@@ -107,6 +120,8 @@ export function envFor(sandbox, extra = {}, options = {}) {
   return {
     ...env,
     ...(options.git ? gitIsolation : {}),
+    HOME: homeDir,
+    TMPDIR: tempDir,
     GROK_BIN: fakeGrok,
     GROK_COMPANION_DATA: sandbox.dataDir,
     GROK_COMPANION_CAPABILITIES: grokCompanionCapabilities,
@@ -190,11 +205,14 @@ function linuxProcessIsZombie(pid) {
   }
 }
 
-export function pidAlive(pid) {
+export function pidAlive(pid, expectedIdentity = null) {
   try {
     process.kill(pid, 0);
   } catch {
     return false;
+  }
+  if (expectedIdentity) {
+    return processIdentitiesMatch(getProcessIdentity(pid), expectedIdentity);
   }
   return process.platform !== "linux" || !linuxProcessIsZombie(pid);
 }

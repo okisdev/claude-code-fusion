@@ -4,6 +4,40 @@ import fs from "node:fs";
 import { spawn } from "node:child_process";
 
 const args = process.argv.slice(2);
+const STDIN_DRAIN_TIMEOUT_MS = 3000;
+const GROUP_CHILD_READY_TIMEOUT_MS = 3000;
+const GROUP_CHILD_READY_POLL_MS = 25;
+
+async function drainStdin() {
+  let prompt = "";
+  let timedOut = false;
+  const timer = setTimeout(() => {
+    timedOut = true;
+    process.stdin.destroy();
+  }, STDIN_DRAIN_TIMEOUT_MS);
+  try {
+    for await (const chunk of process.stdin) {
+      prompt += chunk.toString();
+    }
+  } catch (error) {
+    if (!timedOut) {
+      throw error;
+    }
+  } finally {
+    clearTimeout(timer);
+  }
+  return prompt;
+}
+
+async function waitForFile(file) {
+  const deadline = Date.now() + GROUP_CHILD_READY_TIMEOUT_MS;
+  while (!fs.existsSync(file)) {
+    if (Date.now() >= deadline) {
+      throw new Error(`Timed out waiting for group child readiness: ${file}`);
+    }
+    await new Promise((resolve) => setTimeout(resolve, GROUP_CHILD_READY_POLL_MS));
+  }
+}
 
 if (args.includes("--version")) {
   process.stdout.write(`${process.env.FAKE_CODEX_VERSION_OUTPUT || `codex-cli ${process.env.FAKE_CODEX_VERSION || "0.144.4"}`}\n`);
@@ -29,9 +63,7 @@ if (process.env.FAKE_CODEX_CLOSE_STDIN === "true") {
   process.stdin.destroy();
   await new Promise((resolve) => setTimeout(resolve, 25));
 } else {
-  for await (const chunk of process.stdin) {
-    prompt += chunk.toString();
-  }
+  prompt = await drainStdin();
 }
 
 if (process.env.FAKE_CODEX_ARGS_FILE) {
@@ -265,12 +297,15 @@ switch (mode) {
     if (process.env.FAKE_CODEX_CHILD_PID_FILE) {
       fs.writeFileSync(process.env.FAKE_CODEX_CHILD_PID_FILE, String(holder.pid));
     }
+    holder.unref();
     if (process.env.FAKE_CODEX_GROUP_CHILD_READY_FILE) {
-      while (!fs.existsSync(process.env.FAKE_CODEX_GROUP_CHILD_READY_FILE)) {
-        await new Promise((resolve) => setTimeout(resolve, 5));
+      try {
+        await waitForFile(process.env.FAKE_CODEX_GROUP_CHILD_READY_FILE);
+      } catch (error) {
+        holder.kill("SIGKILL");
+        throw error;
       }
     }
-    holder.unref();
     start();
     complete();
     break;

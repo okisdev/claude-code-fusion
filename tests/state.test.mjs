@@ -7,6 +7,22 @@ import { test } from "node:test";
 import { envFor, makeSandbox, runCompanion, stateModulePath } from "./lib/companion-harness.mjs";
 import { getProcessIdentity } from "../plugins/grok/scripts/lib/process-identity.mjs";
 
+const workerStateModuleUrl = new URL("../plugins/fusion/scripts/lib/worker-state.mjs", import.meta.url).href;
+
+const workerLockTimeoutChild = `
+import fs from "node:fs";
+const [stateUrl, stateDir, taskId, readyFile] = process.argv.slice(1);
+const state = await import(stateUrl);
+fs.writeFileSync(readyFile, "ready\\n");
+const startedAt = Date.now();
+try {
+  state.updateWorkerRecord(taskId, { FUSION_WORKER_STATE_DIR: stateDir }, (current) => ({ ...current, id: taskId }));
+  process.stdout.write(JSON.stringify({ elapsedMs: Date.now() - startedAt, message: null }));
+} catch (error) {
+  process.stdout.write(JSON.stringify({ elapsedMs: Date.now() - startedAt, message: error.message }));
+}
+`;
+
 function sha256Hex(value) {
   const result = spawnSync(
     process.execPath,
@@ -44,6 +60,42 @@ async function waitForFile(file, timeoutMs = 3000) {
       throw new Error(`Timed out waiting for ${file}.`);
     }
     await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+}
+
+function runWorkerLockTimeoutChild(stateDir, taskId, readyFile, timeoutMs) {
+  const child = spawn(process.execPath, ["--input-type=module", "--eval", workerLockTimeoutChild, workerStateModuleUrl, stateDir, taskId, readyFile], {
+    stdio: ["ignore", "pipe", "pipe"],
+    env: { ...process.env, FUSION_LOCK_TIMEOUT_MS: String(timeoutMs) },
+  });
+  let stdout = "";
+  let stderr = "";
+  child.stdout.setEncoding("utf8");
+  child.stderr.setEncoding("utf8");
+  child.stdout.on("data", (chunk) => {
+    stdout += chunk;
+  });
+  child.stderr.on("data", (chunk) => {
+    stderr += chunk;
+  });
+  const completion = new Promise((resolve, reject) => {
+    child.once("error", reject);
+    child.once("close", (code, signal) => resolve({ code, signal, stderr, stdout }));
+  });
+  return { child, completion };
+}
+
+async function waitForCompletion(completion, timeoutMs) {
+  let timer;
+  try {
+    return await Promise.race([
+      completion,
+      new Promise((_, reject) => {
+        timer = setTimeout(() => reject(new Error(`Lock waiter exceeded ${timeoutMs}ms.`)), timeoutMs);
+      }),
+    ]);
+  } finally {
+    clearTimeout(timer);
   }
 }
 
@@ -493,6 +545,45 @@ test("managed collection records delivery without changing the terminal outcome"
   assert.strictEqual(first.resultText, "terminal result");
   assert.strictEqual(first.deliveryCollectedAt, "2026-07-15T00:00:00.000Z");
   assert.strictEqual(second.deliveryCollectedAt, first.deliveryCollectedAt);
+});
+
+test("FUSION_LOCK_TIMEOUT_MS overrides the worker-state default lock timeout", async () => {
+  const { DEFAULT_LOCK_TIMEOUT_MS, resolveLockTimeoutMs } = await import("../plugins/fusion/scripts/lib/worker-state.mjs");
+  assert.strictEqual(resolveLockTimeoutMs({ FUSION_LOCK_TIMEOUT_MS: "1" }), 1);
+  assert.strictEqual(resolveLockTimeoutMs({ FUSION_LOCK_TIMEOUT_MS: "7500" }), 7500);
+  assert.strictEqual(DEFAULT_LOCK_TIMEOUT_MS, 5000);
+});
+
+test("an invalid FUSION_LOCK_TIMEOUT_MS falls back to the worker-state default", async () => {
+  const { DEFAULT_LOCK_TIMEOUT_MS, resolveLockTimeoutMs } = await import("../plugins/fusion/scripts/lib/worker-state.mjs");
+  assert.strictEqual(resolveLockTimeoutMs({}), DEFAULT_LOCK_TIMEOUT_MS);
+  assert.strictEqual(resolveLockTimeoutMs({ FUSION_LOCK_TIMEOUT_MS: "invalid" }), DEFAULT_LOCK_TIMEOUT_MS);
+  assert.strictEqual(resolveLockTimeoutMs({ FUSION_LOCK_TIMEOUT_MS: "0" }), DEFAULT_LOCK_TIMEOUT_MS);
+  assert.strictEqual(resolveLockTimeoutMs({ FUSION_LOCK_TIMEOUT_MS: "-5" }), DEFAULT_LOCK_TIMEOUT_MS);
+  assert.strictEqual(resolveLockTimeoutMs({ FUSION_LOCK_TIMEOUT_MS: "1.5" }), DEFAULT_LOCK_TIMEOUT_MS);
+});
+
+test("a held worker record lock times out a second acquirer within the configured ceiling", async (t) => {
+  const sandbox = makeSandbox(t);
+  const stateModule = await import("../plugins/fusion/scripts/lib/worker-state.mjs");
+  const timeoutMs = 150;
+  const env = { FUSION_WORKER_STATE_DIR: path.join(sandbox.root, "worker-state") };
+  const taskId = "contended-lock";
+  const file = stateModule.workerRecordFile(taskId, env);
+  const lockFile = `${file}.lock`;
+  const waiterReadyFile = path.join(sandbox.root, "contention-waiter-ready");
+  fs.mkdirSync(path.dirname(lockFile), { recursive: true });
+  fs.writeFileSync(lockFile, "held\n");
+  t.after(() => fs.rmSync(lockFile, { force: true }));
+
+  const waiter = runWorkerLockTimeoutChild(env.FUSION_WORKER_STATE_DIR, taskId, waiterReadyFile, timeoutMs);
+  await waitForFile(waiterReadyFile);
+  const result = await waitForCompletion(waiter.completion, timeoutMs + 500);
+  assert.strictEqual(result.code, 0, result.stderr);
+  const outcome = JSON.parse(result.stdout);
+  assert.match(outcome.message, /timed out waiting for Fusion worker state lock/);
+  assert.ok(outcome.elapsedMs >= timeoutMs, `Expected the waiter to wait for at least ${timeoutMs}ms, took ${outcome.elapsedMs}ms.`);
+  assert.ok(outcome.elapsedMs <= timeoutMs + 500, `Expected the waiter to finish near ${timeoutMs}ms, took ${outcome.elapsedMs}ms.`);
 });
 
 test("an abandoned record lock older than ten seconds is reaped", async (t) => {

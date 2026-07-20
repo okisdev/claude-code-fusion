@@ -25,7 +25,7 @@ function createRawTransport(t, sandbox, sessionId) {
 function runSessionEnd(sandbox, sessionId) {
   return spawnSync(process.execPath, [sessionEndHook], {
     input: JSON.stringify({ session_id: sessionId }),
-    env: { ...process.env, GROK_COMPANION_DATA: sandbox.dataDir },
+    env: envFor(sandbox, { CLAUDE_CODE_SESSION_ID: sessionId }),
     encoding: "utf8",
     timeout: 60000,
   });
