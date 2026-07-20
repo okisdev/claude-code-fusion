@@ -877,10 +877,14 @@ function handleSubagentStop(input, env) {
   const refreshed = refreshRecord(record, input, env);
   const failure = workerBudgetFailure(refreshed);
   const message = typeof input.last_assistant_message === "string" ? input.last_assistant_message : "";
-  const finalTextFile = isFusionWorkerAgent(refreshed.agentType) && message.length > 0 ? finalTextArtifactPath(refreshed, env) : null;
+  let finalTextFile = isFusionWorkerAgent(refreshed.agentType) && message.length > 0 ? finalTextArtifactPath(refreshed, env) : null;
   if (finalTextFile) {
-    writePrivateText(finalTextFile, boundedFinalText(message));
-    updateWorkerRecord(refreshed.taskId, env, (current) => ({ ...(current ?? refreshed), outputFile: finalTextFile }));
+    try {
+      writePrivateText(finalTextFile, boundedFinalText(message));
+      updateWorkerRecord(refreshed.taskId, env, (current) => ({ ...(current ?? refreshed), outputFile: finalTextFile }));
+    } catch {
+      finalTextFile = null;
+    }
   }
   const complete = completedReport(refreshed, message);
   const collectorContract = refreshed.completionContract === "collector" || canonicalWorkerAgentType(refreshed.agentType) === "fusion:job-collector";
@@ -914,7 +918,7 @@ function handleSubagentStop(input, env) {
       acceptance: "unverified",
       failureKind: failure?.failureKind ?? (trustedCollectorReport?.kind === "outcome" ? `collection_${trustedCollectorReport.collectionOutcome}` : collectorProtocolFailure ? "collection_protocol" : complete ? null : "delivery"),
       inFlightSince: undefined,
-      ...(successfulCompletion && worker.failureKind ? { recoveredFailureKind: worker.failureKind } : {}),
+      ...(successfulCompletion && worker.failureKind && worker.failureKind !== "unexpected_async" ? { recoveredFailureKind: worker.failureKind } : {}),
       ...(complete && !failure && !collectorProtocolFailure && runtimeAsync && worker.failureKind === "unexpected_async" ? { deliveryMode: "harness_async" } : {}),
       ...(finalTextFile ? { outputFile: finalTextFile } : {}),
       ...(PEER_JOB_FOOTER_AGENTS.has(worker.agentType) ? capturedPeerIdentity(worker.agentType, message, worker.peerEngine) : {}),
@@ -1071,7 +1075,7 @@ function handleStop(input, env) {
       const worker = current ?? record;
       const transportStatus = failure ? "cancel_requested" : runtimeTaskIsTerminal(task) ? "ready_uncollected" : ["ready_uncollected", "ready_background", "cancel_requested"].includes(worker.transportStatus) ? worker.transportStatus : "pending_async";
       const advisoryRound = !failure && transportStatus === "pending_async";
-      const successfulTerminal = !failure && worker.failureKind !== "unexpected_async" && (runtimeTaskSucceeded(task) || ["ready_uncollected", "ready_background"].includes(worker.transportStatus));
+      const successfulTerminal = !failure && worker.failureKind !== "unexpected_async" && runtimeTaskSucceeded(task);
       return {
         ...worker,
         ...(task?.id ? { backgroundTaskId: task.id } : {}),

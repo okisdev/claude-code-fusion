@@ -620,7 +620,7 @@ test("SubagentStop collects a persisted async result and reclassifies the unexpe
   assert.ok(record(box).collectedAt);
   assert.strictEqual(record(box).awaitingVerdict, true);
   assert.strictEqual(record(box).failureKind, null);
-  assert.strictEqual(record(box).recoveredFailureKind, "unexpected_async");
+  assert.strictEqual(record(box).recoveredFailureKind, undefined);
   assert.strictEqual(record(box).deliveryMode, "harness_async");
   const finalTextFile = record(box).outputFile;
   assert.ok(finalTextFile);
@@ -1153,6 +1153,40 @@ test("SubagentStop bounds an oversized final-text artifact with a truncation mar
   const marker = Buffer.from(`\n[fusion: truncated ${omitted} bytes]\n`, "utf8");
   assert.deepStrictEqual(artifact, Buffer.concat([source.subarray(0, 65_536), marker, source.subarray(source.length - 131_072)]));
   assert.ok(artifact.length < 256 * 1024);
+});
+
+test("SubagentStop finalizes the record when the final-text artifact write fails", (t) => {
+  const box = sandbox(t);
+  run(box, dispatch(box));
+  run(box, {
+    hook_event_name: "SubagentStart",
+    session_id: "session-1",
+    cwd: box.cwd,
+    transcript_path: box.transcript,
+    agent_id: "artifact-write-failure",
+    agent_type: "fusion:fast-worker"
+  });
+  const taskId = record(box).taskId;
+  fs.mkdirSync(path.join(box.state, "jobs", `${taskId}.final.txt`), { recursive: true });
+
+  const stopped = run(box, {
+    hook_event_name: "SubagentStop",
+    session_id: "session-1",
+    cwd: box.cwd,
+    transcript_path: box.transcript,
+    agent_id: "artifact-write-failure",
+    agent_type: "fusion:fast-worker",
+    stop_hook_active: false,
+    last_assistant_message: "summary\ndelivery: complete\nverification: passed"
+  });
+  assert.strictEqual(stopped.status, 0, stopped.stderr);
+  assert.strictEqual(stopped.stdout, "");
+
+  const completed = record(box);
+  assert.strictEqual(completed.transportStatus, "done");
+  assert.strictEqual(completed.failureKind, null);
+  assert.strictEqual(completed.outputFile, null);
+  assert.ok(completed.collectedAt);
 });
 
 test("foreground structured usage is canonical and transport completion remains unverified", (t) => {
@@ -2640,6 +2674,50 @@ test("advisory in-flight stop rounds do not consume the cancellation budget for 
   assert.strictEqual(expiredOutput.decision, "block");
   assert.match(expiredOutput.reason, /TaskStop/);
   assert.strictEqual(record(box).transportStatus, "cancel_requested");
+});
+
+test("Stop does not launder a failed runtime task into success across two rounds", (t) => {
+  const box = sandbox(t);
+  run(box, dispatch(box));
+  const taskId = record(box).taskId;
+  updateWorkerRecord(taskId, envFor(box), (current) => ({
+    ...current,
+    transportStatus: "cancel_requested",
+    failureKind: "timeout",
+    cancelReason: "wall clock budget reached (1200000ms)"
+  }));
+  const backgroundTasks = [{ id: "terminal-fail-1", type: "subagent", status: "failed", agent_type: "fusion:fast-worker" }];
+
+  const firstStop = run(box, {
+    hook_event_name: "Stop",
+    session_id: "session-1",
+    cwd: box.cwd,
+    transcript_path: box.transcript,
+    stop_hook_active: false,
+    last_assistant_message: "still working",
+    background_tasks: backgroundTasks
+  });
+  assert.strictEqual(JSON.parse(firstStop.stdout).decision, "block");
+  const afterFirstRound = record(box);
+  assert.strictEqual(afterFirstRound.transportStatus, "ready_uncollected");
+  assert.strictEqual(afterFirstRound.failureKind, "timeout");
+  assert.strictEqual(afterFirstRound.recoveredFailureKind, undefined);
+
+  const secondStop = run(box, {
+    hook_event_name: "Stop",
+    session_id: "session-1",
+    cwd: box.cwd,
+    transcript_path: box.transcript,
+    stop_hook_active: false,
+    last_assistant_message: "still working",
+    background_tasks: backgroundTasks
+  });
+  assert.strictEqual(JSON.parse(secondStop.stdout).decision, "block");
+  const afterSecondRound = record(box);
+  assert.strictEqual(afterSecondRound.transportStatus, "ready_uncollected");
+  assert.strictEqual(afterSecondRound.failureKind, "timeout");
+  assert.strictEqual(afterSecondRound.recoveredFailureKind, undefined);
+  assert.strictEqual(afterSecondRound.cancelReason, "wall clock budget reached (1200000ms)");
 });
 
 test("an explicitly authorized running worker is not cancelled by repeated Stop hooks and becomes owner-ended with its session", (t) => {

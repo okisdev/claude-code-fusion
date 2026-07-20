@@ -278,6 +278,7 @@ export function createWorkerRecord(record, env = process.env) {
       startedAt: null,
       lastActivityAt: null,
       lastProgressAt: null,
+      lastLivenessAt: null,
       finishedAt: null,
       updatedAt: now,
       limits: record.limits ?? null
