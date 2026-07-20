@@ -5,7 +5,11 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { test } from "node:test";
-import { readAuditEvents } from "../plugins/fusion/scripts/inline-delegation-guard.mjs";
+import {
+  DEFAULT_LOCK_TIMEOUT_MS,
+  readAuditEvents,
+  resolveLockTimeoutMs
+} from "../plugins/fusion/scripts/inline-delegation-guard.mjs";
 
 const repoRoot = path.join(import.meta.dirname, "..");
 const script = path.join(repoRoot, "plugins", "fusion", "scripts", "inline-delegation-guard.mjs");
@@ -145,7 +149,7 @@ test("advisory compatibility mode never denies, even far past the budget", (t) =
   }
 });
 
-test("the default mode denies writes after the dispatch window budget until an Agent dispatch", (t) => {
+test("the default mode denies writes after the dispatch window budget and audits enforcement until an Agent dispatch", (t) => {
   const sandbox = makeSandbox(t);
   for (let i = 0; i < 5; i += 1) {
     const result = run(sandbox, writePayload(sandbox));
@@ -159,7 +163,23 @@ test("the default mode denies writes after the dispatch window budget until an A
     assert.match(output.hookSpecificOutput.permissionDecisionReason, /inline write budget is exhausted/i);
   }
   assert.strictEqual(readState(sandbox, "session-1").writesSinceDispatch, 5);
-  assert.strictEqual(readAuditRecords(sandbox).filter((record) => record.event === "write").length, 5);
+  const records = readAuditRecords(sandbox);
+  assert.strictEqual(records.filter((record) => record.event === "write").length, 5);
+  const denies = records.filter((record) => record.event === "deny");
+  assert.strictEqual(denies.length, 2);
+  assert.deepStrictEqual(denies[0], {
+    schemaVersion: 1,
+    at: denies[0].at,
+    session: "session-1",
+    event: "deny",
+    lane: "main",
+    tool: "Edit",
+    path: "file.txt",
+    writeCount: 5,
+    dispatchCount: 0,
+    budget: 5,
+    mode: "enforce"
+  });
 
   run(sandbox, dispatchPayload(sandbox, { subagentType: "fusion:fast-worker" }));
   const allowed = run(sandbox, writePayload(sandbox));
@@ -204,7 +224,7 @@ test("enforcement rejects malformed, truncated, and array state without resettin
   }
 });
 
-test("the fifth write under the default budget attaches one advisory naming the counts", (t) => {
+test("the fifth write under the default budget attaches one advisory and audits a warning alongside the write", (t) => {
   const sandbox = makeSandbox(t);
   for (let i = 0; i < 4; i += 1) {
     const result = run(sandbox, writePayload(sandbox));
@@ -219,6 +239,23 @@ test("the fifth write under the default budget attaches one advisory naming the 
     output.hookSpecificOutput.permissionDecisionReason,
     "5 inline writes happened this session with zero dispatches. The next package belongs in a lane: quick scoped work goes to the codex quick tier gpt-5.6-terra at effort xhigh; trivial or high-volume work goes to gpt-5.6-luna at effort xhigh; work needing the Claude Code tool surface goes to fusion:fast-worker."
   );
+  const records = readAuditRecords(sandbox);
+  assert.strictEqual(records.filter((record) => record.event === "write").length, 5);
+  const warnings = records.filter((record) => record.event === "warn");
+  assert.strictEqual(warnings.length, 1);
+  assert.deepStrictEqual(warnings[0], {
+    schemaVersion: 1,
+    at: warnings[0].at,
+    session: "session-1",
+    event: "warn",
+    lane: "main",
+    tool: "Edit",
+    path: "file.txt",
+    writeCount: 5,
+    dispatchCount: 0,
+    budget: 5,
+    mode: "enforce"
+  });
 });
 
 test("no repeat nagging between threshold multiples, a new advisory fires at 2x and 3x the budget", (t) => {
@@ -442,6 +479,22 @@ test("audit retains writes whose paths cannot be safely recorded", (t) => {
   assert.doesNotMatch(readAuditLines(sandbox).join("\n"), new RegExp(pathSecret));
 });
 
+test("enforcement audit records omit unsafe paths", (t) => {
+  const sandbox = makeSandbox(t);
+  const pathSecret = `sk-${"z".repeat(40)}`;
+  for (let index = 0; index < 4; index += 1) {
+    run(sandbox, writePayload(sandbox));
+  }
+  const unsafeWrite = writePayload(sandbox, { filePath: path.join(sandbox.workDir, pathSecret) });
+  run(sandbox, unsafeWrite);
+  run(sandbox, unsafeWrite);
+
+  const enforcement = readAuditRecords(sandbox).filter((record) => record.event === "warn" || record.event === "deny");
+  assert.strictEqual(enforcement.length, 2);
+  assert.ok(enforcement.every((record) => !Object.hasOwn(record, "path")));
+  assert.doesNotMatch(readAuditLines(sandbox).join("\n"), new RegExp(pathSecret));
+});
+
 test("malformed or oversized subagent types fall back to builtin without entering state or audit", (t) => {
   const sandbox = makeSandbox(t);
   const secrets = ["fusion:bad\nsecret-value", `fusion:${"s".repeat(200)}`, "fusion:token=secret-value", "fusion:api-key-secret-value"];
@@ -620,6 +673,20 @@ test("a write outside the session cwd is not counted", (t) => {
   assert.strictEqual(fs.existsSync(stateFileFor(sandbox, "session-1")), false);
 });
 
+test("FUSION_LOCK_TIMEOUT_MS overrides the default lock timeout", () => {
+  assert.strictEqual(resolveLockTimeoutMs({ FUSION_LOCK_TIMEOUT_MS: "1" }), 1);
+  assert.strictEqual(resolveLockTimeoutMs({ FUSION_LOCK_TIMEOUT_MS: "7500" }), 7500);
+  assert.strictEqual(DEFAULT_LOCK_TIMEOUT_MS, 5000);
+});
+
+test("an invalid FUSION_LOCK_TIMEOUT_MS falls back to the default", () => {
+  assert.strictEqual(resolveLockTimeoutMs({}), DEFAULT_LOCK_TIMEOUT_MS);
+  assert.strictEqual(resolveLockTimeoutMs({ FUSION_LOCK_TIMEOUT_MS: "invalid" }), DEFAULT_LOCK_TIMEOUT_MS);
+  assert.strictEqual(resolveLockTimeoutMs({ FUSION_LOCK_TIMEOUT_MS: "0" }), DEFAULT_LOCK_TIMEOUT_MS);
+  assert.strictEqual(resolveLockTimeoutMs({ FUSION_LOCK_TIMEOUT_MS: "-5" }), DEFAULT_LOCK_TIMEOUT_MS);
+  assert.strictEqual(resolveLockTimeoutMs({ FUSION_LOCK_TIMEOUT_MS: "1.5" }), DEFAULT_LOCK_TIMEOUT_MS);
+});
+
 test("FUSION_INLINE_WRITE_BUDGET overrides the default threshold", (t) => {
   const sandbox = makeSandbox(t);
   const extraEnv = { FUSION_INLINE_WRITE_BUDGET: "2" };
@@ -671,15 +738,19 @@ test("audit appends after a malformed trailing line and readers skip only the da
   assert.strictEqual(audit.malformedCount, 1);
 });
 
-test("audit rotates by size without losing valid records", (t) => {
+test("audit rotates by size without losing valid enforcement records", (t) => {
   const sandbox = makeSandbox(t);
   const extraEnv = { FUSION_INLINE_GUARD_AUDIT_MAX_BYTES: "1", FUSION_INLINE_GUARD_AUDIT_MAX_FILES: "10" };
-  for (let index = 0; index < 4; index += 1) {
+  for (let index = 0; index < 6; index += 1) {
     run(sandbox, writePayload(sandbox), extraEnv);
   }
 
-  assert.strictEqual(auditFiles(sandbox).length, 4);
-  assert.strictEqual(readAuditEvents({ auditDir: sandbox.auditDir }).events.length, 4);
+  const audit = readAuditEvents({ auditDir: sandbox.auditDir });
+  assert.strictEqual(auditFiles(sandbox).length, 7);
+  assert.strictEqual(audit.events.length, 7);
+  assert.strictEqual(audit.events.filter((event) => event.event === "write").length, 5);
+  assert.strictEqual(audit.events.filter((event) => event.event === "warn").length, 1);
+  assert.strictEqual(audit.events.filter((event) => event.event === "deny").length, 1);
 });
 
 test("audit enforces its rotated file cap", (t) => {
@@ -729,4 +800,120 @@ test("concurrent hook invocations serialize dispatch and write increments", asyn
   assert.strictEqual(audit.events.filter((record) => record.event === "write").length, 16);
   assert.strictEqual(audit.events.filter((record) => record.event === "dispatch").length, 16);
   assert.strictEqual(fs.existsSync(path.join(sandbox.auditDir, ".append.lock")), false);
+});
+
+const NO_OP_HEARTBEAT_REASON =
+  "Fusion tasks are in flight for this session, so emit a text-only heartbeat instead of this no-op Bash command.";
+
+function workerStateEnv(sandbox) {
+  const workerStateDir = path.join(sandbox.root, "workers");
+  return { FUSION_WORKER_STATE_DIR: workerStateDir };
+}
+
+function seedInFlightWorker(sandbox, { sessionId = "session-1", taskId = "fusion-abcdef0123456789abcdef01", transportStatus = "pending_async" } = {}) {
+  const jobsDir = path.join(sandbox.root, "workers", "jobs");
+  fs.mkdirSync(jobsDir, { recursive: true });
+  fs.writeFileSync(
+    path.join(jobsDir, `${taskId}.json`),
+    JSON.stringify({
+      schemaVersion: 1,
+      taskId,
+      sessionId,
+      transportStatus,
+      acceptance: "unverified"
+    }),
+    "utf8"
+  );
+}
+
+function bashPayload(sandbox, { sessionId = "session-1", command = "true", agentId } = {}) {
+  const payload = {
+    hook_event_name: "PreToolUse",
+    session_id: sessionId,
+    transcript_path: path.join(sandbox.root, "transcript.jsonl"),
+    cwd: sandbox.workDir,
+    tool_name: "Bash",
+    tool_input: { command }
+  };
+  if (agentId) {
+    payload.agent_id = agentId;
+    payload.agent_type = "Explore";
+  }
+  return payload;
+}
+
+test("in-flight worker tasks deny no-op Bash true with the heartbeat reason", (t) => {
+  const sandbox = makeSandbox(t);
+  seedInFlightWorker(sandbox);
+  const result = run(sandbox, bashPayload(sandbox, { command: "true" }), workerStateEnv(sandbox));
+  assert.strictEqual(result.status, 0);
+  const output = JSON.parse(result.stdout);
+  assert.strictEqual(output.hookSpecificOutput.permissionDecision, "deny");
+  assert.strictEqual(output.hookSpecificOutput.permissionDecisionReason, NO_OP_HEARTBEAT_REASON);
+});
+
+test("in-flight worker tasks allow a real Bash command untouched", (t) => {
+  const sandbox = makeSandbox(t);
+  seedInFlightWorker(sandbox);
+  const result = run(sandbox, bashPayload(sandbox, { command: "ls -la" }), workerStateEnv(sandbox));
+  assert.strictEqual(result.status, 0);
+  assert.strictEqual(result.stdout, "");
+  assert.deepStrictEqual(readAuditRecords(sandbox), []);
+});
+
+test("no in-flight worker tasks allow no-op Bash true untouched", (t) => {
+  const sandbox = makeSandbox(t);
+  const result = run(sandbox, bashPayload(sandbox, { command: "true" }), workerStateEnv(sandbox));
+  assert.strictEqual(result.status, 0);
+  assert.strictEqual(result.stdout, "");
+  assert.deepStrictEqual(readAuditRecords(sandbox), []);
+});
+
+test("advisory mode warns on no-op Bash true without denying when workers are in flight", (t) => {
+  const sandbox = makeSandbox(t);
+  seedInFlightWorker(sandbox);
+  const result = run(sandbox, bashPayload(sandbox, { command: "true" }), {
+    ...workerStateEnv(sandbox),
+    FUSION_INLINE_GUARD_MODE: "advisory"
+  });
+  assert.strictEqual(result.status, 0);
+  const output = JSON.parse(result.stdout);
+  assert.strictEqual(output.hookSpecificOutput.permissionDecision, "allow");
+  assert.strictEqual(output.hookSpecificOutput.permissionDecisionReason, NO_OP_HEARTBEAT_REASON);
+  const warnings = readAuditRecords(sandbox).filter((record) => record.event === "warn");
+  assert.strictEqual(warnings.length, 1);
+  assert.strictEqual(warnings[0].tool, "Bash");
+  assert.strictEqual(warnings[0].mode, "advisory");
+});
+
+test("no-op Bash deny audits an enforcement event for Bash on the main lane", (t) => {
+  const sandbox = makeSandbox(t);
+  seedInFlightWorker(sandbox);
+  run(sandbox, bashPayload(sandbox, { command: "true" }), workerStateEnv(sandbox));
+  const denies = readAuditRecords(sandbox).filter((record) => record.event === "deny");
+  assert.strictEqual(denies.length, 1);
+  assert.deepStrictEqual(denies[0], {
+    schemaVersion: 1,
+    at: denies[0].at,
+    session: "session-1",
+    event: "deny",
+    lane: "main",
+    tool: "Bash",
+    writeCount: 0,
+    dispatchCount: 0,
+    budget: 5,
+    mode: "enforce"
+  });
+  assert.ok(!Object.hasOwn(denies[0], "path"));
+});
+
+test("hooks configuration wires PreToolUse write tools and Bash through the inline guard", () => {
+  const hooks = JSON.parse(fs.readFileSync(path.join(repoRoot, "plugins", "fusion", "hooks", "hooks.json"), "utf8")).hooks;
+  const preToolHandlers = hooks.PreToolUse.flatMap((group) => group.hooks.map((hook) => ({ matcher: group.matcher, command: hook.command }))).filter((hook) => hook.command?.includes("inline-delegation-guard.mjs"));
+  assert.deepStrictEqual(preToolHandlers, [
+    {
+      matcher: "^(Edit|Write|NotebookEdit|MultiEdit|Bash)$",
+      command: 'node "${CLAUDE_PLUGIN_ROOT}/scripts/inline-delegation-guard.mjs"'
+    }
+  ]);
 });

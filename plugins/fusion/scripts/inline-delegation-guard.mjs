@@ -12,6 +12,8 @@ const AUDIT_DIR_ENV = "FUSION_INLINE_GUARD_AUDIT_DIR";
 const AUDIT_RETENTION_DAYS_ENV = "FUSION_INLINE_GUARD_AUDIT_RETENTION_DAYS";
 const AUDIT_MAX_BYTES_ENV = "FUSION_INLINE_GUARD_AUDIT_MAX_BYTES";
 const AUDIT_MAX_FILES_ENV = "FUSION_INLINE_GUARD_AUDIT_MAX_FILES";
+const FUSION_DATA_DIR_ENV = "FUSION_DATA_DIR";
+const WORKER_STATE_DIR_ENV = "FUSION_WORKER_STATE_DIR";
 const DEFAULT_BUDGET = 5;
 const DEFAULT_AUDIT_RETENTION_DAYS = 180;
 const DEFAULT_AUDIT_MAX_BYTES = 2 * 1024 * 1024;
@@ -20,7 +22,8 @@ const AUDIT_SCHEMA_VERSION = 1;
 const STALE_MS = 48 * 60 * 60 * 1000;
 const DAY_MS = 24 * 60 * 60 * 1000;
 const LOCK_RETRY_MS = 10;
-const LOCK_TIMEOUT_MS = 2000;
+export const DEFAULT_LOCK_TIMEOUT_MS = 5000;
+const LOCK_TIMEOUT_ENV = "FUSION_LOCK_TIMEOUT_MS";
 const LOCK_STALE_MS = 10000;
 const DISPATCH_LOG_LIMIT = 200;
 const DESCRIPTION_MAX_LENGTH = 120;
@@ -29,8 +32,13 @@ const AUDIT_FILE_PATTERN = /^events-(\d{4}-\d{2}-\d{2})(?:\.(\d+))?\.jsonl$/;
 const SESSION_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 const WRITE_TOOLS = new Set(["Edit", "Write", "NotebookEdit", "MultiEdit"]);
 const DELEGATION_TOOLS = new Set(["Agent", "Task"]);
+const BASH_TOOL = "Bash";
+const ENFORCEMENT_AUDIT_TOOLS = new Set([...WRITE_TOOLS, BASH_TOOL]);
 const BUILTIN_LANE = "builtin";
 const MAIN_LANE = "main";
+const WORKER_TERMINAL_STATUSES = new Set(["done", "incomplete", "failed", "cancelled", "owner_ended"]);
+const NO_OP_BASH_COMMANDS = new Set(["", "true", ":"]);
+const NO_OP_HEARTBEAT_REASON = "Fusion tasks are in flight for this session, so emit a text-only heartbeat instead of this no-op Bash command.";
 
 function resolveStateDir(env = process.env) {
   const override = env[STATE_ENV];
@@ -45,6 +53,15 @@ function resolveBudget(env = process.env) {
   return Number.isInteger(parsed) && parsed > 0 ? parsed : DEFAULT_BUDGET;
 }
 
+function resolveLockTimeoutMs(env = process.env) {
+  const raw = env[LOCK_TIMEOUT_ENV];
+  if (raw === undefined || raw === null || (typeof raw === "string" && !String(raw).trim())) {
+    return DEFAULT_LOCK_TIMEOUT_MS;
+  }
+  const parsed = typeof raw === "number" ? raw : Number(String(raw).trim());
+  return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : DEFAULT_LOCK_TIMEOUT_MS;
+}
+
 function resolveMode(env = process.env) {
   return String(env[MODE_ENV] ?? "").trim().toLowerCase() === "advisory" ? "advisory" : "enforce";
 }
@@ -55,6 +72,60 @@ function resolveAuditDir(env = process.env) {
     return path.resolve(String(override).trim());
   }
   return path.join(os.homedir(), ".claude", "plugins", "data", "fusion-claude-code-fusion", "inline-guard-audit");
+}
+
+function resolveFusionDataDir(env = process.env) {
+  const override = env[FUSION_DATA_DIR_ENV];
+  if (override && String(override).trim()) {
+    return path.resolve(String(override).trim());
+  }
+  return path.join(os.homedir(), ".claude", "plugins", "data", "fusion-claude-code-fusion");
+}
+
+function resolveWorkerStateDir(env = process.env) {
+  const override = env[WORKER_STATE_DIR_ENV];
+  if (override && String(override).trim()) {
+    return path.resolve(String(override).trim());
+  }
+  return path.join(resolveFusionDataDir(env), "workers");
+}
+
+function sessionHasInFlightWorkerTasks(sessionId, env = process.env) {
+  const jobsDir = path.join(resolveWorkerStateDir(env), "jobs");
+  let entries;
+  try {
+    entries = fs.readdirSync(jobsDir, { withFileTypes: true });
+  } catch {
+    return false;
+  }
+  for (const entry of entries) {
+    if (!entry.isFile() || !entry.name.startsWith("fusion-") || !entry.name.endsWith(".json")) {
+      continue;
+    }
+    try {
+      const record = JSON.parse(fs.readFileSync(path.join(jobsDir, entry.name), "utf8"));
+      if (!record || typeof record !== "object" || Array.isArray(record)) {
+        continue;
+      }
+      if (record.sessionId !== sessionId) {
+        continue;
+      }
+      const status = record.transportStatus;
+      if (typeof status === "string" && !WORKER_TERMINAL_STATUSES.has(status)) {
+        return true;
+      }
+    } catch {
+      continue;
+    }
+  }
+  return false;
+}
+
+function extractBashCommand(toolInput) {
+  if (!toolInput || typeof toolInput !== "object") {
+    return null;
+  }
+  return typeof toolInput.command === "string" ? toolInput.command.trim() : null;
 }
 
 function resolvePositiveInteger(env, name, fallback) {
@@ -149,7 +220,7 @@ function acquireStateLock(file) {
   fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
   fs.chmodSync(dir, 0o700);
   const lockFile = `${file}.lock`;
-  const deadline = Date.now() + LOCK_TIMEOUT_MS;
+  const deadline = Date.now() + resolveLockTimeoutMs();
   for (;;) {
     try {
       const descriptor = fs.openSync(lockFile, fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_WRONLY, 0o600);
@@ -330,6 +401,33 @@ function normalizeAuditEvent(event) {
     const lane = normalizeLane(event.lane);
     const description = sanitizeAuditText(event.description);
     return lane ? { schemaVersion: AUDIT_SCHEMA_VERSION, at: new Date(atMs).toISOString(), session, event: "dispatch", lane, tool: event.tool, ...(description ? { description } : {}) } : null;
+  }
+  if (
+    (event.event === "deny" || event.event === "warn") &&
+    ENFORCEMENT_AUDIT_TOOLS.has(event.tool) &&
+    event.lane === MAIN_LANE &&
+    Number.isInteger(event.writeCount) &&
+    event.writeCount >= 0 &&
+    Number.isInteger(event.dispatchCount) &&
+    event.dispatchCount >= 0 &&
+    Number.isInteger(event.budget) &&
+    event.budget > 0 &&
+    (event.mode === "enforce" || event.mode === "advisory")
+  ) {
+    const safePath = WRITE_TOOLS.has(event.tool) ? sanitizeAuditPath(event.path) : null;
+    return {
+      schemaVersion: AUDIT_SCHEMA_VERSION,
+      at: new Date(atMs).toISOString(),
+      session,
+      event: event.event,
+      lane: MAIN_LANE,
+      tool: event.tool,
+      ...(safePath ? { path: safePath } : {}),
+      writeCount: event.writeCount,
+      dispatchCount: event.dispatchCount,
+      budget: event.budget,
+      mode: event.mode
+    };
   }
   return null;
 }
@@ -690,6 +788,45 @@ function runHook(env = process.env, input = readHookInput()) {
     return;
   }
 
+  if (toolName === BASH_TOOL) {
+    if (input.hook_event_name && input.hook_event_name !== "PreToolUse") {
+      return;
+    }
+    const command = extractBashCommand(input.tool_input);
+    if (command === null || !NO_OP_BASH_COMMANDS.has(command) || !sessionHasInFlightWorkerTasks(sessionId, env)) {
+      return;
+    }
+    const mode = resolveMode(env);
+    const budget = resolveBudget(env);
+    let writeCount = 0;
+    let dispatchCount = 0;
+    try {
+      const snapshot = withStateLock(file, () => normalizeState(readState(file), now));
+      writeCount = snapshot.writesSinceDispatch;
+      dispatchCount = totalDispatches(snapshot.dispatches);
+    } catch {
+      void 0;
+    }
+    const auditEvent = {
+      at: now,
+      session: sessionId,
+      event: mode === "advisory" ? "warn" : "deny",
+      lane: MAIN_LANE,
+      tool: BASH_TOOL,
+      writeCount,
+      dispatchCount,
+      budget,
+      mode
+    };
+    recordAuditEvent(auditEvent, env);
+    if (mode === "advisory") {
+      process.stdout.write(`${JSON.stringify(allowOutput(NO_OP_HEARTBEAT_REASON))}\n`);
+      return;
+    }
+    process.stdout.write(`${JSON.stringify(denyOutput(NO_OP_HEARTBEAT_REASON))}\n`);
+    return;
+  }
+
   if (!WRITE_TOOLS.has(toolName)) {
     return;
   }
@@ -699,6 +836,7 @@ function runHook(env = process.env, input = readHookInput()) {
     return;
   }
 
+  const auditPath = extractAuditWritePath(targetPath, cwd);
   const budget = resolveBudget(env);
   const mode = resolveMode(env);
   const decision = withStateLock(file, () => {
@@ -708,6 +846,7 @@ function runHook(env = process.env, input = readHookInput()) {
     }
     state.writeCount += 1;
     state.writesSinceDispatch += 1;
+    const dispatchCount = totalDispatches(state.dispatches);
     const multiple = budgetMultiple(state.writesSinceDispatch, budget);
     let candidate = null;
     if (multiple >= 1 && !state.advisedMultiples.includes(multiple)) {
@@ -715,23 +854,51 @@ function runHook(env = process.env, input = readHookInput()) {
       candidate = { multiple, writeCount: state.writesSinceDispatch, dispatchEpoch: state.dispatchEpoch };
     }
     writeState(file, state);
-    return { denied: false, candidate };
+    return { denied: false, writeCount: state.writesSinceDispatch, dispatchCount, candidate };
   });
 
   if (decision.denied) {
+    recordAuditEvent(
+      {
+        at: now,
+        session: sessionId,
+        event: "deny",
+        lane: MAIN_LANE,
+        tool: toolName,
+        ...(auditPath ? { path: auditPath } : {}),
+        writeCount: decision.writeCount,
+        dispatchCount: decision.dispatchCount,
+        budget,
+        mode
+      },
+      env
+    );
     const advisory = buildAdvisoryLine(decision.writeCount, decision.dispatchCount);
     process.stdout.write(`${JSON.stringify(denyOutput(`${advisory} The inline write budget is exhausted. Dispatch an Agent or Task before another main-loop write.`))}\n`);
     return;
   }
 
-  const auditPath = extractAuditWritePath(targetPath, cwd);
   recordAuditEvent({ at: now, session: sessionId, event: "write", lane: MAIN_LANE, tool: toolName, ...(auditPath ? { path: auditPath } : {}) }, env);
   if (decision.candidate) {
     withStateLock(file, () => {
       const latest = normalizeState(readState(file), new Date().toISOString());
-      const dispatchCount = totalDispatches(latest.dispatches);
       if (latest.dispatchEpoch === decision.candidate.dispatchEpoch && latest.advisedMultiples.includes(decision.candidate.multiple)) {
-        const advisory = buildAdvisoryLine(decision.candidate.writeCount, dispatchCount);
+        recordAuditEvent(
+          {
+            at: now,
+            session: sessionId,
+            event: "warn",
+            lane: MAIN_LANE,
+            tool: toolName,
+            ...(auditPath ? { path: auditPath } : {}),
+            writeCount: decision.writeCount,
+            dispatchCount: decision.dispatchCount,
+            budget,
+            mode
+          },
+          env
+        );
+        const advisory = buildAdvisoryLine(decision.writeCount, decision.dispatchCount);
         process.stdout.write(`${JSON.stringify(allowOutput(advisory))}\n`);
       }
     });
@@ -781,6 +948,7 @@ export {
   resolveAuditMaxFiles,
   resolveAuditRetentionDays,
   resolveBudget,
+  resolveLockTimeoutMs,
   resolveMode,
   resolveStateDir,
   sanitizeAuditPath,
