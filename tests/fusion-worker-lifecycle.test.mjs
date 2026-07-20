@@ -795,6 +795,74 @@ test("Stop advises on collected unverified workers without blocking and stays qu
   assert.strictEqual(quiet.stdout, "");
 });
 
+test("Stop in-flight advisory emits once then stays silent while stop_hook_active", (t) => {
+  const box = sandbox(t);
+  run(box, dispatch(box));
+  run(box, {
+    ...dispatch(box),
+    hook_event_name: "PostToolUse",
+    tool_response: { isAsync: true, status: "async_launched", agentId: "a1", resolvedModel: "claude-sonnet-5" }
+  });
+  const backgroundTasks = [{ id: "a1", type: "subagent", status: "running", agent_type: "fusion:fast-worker" }];
+
+  const firstStop = run(box, {
+    hook_event_name: "Stop",
+    session_id: "session-1",
+    cwd: box.cwd,
+    transcript_path: box.transcript,
+    stop_hook_active: false,
+    last_assistant_message: "done",
+    background_tasks: backgroundTasks
+  });
+  const firstOutput = JSON.parse(firstStop.stdout);
+  assert.strictEqual(firstOutput.decision, undefined);
+  assert.match(firstOutput.hookSpecificOutput.additionalContext, /still in flight/);
+  assert.match(firstOutput.hookSpecificOutput.additionalContext, /Collection is armed/);
+  assert.strictEqual(record(box).awaitingCollection, true);
+  const armedAt = record(box).awaitingCollectionArmedAt;
+  assert.ok(armedAt);
+
+  const reentered = run(box, {
+    hook_event_name: "Stop",
+    session_id: "session-1",
+    cwd: box.cwd,
+    transcript_path: box.transcript,
+    stop_hook_active: true,
+    last_assistant_message: "done",
+    background_tasks: backgroundTasks
+  });
+  assert.strictEqual(reentered.stdout, "");
+  assert.strictEqual(record(box).awaitingCollection, true);
+  assert.strictEqual(record(box).awaitingCollectionArmedAt, armedAt);
+});
+
+test("Stop terminal-uncollected still blocks when stop_hook_active is true", (t) => {
+  const box = sandbox(t);
+  run(box, dispatch(box));
+  const outputFile = path.join(box.root, "tasks", "agent-a1.output");
+  fs.mkdirSync(path.dirname(outputFile), { recursive: true });
+  fs.writeFileSync(outputFile, "", "utf8");
+  run(box, {
+    ...dispatch(box),
+    hook_event_name: "PostToolUse",
+    tool_response: { isAsync: true, status: "async_launched", agentId: "a1", outputFile, resolvedModel: "claude-sonnet-5" }
+  });
+
+  const terminalStop = run(box, {
+    hook_event_name: "Stop",
+    session_id: "session-1",
+    cwd: box.cwd,
+    transcript_path: box.transcript,
+    stop_hook_active: true,
+    last_assistant_message: "done",
+    background_tasks: [{ id: "a1", type: "subagent", status: "completed", agent_type: "fusion:fast-worker" }]
+  });
+  const decision = JSON.parse(terminalStop.stdout);
+  assert.strictEqual(decision.decision, "block");
+  assert.match(decision.reason, /Call Read with file_path=/);
+  assert.match(decision.reason, new RegExp(outputFile));
+});
+
 test("collection captures peer job footers and leaves absent or malformed footers null", (t) => {
   const cases = [
     {
