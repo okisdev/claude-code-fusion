@@ -20,6 +20,7 @@ import {
   recordedProcessGroupsClean,
   runGrok,
   runningJobLiveness,
+  terminalRecordAttribution,
   terminateProcessGroup,
   terminateRecordedProcessGroups,
   terminateRecordedProcessGroupsSync
@@ -117,6 +118,7 @@ const HISTORY_FAILURE_KINDS = new Set([
   "transport",
   "policy"
 ]);
+const GROK_ROLES = new Set(["burst", "independence", "live-web", "large-context", "best-of-n"]);
 const REVIEW_OUTPUT_SCHEMA = {
   type: "object",
   additionalProperties: false,
@@ -802,6 +804,16 @@ function isFusionRoutedPrompt(prompt) {
     .some((line) => /^\s*(?:fusion-brief:\s*v1|grok-role:|lane:\s*panel\b)/i.test(line));
 }
 
+function grokRoleFromPrompt(prompt) {
+  for (const line of String(prompt ?? "").split(/\r?\n/).slice(0, 12)) {
+    const match = /\bgrok-role:\s*([^\s;,]+)/i.exec(line);
+    if (match) {
+      return GROK_ROLES.has(match[1]) ? match[1] : null;
+    }
+  }
+  return null;
+}
+
 function backgroundDelivery(env = process.env) {
   return env[BACKGROUND_DELIVERY_ENV] === "managed" ? "managed" : "manual";
 }
@@ -1073,7 +1085,10 @@ function classifyFailure({ spawnError = null, result = null, logTail = "" } = {}
   if (result?.promptTransportError || result?.parseError) {
     return "transport";
   }
-  const tail = String(logTail ?? "");
+  const resultEvidence = resultFailed(result)
+    ? [result?.errorMessage, boundedTextTail(result?.text), boundedTextTail(result?.stdoutTail)].filter(Boolean).join("\n")
+    : "";
+  const tail = [String(logTail ?? ""), resultEvidence].filter(Boolean).join("\n");
   for (const [kind, pattern] of STDERR_FAILURE_KINDS) {
     if (pattern.test(tail)) {
       return kind;
@@ -1087,7 +1102,10 @@ function finishJobRecord(jobFile, patch) {
   if (current?.status === "done" || current?.status === "error" || current?.status === "cancelled") {
     return current;
   }
-  return updateJobRecordFile(jobFile, patch);
+  const terminalAttribution = patch?.status === "error" || patch?.status === "cancelled"
+    ? terminalRecordAttribution(current, patch)
+    : {};
+  return updateJobRecordFile(jobFile, { ...patch, ...terminalAttribution });
 }
 
 function deadProcessMessage(deadPids) {
@@ -1101,6 +1119,7 @@ function deadProcessMessage(deadPids) {
 function cleanupRequiredPatch(current, failureKind, message) {
   return {
     ...current,
+    ...terminalRecordAttribution(current),
     cleanupRequired: true,
     errorMessage: message,
     errorTail: message,
@@ -1135,6 +1154,7 @@ function finishDiedJobRecord(file) {
     const failureKind = cancelled ? "cancelled" : "died";
     return {
       ...current,
+      ...terminalRecordAttribution(current),
       status,
       finishedAt: nowIso(),
       resultPayload: retainedResultPayload(
@@ -1164,6 +1184,7 @@ export function refreshRunningJobRecord({ record, file }) {
 }
 
 function resultFailed(result) {
+  if (result == null) return false;
   return Boolean(result.parseError) || Boolean(result.errorMessage) || result.exitCode !== 0 || result.timedOut || isPermissionCancelled(result);
 }
 
@@ -1442,6 +1463,7 @@ function recordSpawnFailure(jobFile, error, context = {}) {
       updateJobRecordFile(jobFile, {
         ...context,
         ...processPatch,
+        ...terminalRecordAttribution(current),
         cleanupRequired: true,
         errorMessage: oneLineSummary(message),
         errorTail: message,
@@ -1544,6 +1566,7 @@ async function handleTask(argv, transport = {}) {
     }
     prompt = CONTINUE_PROMPT;
   }
+  const role = grokRoleFromPrompt(prompt);
 
   const jobId = generateJobId();
   const briefFile = briefPath(dataDir, cwd, jobId);
@@ -1558,6 +1581,7 @@ async function handleTask(argv, transport = {}) {
     delivery: background ? backgroundDelivery() : "foreground",
     claudeSessionId,
     jobClass: bestOfN ? "best_of_n" : "task",
+    role,
     request: {
       model: options.model ?? null,
       effort: options.effort ?? null,
@@ -1570,6 +1594,7 @@ async function handleTask(argv, transport = {}) {
       resumeSourceJobId: resumeSource?.id ?? null,
       resumeReason,
       continuityPolicy: selectedContinuityPolicy,
+      role,
       outputJson: Boolean(options.json),
       ingress: transport.ingress ?? "argv"
     }
@@ -1639,7 +1664,7 @@ async function handleTask(argv, transport = {}) {
 
   const payload = taskSuccessPayload(record, result);
   const finishedAt = nowIso();
-  const final = finishSuccessfulJobRecordFile(jobFile, {
+  const successPatch = {
     status: "done",
     pid: null,
     grokPid: null,
@@ -1650,6 +1675,10 @@ async function handleTask(argv, transport = {}) {
     resultPayload: retainedResultPayload(record, payload),
     ...resultSpendPatch(result),
     failureKind: null
+  };
+  const final = finishSuccessfulJobRecordFile(jobFile, {
+    ...successPatch,
+    terminalAttribution: terminalRecordAttribution(record, successPatch)
   });
 
   if (final.status === "cancelled") {
@@ -2391,6 +2420,7 @@ async function handleCancel(argv, transport = {}) {
     }
     return {
       ...current,
+      ...terminalRecordAttribution(current),
       status: "cancelled",
       finishedAt: nowIso(),
       resultPayload: retainedResultPayload(

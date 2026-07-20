@@ -110,6 +110,18 @@ test("structured quota errors retain reported usage", (t) => {
   });
 });
 
+test("result text 402 errors yield failure kind quota", (t) => {
+  const sandbox = makeSandbox(t);
+  const env = envFor(sandbox, { FAKE_GROK_MODE: "result-text-402-error" });
+  const result = runCompanion(["task", "doomed"], { cwd: sandbox.workDir, env });
+  assert.notStrictEqual(result.status, 0);
+  assert.match(result.stderr, /^failure: quota$/m);
+  const [record] = jobRecords(sandbox.dataDir);
+  assert.strictEqual(record.status, "error");
+  assert.strictEqual(record.failureKind, "quota");
+  assert.strictEqual(record.resultText, "API error (status 402 Payment Required): Grok Build usage balance exhausted");
+});
+
 test("turn-limit failures retain the final envelope and reported spend", (t) => {
   const sandbox = makeSandbox(t);
   const env = envFor(sandbox, {
@@ -326,10 +338,10 @@ test("permission-cancelled turn reports explicit absence when the CLI omits the 
   assert.doesNotMatch(result.stderr, /blocked call: /);
 });
 
-test("cancelled background job yields failure kind cancelled", async (t) => {
+test("cancelled background job retains requested model and effort attribution", async (t) => {
   const sandbox = makeSandbox(t);
   const env = envFor(sandbox, { FAKE_GROK_MODE: "hang" });
-  const launch = runCompanion(["task", "--background", "long running"], {
+  const launch = runCompanion(["task", "--background", "--model", "grok-requested", "--effort", "high", "long running"], {
     cwd: sandbox.workDir,
     env,
   });
@@ -351,6 +363,8 @@ test("cancelled background job yields failure kind cancelled", async (t) => {
     return current && current.status === "cancelled" ? current : null;
   });
   assert.strictEqual(cancelled.failureKind, "cancelled");
+  assert.strictEqual(cancelled.resolvedModel, "grok-requested");
+  assert.strictEqual(cancelled.resolvedEffort, "high");
   const resultOutput = runCompanion(["result", cancelled.id], { cwd: sandbox.workDir, env });
   assert.strictEqual(resultOutput.status, 0, resultOutput.stderr);
   assert.match(resultOutput.stdout, /^failure: cancelled$/m);
