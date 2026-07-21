@@ -102,6 +102,8 @@ The Fusion plugin keeps model routing and reconciliation data under `~/.claude/p
 
 `npm test` runs the suite against fake Codex and Grok binaries with no real peer CLI or network. `claude plugin validate plugins/codex`, `claude plugin validate plugins/grok`, `claude plugin validate plugins/fusion`, and `claude plugin validate .` check every plugin and the marketplace. Iterate with `claude --plugin-dir ./plugins/codex --plugin-dir ./plugins/grok --plugin-dir ./plugins/fusion` plus `/reload-plugins`; after committing and pushing, `claude plugin marketplace update claude-code-fusion` refreshes the installed copy.
 
+CI also runs `node bench/manifest.mjs --check`; contributors should run it after touching `bench/tasks`.
+
 ## Layout
 
 - `.claude-plugin/marketplace.json`: the marketplace manifest; installs as marketplace `claude-code-fusion`.

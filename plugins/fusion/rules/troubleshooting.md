@@ -42,6 +42,16 @@ Fixture heavy test authoring briefs are the dominant `turn_limit` and 570 second
 
 The Grok headless JSON has no top-level `model` field. A model name appears only as a key in `modelUsage` when usage attaches, so model capture depends on that map. Error-path capture also depends on salvaging the envelope before classifying the turn limit failure. Missing `modelUsage` means that the resolved model remains unavailable.
 
+## Worker truncation signatures
+
+Two truncation classes verified in production require recovery. A hard cap cut ends the transcript on a dangling `tool_result` at exactly the Agent frontmatter `maxTurns`, has no final text, and still reports completion in its notification. A narration end leaves the worker's last message as forward looking narration such as "Now let me verify..." at high tool counts.
+
+For either signature, resume with SendMessage and instruct `write the deliverable now, no more scanning`. The resumed worker receives fresh turn headroom and typically finishes in minutes. Ledger turn counts after resuming hide the original cut, so diagnose it from the `.output` transcript tail.
+
+The Fusion job collection bounded window is 540s while the Codex companion result wait allows 570s, so a job finishing inside that 30s gap times out the collector and is collected manually via `/codex:result`.
+
+The fleet mode state file has no writer within the plugin, so disable the fleet default with `FUSION_FLEET_MODE=off` or write that file externally.
+
 ## Codex startup and cache compatibility
 
 Codex exec refuses to start outside a directory with an ancestor `.git` entry. The `projects` trust map in `config.toml` is not consulted by exec. Only `--skip-git-repo-check` or the dangerous bypass flag skips this gate. The companion forwards `--skip-git-repo-check`, and its failure output names that remedy. A directory that is trusted in configuration is not therefore a valid exec directory without an ancestor Git entry.
