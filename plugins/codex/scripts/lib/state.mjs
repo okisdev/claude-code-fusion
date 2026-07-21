@@ -21,6 +21,7 @@ const STATE_MAX_RECORDS_ENV = "CODEX_COMPANION_HISTORY_MAX_RECORDS";
 const JOB_STATUSES = new Set(["running", "done", "error", "cancelled"]);
 const DELIVERY_MODES = new Set(["foreground", "manual", "managed"]);
 const SEMANTIC_STATUSES = new Set(["accepted", "rejected", "unverified"]);
+const ACCEPTANCE_SOURCES = new Set(["collector", "main-loop", "stats"]);
 const JOB_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 const WORKSPACE_SLUG_PATTERN = /^.+-[a-f0-9]{16}$/;
 
@@ -433,6 +434,12 @@ function assertJobRecord(record) {
   if (record.semanticStatus != null && !SEMANTIC_STATUSES.has(record.semanticStatus)) {
     throw new TypeError("Job semantic status is invalid.");
   }
+  if (record.acceptanceSource != null && !ACCEPTANCE_SOURCES.has(record.acceptanceSource)) {
+    throw new TypeError("Job acceptance source is invalid.");
+  }
+  if (record.acceptanceRecordedAt != null && (typeof record.acceptanceRecordedAt !== "string" || !Number.isFinite(Date.parse(record.acceptanceRecordedAt)))) {
+    throw new TypeError("Job acceptance recorded timestamp is invalid.");
+  }
 }
 
 function ownerSessionId(record) {
@@ -447,6 +454,8 @@ function normalizeRecord(record) {
     delivery: record.delivery ?? (record.background ? "manual" : "foreground"),
     deliveryCollectedAt: record.deliveryCollectedAt ?? null,
     schemaVersion: record.schemaVersion ?? JOB_SCHEMA_VERSION,
+    acceptanceSource: record.acceptanceSource ?? null,
+    acceptanceRecordedAt: record.acceptanceRecordedAt ?? null,
     semanticStatus: record.semanticStatus ?? "unverified",
     semanticFailureKind: record.semanticFailureKind ?? null,
     semanticFailureMessage: record.semanticFailureMessage ?? null,
@@ -486,6 +495,8 @@ function terminalPatch(existing, patch, timestamp) {
     codexPidOwnsProcessGroup: false,
     finishedAt: existing.finishedAt ?? patch.finishedAt ?? timestamp,
     updatedAt: patch.updatedAt ?? timestamp,
+    acceptanceSource: patch.acceptanceSource ?? existing.acceptanceSource ?? null,
+    acceptanceRecordedAt: patch.acceptanceRecordedAt ?? existing.acceptanceRecordedAt ?? null,
     failureKind: status === "cancelled" ? "cancelled" : patch.failureKind ?? existing.failureKind ?? null,
     cancelRequestedAt: null
   };
@@ -698,6 +709,8 @@ export function createJobRecord(fields) {
     resolvedEffort: fields.resolvedEffort ?? fields.request?.effort ?? null,
     ...(fields.modelDrift ? { modelDrift: fields.modelDrift } : {}),
     rolloutRecoveryStatus: fields.rolloutRecoveryStatus ?? null,
+    acceptanceSource: fields.acceptanceSource ?? null,
+    acceptanceRecordedAt: fields.acceptanceRecordedAt ?? null,
     semanticStatus: fields.semanticStatus ?? "unverified",
     semanticFailureKind: fields.semanticFailureKind ?? null,
     semanticFailureMessage: fields.semanticFailureMessage ?? null,

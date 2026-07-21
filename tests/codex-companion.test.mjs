@@ -777,13 +777,14 @@ test("trusted-directory failures store and render the skip-git remedy", (t) => {
   assert.match(result.stdout, /--skip-git-repo-check/);
 });
 
-function seedTerminalJob(sandbox, { id, status }) {
+function seedTerminalJob(sandbox, { id, status, ...fields }) {
   const record = createJobRecord({
     id,
     cwd: sandbox.workDir,
     finishedAt: "2026-01-01T00:00:00.000Z",
     request: { effort: "high", model: "gpt-test" },
-    status
+    status,
+    ...fields
   });
   writeJobRecordFile(jobFilePath(sandbox.dataDir, sandbox.workDir, id), record);
 }
@@ -811,10 +812,38 @@ test("record-acceptance stores accepted and rejected semantic verdicts", (t) => 
   assert.equal(record.semanticFailureMessage, "Verification did not pass.");
 });
 
+test("record-acceptance stamps default stats provenance", (t) => {
+  const sandbox = makeSandbox(t);
+  const id = "e".repeat(32);
+  seedTerminalJob(sandbox, { id, status: "done" });
+  const result = runCompanion(["record-acceptance", "--job-id", id, "--acceptance", "accepted"], {
+    cwd: sandbox.workDir,
+    env: envFor(sandbox)
+  });
+  assert.equal(result.status, 0, result.stderr);
+  const [record] = jobRecords(sandbox);
+  assert.equal(record.acceptanceSource, "stats");
+  assert.match(record.acceptanceRecordedAt, /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/);
+});
+
+test("record-acceptance stamps explicit provenance", (t) => {
+  const sandbox = makeSandbox(t);
+  const id = "f".repeat(32);
+  seedTerminalJob(sandbox, { id, status: "done" });
+  const result = runCompanion(["record-acceptance", "--job-id", id, "--acceptance", "accepted", "--source", "main-loop"], {
+    cwd: sandbox.workDir,
+    env: envFor(sandbox)
+  });
+  assert.equal(result.status, 0, result.stderr);
+  const [record] = jobRecords(sandbox);
+  assert.equal(record.acceptanceSource, "main-loop");
+  assert.match(record.acceptanceRecordedAt, /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/);
+});
+
 test("record-acceptance blocks accepted verdicts on failed transport by default", (t) => {
   const sandbox = makeSandbox(t);
   const id = "b".repeat(32);
-  seedTerminalJob(sandbox, { id, status: "error" });
+  seedTerminalJob(sandbox, { id, status: "error", exitCode: 1, failureKind: "timeout" });
   const result = runCompanion(["record-acceptance", "--job-id", id, "--acceptance", "accepted"], {
     cwd: sandbox.workDir,
     env: envFor(sandbox)

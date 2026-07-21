@@ -217,6 +217,8 @@ test("job ids contain 128 bits and records expose the canonical Codex fields", (
   assert.strictEqual(record.status, "running");
   assert.strictEqual(record.delivery, "foreground");
   assert.strictEqual(record.deliveryCollectedAt, null);
+  assert.strictEqual(record.acceptanceSource, null);
+  assert.strictEqual(record.acceptanceRecordedAt, null);
   assert.strictEqual(record.semanticStatus, "unverified");
   assert.strictEqual(record.serviceTier, null);
   assert.strictEqual(record.appliedServiceTier, null);
@@ -370,6 +372,16 @@ test("terminal finalization preserves the first finished timestamp", (t) => {
 
   assert.equal(first.finishedAt, firstFinishedAt);
   assert.equal(second.finishedAt, firstFinishedAt);
+});
+
+test("terminal finalization preserves acceptance provenance", (t) => {
+  const sandbox = makeSandbox(t);
+  const acceptanceRecordedAt = "2026-07-19T07:50:39.000Z";
+  const { file } = makeRecord(sandbox, { acceptanceRecordedAt, acceptanceSource: "collector" });
+  const finished = finishJobRecordFile(file, { status: "done" });
+
+  assert.equal(finished.acceptanceSource, "collector");
+  assert.equal(finished.acceptanceRecordedAt, acceptanceRecordedAt);
 });
 
 test("terminal collection is an atomic idempotent lifecycle transition", (t) => {
