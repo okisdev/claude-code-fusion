@@ -435,6 +435,28 @@ test("history ignores mismatched filenames and native Grok sessions while narrow
   assert.equal(malformed.resumable, false);
 });
 
+test("history surfaces turn_limit failureKind from a terminal job record", (t) => {
+  const sandbox = makeSandbox(t);
+  const jobId = "a1b2c3d4e5f60718293a4b5c6d7e8f90";
+  seedJob(sandbox, {
+    id: jobId,
+    status: "error",
+    failureKind: "turn_limit",
+    sessionId: "a1b2c3d4-e5f6-7182-93a4-b5c6d7e8f901",
+    createdAt: "2026-07-16T00:00:00.000Z"
+  });
+
+  const result = runCompanion(["history", "--json"], {
+    cwd: sandbox.workDir,
+    env: envFor(sandbox)
+  });
+  assert.equal(result.status, 0, result.stderr);
+  const payload = JSON.parse(result.stdout);
+  assert.equal(payload.jobs.length, 1);
+  assert.equal(payload.jobs[0].jobId, jobId);
+  assert.equal(payload.jobs[0].failureKind, "turn_limit");
+});
+
 test("history text rendering escapes every dynamic markdown table cell", () => {
   const output = renderHistoryReport(
     {

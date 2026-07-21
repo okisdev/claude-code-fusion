@@ -116,7 +116,8 @@ const HISTORY_FAILURE_KINDS = new Set([
   "resource",
   "sandbox",
   "transport",
-  "policy"
+  "policy",
+  "turn_limit"
 ]);
 const GROK_ROLES = new Set(["burst", "independence", "live-web", "large-context", "best-of-n"]);
 const REVIEW_OUTPUT_SCHEMA = {
