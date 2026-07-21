@@ -1486,6 +1486,24 @@ function clearInFlightAdvisory(sessionId, env) {
   });
 }
 
+function shouldWriteSettleOnlyAdvisory(sessionId, signature, env) {
+  return readWorkerSessionState(sessionId, env)?.settleOnlyAdvisorySignature !== signature;
+}
+
+function recordSettleOnlyAdvisory(sessionId, signature, env) {
+  updateWorkerSessionState(sessionId, env, (current) => ({ ...(current ?? {}), settleOnlyAdvisorySignature: signature }));
+}
+
+function clearSettleOnlyAdvisory(sessionId, env) {
+  updateWorkerSessionState(sessionId, env, (current) => {
+    if (!current || !("settleOnlyAdvisorySignature" in current)) {
+      return null;
+    }
+    const { settleOnlyAdvisorySignature, ...next } = current;
+    return next;
+  });
+}
+
 function handleStop(input, env) {
   const tasks = Array.isArray(input.background_tasks) ? input.background_tasks : [];
   reconcileTaskNotifications(input, env);
@@ -1538,8 +1556,17 @@ function handleStop(input, env) {
   }
   const terminalUncollected = currentRecords.filter(terminalCollectionPending);
   const settleOnly = settleOnlyRecords(currentRecords);
+  const settleOnlySignature = settleOnly.length > 0 ? inFlightSignature(settleOnly) : null;
+  if (!settleOnlySignature) {
+    clearSettleOnlyAdvisory(input.session_id, env);
+  }
   if (terminalUncollected.length + settleOnly.length > 1) {
-    writeCombinedStopPending(terminalUncollected, settleOnly);
+    if (terminalUncollected.length > 0 || shouldWriteSettleOnlyAdvisory(input.session_id, settleOnlySignature, env)) {
+      writeCombinedStopPending(terminalUncollected, settleOnly);
+      if (settleOnlySignature) {
+        recordSettleOnlyAdvisory(input.session_id, settleOnlySignature, env);
+      }
+    }
     return;
   }
   if (terminalUncollected.length > 0) {
