@@ -1,5 +1,9 @@
 # changelog
 
+## 0.0.34
+
+- the settle-only advisory stops repeating itself: when settlement is legitimately deferred (a package's verification waiting on a sibling landing), the pending-verdict block re-emitted identically at every stop boundary with no new information; it now dedupes by a persisted pending-set signature, the same mechanism the in-flight advisory has used since 0.0.31, emitting once per distinct set and again only when a record enters or leaves; blocking collection demands are unaffected and refresh the signature when they emit combined
+
 ## 0.0.33
 
 - notification collection reads the transcript the notification names: every peer wrapper record in a live traffic window had a null `transcriptPath`, so the completed path extracted nothing, mislabeled clean consult wrappers (nine to eleven turns of a sixty budget, backing peer jobs all clean) as `turn_limit` incomplete, demanded manual raw transcript reads, and skipped peer footer seeding; the reconciler now stamps the record's `transcriptPath` from the notification's own output file element before transition, and a no-text completion classifies `missing_final_text` unless real turn evidence supports `turn_limit`
