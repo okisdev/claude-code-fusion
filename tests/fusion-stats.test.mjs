@@ -23,6 +23,7 @@ import {
   fusionRepositoryKey,
   newestCodexCompanion,
   newestGrokCompanion,
+  normalizeCollectionMethod,
   normalizeCodexTokenUsage,
   pruneDeadWorkspaces,
   recordCodexAcceptance,
@@ -1512,7 +1513,7 @@ test("--record-acceptance updates the Codex job record before appending the ledg
   assert.strictEqual(result.status, 0, result.stderr);
   assert.strictEqual(result.stdout, `Recorded accepted for Codex job ${jobId}.\n`);
   assert.strictEqual(result.stderr, "");
-  assert.deepStrictEqual(JSON.parse(fs.readFileSync(argsFile, "utf8")), ["record-acceptance", "--job-id", jobId, "--acceptance", "accepted", "--reason", "verification passed"]);
+  assert.deepStrictEqual(JSON.parse(fs.readFileSync(argsFile, "utf8")), ["record-acceptance", "--job-id", jobId, "--acceptance", "accepted", "--source", "main-loop", "--reason", "verification passed"]);
   assert.strictEqual(fs.readFileSync(acceptanceSidecarPath(dir, { FUSION_DATA_DIR: fusionData }), "utf8").trim().split("\n").length, 1);
 });
 
@@ -1571,7 +1572,26 @@ test("--record-acceptance forwards --accept-failed-transport unchanged", (t) => 
   );
 
   assert.strictEqual(result.status, 0, result.stderr);
-  assert.deepStrictEqual(JSON.parse(fs.readFileSync(argsFile, "utf8")), ["record-acceptance", "--job-id", jobId, "--acceptance", "accepted", "--accept-failed-transport"]);
+  assert.deepStrictEqual(JSON.parse(fs.readFileSync(argsFile, "utf8")), ["record-acceptance", "--job-id", jobId, "--acceptance", "accepted", "--source", "collector", "--accept-failed-transport"]);
+});
+
+test("--record-acceptance forwards an explicit source to the Codex companion", (t) => {
+  const dir = sandbox(t);
+  const stateRoot = path.join(dir, "state");
+  const fusionData = path.join(dir, "fusion");
+  const jobId = "e".repeat(32);
+  const companion = writeCodexAcceptanceCompanion(dir);
+  const argsFile = path.join(dir, "companion-args.json");
+  writeCodexJob(stateRoot, dir, jobId, { status: "done", jobClass: "task" });
+
+  const result = run(
+    { cwd: dir, codexState: stateRoot },
+    ["--record-acceptance", jobId, "accepted", "--source", "main-loop"],
+    { FUSION_DATA_DIR: fusionData, FUSION_CODEX_COMPANION: companion, FUSION_TEST_CODEX_COMPANION_ARGS: argsFile }
+  );
+
+  assert.strictEqual(result.status, 0, result.stderr);
+  assert.deepStrictEqual(JSON.parse(fs.readFileSync(argsFile, "utf8")), ["record-acceptance", "--job-id", jobId, "--acceptance", "accepted", "--source", "main-loop"]);
 });
 
 test("--record-acceptance resolves a Grok job after a Codex lookup miss", (t) => {
@@ -1640,7 +1660,7 @@ test("--record settles a Fusion task and its Codex peer with direct strict argv"
 
   assert.strictEqual(result.status, 0, result.stderr);
   assert.strictEqual(result.stdout, `Recorded accepted for Fusion worker task ${taskId}.\nRecorded accepted for Codex job ${jobId}.\n`);
-  assert.deepStrictEqual(JSON.parse(fs.readFileSync(argsFile, "utf8")), ["record-acceptance", "--job-id", jobId, "--acceptance", "accepted"]);
+  assert.deepStrictEqual(JSON.parse(fs.readFileSync(argsFile, "utf8")), ["record-acceptance", "--job-id", jobId, "--acceptance", "accepted", "--source", "main-loop"]);
   assert.strictEqual(readWorkerRecord(taskId, env).acceptance, "accepted");
 });
 
@@ -1667,7 +1687,7 @@ test("--record resolves a bare Codex job and settles matching worker rows", (t) 
     { kind: "engine", engine: "codex", jobId, acceptance: "rejected" },
     { kind: "worker", taskId, acceptance: "rejected" }
   ]);
-  assert.deepStrictEqual(JSON.parse(fs.readFileSync(argsFile, "utf8")), ["record-acceptance", "--job-id", jobId, "--acceptance", "rejected"]);
+  assert.deepStrictEqual(JSON.parse(fs.readFileSync(argsFile, "utf8")), ["record-acceptance", "--job-id", jobId, "--acceptance", "rejected", "--source", "main-loop"]);
   assert.strictEqual(readWorkerRecord(taskId, env).acceptance, "rejected");
 });
 
@@ -2425,6 +2445,96 @@ test("Claude worker stats expose lifecycle, exact usage, acceptance, and the uni
   assert.strictEqual(fs.statSync(stateDir).mode & 0o777, 0o700);
   assert.strictEqual(fs.statSync(path.dirname(jobFile)).mode & 0o777, 0o700);
   assert.strictEqual(fs.statSync(jobFile).mode & 0o777, 0o600);
+});
+
+test("Claude worker stats normalize legacy collection methods for grouping and display", (t) => {
+  const dir = sandbox(t);
+  const env = { FUSION_WORKER_STATE_DIR: path.join(dir, "worker-state") };
+  const workers = [
+    ["fusion-legacy-stop", "SubagentStop"],
+    ["fusion-legacy-agent", "Agent"]
+  ];
+  for (const [taskId, collectionMethod] of workers) {
+    createWorkerRecord({ taskId, sessionId: "session-workers", dispatchToolUseId: taskId, agentType: "fusion:fast-worker", workspaceRoot: dir, limits: {} }, env);
+    updateWorkerRecord(taskId, env, (record) => ({ ...record, transportStatus: "done", collectionMethod }));
+  }
+
+  const stats = claudeWorkerStats({ all: true, env, cwd: dir });
+  assert.strictEqual(normalizeCollectionMethod("SubagentStop"), "subagent_stop");
+  assert.strictEqual(normalizeCollectionMethod("Agent"), "agent_result");
+  assert.strictEqual(normalizeCollectionMethod("aGeNt"), "agent_result");
+  assert.deepStrictEqual(stats.byCollectionMethod, { subagent_stop: 1, agent_result: 1 });
+  assert.deepStrictEqual(stats.identities.map((identity) => identity.collectionMethod).sort(), ["agent_result", "subagent_stop"]);
+  assert.match(renderFusionStats({ scope: dir, claudeWorkers: stats }), /By collection method:\n- agent_result: 1\n- subagent_stop: 1/);
+});
+
+test("--unsettled lists terminal unverified jobs and preserves Codex acceptance provenance", (t) => {
+  const dir = sandbox(t);
+  const stateRoot = path.join(dir, "codex-state");
+  const workerState = path.join(dir, "worker-state");
+  const grokData = path.join(dir, "grok-data");
+  const codexUnsettledId = "a".repeat(32);
+  const codexNoProvenanceId = "b".repeat(32);
+  const codexSettledId = "c".repeat(32);
+
+  writeCodexJob(stateRoot, dir, codexUnsettledId, {
+    status: "done",
+    jobClass: "task",
+    acceptance: "unverified",
+    acceptanceSource: "collector",
+    acceptanceRecordedAt: "2026-07-21T00:03:00.000Z",
+    finishedAt: "2026-07-21T00:03:00.000Z"
+  });
+  writeCodexJob(stateRoot, dir, codexNoProvenanceId, {
+    status: "completed",
+    jobClass: "review",
+    acceptance: "unverified",
+    finishedAt: "2026-07-21T00:00:00.000Z"
+  });
+  writeCodexJob(stateRoot, dir, codexSettledId, {
+    status: "done",
+    jobClass: "task",
+    acceptance: "accepted",
+    finishedAt: "2026-07-21T00:04:00.000Z"
+  });
+  writeGrokJob(grokData, dir, "grok-unsettled", {
+    status: "done",
+    mode: "consult",
+    acceptance: "unverified",
+    finishedAt: "2026-07-21T00:02:00.000Z"
+  });
+  writeGrokJob(grokData, dir, "grok-settled", {
+    status: "done",
+    mode: "consult",
+    acceptance: "rejected",
+    finishedAt: "2026-07-21T00:04:00.000Z"
+  });
+  createWorkerRecord({ taskId: "fusion-unsettled", sessionId: "session-workers", dispatchToolUseId: "tool-unsettled", agentType: "fusion:fast-worker", description: "worker task", workspaceRoot: dir, limits: {} }, { FUSION_WORKER_STATE_DIR: workerState });
+  updateWorkerRecord("fusion-unsettled", { FUSION_WORKER_STATE_DIR: workerState }, (record) => ({ ...record, transportStatus: "done", finishedAt: "2026-07-21T00:01:00.000Z" }));
+  createWorkerRecord({ taskId: "fusion-settled", sessionId: "session-workers", dispatchToolUseId: "tool-settled", agentType: "fusion:fast-worker", workspaceRoot: dir, limits: {} }, { FUSION_WORKER_STATE_DIR: workerState });
+  updateWorkerRecord("fusion-settled", { FUSION_WORKER_STATE_DIR: workerState }, (record) => ({ ...record, transportStatus: "done", acceptance: "rejected", finishedAt: "2026-07-21T00:04:00.000Z" }));
+
+  const extraEnv = { FUSION_WORKER_STATE_DIR: workerState, GROK_COMPANION_DATA: grokData };
+  const json = run({ cwd: dir, codexState: stateRoot }, ["--unsettled", "--json"], extraEnv);
+  assert.strictEqual(json.status, 0, json.stderr);
+  const report = JSON.parse(json.stdout);
+  assert.deepStrictEqual(report.unsettled.map((entry) => [entry.engine, entry.id]), [
+    ["codex", codexUnsettledId],
+    ["grok", "grok-unsettled"],
+    ["fusion", "fusion-unsettled"],
+    ["codex", codexNoProvenanceId]
+  ]);
+  const withProvenance = report.unsettled.find((entry) => entry.id === codexUnsettledId);
+  assert.strictEqual(withProvenance.acceptanceSource, "collector");
+  assert.strictEqual(withProvenance.acceptanceRecordedAt, "2026-07-21T00:03:00.000Z");
+  const withoutProvenance = report.unsettled.find((entry) => entry.id === codexNoProvenanceId);
+  assert.strictEqual(Object.hasOwn(withoutProvenance, "acceptanceSource"), false);
+  assert.strictEqual(Object.hasOwn(withoutProvenance, "acceptanceRecordedAt"), false);
+
+  const rendered = run({ cwd: dir, codexState: stateRoot }, ["--unsettled"], extraEnv);
+  assert.strictEqual(rendered.status, 0, rendered.stderr);
+  assert.match(rendered.stdout, /acceptance source: collector, acceptance recorded at: 2026-07-21T00:03:00.000Z/);
+  assert.doesNotMatch(rendered.stdout.split("\n").find((line) => line.includes(codexNoProvenanceId)), /acceptance source|acceptance recorded at/);
 });
 
 test("Claude worker stats report completed harness async deliveries separately from failures", (t) => {
