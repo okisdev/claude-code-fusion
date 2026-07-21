@@ -73,6 +73,16 @@
             "timeout": 10
           }
         ]
+      },
+      {
+        "matcher": "^(TaskOutput|TaskStop)$",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/inline-delegation-guard.mjs\"",
+            "timeout": 10
+          }
+        ]
       }
     ],
     "PostToolUse": [
