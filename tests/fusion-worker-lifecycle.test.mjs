@@ -62,6 +62,28 @@ function record(box) {
   return records[0];
 }
 
+function createSettleOnlyRecord(box, taskId) {
+  const worker = createWorkerRecord({
+    taskId,
+    sessionId: "session-1",
+    agentType: "fusion:fast-worker",
+    workspaceRoot: box.cwd
+  }, envFor(box));
+  const collectedAt = new Date().toISOString();
+  return updateWorkerRecord(worker.taskId, envFor(box), (current) => ({ ...current, transportStatus: "done", collectedAt, collectionMethod: WORKER_COLLECTION_METHODS.SUBAGENT_STOP, awaitingVerdict: true, awaitingVerdictArmedAt: collectedAt }));
+}
+
+function stop(box) {
+  return run(box, {
+    hook_event_name: "Stop",
+    session_id: "session-1",
+    cwd: box.cwd,
+    transcript_path: box.transcript,
+    stop_hook_active: false,
+    background_tasks: []
+  });
+}
+
 test("legacy collection methods normalize when worker records load", (t) => {
   const box = sandbox(t);
   const worker = createWorkerRecord({
@@ -3346,6 +3368,86 @@ test("Stop combines multi-record collection and settlement instructions", (t) =>
   assert.match(decision.reason, new RegExp(`Call Read with file_path=${outputFile.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`));
   assert.doesNotMatch(decision.reason, /no offset or limit/);
   assert.match(decision.reason, new RegExp(`settle-only: ${settling.taskId}: /fusion:stats --record ${settling.taskId}=accepted\\|rejected\\|unverified`));
+});
+
+test("Stop emits a settle-only advisory once for an unchanged pending set", (t) => {
+  const box = sandbox(t);
+  const first = createSettleOnlyRecord(box, `fusion-${"1".repeat(24)}`);
+  const second = createSettleOnlyRecord(box, `fusion-${"2".repeat(24)}`);
+
+  const emitted = stop(box);
+  assert.match(emitted.stdout, new RegExp(`settle-only: ${first.taskId}`));
+  assert.match(emitted.stdout, new RegExp(`settle-only: ${second.taskId}`));
+  assert.strictEqual(readWorkerSessionState("session-1", envFor(box)).settleOnlyAdvisorySignature, [first.taskId, second.taskId].sort().join(","));
+
+  const repeated = stop(box);
+  assert.strictEqual(repeated.status, 0);
+  assert.strictEqual(repeated.stdout, "");
+});
+
+test("Stop re-emits a settle-only advisory when a record enters the pending set", (t) => {
+  const box = sandbox(t);
+  const first = createSettleOnlyRecord(box, `fusion-${"1".repeat(24)}`);
+  const second = createSettleOnlyRecord(box, `fusion-${"2".repeat(24)}`);
+  stop(box);
+  const added = createSettleOnlyRecord(box, `fusion-${"3".repeat(24)}`);
+
+  const emitted = stop(box);
+  assert.match(emitted.stdout, new RegExp(`settle-only: ${first.taskId}`));
+  assert.match(emitted.stdout, new RegExp(`settle-only: ${second.taskId}`));
+  assert.match(emitted.stdout, new RegExp(`settle-only: ${added.taskId}`));
+  assert.strictEqual(readWorkerSessionState("session-1", envFor(box)).settleOnlyAdvisorySignature, [first.taskId, second.taskId, added.taskId].sort().join(","));
+});
+
+test("Stop re-emits a settle-only advisory when a record settles", (t) => {
+  const box = sandbox(t);
+  const settled = createSettleOnlyRecord(box, `fusion-${"1".repeat(24)}`);
+  const firstRemaining = createSettleOnlyRecord(box, `fusion-${"2".repeat(24)}`);
+  const secondRemaining = createSettleOnlyRecord(box, `fusion-${"3".repeat(24)}`);
+  stop(box);
+  recordWorkerAcceptance({ taskId: settled.taskId, acceptance: "accepted", env: envFor(box), source: "main-loop" });
+
+  const emitted = stop(box);
+  assert.doesNotMatch(emitted.stdout, new RegExp(`settle-only: ${settled.taskId}`));
+  assert.match(emitted.stdout, new RegExp(`settle-only: ${firstRemaining.taskId}`));
+  assert.match(emitted.stdout, new RegExp(`settle-only: ${secondRemaining.taskId}`));
+  assert.strictEqual(readWorkerSessionState("session-1", envFor(box)).settleOnlyAdvisorySignature, [firstRemaining.taskId, secondRemaining.taskId].sort().join(","));
+});
+
+test("Stop combines a blocking collection demand with an unchanged settle-only advisory", (t) => {
+  const box = sandbox(t);
+  const first = createSettleOnlyRecord(box, `fusion-${"1".repeat(24)}`);
+  const second = createSettleOnlyRecord(box, `fusion-${"2".repeat(24)}`);
+  stop(box);
+  const collecting = createWorkerRecord({
+    taskId: `fusion-${"3".repeat(24)}`,
+    sessionId: "session-1",
+    agentType: "codex:codex-rescue",
+    workspaceRoot: box.cwd
+  }, envFor(box));
+  updateWorkerRecord(collecting.taskId, envFor(box), (current) => ({ ...current, agentId: "collecting-peer", backgroundTaskId: "collecting-peer", transportStatus: "ready_uncollected", runtimeAsync: true }));
+
+  const emitted = stop(box);
+  const decision = JSON.parse(emitted.stdout);
+  assert.strictEqual(decision.decision, "block");
+  assert.match(decision.reason, /Call TaskOutput with block=true for terminal owned task collecting-peer/);
+  assert.match(decision.reason, new RegExp(`settle-only: ${first.taskId}`));
+  assert.match(decision.reason, new RegExp(`settle-only: ${second.taskId}`));
+  assert.strictEqual(readWorkerSessionState("session-1", envFor(box)).settleOnlyAdvisorySignature, [first.taskId, second.taskId].sort().join(","));
+});
+
+test("Stop clears the settle-only advisory signature when no pending records remain", (t) => {
+  const box = sandbox(t);
+  const first = createSettleOnlyRecord(box, `fusion-${"1".repeat(24)}`);
+  const second = createSettleOnlyRecord(box, `fusion-${"2".repeat(24)}`);
+  stop(box);
+  assert.ok(readWorkerSessionState("session-1", envFor(box)).settleOnlyAdvisorySignature);
+  recordWorkerAcceptance({ taskId: first.taskId, acceptance: "accepted", env: envFor(box), source: "main-loop" });
+  recordWorkerAcceptance({ taskId: second.taskId, acceptance: "accepted", env: envFor(box), source: "main-loop" });
+
+  const quiet = stop(box);
+  assert.strictEqual(quiet.stdout, "");
+  assert.strictEqual(Object.hasOwn(readWorkerSessionState("session-1", envFor(box)), "settleOnlyAdvisorySignature"), false);
 });
 
 test("a delivered completion notification prevents Stop from demanding TaskStop for an expired worker", (t) => {
