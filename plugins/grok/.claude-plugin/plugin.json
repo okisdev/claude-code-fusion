@@ -2,7 +2,7 @@
   "$schema": "https://json.schemastore.org/claude-code-plugin-manifest.json",
   "name": "grok",
   "displayName": "Grok Companion",
-  "version": "0.0.32",
+  "version": "0.0.33",
   "description": "Local Grok CLI delegation: task, review, resumable history, best-of-n tournaments, background jobs, stats, and setup health checks.",
   "author": {
     "name": "Harry Yep"
