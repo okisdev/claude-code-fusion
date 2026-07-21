@@ -517,7 +517,7 @@ export function refreshWorkerTranscript(record, transcriptPath) {
   snapshot.toolUseIds = snapshot.toolUseIds.slice(-2048);
   const usageEntries = Object.entries(snapshot.usageMessages).slice(-512);
   snapshot.usageMessages = Object.fromEntries(usageEntries);
-  snapshot.turns = snapshot.turnIds.length;
+  snapshot.turns = Math.max(integer(record.turns), snapshot.turnIds.length);
   if (record.toolCallsSource !== "tool-response") {
     snapshot.toolCalls = snapshot.toolUseIds.length;
     snapshot.toolCallsSource = snapshot.toolUseIds.length > 0 ? "agent-transcript" : record.toolCallsSource;
