@@ -6,7 +6,7 @@ import path from "node:path";
 import { test } from "node:test";
 
 import { recordCodexAcceptance } from "../plugins/fusion/scripts/fusion-stats.mjs";
-import { createWorkerRecord, readWorkerSessionState, readWorkerRecords, recordWorkerAcceptance, updateWorkerRecord } from "../plugins/fusion/scripts/lib/worker-state.mjs";
+import { createWorkerRecord, readWorkerSessionState, readWorkerRecords, recordWorkerAcceptance, updateWorkerRecord, WORKER_COLLECTION_METHODS } from "../plugins/fusion/scripts/lib/worker-state.mjs";
 import { validateWorkerBrief, workerBudgetFailure, workerLimits } from "../plugins/fusion/scripts/worker-lifecycle.mjs";
 
 const repoRoot = path.join(import.meta.dirname, "..");
@@ -61,6 +61,41 @@ function record(box) {
   assert.strictEqual(records.length, 1);
   return records[0];
 }
+
+test("legacy collection methods normalize when worker records load", (t) => {
+  const box = sandbox(t);
+  const worker = createWorkerRecord({
+    taskId: `fusion-${"a".repeat(24)}`,
+    sessionId: "session-1",
+    agentType: "fusion:fast-worker",
+    workspaceRoot: box.cwd
+  }, envFor(box));
+  const file = path.join(box.state, "jobs", `${worker.taskId}.json`);
+  const stored = JSON.parse(fs.readFileSync(file, "utf8"));
+  fs.writeFileSync(file, `${JSON.stringify({ ...stored, collectionMethod: "SubagentStop" }, null, 2)}\n`, "utf8");
+
+  assert.strictEqual(record(box).collectionMethod, WORKER_COLLECTION_METHODS.SUBAGENT_STOP);
+});
+
+test("collection method write sites use the canonical set", () => {
+  const allowed = new Set(Object.values(WORKER_COLLECTION_METHODS));
+  assert.strictEqual(allowed.size, Object.keys(WORKER_COLLECTION_METHODS).length);
+  for (const method of allowed) {
+    assert.match(method, /^[a-z]+(?:_[a-z]+)*$/);
+  }
+
+  const sources = [
+    fs.readFileSync(script, "utf8"),
+    fs.readFileSync(path.join(repoRoot, "plugins", "fusion", "scripts", "lib", "worker-state.mjs"), "utf8")
+  ];
+  const assignments = sources.flatMap((source) => [...source.matchAll(/collectionMethod:\s*([^,\n}]+)/g)].map((match) => match[1].trim()));
+  assert.ok(assignments.length > 0);
+  assert.ok(assignments.every((expression) => expression === "null" || expression === "collectionMethod" || /^WORKER_COLLECTION_METHODS\.[A-Z_]+$/.test(expression)));
+
+  const calls = sources.flatMap((source) => source.split("\n").filter((line) => line.includes("markWorkerCollected(") && !line.includes("export function")));
+  assert.ok(calls.length > 0);
+  assert.ok(calls.every((line) => line.includes("WORKER_COLLECTION_METHODS.") || line.includes(", collectionMethod, now")));
+});
 
 test("worker limits preserve the default budgets without a sizing hint and retain environment overrides", () => {
   assert.deepStrictEqual(workerLimits("fusion:fast-worker", {}), {
@@ -493,7 +528,7 @@ test("an unexpected async peer wrapper allows Stop while in flight and remains o
   assert.strictEqual(record(box).transportStatus, "done");
   assert.strictEqual(record(box).failureKind, null);
   assert.strictEqual(record(box).deliveryMode, "harness_async");
-  assert.strictEqual(record(box).collectionMethod, "TaskOutput");
+  assert.strictEqual(record(box).collectionMethod, "task_output");
   assert.ok(record(box).collectedAt);
   const collectedAt = record(box).collectedAt;
 
@@ -506,7 +541,7 @@ test("an unexpected async peer wrapper allows Stop while in flight and remains o
     tool_input: { task_id: "peer-async", block: true },
     tool_response: { status: "completed", content: "peer result" }
   });
-  assert.strictEqual(record(box).collectionMethod, "TaskOutput");
+  assert.strictEqual(record(box).collectionMethod, "task_output");
   assert.strictEqual(record(box).collectedAt, collectedAt);
 });
 
@@ -698,7 +733,7 @@ test("SubagentStop keeps a newly evaluated budget failure instead of recovering 
   const completed = record(box);
   assert.strictEqual(completed.transportStatus, "done");
   assert.strictEqual(completed.failureKind, "timeout");
-  assert.strictEqual(completed.collectionMethod, "SubagentStop");
+  assert.strictEqual(completed.collectionMethod, "subagent_stop");
   assert.ok(completed.collectedAt);
   assert.strictEqual(completed.recoveredFailureKind, undefined);
 });
@@ -728,7 +763,7 @@ test("SubagentStop retains failed and incomplete workers on their existing colle
   }, limits);
   assert.strictEqual(record(failed).transportStatus, "failed");
   assert.strictEqual(record(failed).failureKind, "timeout");
-  assert.strictEqual(record(failed).collectionMethod, "SubagentStop");
+  assert.strictEqual(record(failed).collectionMethod, "subagent_stop");
   assert.ok(record(failed).collectedAt);
 
   const incomplete = sandbox(t);
@@ -753,7 +788,7 @@ test("SubagentStop retains failed and incomplete workers on their existing colle
   });
   assert.strictEqual(record(incomplete).transportStatus, "incomplete");
   assert.strictEqual(record(incomplete).failureKind, "delivery");
-  assert.strictEqual(record(incomplete).collectionMethod, "SubagentStop");
+  assert.strictEqual(record(incomplete).collectionMethod, "subagent_stop");
   assert.ok(record(incomplete).collectedAt);
 });
 
@@ -780,7 +815,7 @@ test("a TaskOutput no-task error marks a matching unexpected async peer wrapper 
   const reaped = record(box);
   assert.strictEqual(reaped.transportStatus, "failed");
   assert.strictEqual(reaped.failureKind, "task_reaped");
-  assert.strictEqual(reaped.collectionMethod, "reaped");
+  assert.strictEqual(reaped.collectionMethod, "task_reaped");
   assert.ok(reaped.finishedAt);
   assert.ok(reaped.collectedAt);
   assert.strictEqual(reaped.agentId, "peer-reaped-output");
@@ -810,7 +845,7 @@ test("a TaskStop no-task error marks a matching unexpected async peer wrapper as
   const reaped = record(box);
   assert.strictEqual(reaped.transportStatus, "failed");
   assert.strictEqual(reaped.failureKind, "task_reaped");
-  assert.strictEqual(reaped.collectionMethod, "reaped");
+  assert.strictEqual(reaped.collectionMethod, "task_reaped");
   assert.ok(reaped.finishedAt);
   assert.ok(reaped.collectedAt);
 });
@@ -1230,7 +1265,7 @@ test("Stop advises on collected unverified workers without blocking and stays qu
   });
   const completed = record(box);
   assert.ok(completed.collectedAt);
-  assert.strictEqual(completed.collectionMethod, "Agent");
+  assert.strictEqual(completed.collectionMethod, "agent_result");
   assert.strictEqual(completed.awaitingVerdict, true);
   assert.ok(completed.awaitingVerdictArmedAt);
 
@@ -1531,7 +1566,7 @@ test("a full Read collects terminal output and captures its peer job footer", (t
   });
 
   const collected = record(box);
-  assert.strictEqual(collected.collectionMethod, "Read");
+  assert.strictEqual(collected.collectionMethod, "output_file_read");
   assert.ok(collected.collectedAt);
   assert.strictEqual(collected.transportStatus, "done");
   assert.strictEqual(collected.failureKind, null);
@@ -1629,7 +1664,7 @@ test("a terminal failed runtimeAsync worker is demanded by Stop and collected by
   });
 
   const collected = record(box);
-  assert.strictEqual(collected.collectionMethod, "Read");
+  assert.strictEqual(collected.collectionMethod, "output_file_read");
   assert.ok(collected.collectedAt);
   assert.strictEqual(collected.transportStatus, "done");
   assert.strictEqual(collected.failureKind, "task_reaped");
@@ -1690,7 +1725,7 @@ test("a terminal cancelled runtimeAsync worker is demanded by Stop and collected
   });
 
   const collected = record(box);
-  assert.strictEqual(collected.collectionMethod, "Read");
+  assert.strictEqual(collected.collectionMethod, "output_file_read");
   assert.ok(collected.collectedAt);
   assert.strictEqual(collected.transportStatus, "done");
   assert.strictEqual(collected.failureKind, "cancelled");
@@ -1828,7 +1863,7 @@ test("a ready_uncollected record still collects through a full Read", (t) => {
 
   const collected = record(box);
   assert.strictEqual(collected.transportStatus, "done");
-  assert.strictEqual(collected.collectionMethod, "Read");
+  assert.strictEqual(collected.collectionMethod, "output_file_read");
   assert.ok(collected.collectedAt);
 });
 
@@ -1979,7 +2014,7 @@ test("SubagentStop leaves a malformed peer footer null while arming its verdict"
   });
 
   const collected = record(box);
-  assert.strictEqual(collected.collectionMethod, "SubagentStop");
+  assert.strictEqual(collected.collectionMethod, "subagent_stop");
   assert.strictEqual(collected.peerJobId, null);
   assert.strictEqual(collected.awaitingVerdict, true);
   assert.ok(collected.awaitingVerdictArmedAt);
@@ -2158,7 +2193,7 @@ test("job collector completion requires a terminal marker and fails closed on th
   assert.strictEqual(stopped.stdout, "");
   assert.strictEqual(record(box).transportStatus, "incomplete");
   assert.strictEqual(record(box).failureKind, "collection_protocol");
-  assert.strictEqual(record(box).collectionMethod, "SubagentStop");
+  assert.strictEqual(record(box).collectionMethod, "subagent_stop");
   assert.strictEqual(record(box).peerJobId, undefined);
   assert.strictEqual(record(box).retryCount, 1);
 });
@@ -2305,7 +2340,7 @@ test("an async collector keeps its Read collection requirement", (t) => {
   });
   const collected = record(box);
   assert.strictEqual(collected.transportStatus, "done");
-  assert.strictEqual(collected.collectionMethod, "Read");
+  assert.strictEqual(collected.collectionMethod, "output_file_read");
   assert.ok(collected.collectedAt);
 });
 
@@ -2961,12 +2996,19 @@ test("an explicitly authorized completed worker is collected by SubagentStop bef
 
 test("Stop settles a delivered task notification once without a TaskOutput probe", (t) => {
   const box = sandbox(t);
+  const workerTranscript = path.join(box.root, "notification-worker.output");
+  const finalMessage = "bounded notification result\ndelivery: complete\nverification: passed";
+  fs.writeFileSync(workerTranscript, [
+    JSON.stringify({ type: "assistant", message: { content: [{ type: "tool_use", id: "tool-1" }] } }),
+    JSON.stringify({ type: "user", message: { content: [{ type: "tool_result", tool_use_id: "tool-1", content: "done" }] }, toolUseResult: { content: "done" } }),
+    JSON.stringify({ type: "assistant", message: { content: [{ type: "text", text: "bounded notification result" }, { type: "text", text: "delivery: complete\nverification: passed" }] } })
+  ].join("\n") + "\n", "utf8");
   const workerDispatch = dispatch(box);
   run(box, workerDispatch);
   run(box, {
     ...workerDispatch,
     hook_event_name: "PostToolUse",
-    tool_response: { isAsync: true, status: "async_launched", agentId: "notification-worker" }
+    tool_response: { isAsync: true, status: "async_launched", agentId: "notification-worker", outputFile: workerTranscript }
   });
   const before = record(box);
   fs.appendFileSync(box.transcript, `${JSON.stringify({ type: "user", message: { content: `<task-notification>\n<task-id>${before.agentId}</task-id>\n<status>completed</status>\n</task-notification>` } })}\n`, "utf8");
@@ -2988,6 +3030,9 @@ test("Stop settles a delivered task notification once without a TaskOutput probe
   assert.strictEqual(collected.failureKind, null);
   assert.strictEqual(collected.deliveryMode, null);
   assert.strictEqual(collected.awaitingVerdict, true);
+  assert.strictEqual(collected.outputFile, path.join(box.state, "jobs", `${collected.taskId}.final.txt`));
+  assert.notStrictEqual(collected.outputFile, workerTranscript);
+  assert.strictEqual(fs.readFileSync(collected.outputFile, "utf8"), finalMessage);
 
   const scanState = readWorkerSessionState("session-1", envFor(box));
   assert.strictEqual(scanState.taskNotificationTranscriptPath, box.transcript);
@@ -3009,15 +3054,118 @@ test("Stop settles a delivered task notification once without a TaskOutput probe
   assert.strictEqual(settled.acceptance, "accepted");
 });
 
+test("a completed task notification captures a Codex peer job footer", (t) => {
+  const box = sandbox(t);
+  const peerJobId = "f".repeat(32);
+  const workerTranscript = path.join(box.root, "notification-codex-rescue.output");
+  const finalMessage = `completed rescue\ncodex-session: session-1\njob: ${peerJobId}\nsemantic: unverified\nstate: done`;
+  fs.writeFileSync(workerTranscript, `${JSON.stringify({ type: "assistant", message: { content: [{ type: "text", text: finalMessage }] } })}\n`, "utf8");
+  const workerDispatch = dispatch(box, { subagent_type: "codex:codex-rescue", prompt: "bounded peer brief" });
+  run(box, workerDispatch);
+  run(box, {
+    ...workerDispatch,
+    hook_event_name: "PostToolUse",
+    tool_response: { isAsync: true, status: "async_launched", agentId: "notification-codex-rescue", outputFile: workerTranscript }
+  });
+  const launched = record(box);
+  updateWorkerRecord(launched.taskId, envFor(box), (current) => ({ ...current, transcriptPath: workerTranscript }));
+  const before = record(box);
+  fs.appendFileSync(box.transcript, `${JSON.stringify({ type: "user", message: { content: `<task-notification>\n<task-id>${before.agentId}</task-id>\n<status>completed</status>\n</task-notification>` } })}\n`, "utf8");
+
+  run(box, {
+    hook_event_name: "Stop",
+    session_id: "session-1",
+    cwd: box.cwd,
+    transcript_path: box.transcript,
+    stop_hook_active: true,
+    background_tasks: []
+  });
+
+  const collected = record(box);
+  assert.strictEqual(collected.peerJobId, peerJobId);
+  assert.strictEqual(collected.peerEngine, "codex");
+  assert.strictEqual(collected.peerTransportStatus, undefined);
+  assert.strictEqual(collected.peerSemanticStatus, undefined);
+});
+
+test("a completed task notification does not parse peer footers for fusion workers", (t) => {
+  const box = sandbox(t);
+  const workerTranscript = path.join(box.root, "notification-fast-worker.output");
+  const finalMessage = `completed worker\ncodex-session: session-1\njob: ${"e".repeat(32)}\nsemantic: unverified\nstate: done`;
+  fs.writeFileSync(workerTranscript, `${JSON.stringify({ type: "assistant", message: { content: [{ type: "text", text: finalMessage }] } })}\n`, "utf8");
+  const workerDispatch = dispatch(box);
+  run(box, workerDispatch);
+  run(box, {
+    ...workerDispatch,
+    hook_event_name: "PostToolUse",
+    tool_response: { isAsync: true, status: "async_launched", agentId: "notification-fast-worker", outputFile: workerTranscript }
+  });
+  const before = record(box);
+  fs.appendFileSync(box.transcript, `${JSON.stringify({ type: "user", message: { content: `<task-notification>\n<task-id>${before.agentId}</task-id>\n<status>completed</status>\n</task-notification>` } })}\n`, "utf8");
+
+  run(box, {
+    hook_event_name: "Stop",
+    session_id: "session-1",
+    cwd: box.cwd,
+    transcript_path: box.transcript,
+    stop_hook_active: true,
+    background_tasks: []
+  });
+
+  const collected = record(box);
+  assert.strictEqual(collected.peerJobId, undefined);
+  assert.strictEqual(collected.peerEngine, undefined);
+  assert.strictEqual(collected.peerTransportStatus, undefined);
+  assert.strictEqual(collected.peerSemanticStatus, undefined);
+});
+
+test("a completion notification with a dangling tool result remains incomplete and uncollected", (t) => {
+  const box = sandbox(t);
+  const workerTranscript = path.join(box.root, "notification-dangling.output");
+  fs.writeFileSync(workerTranscript, [
+    JSON.stringify({ type: "assistant", message: { content: [{ type: "text", text: "working" }, { type: "tool_use", id: "tool-1" }] } }),
+    JSON.stringify({ type: "user", message: { content: [{ type: "tool_result", tool_use_id: "tool-1", content: "done" }] }, toolUseResult: { content: "done" } })
+  ].join("\n") + "\n", "utf8");
+  const workerDispatch = dispatch(box);
+  run(box, workerDispatch);
+  run(box, {
+    ...workerDispatch,
+    hook_event_name: "PostToolUse",
+    tool_response: { isAsync: true, status: "async_launched", agentId: "notification-dangling", outputFile: workerTranscript }
+  });
+  const before = record(box);
+  fs.appendFileSync(box.transcript, `${JSON.stringify({ type: "user", message: { content: `<task-notification>\n<task-id>${before.agentId}</task-id>\n<status>completed</status>\n</task-notification>` } })}\n`, "utf8");
+
+  run(box, {
+    hook_event_name: "Stop",
+    session_id: "session-1",
+    cwd: box.cwd,
+    transcript_path: box.transcript,
+    stop_hook_active: true,
+    background_tasks: []
+  });
+
+  const incomplete = record(box);
+  assert.strictEqual(incomplete.transportStatus, "incomplete");
+  assert.strictEqual(incomplete.failureKind, "turn_limit");
+  assert.strictEqual(incomplete.collectionMethod, null);
+  assert.strictEqual(incomplete.collectedAt, null);
+  assert.strictEqual(incomplete.awaitingVerdict, false);
+  assert.strictEqual(incomplete.outputFile, null);
+  assert.strictEqual(fs.existsSync(path.join(box.state, "jobs", `${incomplete.taskId}.final.txt`)), false);
+});
+
 test("a delivered completion notification prevents Stop from demanding TaskStop for an expired worker", (t) => {
   const box = sandbox(t);
+  const workerTranscript = path.join(box.root, "notification-expired.output");
+  fs.writeFileSync(workerTranscript, `${JSON.stringify({ type: "assistant", message: { content: [{ type: "text", text: "expired worker result" }] } })}\n`, "utf8");
   const limits = { FUSION_WORKER_WALL_CLOCK_MS: "1", FUSION_WORKER_STALL_MS: "999999" };
   const workerDispatch = dispatch(box);
   run(box, workerDispatch, limits);
   run(box, {
     ...workerDispatch,
     hook_event_name: "PostToolUse",
-    tool_response: { isAsync: true, status: "async_launched", agentId: "notification-expired" }
+    tool_response: { isAsync: true, status: "async_launched", agentId: "notification-expired", outputFile: workerTranscript }
   }, limits);
   const before = record(box);
   updateWorkerRecord(before.taskId, envFor(box, limits), (current) => ({ ...current, startedAt: new Date(Date.now() - 1_000).toISOString() }));

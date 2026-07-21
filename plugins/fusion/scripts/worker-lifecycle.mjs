@@ -19,6 +19,7 @@ import {
   resolveFusionDataDir,
   updateWorkerRecord,
   updateWorkerSessionState,
+  WORKER_COLLECTION_METHODS,
   workerRecordFile,
   writePrivateJson,
   writePrivateText
@@ -36,6 +37,7 @@ const DEFAULT_BRIEF_MAX_BYTES = 16 * 1024;
 const TASK_NOTIFICATION_SCAN_MAX_BYTES = 4 * 1024 * 1024;
 const TASK_NOTIFICATION_SCAN_CHUNK_BYTES = 64 * 1024;
 const TASK_NOTIFICATION_MAX_LINE_BYTES = 1024 * 1024;
+const TASK_NOTIFICATION_FINAL_SCAN_MAX_BYTES = Math.min(TASK_NOTIFICATION_SCAN_MAX_BYTES, 384 * 1024);
 const FINAL_TEXT_MAX_BYTES = 192 * 1024;
 const FINAL_TEXT_HEAD_BYTES = 64 * 1024;
 const FINAL_TEXT_TAIL_BYTES = 128 * 1024;
@@ -641,6 +643,12 @@ function boundedFinalText(message) {
   ]);
 }
 
+function writeFinalTextArtifact(record, message, env) {
+  const file = finalTextArtifactPath(record, env);
+  writePrivateText(file, boundedFinalText(message));
+  return file;
+}
+
 function collectionResponseDebugEnabled(env) {
   return /^(?:1|true|yes)$/i.test(String(env[COLLECTION_RESPONSE_DEBUG_ENV] ?? "").trim());
 }
@@ -713,7 +721,7 @@ function handlePostToolUse(input, env, failed = false) {
             failureKind: "task_reaped",
             finishedAt: now,
             collectedAt: now,
-            collectionMethod: "reaped",
+            collectionMethod: WORKER_COLLECTION_METHODS.TASK_REAPED,
             awaitingVerdict: true,
             awaitingVerdictArmedAt: now
           };
@@ -744,9 +752,14 @@ function handlePostToolUse(input, env, failed = false) {
         updateWorkerRecord(record.taskId, env, (current) => {
           const worker = current ?? record;
           const transportStatus = input.tool_name === "TaskStop" ? "cancelled" : "done";
+          const collectionMethod = input.tool_name === "Read"
+            ? WORKER_COLLECTION_METHODS.OUTPUT_FILE_READ
+            : input.tool_name === "TaskOutput"
+              ? WORKER_COLLECTION_METHODS.TASK_OUTPUT
+              : WORKER_COLLECTION_METHODS.TASK_STOP;
           const harnessAsyncDelivery = collectedHarnessAsyncDelivery(worker, transportStatus);
           const updated = {
-            ...markWorkerCollected({ ...worker, acceptance: "unverified" }, input.tool_name, now),
+            ...markWorkerCollected({ ...worker, acceptance: "unverified" }, collectionMethod, now),
             transportStatus,
             acceptance: "unverified",
             failureKind: input.tool_name === "TaskStop" ? worker.failureKind ?? "cancelled" : harnessAsyncDelivery ? null : worker.failureKind,
@@ -807,7 +820,7 @@ function handlePostToolUse(input, env, failed = false) {
       updateWorkerRecord(pending.taskId, env, (current) => {
         const worker = current ?? pending;
         return {
-          ...(!failed && completed ? markWorkerCollected(worker, input.tool_name, now) : worker),
+          ...(!failed && completed ? markWorkerCollected(worker, WORKER_COLLECTION_METHODS.AGENT_RESULT, now) : worker),
           ...(agentId ? { agentId, backgroundTaskId: isAsync ? agentId : worker.backgroundTaskId } : {}),
           ...(outputFile ? { transcriptPath: outputFile } : {}),
           ...(resolvedModel ? { resolvedModel } : {}),
@@ -888,7 +901,7 @@ function handleSubagentStop(input, env) {
   let finalTextFile = isFusionWorkerAgent(refreshed.agentType) && message.length > 0 ? finalTextArtifactPath(refreshed, env) : null;
   if (finalTextFile) {
     try {
-      writePrivateText(finalTextFile, boundedFinalText(message));
+      finalTextFile = writeFinalTextArtifact(refreshed, message, env);
       updateWorkerRecord(refreshed.taskId, env, (current) => ({ ...(current ?? refreshed), outputFile: finalTextFile }));
     } catch {
       finalTextFile = null;
@@ -921,7 +934,7 @@ function handleSubagentStop(input, env) {
     const successfulCompletion = complete && !failure && trustedCollectorReport?.kind !== "outcome" && !collectorProtocolFailure;
     const subagentStopCollected = successfulCompletion && finalTextFile != null && !collectorContract;
     return {
-      ...(runtimeAsync && !subagentStopCollected ? worker : markWorkerCollected({ ...worker, acceptance: "unverified" }, subagentStopCollected ? "subagent_stop" : "SubagentStop", now)),
+      ...(runtimeAsync && !subagentStopCollected ? worker : markWorkerCollected({ ...worker, acceptance: "unverified" }, WORKER_COLLECTION_METHODS.SUBAGENT_STOP, now)),
       transportStatus: complete && (trustedCollectorReport?.kind === "outcome" || collectorProtocolFailure) ? "incomplete" : complete ? runtimeAsync && !subagentStopCollected ? "ready_uncollected" : "done" : failure ? "failed" : "incomplete",
       acceptance: "unverified",
       failureKind: failure?.failureKind ?? (trustedCollectorReport?.kind === "outcome" ? `collection_${trustedCollectorReport.collectionOutcome}` : collectorProtocolFailure ? "collection_protocol" : complete ? null : "delivery"),
@@ -1100,15 +1113,102 @@ function scanTaskNotifications(transcriptPath, requestedOffset) {
   }
 }
 
-function taskNotificationTransition(record, status, now) {
+function transcriptEntryContent(entry) {
+  if (Array.isArray(entry?.message?.content)) {
+    return entry.message.content;
+  }
+  return Array.isArray(entry?.content) ? entry.content : [];
+}
+
+function finalAssistantTextFromTranscript(transcriptPath) {
+  if (typeof transcriptPath !== "string" || !path.isAbsolute(transcriptPath)) {
+    return null;
+  }
+  let descriptor;
+  try {
+    descriptor = fs.openSync(transcriptPath, "r");
+    const stat = fs.fstatSync(descriptor);
+    if (!stat.isFile() || stat.size === 0) {
+      return null;
+    }
+    const bytesToRead = Math.min(TASK_NOTIFICATION_FINAL_SCAN_MAX_BYTES, stat.size);
+    const start = stat.size - bytesToRead;
+    const buffer = Buffer.allocUnsafe(bytesToRead);
+    const bytesRead = fs.readSync(descriptor, buffer, 0, buffer.length, start);
+    let text = buffer.subarray(0, bytesRead).toString("utf8");
+    if (start > 0) {
+      const firstNewline = text.indexOf("\n");
+      text = firstNewline === -1 ? "" : text.slice(firstNewline + 1);
+    }
+    const lines = text.split("\n");
+    for (let index = lines.length - 1; index >= 0; index -= 1) {
+      const line = lines[index].replace(/\r$/, "");
+      if (!line.trim() || Buffer.byteLength(line) > TASK_NOTIFICATION_MAX_LINE_BYTES) {
+        continue;
+      }
+      let entry;
+      try {
+        entry = JSON.parse(line);
+      } catch {
+        continue;
+      }
+      const content = transcriptEntryContent(entry);
+      if (entry?.type === "assistant") {
+        if (content.some((block) => block?.type === "tool_use")) {
+          return null;
+        }
+        const blocks = content.filter((block) => block?.type === "text" && typeof block.text === "string" && block.text.length > 0).map((block) => block.text);
+        if (blocks.length > 0) {
+          return blocks.join("\n");
+        }
+      } else if (entry?.type === "user" && (entry.toolUseResult != null || content.some((block) => block?.type === "tool_result"))) {
+        return null;
+      }
+    }
+    return null;
+  } catch {
+    return null;
+  } finally {
+    if (descriptor != null) {
+      try {
+        fs.closeSync(descriptor);
+      } catch {
+        void 0;
+      }
+    }
+  }
+}
+
+function taskNotificationTransition(record, status, now, env) {
   if (SUCCESSFUL_TASK_NOTIFICATION_STATUSES.has(status)) {
+    const finalText = finalAssistantTextFromTranscript(record.transcriptPath);
+    let finalTextFile = null;
+    if (finalText) {
+      try {
+        finalTextFile = writeFinalTextArtifact(record, finalText, env);
+      } catch {
+        finalTextFile = null;
+      }
+    }
+    if (!finalTextFile) {
+      return {
+        ...record,
+        transportStatus: "incomplete",
+        acceptance: "unverified",
+        failureKind: "turn_limit",
+        finishedAt: record.finishedAt ?? now,
+        lastActivityAt: now
+      };
+    }
     const harnessAsyncDelivery = collectedHarnessAsyncDelivery(record, "done");
     return {
-      ...markWorkerCollected({ ...record, acceptance: "unverified" }, "task_notification", now),
+      ...markWorkerCollected({ ...record, acceptance: "unverified" }, WORKER_COLLECTION_METHODS.TASK_NOTIFICATION, now),
       transportStatus: "done",
       acceptance: "unverified",
       failureKind: harnessAsyncDelivery ? null : record.failureKind,
       ...(harnessAsyncDelivery ? { deliveryMode: "harness_async" } : {}),
+      outputFile: finalTextFile,
+      ...(PEER_JOB_FOOTER_AGENTS.has(record.agentType) ? capturedPeerIdentity(record.agentType, finalText, record.peerEngine) : {}),
       finishedAt: record.finishedAt ?? now,
       lastActivityAt: now
     };
@@ -1116,7 +1216,7 @@ function taskNotificationTransition(record, status, now) {
   const cancelled = CANCELLED_TASK_NOTIFICATION_STATUSES.has(status);
   const fallbackFailureKind = cancelled ? "cancelled" : "task_failed";
   return {
-    ...markWorkerCollected({ ...record, acceptance: "unverified" }, "task_notification", now),
+    ...markWorkerCollected({ ...record, acceptance: "unverified" }, WORKER_COLLECTION_METHODS.TASK_NOTIFICATION, now),
     transportStatus: cancelled ? "cancelled" : "failed",
     acceptance: "unverified",
     failureKind: record.failureKind && record.failureKind !== "unexpected_async" ? record.failureKind : fallbackFailureKind,
@@ -1150,7 +1250,7 @@ function reconcileTaskNotifications(input, env) {
           if (!current || current.sessionId !== input.session_id || isTerminalWorkerStatus(current.transportStatus) || ![current.backgroundTaskId, current.agentId].includes(taskId)) {
             return null;
           }
-          return taskNotificationTransition(current, status, now);
+          return taskNotificationTransition(current, status, now, env);
         });
       }
     }

@@ -3,7 +3,7 @@ name: fast-worker
 description: Claude execution fallback on Sonnet for resolved implementation briefs that require the Claude Code tool surface (hooks, subagent files, MCP), remain inside the Claude privacy boundary, or cannot use an eligible peer lane. It is not the default for spec grade multi file packages or quick scoped fixes, which use the Codex primary lane or an eligible Grok protected role. Use for bounded edits, refactors with a clear recipe, approved plan packages, test fixes, codemods, boilerplate, and docs. Every brief includes a verification command; do not send open ended design work.
 model: sonnet
 effort: medium
-maxTurns: 40
+maxTurns: 120
 background: false
 disallowedTools: Agent
 ---
