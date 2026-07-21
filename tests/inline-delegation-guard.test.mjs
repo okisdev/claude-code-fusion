@@ -5,6 +5,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { test } from "node:test";
+import { pathToFileURL } from "node:url";
 import {
   DEFAULT_LOCK_TIMEOUT_MS,
   readAuditEvents,
@@ -13,6 +14,7 @@ import {
 
 const repoRoot = path.join(import.meta.dirname, "..");
 const script = path.join(repoRoot, "plugins", "fusion", "scripts", "inline-delegation-guard.mjs");
+let toolUseSequence = 0;
 
 function makeSandbox(t) {
   const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "inline-guard-test-")));
@@ -20,20 +22,30 @@ function makeSandbox(t) {
   const stateDir = path.join(root, "state");
   const auditDir = path.join(root, "audit");
   const workDir = path.join(root, "work");
+  const clockFile = path.join(root, "clock.mjs");
   fs.mkdirSync(workDir, { recursive: true });
-  return { root, stateDir, auditDir, workDir };
+  fs.writeFileSync(
+    clockFile,
+    "const NativeDate = Date; const now = NativeDate.parse(process.env.FUSION_TEST_NOW); globalThis.Date = class extends NativeDate { constructor(...args) { super(...(args.length === 0 ? [now] : args)); } static now() { return now; } };\n",
+    "utf8"
+  );
+  return { root, stateDir, auditDir, workDir, clockFile };
 }
 
 function envFor(sandbox, extra = {}) {
-  return {
+  const env = {
     ...process.env,
     FUSION_INLINE_GUARD_STATE: sandbox.stateDir,
     FUSION_INLINE_GUARD_AUDIT_DIR: sandbox.auditDir,
     ...extra
   };
+  if (extra.FUSION_TEST_NOW) {
+    env.NODE_OPTIONS = `${process.env.NODE_OPTIONS ?? ""} --import=${pathToFileURL(sandbox.clockFile).href}`.trim();
+  }
+  return env;
 }
 
-function run(sandbox, payload, extraEnv = {}) {
+function runRaw(sandbox, payload, extraEnv = {}) {
   return spawnSync(process.execPath, [script], {
     input: payload === undefined ? "" : JSON.stringify(payload),
     env: envFor(sandbox, extraEnv),
@@ -41,7 +53,17 @@ function run(sandbox, payload, extraEnv = {}) {
   });
 }
 
-async function runAsync(sandbox, payload, extraEnv = {}) {
+function run(sandbox, payload, extraEnv = {}) {
+  if (payload?.hook_event_name === "PostToolUse" && (payload.tool_name === "Agent" || payload.tool_name === "Task")) {
+    const launch = runRaw(sandbox, { ...payload, hook_event_name: "PreToolUse" }, extraEnv);
+    if (launch.status !== 0 || launch.stdout || launch.stderr) {
+      return launch;
+    }
+  }
+  return runRaw(sandbox, payload, extraEnv);
+}
+
+async function runAsyncRaw(sandbox, payload, extraEnv = {}) {
   const child = spawn(process.execPath, [script], {
     env: envFor(sandbox, extraEnv),
     stdio: ["pipe", "pipe", "pipe"]
@@ -57,6 +79,16 @@ async function runAsync(sandbox, payload, extraEnv = {}) {
   child.stdin.end(JSON.stringify(payload));
   const [status] = await once(child, "close");
   return { status, stdout, stderr };
+}
+
+async function runAsync(sandbox, payload, extraEnv = {}) {
+  if (payload?.hook_event_name === "PostToolUse" && (payload.tool_name === "Agent" || payload.tool_name === "Task")) {
+    const launch = await runAsyncRaw(sandbox, { ...payload, hook_event_name: "PreToolUse" }, extraEnv);
+    if (launch.status !== 0 || launch.stdout || launch.stderr) {
+      return launch;
+    }
+  }
+  return runAsyncRaw(sandbox, payload, extraEnv);
 }
 
 function writePayload(sandbox, { sessionId = "session-1", toolName = "Edit", filePath, cwd, agentId } = {}) {
@@ -83,6 +115,7 @@ function dispatchPayload(sandbox, { sessionId = "session-1", toolName = "Agent",
     transcript_path: path.join(sandbox.root, "transcript.jsonl"),
     cwd: sandbox.workDir,
     tool_name: toolName,
+    tool_use_id: `tool-use-${++toolUseSequence}`,
     tool_input: { description, prompt: "do the thing" }
   };
   if (subagentType) {
@@ -106,7 +139,10 @@ function readState(sandbox, sessionId) {
 function completeActiveWave(sandbox, gapMs) {
   const file = stateFileFor(sandbox, "session-1");
   const state = readState(sandbox, "session-1");
-  state.lastDispatchAt = new Date(Date.now() - gapMs - 1000).toISOString();
+  for (const entry of state.dispatchLog) {
+    entry.at = new Date(Date.parse(entry.at) - gapMs - 1000).toISOString();
+  }
+  state.lastDispatchAt = new Date(Date.parse(state.lastDispatchAt) - gapMs - 1000).toISOString();
   fs.writeFileSync(file, JSON.stringify(state), "utf8");
 }
 
@@ -189,6 +225,45 @@ test("the default mode denies writes after the dispatch window budget and audits
   });
 
   run(sandbox, dispatchPayload(sandbox, { subagentType: "fusion:fast-worker" }));
+  const allowed = run(sandbox, writePayload(sandbox));
+  assert.strictEqual(allowed.stdout, "");
+  assert.strictEqual(readState(sandbox, "session-1").writesSinceDispatch, 1);
+});
+
+test("a PostToolUse-only dispatch recovers a missing launch and reopens an exhausted write budget", (t) => {
+  const sandbox = makeSandbox(t);
+  for (let index = 0; index < 5; index += 1) {
+    run(sandbox, writePayload(sandbox));
+  }
+  const denied = run(sandbox, writePayload(sandbox));
+  assert.strictEqual(JSON.parse(denied.stdout).hookSpecificOutput.permissionDecision, "deny");
+
+  const recovered = runRaw(sandbox, dispatchPayload(sandbox, { subagentType: "fusion:fast-worker", description: "recover the missing launch" }));
+  assert.strictEqual(recovered.status, 0);
+  assert.strictEqual(recovered.stdout, "");
+  assert.strictEqual(recovered.stderr, "");
+
+  const recoveredState = readState(sandbox, "session-1");
+  assert.strictEqual(recoveredState.writesSinceDispatch, 0);
+  assert.strictEqual(recoveredState.dispatchEpoch, 1);
+  assert.deepStrictEqual(recoveredState.dispatches, { "fusion:fast-worker": 1 });
+  assert.strictEqual(recoveredState.dispatchLog.length, 1);
+  assert.strictEqual(recoveredState.dispatchLog[0].phase, "confirmed");
+  assert.strictEqual(recoveredState.dispatchLog[0].description, "recover the missing launch");
+
+  const recoveryWarnings = readAuditRecords(sandbox).filter((record) => record.event === "warn" && record.reason === "missing-launch-recovered");
+  assert.deepStrictEqual(recoveryWarnings, [
+    {
+      schemaVersion: 1,
+      at: recoveryWarnings[0].at,
+      session: "session-1",
+      event: "warn",
+      lane: "fusion:fast-worker",
+      tool: "Agent",
+      reason: "missing-launch-recovered"
+    }
+  ]);
+
   const allowed = run(sandbox, writePayload(sandbox));
   assert.strictEqual(allowed.stdout, "");
   assert.strictEqual(readState(sandbox, "session-1").writesSinceDispatch, 1);
@@ -366,7 +441,7 @@ test("two narrow dispatch waves attach the fleet advisory to the following dispa
   assert.strictEqual(output.hookSpecificOutput.permissionDecision, undefined);
   assert.strictEqual(
     output.hookSpecificOutput.additionalContext,
-    "second consecutive narrow wave; fleet default applies: consider /fusion:ultra for the remaining packages or state fleet-decline: <reason>."
+    "2 consecutive narrow waves; fleet default applies: consider /fusion:ultra for the remaining packages or state fleet-decline: <reason>."
   );
   assert.strictEqual(readState(sandbox, "session-1").consecutiveNarrowWaves, 2);
 });
@@ -392,6 +467,99 @@ test("a wide dispatch wave resets the narrow-wave advisory run", (t) => {
   assert.strictEqual(readState(sandbox, "session-1").consecutiveNarrowWaves, 1);
 });
 
+test("launch timestamps preserve a four-wide fleet wave when confirmations span ten minutes", (t) => {
+  const sandbox = makeSandbox(t);
+  const baseMs = Date.parse("2026-07-21T00:00:00.000Z");
+  const payloads = Array.from({ length: 4 }, (_, index) =>
+    dispatchPayload(sandbox, { subagentType: "fusion:fast-worker", description: `package ${index + 1}` })
+  );
+
+  for (const [index, payload] of payloads.entries()) {
+    const launched = runRaw(sandbox, { ...payload, hook_event_name: "PreToolUse" }, { FUSION_TEST_NOW: new Date(baseMs + index * 1000).toISOString() });
+    assert.strictEqual(launched.status, 0);
+    assert.strictEqual(launched.stdout, "");
+  }
+
+  for (const [index, payload] of payloads.entries()) {
+    const confirmed = runRaw(sandbox, payload, { FUSION_TEST_NOW: new Date(baseMs + index * 200000).toISOString() });
+    assert.strictEqual(confirmed.status, 0);
+    assert.strictEqual(confirmed.stdout, "");
+  }
+
+  const state = readState(sandbox, "session-1");
+  assert.strictEqual(state.fleetWaveWidth, 4);
+  assert.strictEqual(state.consecutiveNarrowWaves, 0);
+  assert.strictEqual(state.dispatchLog.length, 4);
+  assert.ok(state.dispatchLog.every((entry) => entry.phase === "confirmed"));
+  assert.deepStrictEqual(
+    state.dispatchLog.map((entry) => entry.at),
+    Array.from({ length: 4 }, (_, index) => new Date(baseMs + index * 1000).toISOString())
+  );
+});
+
+test("abandoned launches do not widen fleet waves or reset the narrow streak and expire after the launch TTL", (t) => {
+  const sandbox = makeSandbox(t);
+  const gapMs = 120000;
+  const baseMs = Date.parse("2026-07-21T04:00:00.000Z");
+  const extraEnv = { FUSION_FLEET_WAVE_GAP_MS: String(gapMs) };
+
+  for (let index = 0; index < 3; index += 1) {
+    const now = new Date(baseMs + index * 180000).toISOString();
+    const payload = dispatchPayload(sandbox, { description: `confirmed solo ${index + 1}` });
+    assert.strictEqual(runRaw(sandbox, { ...payload, hook_event_name: "PreToolUse" }, { ...extraEnv, FUSION_TEST_NOW: now }).stdout, "");
+    const confirmation = runRaw(sandbox, payload, { ...extraEnv, FUSION_TEST_NOW: now });
+    assert.strictEqual(confirmation.status, 0);
+    if (index < 2) {
+      assert.strictEqual(confirmation.stdout, "");
+    } else {
+      assert.match(JSON.parse(confirmation.stdout).hookSpecificOutput.additionalContext, /^2 consecutive narrow waves/);
+    }
+  }
+  assert.strictEqual(readState(sandbox, "session-1").consecutiveNarrowWaves, 2);
+
+  for (let index = 0; index < 4; index += 1) {
+    const payload = dispatchPayload(sandbox, { description: `abandoned launch ${index + 1}` });
+    const now = new Date(baseMs + 540000 + index * 1000).toISOString();
+    assert.strictEqual(runRaw(sandbox, { ...payload, hook_event_name: "PreToolUse" }, { ...extraEnv, FUSION_TEST_NOW: now }).stdout, "");
+  }
+
+  const soloNow = new Date(baseMs + 720000).toISOString();
+  const solo = dispatchPayload(sandbox, { description: "confirmed solo after abandoned launches" });
+  assert.strictEqual(runRaw(sandbox, { ...solo, hook_event_name: "PreToolUse" }, { ...extraEnv, FUSION_TEST_NOW: soloNow }).stdout, "");
+  assert.strictEqual(runRaw(sandbox, solo, { ...extraEnv, FUSION_TEST_NOW: soloNow }).stdout, "");
+
+  const state = readState(sandbox, "session-1");
+  assert.strictEqual(state.fleetWaveWidth, 1);
+  assert.strictEqual(state.consecutiveNarrowWaves, 3);
+  assert.strictEqual(state.dispatchLog.filter((entry) => entry.phase === "launched").length, 4);
+
+  const afterTtl = new Date(baseMs + 30 * 60000).toISOString();
+  assert.strictEqual(run(sandbox, writePayload(sandbox), { ...extraEnv, FUSION_TEST_NOW: afterTtl }).stdout, "");
+  assert.strictEqual(readState(sandbox, "session-1").dispatchLog.filter((entry) => entry.phase === "launched").length, 0);
+});
+
+test("solo launch waves re-nudge at consecutive narrow streaks two and four", (t) => {
+  const sandbox = makeSandbox(t);
+  const baseMs = Date.parse("2026-07-21T02:00:00.000Z");
+  const outputs = [];
+
+  for (let index = 0; index < 5; index += 1) {
+    const now = new Date(baseMs + index * 121000).toISOString();
+    const payload = dispatchPayload(sandbox, { description: `solo package ${index + 1}` });
+    assert.strictEqual(runRaw(sandbox, { ...payload, hook_event_name: "PreToolUse" }, { FUSION_TEST_NOW: now }).stdout, "");
+    outputs.push(runRaw(sandbox, payload, { FUSION_TEST_NOW: now }).stdout);
+  }
+
+  assert.strictEqual(outputs[0], "");
+  assert.strictEqual(outputs[1], "");
+  assert.strictEqual(JSON.parse(outputs[2]).hookSpecificOutput.additionalContext, "2 consecutive narrow waves; fleet default applies: consider /fusion:ultra for the remaining packages or state fleet-decline: <reason>.");
+  assert.strictEqual(outputs[3], "");
+  assert.strictEqual(JSON.parse(outputs[4]).hookSpecificOutput.additionalContext, "4 consecutive narrow waves; fleet default applies: consider /fusion:ultra for the remaining packages or state fleet-decline: <reason>.");
+  const state = readState(sandbox, "session-1");
+  assert.strictEqual(state.consecutiveNarrowWaves, 4);
+  assert.strictEqual(state.lastAdvisedNarrowWaveStreak, 4);
+});
+
 test("an Agent PreToolUse attempt does not reset the write window before dispatch succeeds", (t) => {
   const sandbox = makeSandbox(t);
   for (let index = 0; index < 5; index += 1) {
@@ -402,6 +570,7 @@ test("an Agent PreToolUse attempt does not reset the write window before dispatc
   run(sandbox, attempted);
 
   assert.deepStrictEqual(readState(sandbox, "session-1").dispatches, {});
+  assert.strictEqual(readState(sandbox, "session-1").dispatchLog[0].phase, "launched");
   const denied = run(sandbox, writePayload(sandbox));
   assert.strictEqual(JSON.parse(denied.stdout).hookSpecificOutput.permissionDecision, "deny");
 });
@@ -417,12 +586,16 @@ test("Agent and Task dispatches append ledger entries with their computed lane",
   assert.deepStrictEqual(state.dispatchLog[0], {
     at: state.dispatchLog[0].at,
     lane: "grok",
+    phase: "confirmed",
+    toolUseId: state.dispatchLog[0].toolUseId,
     subagentType: "grok:grok-rescue",
     description: "inspect the failure"
   });
   assert.deepStrictEqual(state.dispatchLog[1], {
     at: state.dispatchLog[1].at,
     lane: "codex",
+    phase: "confirmed",
+    toolUseId: state.dispatchLog[1].toolUseId,
     subagentType: "codex:codex-rescue",
     description: "implement the repair"
   });
@@ -632,6 +805,34 @@ test("legacy state without a period counter starts counting future writes after 
   assert.strictEqual(state.writesSinceDispatch, 5);
   assert.strictEqual(state.dispatchEpoch, 1);
   assert.deepStrictEqual(state.advisedMultiples, [1]);
+});
+
+test("legacy dispatch ledger entries normalize as confirmed launches", (t) => {
+  const sandbox = makeSandbox(t);
+  fs.mkdirSync(sandbox.stateDir, { recursive: true });
+  fs.writeFileSync(
+    stateFileFor(sandbox, "session-1"),
+    JSON.stringify({
+      writeCount: 0,
+      writesSinceDispatch: 0,
+      dispatches: { builtin: 2 },
+      dispatchLog: [
+        { at: "2026-07-21T00:00:00.000Z", lane: "builtin", description: "first legacy launch" },
+        { at: "2026-07-21T00:03:00.000Z", lane: "builtin", description: "second legacy launch" }
+      ],
+      advisedMultiples: [],
+      createdAt: "2026-07-21T00:00:00.000Z",
+      updatedAt: "2026-07-21T00:03:00.000Z"
+    }),
+    "utf8"
+  );
+
+  const result = run(sandbox, writePayload(sandbox));
+  assert.strictEqual(result.status, 0);
+  assert.strictEqual(result.stderr, "");
+  const state = readState(sandbox, "session-1");
+  assert.ok(state.dispatchLog.every((entry) => entry.phase === "confirmed"));
+  assert.ok(state.dispatchLog.every((entry) => !Object.hasOwn(entry, "toolUseId")));
 });
 
 test("a Skill invocation is ignored and does not touch the counters", (t) => {
@@ -958,12 +1159,16 @@ test("no-op Bash deny audits an enforcement event for Bash on the main lane", (t
   assert.ok(!Object.hasOwn(denies[0], "path"));
 });
 
-test("hooks configuration wires PreToolUse write tools and Bash through the inline guard", () => {
+test("hooks configuration wires PreToolUse write tools, Bash, Agent, and Task through the inline guard", () => {
   const hooks = JSON.parse(fs.readFileSync(path.join(repoRoot, "plugins", "fusion", "hooks", "hooks.json"), "utf8")).hooks;
   const preToolHandlers = hooks.PreToolUse.flatMap((group) => group.hooks.map((hook) => ({ matcher: group.matcher, command: hook.command }))).filter((hook) => hook.command?.includes("inline-delegation-guard.mjs"));
   assert.deepStrictEqual(preToolHandlers, [
     {
       matcher: "^(Edit|Write|NotebookEdit|MultiEdit|Bash)$",
+      command: 'node "${CLAUDE_PLUGIN_ROOT}/scripts/inline-delegation-guard.mjs"'
+    },
+    {
+      matcher: "^(Agent|Task)$",
       command: 'node "${CLAUDE_PLUGIN_ROOT}/scripts/inline-delegation-guard.mjs"'
     }
   ]);
