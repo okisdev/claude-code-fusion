@@ -38,9 +38,9 @@ const TASK_NOTIFICATION_SCAN_MAX_BYTES = 4 * 1024 * 1024;
 const TASK_NOTIFICATION_SCAN_CHUNK_BYTES = 64 * 1024;
 const TASK_NOTIFICATION_MAX_LINE_BYTES = 1024 * 1024;
 const TASK_NOTIFICATION_FINAL_SCAN_MAX_BYTES = Math.min(TASK_NOTIFICATION_SCAN_MAX_BYTES, 384 * 1024);
-const FINAL_TEXT_MAX_BYTES = 192 * 1024;
-const FINAL_TEXT_HEAD_BYTES = 64 * 1024;
-const FINAL_TEXT_TAIL_BYTES = 128 * 1024;
+const FINAL_TEXT_MAX_BYTES = 72 * 1024;
+const FINAL_TEXT_HEAD_BYTES = 24 * 1024;
+const FINAL_TEXT_TAIL_BYTES = 48 * 1024;
 const EXECUTION_END_MARKER = /(?:^|\n)delivery:\s*complete\s*\r?\nverification:\s*passed\s*$/i;
 const COVERAGE_END_MARKER = /(?:^|\n)delivery:\s*complete\s*\r?\ncoverage:\s*complete\s*$/i;
 const COLLECTOR_END_MARKER = /(?:^|\n)collector:\s*(?:state=|timeout\b|dead\b|status-error\b).*$/i;
@@ -608,6 +608,14 @@ function absoluteOutputFile(value) {
   return typeof value === "string" && path.isAbsolute(value) ? path.resolve(value) : null;
 }
 
+function regularFileExists(file) {
+  try {
+    return typeof file === "string" && fs.statSync(file).isFile();
+  } catch {
+    return false;
+  }
+}
+
 function outputFileFromLaunchResponse(response, nested) {
   const direct = [response.outputFile, response.output_file, nested.outputFile, nested.output_file].map(absoluteOutputFile).find(Boolean);
   if (direct) {
@@ -734,17 +742,17 @@ function handlePostToolUse(input, env, failed = false) {
         return false;
       }
       if (input.tool_name === "Read") {
-        const partialRead = Object.hasOwn(input.tool_input ?? {}, "offset") || Object.hasOwn(input.tool_input ?? {}, "limit");
-        return !partialRead && terminalCollectionPending(record) && record.outputFile && path.resolve(record.outputFile) === readPath;
+        const collectionPath = record.outputFile ?? record.transcriptPath;
+        return terminalCollectionPending(record) && typeof collectionPath === "string" && path.resolve(collectionPath) === readPath;
       }
       if (input.tool_name === "TaskOutput" && input.tool_input?.block !== true) {
         return false;
       }
       return taskId && [record.backgroundTaskId, record.agentId, record.taskId].includes(taskId);
     });
-    if (!failed) {
+    if (!failed || input.tool_name === "Read") {
       const now = new Date().toISOString();
-      const collectedResultText = ["Read", "TaskOutput"].includes(input.tool_name) ? taskOutputResultText(input) : null;
+      const collectedResultText = !failed && ["Read", "TaskOutput"].includes(input.tool_name) ? taskOutputResultText(input) : null;
       if (["Read", "TaskOutput"].includes(input.tool_name) && matches.length > 0) {
         captureCollectionResponse(input, env);
       }
@@ -838,7 +846,7 @@ function handlePostToolUse(input, env, failed = false) {
     }
     return;
   }
-  if (!isFusionWorkerAgent(input.agent_type)) {
+  if (!isFusionWorkerAgent(input.agent_type) && !PEER_JOB_FOOTER_AGENTS.has(input.agent_type)) {
     return;
   }
   const record = recordForAgent(input, env);
@@ -846,18 +854,25 @@ function handlePostToolUse(input, env, failed = false) {
     return;
   }
   const now = new Date().toISOString();
+  let emitWindDown = false;
   updateWorkerRecord(record.taskId, env, (current) => {
     const selectedTranscript = isAttributedTranscriptPath(input.transcript_path, record) ? input.transcript_path : null;
     const refreshed = selectedTranscript ? refreshWorkerTranscript(current ?? record, selectedTranscript) : current ?? record;
     const progress = !failed && !READ_ONLY_TOOLS.has(input.tool_name);
+    const windDownThreshold = Math.max(0, (refreshed.limits?.maxTurns ?? Number.POSITIVE_INFINITY) - 2);
+    emitWindDown = !isTerminalWorkerStatus(refreshed.transportStatus) && refreshed.windDownContextSentAt == null && (refreshed.turns ?? 0) >= windDownThreshold;
     return {
       ...refreshed,
       lastActivityAt: now,
       inFlightSince: undefined,
       ...(!failed ? { lastLivenessAt: now } : {}),
-      ...(progress ? { lastProgressAt: now, progressEvents: (refreshed.progressEvents ?? 0) + 1 } : {})
+      ...(progress ? { lastProgressAt: now, progressEvents: (refreshed.progressEvents ?? 0) + 1 } : {}),
+      ...(emitWindDown ? { windDownContextSentAt: now } : {})
     };
   });
+  if (emitWindDown) {
+    writeOutput(hookOutput(input.hook_event_name, "Turn budget wind-down: stop making tool calls and write your final deliverable now."));
+  }
 }
 
 function handleSubagentStart(input, env) {
@@ -1020,8 +1035,9 @@ function taskNotificationsFromTranscriptLine(line) {
     for (const block of blocks) {
       const taskId = /<task-id\s*>\s*([^<\s]+)\s*<\/task-id\s*>/i.exec(block[1])?.[1] ?? null;
       const status = /<status\s*>\s*([^<]+?)\s*<\/status\s*>/i.exec(block[1])?.[1]?.trim().toLowerCase() ?? null;
+      const outputFile = absoluteOutputFile(/<output-file\s*>\s*([^<]+?)\s*<\/output-file\s*>/i.exec(block[1])?.[1]?.trim());
       if (taskId && status && (SUCCESSFUL_TASK_NOTIFICATION_STATUSES.has(status) || CANCELLED_TASK_NOTIFICATION_STATUSES.has(status) || FAILED_TASK_NOTIFICATION_STATUSES.has(status))) {
-        notifications.push({ taskId, status });
+        notifications.push({ taskId, status, outputFile });
       }
     }
   }
@@ -1052,7 +1068,7 @@ function scanTaskNotifications(transcriptPath, requestedOffset) {
     const size = fs.fstatSync(descriptor).size;
     const startOffset = Math.min(taskNotificationScanOffset(requestedOffset) ?? 0, size);
     const bytesToScan = Math.min(TASK_NOTIFICATION_SCAN_MAX_BYTES, size - startOffset);
-    const statuses = new Map();
+    const notifications = new Map();
     let cursor = startOffset;
     let safeOffset = startOffset;
     let pending = Buffer.alloc(0);
@@ -1085,7 +1101,7 @@ function scanTaskNotifications(transcriptPath, requestedOffset) {
         }
         if (!skippingLongLine && pending.length > 0) {
           for (const notification of taskNotificationsFromTranscriptLine(pending.toString("utf8").replace(/\r$/, ""))) {
-            statuses.set(notification.taskId, notification.status);
+            notifications.set(notification.taskId, notification);
           }
         }
         pending = Buffer.alloc(0);
@@ -1099,7 +1115,7 @@ function scanTaskNotifications(transcriptPath, requestedOffset) {
         safeOffset = cursor;
       }
     }
-    return { statuses, offset: safeOffset };
+    return { notifications, offset: safeOffset };
   } catch {
     return null;
   } finally {
@@ -1118,6 +1134,55 @@ function transcriptEntryContent(entry) {
     return entry.message.content;
   }
   return Array.isArray(entry?.content) ? entry.content : [];
+}
+
+function boundedTranscriptTailText(transcriptPath) {
+  if (typeof transcriptPath !== "string" || !path.isAbsolute(transcriptPath)) {
+    return null;
+  }
+  let descriptor;
+  try {
+    descriptor = fs.openSync(transcriptPath, "r");
+    const stat = fs.fstatSync(descriptor);
+    if (!stat.isFile() || stat.size === 0) {
+      return null;
+    }
+    const bytesToRead = Math.min(TASK_NOTIFICATION_FINAL_SCAN_MAX_BYTES, stat.size);
+    const start = stat.size - bytesToRead;
+    const buffer = Buffer.allocUnsafe(bytesToRead);
+    const bytesRead = fs.readSync(descriptor, buffer, 0, buffer.length, start);
+    let text = buffer.subarray(0, bytesRead).toString("utf8");
+    if (start > 0) {
+      const firstNewline = text.indexOf("\n");
+      text = firstNewline === -1 ? "" : text.slice(firstNewline + 1);
+    }
+    const parts = [];
+    for (const line of text.split("\n")) {
+      if (!line.trim() || Buffer.byteLength(line) > TASK_NOTIFICATION_MAX_LINE_BYTES) {
+        continue;
+      }
+      try {
+        for (const block of transcriptEntryContent(JSON.parse(line))) {
+          if (block?.type === "text" && typeof block.text === "string") {
+            parts.push(block.text);
+          }
+        }
+      } catch {
+        void 0;
+      }
+    }
+    return parts.length > 0 ? parts.join("\n") : text;
+  } catch {
+    return null;
+  } finally {
+    if (descriptor != null) {
+      try {
+        fs.closeSync(descriptor);
+      } catch {
+        void 0;
+      }
+    }
+  }
 }
 
 function finalAssistantTextFromTranscript(transcriptPath) {
@@ -1180,47 +1245,62 @@ function finalAssistantTextFromTranscript(transcriptPath) {
 }
 
 function taskNotificationTransition(record, status, now, env) {
+  const refreshed = refreshWorkerTranscript(record, record.transcriptPath);
   if (SUCCESSFUL_TASK_NOTIFICATION_STATUSES.has(status)) {
-    const finalText = finalAssistantTextFromTranscript(record.transcriptPath);
-    let finalTextFile = null;
-    if (finalText) {
-      try {
-        finalTextFile = writeFinalTextArtifact(record, finalText, env);
-      } catch {
-        finalTextFile = null;
-      }
-    }
-    if (!finalTextFile) {
+    const finalText = finalAssistantTextFromTranscript(refreshed.transcriptPath);
+    const peerIdentity = PEER_JOB_FOOTER_AGENTS.has(refreshed.agentType)
+      ? capturedPeerIdentity(refreshed.agentType, finalText ?? boundedTranscriptTailText(refreshed.transcriptPath), refreshed.peerEngine)
+      : {};
+    if (!finalText) {
+      const turnLimited = refreshed.failureKind === "turn_limit" || (refreshed.turns ?? 0) >= (refreshed.limits?.maxTurns ?? Number.POSITIVE_INFINITY);
       return {
-        ...record,
+        ...refreshed,
         transportStatus: "incomplete",
         acceptance: "unverified",
-        failureKind: "turn_limit",
-        finishedAt: record.finishedAt ?? now,
+        failureKind: turnLimited ? "turn_limit" : "missing_final_text",
+        ...peerIdentity,
+        finishedAt: refreshed.finishedAt ?? now,
         lastActivityAt: now
       };
     }
-    const harnessAsyncDelivery = collectedHarnessAsyncDelivery(record, "done");
+    let finalTextFile = null;
+    try {
+      finalTextFile = writeFinalTextArtifact(refreshed, finalText, env);
+    } catch {
+      finalTextFile = null;
+    }
+    if (!finalTextFile) {
+      return {
+        ...refreshed,
+        transportStatus: "incomplete",
+        acceptance: "unverified",
+        failureKind: "delivery",
+        ...peerIdentity,
+        finishedAt: refreshed.finishedAt ?? now,
+        lastActivityAt: now
+      };
+    }
+    const harnessAsyncDelivery = collectedHarnessAsyncDelivery(refreshed, "done");
     return {
-      ...markWorkerCollected({ ...record, acceptance: "unverified" }, WORKER_COLLECTION_METHODS.TASK_NOTIFICATION, now),
+      ...markWorkerCollected({ ...refreshed, acceptance: "unverified" }, WORKER_COLLECTION_METHODS.TASK_NOTIFICATION, now),
       transportStatus: "done",
       acceptance: "unverified",
-      failureKind: harnessAsyncDelivery ? null : record.failureKind,
+      failureKind: harnessAsyncDelivery ? null : refreshed.failureKind,
       ...(harnessAsyncDelivery ? { deliveryMode: "harness_async" } : {}),
       outputFile: finalTextFile,
-      ...(PEER_JOB_FOOTER_AGENTS.has(record.agentType) ? capturedPeerIdentity(record.agentType, finalText, record.peerEngine) : {}),
-      finishedAt: record.finishedAt ?? now,
+      ...peerIdentity,
+      finishedAt: refreshed.finishedAt ?? now,
       lastActivityAt: now
     };
   }
   const cancelled = CANCELLED_TASK_NOTIFICATION_STATUSES.has(status);
   const fallbackFailureKind = cancelled ? "cancelled" : "task_failed";
   return {
-    ...markWorkerCollected({ ...record, acceptance: "unverified" }, WORKER_COLLECTION_METHODS.TASK_NOTIFICATION, now),
+    ...markWorkerCollected({ ...refreshed, acceptance: "unverified" }, WORKER_COLLECTION_METHODS.TASK_NOTIFICATION, now),
     transportStatus: cancelled ? "cancelled" : "failed",
     acceptance: "unverified",
-    failureKind: record.failureKind && record.failureKind !== "unexpected_async" ? record.failureKind : fallbackFailureKind,
-    finishedAt: record.finishedAt ?? now,
+    failureKind: refreshed.failureKind && refreshed.failureKind !== "unexpected_async" ? refreshed.failureKind : fallbackFailureKind,
+    finishedAt: refreshed.finishedAt ?? now,
     lastActivityAt: now
   };
 }
@@ -1244,13 +1324,25 @@ function reconcileTaskNotifications(input, env) {
       return;
     }
     const now = new Date().toISOString();
-    for (const [taskId, status] of scanned.statuses) {
+    for (const [taskId, notification] of scanned.notifications) {
       for (const record of candidates.filter((candidate) => [candidate.backgroundTaskId, candidate.agentId].includes(taskId))) {
+        const stamped = updateWorkerRecord(record.taskId, env, (current) => {
+          if (!current || current.sessionId !== input.session_id || isTerminalWorkerStatus(current.transportStatus) || ![current.backgroundTaskId, current.agentId].includes(taskId)) {
+            return null;
+          }
+          const currentTranscriptExists = regularFileExists(current.transcriptPath);
+          return notification.outputFile && (!current.transcriptPath || !currentTranscriptExists)
+            ? { ...current, transcriptPath: notification.outputFile }
+            : current;
+        });
+        if (!stamped || stamped.sessionId !== input.session_id || isTerminalWorkerStatus(stamped.transportStatus) || ![stamped.backgroundTaskId, stamped.agentId].includes(taskId)) {
+          continue;
+        }
         updateWorkerRecord(record.taskId, env, (current) => {
           if (!current || current.sessionId !== input.session_id || isTerminalWorkerStatus(current.transportStatus) || ![current.backgroundTaskId, current.agentId].includes(taskId)) {
             return null;
           }
-          return taskNotificationTransition(current, status, now, env);
+          return taskNotificationTransition(current, notification.status, now, env);
         });
       }
     }
@@ -1354,6 +1446,24 @@ function writeAcceptanceAdvisory(sessionId, env) {
   writeOutput(hookOutput("Stop", `Acceptance remains unverified for ${unverified.length} collected Fusion worker${unverified.length === 1 ? "" : "s"}. Settle each row with exactly one command: ${commands.join("; ")}. pairs are <id>=<verdict> with id either a fusion task id (fusion- plus 24 lowercase hex) or an engine job id (32 lowercase hex), verdict one of accepted|rejected|unverified.`));
 }
 
+function terminalCollectionInstruction(record) {
+  const collectId = record.backgroundTaskId ?? record.agentId;
+  return record.outputFile
+    ? `Call Read with file_path=${record.outputFile} to collect the terminal output before finishing.`
+    : collectId ? `Call TaskOutput with block=true for terminal owned task ${collectId} and collect the result before finishing.` : `Collect terminal owned task ${record.taskId} before finishing.`;
+}
+
+function settleOnlyRecords(records) {
+  return records.filter((record) => record.completionContract !== "collector" && isTerminalWorkerStatus(record.transportStatus) && record.collectedAt && record.awaitingVerdict === true);
+}
+
+function writeCombinedStopPending(terminalUncollected, settleOnly) {
+  const lines = terminalUncollected.map((record) => `${record.taskId}: ${terminalCollectionInstruction(record)}`)
+    .concat(settleOnly.map((record) => `settle-only: ${record.taskId}: /fusion:stats --record ${record.taskId}=accepted|rejected|unverified`));
+  const message = `Fusion worker completion is pending for ${lines.length} records:\n${lines.map((line) => `* ${line}`).join("\n")}\nTransport completion remains unverified until every result and its verification evidence are reviewed. Record accepted or rejected explicitly through /fusion:stats.`;
+  writeOutput(terminalUncollected.length > 0 ? blockStop(message) : hookOutput("Stop", message));
+}
+
 function inFlightSignature(records) {
   return records.map((record) => record.taskId).sort().join(",");
 }
@@ -1427,13 +1537,13 @@ function handleStop(input, env) {
     clearInFlightAdvisory(input.session_id, env);
   }
   const terminalUncollected = currentRecords.filter(terminalCollectionPending);
+  const settleOnly = settleOnlyRecords(currentRecords);
+  if (terminalUncollected.length + settleOnly.length > 1) {
+    writeCombinedStopPending(terminalUncollected, settleOnly);
+    return;
+  }
   if (terminalUncollected.length > 0) {
-    const instructions = terminalUncollected.map((record) => {
-      const collectId = record.backgroundTaskId ?? record.agentId;
-      return record.outputFile
-        ? `Call Read with file_path=${record.outputFile} and no offset or limit to collect the full terminal output before finishing.`
-        : collectId ? `Call TaskOutput with block=true for terminal owned task ${collectId} and collect the result before finishing.` : `Collect terminal owned task ${record.taskId} before finishing.`;
-    });
+    const instructions = terminalUncollected.map(terminalCollectionInstruction);
     instructions.push(
       "Transport completion remains unverified until the result and verification evidence are reviewed. Record accepted or rejected explicitly through /fusion:stats."
     );

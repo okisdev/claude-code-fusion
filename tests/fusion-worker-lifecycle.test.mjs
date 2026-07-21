@@ -1159,7 +1159,7 @@ test("a completed async worker is collected at SubagentStop and remains verdict 
   assert.strictEqual(allowed.stdout, "");
 });
 
-test("SubagentStop bounds an oversized final-text artifact with a truncation marker", (t) => {
+test("SubagentStop bounds an oversized final-text artifact to a 72KB payload with a truncation marker", (t) => {
   const box = sandbox(t);
   run(box, dispatch(box));
   run(box, {
@@ -1184,10 +1184,10 @@ test("SubagentStop bounds an oversized final-text artifact with a truncation mar
 
   const artifact = fs.readFileSync(record(box).outputFile);
   const source = Buffer.from(finalMessage, "utf8");
-  const omitted = source.length - 65_536 - 131_072;
+  const omitted = source.length - 24_576 - 49_152;
   const marker = Buffer.from(`\n[fusion: truncated ${omitted} bytes]\n`, "utf8");
-  assert.deepStrictEqual(artifact, Buffer.concat([source.subarray(0, 65_536), marker, source.subarray(source.length - 131_072)]));
-  assert.ok(artifact.length < 256 * 1024);
+  assert.deepStrictEqual(artifact, Buffer.concat([source.subarray(0, 24_576), marker, source.subarray(source.length - 49_152)]));
+  assert.strictEqual(artifact.length, 72 * 1024 + marker.length);
 });
 
 test("SubagentStop finalizes the record when the final-text artifact write fails", (t) => {
@@ -1522,7 +1522,7 @@ delivery: foreground
   assert.strictEqual(collected.peerEngine, "codex");
 });
 
-test("a full Read collects terminal output and captures its peer job footer", (t) => {
+test("a Read collects terminal output and captures its peer job footer", (t) => {
   const box = sandbox(t);
   const peerJobId = "b".repeat(32);
   const outputFile = path.join(box.root, "tasks", "peer-read.output");
@@ -1621,7 +1621,7 @@ test("Read collection debug capture writes the raw response when enabled", (t) =
   assert.deepStrictEqual(JSON.parse(fs.readFileSync(debugFile, "utf8")), toolResponse);
 });
 
-test("a terminal failed runtimeAsync worker is demanded by Stop and collected by a full Read", (t) => {
+test("a terminal failed runtimeAsync worker is demanded by Stop and collected by a Read", (t) => {
   const box = sandbox(t);
   const outputFile = path.join(box.root, "tasks", "terminal-failed.output");
   const output = "worker final message before it failed\n";
@@ -1682,7 +1682,7 @@ test("a terminal failed runtimeAsync worker is demanded by Stop and collected by
   assert.doesNotMatch(clearedOutput.hookSpecificOutput.additionalContext, /Call Read with file_path=|TaskOutput/);
 });
 
-test("a terminal cancelled runtimeAsync worker is demanded by Stop and collected by a full Read", (t) => {
+test("a terminal cancelled runtimeAsync worker is demanded by Stop and collected by a Read", (t) => {
   const box = sandbox(t);
   const outputFile = path.join(box.root, "tasks", "terminal-cancelled.output");
   const output = "worker final message before it was cancelled\n";
@@ -1743,7 +1743,7 @@ test("a terminal cancelled runtimeAsync worker is demanded by Stop and collected
   assert.doesNotMatch(clearedOutput.hookSpecificOutput.additionalContext, /Call Read with file_path=|TaskOutput/);
 });
 
-test("a partial Read of a terminal runtimeAsync record's output file does not collect it", (t) => {
+test("a failed Read of a terminal runtimeAsync record's output file collects with a limit", (t) => {
   const box = sandbox(t);
   const outputFile = path.join(box.root, "tasks", "terminal-partial.output");
   const output = "worker final message\n";
@@ -1762,32 +1762,49 @@ test("a partial Read of a terminal runtimeAsync record's output file does not co
     outputFile
   }));
 
-  for (const partialInput of [{ offset: 1 }, { limit: 1 }]) {
-    run(box, {
-      hook_event_name: "PostToolUse",
-      session_id: "session-1",
-      cwd: box.cwd,
-      transcript_path: box.transcript,
-      tool_name: "Read",
-      tool_input: { file_path: outputFile, ...partialInput },
-      tool_response: { type: "text", text: output }
-    });
-    const untouched = record(box);
-    assert.strictEqual(untouched.collectedAt, null);
-    assert.strictEqual(untouched.collectionMethod, null);
-    assert.strictEqual(untouched.transportStatus, "failed");
-  }
-
-  const blocked = run(box, {
-    hook_event_name: "Stop",
+  run(box, {
+    hook_event_name: "PostToolUseFailure",
     session_id: "session-1",
     cwd: box.cwd,
     transcript_path: box.transcript,
-    background_tasks: []
+    tool_name: "Read",
+    tool_input: { file_path: outputFile, limit: 1 },
+    tool_response: { is_error: true, content: "Read output exceeded the size limit" }
   });
-  const blockedOutput = JSON.parse(blocked.stdout);
-  assert.strictEqual(blockedOutput.decision, "block");
-  assert.match(blockedOutput.reason, /Call Read with file_path=/);
+
+  const collected = record(box);
+  assert.ok(collected.collectedAt);
+  assert.strictEqual(collected.collectionMethod, "output_file_read");
+  assert.strictEqual(collected.transportStatus, "done");
+});
+
+test("a Read of a terminal runtimeAsync record's transcript path collects with offset and limit", (t) => {
+  const box = sandbox(t);
+  const transcriptPath = path.join(box.root, "tasks", "terminal-transcript.jsonl");
+  fs.mkdirSync(path.dirname(transcriptPath), { recursive: true });
+  fs.writeFileSync(transcriptPath, "worker final message\n", "utf8");
+  run(box, dispatch(box));
+  updateWorkerRecord(record(box).taskId, envFor(box), (current) => ({
+    ...current,
+    transportStatus: "ready_uncollected",
+    outputFile: null,
+    transcriptPath
+  }));
+
+  run(box, {
+    hook_event_name: "PostToolUse",
+    session_id: "session-1",
+    cwd: box.cwd,
+    transcript_path: box.transcript,
+    tool_name: "Read",
+    tool_input: { file_path: transcriptPath, offset: 1, limit: 1 },
+    tool_response: { type: "text", text: "worker" }
+  });
+
+  const collected = record(box);
+  assert.ok(collected.collectedAt);
+  assert.strictEqual(collected.collectionMethod, "output_file_read");
+  assert.strictEqual(collected.transportStatus, "done");
 });
 
 test("a Read of an unrelated file does not collect a terminal runtimeAsync record", (t) => {
@@ -1838,7 +1855,7 @@ test("a Read of an unrelated file does not collect a terminal runtimeAsync recor
   assert.match(blockedOutput.reason, /Call Read with file_path=/);
 });
 
-test("a ready_uncollected record still collects through a full Read", (t) => {
+test("a ready_uncollected record still collects through a Read", (t) => {
   const box = sandbox(t);
   const outputFile = path.join(box.root, "tasks", "ready-uncollected-unchanged.output");
   const output = "worker final message\ndelivery: complete\nverification: passed\n";
@@ -3054,23 +3071,21 @@ test("Stop settles a delivered task notification once without a TaskOutput probe
   assert.strictEqual(settled.acceptance, "accepted");
 });
 
-test("a completed task notification captures a Codex peer job footer", (t) => {
+test("a task notification output file stamps a null transcript path and writes final text", (t) => {
   const box = sandbox(t);
-  const peerJobId = "f".repeat(32);
-  const workerTranscript = path.join(box.root, "notification-codex-rescue.output");
-  const finalMessage = `completed rescue\ncodex-session: session-1\njob: ${peerJobId}\nsemantic: unverified\nstate: done`;
-  fs.writeFileSync(workerTranscript, `${JSON.stringify({ type: "assistant", message: { content: [{ type: "text", text: finalMessage }] } })}\n`, "utf8");
-  const workerDispatch = dispatch(box, { subagent_type: "codex:codex-rescue", prompt: "bounded peer brief" });
+  const workerTranscript = path.join(box.root, "notification-output-file.jsonl");
+  const finalMessage = "notification supplied transcript\ndelivery: complete\nverification: passed";
+  fs.writeFileSync(workerTranscript, `${JSON.stringify({ type: "assistant", requestId: "turn-1", message: { content: [{ type: "text", text: finalMessage }] } })}\n`, "utf8");
+  const workerDispatch = dispatch(box);
   run(box, workerDispatch);
   run(box, {
     ...workerDispatch,
     hook_event_name: "PostToolUse",
-    tool_response: { isAsync: true, status: "async_launched", agentId: "notification-codex-rescue", outputFile: workerTranscript }
+    tool_response: { isAsync: true, status: "async_launched", agentId: "notification-output-file" }
   });
   const launched = record(box);
-  updateWorkerRecord(launched.taskId, envFor(box), (current) => ({ ...current, transcriptPath: workerTranscript }));
-  const before = record(box);
-  fs.appendFileSync(box.transcript, `${JSON.stringify({ type: "user", message: { content: `<task-notification>\n<task-id>${before.agentId}</task-id>\n<status>completed</status>\n</task-notification>` } })}\n`, "utf8");
+  assert.strictEqual(launched.transcriptPath, null);
+  fs.appendFileSync(box.transcript, `${JSON.stringify({ type: "user", message: { content: `<task-notification>\n<task-id>${launched.agentId}</task-id>\n<status>completed</status>\n<output-file>${workerTranscript}</output-file>\n</task-notification>` } })}\n`, "utf8");
 
   run(box, {
     hook_event_name: "Stop",
@@ -3082,10 +3097,82 @@ test("a completed task notification captures a Codex peer job footer", (t) => {
   });
 
   const collected = record(box);
+  assert.strictEqual(collected.transcriptPath, workerTranscript);
+  assert.strictEqual(collected.transportStatus, "done");
+  assert.strictEqual(collected.collectionMethod, "task_notification");
+  assert.strictEqual(collected.failureKind, null);
+  assert.strictEqual(fs.readFileSync(collected.outputFile, "utf8"), finalMessage);
+});
+
+test("a completed task notification captures a Codex peer job footer", (t) => {
+  const box = sandbox(t);
+  const peerJobId = "f".repeat(32);
+  const workerTranscript = path.join(box.root, "notification-codex-rescue.output");
+  const finalMessage = `completed rescue\ncodex-session: session-1\njob: ${peerJobId}\nsemantic: unverified\nstate: done`;
+  fs.writeFileSync(workerTranscript, `${JSON.stringify({ type: "assistant", message: { content: [{ type: "text", text: finalMessage }] } })}\n`, "utf8");
+  const workerDispatch = dispatch(box, { subagent_type: "codex:codex-rescue", prompt: "bounded peer brief" });
+  run(box, workerDispatch);
+  run(box, {
+    ...workerDispatch,
+    hook_event_name: "PostToolUse",
+    tool_response: { isAsync: true, status: "async_launched", agentId: "notification-codex-rescue" }
+  });
+  const launched = record(box);
+  assert.strictEqual(launched.transcriptPath, null);
+  const before = record(box);
+  fs.appendFileSync(box.transcript, `${JSON.stringify({ type: "user", message: { content: `<task-notification>\n<task-id>${before.agentId}</task-id>\n<status>completed</status>\n<output-file>${workerTranscript}</output-file>\n</task-notification>` } })}\n`, "utf8");
+
+  run(box, {
+    hook_event_name: "Stop",
+    session_id: "session-1",
+    cwd: box.cwd,
+    transcript_path: box.transcript,
+    stop_hook_active: true,
+    background_tasks: []
+  });
+
+  const collected = record(box);
+  assert.strictEqual(collected.transcriptPath, workerTranscript);
+  assert.strictEqual(collected.transportStatus, "done");
+  assert.strictEqual(collected.failureKind, null);
   assert.strictEqual(collected.peerJobId, peerJobId);
   assert.strictEqual(collected.peerEngine, "codex");
   assert.strictEqual(collected.peerTransportStatus, undefined);
   assert.strictEqual(collected.peerSemanticStatus, undefined);
+});
+
+test("an incomplete peer notification captures its job footer from the bounded transcript tail", (t) => {
+  const box = sandbox(t);
+  const peerJobId = "d".repeat(32);
+  const workerTranscript = path.join(box.root, "notification-peer-dangling.output");
+  fs.writeFileSync(workerTranscript, [
+    JSON.stringify({ type: "assistant", message: { content: [{ type: "text", text: `partial rescue\njob: ${peerJobId}` }, { type: "tool_use", id: "tool-1" }] } }),
+    JSON.stringify({ type: "user", message: { content: [{ type: "tool_result", tool_use_id: "tool-1", content: "done" }] }, toolUseResult: { content: "done" } })
+  ].join("\n") + "\n", "utf8");
+  const workerDispatch = dispatch(box, { subagent_type: "codex:codex-rescue", prompt: "bounded peer brief" });
+  run(box, workerDispatch);
+  run(box, {
+    ...workerDispatch,
+    hook_event_name: "PostToolUse",
+    tool_response: { isAsync: true, status: "async_launched", agentId: "notification-peer-dangling" }
+  });
+  const launched = record(box);
+  fs.appendFileSync(box.transcript, `${JSON.stringify({ type: "user", message: { content: `<task-notification>\n<task-id>${launched.agentId}</task-id>\n<status>completed</status>\n<output-file>${workerTranscript}</output-file>\n</task-notification>` } })}\n`, "utf8");
+
+  run(box, {
+    hook_event_name: "Stop",
+    session_id: "session-1",
+    cwd: box.cwd,
+    transcript_path: box.transcript,
+    stop_hook_active: true,
+    background_tasks: []
+  });
+
+  const incomplete = record(box);
+  assert.strictEqual(incomplete.transportStatus, "incomplete");
+  assert.strictEqual(incomplete.failureKind, "missing_final_text");
+  assert.strictEqual(incomplete.peerJobId, peerJobId);
+  assert.strictEqual(incomplete.peerEngine, "codex");
 });
 
 test("a completed task notification does not parse peer footers for fusion workers", (t) => {
@@ -3134,6 +3221,7 @@ test("a completion notification with a dangling tool result remains incomplete a
     tool_response: { isAsync: true, status: "async_launched", agentId: "notification-dangling", outputFile: workerTranscript }
   });
   const before = record(box);
+  updateWorkerRecord(before.taskId, envFor(box), (current) => ({ ...current, turns: 5 }));
   fs.appendFileSync(box.transcript, `${JSON.stringify({ type: "user", message: { content: `<task-notification>\n<task-id>${before.agentId}</task-id>\n<status>completed</status>\n</task-notification>` } })}\n`, "utf8");
 
   run(box, {
@@ -3147,12 +3235,117 @@ test("a completion notification with a dangling tool result remains incomplete a
 
   const incomplete = record(box);
   assert.strictEqual(incomplete.transportStatus, "incomplete");
-  assert.strictEqual(incomplete.failureKind, "turn_limit");
+  assert.strictEqual(incomplete.failureKind, "missing_final_text");
+  assert.strictEqual(incomplete.turns, 5);
   assert.strictEqual(incomplete.collectionMethod, null);
   assert.strictEqual(incomplete.collectedAt, null);
   assert.strictEqual(incomplete.awaitingVerdict, false);
   assert.strictEqual(incomplete.outputFile, null);
   assert.strictEqual(fs.existsSync(path.join(box.state, "jobs", `${incomplete.taskId}.final.txt`)), false);
+});
+
+test("a no-text completion at the turn cap remains a turn limit", (t) => {
+  const box = sandbox(t);
+  const workerTranscript = path.join(box.root, "notification-turn-limit.output");
+  fs.writeFileSync(workerTranscript, `${JSON.stringify({ type: "assistant", message: { content: [{ type: "tool_use", id: "tool-1" }] } })}\n`, "utf8");
+  const workerDispatch = dispatch(box);
+  run(box, workerDispatch);
+  run(box, {
+    ...workerDispatch,
+    hook_event_name: "PostToolUse",
+    tool_response: { isAsync: true, status: "async_launched", agentId: "notification-turn-limit", outputFile: workerTranscript }
+  });
+  const launched = record(box);
+  updateWorkerRecord(launched.taskId, envFor(box), (current) => ({ ...current, turns: 60 }));
+  fs.appendFileSync(box.transcript, `${JSON.stringify({ type: "user", message: { content: `<task-notification>\n<task-id>${launched.agentId}</task-id>\n<status>completed</status>\n</task-notification>` } })}\n`, "utf8");
+
+  run(box, {
+    hook_event_name: "Stop",
+    session_id: "session-1",
+    cwd: box.cwd,
+    transcript_path: box.transcript,
+    stop_hook_active: true,
+    background_tasks: []
+  });
+
+  const incomplete = record(box);
+  assert.strictEqual(incomplete.transportStatus, "incomplete");
+  assert.strictEqual(incomplete.failureKind, "turn_limit");
+  assert.strictEqual(incomplete.turns, 60);
+});
+
+test("PostToolUse emits turn wind-down context once at two turns below the cap", (t) => {
+  const box = sandbox(t);
+  const workerDispatch = dispatch(box);
+  run(box, workerDispatch);
+  run(box, {
+    hook_event_name: "SubagentStart",
+    session_id: "session-1",
+    cwd: box.cwd,
+    transcript_path: box.transcript,
+    agent_id: "wind-down",
+    agent_type: "fusion:fast-worker"
+  });
+  const workerTranscript = path.join(box.root, "agent-wind-down.jsonl");
+  fs.writeFileSync(workerTranscript, Array.from({ length: 58 }, (_, index) => JSON.stringify({ type: "assistant", requestId: `turn-${index}`, message: { content: [{ type: "text", text: `turn ${index}` }] } })).join("\n") + "\n", "utf8");
+  const payload = {
+    hook_event_name: "PostToolUse",
+    session_id: "session-1",
+    cwd: box.cwd,
+    transcript_path: workerTranscript,
+    agent_id: "wind-down",
+    agent_type: "fusion:fast-worker",
+    tool_name: "Read"
+  };
+
+  const first = run(box, payload);
+  const firstOutput = JSON.parse(first.stdout);
+  assert.match(firstOutput.hookSpecificOutput.additionalContext, /stop making tool calls and write your final deliverable now/);
+  assert.strictEqual(record(box).turns, 58);
+  const notifiedAt = record(box).windDownContextSentAt;
+  assert.ok(notifiedAt);
+
+  const repeated = run(box, payload);
+  assert.strictEqual(repeated.stdout, "");
+  assert.strictEqual(record(box).windDownContextSentAt, notifiedAt);
+});
+
+test("Stop combines multi-record collection and settlement instructions", (t) => {
+  const box = sandbox(t);
+  const outputFile = path.join(box.root, "peer-terminal.output");
+  fs.writeFileSync(outputFile, "peer result\n", "utf8");
+  const collecting = createWorkerRecord({
+    taskId: `fusion-${"1".repeat(24)}`,
+    sessionId: "session-1",
+    agentType: "codex:codex-rescue",
+    workspaceRoot: box.cwd,
+    outputFile
+  }, envFor(box));
+  updateWorkerRecord(collecting.taskId, envFor(box), (current) => ({ ...current, agentId: "collecting-peer", backgroundTaskId: "collecting-peer", transportStatus: "ready_uncollected", runtimeAsync: true }));
+  const settling = createWorkerRecord({
+    taskId: `fusion-${"2".repeat(24)}`,
+    sessionId: "session-1",
+    agentType: "fusion:fast-worker",
+    workspaceRoot: box.cwd
+  }, envFor(box));
+  const collectedAt = new Date().toISOString();
+  updateWorkerRecord(settling.taskId, envFor(box), (current) => ({ ...current, transportStatus: "done", collectedAt, collectionMethod: WORKER_COLLECTION_METHODS.SUBAGENT_STOP, awaitingVerdict: true, awaitingVerdictArmedAt: collectedAt }));
+
+  const stopped = run(box, {
+    hook_event_name: "Stop",
+    session_id: "session-1",
+    cwd: box.cwd,
+    transcript_path: box.transcript,
+    stop_hook_active: false,
+    background_tasks: []
+  });
+
+  assert.strictEqual(stopped.stdout.trim().split("\n").length, 1);
+  const decision = JSON.parse(stopped.stdout);
+  assert.strictEqual(decision.decision, "block");
+  assert.match(decision.reason, new RegExp(`Call Read with file_path=${outputFile.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`));
+  assert.doesNotMatch(decision.reason, /no offset or limit/);
+  assert.match(decision.reason, new RegExp(`settle-only: ${settling.taskId}: /fusion:stats --record ${settling.taskId}=accepted\\|rejected\\|unverified`));
 });
 
 test("a delivered completion notification prevents Stop from demanding TaskStop for an expired worker", (t) => {

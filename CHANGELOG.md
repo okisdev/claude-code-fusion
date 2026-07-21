@@ -1,5 +1,14 @@
 # changelog
 
+## 0.0.33
+
+- notification collection reads the transcript the notification names: every peer wrapper record in a live traffic window had a null `transcriptPath`, so the completed path extracted nothing, mislabeled clean consult wrappers (nine to eleven turns of a sixty budget, backing peer jobs all clean) as `turn_limit` incomplete, demanded manual raw transcript reads, and skipped peer footer seeding; the reconciler now stamps the record's `transcriptPath` from the notification's own output file element before transition, and a no-text completion classifies `missing_final_text` unless real turn evidence supports `turn_limit`
+- the collection demand is always satisfiable: the old matcher required a full file read of a transcript that can exceed the Read tool's token cap, a physically impossible demand observed re-firing at every stop boundary for an hour; any Read of the record's `outputFile` (or `transcriptPath` when no artifact exists) now marks collection regardless of offset, limit, or a size-refused response, the demand wording drops the full-read requirement, and the final text artifact caps shrink from 192KB to 72KB so a maximum artifact always fits one read
+- stray probes against reaped workers are redirected: the guard's PreToolUse now intercepts `TaskOutput` and `TaskStop` aimed at a terminal fusion worker and points at the record's output file and settlement command instead, ending the "No task found" error class the harness's one minute wrapper reap produced
+- peer footer capture runs on incomplete completions too, so `peerJobId` seeds even when extraction fails and an engine job id settlement propagates to the wrapper ledger row
+- workers get a wind-down instead of an overshoot: at two turns before the budget the lifecycle injects a final-deliverable instruction once per record, replacing the reactive cap that let workers run to sixty-two and sixty-four of sixty
+- stop output consolidates: multiple pending records emit one combined block, and rows that are collected but unsettled carry a `settle-only:` prefix so the two obligations read differently
+
 ## 0.0.32
 
 - worker agent turn caps stop undercutting their budgets: the harness enforces frontmatter `maxTurns` as a hard cap that ends an async worker silently as completed mid run, and `fast-worker`'s 40 sat below its own 60 turn base budget, so standard and large briefs were killed with no deliverable while the honest budget classifier watched a limit that could never fire; frontmatter now carries the doubled large sizing values (120, 60, 24) and a consistency test pins them to the budget table

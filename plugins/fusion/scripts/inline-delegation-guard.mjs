@@ -37,11 +37,14 @@ const WRITE_TOOLS = new Set(["Edit", "Write", "NotebookEdit", "MultiEdit"]);
 const DELEGATION_TOOLS = new Set(["Agent", "Task"]);
 const BASH_TOOL = "Bash";
 const ENFORCEMENT_AUDIT_TOOLS = new Set([...WRITE_TOOLS, BASH_TOOL]);
+const TASK_CONTROL_TOOLS = new Set(["TaskOutput", "TaskStop"]);
 const BUILTIN_LANE = "builtin";
 const MAIN_LANE = "main";
 const WORKER_TERMINAL_STATUSES = new Set(["done", "incomplete", "failed", "cancelled", "owner_ended"]);
+const REAPED_WORKER_TERMINAL_STATUSES = new Set(["done", "incomplete", "failed", "cancelled"]);
 const NO_OP_BASH_COMMANDS = new Set(["", "true", ":"]);
 const NO_OP_HEARTBEAT_REASON = "Fusion tasks are in flight for this session, so emit a text-only heartbeat instead of this no-op Bash command.";
+const REAPED_WORKER_REDIRECT_AUDIT_DESCRIPTION = "reaped-worker-redirect";
 const NARROW_WAVE_ADVISORY_SUFFIX = "consecutive narrow waves; fleet default applies: consider /fusion:ultra for the remaining packages or state fleet-decline: <reason>.";
 const MISSING_LAUNCH_RECOVERY_REASON = "missing-launch-recovered";
 
@@ -124,6 +127,53 @@ function sessionHasInFlightWorkerTasks(sessionId, env = process.env) {
     }
   }
   return false;
+}
+
+function extractTaskControlId(toolInput) {
+  if (!toolInput || typeof toolInput !== "object") {
+    return null;
+  }
+  return typeof toolInput.task_id === "string" && toolInput.task_id.length > 0 ? toolInput.task_id : null;
+}
+
+function findWorkerRecordForTaskControlId(taskId, env = process.env) {
+  const jobsDir = path.join(resolveWorkerStateDir(env), "jobs");
+  let entries;
+  try {
+    entries = fs.readdirSync(jobsDir, { withFileTypes: true });
+  } catch {
+    return null;
+  }
+  const matches = [];
+  for (const entry of entries) {
+    if (!entry.isFile() || !entry.name.startsWith("fusion-") || !entry.name.endsWith(".json")) {
+      continue;
+    }
+    try {
+      const record = JSON.parse(fs.readFileSync(path.join(jobsDir, entry.name), "utf8"));
+      if (!record || typeof record !== "object" || Array.isArray(record)) {
+        continue;
+      }
+      if (record.backgroundTaskId === taskId || record.agentId === taskId) {
+        matches.push(record);
+      }
+    } catch {
+      continue;
+    }
+  }
+  return matches.find((record) => !REAPED_WORKER_TERMINAL_STATUSES.has(record.transportStatus)) ?? matches[0] ?? null;
+}
+
+function reapedWorkerRedirectReason(record, taskId) {
+  const settlementTaskId = typeof record.taskId === "string" && record.taskId.length > 0 ? record.taskId : taskId;
+  const settlement = `/fusion:stats --record ${settlementTaskId}=<verdict>`;
+  if (typeof record.outputFile === "string" && record.outputFile.length > 0) {
+    return `This worker already completed and was reaped; its result is at ${record.outputFile}; Read that file and settle via ${settlement} instead of probing the reaped agent.`;
+  }
+  if (typeof record.transcriptPath === "string" && record.transcriptPath.length > 0) {
+    return `This worker already completed and was reaped; its transcript is at ${record.transcriptPath}; Read that file and settle via ${settlement} instead of probing the reaped agent.`;
+  }
+  return `This worker already completed and was reaped; settle via ${settlement} instead of probing the reaped agent.`;
 }
 
 function extractBashCommand(toolInput) {
@@ -416,6 +466,24 @@ function normalizeAuditEvent(event) {
     return lane
       ? { schemaVersion: AUDIT_SCHEMA_VERSION, at: new Date(atMs).toISOString(), session, event: "warn", lane, tool: event.tool, reason: MISSING_LAUNCH_RECOVERY_REASON }
       : null;
+  }
+  if (
+    (event.event === "deny" || event.event === "warn") &&
+    TASK_CONTROL_TOOLS.has(event.tool) &&
+    event.lane === MAIN_LANE &&
+    event.description === REAPED_WORKER_REDIRECT_AUDIT_DESCRIPTION &&
+    (event.mode === "enforce" || event.mode === "advisory")
+  ) {
+    return {
+      schemaVersion: AUDIT_SCHEMA_VERSION,
+      at: new Date(atMs).toISOString(),
+      session,
+      event: event.event,
+      lane: MAIN_LANE,
+      tool: event.tool,
+      description: REAPED_WORKER_REDIRECT_AUDIT_DESCRIPTION,
+      mode: event.mode
+    };
   }
   if (
     (event.event === "deny" || event.event === "warn") &&
@@ -949,6 +1017,33 @@ function runHook(env = process.env, input = readHookInput()) {
     if (confirmation.shouldAdvise) {
       process.stdout.write(`${JSON.stringify(postToolAdvisoryOutput(`${confirmation.streak} ${NARROW_WAVE_ADVISORY_SUFFIX}`))}\n`);
     }
+    return;
+  }
+
+  if (TASK_CONTROL_TOOLS.has(toolName)) {
+    if (input.hook_event_name && input.hook_event_name !== "PreToolUse") {
+      return;
+    }
+    const taskId = extractTaskControlId(input.tool_input);
+    const record = taskId ? findWorkerRecordForTaskControlId(taskId, env) : null;
+    if (!record || !REAPED_WORKER_TERMINAL_STATUSES.has(record.transportStatus)) {
+      return;
+    }
+    const mode = resolveMode(env);
+    const reason = reapedWorkerRedirectReason(record, taskId);
+    recordAuditEvent(
+      {
+        at: now,
+        session: sessionId,
+        event: mode === "advisory" ? "warn" : "deny",
+        lane: MAIN_LANE,
+        tool: toolName,
+        description: REAPED_WORKER_REDIRECT_AUDIT_DESCRIPTION,
+        mode
+      },
+      env
+    );
+    process.stdout.write(`${JSON.stringify(mode === "advisory" ? allowOutput(reason) : denyOutput(reason))}\n`);
     return;
   }
 

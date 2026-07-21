@@ -1062,7 +1062,18 @@ function workerStateEnv(sandbox) {
   return { FUSION_WORKER_STATE_DIR: workerStateDir };
 }
 
-function seedInFlightWorker(sandbox, { sessionId = "session-1", taskId = "fusion-abcdef0123456789abcdef01", transportStatus = "pending_async" } = {}) {
+function seedInFlightWorker(
+  sandbox,
+  {
+    sessionId = "session-1",
+    taskId = "fusion-abcdef0123456789abcdef01",
+    backgroundTaskId = taskId,
+    agentId,
+    transportStatus = "pending_async",
+    outputFile,
+    transcriptPath
+  } = {}
+) {
   const jobsDir = path.join(sandbox.root, "workers", "jobs");
   fs.mkdirSync(jobsDir, { recursive: true });
   fs.writeFileSync(
@@ -1071,7 +1082,11 @@ function seedInFlightWorker(sandbox, { sessionId = "session-1", taskId = "fusion
       schemaVersion: 1,
       taskId,
       sessionId,
+      backgroundTaskId,
+      ...(agentId ? { agentId } : {}),
       transportStatus,
+      ...(outputFile ? { outputFile } : {}),
+      ...(transcriptPath ? { transcriptPath } : {}),
       acceptance: "unverified"
     }),
     "utf8"
@@ -1092,6 +1107,17 @@ function bashPayload(sandbox, { sessionId = "session-1", command = "true", agent
     payload.agent_type = "Explore";
   }
   return payload;
+}
+
+function taskControlPayload(sandbox, { sessionId = "session-1", toolName = "TaskOutput", taskId } = {}) {
+  return {
+    hook_event_name: "PreToolUse",
+    session_id: sessionId,
+    transcript_path: path.join(sandbox.root, "transcript.jsonl"),
+    cwd: sandbox.workDir,
+    tool_name: toolName,
+    tool_input: { task_id: taskId }
+  };
 }
 
 test("in-flight worker tasks deny no-op Bash true with the heartbeat reason", (t) => {
@@ -1159,7 +1185,88 @@ test("no-op Bash deny audits an enforcement event for Bash on the main lane", (t
   assert.ok(!Object.hasOwn(denies[0], "path"));
 });
 
-test("hooks configuration wires PreToolUse write tools, Bash, Agent, and Task through the inline guard", () => {
+test("TaskOutput against a terminal Fusion worker redirects to its output file", (t) => {
+  const sandbox = makeSandbox(t);
+  const taskId = "fusion-abcdef0123456789abcdef01";
+  const backgroundTaskId = "peer-reaped-output";
+  const outputFile = path.join(sandbox.root, "tasks", "peer-reaped-output.txt");
+  seedInFlightWorker(sandbox, { taskId, backgroundTaskId, transportStatus: "done", outputFile });
+
+  const result = run(sandbox, taskControlPayload(sandbox, { taskId: backgroundTaskId }), workerStateEnv(sandbox));
+  assert.strictEqual(result.status, 0);
+  const output = JSON.parse(result.stdout);
+  assert.strictEqual(output.hookSpecificOutput.permissionDecision, "deny");
+  assert.match(output.hookSpecificOutput.permissionDecisionReason, new RegExp(outputFile));
+  assert.match(output.hookSpecificOutput.permissionDecisionReason, new RegExp(`/fusion:stats --record ${taskId}=<verdict>`));
+  const redirects = readAuditRecords(sandbox).filter((record) => record.tool === "TaskOutput");
+  assert.deepStrictEqual(redirects, [
+    {
+      schemaVersion: 1,
+      at: redirects[0].at,
+      session: "session-1",
+      event: "deny",
+      lane: "main",
+      tool: "TaskOutput",
+      description: "reaped-worker-redirect",
+      mode: "enforce"
+    }
+  ]);
+});
+
+test("TaskOutput against a running Fusion worker is allowed", (t) => {
+  const sandbox = makeSandbox(t);
+  const backgroundTaskId = "peer-running";
+  seedInFlightWorker(sandbox, { backgroundTaskId });
+
+  const result = run(sandbox, taskControlPayload(sandbox, { taskId: backgroundTaskId }), workerStateEnv(sandbox));
+  assert.strictEqual(result.status, 0);
+  assert.strictEqual(result.stdout, "");
+  assert.deepStrictEqual(readAuditRecords(sandbox), []);
+});
+
+test("TaskOutput with an unknown task id is allowed", (t) => {
+  const sandbox = makeSandbox(t);
+  const result = run(sandbox, taskControlPayload(sandbox, { taskId: "not-a-fusion-worker" }), workerStateEnv(sandbox));
+  assert.strictEqual(result.status, 0);
+  assert.strictEqual(result.stdout, "");
+  assert.deepStrictEqual(readAuditRecords(sandbox), []);
+});
+
+test("TaskStop against a terminal Fusion worker redirects to its transcript", (t) => {
+  const sandbox = makeSandbox(t);
+  const taskId = "fusion-abcdef0123456789abcdef01";
+  const agentId = "peer-reaped-stop";
+  const transcriptPath = path.join(sandbox.root, "tasks", "peer-reaped-stop.jsonl");
+  seedInFlightWorker(sandbox, { taskId, agentId, transportStatus: "cancelled", transcriptPath });
+
+  const result = run(sandbox, taskControlPayload(sandbox, { toolName: "TaskStop", taskId: agentId }), workerStateEnv(sandbox));
+  assert.strictEqual(result.status, 0);
+  const output = JSON.parse(result.stdout);
+  assert.strictEqual(output.hookSpecificOutput.permissionDecision, "deny");
+  assert.match(output.hookSpecificOutput.permissionDecisionReason, new RegExp(transcriptPath));
+});
+
+test("advisory mode warns and allows terminal TaskOutput redirects", (t) => {
+  const sandbox = makeSandbox(t);
+  const backgroundTaskId = "peer-advisory";
+  seedInFlightWorker(sandbox, { backgroundTaskId, transportStatus: "failed" });
+
+  const result = run(sandbox, taskControlPayload(sandbox, { taskId: backgroundTaskId }), {
+    ...workerStateEnv(sandbox),
+    FUSION_INLINE_GUARD_MODE: "advisory"
+  });
+  assert.strictEqual(result.status, 0);
+  const output = JSON.parse(result.stdout);
+  assert.strictEqual(output.hookSpecificOutput.permissionDecision, "allow");
+  assert.match(output.hookSpecificOutput.permissionDecisionReason, /settle via \/fusion:stats --record/);
+  const warnings = readAuditRecords(sandbox).filter((record) => record.tool === "TaskOutput");
+  assert.strictEqual(warnings.length, 1);
+  assert.strictEqual(warnings[0].event, "warn");
+  assert.strictEqual(warnings[0].description, "reaped-worker-redirect");
+  assert.strictEqual(warnings[0].mode, "advisory");
+});
+
+test("hooks configuration wires PreToolUse write tools, Bash, Agent, Task, TaskOutput, and TaskStop through the inline guard", () => {
   const hooks = JSON.parse(fs.readFileSync(path.join(repoRoot, "plugins", "fusion", "hooks", "hooks.json"), "utf8")).hooks;
   const preToolHandlers = hooks.PreToolUse.flatMap((group) => group.hooks.map((hook) => ({ matcher: group.matcher, command: hook.command }))).filter((hook) => hook.command?.includes("inline-delegation-guard.mjs"));
   assert.deepStrictEqual(preToolHandlers, [
@@ -1169,6 +1276,10 @@ test("hooks configuration wires PreToolUse write tools, Bash, Agent, and Task th
     },
     {
       matcher: "^(Agent|Task)$",
+      command: 'node "${CLAUDE_PLUGIN_ROOT}/scripts/inline-delegation-guard.mjs"'
+    },
+    {
+      matcher: "^(TaskOutput|TaskStop)$",
       command: 'node "${CLAUDE_PLUGIN_ROOT}/scripts/inline-delegation-guard.mjs"'
     }
   ]);
