@@ -94,6 +94,7 @@ const TRANSPORT_OWNER_MAX_BYTES = 4096;
 const TRANSPORT_MAX_AGE_MS = 60 * 60 * 1000;
 const RECORD_ACCEPTANCE_JOB_ID_PATTERN = /^[a-f0-9]{32}$/;
 const RECORD_ACCEPTANCE_VALUES = new Set(["accepted", "rejected", "unverified"]);
+const RECORD_ACCEPTANCE_SOURCES = new Set(["collector", "main-loop", "stats"]);
 const MODELS_CACHE_SCHEMA_DRIFT_NEXT_STEP = "Codex CLI cannot parse the current models cache (schema drift). Upgrade the Codex CLI, then run /codex:setup again.";
 const SETUP_LOG_PROBE_BYTES = 64 * 1024;
 const SETUP_LOG_PROBE_LIMIT = 5;
@@ -117,7 +118,7 @@ function printUsage() {
       "  node scripts/codex-companion.mjs status [job-id] [--all] [--cwd <dir>] [--json]",
       "  node scripts/codex-companion.mjs result <job-id> [--wait] [--wait-timeout-ms <ms>] [--cwd <dir>] [--json]",
       "  node scripts/codex-companion.mjs cancel <job-id> [--cwd <dir>] [--json]",
-      "  node scripts/codex-companion.mjs record-acceptance --job-id <32 lowercase hex> --acceptance <accepted|rejected|unverified> [--reason <text>] [--accept-failed-transport]",
+      "  node scripts/codex-companion.mjs record-acceptance --job-id <32 lowercase hex> --acceptance <accepted|rejected|unverified> [--reason <text>] [--source <collector|main-loop|stats>] [--accept-failed-transport]",
       "  node scripts/codex-companion.mjs history [--json]",
       "  node scripts/codex-companion.mjs setup [--cwd <dir>] [--json]"
     ].join("\n") + "\n"
@@ -161,9 +162,9 @@ function recordAcceptanceArgs(argv) {
       options.acceptFailedTransport = true;
       continue;
     }
-    const key = token === "--job-id" ? "jobId" : token === "--acceptance" ? "acceptance" : token === "--reason" ? "reason" : null;
+    const key = token === "--job-id" ? "jobId" : token === "--acceptance" ? "acceptance" : token === "--reason" ? "reason" : token === "--source" ? "source" : null;
     if (!key) {
-      throw new CompanionError("The record-acceptance command accepts only --job-id, --acceptance, --reason, and --accept-failed-transport.", "input");
+      throw new CompanionError("The record-acceptance command accepts only --job-id, --acceptance, --reason, --source, and --accept-failed-transport.", "input");
     }
     if (Object.hasOwn(options, key)) {
       throw new CompanionError(`${token} may be provided only once.`, "input");
@@ -180,6 +181,10 @@ function recordAcceptanceArgs(argv) {
   }
   if (!RECORD_ACCEPTANCE_VALUES.has(options.acceptance)) {
     throw new CompanionError("The --acceptance option must be accepted, rejected, or unverified.", "input");
+  }
+  options.source ??= "stats";
+  if (!RECORD_ACCEPTANCE_SOURCES.has(options.source)) {
+    throw new CompanionError("The --source option must be collector, main-loop, or stats.", "input");
   }
   return options;
 }
@@ -1993,7 +1998,7 @@ async function handleCancel(rawArgv) {
 }
 
 async function handleRecordAcceptance(argv) {
-  const { acceptance, acceptFailedTransport, jobId, reason } = recordAcceptanceArgs(argv);
+  const { acceptance, acceptFailedTransport, jobId, reason, source } = recordAcceptanceArgs(argv);
   const found = findJobRecordById(resolveDataDir(), jobId);
   if (!found) {
     throw new CompanionError(`No job record found for ${jobId}.`, "input");
@@ -2004,6 +2009,8 @@ async function handleRecordAcceptance(argv) {
     }
     if (acceptance !== "rejected") {
       return {
+        acceptanceRecordedAt: nowIso(),
+        acceptanceSource: source,
         semanticFailureKind: null,
         semanticFailureMessage: null,
         semanticStatus: acceptance
@@ -2011,6 +2018,8 @@ async function handleRecordAcceptance(argv) {
     }
     return {
       ...(reason === undefined ? {} : { semanticFailureMessage: reason }),
+      acceptanceRecordedAt: nowIso(),
+      acceptanceSource: source,
       semanticStatus: acceptance
     };
   }, { allowTerminal: true });

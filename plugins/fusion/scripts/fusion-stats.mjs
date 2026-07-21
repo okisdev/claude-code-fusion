@@ -112,6 +112,42 @@ function nonEmptyString(value) {
   return text ? text : null;
 }
 
+export function normalizeCollectionMethod(value) {
+  const method = nonEmptyString(value);
+  if (!method) {
+    return null;
+  }
+  if (method.toLowerCase() === "agent") {
+    return "agent_result";
+  }
+  const normalized = method
+    .replace(/([a-z0-9])([A-Z])/g, "$1_$2")
+    .replace(/([A-Z])([A-Z][a-z])/g, "$1_$2")
+    .toLowerCase();
+  return normalized;
+}
+
+function semanticAcceptance(raw, acceptanceObservation = null) {
+  const recorded = raw?.acceptance;
+  if (recorded === "accepted" || recorded === "rejected") {
+    return recorded;
+  }
+  const observed = acceptanceObservation?.acceptance;
+  if (CODEX_ACCEPTANCE_STATES.has(observed)) {
+    return observed;
+  }
+  return "unverified";
+}
+
+function acceptanceProvenance(raw) {
+  const acceptanceSource = nonEmptyString(raw?.acceptanceSource);
+  const acceptanceRecordedAt = nonEmptyString(raw?.acceptanceRecordedAt);
+  return {
+    ...(acceptanceSource ? { acceptanceSource } : {}),
+    ...(acceptanceRecordedAt ? { acceptanceRecordedAt } : {})
+  };
+}
+
 export function resolveCodexJobModel(raw, observation) {
   const resolved = nonEmptyString(raw?.resolvedModel);
   if (resolved) {
@@ -460,12 +496,12 @@ function grokAcceptanceSubcommandUnavailable(result) {
   return /\b(?:unknown|unsupported|unrecognized)\s+(?:subcommand|command)\b/i.test(message) || /\brecord-acceptance\b.*\b(?:unknown|unsupported|unavailable|not found|not supported)\b/i.test(message) || /\b(?:cannot find module|ERR_MODULE_NOT_FOUND)\b/i.test(message);
 }
 
-function recordCodexCompanionAcceptance({ jobId, acceptance, reason, acceptFailedTransport, workspaceRoot, env }) {
+function recordCodexCompanionAcceptance({ jobId, acceptance, source, reason, acceptFailedTransport, workspaceRoot, env }) {
   const bin = newestCodexCompanion(env);
   if (!bin) {
     return { updated: false };
   }
-  const argv = [bin, "record-acceptance", "--job-id", jobId, "--acceptance", acceptance, ...(reason ? ["--reason", reason] : []), ...(acceptFailedTransport ? ["--accept-failed-transport"] : [])];
+  const argv = [bin, "record-acceptance", "--job-id", jobId, "--acceptance", acceptance, ...(source ? ["--source", source] : []), ...(reason ? ["--reason", reason] : []), ...(acceptFailedTransport ? ["--accept-failed-transport"] : [])];
   const result = spawnSync(process.execPath, argv, { cwd: workspaceRoot, encoding: "utf8", env });
   if (!result.error && result.status === 0) {
     return { updated: true };
@@ -1270,15 +1306,14 @@ export function fileBasedEngineStats(descriptor, { all = false, env = process.en
       const jobId = nonEmptyString(raw?.id);
       const acceptanceObservation = jobId ? scopedObservationForJob(acceptanceObservations, raw, observationRepositoryCache) : null;
       if (CODEX_TERMINAL_STATUSES.has(job.status)) {
-        const acceptance = acceptanceObservation?.acceptance;
-        bump(byAcceptance, CODEX_ACCEPTANCE_STATES.has(acceptance) ? acceptance : "unverified");
+        bump(byAcceptance, semanticAcceptance(raw, acceptanceObservation));
       } else {
         pendingTransportJobs += 1;
       }
-      if (jobId && job.status === "error" && acceptanceObservation?.acceptance === "accepted") {
+      if (jobId && job.status === "error" && semanticAcceptance(raw, acceptanceObservation) === "accepted") {
         acceptedWithErrorTransport.push(jobId);
       }
-      if (jobId && job.status === "done" && !acceptanceObservation) {
+      if (jobId && job.status === "done" && semanticAcceptance(raw, acceptanceObservation) === "unverified") {
         doneWithoutAcceptance.push(jobId);
       }
     }
@@ -1394,6 +1429,7 @@ export function claudeWorkerStats({ all = false, env = process.env, cwd = proces
   const byFailureKind = {};
   const byDelivery = {};
   const byModel = {};
+  const byCollectionMethod = {};
   let usage = { inputTokens: 0, cacheCreationInputTokens: 0, cacheReadInputTokens: 0, outputTokens: 0, totalTokens: 0, uncachedTokens: 0 };
   let usageAggregationOverflow = false;
   let pendingTransportJobs = 0;
@@ -1410,6 +1446,10 @@ export function claudeWorkerStats({ all = false, env = process.env, cwd = proces
     bump(byStatus, status);
     bump(byAgent, nonEmptyString(record.agentType) ?? "unknown");
     bump(byDelivery, nonEmptyString(record.expectedDelivery) ?? "unknown");
+    const collectionMethod = normalizeCollectionMethod(record.collectionMethod);
+    if (collectionMethod) {
+      bump(byCollectionMethod, collectionMethod);
+    }
     if (record.resolvedModel) {
       bump(byModel, record.resolvedModel);
     }
@@ -1461,15 +1501,20 @@ export function claudeWorkerStats({ all = false, env = process.env, cwd = proces
     .slice()
     .sort((left, right) => Date.parse(right.createdAt ?? "") - Date.parse(left.createdAt ?? ""))
     .slice(0, 100)
-    .map((record) => ({
-      taskId: record.taskId,
-      sessionId: record.sessionId ?? null,
-      agentId: record.agentId ?? null,
-      backgroundTaskId: record.backgroundTaskId ?? null,
-      agentType: record.agentType,
-      transportStatus: record.transportStatus,
-      acceptance: record.acceptance ?? "unverified"
-    }));
+    .map((record) => {
+      const collectionMethod = normalizeCollectionMethod(record.collectionMethod);
+      return {
+        taskId: record.taskId,
+        sessionId: record.sessionId ?? null,
+        agentId: record.agentId ?? null,
+        backgroundTaskId: record.backgroundTaskId ?? null,
+        agentType: record.agentType,
+        transportStatus: record.transportStatus,
+        acceptance: record.acceptance ?? "unverified",
+        ...(collectionMethod ? { collectionMethod } : {}),
+        ...acceptanceProvenance(record)
+      };
+    });
   return {
     available: true,
     totalJobs: records.length,
@@ -1482,6 +1527,7 @@ export function claudeWorkerStats({ all = false, env = process.env, cwd = proces
     harnessAsyncDeliveries,
     byDelivery,
     byModel,
+    byCollectionMethod,
     usage: usageAggregationOverflow ? null : usage,
     usageCoverage: {
       availability: usageAggregationOverflow ? "overflow" : records.length > 0 && completeUsage === records.length ? "available" : completeUsage > 0 ? "partial" : "unavailable",
@@ -1895,8 +1941,8 @@ function sessionScopedEngineStats(descriptor, sessionId, env) {
       bump(byStatus, status);
       if (descriptor.id === "codex") {
         if (CODEX_TERMINAL_STATUSES.has(status)) {
-          const acceptance = scopedObservationForJob(acceptanceObservations, raw, observationRepositoryCache)?.acceptance;
-          bump(byAcceptance, CODEX_ACCEPTANCE_STATES.has(acceptance) ? acceptance : "unverified");
+          const acceptanceObservation = scopedObservationForJob(acceptanceObservations, raw, observationRepositoryCache);
+          bump(byAcceptance, semanticAcceptance(raw, acceptanceObservation));
         } else {
           pendingTransportJobs += 1;
         }
@@ -1946,6 +1992,7 @@ export function renderSessionReport(report) {
     lines.push("", "## Claude workers (session scope)", "", `Total jobs: ${report.workers.totalJobs}`);
     renderCounts(lines, "By transport status", report.workers.byTransportStatus);
     renderCounts(lines, "By semantic acceptance", report.workers.byAcceptance);
+    renderCounts(lines, "By collection method", report.workers.byCollectionMethod);
     lines.push("", `Semantic acceptance scope: ${report.workers.acceptanceScope}; ${report.workers.pendingTransportJobs} non-terminal job${report.workers.pendingTransportJobs === 1 ? "" : "s"} excluded`);
     renderWorkerIdentities(lines, report.workers.identities);
   }
@@ -2165,6 +2212,7 @@ function renderEngine(lines, name, stats) {
   renderCounts(lines, "By mode", stats.byMode ?? {});
   renderCounts(lines, "By agent", stats.byAgent ?? {});
   renderCounts(lines, "By delivery", stats.byDelivery ?? {});
+  renderCounts(lines, "By collection method", stats.byCollectionMethod ?? {});
   renderCounts(lines, "By kind", stats.byKind ?? {});
   renderCounts(lines, "By model", stats.byModel ?? {});
   renderCounts(lines, "By effort", stats.byEffort ?? {});
@@ -2202,9 +2250,11 @@ function renderWorkerIdentities(lines, identities) {
   if (!Array.isArray(identities) || identities.length === 0) {
     return;
   }
-  lines.push("", "Task identity map:", "task | session | agent | background task | transport | acceptance");
+  const includesCollectionMethod = identities.some((identity) => identity.collectionMethod);
+  const includesAcceptanceProvenance = identities.some((identity) => identity.acceptanceSource || identity.acceptanceRecordedAt);
+  lines.push("", "Task identity map:", `task | session | agent | background task | transport${includesCollectionMethod ? " | collection" : ""} | acceptance${includesAcceptanceProvenance ? " | acceptance source | acceptance recorded at" : ""}`);
   for (const identity of identities) {
-    lines.push(`${identity.taskId} | ${identity.sessionId ?? ""} | ${identity.agentId ?? ""} | ${identity.backgroundTaskId ?? ""} | ${identity.transportStatus} | ${identity.acceptance}`);
+    lines.push(`${identity.taskId} | ${identity.sessionId ?? ""} | ${identity.agentId ?? ""} | ${identity.backgroundTaskId ?? ""} | ${identity.transportStatus}${includesCollectionMethod ? ` | ${identity.collectionMethod ?? ""}` : ""} | ${identity.acceptance}${includesAcceptanceProvenance ? ` | ${identity.acceptanceSource ?? ""} | ${identity.acceptanceRecordedAt ?? ""}` : ""}`);
   }
 }
 
@@ -2374,6 +2424,87 @@ export function renderFusionStats(report) {
   return `${lines.join("\n")}\n`;
 }
 
+function unsettledFinishedAt(raw) {
+  return nonEmptyString(raw?.finishedAt ?? raw?.completedAt ?? raw?.updatedAt);
+}
+
+function unsettledTimestamp(entry) {
+  const timestamp = Date.parse(entry.finishedAt ?? "");
+  return Number.isFinite(timestamp) ? timestamp : Number.NEGATIVE_INFINITY;
+}
+
+function unsettledWorkerEntries(env) {
+  return readWorkerRecords(env)
+    .filter((record) => isTerminalWorkerStatus(record.transportStatus) && semanticAcceptance(record) === "unverified")
+    .map((record) => ({
+      engine: "fusion",
+      id: nonEmptyString(record.taskId) ?? "unknown",
+      description: nonEmptyString(record.description) ?? nonEmptyString(record.agentType) ?? "unknown",
+      finishedAt: unsettledFinishedAt(record),
+      acceptance: "unverified"
+    }));
+}
+
+function unsettledEngineEntries(descriptor, env) {
+  const root = resolveStateRoot(descriptor, env);
+  let jobs;
+  try {
+    jobs = descriptor.enumerateJobs(root, { all: true, env });
+  } catch {
+    return [];
+  }
+  const scoped = selectPreferredJobs(jobs, descriptor, () => true);
+  const acceptanceObservations = descriptor.id === "codex" ? loadAllObservationCandidates(env, ACCEPTANCE_FILENAME, loadAcceptanceObservations) : new Map();
+  const observationRepositoryCache = new Map();
+  return scoped.flatMap((raw) => {
+    if (!descriptor.isTerminal(raw)) {
+      return [];
+    }
+    const acceptanceObservation = descriptor.id === "codex" ? scopedObservationForJob(acceptanceObservations, raw, observationRepositoryCache) : null;
+    if (semanticAcceptance(raw, acceptanceObservation) !== "unverified") {
+      return [];
+    }
+    const id = nonEmptyString(raw?.id);
+    if (!id) {
+      return [];
+    }
+    return [{
+      engine: descriptor.id,
+      id,
+      kind: descriptor.normalizeJob(raw).kind,
+      finishedAt: unsettledFinishedAt(raw),
+      acceptance: "unverified",
+      ...(descriptor.id === "codex" ? acceptanceProvenance(raw) : {})
+    }];
+  });
+}
+
+export function buildUnsettledReport({ env = process.env } = {}) {
+  const unsettled = [
+    ...unsettledWorkerEntries(env),
+    ...unsettledEngineEntries(FILE_ENGINE_DESCRIPTORS.grok, env),
+    ...unsettledEngineEntries(FILE_ENGINE_DESCRIPTORS.codex, env)
+  ].sort((left, right) => unsettledTimestamp(right) - unsettledTimestamp(left));
+  return { unsettled };
+}
+
+export function renderUnsettledReport(report) {
+  const lines = ["# Fusion unsettled jobs"];
+  if (report.unsettled.length === 0) {
+    lines.push("", "No terminal jobs are awaiting semantic acceptance.");
+    return `${lines.join("\n")}\n`;
+  }
+  lines.push("", "Engine | ID | Description or kind | Finished at | Semantic verdict");
+  for (const entry of report.unsettled) {
+    const provenance = [
+      entry.acceptanceSource ? `acceptance source: ${entry.acceptanceSource}` : null,
+      entry.acceptanceRecordedAt ? `acceptance recorded at: ${entry.acceptanceRecordedAt}` : null
+    ].filter(Boolean).join(", ");
+    lines.push(`${entry.engine} | ${entry.id} | ${entry.description ?? entry.kind ?? "unknown"} | ${entry.finishedAt ?? ""} | ${entry.acceptance}${provenance ? ` (${provenance})` : ""}`);
+  }
+  return `${lines.join("\n")}\n`;
+}
+
 function argumentValue(argv, flag) {
   const index = argv.indexOf(flag);
   if (index === -1) {
@@ -2471,7 +2602,7 @@ function isStrictDirectRecordArguments(argv) {
   }
 }
 
-function recordEngineAcceptance({ engine, jobId, verdict, reason, acceptFailedTransport = false, workspaceRoot, asJson, env }) {
+function recordEngineAcceptance({ engine, jobId, verdict, source, reason, acceptFailedTransport = false, workspaceRoot, asJson, env }) {
   if (engine === "grok") {
     recordGrokCompanionAcceptance({
       jobId,
@@ -2487,6 +2618,7 @@ function recordEngineAcceptance({ engine, jobId, verdict, reason, acceptFailedTr
   const companion = recordCodexCompanionAcceptance({
     jobId,
     acceptance: verdict,
+    source,
     reason,
     acceptFailedTransport,
     workspaceRoot,
@@ -2518,7 +2650,7 @@ function settleWorkerRecord({ taskId, verdict, source, reason, acceptFailedTrans
     return [worker];
   }
   const engine = worker.peerEngine === "codex" || worker.peerEngine === "grok" ? worker.peerEngine : resolveEngineJob(peerJobId, env);
-  recordEngineAcceptance({ engine, jobId: peerJobId, verdict, reason, acceptFailedTransport, workspaceRoot, asJson, env });
+  recordEngineAcceptance({ engine, jobId: peerJobId, verdict, source, reason, acceptFailedTransport, workspaceRoot, asJson, env });
   writeRecordConfirmation({ kind: "engine", engine, jobId: peerJobId, worker, asJson, stdout });
   return [worker, { engine, jobId: peerJobId, acceptance: verdict }];
 }
@@ -2526,7 +2658,7 @@ function settleWorkerRecord({ taskId, verdict, source, reason, acceptFailedTrans
 function settleEngineRecord({ jobId, verdict, source, reason, acceptFailedTransport = false, asJson, workspaceRoot, env, stdout }) {
   const engine = resolveEngineJob(jobId, env);
   const confirmation = { engine, jobId, acceptance: verdict };
-  recordEngineAcceptance({ engine, jobId, verdict, reason, acceptFailedTransport, workspaceRoot, asJson, env });
+  recordEngineAcceptance({ engine, jobId, verdict, source, reason, acceptFailedTransport, workspaceRoot, asJson, env });
   writeRecordConfirmation({ kind: "engine", engine, jobId, worker: confirmation, asJson, stdout });
   const writes = [confirmation];
   for (const record of readWorkerRecords(env).filter((candidate) => candidate.peerJobId === jobId)) {
@@ -2605,6 +2737,7 @@ export function main(argv = process.argv.slice(2), { env = process.env, cwd = pr
     const companion = recordCodexCompanionAcceptance({
       jobId: preparedAcceptance.observation.jobId,
       acceptance: preparedAcceptance.observation.acceptance,
+      source: preparedAcceptance.normalizedSource,
       reason: preparedAcceptance.normalizedReason,
       acceptFailedTransport: argv.includes("--accept-failed-transport"),
       workspaceRoot: preparedAcceptance.normalizedRoot,
@@ -2636,6 +2769,12 @@ export function main(argv = process.argv.slice(2), { env = process.env, cwd = pr
     const result = pruneDeadWorkspaces({ env: effectiveEnv, yes: argv.includes("--yes") });
     stdout.write(asJson ? `${JSON.stringify(result, null, 2)}\n` : renderPruneReport(result));
     return result;
+  }
+
+  if (argv.includes("--unsettled")) {
+    const report = buildUnsettledReport({ env: effectiveEnv });
+    stdout.write(asJson ? `${JSON.stringify(report, null, 2)}\n` : renderUnsettledReport(report));
+    return report;
   }
 
   if (argv.includes("--trace")) {

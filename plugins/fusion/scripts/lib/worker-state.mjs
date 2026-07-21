@@ -17,6 +17,27 @@ const TASK_OUTPUT_TRANSCRIPT_CHUNK_BYTES = 64 * 1024;
 const TASK_OUTPUT_TRANSCRIPT_MAX_LINE_BYTES = 1024 * 1024;
 const TERMINAL_STATUSES = new Set(["done", "incomplete", "failed", "cancelled", "owner_ended"]);
 const ACCEPTANCE_STATES = new Set(["accepted", "rejected", "unverified"]);
+export const WORKER_COLLECTION_METHODS = Object.freeze({
+  SUBAGENT_STOP: "subagent_stop",
+  TASK_NOTIFICATION: "task_notification",
+  TASK_OUTPUT: "task_output",
+  OUTPUT_FILE_READ: "output_file_read",
+  AGENT_RESULT: "agent_result",
+  TASK_STOP: "task_stop",
+  TASK_REAPED: "task_reaped"
+});
+const COLLECTION_METHODS_BY_KEY = new Map([
+  ["subagentstop", WORKER_COLLECTION_METHODS.SUBAGENT_STOP],
+  ["tasknotification", WORKER_COLLECTION_METHODS.TASK_NOTIFICATION],
+  ["taskoutput", WORKER_COLLECTION_METHODS.TASK_OUTPUT],
+  ["read", WORKER_COLLECTION_METHODS.OUTPUT_FILE_READ],
+  ["outputfileread", WORKER_COLLECTION_METHODS.OUTPUT_FILE_READ],
+  ["agent", WORKER_COLLECTION_METHODS.AGENT_RESULT],
+  ["agentresult", WORKER_COLLECTION_METHODS.AGENT_RESULT],
+  ["taskstop", WORKER_COLLECTION_METHODS.TASK_STOP],
+  ["reaped", WORKER_COLLECTION_METHODS.TASK_REAPED],
+  ["taskreaped", WORKER_COLLECTION_METHODS.TASK_REAPED]
+]);
 const PEER_JOB_FOOTER_AGENT_TYPES = new Set(["codex:codex-rescue", "grok:grok-rescue", "grok:grok-review-runner"]);
 const AGENT_TYPES = new Map([
   ["fusion:fast-worker", "fusion:fast-worker"],
@@ -176,10 +197,22 @@ export function writePrivateJson(file, value) {
   writePrivateFile(file, `${JSON.stringify(value, null, 2)}\n`);
 }
 
+function canonicalCollectionMethod(value) {
+  return typeof value === "string" ? COLLECTION_METHODS_BY_KEY.get(value.replace(/[^a-z0-9]/gi, "").toLowerCase()) ?? null : null;
+}
+
+function normalizeWorkerRecord(value) {
+  if (!Object.hasOwn(value, "collectionMethod")) {
+    return value;
+  }
+  const collectionMethod = canonicalCollectionMethod(value.collectionMethod);
+  return collectionMethod === value.collectionMethod ? value : { ...value, collectionMethod };
+}
+
 export function readWorkerRecordFile(file) {
   try {
     const value = JSON.parse(fs.readFileSync(file, "utf8"));
-    return value && typeof value === "object" && !Array.isArray(value) ? value : null;
+    return value && typeof value === "object" && !Array.isArray(value) ? normalizeWorkerRecord(value) : null;
   } catch {
     return null;
   }
@@ -214,7 +247,7 @@ export function updateWorkerRecord(taskId, env, updater) {
     if (!next || typeof next !== "object" || Array.isArray(next)) {
       return current;
     }
-    const updated = { ...next, updatedAt: new Date().toISOString() };
+    const updated = normalizeWorkerRecord({ ...next, updatedAt: new Date().toISOString() });
     writePrivateJson(file, updated);
     return updated;
   });
@@ -222,9 +255,13 @@ export function updateWorkerRecord(taskId, env, updater) {
 
 export function markWorkerCollected(record, method, collectedAt = new Date().toISOString()) {
   const awaitingVerdict = !record.collectedAt && record.acceptance === "unverified";
+  const collectionMethod = canonicalCollectionMethod(record.collectionMethod) ?? canonicalCollectionMethod(method);
+  if (!collectionMethod) {
+    throw new TypeError("Fusion worker collection method is invalid.");
+  }
   return {
     ...record,
-    collectionMethod: record.collectionMethod ?? method,
+    collectionMethod,
     collectedAt: record.collectedAt ?? collectedAt,
     awaitingCollection: false,
     awaitingCollectionArmedAt: null,

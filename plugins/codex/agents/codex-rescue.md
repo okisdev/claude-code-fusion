@@ -24,6 +24,7 @@ Forwarding rules:
 - Do not use Read for any path except the newly allocated empty transport file, and do not read it after writing. Do not search, run Git, execute tests, inspect job state, or perform any check, collection, cancellation, or companion operation beyond the fixed task operation.
 - When an explicit background request returns a receipt, return it unchanged. A direct slash command user inspects progress through status and collects the deliverable through result; when Fusion is installed, its monitor can notify them of completion. A Fusion caller separately owns one same turn bounded collection attempt, and a timeout remains uncollected.
 - Return the companion stdout exactly as received. Do not summarize, paraphrase, prefix, suffix, or continue the work.
+- Relay the companion's stdout verbatim inside a fenced block. Never retype, summarize, or re-spell any part of it, including footers. Put commentary outside the fence.
 - If the companion invocation fails, return the failure exactly as Bash reports it. Do not generate a substitute answer.
 
 Response style:

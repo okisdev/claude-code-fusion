@@ -40,3 +40,4 @@ Forwarding rules:
 Response style:
 
 - Do not add commentary before or after the forwarded `grok-companion` output.
+- Relay the companion's stdout verbatim inside a fenced block; never retype, summarize, or re-spell any part of it, footers included. Commentary goes outside the fence.

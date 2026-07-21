@@ -20,6 +20,7 @@ const DEFAULT_AUDIT_RETENTION_DAYS = 180;
 const DEFAULT_AUDIT_MAX_BYTES = 2 * 1024 * 1024;
 const DEFAULT_AUDIT_MAX_FILES = 256;
 const DEFAULT_FLEET_WAVE_GAP_MS = 120000;
+const LAUNCHED_DISPATCH_TTL_MS = 15 * 60 * 1000;
 const AUDIT_SCHEMA_VERSION = 1;
 const STALE_MS = 48 * 60 * 60 * 1000;
 const DAY_MS = 24 * 60 * 60 * 1000;
@@ -41,7 +42,8 @@ const MAIN_LANE = "main";
 const WORKER_TERMINAL_STATUSES = new Set(["done", "incomplete", "failed", "cancelled", "owner_ended"]);
 const NO_OP_BASH_COMMANDS = new Set(["", "true", ":"]);
 const NO_OP_HEARTBEAT_REASON = "Fusion tasks are in flight for this session, so emit a text-only heartbeat instead of this no-op Bash command.";
-const NARROW_WAVE_ADVISORY_LINE = "second consecutive narrow wave; fleet default applies: consider /fusion:ultra for the remaining packages or state fleet-decline: <reason>.";
+const NARROW_WAVE_ADVISORY_SUFFIX = "consecutive narrow waves; fleet default applies: consider /fusion:ultra for the remaining packages or state fleet-decline: <reason>.";
+const MISSING_LAUNCH_RECOVERY_REASON = "missing-launch-recovered";
 
 function resolveStateDir(env = process.env) {
   const override = env[STATE_ENV];
@@ -409,6 +411,12 @@ function normalizeAuditEvent(event) {
     const description = sanitizeAuditText(event.description);
     return lane ? { schemaVersion: AUDIT_SCHEMA_VERSION, at: new Date(atMs).toISOString(), session, event: "dispatch", lane, tool: event.tool, ...(description ? { description } : {}) } : null;
   }
+  if (event.event === "warn" && DELEGATION_TOOLS.has(event.tool) && event.reason === MISSING_LAUNCH_RECOVERY_REASON) {
+    const lane = normalizeLane(event.lane);
+    return lane
+      ? { schemaVersion: AUDIT_SCHEMA_VERSION, at: new Date(atMs).toISOString(), session, event: "warn", lane, tool: event.tool, reason: MISSING_LAUNCH_RECOVERY_REASON }
+      : null;
+  }
   if (
     (event.event === "deny" || event.event === "warn") &&
     ENFORCEMENT_AUDIT_TOOLS.has(event.tool) &&
@@ -644,6 +652,7 @@ function defaultState(now) {
     lastDispatchAt: null,
     fleetWaveWidth: 0,
     consecutiveNarrowWaves: 0,
+    lastAdvisedNarrowWaveStreak: 0,
     dispatches: {},
     dispatchLog: [],
     advisedMultiples: [],
@@ -679,14 +688,32 @@ function normalizeDispatchLog(value) {
     const lane = normalizeLane(raw.lane) ?? BUILTIN_LANE;
     const subagentType = sanitizeIdentifier(raw.subagentType);
     const description = sanitizeAuditText(raw.description);
+    const toolUseId = sanitizeIdentifier(raw.toolUseId, 200);
+    const phase = raw.phase === "launched" ? "launched" : "confirmed";
     entries.push({
       at: Number.isFinite(atMs) ? new Date(atMs).toISOString() : null,
       lane,
+      phase,
+      ...(toolUseId ? { toolUseId } : {}),
       ...(subagentType ? { subagentType } : {}),
       ...(description ? { description } : {})
     });
   }
   return entries;
+}
+
+function pruneExpiredLaunchedDispatches(dispatchLog, now) {
+  const nowMs = Date.parse(now);
+  if (!Number.isFinite(nowMs)) {
+    return dispatchLog;
+  }
+  return dispatchLog.filter((entry) => {
+    if (entry.phase === "confirmed") {
+      return true;
+    }
+    const launchedAtMs = Date.parse(entry.at);
+    return Number.isFinite(launchedAtMs) && nowMs - launchedAtMs <= LAUNCHED_DISPATCH_TTL_MS;
+  });
 }
 
 function normalizeAdvisedMultiples(value) {
@@ -696,11 +723,42 @@ function normalizeAdvisedMultiples(value) {
   return [...new Set(value.filter((multiple) => Number.isInteger(multiple) && multiple > 0))];
 }
 
+function extractToolUseId(input) {
+  return sanitizeIdentifier(input?.tool_use_id, 200);
+}
+
+function latestConfirmedDispatchAt(dispatchLog) {
+  let latestAtMs = null;
+  for (const entry of dispatchLog) {
+    if (entry.phase !== "confirmed") {
+      continue;
+    }
+    const atMs = Date.parse(entry.at);
+    if (Number.isFinite(atMs) && (latestAtMs === null || atMs > latestAtMs)) {
+      latestAtMs = atMs;
+    }
+  }
+  return latestAtMs === null ? null : new Date(latestAtMs).toISOString();
+}
+
+function findLaunchedDispatch(dispatchLog, toolUseId, lane) {
+  if (toolUseId) {
+    const byToolUseId = dispatchLog.findLast((entry) => entry.phase === "launched" && entry.toolUseId === toolUseId);
+    if (byToolUseId) {
+      return byToolUseId;
+    }
+  }
+  return dispatchLog.findLast((entry) => entry.phase === "launched" && entry.lane === lane) ?? null;
+}
+
 function deriveFleetWaveState(dispatchLog, waveGapMs) {
   let fleetWaveWidth = 0;
   let consecutiveNarrowWaves = 0;
   let previousDispatchAtMs = null;
   for (const entry of dispatchLog) {
+    if (entry.phase !== "confirmed") {
+      continue;
+    }
     const dispatchAtMs = Date.parse(entry.at);
     if (!Number.isFinite(dispatchAtMs)) {
       continue;
@@ -728,13 +786,15 @@ function normalizeState(existing, now, waveGapMs = DEFAULT_FLEET_WAVE_GAP_MS) {
   const hasPeriodCounter = Number.isFinite(existing.writesSinceDispatch) && existing.writesSinceDispatch >= 0;
   const writesSinceDispatch = hasPeriodCounter ? Math.floor(existing.writesSinceDispatch) : dispatchCount === 0 ? writeCount : 0;
   const advisedMultiples = hasPeriodCounter || dispatchCount === 0 ? normalizeAdvisedMultiples(existing.advisedMultiples) : [];
-  const dispatchLog = normalizeDispatchLog(existing.dispatchLog);
+  const dispatchLog = pruneExpiredLaunchedDispatches(normalizeDispatchLog(existing.dispatchLog), now);
   const createdAtMs = Date.parse(existing.createdAt);
   const lastDispatchAtMs = Date.parse(existing.lastDispatchAt);
   const derivedFleetWaveState = deriveFleetWaveState(dispatchLog, waveGapMs);
   const fleetWaveWidth = Number.isInteger(existing.fleetWaveWidth) && existing.fleetWaveWidth >= 0 ? existing.fleetWaveWidth : derivedFleetWaveState.fleetWaveWidth;
   const consecutiveNarrowWaves =
     Number.isInteger(existing.consecutiveNarrowWaves) && existing.consecutiveNarrowWaves >= 0 ? existing.consecutiveNarrowWaves : derivedFleetWaveState.consecutiveNarrowWaves;
+  const lastAdvisedNarrowWaveStreak =
+    Number.isInteger(existing.lastAdvisedNarrowWaveStreak) && existing.lastAdvisedNarrowWaveStreak >= 0 ? existing.lastAdvisedNarrowWaveStreak : 0;
   return {
     writeCount,
     writesSinceDispatch,
@@ -742,6 +802,7 @@ function normalizeState(existing, now, waveGapMs = DEFAULT_FLEET_WAVE_GAP_MS) {
     lastDispatchAt: Number.isFinite(lastDispatchAtMs) ? new Date(lastDispatchAtMs).toISOString() : null,
     fleetWaveWidth,
     consecutiveNarrowWaves,
+    lastAdvisedNarrowWaveStreak,
     dispatches,
     dispatchLog,
     advisedMultiples,
@@ -802,47 +863,91 @@ function runHook(env = process.env, input = readHookInput()) {
   const now = new Date().toISOString();
 
   if (DELEGATION_TOOLS.has(toolName)) {
-    if (input.hook_event_name && input.hook_event_name !== "PostToolUse") {
+    if (input.hook_event_name && input.hook_event_name !== "PreToolUse" && input.hook_event_name !== "PostToolUse") {
       return;
     }
     const subagentType = extractSubagentType(input.tool_input);
     const safeSubagentType = sanitizeIdentifier(subagentType);
     const lane = laneForSubagentType(subagentType);
     const description = extractDispatchDescription(input.tool_input);
+    const toolUseId = extractToolUseId(input);
     const waveGapMs = resolveFleetWaveGapMs(env);
-    recordAuditEvent(
-      { at: now, session: sessionId, event: "dispatch", lane, tool: toolName, ...(description ? { description } : {}) },
-      env
-    );
-    const waveAdvisory = withStateLock(file, () => {
+
+    if (input.hook_event_name === "PreToolUse") {
+      withStateLock(file, () => {
+        const state = normalizeState(readState(file), now, waveGapMs);
+        state.dispatchLog.push({
+          at: now,
+          lane,
+          phase: "launched",
+          ...(toolUseId ? { toolUseId } : {}),
+          ...(safeSubagentType ? { subagentType: safeSubagentType } : {}),
+          ...(description ? { description } : {})
+        });
+        if (state.dispatchLog.length > DISPATCH_LOG_LIMIT) {
+          state.dispatchLog.splice(0, state.dispatchLog.length - DISPATCH_LOG_LIMIT);
+        }
+        writeState(file, state);
+      });
+      return;
+    }
+
+    const confirmation = withStateLock(file, () => {
       const state = normalizeState(readState(file), now, waveGapMs);
-      const previousDispatchAtMs = Date.parse(state.lastDispatchAt);
-      const nowMs = Date.parse(now);
-      const isSameWave = Number.isFinite(previousDispatchAtMs) && Number.isFinite(nowMs) && Math.abs(nowMs - previousDispatchAtMs) <= waveGapMs;
-      let shouldAdvise = false;
-      if (isSameWave) {
-        state.fleetWaveWidth += 1;
-      } else if (state.fleetWaveWidth > 0) {
-        state.consecutiveNarrowWaves = state.fleetWaveWidth <= 2 ? state.consecutiveNarrowWaves + 1 : 0;
-        shouldAdvise = state.consecutiveNarrowWaves === 2;
-        state.fleetWaveWidth = 1;
+      let launched = findLaunchedDispatch(state.dispatchLog, toolUseId, lane);
+      const recoveredMissingLaunch = launched === null;
+      if (recoveredMissingLaunch) {
+        launched = {
+          at: now,
+          lane,
+          phase: "confirmed",
+          ...(toolUseId ? { toolUseId } : {}),
+          ...(safeSubagentType ? { subagentType: safeSubagentType } : {}),
+          ...(description ? { description } : {})
+        };
+        state.dispatchLog.push(launched);
+        if (state.dispatchLog.length > DISPATCH_LOG_LIMIT) {
+          state.dispatchLog.splice(0, state.dispatchLog.length - DISPATCH_LOG_LIMIT);
+        }
       } else {
-        state.fleetWaveWidth = 1;
+        launched.phase = "confirmed";
+        if (description) {
+          launched.description = description;
+        }
       }
-      state.dispatches[lane] = (state.dispatches[lane] ?? 0) + 1;
+      const fleetWaveState = deriveFleetWaveState(state.dispatchLog, waveGapMs);
+      state.fleetWaveWidth = fleetWaveState.fleetWaveWidth;
+      state.consecutiveNarrowWaves = fleetWaveState.consecutiveNarrowWaves;
+      if (state.consecutiveNarrowWaves === 0) {
+        state.lastAdvisedNarrowWaveStreak = 0;
+      }
+      const shouldAdvise =
+        state.consecutiveNarrowWaves > 0 &&
+        state.consecutiveNarrowWaves % 2 === 0 &&
+        state.lastAdvisedNarrowWaveStreak !== state.consecutiveNarrowWaves;
+      if (shouldAdvise) {
+        state.lastAdvisedNarrowWaveStreak = state.consecutiveNarrowWaves;
+      }
+      state.dispatches[launched.lane] = (state.dispatches[launched.lane] ?? 0) + 1;
       state.dispatchEpoch += 1;
-      state.lastDispatchAt = now;
+      state.lastDispatchAt = latestConfirmedDispatchAt(state.dispatchLog);
       state.writesSinceDispatch = 0;
       state.advisedMultiples = [];
-      state.dispatchLog.push({ at: now, lane, ...(safeSubagentType ? { subagentType: safeSubagentType } : {}), ...(description ? { description } : {}) });
-      if (state.dispatchLog.length > DISPATCH_LOG_LIMIT) {
-        state.dispatchLog.splice(0, state.dispatchLog.length - DISPATCH_LOG_LIMIT);
-      }
       writeState(file, state);
-      return shouldAdvise;
+      return { shouldAdvise, streak: state.consecutiveNarrowWaves, lane: launched.lane, description: launched.description ?? description, recoveredMissingLaunch };
     });
-    if (waveAdvisory) {
-      process.stdout.write(`${JSON.stringify(postToolAdvisoryOutput(NARROW_WAVE_ADVISORY_LINE))}\n`);
+    if (confirmation.recoveredMissingLaunch) {
+      recordAuditEvent(
+        { at: now, session: sessionId, event: "warn", lane: confirmation.lane, tool: toolName, reason: MISSING_LAUNCH_RECOVERY_REASON },
+        env
+      );
+    }
+    recordAuditEvent(
+      { at: now, session: sessionId, event: "dispatch", lane: confirmation.lane, tool: toolName, ...(confirmation.description ? { description: confirmation.description } : {}) },
+      env
+    );
+    if (confirmation.shouldAdvise) {
+      process.stdout.write(`${JSON.stringify(postToolAdvisoryOutput(`${confirmation.streak} ${NARROW_WAVE_ADVISORY_SUFFIX}`))}\n`);
     }
     return;
   }

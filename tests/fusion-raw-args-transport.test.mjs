@@ -149,5 +149,5 @@ test("the stats CLI forwards --accept-failed-transport from staged arguments unc
 
   const result = spawnSync(process.execPath, [SCRIPT, "--raw-args-token", transport.token], { cwd: directory, env, encoding: "utf8" });
   assert.strictEqual(result.status, 0, result.stderr);
-  assert.deepStrictEqual(JSON.parse(fs.readFileSync(argsFile, "utf8")), ["record-acceptance", "--job-id", jobId, "--acceptance", "accepted", "--accept-failed-transport"]);
+  assert.deepStrictEqual(JSON.parse(fs.readFileSync(argsFile, "utf8")), ["record-acceptance", "--job-id", jobId, "--acceptance", "accepted", "--source", "collector", "--accept-failed-transport"]);
 });
