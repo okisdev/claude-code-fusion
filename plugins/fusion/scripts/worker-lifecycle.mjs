@@ -4,15 +4,20 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
+import { recordEngineAcceptance } from "./lib/engine-acceptance.mjs";
 import {
+  applyQueuedVerdict,
   backfillWorkerTaskOutputTelemetry,
   canonicalWorkerAgentType,
   createWorkerRecord,
   createWorkerTaskId,
   findWorkerRecord,
   isFusionWorkerAgent,
+  isPendingSettlement,
+  isSettledWorker,
   isTerminalWorkerStatus,
   markWorkerCollected,
+  readWorkerRecord,
   readWorkerSessionState,
   readWorkerRecords,
   refreshWorkerTranscript,
@@ -56,6 +61,7 @@ const TERMINAL_RUNTIME_TASK_STATUSES = new Set(["completed", "complete", "done",
 const SUCCESSFUL_TASK_NOTIFICATION_STATUSES = new Set(["completed", "complete", "done"]);
 const CANCELLED_TASK_NOTIFICATION_STATUSES = new Set(["killed", "cancelled", "canceled", "stopped", "terminated"]);
 const FAILED_TASK_NOTIFICATION_STATUSES = new Set(["failed", "error", "timed_out", "timeout"]);
+const ENGINE_JOB_ID_PATTERN = /^[0-9a-f]{32}$/;
 
 function readHookInput() {
   try {
@@ -367,13 +373,18 @@ export function workerBudgetFailure(record, now = Date.now()) {
 }
 
 function markBudgetFailure(record, failure, env) {
-  return updateWorkerRecord(record.taskId, env, (current) => ({
-    ...(current ?? record),
-    transportStatus: "cancel_requested",
-    failureKind: failure.failureKind,
-    cancelReason: failure.reason,
-    cancelRequestedAt: new Date().toISOString()
-  }));
+  return updateWorkerRecord(record.taskId, env, (current) => {
+    if (!current || isTerminalWorkerStatus(current.transportStatus)) {
+      return null;
+    }
+    return {
+      ...current,
+      transportStatus: "cancel_requested",
+      failureKind: failure.failureKind,
+      cancelReason: failure.reason,
+      cancelRequestedAt: new Date().toISOString()
+    };
+  });
 }
 
 function completedReport(record, message) {
@@ -494,6 +505,9 @@ function handlePreToolUse(input, env) {
     return;
   }
   const refreshed = refreshRecord(record, input, env);
+  if (isTerminalWorkerStatus(refreshed.transportStatus)) {
+    return;
+  }
   const failure = workerBudgetFailure(refreshed);
   if (failure) {
     markBudgetFailure(refreshed, failure, env);
@@ -501,7 +515,12 @@ function handlePreToolUse(input, env) {
     return;
   }
   const now = new Date().toISOString();
-  updateWorkerRecord(refreshed.taskId, env, (current) => ({ ...current, lastActivityAt: now, inFlightSince: now }));
+  updateWorkerRecord(refreshed.taskId, env, (current) => {
+    if (!current || isTerminalWorkerStatus(current.transportStatus)) {
+      return null;
+    }
+    return { ...current, lastActivityAt: now, inFlightSince: now };
+  });
 }
 
 function noTaskFoundError(input, failed) {
@@ -710,6 +729,38 @@ function backfillCollectedTaskOutput(record, input) {
   return record;
 }
 
+function settleQueuedVerdict(record, now, env) {
+  const pendingVerdict = record.pendingVerdict;
+  const settled = applyQueuedVerdict(record, now);
+  if (!pendingVerdict || settled.pendingVerdict || settled.acceptanceRecordedAt == null) {
+    return settled;
+  }
+  const peerJobId = typeof settled.peerJobId === "string" && ENGINE_JOB_ID_PATTERN.test(settled.peerJobId) ? settled.peerJobId : null;
+  const peerEngine = settled.peerEngine === "codex" || settled.peerEngine === "grok" ? settled.peerEngine : null;
+  if (!peerJobId || !peerEngine) {
+    return settled;
+  }
+  try {
+    recordEngineAcceptance({
+      engine: peerEngine,
+      jobId: peerJobId,
+      acceptance: settled.acceptance,
+      source: pendingVerdict.source,
+      reason: settled.acceptanceReason,
+      acceptFailedTransport: pendingVerdict.acceptFailedTransport === true,
+      workspaceRoot: typeof settled.workspaceRoot === "string" ? settled.workspaceRoot : process.cwd(),
+      env
+    });
+    const { engineSettlementError: _engineSettlementError, ...withoutEngineSettlementError } = settled;
+    return withoutEngineSettlementError;
+  } catch (error) {
+    return {
+      ...settled,
+      engineSettlementError: error instanceof Error ? error.message : String(error)
+    };
+  }
+}
+
 function handlePostToolUse(input, env, failed = false) {
   if (!input.agent_id && ["Read", "TaskOutput", "TaskStop"].includes(input.tool_name)) {
     const taskId = typeof input.tool_input?.task_id === "string" ? input.tool_input.task_id : null;
@@ -722,17 +773,13 @@ function handlePostToolUse(input, env, failed = false) {
           if (!current || current.sessionId !== input.session_id || isTerminalWorkerStatus(current.transportStatus) || ![current.backgroundTaskId, current.agentId].includes(taskId)) {
             return null;
           }
-          return {
-            ...current,
+          return settleQueuedVerdict({
+            ...markWorkerCollected(current, WORKER_COLLECTION_METHODS.TASK_REAPED, now),
             transportStatus: "failed",
-            acceptance: "unverified",
             failureKind: "task_reaped",
             finishedAt: now,
-            collectedAt: now,
-            collectionMethod: WORKER_COLLECTION_METHODS.TASK_REAPED,
-            awaitingVerdict: true,
-            awaitingVerdictArmedAt: now
-          };
+            lastActivityAt: now
+          }, now, env);
         });
       }
       return;
@@ -758,7 +805,16 @@ function handlePostToolUse(input, env, failed = false) {
       }
       for (const record of matches) {
         updateWorkerRecord(record.taskId, env, (current) => {
-          const worker = current ?? record;
+          if (!current || current.sessionId !== input.session_id) {
+            return null;
+          }
+          const worker = current;
+          const peerIdentity = ["Read", "TaskOutput"].includes(input.tool_name) && PEER_JOB_FOOTER_AGENTS.has(worker.agentType)
+            ? capturedPeerIdentity(worker.agentType, collectedResultText, worker.peerEngine)
+            : {};
+          if (terminalCollectedRecord(worker)) {
+            return peerIdentityBackfill(worker, peerIdentity);
+          }
           const transportStatus = input.tool_name === "TaskStop" ? "cancelled" : "done";
           const collectionMethod = input.tool_name === "Read"
             ? WORKER_COLLECTION_METHODS.OUTPUT_FILE_READ
@@ -766,16 +822,15 @@ function handlePostToolUse(input, env, failed = false) {
               ? WORKER_COLLECTION_METHODS.TASK_OUTPUT
               : WORKER_COLLECTION_METHODS.TASK_STOP;
           const harnessAsyncDelivery = collectedHarnessAsyncDelivery(worker, transportStatus);
-          const updated = {
-            ...markWorkerCollected({ ...worker, acceptance: "unverified" }, collectionMethod, now),
+          const updated = settleQueuedVerdict({
+            ...markWorkerCollected(worker, collectionMethod, now),
             transportStatus,
-            acceptance: "unverified",
             failureKind: input.tool_name === "TaskStop" ? worker.failureKind ?? "cancelled" : harnessAsyncDelivery ? null : worker.failureKind,
             ...(harnessAsyncDelivery ? { deliveryMode: "harness_async" } : {}),
-            ...(["Read", "TaskOutput"].includes(input.tool_name) && PEER_JOB_FOOTER_AGENTS.has(worker.agentType) ? capturedPeerIdentity(worker.agentType, collectedResultText, worker.peerEngine) : {}),
+            ...peerIdentity,
             finishedAt: worker.finishedAt ?? now,
             lastActivityAt: now
-          };
+          }, now, env);
           return ["Read", "TaskOutput"].includes(input.tool_name) ? backfillCollectedTaskOutput(updated, input) : updated;
         });
       }
@@ -826,8 +881,12 @@ function handlePostToolUse(input, env, failed = false) {
       const totalToolUseCount = response.totalToolUseCount ?? nested.totalToolUseCount;
       const now = new Date().toISOString();
       updateWorkerRecord(pending.taskId, env, (current) => {
-        const worker = current ?? pending;
-        return {
+        if (!current || terminalCollectedRecord(current)) {
+          return null;
+        }
+        const worker = current;
+        const transportStatus = failed ? "failed" : isAsync ? "pending_async" : completed && !isTerminalWorkerStatus(worker.transportStatus) ? "done" : worker.transportStatus === "dispatching" ? "running" : worker.transportStatus;
+        const updated = {
           ...(!failed && completed ? markWorkerCollected(worker, WORKER_COLLECTION_METHODS.AGENT_RESULT, now) : worker),
           ...(agentId ? { agentId, backgroundTaskId: isAsync ? agentId : worker.backgroundTaskId } : {}),
           ...(outputFile ? { transcriptPath: outputFile } : {}),
@@ -836,12 +895,13 @@ function handlePostToolUse(input, env, failed = false) {
           ...(directUsage ? { usageAvailability: directUsage.availability, reportedTotalTokens: directUsage.reportedTotalTokens } : {}),
           ...(Number.isFinite(response.totalDurationMs ?? nested.totalDurationMs) ? { durationMs: response.totalDurationMs ?? nested.totalDurationMs } : {}),
           ...(Number.isSafeInteger(totalToolUseCount) ? { toolCalls: totalToolUseCount, toolCallsSource: "tool-response" } : {}),
-          transportStatus: failed ? "failed" : isAsync ? "pending_async" : completed && !isTerminalWorkerStatus(worker.transportStatus) ? "done" : worker.transportStatus === "dispatching" ? "running" : worker.transportStatus,
+          transportStatus,
           failureKind: failed ? "launch" : worker.failureKind,
           finishedAt: failed || completed ? now : worker.finishedAt,
           runtimeAsync: isAsync,
           ...(isAsync ? { startedAt: worker.startedAt ?? now } : {})
         };
+        return isTerminalWorkerStatus(transportStatus) ? settleQueuedVerdict(updated, now, env) : updated;
       });
     }
     return;
@@ -856,8 +916,11 @@ function handlePostToolUse(input, env, failed = false) {
   const now = new Date().toISOString();
   let emitWindDown = false;
   updateWorkerRecord(record.taskId, env, (current) => {
+    if (!current || isTerminalWorkerStatus(current.transportStatus)) {
+      return null;
+    }
     const selectedTranscript = isAttributedTranscriptPath(input.transcript_path, record) ? input.transcript_path : null;
-    const refreshed = selectedTranscript ? refreshWorkerTranscript(current ?? record, selectedTranscript) : current ?? record;
+    const refreshed = selectedTranscript ? refreshWorkerTranscript(current, selectedTranscript) : current;
     const progress = !failed && !READ_ONLY_TOOLS.has(input.tool_name);
     const windDownThreshold = Math.max(0, (refreshed.limits?.maxTurns ?? Number.POSITIVE_INFINITY) - 2);
     emitWindDown = !isTerminalWorkerStatus(refreshed.transportStatus) && refreshed.windDownContextSentAt == null && (refreshed.turns ?? 0) >= windDownThreshold;
@@ -884,14 +947,24 @@ function handleSubagentStart(input, env) {
     return;
   }
   const now = new Date().toISOString();
-  const record = updateWorkerRecord(pending.taskId, env, (current) => ({
-    ...current,
-    agentId: input.agent_id,
-    transportStatus: "running",
-    startedAt: current.startedAt ?? now,
-    lastActivityAt: now,
-    lastProgressAt: now
-  }));
+  let started = false;
+  const record = updateWorkerRecord(pending.taskId, env, (current) => {
+    if (!current || isTerminalWorkerStatus(current.transportStatus)) {
+      return null;
+    }
+    started = true;
+    return {
+      ...current,
+      agentId: input.agent_id,
+      transportStatus: "running",
+      startedAt: current.startedAt ?? now,
+      lastActivityAt: now,
+      lastProgressAt: now
+    };
+  });
+  if (!started) {
+    return;
+  }
   const limits = record.limits;
   const verdictEnvelope = "Keep the final message to a compact verdict envelope that states changed file paths without diffs, the verification command with pass and fail counts, any environment findings, and the path of a file holding the full report when one is written. Write long unified diffs, full test logs, and long quoted file contents to that file instead of inlining them.";
   const delivery = record.completionContract === "collector"
@@ -911,8 +984,13 @@ function handleSubagentStop(input, env) {
     return;
   }
   const refreshed = refreshRecord(record, input, env);
-  const failure = workerBudgetFailure(refreshed);
   const message = typeof input.last_assistant_message === "string" ? input.last_assistant_message : "";
+  if (terminalCollectedRecord(refreshed)) {
+    const peerIdentity = PEER_JOB_FOOTER_AGENTS.has(refreshed.agentType) ? capturedPeerIdentity(refreshed.agentType, message, refreshed.peerEngine) : {};
+    updateWorkerRecord(refreshed.taskId, env, (current) => current && terminalCollectedRecord(current) ? peerIdentityBackfill(current, peerIdentity) : null);
+    return;
+  }
+  const failure = workerBudgetFailure(refreshed);
   let finalTextFile = isFusionWorkerAgent(refreshed.agentType) && message.length > 0 ? finalTextArtifactPath(refreshed, env) : null;
   if (finalTextFile) {
     try {
@@ -927,8 +1005,7 @@ function handleSubagentStop(input, env) {
   const collectorReport = collectorContract ? structuredCollectorReport(message) : null;
   const collectorIdentityMismatch = collectorContract && collectorReport && (collectorReport.peerEngine !== refreshed.expectedPeerEngine || collectorReport.peerJobId !== refreshed.expectedPeerJobId);
   const trustedCollectorReport = collectorIdentityMismatch ? null : collectorReport;
-  const legacyCollectorReport = collectorContract && complete && !collectorReport;
-  const collectorProtocolFailure = legacyCollectorReport || collectorIdentityMismatch;
+  const collectorProtocolFailure = (collectorContract && complete && !collectorReport) || collectorIdentityMismatch;
   if (collectorProtocolFailure && !failure && (refreshed.retryCount ?? 0) < 1 && !input.stop_hook_active) {
     updateWorkerRecord(refreshed.taskId, env, (current) => ({ ...current, retryCount: (current.retryCount ?? 0) + 1 }));
     const expected = refreshed.expectedPeerEngine && refreshed.expectedPeerJobId
@@ -944,20 +1021,26 @@ function handleSubagentStop(input, env) {
   }
   const now = new Date().toISOString();
   updateWorkerRecord(refreshed.taskId, env, (current) => {
-    const worker = current ?? refreshed;
+    if (!current) {
+      return null;
+    }
+    const worker = current;
+    const peerIdentity = PEER_JOB_FOOTER_AGENTS.has(worker.agentType) ? capturedPeerIdentity(worker.agentType, message, worker.peerEngine) : {};
+    if (terminalCollectedRecord(worker)) {
+      return peerIdentityBackfill(worker, peerIdentity);
+    }
     const runtimeAsync = worker.runtimeAsync === true;
     const successfulCompletion = complete && !failure && trustedCollectorReport?.kind !== "outcome" && !collectorProtocolFailure;
     const subagentStopCollected = successfulCompletion && finalTextFile != null && !collectorContract;
-    return {
-      ...(runtimeAsync && !subagentStopCollected ? worker : markWorkerCollected({ ...worker, acceptance: "unverified" }, WORKER_COLLECTION_METHODS.SUBAGENT_STOP, now)),
+    return settleQueuedVerdict({
+      ...(runtimeAsync && !subagentStopCollected ? worker : markWorkerCollected(worker, WORKER_COLLECTION_METHODS.SUBAGENT_STOP, now)),
       transportStatus: complete && (trustedCollectorReport?.kind === "outcome" || collectorProtocolFailure) ? "incomplete" : complete ? runtimeAsync && !subagentStopCollected ? "ready_uncollected" : "done" : failure ? "failed" : "incomplete",
-      acceptance: "unverified",
       failureKind: failure?.failureKind ?? (trustedCollectorReport?.kind === "outcome" ? `collection_${trustedCollectorReport.collectionOutcome}` : collectorProtocolFailure ? "collection_protocol" : complete ? null : "delivery"),
       inFlightSince: undefined,
       ...(successfulCompletion && worker.failureKind && worker.failureKind !== "unexpected_async" ? { recoveredFailureKind: worker.failureKind } : {}),
       ...(complete && !failure && !collectorProtocolFailure && runtimeAsync && worker.failureKind === "unexpected_async" ? { deliveryMode: "harness_async" } : {}),
       ...(finalTextFile ? { outputFile: finalTextFile } : {}),
-      ...(PEER_JOB_FOOTER_AGENTS.has(worker.agentType) ? capturedPeerIdentity(worker.agentType, message, worker.peerEngine) : {}),
+      ...peerIdentity,
       ...(trustedCollectorReport?.peerEngine ? { peerEngine: trustedCollectorReport.peerEngine } : {}),
       ...(trustedCollectorReport?.peerJobId ? { peerJobId: trustedCollectorReport.peerJobId } : {}),
       ...(trustedCollectorReport?.peerTransportStatus ? { peerTransportStatus: trustedCollectorReport.peerTransportStatus } : {}),
@@ -966,7 +1049,7 @@ function handleSubagentStop(input, env) {
       ...(Number.isSafeInteger(trustedCollectorReport?.elapsedSeconds) ? { collectionElapsedSeconds: trustedCollectorReport.elapsedSeconds } : {}),
       finishedAt: now,
       lastActivityAt: now
-    };
+    }, now, env);
   });
 }
 
@@ -1003,6 +1086,15 @@ function terminalTransportObserved(record, task) {
 function terminalCollectionPending(record) {
   return ["ready_uncollected", "ready_background"].includes(record.transportStatus)
     || (record.runtimeAsync === true && isTerminalWorkerStatus(record.transportStatus) && !record.collectedAt);
+}
+
+function terminalCollectedRecord(record) {
+  return Boolean(record) && isTerminalWorkerStatus(record.transportStatus) && Boolean(record.collectedAt) && (isSettledWorker(record) || record.awaitingVerdict === true || record.acceptance === "unverified");
+}
+
+function peerIdentityBackfill(record, identity) {
+  const additions = Object.fromEntries(Object.entries(identity).filter(([key, value]) => value != null && record[key] == null));
+  return Object.keys(additions).length > 0 ? { ...record, ...additions } : null;
 }
 
 function taskNotificationTextParts(value) {
@@ -1253,15 +1345,14 @@ function taskNotificationTransition(record, status, now, env) {
       : {};
     if (!finalText) {
       const turnLimited = refreshed.failureKind === "turn_limit" || (refreshed.turns ?? 0) >= (refreshed.limits?.maxTurns ?? Number.POSITIVE_INFINITY);
-      return {
+      return settleQueuedVerdict({
         ...refreshed,
         transportStatus: "incomplete",
-        acceptance: "unverified",
         failureKind: turnLimited ? "turn_limit" : "missing_final_text",
         ...peerIdentity,
         finishedAt: refreshed.finishedAt ?? now,
         lastActivityAt: now
-      };
+      }, now, env);
     }
     let finalTextFile = null;
     try {
@@ -1270,39 +1361,36 @@ function taskNotificationTransition(record, status, now, env) {
       finalTextFile = null;
     }
     if (!finalTextFile) {
-      return {
+      return settleQueuedVerdict({
         ...refreshed,
         transportStatus: "incomplete",
-        acceptance: "unverified",
         failureKind: "delivery",
         ...peerIdentity,
         finishedAt: refreshed.finishedAt ?? now,
         lastActivityAt: now
-      };
+      }, now, env);
     }
     const harnessAsyncDelivery = collectedHarnessAsyncDelivery(refreshed, "done");
-    return {
-      ...markWorkerCollected({ ...refreshed, acceptance: "unverified" }, WORKER_COLLECTION_METHODS.TASK_NOTIFICATION, now),
+    return settleQueuedVerdict({
+      ...markWorkerCollected(refreshed, WORKER_COLLECTION_METHODS.TASK_NOTIFICATION, now),
       transportStatus: "done",
-      acceptance: "unverified",
       failureKind: harnessAsyncDelivery ? null : refreshed.failureKind,
       ...(harnessAsyncDelivery ? { deliveryMode: "harness_async" } : {}),
       outputFile: finalTextFile,
       ...peerIdentity,
       finishedAt: refreshed.finishedAt ?? now,
       lastActivityAt: now
-    };
+    }, now, env);
   }
   const cancelled = CANCELLED_TASK_NOTIFICATION_STATUSES.has(status);
   const fallbackFailureKind = cancelled ? "cancelled" : "task_failed";
-  return {
-    ...markWorkerCollected({ ...refreshed, acceptance: "unverified" }, WORKER_COLLECTION_METHODS.TASK_NOTIFICATION, now),
+  return settleQueuedVerdict({
+    ...markWorkerCollected(refreshed, WORKER_COLLECTION_METHODS.TASK_NOTIFICATION, now),
     transportStatus: cancelled ? "cancelled" : "failed",
-    acceptance: "unverified",
     failureKind: refreshed.failureKind && refreshed.failureKind !== "unexpected_async" ? refreshed.failureKind : fallbackFailureKind,
     finishedAt: refreshed.finishedAt ?? now,
     lastActivityAt: now
-  };
+  }, now, env);
 }
 
 function reconcileTaskNotifications(input, env) {
@@ -1359,18 +1447,27 @@ function reconcileTaskNotifications(input, env) {
 function armInFlightRecords(records, tasks, env) {
   const inFlight = records.filter((record) => !terminalTransportObserved(record, runtimeTaskForRecord(record, tasks)));
   const armedAt = new Date().toISOString();
+  const armed = [];
   for (const record of inFlight) {
-    updateWorkerRecord(record.taskId, env, (current) => ({
-      ...(current ?? record),
-      awaitingCollection: true,
-      awaitingCollectionArmedAt: current?.awaitingCollectionArmedAt ?? armedAt
-    }));
+    const updated = updateWorkerRecord(record.taskId, env, (current) => {
+      if (!current || terminalTransportObserved(current, runtimeTaskForRecord(current, tasks))) {
+        return null;
+      }
+      return {
+        ...current,
+        awaitingCollection: true,
+        awaitingCollectionArmedAt: current.awaitingCollectionArmedAt ?? armedAt
+      };
+    });
+    if (updated && !terminalTransportObserved(updated, runtimeTaskForRecord(updated, tasks))) {
+      armed.push(updated);
+    }
   }
-  return inFlight;
+  return armed;
 }
 
 function unjudgedPeerCollections(sessionId, env) {
-  return readWorkerRecords(env, { strict: true }).filter((record) => record.sessionId === sessionId && isTerminalWorkerStatus(record.transportStatus) && record.completionContract === "collector" && record.peerJobId && record.peerTransportStatus && !record.acceptanceRecordedAt);
+  return readWorkerRecords(env, { strict: true }).filter((record) => record.sessionId === sessionId && record.completionContract === "collector" && record.peerJobId && record.peerTransportStatus && !isSettledWorker(record));
 }
 
 function unreportedCollectorFailures(sessionId, env) {
@@ -1405,63 +1502,84 @@ function collectorStopGate(input, env) {
   }
   if (missingFailureReports.length > 0) {
     const commands = missingFailureReports.map(collectorResultCommand).filter(Boolean);
-    const legacyCount = missingFailureReports.filter((record) => !(record.peerJobId ?? record.expectedPeerJobId)).length;
     const commandInstruction = commands.length > 0 ? ` Include ${commands.join(" or ")}.` : "";
-    const legacyInstruction = legacyCount > 0 ? " For a legacy record without a peer job id, report its Fusion task id and state that the result remains uncollected; no result command is available." : "";
     writeOutput(blockStop(`Collector failure reporting is incomplete for ${missingFailureReports.map((record) => {
       const engine = record.peerEngine ?? record.expectedPeerEngine;
       const jobId = record.peerJobId ?? record.expectedPeerJobId;
-      const identity = engine && jobId ? `${engine}:${jobId}` : jobId ? `job=${jobId}` : "legacy peer identity unavailable";
+      const identity = engine && jobId ? `${engine}:${jobId}` : jobId ? `job=${jobId}` : "peer identity unavailable";
       return `${record.taskId} (${record.failureKind}, ${identity})`;
-    }).join(", ")}. Report each Fusion task id and every available peer job id, and state explicitly that the peer result remains uncollected.${commandInstruction}${legacyInstruction}`));
+    }).join(", ")}. Report each Fusion task id and every available peer job id, and state explicitly that the peer result remains uncollected.${commandInstruction}`));
     return true;
   }
   const unjudged = unjudgedPeerCollections(input.session_id, env);
   if (unjudged.length > 0) {
-    const acceptanceInstructions = {
-      codex: (record) => `/fusion:stats --record-acceptance ${record.peerJobId} <accepted|rejected|unverified> --source main-loop`,
-      grok: (record) => `/fusion:stats --record-worker-acceptance ${record.taskId} <accepted|rejected|unverified> --source main-loop`
-    };
-    const instructions = unjudged.map((record) => acceptanceInstructions[record.peerEngine]?.(record) ?? `a manual resolution because the collection for Fusion task ${record.taskId} needs manual resolution`);
+    const instructions = unjudged.map((record) => ["codex", "grok"].includes(record.peerEngine) ? `/fusion:stats --record ${record.taskId}=accepted|rejected|unverified` : `a manual resolution because the collection for Fusion task ${record.taskId} needs manual resolution`);
     writeOutput(blockStop(`Collected peer transport results still require an explicit semantic judgment before finishing: ${unjudged.map((record) => `${record.peerEngine}:${record.peerJobId} (task=${record.taskId}, transport=${record.peerTransportStatus}, semantic=${record.peerSemanticStatus ?? "unverified"})`).join(", ")}. After checking the requested completion criteria, record each judgment with ${instructions.join(" or ")}.`));
     return true;
   }
   return false;
 }
 
-function unverifiedCollectedWorkers(sessionId, env) {
-  const records = readWorkerRecords(env, { strict: true }).filter((record) => record.sessionId === sessionId);
-  if (records.length === 0 || records.some((record) => !isTerminalWorkerStatus(record.transportStatus) || !record.collectedAt)) {
-    return [];
-  }
-  return records.filter((record) => record.completionContract !== "collector" && record.awaitingVerdict === true);
+function unverifiedCollectedWorkers(records) {
+  return records.filter(isPendingSettlement);
 }
 
-function writeAcceptanceAdvisory(sessionId, env) {
-  const unverified = unverifiedCollectedWorkers(sessionId, env);
+function writeAcceptanceAdvisory(records, env) {
+  const unverified = unverifiedCollectedWorkers(rereadPendingRecords(records, isPendingSettlement, env));
   if (unverified.length === 0) {
     return;
   }
   const commands = unverified.map((record) => `/fusion:stats --record ${record.taskId}=accepted|rejected|unverified`);
-  writeOutput(hookOutput("Stop", `Acceptance remains unverified for ${unverified.length} collected Fusion worker${unverified.length === 1 ? "" : "s"}. Settle each row with exactly one command: ${commands.join("; ")}. pairs are <id>=<verdict> with id either a fusion task id (fusion- plus 24 lowercase hex) or an engine job id (32 lowercase hex), verdict one of accepted|rejected|unverified.`));
+  const workers = unverified.map((record) => `${record.taskId} (${[record.agentType, record.description].filter((value) => typeof value === "string" && value.trim()).join(", ")})`);
+  writeOutput(hookOutput("Stop", `Acceptance remains unverified for ${unverified.length} collected Fusion worker${unverified.length === 1 ? "" : "s"}: ${workers.join("; ")}. Settle each row with exactly one command: ${commands.join("; ")}. pairs are <id>=<verdict> with id either a fusion task id (fusion- plus 24 lowercase hex) or an engine job id (32 lowercase hex), verdict one of accepted|rejected|unverified.`));
 }
 
 function terminalCollectionInstruction(record) {
   const collectId = record.backgroundTaskId ?? record.agentId;
+  const identity = [record.agentType, record.description].filter((value) => typeof value === "string" && value.trim()).join(", ");
+  const worker = `${record.taskId}${identity ? ` (${identity})` : ""}`;
   return record.outputFile
-    ? `Call Read with file_path=${record.outputFile} to collect the terminal output before finishing.`
-    : collectId ? `Call TaskOutput with block=true for terminal owned task ${collectId} and collect the result before finishing.` : `Collect terminal owned task ${record.taskId} before finishing.`;
+    ? `Call Read with file_path=${record.outputFile} to collect the terminal output for Fusion task ${worker} before finishing.`
+    : collectId ? `Call TaskOutput with block=true for terminal owned task ${collectId} and collect Fusion task ${worker} before finishing.` : `Collect terminal owned task ${worker} before finishing.`;
 }
 
 function settleOnlyRecords(records) {
-  return records.filter((record) => record.completionContract !== "collector" && isTerminalWorkerStatus(record.transportStatus) && record.collectedAt && record.awaitingVerdict === true);
+  return records.filter(isPendingSettlement);
 }
 
-function writeCombinedStopPending(terminalUncollected, settleOnly) {
-  const lines = terminalUncollected.map((record) => `${record.taskId}: ${terminalCollectionInstruction(record)}`)
-    .concat(settleOnly.map((record) => `settle-only: ${record.taskId}: /fusion:stats --record ${record.taskId}=accepted|rejected|unverified`));
+function rereadPendingRecords(records, predicate, env) {
+  return records.map((record) => readWorkerRecord(record.taskId, env)).filter((record) => record && predicate(record));
+}
+
+function settleOnlyInstruction(record) {
+  const identity = [record.agentType, record.description].filter((value) => typeof value === "string" && value.trim()).join(", ");
+  return `settle-only: ${record.taskId}: /fusion:stats --record ${record.taskId}=accepted|rejected|unverified${identity ? ` (${identity})` : ""}`;
+}
+
+function writeCombinedStopPending(terminalUncollected, settleOnly, env) {
+  const currentTerminalUncollected = rereadPendingRecords(terminalUncollected, terminalCollectionPending, env);
+  const currentSettleOnly = rereadPendingRecords(settleOnly, isPendingSettlement, env);
+  if (currentTerminalUncollected.length + currentSettleOnly.length === 0) {
+    return false;
+  }
+  const lines = currentTerminalUncollected.map((record) => `${record.taskId}: ${terminalCollectionInstruction(record)}`)
+    .concat(currentSettleOnly.map(settleOnlyInstruction));
   const message = `Fusion worker completion is pending for ${lines.length} records:\n${lines.map((line) => `* ${line}`).join("\n")}\nTransport completion remains unverified until every result and its verification evidence are reviewed. Record accepted or rejected explicitly through /fusion:stats.`;
-  writeOutput(terminalUncollected.length > 0 ? blockStop(message) : hookOutput("Stop", message));
+  writeOutput(currentTerminalUncollected.length > 0 ? blockStop(message) : hookOutput("Stop", message));
+  return true;
+}
+
+function writeTerminalCollectionPending(records, env) {
+  const terminalUncollected = rereadPendingRecords(records, terminalCollectionPending, env);
+  if (terminalUncollected.length === 0) {
+    return false;
+  }
+  const instructions = terminalUncollected.map(terminalCollectionInstruction);
+  instructions.push(
+    "Transport completion remains unverified until the result and verification evidence are reviewed. Record accepted or rejected explicitly through /fusion:stats."
+  );
+  writeOutput(blockStop(instructions.join(" ")));
+  return true;
 }
 
 function inFlightSignature(records) {
@@ -1486,12 +1604,16 @@ function clearInFlightAdvisory(sessionId, env) {
   });
 }
 
-function shouldWriteSettleOnlyAdvisory(sessionId, signature, env) {
-  return readWorkerSessionState(sessionId, env)?.settleOnlyAdvisorySignature !== signature;
-}
-
-function recordSettleOnlyAdvisory(sessionId, signature, env) {
-  updateWorkerSessionState(sessionId, env, (current) => ({ ...(current ?? {}), settleOnlyAdvisorySignature: signature }));
+function claimSettleOnlyAdvisory(sessionId, signature, env) {
+  let claimed = false;
+  updateWorkerSessionState(sessionId, env, (current) => {
+    if (current?.settleOnlyAdvisorySignature === signature) {
+      return null;
+    }
+    claimed = true;
+    return { ...(current ?? {}), settleOnlyAdvisorySignature: signature };
+  });
+  return claimed;
 }
 
 function clearSettleOnlyAdvisory(sessionId, env) {
@@ -1518,7 +1640,10 @@ function handleStop(input, env) {
     const observedTerminal = terminalTransportObserved(record, task);
     const failure = observedTerminal ? null : workerBudgetFailure(record);
     const updated = updateWorkerRecord(record.taskId, env, (current) => {
-      const worker = current ?? record;
+      if (!current || isTerminalWorkerStatus(current.transportStatus)) {
+        return null;
+      }
+      const worker = current;
       const transportStatus = failure ? "cancel_requested" : runtimeTaskIsTerminal(task) ? "ready_uncollected" : ["ready_uncollected", "ready_background", "cancel_requested"].includes(worker.transportStatus) ? worker.transportStatus : "pending_async";
       const advisoryRound = !failure && transportStatus === "pending_async";
       const successfulTerminal = !failure && worker.failureKind !== "unexpected_async" && runtimeTaskSucceeded(task);
@@ -1539,7 +1664,12 @@ function handleStop(input, env) {
     const now = new Date().toISOString();
     const missingRuntimeIds = cancellations.filter((record) => !record.backgroundTaskId && !record.agentId);
     for (const record of missingRuntimeIds) {
-      updateWorkerRecord(record.taskId, env, (current) => ({ ...current, transportStatus: "failed", failureKind: current.failureKind ?? "owner_lost", finishedAt: now }));
+      updateWorkerRecord(record.taskId, env, (current) => {
+        if (!current || isTerminalWorkerStatus(current.transportStatus)) {
+          return null;
+        }
+        return settleQueuedVerdict({ ...current, transportStatus: "failed", failureKind: current.failureKind ?? "owner_lost", finishedAt: now }, now, env);
+      });
     }
     const cancelIds = cancellations.map((record) => record.backgroundTaskId ?? record.agentId).filter(Boolean);
     if (cancelIds.length === 0) {
@@ -1560,21 +1690,26 @@ function handleStop(input, env) {
   if (!settleOnlySignature) {
     clearSettleOnlyAdvisory(input.session_id, env);
   }
-  if (terminalUncollected.length + settleOnly.length > 1) {
-    if (terminalUncollected.length > 0 || shouldWriteSettleOnlyAdvisory(input.session_id, settleOnlySignature, env)) {
-      writeCombinedStopPending(terminalUncollected, settleOnly);
-      if (settleOnlySignature) {
-        recordSettleOnlyAdvisory(input.session_id, settleOnlySignature, env);
-      }
+  if (terminalUncollected.length > 0 && settleOnly.length > 0) {
+    if (claimSettleOnlyAdvisory(input.session_id, settleOnlySignature, env)) {
+      writeCombinedStopPending(terminalUncollected, settleOnly, env);
+    } else {
+      writeTerminalCollectionPending(terminalUncollected, env);
     }
     return;
   }
   if (terminalUncollected.length > 0) {
-    const instructions = terminalUncollected.map(terminalCollectionInstruction);
-    instructions.push(
-      "Transport completion remains unverified until the result and verification evidence are reviewed. Record accepted or rejected explicitly through /fusion:stats."
-    );
-    writeOutput(blockStop(instructions.join(" ")));
+    writeTerminalCollectionPending(terminalUncollected, env);
+    return;
+  }
+  if (settleOnly.length > 0) {
+    if (!input.stop_hook_active && claimSettleOnlyAdvisory(input.session_id, settleOnlySignature, env)) {
+      if (settleOnly.length === 1) {
+        writeAcceptanceAdvisory(settleOnly, env);
+      } else {
+        writeCombinedStopPending([], settleOnly, env);
+      }
+    }
     return;
   }
   if (inFlight.length > 0) {
@@ -1585,21 +1720,22 @@ function handleStop(input, env) {
     }
     return;
   }
-  if (!input.stop_hook_active) {
-    writeAcceptanceAdvisory(input.session_id, env);
-  }
 }
 
 function handleSessionEnd(input, env) {
   const now = new Date().toISOString();
   for (const record of activeSessionRecords(input.session_id, env)) {
-    updateWorkerRecord(record.taskId, env, (current) => ({
-      ...current,
-      transportStatus: "owner_ended",
-      acceptance: "unverified",
-      failureKind: current.failureKind ?? "owner_lost",
-      finishedAt: now
-    }));
+    updateWorkerRecord(record.taskId, env, (current) => {
+      if (!current || isTerminalWorkerStatus(current.transportStatus)) {
+        return null;
+      }
+      return settleQueuedVerdict({
+        ...current,
+        transportStatus: "owner_ended",
+        failureKind: current.failureKind ?? "owner_lost",
+        finishedAt: now
+      }, now, env);
+    });
   }
 }
 
