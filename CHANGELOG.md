@@ -1,5 +1,9 @@
 # changelog
 
+## 0.0.36
+
+- peer transport wrappers get their own completion contract: 0.0.35's SubagentStop matcher expansion routed `codex:codex-rescue`, `grok:grok-rescue`, and `grok:grok-review-runner` through the claude worker deliverable gate, whose `verification` contract demands a final message ending in `delivery: complete` plus `verification: passed`; a verbatim companion relay ends with the engine envelope (`job:`, `state:`) instead, so every foreground peer delivery burned its single truncation recovery retry arguing with the gate, took a false `failureKind: delivery`, and terminalized as `incomplete`, which the notification reconcile guard skips, breaking notification driven auto collection and forcing a stop collection block on every peer package (observed two of two in the first 0.0.35 session against twenty nine of twenty nine clean on 0.0.34 the same day); dispatches now record a `transport` contract, `completedReport` accepts a relay whose footer parses through `peerJobIdFromCollectedResult` (the same parser settlement identity backfill uses, with `grok:grok-review-runner` always deliverable because its terminal output may be raw json validated by the review consumer), a matching transport retry message covers genuinely truncated relays, and the guards also match the agent type so records created before the fix settle correctly after a hot deploy
+
 ## 0.0.35
 
 - codex adapts to cli 0.145.0: task runs forward `--output-schema <path>` end to end (rescue raw args, exec argv, structured output capture, and a `structured: parsed/invalid/unavailable` footer in the render), adversarial review gains a json schema verdict contract at `plugins/codex/schemas/adversarial-review-verdict.schema.json`, native `review` rejects `--output-schema` because tested versions silently ignore it there, and the 0.144.4 models cache schema drift workaround is deleted with the tested interval moving to 0.145.0 to 0.146.0
