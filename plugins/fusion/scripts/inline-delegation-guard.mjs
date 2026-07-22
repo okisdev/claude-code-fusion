@@ -851,9 +851,8 @@ function normalizeState(existing, now, waveGapMs = DEFAULT_FLEET_WAVE_GAP_MS) {
   const writeCount = Number.isFinite(existing.writeCount) && existing.writeCount >= 0 ? Math.floor(existing.writeCount) : 0;
   const dispatches = normalizeDispatches(existing.dispatches);
   const dispatchCount = totalDispatches(dispatches);
-  const hasPeriodCounter = Number.isFinite(existing.writesSinceDispatch) && existing.writesSinceDispatch >= 0;
-  const writesSinceDispatch = hasPeriodCounter ? Math.floor(existing.writesSinceDispatch) : dispatchCount === 0 ? writeCount : 0;
-  const advisedMultiples = hasPeriodCounter || dispatchCount === 0 ? normalizeAdvisedMultiples(existing.advisedMultiples) : [];
+  const writesSinceDispatch = Number.isFinite(existing.writesSinceDispatch) && existing.writesSinceDispatch >= 0 ? Math.floor(existing.writesSinceDispatch) : 0;
+  const advisedMultiples = normalizeAdvisedMultiples(existing.advisedMultiples);
   const dispatchLog = pruneExpiredLaunchedDispatches(normalizeDispatchLog(existing.dispatchLog), now);
   const createdAtMs = Date.parse(existing.createdAt);
   const lastDispatchAtMs = Date.parse(existing.lastDispatchAt);

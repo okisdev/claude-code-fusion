@@ -785,28 +785,6 @@ test("dispatch ledger initializes when an existing state file has no dispatchLog
   assert.strictEqual(state.dispatchLog[0].lane, "fusion:fast-worker");
 });
 
-test("legacy state without a period counter starts counting future writes after its recorded dispatches", (t) => {
-  const sandbox = makeSandbox(t);
-  fs.mkdirSync(sandbox.stateDir, { recursive: true });
-  fs.writeFileSync(
-    stateFileFor(sandbox, "session-1"),
-    JSON.stringify({ writeCount: 7, dispatches: { codex: 1 }, advisedMultiples: [1], createdAt: "2026-07-10T00:00:00.000Z", updatedAt: "2026-07-10T00:00:00.000Z" }),
-    "utf8"
-  );
-
-  for (let index = 0; index < 4; index += 1) {
-    assert.strictEqual(run(sandbox, writePayload(sandbox)).stdout, "");
-  }
-  const fifth = run(sandbox, writePayload(sandbox));
-  assert.match(JSON.parse(fifth.stdout).hookSpecificOutput.permissionDecisionReason, /^5 inline writes happened since the most recent dispatch/);
-
-  const state = readState(sandbox, "session-1");
-  assert.strictEqual(state.writeCount, 12);
-  assert.strictEqual(state.writesSinceDispatch, 5);
-  assert.strictEqual(state.dispatchEpoch, 1);
-  assert.deepStrictEqual(state.advisedMultiples, [1]);
-});
-
 test("legacy dispatch ledger entries normalize as confirmed launches", (t) => {
   const sandbox = makeSandbox(t);
   fs.mkdirSync(sandbox.stateDir, { recursive: true });
