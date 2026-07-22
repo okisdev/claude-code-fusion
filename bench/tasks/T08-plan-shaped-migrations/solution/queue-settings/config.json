@@ -1,0 +1,7 @@
+{
+  "queue": {
+    "concurrency": 4,
+    "retryDelayMs": 250,
+    "maxAttempts": 3
+  }
+}
