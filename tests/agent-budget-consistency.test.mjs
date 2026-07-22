@@ -14,9 +14,9 @@ function readMaxTurns(agent) {
   return Number.parseInt(maxTurns[1], 10);
 }
 
-// These must stay at 2x the base workerLimits turn budgets in worker-lifecycle.mjs (fast-worker 60, deep-reasoner 30, trivial-worker 12) so a sizing: large brief cannot be undercut by the harness frontmatter cap.
+// These must stay at 2x the base workerLimits turn budgets in worker-lifecycle.mjs (fast-worker 60, deep-reasoner 30, trivial-worker 16) so a sizing: large brief cannot be undercut by the harness frontmatter cap.
 test("agent frontmatter turn caps accommodate large briefs", () => {
   assert.equal(readMaxTurns("fast-worker"), 120);
   assert.equal(readMaxTurns("deep-reasoner"), 60);
-  assert.equal(readMaxTurns("trivial-worker"), 24);
+  assert.equal(readMaxTurns("trivial-worker"), 32);
 });

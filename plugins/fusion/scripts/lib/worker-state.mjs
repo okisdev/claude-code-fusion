@@ -336,6 +336,8 @@ export function createWorkerRecord(record, env = process.env) {
       usageAvailability: "unreported",
       parentTranscriptPath: record.parentTranscriptPath ?? null,
       parentTranscriptBytesAtDispatch: Number.isSafeInteger(record.parentTranscriptBytesAtDispatch) ? record.parentTranscriptBytesAtDispatch : null,
+      packageType: record.packageType ?? "consult",
+      briefBytes: Number.isSafeInteger(record.briefBytes) ? record.briefBytes : null,
       completionContract: record.completionContract ?? "verification",
       ...(record.expectedPeerEngine && record.expectedPeerJobId ? { expectedPeerEngine: record.expectedPeerEngine, expectedPeerJobId: record.expectedPeerJobId } : {}),
       createdAt: record.createdAt ?? now,

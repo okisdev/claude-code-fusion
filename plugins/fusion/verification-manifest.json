@@ -1,0 +1,64 @@
+[
+  {
+    "paths": [
+      "plugins/fusion/scripts/worker-lifecycle.mjs",
+      "plugins/fusion/scripts/lib/worker-state.mjs"
+    ],
+    "suites": [
+      "tests/fusion-worker-lifecycle.test.mjs",
+      "tests/agent-budget-consistency.test.mjs",
+      "tests/codex-wrapper-contract.test.mjs"
+    ]
+  },
+  {
+    "paths": [
+      "plugins/fusion/scripts/fusion-stats.mjs",
+      "plugins/fusion/scripts/lib/engine-acceptance.mjs",
+      "plugins/fusion/scripts/lib/codex-state-roots.mjs",
+      "plugins/fusion/scripts/lib/raw-args-transport.mjs"
+    ],
+    "suites": [
+      "tests/fusion-stats.test.mjs"
+    ]
+  },
+  {
+    "paths": [
+      "plugins/fusion/scripts/inline-delegation-guard.mjs"
+    ],
+    "suites": [
+      "tests/inline-delegation-guard.test.mjs"
+    ]
+  },
+  {
+    "paths": [
+      "plugins/codex/**/*.mjs"
+    ],
+    "suites": [
+      "tests/codex-companion.test.mjs"
+    ]
+  },
+  {
+    "paths": [
+      "plugins/grok/**/*.mjs"
+    ],
+    "suites": [
+      "tests/grok-companion.test.mjs",
+      "tests/grok-exec-supervision.test.mjs",
+      "tests/grok-record-acceptance.test.mjs",
+      "tests/grok-state-lock.test.mjs",
+      "tests/grok-transport.test.mjs",
+      "tests/grok-upstream-contract.test.mjs"
+    ]
+  },
+  {
+    "paths": [
+      "bench/**/*.mjs",
+      "bench/tasks/**/*"
+    ],
+    "suites": [
+      "tests/bench-manifest.test.mjs",
+      "tests/bench-runner.test.mjs",
+      "tests/bench-selftest.test.mjs"
+    ]
+  }
+]
