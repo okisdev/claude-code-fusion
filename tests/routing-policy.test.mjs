@@ -98,11 +98,13 @@ test("Codex admission preserves primary ownership before overflow", () => {
   assert.equal(frontmatterValue(codexRescue, "background"), "false");
 });
 
-test("Grok automatic routing requires exactly one of five protected roles", () => {
-  const expected = ["burst", "independence", "live-web", "large-context", "best-of-n"];
-  assert.deepEqual(protectedRoles(rules, /five protected routing roles: (.+?)\. Grok remains/), expected);
-  assert.deepEqual(protectedRoles(grokRescue, /Automatic Fusion routing must name one protected role: (.+?)\./), expected);
+test("Grok automatic routing exposes four protected roles while the companion retains legacy support", () => {
+  const expected = ["burst", "independence", "live-web", "large-context"];
+  const legacyExpected = [...expected];
+  assert.deepEqual(protectedRoles(rules, /four protected routing roles: (.+?)\. Grok remains/), expected);
+  assert.deepEqual(protectedRoles(grokRescue, /Automatic Fusion routing must name one protected role: (.+?)\./), legacyExpected);
   assert.match(rules, /The single header line for every automatically routed Grok brief includes `grok-role: <role>`/);
+  assert.match(rules, /where `<role>` is exactly one of `burst`, `independence`, `live-web`, or `large-context`/);
   assert.match(rules, /a direct `\/grok:\*` command or explicit user request for Grok is a user selected override and does not need that field/);
   assert.match(rules, /it is not a generic alternative merely because it is idle or fast/);
   assert.match(grokRescue, /Do not take ordinary implementation merely because Grok is idle, fast, or bills to xAI\./);
@@ -114,7 +116,7 @@ test("Grok automatic routing requires exactly one of five protected roles", () =
   assert.match(grokRescue, /An explicit incoming user `--background` stays inside the raw request\./);
   assert.match(grokReviewRunner, /return an output containing `phase: cleanup-required` instead of chaining/);
   assert.match(grokReviewRunner, /top level `status` is `running`, and `cleanupRequired` is not true/);
-  assert.match(readme, /Grok is a complementary specialist and burst lane with five protected roles/);
+  assert.match(readme, /Grok is a complementary specialist and burst lane with four protected roles/);
   assert.equal(frontmatterValue(grokRescue, "background"), "false");
 });
 
@@ -125,7 +127,7 @@ test("Ultra expands capacity without changing lane ownership", () => {
     assert.ok(ultra.includes(`\`${role}\``), `Ultra must preserve the ${role} Grok role`);
   }
   assert.match(ultra, /Every Grok facet brief begins with a single routing header line containing exactly one `grok-role: <role>` field/);
-  assert.match(ultra, /choosing one of `burst`, `independence`, `live-web`, `large-context`, or `best-of-n` from the facet's actual purpose/);
+  assert.match(ultra, /choosing one of `burst`, `independence`, `live-web`, or `large-context` from the facet's actual purpose/);
   assert.match(ultra, /Do not include a second Grok role anywhere in that brief\./);
   assert.match(ultra, /Additional independent Codex implementation facets may use distinct orchestrator owned worktrees when their files are disjoint and verification needs no heavy setup\./);
   assert.match(ultra, /For each such facet, use `--write --cwd "<absolute worktree path>" -- <brief>` as the complete direct prompt to `codex:codex-rescue`\./);
@@ -145,7 +147,7 @@ test("Ultra expands capacity without changing lane ownership", () => {
 test("the panel stays blind, asymmetric, evidence weighted, and main judged", () => {
   assert.match(panel, /In the standard external panel, every engine receives the same neutral brief, works with no knowledge of the other panelists/);
   assert.match(panel, /Never include a candidate answer, a leaning, any prior model opinion, or any context from this conversation\./);
-  assert.match(panel, /Its first line is the single routing header required by policy and includes `lane: panel`, `grok-role: independence`, and the explicit acceptance criteria/);
+  assert.match(panel, /Its first line is the single routing header required by policy and includes `lane: panel`, `grok-role: independence` \(one of the four permitted Grok roles\), and the explicit acceptance criteria/);
   assert.match(panel, /invoke `grok:grok-rescue` and `codex:codex-rescue` with the identical brief as their direct prompt/);
   assert.match(panel, /Do not set `run_in_background`; parallel tool calls provide overlap while each result remains owned and collected/);
   assert.match(panel, /A panel never runs with fewer than two tracks\./);

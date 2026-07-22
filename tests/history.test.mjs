@@ -218,7 +218,7 @@ test("history reports resumability, job class, and Claude session ownership with
     },
     {
       id: "88888888888888888888888888888888",
-      jobClass: "best_of_n",
+      jobClass: "unknown",
       status: "cancelled",
       mode: "write",
       sessionId: "88888888-8888-7888-8888-888888888888",

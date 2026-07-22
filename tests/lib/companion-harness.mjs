@@ -24,10 +24,8 @@ export const grokCompanionCapabilities = [
   "--allow",
   "--disable-web-search",
   "--always-approve",
-  "--best-of-n",
   "--no-subagents",
   "--no-wait-for-background",
-  "--background-wait-timeout",
   "--json-schema",
 ].join(",");
 

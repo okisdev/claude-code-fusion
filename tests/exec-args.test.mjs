@@ -31,9 +31,7 @@ const consultAllows = ["Read", "Grep"];
 const consultTools = "read_file,grep,list_dir";
 const consultWebTools = "read_file,grep,list_dir,web_search,web_fetch";
 const writeTools = "read_file,grep,list_dir,search_replace,run_terminal_cmd";
-const tournamentTools = `${writeTools},Agent`;
-const nonTournamentDisallowedTools = "Agent,search_tool,use_tool,ask_user_question";
-const tournamentDisallowedTools = "search_tool,use_tool,ask_user_question";
+const disallowedTools = "Agent,search_tool,use_tool,ask_user_question";
 
 const consultDenies = ["Edit", "Write", "Bash", "MCPTool(*)"];
 
@@ -141,7 +139,7 @@ test("consult task argv pins the strict sandbox and hard read-only tool surface"
   assert.ok(hasPair(argv, "--max-turns", "60"));
   assert.ok(hasPair(argv, "--permission-mode", "default"));
   assert.ok(hasPair(argv, "--tools", consultTools));
-  assert.ok(hasPair(argv, "--disallowed-tools", nonTournamentDisallowedTools));
+  assert.ok(hasPair(argv, "--disallowed-tools", disallowedTools));
   assert.deepStrictEqual([...flagValues(argv, "--allow")].sort(), [...consultAllows].sort());
   const denyRules = flagValues(argv, "--deny");
   for (const rule of consultDenies) {
@@ -152,7 +150,6 @@ test("consult task argv pins the strict sandbox and hard read-only tool surface"
   assert.ok(!argv.includes("-m"), "Model must not be passed by default.");
   assert.ok(!argv.includes("--effort"), "Effort must not be passed by default.");
   assert.ok(!argv.includes("--always-approve"));
-  assert.ok(!argv.includes("--best-of-n"));
   assert.ok(!argv.includes("-r"));
   assert.ok(!argv.includes("Bash(gh pr view*)"));
   assert.ok(!argv.includes("Bash(git diff*)"));
@@ -212,7 +209,7 @@ test("write task argv includes its explicit tool surface, always-approve, and sa
   assert.ok(argv.includes("--always-approve"));
   assert.ok(hasPair(argv, "--sandbox", "strict"));
   assert.ok(hasPair(argv, "--tools", writeTools));
-  assert.ok(hasPair(argv, "--disallowed-tools", nonTournamentDisallowedTools));
+  assert.ok(hasPair(argv, "--disallowed-tools", disallowedTools));
   const denyRules = flagValues(argv, "--deny");
   for (const rule of writeDenies) {
     assert.ok(denyRules.includes(rule), rule);
@@ -223,26 +220,6 @@ test("write task argv includes its explicit tool surface, always-approve, and sa
   assert.ok(argv.includes("--no-subagents"));
   assert.ok(!argv.includes("-m"));
   assert.ok(!argv.includes("--effort"));
-});
-
-test("best-of-n argv enables Agent, keeps meta tools disabled, implies write mode, and keeps the denies", (t) => {
-  const sandbox = makeSandbox(t);
-  const result = runCompanion(["task", "--best-of-n", "2", "compete on this"], {
-    cwd: sandbox.workDir,
-    env: envFor(sandbox),
-  });
-  assert.strictEqual(result.status, 0, result.stderr);
-  const argv = singleInvocation(sandbox);
-  assert.ok(hasPair(argv, "--best-of-n", "2"));
-  assert.ok(!argv.includes("--no-subagents"));
-  assert.ok(hasPair(argv, "--tools", tournamentTools));
-  assert.ok(hasPair(argv, "--disallowed-tools", tournamentDisallowedTools));
-  assert.ok(argv.includes("--always-approve"));
-  const denyRules = flagValues(argv, "--deny");
-  for (const rule of writeDenies) {
-    assert.ok(denyRules.includes(rule), rule);
-  }
-  assert.ok(denyRules.includes("Read(**/.grok/auth.json)"));
 });
 
 test("resume maps to -r with the given session uuid", (t) => {
@@ -453,14 +430,6 @@ test("max-turns is overridable from the command line", (t) => {
   assert.deepStrictEqual(flagValues(argv, "--max-turns"), ["7"]);
 });
 
-test("best-of-n outside 2 to 10 is rejected", (t) => {
-  const sandbox = makeSandbox(t);
-  const result = runCompanion(["task", "--best-of-n", "11", "hello"], { cwd: sandbox.workDir, env: envFor(sandbox) });
-  assert.notStrictEqual(result.status, 0);
-  assert.match(result.stderr, /between 2 and 10/);
-  assert.strictEqual(readInvocations(sandbox.argsFile).length, 0);
-});
-
 test("write task argv omits the gh read-only allow rules", (t) => {
   const sandbox = makeSandbox(t);
   const result = runCompanion(["task", "--write", "change the code"], {
@@ -495,7 +464,7 @@ test("consult denies every shell, MCP, edit, delegation, and meta-tool surface",
   for (const rule of ["Edit", "Write", "Bash", "MCPTool(*)"]) {
     assert.ok(denies.includes(rule), `Expected ${rule} in consult deny rules.`);
   }
-  assert.ok(hasPair(argv, "--disallowed-tools", nonTournamentDisallowedTools));
+  assert.ok(hasPair(argv, "--disallowed-tools", disallowedTools));
 });
 
 test("web flag drops the web search disable and stays consult", (t) => {
@@ -535,7 +504,7 @@ test("write mode never gains web tool allow rules", () => {
     const argv = buildArgv({ mode: "write", web });
     assert.strictEqual(flagValues(argv, "--allow").length, 0);
     assert.ok(hasPair(argv, "--tools", web ? `${writeTools},web_search,web_fetch` : writeTools));
-    assert.ok(hasPair(argv, "--disallowed-tools", nonTournamentDisallowedTools));
+    assert.ok(hasPair(argv, "--disallowed-tools", disallowedTools));
     assert.ok(!argv.includes("WebSearch"));
     assert.ok(!argv.includes("WebFetch"));
     assert.ok(argv.includes("--always-approve"));

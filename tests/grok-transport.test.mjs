@@ -58,7 +58,7 @@ function ageRawTransport(transport, ageMs) {
 }
 
 test("every Grok slash command keeps raw arguments out of shell command text", () => {
-  for (const name of ["task", "review", "best-of-n", "status", "history", "result", "cancel", "stats", "setup"]) {
+  for (const name of ["task", "review", "status", "history", "result", "cancel", "stats", "setup"]) {
     const file = path.join(repoRoot, "plugins", "grok", "skills", name, "SKILL.md");
     const content = fs.readFileSync(file, "utf8");
     assert.equal(content.match(/\$ARGUMENTS/g)?.length, 1, name);
@@ -374,32 +374,6 @@ test("task records valid Fusion roles and rejects invalid role values", (t) => {
   assert.equal(validRecord.request.role, "live-web");
   assert.equal(invalidRecord.role, null);
   assert.equal(invalidRecord.request.role, null);
-});
-
-test("fixed best-of-n transport defaults preserve opaque prompts and accept the slash command n alias", (t) => {
-  const sandbox = makeSandbox(t);
-  const stdinLog = path.join(sandbox.root, "best-of-n-stdin.jsonl");
-  const env = envFor(sandbox, { FAKE_GROK_STDIN_LOG: stdinLog });
-  const requests = [
-    { raw: "--json -- tournament default", expected: "2", prompt: "tournament default" },
-    { raw: "--json --n 4 -- tournament explicit", expected: "4", prompt: "tournament explicit" }
-  ];
-
-  for (const request of requests) {
-    const transport = createRawTransport(sandbox, env, request.raw);
-    const result = runCompanion([
-      "task",
-      "--transport-default-best-of-n",
-      "--raw-args-token",
-      transport.token
-    ], { cwd: sandbox.workDir, env });
-    assert.equal(result.status, 0, result.stderr);
-  }
-
-  const invocations = readInvocations(sandbox.argsFile);
-  assert.deepEqual(invocations.map((argv) => flagValues(argv, "--best-of-n")[0]), ["2", "4"]);
-  const prompts = fs.readFileSync(stdinLog, "utf8").trim().split("\n").map((line) => JSON.parse(line));
-  assert.deepEqual(prompts, requests.map((request) => request.prompt));
 });
 
 test("invalid Grok session identifiers fail as transport errors and cannot reach summary paths or resume", (t) => {

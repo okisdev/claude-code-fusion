@@ -100,7 +100,7 @@ function directOptions(sandbox, mode, extra = {}) {
   };
 }
 
-test("non-tournament runs disable Agent through the CLI and environment while tournaments retain their background budget", () => {
+test("all managed runs disable Agent through the CLI and environment", () => {
   const env = { GROK_COMPANION_CAPABILITIES: grokCompanionCapabilities };
   const toolSurfaces = {
     consult: "read_file,grep,list_dir",
@@ -116,30 +116,7 @@ test("non-tournament runs disable Agent through the CLI and environment while to
     );
     assert.deepEqual(flagValues(argv, "--tools"), [toolSurfaces[mode]], mode);
     assert.ok(argv.includes("--no-wait-for-background"), mode);
-    assert.equal(flagValues(argv, "--background-wait-timeout").length, 0, mode);
   }
-
-  const tournament = buildGrokArgs({
-    briefFile: "/tmp/grok-brief.md",
-    mode: "write",
-    bestOfN: 3,
-    timeoutMs: 90000,
-    env,
-  });
-  assert.ok(!tournament.includes("--no-subagents"));
-  assert.deepEqual(
-    flagValues(tournament, "--disallowed-tools"),
-    ["search_tool,use_tool,ask_user_question"]
-  );
-  assert.deepEqual(
-    flagValues(tournament, "--tools"),
-    ["read_file,grep,list_dir,search_replace,run_terminal_cmd,Agent"]
-  );
-  assert.ok(!tournament.includes("--no-wait-for-background"));
-  const [backgroundWait] = flagValues(tournament, "--background-wait-timeout").map(Number);
-  assert.ok(Number.isInteger(backgroundWait) && backgroundWait >= 1);
-  assert.ok(backgroundWait * 1000 < 90000);
-  assert.ok(90000 - backgroundWait * 1000 >= 30000);
 });
 
 for (const requiredCapability of ["--prompt-file", "--output-format", "--sandbox", "--tools", "--disallowed-tools", "--deny", "--max-turns", "--no-auto-update", "--permission-mode", "--allow", "--disable-web-search"]) {
@@ -176,11 +153,11 @@ test("write mode fails closed before launch without always-approve support", (t)
   assert.deepEqual(readInvocations(sandbox.argsFile), []);
 });
 
-test("ordinary runs fail closed when Grok cannot skip or bound background work", (t) => {
+test("managed runs fail closed when Grok cannot skip background work", (t) => {
   const sandbox = makeSandbox(t);
   const capabilities = grokCompanionCapabilities
     .split(",")
-    .filter((capability) => !["--no-wait-for-background", "--background-wait-timeout"].includes(capability))
+    .filter((capability) => capability !== "--no-wait-for-background")
     .join(",");
   const result = runCompanion(["task", "inspect the repository"], {
     cwd: sandbox.workDir,
@@ -189,59 +166,6 @@ test("ordinary runs fail closed when Grok cannot skip or bound background work",
 
   assert.notEqual(result.status, 0);
   assert.match(result.stderr, /--no-wait-for-background/);
-  assert.match(result.stderr, /--background-wait-timeout/);
-  assert.deepEqual(readInvocations(sandbox.argsFile), []);
-});
-
-test("ordinary runs fall back to a bounded wait when no-wait is unavailable", (t) => {
-  const sandbox = makeSandbox(t);
-  const capabilities = grokCompanionCapabilities
-    .split(",")
-    .filter((capability) => capability !== "--no-wait-for-background")
-    .join(",");
-  const result = runCompanion(["task", "inspect the repository"], {
-    cwd: sandbox.workDir,
-    env: envFor(sandbox, {
-      GROK_COMPANION_CAPABILITIES: capabilities,
-      GROK_COMPANION_TIMEOUT_MS: "90000",
-    }),
-  });
-
-  assert.equal(result.status, 0, result.stderr);
-  const [argv] = readInvocations(sandbox.argsFile);
-  assert.ok(!argv.includes("--no-wait-for-background"));
-  assert.deepEqual(flagValues(argv, "--background-wait-timeout"), ["60"]);
-});
-
-test("best-of-n fails closed without bounded background wait support", (t) => {
-  const sandbox = makeSandbox(t);
-  const capabilities = grokCompanionCapabilities
-    .split(",")
-    .filter((capability) => capability !== "--background-wait-timeout")
-    .join(",");
-  const result = runCompanion(["task", "--best-of-n", "2", "compare implementations"], {
-    cwd: sandbox.workDir,
-    env: envFor(sandbox, { GROK_COMPANION_CAPABILITIES: capabilities }),
-  });
-
-  assert.notEqual(result.status, 0);
-  assert.match(result.stderr, /--background-wait-timeout/);
-  assert.deepEqual(readInvocations(sandbox.argsFile), []);
-});
-
-test("best-of-n fails closed before launch without tournament flag support", (t) => {
-  const sandbox = makeSandbox(t);
-  const capabilities = grokCompanionCapabilities
-    .split(",")
-    .filter((capability) => capability !== "--best-of-n")
-    .join(",");
-  const result = runCompanion(["task", "--best-of-n", "2", "compare implementations"], {
-    cwd: sandbox.workDir,
-    env: envFor(sandbox, { GROK_COMPANION_CAPABILITIES: capabilities })
-  });
-
-  assert.notEqual(result.status, 0);
-  assert.match(result.stderr, /--best-of-n/);
   assert.deepEqual(readInvocations(sandbox.argsFile), []);
 });
 
@@ -257,8 +181,29 @@ test("setup reports the injected capability verdict without an extra help probe"
   assert.equal(report.ready, true);
   assert.equal(report.capabilities.ready, true);
   assert.equal(report.capabilities.flags["--tools"], true);
-  assert.equal(report.capabilities.flags["--background-wait-timeout"], true);
-  assert.deepEqual(readInvocations(sandbox.argsFile), [["--version"]]);
+  assert.equal(report.doctorCommand.available, true);
+  assert.deepEqual(readInvocations(sandbox.argsFile), [["--version"], ["doctor", "--help"]]);
+});
+
+test("setup reports grok doctor as unavailable when the subcommand is missing", (t) => {
+  const sandbox = makeSandbox(t);
+  const result = runCompanion(["setup", "--json"], {
+    cwd: sandbox.workDir,
+    env: envFor(sandbox, { FAKE_GROK_DOCTOR_UNAVAILABLE: "1" }),
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  const report = JSON.parse(result.stdout);
+  assert.equal(report.doctorCommand.available, false);
+  assert.equal(report.ready, true);
+  assert.deepEqual(readInvocations(sandbox.argsFile), [["--version"], ["doctor", "--help"]]);
+
+  const rendered = runCompanion(["setup"], {
+    cwd: sandbox.workDir,
+    env: envFor(sandbox, { FAKE_GROK_DOCTOR_UNAVAILABLE: "1" }),
+  });
+  assert.equal(rendered.status, 0, rendered.stderr);
+  assert.match(rendered.stdout, /grok doctor: not available/);
 });
 
 test("Grok child environment removes Claude integration state and disables implicit context bridges", async (t) => {
