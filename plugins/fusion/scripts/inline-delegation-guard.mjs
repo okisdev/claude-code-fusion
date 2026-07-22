@@ -3,10 +3,15 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
 
 const STATE_ENV = "FUSION_INLINE_GUARD_STATE";
 const BUDGET_ENV = "FUSION_INLINE_WRITE_BUDGET";
+const TAIL_MAX_BYTES_ENV = "FUSION_INLINE_TAIL_MAX_BYTES";
+const TAIL_ALLOWANCE_ENV = "FUSION_INLINE_TAIL_ALLOWANCE";
+const ZERO_DISPATCH_MAX_BYTES_ENV = "FUSION_INLINE_ZERO_DISPATCH_MAX_BYTES";
+const ZERO_DISPATCH_WRITES_ENV = "FUSION_INLINE_ZERO_DISPATCH_WRITES";
 const MODE_ENV = "FUSION_INLINE_GUARD_MODE";
 const AUDIT_DIR_ENV = "FUSION_INLINE_GUARD_AUDIT_DIR";
 const AUDIT_RETENTION_DAYS_ENV = "FUSION_INLINE_GUARD_AUDIT_RETENTION_DAYS";
@@ -16,6 +21,10 @@ const FUSION_DATA_DIR_ENV = "FUSION_DATA_DIR";
 const WORKER_STATE_DIR_ENV = "FUSION_WORKER_STATE_DIR";
 const FLEET_WAVE_GAP_ENV = "FUSION_FLEET_WAVE_GAP_MS";
 const DEFAULT_BUDGET = 5;
+const DEFAULT_TAIL_MAX_BYTES = 1024;
+const DEFAULT_TAIL_ALLOWANCE = 3;
+const DEFAULT_ZERO_DISPATCH_MAX_BYTES = 16384;
+const DEFAULT_ZERO_DISPATCH_WRITES = 10;
 const DEFAULT_AUDIT_RETENTION_DAYS = 180;
 const DEFAULT_AUDIT_MAX_BYTES = 2 * 1024 * 1024;
 const DEFAULT_AUDIT_MAX_FILES = 256;
@@ -46,7 +55,10 @@ const NO_OP_BASH_COMMANDS = new Set(["", "true", ":"]);
 const NO_OP_HEARTBEAT_REASON = "Fusion tasks are in flight for this session, so emit a text-only heartbeat instead of this no-op Bash command.";
 const REAPED_WORKER_REDIRECT_AUDIT_DESCRIPTION = "reaped-worker-redirect";
 const NARROW_WAVE_ADVISORY_SUFFIX = "consecutive narrow waves; fleet default applies: consider /fusion:ultra for the remaining packages or state fleet-decline: <reason>.";
+const NARROW_WAVE_ADVISORY_REASON = "narrow-wave-advisory";
 const MISSING_LAUNCH_RECOVERY_REASON = "missing-launch-recovered";
+const TAIL_ALLOW_AUDIT_EVENT = "tail-allowed";
+const ZERO_DISPATCH_SOFTENED_AUDIT_EVENT = "zero-dispatch-softened";
 
 function resolveStateDir(env = process.env) {
   const override = env[STATE_ENV];
@@ -59,6 +71,31 @@ function resolveStateDir(env = process.env) {
 function resolveBudget(env = process.env) {
   const parsed = Number.parseInt(String(env[BUDGET_ENV]), 10);
   return Number.isInteger(parsed) && parsed > 0 ? parsed : DEFAULT_BUDGET;
+}
+
+function resolveNonnegativeInteger(env, name, fallback) {
+  const raw = env[name];
+  if (raw === undefined || raw === null || (typeof raw === "string" && !raw.trim())) {
+    return fallback;
+  }
+  const parsed = typeof raw === "number" ? raw : Number(String(raw).trim());
+  return Number.isSafeInteger(parsed) && parsed >= 0 ? parsed : fallback;
+}
+
+function resolveTailMaxBytes(env = process.env) {
+  return resolveNonnegativeInteger(env, TAIL_MAX_BYTES_ENV, DEFAULT_TAIL_MAX_BYTES);
+}
+
+function resolveTailAllowance(env = process.env) {
+  return resolveNonnegativeInteger(env, TAIL_ALLOWANCE_ENV, DEFAULT_TAIL_ALLOWANCE);
+}
+
+function resolveZeroDispatchMaxBytes(env = process.env) {
+  return resolveNonnegativeInteger(env, ZERO_DISPATCH_MAX_BYTES_ENV, DEFAULT_ZERO_DISPATCH_MAX_BYTES);
+}
+
+function resolveZeroDispatchWrites(env = process.env) {
+  return resolveNonnegativeInteger(env, ZERO_DISPATCH_WRITES_ENV, DEFAULT_ZERO_DISPATCH_WRITES);
 }
 
 function resolveLockTimeoutMs(env = process.env) {
@@ -98,14 +135,15 @@ function resolveWorkerStateDir(env = process.env) {
   return path.join(resolveFusionDataDir(env), "workers");
 }
 
-function sessionHasInFlightWorkerTasks(sessionId, env = process.env) {
+function inFlightWorkerTaskSignature(sessionId, env = process.env) {
   const jobsDir = path.join(resolveWorkerStateDir(env), "jobs");
   let entries;
   try {
     entries = fs.readdirSync(jobsDir, { withFileTypes: true });
   } catch {
-    return false;
+    return null;
   }
+  const workers = [];
   for (const entry of entries) {
     if (!entry.isFile() || !entry.name.startsWith("fusion-") || !entry.name.endsWith(".json")) {
       continue;
@@ -120,13 +158,13 @@ function sessionHasInFlightWorkerTasks(sessionId, env = process.env) {
       }
       const status = record.transportStatus;
       if (typeof status === "string" && !WORKER_TERMINAL_STATUSES.has(status)) {
-        return true;
+        workers.push(`${record.taskId ?? entry.name}:${status}`);
       }
     } catch {
       continue;
     }
   }
-  return false;
+  return workers.length > 0 ? workers.sort().join(",") : null;
 }
 
 function extractTaskControlId(toolInput) {
@@ -456,15 +494,80 @@ function normalizeAuditEvent(event) {
     const safePath = sanitizeAuditPath(event.path);
     return { schemaVersion: AUDIT_SCHEMA_VERSION, at: new Date(atMs).toISOString(), session, event: "write", lane: MAIN_LANE, tool: event.tool, ...(safePath ? { path: safePath } : {}) };
   }
+  if (
+    (event.event === TAIL_ALLOW_AUDIT_EVENT || event.event === ZERO_DISPATCH_SOFTENED_AUDIT_EVENT) &&
+    WRITE_TOOLS.has(event.tool) &&
+    event.lane === MAIN_LANE &&
+    Number.isInteger(event.writeCount) &&
+    event.writeCount >= 0 &&
+    Number.isInteger(event.dispatchCount) &&
+    event.dispatchCount >= 0 &&
+    Number.isInteger(event.budget) &&
+    event.budget > 0 &&
+    event.mode === "enforce"
+  ) {
+    const safePath = sanitizeAuditPath(event.path);
+    if (event.event === TAIL_ALLOW_AUDIT_EVENT && Number.isInteger(event.remainingTailSlots) && event.remainingTailSlots >= 0) {
+      return {
+        schemaVersion: AUDIT_SCHEMA_VERSION,
+        at: new Date(atMs).toISOString(),
+        session,
+        event: TAIL_ALLOW_AUDIT_EVENT,
+        lane: MAIN_LANE,
+        tool: event.tool,
+        ...(safePath ? { path: safePath } : {}),
+        writeCount: event.writeCount,
+        dispatchCount: event.dispatchCount,
+        budget: event.budget,
+        mode: "enforce",
+        remainingTailSlots: event.remainingTailSlots,
+        ...(event.suppressed === true ? { suppressed: true } : {})
+      };
+    }
+    if (
+      event.event === ZERO_DISPATCH_SOFTENED_AUDIT_EVENT &&
+      Number.isInteger(event.remainingZeroDispatchWrites) &&
+      event.remainingZeroDispatchWrites >= 0 &&
+      Number.isInteger(event.remainingZeroDispatchBytes) &&
+      event.remainingZeroDispatchBytes >= 0
+    ) {
+      return {
+        schemaVersion: AUDIT_SCHEMA_VERSION,
+        at: new Date(atMs).toISOString(),
+        session,
+        event: ZERO_DISPATCH_SOFTENED_AUDIT_EVENT,
+        lane: MAIN_LANE,
+        tool: event.tool,
+        ...(safePath ? { path: safePath } : {}),
+        writeCount: event.writeCount,
+        dispatchCount: event.dispatchCount,
+        budget: event.budget,
+        mode: "enforce",
+        remainingZeroDispatchWrites: event.remainingZeroDispatchWrites,
+        remainingZeroDispatchBytes: event.remainingZeroDispatchBytes,
+        ...(event.suppressed === true ? { suppressed: true } : {})
+      };
+    }
+    return null;
+  }
   if (event.event === "dispatch" && DELEGATION_TOOLS.has(event.tool)) {
     const lane = normalizeLane(event.lane);
     const description = sanitizeAuditText(event.description);
     return lane ? { schemaVersion: AUDIT_SCHEMA_VERSION, at: new Date(atMs).toISOString(), session, event: "dispatch", lane, tool: event.tool, ...(description ? { description } : {}) } : null;
   }
-  if (event.event === "warn" && DELEGATION_TOOLS.has(event.tool) && event.reason === MISSING_LAUNCH_RECOVERY_REASON) {
+  if (event.event === "warn" && DELEGATION_TOOLS.has(event.tool) && (event.reason === MISSING_LAUNCH_RECOVERY_REASON || event.reason === NARROW_WAVE_ADVISORY_REASON)) {
     const lane = normalizeLane(event.lane);
     return lane
-      ? { schemaVersion: AUDIT_SCHEMA_VERSION, at: new Date(atMs).toISOString(), session, event: "warn", lane, tool: event.tool, reason: MISSING_LAUNCH_RECOVERY_REASON }
+      ? {
+          schemaVersion: AUDIT_SCHEMA_VERSION,
+          at: new Date(atMs).toISOString(),
+          session,
+          event: "warn",
+          lane,
+          tool: event.tool,
+          reason: event.reason,
+          ...(event.suppressed === true ? { suppressed: true } : {})
+        }
       : null;
   }
   if (
@@ -482,7 +585,8 @@ function normalizeAuditEvent(event) {
       lane: MAIN_LANE,
       tool: event.tool,
       description: REAPED_WORKER_REDIRECT_AUDIT_DESCRIPTION,
-      mode: event.mode
+      mode: event.mode,
+      ...(event.event === "warn" && event.suppressed === true ? { suppressed: true } : {})
     };
   }
   if (
@@ -509,7 +613,8 @@ function normalizeAuditEvent(event) {
       writeCount: event.writeCount,
       dispatchCount: event.dispatchCount,
       budget: event.budget,
-      mode: event.mode
+      mode: event.mode,
+      ...(event.event === "warn" && event.suppressed === true ? { suppressed: true } : {})
     };
   }
   return null;
@@ -607,6 +712,32 @@ function extractWritePath(toolInput) {
   }
   const raw = toolInput.file_path ?? toolInput.notebook_path ?? null;
   return typeof raw === "string" && raw.length > 0 ? raw : null;
+}
+
+function inlineWriteBytes(value) {
+  if (!value || typeof value !== "object") {
+    return 0;
+  }
+  if (Array.isArray(value)) {
+    return value.reduce((total, entry) => total + inlineWriteBytes(entry), 0);
+  }
+  let total = 0;
+  for (const [key, entry] of Object.entries(value)) {
+    if ((key === "new_string" || key === "content") && typeof entry === "string") {
+      total += Buffer.byteLength(entry);
+    } else if (entry && typeof entry === "object") {
+      total += inlineWriteBytes(entry);
+    }
+  }
+  return total;
+}
+
+function editReplacementBytes(toolInput) {
+  return typeof toolInput?.new_string === "string" ? Buffer.byteLength(toolInput.new_string) : null;
+}
+
+function writePathSignature(filePath, cwd) {
+  return createHash("sha256").update(path.resolve(cwd, filePath)).digest("hex");
 }
 
 function isInsideCwd(filePath, cwd) {
@@ -716,6 +847,9 @@ function defaultState(now) {
   return {
     writeCount: 0,
     writesSinceDispatch: 0,
+    inlineWriteBytes: 0,
+    tailWritesSinceDispatch: 0,
+    writtenPathSignatures: [],
     dispatchEpoch: 0,
     lastDispatchAt: null,
     fleetWaveWidth: 0,
@@ -724,6 +858,7 @@ function defaultState(now) {
     dispatches: {},
     dispatchLog: [],
     advisedMultiples: [],
+    advisorySignatures: {},
     createdAt: now,
     updatedAt: now
   };
@@ -791,6 +926,26 @@ function normalizeAdvisedMultiples(value) {
   return [...new Set(value.filter((multiple) => Number.isInteger(multiple) && multiple > 0))];
 }
 
+function normalizeWrittenPathSignatures(value) {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+  return [...new Set(value.filter((signature) => typeof signature === "string" && /^[a-f0-9]{64}$/.test(signature)))];
+}
+
+function normalizeAdvisorySignatures(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return {};
+  }
+  const signatures = {};
+  for (const [kind, signature] of Object.entries(value)) {
+    if (/^[a-z][a-z0-9-]{0,79}$/.test(kind) && typeof signature === "string" && signature.length > 0 && signature.length <= 1024) {
+      signatures[kind] = signature;
+    }
+  }
+  return signatures;
+}
+
 function extractToolUseId(input) {
   return sanitizeIdentifier(input?.tool_use_id, 200);
 }
@@ -852,7 +1007,12 @@ function normalizeState(existing, now, waveGapMs = DEFAULT_FLEET_WAVE_GAP_MS) {
   const dispatches = normalizeDispatches(existing.dispatches);
   const dispatchCount = totalDispatches(dispatches);
   const writesSinceDispatch = Number.isFinite(existing.writesSinceDispatch) && existing.writesSinceDispatch >= 0 ? Math.floor(existing.writesSinceDispatch) : 0;
+  const inlineWriteBytes = Number.isSafeInteger(existing.inlineWriteBytes) && existing.inlineWriteBytes >= 0 ? existing.inlineWriteBytes : 0;
+  const tailWritesSinceDispatch =
+    Number.isSafeInteger(existing.tailWritesSinceDispatch) && existing.tailWritesSinceDispatch >= 0 ? existing.tailWritesSinceDispatch : 0;
+  const writtenPathSignatures = normalizeWrittenPathSignatures(existing.writtenPathSignatures);
   const advisedMultiples = normalizeAdvisedMultiples(existing.advisedMultiples);
+  const advisorySignatures = normalizeAdvisorySignatures(existing.advisorySignatures);
   const dispatchLog = pruneExpiredLaunchedDispatches(normalizeDispatchLog(existing.dispatchLog), now);
   const createdAtMs = Date.parse(existing.createdAt);
   const lastDispatchAtMs = Date.parse(existing.lastDispatchAt);
@@ -865,6 +1025,9 @@ function normalizeState(existing, now, waveGapMs = DEFAULT_FLEET_WAVE_GAP_MS) {
   return {
     writeCount,
     writesSinceDispatch,
+    inlineWriteBytes,
+    tailWritesSinceDispatch,
+    writtenPathSignatures,
     dispatchEpoch: Number.isInteger(existing.dispatchEpoch) && existing.dispatchEpoch >= 0 ? existing.dispatchEpoch : dispatchCount,
     lastDispatchAt: Number.isFinite(lastDispatchAtMs) ? new Date(lastDispatchAtMs).toISOString() : null,
     fleetWaveWidth,
@@ -873,15 +1036,40 @@ function normalizeState(existing, now, waveGapMs = DEFAULT_FLEET_WAVE_GAP_MS) {
     dispatches,
     dispatchLog,
     advisedMultiples,
+    advisorySignatures,
     createdAt: Number.isFinite(createdAtMs) ? new Date(createdAtMs).toISOString() : now,
     updatedAt: now
   };
 }
 
-function allowOutput(reason) {
+function stableAdvisorySignature(values) {
+  return createHash("sha256").update(JSON.stringify(values)).digest("hex");
+}
+
+function claimAdvisory(file, kind, signature, now, waveGapMs, isCurrent = () => true) {
+  try {
+    return withStateLock(file, () => {
+      const state = normalizeState(readState(file), now, waveGapMs);
+      if (!isCurrent(state)) {
+        return { skipped: true, suppressed: false };
+      }
+      const suppressed = state.advisorySignatures[kind] === signature;
+      state.advisorySignatures[kind] = signature;
+      writeState(file, state);
+      return { skipped: false, suppressed };
+    });
+  } catch {
+    return { skipped: false, suppressed: false };
+  }
+}
+
+function allowOutput(reason, additionalContext) {
   const hookSpecificOutput = { hookEventName: "PreToolUse", permissionDecision: "allow" };
   if (reason) {
     hookSpecificOutput.permissionDecisionReason = reason;
+  }
+  if (additionalContext) {
+    hookSpecificOutput.additionalContext = additionalContext;
   }
   return { hookSpecificOutput };
 }
@@ -904,6 +1092,14 @@ function buildAdvisoryLine(writeCount, dispatchCount) {
     "The next package belongs in a lane: quick scoped work goes to the codex quick tier gpt-5.6-terra at effort xhigh; " +
     "trivial or high-volume work goes to gpt-5.6-luna at effort xhigh; work needing the Claude Code tool surface goes to fusion:fast-worker."
   );
+}
+
+function buildTailAllowanceAdvisory(remainingTailSlots) {
+  return `The inline write budget is exhausted. Tail allowance permits this small Edit to an already touched file; ${remainingTailSlots} tail ${remainingTailSlots === 1 ? "slot" : "slots"} remain in this dispatch window.`;
+}
+
+function buildZeroDispatchAdvisory(remainingWrites, remainingBytes) {
+  return `The inline write budget is exhausted, but this zero dispatch session remains within its inline relief bounds; ${remainingWrites} ${remainingWrites === 1 ? "write" : "writes"} and ${remainingBytes} ${remainingBytes === 1 ? "byte" : "bytes"} remain before enforcement resumes.`;
 }
 
 function runAllowCommand() {
@@ -999,9 +1195,19 @@ function runHook(env = process.env, input = readHookInput()) {
       state.dispatchEpoch += 1;
       state.lastDispatchAt = latestConfirmedDispatchAt(state.dispatchLog);
       state.writesSinceDispatch = 0;
+      state.tailWritesSinceDispatch = 0;
+      state.writtenPathSignatures = [];
       state.advisedMultiples = [];
       writeState(file, state);
-      return { shouldAdvise, streak: state.consecutiveNarrowWaves, lane: launched.lane, description: launched.description ?? description, recoveredMissingLaunch };
+      return {
+        shouldAdvise,
+        streak: state.consecutiveNarrowWaves,
+        fleetWaveWidth: state.fleetWaveWidth,
+        dispatchEpoch: state.dispatchEpoch,
+        lane: launched.lane,
+        description: launched.description ?? description,
+        recoveredMissingLaunch
+      };
     });
     if (confirmation.recoveredMissingLaunch) {
       recordAuditEvent(
@@ -1014,7 +1220,31 @@ function runHook(env = process.env, input = readHookInput()) {
       env
     );
     if (confirmation.shouldAdvise) {
-      process.stdout.write(`${JSON.stringify(postToolAdvisoryOutput(`${confirmation.streak} ${NARROW_WAVE_ADVISORY_SUFFIX}`))}\n`);
+      const advisory = claimAdvisory(
+        file,
+        "narrow-wave",
+        stableAdvisorySignature([confirmation.streak, confirmation.fleetWaveWidth]),
+        now,
+        waveGapMs,
+        (state) => state.dispatchEpoch === confirmation.dispatchEpoch && state.consecutiveNarrowWaves === confirmation.streak
+      );
+      if (!advisory.skipped) {
+        recordAuditEvent(
+          {
+            at: now,
+            session: sessionId,
+            event: "warn",
+            lane: confirmation.lane,
+            tool: toolName,
+            reason: NARROW_WAVE_ADVISORY_REASON,
+            ...(advisory.suppressed ? { suppressed: true } : {})
+          },
+          env
+        );
+        if (!advisory.suppressed) {
+          process.stdout.write(`${JSON.stringify(postToolAdvisoryOutput(`${confirmation.streak} ${NARROW_WAVE_ADVISORY_SUFFIX}`))}\n`);
+        }
+      }
     }
     return;
   }
@@ -1030,6 +1260,16 @@ function runHook(env = process.env, input = readHookInput()) {
     }
     const mode = resolveMode(env);
     const reason = reapedWorkerRedirectReason(record, taskId);
+    const advisory =
+      mode === "advisory"
+        ? claimAdvisory(
+            file,
+            "reaped-worker-redirect",
+            stableAdvisorySignature([toolName, taskId, record.taskId ?? null, record.transportStatus, record.outputFile ?? null, record.transcriptPath ?? null]),
+            now,
+            resolveFleetWaveGapMs(env)
+          )
+        : { skipped: false, suppressed: false };
     recordAuditEvent(
       {
         at: now,
@@ -1038,11 +1278,14 @@ function runHook(env = process.env, input = readHookInput()) {
         lane: MAIN_LANE,
         tool: toolName,
         description: REAPED_WORKER_REDIRECT_AUDIT_DESCRIPTION,
-        mode
+        mode,
+        ...(advisory.suppressed ? { suppressed: true } : {})
       },
       env
     );
-    process.stdout.write(`${JSON.stringify(mode === "advisory" ? allowOutput(reason) : denyOutput(reason))}\n`);
+    if (mode !== "advisory" || !advisory.suppressed) {
+      process.stdout.write(`${JSON.stringify(mode === "advisory" ? allowOutput(reason) : denyOutput(reason))}\n`);
+    }
     return;
   }
 
@@ -1051,17 +1294,20 @@ function runHook(env = process.env, input = readHookInput()) {
       return;
     }
     const command = extractBashCommand(input.tool_input);
-    if (command === null || !NO_OP_BASH_COMMANDS.has(command) || !sessionHasInFlightWorkerTasks(sessionId, env)) {
+    const inFlightSignature = sessionId ? inFlightWorkerTaskSignature(sessionId, env) : null;
+    if (command === null || !NO_OP_BASH_COMMANDS.has(command) || !inFlightSignature) {
       return;
     }
     const mode = resolveMode(env);
     const budget = resolveBudget(env);
     let writeCount = 0;
     let dispatchCount = 0;
+    let dispatchEpoch = 0;
     try {
       const snapshot = withStateLock(file, () => normalizeState(readState(file), now, resolveFleetWaveGapMs(env)));
       writeCount = snapshot.writesSinceDispatch;
       dispatchCount = totalDispatches(snapshot.dispatches);
+      dispatchEpoch = snapshot.dispatchEpoch;
     } catch {
       void 0;
     }
@@ -1076,9 +1322,24 @@ function runHook(env = process.env, input = readHookInput()) {
       budget,
       mode
     };
+    const advisory =
+      mode === "advisory"
+        ? claimAdvisory(
+            file,
+            "heartbeat",
+            stableAdvisorySignature([inFlightSignature, writeCount, dispatchCount, dispatchEpoch, budget]),
+            now,
+            resolveFleetWaveGapMs(env)
+          )
+        : { skipped: false, suppressed: false };
+    if (advisory.suppressed) {
+      auditEvent.suppressed = true;
+    }
     recordAuditEvent(auditEvent, env);
     if (mode === "advisory") {
-      process.stdout.write(`${JSON.stringify(allowOutput(NO_OP_HEARTBEAT_REASON))}\n`);
+      if (!advisory.suppressed) {
+        process.stdout.write(`${JSON.stringify(allowOutput(NO_OP_HEARTBEAT_REASON))}\n`);
+      }
       return;
     }
     process.stdout.write(`${JSON.stringify(denyOutput(NO_OP_HEARTBEAT_REASON))}\n`);
@@ -1097,22 +1358,64 @@ function runHook(env = process.env, input = readHookInput()) {
   const auditPath = extractAuditWritePath(targetPath, cwd);
   const budget = resolveBudget(env);
   const mode = resolveMode(env);
+  const writeBytes = inlineWriteBytes(input.tool_input);
+  const replacementBytes = toolName === "Edit" ? editReplacementBytes(input.tool_input) : null;
+  const pathSignature = writePathSignature(targetPath, cwd);
+  const tailMaxBytes = resolveTailMaxBytes(env);
+  const tailAllowance = resolveTailAllowance(env);
+  const zeroDispatchMaxBytes = resolveZeroDispatchMaxBytes(env);
+  const zeroDispatchWrites = resolveZeroDispatchWrites(env);
   const decision = withStateLock(file, () => {
     const state = normalizeState(readState(file), now, resolveFleetWaveGapMs(env));
+    const dispatchCount = totalDispatches(state.dispatches);
+    let relief = null;
     if (mode === "enforce" && state.writesSinceDispatch >= budget) {
-      return { denied: true, writeCount: state.writesSinceDispatch, dispatchCount: totalDispatches(state.dispatches) };
+      const tailAllowed =
+        toolName === "Edit" &&
+        replacementBytes !== null &&
+        replacementBytes <= tailMaxBytes &&
+        tailAllowance > 0 &&
+        state.tailWritesSinceDispatch < tailAllowance &&
+        state.writtenPathSignatures.includes(pathSignature);
+      const zeroDispatchAllowed =
+        !tailAllowed &&
+        dispatchCount === 0 &&
+        state.writeCount < zeroDispatchWrites &&
+        state.inlineWriteBytes + writeBytes < zeroDispatchMaxBytes;
+      if (!tailAllowed && !zeroDispatchAllowed) {
+        return { denied: true, writeCount: state.writesSinceDispatch, dispatchCount };
+      }
+      relief = tailAllowed ? TAIL_ALLOW_AUDIT_EVENT : ZERO_DISPATCH_SOFTENED_AUDIT_EVENT;
     }
     state.writeCount += 1;
     state.writesSinceDispatch += 1;
-    const dispatchCount = totalDispatches(state.dispatches);
+    state.inlineWriteBytes += writeBytes;
+    if (!state.writtenPathSignatures.includes(pathSignature)) {
+      state.writtenPathSignatures.push(pathSignature);
+    }
+    if (relief === TAIL_ALLOW_AUDIT_EVENT) {
+      state.tailWritesSinceDispatch += 1;
+    }
     const multiple = budgetMultiple(state.writesSinceDispatch, budget);
     let candidate = null;
     if (multiple >= 1 && !state.advisedMultiples.includes(multiple)) {
       state.advisedMultiples.push(multiple);
-      candidate = { multiple, writeCount: state.writesSinceDispatch, dispatchEpoch: state.dispatchEpoch };
+      if (!relief) {
+        candidate = { multiple, writeCount: state.writesSinceDispatch, dispatchEpoch: state.dispatchEpoch };
+      }
     }
     writeState(file, state);
-    return { denied: false, writeCount: state.writesSinceDispatch, dispatchCount, candidate };
+    return {
+      denied: false,
+      writeCount: state.writesSinceDispatch,
+      dispatchCount,
+      candidate,
+      relief,
+      dispatchEpoch: state.dispatchEpoch,
+      remainingTailSlots: tailAllowance - state.tailWritesSinceDispatch,
+      remainingZeroDispatchWrites: zeroDispatchWrites - state.writeCount,
+      remainingZeroDispatchBytes: zeroDispatchMaxBytes - state.inlineWriteBytes
+    };
   });
 
   if (decision.denied) {
@@ -1137,29 +1440,80 @@ function runHook(env = process.env, input = readHookInput()) {
   }
 
   recordAuditEvent({ at: now, session: sessionId, event: "write", lane: MAIN_LANE, tool: toolName, ...(auditPath ? { path: auditPath } : {}) }, env);
+  if (decision.relief) {
+    const advisory = claimAdvisory(
+      file,
+      decision.relief,
+      stableAdvisorySignature(
+        decision.relief === TAIL_ALLOW_AUDIT_EVENT
+          ? [decision.dispatchEpoch, decision.remainingTailSlots]
+          : [decision.remainingZeroDispatchWrites, decision.remainingZeroDispatchBytes]
+      ),
+      now,
+      resolveFleetWaveGapMs(env)
+    );
+    const auditEvent = {
+      at: now,
+      session: sessionId,
+      event: decision.relief,
+      lane: MAIN_LANE,
+      tool: toolName,
+      ...(auditPath ? { path: auditPath } : {}),
+      writeCount: decision.writeCount,
+      dispatchCount: decision.dispatchCount,
+      budget,
+      mode
+    };
+    if (decision.relief === TAIL_ALLOW_AUDIT_EVENT) {
+      auditEvent.remainingTailSlots = decision.remainingTailSlots;
+    } else {
+      auditEvent.remainingZeroDispatchWrites = decision.remainingZeroDispatchWrites;
+      auditEvent.remainingZeroDispatchBytes = decision.remainingZeroDispatchBytes;
+    }
+    if (advisory.suppressed) {
+      auditEvent.suppressed = true;
+    }
+    recordAuditEvent(auditEvent, env);
+    if (!advisory.suppressed) {
+      const line =
+        decision.relief === TAIL_ALLOW_AUDIT_EVENT
+          ? buildTailAllowanceAdvisory(decision.remainingTailSlots)
+          : buildZeroDispatchAdvisory(decision.remainingZeroDispatchWrites, decision.remainingZeroDispatchBytes);
+      process.stdout.write(`${JSON.stringify(allowOutput(line, line))}\n`);
+    }
+    return;
+  }
   if (decision.candidate) {
-    withStateLock(file, () => {
-      const latest = normalizeState(readState(file), new Date().toISOString(), resolveFleetWaveGapMs(env));
-      if (latest.dispatchEpoch === decision.candidate.dispatchEpoch && latest.advisedMultiples.includes(decision.candidate.multiple)) {
-        recordAuditEvent(
-          {
-            at: now,
-            session: sessionId,
-            event: "warn",
-            lane: MAIN_LANE,
-            tool: toolName,
-            ...(auditPath ? { path: auditPath } : {}),
-            writeCount: decision.writeCount,
-            dispatchCount: decision.dispatchCount,
-            budget,
-            mode
-          },
-          env
-        );
-        const advisory = buildAdvisoryLine(decision.writeCount, decision.dispatchCount);
-        process.stdout.write(`${JSON.stringify(allowOutput(advisory))}\n`);
+    const advisory = claimAdvisory(
+      file,
+      "write-budget",
+      stableAdvisorySignature([decision.candidate.multiple, budget, decision.candidate.dispatchEpoch]),
+      now,
+      resolveFleetWaveGapMs(env),
+      (state) => state.dispatchEpoch === decision.candidate.dispatchEpoch && state.advisedMultiples.includes(decision.candidate.multiple)
+    );
+    if (!advisory.skipped) {
+      recordAuditEvent(
+        {
+          at: now,
+          session: sessionId,
+          event: "warn",
+          lane: MAIN_LANE,
+          tool: toolName,
+          ...(auditPath ? { path: auditPath } : {}),
+          writeCount: decision.writeCount,
+          dispatchCount: decision.dispatchCount,
+          budget,
+          mode,
+          ...(advisory.suppressed ? { suppressed: true } : {})
+        },
+        env
+      );
+      if (!advisory.suppressed) {
+        const line = buildAdvisoryLine(decision.writeCount, decision.dispatchCount);
+        process.stdout.write(`${JSON.stringify(allowOutput(line))}\n`);
       }
-    });
+    }
   }
 }
 
@@ -1209,6 +1563,10 @@ export {
   resolveLockTimeoutMs,
   resolveMode,
   resolveStateDir,
+  resolveTailAllowance,
+  resolveTailMaxBytes,
+  resolveZeroDispatchMaxBytes,
+  resolveZeroDispatchWrites,
   sanitizeAuditPath,
   sanitizeAuditText,
   stateFile,

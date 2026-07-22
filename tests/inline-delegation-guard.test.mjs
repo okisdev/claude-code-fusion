@@ -9,7 +9,11 @@ import { pathToFileURL } from "node:url";
 import {
   DEFAULT_LOCK_TIMEOUT_MS,
   readAuditEvents,
-  resolveLockTimeoutMs
+  resolveLockTimeoutMs,
+  resolveTailAllowance,
+  resolveTailMaxBytes,
+  resolveZeroDispatchMaxBytes,
+  resolveZeroDispatchWrites
 } from "../plugins/fusion/scripts/inline-delegation-guard.mjs";
 
 const repoRoot = path.join(import.meta.dirname, "..");
@@ -91,7 +95,7 @@ async function runAsync(sandbox, payload, extraEnv = {}) {
   return runAsyncRaw(sandbox, payload, extraEnv);
 }
 
-function writePayload(sandbox, { sessionId = "session-1", toolName = "Edit", filePath, cwd, agentId } = {}) {
+function writePayload(sandbox, { sessionId = "session-1", toolName = "Edit", filePath, cwd, agentId, toolInput = {} } = {}) {
   const targetPath = filePath ?? path.join(sandbox.workDir, "file.txt");
   const payload = {
     hook_event_name: "PreToolUse",
@@ -99,7 +103,7 @@ function writePayload(sandbox, { sessionId = "session-1", toolName = "Edit", fil
     transcript_path: path.join(sandbox.root, "transcript.jsonl"),
     cwd: cwd ?? sandbox.workDir,
     tool_name: toolName,
-    tool_input: { file_path: targetPath }
+    tool_input: { file_path: targetPath, ...toolInput }
   };
   if (agentId) {
     payload.agent_id = agentId;
@@ -194,6 +198,7 @@ test("advisory compatibility mode never denies, even far past the budget", (t) =
 
 test("the default mode denies writes after the dispatch window budget and audits enforcement until an Agent dispatch", (t) => {
   const sandbox = makeSandbox(t);
+  run(sandbox, dispatchPayload(sandbox, { subagentType: "fusion:fast-worker" }));
   for (let i = 0; i < 5; i += 1) {
     const result = run(sandbox, writePayload(sandbox));
     assert.notStrictEqual(JSON.parse(result.stdout || '{"hookSpecificOutput":{"permissionDecision":"allow"}}').hookSpecificOutput.permissionDecision, "deny");
@@ -219,7 +224,7 @@ test("the default mode denies writes after the dispatch window budget and audits
     tool: "Edit",
     path: "file.txt",
     writeCount: 5,
-    dispatchCount: 0,
+    dispatchCount: 1,
     budget: 5,
     mode: "enforce"
   });
@@ -230,15 +235,121 @@ test("the default mode denies writes after the dispatch window budget and audits
   assert.strictEqual(readState(sandbox, "session-1").writesSinceDispatch, 1);
 });
 
-test("a PostToolUse-only dispatch recovers a missing launch and reopens an exhausted write budget", (t) => {
+test("a small Edit to a file written in the current window uses one tail slot", (t) => {
   const sandbox = makeSandbox(t);
+  run(sandbox, dispatchPayload(sandbox, { subagentType: "fusion:fast-worker" }));
   for (let index = 0; index < 5; index += 1) {
-    run(sandbox, writePayload(sandbox));
+    run(sandbox, writePayload(sandbox, { toolInput: { new_string: "base" } }));
   }
-  const denied = run(sandbox, writePayload(sandbox));
+
+  const tail = run(sandbox, writePayload(sandbox, { toolInput: { new_string: "finish" } }));
+  const output = JSON.parse(tail.stdout);
+  assert.strictEqual(output.hookSpecificOutput.permissionDecision, "allow");
+  assert.match(output.hookSpecificOutput.permissionDecisionReason, /2 tail slots remain/i);
+  assert.match(output.hookSpecificOutput.additionalContext, /2 tail slots remain/i);
+  assert.strictEqual(readState(sandbox, "session-1").tailWritesSinceDispatch, 1);
+  assert.deepStrictEqual(
+    readAuditRecords(sandbox).filter((record) => record.event === "tail-allowed").map((record) => record.remainingTailSlots),
+    [2]
+  );
+});
+
+test("tail allowance denies a new path Write and an oversized Edit", (t) => {
+  for (const { toolName, filePath, toolInput } of [
+    { toolName: "Write", filePath: "new-file.txt", toolInput: { content: "finish" } },
+    { toolName: "Edit", filePath: "file.txt", toolInput: { new_string: "x".repeat(1025) } }
+  ]) {
+    const sandbox = makeSandbox(t);
+    run(sandbox, dispatchPayload(sandbox, { subagentType: "fusion:fast-worker" }));
+    for (let index = 0; index < 5; index += 1) {
+      run(sandbox, writePayload(sandbox, { toolInput: { new_string: "base" } }));
+    }
+    const denied = run(sandbox, writePayload(sandbox, { toolName, filePath: path.join(sandbox.workDir, filePath), toolInput }));
+    assert.strictEqual(JSON.parse(denied.stdout).hookSpecificOutput.permissionDecision, "deny");
+    assert.strictEqual(readAuditRecords(sandbox).filter((record) => record.event === "tail-allowed").length, 0);
+  }
+});
+
+test("tail allowance exhausts per window and resets after dispatch", (t) => {
+  const sandbox = makeSandbox(t);
+  run(sandbox, dispatchPayload(sandbox, { subagentType: "fusion:fast-worker" }));
+  for (let index = 0; index < 5; index += 1) {
+    run(sandbox, writePayload(sandbox, { toolInput: { new_string: "base" } }));
+  }
+  for (let index = 0; index < 3; index += 1) {
+    const tail = run(sandbox, writePayload(sandbox, { toolInput: { new_string: "finish" } }));
+    assert.strictEqual(JSON.parse(tail.stdout).hookSpecificOutput.permissionDecision, "allow");
+  }
+  const denied = run(sandbox, writePayload(sandbox, { toolInput: { new_string: "finish" } }));
   assert.strictEqual(JSON.parse(denied.stdout).hookSpecificOutput.permissionDecision, "deny");
 
-  const recovered = runRaw(sandbox, dispatchPayload(sandbox, { subagentType: "fusion:fast-worker", description: "recover the missing launch" }));
+  run(sandbox, dispatchPayload(sandbox, { subagentType: "fusion:fast-worker" }));
+  for (let index = 0; index < 5; index += 1) {
+    run(sandbox, writePayload(sandbox, { toolInput: { new_string: "base" } }));
+  }
+  const resetTail = run(sandbox, writePayload(sandbox, { toolInput: { new_string: "finish" } }));
+  assert.strictEqual(JSON.parse(resetTail.stdout).hookSpecificOutput.permissionDecision, "allow");
+  assert.match(JSON.parse(resetTail.stdout).hookSpecificOutput.permissionDecisionReason, /2 tail slots remain/i);
+});
+
+test("zero dispatch sessions soften an exhausted budget within their write and byte bounds", (t) => {
+  const sandbox = makeSandbox(t);
+  for (let index = 0; index < 5; index += 1) {
+    run(sandbox, writePayload(sandbox, { toolInput: { new_string: "a" } }));
+  }
+  const softened = run(sandbox, writePayload(sandbox, { toolName: "Write", filePath: path.join(sandbox.workDir, "new-file.txt"), toolInput: { content: "a" } }));
+  const output = JSON.parse(softened.stdout);
+  assert.strictEqual(output.hookSpecificOutput.permissionDecision, "allow");
+  assert.match(output.hookSpecificOutput.permissionDecisionReason, /zero dispatch session/i);
+  assert.match(output.hookSpecificOutput.additionalContext, /zero dispatch session/i);
+  const audit = readAuditRecords(sandbox).filter((record) => record.event === "zero-dispatch-softened");
+  assert.deepStrictEqual(audit.map((record) => [record.remainingZeroDispatchWrites, record.remainingZeroDispatchBytes]), [[4, 16378]]);
+});
+
+test("zero dispatch softening stops at its configured write and byte bounds", (t) => {
+  const writeSandbox = makeSandbox(t);
+  const writeEnv = { FUSION_INLINE_ZERO_DISPATCH_WRITES: "6" };
+  for (let index = 0; index < 6; index += 1) {
+    run(writeSandbox, writePayload(writeSandbox, { toolName: "Write", filePath: path.join(writeSandbox.workDir, `write-${index}.txt`), toolInput: { content: "a" } }), writeEnv);
+  }
+  const writeDenied = run(writeSandbox, writePayload(writeSandbox, { toolName: "Write", filePath: path.join(writeSandbox.workDir, "write-7.txt"), toolInput: { content: "a" } }), writeEnv);
+  assert.strictEqual(JSON.parse(writeDenied.stdout).hookSpecificOutput.permissionDecision, "deny");
+
+  const byteSandbox = makeSandbox(t);
+  const byteEnv = { FUSION_INLINE_ZERO_DISPATCH_MAX_BYTES: "7" };
+  for (let index = 0; index < 6; index += 1) {
+    run(byteSandbox, writePayload(byteSandbox, { toolName: "Write", filePath: path.join(byteSandbox.workDir, `byte-${index}.txt`), toolInput: { content: "a" } }), byteEnv);
+  }
+  const byteDenied = run(byteSandbox, writePayload(byteSandbox, { toolName: "Write", filePath: path.join(byteSandbox.workDir, "byte-7.txt"), toolInput: { content: "a" } }), byteEnv);
+  assert.strictEqual(JSON.parse(byteDenied.stdout).hookSpecificOutput.permissionDecision, "deny");
+});
+
+test("tail allowance environment overrides apply and zero disables it", (t) => {
+  for (const { env, newString, expected } of [
+    { env: { FUSION_INLINE_TAIL_MAX_BYTES: "1" }, newString: "xx", expected: "deny" },
+    { env: { FUSION_INLINE_TAIL_ALLOWANCE: "0" }, newString: "x", expected: "deny" },
+    { env: { FUSION_INLINE_TAIL_ALLOWANCE: "1" }, newString: "x", expected: "allow" }
+  ]) {
+    const sandbox = makeSandbox(t);
+    run(sandbox, dispatchPayload(sandbox, { subagentType: "fusion:fast-worker" }), env);
+    for (let index = 0; index < 5; index += 1) {
+      run(sandbox, writePayload(sandbox, { toolInput: { new_string: "base" } }), env);
+    }
+    const result = run(sandbox, writePayload(sandbox, { toolInput: { new_string: newString } }), env);
+    assert.strictEqual(JSON.parse(result.stdout).hookSpecificOutput.permissionDecision, expected);
+  }
+});
+
+test("a PostToolUse-only dispatch recovers a missing launch and reopens an exhausted write budget", (t) => {
+  const sandbox = makeSandbox(t);
+  const strictEnv = { FUSION_INLINE_ZERO_DISPATCH_WRITES: "0" };
+  for (let index = 0; index < 5; index += 1) {
+    run(sandbox, writePayload(sandbox), strictEnv);
+  }
+  const denied = run(sandbox, writePayload(sandbox), strictEnv);
+  assert.strictEqual(JSON.parse(denied.stdout).hookSpecificOutput.permissionDecision, "deny");
+
+  const recovered = runRaw(sandbox, dispatchPayload(sandbox, { subagentType: "fusion:fast-worker", description: "recover the missing launch" }), strictEnv);
   assert.strictEqual(recovered.status, 0);
   assert.strictEqual(recovered.stdout, "");
   assert.strictEqual(recovered.stderr, "");
@@ -264,7 +375,7 @@ test("a PostToolUse-only dispatch recovers a missing launch and reopens an exhau
     }
   ]);
 
-  const allowed = run(sandbox, writePayload(sandbox));
+  const allowed = run(sandbox, writePayload(sandbox), strictEnv);
   assert.strictEqual(allowed.stdout, "");
   assert.strictEqual(readState(sandbox, "session-1").writesSinceDispatch, 1);
 });
@@ -562,16 +673,17 @@ test("solo launch waves re-nudge at consecutive narrow streaks two and four", (t
 
 test("an Agent PreToolUse attempt does not reset the write window before dispatch succeeds", (t) => {
   const sandbox = makeSandbox(t);
+  const strictEnv = { FUSION_INLINE_ZERO_DISPATCH_WRITES: "0" };
   for (let index = 0; index < 5; index += 1) {
-    run(sandbox, writePayload(sandbox));
+    run(sandbox, writePayload(sandbox), strictEnv);
   }
   const attempted = dispatchPayload(sandbox, { subagentType: "fusion:fast-worker" });
   attempted.hook_event_name = "PreToolUse";
-  run(sandbox, attempted);
+  run(sandbox, attempted, strictEnv);
 
   assert.deepStrictEqual(readState(sandbox, "session-1").dispatches, {});
   assert.strictEqual(readState(sandbox, "session-1").dispatchLog[0].phase, "launched");
-  const denied = run(sandbox, writePayload(sandbox));
+  const denied = run(sandbox, writePayload(sandbox), strictEnv);
   assert.strictEqual(JSON.parse(denied.stdout).hookSpecificOutput.permissionDecision, "deny");
 });
 
@@ -705,13 +817,14 @@ test("audit retains writes whose paths cannot be safely recorded", (t) => {
 
 test("enforcement audit records omit unsafe paths", (t) => {
   const sandbox = makeSandbox(t);
+  const strictEnv = { FUSION_INLINE_ZERO_DISPATCH_WRITES: "0" };
   const pathSecret = `sk-${"z".repeat(40)}`;
   for (let index = 0; index < 4; index += 1) {
-    run(sandbox, writePayload(sandbox));
+    run(sandbox, writePayload(sandbox), strictEnv);
   }
   const unsafeWrite = writePayload(sandbox, { filePath: path.join(sandbox.workDir, pathSecret) });
-  run(sandbox, unsafeWrite);
-  run(sandbox, unsafeWrite);
+  run(sandbox, unsafeWrite, strictEnv);
+  run(sandbox, unsafeWrite, strictEnv);
 
   const enforcement = readAuditRecords(sandbox).filter((record) => record.event === "warn" || record.event === "deny");
   assert.strictEqual(enforcement.length, 2);
@@ -917,6 +1030,17 @@ test("an invalid FUSION_LOCK_TIMEOUT_MS falls back to the default", () => {
   assert.strictEqual(resolveLockTimeoutMs({ FUSION_LOCK_TIMEOUT_MS: "1.5" }), DEFAULT_LOCK_TIMEOUT_MS);
 });
 
+test("inline relief environment values accept overrides, preserve zero, and reject invalid values", () => {
+  assert.strictEqual(resolveTailMaxBytes({ FUSION_INLINE_TAIL_MAX_BYTES: "512" }), 512);
+  assert.strictEqual(resolveTailAllowance({ FUSION_INLINE_TAIL_ALLOWANCE: "0" }), 0);
+  assert.strictEqual(resolveZeroDispatchMaxBytes({ FUSION_INLINE_ZERO_DISPATCH_MAX_BYTES: "8192" }), 8192);
+  assert.strictEqual(resolveZeroDispatchWrites({ FUSION_INLINE_ZERO_DISPATCH_WRITES: "0" }), 0);
+  assert.strictEqual(resolveTailMaxBytes({ FUSION_INLINE_TAIL_MAX_BYTES: "invalid" }), 1024);
+  assert.strictEqual(resolveTailAllowance({ FUSION_INLINE_TAIL_ALLOWANCE: "-1" }), 3);
+  assert.strictEqual(resolveZeroDispatchMaxBytes({ FUSION_INLINE_ZERO_DISPATCH_MAX_BYTES: "1.5" }), 16384);
+  assert.strictEqual(resolveZeroDispatchWrites({ FUSION_INLINE_ZERO_DISPATCH_WRITES: "not-a-number" }), 10);
+});
+
 test("FUSION_INLINE_WRITE_BUDGET overrides the default threshold", (t) => {
   const sandbox = makeSandbox(t);
   const extraEnv = { FUSION_INLINE_WRITE_BUDGET: "2" };
@@ -970,7 +1094,7 @@ test("audit appends after a malformed trailing line and readers skip only the da
 
 test("audit rotates by size without losing valid enforcement records", (t) => {
   const sandbox = makeSandbox(t);
-  const extraEnv = { FUSION_INLINE_GUARD_AUDIT_MAX_BYTES: "1", FUSION_INLINE_GUARD_AUDIT_MAX_FILES: "10" };
+  const extraEnv = { FUSION_INLINE_GUARD_AUDIT_MAX_BYTES: "1", FUSION_INLINE_GUARD_AUDIT_MAX_FILES: "10", FUSION_INLINE_ZERO_DISPATCH_WRITES: "0" };
   for (let index = 0; index < 6; index += 1) {
     run(sandbox, writePayload(sandbox), extraEnv);
   }
@@ -1140,6 +1264,52 @@ test("advisory mode warns on no-op Bash true without denying when workers are in
   assert.strictEqual(warnings.length, 1);
   assert.strictEqual(warnings[0].tool, "Bash");
   assert.strictEqual(warnings[0].mode, "advisory");
+});
+
+test("advisory heartbeats emit once for unchanged state and audit suppressed repeats", (t) => {
+  const sandbox = makeSandbox(t);
+  seedInFlightWorker(sandbox);
+  const extraEnv = { ...workerStateEnv(sandbox), FUSION_INLINE_GUARD_MODE: "advisory" };
+
+  const first = run(sandbox, bashPayload(sandbox, { command: "true" }), extraEnv);
+  assert.strictEqual(JSON.parse(first.stdout).hookSpecificOutput.permissionDecision, "allow");
+  const repeated = run(sandbox, bashPayload(sandbox, { command: "true" }), extraEnv);
+  assert.strictEqual(repeated.stdout, "");
+
+  const warnings = readAuditRecords(sandbox).filter((record) => record.event === "warn" && record.tool === "Bash");
+  assert.strictEqual(warnings.length, 2);
+  assert.strictEqual(Object.hasOwn(warnings[0], "suppressed"), false);
+  assert.strictEqual(warnings[1].suppressed, true);
+});
+
+test("advisory heartbeat state changes re-arm its advisory", (t) => {
+  const sandbox = makeSandbox(t);
+  seedInFlightWorker(sandbox);
+  const extraEnv = { ...workerStateEnv(sandbox), FUSION_INLINE_GUARD_MODE: "advisory" };
+
+  assert.strictEqual(JSON.parse(run(sandbox, bashPayload(sandbox, { command: "true" }), extraEnv).stdout).hookSpecificOutput.permissionDecision, "allow");
+  assert.strictEqual(run(sandbox, writePayload(sandbox), extraEnv).stdout, "");
+  const rearmed = run(sandbox, bashPayload(sandbox, { command: "true" }), extraEnv);
+  assert.strictEqual(JSON.parse(rearmed.stdout).hookSpecificOutput.permissionDecision, "allow");
+
+  const warnings = readAuditRecords(sandbox).filter((record) => record.event === "warn" && record.tool === "Bash");
+  assert.strictEqual(warnings.length, 2);
+  assert.ok(warnings.every((record) => !Object.hasOwn(record, "suppressed")));
+});
+
+test("enforced heartbeats remain denials on repeated unchanged state", (t) => {
+  const sandbox = makeSandbox(t);
+  seedInFlightWorker(sandbox);
+  const extraEnv = workerStateEnv(sandbox);
+
+  const first = run(sandbox, bashPayload(sandbox, { command: "true" }), extraEnv);
+  const repeated = run(sandbox, bashPayload(sandbox, { command: "true" }), extraEnv);
+  assert.strictEqual(JSON.parse(first.stdout).hookSpecificOutput.permissionDecision, "deny");
+  assert.strictEqual(JSON.parse(repeated.stdout).hookSpecificOutput.permissionDecision, "deny");
+
+  const denials = readAuditRecords(sandbox).filter((record) => record.event === "deny" && record.tool === "Bash");
+  assert.strictEqual(denials.length, 2);
+  assert.ok(denials.every((record) => !Object.hasOwn(record, "suppressed")));
 });
 
 test("no-op Bash deny audits an enforcement event for Bash on the main lane", (t) => {
