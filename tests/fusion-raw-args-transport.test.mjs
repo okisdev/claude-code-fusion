@@ -17,11 +17,10 @@ function sandbox(t) {
 }
 
 test("raw argument parsing preserves quoted values without evaluating shell syntax", () => {
-  const raw = '--record-acceptance task-safe rejected --reason "literal $(touch /tmp/never); `id`; $HOME" --json';
+  const raw = '--record task-safe=rejected --reason "literal $(touch /tmp/never); `id`; $HOME" --json';
   assert.deepStrictEqual(splitRawArgs(raw), [
-    "--record-acceptance",
-    "task-safe",
-    "rejected",
+    "--record",
+    "task-safe=rejected",
     "--reason",
     "literal $(touch /tmp/never); `id`; $HOME",
     "--json"
@@ -145,9 +144,12 @@ test("the stats CLI forwards --accept-failed-transport from staged arguments unc
   const created = spawnSync(process.execPath, [SCRIPT, "transport-create"], { cwd: directory, env, encoding: "utf8" });
   assert.strictEqual(created.status, 0, created.stderr);
   const transport = JSON.parse(created.stdout);
-  fs.writeFileSync(transport.file, `--record-acceptance ${jobId} accepted --accept-failed-transport`);
+  const jobsDirectory = path.join(env.FUSION_CODEX_STATE, "workspace", "jobs");
+  fs.mkdirSync(jobsDirectory, { recursive: true });
+  fs.writeFileSync(path.join(jobsDirectory, `${jobId}.json`), JSON.stringify({ id: jobId, workspaceRoot: directory, status: "error" }));
+  fs.writeFileSync(transport.file, `--record ${jobId}=accepted --accept-failed-transport`);
 
   const result = spawnSync(process.execPath, [SCRIPT, "--raw-args-token", transport.token], { cwd: directory, env, encoding: "utf8" });
   assert.strictEqual(result.status, 0, result.stderr);
-  assert.deepStrictEqual(JSON.parse(fs.readFileSync(argsFile, "utf8")), ["record-acceptance", "--job-id", jobId, "--acceptance", "accepted", "--source", "collector", "--accept-failed-transport"]);
+  assert.deepStrictEqual(JSON.parse(fs.readFileSync(argsFile, "utf8")), ["record-acceptance", "--job-id", jobId, "--acceptance", "accepted", "--source", "main-loop", "--accept-failed-transport"]);
 });

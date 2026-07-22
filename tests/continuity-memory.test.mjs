@@ -191,7 +191,7 @@ test("Fusion routed briefs reject memory and never receive automatic continuity"
   assert.equal(grokInvocations(sandbox).length, 2);
 });
 
-test("legacy review, stop gate, and best-of-n jobs mislabeled as tasks are never resume-last candidates", (t) => {
+test("legacy review and stop gate jobs mislabeled as tasks are never resume-last candidates", (t) => {
   const sandbox = makeSandbox(t);
   const env = envFor(sandbox, { CLAUDE_CODE_SESSION_ID: "claude-current" });
   seedFinishedJob(sandbox, {
@@ -204,13 +204,6 @@ test("legacy review, stop gate, and best-of-n jobs mislabeled as tasks are never
     sessionId: "33333333-3333-7333-8333-333333333333",
     request: { maxTurns: 15 }
   });
-  seedFinishedJob(sandbox, {
-    jobClass: "task",
-    mode: "write",
-    sessionId: "44444444-4444-7444-8444-444444444444",
-    request: { bestOfN: 2 }
-  });
-
   const consult = runTask(sandbox, ["--resume-last", "continue consult"], env);
   assert.notEqual(consult.status, 0);
   assert.match(consult.stderr, /No finished consult grok task/);
@@ -218,37 +211,7 @@ test("legacy review, stop gate, and best-of-n jobs mislabeled as tasks are never
   assert.notEqual(write.status, 0);
   assert.match(write.stderr, /No finished write grok task/);
   assert.equal(grokInvocations(sandbox).length, 0);
-  assert.equal(jobRecords(sandbox.dataDir).length, 3);
-});
-
-test("best-of-n rejects resume and memory before creating a job", (t) => {
-  const resumeSandbox = makeSandbox(t);
-  const resume = runTask(
-    resumeSandbox,
-    [
-      "--best-of-n",
-      "2",
-      "--resume",
-      "55555555-5555-7555-8555-555555555555",
-      "tournament"
-    ],
-    envFor(resumeSandbox)
-  );
-  assert.notEqual(resume.status, 0);
-  assert.match(resume.stderr, /best-of-n always starts fresh/);
-  assert.equal(jobRecords(resumeSandbox.dataDir).length, 0);
-  assert.equal(grokInvocations(resumeSandbox).length, 0);
-
-  const memorySandbox = makeSandbox(t);
-  const memory = runTask(
-    memorySandbox,
-    ["--best-of-n", "2", "--memory", "tournament"],
-    envFor(memorySandbox)
-  );
-  assert.notEqual(memory.status, 0);
-  assert.match(memory.stderr, /best-of-n always disables cross-session memory/);
-  assert.equal(jobRecords(memorySandbox.dataDir).length, 0);
-  assert.equal(grokInvocations(memorySandbox).length, 0);
+  assert.equal(jobRecords(sandbox.dataDir).length, 2);
 });
 
 test("memory is disabled by default and explicit --memory enables it in the Grok child", (t) => {

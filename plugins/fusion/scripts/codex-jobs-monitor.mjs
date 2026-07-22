@@ -20,9 +20,7 @@ import {
   workspaceRootsShareRepository
 } from "./fusion-stats.mjs";
 
-const CURRENT_TERMINAL_STATUSES = new Set(["done", "error", "cancelled"]);
-const LEGACY_TERMINAL_STATUSES = new Set(["completed", "failed"]);
-const TERMINAL_STATUSES = new Set([...CURRENT_TERMINAL_STATUSES, ...LEGACY_TERMINAL_STATUSES]);
+const TERMINAL_STATUSES = new Set(["done", "error", "cancelled"]);
 const DEFAULT_POLL_INTERVAL_MS = 15000;
 const INTERVAL_ENV = "CODEX_JOBS_MONITOR_INTERVAL_MS";
 const PS_COMMAND_ENV = "CODEX_JOBS_MONITOR_PS_COMMAND";
@@ -544,18 +542,15 @@ function maybeCaptureModelAudit(record, seenJobIds, sidecarPath, env = process.e
 
 function terminalObservations(record, env = process.env, rolloutIndex = null) {
   const workspaceRoot = record?.workspaceRoot;
-  const usesLegacyContract = LEGACY_TERMINAL_STATUSES.has(record?.status) || (record?.status === "cancelled" && !record?.finishedAt && record?.completedAt);
-  const rollout = usesLegacyContract
-    ? inspectCodexRollout(record, env, rolloutIndex)
-    : {
-        availability: "unavailable",
-        reason: record?.tokenUsageUnavailableReason ?? "job_record_unavailable",
-        threadId: record?.threadId ?? record?.result?.threadId ?? null,
-        turnId: record?.turnId ?? record?.result?.turnId ?? null,
-        model: null,
-        effort: null,
-        tokenUsage: null
-      };
+  const rollout = {
+    availability: "unavailable",
+    reason: record?.tokenUsageUnavailableReason ?? "job_record_unavailable",
+    threadId: record?.threadId ?? record?.result?.threadId ?? null,
+    turnId: record?.turnId ?? record?.result?.turnId ?? null,
+    model: null,
+    effort: null,
+    tokenUsage: null
+  };
   const resolvedModel = nonEmptyRequestField(record?.resolvedModel) ? String(record.resolvedModel).trim() : null;
   const resolvedEffort = nonEmptyRequestField(record?.resolvedEffort) ? String(record.resolvedEffort).trim() : null;
   const requestedModel = nonEmptyRequestField(record?.request?.model) ? String(record.request.model).trim() : null;
@@ -660,34 +655,6 @@ function quarantineMalformed(file) {
   return quarantine;
 }
 
-function legacyTerminalRecord(key, workspaceRoot) {
-  const separator = key.lastIndexOf(":");
-  if (separator <= 0) {
-    return null;
-  }
-  const transportStatus = key.slice(separator + 1);
-  if (!TERMINAL_STATUSES.has(transportStatus)) {
-    return null;
-  }
-  return {
-    schemaVersion: 1,
-    jobId: key.slice(0, separator),
-    transportStatus,
-    workspaceRoot,
-    repositoryKey: fusionRepositoryKey(workspaceRoot),
-    sessionId: null,
-    kind: "unknown",
-    createdAt: null,
-    startedAt: null,
-    finishedAt: null,
-    observedAt: null,
-    model: null,
-    effort: null,
-    tokenUsage: null,
-    tokenUsageAvailability: "unavailable"
-  };
-}
-
 function loadAnnounced(file, workspaceRoot) {
   let text;
   try {
@@ -712,14 +679,6 @@ function loadAnnounced(file, workspaceRoot) {
           ...record,
           repositoryKey: record.repositoryKey ?? fusionRepositoryKey(workspaceRoot)
         });
-      }
-    }
-    for (const key of announced) {
-      if (!records.has(key)) {
-        const record = legacyTerminalRecord(key, workspaceRoot);
-        if (record) {
-          records.set(key, record);
-        }
       }
     }
     return { exists: true, malformed: false, needsMigration: Array.isArray(raw) || raw?.schemaVersion !== TERMINAL_LEDGER_SCHEMA_VERSION, announced, records };

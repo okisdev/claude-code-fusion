@@ -14,6 +14,14 @@
   if (argsFile) {
     fs.appendFileSync(argsFile, JSON.stringify(process.argv.slice(2)) + "\n");
   }
+  if (process.argv[2] === "doctor") {
+    if (process.env.FAKE_GROK_DOCTOR_UNAVAILABLE === "1") {
+      process.stderr.write("error: unrecognized subcommand 'doctor'\n");
+      process.exit(2);
+    }
+    process.stdout.write("grok doctor: environment diagnostics\n");
+    process.exit(0);
+  }
   if (process.env.FAKE_GROK_ENV_FILE) {
     const trackedEnv = Object.fromEntries(
       Object.entries(process.env)

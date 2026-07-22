@@ -5,7 +5,7 @@ import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { fileURLToPath, pathToFileURL } from "node:url";
+import { fileURLToPath } from "node:url";
 import {
   FILE_ENGINE_DESCRIPTORS,
   STATS_PROVIDER_REGISTRY,
@@ -15,7 +15,6 @@ import {
   buildFusionStats,
   buildSessionReport,
   buildTraceReport,
-  acceptanceSidecarPath,
   claudeWorkerStats,
   codexStats,
   fileBasedEngineStats,
@@ -26,7 +25,6 @@ import {
   normalizeCollectionMethod,
   normalizeCodexTokenUsage,
   pruneDeadWorkspaces,
-  recordCodexAcceptance,
   resolveCodexJobEffort,
   resolveCodexJobModel,
   resolveGitRepositoryCommonDir,
@@ -37,9 +35,8 @@ import {
   workspaceRootsShareRepository
 } from "../plugins/fusion/scripts/fusion-stats.mjs";
 import { resolveStateDir as guardResolveStateDir, stateFile as guardStateFile } from "../plugins/fusion/scripts/inline-delegation-guard.mjs";
-import { resolveCodexStateRoots } from "../plugins/fusion/scripts/lib/codex-state-roots.mjs";
 import { createRawArgsTransport } from "../plugins/fusion/scripts/lib/raw-args-transport.mjs";
-import { createWorkerRecord, readWorkerRecord, recordWorkerAcceptance, updateWorkerRecord, workerRecordFile } from "../plugins/fusion/scripts/lib/worker-state.mjs";
+import { applyQueuedVerdict, createWorkerRecord, readWorkerRecord, recordWorkerAcceptance, updateWorkerRecord, workerRecordFile } from "../plugins/fusion/scripts/lib/worker-state.mjs";
 import { gitIsolation } from "./lib/git-fixture.mjs";
 
 const SCRIPT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "plugins", "fusion", "scripts", "fusion-stats.mjs");
@@ -170,12 +167,6 @@ function writeCacheCompanion(home, engine, version, modifiedAt) {
   return companion;
 }
 
-function fusionStatsWithoutSiblings(root) {
-  const scripts = path.join(root, "fixture", "plugins", "fusion", "scripts");
-  fs.cpSync(path.dirname(SCRIPT), scripts, { recursive: true });
-  return path.join(scripts, "fusion-stats.mjs");
-}
-
 test("acceptance companion resolvers use the newest cache entry and ignore invalid overrides", (t) => {
   const dir = sandbox(t);
   const home = path.join(dir, "home");
@@ -198,41 +189,6 @@ test("acceptance companion resolvers use the newest cache entry and ignore inval
   assert.strictEqual(newestGrokCompanion({ HOME: home, FUSION_GROK_COMPANION: grokDirectory }), newerGrok);
   assert.strictEqual(newestCodexCompanion({ HOME: home, FUSION_CODEX_COMPANION: "codex-companion.mjs" }), newerCodex);
   assert.strictEqual(newestCodexCompanion({ HOME: home, FUSION_CODEX_COMPANION: codexDirectory }), newerCodex);
-});
-
-test("acceptance recording preserves unavailable companion behavior without repository siblings", async (t) => {
-  const dir = sandbox(t);
-  const fixture = await import(`${pathToFileURL(fusionStatsWithoutSiblings(dir)).href}?fixture=${Date.now()}`);
-  const home = path.join(dir, "home");
-  const grokData = path.join(dir, "grok-data");
-  const grokJobId = "a".repeat(32);
-  writeGrokJob(grokData, dir, grokJobId, { status: "done", mode: "consult" });
-
-  assert.strictEqual(fixture.newestGrokCompanion({ HOME: home }), null);
-  assert.strictEqual(fixture.newestCodexCompanion({ HOME: home }), null);
-  assert.throws(
-    () => fixture.main(["--record-acceptance", grokJobId, "accepted"], { cwd: dir, env: { HOME: home, FUSION_CODEX_STATE: path.join(dir, "missing-codex"), GROK_COMPANION_DATA: grokData } }),
-    fixture.GrokPluginUpgradeRequiredError
-  );
-
-  const codexState = path.join(dir, "codex-state");
-  const fusionData = path.join(dir, "fusion-data");
-  const codexJobId = "b".repeat(32);
-  let stdout = "";
-  let stderr = "";
-  writeCodexJob(codexState, dir, codexJobId, { status: "done", jobClass: "task" });
-  const observation = fixture.main(
-    ["--record-acceptance", codexJobId, "accepted"],
-    {
-      cwd: dir,
-      env: { HOME: home, FUSION_CODEX_STATE: codexState, FUSION_DATA_DIR: fusionData, GROK_COMPANION_DATA: path.join(dir, "missing-grok") },
-      stdout: { write(chunk) { stdout += chunk; } },
-      stderr: { write(chunk) { stderr += chunk; } }
-    }
-  );
-  assert.strictEqual(observation.jobId, codexJobId);
-  assert.match(stdout, new RegExp(`Recorded accepted for Codex job ${codexJobId}`));
-  assert.match(stderr, /Warning: Codex job record was not updated because the companion or subcommand is unavailable/);
 });
 
 function createSiblingWorktree(root) {
@@ -258,92 +214,25 @@ test("aggregates codex job state scoped to the workspace", (t) => {
   const dir = sandbox(t);
   const stateRoot = path.join(dir, "state");
   writeCodexJob(stateRoot, dir, "task-a", {
-    status: "completed",
+    status: "done",
     jobClass: "task",
     createdAt: "2026-07-02T06:00:00.000Z",
     startedAt: "2026-07-02T06:00:00.000Z",
-    completedAt: "2026-07-02T06:00:10.000Z"
+    finishedAt: "2026-07-02T06:00:10.000Z"
   });
-  writeCodexJob(stateRoot, "/somewhere/else", "task-b", { status: "failed", jobClass: "task", createdAt: "2026-07-02T05:00:00.000Z" });
+  writeCodexJob(stateRoot, "/somewhere/else", "task-b", { status: "error", jobClass: "task", createdAt: "2026-07-02T05:00:00.000Z" });
 
   const scoped = run({ cwd: dir, codexState: stateRoot }, ["--json"]);
   assert.strictEqual(scoped.status, 0, scoped.stderr);
   const scopedData = JSON.parse(scoped.stdout).codex;
   assert.strictEqual(scopedData.totalJobs, 1);
-  assert.strictEqual(scopedData.byStatus.completed, 1);
+  assert.strictEqual(scopedData.byStatus.done, 1);
   assert.strictEqual(scopedData.meanWallClockSeconds, 10);
 
   const all = run({ cwd: dir, codexState: stateRoot }, ["--all", "--json"]);
   const allData = JSON.parse(all.stdout).codex;
   assert.strictEqual(allData.totalJobs, 2);
-  assert.strictEqual(allData.byStatus.failed, 1);
-});
-
-test("Codex stats aggregate canonical and legacy roots without mutating legacy state", (t) => {
-  const dir = sandbox(t);
-  const [canonicalState, legacyState] = resolveCodexStateRoots({ HOME: dir, FUSION_CODEX_INCLUDE_LEGACY: "1" });
-  writeCodexJob(canonicalState, dir, "canonical", { status: "done", jobClass: "task", createdAt: "2026-07-14T01:00:00.000Z", finishedAt: "2026-07-14T01:00:01.000Z" });
-  const legacyFile = writeCodexJob(legacyState, dir, "legacy", { status: "completed", jobClass: "task", createdAt: "2026-07-13T01:00:00.000Z", completedAt: "2026-07-13T01:00:01.000Z" });
-  const before = fs.readFileSync(legacyFile, "utf8");
-  const result = codexStats({ all: true, env: { HOME: dir, FUSION_DATA_DIR: path.join(dir, "fusion-data"), FUSION_CODEX_INCLUDE_LEGACY: "1" }, cwd: dir });
-  assert.strictEqual(result.available, true);
-  assert.strictEqual(result.totalJobs, 2);
-  assert.strictEqual(result.byStatus.done, 1);
-  assert.strictEqual(result.byStatus.completed, 1);
-  assert.strictEqual(fs.readFileSync(legacyFile, "utf8"), before);
-});
-
-test("default Codex stats ignore legacy history unless explicitly opted in", (t) => {
-  const dir = sandbox(t);
-  const legacyState = path.join(dir, ".claude", "plugins", "data", "codex-openai-codex", "state");
-  writeCodexJob(legacyState, dir, "old", { status: "completed", jobClass: "task", createdAt: "2026-07-13T01:00:00.000Z", completedAt: "2026-07-13T01:00:01.000Z" });
-  assert.deepStrictEqual(resolveCodexStateRoots({ HOME: dir }), [path.join(dir, ".claude", "plugins", "data", "codex-claude-code-fusion", "state")]);
-  assert.strictEqual(codexStats({ all: true, env: { HOME: dir, FUSION_DATA_DIR: path.join(dir, "fusion-data") }, cwd: dir }).available, false);
-  assert.strictEqual(codexStats({ all: true, env: { HOME: dir, FUSION_DATA_DIR: path.join(dir, "fusion-data"), FUSION_CODEX_INCLUDE_LEGACY: "1" }, cwd: dir }).totalJobs, 1);
-});
-
-test("Codex stats deduplicate a job mirrored across canonical and legacy roots", (t) => {
-  const dir = sandbox(t);
-  const [canonicalState, legacyState] = resolveCodexStateRoots({ HOME: dir, FUSION_CODEX_INCLUDE_LEGACY: "1" });
-  const fields = { status: "completed", jobClass: "task", createdAt: "2026-07-14T01:00:00.000Z", completedAt: "2026-07-14T01:00:01.000Z" };
-  writeCodexJob(canonicalState, dir, "mirrored", fields);
-  writeCodexJob(legacyState, dir, "mirrored", fields);
-  const result = codexStats({ all: true, env: { HOME: dir, FUSION_DATA_DIR: path.join(dir, "fusion-data"), FUSION_CODEX_INCLUDE_LEGACY: "1" }, cwd: dir });
-  assert.strictEqual(result.available, true);
-  assert.strictEqual(result.totalJobs, 1);
-});
-
-test("Codex stats collapse stale legacy running mirrors for a deleted workspace", (t) => {
-  const dir = sandbox(t);
-  const [, legacyState] = resolveCodexStateRoots({ HOME: dir, FUSION_CODEX_INCLUDE_LEGACY: "1" });
-  const deletedWorkspace = path.join(dir, "deleted-worktree");
-  writeCodexJob(legacyState, deletedWorkspace, "legacy-mirror", { status: "running", jobClass: "task", createdAt: "2026-07-14T01:00:00.000Z" });
-  writeCodexJob(legacyState, deletedWorkspace, "legacy-mirror", { status: "completed", jobClass: "task", createdAt: "2026-07-14T01:00:00.000Z", completedAt: "2026-07-14T01:00:01.000Z" });
-  const result = codexStats({ all: true, env: { HOME: dir, FUSION_DATA_DIR: path.join(dir, "fusion-data"), FUSION_CODEX_INCLUDE_LEGACY: "1" }, cwd: dir });
-  assert.strictEqual(result.available, true);
-  assert.strictEqual(result.totalJobs, 1);
-  assert.strictEqual(result.byStatus.completed, 1);
-  assert.strictEqual(result.pendingTransportJobs, 0);
-});
-
-test("the compatibility state override retains legacy stale mirror semantics", (t) => {
-  const dir = sandbox(t);
-  const stateRoot = path.join(dir, "custom-legacy-state");
-  const deletedWorkspace = path.join(dir, "deleted-worktree");
-  writeCodexJob(stateRoot, deletedWorkspace, "legacy-mirror", { status: "running", jobClass: "task", createdAt: "2026-07-14T01:00:00.000Z" });
-  writeCodexJob(stateRoot, deletedWorkspace, "legacy-mirror", { status: "completed", jobClass: "task", createdAt: "2026-07-14T01:00:00.000Z", completedAt: "2026-07-14T01:00:01.000Z" });
-  const result = codexStats({ all: true, env: { HOME: dir, FUSION_DATA_DIR: path.join(dir, "fusion-data"), FUSION_CODEX_STATE_DIR: stateRoot }, cwd: dir });
-  assert.strictEqual(result.totalJobs, 1);
-  assert.strictEqual(result.byStatus.completed, 1);
-  assert.strictEqual(result.pendingTransportJobs, 0);
-});
-
-test("an explicit Codex state override excludes legacy home stats", (t) => {
-  const dir = sandbox(t);
-  const [, legacyState] = resolveCodexStateRoots({ HOME: dir, FUSION_CODEX_INCLUDE_LEGACY: "1" });
-  writeCodexJob(legacyState, dir, "legacy", { status: "completed", jobClass: "task", createdAt: "2026-07-14T01:00:00.000Z" });
-  const result = codexStats({ all: true, env: { HOME: dir, FUSION_DATA_DIR: path.join(dir, "fusion-data"), FUSION_CODEX_STATE: path.join(dir, "isolated-state") }, cwd: dir });
-  assert.strictEqual(result.available, false);
+  assert.strictEqual(allData.byStatus.error, 1);
 });
 
 test("aggregates the canonical Codex lifecycle and direct token usage", (t) => {
@@ -478,10 +367,8 @@ test("scopes Codex jobs by Git repository identity across sibling worktrees", (t
   const initialized = spawnSync("git", ["init", "-q"], { cwd: unrelated, encoding: "utf8" });
   assert.strictEqual(initialized.status, 0, initialized.stderr);
   const stateRoot = path.join(dir, "state");
-  writeCodexJob(stateRoot, sibling, "sibling-task", { status: "completed", jobClass: "task", createdAt: "2026-07-02T06:00:00.000Z" });
-  writeCodexJob(stateRoot, unrelated, "unrelated-task", { status: "completed", jobClass: "task", createdAt: "2026-07-02T06:01:00.000Z" });
-  const parentKey = createHash("sha256").update(dir).digest("hex").slice(0, 16);
-  fs.writeFileSync(path.join(stateRoot, `codex-jobs-monitor-announced.parent.${parentKey}.json`), `${JSON.stringify(["parent-task:completed"])}\n`);
+  writeCodexJob(stateRoot, sibling, "sibling-task", { status: "done", jobClass: "task", createdAt: "2026-07-02T06:00:00.000Z" });
+  writeCodexJob(stateRoot, unrelated, "unrelated-task", { status: "done", jobClass: "task", createdAt: "2026-07-02T06:01:00.000Z" });
 
   assert.strictEqual(resolveGitRepositoryCommonDir(main), resolveGitRepositoryCommonDir(sibling));
   assert.strictEqual(workspaceRootsShareRepository(main, sibling), true);
@@ -491,7 +378,7 @@ test("scopes Codex jobs by Git repository identity across sibling worktrees", (t
   assert.strictEqual(result.status, 0, result.stderr);
   const stats = JSON.parse(result.stdout).codex;
   assert.strictEqual(stats.totalJobs, 1);
-  assert.deepStrictEqual(stats.byTransportStatus, { completed: 1 });
+  assert.deepStrictEqual(stats.byTransportStatus, { done: 1 });
 });
 
 test("survives a malformed codex job file", (t) => {
@@ -502,7 +389,7 @@ test("survives a malformed codex job file", (t) => {
   fs.writeFileSync(path.join(jobsDir, "broken.json"), "{ not json");
   fs.writeFileSync(
     path.join(jobsDir, "task-ok.json"),
-    JSON.stringify({ id: "task-ok", workspaceRoot: dir, status: "completed", jobClass: "review", createdAt: "2026-07-02T06:00:00.000Z" })
+    JSON.stringify({ id: "task-ok", workspaceRoot: dir, status: "done", jobClass: "review", createdAt: "2026-07-02T06:00:00.000Z" })
   );
 
   const result = run({ cwd: dir, codexState: stateRoot }, ["--json"]);
@@ -613,11 +500,11 @@ test("codexStats matches fileBasedEngineStats with the codex descriptor", (t) =>
   const dir = sandbox(t);
   const stateRoot = path.join(dir, "state");
   writeCodexJob(stateRoot, dir, "via-wrapper", {
-    status: "completed",
+    status: "done",
     jobClass: "task",
     createdAt: "2026-07-02T06:00:00.000Z",
     startedAt: "2026-07-02T06:00:00.000Z",
-    completedAt: "2026-07-02T06:00:05.000Z"
+    finishedAt: "2026-07-02T06:00:05.000Z"
   });
   const env = { FUSION_CODEX_STATE: stateRoot, FUSION_DATA_DIR: path.join(dir, "fusion-data") };
   const viaCodex = codexStats({ env, cwd: dir });
@@ -680,13 +567,13 @@ function writeTraceFixture(dir) {
     request: { model: "grok-model", effort: "high" }
   });
   writeCodexJob(codexState, dir, "codex-approximate", {
-    status: "completed",
+    status: "done",
     jobClass: "task",
     createdAt: "2026-07-10T10:06:00.000Z",
     request: { model: "codex-model", effort: "xhigh" }
   });
   writeCodexJob(codexState, dir, "codex-outside-span", {
-    status: "completed",
+    status: "done",
     jobClass: "task",
     createdAt: "2026-07-10T11:11:00.000Z",
     request: { model: "outside-model", effort: "low" }
@@ -726,8 +613,8 @@ test("--session reports the seeded lane counters for the current session", (t) =
 test("--session scopes per-engine job counts to the current session where available", (t) => {
   const dir = sandbox(t);
   const codexState = path.join(dir, "codex-state");
-  writeCodexJob(codexState, dir, "own-job", { status: "completed", jobClass: "task", sessionId: "session-abc", createdAt: "2026-07-02T06:00:00.000Z" });
-  writeCodexJob(codexState, dir, "other-job", { status: "completed", jobClass: "task", sessionId: "session-xyz", createdAt: "2026-07-02T06:00:00.000Z" });
+  writeCodexJob(codexState, dir, "own-job", { status: "done", jobClass: "task", sessionId: "session-abc", createdAt: "2026-07-02T06:00:00.000Z" });
+  writeCodexJob(codexState, dir, "other-job", { status: "done", jobClass: "task", sessionId: "session-xyz", createdAt: "2026-07-02T06:00:00.000Z" });
 
   const grokDataDir = path.join(dir, "grok-data");
   writeGrokJob(grokDataDir, dir, "own-grok-job", { status: "done", mode: "consult", claudeSessionId: "session-abc", createdAt: "2026-07-04T00:00:00.000Z" });
@@ -741,7 +628,7 @@ test("--session scopes per-engine job counts to the current session where availa
   const data = JSON.parse(result.stdout);
   assert.strictEqual(data.engines.codex.available, true);
   assert.strictEqual(data.engines.codex.totalJobs, 1);
-  assert.deepStrictEqual(data.engines.codex.byStatus, { completed: 1 });
+  assert.deepStrictEqual(data.engines.codex.byStatus, { done: 1 });
   assert.strictEqual(data.engines.grok.available, true);
   assert.strictEqual(data.engines.grok.totalJobs, 1);
   assert.deepStrictEqual(data.engines.grok.byStatus, { done: 1 });
@@ -772,7 +659,7 @@ test("--trace joins exact Grok and approximate Codex jobs into dispatch time ord
     ["2026-07-10T10:10:00.000Z", "dispatch", "codex"]
   ]);
   assert.match(result.stdout, /grok-model@high \| done/);
-  assert.match(result.stdout, /codex-model@xhigh \| completed/);
+  assert.match(result.stdout, /codex-model@xhigh \| done/);
   assert.match(result.stdout, /codex \(approximate\)/);
   assert.doesNotMatch(result.stdout, /outside-model/);
 });
@@ -816,7 +703,7 @@ test("--trace --json returns the session timeline shape", (t) => {
     jobId: "codex-approximate",
     model: "codex-model",
     effort: "xhigh",
-    status: "completed"
+    status: "done"
   });
 });
 
@@ -862,7 +749,7 @@ test("--trace includes Codex jobs from a sibling worktree in the same repository
   const { main, sibling } = createSiblingWorktree(dir);
   const fixture = writeTraceFixture(main);
   writeCodexJob(fixture.codexState, sibling, "codex-sibling", {
-    status: "completed",
+    status: "done",
     jobClass: "task",
     createdAt: "2026-07-10T10:07:00.000Z",
     request: { model: "sibling-model", effort: "high" }
@@ -873,7 +760,7 @@ test("--trace includes Codex jobs from a sibling worktree in the same repository
     GROK_COMPANION_DATA: fixture.grokDataDir
   });
   assert.strictEqual(result.status, 0, result.stderr);
-  assert.match(result.stdout, /sibling-model@high \| completed/);
+  assert.match(result.stdout, /sibling-model@high \| done/);
 });
 
 test("--prune-dead dry run lists only workspace dirs whose every job cwd is gone", (t) => {
@@ -883,8 +770,8 @@ test("--prune-dead dry run lists only workspace dirs whose every job cwd is gone
   const goneCodexRoot = path.join(dir, "gone-codex-root");
   const goneGrokCwd = path.join(dir, "gone-grok-cwd");
 
-  writeCodexJob(codexState, goneCodexRoot, "dead-codex", { status: "completed", jobClass: "task", createdAt: "2026-07-01T00:00:00.000Z" });
-  writeCodexJob(codexState, dir, "live-codex", { status: "completed", jobClass: "task", createdAt: "2026-07-01T00:00:00.000Z" });
+  writeCodexJob(codexState, goneCodexRoot, "dead-codex", { status: "done", jobClass: "task", createdAt: "2026-07-01T00:00:00.000Z" });
+  writeCodexJob(codexState, dir, "live-codex", { status: "done", jobClass: "task", createdAt: "2026-07-01T00:00:00.000Z" });
 
   writeGrokJob(grokDataDir, goneGrokCwd, "dead-grok-1", { status: "done", mode: "consult", createdAt: "2026-07-01T00:00:00.000Z" });
   writeGrokJob(grokDataDir, goneGrokCwd, "dead-grok-2", { status: "error", mode: "consult", createdAt: "2026-07-01T00:00:00.000Z" });
@@ -917,11 +804,11 @@ test("--prune-dead --yes removes only the all-dead workspace dirs and spares liv
   const goneGrokCwd = path.join(dir, "gone-grok-cwd-2");
 
   writeCodexJob(codexState, path.join(dir, "gone-codex-root-2"), "dead-codex", {
-    status: "failed",
+    status: "error",
     jobClass: "task",
     createdAt: "2026-07-01T00:00:00.000Z"
   });
-  writeCodexJob(codexState, dir, "live-codex", { status: "completed", jobClass: "task", createdAt: "2026-07-01T00:00:00.000Z" });
+  writeCodexJob(codexState, dir, "live-codex", { status: "done", jobClass: "task", createdAt: "2026-07-01T00:00:00.000Z" });
   writeGrokJob(grokDataDir, goneGrokCwd, "dead-grok", { status: "done", mode: "consult", createdAt: "2026-07-01T00:00:00.000Z" });
   writeGrokJob(grokDataDir, dir, "live-cwd-grok", { status: "done", mode: "consult", createdAt: "2026-07-01T00:00:00.000Z" });
 
@@ -986,7 +873,7 @@ test("prune-dead treats any unreadable job record as unsafe for the whole worksp
   fs.mkdirSync(jobsDir, { recursive: true });
   fs.writeFileSync(
     path.join(jobsDir, "dead.json"),
-    JSON.stringify({ id: "dead", workspaceRoot: path.join(dir, "gone"), status: "completed" })
+    JSON.stringify({ id: "dead", workspaceRoot: path.join(dir, "gone"), status: "done" })
   );
   fs.mkdirSync(path.join(jobsDir, "unreadable.json"));
 
@@ -999,8 +886,8 @@ test("prune-dead treats any unreadable job record as unsafe for the whole worksp
 test("prune-dead requires every terminal record to carry an absolute missing cwd", (t) => {
   const dir = sandbox(t);
   const codexState = path.join(dir, "codex-state");
-  writeCodexJob(codexState, undefined, "missing-cwd", { status: "completed" });
-  writeCodexJob(codexState, "", "empty-cwd", { status: "failed" });
+  writeCodexJob(codexState, undefined, "missing-cwd", { status: "done" });
+  writeCodexJob(codexState, "", "empty-cwd", { status: "error" });
   writeCodexJob(codexState, "relative/workspace", "relative-cwd", { status: "cancelled" });
 
   const env = { FUSION_CODEX_STATE: codexState, GROK_COMPANION_DATA: path.join(dir, "missing-grok") };
@@ -1012,8 +899,8 @@ test("prune-dead requires every terminal record to carry an absolute missing cwd
 test("prune-dead revalidates directory mtime, file membership, and running state immediately before removal", (t) => {
   const dir = sandbox(t);
   const codexState = path.join(dir, "codex-state");
-  writeCodexJob(codexState, path.join(dir, "gone-a"), "dead-a", { status: "completed" });
-  writeCodexJob(codexState, path.join(dir, "gone-b"), "dead-b", { status: "failed" });
+  writeCodexJob(codexState, path.join(dir, "gone-a"), "dead-a", { status: "done" });
+  writeCodexJob(codexState, path.join(dir, "gone-b"), "dead-b", { status: "error" });
   const env = { FUSION_CODEX_STATE: codexState, GROK_COMPANION_DATA: path.join(dir, "missing-grok") };
   const candidates = findDeadWorkspaces(env).codex;
   assert.strictEqual(candidates.length, 2);
@@ -1104,23 +991,23 @@ test("codex byModel includes effort from request fields first then sidecar in JS
   const fusionData = path.join(dir, "fusion-data");
 
   writeCodexJob(stateRoot, dir, "from-request", {
-    status: "completed",
+    status: "done",
     jobClass: "task",
     createdAt: "2026-07-02T06:00:00.000Z",
     request: { model: "request-model", effort: "high" }
   });
   writeCodexJob(stateRoot, dir, "from-sidecar", {
-    status: "completed",
+    status: "done",
     jobClass: "task",
     createdAt: "2026-07-02T06:01:00.000Z"
   });
   writeCodexJob(stateRoot, dir, "unknown-job", {
-    status: "failed",
+    status: "error",
     jobClass: "task",
     createdAt: "2026-07-02T06:02:00.000Z"
   });
   writeCodexJob(stateRoot, dir, "request-over-sidecar", {
-    status: "completed",
+    status: "done",
     jobClass: "task",
     createdAt: "2026-07-02T06:03:00.000Z",
     request: { model: "wins-from-request" }
@@ -1166,10 +1053,10 @@ test("codex stats dedupe mirrored job ids and prefer the terminal workspace copy
     request: { model: "stale-model", effort: "low" }
   });
   writeCodexJob(stateRoot, worktreeRoot, "mirrored-job", {
-    status: "completed",
+    status: "done",
     jobClass: "task",
     createdAt: "2026-07-02T06:00:00.000Z",
-    completedAt: "2026-07-02T06:01:00.000Z",
+    finishedAt: "2026-07-02T06:01:00.000Z",
     request: { model: "terminal-model", effort: "high" }
   });
 
@@ -1177,7 +1064,7 @@ test("codex stats dedupe mirrored job ids and prefer the terminal workspace copy
   assert.strictEqual(result.status, 0, result.stderr);
   const codex = JSON.parse(result.stdout).codex;
   assert.strictEqual(codex.totalJobs, 1);
-  assert.deepStrictEqual(codex.byStatus, { completed: 1 });
+  assert.deepStrictEqual(codex.byStatus, { done: 1 });
   assert.deepStrictEqual(codex.byModel, { "terminal-model@high": 1 });
 });
 
@@ -1190,7 +1077,7 @@ test("codex workspace scope resolves the git root and includes descendant worktr
   fs.mkdirSync(nested, { recursive: true });
   fs.mkdirSync(worktree, { recursive: true });
   assert.strictEqual(spawnSync("git", ["init", "--quiet", repo]).status, 0);
-  writeCodexJob(stateRoot, worktree, "worktree-job", { status: "completed", jobClass: "task", createdAt: "2026-07-14T00:00:00.000Z" });
+  writeCodexJob(stateRoot, worktree, "worktree-job", { status: "done", jobClass: "task", createdAt: "2026-07-14T00:00:00.000Z" });
 
   const result = run({ cwd: nested, codexState: stateRoot }, ["--json"]);
   assert.strictEqual(result.status, 0, result.stderr);
@@ -1207,7 +1094,7 @@ test("terminal ledgers supplement cleaned jobs and safely dedupe live state", (t
     {
       schemaVersion: 1,
       jobId: "cleaned-job",
-      transportStatus: "completed",
+      transportStatus: "done",
       workspaceRoot: dir,
       sessionId: "session-ledger",
       kind: "review",
@@ -1224,14 +1111,14 @@ test("terminal ledgers supplement cleaned jobs and safely dedupe live state", (t
 
   const recovered = codexStats({ env: { FUSION_CODEX_STATE: stateRoot, FUSION_DATA_DIR: path.join(dir, "fusion") }, cwd: dir });
   assert.strictEqual(recovered.totalJobs, 1);
-  assert.deepStrictEqual(recovered.byTransportStatus, { completed: 1 });
+  assert.deepStrictEqual(recovered.byTransportStatus, { done: 1 });
   assert.deepStrictEqual(recovered.byAcceptance, { unverified: 1 });
   assert.deepStrictEqual(recovered.byModel, { "ledger-model@high": 1 });
   assert.strictEqual(recovered.evidence.recoveredTerminalJobs, 1);
   assert.deepStrictEqual(recovered.tokenUsage.totals, { inputTokens: 100, cachedInputTokens: 40, outputTokens: 20, reasoningOutputTokens: 5, totalTokens: 120 });
 
   writeCodexJob(stateRoot, dir, "cleaned-job", {
-    status: "completed",
+    status: "done",
     jobClass: "review",
     createdAt: "2026-07-14T00:00:00.000Z",
     request: { model: "state-model", effort: "xhigh" }
@@ -1247,7 +1134,7 @@ test("terminal ledger repository identity survives removal of a sibling worktree
   const { main, sibling } = createSiblingWorktree(dir);
   const stateRoot = path.join(dir, "state");
   writeCodexJob(stateRoot, sibling, "removed-sibling-job", {
-    status: "completed",
+    status: "done",
     jobClass: "task",
     createdAt: "2026-07-14T00:00:00.000Z"
   });
@@ -1255,7 +1142,7 @@ test("terminal ledger repository identity survives removal of a sibling worktree
     {
       schemaVersion: 1,
       jobId: "removed-sibling-job",
-      transportStatus: "completed",
+      transportStatus: "done",
       workspaceRoot: sibling,
       kind: "task",
       createdAt: "2026-07-14T00:00:00.000Z"
@@ -1266,12 +1153,12 @@ test("terminal ledger repository identity survives removal of a sibling worktree
 
   const stats = codexStats({ env: { FUSION_CODEX_STATE: stateRoot, FUSION_DATA_DIR: path.join(dir, "fusion") }, cwd: main });
   assert.strictEqual(stats.totalJobs, 1);
-  assert.deepStrictEqual(stats.byTransportStatus, { completed: 1 });
+  assert.deepStrictEqual(stats.byTransportStatus, { done: 1 });
   assert.strictEqual(stats.evidence.recoveredTerminalJobs, 1);
 
   const all = codexStats({ all: true, env: { FUSION_CODEX_STATE: stateRoot, FUSION_DATA_DIR: path.join(dir, "fusion") }, cwd: main });
   assert.strictEqual(all.totalJobs, 1);
-  assert.deepStrictEqual(all.byTransportStatus, { completed: 1 });
+  assert.deepStrictEqual(all.byTransportStatus, { done: 1 });
   assert.deepStrictEqual(all.evidence.bySource, { state: 1 });
 });
 
@@ -1308,7 +1195,7 @@ test("authoritative terminal ledger repository identity rejects a conflicting pa
     {
       schemaVersion: 1,
       jobId: "nested-repo-job",
-      transportStatus: "completed",
+      transportStatus: "done",
       workspaceRoot: nested,
       repositoryKey: fusionRepositoryKey(nested),
       kind: "task"
@@ -1329,7 +1216,7 @@ test("deleted worktree evidence does not merge with an unrelated repository that
     {
       schemaVersion: 1,
       jobId: "reused-path-job",
-      transportStatus: "completed",
+      transportStatus: "done",
       workspaceRoot: sibling,
       kind: "task"
     }
@@ -1338,38 +1225,22 @@ test("deleted worktree evidence does not merge with an unrelated repository that
   assert.strictEqual(removed.status, 0, removed.stderr);
   fs.mkdirSync(sibling, { recursive: true });
   assert.strictEqual(spawnSync("git", ["init", "-q"], { cwd: sibling }).status, 0);
-  writeCodexJob(stateRoot, sibling, "reused-path-job", { status: "failed", jobClass: "task" });
+  writeCodexJob(stateRoot, sibling, "reused-path-job", { status: "error", jobClass: "task" });
 
   const env = { FUSION_CODEX_STATE: stateRoot, FUSION_DATA_DIR: path.join(dir, "fusion") };
   const all = codexStats({ all: true, env, cwd: main });
   assert.strictEqual(all.totalJobs, 2);
-  assert.deepStrictEqual(all.byTransportStatus, { failed: 1, completed: 1 });
+  assert.deepStrictEqual(all.byTransportStatus, { error: 1, done: 1 });
 
   const original = codexStats({ env, cwd: main });
   assert.strictEqual(original.totalJobs, 1);
-  assert.deepStrictEqual(original.byTransportStatus, { completed: 1 });
+  assert.deepStrictEqual(original.byTransportStatus, { done: 1 });
   const replacement = codexStats({ env, cwd: sibling });
   assert.strictEqual(replacement.totalJobs, 1);
-  assert.deepStrictEqual(replacement.byTransportStatus, { failed: 1 });
+  assert.deepStrictEqual(replacement.byTransportStatus, { error: 1 });
 });
 
-test("legacy string announcement ledgers remain a scoped synthetic lower bound", (t) => {
-  const dir = sandbox(t);
-  const stateRoot = path.join(dir, "state");
-  fs.mkdirSync(stateRoot, { recursive: true });
-  const key = createHash("sha256").update(dir).digest("hex").slice(0, 16);
-  fs.writeFileSync(path.join(stateRoot, `codex-jobs-monitor-announced.legacy.${key}.json`), `${JSON.stringify(["legacy-job:failed"])}\n`);
-
-  const stats = codexStats({ env: { FUSION_CODEX_STATE: stateRoot, FUSION_DATA_DIR: path.join(dir, "fusion") }, cwd: dir });
-  assert.strictEqual(stats.totalJobs, 1);
-  assert.deepStrictEqual(stats.byTransportStatus, { failed: 1 });
-  assert.deepStrictEqual(stats.byModel, { unknown: 1 });
-  assert.deepStrictEqual(stats.byEffort, { unavailable: 1 });
-  assert.strictEqual(stats.tokenUsage.availability, "unavailable");
-  assert.strictEqual(stats.evidence.recoveredLegacyTerminalJobs, 1);
-});
-
-test("codex dedupe keeps identical ids from unrelated workspaces and merges legacy evidence with descendants", (t) => {
+test("codex dedupe keeps identical ids from unrelated workspaces", (t) => {
   const dir = sandbox(t);
   const stateRoot = path.join(dir, "state");
   const firstRoot = path.join(dir, "first");
@@ -1377,54 +1248,34 @@ test("codex dedupe keeps identical ids from unrelated workspaces and merges lega
   const secondRoot = path.join(dir, "second");
   fs.mkdirSync(firstWorktree, { recursive: true });
   fs.mkdirSync(secondRoot, { recursive: true });
-  writeCodexJob(stateRoot, firstWorktree, "shared-id", { status: "completed", jobClass: "task" });
-  writeCodexJob(stateRoot, secondRoot, "shared-id", { status: "failed", jobClass: "task" });
-  const firstKey = createHash("sha256").update(firstRoot).digest("hex").slice(0, 16);
-  fs.writeFileSync(path.join(stateRoot, `codex-jobs-monitor-announced.legacy.${firstKey}.json`), `${JSON.stringify(["shared-id:completed"])}\n`);
-
+  writeCodexJob(stateRoot, firstWorktree, "shared-id", { status: "done", jobClass: "task" });
+  writeCodexJob(stateRoot, secondRoot, "shared-id", { status: "error", jobClass: "task" });
   const all = codexStats({ all: true, env: { FUSION_CODEX_STATE: stateRoot, FUSION_DATA_DIR: path.join(dir, "fusion") }, cwd: dir });
   assert.strictEqual(all.totalJobs, 2);
-  assert.deepStrictEqual(all.byTransportStatus, { completed: 1, failed: 1 });
+  assert.deepStrictEqual(all.byTransportStatus, { done: 1, error: 1 });
 
   const first = codexStats({ env: { FUSION_CODEX_STATE: stateRoot, FUSION_DATA_DIR: path.join(dir, "fusion") }, cwd: firstRoot });
   assert.strictEqual(first.totalJobs, 1);
   assert.deepStrictEqual(first.evidence.bySource, { state: 1 });
 });
 
-test("semantic acceptance is explicit and excludes non-terminal transport jobs", (t) => {
+test("semantic acceptance reads the job record and excludes non-terminal transport jobs", (t) => {
   const dir = sandbox(t);
   const stateRoot = path.join(dir, "state");
-  const fusionData = path.join(dir, "fusion");
-  writeCodexJob(stateRoot, dir, "completed-job", { status: "completed", jobClass: "task", createdAt: "2026-07-14T00:00:00.000Z" });
+  const completedJob = writeCodexJob(stateRoot, dir, "completed-job", { status: "done", jobClass: "task", createdAt: "2026-07-14T00:00:00.000Z" });
   writeCodexJob(stateRoot, dir, "running-job", { status: "running", jobClass: "task", createdAt: "2026-07-14T00:01:00.000Z" });
 
-  const before = codexStats({ env: { FUSION_CODEX_STATE: stateRoot, FUSION_DATA_DIR: fusionData }, cwd: dir });
+  const before = codexStats({ env: { FUSION_CODEX_STATE: stateRoot, FUSION_DATA_DIR: path.join(dir, "fusion") }, cwd: dir });
   assert.deepStrictEqual(before.byAcceptance, { unverified: 1 });
   assert.strictEqual(before.pendingTransportJobs, 1);
   assert.strictEqual(before.acceptanceScope, "terminal transport jobs only");
 
-  recordCodexAcceptance({
-    jobId: "completed-job",
-    acceptance: "accepted",
-    workspaceRoot: dir,
-    env: { FUSION_DATA_DIR: fusionData },
-    sessionId: "session-one",
-    source: "collector",
-    recordedAt: "2026-07-14T00:02:00.000Z"
-  });
-  const after = codexStats({ env: { FUSION_CODEX_STATE: stateRoot, FUSION_DATA_DIR: fusionData }, cwd: dir });
+  fs.writeFileSync(completedJob, JSON.stringify({ id: "completed-job", workspaceRoot: dir, status: "done", jobClass: "task", acceptance: "accepted", semanticAcceptance: "rejected" }));
+  const after = codexStats({ env: { FUSION_CODEX_STATE: stateRoot, FUSION_DATA_DIR: path.join(dir, "fusion") }, cwd: dir });
   assert.deepStrictEqual(after.byAcceptance, { accepted: 1 });
 
-  recordCodexAcceptance({
-    jobId: "completed-job",
-    acceptance: "rejected",
-    workspaceRoot: dir,
-    env: { FUSION_DATA_DIR: fusionData },
-    sessionId: "session-one",
-    source: "collector",
-    recordedAt: "2026-07-14T00:03:00.000Z"
-  });
-  const rejected = codexStats({ env: { FUSION_CODEX_STATE: stateRoot, FUSION_DATA_DIR: fusionData }, cwd: dir });
+  fs.writeFileSync(completedJob, JSON.stringify({ id: "completed-job", workspaceRoot: dir, status: "done", jobClass: "task", acceptance: "rejected" }));
+  const rejected = codexStats({ env: { FUSION_CODEX_STATE: stateRoot, FUSION_DATA_DIR: path.join(dir, "fusion") }, cwd: dir });
   assert.deepStrictEqual(rejected.byAcceptance, { rejected: 1 });
 });
 
@@ -1438,197 +1289,20 @@ test("Codex acceptance and token observations stay scoped when unrelated reposit
   assert.strictEqual(spawnSync("git", ["init", "-q"], { cwd: secondRoot }).status, 0);
   const stateRoot = path.join(dir, "state");
   const fusionData = path.join(dir, "fusion");
-  writeCodexJob(stateRoot, firstRoot, "shared-observation-id", { status: "completed", jobClass: "task" });
-  writeCodexJob(stateRoot, secondRoot, "shared-observation-id", { status: "completed", jobClass: "task" });
+  writeCodexJob(stateRoot, firstRoot, "shared-observation-id", { status: "done", jobClass: "task", acceptance: "accepted" });
+  writeCodexJob(stateRoot, secondRoot, "shared-observation-id", { status: "done", jobClass: "task", acceptance: "rejected" });
   writeTokenUsage(fusionData, firstRoot, [
     { jobId: "shared-observation-id", tokenUsage: { inputTokens: 10, cachedInputTokens: 2, outputTokens: 3, reasoningOutputTokens: 1, totalTokens: 13 }, observedAt: "2026-07-14T00:01:00.000Z" }
   ]);
   writeTokenUsage(fusionData, secondRoot, [
     { jobId: "shared-observation-id", tokenUsage: { inputTokens: 99, cachedInputTokens: 9, outputTokens: 9, reasoningOutputTokens: 4, totalTokens: 108 }, observedAt: "2026-07-14T00:02:00.000Z" }
   ]);
-  recordCodexAcceptance({ jobId: "shared-observation-id", acceptance: "accepted", workspaceRoot: firstRoot, env: { FUSION_DATA_DIR: fusionData }, sessionId: "session-first", recordedAt: "2026-07-14T00:01:00.000Z" });
-  recordCodexAcceptance({ jobId: "shared-observation-id", acceptance: "rejected", workspaceRoot: secondRoot, env: { FUSION_DATA_DIR: fusionData }, sessionId: "session-second", recordedAt: "2026-07-14T00:02:00.000Z" });
-
   const first = codexStats({ env: { FUSION_CODEX_STATE: stateRoot, FUSION_DATA_DIR: fusionData }, cwd: firstRoot });
   assert.deepStrictEqual(first.byAcceptance, { accepted: 1 });
   assert.strictEqual(first.tokenUsage.totals.totalTokens, 13);
   const second = codexStats({ env: { FUSION_CODEX_STATE: stateRoot, FUSION_DATA_DIR: fusionData }, cwd: secondRoot });
   assert.deepStrictEqual(second.byAcceptance, { rejected: 1 });
   assert.strictEqual(second.tokenUsage.totals.totalTokens, 108);
-});
-
-test("acceptance CLI validates fields, redacts short reasons, and recovers stale locks", (t) => {
-  const dir = sandbox(t);
-  const stateRoot = path.join(dir, "state");
-  const fusionData = path.join(dir, "fusion");
-  const jobId = "0123456789abcdef0123456789abcdef";
-  const companion = writeCodexAcceptanceCompanion(dir);
-  fs.mkdirSync(stateRoot, { recursive: true });
-  const sidecar = acceptanceSidecarPath(dir, { FUSION_DATA_DIR: fusionData });
-  fs.mkdirSync(path.dirname(sidecar), { recursive: true });
-  fs.writeFileSync(`${sidecar}.lock`, "stale\n");
-  const stale = new Date(Date.now() - 60000);
-  fs.utimesSync(`${sidecar}.lock`, stale, stale);
-  const secret = `sk-${"a".repeat(20)}`;
-
-  const result = run(
-    { cwd: dir, codexState: stateRoot },
-    ["--record-acceptance", jobId, "rejected", "--reason", `verification failed ${secret}`, "--source", "main-loop", "--json"],
-    { FUSION_DATA_DIR: fusionData, FUSION_CODEX_COMPANION: companion, CLAUDE_CODE_SESSION_ID: "session-safe" }
-  );
-  assert.strictEqual(result.status, 0, result.stderr);
-  const observation = JSON.parse(result.stdout);
-  assert.strictEqual(observation.acceptance, "rejected");
-  assert.strictEqual(observation.reason, "verification failed [redacted]");
-  assert.strictEqual(fs.existsSync(`${sidecar}.lock`), false);
-  assert.strictEqual(fs.readFileSync(sidecar, "utf8").includes(secret), false);
-  assert.strictEqual(fs.statSync(path.dirname(sidecar)).mode & 0o777, 0o700);
-  assert.strictEqual(fs.statSync(sidecar).mode & 0o777, 0o600);
-
-  assert.throws(
-    () => recordCodexAcceptance({ jobId: "bad job id", acceptance: "accepted", workspaceRoot: dir, env: { FUSION_DATA_DIR: fusionData } }),
-    /job id is invalid/
-  );
-  assert.throws(
-    () => recordCodexAcceptance({ jobId, acceptance: "accepted", workspaceRoot: dir, env: { FUSION_DATA_DIR: fusionData }, reason: "line one\nline two" }),
-    /single non-sensitive line/
-  );
-});
-
-test("--record-acceptance updates the Codex job record before appending the ledger", (t) => {
-  const dir = sandbox(t);
-  const stateRoot = path.join(dir, "state");
-  const fusionData = path.join(dir, "fusion");
-  const jobId = "a".repeat(32);
-  const companion = writeCodexAcceptanceCompanion(dir);
-  const argsFile = path.join(dir, "companion-args.json");
-  writeCodexJob(stateRoot, dir, jobId, { status: "done", jobClass: "task" });
-
-  const result = run(
-    { cwd: dir, codexState: stateRoot },
-    ["--record-acceptance", jobId, "accepted", "--reason", "verification passed", "--source", "main-loop"],
-    { FUSION_DATA_DIR: fusionData, FUSION_CODEX_COMPANION: companion, FUSION_TEST_CODEX_COMPANION_ARGS: argsFile }
-  );
-
-  assert.strictEqual(result.status, 0, result.stderr);
-  assert.strictEqual(result.stdout, `Recorded accepted for Codex job ${jobId}.\n`);
-  assert.strictEqual(result.stderr, "");
-  assert.deepStrictEqual(JSON.parse(fs.readFileSync(argsFile, "utf8")), ["record-acceptance", "--job-id", jobId, "--acceptance", "accepted", "--source", "main-loop", "--reason", "verification passed"]);
-  assert.strictEqual(fs.readFileSync(acceptanceSidecarPath(dir, { FUSION_DATA_DIR: fusionData }), "utf8").trim().split("\n").length, 1);
-});
-
-test("--record-acceptance surfaces the Codex transport gate without appending the ledger", (t) => {
-  const dir = sandbox(t);
-  const stateRoot = path.join(dir, "state");
-  const fusionData = path.join(dir, "fusion");
-  const jobId = "b".repeat(32);
-  const companion = writeCodexAcceptanceCompanion(dir);
-  writeCodexJob(stateRoot, dir, jobId, { status: "error", jobClass: "task" });
-
-  const result = run(
-    { cwd: dir, codexState: stateRoot },
-    ["--record-acceptance", jobId, "accepted"],
-    { FUSION_DATA_DIR: fusionData, FUSION_CODEX_COMPANION: companion, FUSION_TEST_CODEX_COMPANION_MODE: "gate" }
-  );
-
-  assert.notStrictEqual(result.status, 0);
-  assert.match(result.stderr, /Accepted Codex jobs must have done transport status/);
-  assert.strictEqual(fs.existsSync(acceptanceSidecarPath(dir, { FUSION_DATA_DIR: fusionData })), false);
-});
-
-test("--record-acceptance keeps the ledger compatible with companions lacking the subcommand", (t) => {
-  const dir = sandbox(t);
-  const stateRoot = path.join(dir, "state");
-  const fusionData = path.join(dir, "fusion");
-  const jobId = "c".repeat(32);
-  const companion = writeCodexAcceptanceCompanion(dir);
-  writeCodexJob(stateRoot, dir, jobId, { status: "done", jobClass: "task" });
-
-  const result = run(
-    { cwd: dir, codexState: stateRoot },
-    ["--record-acceptance", jobId, "rejected", "--json"],
-    { FUSION_DATA_DIR: fusionData, FUSION_CODEX_COMPANION: companion, FUSION_TEST_CODEX_COMPANION_MODE: "absent" }
-  );
-
-  assert.strictEqual(result.status, 0, result.stderr);
-  assert.strictEqual(JSON.parse(result.stdout).acceptance, "rejected");
-  assert.match(result.stderr, /Warning: Codex job record was not updated/);
-  assert.strictEqual(fs.readFileSync(acceptanceSidecarPath(dir, { FUSION_DATA_DIR: fusionData }), "utf8").trim().split("\n").length, 1);
-});
-
-test("--record-acceptance forwards --accept-failed-transport unchanged", (t) => {
-  const dir = sandbox(t);
-  const stateRoot = path.join(dir, "state");
-  const fusionData = path.join(dir, "fusion");
-  const jobId = "d".repeat(32);
-  const companion = writeCodexAcceptanceCompanion(dir);
-  const argsFile = path.join(dir, "companion-args.json");
-  writeCodexJob(stateRoot, dir, jobId, { status: "error", jobClass: "task" });
-
-  const result = run(
-    { cwd: dir, codexState: stateRoot },
-    ["--record-acceptance", jobId, "accepted", "--accept-failed-transport"],
-    { FUSION_DATA_DIR: fusionData, FUSION_CODEX_COMPANION: companion, FUSION_TEST_CODEX_COMPANION_ARGS: argsFile }
-  );
-
-  assert.strictEqual(result.status, 0, result.stderr);
-  assert.deepStrictEqual(JSON.parse(fs.readFileSync(argsFile, "utf8")), ["record-acceptance", "--job-id", jobId, "--acceptance", "accepted", "--source", "collector", "--accept-failed-transport"]);
-});
-
-test("--record-acceptance forwards an explicit source to the Codex companion", (t) => {
-  const dir = sandbox(t);
-  const stateRoot = path.join(dir, "state");
-  const fusionData = path.join(dir, "fusion");
-  const jobId = "e".repeat(32);
-  const companion = writeCodexAcceptanceCompanion(dir);
-  const argsFile = path.join(dir, "companion-args.json");
-  writeCodexJob(stateRoot, dir, jobId, { status: "done", jobClass: "task" });
-
-  const result = run(
-    { cwd: dir, codexState: stateRoot },
-    ["--record-acceptance", jobId, "accepted", "--source", "main-loop"],
-    { FUSION_DATA_DIR: fusionData, FUSION_CODEX_COMPANION: companion, FUSION_TEST_CODEX_COMPANION_ARGS: argsFile }
-  );
-
-  assert.strictEqual(result.status, 0, result.stderr);
-  assert.deepStrictEqual(JSON.parse(fs.readFileSync(argsFile, "utf8")), ["record-acceptance", "--job-id", jobId, "--acceptance", "accepted", "--source", "main-loop"]);
-});
-
-test("--record-acceptance resolves a Grok job after a Codex lookup miss", (t) => {
-  const dir = sandbox(t);
-  const grokData = path.join(dir, "grok-data");
-  const jobId = "e".repeat(32);
-  const companion = writeGrokAcceptanceCompanion(dir);
-  const argsFile = path.join(dir, "grok-companion-args.json");
-  writeGrokJob(grokData, dir, jobId, { status: "done", mode: "consult" });
-
-  const result = run(
-    { cwd: dir, codexState: path.join(dir, "missing") },
-    ["--record-acceptance", jobId, "accepted", "--reason", "verification passed", "--accept-failed-transport", "--json"],
-    { GROK_COMPANION_DATA: grokData, FUSION_GROK_COMPANION: companion, FUSION_TEST_GROK_COMPANION_ARGS: argsFile }
-  );
-
-  assert.strictEqual(result.status, 0, result.stderr);
-  assert.deepStrictEqual(JSON.parse(fs.readFileSync(argsFile, "utf8")), ["record-acceptance", "--job-id", jobId, "--acceptance", "accepted", "--reason", "verification passed", "--accept-failed-transport", "--json"]);
-  assert.strictEqual(JSON.parse(result.stdout).engine, "grok");
-  assert.strictEqual(fs.existsSync(acceptanceSidecarPath(dir, { FUSION_DATA_DIR: path.join(dir, "fusion") })), false);
-});
-
-test("--record-acceptance requires a Grok plugin upgrade when its companion lacks the subcommand", (t) => {
-  const dir = sandbox(t);
-  const grokData = path.join(dir, "grok-data");
-  const jobId = "f".repeat(32);
-  const companion = writeGrokAcceptanceCompanion(dir);
-  writeGrokJob(grokData, dir, jobId, { status: "done", mode: "consult" });
-
-  const result = run(
-    { cwd: dir, codexState: path.join(dir, "missing") },
-    ["--record-acceptance", jobId, "rejected"],
-    { GROK_COMPANION_DATA: grokData, FUSION_GROK_COMPANION: companion, FUSION_TEST_GROK_COMPANION_MODE: "absent" }
-  );
-
-  assert.notStrictEqual(result.status, 0);
-  assert.match(result.stderr, /Grok plugin does not support record-acceptance.*Upgrade the Grok plugin/);
 });
 
 function createTerminalWorker({ taskId, env, workspaceRoot, peerEngine = null, peerJobId = null }) {
@@ -1654,7 +1328,7 @@ test("--record settles a Fusion task and its Codex peer with direct strict argv"
 
   const result = runDirect(
     { cwd: dir, codexState: stateRoot },
-    ["--record", `${taskId}=accepted`, "--source", "main-loop"],
+    ["--record", `${taskId}=accepted`],
     { ...env, FUSION_CODEX_COMPANION: companion, FUSION_TEST_CODEX_COMPANION_ARGS: argsFile }
   );
 
@@ -1662,6 +1336,35 @@ test("--record settles a Fusion task and its Codex peer with direct strict argv"
   assert.strictEqual(result.stdout, `Recorded accepted for Fusion worker task ${taskId}.\nRecorded accepted for Codex job ${jobId}.\n`);
   assert.deepStrictEqual(JSON.parse(fs.readFileSync(argsFile, "utf8")), ["record-acceptance", "--job-id", jobId, "--acceptance", "accepted", "--source", "main-loop"]);
   assert.strictEqual(readWorkerRecord(taskId, env).acceptance, "accepted");
+});
+
+test("--record leaves a terminal worker unsettled when its engine companion fails", (t) => {
+  const dir = sandbox(t);
+  const stateDir = path.join(dir, "worker-state");
+  const taskId = `fusion-${"1".repeat(24)}`;
+  const jobId = "2".repeat(32);
+  const companion = writeCodexAcceptanceCompanion(dir);
+  const env = { FUSION_WORKER_STATE_DIR: stateDir };
+  createTerminalWorker({ taskId, env, workspaceRoot: dir, peerEngine: "codex", peerJobId: jobId });
+  updateWorkerRecord(taskId, env, (record) => ({
+    ...record,
+    collectedAt: "2026-07-22T00:00:00.000Z",
+    awaitingVerdict: true,
+    awaitingVerdictArmedAt: "2026-07-22T00:00:00.000Z"
+  }));
+
+  const result = runDirect(
+    { cwd: dir, codexState: path.join(dir, "missing") },
+    ["--record", `${taskId}=accepted`],
+    { ...env, FUSION_CODEX_COMPANION: companion, FUSION_TEST_CODEX_COMPANION_MODE: "gate" }
+  );
+
+  assert.notStrictEqual(result.status, 0);
+  assert.match(result.stderr, new RegExp(`Failed to settle ${taskId}: Engine settlement failed for Codex job ${jobId}`));
+  const worker = readWorkerRecord(taskId, env);
+  assert.strictEqual(worker.acceptance, "unverified");
+  assert.strictEqual(worker.acceptanceRecordedAt, undefined);
+  assert.strictEqual(worker.awaitingVerdict, true);
 });
 
 test("--record resolves a bare Codex job and settles matching worker rows", (t) => {
@@ -1754,6 +1457,74 @@ test("--record batches mixed verdicts", (t) => {
   assert.strictEqual(readWorkerRecord(secondTaskId, env).acceptance, "rejected");
 });
 
+test("--record queues a nonterminal worker verdict and applies it once terminal", (t) => {
+  const dir = sandbox(t);
+  const stateDir = path.join(dir, "worker-state");
+  const taskId = `fusion-${"7".repeat(24)}`;
+  const env = { FUSION_WORKER_STATE_DIR: stateDir };
+  createWorkerRecord({ taskId, sessionId: "session-queued", dispatchToolUseId: "tool-queued", agentType: "fusion:fast-worker", workspaceRoot: dir, limits: {} }, env);
+
+  const queued = runDirect(
+    { cwd: dir, codexState: path.join(dir, "missing") },
+    ["--record", `${taskId}=accepted`],
+    env
+  );
+
+  assert.strictEqual(queued.status, 0, queued.stderr);
+  assert.strictEqual(queued.stdout, `Queued accepted for ${taskId}; applies when the record turns terminal.\n`);
+  assert.strictEqual(readWorkerRecord(taskId, env).pendingVerdict.acceptance, "accepted");
+  updateWorkerRecord(taskId, env, (record) => applyQueuedVerdict({ ...record, transportStatus: "done" }, "2026-07-22T00:00:00.000Z"));
+  const settled = readWorkerRecord(taskId, env);
+  assert.strictEqual(settled.acceptance, "accepted");
+  assert.strictEqual(settled.acceptanceRecordedAt, "2026-07-22T00:00:00.000Z");
+  assert.strictEqual(settled.pendingVerdict, undefined);
+});
+
+test("--record continues a batch after a failed transport gate", (t) => {
+  const dir = sandbox(t);
+  const stateDir = path.join(dir, "worker-state");
+  const firstTaskId = `fusion-${"8".repeat(24)}`;
+  const failedTaskId = `fusion-${"9".repeat(24)}`;
+  const thirdTaskId = `fusion-${"a".repeat(24)}`;
+  const env = { FUSION_WORKER_STATE_DIR: stateDir };
+  createTerminalWorker({ taskId: firstTaskId, env, workspaceRoot: dir });
+  createTerminalWorker({ taskId: failedTaskId, env, workspaceRoot: dir });
+  createTerminalWorker({ taskId: thirdTaskId, env, workspaceRoot: dir });
+  updateWorkerRecord(failedTaskId, env, (record) => ({ ...record, transportStatus: "failed" }));
+
+  const result = runDirect(
+    { cwd: dir, codexState: path.join(dir, "missing") },
+    ["--record", `${firstTaskId}=accepted`, "--record", `${failedTaskId}=accepted`, "--record", `${thirdTaskId}=rejected`],
+    env
+  );
+
+  assert.notStrictEqual(result.status, 0);
+  assert.match(result.stderr, new RegExp(failedTaskId));
+  assert.doesNotMatch(result.stderr, new RegExp(firstTaskId));
+  assert.doesNotMatch(result.stderr, new RegExp(thirdTaskId));
+  assert.strictEqual(readWorkerRecord(firstTaskId, env).acceptance, "accepted");
+  assert.strictEqual(readWorkerRecord(failedTaskId, env).acceptance, "unverified");
+  assert.strictEqual(readWorkerRecord(thirdTaskId, env).acceptance, "rejected");
+});
+
+test("--record accepts a per-pair failed transport override", (t) => {
+  const dir = sandbox(t);
+  const stateDir = path.join(dir, "worker-state");
+  const taskId = `fusion-${"b".repeat(24)}`;
+  const env = { FUSION_WORKER_STATE_DIR: stateDir };
+  createTerminalWorker({ taskId, env, workspaceRoot: dir });
+  updateWorkerRecord(taskId, env, (record) => ({ ...record, transportStatus: "failed" }));
+
+  const result = runDirect(
+    { cwd: dir, codexState: path.join(dir, "missing") },
+    ["--record", `${taskId}=accepted:accept-failed-transport`],
+    env
+  );
+
+  assert.strictEqual(result.status, 0, result.stderr);
+  assert.strictEqual(readWorkerRecord(taskId, env).acceptance, "accepted");
+});
+
 test("--record rejects a reason attached to multiple pairs and requires transport outside the strict carve-out", (t) => {
   const dir = sandbox(t);
   const stateDir = path.join(dir, "worker-state");
@@ -1775,36 +1546,14 @@ test("--record rejects a reason attached to multiple pairs and requires transpor
   assert.strictEqual(readWorkerRecord(secondTaskId, env).acceptance, "unverified");
 });
 
-test("legacy acceptance aliases continue to work through the raw-args transport", (t) => {
-  const dir = sandbox(t);
-  const stateRoot = path.join(dir, "codex-state");
-  const stateDir = path.join(dir, "worker-state");
-  const fusionData = path.join(dir, "fusion-data");
-  const taskId = `fusion-${"6".repeat(24)}`;
-  const jobId = "7".repeat(32);
-  const companion = writeCodexAcceptanceCompanion(dir);
-  const env = { FUSION_WORKER_STATE_DIR: stateDir, FUSION_DATA_DIR: fusionData, FUSION_CODEX_COMPANION: companion };
-  writeCodexJob(stateRoot, dir, jobId, { status: "done", jobClass: "task" });
-  createTerminalWorker({ taskId, env, workspaceRoot: dir });
-
-  const jobAlias = run({ cwd: dir, codexState: stateRoot }, ["--record-acceptance", jobId, "accepted"], env);
-  const workerAlias = run({ cwd: dir, codexState: stateRoot }, ["--record-worker-acceptance", taskId, "rejected"], env);
-
-  assert.strictEqual(jobAlias.status, 0, jobAlias.stderr);
-  assert.strictEqual(workerAlias.status, 0, workerAlias.stderr);
-  assert.strictEqual(readWorkerRecord(taskId, env).acceptance, "rejected");
-  assert.strictEqual(fs.readFileSync(acceptanceSidecarPath(dir, env), "utf8").trim().split("\n").length, 1);
-});
-
-test("Codex reports acceptance anomalies only when the ledger and transport state diverge", (t) => {
+test("Codex reports acceptance anomalies only when the job record and transport state diverge", (t) => {
   const dir = sandbox(t);
   const stateRoot = path.join(dir, "state");
   const fusionData = path.join(dir, "fusion");
   const acceptedErrorId = "e".repeat(32);
   const doneWithoutAcceptanceId = "f".repeat(32);
-  writeCodexJob(stateRoot, dir, acceptedErrorId, { status: "error", jobClass: "task" });
+  writeCodexJob(stateRoot, dir, acceptedErrorId, { status: "error", jobClass: "task", acceptance: "accepted" });
   writeCodexJob(stateRoot, dir, doneWithoutAcceptanceId, { status: "done", jobClass: "task" });
-  recordCodexAcceptance({ jobId: acceptedErrorId, acceptance: "accepted", workspaceRoot: dir, env: { FUSION_DATA_DIR: fusionData }, recordedAt: "2026-07-17T00:00:00.000Z" });
 
   const stats = codexStats({ env: { FUSION_CODEX_STATE: stateRoot, FUSION_DATA_DIR: fusionData }, cwd: dir });
   assert.deepStrictEqual(stats.acceptanceAnomalies, {
@@ -1815,169 +1564,7 @@ test("Codex reports acceptance anomalies only when the ledger and transport stat
   assert.match(rendered, /Acceptance anomalies:\n- Accepted ledger entries with error transport: 1 \(eeeeeeee\)\n- Done jobs without acceptance records: 1 \(ffffffffffffffffffffffffffffffff\)/);
 });
 
-test("Codex acceptance updates only the matching session collector after its worktree disappears", (t) => {
-  const dir = sandbox(t);
-  const activeRoot = path.join(dir, "active");
-  const deletedWorktree = path.join(dir, "deleted-worktree");
-  const stateDir = path.join(dir, "worker-state");
-  const fusionData = path.join(dir, "fusion");
-  const env = { FUSION_DATA_DIR: fusionData, FUSION_WORKER_STATE_DIR: stateDir };
-  const jobId = "a".repeat(32);
-  fs.mkdirSync(activeRoot, { recursive: true });
-  fs.mkdirSync(deletedWorktree, { recursive: true });
-
-  for (const [taskId, sessionId] of [["fusion-collector-current", "session-current"], ["fusion-collector-other", "session-other"]]) {
-    createWorkerRecord({
-      taskId,
-      sessionId,
-      dispatchToolUseId: `tool-${sessionId}`,
-      agentType: "fusion:job-collector",
-      workspaceRoot: deletedWorktree,
-      completionContract: "collector",
-      limits: {}
-    }, env);
-    updateWorkerRecord(taskId, env, (record) => ({
-      ...record,
-      transportStatus: "done",
-      peerEngine: "codex",
-      peerJobId: jobId,
-      peerTransportStatus: "done",
-      peerSemanticStatus: "unverified",
-      finishedAt: "2026-07-16T00:00:00.000Z"
-    }));
-  }
-  fs.rmSync(deletedWorktree, { recursive: true, force: true });
-
-  const observation = recordCodexAcceptance({
-    jobId,
-    acceptance: "rejected",
-    workspaceRoot: activeRoot,
-    env,
-    sessionId: "session-current",
-    source: "main-loop",
-    reason: "verification did not pass",
-    recordedAt: "2026-07-16T00:01:00.000Z"
-  });
-
-  const current = readWorkerRecord("fusion-collector-current", env);
-  const other = readWorkerRecord("fusion-collector-other", env);
-  assert.strictEqual(current.acceptance, observation.acceptance);
-  assert.strictEqual(current.acceptanceSource, observation.source);
-  assert.strictEqual(current.acceptanceReason, observation.reason);
-  assert.ok(current.acceptanceRecordedAt);
-  assert.strictEqual(other.acceptance, "unverified");
-  assert.strictEqual(other.acceptanceRecordedAt, undefined);
-  const ledger = fs.readFileSync(acceptanceSidecarPath(activeRoot, env), "utf8").trim().split("\n").map((line) => JSON.parse(line));
-  assert.strictEqual(ledger.length, 1);
-  assert.strictEqual(ledger[0].sessionId, "session-current");
-  assert.strictEqual(ledger[0].jobId, jobId);
-  assert.strictEqual(ledger[0].acceptance, current.acceptance);
-});
-
-test("retrying Codex acceptance reconciles a worker write failure without duplicating the ledger", (t) => {
-  const dir = sandbox(t);
-  const stateDir = path.join(dir, "worker-state");
-  const fusionData = path.join(dir, "fusion");
-  const env = { FUSION_DATA_DIR: fusionData, FUSION_WORKER_STATE_DIR: stateDir };
-  const taskId = "fusion-collector-reconcile";
-  const jobId = "9".repeat(32);
-  createWorkerRecord({
-    taskId,
-    sessionId: "session-reconcile",
-    dispatchToolUseId: "tool-reconcile",
-    agentType: "fusion:job-collector",
-    workspaceRoot: dir,
-    completionContract: "collector",
-    limits: {}
-  }, env);
-  updateWorkerRecord(taskId, env, (record) => ({
-    ...record,
-    transportStatus: "done",
-    peerEngine: "codex",
-    peerJobId: jobId,
-    peerTransportStatus: "done",
-    finishedAt: "2026-07-16T00:00:00.000Z"
-  }));
-  const workerLock = `${workerRecordFile(taskId, env)}.lock`;
-  fs.writeFileSync(workerLock, String(process.pid), "utf8");
-  const request = {
-    jobId,
-    acceptance: "accepted",
-    workspaceRoot: dir,
-    env,
-    sessionId: "session-reconcile",
-    source: "main-loop",
-    reason: "verification passed",
-    recordedAt: "2026-07-16T00:01:00.000Z"
-  };
-
-  assert.throws(() => recordCodexAcceptance(request), /worker state lock/);
-  fs.rmSync(workerLock, { force: true });
-  assert.strictEqual(readWorkerRecord(taskId, env).acceptanceRecordedAt, undefined);
-  recordCodexAcceptance(request);
-
-  const ledger = fs.readFileSync(acceptanceSidecarPath(dir, env), "utf8").trim().split("\n");
-  assert.strictEqual(ledger.length, 1);
-  assert.strictEqual(readWorkerRecord(taskId, env).acceptance, "accepted");
-  assert.ok(readWorkerRecord(taskId, env).acceptanceRecordedAt);
-});
-
-test("Codex acceptance without a session records the ledger and leaves collector gates closed", (t) => {
-  const dir = sandbox(t);
-  const stateDir = path.join(dir, "worker-state");
-  const fusionData = path.join(dir, "fusion");
-  const env = { FUSION_DATA_DIR: fusionData, FUSION_WORKER_STATE_DIR: stateDir };
-  const jobId = "b".repeat(32);
-  createWorkerRecord({
-    taskId: "fusion-collector-nosession",
-    sessionId: "session-existing",
-    dispatchToolUseId: "tool-existing",
-    agentType: "fusion:job-collector",
-    workspaceRoot: dir,
-    completionContract: "collector",
-    limits: {}
-  }, env);
-  updateWorkerRecord("fusion-collector-nosession", env, (record) => ({ ...record, transportStatus: "done", peerEngine: "codex", peerJobId: jobId }));
-
-  const observation = recordCodexAcceptance({ jobId, acceptance: "accepted", workspaceRoot: dir, env, sessionId: null });
-
-  assert.strictEqual(observation.sessionId, null);
-  const collector = readWorkerRecord("fusion-collector-nosession", env);
-  assert.strictEqual(collector.acceptance, "unverified");
-  assert.strictEqual(collector.acceptanceRecordedAt, undefined);
-  assert.strictEqual(fs.readFileSync(acceptanceSidecarPath(dir, env), "utf8").trim().split("\n").length, 1);
-});
-
-test("Codex acceptance CLI rejects a session override before writing the ledger", (t) => {
-  const dir = sandbox(t);
-  const stateDir = path.join(dir, "worker-state");
-  const fusionData = path.join(dir, "fusion");
-  const env = { FUSION_DATA_DIR: fusionData, FUSION_WORKER_STATE_DIR: stateDir, CLAUDE_CODE_SESSION_ID: "session-current" };
-  const jobId = "d".repeat(32);
-  createWorkerRecord({
-    taskId: "fusion-collector-other-session",
-    sessionId: "session-other",
-    dispatchToolUseId: "tool-other-session",
-    agentType: "fusion:job-collector",
-    workspaceRoot: dir,
-    completionContract: "collector",
-    limits: {}
-  }, env);
-  updateWorkerRecord("fusion-collector-other-session", env, (record) => ({ ...record, transportStatus: "done", peerEngine: "codex", peerJobId: jobId }));
-
-  const result = run(
-    { cwd: dir, codexState: path.join(dir, "missing") },
-    ["--record-acceptance", jobId, "accepted", "--session", "session-other", "--json"],
-    env
-  );
-
-  assert.notStrictEqual(result.status, 0);
-  assert.match(result.stderr, /acceptance is bound to the current Claude session/);
-  assert.strictEqual(readWorkerRecord("fusion-collector-other-session", env).acceptanceRecordedAt, undefined);
-  assert.strictEqual(fs.existsSync(acceptanceSidecarPath(dir, env)), false);
-});
-
-test("generic worker acceptance rejects collectors in the API and CLI", (t) => {
+test("generic worker acceptance rejects Codex collectors", (t) => {
   const dir = sandbox(t);
   const stateDir = path.join(dir, "worker-state");
   const env = { FUSION_WORKER_STATE_DIR: stateDir };
@@ -1996,13 +1583,6 @@ test("generic worker acceptance rejects collectors in the API and CLI", (t) => {
     () => recordWorkerAcceptance({ taskId: "fusion-collector-guard", acceptance: "accepted", env }),
     /must be recorded through the Codex acceptance ledger/
   );
-  const result = run(
-    { cwd: dir, codexState: path.join(dir, "missing") },
-    ["--record-worker-acceptance", "fusion-collector-guard", "accepted", "--json"],
-    env
-  );
-  assert.notStrictEqual(result.status, 0);
-  assert.match(result.stderr, /must be recorded through the Codex acceptance ledger/);
   const collector = readWorkerRecord("fusion-collector-guard", env);
   assert.strictEqual(collector.acceptance, "unverified");
   assert.strictEqual(collector.acceptanceRecordedAt, undefined);
@@ -2040,7 +1620,7 @@ test("worker acceptance requires --accept-failed-transport only for accepted fai
   const dir = sandbox(t);
   const stateDir = path.join(dir, "worker-state");
   const env = { FUSION_WORKER_STATE_DIR: stateDir };
-  const taskId = "fusion-reaped-acceptance";
+  const taskId = `fusion-${"e".repeat(24)}`;
   createWorkerRecord({
     taskId,
     sessionId: "session-reaped",
@@ -2060,7 +1640,7 @@ test("worker acceptance requires --accept-failed-transport only for accepted fai
 
   const blocked = run(
     { cwd: dir, codexState: path.join(dir, "missing") },
-    ["--record-worker-acceptance", taskId, "accepted", "--json"],
+    ["--record", `${taskId}=accepted`, "--json"],
     env
   );
   assert.notStrictEqual(blocked.status, 0);
@@ -2069,7 +1649,7 @@ test("worker acceptance requires --accept-failed-transport only for accepted fai
 
   const rejected = run(
     { cwd: dir, codexState: path.join(dir, "missing") },
-    ["--record-worker-acceptance", taskId, "rejected", "--json"],
+    ["--record", `${taskId}=rejected`, "--json"],
     env
   );
   assert.strictEqual(rejected.status, 0, rejected.stderr);
@@ -2077,7 +1657,7 @@ test("worker acceptance requires --accept-failed-transport only for accepted fai
 
   const unverified = run(
     { cwd: dir, codexState: path.join(dir, "missing") },
-    ["--record-worker-acceptance", taskId, "unverified", "--json"],
+    ["--record", `${taskId}=unverified`, "--json"],
     env
   );
   assert.strictEqual(unverified.status, 0, unverified.stderr);
@@ -2085,7 +1665,7 @@ test("worker acceptance requires --accept-failed-transport only for accepted fai
 
   const accepted = run(
     { cwd: dir, codexState: path.join(dir, "missing") },
-    ["--record-worker-acceptance", taskId, "accepted", "--accept-failed-transport", "--json"],
+    ["--record", `${taskId}=accepted`, "--accept-failed-transport", "--json"],
     env
   );
   assert.strictEqual(accepted.status, 0, accepted.stderr);
@@ -2160,7 +1740,7 @@ test("exact rollout model observations override request and argv values", (t) =>
   const stateRoot = path.join(dir, "state");
   const fusionData = path.join(dir, "fusion");
   writeCodexJob(stateRoot, dir, "model-conflict", {
-    status: "completed",
+    status: "done",
     jobClass: "task",
     createdAt: "2026-07-14T00:00:00.000Z",
     request: { model: "requested-model", effort: "low" }
@@ -2179,8 +1759,8 @@ test("token totals aggregate exact sidecars and mark missing jobs unavailable", 
   const dir = sandbox(t);
   const stateRoot = path.join(dir, "state");
   const fusionData = path.join(dir, "fusion");
-  writeCodexJob(stateRoot, dir, "with-usage", { status: "completed", jobClass: "task", createdAt: "2026-07-14T00:00:00.000Z" });
-  writeCodexJob(stateRoot, dir, "without-usage", { status: "failed", jobClass: "task", createdAt: "2026-07-14T00:01:00.000Z" });
+  writeCodexJob(stateRoot, dir, "with-usage", { status: "done", jobClass: "task", createdAt: "2026-07-14T00:00:00.000Z" });
+  writeCodexJob(stateRoot, dir, "without-usage", { status: "error", jobClass: "task", createdAt: "2026-07-14T00:01:00.000Z" });
   writeTokenUsage(fusionData, dir, [
     {
       jobId: "with-usage",
@@ -2213,7 +1793,7 @@ test("Codex token totals exclude incomplete usage from records and sidecars", (t
     tokenUsageAvailability: "partial",
     tokenUsage: { inputTokens: 1_000, cachedInputTokens: 300, outputTokens: 200, reasoningOutputTokens: 100, totalTokens: 1_200 }
   });
-  writeCodexJob(stateRoot, dir, "partial-sidecar", { status: "failed", jobClass: "task" });
+  writeCodexJob(stateRoot, dir, "partial-sidecar", { status: "error", jobClass: "task" });
   writeCodexJob(stateRoot, dir, "exact-sidecar", {
     status: "error",
     jobClass: "task",
@@ -2393,14 +1973,14 @@ test("Claude worker stats expose lifecycle, exact usage, acceptance, and the uni
   const stateDir = path.join(dir, "worker-state");
   const env = { FUSION_WORKER_STATE_DIR: stateDir };
   createWorkerRecord({
-    taskId: "fusion-12345678",
+    taskId: "fusion-1234567890abcdef12345678",
     sessionId: "session-workers",
     dispatchToolUseId: "tool-1",
     agentType: "fusion:fast-worker",
     workspaceRoot: dir,
     limits: {}
   }, env);
-  updateWorkerRecord("fusion-12345678", env, (record) => ({
+  updateWorkerRecord("fusion-1234567890abcdef12345678", env, (record) => ({
     ...record,
     agentId: "agent-1",
     backgroundTaskId: "agent-1",
@@ -2427,7 +2007,7 @@ test("Claude worker stats expose lifecycle, exact usage, acceptance, and the uni
   assert.deepStrictEqual(stats.byAcceptance, { unverified: 1 });
   assert.strictEqual(stats.usage.totalTokens, 39);
   assert.deepStrictEqual(stats.identities[0], {
-    taskId: "fusion-12345678",
+    taskId: "fusion-1234567890abcdef12345678",
     sessionId: "session-workers",
     agentId: "agent-1",
     backgroundTaskId: "agent-1",
@@ -2437,11 +2017,11 @@ test("Claude worker stats expose lifecycle, exact usage, acceptance, and the uni
   });
 
   const secret = `sk-${"q".repeat(24)}`;
-  const accepted = run({ cwd: dir, codexState: path.join(dir, "missing") }, ["--record-worker-acceptance", "fusion-12345678", "accepted", "--reason", `verified ${secret}`, "--json"], env);
+  const accepted = run({ cwd: dir, codexState: path.join(dir, "missing") }, ["--record", "fusion-1234567890abcdef12345678=accepted", "--reason", `verified ${secret}`, "--json"], env);
   assert.strictEqual(accepted.status, 0, accepted.stderr);
-  assert.strictEqual(JSON.parse(accepted.stdout).acceptanceReason, "verified [redacted]");
+  assert.strictEqual(readWorkerRecord("fusion-1234567890abcdef12345678", env).acceptanceReason, "verified [redacted]");
   assert.deepStrictEqual(claudeWorkerStats({ all: true, env, cwd: dir }).byAcceptance, { accepted: 1 });
-  const jobFile = path.join(stateDir, "jobs", "fusion-12345678.json");
+  const jobFile = path.join(stateDir, "jobs", "fusion-1234567890abcdef12345678.json");
   assert.strictEqual(fs.statSync(stateDir).mode & 0o777, 0o700);
   assert.strictEqual(fs.statSync(path.dirname(jobFile)).mode & 0o777, 0o700);
   assert.strictEqual(fs.statSync(jobFile).mode & 0o777, 0o600);
@@ -2486,7 +2066,7 @@ test("--unsettled lists terminal unverified jobs and preserves Codex acceptance 
     finishedAt: "2026-07-21T00:03:00.000Z"
   });
   writeCodexJob(stateRoot, dir, codexNoProvenanceId, {
-    status: "completed",
+    status: "done",
     jobClass: "review",
     acceptance: "unverified",
     finishedAt: "2026-07-21T00:00:00.000Z"

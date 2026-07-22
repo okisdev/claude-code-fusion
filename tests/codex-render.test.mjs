@@ -60,6 +60,13 @@ test("model drift is rendered in every terminal footer and never in a running fo
   assert.doesNotMatch(renderTerminalResult(record()), /warning: brief header names/);
 });
 
+test("a structured task result renders its parsing status in the footer", () => {
+  const request = { outputSchemaFile: "/tmp/verdict.schema.json" };
+  assert.match(renderTerminalResult(record({ request, structuredOutput: { verdict: "pass" } })), /semantic: unverified\nstructured: parsed\nstate: done\n$/);
+  assert.match(renderTerminalResult(record({ request, structuredOutput: null, structuredOutputError: "Codex final response is not valid JSON." })), /semantic: unverified\nstructured: invalid\nstate: done\n$/);
+  assert.match(renderTerminalResult(record({ request })), /semantic: unverified\nstructured: unavailable\nstate: done\n$/);
+});
+
 test("a cancelled result renders salvaged partial Codex output", () => {
   const rendered = renderTerminalResult(record({
     partialResultText: "Recovered partial Codex output.",

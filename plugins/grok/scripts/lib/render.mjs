@@ -501,7 +501,8 @@ export function renderSetupReport(report) {
     `- headless safety capabilities: ${report.capabilities?.ready ? "ready" : `not ready, ${report.capabilities?.detail ?? "not checked"}`}`,
     `- data dir: ${report.dataDir.writable ? `writable (${report.dataDir.path})` : `not writable (${report.dataDir.detail})`}`,
     `- stop gate: ${report.stopGate ? "enabled" : "disabled"}`,
-    `- continuity: ${report.continuityPolicy ?? "manual"}`
+    `- continuity: ${report.continuityPolicy ?? "manual"}`,
+    `- grok doctor: ${report.doctorCommand?.available ? "available" : `not available, ${report.doctorCommand?.detail ?? "not checked"}`}`
   ];
 
   const nextSteps = [];

@@ -8,15 +8,17 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { readAuditEvents as readGuardAuditEvents, resolveStateDir as resolveGuardStateDir, stateFile as guardStateFile } from "./inline-delegation-guard.mjs";
 import { resolveCodexStateDir, resolveCodexStateRoots } from "./lib/codex-state-roots.mjs";
+import { recordEngineAcceptance } from "./lib/engine-acceptance.mjs";
 import { consumeRawArgsTransport, createRawArgsTransport, resolveRawArgsTransport } from "./lib/raw-args-transport.mjs";
-import { canonicalWorkerAgentType, isTerminalWorkerStatus, readWorkerRecords, recordCodexCollectorAcceptance, recordWorkerAcceptance } from "./lib/worker-state.mjs";
+import { canonicalWorkerAgentType, isTerminalWorkerStatus, readWorkerRecord, readWorkerRecords, recordWorkerAcceptance, validateWorkerAcceptance } from "./lib/worker-state.mjs";
+
+export { GrokPluginUpgradeRequiredError, newestCodexCompanion, newestGrokCompanion } from "./lib/engine-acceptance.mjs";
 
 const GROK_DATA_DIR_ENV = "GROK_COMPANION_DATA";
 const FUSION_DATA_DIR_ENV = "FUSION_DATA_DIR";
-const CODEX_TERMINAL_STATUSES = new Set(["done", "error", "cancelled", "completed", "failed"]);
+const CODEX_TERMINAL_STATUSES = new Set(["done", "error", "cancelled"]);
 const GROK_TERMINAL_STATUSES = new Set(["done", "error", "cancelled"]);
 const CODEX_ACCEPTANCE_STATES = new Set(["accepted", "rejected", "unverified"]);
-const ACCEPTANCE_FILENAME = "acceptance.jsonl";
 const TOKEN_USAGE_FILENAME = "token-usage.jsonl";
 const TERMINAL_LEDGER_PREFIX = "codex-jobs-monitor-announced";
 const OBSERVATION_LOCK_STALE_MS = 30000;
@@ -26,14 +28,6 @@ const FUSION_TASK_ID_PATTERN = /^fusion-[0-9a-f]{24}$/;
 const ENGINE_JOB_ID_PATTERN = /^[0-9a-f]{32}$/;
 const RECORD_VERDICTS = new Set(["accepted", "rejected", "unverified"]);
 const RECORD_SOURCES = new Set(["collector", "main-loop"]);
-
-export class GrokPluginUpgradeRequiredError extends Error {
-  constructor(message) {
-    super(message);
-    this.name = "GrokPluginUpgradeRequiredError";
-    this.code = "GROK_PLUGIN_UPGRADE_REQUIRED";
-  }
-}
 
 export function fusionWorkspaceKey(workspaceRoot) {
   return createHash("sha256").update(workspaceRoot).digest("hex").slice(0, 16);
@@ -53,10 +47,6 @@ export function modelAuditSidecarPath(workspaceRoot, env = process.env) {
 
 export function tokenUsageSidecarPath(workspaceRoot, env = process.env) {
   return path.join(resolveFusionDataDir(env), "observations", fusionWorkspaceKey(workspaceRoot), TOKEN_USAGE_FILENAME);
-}
-
-export function acceptanceSidecarPath(workspaceRoot, env = process.env) {
-  return path.join(resolveFusionDataDir(env), "observations", fusionWorkspaceKey(workspaceRoot), ACCEPTANCE_FILENAME);
 }
 
 function observationTimestamp(observation) {
@@ -127,16 +117,9 @@ export function normalizeCollectionMethod(value) {
   return normalized;
 }
 
-function semanticAcceptance(raw, acceptanceObservation = null) {
+function semanticAcceptance(raw) {
   const recorded = raw?.acceptance;
-  if (recorded === "accepted" || recorded === "rejected") {
-    return recorded;
-  }
-  const observed = acceptanceObservation?.acceptance;
-  if (CODEX_ACCEPTANCE_STATES.has(observed)) {
-    return observed;
-  }
-  return "unverified";
+  return recorded === "accepted" || recorded === "rejected" ? recorded : "unverified";
 }
 
 function acceptanceProvenance(raw) {
@@ -203,10 +186,6 @@ function loadLatestJsonlByJobId(sidecarPath, timestampField) {
 
 export function loadTokenUsageObservations(sidecarPath) {
   return loadLatestJsonlByJobId(sidecarPath, "observedAt");
-}
-
-export function loadAcceptanceObservations(sidecarPath) {
-  return loadLatestJsonlByJobId(sidecarPath, "recordedAt");
 }
 
 function waitForObservationLock() {
@@ -281,13 +260,6 @@ export function appendTokenUsageObservation(sidecarPath, observation) {
   });
 }
 
-function appendAcceptanceObservation(sidecarPath, observation) {
-  return appendJsonlObservation(sidecarPath, observation, () => {
-    const current = loadAcceptanceObservations(sidecarPath).get(observation.jobId);
-    return !current || ["acceptance", "workspaceRoot", "repositoryKey", "sessionId", "source", "reason"].some((field) => (current[field] ?? null) !== (observation[field] ?? null));
-  });
-}
-
 export function resolveGitWorkspaceRoot(cwd) {
   const resolved = path.resolve(cwd);
   const result = spawnSync("git", ["-C", resolved, "rev-parse", "--show-toplevel"], { encoding: "utf8" });
@@ -348,184 +320,6 @@ export function workspaceRootsShareRepository(leftRoot, rightRoot, cache = new M
     return leftIdentity === rightIdentity;
   }
   return workspaceRootInScope(leftRoot, rightRoot) || workspaceRootInScope(rightRoot, leftRoot);
-}
-
-function validatedIdentifier(value, label, pattern, maximumLength) {
-  const normalized = nonEmptyString(value);
-  if (!normalized || normalized.length > maximumLength || !pattern.test(normalized)) {
-    throw new TypeError(`${label} is invalid.`);
-  }
-  return normalized;
-}
-
-function validatedIsoTimestamp(value) {
-  const normalized = nonEmptyString(value);
-  const parsed = normalized ? Date.parse(normalized) : Number.NaN;
-  if (!normalized || !Number.isFinite(parsed) || new Date(parsed).toISOString() !== normalized) {
-    throw new TypeError("Codex acceptance recordedAt must be an ISO timestamp.");
-  }
-  return normalized;
-}
-
-function sanitizedAcceptanceReason(value) {
-  const normalized = nonEmptyString(value);
-  if (!normalized) {
-    return null;
-  }
-  if (normalized.length > 240 || /[\r\n\u0000-\u001f\u007f]/.test(normalized)) {
-    throw new TypeError("Codex acceptance reason must be a single non-sensitive line of at most 240 characters.");
-  }
-  return normalized
-    .replace(/sk-[A-Za-z0-9_-]{16,}/g, "[redacted]")
-    .replace(/(?:ghp_|gho_|ghu_|ghs_|ghr_)[A-Za-z0-9]{20,}/g, "[redacted]")
-    .replace(/xai-[A-Za-z0-9]{16,}/g, "[redacted]")
-    .replace(/Bearer\s+\S{20,}/gi, "Bearer [redacted]");
-}
-
-function prepareCodexAcceptance({ jobId, acceptance, workspaceRoot = process.cwd(), env = process.env, sessionId = env.CLAUDE_CODE_SESSION_ID || null, reason = null, source = "collector", recordedAt = new Date().toISOString() }) {
-  const normalizedJobId = validatedIdentifier(jobId, "Codex job id", /^[A-Za-z0-9][A-Za-z0-9._:-]*$/, 128);
-  if (!CODEX_ACCEPTANCE_STATES.has(acceptance)) {
-    throw new TypeError(`Codex acceptance must be one of ${[...CODEX_ACCEPTANCE_STATES].join(", ")}.`);
-  }
-  const normalizedRoot = resolveGitWorkspaceRoot(workspaceRoot);
-  const normalizedSessionId = sessionId == null ? null : validatedIdentifier(sessionId, "Codex session id", /^[A-Za-z0-9][A-Za-z0-9._:-]*$/, 128);
-  const normalizedSource = validatedIdentifier(source, "Codex acceptance source", /^[a-z][a-z0-9._-]*$/, 32);
-  const normalizedReason = sanitizedAcceptanceReason(reason);
-  const observation = {
-    schemaVersion: 1,
-    engine: "codex",
-    jobId: normalizedJobId,
-    acceptance,
-    workspaceRoot: normalizedRoot,
-    repositoryKey: fusionRepositoryKey(normalizedRoot),
-    sessionId: normalizedSessionId,
-    source: normalizedSource,
-    recordedAt: validatedIsoTimestamp(recordedAt),
-    ...(normalizedReason ? { reason: normalizedReason } : {})
-  };
-  return { observation, normalizedRoot, normalizedSessionId, normalizedSource, normalizedReason, env };
-}
-
-export function recordCodexAcceptance(options) {
-  const { observation, normalizedRoot, normalizedSessionId, normalizedSource, normalizedReason, env } = prepareCodexAcceptance(options);
-  if (!appendAcceptanceObservation(acceptanceSidecarPath(normalizedRoot, env), observation)) {
-    throw new Error("Codex acceptance ledger is busy; retry the write.");
-  }
-  for (const record of normalizedSessionId == null ? [] : readWorkerRecords(env).filter((candidate) => candidate.sessionId === normalizedSessionId && canonicalWorkerAgentType(candidate.agentType) === "fusion:job-collector" && candidate.completionContract === "collector" && candidate.peerEngine === "codex" && candidate.peerJobId === observation.jobId && isTerminalWorkerStatus(candidate.transportStatus))) {
-    recordCodexCollectorAcceptance({ taskId: record.taskId, jobId: observation.jobId, sessionId: normalizedSessionId, acceptance: observation.acceptance, env, source: normalizedSource, reason: normalizedReason });
-  }
-  return observation;
-}
-
-export function newestGrokCompanion(env = process.env) {
-  const override = typeof env.FUSION_GROK_COMPANION === "string" ? env.FUSION_GROK_COMPANION.trim() : "";
-  if (override && path.isAbsolute(override) && regularFile(override)) {
-    return override;
-  }
-  const base = path.join(configuredHome(env), ".claude", "plugins", "cache", "claude-code-fusion", "grok");
-  try {
-    const candidates = fs
-      .readdirSync(base)
-      .map((version) => path.join(base, version, "scripts", "grok-companion.mjs"))
-      .filter((candidate) => fs.existsSync(candidate))
-      .map((candidate) => ({ candidate, mtime: fs.statSync(candidate).mtimeMs }))
-      .sort((left, right) => right.mtime - left.mtime);
-    if (candidates.length > 0) {
-      return candidates[0].candidate;
-    }
-  } catch {
-    void 0;
-  }
-  const sibling = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..", "grok", "scripts", "grok-companion.mjs");
-  return fs.existsSync(sibling) ? sibling : null;
-}
-
-function configuredHome(env = process.env) {
-  const candidate = typeof env.HOME === "string" ? env.HOME.trim() : "";
-  return candidate && path.isAbsolute(candidate) ? candidate : os.homedir();
-}
-
-function regularFile(file) {
-  try {
-    return fs.statSync(file).isFile();
-  } catch {
-    return false;
-  }
-}
-
-export function newestCodexCompanion(env = process.env) {
-  const override = typeof env.FUSION_CODEX_COMPANION === "string" ? env.FUSION_CODEX_COMPANION.trim() : "";
-  if (override && path.isAbsolute(override) && regularFile(override)) {
-    return override;
-  }
-  const base = path.join(configuredHome(env), ".claude", "plugins", "cache", "claude-code-fusion", "codex");
-  try {
-    const candidates = fs
-      .readdirSync(base)
-      .map((version) => path.join(base, version, "scripts", "codex-companion.mjs"))
-      .filter((candidate) => fs.existsSync(candidate))
-      .map((candidate) => ({ candidate, mtime: fs.statSync(candidate).mtimeMs }))
-      .sort((left, right) => right.mtime - left.mtime || left.candidate.localeCompare(right.candidate));
-    if (candidates.length > 0) {
-      return candidates[0].candidate;
-    }
-  } catch {
-    void 0;
-  }
-  const sibling = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..", "codex", "scripts", "codex-companion.mjs");
-  return fs.existsSync(sibling) ? sibling : null;
-}
-
-function companionFailureMessage(result) {
-  return [result.stderr, result.stdout, result.error?.message].filter((value) => typeof value === "string" && value.trim()).join("\n").trim();
-}
-
-function codexAcceptanceSubcommandUnavailable(result) {
-  if (result.error) {
-    return true;
-  }
-  const message = companionFailureMessage(result);
-  return /\b(?:unknown|unsupported|unrecognized)\s+(?:subcommand|command)\b/i.test(message) || /\brecord-acceptance\b.*\b(?:unknown|unsupported|unavailable|not found|not supported)\b/i.test(message) || /\b(?:cannot find module|ERR_MODULE_NOT_FOUND)\b/i.test(message);
-}
-
-function grokAcceptanceSubcommandUnavailable(result) {
-  if (result.error) {
-    return false;
-  }
-  const message = companionFailureMessage(result);
-  return /\b(?:unknown|unsupported|unrecognized)\s+(?:subcommand|command)\b/i.test(message) || /\brecord-acceptance\b.*\b(?:unknown|unsupported|unavailable|not found|not supported)\b/i.test(message) || /\b(?:cannot find module|ERR_MODULE_NOT_FOUND)\b/i.test(message);
-}
-
-function recordCodexCompanionAcceptance({ jobId, acceptance, source, reason, acceptFailedTransport, workspaceRoot, env }) {
-  const bin = newestCodexCompanion(env);
-  if (!bin) {
-    return { updated: false };
-  }
-  const argv = [bin, "record-acceptance", "--job-id", jobId, "--acceptance", acceptance, ...(source ? ["--source", source] : []), ...(reason ? ["--reason", reason] : []), ...(acceptFailedTransport ? ["--accept-failed-transport"] : [])];
-  const result = spawnSync(process.execPath, argv, { cwd: workspaceRoot, encoding: "utf8", env });
-  if (!result.error && result.status === 0) {
-    return { updated: true };
-  }
-  if (codexAcceptanceSubcommandUnavailable(result)) {
-    return { updated: false };
-  }
-  throw new Error(companionFailureMessage(result) || "Codex acceptance record update failed.");
-}
-
-function recordGrokCompanionAcceptance({ jobId, acceptance, reason, acceptFailedTransport, workspaceRoot, asJson, env }) {
-  const bin = newestGrokCompanion(env);
-  if (!bin) {
-    throw new GrokPluginUpgradeRequiredError("The Grok job was found, but its companion is unavailable. Upgrade the Grok plugin and retry.");
-  }
-  const argv = [bin, "record-acceptance", "--job-id", jobId, "--acceptance", acceptance, ...(reason ? ["--reason", reason] : []), ...(acceptFailedTransport ? ["--accept-failed-transport"] : []), ...(asJson ? ["--json"] : [])];
-  const result = spawnSync(process.execPath, argv, { cwd: workspaceRoot, encoding: "utf8", env });
-  if (!result.error && result.status === 0) {
-    return;
-  }
-  if (grokAcceptanceSubcommandUnavailable(result)) {
-    throw new GrokPluginUpgradeRequiredError("The installed Grok plugin does not support record-acceptance. Upgrade the Grok plugin and retry.");
-  }
-  throw new Error(companionFailureMessage(result) || "Grok acceptance record update failed.");
 }
 
 export function grokStats({ all = false, env = process.env, cwd = process.cwd() } = {}) {
@@ -654,28 +448,6 @@ function terminalLedgerRecord(raw, { workspaceRoot = null, workspaceKey = null, 
   };
 }
 
-function legacyTerminalLedgerRecords(keys, workspaceKey, repositoryKey = null) {
-  const records = [];
-  for (const key of keys) {
-    if (typeof key !== "string") {
-      continue;
-    }
-    const separator = key.lastIndexOf(":");
-    if (separator <= 0) {
-      continue;
-    }
-    const record = terminalLedgerRecord(
-      { jobId: key.slice(0, separator), transportStatus: key.slice(separator + 1) },
-      { workspaceKey, repositoryKey }
-    );
-    if (record) {
-      record._fusionEvidence = "legacy-terminal-ledger";
-      records.push(record);
-    }
-  }
-  return records;
-}
-
 export function readCodexTerminalLedgerFiles(stateRoot) {
   const records = [];
   let entries;
@@ -689,10 +461,6 @@ export function readCodexTerminalLedgerFiles(stateRoot) {
     const workspaceKey = terminalLedgerWorkspaceKey(file);
     try {
       const raw = JSON.parse(fs.readFileSync(file, "utf8"));
-      if (Array.isArray(raw)) {
-        records.push(...legacyTerminalLedgerRecords(raw, workspaceKey));
-        continue;
-      }
       const scopeRoot = nonEmptyString(raw?.workspaceRoot);
       const repositoryKey = nonEmptyString(raw?.repositoryKey);
       if (Array.isArray(raw?.records)) {
@@ -702,8 +470,6 @@ export function readCodexTerminalLedgerFiles(stateRoot) {
             records.push(record);
           }
         }
-      } else if (Array.isArray(raw?.keys)) {
-        records.push(...legacyTerminalLedgerRecords(raw.keys, workspaceKey, repositoryKey));
       }
     } catch {
       void 0;
@@ -714,11 +480,7 @@ export function readCodexTerminalLedgerFiles(stateRoot) {
 
 function readCodexJobEvidence(stateRoot, options = {}) {
   const roots = Object.hasOwn(options, "env") ? resolveCodexStateRoots(options.env) : [stateRoot];
-  const compatibilityOverride = Object.hasOwn(options, "env") && !nonEmptyString(options.env.FUSION_CODEX_STATE) && Boolean(nonEmptyString(options.env.FUSION_CODEX_STATE_DIR));
-  return roots.flatMap((root) => {
-    const legacy = compatibilityOverride || path.basename(path.dirname(path.resolve(root))) === "codex-openai-codex";
-    return [...readWorkspaceJobFiles(root), ...readCodexTerminalLedgerFiles(root)].map((record) => legacy ? { ...record, _fusionLegacySource: true } : record);
-  });
+  return roots.flatMap((root) => [...readWorkspaceJobFiles(root), ...readCodexTerminalLedgerFiles(root)]);
 }
 
 function readGrokJobEvidence(stateRoot) {
@@ -736,7 +498,7 @@ function preferJobCopy(current, candidate, isTerminal) {
   if (currentTerminal !== candidateTerminal) {
     return candidateTerminal ? candidate : current;
   }
-  const evidenceRank = { state: 2, "terminal-ledger": 1, "legacy-terminal-ledger": 0 };
+  const evidenceRank = { state: 2, "terminal-ledger": 1 };
   const currentRank = evidenceRank[current?._fusionEvidence] ?? 0;
   const candidateRank = evidenceRank[candidate?._fusionEvidence] ?? 0;
   if (currentRank !== candidateRank) {
@@ -775,9 +537,6 @@ function sameJobScope(left, right, repositoryCache) {
   const rightRepositoryKey = nonEmptyString(right?._fusionRepositoryKey);
   const leftRoot = nonEmptyString(left?.workspaceRoot);
   const rightRoot = nonEmptyString(right?.workspaceRoot);
-  if (left?._fusionLegacySource && right?._fusionLegacySource && leftRoot && rightRoot && path.resolve(leftRoot) === path.resolve(rightRoot)) {
-    return true;
-  }
   if (leftRepositoryKey && rightRepositoryKey) {
     return leftRepositoryKey === rightRepositoryKey;
   }
@@ -1266,7 +1025,6 @@ export function fileBasedEngineStats(descriptor, { all = false, env = process.en
   const byEvidence = {};
   const auditCache = new Map();
   const tokenObservations = descriptor.usesTokenUsageObservations ? loadAllObservationCandidates(env, TOKEN_USAGE_FILENAME, loadTokenUsageObservations) : new Map();
-  const acceptanceObservations = descriptor.id === "codex" ? loadAllObservationCandidates(env, ACCEPTANCE_FILENAME, loadAcceptanceObservations) : new Map();
   const observationRepositoryCache = new Map();
   let tokenTotals = { inputTokens: 0, cachedInputTokens: 0, outputTokens: 0, reasoningOutputTokens: 0, totalTokens: 0 };
   let tokenAggregationOverflow = false;
@@ -1304,16 +1062,15 @@ export function fileBasedEngineStats(descriptor, { all = false, env = process.en
     }
     if (descriptor.id === "codex") {
       const jobId = nonEmptyString(raw?.id);
-      const acceptanceObservation = jobId ? scopedObservationForJob(acceptanceObservations, raw, observationRepositoryCache) : null;
       if (CODEX_TERMINAL_STATUSES.has(job.status)) {
-        bump(byAcceptance, semanticAcceptance(raw, acceptanceObservation));
+        bump(byAcceptance, semanticAcceptance(raw));
       } else {
         pendingTransportJobs += 1;
       }
-      if (jobId && job.status === "error" && semanticAcceptance(raw, acceptanceObservation) === "accepted") {
+      if (jobId && job.status === "error" && semanticAcceptance(raw) === "accepted") {
         acceptedWithErrorTransport.push(jobId);
       }
-      if (jobId && job.status === "done" && semanticAcceptance(raw, acceptanceObservation) === "unverified") {
+      if (jobId && job.status === "done" && semanticAcceptance(raw) === "unverified") {
         doneWithoutAcceptance.push(jobId);
       }
     }
@@ -1392,7 +1149,6 @@ export function fileBasedEngineStats(descriptor, { all = false, env = process.en
                 evidence: {
                   bySource: byEvidence,
                   recoveredTerminalJobs: byEvidence["terminal-ledger"] ?? 0,
-                  recoveredLegacyTerminalJobs: byEvidence["legacy-terminal-ledger"] ?? 0,
                   isLowerBound: true
                 }
               }
@@ -1933,16 +1689,13 @@ function sessionScopedEngineStats(descriptor, sessionId, env) {
       }
     }
     const scoped = selectPreferredJobs(jobs, descriptor, (raw) => descriptor.sessionOf(raw) === sessionId);
-    const acceptanceObservations = descriptor.id === "codex" ? loadAllObservationCandidates(env, ACCEPTANCE_FILENAME, loadAcceptanceObservations) : new Map();
-    const observationRepositoryCache = new Map();
     totalJobs = scoped.length;
     for (const raw of scoped) {
       const status = raw.status ?? "unknown";
       bump(byStatus, status);
       if (descriptor.id === "codex") {
         if (CODEX_TERMINAL_STATUSES.has(status)) {
-          const acceptanceObservation = scopedObservationForJob(acceptanceObservations, raw, observationRepositoryCache);
-          bump(byAcceptance, semanticAcceptance(raw, acceptanceObservation));
+          bump(byAcceptance, semanticAcceptance(raw));
         } else {
           pendingTransportJobs += 1;
         }
@@ -2240,8 +1993,8 @@ function renderEngine(lines, name, stats) {
       lines.push(`Observed tokens: ${stats.usage.totalTokens} total, ${stats.usage.inputTokens} input, ${stats.usage.cacheReadInputTokens} cached input, ${stats.usage.outputTokens} output${reasoning}`);
     }
   }
-  if (stats.evidence?.recoveredTerminalJobs || stats.evidence?.recoveredLegacyTerminalJobs) {
-    lines.push("", `Recovered from retained terminal ledgers: ${stats.evidence.recoveredTerminalJobs + stats.evidence.recoveredLegacyTerminalJobs}`);
+  if (stats.evidence?.recoveredTerminalJobs) {
+    lines.push("", `Recovered from retained terminal ledgers: ${stats.evidence.recoveredTerminalJobs}`);
   }
   renderWorkerIdentities(lines, stats.identities);
 }
@@ -2454,14 +2207,11 @@ function unsettledEngineEntries(descriptor, env) {
     return [];
   }
   const scoped = selectPreferredJobs(jobs, descriptor, () => true);
-  const acceptanceObservations = descriptor.id === "codex" ? loadAllObservationCandidates(env, ACCEPTANCE_FILENAME, loadAcceptanceObservations) : new Map();
-  const observationRepositoryCache = new Map();
   return scoped.flatMap((raw) => {
     if (!descriptor.isTerminal(raw)) {
       return [];
     }
-    const acceptanceObservation = descriptor.id === "codex" ? scopedObservationForJob(acceptanceObservations, raw, observationRepositoryCache) : null;
-    if (semanticAcceptance(raw, acceptanceObservation) !== "unverified") {
+    if (semanticAcceptance(raw) !== "unverified") {
       return [];
     }
     const id = nonEmptyString(raw?.id);
@@ -2529,14 +2279,17 @@ function parseRecordPair(value) {
     throw new TypeError("--record requires an <id>=<verdict> pair.");
   }
   const id = value.slice(0, separator);
-  const verdict = value.slice(separator + 1);
+  const rawVerdict = value.slice(separator + 1);
+  const overrideSuffix = ":accept-failed-transport";
+  const acceptFailedTransport = rawVerdict.endsWith(overrideSuffix);
+  const verdict = acceptFailedTransport ? rawVerdict.slice(0, -overrideSuffix.length) : rawVerdict;
   if (!FUSION_TASK_ID_PATTERN.test(id) && !ENGINE_JOB_ID_PATTERN.test(id)) {
     throw new TypeError("--record id must be a Fusion task id or a 32 character engine job id.");
   }
   if (!RECORD_VERDICTS.has(verdict)) {
     throw new TypeError("--record verdict must be accepted, rejected, or unverified.");
   }
-  return { id, verdict };
+  return { id, verdict, acceptFailedTransport };
 }
 
 function parseRecordArguments(argv) {
@@ -2591,66 +2344,87 @@ function parseRecordArguments(argv) {
 }
 
 function isStrictDirectRecordArguments(argv) {
-  if (!argv.includes("--record") || argv.includes("--reason")) {
-    return false;
-  }
   try {
-    parseRecordArguments(argv);
-    return true;
+    let records = 0;
+    const flags = new Set();
+    for (let index = 0; index < argv.length; index += 1) {
+      const token = argv[index];
+      if (token === "--record") {
+        parseRecordPair(argv[index + 1]);
+        records += 1;
+        index += 1;
+        continue;
+      }
+      if (token === "--source") {
+        const value = argv[index + 1];
+        if ((value !== "collector" && value !== "main-loop") || flags.has(token)) {
+          return false;
+        }
+        flags.add(token);
+        index += 1;
+        continue;
+      }
+      if (token === "--json" || token === "--accept-failed-transport") {
+        if (flags.has(token)) {
+          return false;
+        }
+        flags.add(token);
+        continue;
+      }
+      return false;
+    }
+    return records > 0;
   } catch {
     return false;
   }
 }
 
-function recordEngineAcceptance({ engine, jobId, verdict, source, reason, acceptFailedTransport = false, workspaceRoot, asJson, env }) {
-  if (engine === "grok") {
-    recordGrokCompanionAcceptance({
-      jobId,
-      acceptance: verdict,
-      reason,
-      acceptFailedTransport,
-      workspaceRoot,
-      asJson,
-      env
-    });
-    return true;
-  }
-  const companion = recordCodexCompanionAcceptance({
-    jobId,
-    acceptance: verdict,
-    source,
-    reason,
-    acceptFailedTransport,
-    workspaceRoot,
-    env
-  });
-  if (!companion.updated) {
-    throw new Error("Codex job record was not updated because the companion or subcommand is unavailable.");
-  }
-  return true;
-}
-
-function writeRecordConfirmation({ kind, engine = null, jobId = null, worker = null, asJson, stdout }) {
+function writeRecordConfirmation({ kind, engine = null, jobId = null, worker = null, queued = false, asJson, stdout }) {
   if (asJson) {
-    stdout.write(`${JSON.stringify(kind === "engine" ? { kind, engine, jobId, acceptance: worker?.acceptance } : { kind, taskId: worker.taskId, acceptance: worker.acceptance })}\n`);
+    stdout.write(`${JSON.stringify(kind === "engine" ? { kind, engine, jobId, acceptance: worker?.acceptance } : { kind, taskId: worker.taskId, acceptance: queued ? worker.pendingVerdict?.acceptance : worker.acceptance, ...(queued ? { queued: true } : {}) })}\n`);
     return;
   }
   if (kind === "engine") {
     stdout.write(`Recorded ${worker.acceptance} for ${engine === "codex" ? "Codex" : "Grok"} job ${jobId}.\n`);
     return;
   }
+  if (queued) {
+    stdout.write(`Queued ${worker.pendingVerdict?.acceptance} for ${worker.taskId}; applies when the record turns terminal.\n`);
+    return;
+  }
   stdout.write(`Recorded ${worker.acceptance} for Fusion worker task ${worker.taskId}.\n`);
 }
 
 function settleWorkerRecord({ taskId, verdict, source, reason, acceptFailedTransport = false, asJson, workspaceRoot, env, stdout }) {
-  const worker = recordWorkerAcceptance({ taskId, acceptance: verdict, env, source, reason, acceptFailedTransport });
-  writeRecordConfirmation({ kind: "worker", worker, asJson, stdout });
-  const peerJobId = typeof worker.peerJobId === "string" && ENGINE_JOB_ID_PATTERN.test(worker.peerJobId) ? worker.peerJobId : null;
+  const current = readWorkerRecord(taskId, env);
+  const peerJobId = isTerminalWorkerStatus(current?.transportStatus) && typeof current.peerJobId === "string" && ENGINE_JOB_ID_PATTERN.test(current.peerJobId) ? current.peerJobId : null;
   if (!peerJobId) {
+    const settlement = recordWorkerAcceptance({ taskId, acceptance: verdict, env, source, reason, acceptFailedTransport });
+    const worker = settlement.record;
+    writeRecordConfirmation({ kind: "worker", worker, queued: settlement.queued, asJson, stdout });
     return [worker];
   }
-  const engine = worker.peerEngine === "codex" || worker.peerEngine === "grok" ? worker.peerEngine : resolveEngineJob(peerJobId, env);
-  recordEngineAcceptance({ engine, jobId: peerJobId, verdict, source, reason, acceptFailedTransport, workspaceRoot, asJson, env });
+  validateWorkerAcceptance({ record: current, taskId, acceptance: verdict, source, reason, acceptFailedTransport });
+  const engine = current.peerEngine === "codex" || current.peerEngine === "grok" ? current.peerEngine : resolveEngineJob(peerJobId, env);
+  try {
+    recordEngineAcceptance({ engine, jobId: peerJobId, acceptance: verdict, source, reason, acceptFailedTransport, workspaceRoot, asJson, env });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    throw new Error(`Engine settlement failed for ${engine === "codex" ? "Codex" : "Grok"} job ${peerJobId}: ${message}`);
+  }
+  let settlement;
+  try {
+    settlement = recordWorkerAcceptance({ taskId, acceptance: verdict, env, source, reason, acceptFailedTransport });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    throw new Error(`Engine settlement succeeded for ${engine === "codex" ? "Codex" : "Grok"} job ${peerJobId}, but Fusion worker task ${taskId} was not settled: ${message}`);
+  }
+  const worker = settlement.record;
+  if (settlement.queued) {
+    writeRecordConfirmation({ kind: "worker", worker, asJson, stdout });
+    return [worker];
+  }
+  writeRecordConfirmation({ kind: "worker", worker, asJson, stdout });
   writeRecordConfirmation({ kind: "engine", engine, jobId: peerJobId, worker, asJson, stdout });
   return [worker, { engine, jobId: peerJobId, acceptance: verdict }];
 }
@@ -2658,38 +2432,45 @@ function settleWorkerRecord({ taskId, verdict, source, reason, acceptFailedTrans
 function settleEngineRecord({ jobId, verdict, source, reason, acceptFailedTransport = false, asJson, workspaceRoot, env, stdout }) {
   const engine = resolveEngineJob(jobId, env);
   const confirmation = { engine, jobId, acceptance: verdict };
-  recordEngineAcceptance({ engine, jobId, verdict, source, reason, acceptFailedTransport, workspaceRoot, asJson, env });
+  recordEngineAcceptance({ engine, jobId, acceptance: verdict, source, reason, acceptFailedTransport, workspaceRoot, asJson, env });
   writeRecordConfirmation({ kind: "engine", engine, jobId, worker: confirmation, asJson, stdout });
   const writes = [confirmation];
   for (const record of readWorkerRecords(env).filter((candidate) => candidate.peerJobId === jobId)) {
-    const worker = recordWorkerAcceptance({ taskId: record.taskId, acceptance: verdict, env, source, reason, acceptFailedTransport });
-    writeRecordConfirmation({ kind: "worker", worker, asJson, stdout });
-    writes.push(worker);
+    const settlement = recordWorkerAcceptance({ taskId: record.taskId, acceptance: verdict, env, source, reason, acceptFailedTransport });
+    writeRecordConfirmation({ kind: "worker", worker: settlement.record, queued: settlement.queued, asJson, stdout });
+    writes.push(settlement.record);
   }
   return writes;
 }
 
-function settleRecords({ records, source, reason, acceptFailedTransport = false, asJson, workspaceRoot, env, stdout }) {
+function settleRecords({ records, source, reason, acceptFailedTransport = false, asJson, workspaceRoot, env, stdout, stderr }) {
   const writes = [];
-  for (const { id, verdict } of records) {
-    if (FUSION_TASK_ID_PATTERN.test(id)) {
-      writes.push(...settleWorkerRecord({ taskId: id, verdict, source, reason, acceptFailedTransport, asJson, workspaceRoot, env, stdout }));
-    } else {
-      writes.push(...settleEngineRecord({ jobId: id, verdict, source, reason, acceptFailedTransport, asJson, workspaceRoot, env, stdout }));
+  const errors = [];
+  for (const { id, verdict, acceptFailedTransport: pairAcceptFailedTransport } of records) {
+    const pairOverride = acceptFailedTransport || pairAcceptFailedTransport;
+    try {
+      if (FUSION_TASK_ID_PATTERN.test(id)) {
+        writes.push(...settleWorkerRecord({ taskId: id, verdict, source, reason, acceptFailedTransport: pairOverride, asJson, workspaceRoot, env, stdout }));
+      } else {
+        writes.push(...settleEngineRecord({ jobId: id, verdict, source, reason, acceptFailedTransport: pairOverride, asJson, workspaceRoot, env, stdout }));
+      }
+    } catch (error) {
+      const failure = { id, error };
+      errors.push(failure);
+      stderr.write(`Failed to settle ${id}: ${error instanceof Error ? error.message : String(error)}\n`);
     }
   }
-  return writes;
+  return { writes, errors };
 }
 
 export function main(argv = process.argv.slice(2), { env = process.env, cwd = process.cwd(), stdout = process.stdout, stderr = process.stderr } = {}) {
   const asJson = argv.includes("--json");
-  const effectiveEnv = argv.includes("--include-legacy") ? { ...env, FUSION_CODEX_INCLUDE_LEGACY: "1" } : env;
 
   if (argv.includes("--audit")) {
     const all = argv.includes("--all");
     const report = buildAuditReport({
-      env: effectiveEnv,
-      sessionId: argv.includes("--session") ? sessionIdFromArgs(argv, effectiveEnv) : null,
+      env,
+      sessionId: argv.includes("--session") ? sessionIdFromArgs(argv, env) : null,
       days: all ? null : positiveAuditDays(argumentValue(argv, "--days")),
       all
     });
@@ -2699,98 +2480,39 @@ export function main(argv = process.argv.slice(2), { env = process.env, cwd = pr
 
   if (argv.includes("--record")) {
     const request = parseRecordArguments(argv);
-    return settleRecords({ ...request, workspaceRoot: cwd, env: effectiveEnv, stdout });
-  }
-
-  if (argv.includes("--record-acceptance")) {
-    if (argv.includes("--session")) {
-      throw new TypeError("--session cannot be used with --record-acceptance; acceptance is bound to the current Claude session.");
+    const result = settleRecords({ ...request, workspaceRoot: cwd, env, stdout, stderr });
+    if (result.errors.length > 0) {
+      throw new Error(`${result.errors.length} record settlement ${result.errors.length === 1 ? "failed" : "failures"}.`);
     }
-    const index = argv.indexOf("--record-acceptance");
-    const workspaceRoot = argumentValue(argv, "--workspace") ?? cwd;
-    const acceptanceRequest = {
-      jobId: argv[index + 1],
-      acceptance: argv[index + 2],
-      workspaceRoot,
-      env: effectiveEnv,
-      sessionId: effectiveEnv.CLAUDE_CODE_SESSION_ID || null,
-      reason: argumentValue(argv, "--reason"),
-      source: argumentValue(argv, "--source") ?? "collector"
-    };
-    const preparedAcceptance = prepareCodexAcceptance(acceptanceRequest);
-    const codexFound = codexJobExists(preparedAcceptance.observation.jobId, effectiveEnv);
-    const grokJob = codexFound ? null : grokJobById(preparedAcceptance.observation.jobId, effectiveEnv);
-    if (grokJob) {
-      recordGrokCompanionAcceptance({
-        jobId: preparedAcceptance.observation.jobId,
-        acceptance: preparedAcceptance.observation.acceptance,
-        reason: preparedAcceptance.normalizedReason,
-        acceptFailedTransport: argv.includes("--accept-failed-transport"),
-        workspaceRoot: preparedAcceptance.normalizedRoot,
-        asJson,
-        env: effectiveEnv
-      });
-      const observation = { ...preparedAcceptance.observation, engine: "grok" };
-      stdout.write(asJson ? `${JSON.stringify(observation, null, 2)}\n` : `Recorded ${observation.acceptance} for Grok job ${observation.jobId}.\n`);
-      return observation;
-    }
-    const companion = recordCodexCompanionAcceptance({
-      jobId: preparedAcceptance.observation.jobId,
-      acceptance: preparedAcceptance.observation.acceptance,
-      source: preparedAcceptance.normalizedSource,
-      reason: preparedAcceptance.normalizedReason,
-      acceptFailedTransport: argv.includes("--accept-failed-transport"),
-      workspaceRoot: preparedAcceptance.normalizedRoot,
-      env: effectiveEnv
-    });
-    const observation = recordCodexAcceptance(acceptanceRequest);
-    if (!companion.updated) {
-      stderr.write("Warning: Codex job record was not updated because the companion or subcommand is unavailable.\n");
-    }
-    stdout.write(asJson ? `${JSON.stringify(observation, null, 2)}\n` : `Recorded ${observation.acceptance} for Codex job ${observation.jobId}.\n`);
-    return observation;
-  }
-
-  if (argv.includes("--record-worker-acceptance")) {
-    const index = argv.indexOf("--record-worker-acceptance");
-    const observation = recordWorkerAcceptance({
-      taskId: argv[index + 1],
-      acceptance: argv[index + 2],
-      env: effectiveEnv,
-      reason: argumentValue(argv, "--reason"),
-      source: argumentValue(argv, "--source") ?? "main-loop",
-      acceptFailedTransport: argv.includes("--accept-failed-transport")
-    });
-    stdout.write(asJson ? `${JSON.stringify(observation, null, 2)}\n` : `Recorded ${observation.acceptance} for Fusion worker task ${observation.taskId}.\n`);
-    return observation;
+    return result.writes;
   }
 
   if (argv.includes("--prune-dead")) {
-    const result = pruneDeadWorkspaces({ env: effectiveEnv, yes: argv.includes("--yes") });
+    const result = pruneDeadWorkspaces({ env, yes: argv.includes("--yes") });
     stdout.write(asJson ? `${JSON.stringify(result, null, 2)}\n` : renderPruneReport(result));
     return result;
   }
 
   if (argv.includes("--unsettled")) {
-    const report = buildUnsettledReport({ env: effectiveEnv });
+    const report = buildUnsettledReport({ env });
     stdout.write(asJson ? `${JSON.stringify(report, null, 2)}\n` : renderUnsettledReport(report));
     return report;
   }
 
   if (argv.includes("--trace")) {
-    const report = buildTraceReport({ env: effectiveEnv, cwd, sessionId: sessionIdFromArgs(argv, effectiveEnv) });
+    const report = buildTraceReport({ env, cwd, sessionId: sessionIdFromArgs(argv, env) });
     stdout.write(asJson ? `${JSON.stringify(report, null, 2)}\n` : renderTraceReport(report));
     return report;
   }
 
   if (argv.includes("--session")) {
-    const report = buildSessionReport({ env: effectiveEnv, sessionId: sessionIdFromArgs(argv, effectiveEnv) });
+    const report = buildSessionReport({ env, sessionId: sessionIdFromArgs(argv, env) });
     stdout.write(asJson ? `${JSON.stringify(report, null, 2)}\n` : renderSessionReport(report));
     return report;
   }
 
   const all = argv.includes("--all");
-  const report = buildFusionStats({ all, env: effectiveEnv, cwd });
+  const report = buildFusionStats({ all, env, cwd });
   if (asJson) {
     stdout.write(`${JSON.stringify(report, null, 2)}\n`);
   } else {

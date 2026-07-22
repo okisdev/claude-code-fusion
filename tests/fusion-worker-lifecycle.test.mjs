@@ -5,7 +5,6 @@ import os from "node:os";
 import path from "node:path";
 import { test } from "node:test";
 
-import { recordCodexAcceptance } from "../plugins/fusion/scripts/fusion-stats.mjs";
 import { createWorkerRecord, readWorkerSessionState, readWorkerRecords, recordWorkerAcceptance, updateWorkerRecord, WORKER_COLLECTION_METHODS } from "../plugins/fusion/scripts/lib/worker-state.mjs";
 import { validateWorkerBrief, workerBudgetFailure, workerLimits } from "../plugins/fusion/scripts/worker-lifecycle.mjs";
 
@@ -34,6 +33,18 @@ function envFor(box, extra = {}) {
 
 function run(box, payload, extra = {}) {
   return spawnSync(process.execPath, [script], { input: JSON.stringify(payload), encoding: "utf8", env: envFor(box, extra) });
+}
+
+function writeCodexAcceptanceCompanion(box) {
+  const companion = path.join(box.root, "codex-companion.mjs");
+  fs.writeFileSync(companion, [
+    'import fs from "node:fs";',
+    "const argv = process.argv.slice(2);",
+    "if (process.env.FUSION_TEST_CODEX_COMPANION_ARGS) {",
+    "  fs.writeFileSync(process.env.FUSION_TEST_CODEX_COMPANION_ARGS, JSON.stringify(argv));",
+    "}"
+  ].join("\n"));
+  return companion;
 }
 
 function brief() {
@@ -71,6 +82,19 @@ function createSettleOnlyRecord(box, taskId) {
   }, envFor(box));
   const collectedAt = new Date().toISOString();
   return updateWorkerRecord(worker.taskId, envFor(box), (current) => ({ ...current, transportStatus: "done", collectedAt, collectionMethod: WORKER_COLLECTION_METHODS.SUBAGENT_STOP, awaitingVerdict: true, awaitingVerdictArmedAt: collectedAt }));
+}
+
+function createAcceptedCollectedRecord(box, taskId, agentId, agentType = "fusion:fast-worker") {
+  const worker = createWorkerRecord({
+    taskId,
+    sessionId: "session-1",
+    agentType,
+    workspaceRoot: box.cwd
+  }, envFor(box));
+  const collectedAt = new Date().toISOString();
+  updateWorkerRecord(worker.taskId, envFor(box), (current) => ({ ...current, agentId, backgroundTaskId: agentId, transportStatus: "done", collectedAt, collectionMethod: WORKER_COLLECTION_METHODS.SUBAGENT_STOP, awaitingVerdict: true, awaitingVerdictArmedAt: collectedAt }));
+  recordWorkerAcceptance({ taskId: worker.taskId, acceptance: "accepted", env: envFor(box), source: "main-loop" });
+  return record(box);
 }
 
 function stop(box) {
@@ -1083,8 +1107,7 @@ test("an armed async worker is collected by SubagentStop and remains verdict gat
     transcript_path: box.transcript,
     background_tasks: []
   });
-  assert.strictEqual(JSON.parse(collectedStop.stdout).decision, undefined);
-  assert.match(JSON.parse(collectedStop.stdout).hookSpecificOutput.additionalContext, /Acceptance remains unverified/);
+  assert.strictEqual(collectedStop.stdout, "");
 
   recordWorkerAcceptance({ taskId: record(box).taskId, acceptance: "accepted", env: envFor(box), source: "main-loop" });
   const settledStop = run(box, {
@@ -2427,27 +2450,6 @@ test("a structured Codex collection persists final text and remains gated until 
   assert.match(JSON.parse(blocked.stdout).reason, new RegExp(peerJobId));
   assert.match(JSON.parse(blocked.stdout).reason, /accepted\|rejected\|unverified/);
 
-  recordCodexAcceptance({
-    jobId: peerJobId,
-    acceptance: "rejected",
-    workspaceRoot: box.cwd,
-    env: envFor(box),
-    sessionId: "session-1",
-    source: "main-loop",
-    reason: "verification did not pass"
-  });
-  assert.strictEqual(record(box).acceptance, "rejected");
-  assert.ok(record(box).acceptanceRecordedAt);
-
-  const allowed = run(box, {
-    hook_event_name: "Stop",
-    session_id: "session-1",
-    cwd: box.cwd,
-    transcript_path: box.transcript,
-    last_assistant_message: "reported rejected delivery",
-    background_tasks: []
-  });
-  assert.strictEqual(allowed.stdout, "");
 });
 
 test("a structured Grok collection remains gated until the main loop records a semantic judgment", (t) => {
@@ -2484,7 +2486,7 @@ test("a structured Grok collection remains gated until the main loop records a s
   });
   assert.strictEqual(JSON.parse(blocked.stdout).decision, "block");
   assert.match(JSON.parse(blocked.stdout).reason, new RegExp(collector.taskId));
-  assert.match(JSON.parse(blocked.stdout).reason, /record-worker-acceptance/);
+  assert.match(JSON.parse(blocked.stdout).reason, new RegExp(`/fusion:stats --record ${collector.taskId}=accepted\\|rejected\\|unverified`));
 
   recordWorkerAcceptance({ taskId: collector.taskId, acceptance: "accepted", env: envFor(box), source: "main-loop" });
   const allowed = run(box, {
@@ -2524,7 +2526,7 @@ test("an unrecognized collector engine requires manual resolution before Stop", 
   assert.strictEqual(JSON.parse(blocked.stdout).decision, "block");
   assert.match(reason, new RegExp(collector.taskId));
   assert.match(reason, /collection for Fusion task .* needs manual resolution/);
-  assert.doesNotMatch(reason, /record-worker-acceptance/);
+  assert.doesNotMatch(reason, /\/fusion:stats --record/);
 });
 
 test("an authorized background worker cannot bypass an unjudged Codex collection", (t) => {
@@ -2704,7 +2706,7 @@ test("legacy collector failures without a peer job id can satisfy the Stop gate"
     background_tasks: [],
   });
   assert.strictEqual(JSON.parse(blocked.stdout).decision, "block");
-  assert.match(JSON.parse(blocked.stdout).reason, /legacy peer identity unavailable/);
+  assert.match(JSON.parse(blocked.stdout).reason, /peer identity unavailable/);
   assert.doesNotMatch(JSON.parse(blocked.stdout).reason, /undefined/);
 
   const reported = run(box, {
@@ -3385,6 +3387,29 @@ test("Stop emits a settle-only advisory once for an unchanged pending set", (t) 
   assert.strictEqual(repeated.stdout, "");
 });
 
+test("Stop stays silent after a pending settlement lands between stops", (t) => {
+  const box = sandbox(t);
+  const settled = createSettleOnlyRecord(box, `fusion-${"4".repeat(24)}`);
+
+  const first = stop(box);
+  assert.match(first.stdout, new RegExp(settled.taskId));
+  recordWorkerAcceptance({ taskId: settled.taskId, acceptance: "accepted", env: envFor(box), source: "main-loop" });
+
+  const second = stop(box);
+  assert.strictEqual(second.stdout, "");
+  assert.doesNotMatch(second.stdout, new RegExp(settled.taskId));
+});
+
+test("Stop deduplicates a single settle-only worker", (t) => {
+  const box = sandbox(t);
+  const settling = createSettleOnlyRecord(box, `fusion-${"5".repeat(24)}`);
+
+  const first = stop(box);
+  assert.match(first.stdout, new RegExp(settling.taskId));
+  const repeated = stop(box);
+  assert.strictEqual(repeated.stdout, "");
+});
+
 test("Stop re-emits a settle-only advisory when a record enters the pending set", (t) => {
   const box = sandbox(t);
   const first = createSettleOnlyRecord(box, `fusion-${"1".repeat(24)}`);
@@ -3414,7 +3439,7 @@ test("Stop re-emits a settle-only advisory when a record settles", (t) => {
   assert.strictEqual(readWorkerSessionState("session-1", envFor(box)).settleOnlyAdvisorySignature, [firstRemaining.taskId, secondRemaining.taskId].sort().join(","));
 });
 
-test("Stop combines a blocking collection demand with an unchanged settle-only advisory", (t) => {
+test("Stop deduplicates unchanged settlement rows while demanding collection", (t) => {
   const box = sandbox(t);
   const first = createSettleOnlyRecord(box, `fusion-${"1".repeat(24)}`);
   const second = createSettleOnlyRecord(box, `fusion-${"2".repeat(24)}`);
@@ -3431,8 +3456,8 @@ test("Stop combines a blocking collection demand with an unchanged settle-only a
   const decision = JSON.parse(emitted.stdout);
   assert.strictEqual(decision.decision, "block");
   assert.match(decision.reason, /Call TaskOutput with block=true for terminal owned task collecting-peer/);
-  assert.match(decision.reason, new RegExp(`settle-only: ${first.taskId}`));
-  assert.match(decision.reason, new RegExp(`settle-only: ${second.taskId}`));
+  assert.doesNotMatch(decision.reason, new RegExp(`settle-only: ${first.taskId}`));
+  assert.doesNotMatch(decision.reason, new RegExp(`settle-only: ${second.taskId}`));
   assert.strictEqual(readWorkerSessionState("session-1", envFor(box)).settleOnlyAdvisorySignature, [first.taskId, second.taskId].sort().join(","));
 });
 
@@ -3507,6 +3532,214 @@ test("malformed parent transcript content does not transition a worker during St
   assert.strictEqual(unchanged.collectedAt, null);
   assert.strictEqual(unchanged.failureKind, null);
   assert.strictEqual(readWorkerSessionState("session-1", envFor(box)).taskNotificationScanOffset, fs.statSync(box.transcript).size);
+});
+
+test("late SubagentStop payloads preserve an accepted collection", (t) => {
+  for (const message of ["", "summary\ndelivery: complete\nverification: passed"]) {
+    const box = sandbox(t);
+    const settled = createAcceptedCollectedRecord(box, `fusion-${message ? "6".repeat(24) : "7".repeat(24)}`, `late-${message ? "full" : "empty"}`);
+
+    const stopped = run(box, {
+      hook_event_name: "SubagentStop",
+      session_id: "session-1",
+      cwd: box.cwd,
+      transcript_path: box.transcript,
+      agent_id: settled.agentId,
+      agent_type: "fusion:fast-worker",
+      stop_hook_active: true,
+      last_assistant_message: message
+    });
+    assert.strictEqual(stopped.stdout, "");
+    assert.strictEqual(record(box).transportStatus, "done");
+    assert.strictEqual(record(box).acceptance, "accepted");
+
+    const following = stop(box);
+    assert.strictEqual(following.stdout, "");
+  }
+});
+
+test("Stop does not demote a settled record listed as a completed background task", (t) => {
+  const box = sandbox(t);
+  const settled = createAcceptedCollectedRecord(box, `fusion-${"8".repeat(24)}`, "settled-background");
+
+  const stopped = run(box, {
+    hook_event_name: "Stop",
+    session_id: "session-1",
+    cwd: box.cwd,
+    transcript_path: box.transcript,
+    stop_hook_active: false,
+    background_tasks: [{ id: settled.agentId, type: "subagent", status: "completed", agent_type: "fusion:fast-worker" }]
+  });
+  assert.strictEqual(stopped.stdout, "");
+  assert.strictEqual(record(box).transportStatus, "done");
+  assert.strictEqual(record(box).acceptance, "accepted");
+});
+
+test("TaskOutput preserves a settled worker verdict", (t) => {
+  const box = sandbox(t);
+  const settled = createAcceptedCollectedRecord(box, `fusion-${"9".repeat(24)}`, "settled-task-output");
+
+  const collected = run(box, {
+    hook_event_name: "PostToolUse",
+    session_id: "session-1",
+    cwd: box.cwd,
+    transcript_path: box.transcript,
+    tool_name: "TaskOutput",
+    tool_input: { task_id: settled.agentId, block: true },
+    tool_response: { status: "completed", content: "late task output" }
+  });
+  assert.strictEqual(collected.stdout, "");
+  assert.strictEqual(record(box).transportStatus, "done");
+  assert.strictEqual(record(box).acceptance, "accepted");
+});
+
+test("a queued verdict settles at the notification-driven terminal transition", (t) => {
+  const box = sandbox(t);
+  const workerTranscript = path.join(box.root, "queued-notification.output");
+  const finalMessage = "notification result\ndelivery: complete\nverification: passed";
+  fs.writeFileSync(workerTranscript, `${JSON.stringify({ type: "assistant", message: { content: [{ type: "text", text: finalMessage }] } })}\n`, "utf8");
+  const workerDispatch = dispatch(box);
+  run(box, workerDispatch);
+  run(box, {
+    ...workerDispatch,
+    hook_event_name: "PostToolUse",
+    tool_response: { isAsync: true, status: "async_launched", agentId: "queued-notification", outputFile: workerTranscript }
+  });
+  const queued = recordWorkerAcceptance({ taskId: record(box).taskId, acceptance: "accepted", env: envFor(box), source: "main-loop" });
+  assert.strictEqual(queued.queued, true);
+  fs.appendFileSync(box.transcript, `${JSON.stringify({ type: "user", message: { content: `<task-notification>\n<task-id>queued-notification</task-id>\n<status>completed</status>\n</task-notification>` } })}\n`, "utf8");
+
+  const stopped = run(box, {
+    hook_event_name: "Stop",
+    session_id: "session-1",
+    cwd: box.cwd,
+    transcript_path: box.transcript,
+    stop_hook_active: true,
+    background_tasks: []
+  });
+  assert.strictEqual(stopped.stdout, "");
+  const settled = record(box);
+  assert.strictEqual(settled.transportStatus, "done");
+  assert.strictEqual(settled.acceptance, "accepted");
+  assert.strictEqual(settled.awaitingVerdict, false);
+  assert.strictEqual(settled.pendingVerdict, undefined);
+});
+
+test("queued accepted verdicts re-arm settlement after cancelled and incomplete hook transitions", (t) => {
+  const cancelled = sandbox(t);
+  run(cancelled, dispatch(cancelled));
+  run(cancelled, {
+    ...dispatch(cancelled),
+    hook_event_name: "PostToolUse",
+    tool_response: { isAsync: true, status: "async_launched", agentId: "queued-cancelled" }
+  });
+  recordWorkerAcceptance({ taskId: record(cancelled).taskId, acceptance: "accepted", env: envFor(cancelled), source: "main-loop" });
+  run(cancelled, {
+    hook_event_name: "PostToolUse",
+    session_id: "session-1",
+    cwd: cancelled.cwd,
+    transcript_path: cancelled.transcript,
+    tool_name: "TaskStop",
+    tool_input: { task_id: "queued-cancelled" },
+    tool_response: { status: "cancelled" }
+  });
+
+  const cancelledRecord = record(cancelled);
+  assert.strictEqual(cancelledRecord.transportStatus, "cancelled");
+  assert.strictEqual(cancelledRecord.acceptance, "unverified");
+  assert.strictEqual(cancelledRecord.awaitingVerdict, true);
+  assert.strictEqual(cancelledRecord.pendingVerdict, undefined);
+  assert.match(cancelledRecord.pendingVerdictError, /transport status is cancelled/);
+
+  const incomplete = sandbox(t);
+  run(incomplete, dispatch(incomplete));
+  run(incomplete, {
+    hook_event_name: "SubagentStart",
+    session_id: "session-1",
+    cwd: incomplete.cwd,
+    transcript_path: incomplete.transcript,
+    agent_id: "queued-incomplete",
+    agent_type: "fusion:fast-worker"
+  });
+  recordWorkerAcceptance({ taskId: record(incomplete).taskId, acceptance: "accepted", env: envFor(incomplete), source: "main-loop" });
+  run(incomplete, {
+    hook_event_name: "SubagentStop",
+    session_id: "session-1",
+    cwd: incomplete.cwd,
+    transcript_path: incomplete.transcript,
+    agent_id: "queued-incomplete",
+    agent_type: "fusion:fast-worker",
+    stop_hook_active: true,
+    last_assistant_message: "partial result"
+  });
+
+  const incompleteRecord = record(incomplete);
+  assert.strictEqual(incompleteRecord.transportStatus, "incomplete");
+  assert.strictEqual(incompleteRecord.acceptance, "unverified");
+  assert.strictEqual(incompleteRecord.awaitingVerdict, true);
+  assert.strictEqual(incompleteRecord.pendingVerdict, undefined);
+  assert.match(incompleteRecord.pendingVerdictError, /transport status is incomplete/);
+});
+
+test("a queued accepted done transition records the linked engine verdict", (t) => {
+  const box = sandbox(t);
+  const peerJobId = "d".repeat(32);
+  const argsFile = path.join(box.root, "codex-companion-args.json");
+  const companion = writeCodexAcceptanceCompanion(box);
+  const workerTranscript = path.join(box.root, "queued-peer-notification.output");
+  fs.writeFileSync(workerTranscript, `${JSON.stringify({ type: "assistant", message: { content: [{ type: "text", text: "peer result\ndelivery: complete\nverification: passed" }] } })}\n`, "utf8");
+  const workerDispatch = dispatch(box);
+  run(box, workerDispatch);
+  run(box, {
+    ...workerDispatch,
+    hook_event_name: "PostToolUse",
+    tool_response: { isAsync: true, status: "async_launched", agentId: "queued-peer-notification", outputFile: workerTranscript }
+  });
+  updateWorkerRecord(record(box).taskId, envFor(box), (current) => ({ ...current, peerEngine: "codex", peerJobId, peerTransportStatus: "done" }));
+  recordWorkerAcceptance({ taskId: record(box).taskId, acceptance: "accepted", env: envFor(box), source: "main-loop" });
+  fs.appendFileSync(box.transcript, `${JSON.stringify({ type: "user", message: { content: "<task-notification>\n<task-id>queued-peer-notification</task-id>\n<status>completed</status>\n</task-notification>" } })}\n`, "utf8");
+
+  const stopped = run(box, {
+    hook_event_name: "Stop",
+    session_id: "session-1",
+    cwd: box.cwd,
+    transcript_path: box.transcript,
+    stop_hook_active: true,
+    background_tasks: []
+  }, { FUSION_CODEX_COMPANION: companion, FUSION_TEST_CODEX_COMPANION_ARGS: argsFile });
+
+  assert.strictEqual(stopped.stdout, "");
+  const settled = record(box);
+  assert.strictEqual(settled.transportStatus, "done");
+  assert.strictEqual(settled.acceptance, "accepted");
+  assert.strictEqual(settled.engineSettlementError, undefined);
+  assert.deepStrictEqual(JSON.parse(fs.readFileSync(argsFile, "utf8")), ["record-acceptance", "--job-id", peerJobId, "--acceptance", "accepted", "--source", "main-loop"]);
+});
+
+test("the peer wrapper SubagentStop matcher reaches job footer collection", (t) => {
+  const box = sandbox(t);
+  const peerJobId = "a".repeat(32);
+  const hooks = JSON.parse(fs.readFileSync(path.join(repoRoot, "plugins", "fusion", "hooks", "hooks.json"), "utf8")).hooks;
+  assert.ok(hooks.SubagentStop.some((group) => group.matcher.includes("grok:grok-rescue")));
+  const peerDispatch = dispatch(box, { subagent_type: "grok:grok-rescue", prompt: "bounded peer brief" });
+  run(box, peerDispatch);
+  run(box, {
+    ...peerDispatch,
+    hook_event_name: "PostToolUse",
+    tool_response: { isAsync: true, status: "async_launched", agentId: "peer-wrapper-stop" }
+  });
+  run(box, {
+    hook_event_name: "SubagentStop",
+    session_id: "session-1",
+    cwd: box.cwd,
+    transcript_path: box.transcript,
+    agent_id: "peer-wrapper-stop",
+    agent_type: "grok:grok-rescue",
+    stop_hook_active: false,
+    last_assistant_message: `peer complete\njob: ${peerJobId}\ndelivery: complete\nverification: passed`
+  });
+  assert.strictEqual(record(box).peerJobId, peerJobId);
+  assert.strictEqual(record(box).peerEngine, "grok");
 });
 
 test("hooks configuration wires lifecycle events through an executable shell command", () => {

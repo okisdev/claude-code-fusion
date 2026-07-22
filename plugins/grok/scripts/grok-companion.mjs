@@ -119,7 +119,7 @@ const HISTORY_FAILURE_KINDS = new Set([
   "policy",
   "turn_limit"
 ]);
-const GROK_ROLES = new Set(["burst", "independence", "live-web", "large-context", "best-of-n"]);
+const GROK_ROLES = new Set(["burst", "independence", "live-web", "large-context"]);
 const REVIEW_OUTPUT_SCHEMA = {
   type: "object",
   additionalProperties: false,
@@ -157,7 +157,7 @@ function printUsage() {
   console.log(
     [
       "Usage:",
-      "  node scripts/grok-companion.mjs task [--prompt-file <path>] [--write] [--web] [--memory] [--background] [--resume <uuid>] [--resume-last] [--fresh] [--model <id>] [--effort <level>] [--max-turns <n>] [--best-of-n <n>] [--cwd <dir>] [--json] [--] [prompt]",
+      "  node scripts/grok-companion.mjs task [--prompt-file <path>] [--write] [--web] [--memory] [--background] [--resume <uuid>] [--resume-last] [--fresh] [--model <id>] [--effort <level>] [--max-turns <n>] [--cwd <dir>] [--json] [--] [prompt]",
       "  node scripts/grok-companion.mjs review [--base <ref>] [--focus <text>] [--cwd <dir>] [--background] [--json]",
       "  node scripts/grok-companion.mjs status [job-id] [--cwd <dir>] [--json]",
       "  node scripts/grok-companion.mjs history [--all] [--limit <n>] [--cwd <dir>] [--json]",
@@ -532,31 +532,27 @@ function consumeRawCommandTransport(token) {
 }
 
 function resolveCommandTransport(rawArgv) {
-  const defaults = { defaultBackground: false, defaultBestOfN: false, defaultWrite: false };
+  const defaults = { defaultBackground: false, defaultWrite: false };
   const transportArgv = [...rawArgv];
   while (
     transportArgv[0] === "--transport-default-write" ||
-    transportArgv[0] === "--transport-default-background" ||
-    transportArgv[0] === "--transport-default-best-of-n"
+    transportArgv[0] === "--transport-default-background"
   ) {
     const option = transportArgv.shift();
     const key = option === "--transport-default-write"
       ? "defaultWrite"
-      : option === "--transport-default-background"
-        ? "defaultBackground"
-        : "defaultBestOfN";
+      : "defaultBackground";
     defaults[key] = true;
   }
   if (transportArgv[0] !== "--raw-args-token") {
     if (
       transportArgv.some((value) => value === "--raw-args-token") ||
       defaults.defaultWrite ||
-      defaults.defaultBackground ||
-      defaults.defaultBestOfN
+      defaults.defaultBackground
     ) {
       throw errorWithFailure("Raw command transport options must not be combined with normal arguments.", "input");
     }
-    return { argv: rawArgv, defaultBackground: false, defaultBestOfN: false, defaultWrite: false, ingress: "argv" };
+    return { argv: rawArgv, defaultBackground: false, defaultWrite: false, ingress: "argv" };
   }
   if (transportArgv.length !== 2) {
     throw errorWithFailure("Raw command transport requires exactly one token.", "input");
@@ -703,14 +699,6 @@ function parseNonnegativeInteger(value, flag) {
   const parsed = Number.parseInt(String(value), 10);
   if (!Number.isInteger(parsed) || parsed < 0) {
     throw inputError(`Expected a non-negative integer for ${flag}.`);
-  }
-  return parsed;
-}
-
-function parseBestOfN(value) {
-  const parsed = parsePositiveInteger(value, "--best-of-n");
-  if (parsed < 2 || parsed > 10) {
-    throw inputError("Expected --best-of-n between 2 and 10.");
   }
   return parsed;
 }
@@ -891,10 +879,7 @@ function jobClassForRecord(job) {
   if (request && typeof request === "object" && !Array.isArray(request) && typeof request.reviewTargetLabel === "string") {
     return "review";
   }
-  if (request && typeof request === "object" && !Array.isArray(request) && request.bestOfN != null) {
-    return "best_of_n";
-  }
-  if (job?.jobClass === "review" || job?.jobClass === "best_of_n" || job?.jobClass === "stop_gate") {
+  if (job?.jobClass === "review" || job?.jobClass === "stop_gate") {
     return job.jobClass;
   }
   if ((job?.jobClass === "task" || job?.jobClass == null) && ordinaryTaskRequest(request)) {
@@ -1495,9 +1480,8 @@ function recordSpawnFailure(jobFile, error, context = {}) {
 
 async function handleTask(argv, transport = {}) {
   const { options, positionals, positionalText } = commandArgs(argv, {
-    valueOptions: ["prompt-file", "resume", "model", "effort", "max-turns", "best-of-n", "cwd"],
+    valueOptions: ["prompt-file", "resume", "model", "effort", "max-turns", "cwd"],
     booleanOptions: ["write", "background", "resume-last", "fresh", "memory", "web", "json"],
-    aliasMap: transport.defaultBestOfN ? { n: "best-of-n" } : {},
     optionsBeforePositionals: true
   }, transport);
 
@@ -1505,15 +1489,10 @@ async function handleTask(argv, transport = {}) {
   const dataDir = resolveDataDir();
   const claudeSessionId = currentClaudeSessionId();
 
-  const bestOfN = options["best-of-n"]
-    ? parseBestOfN(options["best-of-n"])
-    : transport.defaultBestOfN
-      ? 2
-      : null;
   const maxTurns = options["max-turns"] ? parsePositiveInteger(options["max-turns"], "--max-turns") : null;
   const write = options.write === undefined ? Boolean(transport.defaultWrite) : Boolean(options.write);
   const background = Boolean(options.background);
-  const mode = write || bestOfN ? "write" : "consult";
+  const mode = write ? "write" : "consult";
   const memory = Boolean(options.memory);
   const selectedContinuityPolicy = continuityPolicy(dataDir);
   const explicitResume = options.resume != null;
@@ -1526,13 +1505,6 @@ async function handleTask(argv, transport = {}) {
   if (fresh && (explicitResume || resumeLast)) {
     throw inputError("--fresh cannot be combined with --resume or --resume-last.");
   }
-  if (bestOfN && (explicitResume || resumeLast)) {
-    throw inputError("--best-of-n always starts fresh and cannot be combined with resume options.");
-  }
-  if (bestOfN && memory) {
-    throw inputError("--best-of-n always disables cross-session memory and cannot be combined with --memory.");
-  }
-
   let prompt = readTaskPrompt(cwd, options, positionals, positionalText);
   const fusionRouted = isFusionRoutedPrompt(prompt);
   if (memory && fusionRouted) {
@@ -1549,7 +1521,6 @@ async function handleTask(argv, transport = {}) {
   } else if (
     prompt &&
     !fresh &&
-    !bestOfN &&
     selectedContinuityPolicy === "claude-session" &&
     claudeSessionId &&
     !fusionRouted
@@ -1581,13 +1552,12 @@ async function handleTask(argv, transport = {}) {
     background,
     delivery: background ? backgroundDelivery() : "foreground",
     claudeSessionId,
-    jobClass: bestOfN ? "best_of_n" : "task",
+    jobClass: "task",
     role,
     request: {
       model: options.model ?? null,
       effort: options.effort ?? null,
       maxTurns,
-      bestOfN,
       web: Boolean(options.web),
       memory,
       sandboxProfile: sandboxProfileForMode(mode),
@@ -1646,7 +1616,6 @@ async function handleTask(argv, transport = {}) {
       model: options.model ?? null,
       effort: options.effort ?? null,
       maxTurns,
-      bestOfN,
       web: Boolean(options.web),
       memory,
       cwd,
@@ -1732,7 +1701,6 @@ async function handleTaskWorker(argv) {
       model: request.model ?? null,
       effort: request.effort ?? null,
       maxTurns: request.maxTurns ?? null,
-      bestOfN: request.bestOfN ?? null,
       web: Boolean(request.web),
       memory: request.memory === true,
       cwd: record.cwd,
@@ -2756,6 +2724,20 @@ function handleStats(argv, transport = {}) {
   output(options.json ? stats : renderStatsReport(stats), options.json);
 }
 
+const DOCTOR_PROBE_TIMEOUT_MS = 3000;
+
+function doctorCommandAdvisory(bin, available) {
+  if (!available) {
+    return { available: false, detail: "grok is unavailable" };
+  }
+  const probe = spawnSync(bin, ["doctor", "--help"], { encoding: "utf8", timeout: DOCTOR_PROBE_TIMEOUT_MS });
+  const supported = !probe.error && probe.status === 0;
+  return {
+    available: supported,
+    detail: supported ? "grok doctor is available" : "grok doctor is not available on this Grok CLI"
+  };
+}
+
 function handleSetup(argv, transport = {}) {
   const { options } = commandArgs(argv, {
     valueOptions: ["continuity"],
@@ -2790,19 +2772,15 @@ function handleSetup(argv, transport = {}) {
     "--disable-web-search",
     "--always-approve",
     "--json-schema",
-    "--best-of-n",
     "--no-subagents",
-    "--no-wait-for-background",
-    "--background-wait-timeout"
+    "--no-wait-for-background"
   ];
   let capabilities = { ready: false, detail: available ? "capability probe did not run" : "grok is unavailable", flags: {} };
   if (available) {
     try {
       const supported = resolveGrokCapabilities(bin, process.env);
       const flags = Object.fromEntries(capabilityFlags.map((flag) => [flag, supported.has(flag)]));
-      const critical = capabilityFlags.filter(
-        (flag) => !["--no-subagents", "--no-wait-for-background"].includes(flag)
-      );
+      const critical = capabilityFlags.filter((flag) => flag !== "--no-subagents");
       const missing = critical.filter((flag) => !flags[flag]);
       capabilities = {
         ready: missing.length === 0,
@@ -2813,6 +2791,8 @@ function handleSetup(argv, transport = {}) {
       capabilities = { ready: false, detail: error instanceof Error ? error.message : String(error), flags: {} };
     }
   }
+
+  const doctorCommand = doctorCommandAdvisory(bin, available);
 
   const dataDir = resolveDataDir();
   let writable = true;
@@ -2838,6 +2818,7 @@ function handleSetup(argv, transport = {}) {
     ready: available && capabilities.ready && writable,
     grok: { available, detail, bin },
     capabilities,
+    doctorCommand,
     dataDir: { path: dataDir, writable, detail: writeDetail },
     stopGate: Boolean(readConfig(dataDir).stopGate),
     continuityPolicy: continuityPolicy(dataDir)
@@ -3052,9 +3033,6 @@ async function main() {
   }
   if (transport.defaultBackground && subcommand !== "review") {
     throw errorWithFailure("The raw command transport background default is valid only for review.", "input");
-  }
-  if (transport.defaultBestOfN && subcommand !== "task") {
-    throw errorWithFailure("The raw command transport best-of-n default is valid only for task.", "input");
   }
   const argv = transport.argv;
 

@@ -20,7 +20,7 @@ Size gate first (cheap, in the main loop):
 Compose one self contained brief per facet:
 
 - Each brief states its facet's goal, the shared context needed to work it alone, the relevant paths, and what a good result must cover. Claude worker facets use the `fusion-brief: v1` isolated envelope. Implementation facets carry a verification command. Consult and research facets instead carry explicit coverage or acceptance criteria, with collection review as their verification. A facet brief never depends on another facet's output. Pass every brief directly as the Agent prompt; do not write transport files. Companion adapters own any private staging required by their transports.
-- Every Grok facet brief begins with a single routing header line containing exactly one `grok-role: <role>` field, choosing one of `burst`, `independence`, `live-web`, `large-context`, or `best-of-n` from the facet's actual purpose. Do not include a second Grok role anywhere in that brief.
+- Every Grok facet brief begins with a single routing header line containing exactly one `grok-role: <role>` field, choosing one of `burst`, `independence`, `live-web`, or `large-context` from the facet's actual purpose. Do not include a second Grok role anywhere in that brief.
 - Research briefs go to grok with `--web` when live sources help; implementation briefs state write permission explicitly.
 
 Launch the fleet in one message:

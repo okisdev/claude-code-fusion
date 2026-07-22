@@ -136,12 +136,12 @@ async function waitForProcessExit(pid, ownsProcessGroup = false) {
 
 test("version and availability probe the configured Codex binary", () => {
   const env = { ...process.env, CODEX_BIN: fakeCodex };
-  assert.equal(getCodexVersion({ env }), "0.144.4");
+  assert.equal(getCodexVersion({ env }), "0.145.0");
   assert.deepEqual(getCodexAvailability({ env }), {
     available: true,
     bin: fakeCodex,
-    version: "0.144.4",
-    rawVersion: "codex-cli 0.144.4",
+    version: "0.145.0",
+    rawVersion: "codex-cli 0.145.0",
     exitCode: 0,
     errorMessage: null
   });
@@ -276,6 +276,20 @@ test("task arguments leave model and effort unset while pinning networked tools 
   assert.throws(() => buildTaskArgs({ serviceTier: "Priority" }), /Unsupported Codex service tier/);
   assert.match(buildTaskArgs({ write: true }).join(" "), /sandbox_workspace_write\.network_access=false/);
   assert.throws(() => buildTaskArgs({ network: true }), /requires a write task/);
+});
+
+test("task argv forwards an output schema and native review rejects one", () => {
+  const schema = "/tmp/codex-verdict.schema.json";
+  const args = buildTaskArgs({ outputSchemaFile: schema });
+  assert.deepEqual(args.slice(-2), ["--output-schema", schema]);
+  assert.ok(!buildTaskArgs().includes("--output-schema"));
+  assert.throws(() => buildReviewArgs({ outputSchemaFile: schema }), /review ignores --output-schema/);
+});
+
+test("task and review argv retain local rollout persistence", () => {
+  for (const args of [buildTaskArgs(), buildReviewArgs()]) {
+    assert.ok(!args.includes("--ephemeral"));
+  }
 });
 
 test("native review is read-only and maps review targets", () => {

@@ -1,5 +1,16 @@
 # changelog
 
+## 0.0.35
+
+- codex adapts to cli 0.145.0: task runs forward `--output-schema <path>` end to end (rescue raw args, exec argv, structured output capture, and a `structured: parsed/invalid/unavailable` footer in the render), adversarial review gains a json schema verdict contract at `plugins/codex/schemas/adversarial-review-verdict.schema.json`, native `review` rejects `--output-schema` because tested versions silently ignore it there, and the 0.144.4 models cache schema drift workaround is deleted with the tested interval moving to 0.145.0 to 0.146.0
+- grok adapts to cli 0.2.110: setup probes the new `grok doctor` capability and surfaces it as a setup advisory line, and ordinary managed runs now require `--no-wait-for-background` unconditionally, dropping the `--background-wait-timeout` compatibility fallback and its capability probe
+- best-of-n is retired: the tournament skill is deleted and grok's protected roles shrink to four (burst, independence, live-web, large-context) across rules, skills, agents, docs, and tests
+- settlement is centralized: engine acceptance writers move to a shared `engine-acceptance.mjs`, `/fusion:stats` records every verdict through the one `--record <id>=<verdict>` form (`--record-acceptance` and `--record-worker-acceptance` are gone), and a verdict recorded before a worker's record turns terminal queues instead of failing, settling automatically when the record lands
+- the worker lifecycle settles queued verdicts on terminal transitions with the engine cascade, backfills peer identity from rescue wrapper stops (the SubagentStop matcher now also covers `codex:codex-rescue`, `grok:grok-rescue`, and `grok:grok-review-runner`), and guards terminal writers against reprocessing already settled records
+- legacy codex plugin state support is dropped: the `codex-openai-codex` compatibility root, `FUSION_CODEX_INCLUDE_LEGACY`, legacy `completed`/`failed` terminal statuses, and log tail failure kind recovery are removed from stats, breaker, and monitor
+- the inline delegation guard always normalizes persisted dispatch counters instead of branching on a legacy period counter
+- verified engine pins move to codex-cli 0.145.0 and grok 0.2.110
+
 ## 0.0.34
 
 - the settle-only advisory stops repeating itself: when settlement is legitimately deferred (a package's verification waiting on a sibling landing), the pending-verdict block re-emitted identically at every stop boundary with no new information; it now dedupes by a persisted pending-set signature, the same mechanism the in-flight advisory has used since 0.0.31, emitting once per distinct set and again only when a record enters or leaves; blocking collection demands are unaffected and refresh the signature when they emit combined

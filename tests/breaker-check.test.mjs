@@ -44,23 +44,6 @@ function run(sandbox, extraEnv = {}) {
   });
 }
 
-function runWithHome(sandbox, extraEnv = {}) {
-  const env = {
-    ...process.env,
-    HOME: sandbox.root,
-    GROK_COMPANION_DATA: sandbox.grokData
-  };
-  delete env.FUSION_CODEX_STATE;
-  delete env.FUSION_CODEX_STATE_DIR;
-  delete env.CODEX_COMPANION_DATA;
-  Object.assign(env, extraEnv);
-  return spawnSync(process.execPath, [script], { env, encoding: "utf8" });
-}
-
-function homeCodexState(sandbox, pluginDataName) {
-  return path.join(sandbox.root, ".claude", "plugins", "data", pluginDataName, "state");
-}
-
 test("an in-window quota failure prints a grok breaker advisory", (t) => {
   const sandbox = makeSandbox(t);
   writeRecord(jobFile(path.join(sandbox.grokData, "state"), "workspace", "quota"), {
@@ -72,54 +55,6 @@ test("an in-window quota failure prints a grok breaker advisory", (t) => {
   const result = run(sandbox);
   assert.strictEqual(result.status, 0);
   assert.match(result.stdout, /treat the grok breaker as open unless verified recovered/);
-  assert.match(result.stdout, /last failure quota \d+ minutes? ago/);
-  assert.strictEqual(result.stderr, "");
-});
-
-test("a legacy grok 402 stored as a generic error still opens the quota breaker", (t) => {
-  const sandbox = makeSandbox(t);
-  writeRecord(jobFile(path.join(sandbox.grokData, "state"), "workspace", "legacy-quota"), {
-    status: "error",
-    failureKind: "error",
-    errorTail: "request failed with status code: 402",
-    finishedAt: new Date(Date.now() - 30 * 60000).toISOString()
-  });
-
-  const result = run(sandbox);
-  assert.strictEqual(result.status, 0);
-  assert.match(result.stdout, /treat the grok breaker as open unless verified recovered/);
-  assert.match(result.stdout, /last failure quota \d+ minutes? ago/);
-  assert.strictEqual(result.stderr, "");
-});
-
-test("a legacy grok 402 stored only in the job log still opens the quota breaker", (t) => {
-  const sandbox = makeSandbox(t);
-  const file = jobFile(path.join(sandbox.grokData, "state"), "workspace", "legacy-log-quota");
-  writeRecord(file, {
-    status: "error",
-    failureKind: "error",
-    errorTail: "generic failure",
-    finishedAt: new Date(Date.now() - 30 * 60000).toISOString()
-  });
-  fs.writeFileSync(file.replace(/\.json$/, ".log"), "HTTP/1.1 402\n", "utf8");
-
-  const result = run(sandbox);
-  assert.strictEqual(result.status, 0);
-  assert.match(result.stdout, /treat the grok breaker as open unless verified recovered/);
-  assert.match(result.stdout, /last failure quota \d+ minutes? ago/);
-  assert.strictEqual(result.stderr, "");
-});
-
-test("a legacy failed grok job without a failure kind still recovers quota", (t) => {
-  const sandbox = makeSandbox(t);
-  writeRecord(jobFile(path.join(sandbox.grokData, "state"), "workspace", "legacy-empty-kind"), {
-    status: "error",
-    errorTail: "exhausted balance",
-    finishedAt: new Date(Date.now() - 30 * 60000).toISOString()
-  });
-
-  const result = run(sandbox);
-  assert.strictEqual(result.status, 0);
   assert.match(result.stdout, /last failure quota \d+ minutes? ago/);
   assert.strictEqual(result.stderr, "");
 });
@@ -198,9 +133,10 @@ test("one Codex rate limit keeps the breaker closed for its retry", (t) => {
 test("a consecutive second Codex rate limit opens the breaker", (t) => {
   const sandbox = makeSandbox(t);
   writeRecord(jobFile(sandbox.codexState, "workspace", "rate-limit-first"), {
-    status: "failed",
+    status: "error",
+    failureKind: "rate_limited",
     errorMessage: "Rate limit exceeded",
-    completedAt: new Date(Date.now() - 3 * 60000).toISOString()
+    finishedAt: new Date(Date.now() - 3 * 60000).toISOString()
   });
   writeRecord(jobFile(sandbox.codexState, "workspace", "rate-limit-second"), {
     status: "error",
@@ -466,86 +402,15 @@ test("a typed non-breaker Codex error is not reclassified from diagnostic text",
   assert.strictEqual(result.stdout, "");
 });
 
-test("Codex state resolution prefers the canonical override and keeps the legacy override compatible", () => {
-  assert.strictEqual(resolveCodexStateDir({ FUSION_CODEX_STATE: "/canonical", FUSION_CODEX_STATE_DIR: "/legacy" }), "/canonical");
-  assert.strictEqual(resolveCodexStateDir({ FUSION_CODEX_STATE_DIR: "/legacy" }), "/legacy");
+test("Codex state resolution uses configured canonical state sources", () => {
+  assert.strictEqual(resolveCodexStateDir({ FUSION_CODEX_STATE: "/canonical" }), "/canonical");
   assert.strictEqual(resolveCodexStateDir({ CODEX_COMPANION_DATA: "/adapter-data" }), "/adapter-data/state");
   assert.strictEqual(resolveCodexStateDir({}), path.join(os.homedir(), ".claude", "plugins", "data", "codex-claude-code-fusion", "state"));
-});
-
-test("default Codex state resolution reads only canonical state unless legacy inclusion is explicit", () => {
   assert.deepStrictEqual(resolveCodexStateRoots({ HOME: "/test-home" }), ["/test-home/.claude/plugins/data/codex-claude-code-fusion/state"]);
-  assert.deepStrictEqual(resolveCodexStateRoots({ HOME: "/test-home", FUSION_CODEX_INCLUDE_LEGACY: "1" }), [
-    "/test-home/.claude/plugins/data/codex-claude-code-fusion/state",
-    "/test-home/.claude/plugins/data/codex-openai-codex/state"
-  ]);
   assert.deepStrictEqual(resolveCodexStateRoots({ HOME: "/test-home", FUSION_CODEX_STATE: "/override" }), ["/override"]);
   assert.deepStrictEqual(resolveCodexStateRoots({ HOME: "/test-home", CODEX_COMPANION_DATA: "/adapter" }), ["/adapter/state"]);
   assert.deepStrictEqual(resolveCodexStateRoots({ HOME: "/test-home", FUSION_CODEX_STATE: "relative-override" }), ["/test-home/.claude/plugins/data/codex-claude-code-fusion/state"]);
   assert.deepStrictEqual(resolveCodexStateRoots({ HOME: "/test-home", CODEX_COMPANION_DATA: "relative-adapter" }), ["/test-home/.claude/plugins/data/codex-claude-code-fusion/state"]);
-});
-
-test("the breaker ignores legacy Codex state by default and reads it only when explicitly enabled", (t) => {
-  const sandbox = makeSandbox(t);
-  writeRecord(jobFile(homeCodexState(sandbox, "codex-openai-codex"), "workspace", "legacy-auth"), {
-    id: "legacy-auth",
-    status: "failed",
-    errorMessage: "Authentication failed",
-    completedAt: new Date(Date.now() - 2 * 60000).toISOString()
-  });
-  const defaultResult = runWithHome(sandbox);
-  assert.strictEqual(defaultResult.status, 0);
-  assert.strictEqual(defaultResult.stdout, "");
-  const legacyResult = runWithHome(sandbox, { FUSION_CODEX_INCLUDE_LEGACY: "1" });
-  assert.strictEqual(legacyResult.status, 0);
-  assert.match(legacyResult.stdout, /codex breaker as open.*last failure auth/);
-});
-
-test("a mirrored Codex rate limit is deduplicated across canonical and legacy roots", (t) => {
-  const sandbox = makeSandbox(t);
-  const record = {
-    id: "mirrored-rate-limit",
-    status: "failed",
-    errorMessage: "Rate limit exceeded",
-    completedAt: new Date(Date.now() - 2 * 60000).toISOString()
-  };
-  writeRecord(jobFile(homeCodexState(sandbox, "codex-claude-code-fusion"), "workspace", record.id), record);
-  writeRecord(jobFile(homeCodexState(sandbox, "codex-openai-codex"), "workspace", record.id), record);
-  const result = runWithHome(sandbox, { FUSION_CODEX_INCLUDE_LEGACY: "1" });
-  assert.strictEqual(result.status, 0);
-  assert.doesNotMatch(result.stdout, /codex breaker/);
-});
-
-test("a terminal Codex copy supersedes a stale running mirror with the same id", (t) => {
-  const sandbox = makeSandbox(t);
-  writeRecord(jobFile(homeCodexState(sandbox, "codex-claude-code-fusion"), "workspace-a", "mirrored-job"), {
-    id: "mirrored-job",
-    status: "running",
-    errorMessage: "Authentication failed",
-    updatedAt: new Date(Date.now() - 1 * 60000).toISOString()
-  });
-  writeRecord(jobFile(homeCodexState(sandbox, "codex-openai-codex"), "workspace-b", "mirrored-job"), {
-    id: "mirrored-job",
-    status: "completed",
-    errorMessage: "Authentication failed before recovery",
-    completedAt: new Date(Date.now() - 2 * 60000).toISOString()
-  });
-  const result = runWithHome(sandbox, { FUSION_CODEX_INCLUDE_LEGACY: "1" });
-  assert.strictEqual(result.status, 0);
-  assert.doesNotMatch(result.stdout, /codex breaker/);
-});
-
-test("an explicit Codex state override excludes legacy home state", (t) => {
-  const sandbox = makeSandbox(t);
-  writeRecord(jobFile(homeCodexState(sandbox, "codex-openai-codex"), "workspace", "legacy-auth"), {
-    id: "legacy-auth",
-    status: "failed",
-    errorMessage: "Authentication failed",
-    completedAt: new Date(Date.now() - 2 * 60000).toISOString()
-  });
-  const result = runWithHome(sandbox, { FUSION_CODEX_STATE: path.join(sandbox.root, "isolated-state"), FUSION_CODEX_INCLUDE_LEGACY: "1" });
-  assert.strictEqual(result.status, 0);
-  assert.doesNotMatch(result.stdout, /codex breaker/);
 });
 
 test("a failure outside the lookback window is silent", (t) => {

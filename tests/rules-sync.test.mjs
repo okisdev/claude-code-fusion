@@ -223,7 +223,6 @@ test("Grok rules document source verified headless boundaries", () => {
   const doctor = fs.readFileSync(path.join(repoRoot, "plugins", "fusion", "skills", "doctor", "SKILL.md"), "utf8");
   const setup = fs.readFileSync(path.join(repoRoot, "plugins", "grok", "skills", "setup", "SKILL.md"), "utf8");
   const stats = fs.readFileSync(path.join(repoRoot, "plugins", "grok", "skills", "stats", "SKILL.md"), "utf8");
-  const bestOfN = fs.readFileSync(path.join(repoRoot, "plugins", "grok", "skills", "best-of-n", "SKILL.md"), "utf8");
   const review = fs.readFileSync(path.join(repoRoot, "plugins", "grok", "skills", "review", "SKILL.md"), "utf8");
   const contract = fs.readFileSync(path.join(repoRoot, "docs", "grok-contract.md"), "utf8");
   const codexContract = fs.readFileSync(path.join(repoRoot, "docs", "codex-contract.md"), "utf8");
@@ -255,14 +254,13 @@ test("Grok rules document source verified headless boundaries", () => {
     assert.match(text, /--no-subagents/);
     assert.match(text, /--disallowed-tools Agent/);
     assert.match(text, /--no-wait-for-background/);
-    assert.match(text, /--background-wait-timeout/);
     assert.match(text, /--prompt-file \/dev\/stdin/);
     assert.match(text, /search_tool/);
     assert.match(text, /use_tool/);
     assert.match(text, /ask_user_question/);
   }
 
-  for (const text of [rules, troubleshooting, runtime, contract, readme, security, bestOfN]) {
+  for (const text of [rules, troubleshooting, runtime, contract, readme, security]) {
     assert.match(text, /--sandbox strict/);
     assert.doesNotMatch(text, /--sandbox workspace/);
     assert.match(text, /(?:never|no silent)[^\n.]*downgrade[^\n.]*workspace/i);
@@ -346,9 +344,7 @@ test("Grok rules document source verified headless boundaries", () => {
     "--disable-web-search",
     "--always-approve",
     "--json-schema",
-    "--best-of-n",
-    "--no-wait-for-background",
-    "--background-wait-timeout"
+    "--no-wait-for-background"
   ]) {
     assert.match(setup, new RegExp(flag.replaceAll("-", "\\-")));
   }
@@ -367,8 +363,8 @@ test("Grok rules document source verified headless boundaries", () => {
   assert.match(contract, /Upstream wires only `bypassPermissions` at spawn/);
   assert.match(contract, /Upstream ships ACP today/);
   assert.match(contract, /The companion has not adopted ACP yet and continues per-call invocation/);
-  assert.match(codexContract, /failureKind: "setup".*below the tested minimum 0\.144\.0/);
-  assert.match(codexContract, /Versions above the tested 0\.144\.x window remain allowed with the setup compatibility advisory/);
+  assert.match(codexContract, /failureKind: "setup".*below the tested minimum 0\.145\.0/);
+  assert.match(codexContract, /The tested interval runs from 0\.145\.0 up to but excluding 0\.146\.0; versions at or above 0\.146\.0 remain allowed with the setup compatibility advisory/);
   assert.match(codexContract, /Codex configuration parse failures under `--strict-config`.*failureKind: "process"/);
   assert.match(sharedContract, /The Grok instance adds `sandbox`[^\n]*`transport`[^\n]*and `policy`/);
   assert.match(sharedContract, /`setup`: The installed CLI version or installation lacks a required adapter capability and fails capability preflight/);
@@ -385,7 +381,7 @@ test("Grok rules document source verified headless boundaries", () => {
   assert.match(doctor, /raw path variants, symbolic links, and shell or indirect scripts can bypass/i);
   assert.match(doctor, /Bash\(grok inspect:\*\)/);
   assert.match(doctor, /Run `grok inspect --json` and review the reported `permissions`, `hooks`, `plugins`, `agents`, `mcpServers`, and `externalCompat` surfaces/);
-  assert.match(doctor, /successful Grok collection remains unverified until `\/fusion:stats --record-worker-acceptance/i);
+  assert.match(doctor, /successful Grok collection remains unverified until `\/fusion:stats --record <fusion-task-id>=<accepted\|rejected>`/i);
   for (const text of [readme, security]) {
     assert.match(text, /minimum-version enforcement can still force an update/);
     assert.match(text, /file that is unlinked (?:immediately after open|as soon as it is opened)/);

@@ -215,9 +215,69 @@ test("task stays foreground by default and persists the complete terminal record
   assert.equal(entry.record.resolvedModel, "gpt-test");
   assert.equal(entry.record.resolvedEffort, "max");
   assert.equal(entry.record.tokenUsageAvailability, "available");
-  assert.equal(entry.record.codexVersion, "0.144.4");
+  assert.equal(entry.record.codexVersion, "0.145.0");
   assert.equal(fs.statSync(entry.file).mode & 0o777, 0o600);
   assert.equal(fs.statSync(path.dirname(entry.file)).mode & 0o777, 0o700);
+});
+
+test("task resolves an output schema, forwards it, and records parsed structured output", (t) => {
+  const sandbox = makeSandbox(t);
+  const schemaDirectory = path.join(sandbox.workDir, "schemas");
+  const schema = path.join(schemaDirectory, "verdict.json");
+  fs.mkdirSync(schemaDirectory);
+  fs.writeFileSync(schema, JSON.stringify({ type: "object" }));
+  const resolvedSchema = fs.realpathSync.native(schema);
+  const result = runCompanion(["task", "--json", "--output-schema", "schemas/verdict.json", "return a verdict"], {
+    cwd: sandbox.workDir,
+    env: envFor(sandbox, { FAKE_CODEX_JSON_OBJECT_MESSAGE: "true" })
+  });
+  assert.equal(result.status, 0, result.stderr);
+  const record = JSON.parse(result.stdout);
+  assert.equal(record.request.outputSchemaFile, resolvedSchema);
+  assert.equal(record.resultText, '{"verdict":"pass","findings":[]}');
+  assert.deepEqual(record.structuredOutput, { verdict: "pass", findings: [] });
+  assert.equal(record.structuredOutputError, null);
+  const args = readArgs(sandbox);
+  const schemaIndex = args.indexOf("--output-schema");
+  assert.equal(args[schemaIndex + 1], resolvedSchema);
+  assert.equal(jobRecords(sandbox)[0].request.outputSchemaFile, resolvedSchema);
+});
+
+test("task retains a non-JSON agent message and records the structured parsing error", (t) => {
+  const sandbox = makeSandbox(t);
+  const schema = path.join(sandbox.workDir, "verdict.json");
+  fs.writeFileSync(schema, JSON.stringify({ type: "object" }));
+  const result = runCompanion(["task", "--json", "--output-schema", schema, "return a verdict"], {
+    cwd: sandbox.workDir,
+    env: envFor(sandbox)
+  });
+  assert.equal(result.status, 0, result.stderr);
+  const record = JSON.parse(result.stdout);
+  assert.equal(record.resultText, "Codex completed the task.");
+  assert.equal(record.structuredOutput, null);
+  assert.match(record.structuredOutputError, /^Codex final response is not valid JSON:/);
+});
+
+test("task rejects missing, nonregular, oversized, and invalid output schemas before execution", (t) => {
+  const sandbox = makeSandbox(t);
+  const cases = [
+    { path: "missing.json", message: /does not exist/ },
+    { path: "schemas", message: /not a regular file/ },
+    { path: "oversized.json", message: /exceeds the 256 KiB limit/ },
+    { path: "invalid.json", message: /must contain valid JSON/ }
+  ];
+  fs.mkdirSync(path.join(sandbox.workDir, "schemas"));
+  fs.writeFileSync(path.join(sandbox.workDir, "oversized.json"), "x".repeat(256 * 1024 + 1));
+  fs.writeFileSync(path.join(sandbox.workDir, "invalid.json"), "{not-json}");
+  for (const entry of cases) {
+    const result = runCompanion(["task", "--output-schema", entry.path, "return a verdict"], {
+      cwd: sandbox.workDir,
+      env: envFor(sandbox)
+    });
+    assert.equal(result.status, 1);
+    assert.match(result.stderr, entry.message);
+  }
+  assert.equal(fs.existsSync(sandbox.argsFile), false);
 });
 
 test("option shaped text after a task prompt cannot enable background or change execution settings", (t) => {
@@ -572,32 +632,32 @@ test("task rejects an outdated Codex CLI before execution", (t) => {
   const outdated = makeSandbox(t);
   const outdatedResult = runCompanion(["task", "--json", "do work"], {
     cwd: outdated.workDir,
-    env: envFor(outdated, { FAKE_CODEX_VERSION: "0.143.9" })
+    env: envFor(outdated, { FAKE_CODEX_VERSION: "0.144.9" })
   });
   assert.equal(outdatedResult.status, 1);
   assert.equal(outdatedResult.stdout, "");
   const outdatedFailure = JSON.parse(outdatedResult.stderr);
   assert.equal(outdatedFailure.status, "error");
   assert.equal(outdatedFailure.failureKind, "setup");
-  assert.match(outdatedFailure.message, /Upgrade the Codex CLI to version 0\.144\.0 or later\./);
+  assert.match(outdatedFailure.message, /Upgrade the Codex CLI to version 0\.145\.0 or later\./);
   assert.equal(fs.existsSync(outdated.argsFile), false);
   assert.deepEqual(jobRecords(outdated), []);
 
   const text = makeSandbox(t);
   const textResult = runCompanion(["task", "do work"], {
     cwd: text.workDir,
-    env: envFor(text, { FAKE_CODEX_VERSION: "0.143.9" })
+    env: envFor(text, { FAKE_CODEX_VERSION: "0.144.9" })
   });
   assert.equal(textResult.status, 1);
   assert.equal(textResult.stdout, "");
-  assert.match(textResult.stderr, /Upgrade the Codex CLI to version 0\.144\.0 or later\./);
+  assert.match(textResult.stderr, /Upgrade the Codex CLI to version 0\.145\.0 or later\./);
   assert.match(textResult.stderr, /failure: setup/);
   assert.equal(fs.existsSync(text.argsFile), false);
   assert.deepEqual(jobRecords(text), []);
 });
 
 test("task proceeds with tested and newer Codex CLI versions", (t) => {
-  for (const version of ["0.144.0", "0.145.0"]) {
+  for (const version of ["0.145.0", "0.146.0"]) {
     const sandbox = makeSandbox(t);
     const result = runCompanion(["task", "--json", "do work"], {
       cwd: sandbox.workDir,
@@ -1131,6 +1191,7 @@ test("resume-last inherits model, effort, and service tier from its thread", (t)
     ingress: "argv",
     model: "gpt-5.6-terra",
     network: false,
+    outputSchemaFile: null,
     resumeSourceJobId: source.id,
     resumeThreadId: "thread-routing",
     serviceTier: "flex",
@@ -1287,6 +1348,19 @@ test("plain native review uses target flags and focus switches to a read only ta
   assert.equal(jobRecords(sandbox)[1].request.transport, "focused-review");
 });
 
+test("review rejects output schemas because tested Codex review versions ignore them", (t) => {
+  const sandbox = makeSandbox(t);
+  const result = runCompanion(["review", "--json", "--output-schema", "schemas/verdict.json"], {
+    cwd: sandbox.workDir,
+    env: envFor(sandbox)
+  });
+  assert.equal(result.status, 1);
+  const error = JSON.parse(result.stderr);
+  assert.equal(error.failureKind, "input");
+  assert.match(error.message, /review ignores --output-schema on tested CLI versions/);
+  assert.equal(fs.existsSync(sandbox.argsFile), false);
+});
+
 test("adversarial review is a normal read only task with the explicit review contract", (t) => {
   const sandbox = makeSandbox(t);
   const env = envFor(sandbox);
@@ -1301,7 +1375,10 @@ test("adversarial review is a normal read only task with the explicit review con
   const prompt = fs.readFileSync(sandbox.stdinFile, "utf8");
   assert.match(prompt, /strongest evidence that the reviewed change should not ship yet/);
   assert.match(prompt, /cancellation races/);
-  assert.equal(jobRecords(sandbox)[0].request.transport, "adversarial-review");
+  const [record] = jobRecords(sandbox);
+  assert.equal(record.request.transport, "adversarial-review");
+  assert.equal(record.request.outputSchemaFile, path.join(repoRoot, "plugins", "codex", "schemas", "adversarial-review-verdict.schema.json"));
+  assert.deepEqual(args.slice(args.indexOf("--output-schema"), args.indexOf("--output-schema") + 2), ["--output-schema", record.request.outputSchemaFile]);
 });
 
 test("cancel terminates the supervised process group and terminal state cannot be overwritten", async (t) => {
@@ -1470,7 +1547,7 @@ test("setup verifies authentication and the tested Codex version interval", (t) 
   assert.doesNotMatch(JSON.stringify(JSON.parse(redacted.stdout)), /sk-secretvalue123/);
   const redactedVersion = runCompanion(["setup", "--json"], {
     cwd: sandbox.workDir,
-    env: envFor(sandbox, { FAKE_CODEX_VERSION_OUTPUT: "codex-cli 0.144.4 access_token=secretversionvalue" })
+    env: envFor(sandbox, { FAKE_CODEX_VERSION_OUTPUT: "codex-cli 0.145.0 access_token=secretversionvalue" })
   });
   assert.equal(redactedVersion.status, 0, redactedVersion.stderr);
   assert.doesNotMatch(JSON.stringify(JSON.parse(redactedVersion.stdout)), /secretversionvalue/);
@@ -1492,41 +1569,13 @@ test("setup verifies authentication and the tested Codex version interval", (t) 
   assert.doesNotMatch(apiKey.stdout, /codex-test-key/);
   const unsupported = runCompanion(["setup", "--json"], {
     cwd: sandbox.workDir,
-    env: envFor(sandbox, { FAKE_CODEX_VERSION: "0.145.0" })
+    env: envFor(sandbox, { FAKE_CODEX_VERSION: "0.146.0" })
   });
   assert.equal(unsupported.status, 1);
   const unsupportedReport = JSON.parse(unsupported.stdout);
   assert.equal(unsupportedReport.ready, false);
-  assert.match(unsupportedReport.compatibility, /outside the tested/);
-});
-
-test("setup reports recent models cache schema drift from job logs without failing", (t) => {
-  const sandbox = makeSandbox(t);
-  const logFile = jobLogPath(sandbox.dataDir, sandbox.workDir, "models-cache-drift");
-  fs.mkdirSync(path.dirname(logFile), { recursive: true });
-  fs.writeFileSync(logFile, "error: failed to renew cache TTL\n");
-  const result = runCompanion(["setup", "--json"], { cwd: sandbox.workDir, env: envFor(sandbox) });
-  assert.equal(result.status, 0, result.stderr);
-  const report = JSON.parse(result.stdout);
-  assert.equal(report.ready, true);
-  assert.ok(report.nextSteps.includes("Codex CLI cannot parse the current models cache (schema drift). Upgrade the Codex CLI, then run /codex:setup again."));
-});
-
-test("setup only treats a missing field as models cache drift when its log tail names codex_models_manager", (t) => {
-  const sandbox = makeSandbox(t);
-  const logFile = jobLogPath(sandbox.dataDir, sandbox.workDir, "models-cache-missing-field");
-  const nextStep = "Codex CLI cannot parse the current models cache (schema drift). Upgrade the Codex CLI, then run /codex:setup again.";
-  fs.mkdirSync(path.dirname(logFile), { recursive: true });
-  fs.writeFileSync(logFile, "error: missing field `models`\n");
-
-  const unrelated = runCompanion(["setup", "--json"], { cwd: sandbox.workDir, env: envFor(sandbox) });
-  assert.equal(unrelated.status, 0, unrelated.stderr);
-  assert.ok(!JSON.parse(unrelated.stdout).nextSteps.includes(nextStep));
-
-  fs.writeFileSync(logFile, "error: missing field `models` in codex_models_manager\n");
-  const related = runCompanion(["setup", "--json"], { cwd: sandbox.workDir, env: envFor(sandbox) });
-  assert.equal(related.status, 0, related.stderr);
-  assert.ok(JSON.parse(related.stdout).nextSteps.includes(nextStep));
+  assert.match(unsupportedReport.compatibility, /newer than the tested interval \(0\.145\.0 to before 0\.146\.0\)/);
+  assert.match(unsupportedReport.nextSteps.join("\n"), /A verification pass is advised\./);
 });
 
 test("the companion module can be imported without executing its CLI", async () => {

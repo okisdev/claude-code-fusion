@@ -133,7 +133,7 @@
     ],
     "SubagentStop": [
       {
-        "matcher": "^(?:fusion:)?(?:fast-worker|trivial-worker|deep-reasoner|job-collector)$",
+        "matcher": "^(?:(?:fusion:)?(?:fast-worker|trivial-worker|deep-reasoner|job-collector)|codex:codex-rescue|grok:grok-rescue|grok:grok-review-runner)$",
         "hooks": [
           {
             "type": "command",

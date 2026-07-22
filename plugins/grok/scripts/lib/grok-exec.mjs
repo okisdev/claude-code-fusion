@@ -20,7 +20,6 @@ const CONSULT_ALLOW_ENV = "GROK_CONSULT_ALLOW";
 const CAPABILITIES_ENV = "GROK_COMPANION_CAPABILITIES";
 const DEFAULT_FOREGROUND_TIMEOUT_MS = 570000;
 const BACKGROUND_TIMEOUT_CAP_MS = 1800000;
-const BACKGROUND_CLEANUP_RESERVE_MS = 30000;
 const DEFAULT_PIDLESS_RUNNING_GRACE_MS = 15000;
 const TERMINATION_GRACE_MS = 2000;
 const TERMINATION_POLL_MS = 50;
@@ -178,7 +177,7 @@ export function resolveConsultAllowRules(env = process.env) {
     .filter((entry) => /^(?:Read|Grep|WebSearch|WebFetch)(?:\([^(),\r\n]*\))?$/.test(entry));
 }
 
-export function buildGrokChildEnv(env = process.env, { bestOfN = null, memory = false } = {}) {
+export function buildGrokChildEnv(env = process.env, { memory = false } = {}) {
   const childEnv = { ...env };
   for (const key of Object.keys(childEnv)) {
     if (
@@ -196,7 +195,7 @@ export function buildGrokChildEnv(env = process.env, { bestOfN = null, memory = 
   childEnv.GROK_DISABLE_AUTOUPDATER = "1";
   childEnv.GROK_MANAGED_MCPS_ENABLED = "false";
   childEnv.GROK_MEMORY = memory ? "1" : "0";
-  childEnv.GROK_SUBAGENTS = bestOfN ? "1" : "0";
+  childEnv.GROK_SUBAGENTS = "0";
   for (const key of COMPATIBILITY_ENV_KEYS) {
     childEnv[key] = "false";
   }
@@ -243,7 +242,6 @@ export function resolveGrokCapabilities(bin, env = process.env) {
   const capabilities = new Set(`${probe.stdout ?? ""}\n${probe.stderr ?? ""}`.match(CAPABILITY_PATTERN) ?? []);
   for (const [flag, probeArgs] of [
     ["--no-wait-for-background", ["--no-wait-for-background", "--help"]],
-    ["--background-wait-timeout", ["--background-wait-timeout", "1", "--help"]],
     ["--no-auto-update", ["--no-auto-update", "--help"]]
   ]) {
     if (!capabilities.has(flag) && spawnSync(bin, probeArgs, probeOptions).status === 0) {
@@ -261,14 +259,8 @@ function requireGrokCapabilities(capabilities, flags) {
   }
 }
 
-function backgroundWaitSeconds(timeoutMs) {
-  const budget = Number.isFinite(timeoutMs) && timeoutMs > 0 ? timeoutMs : DEFAULT_FOREGROUND_TIMEOUT_MS;
-  return Math.max(1, Math.floor((Math.max(1000, budget) - BACKGROUND_CLEANUP_RESERVE_MS) / 1000));
-}
-
 export function buildGrokArgs(options) {
-  const bestOfN = options.bestOfN ?? null;
-  const mode = bestOfN || options.mode === "write" ? "write" : "consult";
+  const mode = options.mode === "write" ? "write" : "consult";
   const maxTurns = options.maxTurns ?? DEFAULT_MAX_TURNS[mode];
   const capabilities = options.capabilities ?? null;
   const env = options.env ?? process.env;
@@ -291,17 +283,11 @@ export function buildGrokArgs(options) {
   if (supports("--no-auto-update")) {
     args.push("--no-auto-update");
   }
-  if (!bestOfN) {
-    if (supports("--no-subagents")) {
-      args.push("--no-subagents");
-    }
-    if (supports("--no-wait-for-background")) {
-      args.push("--no-wait-for-background");
-    } else if (supports("--background-wait-timeout")) {
-      args.push("--background-wait-timeout", String(backgroundWaitSeconds(options.timeoutMs)));
-    }
-  } else if (supports("--background-wait-timeout")) {
-    args.push("--background-wait-timeout", String(backgroundWaitSeconds(options.timeoutMs)));
+  if (supports("--no-subagents")) {
+    args.push("--no-subagents");
+  }
+  if (supports("--no-wait-for-background")) {
+    args.push("--no-wait-for-background");
   }
   if (!options.web) {
     args.push("--disable-web-search");
@@ -326,7 +312,7 @@ export function buildGrokArgs(options) {
     args.push("--json-schema", schema);
   }
 
-  const disallowedTools = [...(bestOfN ? [] : ["Agent"]), ...DISALLOWED_META_TOOL_IDS];
+  const disallowedTools = ["Agent", ...DISALLOWED_META_TOOL_IDS];
 
   if (mode === "consult") {
     args.push(
@@ -358,7 +344,7 @@ export function buildGrokArgs(options) {
     args.push(
       "--always-approve",
       "--tools",
-      [...WRITE_TOOL_IDS, ...(options.web ? CONSULT_WEB_TOOL_IDS : []), ...(bestOfN ? ["Agent"] : [])].join(","),
+      [...WRITE_TOOL_IDS, ...(options.web ? CONSULT_WEB_TOOL_IDS : [])].join(","),
       "--disallowed-tools",
       disallowedTools.join(",")
     );
@@ -368,10 +354,6 @@ export function buildGrokArgs(options) {
     for (const rule of privateGrokReadDenyRules(env, cwd)) {
       args.push("--deny", rule);
     }
-  }
-
-  if (bestOfN) {
-    args.push("--best-of-n", String(bestOfN));
   }
 
   return args;
@@ -1683,7 +1665,7 @@ export function runGrok(options) {
   const bin = options.bin ?? resolveGrokBin(env);
   const timeoutMs = options.timeoutMs ?? resolveTimeoutMs({ background: Boolean(options.background), env });
   const managedRun = !options.args;
-  const requestedMode = options.bestOfN || options.mode === "write" ? "write" : "consult";
+  const requestedMode = options.mode === "write" ? "write" : "consult";
   let capabilities = null;
   if (managedRun) {
     capabilities = resolveGrokCapabilities(bin, env);
@@ -1699,17 +1681,10 @@ export function runGrok(options) {
     if (options.jsonSchema) {
       requireGrokCapabilities(capabilities, ["--json-schema"]);
     }
-    if (options.bestOfN) {
-      requireGrokCapabilities(capabilities, ["--best-of-n", "--background-wait-timeout"]);
-    } else if (!capabilities.has("--no-wait-for-background") && !capabilities.has("--background-wait-timeout")) {
-      throw capabilityError("The installed Grok CLI cannot bound headless background work. Upgrade Grok to a version with --no-wait-for-background or --background-wait-timeout.");
-    }
+    requireGrokCapabilities(capabilities, ["--no-wait-for-background"]);
   }
   const args = options.args ?? buildGrokArgs({ ...options, capabilities, timeoutMs });
-  const childEnv = buildGrokChildEnv(env, {
-    bestOfN: options.bestOfN ?? null,
-    memory: options.memory === true
-  });
+  const childEnv = buildGrokChildEnv(env, { memory: options.memory === true });
   const captureProcessIdentity = options.captureProcessIdentity ?? getProcessIdentity;
   let prompt = typeof options.prompt === "string" ? options.prompt : null;
   if (managedRun && prompt == null && options.briefFile) {
