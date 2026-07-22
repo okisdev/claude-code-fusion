@@ -28,6 +28,11 @@ const FUSION_TASK_ID_PATTERN = /^fusion-[0-9a-f]{24}$/;
 const ENGINE_JOB_ID_PATTERN = /^[0-9a-f]{32}$/;
 const RECORD_VERDICTS = new Set(["accepted", "rejected", "unverified"]);
 const RECORD_SOURCES = new Set(["collector", "main-loop"]);
+const FUSION_ACCEPTANCE_EPOCH_ENV = "FUSION_ACCEPTANCE_EPOCH";
+const DEFAULT_ACCEPTANCE_EPOCH = "2026-07-22T00:00:00Z";
+const LAST_SEVEN_DAYS_MS = 7 * 24 * 60 * 60 * 1000;
+const LANE_SIGNAL_TRAILING_JOBS = 30;
+const LANE_SIGNAL_MIN_JUDGED_JOBS = 10;
 
 export function fusionWorkspaceKey(workspaceRoot) {
   return createHash("sha256").update(workspaceRoot).digest("hex").slice(0, 16);
@@ -990,6 +995,75 @@ function tokenUsageForJob(raw, observation) {
   return { availability: incomplete ? "partial" : "unavailable", usage: null };
 }
 
+function resolveAcceptanceEpoch(env) {
+  const configured = nonEmptyString(env[FUSION_ACCEPTANCE_EPOCH_ENV]);
+  const configuredTimestamp = Date.parse(configured ?? "");
+  if (configured && Number.isFinite(configuredTimestamp)) {
+    return { value: configured, timestamp: configuredTimestamp };
+  }
+  return { value: DEFAULT_ACCEPTANCE_EPOCH, timestamp: Date.parse(DEFAULT_ACCEPTANCE_EPOCH) };
+}
+
+function codexSku(model, effort) {
+  return `${model}@${effort ?? "unavailable"}`;
+}
+
+function summarizeCodexSkuTelemetry(entries) {
+  const newestCreatedAt = entries.reduce((latest, entry) => Math.max(latest, entry.createdAtMs), Number.NEGATIVE_INFINITY);
+  const trendRows = new Map();
+  if (Number.isFinite(newestCreatedAt)) {
+    const cutoff = newestCreatedAt - LAST_SEVEN_DAYS_MS;
+    for (const entry of entries) {
+      if (entry.createdAtMs < cutoff) {
+        continue;
+      }
+      const row = trendRows.get(entry.sku) ?? { sku: entry.sku, jobs: 0, outputTokens: 0, outputTokenOverflow: false, timeouts: 0 };
+      row.jobs += 1;
+      if (entry.failureKind === "timeout") {
+        row.timeouts += 1;
+      }
+      if (entry.outputTokens != null && !row.outputTokenOverflow) {
+        const outputTokens = row.outputTokens + entry.outputTokens;
+        if (Number.isSafeInteger(outputTokens)) {
+          row.outputTokens = outputTokens;
+        } else {
+          row.outputTokenOverflow = true;
+        }
+      }
+      trendRows.set(entry.sku, row);
+    }
+  }
+  const terminalBySku = new Map();
+  for (const entry of entries) {
+    if (!entry.terminal) {
+      continue;
+    }
+    const terminalEntries = terminalBySku.get(entry.sku) ?? [];
+    terminalEntries.push(entry);
+    terminalBySku.set(entry.sku, terminalEntries);
+  }
+  const laneSignalDrift = [];
+  for (const [sku, terminalEntries] of terminalBySku) {
+    const trailing = terminalEntries.sort((left, right) => right.createdAtMs - left.createdAtMs).slice(0, LANE_SIGNAL_TRAILING_JOBS);
+    const judged = trailing.filter((entry) => entry.acceptance === "accepted" || entry.acceptance === "rejected");
+    if (judged.length < LANE_SIGNAL_MIN_JUDGED_JOBS) {
+      continue;
+    }
+    const accepted = judged.filter((entry) => entry.acceptance === "accepted").length;
+    const acceptanceRate = accepted / judged.length;
+    const timeoutShare = trailing.filter((entry) => entry.failureKind === "timeout").length / trailing.length;
+    if (acceptanceRate < 0.7 || timeoutShare > 0.2) {
+      laneSignalDrift.push({ sku, acceptanceRate, timeoutShare });
+    }
+  }
+  return {
+    last7DaysBySku: [...trendRows.values()]
+      .sort((left, right) => left.sku.localeCompare(right.sku))
+      .map((row) => ({ ...row, timeoutShare: row.timeouts / row.jobs })),
+    laneSignalDrift: laneSignalDrift.sort((left, right) => left.sku.localeCompare(right.sku))
+  };
+}
+
 export function fileBasedEngineStats(descriptor, { all = false, env = process.env, cwd = process.cwd() } = {}) {
   const root = resolveStateRoot(descriptor, env);
   const availableRoots = descriptor.id === "codex" ? resolveCodexStateRoots(env) : [root];
@@ -1035,12 +1109,17 @@ export function fileBasedEngineStats(descriptor, { all = false, env = process.en
   let pendingTransportJobs = 0;
   const acceptedWithErrorTransport = [];
   const doneWithoutAcceptance = [];
+  let historicalAcceptanceAnomalies = 0;
+  const acceptanceEpoch = descriptor.id === "codex" ? resolveAcceptanceEpoch(env) : null;
+  const codexSkuTelemetryEntries = [];
   let durationSum = 0;
   let durationCount = 0;
   let earliest = null;
   let latest = null;
   for (const raw of scoped) {
     const job = descriptor.normalizeJob(raw);
+    let model = null;
+    let effort = null;
     bump(byStatus, job.status);
     bump(byKind, job.kind);
     bump(byEvidence, job.evidence ?? "state");
@@ -1055,10 +1134,26 @@ export function fileBasedEngineStats(descriptor, { all = false, env = process.en
     }
     if (descriptor.includeByModel && typeof descriptor.resolveModel === "function") {
       const observation = descriptor.usesModelAudit ? observationForJob(raw, env, auditCache) : null;
-      const model = descriptor.resolveModel(raw, observation);
-      const effort = typeof descriptor.resolveEffort === "function" ? descriptor.resolveEffort(raw, observation) : null;
+      model = descriptor.resolveModel(raw, observation);
+      effort = typeof descriptor.resolveEffort === "function" ? descriptor.resolveEffort(raw, observation) : null;
       bump(byModel, effort ? `${model}@${effort}` : model);
       bump(byEffort, effort ?? "unavailable");
+    }
+    let codexUsage = null;
+    if (descriptor.id === "codex") {
+      const observation = raw?.id ? scopedObservationForJob(tokenObservations, raw, observationRepositoryCache) : null;
+      codexUsage = tokenUsageForJob(raw, observation);
+      const createdAtMs = Date.parse(job.createdAt ?? "");
+      if (Number.isFinite(createdAtMs)) {
+        codexSkuTelemetryEntries.push({
+          sku: codexSku(model ?? "unknown", effort),
+          createdAtMs,
+          terminal: CODEX_TERMINAL_STATUSES.has(job.status),
+          acceptance: semanticAcceptance(raw),
+          failureKind: nonEmptyString(raw?.failureKind),
+          outputTokens: codexUsage.usage?.outputTokens ?? null
+        });
+      }
     }
     if (descriptor.id === "codex") {
       const jobId = nonEmptyString(raw?.id);
@@ -1067,17 +1162,26 @@ export function fileBasedEngineStats(descriptor, { all = false, env = process.en
       } else {
         pendingTransportJobs += 1;
       }
+      const historical = Number.isFinite(Date.parse(raw?.finishedAt ?? "")) && Date.parse(raw.finishedAt) < acceptanceEpoch.timestamp;
       if (jobId && job.status === "error" && semanticAcceptance(raw) === "accepted") {
-        acceptedWithErrorTransport.push(jobId);
+        if (historical) {
+          historicalAcceptanceAnomalies += 1;
+        } else {
+          acceptedWithErrorTransport.push(jobId);
+        }
       }
       if (jobId && job.status === "done" && semanticAcceptance(raw) === "unverified") {
-        doneWithoutAcceptance.push(jobId);
+        if (historical) {
+          historicalAcceptanceAnomalies += 1;
+        } else {
+          doneWithoutAcceptance.push(jobId);
+        }
       }
     }
     if (descriptor.includeTokenUsage && descriptor.isTerminal(raw)) {
       const observation = descriptor.usesTokenUsageObservations && raw?.id ? scopedObservationForJob(tokenObservations, raw, observationRepositoryCache) : null;
-      const usageResult = typeof descriptor.resolveTokenUsage === "function" ? descriptor.resolveTokenUsage(raw) : tokenUsageForJob(raw, observation);
-        if (usageResult.usage) {
+      const usageResult = codexUsage ?? (typeof descriptor.resolveTokenUsage === "function" ? descriptor.resolveTokenUsage(raw) : tokenUsageForJob(raw, observation));
+      if (usageResult.usage) {
           jobsWithTokenUsage += 1;
           if (!tokenAggregationOverflow) {
             const nextTotals = checkedUsageAddition(tokenTotals, usageResult.usage);
@@ -1110,6 +1214,7 @@ export function fileBasedEngineStats(descriptor, { all = false, env = process.en
       }
     }
   }
+  const codexSkuTelemetry = descriptor.id === "codex" ? summarizeCodexSkuTelemetry(codexSkuTelemetryEntries) : null;
   return {
     available: true,
     scope: all ? "all" : workspaceRoot,
@@ -1123,10 +1228,13 @@ export function fileBasedEngineStats(descriptor, { all = false, env = process.en
           pendingTransportJobs,
           acceptanceAnomalies: {
             acceptedWithErrorTransport,
-            doneWithoutAcceptance
+            doneWithoutAcceptance,
+            ...(historicalAcceptanceAnomalies > 0 ? { historicalPreEpoch: historicalAcceptanceAnomalies, historicalEpoch: acceptanceEpoch.value } : {})
           }
         }
       : {}),
+    ...(codexSkuTelemetry?.last7DaysBySku.length ? { last7DaysBySku: codexSkuTelemetry.last7DaysBySku } : {}),
+    ...(codexSkuTelemetry?.laneSignalDrift.length ? { laneSignalDrift: codexSkuTelemetry.laneSignalDrift } : {}),
     byKind,
     ...(typeof descriptor.resolveMode === "function" ? { byMode } : {}),
     ...(typeof descriptor.resolveFailureKind === "function" ? { byFailureKind } : {}),
@@ -1931,7 +2039,8 @@ function renderCounts(lines, title, map) {
 function renderAcceptanceAnomalies(lines, anomalies) {
   const acceptedWithErrorTransport = anomalies?.acceptedWithErrorTransport ?? [];
   const doneWithoutAcceptance = anomalies?.doneWithoutAcceptance ?? [];
-  if (acceptedWithErrorTransport.length === 0 && doneWithoutAcceptance.length === 0) {
+  const historicalPreEpoch = anomalies?.historicalPreEpoch ?? 0;
+  if (acceptedWithErrorTransport.length === 0 && doneWithoutAcceptance.length === 0 && historicalPreEpoch === 0) {
     return;
   }
   lines.push("", "Acceptance anomalies:");
@@ -1940,6 +2049,33 @@ function renderAcceptanceAnomalies(lines, anomalies) {
   }
   if (doneWithoutAcceptance.length > 0) {
     lines.push(`- Done jobs without acceptance records: ${doneWithoutAcceptance.length} (${doneWithoutAcceptance.join(", ")})`);
+  }
+  if (historicalPreEpoch > 0) {
+    lines.push(`- historical pre-epoch (before ${anomalies.historicalEpoch}): ${historicalPreEpoch}`);
+  }
+}
+
+function formatShare(value) {
+  return `${(value * 100).toFixed(1)}%`;
+}
+
+function renderCodexSkuTrend(lines, rows) {
+  if (!Array.isArray(rows) || rows.length === 0) {
+    return;
+  }
+  lines.push("", "By SKU, last 7 days:", "SKU | jobs | output tokens | timeout share");
+  for (const row of rows) {
+    lines.push(`${row.sku} | ${row.jobs} | ${row.outputTokenOverflow ? "overflow" : row.outputTokens} | ${formatShare(row.timeoutShare)}`);
+  }
+}
+
+function renderLaneSignalDrift(lines, rows) {
+  if (!Array.isArray(rows) || rows.length === 0) {
+    return;
+  }
+  lines.push("", "## Lane signal drift");
+  for (const row of rows) {
+    lines.push(`- ${row.sku}: judged acceptance ${formatShare(row.acceptanceRate)}, timeout share ${formatShare(row.timeoutShare)}; re-score via /fusion:config`);
   }
 }
 
@@ -1969,6 +2105,7 @@ function renderEngine(lines, name, stats) {
   renderCounts(lines, "By kind", stats.byKind ?? {});
   renderCounts(lines, "By model", stats.byModel ?? {});
   renderCounts(lines, "By effort", stats.byEffort ?? {});
+  renderCodexSkuTrend(lines, stats.last7DaysBySku);
   renderCounts(lines, "By failure kind", stats.byFailureKind ?? {});
   if (Number.isSafeInteger(stats.harnessAsyncDeliveries)) {
     lines.push("", `Harness async deliveries: ${stats.harnessAsyncDeliveries}`);
@@ -2105,6 +2242,29 @@ function summarizeFleetBursts(bursts) {
   };
 }
 
+function narrowWaveWatch(dispatchEvents) {
+  const byDaySession = new Map();
+  for (const event of dispatchEvents) {
+    const session = nonEmptyString(event?.session);
+    const at = nonEmptyString(event?.at);
+    const atMs = at ? Date.parse(at) : Number.NaN;
+    if (!session || !Number.isFinite(atMs)) {
+      continue;
+    }
+    const day = at.slice(0, 10);
+    const key = `${day}\u0000${session}`;
+    const events = byDaySession.get(key) ?? [];
+    events.push({ at, atMs, session, day });
+    byDaySession.set(key, events);
+  }
+  return [...byDaySession.values()]
+    .filter((events) => events.length >= 8)
+    .map((events) => ({ day: events[0].day, session: events[0].session, dispatches: events.length, bursts: clusterDispatchBursts(events) }))
+    .filter((entry) => entry.bursts.every((burst) => burst.width === 1))
+    .sort((left, right) => left.day.localeCompare(right.day) || left.session.localeCompare(right.session))
+    .map(({ day, session, dispatches }) => ({ day, session, dispatches }));
+}
+
 /**
  * Derive ultra / fleet visibility from inline-guard audit dispatch events.
  * Pure read-side: clusters same-session dispatches within a short window into bursts.
@@ -2120,7 +2280,9 @@ export function buildFleetUsageStats({ env = process.env } = {}) {
   if (dispatches.length === 0) {
     return emptyFleetUsageStats();
   }
-  return summarizeFleetBursts(clusterDispatchBursts(dispatches));
+  const fleet = summarizeFleetBursts(clusterDispatchBursts(dispatches));
+  const watch = narrowWaveWatch(dispatches);
+  return watch.length > 0 ? { ...fleet, narrowWaveWatch: watch } : fleet;
 }
 
 function renderFleetUsageStats(lines, fleet) {
@@ -2150,6 +2312,12 @@ function renderFleetUsageStats(lines, fleet) {
       lines.push(`- ${day}: ${dayStats.bursts} burst${dayStats.bursts === 1 ? "" : "s"}, ${dayStats.fleetShapedBursts} fleet-shaped${widths ? ` [${widths}]` : ""}${widest}`);
     }
   }
+  if (Array.isArray(fleet.narrowWaveWatch) && fleet.narrowWaveWatch.length > 0) {
+    lines.push("", "Narrow-wave watch:");
+    for (const watch of fleet.narrowWaveWatch) {
+      lines.push(`- ${watch.day}, ${watch.session}, ${watch.dispatches}, all width 1`);
+    }
+  }
 }
 
 export function buildFusionStats({ all = false, env = process.env, cwd = process.cwd() } = {}) {
@@ -2172,6 +2340,7 @@ export function renderFusionStats(report) {
       renderEngine(lines, provider.displayName, report[provider.id]);
     }
   }
+  renderLaneSignalDrift(lines, report.codex?.laneSignalDrift);
   renderFleetUsageStats(lines, report.fleet);
   lines.push("", "Peer token totals include only jobs with exact reported usage. Unavailable jobs are never estimated.");
   return `${lines.join("\n")}\n`;
@@ -2292,10 +2461,11 @@ function parseRecordPair(value) {
   return { id, verdict, acceptFailedTransport };
 }
 
-function parseRecordArguments(argv) {
+function parseRecordArguments(argv, { allowPerPairReasons = false } = {}) {
   const records = [];
   let source = null;
   let reason = null;
+  const reasonsById = new Map();
   let asJson = false;
   let acceptFailedTransport = false;
   for (let index = 0; index < argv.length; index += 1) {
@@ -2303,6 +2473,22 @@ function parseRecordArguments(argv) {
     if (token === "--record") {
       records.push(parseRecordPair(argv[index + 1]));
       index += 1;
+      continue;
+    }
+    if (token === "--reason-for") {
+      const id = argv[index + 1];
+      const pairReason = argv[index + 2];
+      if (!allowPerPairReasons) {
+        throw new TypeError("--reason-for is available only through the raw-args transport.");
+      }
+      if ((!FUSION_TASK_ID_PATTERN.test(id) && !ENGINE_JOB_ID_PATTERN.test(id)) || typeof pairReason !== "string" || !pairReason || reasonsById.has(id)) {
+        throw new TypeError("--reason-for requires one record id and one reason text.");
+      }
+      if (records.at(-1)?.id !== id) {
+        throw new TypeError("--reason-for must immediately follow its --record pair.");
+      }
+      reasonsById.set(id, pairReason);
+      index += 2;
       continue;
     }
     if (token === "--source") {
@@ -2338,9 +2524,23 @@ function parseRecordArguments(argv) {
     throw new TypeError("At least one --record <id>=<verdict> pair is required.");
   }
   if (reason !== null && records.length !== 1) {
-    throw new TypeError("--reason can be used only when exactly one --record pair is present.");
+    throw new TypeError("--reason can be used only when exactly one --record pair is present. Use --reason-for <id> <text> for each rejected pair in a batch.");
   }
-  return { records, source: source ?? "main-loop", reason, asJson, acceptFailedTransport };
+  if (reason !== null && reasonsById.size > 0) {
+    throw new TypeError("Use either --reason or --reason-for, not both.");
+  }
+  for (const record of records) {
+    if (record.verdict !== "rejected" && reasonsById.has(record.id)) {
+      throw new TypeError(`--reason-for applies only to rejected record ${record.id}.`);
+    }
+    record.reason = reason ?? reasonsById.get(record.id) ?? null;
+    if (record.verdict === "rejected") {
+      if (record.reason === null) {
+        throw new TypeError(`Rejected verdict for ${record.id} requires --reason for a single pair or --reason-for <id> <text> for a batch.`);
+      }
+    }
+  }
+  return { records, source: source ?? "main-loop", asJson, acceptFailedTransport };
 }
 
 function isStrictDirectRecordArguments(argv) {
@@ -2443,10 +2643,38 @@ function settleEngineRecord({ jobId, verdict, source, reason, acceptFailedTransp
   return writes;
 }
 
-function settleRecords({ records, source, reason, acceptFailedTransport = false, asJson, workspaceRoot, env, stdout, stderr }) {
+function validateWorkerSettlement({ taskId, verdict, source, reason, acceptFailedTransport, env }) {
+  const current = readWorkerRecord(taskId, env);
+  validateWorkerAcceptance({ record: current, taskId, acceptance: verdict, source, reason, acceptFailedTransport });
+  const peerJobId = isTerminalWorkerStatus(current?.transportStatus) && typeof current.peerJobId === "string" && ENGINE_JOB_ID_PATTERN.test(current.peerJobId) ? current.peerJobId : null;
+  if (peerJobId && current.peerEngine !== "codex" && current.peerEngine !== "grok") {
+    resolveEngineJob(peerJobId, env);
+  }
+}
+
+function validateEngineSettlement({ jobId, verdict, source, reason, acceptFailedTransport, env }) {
+  resolveEngineJob(jobId, env);
+  for (const record of readWorkerRecords(env).filter((candidate) => candidate.peerJobId === jobId)) {
+    validateWorkerAcceptance({ record, taskId: record.taskId, acceptance: verdict, source, reason, acceptFailedTransport });
+  }
+}
+
+function validateRecordSettlements({ records, source, acceptFailedTransport, env }) {
+  for (const { id, verdict, reason = null, acceptFailedTransport: pairAcceptFailedTransport } of records) {
+    const pairOverride = acceptFailedTransport || pairAcceptFailedTransport;
+    if (FUSION_TASK_ID_PATTERN.test(id)) {
+      validateWorkerSettlement({ taskId: id, verdict, source, reason, acceptFailedTransport: pairOverride, env });
+    } else {
+      validateEngineSettlement({ jobId: id, verdict, source, reason, acceptFailedTransport: pairOverride, env });
+    }
+  }
+}
+
+function settleRecords({ records, source, acceptFailedTransport = false, asJson, workspaceRoot, env, stdout, stderr }) {
+  validateRecordSettlements({ records, source, acceptFailedTransport, env });
   const writes = [];
   const errors = [];
-  for (const { id, verdict, acceptFailedTransport: pairAcceptFailedTransport } of records) {
+  for (const { id, verdict, reason = null, acceptFailedTransport: pairAcceptFailedTransport } of records) {
     const pairOverride = acceptFailedTransport || pairAcceptFailedTransport;
     try {
       if (FUSION_TASK_ID_PATTERN.test(id)) {
@@ -2463,7 +2691,7 @@ function settleRecords({ records, source, reason, acceptFailedTransport = false,
   return { writes, errors };
 }
 
-export function main(argv = process.argv.slice(2), { env = process.env, cwd = process.cwd(), stdout = process.stdout, stderr = process.stderr } = {}) {
+export function main(argv = process.argv.slice(2), { env = process.env, cwd = process.cwd(), stdout = process.stdout, stderr = process.stderr, rawArgs = false } = {}) {
   const asJson = argv.includes("--json");
 
   if (argv.includes("--audit")) {
@@ -2479,7 +2707,7 @@ export function main(argv = process.argv.slice(2), { env = process.env, cwd = pr
   }
 
   if (argv.includes("--record")) {
-    const request = parseRecordArguments(argv);
+    const request = parseRecordArguments(argv, { allowPerPairReasons: rawArgs });
     const result = settleRecords({ ...request, workspaceRoot: cwd, env, stdout, stderr });
     if (result.errors.length > 0) {
       throw new Error(`${result.errors.length} record settlement ${result.errors.length === 1 ? "failed" : "failures"}.`);
@@ -2541,6 +2769,11 @@ function runCli(argv = process.argv.slice(2)) {
     return;
   }
   if (isStrictDirectRecordArguments(argv)) {
+    if (argv.some((token, index) => token === "--record" && parseRecordPair(argv[index + 1]).verdict === "rejected")) {
+      process.stderr.write("Rejected verdicts require --reason through the raw-args transport. For batch settlements, use --reason-for <id> <text> for each rejected pair.\n");
+      process.exitCode = 1;
+      return;
+    }
     main(argv);
     return;
   }
@@ -2548,7 +2781,7 @@ function runCli(argv = process.argv.slice(2)) {
     throw new TypeError("Fusion stats requests must be supplied through --raw-args-token.");
   }
   const transport = resolveRawArgsTransport(argv);
-  main(transport.argv);
+  main(transport.argv, { rawArgs: true });
 }
 
 if (isMain()) {
