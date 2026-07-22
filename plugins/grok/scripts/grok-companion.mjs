@@ -12,6 +12,7 @@ import { parseArgs, parseRawArgs, rawBooleanOptionRequested } from "./lib/args.m
 import {
   buildGrokArgs,
   formatBlockedPermissionCall,
+  formatDeniedToolDetail,
   normalizeGrokSessionId,
   resolveGrokBin,
   resolveGrokCapabilities,
@@ -1012,7 +1013,16 @@ function isPermissionCancelled(result) {
 }
 
 function permissionFailureMessage(result) {
-  return PERMISSION_FAILURE_MESSAGE + formatBlockedPermissionCall(result?.blockedPermissionCall ?? null);
+  const blocked = result?.blockedPermissionCall ?? null;
+  const hasBlockedTool = Boolean(blocked && typeof blocked.tool === "string" && blocked.tool.trim());
+  const deniedToolDetail = formatDeniedToolDetail(result?.deniedToolFromStderr ?? null);
+  if (hasBlockedTool) {
+    return PERMISSION_FAILURE_MESSAGE + formatBlockedPermissionCall(blocked) + deniedToolDetail;
+  }
+  if (deniedToolDetail) {
+    return PERMISSION_FAILURE_MESSAGE + deniedToolDetail;
+  }
+  return PERMISSION_FAILURE_MESSAGE + formatBlockedPermissionCall(null);
 }
 
 function grokFailureMessage(result, timeoutMs, failureKind) {
@@ -1543,33 +1553,36 @@ async function handleTask(argv, transport = {}) {
   const jobId = generateJobId();
   const briefFile = briefPath(dataDir, cwd, jobId);
   const jobFile = jobFilePath(dataDir, cwd, jobId);
-  const record = createJobRecord({
-    id: jobId,
-    pid: background ? null : process.pid,
-    mode,
-    cwd,
-    briefFile,
-    background,
-    delivery: background ? backgroundDelivery() : "foreground",
-    claudeSessionId,
-    jobClass: "task",
-    role,
-    request: {
-      model: options.model ?? null,
-      effort: options.effort ?? null,
-      maxTurns,
-      web: Boolean(options.web),
-      memory,
-      sandboxProfile: sandboxProfileForMode(mode),
-      resumeSessionId,
-      resumeSourceJobId: resumeSource?.id ?? null,
-      resumeReason,
-      continuityPolicy: selectedContinuityPolicy,
+  const record = {
+    ...createJobRecord({
+      id: jobId,
+      pid: background ? null : process.pid,
+      mode,
+      cwd,
+      briefFile,
+      background,
+      delivery: background ? backgroundDelivery() : "foreground",
+      claudeSessionId,
+      jobClass: "task",
       role,
-      outputJson: Boolean(options.json),
-      ingress: transport.ingress ?? "argv"
-    }
-  });
+      request: {
+        model: options.model ?? null,
+        effort: options.effort ?? null,
+        maxTurns,
+        web: Boolean(options.web),
+        memory,
+        sandboxProfile: sandboxProfileForMode(mode),
+        resumeSessionId,
+        resumeSourceJobId: resumeSource?.id ?? null,
+        resumeReason,
+        continuityPolicy: selectedContinuityPolicy,
+        role,
+        outputJson: Boolean(options.json),
+        ingress: transport.ingress ?? "argv"
+      }
+    }),
+    repositoryTopLevel: resolveRepositoryTopLevel(cwd)
+  };
   createJobRecordFile(jobFile, record);
   try {
     writeBrief(dataDir, cwd, jobId, prompt);
@@ -1779,6 +1792,22 @@ function ensureGitRepository(cwd) {
   }
 }
 
+function resolveRepositoryTopLevel(cwd) {
+  try {
+    const result = spawnSync("git", ["-C", cwd, "rev-parse", "--show-toplevel"], {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"]
+    });
+    if (result.error || result.status !== 0) {
+      return null;
+    }
+    const value = String(result.stdout ?? "").trim();
+    return value || null;
+  } catch {
+    return null;
+  }
+}
+
 function collectReviewTarget(cwd, base) {
   if (base) {
     const range = runGit(["diff", `${base}...HEAD`], cwd);
@@ -1940,24 +1969,27 @@ async function handleReview(argv, transport = {}) {
   const jobId = generateJobId();
   const briefFile = briefPath(dataDir, cwd, jobId);
   const jobFile = jobFilePath(dataDir, cwd, jobId);
-  const record = createJobRecord({
-    id: jobId,
-    pid: background ? null : process.pid,
-    mode: "consult",
-    cwd,
-    briefFile,
-    background,
-    delivery: background ? backgroundDelivery() : "foreground",
-    claudeSessionId: currentClaudeSessionId(),
-    jobClass: "review",
-    request: {
-      reviewTargetLabel: target.label,
-      memory: false,
-      sandboxProfile: sandboxProfileForMode("consult"),
-      outputJson: Boolean(options.json),
-      ingress: transport.ingress ?? "argv"
-    }
-  });
+  const record = {
+    ...createJobRecord({
+      id: jobId,
+      pid: background ? null : process.pid,
+      mode: "consult",
+      cwd,
+      briefFile,
+      background,
+      delivery: background ? backgroundDelivery() : "foreground",
+      claudeSessionId: currentClaudeSessionId(),
+      jobClass: "review",
+      request: {
+        reviewTargetLabel: target.label,
+        memory: false,
+        sandboxProfile: sandboxProfileForMode("consult"),
+        outputJson: Boolean(options.json),
+        ingress: transport.ingress ?? "argv"
+      }
+    }),
+    repositoryTopLevel: resolveRepositoryTopLevel(cwd)
+  };
   createJobRecordFile(jobFile, record);
   try {
     writeBrief(dataDir, cwd, jobId, prompt);
@@ -2884,9 +2916,8 @@ async function handleStopGate() {
   const jobId = generateJobId();
   const briefFile = briefPath(dataDir, cwd, jobId);
   const jobFile = jobFilePath(dataDir, cwd, jobId);
-  createJobRecordFile(
-    jobFile,
-    createJobRecord({
+  createJobRecordFile(jobFile, {
+    ...createJobRecord({
       id: jobId,
       pid: process.pid,
       mode: "consult",
@@ -2900,8 +2931,9 @@ async function handleStopGate() {
         memory: false,
         sandboxProfile: sandboxProfileForMode("consult")
       }
-    })
-  );
+    }),
+    repositoryTopLevel: resolveRepositoryTopLevel(cwd)
+  });
   try {
     writeBrief(dataDir, cwd, jobId, prompt);
   } catch (error) {

@@ -408,6 +408,40 @@ function maxTurnsReachedError(stderr) {
   return null;
 }
 
+const DENIED_TOOL_STDERR_PATTERNS = [
+  /\b(?:tool|rule)\s+[`'"]?([A-Za-z_][\w./:-]*(?:\([^)\r\n]*\))?)[`'"]?\s+(?:(?:is|was)\s+)?(?:not allowed|denied|disallowed|blocked|rejected)/i,
+  /\b(?:denied|disallowed|blocked|rejected)\s+(?:tool|rule)\s*[:=]?\s*[`'"]?([A-Za-z_][\w./:-]*(?:\([^)\r\n]*\))?)[`'"]?/i,
+  /\bpermission\s+denied(?:\s+(?:for|to))?\s+(?:tool\s+)?[`'"]?([A-Za-z_][\w./:-]*(?:\([^)\r\n]*\))?)[`'"]?/i,
+  /\bnot\s+allowed\s+to\s+(?:use\s+)?(?:tool\s+)?[`'"]?([A-Za-z_][\w./:-]*(?:\([^)\r\n]*\))?)[`'"]?/i,
+  /\b(?:deny|denied)\s+(?:matched\s+)?rule\s*[:=]?\s*[`'"]?([A-Za-z_][\w./()*: -]*)[`'"]?/i
+];
+const DENIED_TOOL_STDERR_NOISE = /^(?:operation|os|error|permission|access|for|to|the|a|an|by)$/i;
+
+export function extractDeniedToolFromStderr(stderr) {
+  const lines = String(stderr ?? "").split(/\r?\n/);
+  for (let index = lines.length - 1; index >= 0; index -= 1) {
+    const line = lines[index].trim();
+    if (!line) {
+      continue;
+    }
+    for (const pattern of DENIED_TOOL_STDERR_PATTERNS) {
+      const match = line.match(pattern);
+      const candidate = match?.[1]?.trim();
+      if (candidate && !DENIED_TOOL_STDERR_NOISE.test(candidate)) {
+        return candidate;
+      }
+    }
+  }
+  return null;
+}
+
+export function formatDeniedToolDetail(toolName) {
+  if (typeof toolName !== "string" || !toolName.trim()) {
+    return "";
+  }
+  return `; denied tool: ${toolName.trim()}`;
+}
+
 function iterJsonObjects(stdout) {
   const trimmed = String(stdout ?? "").trim();
   if (!trimmed) {
@@ -2048,6 +2082,7 @@ export function runGrok(options) {
       const stopReason = validEnvelope ? parsed.stopReason : null;
       const blockedPermissionCall =
         stopReason === "Cancelled" ? extractBlockedPermissionCall(stdout, validEnvelope ? parsed : null) : null;
+      const deniedToolFromStderr = extractDeniedToolFromStderr(stderr);
       const structuredOutput = parsed && Object.hasOwn(parsed, "structuredOutput") ? parsed.structuredOutput : undefined;
       const structuredOutputError = parsed && Object.hasOwn(parsed, "structuredOutputError")
         ? parsed.structuredOutputError
@@ -2081,7 +2116,8 @@ export function runGrok(options) {
         stdoutTail: stdoutTail(stdoutTailBuffer),
         cancelledByCompanion,
         promptTransportError: Boolean(promptTransportError),
-        blockedPermissionCall
+        blockedPermissionCall,
+        deniedToolFromStderr
       });
     });
 
