@@ -245,6 +245,9 @@ function completionContract(agentType, prompt) {
   if (canonical === "fusion:job-collector") {
     return "collector";
   }
+  if (PEER_JOB_FOOTER_AGENTS.has(agentType)) {
+    return "transport";
+  }
   if (canonical === "fusion:deep-reasoner" || (!/^verification:\s*\S/im.test(prompt) && /^acceptance:\s*\S/im.test(prompt))) {
     return "coverage";
   }
@@ -392,6 +395,9 @@ function completedReport(record, message) {
   if (record.completionContract === "collector" || canonicalWorkerAgentType(record.agentType) === "fusion:job-collector") {
     return COLLECTOR_END_MARKER.test(normalized);
   }
+  if (record.completionContract === "transport" || PEER_JOB_FOOTER_AGENTS.has(record.agentType)) {
+    return record.agentType === "grok:grok-review-runner" || peerJobIdFromCollectedResult(normalized) != null;
+  }
   if (record.completionContract === "coverage" || canonicalWorkerAgentType(record.agentType) === "fusion:deep-reasoner") {
     return COVERAGE_END_MARKER.test(normalized);
   }
@@ -427,6 +433,9 @@ function structuredCollectorReport(message) {
 function retryInstruction(record) {
   if (record.completionContract === "collector" || canonicalWorkerAgentType(record.agentType) === "fusion:job-collector") {
     return "Return the exact collector command output, including its terminal `collector:` marker. This is the only retry.";
+  }
+  if (record.completionContract === "transport" || PEER_JOB_FOOTER_AGENTS.has(record.agentType)) {
+    return "The transport relay is incomplete. Return the companion output verbatim, including its `job:` and `state:` footer lines. This is the only retry.";
   }
   if (record.completionContract === "coverage" || canonicalWorkerAgentType(record.agentType) === "fusion:deep-reasoner") {
     return "The task is not deliverable yet. Complete the requested coverage check and return the actual result. End with `delivery: complete` plus `coverage: complete`. This is the only retry.";
