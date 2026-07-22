@@ -254,7 +254,7 @@ export function updateWorkerRecord(taskId, env, updater) {
 }
 
 export function markWorkerCollected(record, method, collectedAt = new Date().toISOString()) {
-  const awaitingVerdict = !record.collectedAt && record.acceptance === "unverified";
+  const awaitingVerdict = record.acceptance === "unverified" && record.acceptanceRecordedAt == null && (record.awaitingVerdict === true || !record.collectedAt);
   const collectionMethod = canonicalCollectionMethod(record.collectionMethod) ?? canonicalCollectionMethod(method);
   if (!collectionMethod) {
     throw new TypeError("Fusion worker collection method is invalid.");
@@ -267,8 +267,11 @@ export function markWorkerCollected(record, method, collectedAt = new Date().toI
     awaitingCollectionArmedAt: null,
     ...(awaitingVerdict ? {
       awaitingVerdict: true,
-      awaitingVerdictArmedAt: collectedAt
-    } : {})
+      awaitingVerdictArmedAt: record.awaitingVerdictArmedAt ?? collectedAt
+    } : {
+      awaitingVerdict: false,
+      awaitingVerdictArmedAt: null
+    })
   };
 }
 
@@ -698,49 +701,133 @@ function validatedAcceptanceFields(acceptance, source, reason) {
   return { safeReason };
 }
 
-function updateWorkerAcceptance({ taskId, acceptance, env, source, safeReason, validateRecord }) {
+function workerAcceptanceGate(record, taskId, acceptance, acceptFailedTransport) {
+  const collector = canonicalWorkerAgentType(record.agentType) === "fusion:job-collector" || record.completionContract === "collector";
+  if (collector && record.peerEngine === "codex") {
+    throw new Error(`Fusion collector task ${taskId} acceptance must be recorded through the Codex acceptance ledger.`);
+  }
+  if (collector && (record.peerEngine !== "grok" || !/^[a-f0-9]{32}$/.test(record.peerJobId ?? "") || !record.peerTransportStatus)) {
+    throw new Error(`Fusion collector task ${taskId} does not contain a verified Grok collection identity.`);
+  }
+  if (acceptance === "accepted" && record.transportStatus === "failed" && !acceptFailedTransport) {
+    throw new Error(`Fusion worker task ${taskId} has transport status failed. Pass --accept-failed-transport to record accepted.`);
+  }
+}
+
+function acceptanceRecordedAt(now) {
+  return now instanceof Date ? now.toISOString() : typeof now === "string" && !Number.isNaN(Date.parse(now)) ? now : new Date().toISOString();
+}
+
+function settleWorkerAcceptance(record, { acceptance, source, reason }, now) {
+  const { pendingVerdict: _pendingVerdict, pendingVerdictError: _pendingVerdictError, ...settled } = record;
+  return {
+    ...settled,
+    acceptance,
+    acceptanceSource: source,
+    acceptanceReason: reason,
+    acceptanceRecordedAt: acceptanceRecordedAt(now),
+    awaitingVerdict: false,
+    awaitingVerdictArmedAt: null
+  };
+}
+
+function workerAcceptanceResult(record, queued) {
+  const result = { record, queued };
+  for (const key of Object.keys(record)) {
+    if (!Object.hasOwn(result, key)) {
+      Object.defineProperty(result, key, { enumerable: false, get: () => record[key] });
+    }
+  }
+  return result;
+}
+
+export function applyQueuedVerdict(record, now) {
+  if (!record?.pendingVerdict || !isTerminalWorkerStatus(record.transportStatus)) {
+    return record;
+  }
+  const { acceptance, source, reason, acceptFailedTransport = false } = record.pendingVerdict;
+  if (acceptance === "accepted" && record.transportStatus !== "done") {
+    const { pendingVerdict: _pendingVerdict, ...unsettled } = record;
+    return {
+      ...unsettled,
+      awaitingVerdict: true,
+      awaitingVerdictArmedAt: acceptanceRecordedAt(now),
+      pendingVerdictError: `Queued accepted verdict was not applied because transport status is ${record.transportStatus}.`
+    };
+  }
+  try {
+    const { safeReason } = validatedAcceptanceFields(acceptance, source, reason);
+    workerAcceptanceGate(record, record.taskId, acceptance, acceptFailedTransport);
+    return settleWorkerAcceptance(record, { acceptance, source, reason: safeReason }, now);
+  } catch (error) {
+    return {
+      ...record,
+      pendingVerdictError: error instanceof Error ? error.message : String(error)
+    };
+  }
+}
+
+export function isPendingSettlement(record) {
+  return record.completionContract !== "collector" && isTerminalWorkerStatus(record.transportStatus) && Boolean(record.collectedAt) && record.awaitingVerdict === true;
+}
+
+export function isSettledWorker(record) {
+  return record.acceptanceRecordedAt != null && record.awaitingVerdict !== true;
+}
+
+function updateWorkerAcceptance({ taskId, acceptance, env, source, safeReason, validateRecord, acceptFailedTransport = false, queueIfNonTerminal = false }) {
+  let queued = false;
   const updated = updateWorkerRecord(taskId, env, (record) => {
     if (!record) {
       throw new Error(`Fusion worker task ${taskId} was not found.`);
     }
     if (!isTerminalWorkerStatus(record.transportStatus)) {
-      throw new Error(`Fusion worker task ${taskId} is not terminal.`);
+      if (!queueIfNonTerminal) {
+        throw new Error(`Fusion worker task ${taskId} is not terminal.`);
+      }
+      queued = true;
+      const { pendingVerdictError: _pendingVerdictError, ...queuedRecord } = record;
+      return {
+        ...queuedRecord,
+        pendingVerdict: {
+          acceptance,
+          source,
+          reason: safeReason,
+          queuedAt: new Date().toISOString(),
+          ...(acceptFailedTransport ? { acceptFailedTransport: true } : {})
+        }
+      };
     }
     validateRecord(record);
-    return {
-      ...record,
-      acceptance,
-      acceptanceSource: source,
-      acceptanceReason: safeReason,
-      acceptanceRecordedAt: new Date().toISOString(),
-      awaitingVerdict: false,
-      awaitingVerdictArmedAt: null
-    };
+    return settleWorkerAcceptance(record, { acceptance, source, reason: safeReason });
   });
-  return updated;
+  return { record: updated, queued };
 }
 
-export function recordWorkerAcceptance({ taskId, acceptance, env = process.env, source = "main-loop", reason = null, acceptFailedTransport = process.argv.includes("--record-worker-acceptance") && process.argv.includes("--accept-failed-transport") }) {
+export function validateWorkerAcceptance({ record, taskId, acceptance, source = "main-loop", reason = null, acceptFailedTransport = false }) {
   const { safeReason } = validatedAcceptanceFields(acceptance, source, reason);
-  return updateWorkerAcceptance({
+  if (!record) {
+    throw new Error(`Fusion worker task ${taskId} was not found.`);
+  }
+  workerAcceptanceGate(record, taskId, acceptance, acceptFailedTransport);
+  return { safeReason };
+}
+
+export function recordWorkerAcceptance({ taskId, acceptance, env = process.env, source = "main-loop", reason = null, acceptFailedTransport = false }) {
+  const { safeReason } = validatedAcceptanceFields(acceptance, source, reason);
+  const result = updateWorkerAcceptance({
     taskId,
     acceptance,
     env,
     source,
     safeReason,
+    acceptFailedTransport,
+    queueIfNonTerminal: true,
     validateRecord(record) {
-      const collector = canonicalWorkerAgentType(record.agentType) === "fusion:job-collector" || record.completionContract === "collector";
-      if (collector && record.peerEngine === "codex") {
-        throw new Error(`Fusion collector task ${taskId} acceptance must be recorded through the Codex acceptance ledger.`);
-      }
-      if (collector && (record.peerEngine !== "grok" || !/^[a-f0-9]{32}$/.test(record.peerJobId ?? "") || !record.peerTransportStatus)) {
-        throw new Error(`Fusion collector task ${taskId} does not contain a verified Grok collection identity.`);
-      }
-      if (acceptance === "accepted" && record.transportStatus === "failed" && !acceptFailedTransport) {
-        throw new Error(`Fusion worker task ${taskId} has transport status failed. Pass --accept-failed-transport to record accepted.`);
-      }
+      workerAcceptanceGate(record, taskId, acceptance, acceptFailedTransport);
     }
   });
+  return workerAcceptanceResult(result.record, result.queued);
 }
 
 export function recordCodexCollectorAcceptance({ taskId, jobId, sessionId, acceptance, env = process.env, source = "main-loop", reason = null }) {
@@ -765,5 +852,5 @@ export function recordCodexCollectorAcceptance({ taskId, jobId, sessionId, accep
         throw new Error(`Fusion collector task ${taskId} does not match the Codex acceptance identity.`);
       }
     }
-  });
+  }).record;
 }

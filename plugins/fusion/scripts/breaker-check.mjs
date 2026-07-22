@@ -72,10 +72,8 @@ function readJobRecords(stateRoot) {
         continue;
       }
       try {
-        const recordFile = path.join(jobsDir, entry.name);
-        const record = JSON.parse(fs.readFileSync(recordFile, "utf8"));
+        const record = JSON.parse(fs.readFileSync(path.join(jobsDir, entry.name), "utf8"));
         if (record && typeof record === "object" && !Array.isArray(record)) {
-          Object.defineProperty(record, "_fusionRecordFile", { value: recordFile });
           records.push(record);
         }
       } catch {
@@ -145,20 +143,7 @@ function grokFailure(record, now, lookbackMs) {
   if (!GROK_FAILURE_STATUSES.has(record.status)) {
     return null;
   }
-  const recordedFailureKind = normalizedRecordedFailureKind(record, record.failureKind);
-  let failureKind = recordedFailureKind;
-  const recoverLegacyFailure = !recordedFailureKind || recordedFailureKind === "error";
-  if (recoverLegacyFailure) {
-    failureKind = codexFailureKind(recordFailureText(record));
-  }
-  if (recoverLegacyFailure && !supportedBreakerFailure(record, failureKind) && typeof record._fusionRecordFile === "string") {
-    try {
-      const log = fs.readFileSync(record._fusionRecordFile.replace(/\.json$/, ".log"), "utf8");
-      failureKind = codexFailureKind(log.slice(-64 * 1024));
-    } catch {
-      void 0;
-    }
-  }
+  const failureKind = normalizedRecordedFailureKind(record, record.failureKind);
   const timestamp = finishedAtMs(record.finishedAt);
   if (!supportedBreakerFailure(record, failureKind) || timestamp == null || !isWithinLookback(timestamp, now, lookbackMs)) {
     return null;
@@ -182,11 +167,7 @@ function codexFailure(record, now, lookbackMs) {
   if (!CODEX_FAILURE_STATUSES.has(record.status)) {
     return null;
   }
-  const recordedFailureKind = normalizedRecordedFailureKind(record, record.failureKind);
-  const recoverLegacyFailure = !recordedFailureKind || recordedFailureKind === "error";
-  const failureKind = recoverLegacyFailure
-    ? codexFailureKind(recordFailureText(record))
-    : recordedFailureKind;
+  const failureKind = normalizedRecordedFailureKind(record, record.failureKind);
   const timestamp = finishedAtMs(record.finishedAt ?? record.completedAt ?? record.updatedAt);
   if (!supportedBreakerFailure(record, failureKind) || timestamp == null || !isWithinLookback(timestamp, now, lookbackMs)) {
     return null;

@@ -146,14 +146,14 @@ async function waitForAnnouncedRecord(sandbox, jobId, sessionId = null, workspac
 
 test("a pre-existing terminal job emits nothing on startup", async (t) => {
   const sandbox = makeSandbox(t);
-  const { record } = seedJob(sandbox, { status: "completed" });
+  const { record } = seedJob(sandbox, { status: "done" });
   const monitor = startMonitor(sandbox, envFor(sandbox));
   t.after(() => monitor.child.kill("SIGKILL"));
   await waitForAnnouncedRecord(sandbox, record.id);
   assert.deepStrictEqual(monitor.lines(), []);
 });
 
-test("a job transitioning to completed emits exactly one correctly shaped line", async (t) => {
+test("a job transitioning to done emits exactly one correctly shaped line", async (t) => {
   const sandbox = makeSandbox(t);
   const { file, record } = seedJob(sandbox, { status: "running" });
   const monitor = startMonitor(sandbox, envFor(sandbox));
@@ -161,13 +161,13 @@ test("a job transitioning to completed emits exactly one correctly shaped line",
   await waitUntil(() => readAnnouncedState(sandbox));
   assert.deepStrictEqual(monitor.lines(), []);
 
-  writeJobRecordFile(file, { ...record, status: "completed", completedAt: new Date().toISOString() });
+  writeJobRecordFile(file, { ...record, status: "done", finishedAt: new Date().toISOString() });
 
   const lines = await waitUntil(() => (monitor.lines().length > 0 ? monitor.lines() : null));
   assert.strictEqual(lines.length, 1);
   assert.strictEqual(
     lines[0],
-    `codex job ${record.id} completed. collect with /codex:result ${record.id}; completion notices do not replace collection.`
+    `codex job ${record.id} done. collect with /codex:result ${record.id}; completion notices do not replace collection.`
   );
 
   await waitForAnnouncedRecord(sandbox, record.id);
@@ -182,14 +182,14 @@ test("monitors jobs from a sibling worktree in the same Git repository", async (
   t.after(() => monitor.child.kill("SIGKILL"));
   await waitUntil(() => readAnnouncedState(sandbox));
 
-  writeJobRecordFile(file, { ...record, status: "completed", completedAt: new Date().toISOString() });
+  writeJobRecordFile(file, { ...record, status: "done", finishedAt: new Date().toISOString() });
 
   const lines = await waitUntil(() => (monitor.lines().length > 0 ? monitor.lines() : null));
   assert.strictEqual(lines.length, 1);
-  assert.match(lines[0], new RegExp(`^codex job ${record.id} completed\\.`));
+  assert.match(lines[0], new RegExp(`^codex job ${record.id} done\\.`));
 });
 
-test("a job transitioning to failed reports a truncated error message when present", async (t) => {
+test("a job transitioning to error reports a truncated error message when present", async (t) => {
   const sandbox = makeSandbox(t);
   const { file, record } = seedJob(sandbox, { status: "running" });
   const monitor = startMonitor(sandbox, envFor(sandbox));
@@ -198,8 +198,8 @@ test("a job transitioning to failed reports a truncated error message when prese
 
   writeJobRecordFile(file, {
     ...record,
-    status: "failed",
-    completedAt: new Date().toISOString(),
+    status: "error",
+    finishedAt: new Date().toISOString(),
     pid: null,
     errorMessage: "worker process exited with status 1\nfull stack trace follows",
   });
@@ -208,24 +208,24 @@ test("a job transitioning to failed reports a truncated error message when prese
   assert.strictEqual(lines.length, 1);
   assert.strictEqual(
     lines[0],
-    `codex job ${record.id} failed (worker process exited with status 1). collect with /codex:result ${record.id}; completion notices do not replace collection.`
+    `codex job ${record.id} error (worker process exited with status 1). collect with /codex:result ${record.id}; completion notices do not replace collection.`
   );
 });
 
-test("a job transitioning to failed with no error message emits no suffix", async (t) => {
+test("a job transitioning to error with no error message emits no suffix", async (t) => {
   const sandbox = makeSandbox(t);
   const { file, record } = seedJob(sandbox, { status: "running" });
   const monitor = startMonitor(sandbox, envFor(sandbox));
   t.after(() => monitor.child.kill("SIGKILL"));
   await waitUntil(() => readAnnouncedState(sandbox));
 
-  writeJobRecordFile(file, { ...record, status: "failed", completedAt: new Date().toISOString(), pid: null });
+  writeJobRecordFile(file, { ...record, status: "error", finishedAt: new Date().toISOString(), pid: null });
 
   const lines = await waitUntil(() => (monitor.lines().length > 0 ? monitor.lines() : null));
   assert.strictEqual(lines.length, 1);
   assert.strictEqual(
     lines[0],
-    `codex job ${record.id} failed. collect with /codex:result ${record.id}; completion notices do not replace collection.`
+    `codex job ${record.id} error. collect with /codex:result ${record.id}; completion notices do not replace collection.`
   );
 });
 
@@ -240,7 +240,7 @@ test("a long error message is truncated to a sane length", async (t) => {
   writeJobRecordFile(file, {
     ...record,
     status: "cancelled",
-    completedAt: new Date().toISOString(),
+    finishedAt: new Date().toISOString(),
     pid: null,
     errorMessage: longMessage,
   });
@@ -272,18 +272,18 @@ test("session monitors announce their own Claude jobs once and still surface orp
   t.after(() => otherMonitor.child.kill("SIGKILL"));
   await waitUntil(() => readAnnouncedState(sandbox, "session-own") && readAnnouncedState(sandbox, "session-other"));
 
-  writeJobRecordFile(ownFile, { ...ownRecord, status: "completed", completedAt: new Date().toISOString() });
-  writeJobRecordFile(otherFile, { ...otherRecord, status: "completed", completedAt: new Date().toISOString() });
-  writeJobRecordFile(orphanFile, { ...orphanRecord, status: "completed", completedAt: new Date().toISOString() });
+  writeJobRecordFile(ownFile, { ...ownRecord, status: "done", finishedAt: new Date().toISOString() });
+  writeJobRecordFile(otherFile, { ...otherRecord, status: "done", finishedAt: new Date().toISOString() });
+  writeJobRecordFile(orphanFile, { ...orphanRecord, status: "done", finishedAt: new Date().toISOString() });
 
   await waitUntil(() => (ownMonitor.lines().length === 2 && otherMonitor.lines().length === 2 ? true : null));
   assert.deepStrictEqual(ownMonitor.lines().sort(), [
-    `codex job ${orphanRecord.id} completed. collect with /codex:result ${orphanRecord.id}; completion notices do not replace collection.`,
-    `codex job ${ownRecord.id} completed. collect with /codex:result ${ownRecord.id}; completion notices do not replace collection.`
+    `codex job ${orphanRecord.id} done. collect with /codex:result ${orphanRecord.id}; completion notices do not replace collection.`,
+    `codex job ${ownRecord.id} done. collect with /codex:result ${ownRecord.id}; completion notices do not replace collection.`
   ].sort());
   assert.deepStrictEqual(otherMonitor.lines().sort(), [
-    `codex job ${orphanRecord.id} completed. collect with /codex:result ${orphanRecord.id}; completion notices do not replace collection.`,
-    `codex job ${otherRecord.id} completed. collect with /codex:result ${otherRecord.id}; completion notices do not replace collection.`
+    `codex job ${orphanRecord.id} done. collect with /codex:result ${orphanRecord.id}; completion notices do not replace collection.`,
+    `codex job ${otherRecord.id} done. collect with /codex:result ${otherRecord.id}; completion notices do not replace collection.`
   ].sort());
 
   const { ownLedger, otherLedger } = await waitUntil(() => {
@@ -309,13 +309,13 @@ test("with the session id env var unset, a job from a different session still em
   t.after(() => monitor.child.kill("SIGKILL"));
   await waitUntil(() => readAnnouncedState(sandbox));
 
-  writeJobRecordFile(file, { ...record, status: "completed", completedAt: new Date().toISOString() });
+  writeJobRecordFile(file, { ...record, status: "done", finishedAt: new Date().toISOString() });
 
   const lines = await waitUntil(() => (monitor.lines().length > 0 ? monitor.lines() : null));
   assert.strictEqual(lines.length, 1);
   assert.strictEqual(
     lines[0],
-    `codex job ${record.id} completed. collect with /codex:result ${record.id}; completion notices do not replace collection.`
+    `codex job ${record.id} done. collect with /codex:result ${record.id}; completion notices do not replace collection.`
   );
 });
 
@@ -330,7 +330,7 @@ test("a job in a different workspace stays silent even once terminal", async (t)
   t.after(() => monitor.child.kill("SIGKILL"));
   await waitUntil(() => readAnnouncedState(sandbox));
 
-  writeJobRecordFile(file, { ...record, status: "completed", completedAt: new Date().toISOString() });
+  writeJobRecordFile(file, { ...record, status: "done", finishedAt: new Date().toISOString() });
 
   await waitUntil(() => readAnnouncedState(sandbox));
   assert.deepStrictEqual(monitor.lines(), []);
@@ -347,13 +347,13 @@ test("a monitor started from a subdirectory still matches jobs recorded against 
   t.after(() => monitor.child.kill("SIGKILL"));
   await waitUntil(() => readAnnouncedState(sandbox));
 
-  writeJobRecordFile(file, { ...record, status: "completed", completedAt: new Date().toISOString() });
+  writeJobRecordFile(file, { ...record, status: "done", finishedAt: new Date().toISOString() });
 
   const lines = await waitUntil(() => (monitor.lines().length > 0 ? monitor.lines() : null));
   assert.strictEqual(lines.length, 1);
   assert.strictEqual(
     lines[0],
-    `codex job ${record.id} completed. collect with /codex:result ${record.id}; completion notices do not replace collection.`
+    `codex job ${record.id} done. collect with /codex:result ${record.id}; completion notices do not replace collection.`
   );
 });
 
@@ -366,11 +366,11 @@ test("a monitor includes jobs recorded in a worktree beneath the repo root", asy
   t.after(() => monitor.child.kill("SIGKILL"));
   await waitUntil(() => readAnnouncedState(sandbox));
 
-  writeJobRecordFile(file, { ...record, status: "completed", completedAt: new Date().toISOString() });
+  writeJobRecordFile(file, { ...record, status: "done", finishedAt: new Date().toISOString() });
 
   const lines = await waitUntil(() => (monitor.lines().length > 0 ? monitor.lines() : null));
   assert.deepStrictEqual(lines, [
-    `codex job ${record.id} completed. collect with /codex:result ${record.id}; completion notices do not replace collection.`
+    `codex job ${record.id} done. collect with /codex:result ${record.id}; completion notices do not replace collection.`
   ]);
 });
 
@@ -552,7 +552,7 @@ test("a terminal worktree copy suppresses a dead alarm for its stale running mir
   seedJob(sandbox, { id, status: "running", pid, pidIdentity }, { workspace: "parent-ws", workspaceRoot: sandbox.workDir });
   seedJob(
     sandbox,
-    { id, status: "completed", completedAt: new Date().toISOString(), pid: null },
+    { id, status: "done", finishedAt: new Date().toISOString(), pid: null },
     { workspace: "worktree-ws", workspaceRoot: worktreeRoot }
   );
 
@@ -588,13 +588,13 @@ test("a vanished state root mid run does not crash the process and a later tick 
 
   fs.rmSync(sandbox.stateRoot, { force: true });
   const { file, record } = seedJob(sandbox, { status: "running" });
-  writeJobRecordFile(file, { ...record, status: "completed", completedAt: new Date().toISOString() });
+  writeJobRecordFile(file, { ...record, status: "done", finishedAt: new Date().toISOString() });
 
   const lines = await waitUntil(() => (monitor.lines().length > 0 ? monitor.lines() : null));
   assert.strictEqual(lines.length, 1);
   assert.strictEqual(
     lines[0],
-    `codex job ${record.id} completed. collect with /codex:result ${record.id}; completion notices do not replace collection.`
+    `codex job ${record.id} done. collect with /codex:result ${record.id}; completion notices do not replace collection.`
   );
 });
 
@@ -608,11 +608,11 @@ test("removing an observed workspace state directory does not disable later moni
   fs.rmSync(path.join(sandbox.stateRoot, "old-workspace"), { recursive: true, force: true });
   const { file, record } = seedJob(sandbox, { status: "running" }, { workspace: "new-workspace" });
   await waitUntil(() => fs.existsSync(file));
-  writeJobRecordFile(file, { ...record, status: "completed", completedAt: new Date().toISOString() });
+  writeJobRecordFile(file, { ...record, status: "done", finishedAt: new Date().toISOString() });
 
   const lines = await waitUntil(() => (monitor.lines().length > 0 ? monitor.lines() : null));
   assert.deepStrictEqual(lines, [
-    `codex job ${record.id} completed. collect with /codex:result ${record.id}; completion notices do not replace collection.`
+    `codex job ${record.id} done. collect with /codex:result ${record.id}; completion notices do not replace collection.`
   ]);
 });
 
@@ -624,11 +624,11 @@ test("a malformed job record does not suppress a healthy job transition", async 
   t.after(() => monitor.child.kill("SIGKILL"));
   await waitUntil(() => readAnnouncedState(sandbox));
 
-  writeJobRecordFile(file, { ...record, status: "completed", completedAt: new Date().toISOString() });
+  writeJobRecordFile(file, { ...record, status: "done", finishedAt: new Date().toISOString() });
 
   const lines = await waitUntil(() => (monitor.lines().length > 0 ? monitor.lines() : null));
   assert.deepStrictEqual(lines, [
-    `codex job ${record.id} completed. collect with /codex:result ${record.id}; completion notices do not replace collection.`
+    `codex job ${record.id} done. collect with /codex:result ${record.id}; completion notices do not replace collection.`
   ]);
 });
 
@@ -670,14 +670,14 @@ function announcedPath(sandbox, sessionId = null, workspaceRoot = sandbox.workDi
   return path.join(sandbox.stateRoot, name);
 }
 
-test("restart with persisted dedup state does not re-announce a completed job", async (t) => {
+test("restart with persisted dedup state does not re-announce a done job", async (t) => {
   const sandbox = makeSandbox(t);
   const { file, record } = seedJob(sandbox, { status: "running" });
   const env = envFor(sandbox);
 
   const first = startMonitor(sandbox, env);
   await waitUntil(() => readAnnouncedState(sandbox));
-  writeJobRecordFile(file, { ...record, status: "completed", completedAt: new Date().toISOString() });
+  writeJobRecordFile(file, { ...record, status: "done", finishedAt: new Date().toISOString() });
   await waitUntil(() => (first.lines().length > 0 ? first.lines() : null));
   assert.strictEqual(first.lines().length, 1);
   first.child.kill("SIGTERM");
@@ -687,9 +687,9 @@ test("restart with persisted dedup state does not re-announce a completed job", 
   const persisted = JSON.parse(fs.readFileSync(announcedPath(sandbox), "utf8"));
   assert.strictEqual(persisted.schemaVersion, 3);
   assert.strictEqual(persisted.repositoryKey, createHash("sha256").update(sandbox.workDir).digest("hex").slice(0, 16));
-  assert.ok(persisted.keys.includes(`${record.id}:completed`));
+  assert.ok(persisted.keys.includes(`${record.id}:done`));
   assert.strictEqual(persisted.records[0].jobId, record.id);
-  assert.strictEqual(persisted.records[0].transportStatus, "completed");
+  assert.strictEqual(persisted.records[0].transportStatus, "done");
   const observedAt = persisted.records[0].observedAt;
 
   const second = startMonitor(sandbox, env);
@@ -697,9 +697,9 @@ test("restart with persisted dedup state does not re-announce a completed job", 
   await waitUntil(() => readAnnouncedState(sandbox)?.records[0]?.observedAt === observedAt);
   assert.strictEqual(JSON.parse(fs.readFileSync(announcedPath(sandbox), "utf8")).records[0].observedAt, observedAt);
 
-  writeJobRecordFile(file, { ...record, status: "running", completedAt: null });
+  writeJobRecordFile(file, { ...record, status: "running", finishedAt: null });
   await waitForAnnouncedRecord(sandbox, record.id);
-  writeJobRecordFile(file, { ...record, status: "completed", completedAt: new Date().toISOString() });
+  writeJobRecordFile(file, { ...record, status: "done", finishedAt: new Date().toISOString() });
   await waitForAnnouncedRecord(sandbox, record.id);
   assert.deepStrictEqual(second.lines(), []);
 });
@@ -723,7 +723,7 @@ test("workspace-scoped dedup lets identical job ids announce independently and p
 
   const first = startMonitor(sandbox, env);
   await waitUntil(() => readAnnouncedState(sandbox, "shared-session"));
-  writeJobRecordFile(firstJob.file, { ...firstJob.record, status: "completed", completedAt: new Date().toISOString() });
+  writeJobRecordFile(firstJob.file, { ...firstJob.record, status: "done", finishedAt: new Date().toISOString() });
   await waitUntil(() => (first.lines().length > 0 ? first.lines() : null));
   first.child.kill("SIGTERM");
   await once(first.child, "close");
@@ -733,11 +733,11 @@ test("workspace-scoped dedup lets identical job ids announce independently and p
   const second = startMonitor(sandbox, env, { cwd: otherWorkDir });
   t.after(() => second.child.kill("SIGKILL"));
   await waitUntil(() => readAnnouncedState(sandbox, "shared-session", otherWorkDir));
-  writeJobRecordFile(secondJob.file, { ...secondJob.record, status: "completed", completedAt: new Date().toISOString() });
+  writeJobRecordFile(secondJob.file, { ...secondJob.record, status: "done", finishedAt: new Date().toISOString() });
 
   const lines = await waitUntil(() => (second.lines().length > 0 ? second.lines() : null));
   assert.strictEqual(lines.length, 1);
-  assert.match(lines[0], new RegExp(`codex job ${sharedId} completed`));
+  assert.match(lines[0], new RegExp(`codex job ${sharedId} done`));
   assert.notStrictEqual(firstStateFile, announcedPath(sandbox, "shared-session", otherWorkDir));
 
   fs.rmSync(secondJob.file);
@@ -748,9 +748,9 @@ test("workspace-scoped dedup lets identical job ids announce independently and p
 test("restart catch-up announces an unrecorded terminal job owned by the active session", async (t) => {
   const sandbox = makeSandbox(t);
   const { record } = seedJob(sandbox, {
-    status: "completed",
+    status: "done",
     sessionId: "session-own",
-    completedAt: new Date().toISOString()
+    finishedAt: new Date().toISOString()
   });
   fs.writeFileSync(announcedPath(sandbox, "session-own"), "[]\n", "utf8");
 
@@ -758,7 +758,7 @@ test("restart catch-up announces an unrecorded terminal job owned by the active 
   t.after(() => monitor.child.kill("SIGKILL"));
   const lines = await waitUntil(() => (monitor.lines().length > 0 ? monitor.lines() : null));
   assert.deepStrictEqual(lines, [
-    `codex job ${record.id} completed. collect with /codex:result ${record.id}; completion notices do not replace collection.`
+    `codex job ${record.id} done. collect with /codex:result ${record.id}; completion notices do not replace collection.`
   ]);
 });
 
@@ -766,7 +766,7 @@ test("an unavailable jobs snapshot neither prunes nor persists announcement stat
   const sandbox = makeSandbox(t);
   const { record } = seedJob(sandbox, { status: "running" });
   const stateFile = announcedPath(sandbox);
-  fs.writeFileSync(stateFile, `${JSON.stringify([`${record.id}:completed`])}\n`, "utf8");
+  fs.writeFileSync(stateFile, `${JSON.stringify([`${record.id}:done`])}\n`, "utf8");
   const monitor = startMonitor(sandbox, envFor(sandbox));
   t.after(() => monitor.child.kill("SIGKILL"));
   await waitUntil(() => readAnnouncedState(sandbox)?.schemaVersion === 3);
@@ -976,36 +976,6 @@ test("a second poll does not duplicate a model-audit observation", async (t) => 
   await waitUntil(() => (readModelAuditLines(sandbox).length > 0 ? true : null));
   await waitUntil(() => readModelAuditLines(sandbox).length === 1);
   assert.strictEqual(readModelAuditLines(sandbox).length, 1);
-});
-
-test("an argv observation is replaced on disk by a higher-ranked terminal observation", async (t) => {
-  const sandbox = makeSandbox(t);
-  const threadId = "thread-model-audit-replacement";
-  const turnId = "turn-model-audit-replacement";
-  writeRollout(sandbox, threadId, [
-    taskEvent("task_started", turnId, "2026-07-14T00:00:00.000Z"),
-    turnContext(turnId, "terminal-model", "xhigh"),
-    taskEvent("task_complete", turnId, "2026-07-14T00:00:03.000Z")
-  ]);
-  const { file, record } = seedJob(sandbox, { status: "running", pid: process.pid, result: { threadId }, turnId });
-  const monitor = startMonitor(sandbox, envForAudit(sandbox));
-  t.after(() => monitor.child.kill("SIGKILL"));
-
-  const argv = await waitUntil(() => {
-    const observations = readModelAuditLines(sandbox);
-    return observations.length === 1 && observations[0].source === "argv" ? observations : null;
-  });
-  assert.strictEqual(argv[0].jobId, record.id);
-
-  writeJobRecordFile(file, { ...record, status: "completed", completedAt: new Date().toISOString() });
-
-  const observations = await waitUntil(() => {
-    const current = readModelAuditLines(sandbox);
-    return current.length === 1 && current[0].source === "rollout-turn-context" ? current : null;
-  });
-  assert.strictEqual(observations[0].jobId, record.id);
-  assert.strictEqual(observations[0].model, "terminal-model");
-  assert.strictEqual(observations[0].effort, "xhigh");
 });
 
 test("concurrent monitor processes append one model-audit observation per job", async (t) => {
@@ -1244,84 +1214,6 @@ test("canonical foreground jobs are retained for stats without emitting completi
   });
   await waitForAnnouncedRecord(sandbox, record.id);
   assert.deepStrictEqual(monitor.lines(), []);
-});
-
-test("legacy terminal transition persists a structured ledger and exact rollout sidecars", async (t) => {
-  const sandbox = makeSandbox(t);
-  const threadId = "thread-monitor";
-  const turnId = "turn-monitor";
-  writeRollout(sandbox, threadId, [
-    taskEvent("task_started", turnId, "2026-07-14T00:00:00.000Z"),
-    turnContext(turnId, "actual-model", "xhigh"),
-    rolloutTokenCount(90, 40, 20, 6, 110),
-    taskEvent("task_complete", turnId, "2026-07-14T00:00:03.000Z")
-  ]);
-  const { file, record } = seedJob(sandbox, {
-    status: "running",
-    turnId,
-    result: { threadId },
-    request: { model: "requested-model", effort: "low" }
-  });
-  const monitor = startMonitor(sandbox, envFor(sandbox));
-  t.after(() => monitor.child.kill("SIGKILL"));
-  await waitUntil(() => readAnnouncedState(sandbox));
-  writeJobRecordFile(file, { ...record, status: "completed", completedAt: new Date().toISOString() });
-  await waitUntil(() => (monitor.lines().length > 0 ? true : null));
-
-  const { state, terminal } = await waitUntil(() => {
-    try {
-      const state = JSON.parse(fs.readFileSync(announcedPath(sandbox), "utf8"));
-      const terminal = state.records.find((entry) => entry.jobId === record.id);
-      return terminal ? { state, terminal } : null;
-    } catch {
-      return null;
-    }
-  });
-  assert.strictEqual(state.schemaVersion, 3);
-  assert.strictEqual(terminal.repositoryKey, state.repositoryKey);
-  assert.strictEqual(terminal.transportStatus, "completed");
-  assert.strictEqual(terminal.model, "actual-model");
-  assert.strictEqual(terminal.modelSource, "rollout-turn-context");
-  assert.strictEqual(terminal.effort, "xhigh");
-  assert.strictEqual(terminal.effortSource, "rollout-turn-context");
-  assert.deepStrictEqual(terminal.tokenUsage, { inputTokens: 90, cachedInputTokens: 40, outputTokens: 20, reasoningOutputTokens: 6, totalTokens: 110 });
-
-  const modelAudit = readModelAuditLines(sandbox);
-  assert.strictEqual(modelAudit.at(-1).source, "rollout-turn-context");
-  assert.strictEqual(modelAudit.at(-1).model, "actual-model");
-  assert.strictEqual(modelAudit.at(-1).workspaceRoot, sandbox.workDir);
-  assert.strictEqual(modelAudit.at(-1).repositoryKey, state.repositoryKey);
-  const tokenPath = path.join(sandbox.fusionData, "observations", createHash("sha256").update(sandbox.workDir).digest("hex").slice(0, 16), "token-usage.jsonl");
-  const tokenAudit = fs.readFileSync(tokenPath, "utf8").trim().split("\n").map((line) => JSON.parse(line));
-  assert.strictEqual(tokenAudit.at(-1).availability, "available");
-  assert.strictEqual(tokenAudit.at(-1).source, "rollout-turn-delta");
-  assert.strictEqual(tokenAudit.at(-1).workspaceRoot, sandbox.workDir);
-  assert.strictEqual(tokenAudit.at(-1).repositoryKey, state.repositoryKey);
-
-  fs.rmSync(file);
-  await waitForAnnouncedRecord(sandbox, record.id);
-  const retained = JSON.parse(fs.readFileSync(announcedPath(sandbox), "utf8"));
-  assert.ok(retained.records.some((entry) => entry.jobId === record.id));
-});
-
-test("legacy announcement arrays migrate to the structured terminal ledger", async (t) => {
-  const sandbox = makeSandbox(t);
-  const file = announcedPath(sandbox);
-  fs.writeFileSync(file, `${JSON.stringify(["legacy-completed:completed", "legacy-dead:dead"])}\n`);
-  const monitor = startMonitor(sandbox, envFor(sandbox));
-  t.after(() => monitor.child.kill("SIGKILL"));
-
-  const migrated = await waitUntil(() => {
-    try {
-      const state = JSON.parse(fs.readFileSync(file, "utf8"));
-      return state?.schemaVersion === 3 ? state : null;
-    } catch {
-      return null;
-    }
-  });
-  assert.ok(migrated.keys.includes("legacy-completed:completed"));
-  assert.ok(migrated.records.some((entry) => entry.jobId === "legacy-completed" && entry.tokenUsageAvailability === "unavailable"));
-  assert.strictEqual(migrated.records.some((entry) => entry.jobId === "legacy-dead"), false);
 });
 
 const REPAIR_UNAVAILABLE_LINE =
