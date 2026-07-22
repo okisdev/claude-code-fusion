@@ -1,5 +1,5 @@
 {
-  "manifestHash": "95091a2baf7fba53922431f03e60e7314b166080320494dd8486d2186b7e86f4",
+  "manifestHash": "21185f22eb2940fa69974d417450b56e48004b39dd31bb931a7ef179e0ef4269",
   "tasks": [
     {
       "id": "T01-seeded-bug",
@@ -68,6 +68,668 @@
         {
           "path": "verify.sh",
           "sha256": "0083db06745d65885b2847eb9b21af308edb41cae936ab8418dd421565ea8bb7"
+        }
+      ]
+    },
+    {
+      "id": "T02-negative-control",
+      "taskSha256": "aa5312d7edd53c9daf14ecec9efda9f2760d96944df290bd1ab469e6fc5a63f0",
+      "files": [
+        {
+          "path": "brief.md",
+          "sha256": "1903d04c597358eb428b21d1a6f2af6441e47ad72a705839ac4c52f8b4d55262"
+        },
+        {
+          "path": "fixtures/package.json",
+          "sha256": "3ca9d4afd21425087cf31893b8f9f63c81b0b8408db5e343ca76e5f8aa26ab9a"
+        },
+        {
+          "path": "fixtures/range.js",
+          "sha256": "fb72b54da770dc61a2b9e454b92a515bfe21feb7cd19cd14995bedf4bdff7d0f"
+        },
+        {
+          "path": "mutant/package.json",
+          "sha256": "3ca9d4afd21425087cf31893b8f9f63c81b0b8408db5e343ca76e5f8aa26ab9a"
+        },
+        {
+          "path": "mutant/range.js",
+          "sha256": "fb72b54da770dc61a2b9e454b92a515bfe21feb7cd19cd14995bedf4bdff7d0f"
+        },
+        {
+          "path": "range.test.mjs",
+          "sha256": "3316cad36d24c6b7de68607ac9bfe07801939d4a2e30a2a3f63e33f62f20f2a1"
+        },
+        {
+          "path": "selftest.sh",
+          "sha256": "5fbf94d686aa4418cb1ced471e34e3efa212bd6b7a0a20acb61ad0ef01ddbdc9"
+        },
+        {
+          "path": "solution/package.json",
+          "sha256": "3ca9d4afd21425087cf31893b8f9f63c81b0b8408db5e343ca76e5f8aa26ab9a"
+        },
+        {
+          "path": "solution/range.js",
+          "sha256": "c0fb2f0bcb4a5a571613dbc20fca57d05dc0ce8b30edd352a7d1e8a48c1dde65"
+        },
+        {
+          "path": "verify.sh",
+          "sha256": "ad158945c80c0cd48005d37bbab95bb37b8b3a6b5a84188ccff429c81c9c992c"
+        }
+      ]
+    },
+    {
+      "id": "T03-spec-implementation",
+      "taskSha256": "3f159e5dab20b26399c14a659864b0f624be3df59aa0b7e4caa99bb7fd74ed1d",
+      "files": [
+        {
+          "path": "brief.md",
+          "sha256": "7cb2e350fed873fcf29a744b83007923f614071d8aa0c64dc56257d3ac2aebdd"
+        },
+        {
+          "path": "event-bus.test.mjs",
+          "sha256": "c9c4a3157f27e1b87d5f6ace912a76001bd2130e5d1bcca2656fbec004b79d20"
+        },
+        {
+          "path": "fixtures/event-bus.js",
+          "sha256": "2e1a342b222e4d8183d4d180ded989d0d157cacd851f08b478a975ba4b556193"
+        },
+        {
+          "path": "fixtures/index.js",
+          "sha256": "f1d88c8e2b27027e6838a3ab0b8088d65c2ec555da0288d56cf39868545bee8b"
+        },
+        {
+          "path": "fixtures/match-pattern.js",
+          "sha256": "aa2c13668e5936dac242ee798207dcf55bdc359402e70af24b9833344febade5"
+        },
+        {
+          "path": "fixtures/package.json",
+          "sha256": "3ca9d4afd21425087cf31893b8f9f63c81b0b8408db5e343ca76e5f8aa26ab9a"
+        },
+        {
+          "path": "fixtures/subscriptions.js",
+          "sha256": "4f606ae3e0f4dd4717d9bf480e22961aee5a89f86652d78f17c245004a41ac53"
+        },
+        {
+          "path": "mutant/event-bus.js",
+          "sha256": "50f8a72a816a2e06caa678abc9db3dfd056fd7b2b7171d9e638e6dc71c1e9124"
+        },
+        {
+          "path": "mutant/index.js",
+          "sha256": "f1d88c8e2b27027e6838a3ab0b8088d65c2ec555da0288d56cf39868545bee8b"
+        },
+        {
+          "path": "mutant/match-pattern.js",
+          "sha256": "a161185182b6260a5d14d5185b56c56da7bc73b261d3e1095fb19d0a3ba2f944"
+        },
+        {
+          "path": "mutant/package.json",
+          "sha256": "3ca9d4afd21425087cf31893b8f9f63c81b0b8408db5e343ca76e5f8aa26ab9a"
+        },
+        {
+          "path": "mutant/subscriptions.js",
+          "sha256": "11660d58bb0f8e70af9aae5911d66d2311eccc1897d787a84fc164e13de46c0e"
+        },
+        {
+          "path": "selftest.sh",
+          "sha256": "779164359601614a062959ac39556d3b1617b06bb0ac872f2ae89105654643a6"
+        },
+        {
+          "path": "solution/event-bus.js",
+          "sha256": "50f8a72a816a2e06caa678abc9db3dfd056fd7b2b7171d9e638e6dc71c1e9124"
+        },
+        {
+          "path": "solution/index.js",
+          "sha256": "f1d88c8e2b27027e6838a3ab0b8088d65c2ec555da0288d56cf39868545bee8b"
+        },
+        {
+          "path": "solution/match-pattern.js",
+          "sha256": "068379db681e9ff5bc1fea9398ad626402bcd9966eba0dfbcb937e71a1843aa1"
+        },
+        {
+          "path": "solution/package.json",
+          "sha256": "3ca9d4afd21425087cf31893b8f9f63c81b0b8408db5e343ca76e5f8aa26ab9a"
+        },
+        {
+          "path": "solution/subscriptions.js",
+          "sha256": "11660d58bb0f8e70af9aae5911d66d2311eccc1897d787a84fc164e13de46c0e"
+        },
+        {
+          "path": "verify.sh",
+          "sha256": "478d97d26684802e24345fc7aa61932a6c0ab2effe98dc638fbfdfc7c125b4e3"
+        }
+      ]
+    },
+    {
+      "id": "T04-checkable-research",
+      "taskSha256": "7cf1e6ac03e4248b4f733b77639f2b4a373a10b195dedad871271b422c242dd8",
+      "files": [
+        {
+          "path": "brief.md",
+          "sha256": "21039740ca5ce88f0c6a77def9bd3d05dad102776a36f47f69e325e2a759fdb5"
+        },
+        {
+          "path": "check-answer.mjs",
+          "sha256": "a745473ce1bcc1c393929622641a68581b1a6f6a4f7f1ac0680bbb24a29c78c8"
+        },
+        {
+          "path": "fixtures/corpus/changelog-v1-v2.md",
+          "sha256": "14cf68b58bd6d2329e3c839eb3e3a139d3819a95efe367521f0172d61398fa50"
+        },
+        {
+          "path": "fixtures/corpus/changelog-v3.md",
+          "sha256": "b40e00ca65189b128cf35a1eaa2712c8a006519d15e78f198b6839668bf6b3dc"
+        },
+        {
+          "path": "fixtures/corpus/changelog-v4.md",
+          "sha256": "2dc81d1fc41cbc9281827d2b3140324d6f16b7f8c3ee3aa2966eb2f8706564e3"
+        },
+        {
+          "path": "fixtures/corpus/config-reference.md",
+          "sha256": "d064d68b791b94a5f84adb7027a890c70956179a568c98edb17b48b346469c08"
+        },
+        {
+          "path": "fixtures/corpus/deprecation-notice.md",
+          "sha256": "d227965b821140034d7721990def5fa3e23effd91806b026c2d7a246a947f84f"
+        },
+        {
+          "path": "fixtures/corpus/faq.md",
+          "sha256": "02467af2fe08f2c538386f113c4ac5dc65bfc165508d9e7735a2d446b5f235aa"
+        },
+        {
+          "path": "fixtures/corpus/known-issues.md",
+          "sha256": "2c69a50fab75b71c5f15fe8a3d94d04ef87b367552e1abe4b55de0eca7da2942"
+        },
+        {
+          "path": "fixtures/corpus/migration-guide-v3-to-v4.md",
+          "sha256": "d057e3ea0ac950c8f59dd35891d7dc212636fd0f3f61e5598c3f8d1d4f095a59"
+        },
+        {
+          "path": "fixtures/corpus/release-notes-v2.0.0.md",
+          "sha256": "b827a2cac65aafd6464b4ac4e29839c54c63b9b831ba20c61206871f45758b60"
+        },
+        {
+          "path": "fixtures/corpus/release-notes-v4.1.0.md",
+          "sha256": "4bdf312e5d1b81fa9e4920466ead911d7eec3767f556ce9175bb52c5de7370fc"
+        },
+        {
+          "path": "fixtures/corpus/support-ticket-digest.md",
+          "sha256": "47a221009e315ae54656968d6c70024e7ca56e70feeb4701200ab36c64cb8e0c"
+        },
+        {
+          "path": "mutant/answer.json",
+          "sha256": "82af0ece5eb0308b20f18ce43204f84b88707966335bf640578f6781dae8ab6f"
+        },
+        {
+          "path": "selftest.sh",
+          "sha256": "5fbf94d686aa4418cb1ced471e34e3efa212bd6b7a0a20acb61ad0ef01ddbdc9"
+        },
+        {
+          "path": "solution/answer.json",
+          "sha256": "0868d02c9cbcedc36876ad885955127507600fe5b203959bac6709feb9bd24e9"
+        },
+        {
+          "path": "verify.sh",
+          "sha256": "1b0d937096d004837b3bd9f1749c545bad794c726fca190a2481bccf59f66264"
+        }
+      ]
+    },
+    {
+      "id": "T05-mechanical-codemod",
+      "taskSha256": "d4f05099ca6e102ab667b6e70ac6a5e7f41eb8e9e6f6e1cee1c975cb208439f8",
+      "files": [
+        {
+          "path": "brief.md",
+          "sha256": "ea2699d0ed2c9e887ff002dc87ae538c07c6e3e2118a0a20fb4dd0cfb672fbf3"
+        },
+        {
+          "path": "fixtures/alert.js",
+          "sha256": "1d7654e140361d1024b49e25c65a7a73492a758e7cf6b629253b70f970dc8ee0"
+        },
+        {
+          "path": "fixtures/digest.js",
+          "sha256": "2ba9746039dfc511356158a13ad96d45dcded362ae68598ef856c14fbb6a938d"
+        },
+        {
+          "path": "fixtures/format.js",
+          "sha256": "d4742b8eac142ff2753e799d9b17598308d2145ea4a8266e0ff17cea4f762ec0"
+        },
+        {
+          "path": "fixtures/greeting.js",
+          "sha256": "775707af3c3093dbfbe713a7aec2664b23ae3122aba2bf40c636712ea7da4785"
+        },
+        {
+          "path": "fixtures/index.js",
+          "sha256": "482643787a0c756e9ddd052933114871c2837b209fd9d97dc16a04b30687d66e"
+        },
+        {
+          "path": "fixtures/invite.js",
+          "sha256": "b3d6702d953831b50e09234710dcc08f632dc56ac20de5c3a08e4976b32743df"
+        },
+        {
+          "path": "fixtures/package.json",
+          "sha256": "3ca9d4afd21425087cf31893b8f9f63c81b0b8408db5e343ca76e5f8aa26ab9a"
+        },
+        {
+          "path": "fixtures/profile.js",
+          "sha256": "cce68f8c0fb379299058078056212076daf71048389ec27d1050b89db67f813e"
+        },
+        {
+          "path": "fixtures/receipt.js",
+          "sha256": "40b9d7f2028ce77bfdf1eb948e1611db0bd867798cb68c89dac6682afcb2fd50"
+        },
+        {
+          "path": "fixtures/reminder.js",
+          "sha256": "8ade53d60a13f54929d7755402f99de350752b1e30522f9999da8c0bdf90b6f8"
+        },
+        {
+          "path": "fixtures/status.js",
+          "sha256": "c507e18c33a45d25a8959683e9691f67b8f9d5922cfeeba2805cbdcdde7757b2"
+        },
+        {
+          "path": "fixtures/summary.js",
+          "sha256": "c1c7c02d6f773638a2863b6a6159214c488f9e787fc352fe37430fb828c27ad5"
+        },
+        {
+          "path": "format.test.mjs",
+          "sha256": "2c00eab4b7290e98dc7667efab7fa534c98c067a8b8f32d4b96d3753c5ddf8db"
+        },
+        {
+          "path": "mutant/alert.js",
+          "sha256": "0f92a7300a29b895a70e50f27a9996fe28eca0c8712e8f15b41dcd8df24c5b0f"
+        },
+        {
+          "path": "mutant/digest.js",
+          "sha256": "c24a19265d367424b4607a7310617f60c3be2260e68768d81711fa0e0700b45d"
+        },
+        {
+          "path": "mutant/format.js",
+          "sha256": "d4742b8eac142ff2753e799d9b17598308d2145ea4a8266e0ff17cea4f762ec0"
+        },
+        {
+          "path": "mutant/greeting.js",
+          "sha256": "9d7b0642e6ce9eca2b81c98273c23e5fdeb33a9f74bcb2e47aef98aa0ea39094"
+        },
+        {
+          "path": "mutant/index.js",
+          "sha256": "482643787a0c756e9ddd052933114871c2837b209fd9d97dc16a04b30687d66e"
+        },
+        {
+          "path": "mutant/invite.js",
+          "sha256": "b3d6702d953831b50e09234710dcc08f632dc56ac20de5c3a08e4976b32743df"
+        },
+        {
+          "path": "mutant/package.json",
+          "sha256": "3ca9d4afd21425087cf31893b8f9f63c81b0b8408db5e343ca76e5f8aa26ab9a"
+        },
+        {
+          "path": "mutant/profile.js",
+          "sha256": "715727946299f84b7174c95a84a8fe71e80248edc3a8103af44f1bd5654cd07f"
+        },
+        {
+          "path": "mutant/receipt.js",
+          "sha256": "15c8135e366b075c258cb6dd3c58faaa1677e1ba3e16b1c1f59b49c11de6186d"
+        },
+        {
+          "path": "mutant/reminder.js",
+          "sha256": "8ade53d60a13f54929d7755402f99de350752b1e30522f9999da8c0bdf90b6f8"
+        },
+        {
+          "path": "mutant/status.js",
+          "sha256": "57d16c3db2885290ad62ca136655eb428da12067cab51bf5d690e15f4d495350"
+        },
+        {
+          "path": "mutant/summary.js",
+          "sha256": "385f76644fd912f1eeb05ea52e10549bbdd178028754a67e8d099866900b8f51"
+        },
+        {
+          "path": "selftest.sh",
+          "sha256": "5fbf94d686aa4418cb1ced471e34e3efa212bd6b7a0a20acb61ad0ef01ddbdc9"
+        },
+        {
+          "path": "solution/alert.js",
+          "sha256": "0f92a7300a29b895a70e50f27a9996fe28eca0c8712e8f15b41dcd8df24c5b0f"
+        },
+        {
+          "path": "solution/digest.js",
+          "sha256": "c24a19265d367424b4607a7310617f60c3be2260e68768d81711fa0e0700b45d"
+        },
+        {
+          "path": "solution/format.js",
+          "sha256": "d16f05a48154735c7a0dc2fd99ddf6a1556abe05991708ae4bff6bfeff0f29c4"
+        },
+        {
+          "path": "solution/greeting.js",
+          "sha256": "9d7b0642e6ce9eca2b81c98273c23e5fdeb33a9f74bcb2e47aef98aa0ea39094"
+        },
+        {
+          "path": "solution/index.js",
+          "sha256": "482643787a0c756e9ddd052933114871c2837b209fd9d97dc16a04b30687d66e"
+        },
+        {
+          "path": "solution/invite.js",
+          "sha256": "611459cc991121c67898b2bda09ad5faea9c1a1d5d50137ddb390e08bd6a5e00"
+        },
+        {
+          "path": "solution/package.json",
+          "sha256": "3ca9d4afd21425087cf31893b8f9f63c81b0b8408db5e343ca76e5f8aa26ab9a"
+        },
+        {
+          "path": "solution/profile.js",
+          "sha256": "715727946299f84b7174c95a84a8fe71e80248edc3a8103af44f1bd5654cd07f"
+        },
+        {
+          "path": "solution/receipt.js",
+          "sha256": "15c8135e366b075c258cb6dd3c58faaa1677e1ba3e16b1c1f59b49c11de6186d"
+        },
+        {
+          "path": "solution/reminder.js",
+          "sha256": "42fa8c02b7f8b7936b87373d675cfef365b323166185cc4a03c89dbc04747ee4"
+        },
+        {
+          "path": "solution/status.js",
+          "sha256": "57d16c3db2885290ad62ca136655eb428da12067cab51bf5d690e15f4d495350"
+        },
+        {
+          "path": "solution/summary.js",
+          "sha256": "385f76644fd912f1eeb05ea52e10549bbdd178028754a67e8d099866900b8f51"
+        },
+        {
+          "path": "verify.sh",
+          "sha256": "e3a9becb8008af45b1edc8acd71cc67c0d72b00b0479dc0eb1f079d1b19e4270"
+        }
+      ]
+    },
+    {
+      "id": "T06-plan-shaped-fixes",
+      "taskSha256": "0e2f2fea89e2e4b5bef2f56554c559e8a42a9cd91bea1cd47ed5046184829d5f",
+      "files": [
+        {
+          "path": "brief.md",
+          "sha256": "2d32813bcaa5f9dd2c0538a252f0c640c193463a2098d293cd3fa16db77b05ec"
+        },
+        {
+          "path": "fixtures/csv-parser/index.js",
+          "sha256": "beec991f2ed86fcfcb8b2cab54bcc0b21c1152a144c1fd0310eec75653b42c66"
+        },
+        {
+          "path": "fixtures/csv-parser/package.json",
+          "sha256": "3ca9d4afd21425087cf31893b8f9f63c81b0b8408db5e343ca76e5f8aa26ab9a"
+        },
+        {
+          "path": "fixtures/duration-formatter/index.js",
+          "sha256": "bf55e6e2fdc80426cd3f594128c4ba7a27658920706f942a5605f147947da936"
+        },
+        {
+          "path": "fixtures/duration-formatter/package.json",
+          "sha256": "3ca9d4afd21425087cf31893b8f9f63c81b0b8408db5e343ca76e5f8aa26ab9a"
+        },
+        {
+          "path": "fixtures/path-matcher/index.js",
+          "sha256": "b3b2d942f130fa36d85d70453e992e47565eee296caaade3d1566a71ddf09a65"
+        },
+        {
+          "path": "fixtures/path-matcher/package.json",
+          "sha256": "3ca9d4afd21425087cf31893b8f9f63c81b0b8408db5e343ca76e5f8aa26ab9a"
+        },
+        {
+          "path": "hidden/csv-parser.test.mjs",
+          "sha256": "6a35fdab80f72c12603db7a749872dd9feb5415c8cf6d4212c27738786fe2aab"
+        },
+        {
+          "path": "hidden/duration-formatter.test.mjs",
+          "sha256": "ccaee7348d3fab0718eca96668b3a4ca6acdbe02d4b006c26cd82ade7293aefa"
+        },
+        {
+          "path": "hidden/path-matcher.test.mjs",
+          "sha256": "332e84f98304f832f898f62b41d974661742f8a2428a4abdc44f390db6ca6f6c"
+        },
+        {
+          "path": "mutant/csv-parser/index.js",
+          "sha256": "0cc19a0f4f466aff818e7b6a86934892617dd636389d1ca397cbb06f3d5e08b1"
+        },
+        {
+          "path": "mutant/csv-parser/package.json",
+          "sha256": "3ca9d4afd21425087cf31893b8f9f63c81b0b8408db5e343ca76e5f8aa26ab9a"
+        },
+        {
+          "path": "mutant/duration-formatter/index.js",
+          "sha256": "88b4342fc1bf1e3bf5964ea0e07d24f1d10a0691b61a976b9581e091b3464faa"
+        },
+        {
+          "path": "mutant/duration-formatter/package.json",
+          "sha256": "3ca9d4afd21425087cf31893b8f9f63c81b0b8408db5e343ca76e5f8aa26ab9a"
+        },
+        {
+          "path": "mutant/path-matcher/index.js",
+          "sha256": "b3b2d942f130fa36d85d70453e992e47565eee296caaade3d1566a71ddf09a65"
+        },
+        {
+          "path": "mutant/path-matcher/package.json",
+          "sha256": "3ca9d4afd21425087cf31893b8f9f63c81b0b8408db5e343ca76e5f8aa26ab9a"
+        },
+        {
+          "path": "selftest.sh",
+          "sha256": "98f8c416e6419c9516311e5c7c46ce33f4c168ca6944f18a383efde547c549ac"
+        },
+        {
+          "path": "solution/csv-parser/index.js",
+          "sha256": "0cc19a0f4f466aff818e7b6a86934892617dd636389d1ca397cbb06f3d5e08b1"
+        },
+        {
+          "path": "solution/csv-parser/package.json",
+          "sha256": "3ca9d4afd21425087cf31893b8f9f63c81b0b8408db5e343ca76e5f8aa26ab9a"
+        },
+        {
+          "path": "solution/duration-formatter/index.js",
+          "sha256": "88b4342fc1bf1e3bf5964ea0e07d24f1d10a0691b61a976b9581e091b3464faa"
+        },
+        {
+          "path": "solution/duration-formatter/package.json",
+          "sha256": "3ca9d4afd21425087cf31893b8f9f63c81b0b8408db5e343ca76e5f8aa26ab9a"
+        },
+        {
+          "path": "solution/path-matcher/index.js",
+          "sha256": "8e08269bbbd54669027798445cfc6a541823079ed4d8080a5b5c764eddf9e9ef"
+        },
+        {
+          "path": "solution/path-matcher/package.json",
+          "sha256": "3ca9d4afd21425087cf31893b8f9f63c81b0b8408db5e343ca76e5f8aa26ab9a"
+        },
+        {
+          "path": "verify.sh",
+          "sha256": "fc695c2a5984d9734564c1fb3079d5965905bf312b30f66856fcc2169b75fb37"
+        }
+      ]
+    },
+    {
+      "id": "T07-plan-shaped-features",
+      "taskSha256": "1d18641a1c5fc4737d6eb81f0e711e6659ef5949b9783a7f517dd08a6606310f",
+      "files": [
+        {
+          "path": "brief.md",
+          "sha256": "070a57b628d3b4d7fab47982f35891e24f1ed97ea007473cedc06df3643f8905"
+        },
+        {
+          "path": "fixtures/package.json",
+          "sha256": "3ca9d4afd21425087cf31893b8f9f63c81b0b8408db5e343ca76e5f8aa26ab9a"
+        },
+        {
+          "path": "fixtures/query-string/index.js",
+          "sha256": "2be310c93a1cf9a8e801c734336ee1030fa32a3ef41ed0c8503e928147bc13d3"
+        },
+        {
+          "path": "fixtures/semver-range/index.js",
+          "sha256": "dcad5eb9b016ee4f3f82128abef997e0129555f6c8e2a2167ff96f3215b431d8"
+        },
+        {
+          "path": "fixtures/text-table/index.js",
+          "sha256": "cc6fa988162d13b5bf52280f9f21b2d8e70f177319cd4a5a1da14ddc24ca19f2"
+        },
+        {
+          "path": "mutant/package.json",
+          "sha256": "3ca9d4afd21425087cf31893b8f9f63c81b0b8408db5e343ca76e5f8aa26ab9a"
+        },
+        {
+          "path": "mutant/query-string/index.js",
+          "sha256": "3682e0127489224c839c8233f8dd4912b1e4d9c1c2066ae23244a73b37b6a144"
+        },
+        {
+          "path": "mutant/semver-range/index.js",
+          "sha256": "5f8af32e169e587f803bf403f5e596da308a4595d4e4b88d52d249b3e6debddf"
+        },
+        {
+          "path": "mutant/text-table/index.js",
+          "sha256": "800f0df53df432c84e68ff6e9ddc994612dcf97e502e76038f7f4cd37eaa89d6"
+        },
+        {
+          "path": "query-string.test.mjs",
+          "sha256": "2319c2ac53262312cea23a85ca9ce562cda03026172e4fe29292cd722a003916"
+        },
+        {
+          "path": "selftest.sh",
+          "sha256": "fadefd2abe4c1411786694b51e330cfd6e1ea2f4e5c74e9b63e74f3ffa001dc0"
+        },
+        {
+          "path": "semver-range.test.mjs",
+          "sha256": "18006f65d2e96acaf7425514fb3aa6245811ede0cd02ac8e7cc1e46cdff2e122"
+        },
+        {
+          "path": "solution/package.json",
+          "sha256": "3ca9d4afd21425087cf31893b8f9f63c81b0b8408db5e343ca76e5f8aa26ab9a"
+        },
+        {
+          "path": "solution/query-string/index.js",
+          "sha256": "3682e0127489224c839c8233f8dd4912b1e4d9c1c2066ae23244a73b37b6a144"
+        },
+        {
+          "path": "solution/semver-range/index.js",
+          "sha256": "5f8af32e169e587f803bf403f5e596da308a4595d4e4b88d52d249b3e6debddf"
+        },
+        {
+          "path": "solution/text-table/index.js",
+          "sha256": "6420e06068562914c84942cc50d7aa742d4b44cabb9c7310236a3a6c0e550041"
+        },
+        {
+          "path": "text-table.test.mjs",
+          "sha256": "a035b9412c124f7360b01cfb9edc4134b22bf602535becbadf2e162d6325b043"
+        },
+        {
+          "path": "verify.sh",
+          "sha256": "04cbb8591265016a4ae042f17cdf9024cb299c230a66429bec8e089cfaee143b"
+        }
+      ]
+    },
+    {
+      "id": "T08-plan-shaped-migrations",
+      "taskSha256": "19e772dd8ae71fe070192790d09a26c0d564f0eac58bd7ed6e967d3375988ed6",
+      "files": [
+        {
+          "path": "brief.md",
+          "sha256": "cfc2db9fa1e2b208fb7c303089a6e2f05a9723641d4603d2f36e0206a5219215"
+        },
+        {
+          "path": "fixtures/mailer-settings/load-mailer-settings.js",
+          "sha256": "cf35a9d39184c941b6d83352b56887ed6424ae588464786bd3d0f5300ae92f33"
+        },
+        {
+          "path": "fixtures/mailer-settings/mailer.env",
+          "sha256": "7bf8cad45309a8ff3392c10c03a7511bd2a6b8428cc9145a61ab346d76d0c0e3"
+        },
+        {
+          "path": "fixtures/notifier-settings/config.json",
+          "sha256": "5bf48a99cb11ea242e6bf66e33a9471abd0d99433ba65cd27edbc66faefc53a6"
+        },
+        {
+          "path": "fixtures/notifier-settings/load-notifier-settings.js",
+          "sha256": "9d79829b44abc04972f7a07e80a186387eb11a9b071ae4566e9e6e96cdd21672"
+        },
+        {
+          "path": "fixtures/package.json",
+          "sha256": "3ca9d4afd21425087cf31893b8f9f63c81b0b8408db5e343ca76e5f8aa26ab9a"
+        },
+        {
+          "path": "fixtures/queue-settings/config.json",
+          "sha256": "101a6d77917d599b66476ea74702f16cc990b7635a8fea96216ed9c21488c763"
+        },
+        {
+          "path": "fixtures/queue-settings/load-queue-settings.js",
+          "sha256": "ff7391d7df5d40c018e8ac7b69a907a0acfef041c3e62d3c4dea69053a9c2403"
+        },
+        {
+          "path": "mailer-settings.test.mjs",
+          "sha256": "95797eff91278b2139042e5999eee1a065f4072ce6b5ccad09929df8c49c12c9"
+        },
+        {
+          "path": "mutant/mailer-settings/load-mailer-settings.js",
+          "sha256": "7a873d73bf13db27347502f85a3b505de89d751a925312122a40dec1f5039da9"
+        },
+        {
+          "path": "mutant/mailer-settings/mailer.json",
+          "sha256": "36e99c37c2c304cc055a28e82bc74c8a45d4d1585936ee98a7cb70f823556510"
+        },
+        {
+          "path": "mutant/notifier-settings/config.json",
+          "sha256": "090076c740fcd70370c6577df2107546c363f554a8d26ddb63ba22c16e9989a0"
+        },
+        {
+          "path": "mutant/notifier-settings/load-notifier-settings.js",
+          "sha256": "9d79829b44abc04972f7a07e80a186387eb11a9b071ae4566e9e6e96cdd21672"
+        },
+        {
+          "path": "mutant/package.json",
+          "sha256": "3ca9d4afd21425087cf31893b8f9f63c81b0b8408db5e343ca76e5f8aa26ab9a"
+        },
+        {
+          "path": "mutant/queue-settings/config.json",
+          "sha256": "2fed50dfbab4d5a5f8c5a1d029b1144fda1d6e2400229e8bba8e961db897b2f9"
+        },
+        {
+          "path": "mutant/queue-settings/load-queue-settings.js",
+          "sha256": "5086628c58237bddc00293c72a86aca3540791510e027bb577678f80b1b588d3"
+        },
+        {
+          "path": "notifier-settings.test.mjs",
+          "sha256": "fd8969409a843d733132f13e0a6a53d982d3ed88f4ef1f7e10ccc07134e27fe2"
+        },
+        {
+          "path": "queue-settings.test.mjs",
+          "sha256": "b6c9388666df9b174202b9d3710ed188f32758fa3193eb03621a93fdfd529be3"
+        },
+        {
+          "path": "selftest.sh",
+          "sha256": "fadefd2abe4c1411786694b51e330cfd6e1ea2f4e5c74e9b63e74f3ffa001dc0"
+        },
+        {
+          "path": "solution/mailer-settings/load-mailer-settings.js",
+          "sha256": "7a873d73bf13db27347502f85a3b505de89d751a925312122a40dec1f5039da9"
+        },
+        {
+          "path": "solution/mailer-settings/mailer.json",
+          "sha256": "36e99c37c2c304cc055a28e82bc74c8a45d4d1585936ee98a7cb70f823556510"
+        },
+        {
+          "path": "solution/notifier-settings/config.json",
+          "sha256": "090076c740fcd70370c6577df2107546c363f554a8d26ddb63ba22c16e9989a0"
+        },
+        {
+          "path": "solution/notifier-settings/load-notifier-settings.js",
+          "sha256": "019efce2f900e95cbc99410024d8adf8b89e96d053cee232a79996aa0229b554"
+        },
+        {
+          "path": "solution/package.json",
+          "sha256": "3ca9d4afd21425087cf31893b8f9f63c81b0b8408db5e343ca76e5f8aa26ab9a"
+        },
+        {
+          "path": "solution/queue-settings/config.json",
+          "sha256": "2fed50dfbab4d5a5f8c5a1d029b1144fda1d6e2400229e8bba8e961db897b2f9"
+        },
+        {
+          "path": "solution/queue-settings/load-queue-settings.js",
+          "sha256": "5086628c58237bddc00293c72a86aca3540791510e027bb577678f80b1b588d3"
+        },
+        {
+          "path": "verify.sh",
+          "sha256": "8fdebce8b9211b1e8d3455a86db3217568abe5417fb340c7c8a6cbc94cc69bf9"
         }
       ]
     }

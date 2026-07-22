@@ -670,6 +670,7 @@ export function createJobRecord(fields) {
     deliveryCollectedAt: fields.deliveryCollectedAt ?? null,
     cwd,
     workspaceRoot,
+    repositoryTopLevel: gitValue(cwd, ["rev-parse", "--show-toplevel"]),
     repositoryIdentity: identity,
     repositoryKey: fields.repositoryKey ?? createHash("sha256").update(identity).digest("hex").slice(0, 16),
     sessionId,

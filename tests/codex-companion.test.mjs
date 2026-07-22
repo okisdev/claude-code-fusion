@@ -72,6 +72,21 @@ test("task header parsing captures model and effort only from a pipe-separated h
   assert.deepEqual(parseTaskHeader("lane: codex | model: gpt-5.6-terra"), { headerModel: "gpt-5.6-terra", headerEffort: null });
 });
 
+test("job records capture the repository top level without requiring a Git repository", (t) => {
+  const sandbox = makeSandbox(t);
+  const repository = path.join(sandbox.root, "repository");
+  const nonRepository = path.join(sandbox.root, "non-repository");
+  fs.mkdirSync(repository);
+  fs.mkdirSync(nonRepository);
+  execFileSync("git", ["init", "--quiet"], { cwd: repository });
+
+  const repositoryRecord = createJobRecord({ cwd: repository, id: "repository-top-level" });
+  const nonRepositoryRecord = createJobRecord({ cwd: nonRepository, id: "non-repository-top-level" });
+
+  assert.equal(repositoryRecord.repositoryTopLevel, execFileSync("git", ["rev-parse", "--show-toplevel"], { cwd: repository, encoding: "utf8" }).trim());
+  assert.equal(nonRepositoryRecord.repositoryTopLevel, null);
+});
+
 test("running record reconciliation waits for the pidless grace window", () => {
   const createdAt = new Date(Date.now() - 1000).toISOString();
   assert.equal(runningRecordNeedsReconciliation({ createdAt, pid: null, status: "running" }, { CODEX_COMPANION_PIDLESS_RUNNING_GRACE_MS: "0" }), true);
@@ -218,6 +233,62 @@ test("task stays foreground by default and persists the complete terminal record
   assert.equal(entry.record.codexVersion, "0.145.0");
   assert.equal(fs.statSync(entry.file).mode & 0o777, 0o600);
   assert.equal(fs.statSync(path.dirname(entry.file)).mode & 0o777, 0o700);
+});
+
+test("sol foreground write tasks add one diagnostic warning without changing the prompt", (t) => {
+  const sandbox = makeSandbox(t);
+  const result = runCompanion(["task", "--write", "--model", "requested-model", "implement the sol-safe change"], {
+    cwd: sandbox.workDir,
+    env: envFor(sandbox, {
+      CODEX_HOME: path.join(sandbox.root, "codex-home"),
+      FAKE_CODEX_MODE: "rollout-completed",
+      FAKE_CODEX_RESOLVED_MODEL: "gpt-5.6-sol"
+    })
+  });
+  const warning = "warning: sol p90 wall clock exceeds the 600s foreground cap. Split the brief or name gpt-5.6-terra.";
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(result.stderr, `${warning}\n`);
+  assert.equal(fs.readFileSync(sandbox.stdinFile, "utf8").trim(), "implement the sol-safe change");
+  const [record] = jobRecords(sandbox);
+  assert.equal(record.diagnostics.filter((diagnostic) => diagnostic.type === "warning" && diagnostic.message === warning).length, 1);
+});
+
+test("sol warning is limited to foreground write tasks", async (t) => {
+  const warning = "warning: sol p90 wall clock exceeds the 600s foreground cap. Split the brief or name gpt-5.6-terra.";
+  const cases = [
+    { args: ["task", "--write", "use terra"], model: "gpt-5.6-terra" },
+    { args: ["task", "use sol in consult mode"], model: "gpt-5.6-sol" }
+  ];
+  for (const entry of cases) {
+    const sandbox = makeSandbox(t);
+    const result = runCompanion(entry.args, {
+      cwd: sandbox.workDir,
+      env: envFor(sandbox, {
+        CODEX_HOME: path.join(sandbox.root, "codex-home"),
+        FAKE_CODEX_MODE: "rollout-completed",
+        FAKE_CODEX_RESOLVED_MODEL: entry.model
+      })
+    });
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(result.stderr, "");
+    assert.equal(jobRecords(sandbox)[0].diagnostics.some((diagnostic) => diagnostic.message === warning), false);
+  }
+
+  const background = makeSandbox(t);
+  const env = envFor(background, {
+    CODEX_HOME: path.join(background.root, "codex-home"),
+    FAKE_CODEX_MODE: "rollout-completed",
+    FAKE_CODEX_RESOLVED_MODEL: "gpt-5.6-sol"
+  });
+  const launched = runCompanion(["task", "--background", "--write", "use sol in the background"], { cwd: background.workDir, env });
+  assert.equal(launched.status, 0, launched.stderr);
+  assert.equal(launched.stderr, "");
+  const completed = await waitFor(() => {
+    const [record] = jobRecords(background);
+    return record?.status === "done" ? record : null;
+  });
+  assert.equal(completed.diagnostics.some((diagnostic) => diagnostic.message === warning), false);
 });
 
 test("task resolves an output schema, forwards it, and records parsed structured output", (t) => {
@@ -955,11 +1026,38 @@ test("foreground timeout persists recovered partial delivery and incomplete cumu
   assert.equal(record.status, "error");
   assert.equal(record.failureKind, "timeout");
   assert.equal(record.resultText, null);
-  assert.equal(record.partialResultText, "Recovered partial Codex output.");
+  const resumeCommand = `'${process.execPath}' '${companion}' task --resume 'thread-123' --cwd '${fs.realpathSync(sandbox.workDir)}'`;
+  const footer = `Resume Codex job ${record.id}: ${resumeCommand}`;
+  assert.equal(record.partialResultText, `Recovered partial Codex output.\n\n${footer}`);
+  assert.equal(record.resumable, true);
+  assert.equal(record.resumeCommand, resumeCommand);
+  assert.equal(record.partialResultText.split(footer).length - 1, 1);
+  const rendered = runCompanion(["result", record.id], { cwd: sandbox.workDir, env: envFor(sandbox) });
+  assert.equal(rendered.status, 1);
+  assert.equal(rendered.stdout.split(footer).length - 1, 1);
   assert.equal(record.tokenUsageAvailability, "partial");
   assert.equal(record.usageIsIncomplete, true);
   assert.equal(record.resolvedModel, "gpt-resolved");
   assert.equal(record.resolvedEffort, "xhigh");
+});
+
+test("timeout jobs without a thread do not advertise resumability", (t) => {
+  const sandbox = makeSandbox(t);
+  const result = runCompanion(["task", "--json", "timeout before the thread starts"], {
+    cwd: sandbox.workDir,
+    env: envFor(sandbox, {
+      CODEX_COMPANION_TIMEOUT_MS: "50",
+      FAKE_CODEX_DELAY_MS: "500"
+    })
+  });
+
+  assert.equal(result.status, 1, result.stderr);
+  const record = JSON.parse(result.stdout);
+  assert.equal(record.status, "error");
+  assert.equal(record.failureKind, "timeout");
+  assert.equal(record.threadId, null);
+  assert.equal(Object.hasOwn(record, "resumable"), false);
+  assert.equal(Object.hasOwn(record, "resumeCommand"), false);
 });
 
 test("history lists canonical jobs across workspaces with local thread and delivery metadata", (t) => {

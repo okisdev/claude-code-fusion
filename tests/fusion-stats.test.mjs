@@ -40,6 +40,7 @@ import { applyQueuedVerdict, createWorkerRecord, readWorkerRecord, recordWorkerA
 import { gitIsolation } from "./lib/git-fixture.mjs";
 
 const SCRIPT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "plugins", "fusion", "scripts", "fusion-stats.mjs");
+const CODEX_MONITOR_SCRIPT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "plugins", "fusion", "scripts", "codex-jobs-monitor.mjs");
 
 function sandbox(t) {
   const dir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "fusion-stats-test-")));
@@ -114,6 +115,24 @@ function runDirect(env, extraArgs = [], extraEnv = {}) {
   });
 }
 
+test("Codex jobs monitor stays silent for an unchanged state directory", (t) => {
+  const dir = sandbox(t);
+  const stateRoot = path.join(dir, "codex-state");
+  fs.mkdirSync(stateRoot, { recursive: true });
+  const result = spawnSync(process.execPath, [CODEX_MONITOR_SCRIPT], {
+    cwd: dir,
+    encoding: "utf8",
+    env: runtimeEnv(
+      { cwd: dir, codexState: stateRoot },
+      { FUSION_CODEX_COMPANION: path.join(dir, "missing-codex-companion.mjs"), CODEX_JOBS_MONITOR_INTERVAL_MS: "1000" }
+    ),
+    timeout: 400,
+    killSignal: "SIGTERM"
+  });
+
+  assert.strictEqual(result.stdout, "");
+});
+
 function writeCodexAcceptanceCompanion(directory) {
   const companion = path.join(directory, "codex-companion.mjs");
   fs.writeFileSync(
@@ -132,6 +151,21 @@ function writeCodexAcceptanceCompanion(directory) {
       "    fs.writeFileSync(process.env.FUSION_TEST_CODEX_COMPANION_ARGS, JSON.stringify(argv));",
       "  }",
       '  process.stdout.write("Recorded Codex acceptance.\\n");',
+      "}"
+    ].join("\n")
+  );
+  return companion;
+}
+
+function writeSelectiveCodexAcceptanceCompanion(directory, failedJobId) {
+  const companion = path.join(directory, "selective-codex-companion.mjs");
+  fs.writeFileSync(
+    companion,
+    [
+      "const argv = process.argv.slice(2);",
+      `if (argv[argv.indexOf("--job-id") + 1] === "${failedJobId}") {`,
+      '  process.stderr.write("Codex acceptance record update failed.\\n");',
+      "  process.exitCode = 1;",
       "}"
     ].join("\n")
   );
@@ -298,6 +332,111 @@ test("Codex stats fail closed when exact token aggregation exceeds the safe inte
   const rendered = renderFusionStats({ scope: "all", codex: stats });
   assert.match(rendered, /Exact token usage coverage, terminal transport jobs only: overflow/);
   assert.doesNotMatch(rendered, /Observed tokens:/);
+});
+
+test("Codex reports lane signal drift only for SKUs that cross an advisory threshold", (t) => {
+  const dir = sandbox(t);
+  const stateRoot = path.join(dir, "state");
+  const fusionData = path.join(dir, "fusion");
+  for (let index = 0; index < 10; index += 1) {
+    const rejected = index >= 6;
+    writeCodexJob(stateRoot, dir, `drift-${index}`, {
+      status: rejected ? "error" : "done",
+      jobClass: "task",
+      acceptance: rejected ? "rejected" : "accepted",
+      failureKind: index >= 6 && index < 9 ? "timeout" : undefined,
+      createdAt: `2026-07-20T00:${String(index).padStart(2, "0")}:00.000Z`,
+      request: { model: "gpt-drift", effort: "xhigh" }
+    });
+    writeCodexJob(stateRoot, dir, `healthy-${index}`, {
+      status: "done",
+      jobClass: "task",
+      acceptance: "accepted",
+      createdAt: `2026-07-20T01:${String(index).padStart(2, "0")}:00.000Z`,
+      request: { model: "gpt-healthy", effort: "high" }
+    });
+  }
+  for (let index = 0; index < 31; index += 1) {
+    const rejected = index < 10;
+    writeCodexJob(stateRoot, dir, `trailing-${index}`, {
+      status: rejected ? "error" : "done",
+      jobClass: "task",
+      acceptance: rejected ? "rejected" : "accepted",
+      createdAt: new Date(Date.parse("2026-07-18T00:00:00.000Z") + index * 60_000).toISOString(),
+      request: { model: "gpt-trailing", effort: "medium" }
+    });
+  }
+
+  const stats = codexStats({ env: { FUSION_CODEX_STATE: stateRoot, FUSION_DATA_DIR: fusionData }, cwd: dir });
+  assert.deepStrictEqual(stats.laneSignalDrift, [{ sku: "gpt-drift@xhigh", acceptanceRate: 0.6, timeoutShare: 0.3 }]);
+  const rendered = renderFusionStats({ scope: dir, codex: stats });
+  assert.match(rendered, /## Lane signal drift\n- gpt-drift@xhigh: judged acceptance 60\.0%, timeout share 30\.0%; re-score via \/fusion:config/);
+  assert.doesNotMatch(rendered, /gpt-healthy@high: judged acceptance/);
+  assert.doesNotMatch(rendered, /gpt-trailing@medium: judged acceptance/);
+
+  const healthyRoot = path.join(dir, "healthy-only");
+  for (let index = 0; index < 10; index += 1) {
+    writeCodexJob(healthyRoot, dir, `only-healthy-${index}`, {
+      status: "done",
+      jobClass: "task",
+      acceptance: "accepted",
+      createdAt: `2026-07-20T02:${String(index).padStart(2, "0")}:00.000Z`,
+      request: { model: "gpt-healthy", effort: "high" }
+    });
+  }
+  const healthyStats = codexStats({ env: { FUSION_CODEX_STATE: healthyRoot, FUSION_DATA_DIR: fusionData }, cwd: dir });
+  assert.strictEqual(healthyStats.laneSignalDrift, undefined);
+  assert.doesNotMatch(renderFusionStats({ scope: dir, codex: healthyStats }), /## Lane signal drift/);
+});
+
+test("Codex renders per-SKU trends from the seven days ending at the newest record", (t) => {
+  const dir = sandbox(t);
+  const stateRoot = path.join(dir, "state");
+  const fusionData = path.join(dir, "fusion");
+  const usage = (outputTokens) => ({ inputTokens: 10, cachedInputTokens: 0, outputTokens, reasoningOutputTokens: 0, totalTokens: 10 + outputTokens });
+  writeCodexJob(stateRoot, dir, "outside-window", {
+    status: "done",
+    jobClass: "task",
+    createdAt: "2026-07-12T00:00:00.000Z",
+    request: { model: "gpt-old", effort: "low" },
+    tokenUsageAvailability: "available",
+    tokenUsage: usage(99)
+  });
+  writeCodexJob(stateRoot, dir, "recent-high", {
+    status: "done",
+    jobClass: "task",
+    createdAt: "2026-07-13T00:00:00.000Z",
+    request: { model: "gpt-trend", effort: "high" },
+    tokenUsageAvailability: "available",
+    tokenUsage: usage(7)
+  });
+  writeCodexJob(stateRoot, dir, "recent-xhigh", {
+    status: "done",
+    jobClass: "task",
+    createdAt: "2026-07-19T00:00:00.000Z",
+    request: { model: "gpt-trend", effort: "xhigh" },
+    tokenUsageAvailability: "available",
+    tokenUsage: usage(11)
+  });
+  writeCodexJob(stateRoot, dir, "recent-timeout", {
+    status: "error",
+    jobClass: "task",
+    acceptance: "rejected",
+    failureKind: "timeout",
+    createdAt: "2026-07-20T00:00:00.000Z",
+    request: { model: "gpt-trend", effort: "xhigh" },
+    tokenUsageAvailability: "available",
+    tokenUsage: usage(13)
+  });
+
+  const stats = codexStats({ env: { FUSION_CODEX_STATE: stateRoot, FUSION_DATA_DIR: fusionData }, cwd: dir });
+  assert.deepStrictEqual(stats.last7DaysBySku, [
+    { sku: "gpt-trend@high", jobs: 1, outputTokens: 7, outputTokenOverflow: false, timeouts: 0, timeoutShare: 0 },
+    { sku: "gpt-trend@xhigh", jobs: 2, outputTokens: 24, outputTokenOverflow: false, timeouts: 1, timeoutShare: 0.5 }
+  ]);
+  const rendered = renderFusionStats({ scope: dir, codex: stats });
+  assert.match(rendered, /By SKU, last 7 days:\nSKU \| jobs \| output tokens \| timeout share\ngpt-trend@high \| 1 \| 7 \| 0\.0%\ngpt-trend@xhigh \| 2 \| 24 \| 50\.0%/);
+  assert.doesNotMatch(rendered, /gpt-old@low \|/);
 });
 
 test("counts canonical running records without repairing or signalling them", (t) => {
@@ -1367,7 +1506,7 @@ test("--record leaves a terminal worker unsettled when its engine companion fail
   assert.strictEqual(worker.awaitingVerdict, true);
 });
 
-test("--record resolves a bare Codex job and settles matching worker rows", (t) => {
+test("--record resolves a bare Codex job with a raw transport reason and settles matching worker rows", (t) => {
   const dir = sandbox(t);
   const stateRoot = path.join(dir, "codex-state");
   const stateDir = path.join(dir, "worker-state");
@@ -1379,9 +1518,10 @@ test("--record resolves a bare Codex job and settles matching worker rows", (t) 
   writeCodexJob(stateRoot, dir, jobId, { status: "done", jobClass: "task" });
   createTerminalWorker({ taskId, env, workspaceRoot: dir, peerEngine: "codex", peerJobId: jobId });
 
-  const result = runDirect(
+  const reason = "The result did not satisfy the requested behavior.";
+  const result = run(
     { cwd: dir, codexState: stateRoot },
-    ["--record", `${jobId}=rejected`, "--json"],
+    ["--record", `${jobId}=rejected`, "--reason", reason, "--json"],
     { ...env, FUSION_CODEX_COMPANION: companion, FUSION_TEST_CODEX_COMPANION_ARGS: argsFile }
   );
 
@@ -1390,8 +1530,28 @@ test("--record resolves a bare Codex job and settles matching worker rows", (t) 
     { kind: "engine", engine: "codex", jobId, acceptance: "rejected" },
     { kind: "worker", taskId, acceptance: "rejected" }
   ]);
-  assert.deepStrictEqual(JSON.parse(fs.readFileSync(argsFile, "utf8")), ["record-acceptance", "--job-id", jobId, "--acceptance", "rejected", "--source", "main-loop"]);
+  assert.deepStrictEqual(JSON.parse(fs.readFileSync(argsFile, "utf8")), ["record-acceptance", "--job-id", jobId, "--acceptance", "rejected", "--source", "main-loop", "--reason", reason]);
   assert.strictEqual(readWorkerRecord(taskId, env).acceptance, "rejected");
+  assert.strictEqual(readWorkerRecord(taskId, env).acceptanceReason, reason);
+});
+
+test("--record refuses a rejected strict direct argument", (t) => {
+  const dir = sandbox(t);
+  const stateDir = path.join(dir, "worker-state");
+  const taskId = `fusion-${"d".repeat(24)}`;
+  const env = { FUSION_WORKER_STATE_DIR: stateDir };
+  createTerminalWorker({ taskId, env, workspaceRoot: dir });
+
+  const result = runDirect(
+    { cwd: dir, codexState: path.join(dir, "missing") },
+    ["--record", `${taskId}=rejected`],
+    env
+  );
+
+  assert.strictEqual(result.status, 1);
+  assert.strictEqual(result.stdout, "");
+  assert.strictEqual(result.stderr, "Rejected verdicts require --reason through the raw-args transport. For batch settlements, use --reason-for <id> <text> for each rejected pair.\n");
+  assert.strictEqual(readWorkerRecord(taskId, env).acceptance, "unverified");
 });
 
 test("--record resolves a bare Grok job and settles matching worker rows", (t) => {
@@ -1436,7 +1596,7 @@ test("--record rejects an engine id that exists in both peer states", (t) => {
   assert.match(result.stderr, /exists in both Codex and Grok state/);
 });
 
-test("--record batches mixed verdicts", (t) => {
+test("--record batches mixed verdicts with per-pair rejection reasons", (t) => {
   const dir = sandbox(t);
   const stateDir = path.join(dir, "worker-state");
   const firstTaskId = `fusion-${"2".repeat(24)}`;
@@ -1445,9 +1605,9 @@ test("--record batches mixed verdicts", (t) => {
   createTerminalWorker({ taskId: firstTaskId, env, workspaceRoot: dir });
   createTerminalWorker({ taskId: secondTaskId, env, workspaceRoot: dir });
 
-  const result = runDirect(
+  const result = run(
     { cwd: dir, codexState: path.join(dir, "missing") },
-    ["--record", `${firstTaskId}=accepted`, "--record", `${secondTaskId}=rejected`],
+    ["--record", `${firstTaskId}=accepted`, "--record", `${secondTaskId}=rejected`, "--reason-for", secondTaskId, "The result did not satisfy the requested behavior."],
     env
   );
 
@@ -1455,6 +1615,29 @@ test("--record batches mixed verdicts", (t) => {
   assert.strictEqual(result.stdout, `Recorded accepted for Fusion worker task ${firstTaskId}.\nRecorded rejected for Fusion worker task ${secondTaskId}.\n`);
   assert.strictEqual(readWorkerRecord(firstTaskId, env).acceptance, "accepted");
   assert.strictEqual(readWorkerRecord(secondTaskId, env).acceptance, "rejected");
+  assert.strictEqual(readWorkerRecord(secondTaskId, env).acceptanceReason, "The result did not satisfy the requested behavior.");
+});
+
+test("--record rejects a raw batch with a rejected pair that has no reason before writing", (t) => {
+  const dir = sandbox(t);
+  const stateDir = path.join(dir, "worker-state");
+  const acceptedTaskId = `fusion-${"4".repeat(24)}`;
+  const rejectedTaskId = `fusion-${"5".repeat(24)}`;
+  const env = { FUSION_WORKER_STATE_DIR: stateDir };
+  createTerminalWorker({ taskId: acceptedTaskId, env, workspaceRoot: dir });
+  createTerminalWorker({ taskId: rejectedTaskId, env, workspaceRoot: dir });
+
+  const result = run(
+    { cwd: dir, codexState: path.join(dir, "missing") },
+    ["--record", `${acceptedTaskId}=accepted`, "--record", `${rejectedTaskId}=rejected`],
+    env
+  );
+
+  assert.notStrictEqual(result.status, 0);
+  assert.match(result.stderr, new RegExp(`Rejected verdict for ${rejectedTaskId} requires --reason for a single pair or --reason-for <id> <text> for a batch`));
+  assert.strictEqual(result.stdout, "");
+  assert.strictEqual(readWorkerRecord(acceptedTaskId, env).acceptance, "unverified");
+  assert.strictEqual(readWorkerRecord(rejectedTaskId, env).acceptance, "unverified");
 });
 
 test("--record queues a nonterminal worker verdict and applies it once terminal", (t) => {
@@ -1480,7 +1663,7 @@ test("--record queues a nonterminal worker verdict and applies it once terminal"
   assert.strictEqual(settled.pendingVerdict, undefined);
 });
 
-test("--record continues a batch after a failed transport gate", (t) => {
+test("--record rejects a whole batch before writes when a pair fails transport validation", (t) => {
   const dir = sandbox(t);
   const stateDir = path.join(dir, "worker-state");
   const firstTaskId = `fusion-${"8".repeat(24)}`;
@@ -1492,9 +1675,9 @@ test("--record continues a batch after a failed transport gate", (t) => {
   createTerminalWorker({ taskId: thirdTaskId, env, workspaceRoot: dir });
   updateWorkerRecord(failedTaskId, env, (record) => ({ ...record, transportStatus: "failed" }));
 
-  const result = runDirect(
+  const result = run(
     { cwd: dir, codexState: path.join(dir, "missing") },
-    ["--record", `${firstTaskId}=accepted`, "--record", `${failedTaskId}=accepted`, "--record", `${thirdTaskId}=rejected`],
+    ["--record", `${firstTaskId}=accepted`, "--record", `${failedTaskId}=accepted`, "--record", `${thirdTaskId}=rejected`, "--reason-for", thirdTaskId, "The result did not satisfy the requested behavior."],
     env
   );
 
@@ -1502,9 +1685,45 @@ test("--record continues a batch after a failed transport gate", (t) => {
   assert.match(result.stderr, new RegExp(failedTaskId));
   assert.doesNotMatch(result.stderr, new RegExp(firstTaskId));
   assert.doesNotMatch(result.stderr, new RegExp(thirdTaskId));
-  assert.strictEqual(readWorkerRecord(firstTaskId, env).acceptance, "accepted");
+  assert.strictEqual(result.stdout, "");
+  assert.strictEqual(readWorkerRecord(firstTaskId, env).acceptance, "unverified");
   assert.strictEqual(readWorkerRecord(failedTaskId, env).acceptance, "unverified");
-  assert.strictEqual(readWorkerRecord(thirdTaskId, env).acceptance, "rejected");
+  assert.strictEqual(readWorkerRecord(thirdTaskId, env).acceptance, "unverified");
+});
+
+test("--record continues a batch after a partial engine transport failure and can rerun", (t) => {
+  const dir = sandbox(t);
+  const stateDir = path.join(dir, "worker-state");
+  const failedTaskId = `fusion-${"8".repeat(24)}`;
+  const settledTaskId = `fusion-${"9".repeat(24)}`;
+  const failedJobId = "a".repeat(32);
+  const settledJobId = "b".repeat(32);
+  const env = { FUSION_WORKER_STATE_DIR: stateDir };
+  createTerminalWorker({ taskId: failedTaskId, env, workspaceRoot: dir, peerEngine: "codex", peerJobId: failedJobId });
+  createTerminalWorker({ taskId: settledTaskId, env, workspaceRoot: dir, peerEngine: "codex", peerJobId: settledJobId });
+  const args = ["--record", `${failedTaskId}=accepted`, "--record", `${settledTaskId}=accepted`];
+  const companion = writeSelectiveCodexAcceptanceCompanion(dir, failedJobId);
+
+  const result = runDirect(
+    { cwd: dir, codexState: path.join(dir, "missing") },
+    args,
+    { ...env, FUSION_CODEX_COMPANION: companion }
+  );
+
+  assert.notStrictEqual(result.status, 0);
+  assert.match(result.stderr, new RegExp(`Failed to settle ${failedTaskId}`));
+  assert.strictEqual(readWorkerRecord(failedTaskId, env).acceptance, "unverified");
+  assert.strictEqual(readWorkerRecord(settledTaskId, env).acceptance, "accepted");
+
+  const retry = runDirect(
+    { cwd: dir, codexState: path.join(dir, "missing") },
+    args,
+    { ...env, FUSION_CODEX_COMPANION: companion }
+  );
+
+  assert.notStrictEqual(retry.status, 0);
+  assert.strictEqual(readWorkerRecord(failedTaskId, env).acceptance, "unverified");
+  assert.strictEqual(readWorkerRecord(settledTaskId, env).acceptance, "accepted");
 });
 
 test("--record accepts a per-pair failed transport override", (t) => {
@@ -1541,9 +1760,29 @@ test("--record rejects a reason attached to multiple pairs and requires transpor
 
   const staged = run({ cwd: dir, codexState: path.join(dir, "missing") }, args, env);
   assert.notStrictEqual(staged.status, 0);
-  assert.match(staged.stderr, /--reason can be used only when exactly one --record pair is present/);
+  assert.match(staged.stderr, /--reason can be used only when exactly one --record pair is present\. Use --reason-for <id> <text> for each rejected pair in a batch/);
   assert.strictEqual(readWorkerRecord(firstTaskId, env).acceptance, "unverified");
   assert.strictEqual(readWorkerRecord(secondTaskId, env).acceptance, "unverified");
+});
+
+test("--record validates every batch pair before writing", (t) => {
+  const dir = sandbox(t);
+  const stateDir = path.join(dir, "worker-state");
+  const presentTaskId = `fusion-${"6".repeat(24)}`;
+  const missingTaskId = `fusion-${"7".repeat(24)}`;
+  const env = { FUSION_WORKER_STATE_DIR: stateDir };
+  createTerminalWorker({ taskId: presentTaskId, env, workspaceRoot: dir });
+
+  const result = run(
+    { cwd: dir, codexState: path.join(dir, "missing") },
+    ["--record", `${presentTaskId}=accepted`, "--record", `${missingTaskId}=accepted`],
+    env
+  );
+
+  assert.notStrictEqual(result.status, 0);
+  assert.match(result.stderr, new RegExp(`Fusion worker task ${missingTaskId} was not found`));
+  assert.strictEqual(result.stdout, "");
+  assert.strictEqual(readWorkerRecord(presentTaskId, env).acceptance, "unverified");
 });
 
 test("Codex reports acceptance anomalies only when the job record and transport state diverge", (t) => {
@@ -1562,6 +1801,45 @@ test("Codex reports acceptance anomalies only when the job record and transport 
   });
   const rendered = renderFusionStats({ scope: dir, codex: stats });
   assert.match(rendered, /Acceptance anomalies:\n- Accepted ledger entries with error transport: 1 \(eeeeeeee\)\n- Done jobs without acceptance records: 1 \(ffffffffffffffffffffffffffffffff\)/);
+});
+
+test("Codex groups pre-epoch acceptance anomalies and falls back from invalid epochs", (t) => {
+  const dir = sandbox(t);
+  const stateRoot = path.join(dir, "state");
+  const fusionData = path.join(dir, "fusion");
+  const historicalAccepted = "a".repeat(32);
+  const historicalUnverified = "b".repeat(32);
+  const currentAccepted = "c".repeat(32);
+  const currentUnverified = "d".repeat(32);
+  writeCodexJob(stateRoot, dir, historicalAccepted, { status: "error", jobClass: "task", acceptance: "accepted", finishedAt: "2026-07-21T23:59:59.000Z" });
+  writeCodexJob(stateRoot, dir, historicalUnverified, { status: "done", jobClass: "task", finishedAt: "2026-07-21T23:59:59.000Z" });
+  writeCodexJob(stateRoot, dir, currentAccepted, { status: "error", jobClass: "task", acceptance: "accepted", finishedAt: "2026-07-22T00:00:00.000Z" });
+  writeCodexJob(stateRoot, dir, currentUnverified, { status: "done", jobClass: "task", finishedAt: "2026-07-22T00:00:00.000Z" });
+
+  const baseEnv = { FUSION_CODEX_STATE: stateRoot, FUSION_DATA_DIR: fusionData };
+  const defaultStats = codexStats({ env: baseEnv, cwd: dir });
+  assert.deepStrictEqual(defaultStats.acceptanceAnomalies, {
+    acceptedWithErrorTransport: [currentAccepted],
+    doneWithoutAcceptance: [currentUnverified],
+    historicalPreEpoch: 2,
+    historicalEpoch: "2026-07-22T00:00:00Z"
+  });
+  const rendered = renderFusionStats({ scope: dir, codex: defaultStats });
+  assert.match(rendered, /Accepted ledger entries with error transport: 1 \(cccccccc\)/);
+  assert.match(rendered, /Done jobs without acceptance records: 1 \(dddddddddddddddddddddddddddddddd\)/);
+  assert.match(rendered, /historical pre-epoch \(before 2026-07-22T00:00:00Z\): 2/);
+  assert.doesNotMatch(rendered, /aaaaaaaa|bbbbbbbb/);
+
+  const fallbackStats = codexStats({ env: { ...baseEnv, FUSION_ACCEPTANCE_EPOCH: "not-an-epoch" }, cwd: dir });
+  assert.deepStrictEqual(fallbackStats.acceptanceAnomalies, defaultStats.acceptanceAnomalies);
+
+  const overriddenStats = codexStats({ env: { ...baseEnv, FUSION_ACCEPTANCE_EPOCH: "2026-07-23T00:00:00Z" }, cwd: dir });
+  assert.deepStrictEqual(overriddenStats.acceptanceAnomalies, {
+    acceptedWithErrorTransport: [],
+    doneWithoutAcceptance: [],
+    historicalPreEpoch: 4,
+    historicalEpoch: "2026-07-23T00:00:00Z"
+  });
 });
 
 test("generic worker acceptance rejects Codex collectors", (t) => {
@@ -1649,7 +1927,7 @@ test("worker acceptance requires --accept-failed-transport only for accepted fai
 
   const rejected = run(
     { cwd: dir, codexState: path.join(dir, "missing") },
-    ["--record", `${taskId}=rejected`, "--json"],
+    ["--record", `${taskId}=rejected`, "--reason", "The result did not satisfy the requested behavior.", "--json"],
     env
   );
   assert.strictEqual(rejected.status, 0, rejected.stderr);
@@ -2303,4 +2581,26 @@ test("fleet usage surface reports zeros without error when the audit dir is empt
   assert.match(rendered, /Dispatch bursts: 0/);
   assert.match(rendered, /Fleet-shaped bursts \(width ≥ 3\): 0/);
   assert.match(rendered, /Widest burst: none/);
+});
+
+test("fleet usage surface watches sessions with eight narrow dispatch waves", (t) => {
+  const dir = sandbox(t);
+  const auditDir = path.join(dir, "inline-guard-audit");
+  const day = "2026-07-16";
+  const narrowSession = "session-narrow";
+  const wideSession = "session-wide";
+  const events = [];
+  for (let index = 0; index < 8; index += 1) {
+    events.push({ schemaVersion: 1, at: `2026-07-16T10:${String(index).padStart(2, "0")}:00.000Z`, session: narrowSession, event: "dispatch", lane: "codex", tool: "Agent" });
+    events.push({ schemaVersion: 1, at: `2026-07-16T11:${String(index * 2).padStart(2, "0")}:00.000Z`, session: wideSession, event: "dispatch", lane: "codex", tool: "Agent" });
+    events.push({ schemaVersion: 1, at: `2026-07-16T11:${String(index * 2).padStart(2, "0")}:00.100Z`, session: wideSession, event: "dispatch", lane: "grok", tool: "Agent" });
+  }
+  writeGuardAuditEvents(auditDir, day, events);
+
+  const fleet = buildFleetUsageStats({ env: { FUSION_INLINE_GUARD_AUDIT_DIR: auditDir } });
+  assert.deepStrictEqual(fleet.narrowWaveWatch, [{ day, session: narrowSession, dispatches: 8 }]);
+  const rendered = renderFusionStats({ scope: dir, fleet });
+  assert.match(rendered, /By day:[\s\S]*- 2026-07-16:/);
+  assert.match(rendered, /Narrow-wave watch:\n- 2026-07-16, session-narrow, 8, all width 1/);
+  assert.doesNotMatch(rendered, /session-wide, 16, all width 1/);
 });

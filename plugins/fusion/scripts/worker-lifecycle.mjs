@@ -5,6 +5,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { recordEngineAcceptance } from "./lib/engine-acceptance.mjs";
+import { appendTokenUsageObservation, fusionRepositoryKey } from "./fusion-stats.mjs";
 import {
   applyQueuedVerdict,
   backfillWorkerTaskOutputTelemetry,
@@ -36,9 +37,13 @@ const STALL_MS_ENV = "FUSION_WORKER_STALL_MS";
 const MAX_TURNS_ENV = "FUSION_WORKER_MAX_TURNS";
 const MAX_OUTPUT_TOKENS_ENV = "FUSION_WORKER_MAX_OUTPUT_TOKENS";
 const MAX_UNCACHED_TOKENS_ENV = "FUSION_WORKER_MAX_UNCACHED_TOKENS";
+const PARENT_CONTEXT_ADVISORY_BYTES_ENV = "FUSION_PARENT_CONTEXT_ADVISORY_BYTES";
+const VERIFICATION_MANIFEST_ENV = "FUSION_VERIFICATION_MANIFEST";
 const COLLECTION_RESPONSE_DEBUG_ENV = "FUSION_WORKER_DEBUG_COLLECTION_RESPONSE";
 const COLLECTION_RESPONSE_DEBUG_FILE = "worker-collection-response.json";
 const DEFAULT_BRIEF_MAX_BYTES = 16 * 1024;
+const SIZING_ADVISORY_BYTES = 8 * 1024;
+const DEFAULT_PARENT_CONTEXT_ADVISORY_BYTES = 4 * 1024 * 1024;
 const TASK_NOTIFICATION_SCAN_MAX_BYTES = 4 * 1024 * 1024;
 const TASK_NOTIFICATION_SCAN_CHUNK_BYTES = 64 * 1024;
 const TASK_NOTIFICATION_MAX_LINE_BYTES = 1024 * 1024;
@@ -84,7 +89,7 @@ function positiveInteger(env, name, fallback) {
 export function workerLimits(agentType, env = process.env, sizing) {
   const canonical = canonicalWorkerAgentType(agentType);
   const defaults = canonical === "fusion:trivial-worker"
-    ? { wallClockMs: 180_000, stallMs: 90_000, maxTurns: 12, maxOutputTokens: 16_000, maxUncachedTokens: 80_000 }
+    ? { wallClockMs: 240_000, stallMs: 120_000, maxTurns: 16, maxOutputTokens: 24_000, maxUncachedTokens: 120_000 }
     : canonical === "fusion:job-collector"
       ? { wallClockMs: 540_000, stallMs: 540_000, maxTurns: 6, maxOutputTokens: 8_000, maxUncachedTokens: 30_000 }
       : canonical === "fusion:deep-reasoner"
@@ -113,12 +118,12 @@ function denyTool(reason) {
   return { hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision: "deny", permissionDecisionReason: reason } };
 }
 
-function allowAgentWithTaskId(toolInput, taskId) {
+function allowAgentWithTaskId(toolInput, taskId, additionalContext = null) {
   const prompt = promptText(toolInput);
   const marker = `fusion-task-id: ${taskId}`;
   const lines = prompt.split(/\r?\n/).filter((line) => !/^fusion-task-id:\s*/i.test(line.trim()));
   lines.splice(lines[0]?.trim() === "fusion-brief: v1" ? 1 : 0, 0, marker);
-  return { hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision: "allow", updatedInput: { ...toolInput, prompt: lines.join("\n") } } };
+  return { hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision: "allow", updatedInput: { ...toolInput, prompt: lines.join("\n") }, ...(additionalContext ? { additionalContext } : {}) } };
 }
 
 function writeOutput(value) {
@@ -127,6 +132,107 @@ function writeOutput(value) {
 
 function promptText(toolInput) {
   return typeof toolInput?.prompt === "string" ? toolInput.prompt : "";
+}
+
+function parentContextAdvisoryBytes(env) {
+  const raw = env[PARENT_CONTEXT_ADVISORY_BYTES_ENV];
+  if (raw === undefined || raw === null || (typeof raw === "string" && !raw.trim())) {
+    return DEFAULT_PARENT_CONTEXT_ADVISORY_BYTES;
+  }
+  const parsed = typeof raw === "number" ? raw : Number(String(raw).trim());
+  return Number.isSafeInteger(parsed) && parsed >= 0 ? parsed : DEFAULT_PARENT_CONTEXT_ADVISORY_BYTES;
+}
+
+function verificationManifestPath(env) {
+  const configured = env[VERIFICATION_MANIFEST_ENV];
+  return typeof configured === "string" && configured.trim()
+    ? path.resolve(configured)
+    : path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "verification-manifest.json");
+}
+
+function globToRegExp(glob) {
+  let pattern = "";
+  for (let index = 0; index < glob.length; index += 1) {
+    const character = glob[index];
+    if (character === "*") {
+      if (glob[index + 1] === "*") {
+        while (glob[index + 1] === "*") {
+          index += 1;
+        }
+        if (glob[index + 1] === "/") {
+          pattern += "(?:.*/)?";
+          index += 1;
+        } else {
+          pattern += ".*";
+        }
+      } else {
+        pattern += "[^/]*";
+      }
+    } else if (character === "?") {
+      pattern += "[^/]";
+    } else {
+      pattern += character.replace(/[|\\{}()[\]^$+?.]/g, "\\$&");
+    }
+  }
+  return new RegExp(`^${pattern}$`);
+}
+
+function readVerificationManifest(env) {
+  try {
+    const manifest = JSON.parse(fs.readFileSync(verificationManifestPath(env), "utf8"));
+    if (!Array.isArray(manifest) || !manifest.every((entry) => entry && typeof entry === "object" && Array.isArray(entry.paths) && entry.paths.length > 0 && entry.paths.every((value) => typeof value === "string" && value) && Array.isArray(entry.suites) && entry.suites.length > 0 && entry.suites.every((value) => typeof value === "string" && value))) {
+      return [];
+    }
+    return manifest.map((entry) => ({ paths: entry.paths.map((glob) => globToRegExp(glob)), suites: entry.suites }));
+  } catch {
+    return [];
+  }
+}
+
+function pathsNamedInBrief(prompt) {
+  const paths = new Set();
+  for (const line of prompt.split(/\r?\n/)) {
+    const field = line.match(/^(?:scope|goal):\s*(.*)$/i);
+    if (!field) {
+      continue;
+    }
+    for (const match of field[1].matchAll(/(?:\.\/)?(?:[A-Za-z0-9_@.+*?\[\]{}-]+\/)+[A-Za-z0-9_@.+*?\[\]{}-]+/g)) {
+      paths.add(match[0].replace(/^\.\//, "").replace(/[.,:;!?)\]}]+$/, ""));
+    }
+  }
+  return paths;
+}
+
+function missingVerificationSuites(prompt, env) {
+  const verification = prompt.split(/\r?\n/).find((line) => /^verification:\s*\S/i.test(line));
+  if (!verification) {
+    return [];
+  }
+  const namedPaths = pathsNamedInBrief(prompt);
+  if (namedPaths.size === 0) {
+    return [];
+  }
+  const required = new Set();
+  for (const entry of readVerificationManifest(env)) {
+    if ([...namedPaths].some((namedPath) => entry.paths.some((pattern) => pattern.test(namedPath)))) {
+      for (const suite of entry.suites) {
+        required.add(suite);
+      }
+    }
+  }
+  return [...required].filter((suite) => !verification.includes(suite));
+}
+
+function briefAdvisories(prompt, briefBytes, hasSizing, env) {
+  const advisories = [];
+  const missingSuites = missingVerificationSuites(prompt, env);
+  if (missingSuites.length > 0) {
+    advisories.push(`Verification advisory: add the required suite${missingSuites.length === 1 ? "" : "s"} to \`verification:\`: ${missingSuites.join(", ")}.`);
+  }
+  if (briefBytes > SIZING_ADVISORY_BYTES && !hasSizing) {
+    advisories.push("Sizing advisory: this brief exceeds 8192 bytes without a `sizing:` field. Add `sizing: large` or split the package into smaller briefs.");
+  }
+  return advisories;
 }
 
 export function validateWorkerBrief(prompt, agentType, env = process.env) {
@@ -161,6 +267,16 @@ export function validateWorkerBrief(prompt, agentType, env = process.env) {
   if (/^fusion-task-id:\s*/im.test(prompt)) {
     return { ok: false, reason: "`fusion-task-id` is reserved for the lifecycle guard." };
   }
+  const packageTypeLines = prompt.split(/\r?\n/).filter((line) => /^package-type\s*:/i.test(line.trim()));
+  if (packageTypeLines.length > 1) {
+    return { ok: false, reason: "Fusion worker brief `package-type:` may appear once and must be one of `implementation`, `consult`, `review`, or `research`." };
+  }
+  const packageType = packageTypeLines.length === 1
+    ? packageTypeLines[0].match(/^package-type\s*:\s*(implementation|consult|review|research)\s*$/i)?.[1]?.toLowerCase()
+    : /^verification:\s*\S/im.test(prompt) ? "implementation" : "consult";
+  if (!packageType) {
+    return { ok: false, reason: "Fusion worker brief `package-type:` must be one of `implementation`, `consult`, `review`, or `research`." };
+  }
   const sizingLines = prompt.split(/\r?\n/).filter((line) => /^sizing\s*:/i.test(line.trim()));
   if (sizingLines.length > 1) {
     return { ok: false, reason: "Fusion worker brief `sizing:` may appear once and must be one of `small`, `standard`, or `large`." };
@@ -170,9 +286,11 @@ export function validateWorkerBrief(prompt, agentType, env = process.env) {
     if (!sizing) {
       return { ok: false, reason: "Fusion worker brief `sizing:` must be one of `small`, `standard`, or `large`." };
     }
-    return { ok: true, sizing };
+    const briefBytes = Buffer.byteLength(prompt);
+    return { ok: true, sizing, packageType, briefBytes, advisories: briefAdvisories(prompt, briefBytes, true, env) };
   }
-  return { ok: true };
+  const briefBytes = Buffer.byteLength(prompt);
+  return { ok: true, packageType, briefBytes, advisories: briefAdvisories(prompt, briefBytes, false, env) };
 }
 
 function externalUserText(entry) {
@@ -266,9 +384,10 @@ function collectorRequestIdentity(prompt) {
   return engine && jobId ? { expectedPeerEngine: engine, expectedPeerJobId: jobId } : null;
 }
 
-function createDispatch(input, agentType, userBackgroundAuthorized, env, sizing) {
+function createDispatch(input, agentType, userBackgroundAuthorized, env, validation = {}) {
   const taskId = createWorkerTaskId(input.session_id, input.tool_use_id);
-  const collectorIdentity = canonicalWorkerAgentType(agentType) === "fusion:job-collector" ? collectorRequestIdentity(promptText(input.tool_input)) : null;
+  const prompt = promptText(input.tool_input);
+  const collectorIdentity = canonicalWorkerAgentType(agentType) === "fusion:job-collector" ? collectorRequestIdentity(prompt) : null;
   let parentTranscriptBytesAtDispatch = null;
   try {
     parentTranscriptBytesAtDispatch = fs.statSync(input.transcript_path).size;
@@ -286,10 +405,76 @@ function createDispatch(input, agentType, userBackgroundAuthorized, env, sizing)
     userBackgroundAuthorized,
     parentTranscriptPath: typeof input.transcript_path === "string" ? input.transcript_path : null,
     parentTranscriptBytesAtDispatch,
-    completionContract: completionContract(agentType, promptText(input.tool_input)),
+    packageType: validation.packageType ?? (/^verification:\s*\S/im.test(prompt) ? "implementation" : "consult"),
+    briefBytes: validation.briefBytes ?? null,
+    completionContract: completionContract(agentType, prompt),
     ...collectorIdentity,
-    limits: workerLimits(agentType, env, sizing)
+    limits: workerLimits(agentType, env, validation.sizing)
   }, env);
+}
+
+function claimParentContextAdvisory(record, env) {
+  const threshold = parentContextAdvisoryBytes(env);
+  if (threshold === 0 || !Number.isSafeInteger(record.parentTranscriptBytesAtDispatch) || record.parentTranscriptBytesAtDispatch <= threshold) {
+    return false;
+  }
+  let claimed = false;
+  try {
+    updateWorkerSessionState(record.sessionId, env, (current) => {
+      if (current?.parentContextAdvisorySent === true) {
+        return null;
+      }
+      claimed = true;
+      return { ...(current ?? {}), parentContextAdvisorySent: true };
+    });
+  } catch {
+    return false;
+  }
+  return claimed;
+}
+
+function observedWorkerTokenUsage(usage) {
+  return {
+    inputTokens: nonNegativeInteger(usage?.inputTokens),
+    cachedInputTokens: nonNegativeInteger(usage?.cacheReadInputTokens),
+    outputTokens: nonNegativeInteger(usage?.outputTokens),
+    reasoningOutputTokens: null,
+    totalTokens: nonNegativeInteger(usage?.totalTokens)
+  };
+}
+
+function observeTerminalTokenUsage(record, env) {
+  if (!record || !isTerminalWorkerStatus(record.transportStatus) || record.usageAvailability !== "available" || typeof record.workspaceRoot !== "string" || !record.workspaceRoot) {
+    return;
+  }
+  try {
+    const repositoryKey = fusionRepositoryKey(record.workspaceRoot);
+    if (!repositoryKey) {
+      return;
+    }
+    appendTokenUsageObservation(path.join(resolveFusionDataDir(env), "observations", repositoryKey, "token-usage.jsonl"), {
+      schemaVersion: 1,
+      jobId: record.taskId,
+      engine: "claude",
+      workspaceRoot: record.workspaceRoot,
+      repositoryKey,
+      availability: record.usageAvailability,
+      tokenUsage: observedWorkerTokenUsage(record.usage),
+      reason: null,
+      threadId: null,
+      turnId: null,
+      source: "worker-record",
+      observedAt: new Date().toISOString()
+    });
+  } catch {
+    void 0;
+  }
+}
+
+function updateLifecycleWorkerRecord(taskId, env, updater) {
+  const updated = updateWorkerRecord(taskId, env, updater);
+  observeTerminalTokenUsage(updated, env);
+  return updated;
 }
 
 function pendingDispatchForStart(input, env) {
@@ -306,7 +491,7 @@ function recordForAgent(input, env) {
   if (taskId) {
     const exact = readWorkerRecords(env, { strict: true }).find((record) => record.taskId === taskId && record.sessionId === input.session_id && canonicalWorkerAgentType(record.agentType) === canonicalWorkerAgentType(input.agent_type));
     if (exact) {
-      return updateWorkerRecord(exact.taskId, env, (current) => ({ ...current, agentId: input.agent_id }));
+      return updateLifecycleWorkerRecord(exact.taskId, env, (current) => ({ ...current, agentId: input.agent_id }));
     }
   }
   return findWorkerRecord((record) => record.agentId === input.agent_id, env, { strict: true });
@@ -345,7 +530,7 @@ function refreshRecord(record, input, env) {
   if (!transcriptPath) {
     return record;
   }
-  return updateWorkerRecord(record.taskId, env, (current) => refreshWorkerTranscript(current ?? record, transcriptPath));
+  return updateLifecycleWorkerRecord(record.taskId, env, (current) => refreshWorkerTranscript(current ?? record, transcriptPath));
 }
 
 export function workerBudgetFailure(record, now = Date.now()) {
@@ -376,7 +561,7 @@ export function workerBudgetFailure(record, now = Date.now()) {
 }
 
 function markBudgetFailure(record, failure, env) {
-  return updateWorkerRecord(record.taskId, env, (current) => {
+  return updateLifecycleWorkerRecord(record.taskId, env, (current) => {
     if (!current || isTerminalWorkerStatus(current.transportStatus)) {
       return null;
     }
@@ -502,8 +687,12 @@ function handlePreToolUse(input, env) {
       writeOutput(denyTool("Fusion workers may detach only when the latest user message explicitly contains `--background`. Remove background mode and collect the result in this turn."));
       return;
     }
-    const record = createDispatch(input, agentType, userBackgroundAuthorized, env, validation.sizing);
-    writeOutput(allowAgentWithTaskId(input.tool_input, record.taskId));
+    const record = createDispatch(input, agentType, userBackgroundAuthorized, env, validation);
+    const advisories = [...(validation.advisories ?? [])];
+    if (claimParentContextAdvisory(record, env)) {
+      advisories.push("The orchestrator transcript is large. Cache reread cost grows with context size times turns. Consider a fresh session for the next goal.");
+    }
+    writeOutput(allowAgentWithTaskId(input.tool_input, record.taskId, advisories.join("\n\n") || null));
     return;
   }
   if (!isFusionWorkerAgent(input.agent_type)) {
@@ -524,7 +713,7 @@ function handlePreToolUse(input, env) {
     return;
   }
   const now = new Date().toISOString();
-  updateWorkerRecord(refreshed.taskId, env, (current) => {
+  updateLifecycleWorkerRecord(refreshed.taskId, env, (current) => {
     if (!current || isTerminalWorkerStatus(current.transportStatus)) {
       return null;
     }
@@ -778,7 +967,7 @@ function handlePostToolUse(input, env, failed = false) {
     if (["TaskOutput", "TaskStop"].includes(input.tool_name) && taskId && noTaskFoundError(input, failed)) {
       const now = new Date().toISOString();
       for (const record of records.filter((candidate) => candidate.sessionId === input.session_id && !isTerminalWorkerStatus(candidate.transportStatus) && [candidate.backgroundTaskId, candidate.agentId].includes(taskId))) {
-        updateWorkerRecord(record.taskId, env, (current) => {
+        updateLifecycleWorkerRecord(record.taskId, env, (current) => {
           if (!current || current.sessionId !== input.session_id || isTerminalWorkerStatus(current.transportStatus) || ![current.backgroundTaskId, current.agentId].includes(taskId)) {
             return null;
           }
@@ -813,7 +1002,7 @@ function handlePostToolUse(input, env, failed = false) {
         captureCollectionResponse(input, env);
       }
       for (const record of matches) {
-        updateWorkerRecord(record.taskId, env, (current) => {
+        updateLifecycleWorkerRecord(record.taskId, env, (current) => {
           if (!current || current.sessionId !== input.session_id) {
             return null;
           }
@@ -862,7 +1051,7 @@ function handlePostToolUse(input, env, failed = false) {
       const outputFile = outputFileFromLaunchResponse(response, nested);
       const now = new Date().toISOString();
       const record = createDispatch(input, agentType, false, env);
-      updateWorkerRecord(record.taskId, env, (current) => ({
+      updateLifecycleWorkerRecord(record.taskId, env, (current) => ({
         ...current,
         ...(agentId ? { agentId, backgroundTaskId: agentId } : {}),
         ...(outputFile ? { outputFile } : {}),
@@ -889,7 +1078,7 @@ function handlePostToolUse(input, env, failed = false) {
       const completed = response.status === "completed" || nested.status === "completed";
       const totalToolUseCount = response.totalToolUseCount ?? nested.totalToolUseCount;
       const now = new Date().toISOString();
-      updateWorkerRecord(pending.taskId, env, (current) => {
+      updateLifecycleWorkerRecord(pending.taskId, env, (current) => {
         if (!current || terminalCollectedRecord(current)) {
           return null;
         }
@@ -924,7 +1113,7 @@ function handlePostToolUse(input, env, failed = false) {
   }
   const now = new Date().toISOString();
   let emitWindDown = false;
-  updateWorkerRecord(record.taskId, env, (current) => {
+  updateLifecycleWorkerRecord(record.taskId, env, (current) => {
     if (!current || isTerminalWorkerStatus(current.transportStatus)) {
       return null;
     }
@@ -957,7 +1146,7 @@ function handleSubagentStart(input, env) {
   }
   const now = new Date().toISOString();
   let started = false;
-  const record = updateWorkerRecord(pending.taskId, env, (current) => {
+  const record = updateLifecycleWorkerRecord(pending.taskId, env, (current) => {
     if (!current || isTerminalWorkerStatus(current.transportStatus)) {
       return null;
     }
@@ -996,7 +1185,7 @@ function handleSubagentStop(input, env) {
   const message = typeof input.last_assistant_message === "string" ? input.last_assistant_message : "";
   if (terminalCollectedRecord(refreshed)) {
     const peerIdentity = PEER_JOB_FOOTER_AGENTS.has(refreshed.agentType) ? capturedPeerIdentity(refreshed.agentType, message, refreshed.peerEngine) : {};
-    updateWorkerRecord(refreshed.taskId, env, (current) => current && terminalCollectedRecord(current) ? peerIdentityBackfill(current, peerIdentity) : null);
+    updateLifecycleWorkerRecord(refreshed.taskId, env, (current) => current && terminalCollectedRecord(current) ? peerIdentityBackfill(current, peerIdentity) : null);
     return;
   }
   const failure = workerBudgetFailure(refreshed);
@@ -1004,7 +1193,7 @@ function handleSubagentStop(input, env) {
   if (finalTextFile) {
     try {
       finalTextFile = writeFinalTextArtifact(refreshed, message, env);
-      updateWorkerRecord(refreshed.taskId, env, (current) => ({ ...(current ?? refreshed), outputFile: finalTextFile }));
+      updateLifecycleWorkerRecord(refreshed.taskId, env, (current) => ({ ...(current ?? refreshed), outputFile: finalTextFile }));
     } catch {
       finalTextFile = null;
     }
@@ -1016,7 +1205,7 @@ function handleSubagentStop(input, env) {
   const trustedCollectorReport = collectorIdentityMismatch ? null : collectorReport;
   const collectorProtocolFailure = (collectorContract && complete && !collectorReport) || collectorIdentityMismatch;
   if (collectorProtocolFailure && !failure && (refreshed.retryCount ?? 0) < 1 && !input.stop_hook_active) {
-    updateWorkerRecord(refreshed.taskId, env, (current) => ({ ...current, retryCount: (current.retryCount ?? 0) + 1 }));
+    updateLifecycleWorkerRecord(refreshed.taskId, env, (current) => ({ ...current, retryCount: (current.retryCount ?? 0) + 1 }));
     const expected = refreshed.expectedPeerEngine && refreshed.expectedPeerJobId
       ? ` Repeat collection for exactly engine=${refreshed.expectedPeerEngine} job=${refreshed.expectedPeerJobId}.`
       : "";
@@ -1024,12 +1213,12 @@ function handleSubagentStop(input, env) {
     return;
   }
   if (!complete && !failure && (refreshed.retryCount ?? 0) < 1 && !input.stop_hook_active) {
-    updateWorkerRecord(refreshed.taskId, env, (current) => ({ ...current, retryCount: (current.retryCount ?? 0) + 1 }));
+    updateLifecycleWorkerRecord(refreshed.taskId, env, (current) => ({ ...current, retryCount: (current.retryCount ?? 0) + 1 }));
     writeOutput(blockStop(retryInstruction(refreshed)));
     return;
   }
   const now = new Date().toISOString();
-  updateWorkerRecord(refreshed.taskId, env, (current) => {
+  updateLifecycleWorkerRecord(refreshed.taskId, env, (current) => {
     if (!current) {
       return null;
     }
@@ -1423,7 +1612,7 @@ function reconcileTaskNotifications(input, env) {
     const now = new Date().toISOString();
     for (const [taskId, notification] of scanned.notifications) {
       for (const record of candidates.filter((candidate) => [candidate.backgroundTaskId, candidate.agentId].includes(taskId))) {
-        const stamped = updateWorkerRecord(record.taskId, env, (current) => {
+        const stamped = updateLifecycleWorkerRecord(record.taskId, env, (current) => {
           if (!current || current.sessionId !== input.session_id || isTerminalWorkerStatus(current.transportStatus) || ![current.backgroundTaskId, current.agentId].includes(taskId)) {
             return null;
           }
@@ -1435,7 +1624,7 @@ function reconcileTaskNotifications(input, env) {
         if (!stamped || stamped.sessionId !== input.session_id || isTerminalWorkerStatus(stamped.transportStatus) || ![stamped.backgroundTaskId, stamped.agentId].includes(taskId)) {
           continue;
         }
-        updateWorkerRecord(record.taskId, env, (current) => {
+        updateLifecycleWorkerRecord(record.taskId, env, (current) => {
           if (!current || current.sessionId !== input.session_id || isTerminalWorkerStatus(current.transportStatus) || ![current.backgroundTaskId, current.agentId].includes(taskId)) {
             return null;
           }
@@ -1458,7 +1647,7 @@ function armInFlightRecords(records, tasks, env) {
   const armedAt = new Date().toISOString();
   const armed = [];
   for (const record of inFlight) {
-    const updated = updateWorkerRecord(record.taskId, env, (current) => {
+    const updated = updateLifecycleWorkerRecord(record.taskId, env, (current) => {
       if (!current || terminalTransportObserved(current, runtimeTaskForRecord(current, tasks))) {
         return null;
       }
@@ -1489,6 +1678,10 @@ function collectorResultCommand(record) {
   return ["codex", "grok"].includes(engine) && /^[a-f0-9]{32}$/.test(jobId ?? "") ? `/${engine}:result ${jobId}` : null;
 }
 
+function settlementCommand(records) {
+  return `/fusion:stats --record ${records.map((record) => `${record.taskId}=accepted|rejected|unverified`).join(" --record ")}`;
+}
+
 function collectorStopGate(input, env) {
   const finalMessage = typeof input.last_assistant_message === "string" ? input.last_assistant_message : "";
   const collectorFailures = unreportedCollectorFailures(input.session_id, env);
@@ -1499,13 +1692,13 @@ function collectorStopGate(input, env) {
     const acknowledged = finalMessage.includes(record.taskId) && (!jobId || finalMessage.includes(jobId)) && /\buncollected\b/i.test(finalMessage) && (!resultCommand || finalMessage.includes(resultCommand));
     if (acknowledged) {
       const reportedAt = new Date().toISOString();
-      updateWorkerRecord(record.taskId, env, (current) => ({
+      updateLifecycleWorkerRecord(record.taskId, env, (current) => ({
         ...current,
         failureReportedAt: reportedAt,
         ...(current.failureKind === "collection_protocol" ? { protocolReportedAt: reportedAt } : {})
       }));
     } else {
-      updateWorkerRecord(record.taskId, env, (current) => ({ ...current, failureStopBlockCount: (current.failureStopBlockCount ?? 0) + 1 }));
+      updateLifecycleWorkerRecord(record.taskId, env, (current) => ({ ...current, failureStopBlockCount: (current.failureStopBlockCount ?? 0) + 1 }));
       missingFailureReports.push(record);
     }
   }
@@ -1522,8 +1715,13 @@ function collectorStopGate(input, env) {
   }
   const unjudged = unjudgedPeerCollections(input.session_id, env);
   if (unjudged.length > 0) {
-    const instructions = unjudged.map((record) => ["codex", "grok"].includes(record.peerEngine) ? `/fusion:stats --record ${record.taskId}=accepted|rejected|unverified` : `a manual resolution because the collection for Fusion task ${record.taskId} needs manual resolution`);
-    writeOutput(blockStop(`Collected peer transport results still require an explicit semantic judgment before finishing: ${unjudged.map((record) => `${record.peerEngine}:${record.peerJobId} (task=${record.taskId}, transport=${record.peerTransportStatus}, semantic=${record.peerSemanticStatus ?? "unverified"})`).join(", ")}. After checking the requested completion criteria, record each judgment with ${instructions.join(" or ")}.`));
+    const settlementRecords = unjudged.filter((record) => ["codex", "grok"].includes(record.peerEngine));
+    const manualRecords = unjudged.filter((record) => !["codex", "grok"].includes(record.peerEngine));
+    const instructions = [
+      settlementRecords.length > 0 ? `record the judgments in one command: ${settlementCommand(settlementRecords)}` : null,
+      ...manualRecords.map((record) => `complete a manual resolution because the collection for Fusion task ${record.taskId} needs manual resolution`)
+    ].filter(Boolean);
+    writeOutput(blockStop(`Collected peer transport results still require an explicit semantic judgment before finishing: ${unjudged.map((record) => `${record.peerEngine}:${record.peerJobId} (task=${record.taskId}, transport=${record.peerTransportStatus}, semantic=${record.peerSemanticStatus ?? "unverified"})`).join(", ")}. After checking the requested completion criteria, ${instructions.join("; ")}.`));
     return true;
   }
   return false;
@@ -1538,9 +1736,8 @@ function writeAcceptanceAdvisory(records, env) {
   if (unverified.length === 0) {
     return;
   }
-  const commands = unverified.map((record) => `/fusion:stats --record ${record.taskId}=accepted|rejected|unverified`);
   const workers = unverified.map((record) => `${record.taskId} (${[record.agentType, record.description].filter((value) => typeof value === "string" && value.trim()).join(", ")})`);
-  writeOutput(hookOutput("Stop", `Acceptance remains unverified for ${unverified.length} collected Fusion worker${unverified.length === 1 ? "" : "s"}: ${workers.join("; ")}. Settle each row with exactly one command: ${commands.join("; ")}. pairs are <id>=<verdict> with id either a fusion task id (fusion- plus 24 lowercase hex) or an engine job id (32 lowercase hex), verdict one of accepted|rejected|unverified.`));
+  writeOutput(hookOutput("Stop", `Acceptance remains unverified for ${unverified.length} collected Fusion worker${unverified.length === 1 ? "" : "s"}: ${workers.join("; ")}. Settle the pending wave in one command: ${settlementCommand(unverified)}. pairs are <id>=<verdict> with id either a fusion task id (fusion- plus 24 lowercase hex) or an engine job id (32 lowercase hex), verdict one of accepted|rejected|unverified.`));
 }
 
 function terminalCollectionInstruction(record) {
@@ -1562,7 +1759,7 @@ function rereadPendingRecords(records, predicate, env) {
 
 function settleOnlyInstruction(record) {
   const identity = [record.agentType, record.description].filter((value) => typeof value === "string" && value.trim()).join(", ");
-  return `settle-only: ${record.taskId}: /fusion:stats --record ${record.taskId}=accepted|rejected|unverified${identity ? ` (${identity})` : ""}`;
+  return `settle-only: ${record.taskId}${identity ? ` (${identity})` : ""}`;
 }
 
 function writeCombinedStopPending(terminalUncollected, settleOnly, env) {
@@ -1573,7 +1770,8 @@ function writeCombinedStopPending(terminalUncollected, settleOnly, env) {
   }
   const lines = currentTerminalUncollected.map((record) => `${record.taskId}: ${terminalCollectionInstruction(record)}`)
     .concat(currentSettleOnly.map(settleOnlyInstruction));
-  const message = `Fusion worker completion is pending for ${lines.length} records:\n${lines.map((line) => `* ${line}`).join("\n")}\nTransport completion remains unverified until every result and its verification evidence are reviewed. Record accepted or rejected explicitly through /fusion:stats.`;
+  const settlementInstruction = currentSettleOnly.length > 0 ? ` Settle the pending wave in one command: ${settlementCommand(currentSettleOnly)}.` : "";
+  const message = `Fusion worker completion is pending for ${lines.length} records:\n${lines.map((line) => `* ${line}`).join("\n")}\nTransport completion remains unverified until every result and its verification evidence are reviewed. Record accepted or rejected explicitly through /fusion:stats.${settlementInstruction}`;
   writeOutput(currentTerminalUncollected.length > 0 ? blockStop(message) : hookOutput("Stop", message));
   return true;
 }
@@ -1591,26 +1789,35 @@ function writeTerminalCollectionPending(records, env) {
   return true;
 }
 
-function inFlightSignature(records) {
+function taskSetSignature(records) {
   return records.map((record) => record.taskId).sort().join(",");
 }
 
-function shouldWriteInFlightAdvisory(sessionId, signature, env) {
-  return readWorkerSessionState(sessionId, env)?.inFlightAdvisorySignature !== signature;
+function inFlightPendingState(record) {
+  return terminalCollectionPending(record) ? "awaiting-collection" : "in-flight";
 }
 
-function recordInFlightAdvisory(sessionId, signature, env) {
-  updateWorkerSessionState(sessionId, env, (current) => ({ ...(current ?? {}), inFlightAdvisorySignature: signature }));
+function inFlightAdvisorySignature(records) {
+  return records
+    .filter((record) => !terminalCollectedRecord(record))
+    .map((record) => `${record.taskId}:${inFlightPendingState(record)}`)
+    .sort()
+    .join(",");
 }
 
-function clearInFlightAdvisory(sessionId, env) {
+function claimStopAdvisory(sessionId, kind, signature, env) {
+  let claimed = false;
   updateWorkerSessionState(sessionId, env, (current) => {
-    if (!current || !("inFlightAdvisorySignature" in current)) {
+    if (current?.stopAdvisorySignatures?.[kind] === signature) {
       return null;
     }
-    const { inFlightAdvisorySignature, ...next } = current;
-    return next;
+    claimed = true;
+    return {
+      ...(current ?? {}),
+      stopAdvisorySignatures: { ...(current?.stopAdvisorySignatures ?? {}), [kind]: signature }
+    };
   });
+  return claimed;
 }
 
 function claimSettleOnlyAdvisory(sessionId, signature, env) {
@@ -1648,7 +1855,7 @@ function handleStop(input, env) {
     const task = runtimeTaskForRecord(record, tasks);
     const observedTerminal = terminalTransportObserved(record, task);
     const failure = observedTerminal ? null : workerBudgetFailure(record);
-    const updated = updateWorkerRecord(record.taskId, env, (current) => {
+    const updated = updateLifecycleWorkerRecord(record.taskId, env, (current) => {
       if (!current || isTerminalWorkerStatus(current.transportStatus)) {
         return null;
       }
@@ -1673,7 +1880,7 @@ function handleStop(input, env) {
     const now = new Date().toISOString();
     const missingRuntimeIds = cancellations.filter((record) => !record.backgroundTaskId && !record.agentId);
     for (const record of missingRuntimeIds) {
-      updateWorkerRecord(record.taskId, env, (current) => {
+      updateLifecycleWorkerRecord(record.taskId, env, (current) => {
         if (!current || isTerminalWorkerStatus(current.transportStatus)) {
           return null;
         }
@@ -1690,12 +1897,9 @@ function handleStop(input, env) {
   }
   const currentRecords = sessionRecords(input.session_id, env);
   const inFlight = armInFlightRecords(currentRecords, tasks, env);
-  if (inFlight.length === 0) {
-    clearInFlightAdvisory(input.session_id, env);
-  }
   const terminalUncollected = currentRecords.filter(terminalCollectionPending);
   const settleOnly = settleOnlyRecords(currentRecords);
-  const settleOnlySignature = settleOnly.length > 0 ? inFlightSignature(settleOnly) : null;
+  const settleOnlySignature = settleOnly.length > 0 ? taskSetSignature(settleOnly) : null;
   if (!settleOnlySignature) {
     clearSettleOnlyAdvisory(input.session_id, env);
   }
@@ -1722,10 +1926,9 @@ function handleStop(input, env) {
     return;
   }
   if (inFlight.length > 0) {
-    const signature = inFlightSignature(inFlight);
-    if (!input.stop_hook_active && shouldWriteInFlightAdvisory(input.session_id, signature, env)) {
+    const signature = inFlightAdvisorySignature(currentRecords);
+    if (!input.stop_hook_active && claimStopAdvisory(input.session_id, "in-flight", signature, env)) {
       writeOutput(hookOutput("Stop", `Fusion task${inFlight.length === 1 ? "" : "s"} ${inFlight.map((record) => record.taskId).join(", ")} ${inFlight.length === 1 ? "is" : "are"} still in flight. Collection is armed and will be required after terminal notification.`));
-      recordInFlightAdvisory(input.session_id, signature, env);
     }
     return;
   }
@@ -1734,7 +1937,7 @@ function handleStop(input, env) {
 function handleSessionEnd(input, env) {
   const now = new Date().toISOString();
   for (const record of activeSessionRecords(input.session_id, env)) {
-    updateWorkerRecord(record.taskId, env, (current) => {
+    updateLifecycleWorkerRecord(record.taskId, env, (current) => {
       if (!current || isTerminalWorkerStatus(current.transportStatus)) {
         return null;
       }

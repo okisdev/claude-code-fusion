@@ -1,0 +1,7 @@
+{
+  "notifier": {
+    "channel": "email",
+    "maxRetries": 5,
+    "muted": false
+  }
+}

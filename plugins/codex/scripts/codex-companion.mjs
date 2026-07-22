@@ -97,6 +97,7 @@ const TRANSPORT_MAX_AGE_MS = 60 * 60 * 1000;
 const RECORD_ACCEPTANCE_JOB_ID_PATTERN = /^[a-f0-9]{32}$/;
 const RECORD_ACCEPTANCE_VALUES = new Set(["accepted", "rejected", "unverified"]);
 const RECORD_ACCEPTANCE_SOURCES = new Set(["collector", "main-loop", "stats"]);
+const SOL_FOREGROUND_WRITE_WARNING = "warning: sol p90 wall clock exceeds the 600s foreground cap. Split the brief or name gpt-5.6-terra.";
 let activeCommandArgv = null;
 
 class CompanionError extends Error {
@@ -966,8 +967,48 @@ function currentProcessIdentity() {
   return identity;
 }
 
+function isSolForegroundWriteTask(record) {
+  return (
+    record.jobClass === "task" &&
+    record.delivery === "foreground" &&
+    record.mode === "write" &&
+    typeof record.resolvedModel === "string" &&
+    record.resolvedModel.toLowerCase().includes("sol")
+  );
+}
+
+function shellArgument(value) {
+  return `'${String(value).replaceAll("'", "'\\''")}'`;
+}
+
+function timeoutResumeCommand(record, threadId) {
+  return `${shellArgument(process.execPath)} ${shellArgument(SELF_PATH)} task --resume ${shellArgument(threadId)} --cwd ${shellArgument(record.cwd)}`;
+}
+
+function appendResumeFooter(text, footer) {
+  const value = typeof text === "string" ? text.trimEnd() : "";
+  return value.split("\n").includes(footer) ? value : value ? `${value}\n\n${footer}` : footer;
+}
+
+function timeoutResumePatch(record, patch) {
+  const failureKind = patch.failureKind ?? record.failureKind;
+  const threadId = patch.threadId ?? record.threadId ?? record.request?.resumeThreadId;
+  if (failureKind !== "timeout" || typeof threadId !== "string" || !threadId.trim()) {
+    return patch;
+  }
+  const resumeCommand = timeoutResumeCommand(record, threadId);
+  const footer = `Resume Codex job ${record.id}: ${resumeCommand}`;
+  const resultText = Object.hasOwn(patch, "resultText") ? patch.resultText : record.resultText;
+  const partialResultText = Object.hasOwn(patch, "partialResultText") ? patch.partialResultText : record.partialResultText;
+  if (typeof resultText === "string" && resultText.trim()) {
+    return { ...patch, resumable: true, resumeCommand, resultText: appendResumeFooter(resultText, footer) };
+  }
+  return { ...patch, resumable: true, resumeCommand, partialResultText: appendResumeFooter(partialResultText, footer) };
+}
+
 function finishJob(file, patch, env = process.env) {
-  const record = finishJobRecordFile(file, patch);
+  const existing = readJobRecordFile(file);
+  const record = finishJobRecordFile(file, existing ? timeoutResumePatch(existing, patch) : patch);
   pruneJobState(resolveDataDir(env), { claudeSessionId: record.claudeSessionId, protectedJobFiles: [file], resumeWorkspaceJobFiles: [file] });
   return record;
 }
@@ -1407,9 +1448,14 @@ async function executeRecord(found) {
     const structured = structuredOutputOutcome(record.request ?? {}, outcome);
     const resolvedModel = outcome.resolvedModel ?? record.resolvedModel;
     const modelDrift = taskModelDrift(record, prompt, resolvedModel);
+    const completedRecord = { ...record, resolvedModel };
+    const diagnostics = outcome.diagnostics.map((diagnostic) => ({ ...diagnostic, message: redactDiagnostic(diagnostic.message) }));
+    if (isSolForegroundWriteTask(completedRecord)) {
+      diagnostics.push({ type: "warning", message: SOL_FOREGROUND_WRITE_WARNING });
+    }
     return finishJob(found.file, {
       cumulativeTokenUsage: outcome.cumulativeTokenUsage,
-      diagnostics: outcome.diagnostics.map((diagnostic) => ({ ...diagnostic, message: redactDiagnostic(diagnostic.message) })),
+      diagnostics,
       errorMessage: outcome.errorMessage ? redactDiagnostic(outcome.errorMessage) : null,
       errorTail: outcome.status === "done" ? null : errorTail || outcome.errorMessage,
       eventsTruncated: outcome.eventsTruncated,
@@ -1626,6 +1672,9 @@ async function dispatchJob(found, asJson) {
     return;
   }
   const completed = await executeRecord(found);
+  if (isSolForegroundWriteTask(completed)) {
+    process.stderr.write(`${SOL_FOREGROUND_WRITE_WARNING}\n`);
+  }
   renderRecord(completed, asJson);
   collectRenderedJob(found.file, completed);
   if (completed.status !== "done") {

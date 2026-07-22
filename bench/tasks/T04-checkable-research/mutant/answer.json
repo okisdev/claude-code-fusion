@@ -1,0 +1,14 @@
+{
+  "queue_concurrency": {
+    "final_default": 6,
+    "changed_in_version": "3.0.0"
+  },
+  "retry_backoff_ms": {
+    "final_default": 1200,
+    "changed_in_version": "3.2.0"
+  },
+  "webhook_timeout_ms": {
+    "final_default": 5000,
+    "changed_in_version": "2.0.0"
+  }
+}

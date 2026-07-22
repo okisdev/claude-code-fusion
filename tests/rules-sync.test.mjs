@@ -233,6 +233,17 @@ test("Grok rules document source verified headless boundaries", () => {
   const subagentSentence = "Upstream parses `--no-subagents`, but the single-turn and agent resolvers do not forward it, while the interactive TUI does apply it; the hard Agent tool deny and `GROK_SUBAGENTS=0` are the effective headless controls.";
   const rustLogSentence = "Every run forces `RUST_LOG=xai_grok_agent::builder=debug,xai_grok_sandbox=warn`.";
   const bubblewrapSentence = "On Linux, a strict profile with deny paths re-executes under bubblewrap and refuses to start when `bwrap` is missing or unusable; macOS has no equivalent hard enforcement and relies on Seatbelt application plus best-effort tool denies.";
+  const freshSessionSentence = "A new goal after a heavy implementation goal prefers a fresh session because orchestrator cache reread cost is context size times turns; `FUSION_PARENT_CONTEXT_ADVISORY_BYTES` names the parent context advisory threshold.";
+  const volumeTierSentence = "Research digests, review triage, doc summaries, and mechanical checks default to gpt-5.6-luna at effort xhigh.";
+  const volumePeerOffloadSentence = "Independent bounded packages overflow to Grok under `burst` when the Codex slot is busy.";
+  const volumeRoutingDefectSentence = "Leaving the volume tiers idle while this work runs on premium lanes is a routing defect.";
+  const balanceCheckSentence = "Balance check: on a delegating project, peer lanes carry a meaningful share of implementation output. A session where Claude worker lanes absorb spec grade or quick scoped packages while Codex sits idle is a routing defect.";
+  const narrowWaveSentence = "Repeated width one dispatch turns on a goal with multiple independent packages are the signature of that defect, and the narrow wave watch in `/fusion:stats` surfaces it.";
+  const settlementSentence = "Settlement is batched per wave: collect and verify every result in a wave, then record all verdicts in one `/fusion:stats --record` call with multiple `<id>=<accepted|rejected|unverified>` pairs, where each id is the fusion task id or the engine job id.";
+  const perPackageSettlementSentence = "Per package settlement turns are reserved for waves of one.";
+  const settlementInvariantSentence = "One settlement validates every pair before writing and is idempotent to rerun after a partial transport failure; it writes the worker ledger and linked engine record for every recorded verdict.";
+  const settlementTransportSentence = "Strict record forms may pass as direct arguments, and anything carrying free text still uses the raw-args transport.";
+  const releaseCadenceSentence = "After each release, `/fusion:stats --prune-dead` runs as part of the release cadence.";
 
   for (const text of [rules, troubleshooting, runtime, contract, readme, security, doctor]) {
     assert.ok(text.includes(bridgeSentence), "Grok bridge isolation wording must stay synchronized");
@@ -318,7 +329,22 @@ test("Grok rules document source verified headless boundaries", () => {
   assert.match(rules, /sandbox still permits consult `read_file` to reach `~\/\.grok\/auth\.json`/i);
   assert.match(rules, /native MCP servers, plugins, or hooks/);
   assert.match(rules, /bridge variables disable compatibility imports, not native Grok configuration/);
-  assert.match(rules, /After collecting and verifying any delegated result, settle its verdict in one call with `\/fusion:stats --record <id>=<accepted\|rejected\|unverified>`, where the id is the fusion task id or the engine job id; one settle writes the worker ledger and the linked engine record together, strict record forms may pass as direct arguments, and anything carrying free text still uses the raw-args transport\. Record accepted only when the verification command or explicit acceptance criteria pass\./);
+  for (const sentence of [
+    freshSessionSentence,
+    volumeTierSentence,
+    volumePeerOffloadSentence,
+    volumeRoutingDefectSentence,
+    balanceCheckSentence,
+    narrowWaveSentence,
+    settlementSentence,
+    perPackageSettlementSentence,
+    settlementInvariantSentence,
+    settlementTransportSentence,
+    releaseCadenceSentence
+  ]) {
+    assert.ok(rules.includes(sentence), `Rules policy sentence must stay synchronized: ${sentence}`);
+  }
+  assert.match(rules, /Record accepted only when the verification command or explicit acceptance criteria pass\./);
   assert.match(rules, /literal state `uncollected`/);
   assert.match(rules, /one process pool per canonical cwd and sandbox profile/);
   assert.match(rules, /agent --no-leader stdio/);

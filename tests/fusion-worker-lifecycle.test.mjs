@@ -5,6 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import { test } from "node:test";
 
+import { fusionRepositoryKey } from "../plugins/fusion/scripts/fusion-stats.mjs";
 import { createWorkerRecord, readWorkerSessionState, readWorkerRecords, recordWorkerAcceptance, updateWorkerRecord, WORKER_COLLECTION_METHODS } from "../plugins/fusion/scripts/lib/worker-state.mjs";
 import { validateWorkerBrief, workerBudgetFailure, workerLimits } from "../plugins/fusion/scripts/worker-lifecycle.mjs";
 
@@ -364,22 +365,125 @@ test("environment overrides take precedence over brief sizing hints", (t) => {
 
 test("trivial worker limits raise token budgets and retain environment overrides", () => {
   assert.deepStrictEqual(workerLimits("fusion:trivial-worker", {}), {
-    wallClockMs: 180_000,
-    stallMs: 90_000,
-    maxTurns: 12,
-    maxOutputTokens: 16_000,
-    maxUncachedTokens: 80_000
+    wallClockMs: 240_000,
+    stallMs: 120_000,
+    maxTurns: 16,
+    maxOutputTokens: 24_000,
+    maxUncachedTokens: 120_000
   });
   assert.deepStrictEqual(workerLimits("fusion:trivial-worker", {
     FUSION_WORKER_MAX_OUTPUT_TOKENS: "17000",
     FUSION_WORKER_MAX_UNCACHED_TOKENS: "90000"
   }), {
-    wallClockMs: 180_000,
-    stallMs: 90_000,
-    maxTurns: 12,
+    wallClockMs: 240_000,
+    stallMs: 120_000,
+    maxTurns: 16,
     maxOutputTokens: 17_000,
     maxUncachedTokens: 90_000
   });
+});
+
+test("package-type envelopes validate, default, and persist their byte length", (t) => {
+  for (const packageType of ["implementation", "consult", "review", "research"]) {
+    const prompt = `${brief()}package-type: ${packageType}\n`;
+    const validation = validateWorkerBrief(prompt, "fusion:fast-worker");
+    assert.strictEqual(validation.ok, true);
+    assert.strictEqual(validation.packageType, packageType);
+    assert.strictEqual(validation.briefBytes, Buffer.byteLength(prompt));
+  }
+
+  assert.strictEqual(validateWorkerBrief(brief(), "fusion:fast-worker").packageType, "implementation");
+  assert.strictEqual(validateWorkerBrief("fusion-brief: v1\ncontext-mode: isolated\ngoal: inspect one file\nscope: src/a.ts\nacceptance: identify the behavior\n", "fusion:fast-worker").packageType, "consult");
+
+  const duplicate = validateWorkerBrief(`${brief()}package-type: review\npackage-type: research\n`, "fusion:fast-worker");
+  assert.strictEqual(duplicate.ok, false);
+  assert.match(duplicate.reason, /may appear once/);
+
+  const invalid = validateWorkerBrief(`${brief()}package-type: deployment\n`, "fusion:fast-worker");
+  assert.strictEqual(invalid.ok, false);
+  assert.match(invalid.reason, /implementation.*consult.*review.*research/);
+
+  const box = sandbox(t);
+  const prompt = `${brief()}package-type: review\n`;
+  const launched = run(box, dispatch(box, { prompt }));
+  assert.strictEqual(JSON.parse(launched.stdout).hookSpecificOutput.permissionDecision, "allow");
+  assert.strictEqual(record(box).packageType, "review");
+  assert.strictEqual(record(box).briefBytes, Buffer.byteLength(prompt));
+});
+
+test("verification manifest advisories identify missing suites and stay silent for complete verification", (t) => {
+  const incomplete = sandbox(t);
+  const prompt = "fusion-brief: v1\ncontext-mode: isolated\ngoal: update plugins/fusion/scripts/worker-lifecycle.mjs\nscope: plugins/fusion/scripts/worker-lifecycle.mjs\nverification: node --test tests/fusion-worker-lifecycle.test.mjs\n";
+  const launched = JSON.parse(run(incomplete, dispatch(incomplete, { prompt })).stdout).hookSpecificOutput;
+  assert.strictEqual(launched.permissionDecision, "allow");
+  assert.match(launched.additionalContext, /Verification advisory/);
+  assert.match(launched.additionalContext, /tests\/agent-budget-consistency\.test\.mjs/);
+  assert.match(launched.additionalContext, /tests\/codex-wrapper-contract\.test\.mjs/);
+  assert.strictEqual(launched.additionalContext.match(/Verification advisory/g).length, 1);
+
+  const complete = sandbox(t);
+  const completePrompt = `${prompt.trimEnd()} tests/agent-budget-consistency.test.mjs tests/codex-wrapper-contract.test.mjs\n`;
+  const completeLaunch = JSON.parse(run(complete, dispatch(complete, { prompt: completePrompt })).stdout).hookSpecificOutput;
+  assert.strictEqual(completeLaunch.permissionDecision, "allow");
+  assert.strictEqual(completeLaunch.additionalContext, undefined);
+});
+
+test("verification manifest failures are silent and the environment override supplies requirements", (t) => {
+  const missing = sandbox(t);
+  const prompt = "fusion-brief: v1\ncontext-mode: isolated\ngoal: update plugins/fusion/scripts/worker-lifecycle.mjs\nscope: plugins/fusion/scripts/worker-lifecycle.mjs\nverification: node --test\n";
+  const missingLaunch = JSON.parse(run(missing, dispatch(missing, { prompt }), { FUSION_VERIFICATION_MANIFEST: path.join(missing.root, "missing-manifest.json") }).stdout).hookSpecificOutput;
+  assert.strictEqual(missingLaunch.permissionDecision, "allow");
+  assert.strictEqual(missingLaunch.additionalContext, undefined);
+
+  const overridden = sandbox(t);
+  const manifest = path.join(overridden.root, "verification-manifest.json");
+  fs.writeFileSync(manifest, JSON.stringify([{ paths: ["src/custom.mjs"], suites: ["tests/custom.test.mjs"] }]));
+  const overridePrompt = "fusion-brief: v1\ncontext-mode: isolated\ngoal: update src/custom.mjs\nscope: src/custom.mjs\nverification: node --test\n";
+  const overrideLaunch = JSON.parse(run(overridden, dispatch(overridden, { prompt: overridePrompt }), { FUSION_VERIFICATION_MANIFEST: manifest }).stdout).hookSpecificOutput;
+  assert.strictEqual(overrideLaunch.permissionDecision, "allow");
+  assert.match(overrideLaunch.additionalContext, /tests\/custom\.test\.mjs/);
+});
+
+test("oversized briefs without sizing advise a large package and combine with verification coverage", (t) => {
+  const sizing = sandbox(t);
+  const oversizedPrompt = `${brief()}${"x".repeat(8_193)}\n`;
+  const sizingLaunch = JSON.parse(run(sizing, dispatch(sizing, { prompt: oversizedPrompt })).stdout).hookSpecificOutput;
+  assert.strictEqual(sizingLaunch.permissionDecision, "allow");
+  assert.match(sizingLaunch.additionalContext, /Sizing advisory/);
+  assert.match(sizingLaunch.additionalContext, /sizing: large/);
+  assert.match(sizingLaunch.additionalContext, /split the package/);
+
+  const combined = sandbox(t);
+  const combinedPrompt = `fusion-brief: v1\ncontext-mode: isolated\ngoal: update plugins/fusion/scripts/worker-lifecycle.mjs\nscope: plugins/fusion/scripts/worker-lifecycle.mjs\nverification: node --test tests/fusion-worker-lifecycle.test.mjs\n${"x".repeat(8_193)}\n`;
+  const combinedLaunch = JSON.parse(run(combined, dispatch(combined, { prompt: combinedPrompt })).stdout).hookSpecificOutput;
+  assert.strictEqual(combinedLaunch.permissionDecision, "allow");
+  assert.match(combinedLaunch.additionalContext, /Verification advisory/);
+  assert.match(combinedLaunch.additionalContext, /Sizing advisory/);
+  assert.strictEqual(combinedLaunch.additionalContext.match(/Verification advisory/g).length, 1);
+});
+
+test("parent context advisory is thresholded, disabled by zero, and emitted once per session", (t) => {
+  const box = sandbox(t);
+  fs.writeFileSync(box.transcript, "x".repeat(64), "utf8");
+
+  const atThreshold = run(box, dispatch(box), { FUSION_PARENT_CONTEXT_ADVISORY_BYTES: "64" });
+  assert.strictEqual(JSON.parse(atThreshold.stdout).hookSpecificOutput.additionalContext, undefined);
+  assert.strictEqual(readWorkerRecords(envFor(box))[0].parentTranscriptBytesAtDispatch, 64);
+
+  const overThreshold = run(box, { ...dispatch(box), tool_use_id: "tool-2" }, { FUSION_PARENT_CONTEXT_ADVISORY_BYTES: "63" });
+  const advisory = JSON.parse(overThreshold.stdout).hookSpecificOutput.additionalContext;
+  assert.match(advisory, /orchestrator transcript is large/);
+  assert.match(advisory, /Cache reread cost grows with context size times turns/);
+  assert.match(advisory, /fresh session for the next goal/);
+  assert.strictEqual(readWorkerSessionState("session-1", envFor(box)).parentContextAdvisorySent, true);
+
+  const repeated = run(box, { ...dispatch(box), tool_use_id: "tool-3" }, { FUSION_PARENT_CONTEXT_ADVISORY_BYTES: "63" });
+  assert.strictEqual(JSON.parse(repeated.stdout).hookSpecificOutput.additionalContext, undefined);
+
+  const disabled = sandbox(t);
+  fs.writeFileSync(disabled.transcript, "x".repeat(64), "utf8");
+  const zero = run(disabled, dispatch(disabled), { FUSION_PARENT_CONTEXT_ADVISORY_BYTES: "0" });
+  assert.strictEqual(JSON.parse(zero.stdout).hookSpecificOutput.additionalContext, undefined);
 });
 
 test("the dispatch guard requires a minimal isolated brief and explicit user background authorization", (t) => {
@@ -1300,6 +1404,54 @@ test("foreground structured usage is canonical and transport completion remains 
   assert.strictEqual(completed.toolCalls, 3);
 });
 
+test("terminal workers emit one repository-scoped token observation", (t) => {
+  const box = sandbox(t);
+  const workerDispatch = dispatch(box);
+  run(box, workerDispatch);
+  const completion = {
+    ...workerDispatch,
+    hook_event_name: "PostToolUse",
+    tool_response: {
+      status: "completed",
+      agentId: "observed-worker",
+      totalTokens: 116,
+      usage: { input_tokens: 10, cache_creation_input_tokens: 20, cache_read_input_tokens: 80, output_tokens: 6 }
+    }
+  };
+  run(box, completion);
+
+  const completed = record(box);
+  const repositoryKey = fusionRepositoryKey(box.cwd);
+  const sidecar = path.join(envFor(box).FUSION_DATA_DIR, "observations", repositoryKey, "token-usage.jsonl");
+  const observations = fs.readFileSync(sidecar, "utf8").trim().split("\n").map((line) => JSON.parse(line));
+  assert.strictEqual(observations.length, 1);
+  const [observation] = observations;
+  assert.deepStrictEqual({ ...observation, observedAt: "timestamp" }, {
+    schemaVersion: 1,
+    jobId: completed.taskId,
+    engine: "claude",
+    workspaceRoot: box.cwd,
+    repositoryKey,
+    availability: "available",
+    tokenUsage: {
+      inputTokens: 10,
+      cachedInputTokens: 80,
+      outputTokens: 6,
+      reasoningOutputTokens: null,
+      totalTokens: 116
+    },
+    reason: null,
+    threadId: null,
+    turnId: null,
+    source: "worker-record",
+    observedAt: "timestamp"
+  });
+  assert.ok(Number.isFinite(Date.parse(observation.observedAt)));
+
+  run(box, completion);
+  assert.strictEqual(fs.readFileSync(sidecar, "utf8").trim().split("\n").length, 1);
+});
+
 test("Stop advises on collected unverified workers without blocking and stays quiet after acceptance", (t) => {
   const box = sandbox(t);
   run(box, dispatch(box));
@@ -1449,6 +1601,102 @@ test("Stop in-flight advisory emits only when the in-flight set changes", (t) =>
     background_tasks: [{ id: "a3", type: "subagent", status: "running", agent_type: "fusion:fast-worker" }]
   });
   assert.match(JSON.parse(newWave.stdout).hookSpecificOutput.additionalContext, /Collection is armed/);
+});
+
+test("Stop re-emits after a terminal task leaves while terminal blocks remain exempt", (t) => {
+  const box = sandbox(t);
+  const firstDispatch = dispatch(box);
+  run(box, firstDispatch);
+  run(box, {
+    ...firstDispatch,
+    hook_event_name: "PostToolUse",
+    tool_response: { isAsync: true, status: "async_launched", agentId: "a1", resolvedModel: "claude-sonnet-5" }
+  });
+  const running = [{ id: "a1", type: "subagent", status: "running", agent_type: "fusion:fast-worker" }];
+  const first = run(box, {
+    hook_event_name: "Stop",
+    session_id: "session-1",
+    cwd: box.cwd,
+    transcript_path: box.transcript,
+    stop_hook_active: false,
+    background_tasks: running
+  });
+  assert.match(JSON.parse(first.stdout).hookSpecificOutput.additionalContext, /still in flight/);
+  let expectedSignature = readWorkerRecords(envFor(box)).map((worker) => `${worker.taskId}:in-flight`).sort().join(",");
+  assert.strictEqual(readWorkerSessionState("session-1", envFor(box)).stopAdvisorySignatures["in-flight"], expectedSignature);
+
+  const repeat = run(box, {
+    hook_event_name: "Stop",
+    session_id: "session-1",
+    cwd: box.cwd,
+    transcript_path: box.transcript,
+    stop_hook_active: false,
+    background_tasks: running
+  });
+  assert.strictEqual(repeat.stdout, "");
+
+  const secondDispatch = { ...dispatch(box, { description: "fix b" }), tool_use_id: "tool-2" };
+  run(box, secondDispatch);
+  run(box, {
+    ...secondDispatch,
+    hook_event_name: "PostToolUse",
+    tool_response: { isAsync: true, status: "async_launched", agentId: "a2", resolvedModel: "claude-sonnet-5" }
+  });
+  running.push({ id: "a2", type: "subagent", status: "running", agent_type: "fusion:fast-worker" });
+  const grown = run(box, {
+    hook_event_name: "Stop",
+    session_id: "session-1",
+    cwd: box.cwd,
+    transcript_path: box.transcript,
+    stop_hook_active: false,
+    background_tasks: running
+  });
+  assert.match(JSON.parse(grown.stdout).hookSpecificOutput.additionalContext, /still in flight/);
+  expectedSignature = readWorkerRecords(envFor(box)).map((worker) => `${worker.taskId}:in-flight`).sort().join(",");
+  assert.strictEqual(readWorkerSessionState("session-1", envFor(box)).stopAdvisorySignatures["in-flight"], expectedSignature);
+
+  const withTerminal = [{ ...running[0], status: "completed" }, running[1]];
+  const terminal = run(box, {
+    hook_event_name: "Stop",
+    session_id: "session-1",
+    cwd: box.cwd,
+    transcript_path: box.transcript,
+    stop_hook_active: false,
+    background_tasks: withTerminal
+  });
+  assert.strictEqual(JSON.parse(terminal.stdout).decision, "block");
+  assert.strictEqual(readWorkerSessionState("session-1", envFor(box)).stopAdvisorySignatures["in-flight"], expectedSignature);
+
+  const terminalRepeat = run(box, {
+    hook_event_name: "Stop",
+    session_id: "session-1",
+    cwd: box.cwd,
+    transcript_path: box.transcript,
+    stop_hook_active: false,
+    background_tasks: withTerminal
+  });
+  assert.strictEqual(JSON.parse(terminalRepeat.stdout).decision, "block");
+
+  const firstWorker = readWorkerRecords(envFor(box)).find((worker) => worker.agentId === "a1");
+  updateWorkerRecord(firstWorker.taskId, envFor(box), (current) => ({
+    ...current,
+    transportStatus: "done",
+    collectedAt: new Date().toISOString(),
+    awaitingCollection: false,
+    awaitingCollectionArmedAt: null,
+    awaitingVerdict: true,
+    awaitingVerdictArmedAt: new Date().toISOString()
+  }));
+  recordWorkerAcceptance({ taskId: firstWorker.taskId, acceptance: "accepted", env: envFor(box), source: "main-loop" });
+  const afterTerminal = run(box, {
+    hook_event_name: "Stop",
+    session_id: "session-1",
+    cwd: box.cwd,
+    transcript_path: box.transcript,
+    stop_hook_active: false,
+    background_tasks: [running[1]]
+  });
+  assert.match(JSON.parse(afterTerminal.stdout).hookSpecificOutput.additionalContext, /still in flight/);
 });
 
 test("a successfully terminal async worker without a final-text artifact demands TaskOutput", (t) => {
@@ -3537,7 +3785,8 @@ test("Stop combines multi-record collection and settlement instructions", (t) =>
   assert.strictEqual(decision.decision, "block");
   assert.match(decision.reason, new RegExp(`Call Read with file_path=${outputFile.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`));
   assert.doesNotMatch(decision.reason, /no offset or limit/);
-  assert.match(decision.reason, new RegExp(`settle-only: ${settling.taskId}: /fusion:stats --record ${settling.taskId}=accepted\\|rejected\\|unverified`));
+  assert.match(decision.reason, new RegExp(`settle-only: ${settling.taskId}`));
+  assert.match(decision.reason, new RegExp(`/fusion:stats --record ${settling.taskId}=accepted\\|rejected\\|unverified`));
 });
 
 test("Stop emits a settle-only advisory once for an unchanged pending set", (t) => {
@@ -3546,8 +3795,11 @@ test("Stop emits a settle-only advisory once for an unchanged pending set", (t) 
   const second = createSettleOnlyRecord(box, `fusion-${"2".repeat(24)}`);
 
   const emitted = stop(box);
-  assert.match(emitted.stdout, new RegExp(`settle-only: ${first.taskId}`));
-  assert.match(emitted.stdout, new RegExp(`settle-only: ${second.taskId}`));
+  const advisory = JSON.parse(emitted.stdout).hookSpecificOutput.additionalContext;
+  assert.match(advisory, new RegExp(`settle-only: ${first.taskId}`));
+  assert.match(advisory, new RegExp(`settle-only: ${second.taskId}`));
+  assert.strictEqual((advisory.match(/\/fusion:stats --record/g) ?? []).length, 1);
+  assert.match(advisory, new RegExp(`/fusion:stats --record ${first.taskId}=accepted\\|rejected\\|unverified --record ${second.taskId}=accepted\\|rejected\\|unverified`));
   assert.strictEqual(readWorkerSessionState("session-1", envFor(box)).settleOnlyAdvisorySignature, [first.taskId, second.taskId].sort().join(","));
 
   const repeated = stop(box);

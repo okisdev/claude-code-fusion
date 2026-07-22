@@ -774,9 +774,6 @@ function installExitHandlers(timer) {
 
 async function main() {
   const repair = await loadCompanionRepair();
-  if (!repair) {
-    safeWriteLine(REPAIR_UNAVAILABLE_LINE);
-  }
   const root = resolveStateRoot();
   const cwd = process.cwd();
   const workspaceRoot = resolveWorkspaceRoot(cwd);
@@ -788,6 +785,7 @@ async function main() {
   const rolloutIndex = { files: [], scannedAt: 0 };
   const repositoryCache = new Map();
   const auditStates = new Map();
+  let announceOnlyPending = !repair;
   let startupPending = true;
 
   pruneOldStateFiles(root, stateFile);
@@ -797,6 +795,10 @@ async function main() {
       return;
     }
     const records = snapshot.records;
+    if (announceOnlyPending && records.length > 0) {
+      safeWriteLine(REPAIR_UNAVAILABLE_LINE);
+      announceOnlyPending = false;
+    }
     const liveIds = new Set(snapshot.recordIds);
     const terminalJobIds = new Set(records.filter(({ record }) => record?.id && TERMINAL_STATUSES.has(record.status)).map(({ record }) => record.id));
     let dirty = false;

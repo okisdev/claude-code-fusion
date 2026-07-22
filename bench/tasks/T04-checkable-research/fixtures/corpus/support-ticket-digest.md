@@ -1,0 +1,3 @@
+# Emberflow support ticket digest, week of 2025-03-17
+
+A recurring theme this week: several tickets asked why retries seemed to take longer after upgrading to v3.2.0, which released three days before this digest. Support confirmed this is expected: v3.2.0 raised the default retry.backoff_ms from 1000 to 1200 milliseconds. One ticket also asked about worker thread counts; support noted that queue.concurrency has defaulted to 6 since v3.0.0 and confirmed the reporting customer had not overridden it in their own emberflow.yml. Both figures were correct for the release running at the time of this digest; teams reading it on a later release should confirm current defaults against the changelog, since both values have changed again since this digest was written.
