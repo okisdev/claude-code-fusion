@@ -2218,6 +2218,174 @@ test("an acceptance brief uses the analysis completion contract", (t) => {
   assert.strictEqual(record(box).transportStatus, "done");
 });
 
+test("peer transport dispatches record the transport completion contract", (t) => {
+  for (const agentType of ["codex:codex-rescue", "grok:grok-rescue"]) {
+    const box = sandbox(t);
+    const peerDispatch = dispatch(box, { subagent_type: agentType, prompt: "bounded peer brief" });
+    run(box, peerDispatch);
+    run(box, {
+      ...peerDispatch,
+      hook_event_name: "PostToolUse",
+      tool_response: { isAsync: true, status: "async_launched", agentId: "transport-contract-" + agentType }
+    });
+    assert.strictEqual(record(box).completionContract, "transport");
+  }
+});
+
+test("a codex peer relay footer completes without a retry and backfills its job id", (t) => {
+  const box = sandbox(t);
+  const peerJobId = "a".repeat(32);
+  const peerDispatch = dispatch(box, { subagent_type: "codex:codex-rescue", prompt: "bounded peer brief" });
+  run(box, peerDispatch);
+  run(box, {
+    ...peerDispatch,
+    hook_event_name: "PostToolUse",
+    tool_response: { isAsync: true, status: "async_launched", agentId: "codex-transport-relay" }
+  });
+
+  const stopped = run(box, {
+    hook_event_name: "SubagentStop",
+    session_id: "session-1",
+    cwd: box.cwd,
+    transcript_path: box.transcript,
+    agent_id: "codex-transport-relay",
+    agent_type: "codex:codex-rescue",
+    stop_hook_active: false,
+    last_assistant_message: ["```text", "companion result prose", "job: " + peerJobId, "delivery: foreground", "semantic: unverified", "state: done", "```", "relay commentary after the envelope"].join("\n")
+  });
+
+  assert.strictEqual(stopped.stdout, "");
+  const completed = record(box);
+  assert.strictEqual(completed.retryCount, 0);
+  assert.strictEqual(completed.failureKind, null);
+  assert.strictEqual(completed.peerJobId, peerJobId);
+  assert.strictEqual(completed.transportStatus, "ready_uncollected");
+});
+
+test("a grok peer relay footer completes without a retry and captures its job id", (t) => {
+  const box = sandbox(t);
+  const peerJobId = "b".repeat(32);
+  const peerDispatch = dispatch(box, { subagent_type: "grok:grok-rescue", prompt: "bounded peer brief" });
+  run(box, peerDispatch);
+  run(box, {
+    ...peerDispatch,
+    hook_event_name: "PostToolUse",
+    tool_response: { isAsync: true, status: "async_launched", agentId: "grok-transport-relay" }
+  });
+
+  const stopped = run(box, {
+    hook_event_name: "SubagentStop",
+    session_id: "session-1",
+    cwd: box.cwd,
+    transcript_path: box.transcript,
+    agent_id: "grok-transport-relay",
+    agent_type: "grok:grok-rescue",
+    stop_hook_active: false,
+    last_assistant_message: ["companion result prose", "grok-session: grok-session-123", "job: " + peerJobId, "state: done"].join("\n")
+  });
+
+  assert.strictEqual(stopped.stdout, "");
+  const completed = record(box);
+  assert.strictEqual(completed.retryCount, 0);
+  assert.strictEqual(completed.failureKind, null);
+  assert.strictEqual(completed.peerJobId, peerJobId);
+  assert.strictEqual(completed.transportStatus, "ready_uncollected");
+});
+
+test("an incomplete peer relay receives one transport retry before terminal delivery failure", (t) => {
+  const box = sandbox(t);
+  const peerDispatch = dispatch(box, { subagent_type: "codex:codex-rescue", prompt: "bounded peer brief" });
+  run(box, peerDispatch);
+  run(box, {
+    ...peerDispatch,
+    hook_event_name: "PostToolUse",
+    tool_response: { isAsync: true, status: "async_launched", agentId: "codex-incomplete-relay" }
+  });
+  const stopPayload = {
+    hook_event_name: "SubagentStop",
+    session_id: "session-1",
+    cwd: box.cwd,
+    transcript_path: box.transcript,
+    agent_id: "codex-incomplete-relay",
+    agent_type: "codex:codex-rescue",
+    stop_hook_active: false,
+    last_assistant_message: "companion result prose\nstate: done"
+  };
+
+  const retried = run(box, stopPayload);
+  assert.strictEqual(retried.stdout.trim().split("\n").length, 1);
+  const retryOutput = JSON.parse(retried.stdout);
+  assert.strictEqual(retryOutput.decision, "block");
+  assert.strictEqual(retryOutput.reason, "The transport relay is incomplete. Return the companion output verbatim, including its `job:` and `state:` footer lines. This is the only retry.");
+  assert.strictEqual(record(box).retryCount, 1);
+
+  const exhausted = run(box, stopPayload);
+  assert.strictEqual(exhausted.stdout, "");
+  const incomplete = record(box);
+  assert.strictEqual(incomplete.transportStatus, "incomplete");
+  assert.strictEqual(incomplete.failureKind, "delivery");
+  assert.strictEqual(incomplete.retryCount, 1);
+});
+
+test("a stale verification contract still accepts a codex peer relay footer", (t) => {
+  const box = sandbox(t);
+  const peerJobId = "c".repeat(32);
+  const peerDispatch = dispatch(box, { subagent_type: "codex:codex-rescue", prompt: "bounded peer brief" });
+  run(box, peerDispatch);
+  run(box, {
+    ...peerDispatch,
+    hook_event_name: "PostToolUse",
+    tool_response: { isAsync: true, status: "async_launched", agentId: "codex-stale-contract" }
+  });
+  updateWorkerRecord(record(box).taskId, envFor(box), (current) => ({ ...current, completionContract: "verification" }));
+
+  const stopped = run(box, {
+    hook_event_name: "SubagentStop",
+    session_id: "session-1",
+    cwd: box.cwd,
+    transcript_path: box.transcript,
+    agent_id: "codex-stale-contract",
+    agent_type: "codex:codex-rescue",
+    stop_hook_active: false,
+    last_assistant_message: ["companion result prose", "job: " + peerJobId, "state: done"].join("\n")
+  });
+
+  assert.strictEqual(stopped.stdout, "");
+  const completed = record(box);
+  assert.strictEqual(completed.completionContract, "verification");
+  assert.strictEqual(completed.retryCount, 0);
+  assert.strictEqual(completed.peerJobId, peerJobId);
+  assert.strictEqual(completed.transportStatus, "ready_uncollected");
+});
+
+test("a grok review runner raw JSON result completes without a transport retry", (t) => {
+  const box = sandbox(t);
+  const worker = createWorkerRecord({
+    taskId: "fusion-" + "d".repeat(24),
+    sessionId: "session-1",
+    agentType: "grok:grok-review-runner",
+    workspaceRoot: box.cwd
+  }, envFor(box));
+  updateWorkerRecord(worker.taskId, envFor(box), (current) => ({ ...current, agentId: "grok-review-json", transportStatus: "running" }));
+
+  const stopped = run(box, {
+    hook_event_name: "SubagentStop",
+    session_id: "session-1",
+    cwd: box.cwd,
+    transcript_path: box.transcript,
+    agent_id: "grok-review-json",
+    agent_type: "grok:grok-review-runner",
+    stop_hook_active: false,
+    last_assistant_message: "{\"review\":\"accepted\",\"findings\":[]}"
+  });
+
+  assert.strictEqual(stopped.stdout, "");
+  const completed = record(box);
+  assert.strictEqual(completed.retryCount, 0);
+  assert.strictEqual(completed.failureKind, null);
+  assert.strictEqual(completed.transportStatus, "done");
+});
+
 test("job collector completion requires a terminal marker and fails closed on the legacy unstructured marker", (t) => {
   const box = sandbox(t);
   const peerJobId = "a".repeat(32);
