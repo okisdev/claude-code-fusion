@@ -4,6 +4,9 @@ function footer(record) {
     lines.push(`codex-session: ${record.threadId}`);
   }
   lines.push(`job: ${record.id}`, `delivery: ${record.delivery ?? (record.background ? "manual" : "foreground")}`, `semantic: ${record.semanticStatus ?? "unverified"}`);
+  if (record.request?.outputSchemaFile) {
+    lines.push(`structured: ${record.structuredOutputError ? "invalid" : Object.hasOwn(record, "structuredOutput") ? "parsed" : "unavailable"}`);
+  }
   lines.push(`state: ${record.status}`);
   if (record.status === "error" || record.status === "cancelled") {
     lines.push(`failure: ${record.failureKind ?? (record.status === "cancelled" ? "cancelled" : "error")}`);

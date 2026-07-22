@@ -211,6 +211,9 @@ export function buildReviewArgs(options = {}) {
   if (options.write === true || options.mode === "write" || options.sandboxMode === "workspace-write" || options.sandboxMode === "danger-full-access") {
     throw new TypeError("Codex native review must use the read-only sandbox.");
   }
+  if (options.outputSchemaFile != null) {
+    throw new TypeError("Codex review ignores --output-schema on tested CLI versions.");
+  }
   const args = baseExecArgs("read-only", options);
   args.push("review");
   const targets = [options.uncommitted === true, options.base != null, options.commit != null].filter(Boolean).length;

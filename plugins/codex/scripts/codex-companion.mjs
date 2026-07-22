@@ -63,6 +63,7 @@ import {
 const SELF_PATH = fileURLToPath(import.meta.url);
 const ROOT_DIR = path.resolve(path.dirname(SELF_PATH), "..");
 const ADVERSARIAL_REVIEW_PROMPT_FILE = path.join(ROOT_DIR, "prompts", "adversarial-review.md");
+const ADVERSARIAL_REVIEW_SCHEMA_FILE = path.join(ROOT_DIR, "schemas", "adversarial-review-verdict.schema.json");
 const FOREGROUND_TIMEOUT_ENV = "CODEX_COMPANION_TIMEOUT_MS";
 const BACKGROUND_TIMEOUT_ENV = "CODEX_COMPANION_BACKGROUND_TIMEOUT_MS";
 const BACKGROUND_DELIVERY_ENV = "CODEX_COMPANION_BACKGROUND_DELIVERY";
@@ -78,14 +79,15 @@ const DEFAULT_WAIT_TIMEOUT_MS = 570000;
 const MAX_WAIT_TIMEOUT_MS = 570000;
 const MAX_PROMPT_BYTES = 4 * 1024 * 1024;
 const MAX_RAW_ARGUMENT_BYTES = MAX_PROMPT_BYTES + 64 * 1024;
+const MAX_OUTPUT_SCHEMA_BYTES = 256 * 1024;
 const HEARTBEAT_INTERVAL_MS = 5000;
 const BACKGROUND_LAUNCH_APPROVAL_TIMEOUT_MS = 10000;
 const BACKGROUND_LAUNCH_POLL_MS = 20;
 const BACKGROUND_ABORT_CLAIM_WAIT_MS = 2000;
 const BACKGROUND_ABORT_CLEANUP_CONFIRM_MS = 1000;
 const BACKGROUND_ABORT_CLEANUP_POLL_MS = 50;
-const TESTED_VERSION_MIN = [0, 144, 0];
-const TESTED_VERSION_MAX = [0, 145, 0];
+const TESTED_VERSION_MIN = [0, 145, 0];
+const TESTED_VERSION_MAX = [0, 146, 0];
 const CONTINUE_PROMPT = "Continue from the current Codex thread state. Complete the next highest value step and continue until the task is resolved.";
 const TRANSPORT_DIRECTORY_PREFIX = "codex-companion-input-";
 const TRANSPORT_TOKEN_PATTERN = /^[a-f0-9]{48}$/;
@@ -95,10 +97,6 @@ const TRANSPORT_MAX_AGE_MS = 60 * 60 * 1000;
 const RECORD_ACCEPTANCE_JOB_ID_PATTERN = /^[a-f0-9]{32}$/;
 const RECORD_ACCEPTANCE_VALUES = new Set(["accepted", "rejected", "unverified"]);
 const RECORD_ACCEPTANCE_SOURCES = new Set(["collector", "main-loop", "stats"]);
-const MODELS_CACHE_SCHEMA_DRIFT_NEXT_STEP = "Codex CLI cannot parse the current models cache (schema drift). Upgrade the Codex CLI, then run /codex:setup again.";
-const SETUP_LOG_PROBE_BYTES = 64 * 1024;
-const SETUP_LOG_PROBE_LIMIT = 5;
-
 let activeCommandArgv = null;
 
 class CompanionError extends Error {
@@ -112,7 +110,7 @@ function printUsage() {
   process.stdout.write(
     [
       "Usage:",
-      "  node scripts/codex-companion.mjs task [--prompt-file <path>] [--write] [--background] [--resume <thread-id>] [--resume-last] [--fresh] [--model <id>] [--effort <level>] [--service-tier <id|none>] [--web] [--network] [--skip-git-repo-check] [--cwd <dir>] [--json] [--] [prompt]",
+      "  node scripts/codex-companion.mjs task [--prompt-file <path>] [--output-schema <path>] [--write] [--background] [--resume <thread-id>] [--resume-last] [--fresh] [--model <id>] [--effort <level>] [--service-tier <id|none>] [--web] [--network] [--skip-git-repo-check] [--cwd <dir>] [--json] [--] [prompt]",
       "  node scripts/codex-companion.mjs review [--base <ref>] [--scope <auto|working-tree|branch>] [--focus <text>] [--background] [--model <id>] [--effort <level>] [--service-tier <id|none>] [--cwd <dir>] [--json]",
       "  node scripts/codex-companion.mjs adversarial-review [--base <ref>] [--scope <auto|working-tree|branch>] [--focus <text>] [--background] [--model <id>] [--effort <level>] [--cwd <dir>] [--json]",
       "  node scripts/codex-companion.mjs status [job-id] [--all] [--cwd <dir>] [--json]",
@@ -213,6 +211,43 @@ function resolveCwd(options = {}) {
   } catch {
     return cwd;
   }
+}
+
+function resolveOutputSchemaFile(cwd, value) {
+  if (typeof value !== "string" || !value.trim()) {
+    throw new CompanionError("--output-schema requires a non-empty path.", "input");
+  }
+  const file = path.resolve(cwd, value);
+  let stats;
+  try {
+    stats = fs.statSync(file);
+  } catch (error) {
+    if (error?.code === "ENOENT") {
+      throw new CompanionError(`Output schema file does not exist: ${file}.`, "input");
+    }
+    throw new CompanionError(`Could not read output schema file ${file}: ${error.message}`, "input");
+  }
+  if (!stats.isFile()) {
+    throw new CompanionError(`Output schema path is not a regular file: ${file}.`, "input");
+  }
+  if (stats.size > MAX_OUTPUT_SCHEMA_BYTES) {
+    throw new CompanionError(`Output schema file exceeds the ${MAX_OUTPUT_SCHEMA_BYTES / 1024} KiB limit: ${file}.`, "input");
+  }
+  let source;
+  try {
+    source = fs.readFileSync(file);
+  } catch (error) {
+    throw new CompanionError(`Could not read output schema file ${file}: ${error.message}`, "input");
+  }
+  if (source.byteLength > MAX_OUTPUT_SCHEMA_BYTES) {
+    throw new CompanionError(`Output schema file exceeds the ${MAX_OUTPUT_SCHEMA_BYTES / 1024} KiB limit: ${file}.`, "input");
+  }
+  try {
+    JSON.parse(source.toString("utf8"));
+  } catch {
+    throw new CompanionError(`Output schema file must contain valid JSON: ${file}.`, "input");
+  }
+  return file;
 }
 
 function nonnegativeInteger(value, label) {
@@ -745,7 +780,7 @@ function preflightCodex(cwd) {
   }
   const version = parseVersion(probe.version);
   if (version && compareVersion(version, TESTED_VERSION_MIN) < 0) {
-    throw new CompanionError(`Codex CLI version ${probe.version} is unsupported. Upgrade the Codex CLI to version 0.144.0 or later.`, "setup");
+    throw new CompanionError(`Codex CLI version ${probe.version} is unsupported. Upgrade the Codex CLI to version 0.145.0 or later.`, "setup");
   }
   return probe;
 }
@@ -765,59 +800,13 @@ function compareVersion(left, right) {
   return 0;
 }
 
+function testedVersionInterval() {
+  return `${TESTED_VERSION_MIN.join(".")} to before ${TESTED_VERSION_MAX.join(".")}`;
+}
+
 function supportedVersion(value) {
   const parsed = parseVersion(value);
   return Boolean(parsed) && compareVersion(parsed, TESTED_VERSION_MIN) >= 0 && compareVersion(parsed, TESTED_VERSION_MAX) < 0;
-}
-
-function setupLogTailContainsSchemaDrift(file) {
-  let descriptor;
-  try {
-    const stat = fs.statSync(file);
-    if (!stat.isFile()) {
-      return false;
-    }
-    const bytes = Math.min(stat.size, SETUP_LOG_PROBE_BYTES);
-    if (bytes === 0) {
-      return false;
-    }
-    const buffer = Buffer.alloc(bytes);
-    descriptor = fs.openSync(file, "r");
-    const read = fs.readSync(descriptor, buffer, 0, bytes, stat.size - bytes);
-    const tail = buffer.subarray(0, read).toString("utf8");
-    return tail.includes("failed to renew cache TTL") || (tail.includes("missing field `") && tail.includes("codex_models_manager"));
-  } catch {
-    return false;
-  } finally {
-    if (descriptor !== undefined) {
-      try {
-        fs.closeSync(descriptor);
-      } catch {}
-    }
-  }
-}
-
-function hasRecentModelsCacheSchemaDrift(dataDir, cwd) {
-  let entries;
-  try {
-    entries = fs.readdirSync(jobsDir(dataDir, cwd), { withFileTypes: true });
-  } catch {
-    return false;
-  }
-  const recentLogs = entries
-    .filter((entry) => entry.isFile() && entry.name.endsWith(".log"))
-    .map((entry) => {
-      const file = path.join(jobsDir(dataDir, cwd), entry.name);
-      try {
-        return { file, modifiedAt: fs.statSync(file).mtimeMs };
-      } catch {
-        return null;
-      }
-    })
-    .filter(Boolean)
-    .sort((left, right) => right.modifiedAt - left.modifiedAt || left.file.localeCompare(right.file))
-    .slice(0, SETUP_LOG_PROBE_LIMIT);
-  return recentLogs.some(({ file }) => setupLogTailContainsSchemaDrift(file));
 }
 
 function findRequestedJob(dataDir, jobId, options) {
@@ -1250,6 +1239,7 @@ function executionArgs(record) {
   }
   return buildTaskArgs({
     ...common,
+    outputSchemaFile: request.outputSchemaFile ?? undefined,
     resumeThreadId: request.resumeThreadId ?? undefined,
     write: request.write === true
   });
@@ -1285,6 +1275,20 @@ function semanticOutcome(outcome) {
     };
   }
   return { semanticFailureKind: null, semanticFailureMessage: null, semanticStatus: "unverified" };
+}
+
+function structuredOutputOutcome(request, outcome) {
+  if (!request.outputSchemaFile || outcome.resultSource !== "agent_message" || typeof outcome.finalResponse !== "string") {
+    return {};
+  }
+  try {
+    return { structuredOutput: JSON.parse(outcome.finalResponse), structuredOutputError: null };
+  } catch (error) {
+    return {
+      structuredOutput: null,
+      structuredOutputError: `Codex final response is not valid JSON: ${oneLine(error.message, "JSON parsing failed.")}`
+    };
+  }
 }
 
 function finishExecutionFailure(file, record, error, env = process.env) {
@@ -1400,6 +1404,7 @@ async function executeRecord(found) {
     }
     const errorTail = redactDiagnostic(readLogTail(record.logFile, 20) || boundedTail(outcome.stderrTail));
     const semantic = semanticOutcome(outcome);
+    const structured = structuredOutputOutcome(record.request ?? {}, outcome);
     const resolvedModel = outcome.resolvedModel ?? record.resolvedModel;
     const modelDrift = taskModelDrift(record, prompt, resolvedModel);
     return finishJob(found.file, {
@@ -1429,6 +1434,7 @@ async function executeRecord(found) {
       semanticFailureMessage: semantic.semanticFailureMessage,
       semanticStatus: semantic.semanticStatus,
       status: outcome.status,
+      ...structured,
       threadId: outcome.threadId,
       tokenUsage: outcome.tokenUsage,
       tokenUsageAvailability: outcome.tokenUsageAvailability,
@@ -1631,7 +1637,7 @@ async function handleTask(rawArgv, transport = {}) {
   const { options, positionals, positionalText } = commandArgs(rawArgv, {
     booleanOptions: ["background", "fresh", "json", "network", "resume-last", "skip-git-repo-check", "web", "write"],
     optionsBeforePositionals: true,
-    valueOptions: ["cwd", "effort", "model", "prompt-file", "resume", "service-tier"]
+    valueOptions: ["cwd", "effort", "model", "output-schema", "prompt-file", "resume", "service-tier"]
   });
   const serviceTier = serviceTierOption(options["service-tier"]);
   const cwd = resolveCwd(options);
@@ -1639,6 +1645,7 @@ async function handleTask(rawArgv, transport = {}) {
   const resume = resolveResume(dataDir, cwd, options);
   const routing = resume.threadId ? inheritedRouting(latestJobRecordForThread(dataDir, resume.threadId), options, serviceTier) : inheritedRouting(null, options, serviceTier);
   const write = options.write ?? Boolean(transport.defaultWrite);
+  const outputSchemaFile = options["output-schema"] ? resolveOutputSchemaFile(cwd, options["output-schema"]) : null;
   let prompt = readTaskPrompt(cwd, options, positionals, positionalText);
   if (!prompt.trim() && resume.threadId) {
     prompt = CONTINUE_PROMPT;
@@ -1656,6 +1663,7 @@ async function handleTask(rawArgv, transport = {}) {
     ingress: transport.ingress ?? "argv",
     model: routing.model,
     network: Boolean(options.network),
+    outputSchemaFile,
     resumeSourceJobId: resume.sourceJobId,
     resumeThreadId: resume.threadId,
     skipGitRepoCheck: Boolean(options["skip-git-repo-check"]),
@@ -1720,8 +1728,11 @@ function adversarialReviewPrompt(target, focus) {
 async function handleReview(rawArgv, adversarial = false, transport = {}) {
   const { options, positionals, positionalText } = commandArgs(rawArgv, {
     booleanOptions: ["background", "json"],
-    valueOptions: ["base", "cwd", "effort", "focus", "model", "scope", "service-tier"]
+    valueOptions: ["base", "cwd", "effort", "focus", "model", "output-schema", "scope", "service-tier"]
   });
+  if (options["output-schema"] != null) {
+    throw new CompanionError("Codex review ignores --output-schema on tested CLI versions.", "input");
+  }
   if (positionals.length > 0 && !options.focus) {
     throw new CompanionError("Review accepts flags only. Pass custom review instructions with --focus.", "input");
   }
@@ -1737,6 +1748,7 @@ async function handleReview(rawArgv, adversarial = false, transport = {}) {
     : focus
       ? focusedReviewPrompt(target, focus)
       : "";
+  const outputSchemaFile = adversarial ? resolveOutputSchemaFile(cwd, ADVERSARIAL_REVIEW_SCHEMA_FILE) : null;
   const request = {
     base: target.base,
     effort: options.effort ?? null,
@@ -1744,6 +1756,7 @@ async function handleReview(rawArgv, adversarial = false, transport = {}) {
     ingress: transport.ingress ?? "argv",
     model: options.model ?? null,
     network: false,
+    outputSchemaFile,
     serviceTier,
     transport: usePromptTransport ? (adversarial ? "adversarial-review" : "focused-review") : "native-review",
     uncommitted: target.uncommitted,
@@ -2118,6 +2131,9 @@ function handleSetup(rawArgv) {
   const codex = getCodexAvailability({ cwd, env: process.env });
   const auth = codex.available ? authenticationStatus(codex.bin, cwd, process.env) : { authenticated: false, detail: null };
   const compatible = codex.available && supportedVersion(codex.version);
+  const installedVersion = parseVersion(codex.version);
+  const newerThanTested = Boolean(installedVersion) && compareVersion(installedVersion, TESTED_VERSION_MAX) >= 0;
+  const testedInterval = testedVersionInterval();
   const dataDir = resolveDataDir();
   let writable = true;
   try {
@@ -2134,13 +2150,10 @@ function handleSetup(rawArgv) {
     nextSteps.push("Run codex login, then run /codex:setup again.");
   }
   if (codex.available && !compatible) {
-    nextSteps.push("Use a Codex CLI version from 0.144.0 to the latest 0.144.x release.");
+    nextSteps.push(newerThanTested ? `Codex CLI version ${codex.version} is newer than the tested interval (${testedInterval}). A verification pass is advised.` : `Use a Codex CLI version in the tested interval (${testedInterval}).`);
   }
   if (!writable) {
     nextSteps.push(`Make the adapter data directory writable: ${dataDir}.`);
-  }
-  if (hasRecentModelsCacheSchemaDrift(dataDir, cwd)) {
-    nextSteps.push(MODELS_CACHE_SCHEMA_DRIFT_NEXT_STEP);
   }
   const report = {
     authenticated: auth.authenticated,
@@ -2151,7 +2164,7 @@ function handleSetup(rawArgv) {
       errorMessage: codex.errorMessage ? redactDiagnostic(boundedTail(codex.errorMessage, 5)) : null,
       rawVersion: codex.rawVersion ? redactDiagnostic(boundedTail(codex.rawVersion, 5)) : null
     },
-    compatibility: compatible ? "tested" : codex.available ? "outside the tested 0.144.x interval" : "unknown",
+    compatibility: compatible ? "tested" : codex.available ? newerThanTested ? `newer than the tested interval (${testedInterval})` : `outside the tested interval (${testedInterval})` : "unknown",
     dataDir,
     nextSteps,
     ready: codex.available && auth.authenticated && compatible && writable,

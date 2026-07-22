@@ -40,7 +40,7 @@ async function waitForFile(file) {
 }
 
 if (args.includes("--version")) {
-  process.stdout.write(`${process.env.FAKE_CODEX_VERSION_OUTPUT || `codex-cli ${process.env.FAKE_CODEX_VERSION || "0.144.4"}`}\n`);
+  process.stdout.write(`${process.env.FAKE_CODEX_VERSION_OUTPUT || `codex-cli ${process.env.FAKE_CODEX_VERSION || "0.145.0"}`}\n`);
   process.exit(0);
 }
 
@@ -103,6 +103,9 @@ function start() {
 }
 
 function complete({ message = "Codex completed the task.", includeMessage = true } = {}) {
+  if (process.env.FAKE_CODEX_JSON_OBJECT_MESSAGE === "true") {
+    message = JSON.stringify({ verdict: "pass", findings: [] });
+  }
   message = process.env.FAKE_CODEX_MESSAGE_BYTES ? "x".repeat(Number(process.env.FAKE_CODEX_MESSAGE_BYTES)) : message;
   if (includeMessage) {
     emit({ type: "item.completed", item: { id: "item_1", type: "agent_message", text: message } });

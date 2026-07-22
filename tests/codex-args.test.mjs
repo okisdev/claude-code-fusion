@@ -92,7 +92,7 @@ test("task style parsing never promotes option shaped prompt suffixes", () => {
   const config = {
     booleanOptions: ["background", "network", "write"],
     optionsBeforePositionals: true,
-    valueOptions: ["cwd", "model"]
+    valueOptions: ["cwd", "model", "output-schema"]
   };
   const parsed = parseRawArgs("--write Fix support for --background --cwd /tmp/other --network", config);
   assert.deepEqual(parsed.options, { write: true });
@@ -101,4 +101,13 @@ test("task style parsing never promotes option shaped prompt suffixes", () => {
     options: { write: true },
     positionals: ["Fix support", "--background"]
   });
+});
+
+test("task style parsing accepts an output schema before the opaque prompt", () => {
+  const parsed = parseRawArgs("--output-schema='schemas/verdict.json' inspect the change", {
+    optionsBeforePositionals: true,
+    valueOptions: ["output-schema"]
+  });
+  assert.deepEqual(parsed.options, { "output-schema": "schemas/verdict.json" });
+  assert.equal(parsed.positionalText, "inspect the change");
 });
