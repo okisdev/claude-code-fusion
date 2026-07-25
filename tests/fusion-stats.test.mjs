@@ -1454,6 +1454,87 @@ function createTerminalWorker({ taskId, env, workspaceRoot, peerEngine = null, p
   }));
 }
 
+test("direct --json emits the Fusion stats JSON report", (t) => {
+  const dir = sandbox(t);
+  const stateRoot = path.join(dir, "codex-state");
+  writeCodexJob(stateRoot, dir, "direct-json", { status: "done", jobClass: "task", createdAt: "2026-07-25T00:00:00.000Z" });
+
+  const result = runDirect({ cwd: dir, codexState: stateRoot }, ["--json"]);
+
+  assert.strictEqual(result.status, 0, result.stderr);
+  const report = JSON.parse(result.stdout);
+  assert.strictEqual(report.scope, dir);
+  assert.strictEqual(report.codex.totalJobs, 1);
+});
+
+test("direct --audit prints the audit report", (t) => {
+  const dir = sandbox(t);
+
+  const result = runDirect({ cwd: dir, codexState: path.join(dir, "missing") }, ["--audit"]);
+
+  assert.strictEqual(result.status, 0, result.stderr);
+  assert.match(result.stdout, /# Fusion inline audit/);
+});
+
+test("direct --json --all emits the all-workspace JSON report", (t) => {
+  const dir = sandbox(t);
+  const stateRoot = path.join(dir, "codex-state");
+  writeCodexJob(stateRoot, path.join(dir, "other-workspace"), "direct-all", { status: "done", jobClass: "task", createdAt: "2026-07-25T00:00:00.000Z" });
+
+  const result = runDirect({ cwd: dir, codexState: stateRoot }, ["--json", "--all"]);
+
+  assert.strictEqual(result.status, 0, result.stderr);
+  assert.strictEqual(JSON.parse(result.stdout).codex.totalJobs, 1);
+});
+
+test("direct --prune-dead runs against fixture state", (t) => {
+  const dir = sandbox(t);
+  const stateRoot = path.join(dir, "codex-state");
+  writeCodexJob(stateRoot, path.join(dir, "gone-workspace"), "direct-prune", { status: "done", jobClass: "task", createdAt: "2026-07-25T00:00:00.000Z" });
+
+  const result = runDirect({ cwd: dir, codexState: stateRoot }, ["--prune-dead"]);
+
+  assert.strictEqual(result.status, 0, result.stderr);
+  assert.match(result.stdout, /# Fusion dead workspace prune \(dry run\)/);
+  assert.match(result.stdout, /codex-state/);
+});
+
+test("direct --session requires the raw-args transport", (t) => {
+  const dir = sandbox(t);
+
+  const result = runDirect({ cwd: dir, codexState: path.join(dir, "missing") }, ["--session", "123e4567-e89b-12d3-a456-426614174000"]);
+
+  assert.notStrictEqual(result.status, 0);
+  assert.match(result.stderr, /Fusion stats requests must be supplied through --raw-args-token\./);
+});
+
+test("direct --source without --record requires the raw-args transport", (t) => {
+  const dir = sandbox(t);
+
+  const result = runDirect({ cwd: dir, codexState: path.join(dir, "missing") }, ["--source", "main-loop"]);
+
+  assert.notStrictEqual(result.status, 0);
+  assert.match(result.stderr, /Fusion stats requests must be supplied through --raw-args-token\./);
+});
+
+test("direct report requests reject unsupported flags", (t) => {
+  const dir = sandbox(t);
+
+  const result = runDirect({ cwd: dir, codexState: path.join(dir, "missing") }, ["--json", "--bogus"]);
+
+  assert.notStrictEqual(result.status, 0);
+  assert.match(result.stderr, /Fusion stats requests must be supplied through --raw-args-token\./);
+});
+
+test("direct report requests reject duplicate flags", (t) => {
+  const dir = sandbox(t);
+
+  const result = runDirect({ cwd: dir, codexState: path.join(dir, "missing") }, ["--json", "--json"]);
+
+  assert.notStrictEqual(result.status, 0);
+  assert.match(result.stderr, /Fusion stats requests must be supplied through --raw-args-token\./);
+});
+
 test("--record settles a Fusion task and its Codex peer with direct strict argv", (t) => {
   const dir = sandbox(t);
   const stateRoot = path.join(dir, "codex-state");
