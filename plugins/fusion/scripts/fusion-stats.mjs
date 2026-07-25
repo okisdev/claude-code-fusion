@@ -2579,6 +2579,11 @@ function isStrictDirectRecordArguments(argv) {
   }
 }
 
+function isStrictDirectReportOrMaintenanceArguments(argv) {
+  const flags = new Set(["--json", "--audit", "--all", "--prune-dead"]);
+  return argv.length > 0 && argv.every((token) => flags.delete(token));
+}
+
 function writeRecordConfirmation({ kind, engine = null, jobId = null, worker = null, queued = false, asJson, stdout }) {
   if (asJson) {
     stdout.write(`${JSON.stringify(kind === "engine" ? { kind, engine, jobId, acceptance: worker?.acceptance } : { kind, taskId: worker.taskId, acceptance: queued ? worker.pendingVerdict?.acceptance : worker.acceptance, ...(queued ? { queued: true } : {}) })}\n`);
@@ -2768,7 +2773,7 @@ function runCli(argv = process.argv.slice(2)) {
     consumeRawArgsTransport(argv[2]);
     return;
   }
-  if (isStrictDirectRecordArguments(argv)) {
+  if (isStrictDirectRecordArguments(argv) || isStrictDirectReportOrMaintenanceArguments(argv)) {
     if (argv.some((token, index) => token === "--record" && parseRecordPair(argv[index + 1]).verdict === "rejected")) {
       process.stderr.write("Rejected verdicts require --reason through the raw-args transport. For batch settlements, use --reason-for <id> <text> for each rejected pair.\n");
       process.exitCode = 1;
