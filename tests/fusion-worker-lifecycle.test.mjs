@@ -7,7 +7,7 @@ import { test } from "node:test";
 
 import { fusionRepositoryKey } from "../plugins/fusion/scripts/fusion-stats.mjs";
 import { createWorkerRecord, readWorkerSessionState, readWorkerRecords, recordWorkerAcceptance, updateWorkerRecord, WORKER_COLLECTION_METHODS } from "../plugins/fusion/scripts/lib/worker-state.mjs";
-import { validateWorkerBrief, workerBudgetFailure, workerLimits } from "../plugins/fusion/scripts/worker-lifecycle.mjs";
+import { reverifyInFlightRecords, validateWorkerBrief, workerBudgetFailure, workerLimits } from "../plugins/fusion/scripts/worker-lifecycle.mjs";
 
 const repoRoot = path.join(import.meta.dirname, "..");
 const script = path.join(repoRoot, "plugins", "fusion", "scripts", "worker-lifecycle.mjs");
@@ -4038,11 +4038,57 @@ test("a queued verdict settles at the notification-driven terminal transition", 
     background_tasks: []
   });
   assert.strictEqual(stopped.stdout, "");
+  assert.doesNotMatch(stopped.stdout, /still in flight/);
   const settled = record(box);
   assert.strictEqual(settled.transportStatus, "done");
   assert.strictEqual(settled.acceptance, "accepted");
   assert.strictEqual(settled.awaitingVerdict, false);
   assert.strictEqual(settled.pendingVerdict, undefined);
+});
+
+test("a completion notification reconciled during Stop does not emit an in-flight advisory", (t) => {
+  const box = sandbox(t);
+  const workerTranscript = path.join(box.root, "stop-notification.output");
+  const finalMessage = "notification result\ndelivery: complete\nverification: passed";
+  fs.writeFileSync(workerTranscript, `${JSON.stringify({ type: "assistant", message: { content: [{ type: "text", text: finalMessage }] } })}\n`, "utf8");
+  const workerDispatch = dispatch(box);
+  run(box, workerDispatch);
+  run(box, {
+    ...workerDispatch,
+    hook_event_name: "PostToolUse",
+    tool_response: { isAsync: true, status: "async_launched", agentId: "stop-notification", outputFile: workerTranscript }
+  });
+  fs.appendFileSync(box.transcript, `${JSON.stringify({ type: "user", message: { content: "<task-notification>\n<task-id>stop-notification</task-id>\n<status>completed</status>\n</task-notification>" } })}\n`, "utf8");
+
+  const stopped = stop(box);
+
+  assert.strictEqual(stopped.status, 0);
+  assert.doesNotMatch(stopped.stdout, /still in flight/);
+  assert.strictEqual(record(box).transportStatus, "done");
+  assert.strictEqual(record(box).collectionMethod, WORKER_COLLECTION_METHODS.TASK_NOTIFICATION);
+});
+
+test("in-flight advisory re-verification excludes a record collected after the initial scan", (t) => {
+  const box = sandbox(t);
+  const worker = createWorkerRecord({
+    taskId: `fusion-${"b".repeat(24)}`,
+    sessionId: "session-1",
+    agentType: "fusion:fast-worker",
+    workspaceRoot: box.cwd
+  }, envFor(box));
+  const candidate = updateWorkerRecord(worker.taskId, envFor(box), (current) => ({ ...current, agentId: "reverify-collected", backgroundTaskId: "reverify-collected", transportStatus: "pending_async" }));
+  const collectedAt = new Date().toISOString();
+  updateWorkerRecord(worker.taskId, envFor(box), (current) => ({
+    ...current,
+    transportStatus: "done",
+    collectedAt,
+    collectionMethod: WORKER_COLLECTION_METHODS.TASK_NOTIFICATION,
+    acceptance: "accepted",
+    acceptanceRecordedAt: collectedAt,
+    awaitingVerdict: false
+  }));
+
+  assert.deepStrictEqual(reverifyInFlightRecords([candidate], [{ id: "reverify-collected", status: "running" }], envFor(box)), []);
 });
 
 test("queued accepted verdicts re-arm settlement after cancelled and incomplete hook transitions", (t) => {

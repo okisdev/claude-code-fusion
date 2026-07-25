@@ -1805,6 +1805,12 @@ function inFlightAdvisorySignature(records) {
     .join(",");
 }
 
+export function reverifyInFlightRecords(records, tasks, env = process.env) {
+  return records
+    .map((record) => readWorkerRecord(record.taskId, env))
+    .filter((record) => record && !terminalCollectedRecord(record) && !terminalTransportObserved(record, runtimeTaskForRecord(record, tasks)));
+}
+
 function claimStopAdvisory(sessionId, kind, signature, env) {
   let claimed = false;
   updateWorkerSessionState(sessionId, env, (current) => {
@@ -1926,9 +1932,13 @@ function handleStop(input, env) {
     return;
   }
   if (inFlight.length > 0) {
-    const signature = inFlightAdvisorySignature(currentRecords);
+    const verifiedInFlight = reverifyInFlightRecords(inFlight, tasks, env);
+    if (verifiedInFlight.length === 0) {
+      return;
+    }
+    const signature = inFlightAdvisorySignature(verifiedInFlight);
     if (!input.stop_hook_active && claimStopAdvisory(input.session_id, "in-flight", signature, env)) {
-      writeOutput(hookOutput("Stop", `Fusion task${inFlight.length === 1 ? "" : "s"} ${inFlight.map((record) => record.taskId).join(", ")} ${inFlight.length === 1 ? "is" : "are"} still in flight. Collection is armed and will be required after terminal notification.`));
+      writeOutput(hookOutput("Stop", `Fusion task${verifiedInFlight.length === 1 ? "" : "s"} ${verifiedInFlight.map((record) => record.taskId).join(", ")} ${verifiedInFlight.length === 1 ? "is" : "are"} still in flight. Collection is armed and will be required after terminal notification.`));
     }
     return;
   }
