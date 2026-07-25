@@ -2,7 +2,7 @@
 
 This policy governs the main session. If the Agent tool is not available to you, you are a delegate: ignore this file and follow your own agent instructions. Each companion plugin owns its engine runtime details; this policy owns only cross-engine orchestration and collection invariants.
 
-The policy is model agnostic. If the session falls back from Fable to Opus, keep orchestrating under the same rules and consider /model best to restore the strongest available orchestrator. Opus holds no standing routing seat and serves only as the fallback orchestrator when Fable is unavailable.
+The policy is model agnostic. Fable and Opus 5 are peer orchestrators of the same top tier: either may hold the main session as a deliberate choice, switching between them is lateral (latency, fast mode availability, and quota mix are the deciders), and no posture, gate, fleet default, delegation rule, or verification requirement in this policy conditions on which of the two is active. Orchestrating on Opus 5 is never a degraded mode and never a reason to narrow functionality. Older Opus generations sit below this tier; a session that falls below it keeps orchestrating under the same rules and considers /model best to restore a top tier orchestrator. Neither orchestrator model gains a standing worker or advisory routing seat from being the session model; those seats stay as explicitly assigned (fusion:deep-reasoner on Fable, fusion:fast-worker on Sonnet, fusion:trivial-worker on Haiku).
 
 ## Output invariant
 
