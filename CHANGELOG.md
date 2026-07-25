@@ -1,5 +1,11 @@
 # changelog
 
+## 0.0.38
+
+- Fable and Opus 5 are peer orchestrators: the routing preamble drops the Opus as fallback framing (switching is lateral; posture, gates, fleet defaults, and delegation never condition on which of the two is active), the readme reframes `best[1m]` floating as lateral within the top tier, and doctor treats a deliberate Opus 5 session as healthy instead of a fallback to recover
+- the stop hook's in flight advisory closes a cross process staleness window: candidate records are fresh read and filtered through the existing terminal collected predicates immediately before signing and emission (`reverifyInFlightRecords`), so an overlapping stop pass can no longer announce a task as still in flight after its notification driven terminal flip landed
+- `/fusion:stats` direct arguments gain a second closed family: value free report and maintenance requests (`--json`, `--audit`, `--all`, `--prune-dead`, each at most once) pass without the raw-args transport; the settlement family, the rejection message, and the transport requirement for `--session` and all free text are unchanged, and the skill carve-out wording now matches the predicate verbatim
+
 ## 0.0.37
 
 - settlement and telemetry become more discriminating: batched settlement validates every pair before writing, reports per pair rejection reasons, and `/fusion:stats` adds lane drift, per SKU trends, narrow wave watch, and an acceptance epoch cutoff; the worker lifecycle adds a parent context advisory, package type and brief byte capture, recalibrated trivial worker budgets, and token observations, while the inline guard gains tail allowance and softens zero dispatches
