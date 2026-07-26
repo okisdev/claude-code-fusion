@@ -1000,6 +1000,239 @@ test("a TaskStop no-task error marks a matching unexpected async peer wrapper as
   assert.ok(reaped.collectedAt);
 });
 
+test("Stop emits one reaped notice when the harness no longer tracks a cancel-requested worker", (t) => {
+  const box = sandbox(t);
+  const workerDispatch = dispatch(box);
+  run(box, workerDispatch);
+  run(box, {
+    ...workerDispatch,
+    hook_event_name: "PostToolUse",
+    tool_response: { isAsync: true, status: "async_launched", agentId: "reaped-cancellation" }
+  });
+  const taskId = record(box).taskId;
+  updateWorkerRecord(taskId, envFor(box), (current) => ({ ...current, transportStatus: "cancel_requested", failureKind: "timeout" }));
+
+  const stopped = run(box, {
+    hook_event_name: "Stop",
+    session_id: "session-1",
+    cwd: box.cwd,
+    transcript_path: box.transcript,
+    stop_hook_active: true,
+    background_tasks: []
+  });
+
+  const output = JSON.parse(stopped.stdout);
+  assert.strictEqual(output.decision, undefined);
+  assert.match(output.hookSpecificOutput.additionalContext, new RegExp(`Fusion task IDs ${taskId} were settled as task_reaped because the harness no longer tracks their runtime tasks`));
+  assert.doesNotMatch(stopped.stdout, /Call TaskStop/);
+  const settled = record(box);
+  assert.strictEqual(settled.transportStatus, "failed");
+  assert.strictEqual(settled.failureKind, "task_reaped");
+  assert.strictEqual(settled.collectionMethod, "task_reaped");
+  assert.ok(settled.finishedAt);
+  assert.ok(settled.collectedAt);
+});
+
+test("Stop emits one TaskStop demand while the harness tracks a cancel-requested worker", (t) => {
+  const box = sandbox(t);
+  const workerDispatch = dispatch(box);
+  run(box, workerDispatch);
+  run(box, {
+    ...workerDispatch,
+    hook_event_name: "PostToolUse",
+    tool_response: { isAsync: true, status: "async_launched", agentId: "live-cancellation" }
+  });
+  updateWorkerRecord(record(box).taskId, envFor(box), (current) => ({ ...current, transportStatus: "cancel_requested", failureKind: "timeout" }));
+
+  const stopped = run(box, {
+    hook_event_name: "Stop",
+    session_id: "session-1",
+    cwd: box.cwd,
+    transcript_path: box.transcript,
+    stop_hook_active: false,
+    background_tasks: [{ id: "live-cancellation", type: "subagent", status: "running", agent_type: "fusion:fast-worker" }]
+  });
+
+  assert.deepStrictEqual(JSON.parse(stopped.stdout), {
+    decision: "block",
+    reason: "Call TaskStop for over-budget task live-cancellation and report the cancellation before finishing."
+  });
+  assert.strictEqual(record(box).transportStatus, "cancel_requested");
+});
+
+test("Stop emits one combined TaskStop demand and reaped notice for mixed cancellations", (t) => {
+  const box = sandbox(t);
+  const absent = createWorkerRecord({
+    taskId: `fusion-${"c".repeat(24)}`,
+    sessionId: "session-1",
+    agentType: "fusion:fast-worker",
+    workspaceRoot: box.cwd
+  }, envFor(box));
+  const live = createWorkerRecord({
+    taskId: `fusion-${"d".repeat(24)}`,
+    sessionId: "session-1",
+    agentType: "fusion:fast-worker",
+    workspaceRoot: box.cwd
+  }, envFor(box));
+  updateWorkerRecord(absent.taskId, envFor(box), (current) => ({ ...current, agentId: "absent-cancellation", backgroundTaskId: "absent-cancellation", transportStatus: "cancel_requested", failureKind: "timeout" }));
+  updateWorkerRecord(live.taskId, envFor(box), (current) => ({ ...current, agentId: "live-cancellation", backgroundTaskId: "live-cancellation", transportStatus: "cancel_requested", failureKind: "timeout" }));
+
+  const stopped = run(box, {
+    hook_event_name: "Stop",
+    session_id: "session-1",
+    cwd: box.cwd,
+    transcript_path: box.transcript,
+    stop_hook_active: true,
+    background_tasks: [{ id: "live-cancellation", type: "subagent", status: "running", agent_type: "fusion:fast-worker" }]
+  });
+
+  const output = JSON.parse(stopped.stdout);
+  assert.deepStrictEqual(output, {
+    decision: "block",
+    reason: `Call TaskStop for over-budget task live-cancellation and report the cancellation before finishing. Fusion task IDs ${absent.taskId} were settled as task_reaped because the harness no longer tracks their runtime tasks.`
+  });
+  const records = readWorkerRecords(envFor(box));
+  const settled = records.find((candidate) => candidate.taskId === absent.taskId);
+  const pending = records.find((candidate) => candidate.taskId === live.taskId);
+  assert.strictEqual(settled.transportStatus, "failed");
+  assert.strictEqual(settled.failureKind, "task_reaped");
+  assert.strictEqual(pending.transportStatus, "cancel_requested");
+});
+
+test("Stop emits one reaped notice while applying a queued rejected verdict", (t) => {
+  const box = sandbox(t);
+  const workerDispatch = dispatch(box);
+  run(box, workerDispatch);
+  run(box, {
+    ...workerDispatch,
+    hook_event_name: "PostToolUse",
+    tool_response: { isAsync: true, status: "async_launched", agentId: "reaped-rejected" }
+  });
+  const worker = updateWorkerRecord(record(box).taskId, envFor(box), (current) => ({ ...current, transportStatus: "cancel_requested", failureKind: "timeout" }));
+  const queued = recordWorkerAcceptance({ taskId: worker.taskId, acceptance: "rejected", env: envFor(box), source: "main-loop", reason: "Runtime result was not delivered." });
+  assert.strictEqual(queued.queued, true);
+
+  const stopped = run(box, {
+    hook_event_name: "Stop",
+    session_id: "session-1",
+    cwd: box.cwd,
+    transcript_path: box.transcript,
+    stop_hook_active: true,
+    background_tasks: []
+  });
+
+  const output = JSON.parse(stopped.stdout);
+  assert.strictEqual(output.decision, undefined);
+  assert.match(output.hookSpecificOutput.additionalContext, new RegExp(`Fusion task IDs ${worker.taskId} were settled as task_reaped because the harness no longer tracks their runtime tasks`));
+  const settled = record(box);
+  assert.strictEqual(settled.transportStatus, "failed");
+  assert.strictEqual(settled.failureKind, "task_reaped");
+  assert.strictEqual(settled.acceptance, "rejected");
+  assert.strictEqual(settled.acceptanceReason, "Runtime result was not delivered.");
+  assert.ok(settled.acceptanceRecordedAt);
+  assert.strictEqual(settled.pendingVerdict, undefined);
+});
+
+test("Stop without a runtime task list emits one response and settles after two unobserved cancellation attempts", (t) => {
+  const box = sandbox(t);
+  const workerDispatch = dispatch(box);
+  run(box, workerDispatch);
+  run(box, {
+    ...workerDispatch,
+    hook_event_name: "PostToolUse",
+    tool_response: { isAsync: true, status: "async_launched", agentId: "unobserved-cancellation" }
+  });
+  updateWorkerRecord(record(box).taskId, envFor(box), (current) => ({ ...current, transportStatus: "cancel_requested", failureKind: "timeout" }));
+  const attempt = {
+    hook_event_name: "PreToolUse",
+    session_id: "session-1",
+    cwd: box.cwd,
+    transcript_path: box.transcript,
+    tool_name: "TaskStop",
+    tool_input: { task_id: "unobserved-cancellation" }
+  };
+
+  run(box, attempt);
+  const firstStopped = run(box, {
+    hook_event_name: "Stop",
+    session_id: "session-1",
+    cwd: box.cwd,
+    transcript_path: box.transcript,
+    stop_hook_active: true
+  });
+  const firstOutput = JSON.parse(firstStopped.stdout);
+  assert.strictEqual(firstOutput.decision, "block");
+  assert.match(firstOutput.reason, /Call TaskStop for over-budget task unobserved-cancellation/);
+  assert.strictEqual(record(box).cancelAttemptCount, 1);
+  assert.strictEqual(record(box).transportStatus, "cancel_requested");
+
+  run(box, attempt);
+  const secondStopped = run(box, {
+    hook_event_name: "Stop",
+    session_id: "session-1",
+    cwd: box.cwd,
+    transcript_path: box.transcript,
+    stop_hook_active: true
+  });
+  const secondOutput = JSON.parse(secondStopped.stdout);
+  assert.strictEqual(secondOutput.decision, undefined);
+  assert.match(secondOutput.hookSpecificOutput.additionalContext, /settled as task_reaped because the harness no longer tracks their runtime tasks/);
+  assert.strictEqual(record(box).cancelAttemptCount, 2);
+  assert.strictEqual(record(box).transportStatus, "failed");
+  assert.strictEqual(record(box).failureKind, "task_reaped");
+});
+
+test("PreToolUse task tools ignore subagents and stamp only matching active main-session workers", (t) => {
+  const box = sandbox(t);
+  const active = createWorkerRecord({
+    taskId: `fusion-${"a".repeat(24)}`,
+    sessionId: "session-1",
+    agentType: "fusion:fast-worker",
+    workspaceRoot: box.cwd
+  }, envFor(box));
+  const terminal = createWorkerRecord({
+    taskId: `fusion-${"b".repeat(24)}`,
+    sessionId: "session-1",
+    agentType: "fusion:fast-worker",
+    workspaceRoot: box.cwd
+  }, envFor(box));
+  updateWorkerRecord(active.taskId, envFor(box), (current) => ({ ...current, agentId: "shared-cancellation", backgroundTaskId: "shared-cancellation", transportStatus: "cancel_requested" }));
+  const terminalBefore = updateWorkerRecord(terminal.taskId, envFor(box), (current) => ({ ...current, agentId: "shared-cancellation", backgroundTaskId: "shared-cancellation", transportStatus: "done", finishedAt: new Date().toISOString() }));
+
+  for (const toolName of ["TaskStop", "TaskOutput"]) {
+    const subagentAttempt = run(box, {
+      hook_event_name: "PreToolUse",
+      session_id: "session-1",
+      cwd: box.cwd,
+      transcript_path: box.transcript,
+      agent_id: "calling-worker",
+      agent_type: "fusion:fast-worker",
+      tool_name: toolName,
+      tool_input: { task_id: "shared-cancellation" }
+    });
+
+    assert.strictEqual(subagentAttempt.stdout, "");
+    assert.strictEqual(readWorkerRecords(envFor(box)).find((candidate) => candidate.taskId === active.taskId).cancelAttemptCount, undefined);
+  }
+
+  const mainAttempt = run(box, {
+    hook_event_name: "PreToolUse",
+    session_id: "session-1",
+    cwd: box.cwd,
+    transcript_path: box.transcript,
+    tool_name: "TaskStop",
+    tool_input: { task_id: "shared-cancellation" }
+  });
+
+  assert.strictEqual(mainAttempt.stdout, "");
+  const records = readWorkerRecords(envFor(box));
+  const stamped = records.find((candidate) => candidate.taskId === active.taskId);
+  const untouched = records.find((candidate) => candidate.taskId === terminal.taskId);
+  assert.strictEqual(stamped.cancelAttemptCount, 1);
+  assert.ok(stamped.lastCancelAttemptAt);
+  assert.deepStrictEqual(untouched, terminalBefore);
+});
+
 test("no-task errors ignore unmatched task ids and terminal worker records", (t) => {
   const box = sandbox(t);
   const peerDispatch = dispatch(box, { subagent_type: "codex:codex-rescue", prompt: "bounded peer brief" });

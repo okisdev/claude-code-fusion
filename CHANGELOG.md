@@ -1,5 +1,11 @@
 # changelog
 
+## 0.0.39
+
+- the over budget stop gate settles instead of looping when the harness has already reaped a worker's runtime task: a `cancel_requested` record whose runtime id is absent from a provided `background_tasks` array settles as `task_reaped` through the same `settleReapedWorker` helper the no task found escape hatch uses, because that hatch never fires for this class; `TaskStop` on a reaped id returns a tool_use_error, which emits neither PostToolUse nor PostToolUseFailure, so the demand was unsatisfiable (observed live: two user interrupted workers held eight consecutive blocking stop rounds while twelve errored `TaskStop` and `TaskOutput` calls delivered zero hook events, and only SessionEnd closed the records)
+- reaped settlements keep the stop hook's single output document invariant: the notice rides the block reason while live cancellations or missing runtime failures still demand, and emits alone only when nothing blocks, so a blocking decision can never be lost to a second stdout document
+- PreToolUse stamps `cancelAttemptCount` on matching non terminal main session workers when `TaskStop` or `TaskOutput` targets their runtime id, and a stop input without any `background_tasks` array settles a cancellation after two unobserved attempts, covering harness inputs that omit the runtime task list
+
 ## 0.0.38
 
 - Fable and Opus 5 are peer orchestrators: the routing preamble drops the Opus as fallback framing (switching is lateral; posture, gates, fleet defaults, and delegation never condition on which of the two is active), the readme reframes `best[1m]` floating as lateral within the top tier, and doctor treats a deliberate Opus 5 session as healthy instead of a fallback to recover
