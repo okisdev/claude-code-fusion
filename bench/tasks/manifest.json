@@ -1,5 +1,5 @@
 {
-  "manifestHash": "21185f22eb2940fa69974d417450b56e48004b39dd31bb931a7ef179e0ef4269",
+  "manifestHash": "e0d1c68370ef0a682e23da0850d081e91365a964c95bf6386e67085114168967",
   "tasks": [
     {
       "id": "T01-seeded-bug",
@@ -730,6 +730,84 @@
         {
           "path": "verify.sh",
           "sha256": "8fdebce8b9211b1e8d3455a86db3217568abe5417fb340c7c8a6cbc94cc69bf9"
+        }
+      ]
+    },
+    {
+      "id": "T09-style-fidelity",
+      "taskSha256": "1ee2b23797abb00de485f8163a3e92fa5f62130a1b54b47d1d805e1eb886251f",
+      "files": [
+        {
+          "path": "behavior.test.mjs",
+          "sha256": "6e558e68c51b2e34f4fcb2df56082bf38f846283cfa80d5192eb8278f0b37909"
+        },
+        {
+          "path": "brief.md",
+          "sha256": "865c133ecd66e54de323c36311612d2d2df0e5df4151c30b8512801159b4cabe"
+        },
+        {
+          "path": "check-style.mjs",
+          "sha256": "6e8ed043ccc51f847398380dfe4f382c07784bc88393180a356664a35aa52927"
+        },
+        {
+          "path": "fixtures/errors.js",
+          "sha256": "e66e091e7340d9811e914ab97fdd9f4eb685ed7b9a1c93446dd837567d195971"
+        },
+        {
+          "path": "fixtures/package.json",
+          "sha256": "48e847860dd4f0907ce91e346dbb00a4a12213163ad3d80a953c343eb9a11979"
+        },
+        {
+          "path": "fixtures/util.js",
+          "sha256": "f47cdc0e49a3899622c73b1eedf27052bc8013742bae3af7aa476ed5ced4e430"
+        },
+        {
+          "path": "mutant/concurrent.js",
+          "sha256": "d5d60ff35bcd2f89d26bc3c848bc90bb54dcb70c1fc64cd5cebac7c26cc358ba"
+        },
+        {
+          "path": "mutant/errors.js",
+          "sha256": "e66e091e7340d9811e914ab97fdd9f4eb685ed7b9a1c93446dd837567d195971"
+        },
+        {
+          "path": "mutant/package.json",
+          "sha256": "48e847860dd4f0907ce91e346dbb00a4a12213163ad3d80a953c343eb9a11979"
+        },
+        {
+          "path": "mutant/retry.js",
+          "sha256": "8a335070acc6cf899bffb5952b2ea124b0900b16c8a533ef93085552d6ac24e0"
+        },
+        {
+          "path": "mutant/util.js",
+          "sha256": "f47cdc0e49a3899622c73b1eedf27052bc8013742bae3af7aa476ed5ced4e430"
+        },
+        {
+          "path": "selftest.sh",
+          "sha256": "5fbf94d686aa4418cb1ced471e34e3efa212bd6b7a0a20acb61ad0ef01ddbdc9"
+        },
+        {
+          "path": "solution/concurrent.js",
+          "sha256": "17671d91d81948e837cca4c3a488d958a1fa2d97c9dee99d1f0667c418105b2c"
+        },
+        {
+          "path": "solution/errors.js",
+          "sha256": "e66e091e7340d9811e914ab97fdd9f4eb685ed7b9a1c93446dd837567d195971"
+        },
+        {
+          "path": "solution/package.json",
+          "sha256": "48e847860dd4f0907ce91e346dbb00a4a12213163ad3d80a953c343eb9a11979"
+        },
+        {
+          "path": "solution/retry.js",
+          "sha256": "fd5ada4343973e6f9e2a07eb6703de67718c3c024d1a76de7c44442be04428f9"
+        },
+        {
+          "path": "solution/util.js",
+          "sha256": "f47cdc0e49a3899622c73b1eedf27052bc8013742bae3af7aa476ed5ced4e430"
+        },
+        {
+          "path": "verify.sh",
+          "sha256": "87d124e1ada0b02e1bffc18ae1b6995a37fd7fcf3c9839e4ce0ba3e4e52c57a3"
         }
       ]
     }
