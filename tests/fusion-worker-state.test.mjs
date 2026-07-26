@@ -82,14 +82,38 @@ test("applyQueuedVerdict settles queued rejected on a failed terminal", () => {
       acceptance: "rejected",
       source: "main-loop",
       reason: "verification failed",
+      failureKind: "style_mismatch",
       queuedAt: "2026-07-22T00:00:00.000Z"
     }
   }), "2026-07-22T00:03:00.000Z");
 
   assert.strictEqual(settled.acceptance, "rejected");
+  assert.strictEqual(settled.acceptanceFailureKind, "style_mismatch");
   assert.strictEqual(settled.acceptanceRecordedAt, "2026-07-22T00:03:00.000Z");
   assert.strictEqual(settled.awaitingVerdict, false);
   assert.strictEqual(settled.pendingVerdict, undefined);
+});
+
+test("worker acceptance preserves semantic failure kinds through settlement and queued verdicts", (t) => {
+  const directory = sandbox(t);
+  const env = { FUSION_WORKER_STATE_DIR: path.join(directory, "worker-state") };
+  const settledTaskId = "fusion-semantic-settled";
+  const queuedTaskId = "fusion-semantic-queued";
+  const baseline = createWorkerRecord({ taskId: settledTaskId, sessionId: "session-semantic", dispatchToolUseId: "tool-semantic", agentType: "fusion:fast-worker", workspaceRoot: directory, limits: {} }, env);
+  assert.strictEqual(baseline.acceptanceFailureKind, null);
+  updateWorkerRecord(settledTaskId, env, (record) => ({ ...record, transportStatus: "done" }));
+
+  const settled = recordWorkerAcceptance({ taskId: settledTaskId, acceptance: "rejected", env, failureKind: "intent_override" });
+  assert.strictEqual(settled.record.acceptanceFailureKind, "intent_override");
+
+  createWorkerRecord({ taskId: queuedTaskId, sessionId: "session-semantic", dispatchToolUseId: "tool-semantic-queued", agentType: "fusion:fast-worker", workspaceRoot: directory, limits: {} }, env);
+  const queued = recordWorkerAcceptance({ taskId: queuedTaskId, acceptance: "rejected", env, failureKind: "scope_rewrite" });
+  assert.strictEqual(queued.queued, true);
+  assert.strictEqual(queued.record.pendingVerdict.failureKind, "scope_rewrite");
+
+  const applied = updateWorkerRecord(queuedTaskId, env, (record) => applyQueuedVerdict({ ...record, transportStatus: "done" }, "2026-07-22T00:05:00.000Z"));
+  assert.strictEqual(applied.acceptanceFailureKind, "scope_rewrite");
+  assert.strictEqual(applied.pendingVerdict, undefined);
 });
 
 test("pending settlement clears after recordWorkerAcceptance and applyQueuedVerdict", (t) => {

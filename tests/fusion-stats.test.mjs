@@ -1600,9 +1600,10 @@ test("--record resolves a bare Codex job with a raw transport reason and settles
   createTerminalWorker({ taskId, env, workspaceRoot: dir, peerEngine: "codex", peerJobId: jobId });
 
   const reason = "The result did not satisfy the requested behavior.";
+  const failureKind = "wrong_approach";
   const result = run(
     { cwd: dir, codexState: stateRoot },
-    ["--record", `${jobId}=rejected`, "--reason", reason, "--json"],
+    ["--record", `${jobId}=rejected`, "--reason", reason, "--failure-kind", failureKind, "--json"],
     { ...env, FUSION_CODEX_COMPANION: companion, FUSION_TEST_CODEX_COMPANION_ARGS: argsFile }
   );
 
@@ -1611,9 +1612,10 @@ test("--record resolves a bare Codex job with a raw transport reason and settles
     { kind: "engine", engine: "codex", jobId, acceptance: "rejected" },
     { kind: "worker", taskId, acceptance: "rejected" }
   ]);
-  assert.deepStrictEqual(JSON.parse(fs.readFileSync(argsFile, "utf8")), ["record-acceptance", "--job-id", jobId, "--acceptance", "rejected", "--source", "main-loop", "--reason", reason]);
+  assert.deepStrictEqual(JSON.parse(fs.readFileSync(argsFile, "utf8")), ["record-acceptance", "--job-id", jobId, "--acceptance", "rejected", "--source", "main-loop", "--reason", reason, "--failure-kind", failureKind]);
   assert.strictEqual(readWorkerRecord(taskId, env).acceptance, "rejected");
   assert.strictEqual(readWorkerRecord(taskId, env).acceptanceReason, reason);
+  assert.strictEqual(readWorkerRecord(taskId, env).acceptanceFailureKind, failureKind);
 });
 
 test("--record refuses a rejected strict direct argument", (t) => {
@@ -1632,6 +1634,60 @@ test("--record refuses a rejected strict direct argument", (t) => {
   assert.strictEqual(result.status, 1);
   assert.strictEqual(result.stdout, "");
   assert.strictEqual(result.stderr, "Rejected verdicts require --reason through the raw-args transport. For batch settlements, use --reason-for <id> <text> for each rejected pair.\n");
+  assert.strictEqual(readWorkerRecord(taskId, env).acceptance, "unverified");
+});
+
+test("--record with --failure-kind requires the raw-args transport", (t) => {
+  const dir = sandbox(t);
+  const stateDir = path.join(dir, "worker-state");
+  const taskId = `fusion-${"e".repeat(24)}`;
+  const env = { FUSION_WORKER_STATE_DIR: stateDir };
+  createTerminalWorker({ taskId, env, workspaceRoot: dir });
+
+  const result = runDirect(
+    { cwd: dir, codexState: path.join(dir, "missing") },
+    ["--record", `${taskId}=rejected`, "--reason", "The output did not meet the requested scope.", "--failure-kind", "scope_rewrite"],
+    env
+  );
+
+  assert.notStrictEqual(result.status, 0);
+  assert.match(result.stderr, /Fusion stats requests must be supplied through --raw-args-token\./);
+  assert.strictEqual(readWorkerRecord(taskId, env).acceptance, "unverified");
+});
+
+test("--record rejects semantic failure kinds on non-rejected verdicts", (t) => {
+  const dir = sandbox(t);
+  const stateDir = path.join(dir, "worker-state");
+  const taskId = `fusion-${"f".repeat(24)}`;
+  const env = { FUSION_WORKER_STATE_DIR: stateDir };
+  createTerminalWorker({ taskId, env, workspaceRoot: dir });
+
+  const result = run(
+    { cwd: dir, codexState: path.join(dir, "missing") },
+    ["--record", `${taskId}=accepted`, "--failure-kind", "intent_override"],
+    env
+  );
+
+  assert.notStrictEqual(result.status, 0);
+  assert.match(result.stderr, new RegExp(`--failure-kind applies only to rejected record ${taskId}`));
+  assert.strictEqual(readWorkerRecord(taskId, env).acceptance, "unverified");
+});
+
+test("--record rejects invalid semantic failure kinds", (t) => {
+  const dir = sandbox(t);
+  const stateDir = path.join(dir, "worker-state");
+  const taskId = `fusion-${"0".repeat(24)}`;
+  const env = { FUSION_WORKER_STATE_DIR: stateDir };
+  createTerminalWorker({ taskId, env, workspaceRoot: dir });
+
+  const result = run(
+    { cwd: dir, codexState: path.join(dir, "missing") },
+    ["--record", `${taskId}=rejected`, "--reason", "The output did not meet the requested scope.", "--failure-kind", "not_a_kind"],
+    env
+  );
+
+  assert.notStrictEqual(result.status, 0);
+  assert.match(result.stderr, /The --failure-kind value must be one of intent_override, scope_rewrite, wrong_approach, style_mismatch\./);
   assert.strictEqual(readWorkerRecord(taskId, env).acceptance, "unverified");
 });
 
@@ -1677,26 +1733,31 @@ test("--record rejects an engine id that exists in both peer states", (t) => {
   assert.match(result.stderr, /exists in both Codex and Grok state/);
 });
 
-test("--record batches mixed verdicts with per-pair rejection reasons", (t) => {
+test("--record batches mixed verdicts with per-pair rejection reasons and failure kinds", (t) => {
   const dir = sandbox(t);
   const stateDir = path.join(dir, "worker-state");
   const firstTaskId = `fusion-${"2".repeat(24)}`;
   const secondTaskId = `fusion-${"3".repeat(24)}`;
+  const jobId = "4".repeat(32);
+  const argsFile = path.join(dir, "codex-companion-args.json");
+  const companion = writeCodexAcceptanceCompanion(dir);
   const env = { FUSION_WORKER_STATE_DIR: stateDir };
   createTerminalWorker({ taskId: firstTaskId, env, workspaceRoot: dir });
-  createTerminalWorker({ taskId: secondTaskId, env, workspaceRoot: dir });
+  createTerminalWorker({ taskId: secondTaskId, env, workspaceRoot: dir, peerEngine: "codex", peerJobId: jobId });
 
   const result = run(
     { cwd: dir, codexState: path.join(dir, "missing") },
-    ["--record", `${firstTaskId}=accepted`, "--record", `${secondTaskId}=rejected`, "--reason-for", secondTaskId, "The result did not satisfy the requested behavior."],
-    env
+    ["--record", `${firstTaskId}=accepted`, "--record", `${secondTaskId}=rejected`, "--reason-for", secondTaskId, "The result did not satisfy the requested behavior.", "--failure-kind-for", secondTaskId, "scope_rewrite"],
+    { ...env, FUSION_CODEX_COMPANION: companion, FUSION_TEST_CODEX_COMPANION_ARGS: argsFile }
   );
 
   assert.strictEqual(result.status, 0, result.stderr);
-  assert.strictEqual(result.stdout, `Recorded accepted for Fusion worker task ${firstTaskId}.\nRecorded rejected for Fusion worker task ${secondTaskId}.\n`);
+  assert.strictEqual(result.stdout, `Recorded accepted for Fusion worker task ${firstTaskId}.\nRecorded rejected for Fusion worker task ${secondTaskId}.\nRecorded rejected for Codex job ${jobId}.\n`);
   assert.strictEqual(readWorkerRecord(firstTaskId, env).acceptance, "accepted");
   assert.strictEqual(readWorkerRecord(secondTaskId, env).acceptance, "rejected");
   assert.strictEqual(readWorkerRecord(secondTaskId, env).acceptanceReason, "The result did not satisfy the requested behavior.");
+  assert.strictEqual(readWorkerRecord(secondTaskId, env).acceptanceFailureKind, "scope_rewrite");
+  assert.deepStrictEqual(JSON.parse(fs.readFileSync(argsFile, "utf8")), ["record-acceptance", "--job-id", jobId, "--acceptance", "rejected", "--source", "main-loop", "--reason", "The result did not satisfy the requested behavior.", "--failure-kind", "scope_rewrite"]);
 });
 
 test("--record rejects a raw batch with a rejected pair that has no reason before writing", (t) => {

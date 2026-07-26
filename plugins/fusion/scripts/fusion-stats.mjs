@@ -27,6 +27,7 @@ const PRUNE_EVIDENCE = Symbol("pruneEvidence");
 const FUSION_TASK_ID_PATTERN = /^fusion-[0-9a-f]{24}$/;
 const ENGINE_JOB_ID_PATTERN = /^[0-9a-f]{32}$/;
 const RECORD_VERDICTS = new Set(["accepted", "rejected", "unverified"]);
+const SEMANTIC_FAILURE_KINDS = new Set(["intent_override", "scope_rewrite", "wrong_approach", "style_mismatch"]);
 const RECORD_SOURCES = new Set(["collector", "main-loop"]);
 const FUSION_ACCEPTANCE_EPOCH_ENV = "FUSION_ACCEPTANCE_EPOCH";
 const DEFAULT_ACCEPTANCE_EPOCH = "2026-07-22T00:00:00Z";
@@ -2465,7 +2466,9 @@ function parseRecordArguments(argv, { allowPerPairReasons = false } = {}) {
   const records = [];
   let source = null;
   let reason = null;
+  let failureKind = null;
   const reasonsById = new Map();
+  const failureKindsById = new Map();
   let asJson = false;
   let acceptFailedTransport = false;
   for (let index = 0; index < argv.length; index += 1) {
@@ -2491,6 +2494,25 @@ function parseRecordArguments(argv, { allowPerPairReasons = false } = {}) {
       index += 2;
       continue;
     }
+    if (token === "--failure-kind-for") {
+      const id = argv[index + 1];
+      const pairFailureKind = argv[index + 2];
+      if (!allowPerPairReasons) {
+        throw new TypeError("--failure-kind-for is available only through the raw-args transport.");
+      }
+      if (!SEMANTIC_FAILURE_KINDS.has(pairFailureKind)) {
+        throw new TypeError("The --failure-kind value must be one of intent_override, scope_rewrite, wrong_approach, style_mismatch.");
+      }
+      if ((!FUSION_TASK_ID_PATTERN.test(id) && !ENGINE_JOB_ID_PATTERN.test(id)) || failureKindsById.has(id)) {
+        throw new TypeError("--failure-kind-for requires one record id and one failure kind.");
+      }
+      if (records.at(-1)?.id !== id) {
+        throw new TypeError("--failure-kind-for must immediately follow its --record pair.");
+      }
+      failureKindsById.set(id, pairFailureKind);
+      index += 2;
+      continue;
+    }
     if (token === "--source") {
       if (source !== null || !RECORD_SOURCES.has(argv[index + 1])) {
         throw new TypeError("--source must be collector or main-loop.");
@@ -2504,6 +2526,18 @@ function parseRecordArguments(argv, { allowPerPairReasons = false } = {}) {
         throw new TypeError("--reason requires text.");
       }
       reason = argv[index + 1];
+      index += 1;
+      continue;
+    }
+    if (token === "--failure-kind") {
+      const candidate = argv[index + 1];
+      if (!SEMANTIC_FAILURE_KINDS.has(candidate)) {
+        throw new TypeError("The --failure-kind value must be one of intent_override, scope_rewrite, wrong_approach, style_mismatch.");
+      }
+      if (failureKind !== null) {
+        throw new TypeError("Duplicate --failure-kind.");
+      }
+      failureKind = candidate;
       index += 1;
       continue;
     }
@@ -2529,11 +2563,21 @@ function parseRecordArguments(argv, { allowPerPairReasons = false } = {}) {
   if (reason !== null && reasonsById.size > 0) {
     throw new TypeError("Use either --reason or --reason-for, not both.");
   }
+  if (failureKind !== null && records.length !== 1) {
+    throw new TypeError("--failure-kind can be used only when exactly one --record pair is present. Use --failure-kind-for <id> <kind> for each rejected pair in a batch.");
+  }
+  if (failureKind !== null && failureKindsById.size > 0) {
+    throw new TypeError("Use either --failure-kind or --failure-kind-for, not both.");
+  }
   for (const record of records) {
     if (record.verdict !== "rejected" && reasonsById.has(record.id)) {
       throw new TypeError(`--reason-for applies only to rejected record ${record.id}.`);
     }
     record.reason = reason ?? reasonsById.get(record.id) ?? null;
+    record.failureKind = failureKind ?? failureKindsById.get(record.id) ?? null;
+    if (record.verdict !== "rejected" && record.failureKind !== null) {
+      throw new TypeError(`--failure-kind applies only to rejected record ${record.id}.`);
+    }
     if (record.verdict === "rejected") {
       if (record.reason === null) {
         throw new TypeError(`Rejected verdict for ${record.id} requires --reason for a single pair or --reason-for <id> <text> for a batch.`);
@@ -2600,26 +2644,26 @@ function writeRecordConfirmation({ kind, engine = null, jobId = null, worker = n
   stdout.write(`Recorded ${worker.acceptance} for Fusion worker task ${worker.taskId}.\n`);
 }
 
-function settleWorkerRecord({ taskId, verdict, source, reason, acceptFailedTransport = false, asJson, workspaceRoot, env, stdout }) {
+function settleWorkerRecord({ taskId, verdict, source, reason, failureKind, acceptFailedTransport = false, asJson, workspaceRoot, env, stdout }) {
   const current = readWorkerRecord(taskId, env);
   const peerJobId = isTerminalWorkerStatus(current?.transportStatus) && typeof current.peerJobId === "string" && ENGINE_JOB_ID_PATTERN.test(current.peerJobId) ? current.peerJobId : null;
   if (!peerJobId) {
-    const settlement = recordWorkerAcceptance({ taskId, acceptance: verdict, env, source, reason, acceptFailedTransport });
+    const settlement = recordWorkerAcceptance({ taskId, acceptance: verdict, env, source, reason, failureKind, acceptFailedTransport });
     const worker = settlement.record;
     writeRecordConfirmation({ kind: "worker", worker, queued: settlement.queued, asJson, stdout });
     return [worker];
   }
-  validateWorkerAcceptance({ record: current, taskId, acceptance: verdict, source, reason, acceptFailedTransport });
+  validateWorkerAcceptance({ record: current, taskId, acceptance: verdict, source, reason, failureKind, acceptFailedTransport });
   const engine = current.peerEngine === "codex" || current.peerEngine === "grok" ? current.peerEngine : resolveEngineJob(peerJobId, env);
   try {
-    recordEngineAcceptance({ engine, jobId: peerJobId, acceptance: verdict, source, reason, acceptFailedTransport, workspaceRoot, asJson, env });
+    recordEngineAcceptance({ engine, jobId: peerJobId, acceptance: verdict, source, reason, failureKind, acceptFailedTransport, workspaceRoot, asJson, env });
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     throw new Error(`Engine settlement failed for ${engine === "codex" ? "Codex" : "Grok"} job ${peerJobId}: ${message}`);
   }
   let settlement;
   try {
-    settlement = recordWorkerAcceptance({ taskId, acceptance: verdict, env, source, reason, acceptFailedTransport });
+    settlement = recordWorkerAcceptance({ taskId, acceptance: verdict, env, source, reason, failureKind, acceptFailedTransport });
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     throw new Error(`Engine settlement succeeded for ${engine === "codex" ? "Codex" : "Grok"} job ${peerJobId}, but Fusion worker task ${taskId} was not settled: ${message}`);
@@ -2634,43 +2678,43 @@ function settleWorkerRecord({ taskId, verdict, source, reason, acceptFailedTrans
   return [worker, { engine, jobId: peerJobId, acceptance: verdict }];
 }
 
-function settleEngineRecord({ jobId, verdict, source, reason, acceptFailedTransport = false, asJson, workspaceRoot, env, stdout }) {
+function settleEngineRecord({ jobId, verdict, source, reason, failureKind, acceptFailedTransport = false, asJson, workspaceRoot, env, stdout }) {
   const engine = resolveEngineJob(jobId, env);
   const confirmation = { engine, jobId, acceptance: verdict };
-  recordEngineAcceptance({ engine, jobId, acceptance: verdict, source, reason, acceptFailedTransport, workspaceRoot, asJson, env });
+  recordEngineAcceptance({ engine, jobId, acceptance: verdict, source, reason, failureKind, acceptFailedTransport, workspaceRoot, asJson, env });
   writeRecordConfirmation({ kind: "engine", engine, jobId, worker: confirmation, asJson, stdout });
   const writes = [confirmation];
   for (const record of readWorkerRecords(env).filter((candidate) => candidate.peerJobId === jobId)) {
-    const settlement = recordWorkerAcceptance({ taskId: record.taskId, acceptance: verdict, env, source, reason, acceptFailedTransport });
+    const settlement = recordWorkerAcceptance({ taskId: record.taskId, acceptance: verdict, env, source, reason, failureKind, acceptFailedTransport });
     writeRecordConfirmation({ kind: "worker", worker: settlement.record, queued: settlement.queued, asJson, stdout });
     writes.push(settlement.record);
   }
   return writes;
 }
 
-function validateWorkerSettlement({ taskId, verdict, source, reason, acceptFailedTransport, env }) {
+function validateWorkerSettlement({ taskId, verdict, source, reason, failureKind, acceptFailedTransport, env }) {
   const current = readWorkerRecord(taskId, env);
-  validateWorkerAcceptance({ record: current, taskId, acceptance: verdict, source, reason, acceptFailedTransport });
+  validateWorkerAcceptance({ record: current, taskId, acceptance: verdict, source, reason, failureKind, acceptFailedTransport });
   const peerJobId = isTerminalWorkerStatus(current?.transportStatus) && typeof current.peerJobId === "string" && ENGINE_JOB_ID_PATTERN.test(current.peerJobId) ? current.peerJobId : null;
   if (peerJobId && current.peerEngine !== "codex" && current.peerEngine !== "grok") {
     resolveEngineJob(peerJobId, env);
   }
 }
 
-function validateEngineSettlement({ jobId, verdict, source, reason, acceptFailedTransport, env }) {
+function validateEngineSettlement({ jobId, verdict, source, reason, failureKind, acceptFailedTransport, env }) {
   resolveEngineJob(jobId, env);
   for (const record of readWorkerRecords(env).filter((candidate) => candidate.peerJobId === jobId)) {
-    validateWorkerAcceptance({ record, taskId: record.taskId, acceptance: verdict, source, reason, acceptFailedTransport });
+    validateWorkerAcceptance({ record, taskId: record.taskId, acceptance: verdict, source, reason, failureKind, acceptFailedTransport });
   }
 }
 
 function validateRecordSettlements({ records, source, acceptFailedTransport, env }) {
-  for (const { id, verdict, reason = null, acceptFailedTransport: pairAcceptFailedTransport } of records) {
+  for (const { id, verdict, reason = null, failureKind = null, acceptFailedTransport: pairAcceptFailedTransport } of records) {
     const pairOverride = acceptFailedTransport || pairAcceptFailedTransport;
     if (FUSION_TASK_ID_PATTERN.test(id)) {
-      validateWorkerSettlement({ taskId: id, verdict, source, reason, acceptFailedTransport: pairOverride, env });
+      validateWorkerSettlement({ taskId: id, verdict, source, reason, failureKind, acceptFailedTransport: pairOverride, env });
     } else {
-      validateEngineSettlement({ jobId: id, verdict, source, reason, acceptFailedTransport: pairOverride, env });
+      validateEngineSettlement({ jobId: id, verdict, source, reason, failureKind, acceptFailedTransport: pairOverride, env });
     }
   }
 }
@@ -2679,13 +2723,13 @@ function settleRecords({ records, source, acceptFailedTransport = false, asJson,
   validateRecordSettlements({ records, source, acceptFailedTransport, env });
   const writes = [];
   const errors = [];
-  for (const { id, verdict, reason = null, acceptFailedTransport: pairAcceptFailedTransport } of records) {
+  for (const { id, verdict, reason = null, failureKind = null, acceptFailedTransport: pairAcceptFailedTransport } of records) {
     const pairOverride = acceptFailedTransport || pairAcceptFailedTransport;
     try {
       if (FUSION_TASK_ID_PATTERN.test(id)) {
-        writes.push(...settleWorkerRecord({ taskId: id, verdict, source, reason, acceptFailedTransport: pairOverride, asJson, workspaceRoot, env, stdout }));
+        writes.push(...settleWorkerRecord({ taskId: id, verdict, source, reason, failureKind, acceptFailedTransport: pairOverride, asJson, workspaceRoot, env, stdout }));
       } else {
-        writes.push(...settleEngineRecord({ jobId: id, verdict, source, reason, acceptFailedTransport: pairOverride, asJson, workspaceRoot, env, stdout }));
+        writes.push(...settleEngineRecord({ jobId: id, verdict, source, reason, failureKind, acceptFailedTransport: pairOverride, asJson, workspaceRoot, env, stdout }));
       }
     } catch (error) {
       const failure = { id, error };

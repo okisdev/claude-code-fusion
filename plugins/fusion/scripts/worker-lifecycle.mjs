@@ -269,13 +269,13 @@ export function validateWorkerBrief(prompt, agentType, env = process.env) {
   }
   const packageTypeLines = prompt.split(/\r?\n/).filter((line) => /^package-type\s*:/i.test(line.trim()));
   if (packageTypeLines.length > 1) {
-    return { ok: false, reason: "Fusion worker brief `package-type:` may appear once and must be one of `implementation`, `consult`, `review`, or `research`." };
+    return { ok: false, reason: "Fusion worker brief `package-type:` may appear once and must be one of `implementation`, `consult`, `review`, `research`, or `design`." };
   }
   const packageType = packageTypeLines.length === 1
-    ? packageTypeLines[0].match(/^package-type\s*:\s*(implementation|consult|review|research)\s*$/i)?.[1]?.toLowerCase()
+    ? packageTypeLines[0].match(/^package-type\s*:\s*(implementation|consult|review|research|design)\s*$/i)?.[1]?.toLowerCase()
     : /^verification:\s*\S/im.test(prompt) ? "implementation" : "consult";
   if (!packageType) {
-    return { ok: false, reason: "Fusion worker brief `package-type:` must be one of `implementation`, `consult`, `review`, or `research`." };
+    return { ok: false, reason: "Fusion worker brief `package-type:` must be one of `implementation`, `consult`, `review`, `research`, or `design`." };
   }
   const sizingLines = prompt.split(/\r?\n/).filter((line) => /^sizing\s*:/i.test(line.trim()));
   if (sizingLines.length > 1) {
@@ -961,6 +961,7 @@ function settleQueuedVerdict(record, now, env) {
       acceptance: settled.acceptance,
       source: pendingVerdict.source,
       reason: settled.acceptanceReason,
+      failureKind: settled.acceptanceFailureKind ?? null,
       acceptFailedTransport: pendingVerdict.acceptFailedTransport === true,
       workspaceRoot: typeof settled.workspaceRoot === "string" ? settled.workspaceRoot : process.cwd(),
       env

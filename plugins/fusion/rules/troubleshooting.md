@@ -58,7 +58,7 @@ Codex exec refuses to start outside a directory with an ancestor `.git` entry. T
 
 ## Acceptance and worker lifecycle
 
-`/fusion:stats --record` writes the verdict back to the Codex job record through the companion's `record-acceptance` subcommand. Recording `accepted` for a job whose transport failed requires the explicit `--accept-failed-transport` override. The stats report includes an acceptance anomalies block when transport and acceptance evidence conflict or when other acceptance integrity checks find a problem.
+`/fusion:stats --record` writes the verdict back to the Codex job record through the companion's `record-acceptance` subcommand. Rejected verdicts require `--reason` via the raw args transport, and judgment shaped rejections may add `--failure-kind` (`intent_override`, `scope_rewrite`, `wrong_approach`, `style_mismatch`). Recording `accepted` for a job whose transport failed requires the explicit `--accept-failed-transport` override. The stats report includes an acceptance anomalies block when transport and acceptance evidence conflict or when other acceptance integrity checks find a problem.
 
 Worker lifecycle defaults are 1200000ms of wall clock, 300000ms of stall time, 240000 uncached tokens, and 60 turns. The output token budget is unchanged. The Stop hook adds a non-blocking advisory when collected workers remain acceptance unverified.
 

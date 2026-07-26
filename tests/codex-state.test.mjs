@@ -637,6 +637,17 @@ test("structurally invalid records are preserved for forward compatibility and f
   assert.deepStrictEqual(listJobRecords(sandbox.dataDir, sandbox.workDir), []);
 });
 
+test("semantic failure kinds accept legacy policy records and reject unknown values", (t) => {
+  const sandbox = makeSandbox(t);
+  const legacy = makeRecord(sandbox, { id: "legacy-policy", semanticFailureKind: "policy" });
+  assert.equal(legacy.record.semanticFailureKind, "policy");
+
+  const invalidFile = jobFilePath(sandbox.dataDir, sandbox.workDir, "invalid-semantic-failure-kind");
+  const invalid = { ...createJobRecord({ cwd: sandbox.workDir, id: "invalid-semantic-failure-kind" }), semanticFailureKind: "arbitrary" };
+  fs.writeFileSync(invalidFile, `${JSON.stringify(invalid)}\n`, { mode: 0o600 });
+  assert.equal(readJobRecordFile(invalidFile), null);
+});
+
 test("global lookup rejects an id that is ambiguous across workspaces", (t) => {
   const sandbox = makeSandbox(t);
   const otherWorkDir = path.join(sandbox.root, "other-work");

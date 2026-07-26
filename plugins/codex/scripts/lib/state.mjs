@@ -21,6 +21,7 @@ const STATE_MAX_RECORDS_ENV = "CODEX_COMPANION_HISTORY_MAX_RECORDS";
 const JOB_STATUSES = new Set(["running", "done", "error", "cancelled"]);
 const DELIVERY_MODES = new Set(["foreground", "manual", "managed"]);
 const SEMANTIC_STATUSES = new Set(["accepted", "rejected", "unverified"]);
+const SEMANTIC_FAILURE_KINDS = new Set(["intent_override", "scope_rewrite", "wrong_approach", "style_mismatch"]);
 const ACCEPTANCE_SOURCES = new Set(["collector", "main-loop", "stats"]);
 const JOB_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 const WORKSPACE_SLUG_PATTERN = /^.+-[a-f0-9]{16}$/;
@@ -433,6 +434,9 @@ function assertJobRecord(record) {
   }
   if (record.semanticStatus != null && !SEMANTIC_STATUSES.has(record.semanticStatus)) {
     throw new TypeError("Job semantic status is invalid.");
+  }
+  if (record.semanticFailureKind != null && record.semanticFailureKind !== "policy" && !SEMANTIC_FAILURE_KINDS.has(record.semanticFailureKind)) {
+    throw new TypeError("Job semantic failure kind is invalid.");
   }
   if (record.acceptanceSource != null && !ACCEPTANCE_SOURCES.has(record.acceptanceSource)) {
     throw new TypeError("Job acceptance source is invalid.");
