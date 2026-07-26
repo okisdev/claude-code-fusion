@@ -658,6 +658,22 @@ function canonicalToolResponseUsage(response) {
 }
 
 function handlePreToolUse(input, env) {
+  if (!input.agent_id && ["TaskStop", "TaskOutput"].includes(input.tool_name) && typeof input.tool_input?.task_id === "string") {
+    const taskId = input.tool_input.task_id;
+    const now = new Date().toISOString();
+    for (const record of readWorkerRecords(env, { strict: true }).filter((candidate) => candidate.sessionId === input.session_id && !isTerminalWorkerStatus(candidate.transportStatus) && [candidate.backgroundTaskId, candidate.agentId].includes(taskId))) {
+      updateLifecycleWorkerRecord(record.taskId, env, (current) => {
+        if (!current || current.sessionId !== input.session_id || isTerminalWorkerStatus(current.transportStatus) || ![current.backgroundTaskId, current.agentId].includes(taskId)) {
+          return null;
+        }
+        return {
+          ...current,
+          cancelAttemptCount: (current.cancelAttemptCount ?? 0) + 1,
+          lastCancelAttemptAt: now
+        };
+      });
+    }
+  }
   if (input.tool_name === "Agent" || input.tool_name === "Task") {
     const agentType = input.tool_input?.subagent_type;
     if (PEER_WRAPPER_AGENTS.has(agentType)) {
@@ -959,6 +975,16 @@ function settleQueuedVerdict(record, now, env) {
   }
 }
 
+function settleReapedWorker(current, now, env) {
+  return settleQueuedVerdict({
+    ...markWorkerCollected(current, WORKER_COLLECTION_METHODS.TASK_REAPED, now),
+    transportStatus: "failed",
+    failureKind: "task_reaped",
+    finishedAt: now,
+    lastActivityAt: now
+  }, now, env);
+}
+
 function handlePostToolUse(input, env, failed = false) {
   if (!input.agent_id && ["Read", "TaskOutput", "TaskStop"].includes(input.tool_name)) {
     const taskId = typeof input.tool_input?.task_id === "string" ? input.tool_input.task_id : null;
@@ -971,13 +997,7 @@ function handlePostToolUse(input, env, failed = false) {
           if (!current || current.sessionId !== input.session_id || isTerminalWorkerStatus(current.transportStatus) || ![current.backgroundTaskId, current.agentId].includes(taskId)) {
             return null;
           }
-          return settleQueuedVerdict({
-            ...markWorkerCollected(current, WORKER_COLLECTION_METHODS.TASK_REAPED, now),
-            transportStatus: "failed",
-            failureKind: "task_reaped",
-            finishedAt: now,
-            lastActivityAt: now
-          }, now, env);
+          return settleReapedWorker(current, now, env);
         });
       }
       return;
@@ -1849,7 +1869,8 @@ function clearSettleOnlyAdvisory(sessionId, env) {
 }
 
 function handleStop(input, env) {
-  const tasks = Array.isArray(input.background_tasks) ? input.background_tasks : [];
+  const hasBackgroundTasks = Array.isArray(input.background_tasks);
+  const tasks = hasBackgroundTasks ? input.background_tasks : [];
   reconcileTaskNotifications(input, env);
   const initialRecords = sessionRecords(input.session_id, env);
   if (initialRecords.every((record) => !terminalCollectionPending(record)) && collectorStopGate(input, env)) {
@@ -1893,13 +1914,38 @@ function handleStop(input, env) {
         return settleQueuedVerdict({ ...current, transportStatus: "failed", failureKind: current.failureKind ?? "owner_lost", finishedAt: now }, now, env);
       });
     }
-    const cancelIds = cancellations.map((record) => record.backgroundTaskId ?? record.agentId).filter(Boolean);
-    if (cancelIds.length === 0) {
-      writeOutput(blockStop(`Fusion task${missingRuntimeIds.length === 1 ? "" : "s"} ${missingRuntimeIds.map((record) => record.taskId).join(", ")} failed before a runtime task id was available. Report the failure before finishing.`));
+    const reapedTaskIds = [];
+    for (const record of cancellations.filter((candidate) => candidate.backgroundTaskId || candidate.agentId)) {
+      if (hasBackgroundTasks ? runtimeTaskForRecord(record, tasks) : (record.cancelAttemptCount ?? 0) < 2) {
+        continue;
+      }
+      let settled = false;
+      updateLifecycleWorkerRecord(record.taskId, env, (current) => {
+        if (!current || isTerminalWorkerStatus(current.transportStatus)) {
+          return null;
+        }
+        settled = true;
+        return settleReapedWorker(current, now, env);
+      });
+      if (settled) {
+        reapedTaskIds.push(record.taskId);
+      }
+    }
+    const reapedSentence = reapedTaskIds.length > 0 ? `Fusion task IDs ${reapedTaskIds.join(", ")} were settled as task_reaped because the harness no longer tracks their runtime tasks.` : "";
+    const reapedSuffix = reapedSentence ? ` ${reapedSentence}` : "";
+    const cancelIds = cancellations.filter((record) => !reapedTaskIds.includes(record.taskId)).map((record) => record.backgroundTaskId ?? record.agentId).filter(Boolean);
+    if (cancelIds.length > 0) {
+      writeOutput(blockStop(`Call TaskStop for over-budget task${cancelIds.length === 1 ? "" : "s"} ${cancelIds.join(", ")} and report the cancellation before finishing.${reapedSuffix}`));
       return;
     }
-    writeOutput(blockStop(`Call TaskStop for over-budget task${cancelIds.length === 1 ? "" : "s"} ${cancelIds.join(", ")} and report the cancellation before finishing.`));
-    return;
+    if (missingRuntimeIds.length > 0) {
+      writeOutput(blockStop(`Fusion task${missingRuntimeIds.length === 1 ? "" : "s"} ${missingRuntimeIds.map((record) => record.taskId).join(", ")} failed before a runtime task id was available. Report the failure before finishing.${reapedSuffix}`));
+      return;
+    }
+    if (reapedSentence) {
+      writeOutput(hookOutput("Stop", reapedSentence));
+      return;
+    }
   }
   const currentRecords = sessionRecords(input.session_id, env);
   const inFlight = armInFlightRecords(currentRecords, tasks, env);
