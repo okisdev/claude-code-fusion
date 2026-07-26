@@ -84,6 +84,7 @@ const DEFAULT_WAIT_POLL_MS = 2000;
 const DEFAULT_WAIT_TIMEOUT_MS = 570000;
 const RECORD_ACCEPTANCE_JOB_ID_PATTERN = /^[a-f0-9]{32}$/;
 const RECORD_ACCEPTANCE_VALUES = new Set(["accepted", "rejected", "unverified"]);
+const SEMANTIC_FAILURE_KINDS = new Set(["intent_override", "scope_rewrite", "wrong_approach", "style_mismatch"]);
 const MAX_WAIT_TIMEOUT_MS = 570000;
 const CONTINUE_PROMPT =
   "Continue from the current thread state. Pick the next highest-value step and follow through until the task is resolved.";
@@ -164,7 +165,7 @@ function printUsage() {
       "  node scripts/grok-companion.mjs history [--all] [--limit <n>] [--cwd <dir>] [--json]",
       "  node scripts/grok-companion.mjs result <job-id> [--cwd <dir>] [--wait] [--wait-timeout-ms <ms>] [--json]",
       "  node scripts/grok-companion.mjs cancel <job-id> [--cwd <dir>] [--json]",
-      "  node scripts/grok-companion.mjs record-acceptance --job-id <32 lowercase hex> --acceptance <accepted|rejected|unverified> [--reason <text>] [--accept-failed-transport]",
+      "  node scripts/grok-companion.mjs record-acceptance --job-id <32 lowercase hex> --acceptance <accepted|rejected|unverified> [--reason <text>] [--failure-kind <intent_override|scope_rewrite|wrong_approach|style_mismatch>] [--accept-failed-transport]",
       "  node scripts/grok-companion.mjs stats [--all] [--cwd <dir>] [--json]",
       "  node scripts/grok-companion.mjs setup [--continuity <manual|claude-session>] [--enable-stop-gate] [--disable-stop-gate] [--json]",
       "  node scripts/grok-companion.mjs stop-gate"
@@ -183,9 +184,9 @@ function recordAcceptanceArgs(argv) {
       options.acceptFailedTransport = true;
       continue;
     }
-    const key = token === "--job-id" ? "jobId" : token === "--acceptance" ? "acceptance" : token === "--reason" ? "reason" : null;
+    const key = token === "--job-id" ? "jobId" : token === "--acceptance" ? "acceptance" : token === "--reason" ? "reason" : token === "--failure-kind" ? "failureKind" : null;
     if (!key) {
-      throw errorWithFailure("The record-acceptance command accepts only --job-id, --acceptance, --reason, and --accept-failed-transport.", "input");
+      throw errorWithFailure("The record-acceptance command accepts only --job-id, --acceptance, --reason, --failure-kind, and --accept-failed-transport.", "input");
     }
     if (Object.hasOwn(options, key)) {
       throw errorWithFailure(`${token} may be provided only once.`, "input");
@@ -202,6 +203,15 @@ function recordAcceptanceArgs(argv) {
   }
   if (!RECORD_ACCEPTANCE_VALUES.has(options.acceptance)) {
     throw errorWithFailure("The --acceptance option must be accepted, rejected, or unverified.", "input");
+  }
+  if (options.failureKind !== undefined && !SEMANTIC_FAILURE_KINDS.has(options.failureKind)) {
+    throw errorWithFailure("The --failure-kind option must be intent_override, scope_rewrite, wrong_approach, or style_mismatch.", "input");
+  }
+  if (options.failureKind !== undefined && options.acceptance !== "rejected") {
+    throw errorWithFailure("The --failure-kind option is valid only with --acceptance rejected.", "input");
+  }
+  if (options.acceptance === "rejected" && !options.reason?.trim()) {
+    throw errorWithFailure("A rejected acceptance requires --reason.", "input");
   }
   return options;
 }
@@ -3003,7 +3013,7 @@ async function handleStopGate() {
 }
 
 function handleRecordAcceptance(argv) {
-  const { acceptance, acceptFailedTransport, jobId, reason } = recordAcceptanceArgs(argv);
+  const { acceptance, acceptFailedTransport, failureKind, jobId, reason } = recordAcceptanceArgs(argv);
   const found = findJobRecordById(resolveDataDir(), jobId);
   if (!found) {
     throw errorWithFailure(`No job record found for ${jobId}.`, "input");
@@ -3025,7 +3035,8 @@ function handleRecordAcceptance(argv) {
     }
     return {
       ...current,
-      ...(reason === undefined ? {} : { semanticFailureMessage: reason }),
+      semanticFailureKind: failureKind ?? null,
+      semanticFailureMessage: reason,
       semanticStatus: acceptance
     };
   }, { allowTerminal: true });

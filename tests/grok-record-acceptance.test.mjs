@@ -45,14 +45,53 @@ test("record-acceptance stores accepted and rejected semantic verdicts", (t) => 
   let [record] = jobRecords(sandbox.dataDir);
   assert.equal(record.semanticStatus, "accepted");
 
-  const rejected = runCompanion(["record-acceptance", "--job-id", id, "--acceptance", "rejected", "--reason", "Verification did not pass."], {
+  const rejected = runCompanion(["record-acceptance", "--job-id", id, "--acceptance", "rejected", "--reason", "Verification did not pass.", "--failure-kind", "intent_override"], {
     cwd: sandbox.workDir,
     env: envFor(sandbox)
   });
   assert.equal(rejected.status, 0, rejected.stderr);
   [record] = jobRecords(sandbox.dataDir);
   assert.equal(record.semanticStatus, "rejected");
+  assert.equal(record.semanticFailureKind, "intent_override");
   assert.equal(record.semanticFailureMessage, "Verification did not pass.");
+});
+
+test("record-acceptance requires a reason for rejected verdicts", (t) => {
+  const sandbox = makeSandbox(t);
+  const id = "1".repeat(32);
+  seedTerminalJob(sandbox, { id, status: "done" });
+  const result = runCompanion(["record-acceptance", "--job-id", id, "--acceptance", "rejected"], {
+    cwd: sandbox.workDir,
+    env: envFor(sandbox)
+  });
+  assert.equal(result.status, 1);
+  assert.equal(result.stderr, "A rejected acceptance requires --reason.\nstate: error\nfailure: input\n");
+});
+
+test("record-acceptance permits failure kinds only for rejected verdicts", (t) => {
+  const sandbox = makeSandbox(t);
+  const id = "2".repeat(32);
+  seedTerminalJob(sandbox, { id, status: "done" });
+  const result = runCompanion(["record-acceptance", "--job-id", id, "--acceptance", "accepted", "--failure-kind", "intent_override"], {
+    cwd: sandbox.workDir,
+    env: envFor(sandbox)
+  });
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /--failure-kind option is valid only with --acceptance rejected/);
+  assert.match(result.stderr, /failure: input/);
+});
+
+test("record-acceptance rejects unknown semantic failure kinds", (t) => {
+  const sandbox = makeSandbox(t);
+  const id = "3".repeat(32);
+  seedTerminalJob(sandbox, { id, status: "done" });
+  const result = runCompanion(["record-acceptance", "--job-id", id, "--acceptance", "rejected", "--reason", "Verification did not pass.", "--failure-kind", "unknown"], {
+    cwd: sandbox.workDir,
+    env: envFor(sandbox)
+  });
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /intent_override, scope_rewrite, wrong_approach, or style_mismatch/);
+  assert.match(result.stderr, /failure: input/);
 });
 
 test("record-acceptance blocks accepted verdicts on failed transport by default", (t) => {

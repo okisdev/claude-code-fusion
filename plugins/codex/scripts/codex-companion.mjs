@@ -97,6 +97,7 @@ const TRANSPORT_MAX_AGE_MS = 60 * 60 * 1000;
 const RECORD_ACCEPTANCE_JOB_ID_PATTERN = /^[a-f0-9]{32}$/;
 const RECORD_ACCEPTANCE_VALUES = new Set(["accepted", "rejected", "unverified"]);
 const RECORD_ACCEPTANCE_SOURCES = new Set(["collector", "main-loop", "stats"]);
+const SEMANTIC_FAILURE_KINDS = new Set(["intent_override", "scope_rewrite", "wrong_approach", "style_mismatch"]);
 const SOL_FOREGROUND_WRITE_WARNING = "warning: sol p90 wall clock exceeds the 600s foreground cap. Split the brief or name gpt-5.6-terra.";
 let activeCommandArgv = null;
 
@@ -117,7 +118,7 @@ function printUsage() {
       "  node scripts/codex-companion.mjs status [job-id] [--all] [--cwd <dir>] [--json]",
       "  node scripts/codex-companion.mjs result <job-id> [--wait] [--wait-timeout-ms <ms>] [--cwd <dir>] [--json]",
       "  node scripts/codex-companion.mjs cancel <job-id> [--cwd <dir>] [--json]",
-      "  node scripts/codex-companion.mjs record-acceptance --job-id <32 lowercase hex> --acceptance <accepted|rejected|unverified> [--reason <text>] [--source <collector|main-loop|stats>] [--accept-failed-transport]",
+      "  node scripts/codex-companion.mjs record-acceptance --job-id <32 lowercase hex> --acceptance <accepted|rejected|unverified> [--reason <text>] [--failure-kind <intent_override|scope_rewrite|wrong_approach|style_mismatch>] [--source <collector|main-loop|stats>] [--accept-failed-transport]",
       "  node scripts/codex-companion.mjs history [--json]",
       "  node scripts/codex-companion.mjs setup [--cwd <dir>] [--json]"
     ].join("\n") + "\n"
@@ -161,9 +162,9 @@ function recordAcceptanceArgs(argv) {
       options.acceptFailedTransport = true;
       continue;
     }
-    const key = token === "--job-id" ? "jobId" : token === "--acceptance" ? "acceptance" : token === "--reason" ? "reason" : token === "--source" ? "source" : null;
+    const key = token === "--job-id" ? "jobId" : token === "--acceptance" ? "acceptance" : token === "--reason" ? "reason" : token === "--failure-kind" ? "failureKind" : token === "--source" ? "source" : null;
     if (!key) {
-      throw new CompanionError("The record-acceptance command accepts only --job-id, --acceptance, --reason, --source, and --accept-failed-transport.", "input");
+      throw new CompanionError("The record-acceptance command accepts only --job-id, --acceptance, --reason, --failure-kind, --source, and --accept-failed-transport.", "input");
     }
     if (Object.hasOwn(options, key)) {
       throw new CompanionError(`${token} may be provided only once.`, "input");
@@ -180,6 +181,15 @@ function recordAcceptanceArgs(argv) {
   }
   if (!RECORD_ACCEPTANCE_VALUES.has(options.acceptance)) {
     throw new CompanionError("The --acceptance option must be accepted, rejected, or unverified.", "input");
+  }
+  if (options.failureKind !== undefined && !SEMANTIC_FAILURE_KINDS.has(options.failureKind)) {
+    throw new CompanionError("The --failure-kind option must be intent_override, scope_rewrite, wrong_approach, or style_mismatch.", "input");
+  }
+  if (options.failureKind !== undefined && options.acceptance !== "rejected") {
+    throw new CompanionError("The --failure-kind option is valid only with --acceptance rejected.", "input");
+  }
+  if (options.acceptance === "rejected" && !options.reason?.trim()) {
+    throw new CompanionError("A rejected acceptance requires --reason.", "input");
   }
   options.source ??= "stats";
   if (!RECORD_ACCEPTANCE_SOURCES.has(options.source)) {
@@ -2060,7 +2070,7 @@ async function handleCancel(rawArgv) {
 }
 
 async function handleRecordAcceptance(argv) {
-  const { acceptance, acceptFailedTransport, jobId, reason, source } = recordAcceptanceArgs(argv);
+  const { acceptance, acceptFailedTransport, failureKind, jobId, reason, source } = recordAcceptanceArgs(argv);
   const found = findJobRecordById(resolveDataDir(), jobId);
   if (!found) {
     throw new CompanionError(`No job record found for ${jobId}.`, "input");
@@ -2079,9 +2089,10 @@ async function handleRecordAcceptance(argv) {
       };
     }
     return {
-      ...(reason === undefined ? {} : { semanticFailureMessage: reason }),
       acceptanceRecordedAt: nowIso(),
       acceptanceSource: source,
+      semanticFailureKind: failureKind ?? null,
+      semanticFailureMessage: reason,
       semanticStatus: acceptance
     };
   }, { allowTerminal: true });
