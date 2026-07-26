@@ -153,3 +153,32 @@ test("the stats CLI forwards --accept-failed-transport from staged arguments unc
   assert.strictEqual(result.status, 0, result.stderr);
   assert.deepStrictEqual(JSON.parse(fs.readFileSync(argsFile, "utf8")), ["record-acceptance", "--job-id", jobId, "--acceptance", "accepted", "--source", "main-loop", "--accept-failed-transport"]);
 });
+
+test("the stats CLI forwards --failure-kind-for from staged arguments", (t) => {
+  const directory = sandbox(t);
+  const companion = path.join(directory, "codex-companion.mjs");
+  const argsFile = path.join(directory, "companion-args.json");
+  const jobId = "b".repeat(32);
+  fs.writeFileSync(companion, 'import fs from "node:fs";\nfs.writeFileSync(process.env.FUSION_TEST_CODEX_COMPANION_ARGS, JSON.stringify(process.argv.slice(2)));\n');
+  const env = {
+    ...process.env,
+    CLAUDE_CODE_SESSION_ID: "fusion-stats-transport-semantic-failure-test",
+    FUSION_CODEX_STATE: path.join(directory, "missing-codex"),
+    FUSION_CODEX_COMPANION: companion,
+    FUSION_GROK_COMPANION: path.join(directory, "missing-grok.mjs"),
+    FUSION_DATA_DIR: path.join(directory, "fusion"),
+    FUSION_TEST_CODEX_COMPANION_ARGS: argsFile,
+    FUSION_WORKER_STATE_DIR: path.join(directory, "missing-workers")
+  };
+  const created = spawnSync(process.execPath, [SCRIPT, "transport-create"], { cwd: directory, env, encoding: "utf8" });
+  assert.strictEqual(created.status, 0, created.stderr);
+  const transport = JSON.parse(created.stdout);
+  const jobsDirectory = path.join(env.FUSION_CODEX_STATE, "workspace", "jobs");
+  fs.mkdirSync(jobsDirectory, { recursive: true });
+  fs.writeFileSync(path.join(jobsDirectory, `${jobId}.json`), JSON.stringify({ id: jobId, workspaceRoot: directory, status: "done" }));
+  fs.writeFileSync(transport.file, `--record ${jobId}=rejected --failure-kind-for ${jobId} scope_rewrite --reason "The output did not satisfy the requested scope."`);
+
+  const result = spawnSync(process.execPath, [SCRIPT, "--raw-args-token", transport.token], { cwd: directory, env, encoding: "utf8" });
+  assert.strictEqual(result.status, 0, result.stderr);
+  assert.deepStrictEqual(JSON.parse(fs.readFileSync(argsFile, "utf8")), ["record-acceptance", "--job-id", jobId, "--acceptance", "rejected", "--source", "main-loop", "--reason", "The output did not satisfy the requested scope.", "--failure-kind", "scope_rewrite"]);
+});

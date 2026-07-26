@@ -384,7 +384,7 @@ test("trivial worker limits raise token budgets and retain environment overrides
 });
 
 test("package-type envelopes validate, default, and persist their byte length", (t) => {
-  for (const packageType of ["implementation", "consult", "review", "research"]) {
+  for (const packageType of ["implementation", "consult", "review", "research", "design"]) {
     const prompt = `${brief()}package-type: ${packageType}\n`;
     const validation = validateWorkerBrief(prompt, "fusion:fast-worker");
     assert.strictEqual(validation.ok, true);
@@ -4380,7 +4380,7 @@ test("queued accepted verdicts re-arm settlement after cancelled and incomplete 
   assert.match(incompleteRecord.pendingVerdictError, /transport status is incomplete/);
 });
 
-test("a queued accepted done transition records the linked engine verdict", (t) => {
+test("a queued rejected done transition records the linked engine verdict with a semantic failure kind", (t) => {
   const box = sandbox(t);
   const peerJobId = "d".repeat(32);
   const argsFile = path.join(box.root, "codex-companion-args.json");
@@ -4395,7 +4395,7 @@ test("a queued accepted done transition records the linked engine verdict", (t) 
     tool_response: { isAsync: true, status: "async_launched", agentId: "queued-peer-notification", outputFile: workerTranscript }
   });
   updateWorkerRecord(record(box).taskId, envFor(box), (current) => ({ ...current, peerEngine: "codex", peerJobId, peerTransportStatus: "done" }));
-  recordWorkerAcceptance({ taskId: record(box).taskId, acceptance: "accepted", env: envFor(box), source: "main-loop" });
+  recordWorkerAcceptance({ taskId: record(box).taskId, acceptance: "rejected", env: envFor(box), source: "main-loop", reason: "The result did not meet the requested behavior.", failureKind: "wrong_approach" });
   fs.appendFileSync(box.transcript, `${JSON.stringify({ type: "user", message: { content: "<task-notification>\n<task-id>queued-peer-notification</task-id>\n<status>completed</status>\n</task-notification>" } })}\n`, "utf8");
 
   const stopped = run(box, {
@@ -4410,9 +4410,10 @@ test("a queued accepted done transition records the linked engine verdict", (t) 
   assert.strictEqual(stopped.stdout, "");
   const settled = record(box);
   assert.strictEqual(settled.transportStatus, "done");
-  assert.strictEqual(settled.acceptance, "accepted");
+  assert.strictEqual(settled.acceptance, "rejected");
+  assert.strictEqual(settled.acceptanceFailureKind, "wrong_approach");
   assert.strictEqual(settled.engineSettlementError, undefined);
-  assert.deepStrictEqual(JSON.parse(fs.readFileSync(argsFile, "utf8")), ["record-acceptance", "--job-id", peerJobId, "--acceptance", "accepted", "--source", "main-loop"]);
+  assert.deepStrictEqual(JSON.parse(fs.readFileSync(argsFile, "utf8")), ["record-acceptance", "--job-id", peerJobId, "--acceptance", "rejected", "--source", "main-loop", "--reason", "The result did not meet the requested behavior.", "--failure-kind", "wrong_approach"]);
 });
 
 test("the peer wrapper SubagentStop matcher reaches job footer collection", (t) => {

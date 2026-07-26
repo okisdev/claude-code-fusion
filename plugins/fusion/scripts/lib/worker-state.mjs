@@ -17,6 +17,7 @@ const TASK_OUTPUT_TRANSCRIPT_CHUNK_BYTES = 64 * 1024;
 const TASK_OUTPUT_TRANSCRIPT_MAX_LINE_BYTES = 1024 * 1024;
 const TERMINAL_STATUSES = new Set(["done", "incomplete", "failed", "cancelled", "owner_ended"]);
 const ACCEPTANCE_STATES = new Set(["accepted", "rejected", "unverified"]);
+const SEMANTIC_FAILURE_KINDS = new Set(["intent_override", "scope_rewrite", "wrong_approach", "style_mismatch"]);
 export const WORKER_COLLECTION_METHODS = Object.freeze({
   SUBAGENT_STOP: "subagent_stop",
   TASK_NOTIFICATION: "task_notification",
@@ -302,6 +303,7 @@ export function createWorkerRecord(record, env = process.env) {
       userBackgroundAuthorized: record.userBackgroundAuthorized === true,
       transportStatus: "dispatching",
       acceptance: "unverified",
+      acceptanceFailureKind: record.acceptanceFailureKind ?? null,
       ...(PEER_JOB_FOOTER_AGENT_TYPES.has(record.agentType) ? { peerJobId: null } : {}),
       failureKind: null,
       deliveryMode: null,
@@ -683,7 +685,7 @@ export function backfillWorkerTaskOutputTelemetry(record, transcriptPath) {
   };
 }
 
-function validatedAcceptanceFields(acceptance, source, reason) {
+function validatedAcceptanceFields(acceptance, source, reason, failureKind) {
   if (!ACCEPTANCE_STATES.has(acceptance)) {
     throw new TypeError("Fusion worker acceptance must be accepted, rejected, or unverified.");
   }
@@ -700,7 +702,13 @@ function validatedAcceptanceFields(acceptance, source, reason) {
         .trim()
         .slice(0, 240)
     : null;
-  return { safeReason };
+  if (failureKind != null && !SEMANTIC_FAILURE_KINDS.has(failureKind)) {
+    throw new TypeError("Fusion worker acceptance failure kind must be one of intent_override, scope_rewrite, wrong_approach, style_mismatch.");
+  }
+  if (failureKind != null && acceptance !== "rejected") {
+    throw new TypeError("Fusion worker acceptance failure kind applies only to rejected acceptance.");
+  }
+  return { safeReason, safeFailureKind: failureKind ?? null };
 }
 
 function workerAcceptanceGate(record, taskId, acceptance, acceptFailedTransport) {
@@ -720,13 +728,14 @@ function acceptanceRecordedAt(now) {
   return now instanceof Date ? now.toISOString() : typeof now === "string" && !Number.isNaN(Date.parse(now)) ? now : new Date().toISOString();
 }
 
-function settleWorkerAcceptance(record, { acceptance, source, reason }, now) {
+function settleWorkerAcceptance(record, { acceptance, source, reason, failureKind }, now) {
   const { pendingVerdict: _pendingVerdict, pendingVerdictError: _pendingVerdictError, ...settled } = record;
   return {
     ...settled,
     acceptance,
     acceptanceSource: source,
     acceptanceReason: reason,
+    acceptanceFailureKind: failureKind,
     acceptanceRecordedAt: acceptanceRecordedAt(now),
     awaitingVerdict: false,
     awaitingVerdictArmedAt: null
@@ -747,7 +756,7 @@ export function applyQueuedVerdict(record, now) {
   if (!record?.pendingVerdict || !isTerminalWorkerStatus(record.transportStatus)) {
     return record;
   }
-  const { acceptance, source, reason, acceptFailedTransport = false } = record.pendingVerdict;
+  const { acceptance, source, reason, failureKind, acceptFailedTransport = false } = record.pendingVerdict;
   if (acceptance === "accepted" && record.transportStatus !== "done") {
     const { pendingVerdict: _pendingVerdict, ...unsettled } = record;
     return {
@@ -758,9 +767,9 @@ export function applyQueuedVerdict(record, now) {
     };
   }
   try {
-    const { safeReason } = validatedAcceptanceFields(acceptance, source, reason);
+    const { safeReason, safeFailureKind } = validatedAcceptanceFields(acceptance, source, reason, failureKind);
     workerAcceptanceGate(record, record.taskId, acceptance, acceptFailedTransport);
-    return settleWorkerAcceptance(record, { acceptance, source, reason: safeReason }, now);
+    return settleWorkerAcceptance(record, { acceptance, source, reason: safeReason, failureKind: safeFailureKind }, now);
   } catch (error) {
     return {
       ...record,
@@ -777,7 +786,7 @@ export function isSettledWorker(record) {
   return record.acceptanceRecordedAt != null && record.awaitingVerdict !== true;
 }
 
-function updateWorkerAcceptance({ taskId, acceptance, env, source, safeReason, validateRecord, acceptFailedTransport = false, queueIfNonTerminal = false }) {
+function updateWorkerAcceptance({ taskId, acceptance, env, source, safeReason, safeFailureKind, validateRecord, acceptFailedTransport = false, queueIfNonTerminal = false }) {
   let queued = false;
   const updated = updateWorkerRecord(taskId, env, (record) => {
     if (!record) {
@@ -795,34 +804,36 @@ function updateWorkerAcceptance({ taskId, acceptance, env, source, safeReason, v
           acceptance,
           source,
           reason: safeReason,
+          failureKind: safeFailureKind,
           queuedAt: new Date().toISOString(),
           ...(acceptFailedTransport ? { acceptFailedTransport: true } : {})
         }
       };
     }
     validateRecord(record);
-    return settleWorkerAcceptance(record, { acceptance, source, reason: safeReason });
+    return settleWorkerAcceptance(record, { acceptance, source, reason: safeReason, failureKind: safeFailureKind });
   });
   return { record: updated, queued };
 }
 
-export function validateWorkerAcceptance({ record, taskId, acceptance, source = "main-loop", reason = null, acceptFailedTransport = false }) {
-  const { safeReason } = validatedAcceptanceFields(acceptance, source, reason);
+export function validateWorkerAcceptance({ record, taskId, acceptance, source = "main-loop", reason = null, failureKind = null, acceptFailedTransport = false }) {
+  const { safeReason, safeFailureKind } = validatedAcceptanceFields(acceptance, source, reason, failureKind);
   if (!record) {
     throw new Error(`Fusion worker task ${taskId} was not found.`);
   }
   workerAcceptanceGate(record, taskId, acceptance, acceptFailedTransport);
-  return { safeReason };
+  return { safeReason, safeFailureKind };
 }
 
-export function recordWorkerAcceptance({ taskId, acceptance, env = process.env, source = "main-loop", reason = null, acceptFailedTransport = false }) {
-  const { safeReason } = validatedAcceptanceFields(acceptance, source, reason);
+export function recordWorkerAcceptance({ taskId, acceptance, env = process.env, source = "main-loop", reason = null, failureKind = null, acceptFailedTransport = false }) {
+  const { safeReason, safeFailureKind } = validatedAcceptanceFields(acceptance, source, reason, failureKind);
   const result = updateWorkerAcceptance({
     taskId,
     acceptance,
     env,
     source,
     safeReason,
+    safeFailureKind,
     acceptFailedTransport,
     queueIfNonTerminal: true,
     validateRecord(record) {
@@ -832,20 +843,21 @@ export function recordWorkerAcceptance({ taskId, acceptance, env = process.env, 
   return workerAcceptanceResult(result.record, result.queued);
 }
 
-export function recordCodexCollectorAcceptance({ taskId, jobId, sessionId, acceptance, env = process.env, source = "main-loop", reason = null }) {
+export function recordCodexCollectorAcceptance({ taskId, jobId, sessionId, acceptance, env = process.env, source = "main-loop", reason = null, failureKind = null }) {
   if (typeof jobId !== "string" || !/^[a-f0-9]{32}$/.test(jobId)) {
     throw new TypeError("Codex collector job id is invalid.");
   }
   if (typeof sessionId !== "string" || !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(sessionId)) {
     throw new TypeError("Codex collector session id is invalid.");
   }
-  const { safeReason } = validatedAcceptanceFields(acceptance, source, reason);
+  const { safeReason, safeFailureKind } = validatedAcceptanceFields(acceptance, source, reason, failureKind);
   return updateWorkerAcceptance({
     taskId,
     acceptance,
     env,
     source,
     safeReason,
+    safeFailureKind,
     validateRecord(record) {
       if (canonicalWorkerAgentType(record.agentType) !== "fusion:job-collector" || record.completionContract !== "collector") {
         throw new Error(`Fusion worker task ${taskId} is not a Codex collector.`);
