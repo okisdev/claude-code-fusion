@@ -99,3 +99,9 @@ Job statuses, liveness, rendered outcome footers, failure kind definitions, back
 
 - A missing grok binary fails fast with a message pointing at `/grok:setup`, and the `grok-rescue` agent returns a single `grok unavailable: <reason>` line the orchestrator uses to stop routing to Grok for the session.
 - A bad `--cwd` fails before the companion creates a job record and maps to the shared `input` failure kind.
+
+## X content access
+
+Live web consults reach x.com post content through the generic `web_fetch` tool; a controlled probe on 2026-07-26 retrieved a full post body directly from an x.com status URL while the Codex web surface returned empty HTML for the same URL, so X reads are treated as a Grok lane monopoly in routing. The richer first party `x_search` backend tool (keyword, semantic, user, and thread retrieval) exists in the Grok CLI but rides the agent profile and SDK tool override surface, not the `--tools` built in allowlist this companion uses; it stays unwired until upstream documents headless enablement, and adding it blind would trip the forced builder tracing's fail closed gate.
+
+The Grok companion's `record-acceptance` requires `--reason` for a rejected verdict and accepts `--failure-kind` with one of `intent_override`, `scope_rewrite`, `wrong_approach`, or `style_mismatch`; the kind lands in `semanticFailureKind`.
