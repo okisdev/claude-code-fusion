@@ -14,6 +14,9 @@ function makeSandbox(t) {
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
   return {
     root,
+    home: path.join(root, "home"),
+    workerState: path.join(root, "worker-state"),
+    dataDir: path.join(root, "fusion-data"),
     grokData: path.join(root, "grok-data"),
     codexState: path.join(root, "codex-state")
   };
@@ -29,10 +32,19 @@ function writeRecord(file, record) {
 }
 
 function envFor(sandbox, extra = {}) {
+  const inherited = Object.fromEntries(
+    Object.entries(process.env).filter(
+      ([key]) => key !== "HOME" && key !== "CLAUDE_CODE_SESSION_ID" && !/^(?:FUSION|GROK|CODEX)_/.test(key)
+    )
+  );
   return {
-    ...process.env,
-    GROK_COMPANION_DATA: sandbox.grokData,
+    ...inherited,
+    HOME: sandbox.home,
+    FUSION_DATA_DIR: sandbox.dataDir,
+    FUSION_WORKER_STATE_DIR: sandbox.workerState,
+    FUSION_CODEX_STATE: sandbox.codexState,
     FUSION_CODEX_STATE_DIR: sandbox.codexState,
+    GROK_COMPANION_DATA: sandbox.grokData,
     ...extra
   };
 }
