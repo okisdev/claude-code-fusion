@@ -288,6 +288,8 @@ test("aggregates the canonical Codex lifecycle and direct token usage", (t) => {
     createdAt: "2026-07-02T06:01:00.000Z",
     startedAt: "2026-07-02T06:01:00.000Z",
     finishedAt: "2026-07-02T06:01:03.000Z",
+    timeoutMs: 3000,
+    failureKind: "timeout",
     tokenUsageAvailability: "unavailable"
   });
 
@@ -301,6 +303,10 @@ test("aggregates the canonical Codex lifecycle and direct token usage", (t) => {
   assert.strictEqual(stats.tokenUsage.jobsWithUsage, 1);
   assert.strictEqual(stats.tokenUsage.jobsWithoutUsage, 1);
   assert.deepStrictEqual(stats.tokenUsage.totals, { inputTokens: 120, cachedInputTokens: 40, outputTokens: 30, reasoningOutputTokens: 12, totalTokens: 150 });
+  assert.deepStrictEqual(stats.last7DaysBySku, [
+    { sku: "gpt-5.4@high", jobs: 1, outputTokens: 30, outputTokenOverflow: false, timeouts: 0, nearCap: 0, timeoutShare: 0, nearCapShare: 0 },
+    { sku: "unknown@unavailable", jobs: 1, outputTokens: 0, outputTokenOverflow: false, timeouts: 1, nearCap: 1, timeoutShare: 1, nearCapShare: 1 }
+  ]);
 });
 
 test("Codex stats fail closed when exact token aggregation exceeds the safe integer range", (t) => {
@@ -414,6 +420,9 @@ test("Codex renders per-SKU trends from the seven days ending at the newest reco
     status: "done",
     jobClass: "task",
     createdAt: "2026-07-19T00:00:00.000Z",
+    startedAt: "2026-07-19T00:00:00.000Z",
+    finishedAt: "2026-07-19T00:00:40.000Z",
+    timeoutMs: 60000,
     request: { model: "gpt-trend", effort: "xhigh" },
     tokenUsageAvailability: "available",
     tokenUsage: usage(11)
@@ -431,11 +440,11 @@ test("Codex renders per-SKU trends from the seven days ending at the newest reco
 
   const stats = codexStats({ env: { FUSION_CODEX_STATE: stateRoot, FUSION_DATA_DIR: fusionData }, cwd: dir });
   assert.deepStrictEqual(stats.last7DaysBySku, [
-    { sku: "gpt-trend@high", jobs: 1, outputTokens: 7, outputTokenOverflow: false, timeouts: 0, timeoutShare: 0 },
-    { sku: "gpt-trend@xhigh", jobs: 2, outputTokens: 24, outputTokenOverflow: false, timeouts: 1, timeoutShare: 0.5 }
+    { sku: "gpt-trend@high", jobs: 1, outputTokens: 7, outputTokenOverflow: false, timeouts: 0, nearCap: 0, timeoutShare: 0, nearCapShare: 0 },
+    { sku: "gpt-trend@xhigh", jobs: 2, outputTokens: 24, outputTokenOverflow: false, timeouts: 1, nearCap: 2, timeoutShare: 0.5, nearCapShare: 1 }
   ]);
   const rendered = renderFusionStats({ scope: dir, codex: stats });
-  assert.match(rendered, /By SKU, last 7 days:\nSKU \| jobs \| output tokens \| timeout share\ngpt-trend@high \| 1 \| 7 \| 0\.0%\ngpt-trend@xhigh \| 2 \| 24 \| 50\.0%/);
+  assert.match(rendered, /By SKU, last 7 days:\nSKU \| jobs \| output tokens \| timeout share \| near-cap share\ngpt-trend@high \| 1 \| 7 \| 0\.0% \| 0\.0%\ngpt-trend@xhigh \| 2 \| 24 \| 50\.0% \| 100\.0%/);
   assert.doesNotMatch(rendered, /gpt-old@low \|/);
 });
 
@@ -983,6 +992,26 @@ test("--prune-dead --yes removes only the all-dead workspace dirs and spares liv
   assert.strictEqual(after.grok.length, 0);
 });
 
+test("--prune-dead lists and removes unused acceptance observations", (t) => {
+  const dir = sandbox(t);
+  const stateRoot = path.join(dir, "state");
+  const fusionData = path.join(dir, "fusion-data");
+  const key = "retired-acceptance";
+  const file = path.join(fusionData, "observations", key, "acceptance.jsonl");
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.writeFileSync(file, "{\"jobId\":\"obsolete\"}\n");
+
+  const dryRun = run({ cwd: dir, codexState: stateRoot }, ["--prune-dead", "--json"], { FUSION_DATA_DIR: fusionData });
+  assert.strictEqual(dryRun.status, 0, dryRun.stderr);
+  assert.deepStrictEqual(JSON.parse(dryRun.stdout).dead.acceptance, [{ key, file }]);
+  assert.ok(fs.existsSync(file));
+
+  const confirmed = run({ cwd: dir, codexState: stateRoot }, ["--prune-dead", "--yes", "--json"], { FUSION_DATA_DIR: fusionData });
+  assert.strictEqual(confirmed.status, 0, confirmed.stderr);
+  assert.deepStrictEqual(JSON.parse(confirmed.stdout).dead.acceptance, [{ key, file }]);
+  assert.strictEqual(fs.existsSync(file), false);
+});
+
 test("pruneDeadWorkspaces never touches a workspace with any running job even without a live cwd", (t) => {
   const dir = sandbox(t);
   const grokDataDir = path.join(dir, "grok-data");
@@ -1233,13 +1262,15 @@ test("terminal ledgers supplement cleaned jobs and safely dedupe live state", (t
     {
       schemaVersion: 1,
       jobId: "cleaned-job",
-      transportStatus: "done",
+      transportStatus: "error",
       workspaceRoot: dir,
       sessionId: "session-ledger",
       kind: "review",
       createdAt: "2026-07-14T00:00:00.000Z",
       startedAt: "2026-07-14T00:00:01.000Z",
       finishedAt: "2026-07-14T00:00:11.000Z",
+      timeoutMs: 60000,
+      failureKind: "timeout",
       observedAt: "2026-07-14T00:00:12.000Z",
       model: "ledger-model",
       effort: "high",
@@ -1250,11 +1281,14 @@ test("terminal ledgers supplement cleaned jobs and safely dedupe live state", (t
 
   const recovered = codexStats({ env: { FUSION_CODEX_STATE: stateRoot, FUSION_DATA_DIR: path.join(dir, "fusion") }, cwd: dir });
   assert.strictEqual(recovered.totalJobs, 1);
-  assert.deepStrictEqual(recovered.byTransportStatus, { done: 1 });
+  assert.deepStrictEqual(recovered.byTransportStatus, { error: 1 });
   assert.deepStrictEqual(recovered.byAcceptance, { unverified: 1 });
   assert.deepStrictEqual(recovered.byModel, { "ledger-model@high": 1 });
   assert.strictEqual(recovered.evidence.recoveredTerminalJobs, 1);
   assert.deepStrictEqual(recovered.tokenUsage.totals, { inputTokens: 100, cachedInputTokens: 40, outputTokens: 20, reasoningOutputTokens: 5, totalTokens: 120 });
+  assert.deepStrictEqual(recovered.last7DaysBySku, [
+    { sku: "ledger-model@high", jobs: 1, outputTokens: 20, outputTokenOverflow: false, timeouts: 1, nearCap: 1, timeoutShare: 1, nearCapShare: 1 }
+  ]);
 
   writeCodexJob(stateRoot, dir, "cleaned-job", {
     status: "done",
@@ -1476,6 +1510,15 @@ test("direct --audit prints the audit report", (t) => {
   assert.match(result.stdout, /# Fusion inline audit/);
 });
 
+test("bare direct invocation prints the Fusion stats report", (t) => {
+  const dir = sandbox(t);
+
+  const result = runDirect({ cwd: dir, codexState: path.join(dir, "missing") });
+
+  assert.strictEqual(result.status, 0, result.stderr);
+  assert.match(result.stdout, /# Fusion stats/);
+});
+
 test("direct --json --all emits the all-workspace JSON report", (t) => {
   const dir = sandbox(t);
   const stateRoot = path.join(dir, "codex-state");
@@ -1556,6 +1599,26 @@ test("--record settles a Fusion task and its Codex peer with direct strict argv"
   assert.strictEqual(result.stdout, `Recorded accepted for Fusion worker task ${taskId}.\nRecorded accepted for Codex job ${jobId}.\n`);
   assert.deepStrictEqual(JSON.parse(fs.readFileSync(argsFile, "utf8")), ["record-acceptance", "--job-id", jobId, "--acceptance", "accepted", "--source", "main-loop"]);
   assert.strictEqual(readWorkerRecord(taskId, env).acceptance, "accepted");
+});
+
+test("--record settles multiple direct pairs after one flag", (t) => {
+  const dir = sandbox(t);
+  const stateDir = path.join(dir, "worker-state");
+  const firstTaskId = `fusion-${"1".repeat(24)}`;
+  const secondTaskId = `fusion-${"2".repeat(24)}`;
+  const env = { FUSION_WORKER_STATE_DIR: stateDir };
+  createTerminalWorker({ taskId: firstTaskId, env, workspaceRoot: dir });
+  createTerminalWorker({ taskId: secondTaskId, env, workspaceRoot: dir });
+
+  const result = runDirect(
+    { cwd: dir, codexState: path.join(dir, "missing") },
+    ["--record", `${firstTaskId}=accepted`, `${secondTaskId}=unverified`],
+    env
+  );
+
+  assert.strictEqual(result.status, 0, result.stderr);
+  assert.strictEqual(readWorkerRecord(firstTaskId, env).acceptance, "accepted");
+  assert.strictEqual(readWorkerRecord(secondTaskId, env).acceptance, "unverified");
 });
 
 test("--record leaves a terminal worker unsettled when its engine companion fails", (t) => {
@@ -1760,6 +1823,26 @@ test("--record batches mixed verdicts with per-pair rejection reasons and failur
   assert.deepStrictEqual(JSON.parse(fs.readFileSync(argsFile, "utf8")), ["record-acceptance", "--job-id", jobId, "--acceptance", "rejected", "--source", "main-loop", "--reason", "The result did not satisfy the requested behavior.", "--failure-kind", "scope_rewrite"]);
 });
 
+test("--record settles multiple transported pairs after one flag", (t) => {
+  const dir = sandbox(t);
+  const stateDir = path.join(dir, "worker-state");
+  const firstTaskId = `fusion-${"c".repeat(24)}`;
+  const secondTaskId = `fusion-${"d".repeat(24)}`;
+  const env = { FUSION_WORKER_STATE_DIR: stateDir };
+  createTerminalWorker({ taskId: firstTaskId, env, workspaceRoot: dir });
+  createTerminalWorker({ taskId: secondTaskId, env, workspaceRoot: dir });
+
+  const result = run(
+    { cwd: dir, codexState: path.join(dir, "missing") },
+    ["--record", `${firstTaskId}=accepted`, `${secondTaskId}=unverified`],
+    env
+  );
+
+  assert.strictEqual(result.status, 0, result.stderr);
+  assert.strictEqual(readWorkerRecord(firstTaskId, env).acceptance, "accepted");
+  assert.strictEqual(readWorkerRecord(secondTaskId, env).acceptance, "unverified");
+});
+
 test("--record rejects a raw batch with a rejected pair that has no reason before writing", (t) => {
   const dir = sandbox(t);
   const stateDir = path.join(dir, "worker-state");
@@ -1894,7 +1977,7 @@ test("--record rejects a reason attached to multiple pairs and requires transpor
   const env = { FUSION_WORKER_STATE_DIR: stateDir };
   createTerminalWorker({ taskId: firstTaskId, env, workspaceRoot: dir });
   createTerminalWorker({ taskId: secondTaskId, env, workspaceRoot: dir });
-  const args = ["--record", `${firstTaskId}=accepted`, "--record", `${secondTaskId}=rejected`, "--reason", "mixed verdicts"];
+  const args = ["--record", `${firstTaskId}=accepted`, `${secondTaskId}=rejected`, "--reason", "mixed verdicts"];
 
   const direct = runDirect({ cwd: dir, codexState: path.join(dir, "missing") }, args, env);
   assert.notStrictEqual(direct.status, 0);

@@ -91,7 +91,7 @@ test("every executable private transport surface follows its declared Write tran
     assert.match(content, /file is not empty/, file);
     if (file === "plugins/fusion/skills/stats/SKILL.md") {
       assert.match(content, /sole carve-outs are two strict direct forms: a verdict settlement/, file);
-      assert.match(content, /repeatable `--record <id>=<accepted\|rejected\|unverified>\[:accept-failed-transport\]` pairs, optional `--source collector\|main-loop`, and the value free `--json` and `--accept-failed-transport` flags/, file);
+      assert.match(content, /repeatable `--record` flags, each carrying one or more `<id>=<accepted\|rejected\|unverified>\[:accept-failed-transport\]` pairs, optional `--source collector\|main-loop`, and the value free `--json` and `--accept-failed-transport` flags/, file);
       assert.match(content, /a value free report or maintenance request made only of any combination of `--json`, `--audit`, `--all`, and `--prune-dead`, each at most once/, file);
       assert.match(content, /Anything else, including every `--reason` text value, every `--failure-kind` and `--failure-kind-for` value, and `--session <id>`, still uses the raw-args transport exactly as described above\./, file);
     }

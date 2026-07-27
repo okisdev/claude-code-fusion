@@ -266,6 +266,43 @@ export function appendTokenUsageObservation(sidecarPath, observation) {
   });
 }
 
+export function appendModelAuditObservation(sidecarPath, observation) {
+  ensurePrivateDirectory(path.dirname(sidecarPath));
+  const lockPath = `${sidecarPath}.lock`;
+  let lock;
+  try {
+    lock = fs.openSync(lockPath, fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_WRONLY, 0o600);
+    fs.fchmodSync(lock, 0o600);
+  } catch (error) {
+    if (error?.code === "EEXIST") {
+      return false;
+    }
+    throw error;
+  }
+  try {
+    if (fs.existsSync(sidecarPath)) {
+      fs.chmodSync(sidecarPath, 0o600);
+    }
+    const observations = loadModelAuditObservations(sidecarPath);
+    const current = observations.get(observation.jobId);
+    if (!current || modelObservationRank(observation) > modelObservationRank(current)) {
+      observations.set(observation.jobId, observation);
+    }
+    const replacementPath = `${sidecarPath}.${process.pid}.${Date.now()}.tmp`;
+    try {
+      fs.writeFileSync(replacementPath, `${[...observations.values()].map((entry) => JSON.stringify(entry)).join("\n")}\n`, { encoding: "utf8", mode: 0o600 });
+      fs.chmodSync(replacementPath, 0o600);
+      fs.renameSync(replacementPath, sidecarPath);
+    } finally {
+      fs.rmSync(replacementPath, { force: true });
+    }
+    return true;
+  } finally {
+    fs.closeSync(lock);
+    fs.rmSync(lockPath, { force: true });
+  }
+}
+
 export function resolveGitWorkspaceRoot(cwd) {
   const resolved = path.resolve(cwd);
   const result = spawnSync("git", ["-C", resolved, "rev-parse", "--show-toplevel"], { encoding: "utf8" });
@@ -443,6 +480,8 @@ function terminalLedgerRecord(raw, { workspaceRoot = null, workspaceKey = null, 
     startedAt: raw?.startedAt ?? null,
     finishedAt: raw?.finishedAt ?? raw?.completedAt ?? raw?.observedAt ?? null,
     completedAt: raw?.finishedAt ?? raw?.completedAt ?? raw?.observedAt ?? null,
+    timeoutMs: raw?.timeoutMs ?? null,
+    failureKind: raw?.failureKind ?? null,
     request: model || effort ? { model, effort } : null,
     _fusionObservedModel: raw?.modelSource === "rollout-turn-context" ? model : null,
     _fusionObservedEffort: raw?.effortSource === "rollout-turn-context" ? effort : null,
@@ -1018,10 +1057,13 @@ function summarizeCodexSkuTelemetry(entries) {
       if (entry.createdAtMs < cutoff) {
         continue;
       }
-      const row = trendRows.get(entry.sku) ?? { sku: entry.sku, jobs: 0, outputTokens: 0, outputTokenOverflow: false, timeouts: 0 };
+      const row = trendRows.get(entry.sku) ?? { sku: entry.sku, jobs: 0, outputTokens: 0, outputTokenOverflow: false, timeouts: 0, nearCap: 0 };
       row.jobs += 1;
       if (entry.failureKind === "timeout") {
         row.timeouts += 1;
+      }
+      if (entry.failureKind === "timeout" || (entry.durationSeconds != null && entry.timeoutMs != null && entry.timeoutMs / 1000 - entry.durationSeconds <= 30)) {
+        row.nearCap += 1;
       }
       if (entry.outputTokens != null && !row.outputTokenOverflow) {
         const outputTokens = row.outputTokens + entry.outputTokens;
@@ -1060,7 +1102,7 @@ function summarizeCodexSkuTelemetry(entries) {
   return {
     last7DaysBySku: [...trendRows.values()]
       .sort((left, right) => left.sku.localeCompare(right.sku))
-      .map((row) => ({ ...row, timeoutShare: row.timeouts / row.jobs })),
+      .map((row) => ({ ...row, timeoutShare: row.timeouts / row.jobs, nearCapShare: row.nearCap / row.jobs })),
     laneSignalDrift: laneSignalDrift.sort((left, right) => left.sku.localeCompare(right.sku))
   };
 }
@@ -1152,7 +1194,9 @@ export function fileBasedEngineStats(descriptor, { all = false, env = process.en
           terminal: CODEX_TERMINAL_STATUSES.has(job.status),
           acceptance: semanticAcceptance(raw),
           failureKind: nonEmptyString(raw?.failureKind),
-          outputTokens: codexUsage.usage?.outputTokens ?? null
+          outputTokens: codexUsage.usage?.outputTokens ?? null,
+          durationSeconds: job.durationSeconds,
+          timeoutMs: raw?.timeoutMs ?? null
         });
       }
     }
@@ -1954,11 +1998,37 @@ function scanDeadWorkspaces(descriptor, env) {
   return candidates;
 }
 
+function findUnusedAcceptanceObservations(env) {
+  const root = path.join(resolveFusionDataDir(env), "observations");
+  let workspaces;
+  try {
+    workspaces = fs.readdirSync(root, { withFileTypes: true });
+  } catch {
+    return [];
+  }
+  const candidates = [];
+  for (const workspace of workspaces) {
+    if (!workspace.isDirectory()) {
+      continue;
+    }
+    const file = path.join(root, workspace.name, "acceptance.jsonl");
+    try {
+      if (fs.lstatSync(file).isFile()) {
+        candidates.push({ key: workspace.name, file });
+      }
+    } catch {
+      void 0;
+    }
+  }
+  return candidates;
+}
+
 export function findDeadWorkspaces(env = process.env) {
   const dead = {};
   for (const descriptor of WORKSPACE_ENGINE_DESCRIPTORS) {
     dead[descriptor.id] = scanDeadWorkspaces(descriptor, env);
   }
+  dead.acceptance = findUnusedAcceptanceObservations(env);
   return dead;
 }
 
@@ -1969,6 +2039,9 @@ export function pruneDeadWorkspaces({ env = process.env, yes = false, beforeRemo
   }
   const removed = {};
   for (const [engineId, candidates] of Object.entries(dead)) {
+    if (engineId === "acceptance") {
+      continue;
+    }
     removed[engineId] = [];
     const descriptor = WORKSPACE_ENGINE_DESCRIPTORS.find((entry) => entry.id === engineId);
     for (const candidate of candidates) {
@@ -1980,6 +2053,18 @@ export function pruneDeadWorkspaces({ env = process.env, yes = false, beforeRemo
       }
       fs.rmSync(candidate.dir, { recursive: true, force: true });
       removed[engineId].push(candidate);
+    }
+  }
+  removed.acceptance = [];
+  for (const candidate of dead.acceptance ?? []) {
+    try {
+      if (!fs.lstatSync(candidate.file).isFile()) {
+        continue;
+      }
+      fs.rmSync(candidate.file, { force: true });
+      removed.acceptance.push(candidate);
+    } catch {
+      void 0;
     }
   }
   return { applied: true, dead: removed };
@@ -2064,9 +2149,9 @@ function renderCodexSkuTrend(lines, rows) {
   if (!Array.isArray(rows) || rows.length === 0) {
     return;
   }
-  lines.push("", "By SKU, last 7 days:", "SKU | jobs | output tokens | timeout share");
+  lines.push("", "By SKU, last 7 days:", "SKU | jobs | output tokens | timeout share | near-cap share");
   for (const row of rows) {
-    lines.push(`${row.sku} | ${row.jobs} | ${row.outputTokenOverflow ? "overflow" : row.outputTokens} | ${formatShare(row.timeoutShare)}`);
+    lines.push(`${row.sku} | ${row.jobs} | ${row.outputTokenOverflow ? "overflow" : row.outputTokens} | ${formatShare(row.timeoutShare)} | ${formatShare(row.nearCapShare)}`);
   }
 }
 
@@ -2476,6 +2561,14 @@ function parseRecordArguments(argv, { allowPerPairReasons = false } = {}) {
     if (token === "--record") {
       records.push(parseRecordPair(argv[index + 1]));
       index += 1;
+      while (typeof argv[index + 1] === "string" && !argv[index + 1].startsWith("--")) {
+        try {
+          records.push(parseRecordPair(argv[index + 1]));
+        } catch {
+          break;
+        }
+        index += 1;
+      }
       continue;
     }
     if (token === "--reason-for") {
@@ -2597,6 +2690,15 @@ function isStrictDirectRecordArguments(argv) {
         parseRecordPair(argv[index + 1]);
         records += 1;
         index += 1;
+        while (typeof argv[index + 1] === "string" && !argv[index + 1].startsWith("--")) {
+          try {
+            parseRecordPair(argv[index + 1]);
+          } catch {
+            break;
+          }
+          records += 1;
+          index += 1;
+        }
         continue;
       }
       if (token === "--source") {
@@ -2625,7 +2727,21 @@ function isStrictDirectRecordArguments(argv) {
 
 function isStrictDirectReportOrMaintenanceArguments(argv) {
   const flags = new Set(["--json", "--audit", "--all", "--prune-dead"]);
-  return argv.length > 0 && argv.every((token) => flags.delete(token));
+  return argv.every((token) => flags.delete(token));
+}
+
+function hasRejectedRecordPair(argv) {
+  for (let index = 0; index < argv.length; index += 1) {
+    if (argv[index] !== "--record") {
+      continue;
+    }
+    for (let pairIndex = index + 1; typeof argv[pairIndex] === "string" && !argv[pairIndex].startsWith("--"); pairIndex += 1) {
+      if (parseRecordPair(argv[pairIndex]).verdict === "rejected") {
+        return true;
+      }
+    }
+  }
+  return false;
 }
 
 function writeRecordConfirmation({ kind, engine = null, jobId = null, worker = null, queued = false, asJson, stdout }) {
@@ -2818,7 +2934,7 @@ function runCli(argv = process.argv.slice(2)) {
     return;
   }
   if (isStrictDirectRecordArguments(argv) || isStrictDirectReportOrMaintenanceArguments(argv)) {
-    if (argv.some((token, index) => token === "--record" && parseRecordPair(argv[index + 1]).verdict === "rejected")) {
+    if (hasRejectedRecordPair(argv)) {
       process.stderr.write("Rejected verdicts require --reason through the raw-args transport. For batch settlements, use --reason-for <id> <text> for each rejected pair.\n");
       process.exitCode = 1;
       return;
