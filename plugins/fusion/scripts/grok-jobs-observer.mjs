@@ -4,7 +4,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { FILE_ENGINE_DESCRIPTORS, appendTokenUsageObservation, resolveFusionDataDir, tokenUsageSidecarPath } from "./fusion-stats.mjs";
+import { FILE_ENGINE_DESCRIPTORS, appendModelAuditObservation, appendTokenUsageObservation, fusionRepositoryKey, modelAuditSidecarPath, resolveFusionDataDir, tokenUsageSidecarPath } from "./fusion-stats.mjs";
 
 const TERMINAL_STATUSES = new Set(["done", "error", "cancelled"]);
 const DEFAULT_POLL_INTERVAL_MS = 15000;
@@ -120,6 +120,7 @@ export function observeGrokJobs({ env = process.env, now = () => new Date().toIS
       continue;
     }
     const workspaceRoot = path.resolve(record.cwd);
+    const repositoryKey = fusionRepositoryKey(workspaceRoot);
     const available = hasUsageObject(record);
     const observedAt = now();
     const appended = appendTokenUsageObservation(tokenUsageSidecarPath(workspaceRoot, env), {
@@ -127,6 +128,7 @@ export function observeGrokJobs({ env = process.env, now = () => new Date().toIS
       jobId: record.id,
       engine: "grok",
       workspaceRoot,
+      repositoryKey,
       availability: available ? "available" : "unavailable",
       tokenUsage: available ? grokTokenUsageObservation(record.usage) : null,
       source: "grok-job-record",
@@ -134,6 +136,21 @@ export function observeGrokJobs({ env = process.env, now = () => new Date().toIS
     });
     if (!appended) {
       continue;
+    }
+    const resolvedModel = typeof record.resolvedModel === "string" && record.resolvedModel.trim() ? record.resolvedModel.trim() : null;
+    if (resolvedModel) {
+      const resolvedEffort = typeof record.resolvedEffort === "string" && record.resolvedEffort.trim() ? record.resolvedEffort.trim() : null;
+      appendModelAuditObservation(modelAuditSidecarPath(workspaceRoot, env), {
+        schemaVersion: 1,
+        jobId: record.id,
+        engine: "grok",
+        model: resolvedModel,
+        effort: resolvedEffort,
+        workspaceRoot,
+        repositoryKey,
+        source: "grok-job-record",
+        observedAt
+      });
     }
     observations += 1;
     if (available) {

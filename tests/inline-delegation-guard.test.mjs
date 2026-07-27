@@ -150,6 +150,16 @@ function completeActiveWave(sandbox, gapMs) {
   fs.writeFileSync(file, JSON.stringify(state), "utf8");
 }
 
+function triggerNarrowWaveAdvisory(sandbox, extraEnv = {}, payload = dispatchPayload(sandbox)) {
+  const gapMs = Number(extraEnv.FUSION_FLEET_WAVE_GAP_MS);
+  assert.ok(Number.isFinite(gapMs) && gapMs > 0);
+  assert.strictEqual(run(sandbox, dispatchPayload(sandbox), extraEnv).stdout, "");
+  completeActiveWave(sandbox, gapMs);
+  assert.strictEqual(run(sandbox, dispatchPayload(sandbox), extraEnv).stdout, "");
+  completeActiveWave(sandbox, gapMs);
+  return run(sandbox, payload, extraEnv);
+}
+
 function auditFiles(sandbox) {
   if (!fs.existsSync(sandbox.auditDir)) {
     return [];
@@ -555,6 +565,62 @@ test("two narrow dispatch waves attach the fleet advisory to the following dispa
     "2 consecutive narrow waves; fleet default applies: consider /fusion:ultra for the remaining packages or state fleet-decline: <reason>."
   );
   assert.strictEqual(readState(sandbox, "session-1").consecutiveNarrowWaves, 2);
+});
+
+test("a fleet decline after the last user message suppresses the narrow-wave context and remains audited", (t) => {
+  const sandbox = makeSandbox(t);
+  const transcript = path.join(sandbox.root, "transcript.jsonl");
+  fs.writeFileSync(
+    transcript,
+    `${[
+      { type: "user", message: { content: "continue with the package" } },
+      { type: "assistant", message: { content: [{ type: "text", text: "fleet-decline: codex single flight" }] } }
+    ]
+      .map((entry) => JSON.stringify(entry))
+      .join("\n")}\n`,
+    "utf8"
+  );
+
+  const result = triggerNarrowWaveAdvisory(sandbox, { FUSION_FLEET_WAVE_GAP_MS: "10000" });
+  assert.strictEqual(result.stdout, "");
+  assert.strictEqual(readState(sandbox, "session-1").lastAdvisedNarrowWaveStreak, 2);
+  const warnings = readAuditRecords(sandbox).filter((record) => record.event === "warn" && record.reason === "narrow-wave-advisory");
+  assert.strictEqual(warnings.length, 1);
+  assert.strictEqual(warnings[0].declineStated, true);
+});
+
+test("a fleet decline before the last user message does not suppress the narrow-wave context", (t) => {
+  const sandbox = makeSandbox(t);
+  const transcript = path.join(sandbox.root, "transcript.jsonl");
+  fs.writeFileSync(
+    transcript,
+    `${[
+      { type: "user", message: { content: "continue with the package" } },
+      { type: "assistant", message: { content: [{ type: "text", text: "fleet-decline: codex single flight" }] } },
+      { type: "user", message: { content: "continue with the next package" } }
+    ]
+      .map((entry) => JSON.stringify(entry))
+      .join("\n")}\n`,
+    "utf8"
+  );
+
+  const result = triggerNarrowWaveAdvisory(sandbox, { FUSION_FLEET_WAVE_GAP_MS: "10000" });
+  assert.strictEqual(
+    JSON.parse(result.stdout).hookSpecificOutput.additionalContext,
+    "2 consecutive narrow waves; fleet default applies: consider /fusion:ultra for the remaining packages or state fleet-decline: <reason>."
+  );
+});
+
+test("a missing transcript does not suppress the narrow-wave context", (t) => {
+  const sandbox = makeSandbox(t);
+  const payload = dispatchPayload(sandbox);
+  payload.transcript_path = path.join(sandbox.root, "missing-transcript.jsonl");
+
+  const result = triggerNarrowWaveAdvisory(sandbox, { FUSION_FLEET_WAVE_GAP_MS: "10000" }, payload);
+  assert.strictEqual(
+    JSON.parse(result.stdout).hookSpecificOutput.additionalContext,
+    "2 consecutive narrow waves; fleet default applies: consider /fusion:ultra for the remaining packages or state fleet-decline: <reason>."
+  );
 });
 
 test("a wide dispatch wave resets the narrow-wave advisory run", (t) => {

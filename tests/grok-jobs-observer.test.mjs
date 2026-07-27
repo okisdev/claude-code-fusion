@@ -7,7 +7,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { test } from "node:test";
 
-import { tokenUsageSidecarPath } from "../plugins/fusion/scripts/fusion-stats.mjs";
+import { fusionRepositoryKey, modelAuditSidecarPath, tokenUsageSidecarPath } from "../plugins/fusion/scripts/fusion-stats.mjs";
 import { grokJobsObserverStatePath, observeGrokJobs } from "../plugins/fusion/scripts/grok-jobs-observer.mjs";
 
 const observerScript = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "plugins", "fusion", "scripts", "grok-jobs-observer.mjs");
@@ -46,6 +46,8 @@ test("reobserves unavailable terminal jobs until usage becomes available", (t) =
   const env = { GROK_COMPANION_DATA: grokData, FUSION_DATA_DIR: fusionData };
   writeGrokJob(grokData, workspaceRoot, "grok-available", {
     status: "done",
+    resolvedModel: "grok-4",
+    resolvedEffort: "high",
     usage: {
       input_tokens: 120,
       cache_read_input_tokens: 40,
@@ -54,13 +56,20 @@ test("reobserves unavailable terminal jobs until usage becomes available", (t) =
       total_tokens: 150
     }
   });
-  writeGrokJob(grokData, workspaceRoot, "grok-unavailable", { status: "error" });
+  writeGrokJob(grokData, workspaceRoot, "grok-unavailable", {
+    status: "error",
+    resolvedModel: "grok-4",
+    resolvedEffort: null
+  });
   writeGrokJob(grokData, workspaceRoot, "grok-running", {
     status: "running",
+    resolvedModel: "grok-4",
+    resolvedEffort: "low",
     usage: { input_tokens: 1, cache_read_input_tokens: 0, output_tokens: 1, reasoning_tokens: 0, total_tokens: 2 }
   });
 
   assert.strictEqual(observeGrokJobs({ env, now: () => "2026-07-22T00:00:00.000Z" }), 2);
+  const repositoryKey = fusionRepositoryKey(workspaceRoot);
   const observations = readJsonLines(tokenUsageSidecarPath(workspaceRoot, env));
   assert.deepStrictEqual(observations, [
     {
@@ -68,6 +77,7 @@ test("reobserves unavailable terminal jobs until usage becomes available", (t) =
       jobId: "grok-available",
       engine: "grok",
       workspaceRoot,
+      repositoryKey,
       availability: "available",
       tokenUsage: { inputTokens: 120, cachedInputTokens: 40, outputTokens: 30, reasoningOutputTokens: 12, totalTokens: 150 },
       source: "grok-job-record",
@@ -78,8 +88,35 @@ test("reobserves unavailable terminal jobs until usage becomes available", (t) =
       jobId: "grok-unavailable",
       engine: "grok",
       workspaceRoot,
+      repositoryKey,
       availability: "unavailable",
       tokenUsage: null,
+      source: "grok-job-record",
+      observedAt: "2026-07-22T00:00:00.000Z"
+    }
+  ]);
+  const modelAuditPath = modelAuditSidecarPath(workspaceRoot, env);
+  const modelAudits = readJsonLines(modelAuditPath);
+  assert.deepStrictEqual(modelAudits, [
+    {
+      schemaVersion: 1,
+      jobId: "grok-available",
+      engine: "grok",
+      model: "grok-4",
+      effort: "high",
+      workspaceRoot,
+      repositoryKey,
+      source: "grok-job-record",
+      observedAt: "2026-07-22T00:00:00.000Z"
+    },
+    {
+      schemaVersion: 1,
+      jobId: "grok-unavailable",
+      engine: "grok",
+      model: "grok-4",
+      effort: null,
+      workspaceRoot,
+      repositoryKey,
       source: "grok-job-record",
       observedAt: "2026-07-22T00:00:00.000Z"
     }
@@ -90,9 +127,12 @@ test("reobserves unavailable terminal jobs until usage becomes available", (t) =
   assert.deepStrictEqual(observerState.unavailableObservedAt, { "grok-unavailable": "2026-07-22T00:00:00.000Z" });
   assert.strictEqual(observeGrokJobs({ env, now: () => "2026-07-22T00:01:00.000Z" }), 1);
   assert.deepStrictEqual(readJsonLines(tokenUsageSidecarPath(workspaceRoot, env)), observations);
+  assert.deepStrictEqual(readJsonLines(modelAuditPath), modelAudits);
 
   writeGrokJob(grokData, workspaceRoot, "grok-unavailable", {
     status: "error",
+    resolvedModel: "grok-4",
+    resolvedEffort: null,
     usage: { input_tokens: 90, cache_read_input_tokens: 20, output_tokens: 10, reasoning_tokens: 4, total_tokens: 120 }
   });
   assert.strictEqual(observeGrokJobs({ env, now: () => "2026-07-22T00:02:00.000Z" }), 1);
@@ -103,14 +143,17 @@ test("reobserves unavailable terminal jobs until usage becomes available", (t) =
       jobId: "grok-unavailable",
       engine: "grok",
       workspaceRoot,
+      repositoryKey,
       availability: "available",
       tokenUsage: { inputTokens: 90, cachedInputTokens: 20, outputTokens: 10, reasoningOutputTokens: 4, totalTokens: 120 },
       source: "grok-job-record",
       observedAt: "2026-07-22T00:02:00.000Z"
     }
   ]);
+  assert.deepStrictEqual(readJsonLines(modelAuditPath), modelAudits);
   assert.deepStrictEqual(JSON.parse(fs.readFileSync(grokJobsObserverStatePath(env), "utf8")).observedJobIds, ["grok-available", "grok-unavailable"]);
   assert.strictEqual(observeGrokJobs({ env, now: () => "2026-07-22T00:03:00.000Z" }), 0);
+  assert.deepStrictEqual(readJsonLines(modelAuditPath), modelAudits);
 });
 
 test("marks an unavailable terminal job only after its observation TTL", (t) => {

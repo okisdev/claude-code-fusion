@@ -56,6 +56,7 @@ const NO_OP_HEARTBEAT_REASON = "Fusion tasks are in flight for this session, so 
 const REAPED_WORKER_REDIRECT_AUDIT_DESCRIPTION = "reaped-worker-redirect";
 const NARROW_WAVE_ADVISORY_SUFFIX = "consecutive narrow waves; fleet default applies: consider /fusion:ultra for the remaining packages or state fleet-decline: <reason>.";
 const NARROW_WAVE_ADVISORY_REASON = "narrow-wave-advisory";
+const TRANSCRIPT_TAIL_MAX_BYTES = 262144;
 const MISSING_LAUNCH_RECOVERY_REASON = "missing-launch-recovered";
 const TAIL_ALLOW_AUDIT_EVENT = "tail-allowed";
 const ZERO_DISPATCH_SOFTENED_AUDIT_EVENT = "zero-dispatch-softened";
@@ -109,6 +110,88 @@ function resolveLockTimeoutMs(env = process.env) {
 
 function resolveMode(env = process.env) {
   return String(env[MODE_ENV] ?? "").trim().toLowerCase() === "advisory" ? "advisory" : "enforce";
+}
+
+function transcriptEntryContent(entry) {
+  if (Array.isArray(entry?.message?.content)) {
+    return entry.message.content;
+  }
+  return Array.isArray(entry?.content) ? entry.content : [];
+}
+
+function isExternalUserMessage(entry) {
+  if (entry?.type !== "user" || entry.toolUseResult != null || entry.sourceToolAssistantUUID || entry.isMeta === true || entry?.message?.isMeta === true) {
+    return false;
+  }
+  const content = entry?.message?.content ?? entry?.content;
+  if (typeof content === "string") {
+    return true;
+  }
+  return (
+    Array.isArray(content) &&
+    content.length > 0 &&
+    content.every((block) => block?.type === "text" && typeof block.text === "string")
+  );
+}
+
+function hasFleetDeclineAfterLastUserMessage(transcriptPath) {
+  if (typeof transcriptPath !== "string" || !transcriptPath) {
+    return false;
+  }
+  let descriptor;
+  try {
+    descriptor = fs.openSync(transcriptPath, "r");
+    const stat = fs.fstatSync(descriptor);
+    if (!stat.isFile() || stat.size === 0) {
+      return false;
+    }
+    const bytesToRead = Math.min(TRANSCRIPT_TAIL_MAX_BYTES, stat.size);
+    const start = stat.size - bytesToRead;
+    const buffer = Buffer.allocUnsafe(bytesToRead);
+    const bytesRead = fs.readSync(descriptor, buffer, 0, buffer.length, start);
+    let text = buffer.subarray(0, bytesRead).toString("utf8");
+    if (start > 0) {
+      const firstNewline = text.indexOf("\n");
+      text = firstNewline === -1 ? "" : text.slice(firstNewline + 1);
+    }
+    const entries = [];
+    for (const line of text.split("\n")) {
+      if (!line.trim()) {
+        continue;
+      }
+      try {
+        entries.push(JSON.parse(line));
+      } catch {
+        void 0;
+      }
+    }
+    const lastUserIndex = entries.findLastIndex(isExternalUserMessage);
+    if (lastUserIndex === -1) {
+      return false;
+    }
+    const assistantText = [];
+    for (const entry of entries.slice(lastUserIndex + 1)) {
+      if (entry?.type !== "assistant") {
+        continue;
+      }
+      for (const block of transcriptEntryContent(entry)) {
+        if (block?.type === "text" && typeof block.text === "string") {
+          assistantText.push(block.text);
+        }
+      }
+    }
+    return /^\s*fleet-decline:/mi.test(assistantText.join("\n"));
+  } catch {
+    return false;
+  } finally {
+    if (descriptor != null) {
+      try {
+        fs.closeSync(descriptor);
+      } catch {
+        void 0;
+      }
+    }
+  }
 }
 
 function resolveAuditDir(env = process.env) {
@@ -566,6 +649,7 @@ function normalizeAuditEvent(event) {
           lane,
           tool: event.tool,
           reason: event.reason,
+          ...(event.reason === NARROW_WAVE_ADVISORY_REASON && event.declineStated === true ? { declineStated: true } : {}),
           ...(event.suppressed === true ? { suppressed: true } : {})
         }
       : null;
@@ -1220,6 +1304,7 @@ function runHook(env = process.env, input = readHookInput()) {
       env
     );
     if (confirmation.shouldAdvise) {
+      const declineStated = hasFleetDeclineAfterLastUserMessage(input.transcript_path);
       const advisory = claimAdvisory(
         file,
         "narrow-wave",
@@ -1237,11 +1322,12 @@ function runHook(env = process.env, input = readHookInput()) {
             lane: confirmation.lane,
             tool: toolName,
             reason: NARROW_WAVE_ADVISORY_REASON,
+            ...(declineStated ? { declineStated: true } : {}),
             ...(advisory.suppressed ? { suppressed: true } : {})
           },
           env
         );
-        if (!advisory.suppressed) {
+        if (!advisory.suppressed && !declineStated) {
           process.stdout.write(`${JSON.stringify(postToolAdvisoryOutput(`${confirmation.streak} ${NARROW_WAVE_ADVISORY_SUFFIX}`))}\n`);
         }
       }
