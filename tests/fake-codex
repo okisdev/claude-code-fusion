@@ -201,6 +201,10 @@ switch (mode) {
   case "oversized-event":
     start();
     emit({ type: "future.event", payload: "x".repeat(Number(process.env.FAKE_CODEX_EVENT_BYTES || 4096)) });
+    break;
+  case "oversized-midrun-event":
+    start();
+    emit({ type: "future.event", payload: "x".repeat(Number(process.env.FAKE_CODEX_EVENT_BYTES || 4096)) });
     complete();
     break;
   case "malformed":

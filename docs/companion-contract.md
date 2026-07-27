@@ -44,7 +44,7 @@ The shared failure kinds are:
 - `cancelled`: The plugin cancel command, companion signal forwarding, or session cleanup intentionally marked the job cancelled.
 - `input`: The request was rejected before job creation, for example because the working directory was invalid.
 - `died`: The driving process exited without recording an outcome, or no driving pid or engine child pid was recorded before the pidless launcher grace window elapsed.
-- `resource`: The adapter rejected an artifact that exceeded a bounded resource limit or could not acquire an exclusive runtime resource, including because of an active session lease or an ambiguous legacy id.
+- `resource`: The adapter rejected an artifact that exceeded a bounded resource limit, a run whose protocol was left incomplete by skipped oversized events, or could not acquire an exclusive runtime resource, including because of an active session lease or an ambiguous legacy id.
 
 Engine adapters may define additional typed failure kinds beyond this shared set. The current Codex instance adds `protocol`, for a required structured lifecycle stream that was malformed, incomplete, or incompatible with the adapter, `process`, for an engine process that exited because of an unexpected signal or other unrequested process termination, and `policy`, for a forbidden Codex collaboration tool call. The Grok instance adds `sandbox`, for sandbox initialization or enforcement failure, `transport`, for prompt delivery or structured envelope failure, and `policy`, for missing positive tool-policy evidence or a fallback, unmappable, or unmatched tool-policy warning.
 

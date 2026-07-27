@@ -99,6 +99,7 @@ const RECORD_ACCEPTANCE_VALUES = new Set(["accepted", "rejected", "unverified"])
 const RECORD_ACCEPTANCE_SOURCES = new Set(["collector", "main-loop", "stats"]);
 const SEMANTIC_FAILURE_KINDS = new Set(["intent_override", "scope_rewrite", "wrong_approach", "style_mismatch"]);
 const SOL_FOREGROUND_WRITE_WARNING = "warning: sol p90 wall clock exceeds the 600s foreground cap. Split the brief or name gpt-5.6-terra.";
+const IMPLICIT_SUBDIRECTORY_CWD_WARNING = (cwd, workspaceRoot) => `Codex cwd ${cwd} sits below repository top level ${workspaceRoot} without an explicit --cwd; the sandbox roots at this subdirectory. Pass --cwd to pin the intended workspace.`;
 let activeCommandArgv = null;
 
 class CompanionError extends Error {
@@ -1208,7 +1209,7 @@ function inheritedRouting(record, options, defaultServiceTier) {
   return { effort, inherited, model, serviceTier };
 }
 
-function createReservedJob({ background, brief, codexVersion, cwd, dataDir, jobClass, mode, request }) {
+function createReservedJob({ background, brief, codexVersion, cwd, dataDir, explicitCwd, jobClass, mode, request }) {
   brief = boundedPrompt(brief);
   const ownerIdentity = background ? null : currentProcessIdentity();
   const reserveWorkspace = (reservedRequest) => withWorkspaceLock(dataDir, cwd, () => {
@@ -1239,7 +1240,7 @@ function createReservedJob({ background, brief, codexVersion, cwd, dataDir, jobC
       pid: background ? null : process.pid,
       pidIdentity: ownerIdentity,
       pidOwnsProcessGroup: false,
-      request: reservedRequest,
+      request: explicitCwd ? { ...reservedRequest, explicitCwd: true } : reservedRequest,
       workspaceRoot: canonicalWorkspaceRoot(cwd)
     });
     const file = jobFilePath(dataDir, cwd, id);
@@ -1340,6 +1341,13 @@ function structuredOutputOutcome(request, outcome) {
       structuredOutputError: `Codex final response is not valid JSON: ${oneLine(error.message, "JSON parsing failed.")}`
     };
   }
+}
+
+function implicitSubdirectoryCwdWarning(record) {
+  if (record.request?.explicitCwd === true || record.repositoryTopLevel == null || record.workspaceRoot === record.cwd) {
+    return null;
+  }
+  return IMPLICIT_SUBDIRECTORY_CWD_WARNING(record.cwd, record.workspaceRoot);
 }
 
 function finishExecutionFailure(file, record, error, env = process.env) {
@@ -1462,6 +1470,10 @@ async function executeRecord(found) {
     const diagnostics = outcome.diagnostics.map((diagnostic) => ({ ...diagnostic, message: redactDiagnostic(diagnostic.message) }));
     if (isSolForegroundWriteTask(completedRecord)) {
       diagnostics.push({ type: "warning", message: SOL_FOREGROUND_WRITE_WARNING });
+    }
+    const cwdWarning = implicitSubdirectoryCwdWarning(completedRecord);
+    if (cwdWarning) {
+      diagnostics.push({ type: "warning", message: cwdWarning });
     }
     return finishJob(found.file, {
       cumulativeTokenUsage: outcome.cumulativeTokenUsage,
@@ -1685,6 +1697,10 @@ async function dispatchJob(found, asJson) {
   if (isSolForegroundWriteTask(completed)) {
     process.stderr.write(`${SOL_FOREGROUND_WRITE_WARNING}\n`);
   }
+  const cwdWarning = implicitSubdirectoryCwdWarning(completed);
+  if (cwdWarning) {
+    process.stderr.write(`${cwdWarning}\n`);
+  }
   renderRecord(completed, asJson);
   collectRenderedJob(found.file, completed);
   if (completed.status !== "done") {
@@ -1739,6 +1755,7 @@ async function handleTask(rawArgv, transport = {}) {
     codexVersion: probe.version,
     cwd,
     dataDir,
+    explicitCwd: options.cwd != null,
     jobClass: "task",
     mode: write ? "write" : "consult",
     request
@@ -1830,6 +1847,7 @@ async function handleReview(rawArgv, adversarial = false, transport = {}) {
     codexVersion: probe.version,
     cwd,
     dataDir,
+    explicitCwd: options.cwd != null,
     jobClass: adversarial ? "adversarial-review" : "review",
     mode: "consult",
     request

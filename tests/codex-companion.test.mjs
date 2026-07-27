@@ -72,6 +72,47 @@ test("task header parsing captures model and effort only from a pipe-separated h
   assert.deepEqual(parseTaskHeader("lane: codex | model: gpt-5.6-terra"), { headerModel: "gpt-5.6-terra", headerEffort: null });
 });
 
+test("task warns when an implicit cwd is below a repository top level", (t) => {
+  const sandbox = makeSandbox(t);
+  const subdirectory = path.join(sandbox.workDir, "apps", "api");
+  fs.mkdirSync(subdirectory, { recursive: true });
+  execFileSync("git", ["init", "--quiet"], { cwd: sandbox.workDir });
+
+  const cwd = fs.realpathSync(subdirectory);
+  const workspaceRoot = fs.realpathSync(sandbox.workDir);
+  const warning = `Codex cwd ${cwd} sits below repository top level ${workspaceRoot} without an explicit --cwd; the sandbox roots at this subdirectory. Pass --cwd to pin the intended workspace.`;
+  const result = runCompanion(["task", "inspect the API"], { cwd: subdirectory, env: envFor(sandbox) });
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(result.stderr, `${warning}\n`);
+  assert.equal(jobRecords(sandbox)[0].diagnostics.filter((diagnostic) => diagnostic.type === "warning" && diagnostic.message === warning).length, 1);
+});
+
+test("task does not warn for an explicit cwd below a repository top level", (t) => {
+  const sandbox = makeSandbox(t);
+  const subdirectory = path.join(sandbox.workDir, "apps", "api");
+  fs.mkdirSync(subdirectory, { recursive: true });
+  execFileSync("git", ["init", "--quiet"], { cwd: sandbox.workDir });
+
+  const result = runCompanion(["task", "--cwd", ".", "inspect the API"], { cwd: subdirectory, env: envFor(sandbox) });
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(result.stderr, "");
+  assert.equal(jobRecords(sandbox)[0].diagnostics.some((diagnostic) => diagnostic.type === "warning"), false);
+});
+
+test("task does not warn for an implicit cwd outside a Git repository", (t) => {
+  const sandbox = makeSandbox(t);
+  const subdirectory = path.join(sandbox.workDir, "apps", "api");
+  fs.mkdirSync(subdirectory, { recursive: true });
+
+  const result = runCompanion(["task", "inspect the API"], { cwd: subdirectory, env: envFor(sandbox) });
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(result.stderr, "");
+  assert.equal(jobRecords(sandbox)[0].diagnostics.some((diagnostic) => diagnostic.type === "warning"), false);
+});
+
 test("job records capture the repository top level without requiring a Git repository", (t) => {
   const sandbox = makeSandbox(t);
   const repository = path.join(sandbox.root, "repository");

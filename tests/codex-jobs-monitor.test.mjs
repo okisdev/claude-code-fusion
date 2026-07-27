@@ -1141,6 +1141,8 @@ test("canonical terminal records use direct model and token evidence without rol
     status: "running",
     threadId,
     turnId,
+    timeoutMs: 60000,
+    failureKind: "timeout",
     request: { model: "requested-model", effort: "low" },
     resolvedModel: "actual-model",
     resolvedEffort: "xhigh"
@@ -1171,6 +1173,8 @@ test("canonical terminal records use direct model and token evidence without rol
   });
   assert.strictEqual(terminal.transportStatus, "done");
   assert.strictEqual(terminal.finishedAt, finishedAt);
+  assert.strictEqual(terminal.timeoutMs, 60000);
+  assert.strictEqual(terminal.failureKind, "timeout");
   assert.strictEqual(terminal.model, "actual-model");
   assert.strictEqual(terminal.modelSource, "job-record");
   assert.strictEqual(terminal.effort, "xhigh");

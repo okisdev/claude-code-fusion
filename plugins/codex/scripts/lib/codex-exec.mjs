@@ -966,6 +966,10 @@ function classifyDiagnostic(state, event) {
   if (!diagnostic || typeof diagnostic.message !== "string") {
     return;
   }
+  recordDiagnostic(state, diagnostic);
+}
+
+function recordDiagnostic(state, diagnostic) {
   state.diagnostics.push({ ...diagnostic, message: safeDiagnosticMessage(diagnostic.message) });
   if (state.diagnostics.length > MAX_DIAGNOSTICS) {
     state.diagnostics.splice(0, state.diagnostics.length - MAX_DIAGNOSTICS);
@@ -1240,6 +1244,7 @@ export async function runCodex(options = {}) {
     eventsTruncated: false,
     expectedResumeThreadId: typeof options.resumeThreadId === "string" && options.resumeThreadId.trim() ? options.resumeThreadId.trim() : null,
     finalResponse: "",
+    oversizedEventsSkipped: 0,
     protocolError: null,
     resourceError: null,
     resumeThreadMismatch: false,
@@ -1471,6 +1476,7 @@ export async function runCodex(options = {}) {
     await spawnCheckpointPromise;
     let segments = [];
     let segmentBytes = 0;
+    let skippingOversizedEvent = false;
     try {
       for await (const rawChunk of child.stdout) {
         const chunk = Buffer.from(rawChunk);
@@ -1479,11 +1485,27 @@ export async function runCodex(options = {}) {
           const newline = chunk.indexOf(10, offset);
           const end = newline === -1 ? chunk.length : newline;
           const segment = chunk.subarray(offset, end);
+          if (skippingOversizedEvent) {
+            if (newline === -1) {
+              break;
+            }
+            skippingOversizedEvent = false;
+            offset = newline + 1;
+            continue;
+          }
           if (segmentBytes + segment.length > eventLineMaxBytes) {
-            recordResourceError(state, `Codex emitted a JSONL event larger than the ${eventLineMaxBytes} byte limit.`);
-            void requestTermination();
-            child.stdout.destroy();
-            return;
+            state.oversizedEventsSkipped += 1;
+            if (state.oversizedEventsSkipped === 1) {
+              recordDiagnostic(state, { type: "warning", message: `Skipped a JSONL event larger than the ${eventLineMaxBytes} byte limit.` });
+            }
+            segments = [];
+            segmentBytes = 0;
+            if (newline === -1) {
+              skippingOversizedEvent = true;
+              break;
+            }
+            offset = newline + 1;
+            continue;
           }
           if (segment.length > 0) {
             segments.push(segment);
@@ -1529,7 +1551,10 @@ export async function runCodex(options = {}) {
     fs.closeSync(eventsFd);
   }
   if (!state.timedOut && !state.cancelled && !spawnError && !state.callbackError && processOutcome.exitCode === 0 && !processOutcome.signal) {
-    if (!state.threadStarted) {
+    const protocolIncomplete = !state.threadStarted || !state.turnStarted || !state.terminalEvent;
+    if (protocolIncomplete && state.oversizedEventsSkipped > 0) {
+      recordResourceError(state, `Codex emitted a JSONL event larger than the ${eventLineMaxBytes} byte limit.`);
+    } else if (!state.threadStarted) {
       recordProtocolError(state, "Codex exited without thread.started.");
     } else if (!state.turnStarted) {
       recordProtocolError(state, "Codex exited without turn.started.");

@@ -7,7 +7,7 @@ import { test } from "node:test";
 
 import { fusionRepositoryKey } from "../plugins/fusion/scripts/fusion-stats.mjs";
 import { createWorkerRecord, readWorkerSessionState, readWorkerRecords, recordWorkerAcceptance, updateWorkerRecord, WORKER_COLLECTION_METHODS } from "../plugins/fusion/scripts/lib/worker-state.mjs";
-import { reverifyInFlightRecords, validateWorkerBrief, workerBudgetFailure, workerLimits } from "../plugins/fusion/scripts/worker-lifecycle.mjs";
+import { reverifyCancellationRecords, reverifyInFlightRecords, validateWorkerBrief, workerBudgetFailure, workerLimits } from "../plugins/fusion/scripts/worker-lifecycle.mjs";
 
 const repoRoot = path.join(import.meta.dirname, "..");
 const script = path.join(repoRoot, "plugins", "fusion", "scripts", "worker-lifecycle.mjs");
@@ -409,6 +409,25 @@ test("package-type envelopes validate, default, and persist their byte length", 
   assert.strictEqual(JSON.parse(launched.stdout).hookSpecificOutput.permissionDecision, "allow");
   assert.strictEqual(record(box).packageType, "review");
   assert.strictEqual(record(box).briefBytes, Buffer.byteLength(prompt));
+
+  const peerCases = [
+    ["rescue prompt --write", "implementation"],
+    ["rescue prompt --transport-default-write", "implementation"],
+    ["rescue prompt --write\npackage-type: review", "review"],
+    ["bounded peer consult", "consult"],
+    ["rescue prompt -- --write", "consult"]
+  ];
+  for (const [peerPrompt, packageType] of peerCases) {
+    const peer = sandbox(t);
+    const peerDispatch = dispatch(peer, { subagent_type: "codex:codex-rescue", prompt: peerPrompt });
+    run(peer, peerDispatch);
+    run(peer, {
+      ...peerDispatch,
+      hook_event_name: "PostToolUse",
+      tool_response: { isAsync: true, status: "async_launched", agentId: `peer-package-${packageType}` }
+    });
+    assert.strictEqual(record(peer).packageType, packageType);
+  }
 });
 
 test("verification manifest advisories identify missing suites and stay silent for complete verification", (t) => {
@@ -507,6 +526,12 @@ test("the dispatch guard requires a minimal isolated brief and explicit user bac
   assert.strictEqual(JSON.parse(authorized.stdout).hookSpecificOutput.permissionDecision, "allow");
   assert.match(JSON.parse(authorized.stdout).hookSpecificOutput.updatedInput.prompt, /^fusion-brief: v1\nfusion-task-id: fusion-/);
   assert.strictEqual(record(box).expectedDelivery, "manual-background");
+
+  const leadingBlank = sandbox(t);
+  const leadingBlankPrompt = `\n\n${brief()}`;
+  const leadingBlankLaunch = JSON.parse(run(leadingBlank, dispatch(leadingBlank, { prompt: leadingBlankPrompt })).stdout).hookSpecificOutput;
+  assert.strictEqual(leadingBlankLaunch.permissionDecision, "allow");
+  assert.match(leadingBlankLaunch.updatedInput.prompt, /^\n\nfusion-brief: v1\nfusion-task-id: fusion-/);
 });
 
 test("SubagentStart requires verdict envelopes for execution and coverage workers but not collectors", (t) => {
@@ -527,6 +552,8 @@ test("SubagentStart requires verdict envelopes for execution and coverage worker
   assert.match(executionInstruction, /pass and fail counts/);
   assert.match(executionInstruction, /environment findings/);
   assert.match(executionInstruction, /long unified diffs, full test logs, and long quoted file contents/);
+  assert.match(executionInstruction, /At 85 percent of the output token budget/);
+  assert.match(executionInstruction, /exactly one final Write of the deliverable is permitted/);
 
   const coverage = sandbox(t);
   run(coverage, dispatch(coverage, {
@@ -3396,6 +3423,50 @@ test("worker tool calls are denied after the wall clock budget and cancellation 
   assert.strictEqual(record(box).failureKind, "timeout");
 });
 
+test("a token limit permits exactly one final deliverable Write", (t) => {
+  const box = sandbox(t);
+  run(box, dispatch(box));
+  run(box, {
+    hook_event_name: "SubagentStart",
+    session_id: "session-1",
+    cwd: box.cwd,
+    transcript_path: box.transcript,
+    agent_id: "token-grace",
+    agent_type: "fusion:fast-worker"
+  });
+  const taskId = record(box).taskId;
+  updateWorkerRecord(taskId, envFor(box), (current) => ({
+    ...current,
+    usage: { inputTokens: 0, cacheCreationInputTokens: 0, cacheReadInputTokens: 0, outputTokens: 48_000, totalTokens: 48_000, uncachedTokens: 48_000 }
+  }));
+  const write = {
+    hook_event_name: "PreToolUse",
+    session_id: "session-1",
+    cwd: box.cwd,
+    transcript_path: box.transcript,
+    agent_id: "token-grace",
+    agent_type: "fusion:fast-worker",
+    tool_name: "Write",
+    tool_input: { file_path: path.join(box.cwd, "deliverable.md"), content: "deliverable" }
+  };
+
+  const firstWrite = JSON.parse(run(box, write).stdout).hookSpecificOutput;
+  assert.strictEqual(firstWrite.permissionDecision, "allow");
+  assert.strictEqual(firstWrite.additionalContext, "Final deliverable write permitted; every further tool call will be denied.");
+  const graceUsedAt = record(box).terminalWriteGraceUsedAt;
+  assert.ok(graceUsedAt);
+
+  const expectedReason = `Fusion worker ${taskId} must stop: output token budget reached (48000). Return a concise partial result now; do not retry or call more tools. If the deliverable file is not yet written, one final Write is permitted.`;
+  const secondWrite = JSON.parse(run(box, write).stdout).hookSpecificOutput;
+  assert.strictEqual(secondWrite.permissionDecision, "deny");
+  assert.strictEqual(secondWrite.permissionDecisionReason, expectedReason);
+  assert.strictEqual(record(box).terminalWriteGraceUsedAt, graceUsedAt);
+
+  const bash = JSON.parse(run(box, { ...write, tool_name: "Bash", tool_input: { command: "true" } }).stdout).hookSpecificOutput;
+  assert.strictEqual(bash.permissionDecision, "deny");
+  assert.strictEqual(bash.permissionDecisionReason, expectedReason);
+});
+
 test("an explicitly authorized background worker still requires TaskStop after its budget expires", (t) => {
   const box = sandbox(t);
   const limits = { FUSION_WORKER_WALL_CLOCK_MS: "1", FUSION_WORKER_STALL_MS: "999999" };
@@ -3983,6 +4054,46 @@ test("PostToolUse emits turn wind-down context once at two turns below the cap",
   assert.strictEqual(record(box).windDownContextSentAt, notifiedAt);
 });
 
+test("PostToolUse emits token wind-down context once at 85 percent of the cap", (t) => {
+  const box = sandbox(t);
+  const workerDispatch = dispatch(box);
+  run(box, workerDispatch);
+  run(box, {
+    hook_event_name: "SubagentStart",
+    session_id: "session-1",
+    cwd: box.cwd,
+    transcript_path: box.transcript,
+    agent_id: "token-wind-down",
+    agent_type: "fusion:fast-worker"
+  });
+  const workerTranscript = path.join(box.root, "agent-token-wind-down.jsonl");
+  fs.writeFileSync(workerTranscript, `${JSON.stringify({ type: "assistant", requestId: "token-before", message: { usage: { output_tokens: 40_799 } } })}\n`, "utf8");
+  const payload = {
+    hook_event_name: "PostToolUse",
+    session_id: "session-1",
+    cwd: box.cwd,
+    transcript_path: workerTranscript,
+    agent_id: "token-wind-down",
+    agent_type: "fusion:fast-worker",
+    tool_name: "Read"
+  };
+
+  const before = run(box, payload);
+  assert.strictEqual(before.stdout, "");
+  assert.strictEqual(record(box).tokenWindDownSentAt, undefined);
+
+  fs.appendFileSync(workerTranscript, `${JSON.stringify({ type: "assistant", requestId: "token-threshold", message: { usage: { output_tokens: 1 } } })}\n`, "utf8");
+  const threshold = JSON.parse(run(box, payload).stdout).hookSpecificOutput;
+  assert.strictEqual(threshold.additionalContext, "Token budget wind-down: stop making tool calls and write your final deliverable now.");
+  assert.strictEqual(record(box).usage.outputTokens, 40_800);
+  const notifiedAt = record(box).tokenWindDownSentAt;
+  assert.ok(notifiedAt);
+
+  const repeated = run(box, payload);
+  assert.strictEqual(repeated.stdout, "");
+  assert.strictEqual(record(box).tokenWindDownSentAt, notifiedAt);
+});
+
 test("Stop combines multi-record collection and settlement instructions", (t) => {
   const box = sandbox(t);
   const outputFile = path.join(box.root, "peer-terminal.output");
@@ -4322,6 +4433,20 @@ test("in-flight advisory re-verification excludes a record collected after the i
   }));
 
   assert.deepStrictEqual(reverifyInFlightRecords([candidate], [{ id: "reverify-collected", status: "running" }], envFor(box)), []);
+});
+
+test("cancellation demand re-verification excludes a record that turned done on disk", (t) => {
+  const box = sandbox(t);
+  const worker = createWorkerRecord({
+    taskId: `fusion-${"d".repeat(24)}`,
+    sessionId: "session-1",
+    agentType: "fusion:fast-worker",
+    workspaceRoot: box.cwd
+  }, envFor(box));
+  const candidate = updateWorkerRecord(worker.taskId, envFor(box), (current) => ({ ...current, agentId: "reverify-cancellation", backgroundTaskId: "reverify-cancellation", transportStatus: "cancel_requested", failureKind: "timeout" }));
+  updateWorkerRecord(worker.taskId, envFor(box), (current) => ({ ...current, transportStatus: "done", finishedAt: new Date().toISOString() }));
+
+  assert.deepStrictEqual(reverifyCancellationRecords([candidate], envFor(box)), []);
 });
 
 test("queued accepted verdicts re-arm settlement after cancelled and incomplete hook transitions", (t) => {

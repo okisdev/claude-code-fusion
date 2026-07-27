@@ -9,10 +9,10 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 
 import {
   FILE_ENGINE_DESCRIPTORS,
+  appendModelAuditObservation,
   appendTokenUsageObservation,
   fusionRepositoryKey,
   loadModelAuditObservations,
-  modelObservationRank,
   normalizeCodexTokenUsage,
   resolveFusionDataDir,
   fusionWorkspaceKey,
@@ -308,43 +308,6 @@ function ensurePrivateDirectory(directory) {
   }
 }
 
-function appendModelAuditObservation(sidecarPath, observation) {
-  ensurePrivateDirectory(path.dirname(sidecarPath));
-  const lockPath = `${sidecarPath}.lock`;
-  let lock;
-  try {
-    lock = fs.openSync(lockPath, fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_WRONLY, 0o600);
-    fs.fchmodSync(lock, 0o600);
-  } catch (error) {
-    if (error?.code === "EEXIST") {
-      return false;
-    }
-    throw error;
-  }
-  try {
-    if (fs.existsSync(sidecarPath)) {
-      fs.chmodSync(sidecarPath, 0o600);
-    }
-    const observations = loadModelAuditObservations(sidecarPath);
-    const current = observations.get(observation.jobId);
-    if (!current || modelObservationRank(observation) > modelObservationRank(current)) {
-      observations.set(observation.jobId, observation);
-    }
-    const replacementPath = `${sidecarPath}.${process.pid}.${Date.now()}.tmp`;
-    try {
-      fs.writeFileSync(replacementPath, `${[...observations.values()].map((entry) => JSON.stringify(entry)).join("\n")}\n`, { encoding: "utf8", mode: 0o600 });
-      fs.chmodSync(replacementPath, 0o600);
-      fs.renameSync(replacementPath, sidecarPath);
-    } finally {
-      fs.rmSync(replacementPath, { force: true });
-    }
-    return true;
-  } finally {
-    fs.closeSync(lock);
-    fs.rmSync(lockPath, { force: true });
-  }
-}
-
 function resolveSessionsDir(env = process.env) {
   const override = env[SESSIONS_DIR_ENV];
   if (override && String(override).trim()) {
@@ -624,6 +587,8 @@ function terminalLedgerRecord(record, observations, scopeRoot) {
     createdAt: record.createdAt ?? null,
     startedAt: record.startedAt ?? null,
     finishedAt: record.finishedAt ?? record.completedAt ?? record.updatedAt ?? null,
+    timeoutMs: record.timeoutMs ?? null,
+    failureKind: record.failureKind ?? null,
     observedAt: new Date().toISOString(),
     model: observations.model,
     modelSource: observations.modelSource,

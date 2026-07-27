@@ -122,7 +122,8 @@ function allowAgentWithTaskId(toolInput, taskId, additionalContext = null) {
   const prompt = promptText(toolInput);
   const marker = `fusion-task-id: ${taskId}`;
   const lines = prompt.split(/\r?\n/).filter((line) => !/^fusion-task-id:\s*/i.test(line.trim()));
-  lines.splice(lines[0]?.trim() === "fusion-brief: v1" ? 1 : 0, 0, marker);
+  const firstNonBlankLine = lines.findIndex((line) => line.trim());
+  lines.splice(lines[firstNonBlankLine]?.trim() === "fusion-brief: v1" ? firstNonBlankLine + 1 : 0, 0, marker);
   return { hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision: "allow", updatedInput: { ...toolInput, prompt: lines.join("\n") }, ...(additionalContext ? { additionalContext } : {}) } };
 }
 
@@ -388,6 +389,24 @@ function createDispatch(input, agentType, userBackgroundAuthorized, env, validat
   const taskId = createWorkerTaskId(input.session_id, input.tool_use_id);
   const prompt = promptText(input.tool_input);
   const collectorIdentity = canonicalWorkerAgentType(agentType) === "fusion:job-collector" ? collectorRequestIdentity(prompt) : null;
+  const fallbackPackageType = () => {
+    if (!PEER_WRAPPER_AGENTS.has(agentType)) {
+      return /^verification:\s*\S/im.test(prompt) ? "implementation" : "consult";
+    }
+    const packageTypeLines = prompt.split(/\r?\n/).filter((line) => /^package-type\s*:/i.test(line.trim()));
+    const explicitPackageType = packageTypeLines.length === 1
+      ? packageTypeLines[0].match(/^package-type\s*:\s*(implementation|consult|review|research|design)\s*$/i)?.[1]?.toLowerCase()
+      : null;
+    if (explicitPackageType) {
+      return explicitPackageType;
+    }
+    const separator = /(?:^|\s)--(?=\s|$)/.exec(prompt);
+    const peerPromptPrefix = separator ? prompt.slice(0, separator.index) : prompt;
+    if (/(?:^|\s)--(?:write|transport-default-write)(?=\s|$)/.test(peerPromptPrefix)) {
+      return "implementation";
+    }
+    return /^verification:\s*\S/im.test(prompt) ? "implementation" : "consult";
+  };
   let parentTranscriptBytesAtDispatch = null;
   try {
     parentTranscriptBytesAtDispatch = fs.statSync(input.transcript_path).size;
@@ -405,7 +424,7 @@ function createDispatch(input, agentType, userBackgroundAuthorized, env, validat
     userBackgroundAuthorized,
     parentTranscriptPath: typeof input.transcript_path === "string" ? input.transcript_path : null,
     parentTranscriptBytesAtDispatch,
-    packageType: validation.packageType ?? (/^verification:\s*\S/im.test(prompt) ? "implementation" : "consult"),
+    packageType: validation.packageType ?? fallbackPackageType(),
     briefBytes: validation.briefBytes ?? null,
     completionContract: completionContract(agentType, prompt),
     ...collectorIdentity,
@@ -725,7 +744,23 @@ function handlePreToolUse(input, env) {
   const failure = workerBudgetFailure(refreshed);
   if (failure) {
     markBudgetFailure(refreshed, failure, env);
-    writeOutput(denyTool(`Fusion worker ${refreshed.taskId} must stop: ${failure.reason}. Return a concise partial result now; do not retry or call more tools.`));
+    if (failure.failureKind === "token_limit" && input.tool_name === "Write" && !refreshed.terminalWriteGraceUsedAt) {
+      const now = new Date().toISOString();
+      let terminalWriteGraceUsed = false;
+      updateLifecycleWorkerRecord(refreshed.taskId, env, (current) => {
+        if (!current || isTerminalWorkerStatus(current.transportStatus) || current.terminalWriteGraceUsedAt) {
+          return null;
+        }
+        terminalWriteGraceUsed = true;
+        return { ...current, terminalWriteGraceUsedAt: now };
+      });
+      if (terminalWriteGraceUsed) {
+        writeOutput({ hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision: "allow", additionalContext: "Final deliverable write permitted; every further tool call will be denied." } });
+        return;
+      }
+    }
+    const terminalWriteHint = failure.failureKind === "token_limit" ? " If the deliverable file is not yet written, one final Write is permitted." : "";
+    writeOutput(denyTool(`Fusion worker ${refreshed.taskId} must stop: ${failure.reason}. Return a concise partial result now; do not retry or call more tools.${terminalWriteHint}`));
     return;
   }
   const now = new Date().toISOString();
@@ -1133,7 +1168,8 @@ function handlePostToolUse(input, env, failed = false) {
     return;
   }
   const now = new Date().toISOString();
-  let emitWindDown = false;
+  let emitTurnWindDown = false;
+  let emitTokenWindDown = false;
   updateLifecycleWorkerRecord(record.taskId, env, (current) => {
     if (!current || isTerminalWorkerStatus(current.transportStatus)) {
       return null;
@@ -1141,18 +1177,23 @@ function handlePostToolUse(input, env, failed = false) {
     const selectedTranscript = isAttributedTranscriptPath(input.transcript_path, record) ? input.transcript_path : null;
     const refreshed = selectedTranscript ? refreshWorkerTranscript(current, selectedTranscript) : current;
     const progress = !failed && !READ_ONLY_TOOLS.has(input.tool_name);
-    const windDownThreshold = Math.max(0, (refreshed.limits?.maxTurns ?? Number.POSITIVE_INFINITY) - 2);
-    emitWindDown = !isTerminalWorkerStatus(refreshed.transportStatus) && refreshed.windDownContextSentAt == null && (refreshed.turns ?? 0) >= windDownThreshold;
+    const turnWindDownThreshold = Math.max(0, (refreshed.limits?.maxTurns ?? Number.POSITIVE_INFINITY) - 2);
+    const tokenWindDownThreshold = (refreshed.limits?.maxOutputTokens ?? Number.POSITIVE_INFINITY) * 0.85;
+    emitTokenWindDown = !isTerminalWorkerStatus(refreshed.transportStatus) && refreshed.tokenWindDownSentAt == null && (refreshed.usage?.outputTokens ?? 0) >= tokenWindDownThreshold;
+    emitTurnWindDown = !emitTokenWindDown && !isTerminalWorkerStatus(refreshed.transportStatus) && refreshed.windDownContextSentAt == null && (refreshed.turns ?? 0) >= turnWindDownThreshold;
     return {
       ...refreshed,
       lastActivityAt: now,
       inFlightSince: undefined,
       ...(!failed ? { lastLivenessAt: now } : {}),
       ...(progress ? { lastProgressAt: now, progressEvents: (refreshed.progressEvents ?? 0) + 1 } : {}),
-      ...(emitWindDown ? { windDownContextSentAt: now } : {})
+      ...(emitTurnWindDown ? { windDownContextSentAt: now } : {}),
+      ...(emitTokenWindDown ? { tokenWindDownSentAt: now } : {})
     };
   });
-  if (emitWindDown) {
+  if (emitTokenWindDown) {
+    writeOutput(hookOutput(input.hook_event_name, "Token budget wind-down: stop making tool calls and write your final deliverable now."));
+  } else if (emitTurnWindDown) {
     writeOutput(hookOutput(input.hook_event_name, "Turn budget wind-down: stop making tool calls and write your final deliverable now."));
   }
 }
@@ -1191,7 +1232,7 @@ function handleSubagentStart(input, env) {
     : record.completionContract === "coverage"
       ? `End the completed analysis with separate lines \`delivery: complete\` and \`coverage: complete\`. ${verdictEnvelope}`
       : `End a successful execution report with separate lines \`delivery: complete\` and \`verification: passed\`. ${verdictEnvelope}`;
-  writeOutput(hookOutput("SubagentStart", `Fusion task id: ${record.taskId}. Work only from the supplied isolated brief. Do not request or reconstruct the parent transcript. Budgets: ${limits.wallClockMs}ms wall clock, ${limits.stallMs}ms without successful tool activity, ${limits.maxTurns} turns, ${limits.maxOutputTokens} output tokens, ${limits.maxUncachedTokens} uncached tokens. Retry at most once. ${delivery}`));
+  writeOutput(hookOutput("SubagentStart", `Fusion task id: ${record.taskId}. Work only from the supplied isolated brief. Do not request or reconstruct the parent transcript. Budgets: ${limits.wallClockMs}ms wall clock, ${limits.stallMs}ms without successful tool activity, ${limits.maxTurns} turns, ${limits.maxOutputTokens} output tokens, ${limits.maxUncachedTokens} uncached tokens. Retry at most once. At 85 percent of the output token budget, stop making tool calls and write the final deliverable; after the token limit, exactly one final Write of the deliverable is permitted. ${delivery}`));
 }
 
 function handleSubagentStop(input, env) {
@@ -1832,6 +1873,12 @@ export function reverifyInFlightRecords(records, tasks, env = process.env) {
     .filter((record) => record && !terminalCollectedRecord(record) && !terminalTransportObserved(record, runtimeTaskForRecord(record, tasks)));
 }
 
+export function reverifyCancellationRecords(records, env = process.env) {
+  return records
+    .map((record) => readWorkerRecord(record.taskId, env))
+    .filter((record) => record && !isTerminalWorkerStatus(record.transportStatus) && !terminalCollectedRecord(record));
+}
+
 function claimStopAdvisory(sessionId, kind, signature, env) {
   let claimed = false;
   updateWorkerSessionState(sessionId, env, (current) => {
@@ -1904,9 +1951,10 @@ function handleStop(input, env) {
     pending.push(updated);
   }
   const cancellations = pending.filter((record) => record.transportStatus === "cancel_requested" || (!record.userBackgroundAuthorized && !["ready_uncollected", "ready_background"].includes(record.transportStatus) && (record.stopBlockCount ?? 0) >= 6));
-  if (cancellations.length > 0) {
+  const verifiedCancellations = reverifyCancellationRecords(cancellations, env);
+  if (verifiedCancellations.length > 0) {
     const now = new Date().toISOString();
-    const missingRuntimeIds = cancellations.filter((record) => !record.backgroundTaskId && !record.agentId);
+    const missingRuntimeIds = verifiedCancellations.filter((record) => !record.backgroundTaskId && !record.agentId);
     for (const record of missingRuntimeIds) {
       updateLifecycleWorkerRecord(record.taskId, env, (current) => {
         if (!current || isTerminalWorkerStatus(current.transportStatus)) {
@@ -1916,7 +1964,7 @@ function handleStop(input, env) {
       });
     }
     const reapedTaskIds = [];
-    for (const record of cancellations.filter((candidate) => candidate.backgroundTaskId || candidate.agentId)) {
+    for (const record of verifiedCancellations.filter((candidate) => candidate.backgroundTaskId || candidate.agentId)) {
       if (hasBackgroundTasks ? runtimeTaskForRecord(record, tasks) : (record.cancelAttemptCount ?? 0) < 2) {
         continue;
       }
@@ -1934,7 +1982,7 @@ function handleStop(input, env) {
     }
     const reapedSentence = reapedTaskIds.length > 0 ? `Fusion task IDs ${reapedTaskIds.join(", ")} were settled as task_reaped because the harness no longer tracks their runtime tasks.` : "";
     const reapedSuffix = reapedSentence ? ` ${reapedSentence}` : "";
-    const cancelIds = cancellations.filter((record) => !reapedTaskIds.includes(record.taskId)).map((record) => record.backgroundTaskId ?? record.agentId).filter(Boolean);
+    const cancelIds = verifiedCancellations.filter((record) => !reapedTaskIds.includes(record.taskId)).map((record) => record.backgroundTaskId ?? record.agentId).filter(Boolean);
     if (cancelIds.length > 0) {
       writeOutput(blockStop(`Call TaskStop for over-budget task${cancelIds.length === 1 ? "" : "s"} ${cancelIds.join(", ")} and report the cancellation before finishing.${reapedSuffix}`));
       return;

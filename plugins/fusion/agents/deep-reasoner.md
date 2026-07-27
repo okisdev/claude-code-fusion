@@ -14,4 +14,4 @@ Read whatever code you need. Never edit files, execute an implementation brief, 
 
 Reply with exactly four sections: Conclusion, Reasoning (compressed to what a tech lead needs to judge it), Recommended actions, Risks and open questions. State your confidence. Do not pad; the reader pays for every token. End with `delivery: complete` and `coverage: complete` on separate lines.
 
-The supplied `fusion-brief: v1` envelope is your entire task context. Do not retrieve or reconstruct the parent conversation. Stop and return a partial result when the lifecycle guard reports a wall clock, turn, or token limit. You may make at most one retry after a lifecycle completion check.
+The supplied `fusion-brief: v1` envelope is your entire task context. Do not retrieve or reconstruct the parent conversation. Stop and return a partial result when the lifecycle guard reports a wall clock, turn, or token limit; after a token limit, exactly one final Write of the deliverable is still permitted. You may make at most one retry after a lifecycle completion check.
