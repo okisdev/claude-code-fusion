@@ -525,7 +525,7 @@ test("a closed stdin fails even when Codex emits a completed lifecycle", async (
   assert.match(outcome.errorMessage, /closed stdin before accepting the complete prompt/i);
 });
 
-test("prompt, JSONL event, and final response limits fail with a resource error", async (t) => {
+test("prompt, incomplete oversized JSONL events, and final responses fail with a resource error", async (t) => {
   await assert.rejects(
     runFixture(t, "completed", { prompt: "x".repeat(65), promptMaxBytes: 64 }),
     (error) => error?.failureKind === "resource"
@@ -536,12 +536,28 @@ test("prompt, JSONL event, and final response limits fail with a resource error"
   });
   assert.equal(oversizedEvent.outcome.status, "error");
   assert.equal(oversizedEvent.outcome.failureKind, "resource");
+  assert.equal(oversizedEvent.outcome.errorMessage, "Codex emitted a JSONL event larger than the 128 byte limit.");
+  assert.deepEqual(oversizedEvent.outcome.diagnostics, [
+    { type: "warning", message: "Skipped a JSONL event larger than the 128 byte limit." }
+  ]);
   const oversizedResult = await runFixture(t, "completed", {
     resultMaxBytes: 64,
     env: { FAKE_CODEX_MESSAGE_BYTES: "1024" }
   });
   assert.equal(oversizedResult.outcome.status, "error");
   assert.equal(oversizedResult.outcome.failureKind, "resource");
+});
+
+test("oversized JSONL events are skipped when the lifecycle completes", async (t) => {
+  const { outcome } = await runFixture(t, "oversized-midrun-event", {
+    eventLineMaxBytes: 128,
+    env: { FAKE_CODEX_EVENT_BYTES: "1024" }
+  });
+  assert.equal(outcome.status, "done");
+  assert.equal(outcome.failureKind, null);
+  assert.deepEqual(outcome.diagnostics, [
+    { type: "warning", message: "Skipped a JSONL event larger than the 128 byte limit." }
+  ]);
 });
 
 test("final responses come only from the bounded JSONL stream", async (t) => {
