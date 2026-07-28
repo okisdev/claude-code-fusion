@@ -304,8 +304,8 @@ test("aggregates the canonical Codex lifecycle and direct token usage", (t) => {
   assert.strictEqual(stats.tokenUsage.jobsWithoutUsage, 1);
   assert.deepStrictEqual(stats.tokenUsage.totals, { inputTokens: 120, cachedInputTokens: 40, outputTokens: 30, reasoningOutputTokens: 12, totalTokens: 150 });
   assert.deepStrictEqual(stats.last7DaysBySku, [
-    { sku: "gpt-5.4@high", jobs: 1, outputTokens: 30, outputTokenOverflow: false, timeouts: 0, nearCap: 0, timeoutShare: 0, nearCapShare: 0 },
-    { sku: "unknown@unavailable", jobs: 1, outputTokens: 0, outputTokenOverflow: false, timeouts: 1, nearCap: 1, timeoutShare: 1, nearCapShare: 1 }
+    { sku: "gpt-5.4@high", jobs: 1, outputTokens: 30, outputTokenOverflow: false, timeouts: 0, salvagedTimeouts: 0, nearCap: 0, timeoutShare: 0, nearCapShare: 0 },
+    { sku: "unknown@unavailable", jobs: 1, outputTokens: 0, outputTokenOverflow: false, timeouts: 1, salvagedTimeouts: 0, nearCap: 1, timeoutShare: 1, nearCapShare: 1 }
   ]);
 });
 
@@ -430,21 +430,30 @@ test("Codex renders per-SKU trends from the seven days ending at the newest reco
   writeCodexJob(stateRoot, dir, "recent-timeout", {
     status: "error",
     jobClass: "task",
-    acceptance: "rejected",
+    semanticStatus: "rejected",
     failureKind: "timeout",
     createdAt: "2026-07-20T00:00:00.000Z",
     request: { model: "gpt-trend", effort: "xhigh" },
     tokenUsageAvailability: "available",
     tokenUsage: usage(13)
   });
+  writeCodexJob(stateRoot, dir, "recent-salvaged-timeout", {
+    status: "error",
+    jobClass: "task",
+    semanticStatus: "accepted",
+    failureKind: "timeout",
+    createdAt: "2026-07-20T01:00:00.000Z",
+    request: { model: "gpt-trend", effort: "xhigh" },
+    tokenUsageAvailability: "available",
+    tokenUsage: usage(5)
+  });
 
   const stats = codexStats({ env: { FUSION_CODEX_STATE: stateRoot, FUSION_DATA_DIR: fusionData }, cwd: dir });
   assert.deepStrictEqual(stats.last7DaysBySku, [
-    { sku: "gpt-trend@high", jobs: 1, outputTokens: 7, outputTokenOverflow: false, timeouts: 0, nearCap: 0, timeoutShare: 0, nearCapShare: 0 },
-    { sku: "gpt-trend@xhigh", jobs: 2, outputTokens: 24, outputTokenOverflow: false, timeouts: 1, nearCap: 2, timeoutShare: 0.5, nearCapShare: 1 }
+    { sku: "gpt-trend@xhigh", jobs: 3, outputTokens: 29, outputTokenOverflow: false, timeouts: 2, salvagedTimeouts: 1, nearCap: 3, timeoutShare: 2 / 3, nearCapShare: 1 }
   ]);
   const rendered = renderFusionStats({ scope: dir, codex: stats });
-  assert.match(rendered, /By SKU, last 7 days:\nSKU \| jobs \| output tokens \| timeout share \| near-cap share\ngpt-trend@high \| 1 \| 7 \| 0\.0% \| 0\.0%\ngpt-trend@xhigh \| 2 \| 24 \| 50\.0% \| 100\.0%/);
+  assert.match(rendered, /By SKU, last 7 days:\nSKU \| jobs \| output tokens \| timeout share \| near-cap share \| salvaged\ngpt-trend@xhigh \| 3 \| 29 \| 66\.7% \| 100\.0% \| 1\/2/);
   assert.doesNotMatch(rendered, /gpt-old@low \|/);
 });
 
@@ -1287,7 +1296,7 @@ test("terminal ledgers supplement cleaned jobs and safely dedupe live state", (t
   assert.strictEqual(recovered.evidence.recoveredTerminalJobs, 1);
   assert.deepStrictEqual(recovered.tokenUsage.totals, { inputTokens: 100, cachedInputTokens: 40, outputTokens: 20, reasoningOutputTokens: 5, totalTokens: 120 });
   assert.deepStrictEqual(recovered.last7DaysBySku, [
-    { sku: "ledger-model@high", jobs: 1, outputTokens: 20, outputTokenOverflow: false, timeouts: 1, nearCap: 1, timeoutShare: 1, nearCapShare: 1 }
+    { sku: "ledger-model@high", jobs: 1, outputTokens: 20, outputTokenOverflow: false, timeouts: 1, salvagedTimeouts: 0, nearCap: 1, timeoutShare: 1, nearCapShare: 1 }
   ]);
 
   writeCodexJob(stateRoot, dir, "cleaned-job", {
@@ -1443,11 +1452,11 @@ test("semantic acceptance reads the job record and excludes non-terminal transpo
   assert.strictEqual(before.pendingTransportJobs, 1);
   assert.strictEqual(before.acceptanceScope, "terminal transport jobs only");
 
-  fs.writeFileSync(completedJob, JSON.stringify({ id: "completed-job", workspaceRoot: dir, status: "done", jobClass: "task", acceptance: "accepted", semanticAcceptance: "rejected" }));
+  fs.writeFileSync(completedJob, JSON.stringify({ id: "completed-job", workspaceRoot: dir, status: "done", jobClass: "task", semanticStatus: "accepted", semanticAcceptance: "rejected" }));
   const after = codexStats({ env: { FUSION_CODEX_STATE: stateRoot, FUSION_DATA_DIR: path.join(dir, "fusion") }, cwd: dir });
   assert.deepStrictEqual(after.byAcceptance, { accepted: 1 });
 
-  fs.writeFileSync(completedJob, JSON.stringify({ id: "completed-job", workspaceRoot: dir, status: "done", jobClass: "task", acceptance: "rejected" }));
+  fs.writeFileSync(completedJob, JSON.stringify({ id: "completed-job", workspaceRoot: dir, status: "done", jobClass: "task", semanticStatus: "rejected" }));
   const rejected = codexStats({ env: { FUSION_CODEX_STATE: stateRoot, FUSION_DATA_DIR: path.join(dir, "fusion") }, cwd: dir });
   assert.deepStrictEqual(rejected.byAcceptance, { rejected: 1 });
 });
@@ -2026,6 +2035,33 @@ test("Codex reports acceptance anomalies only when the job record and transport 
   });
   const rendered = renderFusionStats({ scope: dir, codex: stats });
   assert.match(rendered, /Acceptance anomalies:\n- Accepted ledger entries with error transport: 1 \(eeeeeeee\)\n- Done jobs without acceptance records: 1 \(ffffffffffffffffffffffffffffffff\)/);
+});
+
+test("Codex acceptedWithErrorTransport excludes salvaged timeouts but keeps other error kinds", (t) => {
+  const dir = sandbox(t);
+  const stateRoot = path.join(dir, "state");
+  const fusionData = path.join(dir, "fusion");
+  const nonTimeoutAcceptedId = "1".repeat(32);
+  const salvagedTimeoutId = "2".repeat(32);
+  writeCodexJob(stateRoot, dir, nonTimeoutAcceptedId, {
+    status: "error",
+    jobClass: "task",
+    semanticStatus: "accepted",
+    failureKind: "tool_error"
+  });
+  writeCodexJob(stateRoot, dir, salvagedTimeoutId, {
+    status: "error",
+    jobClass: "task",
+    semanticStatus: "accepted",
+    failureKind: "timeout"
+  });
+
+  const stats = codexStats({ env: { FUSION_CODEX_STATE: stateRoot, FUSION_DATA_DIR: fusionData }, cwd: dir });
+  assert.deepStrictEqual(stats.acceptanceAnomalies, {
+    acceptedWithErrorTransport: [nonTimeoutAcceptedId],
+    doneWithoutAcceptance: []
+  });
+  assert.ok(!stats.acceptanceAnomalies.acceptedWithErrorTransport.includes(salvagedTimeoutId));
 });
 
 test("Codex groups pre-epoch acceptance anomalies and falls back from invalid epochs", (t) => {

@@ -96,6 +96,7 @@ export function createJobRecord(fields) {
   return withStructuredStatuses({
     schemaVersion: 1,
     engine: "grok",
+    companionVersion: fields.companionVersion ?? null,
     id: fields.id,
     pid,
     pidIdentity: Object.hasOwn(fields, "pidIdentity") ? fields.pidIdentity : pid ? getProcessIdentity(pid) : null,

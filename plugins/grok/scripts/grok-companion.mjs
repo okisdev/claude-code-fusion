@@ -73,6 +73,28 @@ const SELF_PATH = fileURLToPath(import.meta.url);
 const ROOT_DIR = path.resolve(path.dirname(SELF_PATH), "..");
 const REVIEW_PROMPT_FILE = path.join(ROOT_DIR, "prompts", "review.md");
 const STOP_GATE_PROMPT_FILE = path.join(ROOT_DIR, "prompts", "stop-gate.md");
+let cachedGrokCompanionVersion;
+
+function resolvePluginRoot(env = process.env) {
+  if (env.CLAUDE_PLUGIN_ROOT && env.CLAUDE_PLUGIN_ROOT.trim()) {
+    return path.resolve(env.CLAUDE_PLUGIN_ROOT.trim());
+  }
+  return path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+}
+
+function resolveGrokCompanionVersion(env = process.env) {
+  if (cachedGrokCompanionVersion !== undefined) {
+    return cachedGrokCompanionVersion;
+  }
+  try {
+    const manifest = JSON.parse(fs.readFileSync(path.join(resolvePluginRoot(env), ".claude-plugin", "plugin.json"), "utf8"));
+    cachedGrokCompanionVersion = typeof manifest?.version === "string" ? manifest.version : null;
+  } catch {
+    cachedGrokCompanionVersion = null;
+  }
+  return cachedGrokCompanionVersion;
+}
+
 const STOP_GATE_OPTION_ENV = "CLAUDE_PLUGIN_OPTION_STOP_GATE";
 const CONTINUITY_POLICY_ENV = "GROK_COMPANION_CONTINUITY_POLICY";
 const STOP_GATE_TIMEOUT_MS = 240000;
@@ -1566,6 +1588,7 @@ async function handleTask(argv, transport = {}) {
   const record = {
     ...createJobRecord({
       id: jobId,
+      companionVersion: resolveGrokCompanionVersion(),
       pid: background ? null : process.pid,
       mode,
       cwd,
@@ -1982,6 +2005,7 @@ async function handleReview(argv, transport = {}) {
   const record = {
     ...createJobRecord({
       id: jobId,
+      companionVersion: resolveGrokCompanionVersion(),
       pid: background ? null : process.pid,
       mode: "consult",
       cwd,
@@ -2929,6 +2953,7 @@ async function handleStopGate() {
   createJobRecordFile(jobFile, {
     ...createJobRecord({
       id: jobId,
+      companionVersion: resolveGrokCompanionVersion(),
       pid: process.pid,
       mode: "consult",
       cwd,

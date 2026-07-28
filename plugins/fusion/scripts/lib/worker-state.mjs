@@ -2,6 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 
 const DATA_DIR_ENV = "FUSION_DATA_DIR";
 const WORKER_STATE_ENV = "FUSION_WORKER_STATE_DIR";
@@ -50,6 +51,27 @@ const AGENT_TYPES = new Map([
   ["fusion:job-collector", "fusion:job-collector"],
   ["job-collector", "fusion:job-collector"]
 ]);
+let cachedFusionCompanionVersion;
+
+function resolvePluginRoot(env = process.env) {
+  if (env.CLAUDE_PLUGIN_ROOT && env.CLAUDE_PLUGIN_ROOT.trim()) {
+    return path.resolve(env.CLAUDE_PLUGIN_ROOT.trim());
+  }
+  return path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..");
+}
+
+function resolveFusionCompanionVersion(env = process.env) {
+  if (cachedFusionCompanionVersion !== undefined) {
+    return cachedFusionCompanionVersion;
+  }
+  try {
+    const manifest = JSON.parse(fs.readFileSync(path.join(resolvePluginRoot(env), ".claude-plugin", "plugin.json"), "utf8"));
+    cachedFusionCompanionVersion = typeof manifest?.version === "string" ? manifest.version : null;
+  } catch {
+    cachedFusionCompanionVersion = null;
+  }
+  return cachedFusionCompanionVersion;
+}
 
 export function resolveLockTimeoutMs(env = process.env) {
   const raw = env[LOCK_TIMEOUT_ENV];
@@ -290,6 +312,7 @@ export function createWorkerRecord(record, env = process.env) {
     const now = new Date().toISOString();
     const value = {
       schemaVersion: 1,
+      companionVersion: resolveFusionCompanionVersion(env),
       taskId: record.taskId,
       sessionId: record.sessionId,
       dispatchToolUseId: record.dispatchToolUseId ?? null,

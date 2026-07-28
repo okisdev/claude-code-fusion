@@ -124,7 +124,7 @@ export function normalizeCollectionMethod(value) {
 }
 
 function semanticAcceptance(raw) {
-  const recorded = raw?.acceptance;
+  const recorded = raw?.semanticStatus ?? raw?.acceptance;
   return recorded === "accepted" || recorded === "rejected" ? recorded : "unverified";
 }
 
@@ -1057,10 +1057,13 @@ function summarizeCodexSkuTelemetry(entries) {
       if (entry.createdAtMs < cutoff) {
         continue;
       }
-      const row = trendRows.get(entry.sku) ?? { sku: entry.sku, jobs: 0, outputTokens: 0, outputTokenOverflow: false, timeouts: 0, nearCap: 0 };
+      const row = trendRows.get(entry.sku) ?? { sku: entry.sku, jobs: 0, outputTokens: 0, outputTokenOverflow: false, timeouts: 0, salvagedTimeouts: 0, nearCap: 0 };
       row.jobs += 1;
       if (entry.failureKind === "timeout") {
         row.timeouts += 1;
+        if (entry.acceptance === "accepted") {
+          row.salvagedTimeouts += 1;
+        }
       }
       if (entry.failureKind === "timeout" || (entry.durationSeconds != null && entry.timeoutMs != null && entry.timeoutMs / 1000 - entry.durationSeconds <= 30)) {
         row.nearCap += 1;
@@ -1208,7 +1211,7 @@ export function fileBasedEngineStats(descriptor, { all = false, env = process.en
         pendingTransportJobs += 1;
       }
       const historical = Number.isFinite(Date.parse(raw?.finishedAt ?? "")) && Date.parse(raw.finishedAt) < acceptanceEpoch.timestamp;
-      if (jobId && job.status === "error" && semanticAcceptance(raw) === "accepted") {
+      if (jobId && job.status === "error" && semanticAcceptance(raw) === "accepted" && nonEmptyString(raw?.failureKind) !== "timeout") {
         if (historical) {
           historicalAcceptanceAnomalies += 1;
         } else {
@@ -2149,9 +2152,10 @@ function renderCodexSkuTrend(lines, rows) {
   if (!Array.isArray(rows) || rows.length === 0) {
     return;
   }
-  lines.push("", "By SKU, last 7 days:", "SKU | jobs | output tokens | timeout share | near-cap share");
+  lines.push("", "By SKU, last 7 days:", "SKU | jobs | output tokens | timeout share | near-cap share | salvaged");
   for (const row of rows) {
-    lines.push(`${row.sku} | ${row.jobs} | ${row.outputTokenOverflow ? "overflow" : row.outputTokens} | ${formatShare(row.timeoutShare)} | ${formatShare(row.nearCapShare)}`);
+    const salvaged = `${row.salvagedTimeouts ?? 0}/${row.timeouts ?? 0}`;
+    lines.push(`${row.sku} | ${row.jobs} | ${row.outputTokenOverflow ? "overflow" : row.outputTokens} | ${formatShare(row.timeoutShare)} | ${formatShare(row.nearCapShare)} | ${salvaged}`);
   }
 }
 

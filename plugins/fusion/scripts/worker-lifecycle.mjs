@@ -1021,6 +1021,18 @@ function settleReapedWorker(current, now, env) {
   }, now, env);
 }
 
+function settleReapedIfActive(taskId, now, env, extraGuard) {
+  let settled = false;
+  updateLifecycleWorkerRecord(taskId, env, (current) => {
+    if (!current || isTerminalWorkerStatus(current.transportStatus) || !extraGuard(current)) {
+      return null;
+    }
+    settled = true;
+    return settleReapedWorker(current, now, env);
+  });
+  return settled;
+}
+
 function handlePostToolUse(input, env, failed = false) {
   if (!input.agent_id && ["Read", "TaskOutput", "TaskStop"].includes(input.tool_name)) {
     const taskId = typeof input.tool_input?.task_id === "string" ? input.tool_input.task_id : null;
@@ -1029,12 +1041,7 @@ function handlePostToolUse(input, env, failed = false) {
     if (["TaskOutput", "TaskStop"].includes(input.tool_name) && taskId && noTaskFoundError(input, failed)) {
       const now = new Date().toISOString();
       for (const record of records.filter((candidate) => candidate.sessionId === input.session_id && !isTerminalWorkerStatus(candidate.transportStatus) && [candidate.backgroundTaskId, candidate.agentId].includes(taskId))) {
-        updateLifecycleWorkerRecord(record.taskId, env, (current) => {
-          if (!current || current.sessionId !== input.session_id || isTerminalWorkerStatus(current.transportStatus) || ![current.backgroundTaskId, current.agentId].includes(taskId)) {
-            return null;
-          }
-          return settleReapedWorker(current, now, env);
-        });
+        settleReapedIfActive(record.taskId, now, env, (current) => current.sessionId === input.session_id && [current.backgroundTaskId, current.agentId].includes(taskId));
       }
       return;
     }
@@ -1789,12 +1796,8 @@ function collectorStopGate(input, env) {
   return false;
 }
 
-function unverifiedCollectedWorkers(records) {
-  return records.filter(isPendingSettlement);
-}
-
 function writeAcceptanceAdvisory(records, env) {
-  const unverified = unverifiedCollectedWorkers(rereadPendingRecords(records, isPendingSettlement, env));
+  const unverified = settleOnlyRecords(rereadPendingRecords(records, isPendingSettlement, env));
   if (unverified.length === 0) {
     return;
   }
@@ -1811,7 +1814,7 @@ function terminalCollectionInstruction(record) {
     : collectId ? `Call TaskOutput with block=true for terminal owned task ${collectId} and collect Fusion task ${worker} before finishing.` : `Collect terminal owned task ${worker} before finishing.`;
 }
 
-function settleOnlyRecords(records) {
+export function settleOnlyRecords(records) {
   return records.filter(isPendingSettlement);
 }
 
@@ -1873,10 +1876,18 @@ export function reverifyInFlightRecords(records, tasks, env = process.env) {
     .filter((record) => record && !terminalCollectedRecord(record) && !terminalTransportObserved(record, runtimeTaskForRecord(record, tasks)));
 }
 
+export function runtimeTaskMissing(record, hasBackgroundTasks, tasks) {
+  return hasBackgroundTasks ? !runtimeTaskForRecord(record, tasks) : (record.cancelAttemptCount ?? 0) >= 2;
+}
+
+export function needsCancellation(record) {
+  return record.transportStatus === "cancel_requested" || (!record.userBackgroundAuthorized && !["ready_uncollected", "ready_background"].includes(record.transportStatus) && (record.stopBlockCount ?? 0) >= 6);
+}
+
 export function reverifyCancellationRecords(records, env = process.env) {
   return records
     .map((record) => readWorkerRecord(record.taskId, env))
-    .filter((record) => record && !isTerminalWorkerStatus(record.transportStatus) && !terminalCollectedRecord(record));
+    .filter((record) => record && !terminalCollectedRecord(record) && needsCancellation(record));
 }
 
 function claimStopAdvisory(sessionId, kind, signature, env) {
@@ -1950,7 +1961,7 @@ function handleStop(input, env) {
     });
     pending.push(updated);
   }
-  const cancellations = pending.filter((record) => record.transportStatus === "cancel_requested" || (!record.userBackgroundAuthorized && !["ready_uncollected", "ready_background"].includes(record.transportStatus) && (record.stopBlockCount ?? 0) >= 6));
+  const cancellations = pending.filter(needsCancellation);
   const verifiedCancellations = reverifyCancellationRecords(cancellations, env);
   if (verifiedCancellations.length > 0) {
     const now = new Date().toISOString();
@@ -1965,17 +1976,10 @@ function handleStop(input, env) {
     }
     const reapedTaskIds = [];
     for (const record of verifiedCancellations.filter((candidate) => candidate.backgroundTaskId || candidate.agentId)) {
-      if (hasBackgroundTasks ? runtimeTaskForRecord(record, tasks) : (record.cancelAttemptCount ?? 0) < 2) {
+      if (!runtimeTaskMissing(record, hasBackgroundTasks, tasks)) {
         continue;
       }
-      let settled = false;
-      updateLifecycleWorkerRecord(record.taskId, env, (current) => {
-        if (!current || isTerminalWorkerStatus(current.transportStatus)) {
-          return null;
-        }
-        settled = true;
-        return settleReapedWorker(current, now, env);
-      });
+      const settled = settleReapedIfActive(record.taskId, now, env, () => true);
       if (settled) {
         reapedTaskIds.push(record.taskId);
       }

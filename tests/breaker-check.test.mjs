@@ -4,7 +4,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { test } from "node:test";
-import { codexFailureKind, resolveCodexStateDir, resolveCodexStateRoots } from "../plugins/fusion/scripts/breaker-check.mjs";
+import { advisoryLine, codexFailureKind, resolveCodexStateDir, resolveCodexStateRoots } from "../plugins/fusion/scripts/breaker-check.mjs";
 
 const repoRoot = path.join(import.meta.dirname, "..");
 const script = path.join(repoRoot, "plugins", "fusion", "scripts", "breaker-check.mjs");
@@ -67,8 +67,25 @@ test("an in-window quota failure prints a grok breaker advisory", (t) => {
   const result = run(sandbox);
   assert.strictEqual(result.status, 0);
   assert.match(result.stdout, /treat the grok breaker as open unless verified recovered/);
-  assert.match(result.stdout, /last failure quota \d+ minutes? ago/);
+  assert.match(result.stdout, /last failure quota \d+ minutes? ago \(1 quota across 1 terminal jobs, 12h window\)/);
   assert.strictEqual(result.stderr, "");
+});
+
+test("advisoryLine renders kind and terminal proportions with singular and plural counts", () => {
+  const now = Date.parse("2026-01-01T12:00:00.000Z");
+  const lookbackMs = 12 * 60 * 60 * 1000;
+  assert.strictEqual(
+    advisoryLine("grok", { failureKind: "quota", timestamp: now - 30 * 60000, kindCount: 1, terminalCount: 1 }, now, lookbackMs),
+    "fusion breaker advisory: treat the grok breaker as open unless verified recovered; last failure quota 30 minutes ago (1 quota across 1 terminal jobs, 12h window). Route new work to another eligible healthy lane."
+  );
+  assert.strictEqual(
+    advisoryLine("codex", { failureKind: "rate_limited", timestamp: now - 2 * 60000, kindCount: 2, terminalCount: 3 }, now, lookbackMs),
+    "fusion breaker advisory: treat the codex breaker as open unless verified recovered; last failure rate_limited 2 minutes ago (2 rate_limited across 3 terminal jobs, 12h window). Route new work to another eligible healthy lane."
+  );
+  assert.strictEqual(
+    advisoryLine("grok", { failureKind: "auth", timestamp: now - 90 * 60000, kindCount: 1, terminalCount: 2 }, now, 0.1 * 60 * 60 * 1000),
+    "fusion breaker advisory: treat the grok breaker as open unless verified recovered; last failure auth 1 hour ago (1 auth across 2 terminal jobs, 0.1h window). Route new work to another eligible healthy lane."
+  );
 });
 
 test("breaker quota recovery matches the companion diagnostic vocabulary", () => {
@@ -159,7 +176,7 @@ test("a consecutive second Codex rate limit opens the breaker", (t) => {
 
   const result = run(sandbox);
   assert.strictEqual(result.status, 0);
-  assert.match(result.stdout, /^fusion breaker advisory: treat the codex breaker as open unless verified recovered; last failure rate_limited \d+ minutes? ago\. Route new work to another eligible healthy lane\.\n$/);
+  assert.match(result.stdout, /^fusion breaker advisory: treat the codex breaker as open unless verified recovered; last failure rate_limited \d+ minutes? ago \(2 rate_limited across 2 terminal jobs, 12h window\)\. Route new work to another eligible healthy lane\.\n$/);
   assert.strictEqual(result.stderr, "");
 });
 
@@ -244,7 +261,7 @@ test("two Grok rate limits inside the configured window open only the Grok break
 
   const result = run(sandbox);
   assert.strictEqual(result.status, 0);
-  assert.match(result.stdout, /^fusion breaker advisory: treat the grok breaker as open unless verified recovered; last failure rate_limited \d+ minutes? ago\. Route new work to another eligible healthy lane\.\n$/);
+  assert.match(result.stdout, /^fusion breaker advisory: treat the grok breaker as open unless verified recovered; last failure rate_limited \d+ minutes? ago \(2 rate_limited across 2 terminal jobs, 12h window\)\. Route new work to another eligible healthy lane\.\n$/);
   assert.strictEqual(result.stderr, "");
 });
 
@@ -278,7 +295,7 @@ test("a typed Codex adapter error uses the canonical status and finished timesta
 
   const result = run(sandbox);
   assert.strictEqual(result.status, 0);
-  assert.match(result.stdout, /^fusion breaker advisory: treat the codex breaker as open unless verified recovered; last failure auth \d+ minutes? ago\. Route new work to another eligible healthy lane\.\n$/);
+  assert.match(result.stdout, /^fusion breaker advisory: treat the codex breaker as open unless verified recovered; last failure auth \d+ minutes? ago \(1 auth across 1 terminal jobs, 12h window\)\. Route new work to another eligible healthy lane\.\n$/);
 });
 
 test("a typed Codex protocol failure opens the compatibility breaker", (t) => {
@@ -292,7 +309,7 @@ test("a typed Codex protocol failure opens the compatibility breaker", (t) => {
 
   const result = run(sandbox);
   assert.strictEqual(result.status, 0);
-  assert.match(result.stdout, /^fusion breaker advisory: treat the codex breaker as open unless verified recovered; last failure protocol \d+ minutes? ago\. Route new work to another eligible healthy lane\.\n$/);
+  assert.match(result.stdout, /^fusion breaker advisory: treat the codex breaker as open unless verified recovered; last failure protocol \d+ minutes? ago \(1 protocol across 1 terminal jobs, 12h window\)\. Route new work to another eligible healthy lane\.\n$/);
 });
 
 test("a collaboration policy violation is treated as a protocol breaker but an ordinary policy denial is not", (t) => {

@@ -64,6 +64,7 @@ const SELF_PATH = fileURLToPath(import.meta.url);
 const ROOT_DIR = path.resolve(path.dirname(SELF_PATH), "..");
 const ADVERSARIAL_REVIEW_PROMPT_FILE = path.join(ROOT_DIR, "prompts", "adversarial-review.md");
 const ADVERSARIAL_REVIEW_SCHEMA_FILE = path.join(ROOT_DIR, "schemas", "adversarial-review-verdict.schema.json");
+const COMPANION_MANIFEST_FILE = path.join(ROOT_DIR, ".claude-plugin", "plugin.json");
 const FOREGROUND_TIMEOUT_ENV = "CODEX_COMPANION_TIMEOUT_MS";
 const BACKGROUND_TIMEOUT_ENV = "CODEX_COMPANION_BACKGROUND_TIMEOUT_MS";
 const BACKGROUND_DELIVERY_ENV = "CODEX_COMPANION_BACKGROUND_DELIVERY";
@@ -101,6 +102,8 @@ const SEMANTIC_FAILURE_KINDS = new Set(["intent_override", "scope_rewrite", "wro
 const SOL_FOREGROUND_WRITE_WARNING = "warning: sol p90 wall clock exceeds the 600s foreground cap. Split the brief or name gpt-5.6-terra.";
 const IMPLICIT_SUBDIRECTORY_CWD_WARNING = (cwd, workspaceRoot) => `Codex cwd ${cwd} sits below repository top level ${workspaceRoot} without an explicit --cwd; the sandbox roots at this subdirectory. Pass --cwd to pin the intended workspace.`;
 let activeCommandArgv = null;
+let cachedCompanionVersion = null;
+let companionVersionRead = false;
 
 class CompanionError extends Error {
   constructor(message, failureKind = "error") {
@@ -290,6 +293,18 @@ function nonnegativeEnvMs(name, fallback, env = process.env) {
 
 function resolveExecutionTimeout(background, env = process.env) {
   return positiveEnvMs(background ? BACKGROUND_TIMEOUT_ENV : FOREGROUND_TIMEOUT_ENV, background ? DEFAULT_BACKGROUND_TIMEOUT_MS : DEFAULT_FOREGROUND_TIMEOUT_MS, env);
+}
+
+function companionVersion() {
+  if (companionVersionRead) {
+    return cachedCompanionVersion;
+  }
+  companionVersionRead = true;
+  try {
+    const manifest = JSON.parse(fs.readFileSync(COMPANION_MANIFEST_FILE, "utf8"));
+    cachedCompanionVersion = typeof manifest.version === "string" && manifest.version.trim() ? manifest.version.trim() : null;
+  } catch {}
+  return cachedCompanionVersion;
 }
 
 function backgroundDelivery(env = process.env) {
@@ -1209,7 +1224,7 @@ function inheritedRouting(record, options, defaultServiceTier) {
   return { effort, inherited, model, serviceTier };
 }
 
-function createReservedJob({ background, brief, codexVersion, cwd, dataDir, explicitCwd, jobClass, mode, request }) {
+function createReservedJob({ background, brief, codexVersion, companionVersion, cwd, dataDir, explicitCwd, jobClass, mode, request, timeoutMs }) {
   brief = boundedPrompt(brief);
   const ownerIdentity = background ? null : currentProcessIdentity();
   const reserveWorkspace = (reservedRequest) => withWorkspaceLock(dataDir, cwd, () => {
@@ -1229,6 +1244,7 @@ function createReservedJob({ background, brief, codexVersion, cwd, dataDir, expl
       briefFile,
       claudeSessionId: currentClaudeSessionId(),
       codexVersion,
+      companionVersion,
       cwd,
       delivery: background ? backgroundDelivery() : "foreground",
       eventsFile: jobEventsPath(dataDir, cwd, id),
@@ -1241,6 +1257,7 @@ function createReservedJob({ background, brief, codexVersion, cwd, dataDir, expl
       pidIdentity: ownerIdentity,
       pidOwnsProcessGroup: false,
       request: explicitCwd ? { ...reservedRequest, explicitCwd: true } : reservedRequest,
+      timeoutMs,
       workspaceRoot: canonicalWorkspaceRoot(cwd)
     });
     const file = jobFilePath(dataDir, cwd, id);
@@ -1384,6 +1401,7 @@ async function executeRecord(found) {
     heartbeatAt: nowIso(),
     phase: record.background ? "codex-spawning" : "executing",
     serviceTier,
+    timeoutMs,
     pid: process.pid,
     pidIdentity: ownerIdentity,
     pidOwnsProcessGroup: record.background && process.platform !== "win32",
@@ -1753,12 +1771,14 @@ async function handleTask(rawArgv, transport = {}) {
     background: Boolean(options.background),
     brief: prompt,
     codexVersion: probe.version,
+    companionVersion: companionVersion(),
     cwd,
     dataDir,
     explicitCwd: options.cwd != null,
     jobClass: "task",
     mode: write ? "write" : "consult",
-    request
+    request,
+    timeoutMs: resolveExecutionTimeout(Boolean(options.background))
   });
   await dispatchJob(found, Boolean(options.json));
 }
@@ -1845,12 +1865,14 @@ async function handleReview(rawArgv, adversarial = false, transport = {}) {
     background: Boolean(options.background),
     brief,
     codexVersion: probe.version,
+    companionVersion: companionVersion(),
     cwd,
     dataDir,
     explicitCwd: options.cwd != null,
     jobClass: adversarial ? "adversarial-review" : "review",
     mode: "consult",
-    request
+    request,
+    timeoutMs: resolveExecutionTimeout(Boolean(options.background))
   });
   await dispatchJob(found, Boolean(options.json));
 }

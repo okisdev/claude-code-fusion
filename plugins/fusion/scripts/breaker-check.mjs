@@ -232,7 +232,13 @@ function latestBreakerFailure(records, failureReader, now, lookbackMs) {
     }
     previousTransientFailure = outcome;
   }
-  return newerFailure(immediate, repeatedTransientFailure);
+  const failure = newerFailure(immediate, repeatedTransientFailure);
+  if (failure == null) {
+    return null;
+  }
+  const kindCount = outcomes.filter((outcome) => outcome.failureKind === failure.failureKind).length;
+  const terminalCount = outcomes.length;
+  return { ...failure, kindCount, terminalCount };
 }
 
 function formatAge(timestamp, now) {
@@ -251,8 +257,14 @@ function formatAge(timestamp, now) {
   return `${days} day${days === 1 ? "" : "s"} ago`;
 }
 
-function advisoryLine(engine, failure, now) {
-  return `fusion breaker advisory: treat the ${engine} breaker as open unless verified recovered; last failure ${failure.failureKind} ${formatAge(failure.timestamp, now)}. Route new work to another eligible healthy lane.`;
+function formatLookbackHours(lookbackMs) {
+  const hours = lookbackMs / (60 * 60 * 1000);
+  return hours % 1 === 0 ? String(hours) : hours.toFixed(1);
+}
+
+function advisoryLine(engine, failure, now, lookbackMs = DEFAULT_LOOKBACK_HOURS * 60 * 60 * 1000) {
+  const hoursText = formatLookbackHours(lookbackMs);
+  return `fusion breaker advisory: treat the ${engine} breaker as open unless verified recovered; last failure ${failure.failureKind} ${formatAge(failure.timestamp, now)} (${failure.kindCount} ${failure.failureKind} across ${failure.terminalCount} terminal jobs, ${hoursText}h window). Route new work to another eligible healthy lane.`;
 }
 
 function workerFailure(record, now, lookbackMs) {
@@ -279,14 +291,14 @@ function run(env = process.env, now = Date.now()) {
   const codex = latestBreakerFailure(readDeduplicatedJobRecords(resolveCodexStateRoots(env)), codexFailure, now, lookbackMs);
   const lines = [];
   if (grok) {
-    lines.push(advisoryLine("grok", grok, now));
+    lines.push(advisoryLine("grok", grok, now, lookbackMs));
   }
   if (codex) {
-    lines.push(advisoryLine("codex", codex, now));
+    lines.push(advisoryLine("codex", codex, now, lookbackMs));
   }
   const fastWorker = latestBreakerFailure(workerBreakerRecords(env), workerFailure, now, lookbackMs);
   if (fastWorker) {
-    lines.push(advisoryLine("fusion:fast-worker", fastWorker, now));
+    lines.push(advisoryLine("fusion:fast-worker", fastWorker, now, lookbackMs));
   }
   if (lines.length > 0) {
     process.stdout.write(`${lines.join("\n")}\n`);

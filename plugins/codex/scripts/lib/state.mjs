@@ -444,6 +444,12 @@ function assertJobRecord(record) {
   if (record.acceptanceRecordedAt != null && (typeof record.acceptanceRecordedAt !== "string" || !Number.isFinite(Date.parse(record.acceptanceRecordedAt)))) {
     throw new TypeError("Job acceptance recorded timestamp is invalid.");
   }
+  if (record.timeoutMs != null && (!Number.isSafeInteger(record.timeoutMs) || record.timeoutMs <= 0)) {
+    throw new TypeError("Job timeout is invalid.");
+  }
+  if (record.companionVersion != null && (typeof record.companionVersion !== "string" || !record.companionVersion.trim())) {
+    throw new TypeError("Job companion version is invalid.");
+  }
 }
 
 function ownerSessionId(record) {
@@ -467,6 +473,8 @@ function normalizeRecord(record) {
     appliedServiceTier: record.appliedServiceTier ?? null,
     resolvedModel: record.resolvedModel ?? null,
     resolvedEffort: record.resolvedEffort ?? null,
+    timeoutMs: record.timeoutMs ?? null,
+    companionVersion: record.companionVersion ?? null,
     sessionId,
     claudeSessionId: sessionId
   };
@@ -729,6 +737,8 @@ export function createJobRecord(fields) {
     failureKind: fields.failureKind ?? null,
     cancelRequestedAt: fields.cancelRequestedAt ?? null,
     codexVersion: fields.codexVersion ?? null,
+    timeoutMs: fields.timeoutMs ?? null,
+    companionVersion: fields.companionVersion ?? null,
     request: fields.request ?? null
   };
   assertJobRecord(record);

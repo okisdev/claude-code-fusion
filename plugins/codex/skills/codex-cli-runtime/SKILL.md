@@ -34,6 +34,7 @@ Execution rules:
 - A task is read only unless `--write` is present. Review commands are always read only.
 - Leave `--model` and `--effort` unset unless explicitly requested so Codex configuration remains authoritative.
 - Use `--resume <thread-id>` only with a real thread identifier returned by Codex. Use `--resume-last` for the newest eligible task thread launched by the current Claude session, or the newest eligible workspace task when no Claude session id is available.
+- A foreground timeout with a resumable thread is salvaged by the wrapper's single scripted wind down resume; the resumed job links through `request.resumeThreadId`, and a second timeout terminalizes the package.
 - Use `--fresh` only when the caller explicitly requests a new thread. It cannot be combined with either resume form.
 - Use `--web` only when explicitly requested. Use `--network` only with `--write` and only when explicitly requested.
 - Use `--output-schema <path>` only for task mode. The companion resolves the path, requires a regular JSON file at most 256 KiB, and records one JSON parsing result without retrying the task. Native `review` ignores output schemas on tested CLI versions. Review shaped task briefs can use `${CLAUDE_PLUGIN_ROOT}/schemas/adversarial-review-verdict.schema.json`; adversarial review uses that schema automatically.
