@@ -1093,6 +1093,7 @@ test("record-acceptance rejects unknown job ids", (t) => {
 
 test("foreground timeout persists recovered partial delivery and incomplete cumulative usage", (t) => {
   const sandbox = makeSandbox(t);
+  const expectedCompanionVersion = JSON.parse(fs.readFileSync(path.join(repoRoot, "plugins", "codex", ".claude-plugin", "plugin.json"), "utf8")).version;
   const result = runCompanion(["task", "--json", "implement until timeout"], {
     cwd: sandbox.workDir,
     env: envFor(sandbox, {
@@ -1105,6 +1106,8 @@ test("foreground timeout persists recovered partial delivery and incomplete cumu
   const record = JSON.parse(result.stdout);
   assert.equal(record.status, "error");
   assert.equal(record.failureKind, "timeout");
+  assert.equal(record.timeoutMs, 50);
+  assert.equal(record.companionVersion, expectedCompanionVersion);
   assert.equal(record.resultText, null);
   const resumeCommand = `'${process.execPath}' '${companion}' task --resume 'thread-123' --cwd '${fs.realpathSync(sandbox.workDir)}'`;
   const footer = `Resume Codex job ${record.id}: ${resumeCommand}`;

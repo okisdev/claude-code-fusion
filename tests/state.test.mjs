@@ -147,11 +147,14 @@ test("creating a job record never overwrites an existing record", async (t) => {
   const jobFile = stateModule.jobFilePath(sandbox.dataDir, sandbox.workDir, jobId);
   const first = stateModule.createJobRecord({
     id: jobId,
+    companionVersion: "0.0.41",
     mode: "consult",
     cwd: sandbox.workDir,
     briefFile: path.join(sandbox.dataDir, "first.md"),
     background: false,
   });
+  assert.strictEqual(first.companionVersion, "0.0.41");
+  assert.strictEqual(stateModule.createJobRecord({ ...first, id: `${jobId}-default`, companionVersion: undefined }).companionVersion, null);
   stateModule.createJobRecordFile(jobFile, first);
 
   let error;
@@ -164,6 +167,7 @@ test("creating a job record never overwrites an existing record", async (t) => {
   );
   assert.strictEqual(error.failureKind, "resource");
   assert.deepStrictEqual(stateModule.readJobRecordFile(jobFile), first);
+  assert.strictEqual(stateModule.readJobRecordFile(jobFile).companionVersion, "0.0.41");
 });
 
 test("a running resume owner holds the workspace lease until it becomes terminal", async (t) => {

@@ -35,6 +35,16 @@ test("settlement seam identifies pending and settled worker records", () => {
   assert.strictEqual(isSettledWorker(settled), true);
 });
 
+test("created worker records stamp the Fusion companion version", (t) => {
+  const directory = sandbox(t);
+  const env = { FUSION_WORKER_STATE_DIR: path.join(directory, "worker-state") };
+  const expectedVersion = JSON.parse(fs.readFileSync(new URL("../plugins/fusion/.claude-plugin/plugin.json", import.meta.url), "utf8")).version;
+  const record = createWorkerRecord({ taskId: "fusion-version-stamp", sessionId: "session-version", dispatchToolUseId: "tool-version", agentType: "fusion:fast-worker", workspaceRoot: directory, limits: {} }, env);
+
+  assert.strictEqual(typeof record.companionVersion, "string");
+  assert.strictEqual(record.companionVersion, expectedVersion);
+});
+
 test("markWorkerCollected preserves an already settled acceptance", () => {
   const settled = markWorkerCollected(
     unverifiedRecord({ collectedAt: null, acceptance: "rejected", acceptanceRecordedAt: "2026-07-22T00:01:00.000Z", acceptanceSource: "main-loop", awaitingVerdict: false, awaitingVerdictArmedAt: null }),
