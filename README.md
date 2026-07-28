@@ -56,6 +56,7 @@ Then, in a new session, run `/fusion:setup` once per machine (it writes the rout
 | `/fusion:panel <question>` | Blind multi-model panel with attributed adjudication, for decisions where a wrong answer is expensive. Also fires from plain language ("help me decide", "compare these") |
 | `/fusion:ultra <task>` | Fans a large task out as a fleet while preserving lane ownership: Codex keeps the primary deep implementation seat and Grok supplies protected burst, research, large context, and independent breadth. It synthesizes and verifies the combined result, fires from "go deep", "audit everything", or "be exhaustive", and returns small tasks to ordinary routing. |
 | `/fusion:setup` | Install or update the routing rules into `~/.claude/rules/`; offers the optional permission allow |
+| `/fusion:smoke` | Run the post-update live smoke wave across version parity and the three dispatch lanes before real delegated work |
 | `/fusion:config` | Read the local model configuration across engines, enumerate available models, and change defaults interactively |
 | `/fusion:doctor` | Audit model pins, environment overrides, peer model defaults (Grok and Codex config keys), rules drift, and stale agent copies |
 
@@ -110,7 +111,7 @@ CI also runs `node bench/manifest.mjs --check`; contributors should run it after
 - `.claude-plugin/marketplace.json`: the marketplace manifest; installs as marketplace `claude-code-fusion`.
 - `plugins/codex/`: the Codex integration (companion runtime, `codex-rescue` agent, `/codex:*` commands).
 - `plugins/grok/`: the Grok integration (companion runtime, `grok-rescue` agent, `/grok:*` commands).
-- `plugins/fusion/`: the orchestration layer: tier agents (`agents/`), the routing policy payload (`rules/`), and the `/fusion:panel`, `/fusion:setup`, `/fusion:doctor`, `/fusion:stats`, `/fusion:ultra`, and `/fusion:config` commands.
+- `plugins/fusion/`: the orchestration layer: tier agents (`agents/`), the routing policy payload (`rules/`), and the `/fusion:panel`, `/fusion:setup`, `/fusion:smoke`, `/fusion:doctor`, `/fusion:stats`, `/fusion:ultra`, and `/fusion:config` commands.
 - `bench/`: the benchmark methodology, harness, and task suite; no published results yet, see the publication gate in [bench/METHODOLOGY.md](bench/METHODOLOGY.md).
 - `tests/`: the fake Codex, Grok, and Claude driven test suite.
 
