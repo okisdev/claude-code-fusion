@@ -7,7 +7,7 @@ import { test } from "node:test";
 
 import { fusionRepositoryKey } from "../plugins/fusion/scripts/fusion-stats.mjs";
 import { createWorkerRecord, readWorkerSessionState, readWorkerRecords, recordWorkerAcceptance, updateWorkerRecord, WORKER_COLLECTION_METHODS } from "../plugins/fusion/scripts/lib/worker-state.mjs";
-import { reverifyCancellationRecords, reverifyInFlightRecords, validateWorkerBrief, workerBudgetFailure, workerLimits } from "../plugins/fusion/scripts/worker-lifecycle.mjs";
+import { needsCancellation, reverifyCancellationRecords, reverifyInFlightRecords, runtimeTaskMissing, settleOnlyRecords, validateWorkerBrief, workerBudgetFailure, workerLimits } from "../plugins/fusion/scripts/worker-lifecycle.mjs";
 
 const repoRoot = path.join(import.meta.dirname, "..");
 const script = path.join(repoRoot, "plugins", "fusion", "scripts", "worker-lifecycle.mjs");
@@ -4576,4 +4576,52 @@ test("hooks configuration wires lifecycle events through an executable shell com
   }
   const dispatchHandlers = hooks.PostToolUse.flatMap((group) => group.hooks.map((hook) => ({ matcher: group.matcher, command: hook.command }))).filter((hook) => hook.command?.includes("inline-delegation-guard.mjs"));
   assert.deepStrictEqual(dispatchHandlers, [{ matcher: "^(Agent|Task)$", command: 'node "${CLAUDE_PLUGIN_ROOT}/scripts/inline-delegation-guard.mjs"' }]);
+});
+
+test("cancellation demand predicate covers both disjuncts and terminal-ready exclusions", () => {
+  const cases = [
+    [{ transportStatus: "cancel_requested" }, true],
+    [{ transportStatus: "pending_async", userBackgroundAuthorized: false, stopBlockCount: 6 }, true],
+    [{ transportStatus: "pending_async", userBackgroundAuthorized: false, stopBlockCount: 5 }, false],
+    [{ transportStatus: "pending_async", userBackgroundAuthorized: true, stopBlockCount: 6 }, false],
+    [{ transportStatus: "ready_uncollected", userBackgroundAuthorized: false, stopBlockCount: 6 }, false],
+    [{ transportStatus: "ready_background", userBackgroundAuthorized: false, stopBlockCount: 6 }, false]
+  ];
+
+  for (const [record, expected] of cases) {
+    assert.strictEqual(needsCancellation(record), expected);
+  }
+});
+
+test("runtime task absence uses runtime visibility or cancellation attempts", () => {
+  const record = { backgroundTaskId: "runtime-task", cancelAttemptCount: 0 };
+
+  assert.strictEqual(runtimeTaskMissing(record, true, [{ id: "runtime-task" }]), false);
+  assert.strictEqual(runtimeTaskMissing(record, true, []), true);
+  assert.strictEqual(runtimeTaskMissing({ cancelAttemptCount: 0 }, false, []), false);
+  assert.strictEqual(runtimeTaskMissing({ cancelAttemptCount: 1 }, false, []), false);
+  assert.strictEqual(runtimeTaskMissing({ cancelAttemptCount: 2 }, false, []), true);
+});
+
+test("settle-only predicate keeps only pending settlement records", () => {
+  const records = [
+    { taskId: "pending", completionContract: "worker", transportStatus: "done", collectedAt: "2026-07-28T00:00:00.000Z", awaitingVerdict: true },
+    { taskId: "settled", completionContract: "worker", transportStatus: "done", collectedAt: "2026-07-28T00:00:00.000Z", awaitingVerdict: false }
+  ];
+
+  assert.deepStrictEqual(settleOnlyRecords(records), [records[0]]);
+});
+
+test("cancellation demand and re-verification agree for an uncollected failed record", (t) => {
+  const box = sandbox(t);
+  const worker = createWorkerRecord({
+    taskId: `fusion-${"e".repeat(24)}`,
+    sessionId: "session-1",
+    agentType: "fusion:fast-worker",
+    workspaceRoot: box.cwd
+  }, envFor(box));
+  const candidate = updateWorkerRecord(worker.taskId, envFor(box), (current) => ({ ...current, transportStatus: "failed", stopBlockCount: 6 }));
+
+  assert.strictEqual(needsCancellation(candidate), true);
+  assert.deepStrictEqual(reverifyCancellationRecords([candidate], envFor(box)).map((record) => record.taskId), [candidate.taskId]);
 });
