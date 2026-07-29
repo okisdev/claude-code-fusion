@@ -2529,13 +2529,19 @@ function sessionIdFromArgs(argv, env) {
   return typeof selected === "string" && selected && !selected.startsWith("--") ? selected : env.CLAUDE_CODE_SESSION_ID || null;
 }
 
+const RECORD_REASON_EXAMPLE = 'example: --record <id>=rejected --reason-for <id> "why it failed"';
+
+function recordReasonGrammarError(message) {
+  return new TypeError(`${message}\n${RECORD_REASON_EXAMPLE}`);
+}
+
 function parseRecordPair(value) {
   if (typeof value !== "string") {
-    throw new TypeError("--record requires an <id>=<verdict> pair.");
+    throw recordReasonGrammarError("--record requires an <id>=<verdict> pair.");
   }
   const separator = value.indexOf("=");
   if (separator <= 0 || separator !== value.lastIndexOf("=")) {
-    throw new TypeError("--record requires an <id>=<verdict> pair.");
+    throw recordReasonGrammarError("--record requires an <id>=<verdict> pair.");
   }
   const id = value.slice(0, separator);
   const rawVerdict = value.slice(separator + 1);
@@ -2543,10 +2549,10 @@ function parseRecordPair(value) {
   const acceptFailedTransport = rawVerdict.endsWith(overrideSuffix);
   const verdict = acceptFailedTransport ? rawVerdict.slice(0, -overrideSuffix.length) : rawVerdict;
   if (!FUSION_TASK_ID_PATTERN.test(id) && !ENGINE_JOB_ID_PATTERN.test(id)) {
-    throw new TypeError("--record id must be a Fusion task id or a 32 character engine job id.");
+    throw recordReasonGrammarError("--record id must be a Fusion task id or a 32 character engine job id.");
   }
   if (!RECORD_VERDICTS.has(verdict)) {
-    throw new TypeError("--record verdict must be accepted, rejected, or unverified.");
+    throw recordReasonGrammarError("--record verdict must be accepted, rejected, or unverified.");
   }
   return { id, verdict, acceptFailedTransport };
 }
@@ -2579,13 +2585,13 @@ function parseRecordArguments(argv, { allowPerPairReasons = false } = {}) {
       const id = argv[index + 1];
       const pairReason = argv[index + 2];
       if (!allowPerPairReasons) {
-        throw new TypeError("--reason-for is available only through the raw-args transport.");
+        throw recordReasonGrammarError("--reason-for is available only through the raw-args transport.");
       }
-      if ((!FUSION_TASK_ID_PATTERN.test(id) && !ENGINE_JOB_ID_PATTERN.test(id)) || typeof pairReason !== "string" || !pairReason || reasonsById.has(id)) {
-        throw new TypeError("--reason-for requires one record id and one reason text.");
+      if ((!FUSION_TASK_ID_PATTERN.test(id) && !ENGINE_JOB_ID_PATTERN.test(id)) || typeof pairReason !== "string" || !pairReason) {
+        throw recordReasonGrammarError("--reason-for requires a valid record id and nonempty reason text.");
       }
-      if (records.at(-1)?.id !== id) {
-        throw new TypeError("--reason-for must immediately follow its --record pair.");
+      if (reasonsById.has(id)) {
+        throw recordReasonGrammarError(`Duplicate --reason-for for record ${id}.`);
       }
       reasonsById.set(id, pairReason);
       index += 2;
@@ -2620,7 +2626,7 @@ function parseRecordArguments(argv, { allowPerPairReasons = false } = {}) {
     }
     if (token === "--reason") {
       if (reason !== null || typeof argv[index + 1] !== "string" || !argv[index + 1]) {
-        throw new TypeError("--reason requires text.");
+        throw recordReasonGrammarError(reason !== null ? "Duplicate --reason." : "--reason requires nonempty text.");
       }
       reason = argv[index + 1];
       index += 1;
@@ -2649,16 +2655,20 @@ function parseRecordArguments(argv, { allowPerPairReasons = false } = {}) {
       acceptFailedTransport = true;
       continue;
     }
-    throw new TypeError(`Unsupported --record argument: ${String(token)}.`);
+    throw recordReasonGrammarError(`Unsupported --record argument: ${String(token)}.`);
+  }
+  const knownPairIds = [...new Set(records.map((record) => record.id))];
+  for (const id of reasonsById.keys()) {
+    if (!knownPairIds.includes(id)) {
+      throw recordReasonGrammarError(`--reason-for record id ${id} does not match a recorded pair. Known pair ids: ${knownPairIds.join(", ") || "(none)"}.`);
+    }
   }
   if (records.length === 0) {
-    throw new TypeError("At least one --record <id>=<verdict> pair is required.");
+    throw recordReasonGrammarError("At least one --record <id>=<verdict> pair is required.");
   }
-  if (reason !== null && records.length !== 1) {
-    throw new TypeError("--reason can be used only when exactly one --record pair is present. Use --reason-for <id> <text> for each rejected pair in a batch.");
-  }
-  if (reason !== null && reasonsById.size > 0) {
-    throw new TypeError("Use either --reason or --reason-for, not both.");
+  const rejectedRecords = records.filter((record) => record.verdict === "rejected");
+  if (reason !== null && rejectedRecords.length === 0) {
+    throw recordReasonGrammarError("--reason requires at least one rejected --record pair.");
   }
   if (failureKind !== null && records.length !== 1) {
     throw new TypeError("--failure-kind can be used only when exactly one --record pair is present. Use --failure-kind-for <id> <kind> for each rejected pair in a batch.");
@@ -2668,16 +2678,16 @@ function parseRecordArguments(argv, { allowPerPairReasons = false } = {}) {
   }
   for (const record of records) {
     if (record.verdict !== "rejected" && reasonsById.has(record.id)) {
-      throw new TypeError(`--reason-for applies only to rejected record ${record.id}.`);
+      throw recordReasonGrammarError(`--reason-for applies only to rejected record ${record.id}.`);
     }
-    record.reason = reason ?? reasonsById.get(record.id) ?? null;
+    record.reason = record.verdict === "rejected" ? reasonsById.get(record.id) ?? reason : null;
     record.failureKind = failureKind ?? failureKindsById.get(record.id) ?? null;
     if (record.verdict !== "rejected" && record.failureKind !== null) {
       throw new TypeError(`--failure-kind applies only to rejected record ${record.id}.`);
     }
     if (record.verdict === "rejected") {
       if (record.reason === null) {
-        throw new TypeError(`Rejected verdict for ${record.id} requires --reason for a single pair or --reason-for <id> <text> for a batch.`);
+        throw recordReasonGrammarError(`Rejected verdict for ${record.id} requires --reason or --reason-for <id> <text>.`);
       }
     }
   }
