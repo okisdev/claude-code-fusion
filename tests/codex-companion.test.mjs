@@ -271,7 +271,7 @@ test("task stays foreground by default and persists the complete terminal record
   assert.equal(entry.record.resolvedModel, "gpt-test");
   assert.equal(entry.record.resolvedEffort, "max");
   assert.equal(entry.record.tokenUsageAvailability, "available");
-  assert.equal(entry.record.codexVersion, "0.145.0");
+  assert.equal(entry.record.codexVersion, "0.146.0");
   assert.equal(fs.statSync(entry.file).mode & 0o777, 0o600);
   assert.equal(fs.statSync(path.dirname(entry.file)).mode & 0o777, 0o700);
 });
@@ -744,32 +744,32 @@ test("task rejects an outdated Codex CLI before execution", (t) => {
   const outdated = makeSandbox(t);
   const outdatedResult = runCompanion(["task", "--json", "do work"], {
     cwd: outdated.workDir,
-    env: envFor(outdated, { FAKE_CODEX_VERSION: "0.144.9" })
+    env: envFor(outdated, { FAKE_CODEX_VERSION: "0.145.0" })
   });
   assert.equal(outdatedResult.status, 1);
   assert.equal(outdatedResult.stdout, "");
   const outdatedFailure = JSON.parse(outdatedResult.stderr);
   assert.equal(outdatedFailure.status, "error");
   assert.equal(outdatedFailure.failureKind, "setup");
-  assert.match(outdatedFailure.message, /Upgrade the Codex CLI to version 0\.145\.0 or later\./);
+  assert.match(outdatedFailure.message, /Upgrade the Codex CLI to version 0\.146\.0 or later\./);
   assert.equal(fs.existsSync(outdated.argsFile), false);
   assert.deepEqual(jobRecords(outdated), []);
 
   const text = makeSandbox(t);
   const textResult = runCompanion(["task", "do work"], {
     cwd: text.workDir,
-    env: envFor(text, { FAKE_CODEX_VERSION: "0.144.9" })
+    env: envFor(text, { FAKE_CODEX_VERSION: "0.145.0" })
   });
   assert.equal(textResult.status, 1);
   assert.equal(textResult.stdout, "");
-  assert.match(textResult.stderr, /Upgrade the Codex CLI to version 0\.145\.0 or later\./);
+  assert.match(textResult.stderr, /Upgrade the Codex CLI to version 0\.146\.0 or later\./);
   assert.match(textResult.stderr, /failure: setup/);
   assert.equal(fs.existsSync(text.argsFile), false);
   assert.deepEqual(jobRecords(text), []);
 });
 
-test("task proceeds with tested and newer Codex CLI versions", (t) => {
-  for (const version of ["0.145.0", "0.146.0"]) {
+test("task proceeds with tested, alpha hotfix, and newer Codex CLI versions", (t) => {
+  for (const version of ["0.146.0", "0.146.0-alpha.10", "0.146.0-alpha.10.1", "0.147.0"]) {
     const sandbox = makeSandbox(t);
     const result = runCompanion(["task", "--json", "do work"], {
       cwd: sandbox.workDir,
@@ -1714,12 +1714,22 @@ test("status repairs an ownerless running record as died", async (t) => {
 
 test("setup verifies authentication and the tested Codex version interval", (t) => {
   const sandbox = makeSandbox(t);
-  const ready = runCompanion(["setup", "--json"], { cwd: sandbox.workDir, env: envFor(sandbox) });
+  const ready = runCompanion(["setup", "--json"], { cwd: sandbox.workDir, env: envFor(sandbox, { FAKE_CODEX_VERSION: "0.146.0" }) });
   assert.equal(ready.status, 0, ready.stderr);
   const readyReport = JSON.parse(ready.stdout);
   assert.equal(readyReport.ready, true);
   assert.equal(readyReport.compatibility, "tested");
   assert.equal(readyReport.authenticated, true);
+  for (const version of ["0.146.0-alpha.10", "0.146.0-alpha.10.1"]) {
+    const alpha = runCompanion(["setup", "--json"], {
+      cwd: sandbox.workDir,
+      env: envFor(sandbox, { FAKE_CODEX_VERSION: version })
+    });
+    assert.equal(alpha.status, 0, alpha.stderr);
+    const alphaReport = JSON.parse(alpha.stdout);
+    assert.equal(alphaReport.ready, true);
+    assert.equal(alphaReport.compatibility, "tested");
+  }
   const redacted = runCompanion(["setup", "--json"], {
     cwd: sandbox.workDir,
     env: envFor(sandbox, { FAKE_CODEX_AUTH_DETAIL: "Logged in with api_key=sk-secretvalue123" })
@@ -1728,7 +1738,7 @@ test("setup verifies authentication and the tested Codex version interval", (t) 
   assert.doesNotMatch(JSON.stringify(JSON.parse(redacted.stdout)), /sk-secretvalue123/);
   const redactedVersion = runCompanion(["setup", "--json"], {
     cwd: sandbox.workDir,
-    env: envFor(sandbox, { FAKE_CODEX_VERSION_OUTPUT: "codex-cli 0.145.0 access_token=secretversionvalue" })
+    env: envFor(sandbox, { FAKE_CODEX_VERSION_OUTPUT: "codex-cli 0.146.0 access_token=secretversionvalue" })
   });
   assert.equal(redactedVersion.status, 0, redactedVersion.stderr);
   assert.doesNotMatch(JSON.stringify(JSON.parse(redactedVersion.stdout)), /secretversionvalue/);
@@ -1750,12 +1760,12 @@ test("setup verifies authentication and the tested Codex version interval", (t) 
   assert.doesNotMatch(apiKey.stdout, /codex-test-key/);
   const unsupported = runCompanion(["setup", "--json"], {
     cwd: sandbox.workDir,
-    env: envFor(sandbox, { FAKE_CODEX_VERSION: "0.146.0" })
+    env: envFor(sandbox, { FAKE_CODEX_VERSION: "0.147.0" })
   });
   assert.equal(unsupported.status, 1);
   const unsupportedReport = JSON.parse(unsupported.stdout);
   assert.equal(unsupportedReport.ready, false);
-  assert.match(unsupportedReport.compatibility, /newer than the tested interval \(0\.145\.0 to before 0\.146\.0\)/);
+  assert.match(unsupportedReport.compatibility, /newer than the tested interval \(0\.146\.0 to before 0\.147\.0\)/);
   assert.match(unsupportedReport.nextSteps.join("\n"), /A verification pass is advised\./);
 });
 
