@@ -47,6 +47,37 @@ test("auth stderr yields failure kind auth", (t) => {
   assert.match(resultOutput.stdout, /^failure: auth$/m);
 });
 
+for (const [policy, upstreamMessage, remediation] of [
+  [
+    "below",
+    "older than the minimum required by your organization",
+    /older than your organization's required minimum version\. Upgrade Grok, then rerun \/grok:setup\./i
+  ],
+  [
+    "above",
+    "newer than the maximum allowed by your organization",
+    /newer than your organization's allowed maximum version\. Install an approved Grok build at or below that ceiling \(for example `grok update --version <approved>`\), then rerun \/grok:setup\./i
+  ]
+]) {
+  test(`hard organization version policy ${policy} range death yields failure kind setup`, (t) => {
+    const sandbox = makeSandbox(t);
+    const env = envFor(sandbox, {
+      FAKE_GROK_MODE: "required-version-policy-death",
+      FAKE_GROK_REQUIRED_VERSION_POLICY: policy
+    });
+    const result = runCompanion(["task", "doomed"], { cwd: sandbox.workDir, env });
+    assert.notStrictEqual(result.status, 0);
+    assert.match(result.stderr, /^failure: setup$/m);
+    assert.match(result.stderr, remediation);
+    const [record] = jobRecords(sandbox.dataDir);
+    assert.strictEqual(record.status, "error");
+    assert.strictEqual(record.failureKind, "setup");
+    assert.strictEqual(record.sessionId, null);
+    assert.match(record.errorMessage, remediation);
+    assert.match(record.errorTail, new RegExp(upstreamMessage, "i"));
+  });
+}
+
 for (const { name, mode, failureKind } of [
   { name: "quota stderr yields failure kind quota", mode: "quota-error", failureKind: "quota" },
   { name: "mixed quota and auth stderr yields failure kind quota", mode: "quota-auth-error", failureKind: "quota" },
