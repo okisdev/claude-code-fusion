@@ -165,6 +165,7 @@ test("worker limits preserve the default budgets without a sizing hint and retai
     maxOutputTokens: 8_000,
     maxUncachedTokens: 6_000
   });
+  assert.deepStrictEqual(workerLimits("fusion:claude-worker", {}), workerLimits("fusion:fast-worker", {}));
 });
 
 test("the stall budget uses successful-call liveness without changing execution progress telemetry", (t) => {
@@ -554,6 +555,7 @@ test("SubagentStart requires verdict envelopes for execution and coverage worker
   assert.match(executionInstruction, /long unified diffs, full test logs, and long quoted file contents/);
   assert.match(executionInstruction, /At 85 percent of the output token budget/);
   assert.match(executionInstruction, /exactly one final Write of the deliverable is permitted/);
+  assert.match(executionInstruction, /Write your deliverable artifact to a file early, before deep work, and keep updating it; your final message names its path, and a budget death must still leave a readable artifact\./);
 
   const coverage = sandbox(t);
   run(coverage, dispatch(coverage, {
@@ -571,6 +573,7 @@ test("SubagentStart requires verdict envelopes for execution and coverage worker
   const coverageInstruction = JSON.parse(coverageStart.stdout).hookSpecificOutput.additionalContext;
   assert.match(coverageInstruction, /End the completed analysis with separate lines `delivery: complete` and `coverage: complete`/);
   assert.match(coverageInstruction, /compact verdict envelope/);
+  assert.match(coverageInstruction, /Write your deliverable artifact to a file early, before deep work, and keep updating it; your final message names its path, and a budget death must still leave a readable artifact\./);
 
   const collector = sandbox(t);
   const peerJobId = "a".repeat(32);
@@ -586,6 +589,31 @@ test("SubagentStart requires verdict envelopes for execution and coverage worker
   const collectorInstruction = JSON.parse(collectorStart.stdout).hookSpecificOutput.additionalContext;
   assert.match(collectorInstruction, /Return the collector command output exactly, including its terminal `collector:` marker/);
   assert.doesNotMatch(collectorInstruction, /compact verdict envelope|changed file paths without diffs/);
+  assert.doesNotMatch(collectorInstruction, /Write your deliverable artifact to a file early/);
+});
+
+test("claude-worker shares the fast worker lifecycle tier and hook matchers", (t) => {
+  const box = sandbox(t);
+  const launch = run(box, dispatch(box, { subagent_type: "fusion:claude-worker" }));
+  assert.strictEqual(JSON.parse(launch.stdout).hookSpecificOutput.permissionDecision, "allow");
+  assert.strictEqual(record(box).agentType, "fusion:claude-worker");
+  assert.deepStrictEqual(record(box).limits, workerLimits("fusion:fast-worker", envFor(box)));
+
+  const started = run(box, {
+    hook_event_name: "SubagentStart",
+    session_id: "session-1",
+    cwd: box.cwd,
+    transcript_path: box.transcript,
+    agent_id: "claude-worker-start",
+    agent_type: "fusion:claude-worker"
+  });
+  assert.match(JSON.parse(started.stdout).hookSpecificOutput.additionalContext, /Write your deliverable artifact to a file early/);
+
+  const hooks = JSON.parse(fs.readFileSync(path.join(repoRoot, "plugins", "fusion", "hooks", "hooks.json"), "utf8")).hooks;
+  for (const event of ["SubagentStart", "SubagentStop"]) {
+    assert.ok(hooks[event].some((group) => new RegExp(group.matcher).test("fusion:claude-worker")), event);
+    assert.ok(hooks[event].some((group) => new RegExp(group.matcher).test("fusion:fast-worker")), event);
+  }
 });
 
 test("parallel same-type workers correlate by their injected task ids even when they start out of order", (t) => {
@@ -720,6 +748,78 @@ test("an unexpected async peer wrapper allows Stop while in flight and remains o
   });
   assert.strictEqual(record(box).collectionMethod, "task_output");
   assert.strictEqual(record(box).collectedAt, collectedAt);
+});
+
+test("a wrapper API death auto-settles for redispatch and reports its persisted brief", (t) => {
+  const box = sandbox(t);
+  const peerDispatch = dispatch(box, { subagent_type: "codex:codex-rescue", prompt: "redispatch this exact wrapper brief" });
+  run(box, peerDispatch);
+  run(box, {
+    ...peerDispatch,
+    hook_event_name: "PostToolUse",
+    tool_response: { isAsync: true, status: "async_launched", agentId: "api-death-wrapper" }
+  });
+  const launched = record(box);
+  assert.ok(launched.briefFile);
+  assert.strictEqual(fs.readFileSync(launched.briefFile, "utf8"), "redispatch this exact wrapper brief");
+
+  run(box, {
+    hook_event_name: "SubagentStop",
+    session_id: "session-1",
+    cwd: box.cwd,
+    transcript_path: box.transcript,
+    agent_id: "api-death-wrapper",
+    agent_type: "codex:codex-rescue",
+    stop_hook_active: true,
+    last_assistant_message: "terminated early due to an API error"
+  });
+  const settled = record(box);
+  assert.strictEqual(settled.transportStatus, "failed");
+  assert.strictEqual(settled.failureKind, "delivery");
+  assert.strictEqual(settled.acceptance, "rejected");
+  assert.strictEqual(settled.acceptanceSource, "lifecycle");
+  assert.strictEqual(settled.acceptanceReason, "wrapper died on a harness API error before dispatch; redispatch the brief");
+  assert.strictEqual(settled.peerJobId, null);
+
+  const advised = stop(box);
+  const advisory = JSON.parse(advised.stdout);
+  assert.strictEqual(advisory.decision, undefined);
+  assert.match(advisory.hookSpecificOutput.additionalContext, new RegExp(settled.taskId));
+  assert.match(advisory.hookSpecificOutput.additionalContext, new RegExp(settled.briefFile.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+  assert.match(advisory.hookSpecificOutput.additionalContext, /redispatch/);
+});
+
+test("wrapper API deaths with a peer job or readable artifact remain unverified", (t) => {
+  for (const variant of ["peer-job", "output-artifact"]) {
+    const box = sandbox(t);
+    const peerDispatch = dispatch(box, { subagent_type: "grok:grok-rescue", prompt: "bounded peer brief" });
+    run(box, peerDispatch);
+    run(box, {
+      ...peerDispatch,
+      hook_event_name: "PostToolUse",
+      tool_response: { isAsync: true, status: "async_launched", agentId: `api-death-${variant}` }
+    });
+    if (variant === "peer-job") {
+      updateWorkerRecord(record(box).taskId, envFor(box), (current) => ({ ...current, peerJobId: "a".repeat(32), peerEngine: "grok" }));
+    } else {
+      const outputFile = path.join(box.root, "wrapper-output.txt");
+      fs.writeFileSync(outputFile, "partial wrapper output\n", "utf8");
+      updateWorkerRecord(record(box).taskId, envFor(box), (current) => ({ ...current, outputFile }));
+    }
+    run(box, {
+      hook_event_name: "SubagentStop",
+      session_id: "session-1",
+      cwd: box.cwd,
+      transcript_path: box.transcript,
+      agent_id: `api-death-${variant}`,
+      agent_type: "grok:grok-rescue",
+      stop_hook_active: true,
+      last_assistant_message: "Connection closed mid-response"
+    });
+    const unresolved = record(box);
+    assert.notStrictEqual(unresolved.acceptanceSource, "lifecycle");
+    assert.notStrictEqual(unresolved.acceptance, "rejected");
+  }
 });
 
 test("TaskOutput backfills zero telemetry from the harness task transcript", (t) => {
@@ -4094,7 +4194,7 @@ test("PostToolUse emits token wind-down context once at 85 percent of the cap", 
   assert.strictEqual(record(box).tokenWindDownSentAt, notifiedAt);
 });
 
-test("Stop combines multi-record collection and settlement instructions", (t) => {
+test("Stop keeps terminal collection demands blocking without adding settlement demands", (t) => {
   const box = sandbox(t);
   const outputFile = path.join(box.root, "peer-terminal.output");
   fs.writeFileSync(outputFile, "peer result\n", "utf8");
@@ -4129,19 +4229,27 @@ test("Stop combines multi-record collection and settlement instructions", (t) =>
   assert.strictEqual(decision.decision, "block");
   assert.match(decision.reason, new RegExp(`Call Read with file_path=${outputFile.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`));
   assert.doesNotMatch(decision.reason, /no offset or limit/);
-  assert.match(decision.reason, new RegExp(`settle-only: ${settling.taskId}`));
-  assert.match(decision.reason, new RegExp(`/fusion:stats --record ${settling.taskId}=accepted\\|rejected\\|unverified`));
+  assert.doesNotMatch(decision.reason, new RegExp(settling.taskId));
+  assert.doesNotMatch(decision.reason, /\/fusion:stats --record/);
 });
 
-test("Stop emits a settle-only advisory once for an unchanged pending set", (t) => {
+test("Stop advises once without blocking when a collected worker has an in-flight sibling", (t) => {
   const box = sandbox(t);
   const first = createSettleOnlyRecord(box, `fusion-${"1".repeat(24)}`);
   const second = createSettleOnlyRecord(box, `fusion-${"2".repeat(24)}`);
+  const active = createWorkerRecord({
+    taskId: `fusion-${"3".repeat(24)}`,
+    sessionId: "session-1",
+    agentType: "fusion:fast-worker",
+    workspaceRoot: box.cwd
+  }, envFor(box));
+  updateWorkerRecord(active.taskId, envFor(box), (current) => ({ ...current, agentId: "wave-active", backgroundTaskId: "wave-active", transportStatus: "pending_async" }));
 
   const emitted = stop(box);
   const advisory = JSON.parse(emitted.stdout).hookSpecificOutput.additionalContext;
-  assert.match(advisory, new RegExp(`settle-only: ${first.taskId}`));
-  assert.match(advisory, new RegExp(`settle-only: ${second.taskId}`));
+  assert.strictEqual(JSON.parse(emitted.stdout).decision, undefined);
+  assert.match(advisory, new RegExp(first.taskId));
+  assert.match(advisory, new RegExp(second.taskId));
   assert.strictEqual((advisory.match(/\/fusion:stats --record/g) ?? []).length, 1);
   assert.match(advisory, new RegExp(`/fusion:stats --record ${first.taskId}=accepted\\|rejected\\|unverified --record ${second.taskId}=accepted\\|rejected\\|unverified`));
   assert.strictEqual(readWorkerSessionState("session-1", envFor(box)).settleOnlyAdvisorySignature, [first.taskId, second.taskId].sort().join(","));
@@ -4151,92 +4259,50 @@ test("Stop emits a settle-only advisory once for an unchanged pending set", (t) 
   assert.strictEqual(repeated.stdout, "");
 });
 
-test("Stop stays silent after a pending settlement lands between stops", (t) => {
+test("Stop blocks one batched settlement demand after the wave drains", (t) => {
   const box = sandbox(t);
-  const settled = createSettleOnlyRecord(box, `fusion-${"4".repeat(24)}`);
+  const first = createSettleOnlyRecord(box, `fusion-${"4".repeat(24)}`);
+  const second = createSettleOnlyRecord(box, `fusion-${"5".repeat(24)}`);
 
-  const first = stop(box);
-  assert.match(first.stdout, new RegExp(settled.taskId));
-  recordWorkerAcceptance({ taskId: settled.taskId, acceptance: "accepted", env: envFor(box), source: "main-loop" });
-
-  const second = stop(box);
-  assert.strictEqual(second.stdout, "");
-  assert.doesNotMatch(second.stdout, new RegExp(settled.taskId));
+  const blocked = stop(box);
+  const output = JSON.parse(blocked.stdout);
+  assert.strictEqual(output.decision, "block");
+  assert.strictEqual((output.reason.match(/\/fusion:stats --record/g) ?? []).length, 1);
+  assert.match(output.reason, new RegExp(`/fusion:stats --record ${first.taskId}=accepted\\|rejected\\|unverified --record ${second.taskId}=accepted\\|rejected\\|unverified`));
 });
 
-test("Stop deduplicates a single settle-only worker", (t) => {
+test("a stale collected settlement blocks despite an in-flight sibling", (t) => {
   const box = sandbox(t);
-  const settling = createSettleOnlyRecord(box, `fusion-${"5".repeat(24)}`);
-
-  const first = stop(box);
-  assert.match(first.stdout, new RegExp(settling.taskId));
-  const repeated = stop(box);
-  assert.strictEqual(repeated.stdout, "");
-});
-
-test("Stop re-emits a settle-only advisory when a record enters the pending set", (t) => {
-  const box = sandbox(t);
-  const first = createSettleOnlyRecord(box, `fusion-${"1".repeat(24)}`);
-  const second = createSettleOnlyRecord(box, `fusion-${"2".repeat(24)}`);
-  stop(box);
-  const added = createSettleOnlyRecord(box, `fusion-${"3".repeat(24)}`);
-
-  const emitted = stop(box);
-  assert.match(emitted.stdout, new RegExp(`settle-only: ${first.taskId}`));
-  assert.match(emitted.stdout, new RegExp(`settle-only: ${second.taskId}`));
-  assert.match(emitted.stdout, new RegExp(`settle-only: ${added.taskId}`));
-  assert.strictEqual(readWorkerSessionState("session-1", envFor(box)).settleOnlyAdvisorySignature, [first.taskId, second.taskId, added.taskId].sort().join(","));
-});
-
-test("Stop re-emits a settle-only advisory when a record settles", (t) => {
-  const box = sandbox(t);
-  const settled = createSettleOnlyRecord(box, `fusion-${"1".repeat(24)}`);
-  const firstRemaining = createSettleOnlyRecord(box, `fusion-${"2".repeat(24)}`);
-  const secondRemaining = createSettleOnlyRecord(box, `fusion-${"3".repeat(24)}`);
-  stop(box);
-  recordWorkerAcceptance({ taskId: settled.taskId, acceptance: "accepted", env: envFor(box), source: "main-loop" });
-
-  const emitted = stop(box);
-  assert.doesNotMatch(emitted.stdout, new RegExp(`settle-only: ${settled.taskId}`));
-  assert.match(emitted.stdout, new RegExp(`settle-only: ${firstRemaining.taskId}`));
-  assert.match(emitted.stdout, new RegExp(`settle-only: ${secondRemaining.taskId}`));
-  assert.strictEqual(readWorkerSessionState("session-1", envFor(box)).settleOnlyAdvisorySignature, [firstRemaining.taskId, secondRemaining.taskId].sort().join(","));
-});
-
-test("Stop deduplicates unchanged settlement rows while demanding collection", (t) => {
-  const box = sandbox(t);
-  const first = createSettleOnlyRecord(box, `fusion-${"1".repeat(24)}`);
-  const second = createSettleOnlyRecord(box, `fusion-${"2".repeat(24)}`);
-  stop(box);
-  const collecting = createWorkerRecord({
-    taskId: `fusion-${"3".repeat(24)}`,
+  const settling = createSettleOnlyRecord(box, `fusion-${"6".repeat(24)}`);
+  updateWorkerRecord(settling.taskId, envFor(box), (current) => ({ ...current, collectedAt: new Date(Date.now() - 2_000).toISOString() }));
+  const active = createWorkerRecord({
+    taskId: `fusion-${"7".repeat(24)}`,
     sessionId: "session-1",
-    agentType: "codex:codex-rescue",
+    agentType: "fusion:fast-worker",
     workspaceRoot: box.cwd
   }, envFor(box));
-  updateWorkerRecord(collecting.taskId, envFor(box), (current) => ({ ...current, agentId: "collecting-peer", backgroundTaskId: "collecting-peer", transportStatus: "ready_uncollected", runtimeAsync: true }));
+  updateWorkerRecord(active.taskId, envFor(box), (current) => ({ ...current, agentId: "stale-wave-active", backgroundTaskId: "stale-wave-active", transportStatus: "pending_async" }));
 
-  const emitted = stop(box);
-  const decision = JSON.parse(emitted.stdout);
-  assert.strictEqual(decision.decision, "block");
-  assert.match(decision.reason, /Call TaskOutput with block=true for terminal owned task collecting-peer/);
-  assert.doesNotMatch(decision.reason, new RegExp(`settle-only: ${first.taskId}`));
-  assert.doesNotMatch(decision.reason, new RegExp(`settle-only: ${second.taskId}`));
-  assert.strictEqual(readWorkerSessionState("session-1", envFor(box)).settleOnlyAdvisorySignature, [first.taskId, second.taskId].sort().join(","));
+  const blocked = run(box, {
+    hook_event_name: "Stop",
+    session_id: "session-1",
+    cwd: box.cwd,
+    transcript_path: box.transcript,
+    stop_hook_active: false,
+    background_tasks: [{ id: "stale-wave-active", type: "subagent", status: "running", agent_type: "fusion:fast-worker" }]
+  }, { FUSION_SETTLE_DEMAND_STALE_MS: "1" });
+  const output = JSON.parse(blocked.stdout);
+  assert.strictEqual(output.decision, "block");
+  assert.match(output.reason, new RegExp(settling.taskId));
 });
 
-test("Stop clears the settle-only advisory signature when no pending records remain", (t) => {
+test("Stop stays silent after a pending single-worker settlement lands", (t) => {
   const box = sandbox(t);
-  const first = createSettleOnlyRecord(box, `fusion-${"1".repeat(24)}`);
-  const second = createSettleOnlyRecord(box, `fusion-${"2".repeat(24)}`);
+  const settled = createSettleOnlyRecord(box, `fusion-${"8".repeat(24)}`);
   stop(box);
-  assert.ok(readWorkerSessionState("session-1", envFor(box)).settleOnlyAdvisorySignature);
-  recordWorkerAcceptance({ taskId: first.taskId, acceptance: "accepted", env: envFor(box), source: "main-loop" });
-  recordWorkerAcceptance({ taskId: second.taskId, acceptance: "accepted", env: envFor(box), source: "main-loop" });
-
+  recordWorkerAcceptance({ taskId: settled.taskId, acceptance: "accepted", env: envFor(box), source: "main-loop" });
   const quiet = stop(box);
   assert.strictEqual(quiet.stdout, "");
-  assert.strictEqual(Object.hasOwn(readWorkerSessionState("session-1", envFor(box)), "settleOnlyAdvisorySignature"), false);
 });
 
 test("a delivered completion notification prevents Stop from demanding TaskStop for an expired worker", (t) => {

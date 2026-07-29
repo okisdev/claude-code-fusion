@@ -44,6 +44,8 @@ const PEER_JOB_FOOTER_AGENT_TYPES = new Set(["codex:codex-rescue", "grok:grok-re
 const AGENT_TYPES = new Map([
   ["fusion:fast-worker", "fusion:fast-worker"],
   ["fast-worker", "fusion:fast-worker"],
+  ["fusion:claude-worker", "fusion:claude-worker"],
+  ["claude-worker", "fusion:claude-worker"],
   ["fusion:trivial-worker", "fusion:trivial-worker"],
   ["trivial-worker", "fusion:trivial-worker"],
   ["fusion:deep-reasoner", "fusion:deep-reasoner"],
@@ -363,6 +365,7 @@ export function createWorkerRecord(record, env = process.env) {
       parentTranscriptBytesAtDispatch: Number.isSafeInteger(record.parentTranscriptBytesAtDispatch) ? record.parentTranscriptBytesAtDispatch : null,
       packageType: record.packageType ?? "consult",
       briefBytes: Number.isSafeInteger(record.briefBytes) ? record.briefBytes : null,
+      briefFile: record.briefFile ?? null,
       completionContract: record.completionContract ?? "verification",
       ...(record.expectedPeerEngine && record.expectedPeerJobId ? { expectedPeerEngine: record.expectedPeerEngine, expectedPeerJobId: record.expectedPeerJobId } : {}),
       createdAt: record.createdAt ?? now,
