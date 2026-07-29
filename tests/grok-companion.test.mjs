@@ -226,12 +226,28 @@ test("task parses text compatibility output only when structuredOutput is absent
 });
 
 test("task rejects invalid and oversized inline schemas before launch", (t) => {
-  for (const schema of ["not-json", JSON.stringify("x".repeat(256 * 1024))]) {
+  const cases = [
+    { schema: "not-json", viaTransport: false },
+    { schema: JSON.stringify("x".repeat(256 * 1024)), viaTransport: true }
+  ];
+  for (const { schema, viaTransport } of cases) {
     const sandbox = makeSandbox(t);
-    const result = runCompanion(["task", "--json-schema", schema, "complete the task"], {
-      cwd: sandbox.workDir,
-      env: envFor(sandbox)
-    });
+    let result;
+    if (viaTransport) {
+      const created = runCompanion(["transport-create"], { cwd: sandbox.workDir, env: envFor(sandbox) });
+      assert.equal(created.status, 0, created.stderr);
+      const transport = JSON.parse(created.stdout);
+      fs.writeFileSync(transport.file, `--json-schema ${schema} -- complete the task`);
+      result = runCompanion(["task", "--raw-args-token", transport.token], {
+        cwd: sandbox.workDir,
+        env: envFor(sandbox)
+      });
+    } else {
+      result = runCompanion(["task", "--json-schema", schema, "complete the task"], {
+        cwd: sandbox.workDir,
+        env: envFor(sandbox)
+      });
+    }
 
     assert.notEqual(result.status, 0);
     assert.match(result.stderr, /failure: input/);
