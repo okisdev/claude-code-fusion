@@ -640,6 +640,7 @@ function normalizeAuditEvent(event) {
   }
   if (event.event === "warn" && DELEGATION_TOOLS.has(event.tool) && (event.reason === MISSING_LAUNCH_RECOVERY_REASON || event.reason === NARROW_WAVE_ADVISORY_REASON)) {
     const lane = normalizeLane(event.lane);
+    const pendingIncludedWidth = Number.isInteger(event.pendingIncludedWidth) && event.pendingIncludedWidth > 0 ? event.pendingIncludedWidth : null;
     return lane
       ? {
           schemaVersion: AUDIT_SCHEMA_VERSION,
@@ -650,6 +651,7 @@ function normalizeAuditEvent(event) {
           tool: event.tool,
           reason: event.reason,
           ...(event.reason === NARROW_WAVE_ADVISORY_REASON && event.declineStated === true ? { declineStated: true } : {}),
+          ...(event.reason === NARROW_WAVE_ADVISORY_REASON && pendingIncludedWidth !== null ? { pendingIncludedWidth } : {}),
           ...(event.suppressed === true ? { suppressed: true } : {})
         }
       : null;
@@ -1083,6 +1085,31 @@ function deriveFleetWaveState(dispatchLog, waveGapMs) {
   return { fleetWaveWidth, consecutiveNarrowWaves };
 }
 
+function deriveInclusiveFleetWaveWidth(dispatchLog, waveGapMs, currentEntry) {
+  const entries = dispatchLog.filter((entry) => {
+    if (entry.phase !== "confirmed" && entry.phase !== "launched") {
+      return false;
+    }
+    return Number.isFinite(Date.parse(entry.at));
+  });
+  const currentIndex = entries.indexOf(currentEntry);
+  if (currentIndex < 0) {
+    return 0;
+  }
+
+  let firstIndex = currentIndex;
+  while (firstIndex > 0 && Math.abs(Date.parse(entries[firstIndex].at) - Date.parse(entries[firstIndex - 1].at)) <= waveGapMs) {
+    firstIndex -= 1;
+  }
+
+  let lastIndex = currentIndex;
+  while (lastIndex < entries.length - 1 && Math.abs(Date.parse(entries[lastIndex + 1].at) - Date.parse(entries[lastIndex].at)) <= waveGapMs) {
+    lastIndex += 1;
+  }
+
+  return lastIndex - firstIndex + 1;
+}
+
 function normalizeState(existing, now, waveGapMs = DEFAULT_FLEET_WAVE_GAP_MS) {
   if (!existing || typeof existing !== "object") {
     return defaultState(now);
@@ -1262,9 +1289,17 @@ function runHook(env = process.env, input = readHookInput()) {
           launched.description = description;
         }
       }
-      const fleetWaveState = deriveFleetWaveState(state.dispatchLog, waveGapMs);
-      state.fleetWaveWidth = fleetWaveState.fleetWaveWidth;
-      state.consecutiveNarrowWaves = fleetWaveState.consecutiveNarrowWaves;
+      const pendingIncludedWidth = deriveInclusiveFleetWaveWidth(state.dispatchLog, waveGapMs, launched) || state.fleetWaveWidth;
+      const previousDispatchAtMs = Date.parse(state.lastDispatchAt);
+      const currentDispatchAtMs = Date.parse(launched.at);
+      const sameWave = Number.isFinite(previousDispatchAtMs) && Number.isFinite(currentDispatchAtMs) && Math.abs(currentDispatchAtMs - previousDispatchAtMs) <= waveGapMs;
+      const previousFleetWaveWidth = state.fleetWaveWidth;
+      state.fleetWaveWidth = pendingIncludedWidth;
+      if (pendingIncludedWidth > 2) {
+        state.consecutiveNarrowWaves = 0;
+      } else if (pendingIncludedWidth === 1 && !sameWave) {
+        state.consecutiveNarrowWaves = previousFleetWaveWidth > 0 && previousFleetWaveWidth <= 2 ? state.consecutiveNarrowWaves + 1 : 0;
+      }
       if (state.consecutiveNarrowWaves === 0) {
         state.lastAdvisedNarrowWaveStreak = 0;
       }
@@ -1287,6 +1322,7 @@ function runHook(env = process.env, input = readHookInput()) {
         shouldAdvise,
         streak: state.consecutiveNarrowWaves,
         fleetWaveWidth: state.fleetWaveWidth,
+        pendingIncludedWidth,
         dispatchEpoch: state.dispatchEpoch,
         lane: launched.lane,
         description: launched.description ?? description,
@@ -1322,6 +1358,7 @@ function runHook(env = process.env, input = readHookInput()) {
             lane: confirmation.lane,
             tool: toolName,
             reason: NARROW_WAVE_ADVISORY_REASON,
+            pendingIncludedWidth: confirmation.pendingIncludedWidth,
             ...(declineStated ? { declineStated: true } : {}),
             ...(advisory.suppressed ? { suppressed: true } : {})
           },

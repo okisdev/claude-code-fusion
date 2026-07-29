@@ -6,8 +6,10 @@ import test from "node:test";
 
 import {
   envFor,
+  flagValues,
   jobRecords,
   makeSandbox,
+  readInvocations,
   repoRoot,
   runCompanion
 } from "./lib/companion-harness.mjs";
@@ -144,4 +146,112 @@ test("task job records null repositoryTopLevel outside a git directory", (t) => 
   const record = jobRecords(sandbox.dataDir)[0];
   assert.equal(record.cwd, sandbox.workDir);
   assert.equal(record.repositoryTopLevel, null);
+});
+
+const taskSchema = JSON.stringify({
+  type: "object",
+  required: ["status", "summary", "files"],
+  properties: {
+    status: { type: "string" },
+    summary: { type: "string" },
+    files: { type: "array", items: { type: "string" } }
+  }
+});
+
+test("task passes an inline JSON schema and renders structured success", (t) => {
+  const sandbox = makeSandbox(t);
+  const result = runCompanion(["task", "--json-schema", taskSchema, "--json", "complete the task"], {
+    cwd: sandbox.workDir,
+    env: envFor(sandbox, { FAKE_GROK_MODE: "task-structured-success" })
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  const payload = JSON.parse(result.stdout);
+  assert.deepEqual(flagValues(readInvocations(sandbox.argsFile)[0], "--json-schema"), [taskSchema]);
+  assert.deepEqual(payload.structuredOutput, {
+    status: "completed",
+    summary: "The requested task completed.",
+    files: ["src/app.mjs"]
+  });
+  assert.equal(payload.structuredOutputError, null);
+  const [record] = jobRecords(sandbox.dataDir);
+  assert.equal(record.request.jsonSchema, taskSchema);
+  assert.deepEqual(record.structuredOutput, payload.structuredOutput);
+
+  const human = runCompanion(["task", "--json-schema", taskSchema, "complete the task"], {
+    cwd: sandbox.workDir,
+    env: envFor(sandbox, { FAKE_GROK_MODE: "task-structured-success" })
+  });
+  assert.equal(human.status, 0, human.stderr);
+  assert.match(human.stdout, /structured: parsed/);
+});
+
+for (const [mode, description] of [
+  ["task-structured-error", "a structured output error"],
+  ["task-structured-null", "a null structured output"]
+]) {
+  test(`task fails with failure kind error for ${description}`, (t) => {
+    const sandbox = makeSandbox(t);
+    const result = runCompanion(["task", "--json-schema", taskSchema, "complete the task"], {
+      cwd: sandbox.workDir,
+      env: envFor(sandbox, { FAKE_GROK_MODE: mode })
+    });
+
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /failed validation/);
+    assert.match(result.stderr, /state: error\nfailure: error/);
+    const [record] = jobRecords(sandbox.dataDir);
+    assert.equal(record.status, "error");
+    assert.equal(record.failureKind, "error");
+    assert.equal(record.structuredOutput, null);
+  });
+}
+
+test("task parses text compatibility output only when structuredOutput is absent", (t) => {
+  const sandbox = makeSandbox(t);
+  const result = runCompanion(["task", "--json-schema", taskSchema, "--json", "complete the task"], {
+    cwd: sandbox.workDir,
+    env: envFor(sandbox, { FAKE_GROK_MODE: "task-structured-absent" })
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  const payload = JSON.parse(result.stdout);
+  assert.deepEqual(payload.structuredOutput, {
+    status: "completed",
+    summary: "The requested task completed.",
+    files: ["src/app.mjs"]
+  });
+  assert.equal(payload.structuredOutputError, null);
+  assert.match(payload.text, /Here is the result/);
+});
+
+test("task rejects invalid and oversized inline schemas before launch", (t) => {
+  const cases = [
+    { schema: "not-json", viaTransport: false },
+    { schema: JSON.stringify("x".repeat(256 * 1024)), viaTransport: true }
+  ];
+  for (const { schema, viaTransport } of cases) {
+    const sandbox = makeSandbox(t);
+    let result;
+    if (viaTransport) {
+      const created = runCompanion(["transport-create"], { cwd: sandbox.workDir, env: envFor(sandbox) });
+      assert.equal(created.status, 0, created.stderr);
+      const transport = JSON.parse(created.stdout);
+      fs.writeFileSync(transport.file, `--json-schema ${schema} -- complete the task`);
+      result = runCompanion(["task", "--raw-args-token", transport.token], {
+        cwd: sandbox.workDir,
+        env: envFor(sandbox)
+      });
+    } else {
+      result = runCompanion(["task", "--json-schema", schema, "complete the task"], {
+        cwd: sandbox.workDir,
+        env: envFor(sandbox)
+      });
+    }
+
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /failure: input/);
+    assert.deepEqual(readInvocations(sandbox.argsFile), []);
+    assert.deepEqual(jobRecords(sandbox.dataDir), []);
+  }
 });

@@ -87,8 +87,8 @@ const BACKGROUND_LAUNCH_POLL_MS = 20;
 const BACKGROUND_ABORT_CLAIM_WAIT_MS = 2000;
 const BACKGROUND_ABORT_CLEANUP_CONFIRM_MS = 1000;
 const BACKGROUND_ABORT_CLEANUP_POLL_MS = 50;
-const TESTED_VERSION_MIN = [0, 145, 0];
-const TESTED_VERSION_MAX = [0, 146, 0];
+const TESTED_VERSION_MIN = [0, 146, 0];
+const TESTED_VERSION_MAX = [0, 147, 0];
 const CONTINUE_PROMPT = "Continue from the current Codex thread state. Complete the next highest value step and continue until the task is resolved.";
 const TRANSPORT_DIRECTORY_PREFIX = "codex-companion-input-";
 const TRANSPORT_TOKEN_PATTERN = /^[a-f0-9]{48}$/;
@@ -807,7 +807,7 @@ function preflightCodex(cwd) {
   }
   const version = parseVersion(probe.version);
   if (version && compareVersion(version, TESTED_VERSION_MIN) < 0) {
-    throw new CompanionError(`Codex CLI version ${probe.version} is unsupported. Upgrade the Codex CLI to version 0.145.0 or later.`, "setup");
+    throw new CompanionError(`Codex CLI version ${probe.version} is unsupported. Upgrade the Codex CLI to version ${TESTED_VERSION_MIN.join(".")} or later.`, "setup");
   }
   return probe;
 }

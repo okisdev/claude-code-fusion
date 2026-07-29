@@ -124,6 +124,7 @@ const HISTORY_STATUSES = new Set(["running", "done", "error", "cancelled"]);
 const HISTORY_MODES = new Set(["consult", "write"]);
 const HISTORY_DELIVERIES = new Set(["foreground", "manual", "managed"]);
 const HISTORY_DELIVERY_STATUSES = new Set(["pending", "delivered", "collected"]);
+const MAX_JSON_SCHEMA_BYTES = 256 * 1024;
 const HISTORY_SEMANTIC_STATUSES = new Set(["unverified", "accepted", "rejected"]);
 const HISTORY_FAILURE_KINDS = new Set([
   "quota",
@@ -181,7 +182,7 @@ function printUsage() {
   console.log(
     [
       "Usage:",
-      "  node scripts/grok-companion.mjs task [--prompt-file <path>] [--write] [--web] [--memory] [--background] [--resume <uuid>] [--resume-last] [--fresh] [--model <id>] [--effort <level>] [--max-turns <n>] [--cwd <dir>] [--json] [--] [prompt]",
+      "  node scripts/grok-companion.mjs task [--prompt-file <path>] [--write] [--web] [--memory] [--background] [--resume <uuid>] [--resume-last] [--fresh] [--model <id>] [--effort <level>] [--max-turns <n>] [--cwd <dir>] [--json-schema <schema>] [--json] [--] [prompt]",
       "  node scripts/grok-companion.mjs review [--base <ref>] [--focus <text>] [--cwd <dir>] [--background] [--json]",
       "  node scripts/grok-companion.mjs status [job-id] [--cwd <dir>] [--json]",
       "  node scripts/grok-companion.mjs history [--all] [--limit <n>] [--cwd <dir>] [--json]",
@@ -736,6 +737,19 @@ function parseNonnegativeInteger(value, flag) {
   return parsed;
 }
 
+function parseJsonSchema(value) {
+  const schema = String(value ?? "");
+  if (Buffer.byteLength(schema, "utf8") > MAX_JSON_SCHEMA_BYTES) {
+    throw inputError("The --json-schema value exceeds the 256 KiB limit.");
+  }
+  try {
+    JSON.parse(schema);
+  } catch (error) {
+    throw inputError(`The --json-schema value must be valid inline JSON: ${oneLineSummary(error.message, "invalid JSON")}`);
+  }
+  return schema;
+}
+
 function commandArgs(argv, config, transport) {
   activeCommandConfig = config;
   activeCommandOptions = null;
@@ -1039,6 +1053,14 @@ export function validateResumeSessionId(dataDir, cwd, sessionId, mode, memory = 
 
 const PERMISSION_FAILURE_MESSAGE =
   "Grok's turn was cancelled by the consult-mode permission gate (a tool call outside the hard read-only tool set). Re-dispatch with --write if repository changes or command execution are acceptable, or rewrite the brief to use file reading and search only.";
+const REQUIRED_VERSION_POLICY_FAILURE_PATTERNS = [
+  { direction: "below", pattern: /\bis older than the minimum required by your organization\b/i },
+  { direction: "above", pattern: /\bis newer than the maximum allowed by your organization\b/i }
+];
+const REQUIRED_VERSION_POLICY_FAILURE_MESSAGES = {
+  below: "The installed Grok binary is older than your organization's required minimum version. Upgrade Grok, then rerun /grok:setup.",
+  above: "The installed Grok binary is newer than your organization's allowed maximum version. Install an approved Grok build at or below that ceiling (for example `grok update --version <approved>`), then rerun /grok:setup."
+};
 
 function isPermissionCancelled(result) {
   return Boolean(result) && result.exitCode === 0 && !result.timedOut && result.stopReason === "Cancelled";
@@ -1057,9 +1079,27 @@ function permissionFailureMessage(result) {
   return PERMISSION_FAILURE_MESSAGE + formatBlockedPermissionCall(null);
 }
 
+function requiredVersionPolicyDirection(stderr) {
+  const text = String(stderr ?? "");
+  return REQUIRED_VERSION_POLICY_FAILURE_PATTERNS.find(({ pattern }) => pattern.test(text))?.direction ?? null;
+}
+
+function isRequiredVersionPolicyFailure(result, stderr) {
+  return Boolean(
+    result &&
+      result.exitCode !== 0 &&
+      !result.timedOut &&
+      result.hasJsonEnvelope === false &&
+      requiredVersionPolicyDirection(stderr)
+  );
+}
+
 function grokFailureMessage(result, timeoutMs, failureKind) {
   if (failureKind === "permission") {
     return permissionFailureMessage(result);
+  }
+  if (failureKind === "setup" && isRequiredVersionPolicyFailure(result, result?.stderrTail)) {
+    return REQUIRED_VERSION_POLICY_FAILURE_MESSAGES[requiredVersionPolicyDirection(result.stderrTail)];
   }
   if (result.parseError) {
     return result.parseError;
@@ -1112,6 +1152,9 @@ function classifyFailure({ spawnError = null, result = null, logTail = "" } = {}
   }
   if (result?.promptTransportError || result?.parseError) {
     return "transport";
+  }
+  if (isRequiredVersionPolicyFailure(result, result?.stderrTail)) {
+    return "setup";
   }
   const resultEvidence = resultFailed(result)
     ? [result?.errorMessage, boundedTextTail(result?.text), boundedTextTail(result?.stdoutTail)].filter(Boolean).join("\n")
@@ -1442,6 +1485,38 @@ function failJob(jobFile, logFile, result, timeoutMs) {
   throw new Error(renderedMessage);
 }
 
+function finishTaskStructuredFailure(jobFile, result, evaluation) {
+  const current = readJobRecordFile(jobFile);
+  const message = `Grok task output failed validation: ${evaluation.error}`;
+  const detail = boundedTextTail(result?.text);
+  const renderedMessage = failureOutcomeMessage({
+    message,
+    detail,
+    jobId: current?.id,
+    status: "error",
+    failureKind: "error"
+  });
+  finishJobRecord(jobFile, {
+    status: "error",
+    pid: null,
+    grokPid: null,
+    finishedAt: nowIso(),
+    exitCode: result.exitCode,
+    sessionId: result.sessionId,
+    resultText: result.text ?? null,
+    resultPayload: retainedResultPayload(
+      current,
+      failureResultPayload(current, { status: "error", failureKind: "error", message: renderedMessage, result })
+    ),
+    ...resultSpendPatch(result),
+    errorMessage: oneLineSummary(message),
+    errorTail: detail || message,
+    failureKind: "error",
+    cancelRequestedAt: null
+  });
+  return renderedMessage;
+}
+
 function describeLaunchFailure(error) {
   if (error?.code === "ENOENT") {
     return `The grok CLI (${resolveGrokBin()}) was not found on PATH. Install and authenticate it, then run /grok:setup to verify.`;
@@ -1522,11 +1597,12 @@ function recordSpawnFailure(jobFile, error, context = {}) {
 
 async function handleTask(argv, transport = {}) {
   const { options, positionals, positionalText } = commandArgs(argv, {
-    valueOptions: ["prompt-file", "resume", "model", "effort", "max-turns", "cwd"],
+    valueOptions: ["prompt-file", "resume", "model", "effort", "max-turns", "cwd", "json-schema"],
     booleanOptions: ["write", "background", "resume-last", "fresh", "memory", "web", "json"],
     optionsBeforePositionals: true
   }, transport);
 
+  const jsonSchema = options["json-schema"] === undefined ? null : parseJsonSchema(options["json-schema"]);
   const cwd = resolveCwd(options);
   const dataDir = resolveDataDir();
   const claudeSessionId = currentClaudeSessionId();
@@ -1610,6 +1686,7 @@ async function handleTask(argv, transport = {}) {
         resumeReason,
         continuityPolicy: selectedContinuityPolicy,
         role,
+        jsonSchema,
         outputJson: Boolean(options.json),
         ingress: transport.ingress ?? "argv"
       }
@@ -1664,6 +1741,7 @@ async function handleTask(argv, transport = {}) {
       maxTurns,
       web: Boolean(options.web),
       memory,
+      jsonSchema,
       cwd,
       logFile,
       timeoutMs,
@@ -1676,6 +1754,11 @@ async function handleTask(argv, transport = {}) {
 
   if (resultFailed(result)) {
     failJob(jobFile, logFile, result, timeoutMs);
+  }
+
+  const structured = consumeTaskStructuredResult(result, jsonSchema !== null);
+  if (!structured.valid) {
+    throw new Error(finishTaskStructuredFailure(jobFile, result, structured));
   }
 
   const payload = taskSuccessPayload(record, result);
@@ -1709,7 +1792,16 @@ async function handleTask(argv, transport = {}) {
   }
 
   output(
-    options.json ? payload : renderTaskResult({ text: result.text, sessionId: result.sessionId, jobId }),
+    options.json
+      ? payload
+      : renderTaskResult({
+          text: result.text,
+          structuredOutput: result.structuredOutput,
+          structuredOutputError: result.structuredOutputError,
+          schemaRequested: jsonSchema !== null,
+          sessionId: result.sessionId,
+          jobId
+        }),
     options.json
   );
 }
@@ -1749,6 +1841,7 @@ async function handleTaskWorker(argv) {
       maxTurns: request.maxTurns ?? null,
       web: Boolean(request.web),
       memory: request.memory === true,
+      jsonSchema: request.jsonSchema ?? null,
       cwd: record.cwd,
       logFile,
       timeoutMs,
@@ -1757,6 +1850,11 @@ async function handleTaskWorker(argv) {
 
     const finishedAt = nowIso();
     if (!resultFailed(result)) {
+      const structured = consumeTaskStructuredResult(result, request.jsonSchema != null);
+      if (!structured.valid) {
+        finishTaskStructuredFailure(found.file, result, structured);
+        return;
+      }
       const payload = taskSuccessPayload(record, result);
       finishSuccessfulJobRecordFile(found.file, {
         status: "done",
@@ -1889,17 +1987,50 @@ function evaluateReviewText(text) {
   return { valid: true, value: validation.value };
 }
 
-function evaluateReviewResult(result) {
+function evaluateStructuredResult(result, textEvaluator, validator = null) {
   if (typeof result?.structuredOutputError === "string" && result.structuredOutputError.trim()) {
     return { valid: false, error: oneLineSummary(result.structuredOutputError) };
   }
   if (result?.structuredOutput !== undefined) {
-    const validation = validateReviewOutput(result.structuredOutput);
-    return validation.valid
-      ? { valid: true, value: validation.value }
-      : { valid: false, error: validation.error };
+    if (validator) {
+      const validation = validator(result.structuredOutput);
+      return validation.valid
+        ? { valid: true, value: validation.value }
+        : { valid: false, error: validation.error };
+    }
+    if (result.structuredOutput === null) {
+      return { valid: false, error: "Grok returned a null structured output." };
+    }
+    return { valid: true, value: result.structuredOutput };
   }
-  return evaluateReviewText(result?.text);
+  return textEvaluator(result?.text);
+}
+
+function evaluateTaskText(text) {
+  const parsed = extractFirstJsonObject(text);
+  return parsed
+    ? { valid: true, value: parsed }
+    : { valid: false, error: "No JSON object found in the reply." };
+}
+
+function evaluateTaskResult(result) {
+  return evaluateStructuredResult(result, evaluateTaskText);
+}
+
+function consumeTaskStructuredResult(result, schemaRequested) {
+  if (!schemaRequested) {
+    return { valid: true, value: result?.text };
+  }
+  const evaluation = evaluateTaskResult(result);
+  if (evaluation.valid && result.structuredOutput === undefined) {
+    result.structuredOutput = evaluation.value;
+    result.structuredOutputError = null;
+  }
+  return evaluation;
+}
+
+function evaluateReviewResult(result) {
+  return evaluateStructuredResult(result, evaluateReviewText, validateReviewOutput);
 }
 
 async function runReviewJob(record, jobFile, options = {}) {
@@ -2309,7 +2440,14 @@ function renderResultRecord(record, dataDir) {
     return `${lines.join("\n")}\n`;
   }
 
-  return renderTaskResult({ text: record.resultText ?? "", sessionId: record.sessionId, jobId: record.id });
+  return renderTaskResult({
+    text: record.resultText ?? "",
+    structuredOutput: record.structuredOutput,
+    structuredOutputError: record.structuredOutputError,
+    schemaRequested: record.request?.jsonSchema != null,
+    sessionId: record.sessionId,
+    jobId: record.id
+  });
 }
 
 function jsonResultPayload(record, dataDir, options = {}) {
@@ -2791,6 +2929,8 @@ function handleStats(argv, transport = {}) {
 }
 
 const DOCTOR_PROBE_TIMEOUT_MS = 3000;
+const SHELL_ENVIRONMENT_POLICY_DETAIL =
+  "Grok 0.2.112+ supports [shell_environment_policy] to control which environment variables reach shell tools in write runs.";
 
 function doctorCommandAdvisory(bin, available) {
   if (!available) {
@@ -2801,6 +2941,58 @@ function doctorCommandAdvisory(bin, available) {
   return {
     available: supported,
     detail: supported ? "grok doctor is available" : "grok doctor is not available on this Grok CLI"
+  };
+}
+
+function resolveGrokConfigPath(env = process.env, cwd = process.cwd()) {
+  const grokHome = typeof env.GROK_HOME === "string" && env.GROK_HOME.trim()
+    ? path.resolve(cwd, env.GROK_HOME.trim())
+    : path.join(
+        typeof env.HOME === "string" && env.HOME.trim() ? path.resolve(cwd, env.HOME.trim()) : os.homedir(),
+        ".grok"
+      );
+  return path.join(grokHome, "config.toml");
+}
+
+function shellEnvironmentPolicyPresent(config) {
+  for (const line of config.split(/\r?\n/)) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith("#")) {
+      continue;
+    }
+    if (trimmed.startsWith("[") && !/^\[\[?[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)*\]\]?\s*(?:#.*)?$/.test(trimmed)) {
+      return null;
+    }
+    if (/^\[shell_environment_policy\]\s*(?:#.*)?$/.test(trimmed)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function shellEnvironmentPolicyAdvisory(env = process.env, cwd = process.cwd()) {
+  let config;
+  try {
+    config = fs.readFileSync(resolveGrokConfigPath(env, cwd), "utf8");
+  } catch {
+    return {
+      available: false,
+      present: false,
+      detail: `${SHELL_ENVIRONMENT_POLICY_DETAIL} The Grok config file is unavailable.`
+    };
+  }
+  const present = shellEnvironmentPolicyPresent(config);
+  if (present == null) {
+    return {
+      available: false,
+      present: false,
+      detail: `${SHELL_ENVIRONMENT_POLICY_DETAIL} The Grok config file could not be parsed.`
+    };
+  }
+  return {
+    available: true,
+    present,
+    detail: `${SHELL_ENVIRONMENT_POLICY_DETAIL} The [shell_environment_policy] table is ${present ? "present" : "not present"}. Presence does not prove the policy restricts the write-run shell environment.`
   };
 }
 
@@ -2859,6 +3051,7 @@ function handleSetup(argv, transport = {}) {
   }
 
   const doctorCommand = doctorCommandAdvisory(bin, available);
+  const shellEnvironmentPolicy = shellEnvironmentPolicyAdvisory(process.env);
 
   const dataDir = resolveDataDir();
   let writable = true;
@@ -2885,6 +3078,7 @@ function handleSetup(argv, transport = {}) {
     grok: { available, detail, bin },
     capabilities,
     doctorCommand,
+    shellEnvironmentPolicy,
     dataDir: { path: dataDir, writable, detail: writeDetail },
     stopGate: Boolean(readConfig(dataDir).stopGate),
     continuityPolicy: continuityPolicy(dataDir)

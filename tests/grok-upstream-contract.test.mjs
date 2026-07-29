@@ -17,9 +17,46 @@ import {
   runCompanion,
 } from "./lib/companion-harness.mjs";
 
-const { buildGrokArgs, processGroupAlive, runGrok, terminateExitedLeaderProcessGroup } = await import(
+const { buildGrokArgs, processGroupAlive, resolveGrokCapabilities, runGrok, terminateExitedLeaderProcessGroup } = await import(
   path.join(repoRoot, "plugins", "grok", "scripts", "lib", "grok-exec.mjs")
 );
+
+const requiredCapabilityProbes = [
+  ["--prompt-file", "--prompt-file=/dev/null"],
+  ["--output-format", "--output-format=json"],
+  ["--sandbox", "--sandbox=strict"],
+  ["--tools", "--tools=read_file"],
+  ["--disallowed-tools", "--disallowed-tools=Agent"],
+  ["--deny", "--deny=x"],
+  ["--max-turns", "--max-turns=1"],
+  ["--no-auto-update", "--no-auto-update"],
+  ["--permission-mode", "--permission-mode=default"],
+  ["--allow", "--allow=x"],
+  ["--always-approve", "--always-approve"],
+  ["--disable-web-search", "--disable-web-search"],
+  ["--json-schema", "--json-schema={}"],
+  ["--no-wait-for-background", "--no-wait-for-background"]
+];
+
+test("capability probes accept every required flag hidden from help", (t) => {
+  const sandbox = makeSandbox(t);
+  const env = envFor(sandbox, {
+    FAKE_GROK_HIDDEN_CAPABILITIES: requiredCapabilityProbes.map(([flag]) => flag).join(",")
+  });
+  delete env.GROK_COMPANION_CAPABILITIES;
+
+  const first = resolveGrokCapabilities(env.GROK_BIN, env);
+  const second = resolveGrokCapabilities(env.GROK_BIN, env);
+
+  for (const [flag] of requiredCapabilityProbes) {
+    assert.equal(first.has(flag), true, flag);
+  }
+  assert.strictEqual(second, first);
+  assert.deepEqual(readInvocations(sandbox.argsFile), [
+    ["--help"],
+    ...requiredCapabilityProbes.map(([, probeFlag]) => [probeFlag, "--help"])
+  ]);
+});
 
 test("exited leader cleanup with no identity signals only the original process group", async () => {
   const calls = [];
@@ -119,6 +156,44 @@ test("all managed runs disable Agent through the CLI and environment", () => {
   }
 });
 
+test("task forwards a requested JSON schema without requiring it for ordinary text", () => {
+  const schema = JSON.stringify({ type: "object", required: ["status"] });
+  const withSchema = buildGrokArgs({
+    briefFile: "/tmp/grok-brief.md",
+    mode: "consult",
+    timeoutMs: 90000,
+    jsonSchema: schema,
+    env: { GROK_COMPANION_CAPABILITIES: grokCompanionCapabilities }
+  });
+  assert.deepEqual(flagValues(withSchema, "--json-schema"), [schema]);
+
+  const capabilities = new Set(grokCompanionCapabilities.split(",").filter((flag) => flag !== "--json-schema"));
+  const withoutSchema = buildGrokArgs({
+    briefFile: "/tmp/grok-brief.md",
+    mode: "consult",
+    timeoutMs: 90000,
+    capabilities,
+    env: { GROK_COMPANION_CAPABILITIES: capabilities }
+  });
+  assert.doesNotMatch(withoutSchema.join(" "), /--json-schema/);
+});
+
+test("task schema requests fail preflight when structured output support is missing", (t) => {
+  const sandbox = makeSandbox(t);
+  const capabilities = grokCompanionCapabilities
+    .split(",")
+    .filter((capability) => capability !== "--json-schema")
+    .join(",");
+  const result = runCompanion(["task", "--json-schema", "{}", "complete the task"], {
+    cwd: sandbox.workDir,
+    env: envFor(sandbox, { GROK_COMPANION_CAPABILITIES: capabilities })
+  });
+
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /--json-schema/);
+  assert.deepEqual(readInvocations(sandbox.argsFile), []);
+});
+
 for (const requiredCapability of ["--prompt-file", "--output-format", "--sandbox", "--tools", "--disallowed-tools", "--deny", "--max-turns", "--no-auto-update", "--permission-mode", "--allow", "--disable-web-search"]) {
   test(`consult fails closed before launch when Grok lacks ${requiredCapability}`, (t) => {
     const sandbox = makeSandbox(t);
@@ -182,7 +257,39 @@ test("setup reports the injected capability verdict without an extra help probe"
   assert.equal(report.capabilities.ready, true);
   assert.equal(report.capabilities.flags["--tools"], true);
   assert.equal(report.doctorCommand.available, true);
+  assert.equal(report.shellEnvironmentPolicy.available, false);
+  assert.equal(report.shellEnvironmentPolicy.present, false);
   assert.deepEqual(readInvocations(sandbox.argsFile), [["--version"], ["doctor", "--help"]]);
+});
+
+test("setup reports shell environment policy presence without affecting readiness", (t) => {
+  const sandbox = makeSandbox(t);
+  const configPath = path.join(sandbox.root, "grok-home", "config.toml");
+  fs.mkdirSync(path.dirname(configPath), { recursive: true });
+  fs.writeFileSync(configPath, "[shell_environment_policy]\nallow = [\"PATH\"]\n", "utf8");
+
+  const present = runCompanion(["setup", "--json"], {
+    cwd: sandbox.workDir,
+    env: envFor(sandbox)
+  });
+  assert.equal(present.status, 0, present.stderr);
+  const presentReport = JSON.parse(present.stdout);
+  assert.equal(presentReport.ready, true);
+  assert.equal(presentReport.shellEnvironmentPolicy.available, true);
+  assert.equal(presentReport.shellEnvironmentPolicy.present, true);
+  assert.match(presentReport.shellEnvironmentPolicy.detail, /table is present/i);
+  assert.match(presentReport.shellEnvironmentPolicy.detail, /Presence does not prove the policy restricts the write-run shell environment\./);
+
+  fs.writeFileSync(configPath, "[shell_environment_policy\n", "utf8");
+  const unparseable = runCompanion(["setup", "--json"], {
+    cwd: sandbox.workDir,
+    env: envFor(sandbox)
+  });
+  assert.equal(unparseable.status, 0, unparseable.stderr);
+  const unparseableReport = JSON.parse(unparseable.stdout);
+  assert.equal(unparseableReport.ready, true);
+  assert.equal(unparseableReport.shellEnvironmentPolicy.available, false);
+  assert.equal(unparseableReport.shellEnvironmentPolicy.present, false);
 });
 
 test("setup reports grok doctor as unavailable when the subcommand is missing", (t) => {

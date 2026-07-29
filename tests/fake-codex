@@ -40,7 +40,7 @@ async function waitForFile(file) {
 }
 
 if (args.includes("--version")) {
-  process.stdout.write(`${process.env.FAKE_CODEX_VERSION_OUTPUT || `codex-cli ${process.env.FAKE_CODEX_VERSION || "0.145.0"}`}\n`);
+  process.stdout.write(`${process.env.FAKE_CODEX_VERSION_OUTPUT || `codex-cli ${process.env.FAKE_CODEX_VERSION || "0.146.0"}`}\n`);
   process.exit(0);
 }
 

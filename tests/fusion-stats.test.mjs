@@ -1832,6 +1832,68 @@ test("--record batches mixed verdicts with per-pair rejection reasons and failur
   assert.deepStrictEqual(JSON.parse(fs.readFileSync(argsFile, "utf8")), ["record-acceptance", "--job-id", jobId, "--acceptance", "rejected", "--source", "main-loop", "--reason", "The result did not satisfy the requested behavior.", "--failure-kind", "scope_rewrite"]);
 });
 
+test("--record binds --reason-for by id anywhere in a raw request", (t) => {
+  const dir = sandbox(t);
+  const stateDir = path.join(dir, "worker-state");
+  const acceptedTaskId = `fusion-${"7".repeat(24)}`;
+  const firstRejectedTaskId = `fusion-${"8".repeat(24)}`;
+  const secondRejectedTaskId = `fusion-${"9".repeat(24)}`;
+  const env = { FUSION_WORKER_STATE_DIR: stateDir };
+  createTerminalWorker({ taskId: acceptedTaskId, env, workspaceRoot: dir });
+  createTerminalWorker({ taskId: firstRejectedTaskId, env, workspaceRoot: dir });
+  createTerminalWorker({ taskId: secondRejectedTaskId, env, workspaceRoot: dir });
+
+  const result = run(
+    { cwd: dir, codexState: path.join(dir, "missing") },
+    ["--reason-for", secondRejectedTaskId, "The final check failed.", "--record", `${acceptedTaskId}=accepted`, "--record", `${firstRejectedTaskId}=rejected`, "--record", `${secondRejectedTaskId}=rejected`, "--reason-for", firstRejectedTaskId, "The requested behavior was missing."],
+    env
+  );
+
+  assert.strictEqual(result.status, 0, result.stderr);
+  assert.strictEqual(readWorkerRecord(acceptedTaskId, env).acceptanceReason, null);
+  assert.strictEqual(readWorkerRecord(firstRejectedTaskId, env).acceptanceReason, "The requested behavior was missing.");
+  assert.strictEqual(readWorkerRecord(secondRejectedTaskId, env).acceptanceReason, "The final check failed.");
+});
+
+test("--record identifies the known pairs for an unknown --reason-for id", (t) => {
+  const dir = sandbox(t);
+  const stateDir = path.join(dir, "worker-state");
+  const knownTaskId = `fusion-${"a".repeat(24)}`;
+  const unknownTaskId = `fusion-${"b".repeat(24)}`;
+  const env = { FUSION_WORKER_STATE_DIR: stateDir };
+  createTerminalWorker({ taskId: knownTaskId, env, workspaceRoot: dir });
+
+  const result = run(
+    { cwd: dir, codexState: path.join(dir, "missing") },
+    ["--reason-for", unknownTaskId, "The final check failed.", "--record", `${knownTaskId}=accepted`],
+    env
+  );
+
+  assert.notStrictEqual(result.status, 0);
+  assert.match(result.stderr, new RegExp(`--reason-for record id ${unknownTaskId} does not match a recorded pair\\. Known pair ids: ${knownTaskId}\\.`));
+  assert.match(result.stderr, /^example: --record <id>=rejected --reason-for <id> "why it failed"$/m);
+  assert.strictEqual(readWorkerRecord(knownTaskId, env).acceptance, "unverified");
+});
+
+test("--record rejects duplicate --reason-for entries", (t) => {
+  const dir = sandbox(t);
+  const stateDir = path.join(dir, "worker-state");
+  const taskId = `fusion-${"c".repeat(24)}`;
+  const env = { FUSION_WORKER_STATE_DIR: stateDir };
+  createTerminalWorker({ taskId, env, workspaceRoot: dir });
+
+  const result = run(
+    { cwd: dir, codexState: path.join(dir, "missing") },
+    ["--record", `${taskId}=rejected`, "--reason-for", taskId, "The final check failed.", "--reason-for", taskId, "The retry also failed."],
+    env
+  );
+
+  assert.notStrictEqual(result.status, 0);
+  assert.match(result.stderr, new RegExp(`Duplicate --reason-for for record ${taskId}\\.`));
+  assert.match(result.stderr, /^example: --record <id>=rejected --reason-for <id> "why it failed"$/m);
+  assert.strictEqual(readWorkerRecord(taskId, env).acceptance, "unverified");
+});
+
 test("--record settles multiple transported pairs after one flag", (t) => {
   const dir = sandbox(t);
   const stateDir = path.join(dir, "worker-state");
@@ -1868,7 +1930,8 @@ test("--record rejects a raw batch with a rejected pair that has no reason befor
   );
 
   assert.notStrictEqual(result.status, 0);
-  assert.match(result.stderr, new RegExp(`Rejected verdict for ${rejectedTaskId} requires --reason for a single pair or --reason-for <id> <text> for a batch`));
+  assert.match(result.stderr, new RegExp(`Rejected verdict for ${rejectedTaskId} requires --reason or --reason-for <id> <text>\\.`));
+  assert.match(result.stderr, /^example: --record <id>=rejected --reason-for <id> "why it failed"$/m);
   assert.strictEqual(result.stdout, "");
   assert.strictEqual(readWorkerRecord(acceptedTaskId, env).acceptance, "unverified");
   assert.strictEqual(readWorkerRecord(rejectedTaskId, env).acceptance, "unverified");
@@ -1978,25 +2041,46 @@ test("--record accepts a per-pair failed transport override", (t) => {
   assert.strictEqual(readWorkerRecord(taskId, env).acceptance, "accepted");
 });
 
-test("--record rejects a reason attached to multiple pairs and requires transport outside the strict carve-out", (t) => {
+test("--record broadcasts --reason to rejected pairs without a per-pair reason", (t) => {
   const dir = sandbox(t);
   const stateDir = path.join(dir, "worker-state");
   const firstTaskId = `fusion-${"4".repeat(24)}`;
   const secondTaskId = `fusion-${"5".repeat(24)}`;
+  const thirdTaskId = `fusion-${"6".repeat(24)}`;
   const env = { FUSION_WORKER_STATE_DIR: stateDir };
   createTerminalWorker({ taskId: firstTaskId, env, workspaceRoot: dir });
   createTerminalWorker({ taskId: secondTaskId, env, workspaceRoot: dir });
-  const args = ["--record", `${firstTaskId}=accepted`, `${secondTaskId}=rejected`, "--reason", "mixed verdicts"];
+  createTerminalWorker({ taskId: thirdTaskId, env, workspaceRoot: dir });
+  const args = ["--record", `${firstTaskId}=accepted`, "--record", `${secondTaskId}=rejected`, "--record", `${thirdTaskId}=rejected`, "--reason", "shared failure", "--reason-for", thirdTaskId, "specific failure"];
 
   const direct = runDirect({ cwd: dir, codexState: path.join(dir, "missing") }, args, env);
   assert.notStrictEqual(direct.status, 0);
   assert.match(direct.stderr, /must be supplied through --raw-args-token/);
 
   const staged = run({ cwd: dir, codexState: path.join(dir, "missing") }, args, env);
-  assert.notStrictEqual(staged.status, 0);
-  assert.match(staged.stderr, /--reason can be used only when exactly one --record pair is present\. Use --reason-for <id> <text> for each rejected pair in a batch/);
-  assert.strictEqual(readWorkerRecord(firstTaskId, env).acceptance, "unverified");
-  assert.strictEqual(readWorkerRecord(secondTaskId, env).acceptance, "unverified");
+  assert.strictEqual(staged.status, 0, staged.stderr);
+  assert.strictEqual(readWorkerRecord(firstTaskId, env).acceptanceReason, null);
+  assert.strictEqual(readWorkerRecord(secondTaskId, env).acceptanceReason, "shared failure");
+  assert.strictEqual(readWorkerRecord(thirdTaskId, env).acceptanceReason, "specific failure");
+});
+
+test("--record rejects a broadcast --reason without rejected pairs", (t) => {
+  const dir = sandbox(t);
+  const stateDir = path.join(dir, "worker-state");
+  const taskId = `fusion-${"7".repeat(24)}`;
+  const env = { FUSION_WORKER_STATE_DIR: stateDir };
+  createTerminalWorker({ taskId, env, workspaceRoot: dir });
+
+  const result = run(
+    { cwd: dir, codexState: path.join(dir, "missing") },
+    ["--record", `${taskId}=accepted`, "--reason", "This must not apply."],
+    env
+  );
+
+  assert.notStrictEqual(result.status, 0);
+  assert.match(result.stderr, /--reason requires at least one rejected --record pair\./);
+  assert.match(result.stderr, /^example: --record <id>=rejected --reason-for <id> "why it failed"$/m);
+  assert.strictEqual(readWorkerRecord(taskId, env).acceptance, "unverified");
 });
 
 test("--record validates every batch pair before writing", (t) => {
@@ -2556,10 +2640,10 @@ test("Claude worker stats expose lifecycle, exact usage, acceptance, and the uni
   });
 
   const secret = `sk-${"q".repeat(24)}`;
-  const accepted = run({ cwd: dir, codexState: path.join(dir, "missing") }, ["--record", "fusion-1234567890abcdef12345678=accepted", "--reason", `verified ${secret}`, "--json"], env);
-  assert.strictEqual(accepted.status, 0, accepted.stderr);
+  const rejected = run({ cwd: dir, codexState: path.join(dir, "missing") }, ["--record", "fusion-1234567890abcdef12345678=rejected", "--reason", `verified ${secret}`, "--json"], env);
+  assert.strictEqual(rejected.status, 0, rejected.stderr);
   assert.strictEqual(readWorkerRecord("fusion-1234567890abcdef12345678", env).acceptanceReason, "verified [redacted]");
-  assert.deepStrictEqual(claudeWorkerStats({ all: true, env, cwd: dir }).byAcceptance, { accepted: 1 });
+  assert.deepStrictEqual(claudeWorkerStats({ all: true, env, cwd: dir }).byAcceptance, { rejected: 1 });
   const jobFile = path.join(stateDir, "jobs", "fusion-1234567890abcdef12345678.json");
   assert.strictEqual(fs.statSync(stateDir).mode & 0o777, 0o700);
   assert.strictEqual(fs.statSync(path.dirname(jobFile)).mode & 0o777, 0o700);

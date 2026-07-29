@@ -44,6 +44,22 @@ const USD_TICKS = 10_000_000_000;
 const STDIN_PROMPT_FILE = "/dev/stdin";
 const SESSION_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const CAPABILITY_PATTERN = /--[a-z0-9][a-z0-9-]*/gi;
+const REQUIRED_CAPABILITY_PROBES = [
+  ["--prompt-file", "--prompt-file=/dev/null"],
+  ["--output-format", "--output-format=json"],
+  ["--sandbox", "--sandbox=strict"],
+  ["--tools", "--tools=read_file"],
+  ["--disallowed-tools", "--disallowed-tools=Agent"],
+  ["--deny", "--deny=x"],
+  ["--max-turns", "--max-turns=1"],
+  ["--no-auto-update", "--no-auto-update"],
+  ["--permission-mode", "--permission-mode=default"],
+  ["--allow", "--allow=x"],
+  ["--always-approve", "--always-approve"],
+  ["--disable-web-search", "--disable-web-search"],
+  ["--json-schema", "--json-schema={}"],
+  ["--no-wait-for-background", "--no-wait-for-background"]
+];
 
 const capabilityCache = new Map();
 
@@ -240,11 +256,8 @@ export function resolveGrokCapabilities(bin, env = process.env) {
     throw capabilityError(`Unable to inspect Grok CLI capabilities with --help${detail ? `: ${detail}` : "."}`);
   }
   const capabilities = new Set(`${probe.stdout ?? ""}\n${probe.stderr ?? ""}`.match(CAPABILITY_PATTERN) ?? []);
-  for (const [flag, probeArgs] of [
-    ["--no-wait-for-background", ["--no-wait-for-background", "--help"]],
-    ["--no-auto-update", ["--no-auto-update", "--help"]]
-  ]) {
-    if (!capabilities.has(flag) && spawnSync(bin, probeArgs, probeOptions).status === 0) {
+  for (const [flag, probeFlag] of REQUIRED_CAPABILITY_PROBES) {
+    if (!capabilities.has(flag) && spawnSync(bin, [probeFlag, "--help"], probeOptions).status === 0) {
       capabilities.add(flag);
     }
   }
@@ -2109,11 +2122,13 @@ export function runGrok(options) {
         structuredOutputError,
         errorMessage,
         securityFailureKind: securityFailure?.kind ?? null,
+        hasJsonEnvelope: validEnvelope,
         exitCode,
         timedOut,
         turnLimitReached,
         parseError,
         stdoutTail: stdoutTail(stdoutTailBuffer),
+        stderrTail: stdoutTail(stderr),
         cancelledByCompanion,
         promptTransportError: Boolean(promptTransportError),
         blockedPermissionCall,

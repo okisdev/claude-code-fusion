@@ -41,9 +41,11 @@ const PARENT_CONTEXT_ADVISORY_BYTES_ENV = "FUSION_PARENT_CONTEXT_ADVISORY_BYTES"
 const VERIFICATION_MANIFEST_ENV = "FUSION_VERIFICATION_MANIFEST";
 const COLLECTION_RESPONSE_DEBUG_ENV = "FUSION_WORKER_DEBUG_COLLECTION_RESPONSE";
 const COLLECTION_RESPONSE_DEBUG_FILE = "worker-collection-response.json";
+const SETTLE_DEMAND_STALE_MS_ENV = "FUSION_SETTLE_DEMAND_STALE_MS";
 const DEFAULT_BRIEF_MAX_BYTES = 16 * 1024;
 const SIZING_ADVISORY_BYTES = 8 * 1024;
 const DEFAULT_PARENT_CONTEXT_ADVISORY_BYTES = 4 * 1024 * 1024;
+const DEFAULT_SETTLE_DEMAND_STALE_MS = 1_800_000;
 const TASK_NOTIFICATION_SCAN_MAX_BYTES = 4 * 1024 * 1024;
 const TASK_NOTIFICATION_SCAN_CHUNK_BYTES = 64 * 1024;
 const TASK_NOTIFICATION_MAX_LINE_BYTES = 1024 * 1024;
@@ -57,8 +59,8 @@ const COLLECTOR_END_MARKER = /(?:^|\n)collector:\s*(?:state=|timeout\b|dead\b|st
 const COLLECTOR_TERMINAL_MARKER = /^collector:\s*state=(done|error|cancelled|completed|failed)\s+semantic=(accepted|rejected|unverified)\s+engine=(codex|grok)\s+job=([a-f0-9]{32})\s+elapsed=(\d+)s$/i;
 const COLLECTOR_OUTCOME_MARKER = /^collector:\s*(timeout|dead|status-error)\s+engine=(codex|grok)\s+job=([a-f0-9]{32})\s+elapsed=(\d+)s$/i;
 const READ_ONLY_TOOLS = new Set(["Read", "Grep", "Glob", "LS", "WebSearch", "WebFetch"]);
-const EXECUTION_AGENTS = new Set(["fusion:fast-worker", "fusion:trivial-worker"]);
-const BRIEF_AGENTS = new Set(["fusion:fast-worker", "fusion:trivial-worker", "fusion:deep-reasoner"]);
+const EXECUTION_AGENTS = new Set(["fusion:fast-worker", "fusion:claude-worker", "fusion:trivial-worker"]);
+const BRIEF_AGENTS = new Set(["fusion:fast-worker", "fusion:claude-worker", "fusion:trivial-worker", "fusion:deep-reasoner"]);
 const PEER_WRAPPER_AGENTS = new Set(["codex:codex-rescue", "codex-rescue", "grok:grok-rescue", "grok-rescue"]);
 const MANAGED_PEER_AGENTS = new Set(["grok:grok-review-runner", "grok-review-runner"]);
 const PEER_JOB_FOOTER_AGENTS = new Set(["codex:codex-rescue", "grok:grok-rescue", "grok:grok-review-runner"]);
@@ -67,6 +69,8 @@ const SUCCESSFUL_TASK_NOTIFICATION_STATUSES = new Set(["completed", "complete", 
 const CANCELLED_TASK_NOTIFICATION_STATUSES = new Set(["killed", "cancelled", "canceled", "stopped", "terminated"]);
 const FAILED_TASK_NOTIFICATION_STATUSES = new Set(["failed", "error", "timed_out", "timeout"]);
 const ENGINE_JOB_ID_PATTERN = /^[0-9a-f]{32}$/;
+const WRAPPER_API_DEATH_PATTERN = /terminated early due to an API error|Connection closed mid-response/i;
+const WRAPPER_API_DEATH_REASON = "wrapper died on a harness API error before dispatch; redispatch the brief";
 
 function readHookInput() {
   try {
@@ -413,7 +417,7 @@ function createDispatch(input, agentType, userBackgroundAuthorized, env, validat
   } catch {
     void 0;
   }
-  return createWorkerRecord({
+  const record = createWorkerRecord({
     taskId,
     sessionId: input.session_id,
     dispatchToolUseId: input.tool_use_id ?? null,
@@ -430,6 +434,16 @@ function createDispatch(input, agentType, userBackgroundAuthorized, env, validat
     ...collectorIdentity,
     limits: workerLimits(agentType, env, validation.sizing)
   }, env);
+  if (!PEER_WRAPPER_AGENTS.has(agentType)) {
+    return record;
+  }
+  try {
+    const briefFile = briefArtifactPath(record, env);
+    writePrivateText(briefFile, prompt);
+    return updateLifecycleWorkerRecord(record.taskId, env, (current) => current ? { ...current, briefFile } : null);
+  } catch {
+    return record;
+  }
 }
 
 function claimParentContextAdvisory(record, env) {
@@ -906,6 +920,10 @@ function finalTextArtifactPath(record, env) {
   return path.join(path.dirname(workerRecordFile(record.taskId, env)), `${record.taskId}.final.txt`);
 }
 
+function briefArtifactPath(record, env) {
+  return path.join(path.dirname(workerRecordFile(record.taskId, env)), `${record.taskId}.brief.txt`);
+}
+
 function boundedFinalText(message) {
   const text = Buffer.from(message, "utf8");
   if (text.length <= FINAL_TEXT_MAX_BYTES) {
@@ -1009,6 +1027,64 @@ function settleQueuedVerdict(record, now, env) {
       engineSettlementError: error instanceof Error ? error.message : String(error)
     };
   }
+}
+
+function readableOutputArtifact(record) {
+  for (const candidate of [record.outputFile, record.transcriptPath]) {
+    if (typeof candidate !== "string" || !path.isAbsolute(candidate)) {
+      continue;
+    }
+    try {
+      if (fs.statSync(candidate).isFile()) {
+        fs.accessSync(candidate, fs.constants.R_OK);
+        return true;
+      }
+    } catch {
+      void 0;
+    }
+  }
+  return false;
+}
+
+function wrapperApiDeathEvidence(record, evidence) {
+  const texts = [evidence, record.notificationSummary, record.statusDetail, record.finalText].filter((value) => typeof value === "string");
+  return PEER_WRAPPER_AGENTS.has(record.agentType)
+    && !record.peerJobId
+    && !readableOutputArtifact(record)
+    && WRAPPER_API_DEATH_PATTERN.test(texts.join("\n"));
+}
+
+function settleWrapperApiDeath(record, evidence, now, env) {
+  if (!wrapperApiDeathEvidence(record, evidence)) {
+    return record;
+  }
+  return settleQueuedVerdict({
+    ...record,
+    transportStatus: "failed",
+    failureKind: "delivery",
+    pendingVerdict: {
+      acceptance: "rejected",
+      source: "lifecycle",
+      reason: WRAPPER_API_DEATH_REASON,
+      failureKind: null,
+      queuedAt: now
+    },
+    finishedAt: record.finishedAt ?? now,
+    lastActivityAt: now
+  }, now, env);
+}
+
+function isAutoSettledWrapperApiDeath(record) {
+  return record?.acceptance === "rejected" && record.acceptanceSource === "lifecycle" && record.acceptanceReason === WRAPPER_API_DEATH_REASON;
+}
+
+function statusEvidence(value) {
+  if (!value || typeof value !== "object") {
+    return "";
+  }
+  return [value.notificationSummary, value.notification_summary, value.summary, value.statusDetail, value.status_detail, value.detail, value.error]
+    .filter((part) => typeof part === "string")
+    .join("\n");
 }
 
 function settleReapedWorker(current, now, env) {
@@ -1239,7 +1315,10 @@ function handleSubagentStart(input, env) {
     : record.completionContract === "coverage"
       ? `End the completed analysis with separate lines \`delivery: complete\` and \`coverage: complete\`. ${verdictEnvelope}`
       : `End a successful execution report with separate lines \`delivery: complete\` and \`verification: passed\`. ${verdictEnvelope}`;
-  writeOutput(hookOutput("SubagentStart", `Fusion task id: ${record.taskId}. Work only from the supplied isolated brief. Do not request or reconstruct the parent transcript. Budgets: ${limits.wallClockMs}ms wall clock, ${limits.stallMs}ms without successful tool activity, ${limits.maxTurns} turns, ${limits.maxOutputTokens} output tokens, ${limits.maxUncachedTokens} uncached tokens. Retry at most once. At 85 percent of the output token budget, stop making tool calls and write the final deliverable; after the token limit, exactly one final Write of the deliverable is permitted. ${delivery}`));
+  const artifactFirst = EXECUTION_AGENTS.has(canonicalWorkerAgentType(record.agentType))
+    ? " Write your deliverable artifact to a file early, before deep work, and keep updating it; your final message names its path, and a budget death must still leave a readable artifact."
+    : "";
+  writeOutput(hookOutput("SubagentStart", `Fusion task id: ${record.taskId}. Work only from the supplied isolated brief. Do not request or reconstruct the parent transcript. Budgets: ${limits.wallClockMs}ms wall clock, ${limits.stallMs}ms without successful tool activity, ${limits.maxTurns} turns, ${limits.maxOutputTokens} output tokens, ${limits.maxUncachedTokens} uncached tokens. Retry at most once. At 85 percent of the output token budget, stop making tool calls and write the final deliverable; after the token limit, exactly one final Write of the deliverable is permitted.${artifactFirst} ${delivery}`));
 }
 
 function handleSubagentStop(input, env) {
@@ -1266,6 +1345,13 @@ function handleSubagentStop(input, env) {
     } catch {
       finalTextFile = null;
     }
+  }
+  if (wrapperApiDeathEvidence(refreshed, [message, statusEvidence(input)].join("\n"))) {
+    const now = new Date().toISOString();
+    updateLifecycleWorkerRecord(refreshed.taskId, env, (current) => current && !isTerminalWorkerStatus(current.transportStatus)
+      ? settleWrapperApiDeath(current, [message, statusEvidence(input)].join("\n"), now, env)
+      : null);
+    return;
   }
   const complete = completedReport(refreshed, message);
   const collectorContract = refreshed.completionContract === "collector" || canonicalWorkerAgentType(refreshed.agentType) === "fusion:job-collector";
@@ -1344,6 +1430,10 @@ function runtimeTaskSucceeded(task) {
   return typeof task?.status === "string" && ["completed", "complete", "done"].includes(task.status.trim().toLowerCase());
 }
 
+function runtimeTaskFailed(task) {
+  return typeof task?.status === "string" && FAILED_TASK_NOTIFICATION_STATUSES.has(task.status.trim().toLowerCase());
+}
+
 function terminalTransportObserved(record, task) {
   return isTerminalWorkerStatus(record.transportStatus)
     || ["ready_uncollected", "ready_background"].includes(record.transportStatus)
@@ -1352,7 +1442,7 @@ function terminalTransportObserved(record, task) {
 
 function terminalCollectionPending(record) {
   return ["ready_uncollected", "ready_background"].includes(record.transportStatus)
-    || (record.runtimeAsync === true && isTerminalWorkerStatus(record.transportStatus) && !record.collectedAt);
+    || (record.runtimeAsync === true && isTerminalWorkerStatus(record.transportStatus) && !record.collectedAt && !isAutoSettledWrapperApiDeath(record));
 }
 
 function terminalCollectedRecord(record) {
@@ -1377,6 +1467,16 @@ function taskNotificationTextParts(value) {
   return [];
 }
 
+function notificationField(block, names) {
+  for (const name of names) {
+    const match = new RegExp(`<${name}\\s*>\\s*([\\s\\S]*?)\\s*</${name}\\s*>`, "i").exec(block);
+    if (match?.[1]?.trim()) {
+      return match[1].trim();
+    }
+  }
+  return null;
+}
+
 function taskNotificationsFromTranscriptLine(line) {
   let entry;
   try {
@@ -1395,8 +1495,10 @@ function taskNotificationsFromTranscriptLine(line) {
       const taskId = /<task-id\s*>\s*([^<\s]+)\s*<\/task-id\s*>/i.exec(block[1])?.[1] ?? null;
       const status = /<status\s*>\s*([^<]+?)\s*<\/status\s*>/i.exec(block[1])?.[1]?.trim().toLowerCase() ?? null;
       const outputFile = absoluteOutputFile(/<output-file\s*>\s*([^<]+?)\s*<\/output-file\s*>/i.exec(block[1])?.[1]?.trim());
+      const notificationSummary = notificationField(block[1], ["notification-summary", "summary"]);
+      const statusDetail = notificationField(block[1], ["status-detail", "status_detail", "detail"]);
       if (taskId && status && (SUCCESSFUL_TASK_NOTIFICATION_STATUSES.has(status) || CANCELLED_TASK_NOTIFICATION_STATUSES.has(status) || FAILED_TASK_NOTIFICATION_STATUSES.has(status))) {
-        notifications.push({ taskId, status, outputFile });
+        notifications.push({ taskId, status, outputFile, notificationSummary, statusDetail });
       }
     }
   }
@@ -1603,7 +1705,8 @@ function finalAssistantTextFromTranscript(transcriptPath) {
   }
 }
 
-function taskNotificationTransition(record, status, now, env) {
+function taskNotificationTransition(record, notification, now, env) {
+  const { status } = notification;
   const refreshed = refreshWorkerTranscript(record, record.transcriptPath);
   if (SUCCESSFUL_TASK_NOTIFICATION_STATUSES.has(status)) {
     const finalText = finalAssistantTextFromTranscript(refreshed.transcriptPath);
@@ -1651,13 +1754,14 @@ function taskNotificationTransition(record, status, now, env) {
   }
   const cancelled = CANCELLED_TASK_NOTIFICATION_STATUSES.has(status);
   const fallbackFailureKind = cancelled ? "cancelled" : "task_failed";
-  return settleQueuedVerdict({
+  const terminal = {
     ...markWorkerCollected(refreshed, WORKER_COLLECTION_METHODS.TASK_NOTIFICATION, now),
     transportStatus: cancelled ? "cancelled" : "failed",
     failureKind: refreshed.failureKind && refreshed.failureKind !== "unexpected_async" ? refreshed.failureKind : fallbackFailureKind,
     finishedAt: refreshed.finishedAt ?? now,
     lastActivityAt: now
-  }, now, env);
+  };
+  return cancelled ? settleQueuedVerdict(terminal, now, env) : settleWrapperApiDeath(terminal, statusEvidence(notification), now, env);
 }
 
 function reconcileTaskNotifications(input, env) {
@@ -1686,9 +1790,12 @@ function reconcileTaskNotifications(input, env) {
             return null;
           }
           const currentTranscriptExists = regularFileExists(current.transcriptPath);
-          return notification.outputFile && (!current.transcriptPath || !currentTranscriptExists)
-            ? { ...current, transcriptPath: notification.outputFile }
-            : current;
+          return {
+            ...current,
+            ...(notification.outputFile && (!current.transcriptPath || !currentTranscriptExists) ? { transcriptPath: notification.outputFile } : {}),
+            ...(notification.notificationSummary ? { notificationSummary: notification.notificationSummary } : {}),
+            ...(notification.statusDetail ? { statusDetail: notification.statusDetail } : {})
+          };
         });
         if (!stamped || stamped.sessionId !== input.session_id || isTerminalWorkerStatus(stamped.transportStatus) || ![stamped.backgroundTaskId, stamped.agentId].includes(taskId)) {
           continue;
@@ -1697,7 +1804,7 @@ function reconcileTaskNotifications(input, env) {
           if (!current || current.sessionId !== input.session_id || isTerminalWorkerStatus(current.transportStatus) || ![current.backgroundTaskId, current.agentId].includes(taskId)) {
             return null;
           }
-          return taskNotificationTransition(current, notification.status, now, env);
+          return taskNotificationTransition(current, notification, now, env);
         });
       }
     }
@@ -1822,22 +1929,26 @@ function rereadPendingRecords(records, predicate, env) {
   return records.map((record) => readWorkerRecord(record.taskId, env)).filter((record) => record && predicate(record));
 }
 
-function settleOnlyInstruction(record) {
-  const identity = [record.agentType, record.description].filter((value) => typeof value === "string" && value.trim()).join(", ");
-  return `settle-only: ${record.taskId}${identity ? ` (${identity})` : ""}`;
+function settleDemandStaleMs(env) {
+  const raw = env[SETTLE_DEMAND_STALE_MS_ENV];
+  if (raw === undefined || raw === null || (typeof raw === "string" && !raw.trim())) {
+    return DEFAULT_SETTLE_DEMAND_STALE_MS;
+  }
+  const parsed = typeof raw === "number" ? raw : Number(String(raw).trim());
+  return Number.isSafeInteger(parsed) && parsed >= 0 ? parsed : DEFAULT_SETTLE_DEMAND_STALE_MS;
 }
 
-function writeCombinedStopPending(terminalUncollected, settleOnly, env) {
-  const currentTerminalUncollected = rereadPendingRecords(terminalUncollected, terminalCollectionPending, env);
-  const currentSettleOnly = rereadPendingRecords(settleOnly, isPendingSettlement, env);
-  if (currentTerminalUncollected.length + currentSettleOnly.length === 0) {
+function hasStaleSettlement(records, env, now = Date.now()) {
+  const oldestCollectedAt = Math.min(...records.map((record) => Date.parse(record.collectedAt ?? "")).filter(Number.isFinite));
+  return Number.isFinite(oldestCollectedAt) && now - oldestCollectedAt > settleDemandStaleMs(env);
+}
+
+function writeSettlementDemand(records, env) {
+  const current = rereadPendingRecords(records, isPendingSettlement, env);
+  if (current.length === 0) {
     return false;
   }
-  const lines = currentTerminalUncollected.map((record) => `${record.taskId}: ${terminalCollectionInstruction(record)}`)
-    .concat(currentSettleOnly.map(settleOnlyInstruction));
-  const settlementInstruction = currentSettleOnly.length > 0 ? ` Settle the pending wave in one command: ${settlementCommand(currentSettleOnly)}.` : "";
-  const message = `Fusion worker completion is pending for ${lines.length} records:\n${lines.map((line) => `* ${line}`).join("\n")}\nTransport completion remains unverified until every result and its verification evidence are reviewed. Record accepted or rejected explicitly through /fusion:stats.${settlementInstruction}`;
-  writeOutput(currentTerminalUncollected.length > 0 ? blockStop(message) : hookOutput("Stop", message));
+  writeOutput(blockStop(`Collected Fusion worker results still require explicit acceptance before finishing. Settle the pending wave in one command: ${settlementCommand(current)}.`));
   return true;
 }
 
@@ -1927,6 +2038,28 @@ function clearSettleOnlyAdvisory(sessionId, env) {
   });
 }
 
+function writeWrapperApiDeathRedispatchAdvisory(sessionId, env) {
+  const records = sessionRecords(sessionId, env).filter((record) => isAutoSettledWrapperApiDeath(record) && typeof record.briefFile === "string" && !record.redispatchAdvisoryAt);
+  if (records.length === 0) {
+    return false;
+  }
+  const advisedAt = new Date().toISOString();
+  const advised = [];
+  for (const record of records) {
+    const updated = updateLifecycleWorkerRecord(record.taskId, env, (current) => current && isAutoSettledWrapperApiDeath(current) && !current.redispatchAdvisoryAt
+      ? { ...current, redispatchAdvisoryAt: advisedAt }
+      : null);
+    if (updated?.redispatchAdvisoryAt === advisedAt) {
+      advised.push(updated);
+    }
+  }
+  if (advised.length === 0) {
+    return false;
+  }
+  writeOutput(hookOutput("Stop", `Fusion wrapper API death: redispatch ${advised.map((record) => `${record.taskId} from ${record.briefFile}`).join("; ")}.`));
+  return true;
+}
+
 function handleStop(input, env) {
   const hasBackgroundTasks = Array.isArray(input.background_tasks);
   const tasks = hasBackgroundTasks ? input.background_tasks : [];
@@ -1941,23 +2074,27 @@ function handleStop(input, env) {
     const task = runtimeTaskForRecord(record, tasks);
     const observedTerminal = terminalTransportObserved(record, task);
     const failure = observedTerminal ? null : workerBudgetFailure(record);
+    const now = new Date().toISOString();
     const updated = updateLifecycleWorkerRecord(record.taskId, env, (current) => {
       if (!current || isTerminalWorkerStatus(current.transportStatus)) {
         return null;
       }
       const worker = current;
-      const transportStatus = failure ? "cancel_requested" : runtimeTaskIsTerminal(task) ? "ready_uncollected" : ["ready_uncollected", "ready_background", "cancel_requested"].includes(worker.transportStatus) ? worker.transportStatus : "pending_async";
+      const wrapperApiDeath = runtimeTaskFailed(task) && wrapperApiDeathEvidence(worker, statusEvidence(task));
+      const transportStatus = wrapperApiDeath ? "failed" : failure ? "cancel_requested" : runtimeTaskIsTerminal(task) ? "ready_uncollected" : ["ready_uncollected", "ready_background", "cancel_requested"].includes(worker.transportStatus) ? worker.transportStatus : "pending_async";
       const advisoryRound = !failure && transportStatus === "pending_async";
       const successfulTerminal = !failure && worker.failureKind !== "unexpected_async" && runtimeTaskSucceeded(task);
-      return {
+      const transitioned = {
         ...worker,
         ...(task?.id ? { backgroundTaskId: task.id } : {}),
         transportStatus,
-        failureKind: failure?.failureKind ?? (successfulTerminal ? null : worker.failureKind),
+        failureKind: wrapperApiDeath ? "delivery" : failure?.failureKind ?? (successfulTerminal ? null : worker.failureKind),
         ...(successfulTerminal && worker.failureKind ? { recoveredFailureKind: worker.failureKind } : {}),
         cancelReason: failure?.reason ?? worker.cancelReason,
-        stopBlockCount: advisoryRound ? worker.stopBlockCount ?? 0 : (worker.stopBlockCount ?? 0) + 1
+        stopBlockCount: advisoryRound ? worker.stopBlockCount ?? 0 : (worker.stopBlockCount ?? 0) + 1,
+        ...(wrapperApiDeath ? { finishedAt: worker.finishedAt ?? now, lastActivityAt: now } : {})
       };
+      return wrapperApiDeath ? settleWrapperApiDeath(transitioned, statusEvidence(task), now, env) : transitioned;
     });
     pending.push(updated);
   }
@@ -2008,25 +2145,18 @@ function handleStop(input, env) {
   if (!settleOnlySignature) {
     clearSettleOnlyAdvisory(input.session_id, env);
   }
-  if (terminalUncollected.length > 0 && settleOnly.length > 0) {
-    if (claimSettleOnlyAdvisory(input.session_id, settleOnlySignature, env)) {
-      writeCombinedStopPending(terminalUncollected, settleOnly, env);
-    } else {
-      writeTerminalCollectionPending(terminalUncollected, env);
-    }
-    return;
-  }
   if (terminalUncollected.length > 0) {
     writeTerminalCollectionPending(terminalUncollected, env);
     return;
   }
   if (settleOnly.length > 0) {
+    const hasInFlightSibling = currentRecords.some((record) => !isTerminalWorkerStatus(record.transportStatus));
+    if ((!hasInFlightSibling && settleOnly.length > 1) || hasStaleSettlement(settleOnly, env)) {
+      writeSettlementDemand(settleOnly, env);
+      return;
+    }
     if (!input.stop_hook_active && claimSettleOnlyAdvisory(input.session_id, settleOnlySignature, env)) {
-      if (settleOnly.length === 1) {
-        writeAcceptanceAdvisory(settleOnly, env);
-      } else {
-        writeCombinedStopPending([], settleOnly, env);
-      }
+      writeAcceptanceAdvisory(settleOnly, env);
     }
     return;
   }
@@ -2041,6 +2171,7 @@ function handleStop(input, env) {
     }
     return;
   }
+  writeWrapperApiDeathRedispatchAdvisory(input.session_id, env);
 }
 
 function handleSessionEnd(input, env) {

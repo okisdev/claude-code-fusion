@@ -674,6 +674,34 @@ test("launch timestamps preserve a four-wide fleet wave when confirmations span 
   );
 });
 
+test("same-message multi-Agent batches include pending launches before deciding the narrow streak", (t) => {
+  const sandbox = makeSandbox(t);
+  const gapMs = 10000;
+  const extraEnv = { FUSION_FLEET_WAVE_GAP_MS: String(gapMs) };
+  const baseMs = Date.parse("2026-07-21T05:00:00.000Z");
+  const at = (offsetMs) => ({ ...extraEnv, FUSION_TEST_NOW: new Date(baseMs + offsetMs).toISOString() });
+
+  for (let index = 0; index < 2; index += 1) {
+    const payload = dispatchPayload(sandbox, { description: `prior solo ${index + 1}` });
+    const now = at(index * 12000);
+    assert.strictEqual(runRaw(sandbox, { ...payload, hook_event_name: "PreToolUse" }, now).stdout, "");
+    assert.strictEqual(runRaw(sandbox, payload, now).stdout, "");
+  }
+  assert.strictEqual(readState(sandbox, "session-1").consecutiveNarrowWaves, 1);
+
+  const payloads = Array.from({ length: 3 }, (_, index) => dispatchPayload(sandbox, { description: `batched package ${index + 1}` }));
+  for (const [index, payload] of payloads.entries()) {
+    assert.strictEqual(runRaw(sandbox, { ...payload, hook_event_name: "PreToolUse" }, at(24000 + index * 1000)).stdout, "");
+  }
+
+  const outputs = payloads.map((payload, index) => runRaw(sandbox, payload, at(27000 + index * 1000)).stdout);
+  assert.deepStrictEqual(outputs, ["", "", ""]);
+  const state = readState(sandbox, "session-1");
+  assert.strictEqual(state.fleetWaveWidth, 3);
+  assert.strictEqual(state.consecutiveNarrowWaves, 0);
+  assert.strictEqual(readAuditRecords(sandbox).filter((record) => record.reason === "narrow-wave-advisory").length, 0);
+});
+
 test("abandoned launches do not widen fleet waves or reset the narrow streak and expire after the launch TTL", (t) => {
   const sandbox = makeSandbox(t);
   const gapMs = 120000;
@@ -735,6 +763,39 @@ test("solo launch waves re-nudge at consecutive narrow streaks two and four", (t
   const state = readState(sandbox, "session-1");
   assert.strictEqual(state.consecutiveNarrowWaves, 4);
   assert.strictEqual(state.lastAdvisedNarrowWaveStreak, 4);
+  assert.deepStrictEqual(
+    readAuditRecords(sandbox).filter((record) => record.reason === "narrow-wave-advisory").map((record) => record.pendingIncludedWidth),
+    [1, 1]
+  );
+});
+
+test("pending launches that expire do not permanently widen a later wave", (t) => {
+  const sandbox = makeSandbox(t);
+  const gapMs = 10000;
+  const extraEnv = { FUSION_FLEET_WAVE_GAP_MS: String(gapMs) };
+  const baseMs = Date.parse("2026-07-21T06:00:00.000Z");
+  const pendingPayloads = Array.from({ length: 2 }, (_, index) => dispatchPayload(sandbox, { description: `pending package ${index + 1}` }));
+
+  for (const [index, payload] of pendingPayloads.entries()) {
+    assert.strictEqual(
+      runRaw(sandbox, { ...payload, hook_event_name: "PreToolUse" }, { ...extraEnv, FUSION_TEST_NOW: new Date(baseMs + index * 1000).toISOString() }).stdout,
+      ""
+    );
+  }
+  assert.strictEqual(
+    runRaw(sandbox, pendingPayloads[0], { ...extraEnv, FUSION_TEST_NOW: new Date(baseMs + 2000).toISOString() }).stdout,
+    ""
+  );
+  assert.strictEqual(readState(sandbox, "session-1").fleetWaveWidth, 2);
+
+  const later = new Date(baseMs + 16 * 60 * 1000).toISOString();
+  const solo = dispatchPayload(sandbox, { description: "confirmed after pending expiry" });
+  assert.strictEqual(runRaw(sandbox, { ...solo, hook_event_name: "PreToolUse" }, { ...extraEnv, FUSION_TEST_NOW: later }).stdout, "");
+  assert.strictEqual(runRaw(sandbox, solo, { ...extraEnv, FUSION_TEST_NOW: later }).stdout, "");
+
+  const state = readState(sandbox, "session-1");
+  assert.strictEqual(state.fleetWaveWidth, 1);
+  assert.strictEqual(state.dispatchLog.filter((entry) => entry.phase === "launched").length, 0);
 });
 
 test("an Agent PreToolUse attempt does not reset the write window before dispatch succeeds", (t) => {

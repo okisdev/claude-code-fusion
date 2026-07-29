@@ -248,9 +248,17 @@ export function renderHistoryReport(history, now = Date.now()) {
   return `${lines.join("\n")}\n`;
 }
 
-export function renderTaskResult({ text, sessionId, jobId }) {
+export function renderTaskResult({ text, structuredOutput, structuredOutputError, schemaRequested = false, sessionId, jobId }) {
   const lines = [String(text ?? "").trimEnd() || "Grok returned no output."];
   lines.push("");
+  if (schemaRequested) {
+    const structuredStatus = structuredOutputError || structuredOutput === null
+      ? "invalid"
+      : structuredOutput !== undefined
+        ? "parsed"
+        : "unavailable";
+    lines.push(`structured: ${structuredStatus}`);
+  }
   if (sessionId) {
     lines.push(`grok-session: ${sessionId}`);
   }

@@ -22,6 +22,33 @@
     process.stdout.write("grok doctor: environment diagnostics\n");
     process.exit(0);
   }
+  if (process.argv.includes("--help")) {
+    const hiddenCapabilities = new Set(
+      String(process.env.FAKE_GROK_HIDDEN_CAPABILITIES ?? "")
+        .split(",")
+        .map((flag) => flag.trim())
+        .filter(Boolean)
+    );
+    const capabilities = [
+      "--prompt-file",
+      "--output-format",
+      "--sandbox",
+      "--tools",
+      "--disallowed-tools",
+      "--deny",
+      "--max-turns",
+      "--no-auto-update",
+      "--permission-mode",
+      "--allow",
+      "--disable-web-search",
+      "--always-approve",
+      "--no-subagents",
+      "--no-wait-for-background",
+      "--json-schema"
+    ];
+    process.stdout.write(`${capabilities.filter((flag) => !hiddenCapabilities.has(flag)).join("\n")}\n`);
+    process.exit(0);
+  }
   if (process.env.FAKE_GROK_ENV_FILE) {
     const trackedEnv = Object.fromEntries(
       Object.entries(process.env)
@@ -169,6 +196,11 @@
       }
     ],
     next_steps: ["Run the tests."]
+  };
+  const taskObject = {
+    status: "completed",
+    summary: "The requested task completed.",
+    files: ["src/app.mjs"]
   };
 
   const emit = (envelope) => {
@@ -459,6 +491,50 @@
     process.exit(0);
   }
 
+  if (mode === "task-structured-success") {
+    emit({
+      text: "The requested task completed.",
+      structuredOutput: taskObject,
+      stopReason: "EndTurn",
+      sessionId: "55555555-5555-7555-8555-555555555555",
+      requestId: "req-task-structured-success"
+    });
+    process.exit(0);
+  }
+
+  if (mode === "task-structured-error") {
+    emit({
+      text: JSON.stringify(taskObject),
+      structuredOutput: null,
+      structuredOutputError: "output does not match the requested schema",
+      stopReason: "EndTurn",
+      sessionId: "56565656-5656-7565-8565-565656565656",
+      requestId: "req-task-structured-error"
+    });
+    process.exit(0);
+  }
+
+  if (mode === "task-structured-null") {
+    emit({
+      text: JSON.stringify(taskObject),
+      structuredOutput: null,
+      stopReason: "EndTurn",
+      sessionId: "57575757-5757-7575-8575-575757575757",
+      requestId: "req-task-structured-null"
+    });
+    process.exit(0);
+  }
+
+  if (mode === "task-structured-absent") {
+    emit({
+      text: `Here is the result:\n\`\`\`json\n${JSON.stringify(taskObject)}\n\`\`\``,
+      stopReason: "EndTurn",
+      sessionId: "58585858-5858-7585-8585-585858585858",
+      requestId: "req-task-structured-absent"
+    });
+    process.exit(0);
+  }
+
   if (mode === "badjson-then-ok") {
     const count = nextAttempt();
     if (count === 0) {
@@ -685,6 +761,14 @@
 
   if (mode === "error") {
     process.stderr.write("Fake grok failed on purpose.\n");
+    process.exit(1);
+  }
+
+  if (mode === "required-version-policy-death") {
+    const message = process.env.FAKE_GROK_REQUIRED_VERSION_POLICY === "above"
+      ? "This version of Grok (0.2.113) is newer than the maximum allowed by your organization (0.2.112).\n\nInstall an approved version through your organization's approved method (for example, run `grok update --version 0.2.112`)."
+      : "This version of Grok (0.2.109) is older than the minimum required by your organization (0.2.112).\n\nUpdate to an approved version through your organization's approved method (for example, run `grok update`).";
+    process.stderr.write(`${message}\n`);
     process.exit(1);
   }
 

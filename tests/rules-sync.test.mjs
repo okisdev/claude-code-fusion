@@ -210,6 +210,7 @@ test("background collection distinguishes explicit Fusion receipts from foregrou
   assert.match(rules, /closed direct prompt containing exactly one standalone `engine: codex\|grok` line and one standalone `job: <32 lowercase hexadecimal characters>` line/);
   assert.match(rules, /The lifecycle binds the collected marker to this dispatch identity\./);
   assert.match(rules, /Grok companion calls also remain foreground inside their owning Agent; expected duration does not authorize managed detachment/);
+  assert.match(rules, /A width one Claude worker dispatch may instead pass `run_in_background: false` so the deliverable returns synchronously inside the tool result; the lifecycle records it as an ordinary foreground worker\./);
   assert.doesNotMatch(rules, /Managed Grok detachment is different/);
   assert.match(rules, /Direct Codex and Grok slash commands with explicit `--background` return manual receipts for the user to inspect and collect through their status and result commands/);
   assert.match(task, /Direct users inspect progress through `\/codex:status` and collect the deliverable through `\/codex:result`; when Fusion is installed, its monitor can notify them of completion/);
@@ -389,8 +390,8 @@ test("Grok rules document source verified headless boundaries", () => {
   assert.match(contract, /Upstream wires only `bypassPermissions` at spawn/);
   assert.match(contract, /Upstream ships ACP today/);
   assert.match(contract, /The companion has not adopted ACP yet and continues per-call invocation/);
-  assert.match(codexContract, /failureKind: "setup".*below the tested minimum 0\.145\.0/);
-  assert.match(codexContract, /The tested interval runs from 0\.145\.0 up to but excluding 0\.146\.0; versions at or above 0\.146\.0 remain allowed with the setup compatibility advisory/);
+  assert.match(codexContract, /failureKind: "setup".*below the tested minimum 0\.146\.0/);
+  assert.match(codexContract, /The tested interval runs from 0\.146\.0 up to but excluding 0\.147\.0; versions at or above 0\.147\.0 remain allowed with the setup compatibility advisory/);
   assert.match(codexContract, /Codex configuration parse failures under `--strict-config`.*failureKind: "process"/);
   assert.match(sharedContract, /The Grok instance adds `sandbox`[^\n]*`transport`[^\n]*and `policy`/);
   assert.match(sharedContract, /`setup`: The installed CLI version or installation lacks a required adapter capability and fails capability preflight/);
@@ -409,7 +410,7 @@ test("Grok rules document source verified headless boundaries", () => {
   assert.match(doctor, /Run `grok inspect --json` and review the reported `permissions`, `hooks`, `plugins`, `agents`, `mcpServers`, and `externalCompat` surfaces/);
   assert.match(doctor, /successful Grok collection remains unverified until `\/fusion:stats --record <fusion-task-id>=<accepted\|rejected>`/i);
   for (const text of [readme, security]) {
-    assert.match(text, /minimum-version enforcement can still force an update/);
+    assert.match(text, /Grok 0\.2\.112\+/);
     assert.match(text, /file that is unlinked (?:immediately after open|as soon as it is opened)/);
     assert.match(text, /all of `\/private\/var\/folders`/);
     assert.match(text, /native MCP servers, plugins, or hooks/);
