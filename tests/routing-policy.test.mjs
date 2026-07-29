@@ -24,7 +24,7 @@ function protectedRoles(content, pattern) {
 const rules = readRepoFile("plugins/fusion/rules/orchestration.md");
 const troubleshooting = readRepoFile("plugins/fusion/rules/troubleshooting.md");
 const deepReasoner = readRepoFile("plugins/fusion/agents/deep-reasoner.md");
-const fastWorker = readRepoFile("plugins/fusion/agents/fast-worker.md");
+const claudeWorker = readRepoFile("plugins/fusion/agents/claude-worker.md");
 const trivialWorker = readRepoFile("plugins/fusion/agents/trivial-worker.md");
 const ultra = readRepoFile("plugins/fusion/skills/ultra/SKILL.md");
 const panel = readRepoFile("plugins/fusion/skills/panel/SKILL.md");
@@ -48,7 +48,7 @@ test("the main Claude session remains the sole control plane", () => {
   assert.match(readme, /sole control plane: resolve ambiguity, decompose, integrate, verify, record semantic acceptance, make the final judgment, and communicate with the user; it does not execute work packages/);
 });
 
-test("Claude workers stay inside their advisory and fallback roles", () => {
+test("Claude workers stay inside their advisory and capability roles", () => {
   assert.match(deepReasoner, /Read only advisory lane/);
   assert.match(deepReasoner, /It recommends and challenges; the main session decides, implements through another lane, and owns acceptance\./);
   assert.match(deepReasoner, /Never edit files, execute an implementation brief, dispatch another agent, or claim final acceptance\./);
@@ -56,12 +56,13 @@ test("Claude workers stay inside their advisory and fallback roles", () => {
   assert.equal(frontmatterValue(deepReasoner, "tools"), "Read, Grep, Glob");
   assert.equal(frontmatterValue(deepReasoner, "background"), "false");
 
-  assert.match(fastWorker, /Claude execution fallback/);
-  assert.match(fastWorker, /resolved implementation briefs that require the Claude Code tool surface/);
-  assert.match(fastWorker, /remain inside the Claude privacy boundary/);
-  assert.match(fastWorker, /Every brief includes a verification command/);
-  assert.equal(frontmatterValue(fastWorker, "disallowedTools"), "Agent");
-  assert.equal(frontmatterValue(fastWorker, "background"), "false");
+  assert.match(claudeWorker, /Claude tool-surface and privacy executor on Sonnet\./);
+  assert.match(claudeWorker, /The only lane for packages whose load-bearing capability is the Claude Code tool surface/);
+  assert.match(claudeWorker, /structurally stranded package no peer lane can execute, stated as claude-fallback: <reason> in the brief header/);
+  assert.match(claudeWorker, /Not a general implementation fallback: generic resolved briefs route to the Codex volume tiers\./);
+  assert.match(claudeWorker, /Write your deliverable artifact to a file early and keep updating it/);
+  assert.equal(frontmatterValue(claudeWorker, "disallowedTools"), "Agent");
+  assert.equal(frontmatterValue(claudeWorker, "background"), "false");
 
   assert.match(trivialWorker, /Fallback tier only for exact, low risk, tiny packages/);
   assert.match(trivialWorker, /when no eligible peer lane is available or Claude-only tools or privacy are required/);
@@ -72,14 +73,14 @@ test("Claude workers stay inside their advisory and fallback roles", () => {
   assert.equal(frontmatterValue(trivialWorker, "background"), "false");
 
   assert.match(troubleshooting, /`fusion:deep-reasoner` is a read only advisory lane and never receives an implementation brief as an execution retry/);
-  assert.doesNotMatch(troubleshooting, /fusion:trivial-worker to fusion:fast-worker to fusion:deep-reasoner/);
+  assert.doesNotMatch(troubleshooting, /fusion:trivial-worker to fusion:claude-worker to fusion:deep-reasoner/);
 });
 
 test("Codex admission preserves primary ownership before overflow", () => {
   assert.match(rules, /Codex is the primary implementation lane and the default deep external reviewer\./);
   assert.match(
     rules,
-    /Codex admission follows one ladder: use the current workspace when its Codex slot is free; otherwise use an isolated Codex worktree for an independent, worktree eligible package; otherwise route an independent package that fits Grok's safety and turn boundaries under the `burst` role; otherwise use the matching Claude fallback\./
+    /otherwise route generic overflow to the Codex volume tiers and reserve `fusion:claude-worker` for Claude-surface work or structurally stranded packages with a stated `claude-fallback: <reason>` header\./
   );
   assert.match(rules, /Worktree eligible means disjoint files and verification that needs no heavy dependency setup\./);
   assert.match(rules, /Dispatch a Codex implementation package there by using `--write --cwd "<absolute worktree path>" -- <brief>` as the complete direct prompt to `codex:codex-rescue`\./);
@@ -93,7 +94,7 @@ test("Codex admission preserves primary ownership before overflow", () => {
   assert.match(readme, /Codex is the primary implementation lane and default deep external reviewer\./);
   assert.match(
     readme,
-    /Codex first admission follows this order: use Codex in the current workspace, then an isolated Codex worktree for an independent eligible package, then Grok under `burst` for an independent package inside its safety and turn boundaries, then the matching Claude fallback\./
+    /then route generic overflow to the Codex volume tiers and reserve `fusion:claude-worker` for Claude-surface work or structurally stranded packages carrying `claude-fallback: <reason>`\./
   );
   assert.equal(frontmatterValue(codexRescue, "background"), "false");
 });
