@@ -38,7 +38,7 @@ test("the main Claude session remains the sole control plane", () => {
     rules,
     /The main session owns ambiguity resolution, decomposition, integration, semantic acceptance, final judgment, and user communication\./
   );
-  assert.match(rules, /It may perform one bounded micro step and read only verification, but it never executes a work package\./);
+  assert.match(rules, /It may perform bounded inline work under the inline work gate and read only verification, but it never executes a work package\./);
   assert.match(rules, /Explore owns open ended read only repository reconnaissance\./);
   assert.match(
     rules,
