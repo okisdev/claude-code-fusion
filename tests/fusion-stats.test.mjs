@@ -2983,6 +2983,8 @@ test("coercion ledger renders every counter in text and JSON", (t) => {
     fleetShapedWaves: 1,
     verificationResets: 2,
     unverifiedAccumulations: 2,
+    inlineSprawlWindows: 0,
+    deepestUnverifiedWindow: 0,
     postureMix: {
       judgment: 3,
       strict: 3,
@@ -2996,6 +2998,8 @@ Narrow-wave advisories: 2
 Fleet-shaped waves: 1
 Verification resets: 2
 Unverified accumulations: 2
+Inline sprawl windows: 0
+Deepest unverified window: 0
 
 Posture mix:
 - judgment: 3
@@ -3060,6 +3064,8 @@ test("coercion ledger tolerates legacy audit events without posture or verificat
     fleetShapedWaves: 0,
     verificationResets: 0,
     unverifiedAccumulations: 0,
+    inlineSprawlWindows: 0,
+    deepestUnverifiedWindow: 0,
     postureMix: {
       judgment: 0,
       strict: 0,
@@ -3098,12 +3104,43 @@ test("coercion ledger skips malformed lines and unknown event kinds", (t) => {
     fleetShapedWaves: 0,
     verificationResets: 0,
     unverifiedAccumulations: 0,
+    inlineSprawlWindows: 0,
+    deepestUnverifiedWindow: 0,
     postureMix: {
       judgment: 0,
       strict: 1,
       unset: 0
     }
   });
+});
+
+test("coercion ledger counts inline sprawl windows from advisory depth without any denial", (t) => {
+  const dir = sandbox(t);
+  const auditDir = path.join(dir, "inline-guard-audit");
+  writeGuardAuditEvents(auditDir, "2026-07-30", [
+    { schemaVersion: 1, at: "2026-07-30T10:00:00.000Z", session: "session-sprawl", event: "warn", lane: "main", tool: "Edit", writeCount: 5, dispatchCount: 0, budget: 5, mode: "advisory", posture: "judgment" },
+    { schemaVersion: 1, at: "2026-07-30T10:01:00.000Z", session: "session-sprawl", event: "warn", lane: "main", tool: "Write", writeCount: 15, dispatchCount: 0, budget: 5, mode: "advisory", posture: "judgment" },
+    { schemaVersion: 1, at: "2026-07-30T10:02:00.000Z", session: "session-sprawl", event: "verification", lane: "main", tool: "Bash", writeCount: 15, dispatchCount: 0, budget: 5, mode: "advisory", posture: "judgment" },
+    { schemaVersion: 1, at: "2026-07-30T10:03:00.000Z", session: "session-sprawl", event: "warn", lane: "main", tool: "Edit", writeCount: 5, dispatchCount: 0, budget: 5, mode: "advisory", posture: "judgment" },
+    { schemaVersion: 1, at: "2026-07-30T11:00:00.000Z", session: "session-tidy", event: "warn", lane: "main", tool: "Edit", writeCount: 5, dispatchCount: 1, budget: 5, mode: "advisory", posture: "judgment" },
+    { schemaVersion: 1, at: "2026-07-30T11:01:00.000Z", session: "session-tidy", event: "dispatch", lane: "codex", tool: "Agent" }
+  ]);
+
+  const report = buildFusionStats({
+    env: {
+      FUSION_DATA_DIR: path.join(dir, "fusion-data"),
+      FUSION_INLINE_GUARD_AUDIT_DIR: auditDir,
+      FUSION_CODEX_STATE: path.join(dir, "missing-codex"),
+      GROK_COMPANION_DATA: path.join(dir, "missing-grok"),
+      FUSION_WORKER_STATE_DIR: path.join(dir, "missing-workers")
+    },
+    cwd: dir
+  });
+
+  assert.strictEqual(report.coercionLedger.inlineSprawlWindows, 1);
+  assert.strictEqual(report.coercionLedger.deepestUnverifiedWindow, 15);
+  assert.strictEqual(report.coercionLedger.unverifiedAccumulations, 0);
+  assert.match(renderFusionStats(report), /Inline sprawl windows: 1\nDeepest unverified window: 15/);
 });
 
 test("coercion ledger ratio advisory appears only when declines dominate a small fleet count", (t) => {
@@ -3139,6 +3176,8 @@ test("coercion ledger ratio advisory appears only when declines dominate a small
       fleetShapedWaves: 11,
       verificationResets: 0,
       unverifiedAccumulations: 0,
+      inlineSprawlWindows: 0,
+      deepestUnverifiedWindow: 0,
       postureMix: {
         judgment: 0,
         strict: 0,
