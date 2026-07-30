@@ -1,6 +1,6 @@
 ---
 name: claude-worker
-description: Claude tool-surface and privacy executor on Sonnet. The only lane for packages whose load-bearing capability is the Claude Code tool surface (hooks, subagent files, MCP, plugin state) or the Claude privacy boundary, plus a structurally stranded package no peer lane can execute, stated as claude-fallback: <reason> in the brief header. Not a general implementation fallback: generic resolved briefs route to the Codex volume tiers.
+description: "Claude tool-surface and privacy executor on Sonnet. The only lane for packages whose load-bearing capability is the Claude Code tool surface (hooks, subagent files, MCP, plugin state) or the Claude privacy boundary, plus a structurally stranded package no peer lane can execute, stated as claude-fallback: <reason> in the brief header. Not a general implementation fallback: generic resolved briefs route to the Codex volume tiers."
 model: sonnet
 effort: medium
 maxTurns: 120

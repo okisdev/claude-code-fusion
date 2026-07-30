@@ -1,16 +1,12 @@
 import assert from "node:assert/strict";
-import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
 import { test } from "node:test";
 
 import { fusionRepositoryKey, modelAuditSidecarPath, tokenUsageSidecarPath } from "../plugins/fusion/scripts/fusion-stats.mjs";
-import { grokJobsObserverStatePath, observeGrokJobs } from "../plugins/fusion/scripts/grok-jobs-observer.mjs";
-
-const observerScript = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "plugins", "fusion", "scripts", "grok-jobs-observer.mjs");
+import { grokJobsObserverStatePath, observeGrokJobs, observeGrokJobsSafely } from "../plugins/fusion/scripts/grok-jobs-observer.mjs";
 
 function sandbox(t) {
   const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "grok-jobs-observer-test-")));
@@ -172,7 +168,7 @@ test("marks an unavailable terminal job only after its observation TTL", (t) => 
   assert.strictEqual(readJsonLines(tokenUsageSidecarPath(workspaceRoot, env)).length, 1);
 });
 
-test("the observer emits no stdout when its state has no new terminal jobs", (t) => {
+test("the observer leaves sidecars unchanged when no terminal jobs are new", (t) => {
   const root = sandbox(t);
   const workspaceRoot = path.join(root, "workspace");
   const grokData = path.join(root, "grok-data");
@@ -181,22 +177,20 @@ test("the observer emits no stdout when its state has no new terminal jobs", (t)
   const env = { GROK_COMPANION_DATA: grokData, FUSION_DATA_DIR: fusionData };
   writeGrokJob(grokData, workspaceRoot, "grok-observed", {
     status: "done",
+    resolvedModel: "grok-4",
+    resolvedEffort: "high",
     usage: { inputTokens: 10, cacheReadTokens: 2, outputTokens: 3, reasoningTokens: 1, totalTokens: 13 }
   });
   assert.strictEqual(observeGrokJobs({ env }), 1);
+  const tokenUsage = fs.readFileSync(tokenUsageSidecarPath(workspaceRoot, env), "utf8");
+  const modelAudit = fs.readFileSync(modelAuditSidecarPath(workspaceRoot, env), "utf8");
 
-  const result = spawnSync(process.execPath, [observerScript], {
-    cwd: workspaceRoot,
-    encoding: "utf8",
-    env: { ...process.env, ...env, GROK_JOBS_OBSERVER_INTERVAL_MS: "1000" },
-    timeout: 400,
-    killSignal: "SIGTERM"
-  });
-
-  assert.strictEqual(result.stdout, "");
+  assert.strictEqual(observeGrokJobs({ env }), 0);
+  assert.strictEqual(fs.readFileSync(tokenUsageSidecarPath(workspaceRoot, env), "utf8"), tokenUsage);
+  assert.strictEqual(fs.readFileSync(modelAuditSidecarPath(workspaceRoot, env), "utf8"), modelAudit);
 });
 
-test("the observer monitor ignores poll IO failures", (t) => {
+test("the observer safely ignores poll IO failures", (t) => {
   const root = sandbox(t);
   const workspaceRoot = path.join(root, "workspace");
   const grokData = path.join(root, "grok-data");
@@ -208,15 +202,6 @@ test("the observer monitor ignores poll IO failures", (t) => {
     usage: { input_tokens: 10, cache_read_input_tokens: 2, output_tokens: 3, reasoning_tokens: 1, total_tokens: 13 }
   });
 
-  const result = spawnSync(process.execPath, [observerScript], {
-    cwd: workspaceRoot,
-    encoding: "utf8",
-    env: { ...process.env, GROK_COMPANION_DATA: grokData, FUSION_DATA_DIR: fusionData, GROK_JOBS_OBSERVER_INTERVAL_MS: "25" },
-    timeout: 200,
-    killSignal: "SIGTERM"
-  });
-
-  assert.strictEqual(result.stdout, "");
-  assert.strictEqual(result.stderr, "");
-  assert.strictEqual(result.status, 0);
+  const env = { GROK_COMPANION_DATA: grokData, FUSION_DATA_DIR: fusionData };
+  assert.strictEqual(observeGrokJobsSafely({ env }), 0);
 });

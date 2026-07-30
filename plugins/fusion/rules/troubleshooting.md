@@ -50,7 +50,7 @@ For either signature, resume with SendMessage and instruct `write the deliverabl
 
 The Fusion job collection bounded window is 540s while the Codex companion result wait allows 570s, so a job finishing inside that 30s gap times out the collector and is collected manually via `/codex:result`. A package dying twice on timeout is resized, not retried.
 
-The fleet mode state file has no writer within the plugin, so disable the fleet default with `FUSION_FLEET_MODE=off` or write that file externally.
+The fleet reminder is evidence triggered in `judgment` posture and unconditional in `strict`, so `/fusion:config set-posture judgment` is the normal way to quiet it. The fleet mode state file still has no writer within the plugin, so suppressing the reminder outright needs `FUSION_FLEET_MODE=off` or an external write to that file.
 
 ## Codex startup and cache compatibility
 

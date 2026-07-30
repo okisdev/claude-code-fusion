@@ -8,7 +8,8 @@ import { once } from "node:events";
 import { test } from "node:test";
 import { getProcessIdentity } from "../plugins/codex/scripts/lib/codex-exec.mjs";
 import { inspectCodexRollout } from "../plugins/fusion/scripts/codex-jobs-monitor.mjs";
-import { fusionRepositoryKey } from "../plugins/fusion/scripts/fusion-stats.mjs";
+import { fusionRepositoryKey, modelAuditSidecarPath, tokenUsageSidecarPath } from "../plugins/fusion/scripts/fusion-stats.mjs";
+import { grokJobsObserverStatePath } from "../plugins/fusion/scripts/grok-jobs-observer.mjs";
 
 const repoRoot = path.join(import.meta.dirname, "..");
 const monitorScript = path.join(repoRoot, "plugins", "fusion", "scripts", "codex-jobs-monitor.mjs");
@@ -18,12 +19,14 @@ function makeSandbox(t) {
   const stateRoot = path.join(root, "state");
   const workDir = path.join(root, "work");
   const fusionData = path.join(root, "fusion-data");
+  const grokData = path.join(root, "grok-data");
   const sessionsDir = path.join(root, "sessions");
   fs.mkdirSync(stateRoot, { recursive: true });
   fs.mkdirSync(workDir, { recursive: true });
   fs.mkdirSync(fusionData, { recursive: true });
+  fs.mkdirSync(grokData, { recursive: true });
   fs.mkdirSync(sessionsDir, { recursive: true });
-  const sandbox = { root, stateRoot, workDir, fusionData, sessionsDir, children: new Set() };
+  const sandbox = { root, stateRoot, workDir, fusionData, grokData, sessionsDir, children: new Set() };
   t.after(async () => {
     const closing = [...sandbox.children].map((child) => {
       if (child.exitCode != null || child.signalCode != null) {
@@ -46,6 +49,25 @@ function jobsDirFor(sandbox, workspace) {
 function writeJobRecordFile(file, record) {
   fs.mkdirSync(path.dirname(file), { recursive: true });
   fs.writeFileSync(file, `${JSON.stringify(record, null, 2)}\n`, "utf8");
+}
+
+function grokWorkspaceSlug(cwd) {
+  const absolute = path.resolve(cwd);
+  return `${path.basename(absolute)}-${createHash("sha256").update(absolute).digest("hex").slice(0, 16)}`;
+}
+
+function writeGrokJob(sandbox, cwd, id, fields) {
+  const jobsDir = path.join(sandbox.grokData, "state", grokWorkspaceSlug(cwd), "jobs");
+  fs.mkdirSync(jobsDir, { recursive: true });
+  fs.writeFileSync(path.join(jobsDir, `${id}.json`), `${JSON.stringify({ id, cwd, ...fields })}\n`);
+}
+
+function readJsonLines(file) {
+  try {
+    return fs.readFileSync(file, "utf8").split("\n").filter(Boolean).map((line) => JSON.parse(line));
+  } catch {
+    return [];
+  }
 }
 
 function seedJob(sandbox, fields = {}, { workspace = "ws", workspaceRoot } = {}) {
@@ -74,6 +96,7 @@ function envFor(sandbox, extra = {}) {
     ...env,
     FUSION_CODEX_STATE: sandbox.stateRoot,
     FUSION_DATA_DIR: sandbox.fusionData,
+    GROK_COMPANION_DATA: sandbox.grokData,
     CODEX_JOBS_MONITOR_SESSIONS_DIR: sandbox.sessionsDir,
     CODEX_JOBS_MONITOR_INTERVAL_MS: "200",
     ...extra,
@@ -150,6 +173,108 @@ test("a pre-existing terminal job emits nothing on startup", async (t) => {
   const monitor = startMonitor(sandbox, envFor(sandbox));
   t.after(() => monitor.child.kill("SIGKILL"));
   await waitForAnnouncedRecord(sandbox, record.id);
+  assert.deepStrictEqual(monitor.lines(), []);
+});
+
+test("the merged monitor observes a terminal Grok job in its recorded workspace", async (t) => {
+  const sandbox = makeSandbox(t);
+  const workspaceRoot = path.join(sandbox.root, "grok-workspace");
+  const env = envFor(sandbox);
+  fs.mkdirSync(workspaceRoot, { recursive: true });
+  writeGrokJob(sandbox, workspaceRoot, "grok-terminal", {
+    status: "done",
+    resolvedModel: "grok-4",
+    resolvedEffort: "high",
+    usage: { input_tokens: 120, cache_read_input_tokens: 40, output_tokens: 30, reasoning_tokens: 12, total_tokens: 150 }
+  });
+
+  const monitor = startMonitor(sandbox, env);
+  t.after(() => monitor.child.kill("SIGKILL"));
+  const { tokenUsage, modelAudit } = await waitUntil(() => {
+    const tokenUsage = readJsonLines(tokenUsageSidecarPath(workspaceRoot, env));
+    const modelAudit = readJsonLines(modelAuditSidecarPath(workspaceRoot, env));
+    return tokenUsage.length === 1 && modelAudit.length === 1 ? { tokenUsage, modelAudit } : null;
+  });
+  const repositoryKey = fusionRepositoryKey(workspaceRoot);
+  const [{ observedAt: tokenObservedAt, ...tokenObservation }] = tokenUsage;
+  const [{ observedAt: modelObservedAt, ...modelObservation }] = modelAudit;
+
+  assert.ok(typeof tokenObservedAt === "string" && tokenObservedAt.length > 0);
+  assert.ok(typeof modelObservedAt === "string" && modelObservedAt.length > 0);
+  assert.deepStrictEqual(tokenObservation, {
+    schemaVersion: 1,
+    jobId: "grok-terminal",
+    engine: "grok",
+    workspaceRoot,
+    repositoryKey,
+    availability: "available",
+    tokenUsage: { inputTokens: 120, cachedInputTokens: 40, outputTokens: 30, reasoningOutputTokens: 12, totalTokens: 150 },
+    source: "grok-job-record"
+  });
+  assert.deepStrictEqual(modelObservation, {
+    schemaVersion: 1,
+    jobId: "grok-terminal",
+    engine: "grok",
+    model: "grok-4",
+    effort: "high",
+    workspaceRoot,
+    repositoryKey,
+    source: "grok-job-record"
+  });
+  assert.deepStrictEqual(JSON.parse(fs.readFileSync(grokJobsObserverStatePath(env), "utf8")).observedJobIds, ["grok-terminal"]);
+});
+
+test("a Grok observation does not suppress a Codex notification on the same tick", async (t) => {
+  const sandbox = makeSandbox(t);
+  const workspaceRoot = path.join(sandbox.root, "grok-workspace");
+  const { file, record } = seedJob(sandbox, { status: "running" });
+  const env = envFor(sandbox);
+  fs.mkdirSync(workspaceRoot, { recursive: true });
+  const monitor = startMonitor(sandbox, env);
+  t.after(() => monitor.child.kill("SIGKILL"));
+  await waitUntil(() => readAnnouncedState(sandbox));
+
+  writeGrokJob(sandbox, workspaceRoot, "grok-same-tick", {
+    status: "done",
+    usage: { input_tokens: 10, cache_read_input_tokens: 2, output_tokens: 3, reasoning_tokens: 1, total_tokens: 13 }
+  });
+  writeJobRecordFile(file, { ...record, status: "done", finishedAt: new Date().toISOString() });
+
+  const lines = await waitUntil(() => (monitor.lines().length > 0 ? monitor.lines() : null));
+  await waitUntil(() => readJsonLines(tokenUsageSidecarPath(workspaceRoot, env)).some((observation) => observation.jobId === "grok-same-tick"));
+  assert.deepStrictEqual(lines, [
+    `codex job ${record.id} done. collect with /codex:result ${record.id}; completion notices do not replace collection.`
+  ]);
+});
+
+test("a non-directory Grok state root leaves Codex announcements unchanged", async (t) => {
+  const sandbox = makeSandbox(t);
+  const { file, record } = seedJob(sandbox, { status: "running" });
+  fs.writeFileSync(path.join(sandbox.grokData, "state"), "not a directory\n");
+  const monitor = startMonitor(sandbox, envFor(sandbox));
+  t.after(() => monitor.child.kill("SIGKILL"));
+  await waitUntil(() => readAnnouncedState(sandbox));
+
+  writeJobRecordFile(file, { ...record, status: "done", finishedAt: new Date().toISOString() });
+
+  const lines = await waitUntil(() => (monitor.lines().length > 0 ? monitor.lines() : null));
+  assert.deepStrictEqual(lines, [
+    `codex job ${record.id} done. collect with /codex:result ${record.id}; completion notices do not replace collection.`
+  ]);
+  await assertMonitorStaysAlive(monitor);
+});
+
+test("a Grok observation produces no stdout", async (t) => {
+  const sandbox = makeSandbox(t);
+  const env = envFor(sandbox);
+  writeGrokJob(sandbox, sandbox.workDir, "grok-silent", {
+    status: "done",
+    usage: { input_tokens: 10, cache_read_input_tokens: 2, output_tokens: 3, reasoning_tokens: 1, total_tokens: 13 }
+  });
+  const monitor = startMonitor(sandbox, env);
+  t.after(() => monitor.child.kill("SIGKILL"));
+
+  await waitUntil(() => fs.existsSync(grokJobsObserverStatePath(env)));
   assert.deepStrictEqual(monitor.lines(), []);
 });
 

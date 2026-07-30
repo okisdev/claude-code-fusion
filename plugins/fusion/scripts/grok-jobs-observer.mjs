@@ -2,21 +2,13 @@
 
 import fs from "node:fs";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
 
 import { FILE_ENGINE_DESCRIPTORS, appendModelAuditObservation, appendTokenUsageObservation, fusionRepositoryKey, modelAuditSidecarPath, resolveFusionDataDir, tokenUsageSidecarPath } from "./fusion-stats.mjs";
 
 const TERMINAL_STATUSES = new Set(["done", "error", "cancelled"]);
-const DEFAULT_POLL_INTERVAL_MS = 15000;
 const DEFAULT_UNAVAILABLE_TTL_MS = 6 * 60 * 60 * 1000;
-const INTERVAL_ENV = "GROK_JOBS_OBSERVER_INTERVAL_MS";
 const UNAVAILABLE_TTL_ENV = "GROK_JOBS_OBSERVER_UNAVAILABLE_TTL_MS";
 const STATE_SCHEMA_VERSION = 2;
-
-function resolvePollIntervalMs(env = process.env) {
-  const parsed = Number.parseInt(String(env[INTERVAL_ENV]), 10);
-  return Number.isInteger(parsed) && parsed > 0 ? parsed : DEFAULT_POLL_INTERVAL_MS;
-}
 
 function resolveUnavailableTtlMs(env = process.env) {
   const parsed = Number.parseInt(String(env[UNAVAILABLE_TTL_ENV]), 10);
@@ -178,32 +170,10 @@ export function observeGrokJobs({ env = process.env, now = () => new Date().toIS
   return observations;
 }
 
-function observeGrokJobsSafely() {
+export function observeGrokJobsSafely(options) {
   try {
-    return observeGrokJobs();
+    return observeGrokJobs(options);
   } catch {
     return 0;
   }
-}
-
-function installExitHandlers(timer) {
-  const shutdown = () => {
-    clearInterval(timer);
-    process.exit(0);
-  };
-  process.on("SIGTERM", shutdown);
-  process.on("SIGINT", shutdown);
-  process.on("SIGHUP", shutdown);
-}
-
-function main() {
-  observeGrokJobsSafely();
-  const timer = setInterval(() => {
-    observeGrokJobsSafely();
-  }, resolvePollIntervalMs());
-  installExitHandlers(timer);
-}
-
-if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
-  main();
 }

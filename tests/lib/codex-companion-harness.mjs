@@ -48,6 +48,9 @@ export function envFor(sandbox, extra = {}) {
     CLAUDE_CODE_SESSION_ID: "claude-session-1",
     CODEX_BIN: fakeCodex,
     CODEX_COMPANION_DATA: sandbox.dataDir,
+    // Contended runners blow the 5s product default and surface as a job record lock timeout
+    // rather than the behavior under test; tests that exercise the timeout set their own value.
+    CODEX_COMPANION_LOCK_TIMEOUT_MS: "15000",
     CODEX_COMPANION_PIDLESS_RUNNING_GRACE_MS: "50",
     CODEX_COMPANION_WAIT_POLL_MS: "10",
     CODEX_HOME: sandbox.codexHome,

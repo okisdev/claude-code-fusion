@@ -8,6 +8,7 @@ import { test } from "node:test";
 import { pathToFileURL } from "node:url";
 import {
   DEFAULT_LOCK_TIMEOUT_MS,
+  normalizeAuditEvent,
   readAuditEvents,
   resolveLockTimeoutMs,
   resolveTailAllowance,
@@ -25,6 +26,7 @@ function makeSandbox(t) {
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
   const stateDir = path.join(root, "state");
   const auditDir = path.join(root, "audit");
+  const dataDir = path.join(root, "data");
   const workDir = path.join(root, "work");
   const clockFile = path.join(root, "clock.mjs");
   fs.mkdirSync(workDir, { recursive: true });
@@ -33,7 +35,7 @@ function makeSandbox(t) {
     "const NativeDate = Date; const now = NativeDate.parse(process.env.FUSION_TEST_NOW); globalThis.Date = class extends NativeDate { constructor(...args) { super(...(args.length === 0 ? [now] : args)); } static now() { return now; } };\n",
     "utf8"
   );
-  return { root, stateDir, auditDir, workDir, clockFile };
+  return { root, stateDir, auditDir, dataDir, workDir, clockFile };
 }
 
 function envFor(sandbox, extra = {}) {
@@ -41,6 +43,7 @@ function envFor(sandbox, extra = {}) {
     ...process.env,
     FUSION_INLINE_GUARD_STATE: sandbox.stateDir,
     FUSION_INLINE_GUARD_AUDIT_DIR: sandbox.auditDir,
+    FUSION_DATA_DIR: sandbox.dataDir,
     ...extra
   };
   if (extra.FUSION_TEST_NOW) {
@@ -132,6 +135,18 @@ function dispatchPayload(sandbox, { sessionId = "session-1", toolName = "Agent",
   return payload;
 }
 
+function verificationPayload(sandbox, { sessionId = "session-1", command = "node --test", toolResponse = {} } = {}) {
+  return {
+    hook_event_name: "PostToolUse",
+    session_id: sessionId,
+    transcript_path: path.join(sandbox.root, "transcript.jsonl"),
+    cwd: sandbox.workDir,
+    tool_name: "Bash",
+    tool_input: { command },
+    tool_response: toolResponse
+  };
+}
+
 function stateFileFor(sandbox, sessionId) {
   return path.join(sandbox.stateDir, `${sessionId}.json`);
 }
@@ -206,16 +221,17 @@ test("advisory compatibility mode never denies, even far past the budget", (t) =
   }
 });
 
-test("the default mode denies writes after the dispatch window budget and audits enforcement until an Agent dispatch", (t) => {
+test("strict posture denies writes after the dispatch window budget and audits enforcement until an Agent dispatch", (t) => {
   const sandbox = makeSandbox(t);
-  run(sandbox, dispatchPayload(sandbox, { subagentType: "fusion:fast-worker" }));
+  const strictEnv = { FUSION_POSTURE: "strict" };
+  run(sandbox, dispatchPayload(sandbox, { subagentType: "fusion:fast-worker" }), strictEnv);
   for (let i = 0; i < 5; i += 1) {
-    const result = run(sandbox, writePayload(sandbox));
+    const result = run(sandbox, writePayload(sandbox), strictEnv);
     assert.notStrictEqual(JSON.parse(result.stdout || '{"hookSpecificOutput":{"permissionDecision":"allow"}}').hookSpecificOutput.permissionDecision, "deny");
   }
 
   for (let i = 0; i < 2; i += 1) {
-    const denied = run(sandbox, writePayload(sandbox));
+    const denied = run(sandbox, writePayload(sandbox), strictEnv);
     const output = JSON.parse(denied.stdout);
     assert.strictEqual(output.hookSpecificOutput.permissionDecision, "deny");
     assert.match(output.hookSpecificOutput.permissionDecisionReason, /inline write budget is exhausted/i);
@@ -236,11 +252,12 @@ test("the default mode denies writes after the dispatch window budget and audits
     writeCount: 5,
     dispatchCount: 1,
     budget: 5,
-    mode: "enforce"
+    mode: "enforce",
+    posture: "strict"
   });
 
-  run(sandbox, dispatchPayload(sandbox, { subagentType: "fusion:fast-worker" }));
-  const allowed = run(sandbox, writePayload(sandbox));
+  run(sandbox, dispatchPayload(sandbox, { subagentType: "fusion:fast-worker" }), strictEnv);
+  const allowed = run(sandbox, writePayload(sandbox), strictEnv);
   assert.strictEqual(allowed.stdout, "");
   assert.strictEqual(readState(sandbox, "session-1").writesSinceDispatch, 1);
 });
@@ -270,11 +287,12 @@ test("tail allowance denies a new path Write and an oversized Edit", (t) => {
     { toolName: "Edit", filePath: "file.txt", toolInput: { new_string: "x".repeat(1025) } }
   ]) {
     const sandbox = makeSandbox(t);
-    run(sandbox, dispatchPayload(sandbox, { subagentType: "fusion:fast-worker" }));
+    const extraEnv = { FUSION_INLINE_ZERO_DISPATCH_WRITES: "0" };
+    run(sandbox, dispatchPayload(sandbox, { subagentType: "fusion:fast-worker" }), extraEnv);
     for (let index = 0; index < 5; index += 1) {
-      run(sandbox, writePayload(sandbox, { toolInput: { new_string: "base" } }));
+      run(sandbox, writePayload(sandbox, { toolInput: { new_string: "base" } }), extraEnv);
     }
-    const denied = run(sandbox, writePayload(sandbox, { toolName, filePath: path.join(sandbox.workDir, filePath), toolInput }));
+    const denied = run(sandbox, writePayload(sandbox, { toolName, filePath: path.join(sandbox.workDir, filePath), toolInput }), extraEnv);
     assert.strictEqual(JSON.parse(denied.stdout).hookSpecificOutput.permissionDecision, "deny");
     assert.strictEqual(readAuditRecords(sandbox).filter((record) => record.event === "tail-allowed").length, 0);
   }
@@ -282,22 +300,23 @@ test("tail allowance denies a new path Write and an oversized Edit", (t) => {
 
 test("tail allowance exhausts per window and resets after dispatch", (t) => {
   const sandbox = makeSandbox(t);
-  run(sandbox, dispatchPayload(sandbox, { subagentType: "fusion:fast-worker" }));
+  const extraEnv = { FUSION_INLINE_ZERO_DISPATCH_WRITES: "0" };
+  run(sandbox, dispatchPayload(sandbox, { subagentType: "fusion:fast-worker" }), extraEnv);
   for (let index = 0; index < 5; index += 1) {
-    run(sandbox, writePayload(sandbox, { toolInput: { new_string: "base" } }));
+    run(sandbox, writePayload(sandbox, { toolInput: { new_string: "base" } }), extraEnv);
   }
   for (let index = 0; index < 3; index += 1) {
-    const tail = run(sandbox, writePayload(sandbox, { toolInput: { new_string: "finish" } }));
+    const tail = run(sandbox, writePayload(sandbox, { toolInput: { new_string: "finish" } }), extraEnv);
     assert.strictEqual(JSON.parse(tail.stdout).hookSpecificOutput.permissionDecision, "allow");
   }
-  const denied = run(sandbox, writePayload(sandbox, { toolInput: { new_string: "finish" } }));
+  const denied = run(sandbox, writePayload(sandbox, { toolInput: { new_string: "finish" } }), extraEnv);
   assert.strictEqual(JSON.parse(denied.stdout).hookSpecificOutput.permissionDecision, "deny");
 
-  run(sandbox, dispatchPayload(sandbox, { subagentType: "fusion:fast-worker" }));
+  run(sandbox, dispatchPayload(sandbox, { subagentType: "fusion:fast-worker" }), extraEnv);
   for (let index = 0; index < 5; index += 1) {
-    run(sandbox, writePayload(sandbox, { toolInput: { new_string: "base" } }));
+    run(sandbox, writePayload(sandbox, { toolInput: { new_string: "base" } }), extraEnv);
   }
-  const resetTail = run(sandbox, writePayload(sandbox, { toolInput: { new_string: "finish" } }));
+  const resetTail = run(sandbox, writePayload(sandbox, { toolInput: { new_string: "finish" } }), extraEnv);
   assert.strictEqual(JSON.parse(resetTail.stdout).hookSpecificOutput.permissionDecision, "allow");
   assert.match(JSON.parse(resetTail.stdout).hookSpecificOutput.permissionDecisionReason, /2 tail slots remain/i);
 });
@@ -310,8 +329,11 @@ test("zero dispatch sessions soften an exhausted budget within their write and b
   const softened = run(sandbox, writePayload(sandbox, { toolName: "Write", filePath: path.join(sandbox.workDir, "new-file.txt"), toolInput: { content: "a" } }));
   const output = JSON.parse(softened.stdout);
   assert.strictEqual(output.hookSpecificOutput.permissionDecision, "allow");
-  assert.match(output.hookSpecificOutput.permissionDecisionReason, /zero dispatch session/i);
-  assert.match(output.hookSpecificOutput.additionalContext, /zero dispatch session/i);
+  assert.strictEqual(
+    output.hookSpecificOutput.permissionDecisionReason,
+    "The inline write budget is exhausted; this window remains within its inline relief bounds, with 4 writes and 16378 bytes left before enforcement resumes."
+  );
+  assert.strictEqual(output.hookSpecificOutput.additionalContext, output.hookSpecificOutput.permissionDecisionReason);
   const audit = readAuditRecords(sandbox).filter((record) => record.event === "zero-dispatch-softened");
   assert.deepStrictEqual(audit.map((record) => [record.remainingZeroDispatchWrites, record.remainingZeroDispatchBytes]), [[4, 16378]]);
 });
@@ -334,11 +356,275 @@ test("zero dispatch softening stops at its configured write and byte bounds", (t
   assert.strictEqual(JSON.parse(byteDenied.stdout).hookSpecificOutput.permissionDecision, "deny");
 });
 
+test("a passing verification resets five writes and allows the sixth write", (t) => {
+  const sandbox = makeSandbox(t);
+  const extraEnv = { FUSION_INLINE_TAIL_ALLOWANCE: "0", FUSION_INLINE_ZERO_DISPATCH_WRITES: "0" };
+  for (let index = 0; index < 5; index += 1) {
+    run(sandbox, writePayload(sandbox), extraEnv);
+  }
+
+  const verified = run(sandbox, verificationPayload(sandbox), extraEnv);
+  assert.strictEqual(verified.status, 0);
+  assert.strictEqual(verified.stdout, "");
+  assert.strictEqual(verified.stderr, "");
+
+  const sixth = run(sandbox, writePayload(sandbox), extraEnv);
+  assert.strictEqual(sixth.stdout, "");
+  assert.strictEqual(readState(sandbox, "session-1").writesSinceDispatch, 1);
+  const verifications = readAuditRecords(sandbox).filter((record) => record.event === "verification");
+  assert.deepStrictEqual(verifications, [
+    {
+      schemaVersion: 1,
+      at: verifications[0].at,
+      session: "session-1",
+      event: "verification",
+      lane: "main",
+      tool: "Bash",
+      writeCount: 5,
+      dispatchCount: 0,
+      budget: 5,
+      mode: "enforce",
+      posture: "judgment"
+    }
+  ]);
+});
+
+test("a verification whose exit status is masked by a later segment does not reset the window", (t) => {
+  for (const command of ["npm test 2>&1 | tail -20", "npm test || true", "npm test && git status --short"]) {
+    const sandbox = makeSandbox(t);
+    const extraEnv = { FUSION_INLINE_TAIL_ALLOWANCE: "0", FUSION_INLINE_ZERO_DISPATCH_WRITES: "0" };
+    for (let index = 0; index < 5; index += 1) {
+      run(sandbox, writePayload(sandbox), extraEnv);
+    }
+
+    const verification = run(sandbox, verificationPayload(sandbox, { command }), extraEnv);
+    assert.strictEqual(verification.stdout, "");
+    const sixth = run(sandbox, writePayload(sandbox), extraEnv);
+    assert.strictEqual(JSON.parse(sixth.stdout).hookSpecificOutput.permissionDecision, "deny");
+    assert.strictEqual(readState(sandbox, "session-1").writesSinceDispatch, 5);
+    assert.strictEqual(readAuditRecords(sandbox).filter((record) => record.event === "verification").length, 0);
+  }
+});
+
+test("a verification that ends the command resets the window through every separator", (t) => {
+  for (const command of ["pnpm lint && npm test", "echo starting; npm run test:unit", "npm test > /tmp/out 2>&1"]) {
+    const sandbox = makeSandbox(t);
+    const extraEnv = { FUSION_INLINE_TAIL_ALLOWANCE: "0", FUSION_INLINE_ZERO_DISPATCH_WRITES: "0" };
+    for (let index = 0; index < 5; index += 1) {
+      run(sandbox, writePayload(sandbox), extraEnv);
+    }
+
+    run(sandbox, verificationPayload(sandbox, { command }), extraEnv);
+    const sixth = run(sandbox, writePayload(sandbox), extraEnv);
+    assert.strictEqual(sixth.stdout, "");
+    assert.strictEqual(readState(sandbox, "session-1").writesSinceDispatch, 1);
+  }
+});
+
+test("failed and interrupted verifications do not reset the write window", (t) => {
+  for (const toolResponse of [{ is_error: true }, { is_error: "true" }, { isError: true }, { interrupted: true }]) {
+    const sandbox = makeSandbox(t);
+    const extraEnv = { FUSION_INLINE_TAIL_ALLOWANCE: "0", FUSION_INLINE_ZERO_DISPATCH_WRITES: "0" };
+    for (let index = 0; index < 5; index += 1) {
+      run(sandbox, writePayload(sandbox), extraEnv);
+    }
+
+    const verification = run(sandbox, verificationPayload(sandbox, { toolResponse }), extraEnv);
+    assert.strictEqual(verification.stdout, "");
+    const sixth = run(sandbox, writePayload(sandbox), extraEnv);
+    assert.strictEqual(JSON.parse(sixth.stdout).hookSpecificOutput.permissionDecision, "deny");
+    assert.strictEqual(readState(sandbox, "session-1").writesSinceDispatch, 5);
+    assert.strictEqual(readAuditRecords(sandbox).filter((record) => record.event === "verification").length, 0);
+  }
+});
+
+test("a passing verification without writes is a state and audit no-op", (t) => {
+  const sandbox = makeSandbox(t);
+  const verification = run(sandbox, verificationPayload(sandbox));
+  assert.strictEqual(verification.status, 0);
+  assert.strictEqual(verification.stdout, "");
+  assert.strictEqual(fs.existsSync(stateFileFor(sandbox, "session-1")), false);
+  assert.deepStrictEqual(readAuditRecords(sandbox), []);
+});
+
+test("an unrecognized Bash command does not reset the write window", (t) => {
+  const sandbox = makeSandbox(t);
+  const extraEnv = { FUSION_INLINE_TAIL_ALLOWANCE: "0", FUSION_INLINE_ZERO_DISPATCH_WRITES: "0" };
+  for (let index = 0; index < 5; index += 1) {
+    run(sandbox, writePayload(sandbox), extraEnv);
+  }
+
+  const unrecognized = run(sandbox, verificationPayload(sandbox, { command: "git status --short" }), extraEnv);
+  assert.strictEqual(unrecognized.stdout, "");
+  const sixth = run(sandbox, writePayload(sandbox), extraEnv);
+  assert.strictEqual(JSON.parse(sixth.stdout).hookSpecificOutput.permissionDecision, "deny");
+  assert.strictEqual(readAuditRecords(sandbox).filter((record) => record.event === "verification").length, 0);
+});
+
+test("a verification reset leaves dispatch and fleet telemetry unchanged", (t) => {
+  const sandbox = makeSandbox(t);
+  run(sandbox, dispatchPayload(sandbox, { subagentType: "codex:codex-rescue" }));
+  for (let index = 0; index < 3; index += 1) {
+    run(sandbox, writePayload(sandbox));
+  }
+  const before = readState(sandbox, "session-1");
+  const telemetryBefore = {
+    dispatches: before.dispatches,
+    dispatchEpoch: before.dispatchEpoch,
+    lastDispatchAt: before.lastDispatchAt,
+    fleetWaveWidth: before.fleetWaveWidth,
+    consecutiveNarrowWaves: before.consecutiveNarrowWaves,
+    lastAdvisedNarrowWaveStreak: before.lastAdvisedNarrowWaveStreak,
+    dispatchLog: before.dispatchLog
+  };
+
+  const verification = run(sandbox, verificationPayload(sandbox));
+  assert.strictEqual(verification.stdout, "");
+  const after = readState(sandbox, "session-1");
+  assert.deepStrictEqual(
+    {
+      dispatches: after.dispatches,
+      dispatchEpoch: after.dispatchEpoch,
+      lastDispatchAt: after.lastDispatchAt,
+      fleetWaveWidth: after.fleetWaveWidth,
+      consecutiveNarrowWaves: after.consecutiveNarrowWaves,
+      lastAdvisedNarrowWaveStreak: after.lastAdvisedNarrowWaveStreak,
+      dispatchLog: after.dispatchLog
+    },
+    telemetryBefore
+  );
+});
+
+test("strict posture ignores a passing verification and preserves the strict deny reason", (t) => {
+  const sandbox = makeSandbox(t);
+  const extraEnv = { FUSION_POSTURE: "strict", FUSION_INLINE_TAIL_ALLOWANCE: "0", FUSION_INLINE_ZERO_DISPATCH_WRITES: "0" };
+  for (let index = 0; index < 5; index += 1) {
+    run(sandbox, writePayload(sandbox), extraEnv);
+  }
+
+  assert.strictEqual(run(sandbox, verificationPayload(sandbox), extraEnv).stdout, "");
+  assert.strictEqual(readState(sandbox, "session-1").writesSinceDispatch, 5);
+  const sixth = run(sandbox, writePayload(sandbox), extraEnv);
+  assert.strictEqual(
+    JSON.parse(sixth.stdout).hookSpecificOutput.permissionDecisionReason,
+    "5 inline writes happened this session with zero dispatches. Lanes: quick scoped work goes to the codex quick tier gpt-5.6-terra at effort xhigh; trivial or high volume work goes to gpt-5.6-luna at effort xhigh; work needing the Claude Code tool surface goes to fusion:claude-worker. The inline write budget is exhausted. Dispatch an Agent or Task before another main-loop write."
+  );
+  assert.strictEqual(readAuditRecords(sandbox).filter((record) => record.event === "verification").length, 0);
+});
+
+test("inline relief is symmetric after dispatch in judgment posture and remains strict in strict posture", (t) => {
+  for (const [posture, expected] of [
+    ["judgment", "allow"],
+    ["strict", "deny"]
+  ]) {
+    const sandbox = makeSandbox(t);
+    const extraEnv = { FUSION_POSTURE: posture, FUSION_INLINE_TAIL_ALLOWANCE: "0" };
+    run(sandbox, dispatchPayload(sandbox, { subagentType: "codex:codex-rescue" }), extraEnv);
+    for (let index = 0; index < 5; index += 1) {
+      run(
+        sandbox,
+        writePayload(sandbox, { toolName: "Write", filePath: path.join(sandbox.workDir, `${posture}-${index}.txt`), toolInput: { content: "a" } }),
+        extraEnv
+      );
+    }
+    const sixth = run(
+      sandbox,
+      writePayload(sandbox, { toolName: "Write", filePath: path.join(sandbox.workDir, `${posture}-sixth.txt`), toolInput: { content: "a" } }),
+      extraEnv
+    );
+    assert.strictEqual(JSON.parse(sixth.stdout).hookSpecificOutput.permissionDecision, expected);
+    assert.strictEqual(readAuditRecords(sandbox).filter((record) => record.event === "zero-dispatch-softened").length, expected === "allow" ? 1 : 0);
+  }
+});
+
+test("per-window relief counters reset on dispatch and verification", (t) => {
+  const sandbox = makeSandbox(t);
+  for (let index = 0; index < 2; index += 1) {
+    run(sandbox, writePayload(sandbox, { toolInput: { new_string: "ab" } }));
+  }
+  assert.strictEqual(readState(sandbox, "session-1").reliefWritesInWindow, 2);
+  assert.strictEqual(readState(sandbox, "session-1").reliefBytesInWindow, 4);
+
+  run(sandbox, dispatchPayload(sandbox, { subagentType: "codex:codex-rescue" }));
+  assert.strictEqual(readState(sandbox, "session-1").reliefWritesInWindow, 0);
+  assert.strictEqual(readState(sandbox, "session-1").reliefBytesInWindow, 0);
+
+  for (let index = 0; index < 3; index += 1) {
+    run(sandbox, writePayload(sandbox, { toolInput: { new_string: "xyz" } }));
+  }
+  assert.strictEqual(readState(sandbox, "session-1").reliefWritesInWindow, 3);
+  assert.strictEqual(readState(sandbox, "session-1").reliefBytesInWindow, 9);
+
+  run(sandbox, verificationPayload(sandbox));
+  assert.strictEqual(readState(sandbox, "session-1").reliefWritesInWindow, 0);
+  assert.strictEqual(readState(sandbox, "session-1").reliefBytesInWindow, 0);
+});
+
+test("judgment posture uses the exact unverified deny reason and the guard omits the retired lane", (t) => {
+  const sandbox = makeSandbox(t);
+  const extraEnv = { FUSION_INLINE_TAIL_ALLOWANCE: "0", FUSION_INLINE_ZERO_DISPATCH_WRITES: "0" };
+  for (let index = 0; index < 5; index += 1) {
+    run(sandbox, writePayload(sandbox), extraEnv);
+  }
+  const sixth = run(sandbox, writePayload(sandbox), extraEnv);
+  assert.strictEqual(
+    JSON.parse(sixth.stdout).hookSpecificOutput.permissionDecisionReason,
+    "5 main loop writes are unverified in this window. Run this change's verification command, or route the remaining work to a lane, then continue. Lanes: quick scoped work goes to the codex quick tier gpt-5.6-terra at effort xhigh; trivial or high volume work goes to gpt-5.6-luna at effort xhigh; work needing the Claude Code tool surface goes to fusion:claude-worker."
+  );
+  assert.doesNotMatch(fs.readFileSync(script, "utf8"), /fast-worker/);
+});
+
+test("audit normalization accepts verification posture and every legacy event category", () => {
+  const at = "2026-07-30T00:00:00.000Z";
+  const verification = {
+    at,
+    session: "session-1",
+    event: "verification",
+    lane: "main",
+    tool: "Bash",
+    writeCount: 5,
+    dispatchCount: 2,
+    budget: 5,
+    mode: "enforce",
+    posture: "judgment"
+  };
+  assert.deepStrictEqual(normalizeAuditEvent(verification), { schemaVersion: 1, ...verification });
+  assert.strictEqual(normalizeAuditEvent({ ...verification, posture: "reckless" }), null);
+
+  const legacyEvents = [
+    { at, session: "session-1", event: "write", lane: "main", tool: "Edit", path: "file.txt" },
+    { at, session: "session-1", event: "tail-allowed", lane: "main", tool: "Edit", path: "file.txt", writeCount: 6, dispatchCount: 1, budget: 5, mode: "enforce", remainingTailSlots: 2 },
+    {
+      at,
+      session: "session-1",
+      event: "zero-dispatch-softened",
+      lane: "main",
+      tool: "Write",
+      path: "file.txt",
+      writeCount: 6,
+      dispatchCount: 0,
+      budget: 5,
+      mode: "enforce",
+      remainingZeroDispatchWrites: 4,
+      remainingZeroDispatchBytes: 100
+    },
+    { at, session: "session-1", event: "dispatch", lane: "codex", tool: "Agent", description: "legacy dispatch" },
+    { at, session: "session-1", event: "warn", lane: "codex", tool: "Agent", reason: "missing-launch-recovered" },
+    { at, session: "session-1", event: "warn", lane: "codex", tool: "Task", reason: "narrow-wave-advisory", pendingIncludedWidth: 1 },
+    { at, session: "session-1", event: "deny", lane: "main", tool: "TaskOutput", description: "reaped-worker-redirect", mode: "enforce" },
+    { at, session: "session-1", event: "warn", lane: "main", tool: "TaskStop", description: "reaped-worker-redirect", mode: "advisory", suppressed: true },
+    { at, session: "session-1", event: "deny", lane: "main", tool: "Edit", path: "file.txt", writeCount: 5, dispatchCount: 1, budget: 5, mode: "enforce" },
+    { at, session: "session-1", event: "warn", lane: "main", tool: "Bash", writeCount: 5, dispatchCount: 1, budget: 5, mode: "advisory", suppressed: true }
+  ];
+  assert.ok(legacyEvents.every((event) => normalizeAuditEvent(event) !== null));
+  assert.ok(legacyEvents.every((event) => !Object.hasOwn(normalizeAuditEvent(event), "posture")));
+});
+
 test("tail allowance environment overrides apply and zero disables it", (t) => {
   for (const { env, newString, expected } of [
-    { env: { FUSION_INLINE_TAIL_MAX_BYTES: "1" }, newString: "xx", expected: "deny" },
-    { env: { FUSION_INLINE_TAIL_ALLOWANCE: "0" }, newString: "x", expected: "deny" },
-    { env: { FUSION_INLINE_TAIL_ALLOWANCE: "1" }, newString: "x", expected: "allow" }
+    { env: { FUSION_INLINE_TAIL_MAX_BYTES: "1", FUSION_INLINE_ZERO_DISPATCH_WRITES: "0" }, newString: "xx", expected: "deny" },
+    { env: { FUSION_INLINE_TAIL_ALLOWANCE: "0", FUSION_INLINE_ZERO_DISPATCH_WRITES: "0" }, newString: "x", expected: "deny" },
+    { env: { FUSION_INLINE_TAIL_ALLOWANCE: "1", FUSION_INLINE_ZERO_DISPATCH_WRITES: "0" }, newString: "x", expected: "allow" }
   ]) {
     const sandbox = makeSandbox(t);
     run(sandbox, dispatchPayload(sandbox, { subagentType: "fusion:fast-worker" }), env);
@@ -381,7 +667,8 @@ test("a PostToolUse-only dispatch recovers a missing launch and reopens an exhau
       event: "warn",
       lane: "fusion:fast-worker",
       tool: "Agent",
-      reason: "missing-launch-recovered"
+      reason: "missing-launch-recovered",
+      posture: "judgment"
     }
   ]);
 
@@ -440,7 +727,7 @@ test("the fifth write under the default budget attaches one advisory and audits 
   assert.strictEqual(output.hookSpecificOutput.permissionDecision, "allow");
   assert.strictEqual(
     output.hookSpecificOutput.permissionDecisionReason,
-    "5 inline writes happened this session with zero dispatches. The next package belongs in a lane: quick scoped work goes to the codex quick tier gpt-5.6-terra at effort xhigh; trivial or high-volume work goes to gpt-5.6-luna at effort xhigh; work needing the Claude Code tool surface goes to fusion:fast-worker."
+    "5 inline writes happened this session with zero dispatches. Lanes: quick scoped work goes to the codex quick tier gpt-5.6-terra at effort xhigh; trivial or high volume work goes to gpt-5.6-luna at effort xhigh; work needing the Claude Code tool surface goes to fusion:claude-worker."
   );
   const records = readAuditRecords(sandbox);
   assert.strictEqual(records.filter((record) => record.event === "write").length, 5);
@@ -457,7 +744,8 @@ test("the fifth write under the default budget attaches one advisory and audits 
     writeCount: 5,
     dispatchCount: 0,
     budget: 5,
-    mode: "enforce"
+    mode: "enforce",
+    posture: "judgment"
   });
 });
 
@@ -562,7 +850,7 @@ test("two narrow dispatch waves attach the fleet advisory to the following dispa
   assert.strictEqual(output.hookSpecificOutput.permissionDecision, undefined);
   assert.strictEqual(
     output.hookSpecificOutput.additionalContext,
-    "2 consecutive narrow waves; fleet default applies: consider /fusion:ultra for the remaining packages or state fleet-decline: <reason>."
+    "2 consecutive width one dispatch waves. If the remaining packages are independent, dispatch them together; /fusion:ultra is available when the goal is genuinely wide."
   );
   assert.strictEqual(readState(sandbox, "session-1").consecutiveNarrowWaves, 2);
 });
@@ -607,7 +895,7 @@ test("a fleet decline before the last user message does not suppress the narrow-
   const result = triggerNarrowWaveAdvisory(sandbox, { FUSION_FLEET_WAVE_GAP_MS: "10000" });
   assert.strictEqual(
     JSON.parse(result.stdout).hookSpecificOutput.additionalContext,
-    "2 consecutive narrow waves; fleet default applies: consider /fusion:ultra for the remaining packages or state fleet-decline: <reason>."
+    "2 consecutive width one dispatch waves. If the remaining packages are independent, dispatch them together; /fusion:ultra is available when the goal is genuinely wide."
   );
 });
 
@@ -619,7 +907,7 @@ test("a missing transcript does not suppress the narrow-wave context", (t) => {
   const result = triggerNarrowWaveAdvisory(sandbox, { FUSION_FLEET_WAVE_GAP_MS: "10000" }, payload);
   assert.strictEqual(
     JSON.parse(result.stdout).hookSpecificOutput.additionalContext,
-    "2 consecutive narrow waves; fleet default applies: consider /fusion:ultra for the remaining packages or state fleet-decline: <reason>."
+    "2 consecutive width one dispatch waves. If the remaining packages are independent, dispatch them together; /fusion:ultra is available when the goal is genuinely wide."
   );
 });
 
@@ -717,7 +1005,7 @@ test("abandoned launches do not widen fleet waves or reset the narrow streak and
     if (index < 2) {
       assert.strictEqual(confirmation.stdout, "");
     } else {
-      assert.match(JSON.parse(confirmation.stdout).hookSpecificOutput.additionalContext, /^2 consecutive narrow waves/);
+      assert.match(JSON.parse(confirmation.stdout).hookSpecificOutput.additionalContext, /^2 consecutive width one dispatch waves/);
     }
   }
   assert.strictEqual(readState(sandbox, "session-1").consecutiveNarrowWaves, 2);
@@ -757,9 +1045,9 @@ test("solo launch waves re-nudge at consecutive narrow streaks two and four", (t
 
   assert.strictEqual(outputs[0], "");
   assert.strictEqual(outputs[1], "");
-  assert.strictEqual(JSON.parse(outputs[2]).hookSpecificOutput.additionalContext, "2 consecutive narrow waves; fleet default applies: consider /fusion:ultra for the remaining packages or state fleet-decline: <reason>.");
+  assert.strictEqual(JSON.parse(outputs[2]).hookSpecificOutput.additionalContext, "2 consecutive width one dispatch waves. If the remaining packages are independent, dispatch them together; /fusion:ultra is available when the goal is genuinely wide.");
   assert.strictEqual(outputs[3], "");
-  assert.strictEqual(JSON.parse(outputs[4]).hookSpecificOutput.additionalContext, "4 consecutive narrow waves; fleet default applies: consider /fusion:ultra for the remaining packages or state fleet-decline: <reason>.");
+  assert.strictEqual(JSON.parse(outputs[4]).hookSpecificOutput.additionalContext, "4 consecutive width one dispatch waves. If the remaining packages are independent, dispatch them together; /fusion:ultra is available when the goal is genuinely wide.");
   const state = readState(sandbox, "session-1");
   assert.strictEqual(state.consecutiveNarrowWaves, 4);
   assert.strictEqual(state.lastAdvisedNarrowWaveStreak, 4);
@@ -1455,7 +1743,8 @@ test("no-op Bash deny audits an enforcement event for Bash on the main lane", (t
     writeCount: 0,
     dispatchCount: 0,
     budget: 5,
-    mode: "enforce"
+    mode: "enforce",
+    posture: "judgment"
   });
   assert.ok(!Object.hasOwn(denies[0], "path"));
 });
@@ -1483,7 +1772,8 @@ test("TaskOutput against a terminal Fusion worker redirects to its output file",
       lane: "main",
       tool: "TaskOutput",
       description: "reaped-worker-redirect",
-      mode: "enforce"
+      mode: "enforce",
+      posture: "judgment"
     }
   ]);
 });
@@ -1539,6 +1829,7 @@ test("advisory mode warns and allows terminal TaskOutput redirects", (t) => {
   assert.strictEqual(warnings[0].event, "warn");
   assert.strictEqual(warnings[0].description, "reaped-worker-redirect");
   assert.strictEqual(warnings[0].mode, "advisory");
+  assert.strictEqual(warnings[0].posture, "judgment");
 });
 
 test("hooks configuration wires PreToolUse write tools, Bash, Agent, Task, TaskOutput, and TaskStop through the inline guard", () => {
@@ -1555,6 +1846,13 @@ test("hooks configuration wires PreToolUse write tools, Bash, Agent, Task, TaskO
     },
     {
       matcher: "^(TaskOutput|TaskStop)$",
+      command: 'node "${CLAUDE_PLUGIN_ROOT}/scripts/inline-delegation-guard.mjs"'
+    }
+  ]);
+  const postToolHandlers = hooks.PostToolUse.flatMap((group) => group.hooks.map((hook) => ({ matcher: group.matcher, command: hook.command }))).filter((hook) => hook.command?.includes("inline-delegation-guard.mjs"));
+  assert.deepStrictEqual(postToolHandlers, [
+    {
+      matcher: "^(Agent|Task|Bash)$",
       command: 'node "${CLAUDE_PLUGIN_ROOT}/scripts/inline-delegation-guard.mjs"'
     }
   ]);

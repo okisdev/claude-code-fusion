@@ -4641,7 +4641,7 @@ test("hooks configuration wires lifecycle events through an executable shell com
     assert.ok(handlers.every((handler) => handler.command === 'node "${CLAUDE_PLUGIN_ROOT}/scripts/worker-lifecycle.mjs"'));
   }
   const dispatchHandlers = hooks.PostToolUse.flatMap((group) => group.hooks.map((hook) => ({ matcher: group.matcher, command: hook.command }))).filter((hook) => hook.command?.includes("inline-delegation-guard.mjs"));
-  assert.deepStrictEqual(dispatchHandlers, [{ matcher: "^(Agent|Task)$", command: 'node "${CLAUDE_PLUGIN_ROOT}/scripts/inline-delegation-guard.mjs"' }]);
+  assert.deepStrictEqual(dispatchHandlers, [{ matcher: "^(Agent|Task|Bash)$", command: 'node "${CLAUDE_PLUGIN_ROOT}/scripts/inline-delegation-guard.mjs"' }]);
 });
 
 test("cancellation demand predicate covers both disjuncts and terminal-ready exclusions", () => {

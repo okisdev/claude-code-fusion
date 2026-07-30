@@ -19,6 +19,7 @@ import {
   tokenUsageSidecarPath,
   workspaceRootsShareRepository
 } from "./fusion-stats.mjs";
+import { observeGrokJobsSafely } from "./grok-jobs-observer.mjs";
 
 const TERMINAL_STATUSES = new Set(["done", "error", "cancelled"]);
 const DEFAULT_POLL_INTERVAL_MS = 15000;
@@ -843,10 +844,16 @@ async function main() {
       startupPending = false;
     }
   } catch {}
+  try {
+    observeGrokJobsSafely();
+  } catch {}
 
   const timer = setInterval(() => {
     try {
       processSnapshot(readWorkspaceJobsSnapshot(root, workspaceRoot, repositoryCache));
+    } catch {}
+    try {
+      observeGrokJobsSafely();
     } catch {}
   }, resolvePollIntervalMs());
 
