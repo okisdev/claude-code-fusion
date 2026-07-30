@@ -7,22 +7,42 @@ import { test } from "node:test";
 
 const repoRoot = path.join(import.meta.dirname, "..");
 const script = path.join(repoRoot, "plugins", "fusion", "scripts", "fleet-posture.mjs");
+const LEGACY_CONTEXT = "fleet-default active: a goal that decomposes into three or more independent work packages convenes /fusion:ultra once bootstrap dependencies are resolved; narrower execution states `fleet-decline: <reason>` visibly in the reply.";
 
 function makeSandbox(t) {
   const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "fleet-posture-test-")));
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
-  return { root, dataDir: path.join(root, "fusion-data") };
+  return { root, dataDir: path.join(root, "fusion-data"), stateDir: path.join(root, "inline-guard") };
 }
 
 function envFor(sandbox, extra = {}) {
-  const env = { ...process.env, FUSION_DATA_DIR: sandbox.dataDir, ...extra };
-  if (!Object.hasOwn(extra, "FUSION_FLEET_MODE")) {
-    delete env.FUSION_FLEET_MODE;
+  const env = { ...process.env, FUSION_DATA_DIR: sandbox.dataDir, FUSION_INLINE_GUARD_STATE: sandbox.stateDir, ...extra };
+  for (const name of ["FUSION_FLEET_MODE", "FUSION_POSTURE", "FUSION_NARROW_WAVE_THRESHOLD"]) {
+    if (!Object.hasOwn(extra, name)) {
+      delete env[name];
+    }
   }
   return env;
 }
 
-function run(sandbox, input = JSON.stringify({ session_id: "session-1", prompt: "do work", cwd: sandbox.root }), extraEnv = {}) {
+function hookInput(sandbox, sessionId = "session-1") {
+  return JSON.stringify({ ...(sessionId === undefined ? {} : { session_id: sessionId }), prompt: "do work", cwd: sandbox.root });
+}
+
+function statePath(sandbox, sessionId = "session-1") {
+  return path.join(sandbox.stateDir, `${sessionId}.json`);
+}
+
+function writeState(sandbox, state, sessionId = "session-1") {
+  fs.mkdirSync(sandbox.stateDir, { recursive: true });
+  fs.writeFileSync(statePath(sandbox, sessionId), JSON.stringify(state), "utf8");
+}
+
+function judgmentContext(streak) {
+  return `${streak} consecutive width one dispatch waves in this session. If the remaining packages are independent, dispatch them together in one message; /fusion:ultra is available when the goal is genuinely wide.`;
+}
+
+function run(sandbox, input = hookInput(sandbox), extraEnv = {}) {
   return spawnSync(process.execPath, [script], {
     input,
     env: envFor(sandbox, extraEnv),
@@ -30,46 +50,99 @@ function run(sandbox, input = JSON.stringify({ session_id: "session-1", prompt: 
   });
 }
 
-test("the default posture emits the UserPromptSubmit fleet reminder", (t) => {
-  const sandbox = makeSandbox(t);
-  const result = run(sandbox);
-
-  assert.strictEqual(result.status, 0);
-  assert.strictEqual(result.stderr, "");
-  const output = JSON.parse(result.stdout);
-  assert.strictEqual(output.hookSpecificOutput.hookEventName, "UserPromptSubmit");
-  assert.match(output.hookSpecificOutput.additionalContext, /fleet-default active/);
-});
-
-test("FUSION_FLEET_MODE=off disables the reminder", (t) => {
-  const sandbox = makeSandbox(t);
-  const result = run(sandbox, undefined, { FUSION_FLEET_MODE: "off" });
-
+function assertSilent(result) {
   assert.strictEqual(result.status, 0);
   assert.strictEqual(result.stdout, "");
   assert.strictEqual(result.stderr, "");
+}
+
+function assertContext(result, additionalContext) {
+  assert.strictEqual(result.status, 0);
+  assert.strictEqual(result.stderr, "");
+  assert.deepStrictEqual(JSON.parse(result.stdout), {
+    hookSpecificOutput: { hookEventName: "UserPromptSubmit", additionalContext }
+  });
+}
+
+test("judgment posture is silent without guard state", (t) => {
+  const sandbox = makeSandbox(t);
+  const result = run(sandbox);
+
+  assertSilent(result);
+  assert.strictEqual(fs.existsSync(statePath(sandbox)), false);
 });
 
-test("the fleet mode state file can disable the reminder", (t) => {
+test("judgment posture is silent below the narrow wave threshold", (t) => {
   const sandbox = makeSandbox(t);
+
+  for (const streak of [0, 1]) {
+    writeState(sandbox, { consecutiveNarrowWaves: streak });
+    assertSilent(run(sandbox));
+  }
+});
+
+test("judgment posture emits the observed narrow wave streak", (t) => {
+  const sandbox = makeSandbox(t);
+  writeState(sandbox, { consecutiveNarrowWaves: 2 });
+  const original = fs.readFileSync(statePath(sandbox), "utf8");
+
+  assertContext(run(sandbox), judgmentContext(2));
+  assert.strictEqual(fs.readFileSync(statePath(sandbox), "utf8"), original);
+});
+
+test("judgment posture honors a valid narrow wave threshold and falls back for malformed values", (t) => {
+  const sandbox = makeSandbox(t);
+  writeState(sandbox, { consecutiveNarrowWaves: 2 });
+
+  assertSilent(run(sandbox, hookInput(sandbox), { FUSION_NARROW_WAVE_THRESHOLD: "3" }));
+  writeState(sandbox, { consecutiveNarrowWaves: 3 });
+  assertContext(run(sandbox, hookInput(sandbox), { FUSION_NARROW_WAVE_THRESHOLD: "3" }), judgmentContext(3));
+  writeState(sandbox, { consecutiveNarrowWaves: 2 });
+  assertContext(run(sandbox, hookInput(sandbox), { FUSION_NARROW_WAVE_THRESHOLD: "invalid" }), judgmentContext(2));
+});
+
+test("strict posture emits the legacy reminder without guard state", (t) => {
+  const sandbox = makeSandbox(t);
+
+  assertContext(run(sandbox, hookInput(sandbox), { FUSION_POSTURE: "strict" }), LEGACY_CONTEXT);
+  assert.strictEqual(fs.existsSync(statePath(sandbox)), false);
+});
+
+test("FUSION_FLEET_MODE=off suppresses both postures", (t) => {
+  const sandbox = makeSandbox(t);
+  writeState(sandbox, { consecutiveNarrowWaves: 2 });
+
+  assertSilent(run(sandbox, hookInput(sandbox), { FUSION_FLEET_MODE: "off" }));
+  assertSilent(run(sandbox, hookInput(sandbox), { FUSION_FLEET_MODE: "off", FUSION_POSTURE: "strict" }));
+});
+
+test("the fleet mode state file suppresses both postures", (t) => {
+  const sandbox = makeSandbox(t);
+  writeState(sandbox, { consecutiveNarrowWaves: 2 });
   fs.mkdirSync(sandbox.dataDir, { recursive: true });
   fs.writeFileSync(path.join(sandbox.dataDir, "fleet-mode"), "off\n", "utf8");
-  const result = run(sandbox);
 
-  assert.strictEqual(result.status, 0);
-  assert.strictEqual(result.stdout, "");
-  assert.strictEqual(result.stderr, "");
+  assertSilent(run(sandbox));
+  assertSilent(run(sandbox, hookInput(sandbox), { FUSION_POSTURE: "strict" }));
 });
 
 test("an enabled environment mode overrides a disabled state file", (t) => {
   const sandbox = makeSandbox(t);
   fs.mkdirSync(sandbox.dataDir, { recursive: true });
   fs.writeFileSync(path.join(sandbox.dataDir, "fleet-mode"), "off\n", "utf8");
-  const result = run(sandbox, undefined, { FUSION_FLEET_MODE: "on" });
 
-  assert.strictEqual(result.status, 0);
-  assert.strictEqual(result.stderr, "");
-  assert.match(JSON.parse(result.stdout).hookSpecificOutput.additionalContext, /fleet-default active/);
+  assertContext(run(sandbox, hookInput(sandbox), { FUSION_FLEET_MODE: "on", FUSION_POSTURE: "strict" }), LEGACY_CONTEXT);
+});
+
+test("invalid guard state is silent", (t) => {
+  const sandbox = makeSandbox(t);
+
+  fs.mkdirSync(sandbox.stateDir, { recursive: true });
+  fs.writeFileSync(statePath(sandbox), "{not json", "utf8");
+  assertSilent(run(sandbox));
+  assertSilent(run(sandbox, hookInput(sandbox, undefined)));
+  writeState(sandbox, { consecutiveNarrowWaves: "2" });
+  assertSilent(run(sandbox));
 });
 
 test("malformed hook input is silent", (t) => {

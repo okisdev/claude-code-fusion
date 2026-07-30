@@ -1,7 +1,7 @@
 ---
 name: ultra
-description: "Fans the work out as a fleet of parallel Grok and Codex agents billed to their own subscriptions, then synthesizes one result. The peer engine equivalent of ultracode, adding intensity without spending Claude quota on the fleet. The default execution posture for any goal that decomposes into three or more independent work packages, not only an intensity booster for explicit asks."
-when_to_use: "Proactively convene whenever the goal decomposes into three or more independent work packages once bootstrap dependencies are resolved; this is the default posture, not an escalation. Also convene on any explicit ask to go deep, be thorough, or exhaustive: deep research on a topic, a comprehensive audit, an exhaustive bug hunt, mapping a whole subsystem, or implementing a large multi part feature. Declining a fleet shaped goal requires a visible fleet-decline: <reason> line."
+description: "Fans the work out as a fleet of parallel Grok and Codex agents billed to their own subscriptions, then synthesizes one result. The peer engine equivalent of ultracode, adding intensity without spending Claude quota on the fleet. Use it for genuinely broad goals, not only explicit asks for intensity."
+when_to_use: "Convene on an explicit ask to go deep, be thorough, or exhaustive: deep research on a topic, a comprehensive audit, an exhaustive bug hunt, mapping a whole subsystem, or implementing a large multi part feature. Also convene when the goal genuinely decomposes into three or more independent work packages and each one can be collected and verified. A goal that is one coherent package, or whose packages depend on each other in sequence, does not need a fleet and needs no justification for staying narrow."
 argument-hint: '[the task to pursue exhaustively]'
 allowed-tools: Agent, Read, Bash, AskUserQuestion
 ---
@@ -14,7 +14,7 @@ Task:
 Size gate first (cheap, in the main loop):
 
 - If the task is small, a single question, or a one file change, do NOT convene a fleet. Return it to the normal routing policy: questions stay in the main session, and requested changes normally use the Codex primary lane. Say you skipped the fleet because the task did not warrant it.
-- Skipping a goal that decomposes into three or more independent packages is a decline: state a visible `fleet-decline: <reason>` line in the reply. Decline reasons are premises, and when one expires (a lane recovers, the goal enters implement, packages accrete to three) the fleet question reopens.
+- Width is a judgment call, not a floor. A goal that stays narrow because its packages interlock, depend on each other, or are one coherent change needs no decline statement. The real defect is dispatching independent packages one per turn instead of together.
 - Otherwise decompose the task into independent facets. Research decomposes by angle or source (different subsystems, different questions, different documents). Implementation decomposes by work package. Facet count follows the goal's natural package count with a floor of three: 6 to 8 facets when the seams allow it; up to about 12 only when the user asked for maximum coverage and the facets are truly independent. A three package goal is fleet shaped even though it sits below six.
 
 Compose one self contained brief per facet:
