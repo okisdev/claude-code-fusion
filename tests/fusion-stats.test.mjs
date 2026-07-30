@@ -2949,3 +2949,205 @@ test("fleet usage surface watches sessions with eight narrow dispatch waves", (t
   assert.match(rendered, /Narrow-wave watch:\n- 2026-07-16, session-narrow, 8, all width 1/);
   assert.doesNotMatch(rendered, /session-wide, 16, all width 1/);
 });
+
+test("coercion ledger renders every counter in text and JSON", (t) => {
+  const dir = sandbox(t);
+  const auditDir = path.join(dir, "inline-guard-audit");
+  const day = "2026-07-17";
+  writeGuardAuditEvents(auditDir, day, [
+    { schemaVersion: 1, at: "2026-07-17T10:00:00.000Z", session: "session-a", event: "dispatch", lane: "grok", tool: "Agent" },
+    { schemaVersion: 1, at: "2026-07-17T10:00:00.100Z", session: "session-a", event: "dispatch", lane: "codex", tool: "Agent" },
+    { schemaVersion: 1, at: "2026-07-17T10:00:00.200Z", session: "session-a", event: "dispatch", lane: "grok", tool: "Agent" },
+    { schemaVersion: 1, at: "2026-07-17T10:01:00.000Z", session: "session-a", event: "warn", lane: "main", tool: "Agent", reason: "narrow-wave-advisory", declineStated: true, posture: "judgment" },
+    { schemaVersion: 1, at: "2026-07-17T10:02:00.000Z", session: "session-a", event: "warn", lane: "main", tool: "Agent", reason: "narrow-wave-advisory", posture: "strict" },
+    { schemaVersion: 1, at: "2026-07-17T10:03:00.000Z", session: "session-a", event: "warn", lane: "main", tool: "Bash", reason: "other" },
+    { schemaVersion: 1, at: "2026-07-17T10:04:00.000Z", session: "session-a", event: "deny", lane: "main", tool: "Edit", posture: "strict" },
+    { schemaVersion: 1, at: "2026-07-17T10:05:00.000Z", session: "session-a", event: "verification", lane: "main", tool: "Bash", posture: "judgment" },
+    { schemaVersion: 1, at: "2026-07-17T10:06:00.000Z", session: "session-a", event: "deny", lane: "main", tool: "Write" },
+    { schemaVersion: 1, at: "2026-07-17T11:00:00.000Z", session: "session-b", event: "verification", lane: "main", tool: "Bash", posture: "strict" },
+    { schemaVersion: 1, at: "2026-07-17T11:01:00.000Z", session: "session-b", event: "deny", lane: "main", tool: "NotebookEdit", posture: "judgment" },
+    { schemaVersion: 1, at: "2026-07-17T11:02:00.000Z", session: "session-b", event: "dispatch", lane: "codex", tool: "Agent" }
+  ]);
+  const env = {
+    FUSION_DATA_DIR: path.join(dir, "fusion-data"),
+    FUSION_INLINE_GUARD_AUDIT_DIR: auditDir,
+    FUSION_CODEX_STATE: path.join(dir, "missing-codex"),
+    GROK_COMPANION_DATA: path.join(dir, "missing-grok"),
+    FUSION_WORKER_STATE_DIR: path.join(dir, "missing-workers")
+  };
+
+  const report = buildFusionStats({ env, cwd: dir });
+  assert.deepStrictEqual(report.coercionLedger, {
+    fleetDeclines: 1,
+    narrowWaveAdvisories: 2,
+    fleetShapedWaves: 1,
+    verificationResets: 2,
+    unverifiedAccumulations: 2,
+    postureMix: {
+      judgment: 3,
+      strict: 3,
+      unset: 2
+    }
+  });
+  const expectedSection = `## Coercion ledger
+
+Fleet declines: 1
+Narrow-wave advisories: 2
+Fleet-shaped waves: 1
+Verification resets: 2
+Unverified accumulations: 2
+
+Posture mix:
+- judgment: 3
+- strict: 3
+- unset: 2`;
+  assert.ok(renderFusionStats(report).includes(expectedSection));
+
+  const result = runDirect({ cwd: dir, codexState: path.join(dir, "missing-codex") }, ["--json"], { FUSION_INLINE_GUARD_AUDIT_DIR: auditDir });
+  assert.strictEqual(result.status, 0, result.stderr);
+  assert.deepStrictEqual(JSON.parse(result.stdout).coercionLedger, report.coercionLedger);
+});
+
+test("coercion ledger counts only denied windows without a verification reset", (t) => {
+  const dir = sandbox(t);
+  const auditDir = path.join(dir, "inline-guard-audit");
+  writeGuardAuditEvents(auditDir, "2026-07-18", [
+    { schemaVersion: 1, at: "2026-07-18T10:00:00.000Z", session: "session-window", event: "deny", lane: "main", tool: "Edit" },
+    { schemaVersion: 1, at: "2026-07-18T10:01:00.000Z", session: "session-window", event: "verification", lane: "main", tool: "Bash" },
+    { schemaVersion: 1, at: "2026-07-18T10:02:00.000Z", session: "session-window", event: "deny", lane: "main", tool: "Write" },
+    { schemaVersion: 1, at: "2026-07-18T10:03:00.000Z", session: "session-window", event: "deny", lane: "main", tool: "MultiEdit" },
+    { schemaVersion: 1, at: "2026-07-18T10:04:00.000Z", session: "session-window", event: "dispatch", lane: "codex", tool: "Agent" },
+    { schemaVersion: 1, at: "2026-07-18T10:05:00.000Z", session: "session-window", event: "deny", lane: "main", tool: "NotebookEdit" }
+  ]);
+
+  const report = buildFusionStats({
+    env: {
+      FUSION_DATA_DIR: path.join(dir, "fusion-data"),
+      FUSION_INLINE_GUARD_AUDIT_DIR: auditDir,
+      FUSION_CODEX_STATE: path.join(dir, "missing-codex"),
+      GROK_COMPANION_DATA: path.join(dir, "missing-grok"),
+      FUSION_WORKER_STATE_DIR: path.join(dir, "missing-workers")
+    },
+    cwd: dir
+  });
+
+  assert.strictEqual(report.coercionLedger.verificationResets, 1);
+  assert.strictEqual(report.coercionLedger.unverifiedAccumulations, 2);
+});
+
+test("coercion ledger tolerates legacy audit events without posture or verification", (t) => {
+  const dir = sandbox(t);
+  const auditDir = path.join(dir, "inline-guard-audit");
+  writeGuardAuditEvents(auditDir, "2026-07-19", [
+    { schemaVersion: 1, at: "2026-07-19T10:00:00.000Z", session: "session-legacy", event: "write", lane: "main", tool: "Edit", path: "src/a.mjs" },
+    { schemaVersion: 1, at: "2026-07-19T11:00:00.000Z", session: "session-legacy", event: "dispatch", lane: "codex", tool: "Agent" }
+  ]);
+
+  const report = buildFusionStats({
+    env: {
+      FUSION_DATA_DIR: path.join(dir, "fusion-data"),
+      FUSION_INLINE_GUARD_AUDIT_DIR: auditDir,
+      FUSION_CODEX_STATE: path.join(dir, "missing-codex"),
+      GROK_COMPANION_DATA: path.join(dir, "missing-grok"),
+      FUSION_WORKER_STATE_DIR: path.join(dir, "missing-workers")
+    },
+    cwd: dir
+  });
+
+  assert.deepStrictEqual(report.coercionLedger, {
+    fleetDeclines: 0,
+    narrowWaveAdvisories: 0,
+    fleetShapedWaves: 0,
+    verificationResets: 0,
+    unverifiedAccumulations: 0,
+    postureMix: {
+      judgment: 0,
+      strict: 0,
+      unset: 0
+    }
+  });
+  assert.doesNotMatch(renderFusionStats(report), /## Coercion ledger/);
+});
+
+test("coercion ledger skips malformed lines and unknown event kinds", (t) => {
+  const dir = sandbox(t);
+  const auditDir = path.join(dir, "inline-guard-audit");
+  fs.mkdirSync(auditDir, { recursive: true });
+  fs.writeFileSync(path.join(auditDir, "events-2026-07-20.jsonl"), [
+    "{malformed",
+    JSON.stringify({ schemaVersion: 1, at: "2026-07-20T10:00:00.000Z", session: "session-unknown", event: "future-event", posture: "strict" }),
+    JSON.stringify({ schemaVersion: 1, at: "not-a-date", session: "session-invalid", event: "deny", lane: "main", tool: "Edit" }),
+    JSON.stringify({ schemaVersion: 1, at: "2026-07-20T10:01:00.000Z", session: "session-invalid", event: "warn", reason: "narrow-wave-advisory", declineStated: true, posture: "loose" }),
+    JSON.stringify({ schemaVersion: 1, at: "2026-07-20T10:02:00.000Z", session: "session-valid", event: "warn", reason: "narrow-wave-advisory", declineStated: true, posture: "strict" })
+  ].join("\n"), "utf8");
+
+  const report = buildFusionStats({
+    env: {
+      FUSION_DATA_DIR: path.join(dir, "fusion-data"),
+      FUSION_INLINE_GUARD_AUDIT_DIR: auditDir,
+      FUSION_CODEX_STATE: path.join(dir, "missing-codex"),
+      GROK_COMPANION_DATA: path.join(dir, "missing-grok"),
+      FUSION_WORKER_STATE_DIR: path.join(dir, "missing-workers")
+    },
+    cwd: dir
+  });
+
+  assert.deepStrictEqual(report.coercionLedger, {
+    fleetDeclines: 1,
+    narrowWaveAdvisories: 1,
+    fleetShapedWaves: 0,
+    verificationResets: 0,
+    unverifiedAccumulations: 0,
+    postureMix: {
+      judgment: 0,
+      strict: 1,
+      unset: 0
+    }
+  });
+});
+
+test("coercion ledger ratio advisory appears only when declines dominate a small fleet count", (t) => {
+  const dir = sandbox(t);
+  const dominantAuditDir = path.join(dir, "dominant-audit");
+  const balancedAuditDir = path.join(dir, "balanced-audit");
+  const dispatches = [
+    { schemaVersion: 1, at: "2026-07-21T10:00:00.000Z", session: "session-ratio", event: "dispatch", lane: "grok", tool: "Agent" },
+    { schemaVersion: 1, at: "2026-07-21T10:00:00.100Z", session: "session-ratio", event: "dispatch", lane: "codex", tool: "Agent" },
+    { schemaVersion: 1, at: "2026-07-21T10:00:00.200Z", session: "session-ratio", event: "dispatch", lane: "grok", tool: "Agent" }
+  ];
+  const declines = Array.from({ length: 5 }, (_, index) => ({ schemaVersion: 1, at: `2026-07-21T11:0${index}:00.000Z`, session: "session-ratio", event: "warn", lane: "main", tool: "Agent", reason: "narrow-wave-advisory", declineStated: true }));
+  writeGuardAuditEvents(dominantAuditDir, "2026-07-21", [...dispatches, ...declines]);
+  writeGuardAuditEvents(balancedAuditDir, "2026-07-21", [...dispatches, ...declines.slice(0, 4)]);
+
+  const reportFor = (auditDir) => buildFusionStats({
+    env: {
+      FUSION_DATA_DIR: path.join(dir, path.basename(auditDir), "fusion-data"),
+      FUSION_INLINE_GUARD_AUDIT_DIR: auditDir,
+      FUSION_CODEX_STATE: path.join(dir, "missing-codex"),
+      GROK_COMPANION_DATA: path.join(dir, "missing-grok"),
+      FUSION_WORKER_STATE_DIR: path.join(dir, "missing-workers")
+    },
+    cwd: dir
+  });
+  const dominant = renderFusionStats(reportFor(dominantAuditDir));
+  const balanced = renderFusionStats(reportFor(balancedAuditDir));
+  const largeFleet = renderFusionStats({
+    scope: dir,
+    coercionLedger: {
+      fleetDeclines: 55,
+      narrowWaveAdvisories: 55,
+      fleetShapedWaves: 11,
+      verificationResets: 0,
+      unverifiedAccumulations: 0,
+      postureMix: {
+        judgment: 0,
+        strict: 0,
+        unset: 55
+      }
+    }
+  });
+
+  assert.match(dominant, /Advisory: Fleet declines to fleet-shaped waves are 5:1; the fleet default is being overridden more often than honored\./);
+  assert.doesNotMatch(balanced, /the fleet default is being overridden more often than honored/);
+  assert.doesNotMatch(largeFleet, /the fleet default is being overridden more often than honored/);
+});

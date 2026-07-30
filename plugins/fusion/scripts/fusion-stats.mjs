@@ -6,7 +6,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { readAuditEvents as readGuardAuditEvents, resolveStateDir as resolveGuardStateDir, stateFile as guardStateFile } from "./inline-delegation-guard.mjs";
+import { listAuditSegments as listGuardAuditSegments, readAuditEvents as readGuardAuditEvents, resolveAuditDir as resolveGuardAuditDir, resolveStateDir as resolveGuardStateDir, stateFile as guardStateFile } from "./inline-delegation-guard.mjs";
 import { resolveCodexStateDir, resolveCodexStateRoots } from "./lib/codex-state-roots.mjs";
 import { recordEngineAcceptance } from "./lib/engine-acceptance.mjs";
 import { consumeRawArgsTransport, createRawArgsTransport, resolveRawArgsTransport } from "./lib/raw-args-transport.mjs";
@@ -2241,6 +2241,10 @@ function renderWorkerIdentities(lines, identities) {
 /** Dispatches from one session that land within this gap form one burst (ultra fleet fan-out). */
 const FLEET_BURST_GAP_MS = 5000;
 const FLEET_SHAPED_MIN_WIDTH = 3;
+const COERCION_LEDGER_POSTURES = ["judgment", "strict"];
+const COERCION_LEDGER_POSTURE_EVENTS = new Set(["deny", "warn", "verification", "tail-allowed", "zero-dispatch-softened"]);
+const COERCION_LEDGER_WRITE_TOOLS = new Set(["Edit", "Write", "NotebookEdit", "MultiEdit"]);
+const COERCION_LEDGER_SMALL_FLEET_SHAPED_WAVES = 10;
 
 function emptyFleetUsageStats() {
   return {
@@ -2410,16 +2414,171 @@ function renderFleetUsageStats(lines, fleet) {
   }
 }
 
+function emptyCoercionLedger(fleetShapedWaves = 0) {
+  return {
+    fleetDeclines: 0,
+    narrowWaveAdvisories: 0,
+    fleetShapedWaves,
+    verificationResets: 0,
+    unverifiedAccumulations: 0,
+    postureMix: {
+      judgment: 0,
+      strict: 0,
+      unset: 0
+    }
+  };
+}
+
+function normalizeCoercionAuditEvent(value) {
+  if (!value || typeof value !== "object" || value.schemaVersion !== 1 || typeof value.at !== "string" || typeof value.session !== "string" || typeof value.event !== "string") {
+    return null;
+  }
+  const atMs = Date.parse(value.at);
+  const session = value.session.trim();
+  if (!Number.isFinite(atMs) || !session) {
+    return null;
+  }
+  const postureEvent = COERCION_LEDGER_POSTURE_EVENTS.has(value.event);
+  if (value.event !== "dispatch" && !postureEvent) {
+    return null;
+  }
+  if (value.posture !== undefined && !COERCION_LEDGER_POSTURES.includes(value.posture)) {
+    return null;
+  }
+  if (value.event === "verification" && value.lane !== "main") {
+    return null;
+  }
+  return {
+    atMs,
+    session,
+    event: value.event,
+    postureEvent,
+    posture: value.posture ?? null,
+    narrowWaveAdvisory: value.event === "warn" && value.reason === "narrow-wave-advisory",
+    declineStated: value.declineStated === true,
+    deniedWrite: value.event === "deny" && value.lane === "main" && COERCION_LEDGER_WRITE_TOOLS.has(value.tool)
+  };
+}
+
+function readCoercionAuditEvents(env) {
+  const events = [];
+  let order = 0;
+  try {
+    const segments = listGuardAuditSegments(resolveGuardAuditDir(env)).sort((left, right) => left.date.localeCompare(right.date) || left.index - right.index);
+    for (const segment of segments) {
+      let text;
+      try {
+        text = fs.readFileSync(segment.file, "utf8");
+      } catch {
+        continue;
+      }
+      for (const line of text.split("\n")) {
+        if (!line.trim()) {
+          continue;
+        }
+        try {
+          const event = normalizeCoercionAuditEvent(JSON.parse(line));
+          if (event) {
+            events.push({ ...event, order });
+            order += 1;
+          }
+        } catch {
+          void 0;
+        }
+      }
+    }
+  } catch {
+    return [];
+  }
+  return events.sort((left, right) => left.atMs - right.atMs || left.order - right.order);
+}
+
+function countUnverifiedAccumulations(events) {
+  const deniedBySession = new Map();
+  let count = 0;
+  for (const event of events) {
+    if (event.event === "verification") {
+      deniedBySession.set(event.session, false);
+      continue;
+    }
+    if (event.event === "dispatch") {
+      if (deniedBySession.get(event.session) === true) {
+        count += 1;
+      }
+      deniedBySession.set(event.session, false);
+      continue;
+    }
+    if (event.deniedWrite) {
+      deniedBySession.set(event.session, true);
+    }
+  }
+  for (const denied of deniedBySession.values()) {
+    if (denied) {
+      count += 1;
+    }
+  }
+  return count;
+}
+
+export function buildCoercionLedger({ env = process.env, fleet = null } = {}) {
+  const fleetShapedWaves = Number.isSafeInteger(fleet?.fleetShapedBursts) && fleet.fleetShapedBursts >= 0 ? fleet.fleetShapedBursts : buildFleetUsageStats({ env }).fleetShapedBursts;
+  const ledger = emptyCoercionLedger(fleetShapedWaves);
+  const events = readCoercionAuditEvents(env);
+  for (const event of events) {
+    if (event.narrowWaveAdvisory) {
+      ledger.narrowWaveAdvisories += 1;
+      if (event.declineStated) {
+        ledger.fleetDeclines += 1;
+      }
+    }
+    if (event.event === "verification") {
+      ledger.verificationResets += 1;
+    }
+    if (event.postureEvent) {
+      ledger.postureMix[event.posture ?? "unset"] += 1;
+    }
+  }
+  ledger.unverifiedAccumulations = countUnverifiedAccumulations(events);
+  return ledger;
+}
+
+function hasCoercionLedgerData(ledger) {
+  if (!ledger || typeof ledger !== "object") {
+    return false;
+  }
+  return ["fleetDeclines", "narrowWaveAdvisories", "fleetShapedWaves", "verificationResets", "unverifiedAccumulations"].some((key) => (ledger[key] ?? 0) > 0) || Object.values(ledger.postureMix ?? {}).some((count) => count > 0);
+}
+
+function renderCoercionLedger(lines, ledger) {
+  if (!hasCoercionLedgerData(ledger)) {
+    return;
+  }
+  lines.push("", "## Coercion ledger", "");
+  lines.push(`Fleet declines: ${ledger.fleetDeclines ?? 0}`);
+  lines.push(`Narrow-wave advisories: ${ledger.narrowWaveAdvisories ?? 0}`);
+  lines.push(`Fleet-shaped waves: ${ledger.fleetShapedWaves ?? 0}`);
+  lines.push(`Verification resets: ${ledger.verificationResets ?? 0}`);
+  lines.push(`Unverified accumulations: ${ledger.unverifiedAccumulations ?? 0}`);
+  renderCounts(lines, "Posture mix", ledger.postureMix ?? {});
+  const fleetDeclines = ledger.fleetDeclines ?? 0;
+  const fleetShapedWaves = ledger.fleetShapedWaves ?? 0;
+  if (fleetDeclines >= 5 && fleetShapedWaves <= COERCION_LEDGER_SMALL_FLEET_SHAPED_WAVES && fleetDeclines >= 5 * Math.max(1, fleetShapedWaves)) {
+    lines.push("", `Advisory: Fleet declines to fleet-shaped waves are ${fleetDeclines}:${fleetShapedWaves}; the fleet default is being overridden more often than honored.`);
+  }
+}
+
 export function buildFusionStats({ all = false, env = process.env, cwd = process.cwd() } = {}) {
   const options = { all, env, cwd };
   const engines = {};
   for (const provider of STATS_PROVIDER_REGISTRY) {
     engines[provider.id] = provider.collect(options);
   }
+  const fleet = buildFleetUsageStats({ env });
   return {
     scope: all ? "all" : resolveGitWorkspaceRoot(cwd),
     ...engines,
-    fleet: buildFleetUsageStats({ env })
+    fleet,
+    coercionLedger: buildCoercionLedger({ env, fleet })
   };
 }
 
@@ -2432,6 +2591,7 @@ export function renderFusionStats(report) {
   }
   renderLaneSignalDrift(lines, report.codex?.laneSignalDrift);
   renderFleetUsageStats(lines, report.fleet);
+  renderCoercionLedger(lines, report.coercionLedger);
   lines.push("", "Peer token totals include only jobs with exact reported usage. Unavailable jobs are never estimated.");
   return `${lines.join("\n")}\n`;
 }
