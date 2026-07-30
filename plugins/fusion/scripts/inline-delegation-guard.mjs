@@ -5,6 +5,8 @@ import os from "node:os";
 import path from "node:path";
 import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
+import { JUDGMENT_POSTURE, POSTURE_VALUES, STRICT_POSTURE, resolveFusionDataDir, resolvePosture } from "./lib/posture.mjs";
+import { isVerificationCommand } from "./lib/verification-command.mjs";
 
 const STATE_ENV = "FUSION_INLINE_GUARD_STATE";
 const BUDGET_ENV = "FUSION_INLINE_WRITE_BUDGET";
@@ -17,7 +19,6 @@ const AUDIT_DIR_ENV = "FUSION_INLINE_GUARD_AUDIT_DIR";
 const AUDIT_RETENTION_DAYS_ENV = "FUSION_INLINE_GUARD_AUDIT_RETENTION_DAYS";
 const AUDIT_MAX_BYTES_ENV = "FUSION_INLINE_GUARD_AUDIT_MAX_BYTES";
 const AUDIT_MAX_FILES_ENV = "FUSION_INLINE_GUARD_AUDIT_MAX_FILES";
-const FUSION_DATA_DIR_ENV = "FUSION_DATA_DIR";
 const WORKER_STATE_DIR_ENV = "FUSION_WORKER_STATE_DIR";
 const FLEET_WAVE_GAP_ENV = "FUSION_FLEET_WAVE_GAP_MS";
 const DEFAULT_BUDGET = 5;
@@ -54,7 +55,7 @@ const REAPED_WORKER_TERMINAL_STATUSES = new Set(["done", "incomplete", "failed",
 const NO_OP_BASH_COMMANDS = new Set(["", "true", ":"]);
 const NO_OP_HEARTBEAT_REASON = "Fusion tasks are in flight for this session, so emit a text-only heartbeat instead of this no-op Bash command.";
 const REAPED_WORKER_REDIRECT_AUDIT_DESCRIPTION = "reaped-worker-redirect";
-const NARROW_WAVE_ADVISORY_SUFFIX = "consecutive narrow waves; fleet default applies: consider /fusion:ultra for the remaining packages or state fleet-decline: <reason>.";
+const NARROW_WAVE_ADVISORY_SUFFIX = "consecutive width one dispatch waves. If the remaining packages are independent, dispatch them together; /fusion:ultra is available when the goal is genuinely wide.";
 const NARROW_WAVE_ADVISORY_REASON = "narrow-wave-advisory";
 const TRANSCRIPT_TAIL_MAX_BYTES = 262144;
 const MISSING_LAUNCH_RECOVERY_REASON = "missing-launch-recovered";
@@ -200,14 +201,6 @@ function resolveAuditDir(env = process.env) {
     return path.resolve(String(override).trim());
   }
   return path.join(os.homedir(), ".claude", "plugins", "data", "fusion-claude-code-fusion", "inline-guard-audit");
-}
-
-function resolveFusionDataDir(env = process.env) {
-  const override = env[FUSION_DATA_DIR_ENV];
-  if (override && String(override).trim()) {
-    return path.resolve(String(override).trim());
-  }
-  return path.join(os.homedir(), ".claude", "plugins", "data", "fusion-claude-code-fusion");
 }
 
 function resolveWorkerStateDir(env = process.env) {
@@ -570,12 +563,40 @@ function normalizeAuditEvent(event) {
   }
   const atMs = Date.parse(event.at);
   const session = normalizeSessionId(event.session);
-  if (!Number.isFinite(atMs) || !session) {
+  const posturePresent = Object.hasOwn(event, "posture");
+  if (!Number.isFinite(atMs) || !session || (posturePresent && !POSTURE_VALUES.includes(event.posture))) {
     return null;
   }
+  const posture = posturePresent ? { posture: event.posture } : {};
   if (event.event === "write" && WRITE_TOOLS.has(event.tool) && event.lane === MAIN_LANE) {
     const safePath = sanitizeAuditPath(event.path);
     return { schemaVersion: AUDIT_SCHEMA_VERSION, at: new Date(atMs).toISOString(), session, event: "write", lane: MAIN_LANE, tool: event.tool, ...(safePath ? { path: safePath } : {}) };
+  }
+  if (
+    event.event === "verification" &&
+    event.tool === BASH_TOOL &&
+    event.lane === MAIN_LANE &&
+    Number.isInteger(event.writeCount) &&
+    event.writeCount >= 0 &&
+    Number.isInteger(event.dispatchCount) &&
+    event.dispatchCount >= 0 &&
+    Number.isInteger(event.budget) &&
+    event.budget > 0 &&
+    (event.mode === "enforce" || event.mode === "advisory")
+  ) {
+    return {
+      schemaVersion: AUDIT_SCHEMA_VERSION,
+      at: new Date(atMs).toISOString(),
+      session,
+      event: "verification",
+      lane: MAIN_LANE,
+      tool: BASH_TOOL,
+      writeCount: event.writeCount,
+      dispatchCount: event.dispatchCount,
+      budget: event.budget,
+      mode: event.mode,
+      ...posture
+    };
   }
   if (
     (event.event === TAIL_ALLOW_AUDIT_EVENT || event.event === ZERO_DISPATCH_SOFTENED_AUDIT_EVENT) &&
@@ -603,6 +624,7 @@ function normalizeAuditEvent(event) {
         dispatchCount: event.dispatchCount,
         budget: event.budget,
         mode: "enforce",
+        ...posture,
         remainingTailSlots: event.remainingTailSlots,
         ...(event.suppressed === true ? { suppressed: true } : {})
       };
@@ -626,6 +648,7 @@ function normalizeAuditEvent(event) {
         dispatchCount: event.dispatchCount,
         budget: event.budget,
         mode: "enforce",
+        ...posture,
         remainingZeroDispatchWrites: event.remainingZeroDispatchWrites,
         remainingZeroDispatchBytes: event.remainingZeroDispatchBytes,
         ...(event.suppressed === true ? { suppressed: true } : {})
@@ -650,6 +673,7 @@ function normalizeAuditEvent(event) {
           lane,
           tool: event.tool,
           reason: event.reason,
+          ...posture,
           ...(event.reason === NARROW_WAVE_ADVISORY_REASON && event.declineStated === true ? { declineStated: true } : {}),
           ...(event.reason === NARROW_WAVE_ADVISORY_REASON && pendingIncludedWidth !== null ? { pendingIncludedWidth } : {}),
           ...(event.suppressed === true ? { suppressed: true } : {})
@@ -672,6 +696,7 @@ function normalizeAuditEvent(event) {
       tool: event.tool,
       description: REAPED_WORKER_REDIRECT_AUDIT_DESCRIPTION,
       mode: event.mode,
+      ...posture,
       ...(event.event === "warn" && event.suppressed === true ? { suppressed: true } : {})
     };
   }
@@ -700,6 +725,7 @@ function normalizeAuditEvent(event) {
       dispatchCount: event.dispatchCount,
       budget: event.budget,
       mode: event.mode,
+      ...posture,
       ...(event.event === "warn" && event.suppressed === true ? { suppressed: true } : {})
     };
   }
@@ -934,6 +960,8 @@ function defaultState(now) {
     writeCount: 0,
     writesSinceDispatch: 0,
     inlineWriteBytes: 0,
+    reliefWritesInWindow: 0,
+    reliefBytesInWindow: 0,
     tailWritesSinceDispatch: 0,
     writtenPathSignatures: [],
     dispatchEpoch: 0,
@@ -1119,6 +1147,8 @@ function normalizeState(existing, now, waveGapMs = DEFAULT_FLEET_WAVE_GAP_MS) {
   const dispatchCount = totalDispatches(dispatches);
   const writesSinceDispatch = Number.isFinite(existing.writesSinceDispatch) && existing.writesSinceDispatch >= 0 ? Math.floor(existing.writesSinceDispatch) : 0;
   const inlineWriteBytes = Number.isSafeInteger(existing.inlineWriteBytes) && existing.inlineWriteBytes >= 0 ? existing.inlineWriteBytes : 0;
+  const reliefWritesInWindow = Number.isSafeInteger(existing.reliefWritesInWindow) && existing.reliefWritesInWindow >= 0 ? existing.reliefWritesInWindow : 0;
+  const reliefBytesInWindow = Number.isSafeInteger(existing.reliefBytesInWindow) && existing.reliefBytesInWindow >= 0 ? existing.reliefBytesInWindow : 0;
   const tailWritesSinceDispatch =
     Number.isSafeInteger(existing.tailWritesSinceDispatch) && existing.tailWritesSinceDispatch >= 0 ? existing.tailWritesSinceDispatch : 0;
   const writtenPathSignatures = normalizeWrittenPathSignatures(existing.writtenPathSignatures);
@@ -1137,6 +1167,8 @@ function normalizeState(existing, now, waveGapMs = DEFAULT_FLEET_WAVE_GAP_MS) {
     writeCount,
     writesSinceDispatch,
     inlineWriteBytes,
+    reliefWritesInWindow,
+    reliefBytesInWindow,
     tailWritesSinceDispatch,
     writtenPathSignatures,
     dispatchEpoch: Number.isInteger(existing.dispatchEpoch) && existing.dispatchEpoch >= 0 ? existing.dispatchEpoch : dispatchCount,
@@ -1193,16 +1225,29 @@ function postToolAdvisoryOutput(additionalContext) {
   return { hookSpecificOutput: { hookEventName: "PostToolUse", additionalContext } };
 }
 
+function resetWriteWindow(state) {
+  state.writesSinceDispatch = 0;
+  state.tailWritesSinceDispatch = 0;
+  state.writtenPathSignatures = [];
+  state.advisedMultiples = [];
+  state.reliefWritesInWindow = 0;
+  state.reliefBytesInWindow = 0;
+}
+
+function buildUnverifiedLine(writeCount) {
+  return `${writeCount} main loop ${writeCount === 1 ? "write is" : "writes are"} unverified in this window.`;
+}
+
+function buildLaneHint() {
+  return "Lanes: quick scoped work goes to the codex quick tier gpt-5.6-terra at effort xhigh; trivial or high volume work goes to gpt-5.6-luna at effort xhigh; work needing the Claude Code tool surface goes to fusion:claude-worker.";
+}
+
 function buildAdvisoryLine(writeCount, dispatchCount) {
   const countSummary =
     dispatchCount === 0
       ? `${writeCount} inline writes happened this session with zero dispatches. `
       : `${writeCount} inline writes happened since the most recent dispatch; this session has ${dispatchCount} dispatch${dispatchCount === 1 ? "" : "es"}. `;
-  return (
-    countSummary +
-    "The next package belongs in a lane: quick scoped work goes to the codex quick tier gpt-5.6-terra at effort xhigh; " +
-    "trivial or high-volume work goes to gpt-5.6-luna at effort xhigh; work needing the Claude Code tool surface goes to fusion:fast-worker."
-  );
+  return countSummary + buildLaneHint();
 }
 
 function buildTailAllowanceAdvisory(remainingTailSlots) {
@@ -1210,7 +1255,7 @@ function buildTailAllowanceAdvisory(remainingTailSlots) {
 }
 
 function buildZeroDispatchAdvisory(remainingWrites, remainingBytes) {
-  return `The inline write budget is exhausted, but this zero dispatch session remains within its inline relief bounds; ${remainingWrites} ${remainingWrites === 1 ? "write" : "writes"} and ${remainingBytes} ${remainingBytes === 1 ? "byte" : "bytes"} remain before enforcement resumes.`;
+  return `The inline write budget is exhausted; this window remains within its inline relief bounds, with ${remainingWrites} ${remainingWrites === 1 ? "write" : "writes"} and ${remainingBytes} ${remainingBytes === 1 ? "byte" : "bytes"} left before enforcement resumes.`;
 }
 
 function runAllowCommand() {
@@ -1235,6 +1280,7 @@ function runHook(env = process.env, input = readHookInput()) {
   pruneStaleState(stateDir);
   const file = stateFile(stateDir, sessionId);
   const now = new Date().toISOString();
+  const posture = resolvePosture(env);
 
   if (DELEGATION_TOOLS.has(toolName)) {
     if (input.hook_event_name && input.hook_event_name !== "PreToolUse" && input.hook_event_name !== "PostToolUse") {
@@ -1313,10 +1359,7 @@ function runHook(env = process.env, input = readHookInput()) {
       state.dispatches[launched.lane] = (state.dispatches[launched.lane] ?? 0) + 1;
       state.dispatchEpoch += 1;
       state.lastDispatchAt = latestConfirmedDispatchAt(state.dispatchLog);
-      state.writesSinceDispatch = 0;
-      state.tailWritesSinceDispatch = 0;
-      state.writtenPathSignatures = [];
-      state.advisedMultiples = [];
+      resetWriteWindow(state);
       writeState(file, state);
       return {
         shouldAdvise,
@@ -1331,7 +1374,7 @@ function runHook(env = process.env, input = readHookInput()) {
     });
     if (confirmation.recoveredMissingLaunch) {
       recordAuditEvent(
-        { at: now, session: sessionId, event: "warn", lane: confirmation.lane, tool: toolName, reason: MISSING_LAUNCH_RECOVERY_REASON },
+        { at: now, session: sessionId, event: "warn", lane: confirmation.lane, tool: toolName, reason: MISSING_LAUNCH_RECOVERY_REASON, posture },
         env
       );
     }
@@ -1358,6 +1401,7 @@ function runHook(env = process.env, input = readHookInput()) {
             lane: confirmation.lane,
             tool: toolName,
             reason: NARROW_WAVE_ADVISORY_REASON,
+            posture,
             pendingIncludedWidth: confirmation.pendingIncludedWidth,
             ...(declineStated ? { declineStated: true } : {}),
             ...(advisory.suppressed ? { suppressed: true } : {})
@@ -1402,6 +1446,7 @@ function runHook(env = process.env, input = readHookInput()) {
         tool: toolName,
         description: REAPED_WORKER_REDIRECT_AUDIT_DESCRIPTION,
         mode,
+        posture,
         ...(advisory.suppressed ? { suppressed: true } : {})
       },
       env
@@ -1413,10 +1458,54 @@ function runHook(env = process.env, input = readHookInput()) {
   }
 
   if (toolName === BASH_TOOL) {
+    const command = extractBashCommand(input.tool_input);
+    if (input.hook_event_name === "PostToolUse") {
+      const toolResponse = input.tool_response;
+      if (
+        posture !== JUDGMENT_POSTURE ||
+        command === null ||
+        !isVerificationCommand(command, env) ||
+        !toolResponse ||
+        typeof toolResponse !== "object" ||
+        Array.isArray(toolResponse) ||
+        toolResponse.is_error === true ||
+        toolResponse.interrupted === true
+      ) {
+        return;
+      }
+      const verification = withStateLock(file, () => {
+        const state = normalizeState(readState(file), now, resolveFleetWaveGapMs(env));
+        if (state.writesSinceDispatch === 0) {
+          return null;
+        }
+        const writeCount = state.writesSinceDispatch;
+        const dispatchCount = totalDispatches(state.dispatches);
+        resetWriteWindow(state);
+        writeState(file, state);
+        return { writeCount, dispatchCount };
+      });
+      if (verification) {
+        recordAuditEvent(
+          {
+            at: now,
+            session: sessionId,
+            event: "verification",
+            lane: MAIN_LANE,
+            tool: BASH_TOOL,
+            writeCount: verification.writeCount,
+            dispatchCount: verification.dispatchCount,
+            budget: resolveBudget(env),
+            mode: resolveMode(env),
+            posture
+          },
+          env
+        );
+      }
+      return;
+    }
     if (input.hook_event_name && input.hook_event_name !== "PreToolUse") {
       return;
     }
-    const command = extractBashCommand(input.tool_input);
     const inFlightSignature = sessionId ? inFlightWorkerTaskSignature(sessionId, env) : null;
     if (command === null || !NO_OP_BASH_COMMANDS.has(command) || !inFlightSignature) {
       return;
@@ -1443,7 +1532,8 @@ function runHook(env = process.env, input = readHookInput()) {
       writeCount,
       dispatchCount,
       budget,
-      mode
+      mode,
+      posture
     };
     const advisory =
       mode === "advisory"
@@ -1502,9 +1592,9 @@ function runHook(env = process.env, input = readHookInput()) {
         state.writtenPathSignatures.includes(pathSignature);
       const zeroDispatchAllowed =
         !tailAllowed &&
-        dispatchCount === 0 &&
-        state.writeCount < zeroDispatchWrites &&
-        state.inlineWriteBytes + writeBytes < zeroDispatchMaxBytes;
+        (posture !== STRICT_POSTURE || dispatchCount === 0) &&
+        (posture === STRICT_POSTURE ? state.writeCount : state.reliefWritesInWindow) < zeroDispatchWrites &&
+        (posture === STRICT_POSTURE ? state.inlineWriteBytes : state.reliefBytesInWindow) + writeBytes < zeroDispatchMaxBytes;
       if (!tailAllowed && !zeroDispatchAllowed) {
         return { denied: true, writeCount: state.writesSinceDispatch, dispatchCount };
       }
@@ -1513,6 +1603,8 @@ function runHook(env = process.env, input = readHookInput()) {
     state.writeCount += 1;
     state.writesSinceDispatch += 1;
     state.inlineWriteBytes += writeBytes;
+    state.reliefWritesInWindow += 1;
+    state.reliefBytesInWindow += writeBytes;
     if (!state.writtenPathSignatures.includes(pathSignature)) {
       state.writtenPathSignatures.push(pathSignature);
     }
@@ -1536,8 +1628,8 @@ function runHook(env = process.env, input = readHookInput()) {
       relief,
       dispatchEpoch: state.dispatchEpoch,
       remainingTailSlots: tailAllowance - state.tailWritesSinceDispatch,
-      remainingZeroDispatchWrites: zeroDispatchWrites - state.writeCount,
-      remainingZeroDispatchBytes: zeroDispatchMaxBytes - state.inlineWriteBytes
+      remainingZeroDispatchWrites: zeroDispatchWrites - (posture === STRICT_POSTURE ? state.writeCount : state.reliefWritesInWindow),
+      remainingZeroDispatchBytes: zeroDispatchMaxBytes - (posture === STRICT_POSTURE ? state.inlineWriteBytes : state.reliefBytesInWindow)
     };
   });
 
@@ -1553,12 +1645,16 @@ function runHook(env = process.env, input = readHookInput()) {
         writeCount: decision.writeCount,
         dispatchCount: decision.dispatchCount,
         budget,
-        mode
+        mode,
+        posture
       },
       env
     );
-    const advisory = buildAdvisoryLine(decision.writeCount, decision.dispatchCount);
-    process.stdout.write(`${JSON.stringify(denyOutput(`${advisory} The inline write budget is exhausted. Dispatch an Agent or Task before another main-loop write.`))}\n`);
+    const reason =
+      posture === STRICT_POSTURE
+        ? `${buildAdvisoryLine(decision.writeCount, decision.dispatchCount)} The inline write budget is exhausted. Dispatch an Agent or Task before another main-loop write.`
+        : `${buildUnverifiedLine(decision.writeCount)} Run this change's verification command, or route the remaining work to a lane, then continue. ${buildLaneHint()}`;
+    process.stdout.write(`${JSON.stringify(denyOutput(reason))}\n`);
     return;
   }
 
@@ -1585,7 +1681,8 @@ function runHook(env = process.env, input = readHookInput()) {
       writeCount: decision.writeCount,
       dispatchCount: decision.dispatchCount,
       budget,
-      mode
+      mode,
+      posture
     };
     if (decision.relief === TAIL_ALLOW_AUDIT_EVENT) {
       auditEvent.remainingTailSlots = decision.remainingTailSlots;
@@ -1628,6 +1725,7 @@ function runHook(env = process.env, input = readHookInput()) {
           dispatchCount: decision.dispatchCount,
           budget,
           mode,
+          posture,
           ...(advisory.suppressed ? { suppressed: true } : {})
         },
         env
@@ -1667,6 +1765,9 @@ if (isMain()) {
 
 export {
   buildAdvisoryLine,
+  buildLaneHint,
+  buildUnverifiedLine,
+  buildZeroDispatchAdvisory,
   budgetMultiple,
   extractDispatchDescription,
   extractAuditWritePath,

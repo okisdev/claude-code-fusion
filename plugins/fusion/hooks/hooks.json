@@ -26,7 +26,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "echo 'Context was compacted. Restate the session execution posture (coordinate, implement, or triage) in your next message. If the main loop has made five or more file edits since the last collected delegate result, posture is implement: package and dispatch before further product edits. Reassess routing for the remaining work: does anything now belong to fusion:deep-reasoner, a peer engine, or the panel? If the remaining work decomposes into three or more independent packages, the fleet default applies: convene /fusion:ultra or state fleet-decline: <reason>.'",
+            "command": "echo 'Context was compacted. Restate the session execution posture (coordinate, implement, or triage) in your next message. Confirm that every dispatched package is still tracked to collection and verification, and that any main loop work since the last verification still has a verification command to run. Reassess routing for the remaining work: does anything now belong to fusion:deep-reasoner, a peer engine, or the panel?'",
             "timeout": 5
           }
         ]
@@ -97,7 +97,7 @@
         ]
       },
       {
-        "matcher": "^(Agent|Task)$",
+        "matcher": "^(Agent|Task|Bash)$",
         "hooks": [
           {
             "type": "command",
