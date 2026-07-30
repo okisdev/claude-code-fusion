@@ -1,14 +1,8 @@
 [
   {
-    "name": "codex-jobs",
+    "name": "engine-jobs",
     "command": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/codex-jobs-monitor.mjs\"",
-    "description": "Codex background job completions",
-    "when": "always"
-  },
-  {
-    "name": "grok-jobs-observer",
-    "command": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/grok-jobs-observer.mjs\"",
-    "description": "Grok token usage observations",
+    "description": "Codex job completions and peer engine token observations",
     "when": "always"
   }
 ]
