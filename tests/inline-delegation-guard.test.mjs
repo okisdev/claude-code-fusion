@@ -389,8 +389,40 @@ test("a passing verification resets five writes and allows the sixth write", (t)
   ]);
 });
 
+test("a verification whose exit status is masked by a later segment does not reset the window", (t) => {
+  for (const command of ["npm test 2>&1 | tail -20", "npm test || true", "npm test && git status --short"]) {
+    const sandbox = makeSandbox(t);
+    const extraEnv = { FUSION_INLINE_TAIL_ALLOWANCE: "0", FUSION_INLINE_ZERO_DISPATCH_WRITES: "0" };
+    for (let index = 0; index < 5; index += 1) {
+      run(sandbox, writePayload(sandbox), extraEnv);
+    }
+
+    const verification = run(sandbox, verificationPayload(sandbox, { command }), extraEnv);
+    assert.strictEqual(verification.stdout, "");
+    const sixth = run(sandbox, writePayload(sandbox), extraEnv);
+    assert.strictEqual(JSON.parse(sixth.stdout).hookSpecificOutput.permissionDecision, "deny");
+    assert.strictEqual(readState(sandbox, "session-1").writesSinceDispatch, 5);
+    assert.strictEqual(readAuditRecords(sandbox).filter((record) => record.event === "verification").length, 0);
+  }
+});
+
+test("a verification that ends the command resets the window through every separator", (t) => {
+  for (const command of ["pnpm lint && npm test", "echo starting; npm run test:unit", "npm test > /tmp/out 2>&1"]) {
+    const sandbox = makeSandbox(t);
+    const extraEnv = { FUSION_INLINE_TAIL_ALLOWANCE: "0", FUSION_INLINE_ZERO_DISPATCH_WRITES: "0" };
+    for (let index = 0; index < 5; index += 1) {
+      run(sandbox, writePayload(sandbox), extraEnv);
+    }
+
+    run(sandbox, verificationPayload(sandbox, { command }), extraEnv);
+    const sixth = run(sandbox, writePayload(sandbox), extraEnv);
+    assert.strictEqual(sixth.stdout, "");
+    assert.strictEqual(readState(sandbox, "session-1").writesSinceDispatch, 1);
+  }
+});
+
 test("failed and interrupted verifications do not reset the write window", (t) => {
-  for (const toolResponse of [{ is_error: true }, { interrupted: true }]) {
+  for (const toolResponse of [{ is_error: true }, { is_error: "true" }, { isError: true }, { interrupted: true }]) {
     const sandbox = makeSandbox(t);
     const extraEnv = { FUSION_INLINE_TAIL_ALLOWANCE: "0", FUSION_INLINE_ZERO_DISPATCH_WRITES: "0" };
     for (let index = 0; index < 5; index += 1) {

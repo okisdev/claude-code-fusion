@@ -1468,8 +1468,9 @@ function runHook(env = process.env, input = readHookInput()) {
         !toolResponse ||
         typeof toolResponse !== "object" ||
         Array.isArray(toolResponse) ||
-        toolResponse.is_error === true ||
-        toolResponse.interrupted === true
+        Boolean(toolResponse.is_error) ||
+        Boolean(toolResponse.isError) ||
+        Boolean(toolResponse.interrupted)
       ) {
         return;
       }

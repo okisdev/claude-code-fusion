@@ -229,10 +229,14 @@ function isVerificationCommand(command, env = process.env) {
   if (!trimmed || trimmed.length > COMMAND_MAX_LENGTH) {
     return false;
   }
-  const pattern = customPattern(env);
-  return trimmed
+  // Only the final segment's exit status reaches the caller, so a verification anywhere
+  // earlier can fail while the command as a whole reports success.
+  const segments = trimmed
     .split(SEGMENT_SEPARATOR)
-    .some((segment) => segment.trim().length > 0 && isVerificationSegment(segment.trim(), pattern));
+    .map((segment) => segment.trim())
+    .filter((segment) => segment.length > 0);
+  const last = segments.at(-1);
+  return last !== undefined && isVerificationSegment(last, customPattern(env));
 }
 
 export { PATTERN_ENV, isVerificationCommand };
