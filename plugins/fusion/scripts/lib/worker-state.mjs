@@ -6,6 +6,10 @@ import { fileURLToPath } from "node:url";
 
 const DATA_DIR_ENV = "FUSION_DATA_DIR";
 const WORKER_STATE_ENV = "FUSION_WORKER_STATE_DIR";
+const RETENTION_DAYS_ENV = "FUSION_WORKER_RETENTION_DAYS";
+const DEFAULT_RETENTION_DAYS = 90;
+const DAY_MS = 24 * 60 * 60 * 1000;
+const RECORD_SIDECAR_SUFFIXES = ["final.txt", "brief.txt"];
 const LOCK_STALE_MS = 30_000;
 const LOCK_WAIT_MS = 10;
 export const DEFAULT_LOCK_TIMEOUT_MS = 5_000;
@@ -157,6 +161,78 @@ export function resolveWorkerStateDir(env = process.env) {
   return path.join(resolveFusionDataDir(env), "workers");
 }
 
+export function resolveWorkerRetentionDays(env = process.env) {
+  const parsed = Number.parseInt(String(env[RETENTION_DAYS_ENV]), 10);
+  return Number.isInteger(parsed) && parsed >= 0 ? parsed : DEFAULT_RETENTION_DAYS;
+}
+
+function readDirectorySafely(directory) {
+  try {
+    return fs.readdirSync(directory);
+  } catch {
+    return [];
+  }
+}
+
+function removeSafely(file) {
+  try {
+    fs.rmSync(file, { force: true });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function expiredBefore(file, cutoffMs) {
+  try {
+    return fs.statSync(file).mtimeMs < cutoffMs;
+  } catch {
+    return false;
+  }
+}
+
+export function pruneExpiredWorkerRecords(env = process.env, nowMs = Date.now()) {
+  const retentionDays = resolveWorkerRetentionDays(env);
+  const summary = { records: 0, sessions: 0 };
+  if (retentionDays === 0) {
+    return summary;
+  }
+  const cutoffMs = nowMs - retentionDays * DAY_MS;
+  const root = resolveWorkerStateDir(env);
+  const jobsDir = path.join(root, "jobs");
+  for (const entry of readDirectorySafely(jobsDir)) {
+    if (!entry.endsWith(".json")) {
+      continue;
+    }
+    const file = path.join(jobsDir, entry);
+    if (!expiredBefore(file, cutoffMs)) {
+      continue;
+    }
+    const record = readWorkerRecordFile(file);
+    if (record && !isTerminalWorkerStatus(record.transportStatus)) {
+      continue;
+    }
+    const taskId = entry.slice(0, -".json".length);
+    for (const suffix of RECORD_SIDECAR_SUFFIXES) {
+      removeSafely(path.join(jobsDir, `${taskId}.${suffix}`));
+    }
+    if (removeSafely(file)) {
+      summary.records += 1;
+    }
+  }
+  const sessionsDir = path.join(root, "sessions");
+  for (const entry of readDirectorySafely(sessionsDir)) {
+    if (!entry.endsWith(".json")) {
+      continue;
+    }
+    const file = path.join(sessionsDir, entry);
+    if (expiredBefore(file, cutoffMs) && removeSafely(file)) {
+      summary.sessions += 1;
+    }
+  }
+  return summary;
+}
+
 export function canonicalWorkerAgentType(value) {
   return typeof value === "string" ? AGENT_TYPES.get(value) ?? null : null;
 }
@@ -165,7 +241,7 @@ export function isFusionWorkerAgent(value) {
   return canonicalWorkerAgentType(value) != null;
 }
 
-export function workerLane(value) {
+function workerLane(value) {
   return canonicalWorkerAgentType(value);
 }
 
@@ -180,7 +256,7 @@ export function workerRecordFile(taskId, env = process.env) {
   return path.join(resolveWorkerStateDir(env), "jobs", `${taskId}.json`);
 }
 
-export function workerSessionStateFile(sessionId, env = process.env) {
+function workerSessionStateFile(sessionId, env = process.env) {
   if (typeof sessionId !== "string" || !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(sessionId)) {
     throw new TypeError("Fusion worker session id is invalid.");
   }
@@ -218,7 +294,7 @@ export function writePrivateText(file, text) {
   writePrivateFile(file, text);
 }
 
-export function writePrivateJson(file, value) {
+function writePrivateJson(file, value) {
   writePrivateFile(file, `${JSON.stringify(value, null, 2)}\n`);
 }
 
@@ -234,7 +310,7 @@ function normalizeWorkerRecord(value) {
   return collectionMethod === value.collectionMethod ? value : { ...value, collectionMethod };
 }
 
-export function readWorkerRecordFile(file) {
+function readWorkerRecordFile(file) {
   try {
     const value = JSON.parse(fs.readFileSync(file, "utf8"));
     return value && typeof value === "object" && !Array.isArray(value) ? normalizeWorkerRecord(value) : null;
@@ -307,6 +383,11 @@ export function createWorkerTaskId(sessionId, toolUseId) {
 
 export function createWorkerRecord(record, env = process.env) {
   const file = workerRecordFile(record.taskId, env);
+  try {
+    pruneExpiredWorkerRecords(env);
+  } catch {
+    void 0;
+  }
   return withLock(file, () => {
     if (readWorkerRecordFile(file)) {
       throw new Error(`Fusion worker task ${record.taskId} already exists.`);
@@ -642,7 +723,7 @@ function taskOutputTelemetryLine(line, telemetry) {
   return { turns: telemetry.turns + 1, toolCalls: telemetry.toolCalls + toolCalls, usage: nextUsage };
 }
 
-export function taskOutputTelemetry(transcriptPath) {
+function taskOutputTelemetry(transcriptPath) {
   if (typeof transcriptPath !== "string" || !path.isAbsolute(transcriptPath)) {
     return null;
   }
@@ -869,7 +950,7 @@ export function recordWorkerAcceptance({ taskId, acceptance, env = process.env, 
   return workerAcceptanceResult(result.record, result.queued);
 }
 
-export function recordCodexCollectorAcceptance({ taskId, jobId, sessionId, acceptance, env = process.env, source = "main-loop", reason = null, failureKind = null }) {
+function recordCodexCollectorAcceptance({ taskId, jobId, sessionId, acceptance, env = process.env, source = "main-loop", reason = null, failureKind = null }) {
   if (typeof jobId !== "string" || !/^[a-f0-9]{32}$/.test(jobId)) {
     throw new TypeError("Codex collector job id is invalid.");
   }
