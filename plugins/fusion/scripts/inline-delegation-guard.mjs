@@ -14,6 +14,7 @@ const TAIL_MAX_BYTES_ENV = "FUSION_INLINE_TAIL_MAX_BYTES";
 const TAIL_ALLOWANCE_ENV = "FUSION_INLINE_TAIL_ALLOWANCE";
 const ZERO_DISPATCH_MAX_BYTES_ENV = "FUSION_INLINE_ZERO_DISPATCH_MAX_BYTES";
 const ZERO_DISPATCH_WRITES_ENV = "FUSION_INLINE_ZERO_DISPATCH_WRITES";
+const UNVERIFIED_CEILING_ENV = "FUSION_INLINE_UNVERIFIED_CEILING";
 const AUDIT_DIR_ENV = "FUSION_INLINE_GUARD_AUDIT_DIR";
 const AUDIT_RETENTION_DAYS_ENV = "FUSION_INLINE_GUARD_AUDIT_RETENTION_DAYS";
 const AUDIT_MAX_BYTES_ENV = "FUSION_INLINE_GUARD_AUDIT_MAX_BYTES";
@@ -25,6 +26,8 @@ const DEFAULT_TAIL_MAX_BYTES = 1024;
 const DEFAULT_TAIL_ALLOWANCE = 3;
 const DEFAULT_ZERO_DISPATCH_MAX_BYTES = 16384;
 const DEFAULT_ZERO_DISPATCH_WRITES = 10;
+const DEFAULT_UNVERIFIED_CEILING_MULTIPLE = 8;
+const UNVERIFIED_CEILING_WARNING_MULTIPLES = 2;
 const DEFAULT_AUDIT_RETENTION_DAYS = 180;
 const DEFAULT_AUDIT_MAX_BYTES = 2 * 1024 * 1024;
 const DEFAULT_AUDIT_MAX_FILES = 256;
@@ -60,6 +63,7 @@ const TRANSCRIPT_TAIL_MAX_BYTES = 262144;
 const MISSING_LAUNCH_RECOVERY_REASON = "missing-launch-recovered";
 const TAIL_ALLOW_AUDIT_EVENT = "tail-allowed";
 const ZERO_DISPATCH_SOFTENED_AUDIT_EVENT = "zero-dispatch-softened";
+const UNVERIFIED_CEILING_AUDIT_REASON = "unverified-ceiling";
 
 function resolveStateDir(env = process.env) {
   const override = env[STATE_ENV];
@@ -97,6 +101,10 @@ function resolveZeroDispatchMaxBytes(env = process.env) {
 
 function resolveZeroDispatchWrites(env = process.env) {
   return resolveNonnegativeInteger(env, ZERO_DISPATCH_WRITES_ENV, DEFAULT_ZERO_DISPATCH_WRITES);
+}
+
+function resolveUnverifiedCeiling(env = process.env) {
+  return resolveNonnegativeInteger(env, UNVERIFIED_CEILING_ENV, resolveBudget(env) * DEFAULT_UNVERIFIED_CEILING_MULTIPLE);
 }
 
 function resolveLockTimeoutMs(env = process.env) {
@@ -725,6 +733,9 @@ function normalizeAuditEvent(event) {
       budget: event.budget,
       mode: event.mode,
       ...posture,
+      ...(event.event === "deny" && event.reason === UNVERIFIED_CEILING_AUDIT_REASON && Number.isInteger(event.ceiling) && event.ceiling > 0
+        ? { reason: UNVERIFIED_CEILING_AUDIT_REASON, ceiling: event.ceiling }
+        : {}),
       ...(event.event === "warn" && event.suppressed === true ? { suppressed: true } : {})
     };
   }
@@ -1241,8 +1252,14 @@ function buildAdvisoryLine(writeCount, dispatchCount) {
   return countSummary + buildLaneHint();
 }
 
-function buildUnverifiedAdvisory(writeCount) {
-  return `${buildUnverifiedLine(writeCount)} Run this change's verification command once it is coherent, or hand the remaining work to a lane. ${buildLaneHint()}`;
+function buildUnverifiedAdvisory(writeCount, ceiling = 0, budget = DEFAULT_BUDGET) {
+  const approaching = ceiling > 0 && writeCount >= ceiling - UNVERIFIED_CEILING_WARNING_MULTIPLES * budget;
+  const ceilingNote = approaching ? ` This window stops at ${ceiling} unverified writes.` : "";
+  return `${buildUnverifiedLine(writeCount)} Run this change's verification command once it is coherent, or hand the remaining work to a lane.${ceilingNote} ${buildLaneHint()}`;
+}
+
+function buildUnverifiedCeilingReason(writeCount) {
+  return `${buildUnverifiedLine(writeCount)} This window has reached its unverified ceiling. Run this change's verification command, or dispatch the remaining work; either one reopens the window. ${buildLaneHint()}`;
 }
 
 function buildTailAllowanceAdvisory(remainingTailSlots) {
@@ -1530,10 +1547,14 @@ function runHook(env = process.env, input = readHookInput()) {
   const tailAllowance = resolveTailAllowance(env);
   const zeroDispatchMaxBytes = resolveZeroDispatchMaxBytes(env);
   const zeroDispatchWrites = resolveZeroDispatchWrites(env);
+  const unverifiedCeiling = resolveUnverifiedCeiling(env);
   const decision = withStateLock(file, () => {
     const state = normalizeState(readState(file), now, resolveFleetWaveGapMs(env));
     const dispatchCount = totalDispatches(state.dispatches);
     let relief = null;
+    if (mode !== "enforce" && unverifiedCeiling > 0 && state.writesSinceDispatch >= unverifiedCeiling) {
+      return { denied: true, ceiling: true, writeCount: state.writesSinceDispatch, dispatchCount };
+    }
     if (mode === "enforce" && state.writesSinceDispatch >= budget) {
       const tailAllowed =
         toolName === "Edit" &&
@@ -1596,11 +1617,14 @@ function runHook(env = process.env, input = readHookInput()) {
         dispatchCount: decision.dispatchCount,
         budget,
         mode,
-        posture
+        posture,
+        ...(decision.ceiling ? { reason: UNVERIFIED_CEILING_AUDIT_REASON, ceiling: unverifiedCeiling } : {})
       },
       env
     );
-    const reason = `${buildAdvisoryLine(decision.writeCount, decision.dispatchCount)} The inline write budget is exhausted. Dispatch an Agent or Task before another main-loop write.`;
+    const reason = decision.ceiling
+      ? buildUnverifiedCeilingReason(decision.writeCount)
+      : `${buildAdvisoryLine(decision.writeCount, decision.dispatchCount)} The inline write budget is exhausted. Dispatch an Agent or Task before another main-loop write.`;
     process.stdout.write(`${JSON.stringify(denyOutput(reason))}\n`);
     return;
   }
@@ -1681,7 +1705,7 @@ function runHook(env = process.env, input = readHookInput()) {
         const line =
           posture === STRICT_POSTURE
             ? buildAdvisoryLine(decision.writeCount, decision.dispatchCount)
-            : buildUnverifiedAdvisory(decision.writeCount);
+            : buildUnverifiedAdvisory(decision.writeCount, unverifiedCeiling, budget);
         process.stdout.write(`${JSON.stringify(allowOutput(line))}\n`);
       }
     }
@@ -1714,36 +1738,19 @@ if (isMain()) {
 }
 
 export {
-  buildAdvisoryLine,
-  buildLaneHint,
-  buildUnverifiedAdvisory,
-  buildUnverifiedLine,
-  buildZeroDispatchAdvisory,
-  budgetMultiple,
-  extractDispatchDescription,
-  extractAuditWritePath,
-  extractWritePath,
-  isInsideCwd,
-  isSubagentPayload,
-  laneForSubagentType,
   listAuditSegments,
   normalizeAuditEvent,
   normalizeSessionId,
   readAuditEvents,
   resolveAuditDir,
-  resolveAuditMaxBytes,
-  resolveAuditMaxFiles,
-  resolveAuditRetentionDays,
-  resolveBudget,
   resolveLockTimeoutMs,
   resolveMode,
   resolveStateDir,
   resolveTailAllowance,
   resolveTailMaxBytes,
+  resolveUnverifiedCeiling,
   resolveZeroDispatchMaxBytes,
   resolveZeroDispatchWrites,
-  sanitizeAuditPath,
-  sanitizeAuditText,
   stateFile,
   totalDispatches
 };

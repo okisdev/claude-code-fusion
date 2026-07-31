@@ -60,7 +60,7 @@ function observationTimestamp(observation) {
   return Number.isFinite(parsed) ? parsed : Number.NEGATIVE_INFINITY;
 }
 
-export function modelObservationRank(observation) {
+function modelObservationRank(observation) {
   if (observation?.source === "rollout-turn-context") {
     return 2;
   }
@@ -190,7 +190,7 @@ function loadLatestJsonlByJobId(sidecarPath, timestampField) {
   return byJobId;
 }
 
-export function loadTokenUsageObservations(sidecarPath) {
+function loadTokenUsageObservations(sidecarPath) {
   return loadLatestJsonlByJobId(sidecarPath, "observedAt");
 }
 
@@ -303,7 +303,7 @@ export function appendModelAuditObservation(sidecarPath, observation) {
   }
 }
 
-export function resolveGitWorkspaceRoot(cwd) {
+function resolveGitWorkspaceRoot(cwd) {
   const resolved = path.resolve(cwd);
   const result = spawnSync("git", ["-C", resolved, "rev-parse", "--show-toplevel"], { encoding: "utf8" });
   if (!result.error && result.status === 0 && result.stdout.trim()) {
@@ -329,7 +329,7 @@ export function resolveGitRepositoryCommonDir(cwd) {
   }
 }
 
-export function workspaceRootInScope(recordedRoot, workspaceRoot) {
+function workspaceRootInScope(recordedRoot, workspaceRoot) {
   if (typeof recordedRoot !== "string" || !recordedRoot.trim()) {
     return false;
   }
@@ -365,7 +365,7 @@ export function workspaceRootsShareRepository(leftRoot, rightRoot, cache = new M
   return workspaceRootInScope(leftRoot, rightRoot) || workspaceRootInScope(rightRoot, leftRoot);
 }
 
-export function grokStats({ all = false, env = process.env, cwd = process.cwd() } = {}) {
+function grokStats({ all = false, env = process.env, cwd = process.cwd() } = {}) {
   return fileBasedEngineStats(FILE_ENGINE_DESCRIPTORS.grok, { all, env, cwd });
 }
 
@@ -493,7 +493,7 @@ function terminalLedgerRecord(raw, { workspaceRoot = null, workspaceKey = null, 
   };
 }
 
-export function readCodexTerminalLedgerFiles(stateRoot) {
+function readCodexTerminalLedgerFiles(stateRoot) {
   const records = [];
   let entries;
   try {
@@ -1804,7 +1804,7 @@ export function buildTraceReport({ env = process.env, cwd = process.cwd(), sessi
   };
 }
 
-export function renderTraceReport(report) {
+function renderTraceReport(report) {
   const lines = ["# Fusion session trace", "", `Session: ${report.sessionId ?? "unset"}`];
   if (!report.available) {
     lines.push("", `Session data unavailable: ${report.reason}`);
@@ -2247,6 +2247,7 @@ const COERCION_LEDGER_WRITE_TOOLS = new Set(["Edit", "Write", "NotebookEdit", "M
 const COERCION_LEDGER_SMALL_FLEET_SHAPED_WAVES = 10;
 const COERCION_LEDGER_SPRAWL_MULTIPLE = 2;
 const COERCION_LEDGER_DEFAULT_BUDGET = 5;
+const COERCION_LEDGER_CEILING_REASON = "unverified-ceiling";
 
 function emptyFleetUsageStats() {
   return {
@@ -2425,6 +2426,7 @@ function emptyCoercionLedger(fleetShapedWaves = 0) {
     unverifiedAccumulations: 0,
     inlineSprawlWindows: 0,
     deepestUnverifiedWindow: 0,
+    unverifiedCeilingStops: 0,
     postureMix: {
       judgment: 0,
       strict: 0,
@@ -2463,6 +2465,7 @@ function normalizeCoercionAuditEvent(value) {
     narrowWaveAdvisory: value.event === "warn" && value.reason === "narrow-wave-advisory",
     declineStated: value.declineStated === true,
     deniedWrite: value.event === "deny" && value.lane === "main" && COERCION_LEDGER_WRITE_TOOLS.has(value.tool),
+    ceilingStop: value.event === "deny" && value.lane === "main" && value.reason === COERCION_LEDGER_CEILING_REASON,
     unverifiedWindowWrites,
     unverifiedWindowBudget: unverifiedWindowWrites !== null && Number.isInteger(value.budget) && value.budget > 0 ? value.budget : null
   };
@@ -2548,7 +2551,7 @@ function summarizeInlineWindows(events) {
   return { unverifiedAccumulations, inlineSprawlWindows, deepestUnverifiedWindow };
 }
 
-export function buildCoercionLedger({ env = process.env, fleet = null } = {}) {
+function buildCoercionLedger({ env = process.env, fleet = null } = {}) {
   const fleetShapedWaves = Number.isSafeInteger(fleet?.fleetShapedBursts) && fleet.fleetShapedBursts >= 0 ? fleet.fleetShapedBursts : buildFleetUsageStats({ env }).fleetShapedBursts;
   const ledger = emptyCoercionLedger(fleetShapedWaves);
   const events = readCoercionAuditEvents(env);
@@ -2561,6 +2564,9 @@ export function buildCoercionLedger({ env = process.env, fleet = null } = {}) {
     }
     if (event.event === "verification") {
       ledger.verificationResets += 1;
+    }
+    if (event.ceilingStop) {
+      ledger.unverifiedCeilingStops += 1;
     }
     if (event.postureEvent) {
       ledger.postureMix[event.posture ?? "unset"] += 1;
@@ -2575,7 +2581,7 @@ function hasCoercionLedgerData(ledger) {
     return false;
   }
   return (
-    ["fleetDeclines", "narrowWaveAdvisories", "fleetShapedWaves", "verificationResets", "unverifiedAccumulations", "inlineSprawlWindows", "deepestUnverifiedWindow"].some(
+    ["fleetDeclines", "narrowWaveAdvisories", "fleetShapedWaves", "verificationResets", "unverifiedAccumulations", "inlineSprawlWindows", "deepestUnverifiedWindow", "unverifiedCeilingStops"].some(
       (key) => (ledger[key] ?? 0) > 0
     ) || Object.values(ledger.postureMix ?? {}).some((count) => count > 0)
   );
@@ -2593,6 +2599,7 @@ function renderCoercionLedger(lines, ledger) {
   lines.push(`Unverified accumulations: ${ledger.unverifiedAccumulations ?? 0}`);
   lines.push(`Inline sprawl windows: ${ledger.inlineSprawlWindows ?? 0}`);
   lines.push(`Deepest unverified window: ${ledger.deepestUnverifiedWindow ?? 0}`);
+  lines.push(`Unverified ceiling stops: ${ledger.unverifiedCeilingStops ?? 0}`);
   renderCounts(lines, "Posture mix", ledger.postureMix ?? {});
   const fleetDeclines = ledger.fleetDeclines ?? 0;
   const fleetShapedWaves = ledger.fleetShapedWaves ?? 0;
@@ -2682,7 +2689,7 @@ function unsettledEngineEntries(descriptor, env) {
   });
 }
 
-export function buildUnsettledReport({ env = process.env } = {}) {
+function buildUnsettledReport({ env = process.env } = {}) {
   const unsettled = [
     ...unsettledWorkerEntries(env),
     ...unsettledEngineEntries(FILE_ENGINE_DESCRIPTORS.grok, env),
@@ -2691,7 +2698,7 @@ export function buildUnsettledReport({ env = process.env } = {}) {
   return { unsettled };
 }
 
-export function renderUnsettledReport(report) {
+function renderUnsettledReport(report) {
   const lines = ["# Fusion unsettled jobs"];
   if (report.unsettled.length === 0) {
     lines.push("", "No terminal jobs are awaiting semantic acceptance.");
