@@ -13,7 +13,7 @@ import {
   resolveModelRoutingPath
 } from "./model-table.mjs";
 
-export const NORMALIZED_MODEL_TABLE_MARKER = "[[fusion:model-table:normalized]]";
+const NORMALIZED_MODEL_TABLE_MARKER = "[[fusion:model-table:normalized]]";
 
 export function sha256(content) {
   return createHash("sha256").update(content).digest("hex");
@@ -31,17 +31,17 @@ function trimBoundaryNewlines(value) {
   return String(value).replace(/\r\n/g, "\n").replace(/^\n+/, "").replace(/\n+$/, "");
 }
 
-export function extractModelTableRegion(content) {
+function extractModelTableRegion(content) {
   const match = modelTableRegionRegex().exec(content);
   return match ? trimBoundaryNewlines(match[2]) : null;
 }
 
-export function replaceModelTableRegion(content, replacement) {
+function replaceModelTableRegion(content, replacement) {
   const body = trimBoundaryNewlines(replacement);
   return content.replace(modelTableRegionRegex(), (_match, prefix, _current, suffix) => `${prefix}${body}${suffix}`);
 }
 
-export function normalizeModelTableRegion(content) {
+function normalizeModelTableRegion(content) {
   return replaceModelTableRegion(content, NORMALIZED_MODEL_TABLE_MARKER);
 }
 
@@ -73,7 +73,7 @@ export function readManifestHashes(manifestPath) {
   }
 }
 
-export function resolveLiveRulesPath(env = process.env) {
+function resolveLiveRulesPath(env = process.env) {
   const override = env.FUSION_RULES_FILE;
   if (override && override.trim()) {
     return path.resolve(override.trim());
@@ -85,7 +85,7 @@ function displayLiveRulesPath(liveFile, env) {
   return env.FUSION_RULES_FILE && env.FUSION_RULES_FILE.trim() ? liveFile : "~/.claude/rules/orchestration.md";
 }
 
-export function writeAtomic(target, content) {
+function writeAtomic(target, content) {
   fs.mkdirSync(path.dirname(target), { recursive: true });
   const tmpPath = `${target}.tmp-${process.pid}`;
   fs.writeFileSync(tmpPath, content, "utf8");

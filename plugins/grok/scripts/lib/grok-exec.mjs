@@ -173,7 +173,7 @@ export function resolveTimeoutMs({ background = false, env = process.env } = {})
   return configured ?? DEFAULT_FOREGROUND_TIMEOUT_MS;
 }
 
-export function resolvePidlessRunningGraceMs(env = process.env) {
+function resolvePidlessRunningGraceMs(env = process.env) {
   const raw = Number(env[PIDLESS_RUNNING_GRACE_ENV]);
   return Number.isFinite(raw) && raw >= 0 ? Math.floor(raw) : DEFAULT_PIDLESS_RUNNING_GRACE_MS;
 }
@@ -182,7 +182,7 @@ export function sandboxProfileForMode(mode) {
   return "strict";
 }
 
-export function resolveConsultAllowRules(env = process.env) {
+function resolveConsultAllowRules(env = process.env) {
   const raw = env[CONSULT_ALLOW_ENV];
   if (raw == null || !String(raw).trim()) {
     return [];
@@ -193,7 +193,7 @@ export function resolveConsultAllowRules(env = process.env) {
     .filter((entry) => /^(?:Read|Grep|WebSearch|WebFetch)(?:\([^(),\r\n]*\))?$/.test(entry));
 }
 
-export function buildGrokChildEnv(env = process.env, { memory = false } = {}) {
+function buildGrokChildEnv(env = process.env, { memory = false } = {}) {
   const childEnv = { ...env };
   for (const key of Object.keys(childEnv)) {
     if (
@@ -384,7 +384,7 @@ function tryParseObject(text) {
   }
 }
 
-export function parseGrokOutput(stdout) {
+function parseGrokOutput(stdout) {
   const trimmed = String(stdout ?? "").trim();
   if (!trimmed) {
     return null;
@@ -568,7 +568,7 @@ function isPermissionFailureUpdate(payload) {
   return /permission|denied|cancelled|canceled|not allowed|allow list|allowlist/i.test(joined);
 }
 
-export function extractBlockedPermissionCall(stdout, envelope = null) {
+function extractBlockedPermissionCall(stdout, envelope = null) {
   const objects = iterJsonObjects(stdout);
   if (envelope && typeof envelope === "object" && !objects.includes(envelope)) {
     objects.push(envelope);
@@ -1326,7 +1326,7 @@ function readResolvedSessionMetadata(cwd, sessionId, env) {
   return matching.length === 1 ? readSessionSummary(matching[0]) : null;
 }
 
-export function resolvedOutputMetadata(parsed, cwd, env = process.env) {
+function resolvedOutputMetadata(parsed, cwd, env = process.env) {
   const sessionId = normalizeGrokSessionId(stringField(parsed, "sessionId", "session_id"));
   const summary = readResolvedSessionMetadata(cwd, sessionId, env);
   const modelUsage = objectField(parsed, "modelUsage", "model_usage");
@@ -1495,7 +1495,7 @@ export function recordedProcessState(pid, identity = null) {
   return "absent";
 }
 
-export function recordedProcessTargets(record) {
+function recordedProcessTargets(record) {
   const targets = new Map();
   const grokPid = normalizedPid(record?.grokPid);
   const pid = normalizedPid(record?.pid);

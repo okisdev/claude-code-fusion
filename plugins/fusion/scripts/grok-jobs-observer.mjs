@@ -28,7 +28,7 @@ function tokenField(usage, names) {
   return null;
 }
 
-export function grokTokenUsageObservation(usage) {
+function grokTokenUsageObservation(usage) {
   if (!usage || typeof usage !== "object" || Array.isArray(usage)) {
     return null;
   }

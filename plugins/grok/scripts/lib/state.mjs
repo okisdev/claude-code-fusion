@@ -658,11 +658,11 @@ export function readJobRecordFile(file) {
   }
 }
 
-export function writeJobRecord(dataDir, cwd, record) {
+function writeJobRecord(dataDir, cwd, record) {
   return writeJobRecordFile(jobFilePath(dataDir, cwd, record.id), record);
 }
 
-export function readJobRecord(dataDir, cwd, jobId) {
+function readJobRecord(dataDir, cwd, jobId) {
   return readJobRecordFile(jobFilePath(dataDir, cwd, jobId));
 }
 

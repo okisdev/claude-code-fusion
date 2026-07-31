@@ -44,10 +44,8 @@ function isStrictPosture(env = process.env) {
 }
 
 export {
-  DEFAULT_POSTURE,
   JUDGMENT_POSTURE,
   POSTURE_ENV,
-  POSTURE_FILE,
   POSTURE_VALUES,
   STRICT_POSTURE,
   isStrictPosture,

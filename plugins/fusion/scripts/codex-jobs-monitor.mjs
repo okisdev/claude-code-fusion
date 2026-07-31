@@ -51,7 +51,7 @@ function isRegularFile(candidate) {
  * (c) installed-cache ../../../codex/<version>/scripts/codex-companion.mjs
  *     preferring the fusion plugin version directory name, else lex-latest.
  */
-export function resolveCodexCompanionPath(env = process.env, selfPath = fileURLToPath(import.meta.url)) {
+function resolveCodexCompanionPath(env = process.env, selfPath = fileURLToPath(import.meta.url)) {
   const override = typeof env[CODEX_COMPANION_ENV] === "string" ? env[CODEX_COMPANION_ENV].trim() : "";
   if (override) {
     // Same semantics as job-collect: when set, only an absolute regular file is accepted.
