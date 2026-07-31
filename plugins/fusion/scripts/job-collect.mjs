@@ -101,7 +101,7 @@ function parseBoolean(value, fallback, field) {
   return value;
 }
 
-export function parseCollectionRequest(raw) {
+function parseCollectionRequest(raw) {
   let request;
   try {
     request = JSON.parse(raw);
@@ -258,11 +258,11 @@ export function terminalMetadata(output, json = false) {
   return { state: states[0], semantic };
 }
 
-export function terminalState(output, json = false) {
+function terminalState(output, json = false) {
   return terminalMetadata(output, json)?.state ?? null;
 }
 
-export function reportsDead(output, json = false) {
+function reportsDead(output, json = false) {
   if (json) {
     const record = parsedJson(output);
     return record?.failureKind === "died" || record?.failure === "died";

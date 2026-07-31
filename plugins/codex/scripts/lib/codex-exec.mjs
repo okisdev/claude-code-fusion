@@ -440,7 +440,7 @@ function rolloutLines(file, options = {}) {
   }
 }
 
-export function recoverRolloutObservation(threadId, options = {}) {
+function recoverRolloutObservation(threadId, options = {}) {
   const result = {
     collaborationTool: null,
     cumulativeTokenUsage: null,

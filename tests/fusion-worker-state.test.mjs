@@ -3,7 +3,19 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { WORKER_COLLECTION_METHODS, applyQueuedVerdict, createWorkerRecord, isPendingSettlement, isSettledWorker, markWorkerCollected, recordWorkerAcceptance, updateWorkerRecord } from "../plugins/fusion/scripts/lib/worker-state.mjs";
+import {
+  WORKER_COLLECTION_METHODS,
+  applyQueuedVerdict,
+  canonicalWorkerAgentType,
+  createWorkerRecord,
+  isPendingSettlement,
+  isSettledWorker,
+  markWorkerCollected,
+  pruneExpiredWorkerRecords,
+  recordWorkerAcceptance,
+  resolveWorkerRetentionDays,
+  updateWorkerRecord
+} from "../plugins/fusion/scripts/lib/worker-state.mjs";
 
 function sandbox(t) {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), "fusion-worker-state-"));
@@ -25,6 +37,72 @@ function unverifiedRecord(overrides = {}) {
   };
 }
 
+test("retired agent types still canonicalize so historical ledger records stay readable", () => {
+  assert.strictEqual(canonicalWorkerAgentType("fusion:fast-worker"), "fusion:fast-worker");
+  assert.strictEqual(canonicalWorkerAgentType("fast-worker"), "fusion:fast-worker");
+  assert.strictEqual(canonicalWorkerAgentType("fusion:claude-worker"), "fusion:claude-worker");
+});
+
+test("worker record retention defaults to ninety days and accepts a zero opt out", () => {
+  assert.strictEqual(resolveWorkerRetentionDays({}), 90);
+  assert.strictEqual(resolveWorkerRetentionDays({ FUSION_WORKER_RETENTION_DAYS: "30" }), 30);
+  assert.strictEqual(resolveWorkerRetentionDays({ FUSION_WORKER_RETENTION_DAYS: "0" }), 0);
+  assert.strictEqual(resolveWorkerRetentionDays({ FUSION_WORKER_RETENTION_DAYS: "not-a-number" }), 90);
+});
+
+test("retention removes expired terminal records with their sidecars and keeps live work", (t) => {
+  const directory = sandbox(t);
+  const stateDir = path.join(directory, "worker-state");
+  const env = { FUSION_WORKER_STATE_DIR: stateDir, FUSION_WORKER_RETENTION_DAYS: "30" };
+  const jobsDir = path.join(stateDir, "jobs");
+  const sessionsDir = path.join(stateDir, "sessions");
+  fs.mkdirSync(jobsDir, { recursive: true });
+  fs.mkdirSync(sessionsDir, { recursive: true });
+
+  const now = Date.parse("2026-07-31T00:00:00.000Z");
+  const expiredMs = now - 40 * 24 * 60 * 60 * 1000;
+  const freshMs = now - 5 * 24 * 60 * 60 * 1000;
+  const write = (name, value, mtimeMs) => {
+    const file = path.join(jobsDir, name);
+    fs.writeFileSync(file, typeof value === "string" ? value : JSON.stringify(value));
+    fs.utimesSync(file, mtimeMs / 1000, mtimeMs / 1000);
+    return file;
+  };
+
+  write("fusion-aaaaaaaaaaaaaaaaaaaaaaaa.json", { taskId: "fusion-aaaaaaaaaaaaaaaaaaaaaaaa", transportStatus: "done" }, expiredMs);
+  write("fusion-aaaaaaaaaaaaaaaaaaaaaaaa.final.txt", "collected result", expiredMs);
+  write("fusion-bbbbbbbbbbbbbbbbbbbbbbbb.json", { taskId: "fusion-bbbbbbbbbbbbbbbbbbbbbbbb", transportStatus: "pending_async" }, expiredMs);
+  write("fusion-cccccccccccccccccccccccc.json", { taskId: "fusion-cccccccccccccccccccccccc", transportStatus: "done" }, freshMs);
+  const expiredSession = path.join(sessionsDir, "session-old.json");
+  fs.writeFileSync(expiredSession, "{}");
+  fs.utimesSync(expiredSession, expiredMs / 1000, expiredMs / 1000);
+
+  const summary = pruneExpiredWorkerRecords(env, now);
+
+  assert.deepStrictEqual(summary, { records: 1, sessions: 1 });
+  assert.strictEqual(fs.existsSync(path.join(jobsDir, "fusion-aaaaaaaaaaaaaaaaaaaaaaaa.json")), false);
+  assert.strictEqual(fs.existsSync(path.join(jobsDir, "fusion-aaaaaaaaaaaaaaaaaaaaaaaa.final.txt")), false);
+  assert.strictEqual(fs.existsSync(path.join(jobsDir, "fusion-bbbbbbbbbbbbbbbbbbbbbbbb.json")), true);
+  assert.strictEqual(fs.existsSync(path.join(jobsDir, "fusion-cccccccccccccccccccccccc.json")), true);
+  assert.strictEqual(fs.existsSync(expiredSession), false);
+});
+
+test("retention set to zero removes nothing", (t) => {
+  const directory = sandbox(t);
+  const stateDir = path.join(directory, "worker-state");
+  const jobsDir = path.join(stateDir, "jobs");
+  fs.mkdirSync(jobsDir, { recursive: true });
+  const file = path.join(jobsDir, "fusion-dddddddddddddddddddddddd.json");
+  fs.writeFileSync(file, JSON.stringify({ taskId: "fusion-dddddddddddddddddddddddd", transportStatus: "done" }));
+  const ancient = Date.parse("2020-01-01T00:00:00.000Z") / 1000;
+  fs.utimesSync(file, ancient, ancient);
+
+  const summary = pruneExpiredWorkerRecords({ FUSION_WORKER_STATE_DIR: stateDir, FUSION_WORKER_RETENTION_DAYS: "0" }, Date.now());
+
+  assert.deepStrictEqual(summary, { records: 0, sessions: 0 });
+  assert.strictEqual(fs.existsSync(file), true);
+});
+
 test("settlement seam identifies pending and settled worker records", () => {
   const pending = unverifiedRecord();
   const settled = unverifiedRecord({ acceptance: "accepted", acceptanceRecordedAt: "2026-07-22T00:01:00.000Z", awaitingVerdict: false, awaitingVerdictArmedAt: null });
@@ -39,7 +117,7 @@ test("created worker records stamp the Fusion companion version", (t) => {
   const directory = sandbox(t);
   const env = { FUSION_WORKER_STATE_DIR: path.join(directory, "worker-state") };
   const expectedVersion = JSON.parse(fs.readFileSync(new URL("../plugins/fusion/.claude-plugin/plugin.json", import.meta.url), "utf8")).version;
-  const record = createWorkerRecord({ taskId: "fusion-version-stamp", sessionId: "session-version", dispatchToolUseId: "tool-version", agentType: "fusion:fast-worker", workspaceRoot: directory, limits: {} }, env);
+  const record = createWorkerRecord({ taskId: "fusion-version-stamp", sessionId: "session-version", dispatchToolUseId: "tool-version", agentType: "fusion:claude-worker", workspaceRoot: directory, limits: {} }, env);
 
   assert.strictEqual(typeof record.companionVersion, "string");
   assert.strictEqual(record.companionVersion, expectedVersion);
@@ -109,14 +187,14 @@ test("worker acceptance preserves semantic failure kinds through settlement and 
   const env = { FUSION_WORKER_STATE_DIR: path.join(directory, "worker-state") };
   const settledTaskId = "fusion-semantic-settled";
   const queuedTaskId = "fusion-semantic-queued";
-  const baseline = createWorkerRecord({ taskId: settledTaskId, sessionId: "session-semantic", dispatchToolUseId: "tool-semantic", agentType: "fusion:fast-worker", workspaceRoot: directory, limits: {} }, env);
+  const baseline = createWorkerRecord({ taskId: settledTaskId, sessionId: "session-semantic", dispatchToolUseId: "tool-semantic", agentType: "fusion:claude-worker", workspaceRoot: directory, limits: {} }, env);
   assert.strictEqual(baseline.acceptanceFailureKind, null);
   updateWorkerRecord(settledTaskId, env, (record) => ({ ...record, transportStatus: "done" }));
 
   const settled = recordWorkerAcceptance({ taskId: settledTaskId, acceptance: "rejected", env, failureKind: "intent_override" });
   assert.strictEqual(settled.record.acceptanceFailureKind, "intent_override");
 
-  createWorkerRecord({ taskId: queuedTaskId, sessionId: "session-semantic", dispatchToolUseId: "tool-semantic-queued", agentType: "fusion:fast-worker", workspaceRoot: directory, limits: {} }, env);
+  createWorkerRecord({ taskId: queuedTaskId, sessionId: "session-semantic", dispatchToolUseId: "tool-semantic-queued", agentType: "fusion:claude-worker", workspaceRoot: directory, limits: {} }, env);
   const queued = recordWorkerAcceptance({ taskId: queuedTaskId, acceptance: "rejected", env, failureKind: "scope_rewrite" });
   assert.strictEqual(queued.queued, true);
   assert.strictEqual(queued.record.pendingVerdict.failureKind, "scope_rewrite");
@@ -130,7 +208,7 @@ test("pending settlement clears after recordWorkerAcceptance and applyQueuedVerd
   const directory = sandbox(t);
   const env = { FUSION_WORKER_STATE_DIR: path.join(directory, "worker-state") };
   const taskId = "fusion-contract-anchor";
-  createWorkerRecord({ taskId, sessionId: "session-anchor", dispatchToolUseId: "tool-anchor", agentType: "fusion:fast-worker", workspaceRoot: directory, limits: {} }, env);
+  createWorkerRecord({ taskId, sessionId: "session-anchor", dispatchToolUseId: "tool-anchor", agentType: "fusion:claude-worker", workspaceRoot: directory, limits: {} }, env);
   updateWorkerRecord(taskId, env, (record) => markWorkerCollected({ ...record, transportStatus: "done" }, WORKER_COLLECTION_METHODS.TASK_NOTIFICATION, "2026-07-22T00:00:00.000Z"));
   const pending = updateWorkerRecord(taskId, env, (record) => record);
 

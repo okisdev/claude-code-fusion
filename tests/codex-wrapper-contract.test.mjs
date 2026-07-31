@@ -47,7 +47,7 @@ function dispatch(box, overrides = {}) {
     transcript_path: box.transcript,
     cwd: box.cwd,
     tool_name: "Agent",
-    tool_input: { subagent_type: "fusion:fast-worker", description: "fix a", prompt: brief(), ...overrides }
+    tool_input: { subagent_type: "fusion:claude-worker", description: "fix a", prompt: brief(), ...overrides }
   };
 }
 
@@ -160,7 +160,7 @@ test("a codex:codex-rescue final that is truncated forward-looking narration blo
   assert.strictEqual(stable.retryCount, 1);
 });
 
-test("a fusion:fast-worker final without EXECUTION_END_MARKER is still blocked", (t) => {
+test("a fusion:claude-worker final without EXECUTION_END_MARKER is still blocked", (t) => {
   const box = sandbox(t);
   run(box, dispatch(box));
   run(box, {
@@ -169,7 +169,7 @@ test("a fusion:fast-worker final without EXECUTION_END_MARKER is still blocked",
     cwd: box.cwd,
     transcript_path: box.transcript,
     agent_id: "fast-worker-narration-only",
-    agent_type: "fusion:fast-worker"
+    agent_type: "fusion:claude-worker"
   });
 
   const blocked = run(box, {
@@ -178,7 +178,7 @@ test("a fusion:fast-worker final without EXECUTION_END_MARKER is still blocked",
     cwd: box.cwd,
     transcript_path: box.transcript,
     agent_id: "fast-worker-narration-only",
-    agent_type: "fusion:fast-worker",
+    agent_type: "fusion:claude-worker",
     stop_hook_active: false,
     last_assistant_message: "I still need to confirm the fix and will report the final result shortly."
   });
@@ -197,7 +197,7 @@ test("the SubagentStop matcher matches all seven peer and Claude worker agent na
   assert.ok(group);
   const matcher = new RegExp(group.matcher);
   const agentNames = [
-    "fusion:fast-worker",
+    "fusion:claude-worker",
     "fusion:trivial-worker",
     "fusion:deep-reasoner",
     "fusion:job-collector",

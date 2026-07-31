@@ -750,7 +750,7 @@ test("--session reports the seeded lane counters for the current session", (t) =
   const guardStateDir = path.join(dir, "guard-state");
   writeGuardState(guardStateDir, "session-abc", {
     writeCount: 7,
-    dispatches: { grok: 2, "fusion:fast-worker": 1 },
+    dispatches: { grok: 2, "fusion:claude-worker": 1 },
     advisedMultiples: [1],
     createdAt: "2026-07-10T00:00:00.000Z",
     updatedAt: "2026-07-10T00:00:05.000Z"
@@ -764,7 +764,7 @@ test("--session reports the seeded lane counters for the current session", (t) =
   const data = JSON.parse(result.stdout);
   assert.strictEqual(data.sessionId, "session-abc");
   assert.strictEqual(data.guard.writeCount, 7);
-  assert.deepStrictEqual(data.guard.dispatches, { grok: 2, "fusion:fast-worker": 1 });
+  assert.deepStrictEqual(data.guard.dispatches, { grok: 2, "fusion:claude-worker": 1 });
 });
 
 test("--session scopes per-engine job counts to the current session where available", (t) => {
@@ -1488,7 +1488,7 @@ test("Codex acceptance and token observations stay scoped when unrelated reposit
 });
 
 function createTerminalWorker({ taskId, env, workspaceRoot, peerEngine = null, peerJobId = null }) {
-  createWorkerRecord({ taskId, sessionId: "session-settlement", dispatchToolUseId: `tool-${taskId}`, agentType: "fusion:fast-worker", workspaceRoot, limits: {} }, env);
+  createWorkerRecord({ taskId, sessionId: "session-settlement", dispatchToolUseId: `tool-${taskId}`, agentType: "fusion:claude-worker", workspaceRoot, limits: {} }, env);
   updateWorkerRecord(taskId, env, (record) => ({
     ...record,
     transportStatus: "done",
@@ -1942,7 +1942,7 @@ test("--record queues a nonterminal worker verdict and applies it once terminal"
   const stateDir = path.join(dir, "worker-state");
   const taskId = `fusion-${"7".repeat(24)}`;
   const env = { FUSION_WORKER_STATE_DIR: stateDir };
-  createWorkerRecord({ taskId, sessionId: "session-queued", dispatchToolUseId: "tool-queued", agentType: "fusion:fast-worker", workspaceRoot: dir, limits: {} }, env);
+  createWorkerRecord({ taskId, sessionId: "session-queued", dispatchToolUseId: "tool-queued", agentType: "fusion:claude-worker", workspaceRoot: dir, limits: {} }, env);
 
   const queued = runDirect(
     { cwd: dir, codexState: path.join(dir, "missing") },
@@ -2248,7 +2248,7 @@ test("worker acceptance requires --accept-failed-transport only for accepted fai
     taskId,
     sessionId: "session-reaped",
     dispatchToolUseId: "tool-reaped",
-    agentType: "fusion:fast-worker",
+    agentType: "fusion:claude-worker",
     workspaceRoot: dir,
     limits: {}
   }, env);
@@ -2304,7 +2304,7 @@ test("--record settles accepted failed-transport with --accept-failed-transport"
     taskId,
     sessionId: "session-record-reaped",
     dispatchToolUseId: "tool-record-reaped",
-    agentType: "fusion:fast-worker",
+    agentType: "fusion:claude-worker",
     workspaceRoot: dir,
     limits: {}
   }, env);
@@ -2599,7 +2599,7 @@ test("Claude worker stats expose lifecycle, exact usage, acceptance, and the uni
     taskId: "fusion-1234567890abcdef12345678",
     sessionId: "session-workers",
     dispatchToolUseId: "tool-1",
-    agentType: "fusion:fast-worker",
+    agentType: "fusion:claude-worker",
     workspaceRoot: dir,
     limits: {}
   }, env);
@@ -2634,7 +2634,7 @@ test("Claude worker stats expose lifecycle, exact usage, acceptance, and the uni
     sessionId: "session-workers",
     agentId: "agent-1",
     backgroundTaskId: "agent-1",
-    agentType: "fusion:fast-worker",
+    agentType: "fusion:claude-worker",
     transportStatus: "done",
     acceptance: "unverified"
   });
@@ -2658,7 +2658,7 @@ test("Claude worker stats normalize legacy collection methods for grouping and d
     ["fusion-legacy-agent", "Agent"]
   ];
   for (const [taskId, collectionMethod] of workers) {
-    createWorkerRecord({ taskId, sessionId: "session-workers", dispatchToolUseId: taskId, agentType: "fusion:fast-worker", workspaceRoot: dir, limits: {} }, env);
+    createWorkerRecord({ taskId, sessionId: "session-workers", dispatchToolUseId: taskId, agentType: "fusion:claude-worker", workspaceRoot: dir, limits: {} }, env);
     updateWorkerRecord(taskId, env, (record) => ({ ...record, transportStatus: "done", collectionMethod }));
   }
 
@@ -2712,9 +2712,9 @@ test("--unsettled lists terminal unverified jobs and preserves Codex acceptance 
     acceptance: "rejected",
     finishedAt: "2026-07-21T00:04:00.000Z"
   });
-  createWorkerRecord({ taskId: "fusion-unsettled", sessionId: "session-workers", dispatchToolUseId: "tool-unsettled", agentType: "fusion:fast-worker", description: "worker task", workspaceRoot: dir, limits: {} }, { FUSION_WORKER_STATE_DIR: workerState });
+  createWorkerRecord({ taskId: "fusion-unsettled", sessionId: "session-workers", dispatchToolUseId: "tool-unsettled", agentType: "fusion:claude-worker", description: "worker task", workspaceRoot: dir, limits: {} }, { FUSION_WORKER_STATE_DIR: workerState });
   updateWorkerRecord("fusion-unsettled", { FUSION_WORKER_STATE_DIR: workerState }, (record) => ({ ...record, transportStatus: "done", finishedAt: "2026-07-21T00:01:00.000Z" }));
-  createWorkerRecord({ taskId: "fusion-settled", sessionId: "session-workers", dispatchToolUseId: "tool-settled", agentType: "fusion:fast-worker", workspaceRoot: dir, limits: {} }, { FUSION_WORKER_STATE_DIR: workerState });
+  createWorkerRecord({ taskId: "fusion-settled", sessionId: "session-workers", dispatchToolUseId: "tool-settled", agentType: "fusion:claude-worker", workspaceRoot: dir, limits: {} }, { FUSION_WORKER_STATE_DIR: workerState });
   updateWorkerRecord("fusion-settled", { FUSION_WORKER_STATE_DIR: workerState }, (record) => ({ ...record, transportStatus: "done", acceptance: "rejected", finishedAt: "2026-07-21T00:04:00.000Z" }));
 
   const extraEnv = { FUSION_WORKER_STATE_DIR: workerState, GROK_COMPANION_DATA: grokData };
@@ -2745,7 +2745,7 @@ test("Claude worker stats report completed harness async deliveries separately f
   const stateDir = path.join(dir, "worker-state");
   const env = { FUSION_WORKER_STATE_DIR: stateDir };
   for (const [taskId, dispatchToolUseId] of [["fusion-async-legacy", "tool-legacy"], ["fusion-async-modern", "tool-modern"], ["fusion-async-pending", "tool-pending"]]) {
-    createWorkerRecord({ taskId, sessionId: "session-workers", dispatchToolUseId, agentType: "fusion:fast-worker", workspaceRoot: dir, limits: {} }, env);
+    createWorkerRecord({ taskId, sessionId: "session-workers", dispatchToolUseId, agentType: "fusion:claude-worker", workspaceRoot: dir, limits: {} }, env);
   }
   updateWorkerRecord("fusion-async-legacy", env, (record) => ({ ...record, transportStatus: "done", failureKind: "unexpected_async" }));
   updateWorkerRecord("fusion-async-modern", env, (record) => ({ ...record, transportStatus: "done", deliveryMode: "harness_async" }));
@@ -2765,7 +2765,7 @@ test("Claude worker stats fail closed on malformed complete usage and aggregate 
     taskId: "fusion-worker-malformed",
     sessionId: "session-workers",
     dispatchToolUseId: "tool-malformed",
-    agentType: "fusion:fast-worker",
+    agentType: "fusion:claude-worker",
     workspaceRoot: dir,
     limits: {}
   }, malformedEnv);
@@ -2792,7 +2792,7 @@ test("Claude worker stats fail closed on malformed complete usage and aggregate 
       taskId,
       sessionId: "session-workers",
       dispatchToolUseId: toolId,
-      agentType: "fusion:fast-worker",
+      agentType: "fusion:claude-worker",
       workspaceRoot: dir,
       limits: {}
     }, overflowEnv);
@@ -2985,6 +2985,7 @@ test("coercion ledger renders every counter in text and JSON", (t) => {
     unverifiedAccumulations: 2,
     inlineSprawlWindows: 0,
     deepestUnverifiedWindow: 0,
+    unverifiedCeilingStops: 0,
     postureMix: {
       judgment: 3,
       strict: 3,
@@ -3000,6 +3001,7 @@ Verification resets: 2
 Unverified accumulations: 2
 Inline sprawl windows: 0
 Deepest unverified window: 0
+Unverified ceiling stops: 0
 
 Posture mix:
 - judgment: 3
@@ -3066,6 +3068,7 @@ test("coercion ledger tolerates legacy audit events without posture or verificat
     unverifiedAccumulations: 0,
     inlineSprawlWindows: 0,
     deepestUnverifiedWindow: 0,
+    unverifiedCeilingStops: 0,
     postureMix: {
       judgment: 0,
       strict: 0,
@@ -3106,6 +3109,7 @@ test("coercion ledger skips malformed lines and unknown event kinds", (t) => {
     unverifiedAccumulations: 0,
     inlineSprawlWindows: 0,
     deepestUnverifiedWindow: 0,
+    unverifiedCeilingStops: 0,
     postureMix: {
       judgment: 0,
       strict: 1,
@@ -3143,6 +3147,45 @@ test("coercion ledger counts inline sprawl windows from advisory depth without a
   assert.match(renderFusionStats(report), /Inline sprawl windows: 1\nDeepest unverified window: 15/);
 });
 
+test("coercion ledger counts unverified ceiling stops apart from other denials", (t) => {
+  const dir = sandbox(t);
+  const auditDir = path.join(dir, "inline-guard-audit");
+  writeGuardAuditEvents(auditDir, "2026-07-31", [
+    { schemaVersion: 1, at: "2026-07-31T10:00:00.000Z", session: "session-ceiling", event: "warn", lane: "main", tool: "Edit", writeCount: 35, dispatchCount: 0, budget: 5, mode: "advisory", posture: "judgment" },
+    {
+      schemaVersion: 1,
+      at: "2026-07-31T10:01:00.000Z",
+      session: "session-ceiling",
+      event: "deny",
+      lane: "main",
+      tool: "Edit",
+      writeCount: 40,
+      dispatchCount: 0,
+      budget: 5,
+      mode: "advisory",
+      posture: "judgment",
+      reason: "unverified-ceiling",
+      ceiling: 40
+    },
+    { schemaVersion: 1, at: "2026-07-31T10:02:00.000Z", session: "session-strict", event: "deny", lane: "main", tool: "Edit", writeCount: 5, dispatchCount: 0, budget: 5, mode: "enforce", posture: "strict" }
+  ]);
+
+  const report = buildFusionStats({
+    env: {
+      FUSION_DATA_DIR: path.join(dir, "fusion-data"),
+      FUSION_INLINE_GUARD_AUDIT_DIR: auditDir,
+      FUSION_CODEX_STATE: path.join(dir, "missing-codex"),
+      GROK_COMPANION_DATA: path.join(dir, "missing-grok"),
+      FUSION_WORKER_STATE_DIR: path.join(dir, "missing-workers")
+    },
+    cwd: dir
+  });
+
+  assert.strictEqual(report.coercionLedger.unverifiedCeilingStops, 1);
+  assert.strictEqual(report.coercionLedger.unverifiedAccumulations, 2);
+  assert.match(renderFusionStats(report), /Unverified ceiling stops: 1/);
+});
+
 test("coercion ledger ratio advisory appears only when declines dominate a small fleet count", (t) => {
   const dir = sandbox(t);
   const dominantAuditDir = path.join(dir, "dominant-audit");
@@ -3178,6 +3221,7 @@ test("coercion ledger ratio advisory appears only when declines dominate a small
       unverifiedAccumulations: 0,
       inlineSprawlWindows: 0,
       deepestUnverifiedWindow: 0,
+      unverifiedCeilingStops: 0,
       postureMix: {
         judgment: 0,
         strict: 0,

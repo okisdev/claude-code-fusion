@@ -239,4 +239,5 @@ function isVerificationCommand(command, env = process.env) {
   return last !== undefined && isVerificationSegment(last, customPattern(env));
 }
 
-export { PATTERN_ENV, isVerificationCommand };
+export {
+   isVerificationCommand };

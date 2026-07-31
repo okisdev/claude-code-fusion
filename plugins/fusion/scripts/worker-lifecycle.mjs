@@ -27,24 +27,17 @@ import {
   updateWorkerSessionState,
   WORKER_COLLECTION_METHODS,
   workerRecordFile,
-  writePrivateJson,
   writePrivateText
 } from "./lib/worker-state.mjs";
 
-const BRIEF_MAX_BYTES_ENV = "FUSION_WORKER_BRIEF_MAX_BYTES";
 const WALL_CLOCK_MS_ENV = "FUSION_WORKER_WALL_CLOCK_MS";
 const STALL_MS_ENV = "FUSION_WORKER_STALL_MS";
-const MAX_TURNS_ENV = "FUSION_WORKER_MAX_TURNS";
-const MAX_OUTPUT_TOKENS_ENV = "FUSION_WORKER_MAX_OUTPUT_TOKENS";
-const MAX_UNCACHED_TOKENS_ENV = "FUSION_WORKER_MAX_UNCACHED_TOKENS";
 const PARENT_CONTEXT_ADVISORY_BYTES_ENV = "FUSION_PARENT_CONTEXT_ADVISORY_BYTES";
 const VERIFICATION_MANIFEST_ENV = "FUSION_VERIFICATION_MANIFEST";
-const COLLECTION_RESPONSE_DEBUG_ENV = "FUSION_WORKER_DEBUG_COLLECTION_RESPONSE";
-const COLLECTION_RESPONSE_DEBUG_FILE = "worker-collection-response.json";
-const SETTLE_DEMAND_STALE_MS_ENV = "FUSION_SETTLE_DEMAND_STALE_MS";
 const DEFAULT_BRIEF_MAX_BYTES = 16 * 1024;
 const SIZING_ADVISORY_BYTES = 8 * 1024;
 const DEFAULT_PARENT_CONTEXT_ADVISORY_BYTES = 4 * 1024 * 1024;
+const SETTLE_DEMAND_STALE_MS_ENV = "FUSION_SETTLE_DEMAND_STALE_MS";
 const DEFAULT_SETTLE_DEMAND_STALE_MS = 1_800_000;
 const TASK_NOTIFICATION_SCAN_MAX_BYTES = 4 * 1024 * 1024;
 const TASK_NOTIFICATION_SCAN_CHUNK_BYTES = 64 * 1024;
@@ -59,8 +52,8 @@ const COLLECTOR_END_MARKER = /(?:^|\n)collector:\s*(?:state=|timeout\b|dead\b|st
 const COLLECTOR_TERMINAL_MARKER = /^collector:\s*state=(done|error|cancelled|completed|failed)\s+semantic=(accepted|rejected|unverified)\s+engine=(codex|grok)\s+job=([a-f0-9]{32})\s+elapsed=(\d+)s$/i;
 const COLLECTOR_OUTCOME_MARKER = /^collector:\s*(timeout|dead|status-error)\s+engine=(codex|grok)\s+job=([a-f0-9]{32})\s+elapsed=(\d+)s$/i;
 const READ_ONLY_TOOLS = new Set(["Read", "Grep", "Glob", "LS", "WebSearch", "WebFetch"]);
-const EXECUTION_AGENTS = new Set(["fusion:fast-worker", "fusion:claude-worker", "fusion:trivial-worker"]);
-const BRIEF_AGENTS = new Set(["fusion:fast-worker", "fusion:claude-worker", "fusion:trivial-worker", "fusion:deep-reasoner"]);
+const EXECUTION_AGENTS = new Set(["fusion:claude-worker", "fusion:trivial-worker"]);
+const BRIEF_AGENTS = new Set(["fusion:claude-worker", "fusion:trivial-worker", "fusion:deep-reasoner"]);
 const PEER_WRAPPER_AGENTS = new Set(["codex:codex-rescue", "codex-rescue", "grok:grok-rescue", "grok-rescue"]);
 const MANAGED_PEER_AGENTS = new Set(["grok:grok-review-runner", "grok-review-runner"]);
 const PEER_JOB_FOOTER_AGENTS = new Set(["codex:codex-rescue", "grok:grok-rescue", "grok:grok-review-runner"]);
@@ -104,9 +97,9 @@ export function workerLimits(agentType, env = process.env, sizing) {
   return {
     wallClockMs: positiveInteger(env, WALL_CLOCK_MS_ENV, scaled.wallClockMs),
     stallMs: positiveInteger(env, STALL_MS_ENV, scaled.stallMs),
-    maxTurns: positiveInteger(env, MAX_TURNS_ENV, scaled.maxTurns),
-    maxOutputTokens: positiveInteger(env, MAX_OUTPUT_TOKENS_ENV, scaled.maxOutputTokens),
-    maxUncachedTokens: positiveInteger(env, MAX_UNCACHED_TOKENS_ENV, scaled.maxUncachedTokens)
+    maxTurns: scaled.maxTurns,
+    maxOutputTokens: scaled.maxOutputTokens,
+    maxUncachedTokens: scaled.maxUncachedTokens
   };
 }
 
@@ -245,7 +238,7 @@ export function validateWorkerBrief(prompt, agentType, env = process.env) {
   if (!BRIEF_AGENTS.has(canonical)) {
     return { ok: true };
   }
-  const maximumBytes = positiveInteger(env, BRIEF_MAX_BYTES_ENV, DEFAULT_BRIEF_MAX_BYTES);
+  const maximumBytes = DEFAULT_BRIEF_MAX_BYTES;
   if (Buffer.byteLength(prompt) > maximumBytes) {
     return { ok: false, reason: `Fusion worker brief exceeds ${maximumBytes} bytes; reduce it to the minimal self-contained task context.` };
   }
@@ -313,7 +306,7 @@ function externalUserText(entry) {
   return text || null;
 }
 
-export function latestUserRequestedBackground(transcriptPath) {
+function latestUserRequestedBackground(transcriptPath) {
   if (typeof transcriptPath !== "string" || !transcriptPath) {
     return false;
   }
@@ -943,17 +936,6 @@ function writeFinalTextArtifact(record, message, env) {
   return file;
 }
 
-function collectionResponseDebugEnabled(env) {
-  return /^(?:1|true|yes)$/i.test(String(env[COLLECTION_RESPONSE_DEBUG_ENV] ?? "").trim());
-}
-
-function captureCollectionResponse(input, env) {
-  if (!collectionResponseDebugEnabled(env)) {
-    return;
-  }
-  writePrivateJson(path.join(resolveFusionDataDir(env), COLLECTION_RESPONSE_DEBUG_FILE), input.tool_response ?? null);
-}
-
 function peerJobIdFromCollectedResult(text) {
   let peerJobId = null;
   for (const line of String(text ?? "").split(/\r?\n/)) {
@@ -1138,7 +1120,6 @@ function handlePostToolUse(input, env, failed = false) {
       const now = new Date().toISOString();
       const collectedResultText = !failed && ["Read", "TaskOutput"].includes(input.tool_name) ? taskOutputResultText(input) : null;
       if (["Read", "TaskOutput"].includes(input.tool_name) && matches.length > 0) {
-        captureCollectionResponse(input, env);
       }
       for (const record of matches) {
         updateLifecycleWorkerRecord(record.taskId, env, (current) => {

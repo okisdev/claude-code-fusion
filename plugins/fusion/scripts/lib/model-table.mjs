@@ -8,9 +8,9 @@ export const MODEL_ROUTING_SCHEMA_VERSION = 1;
 export const MODEL_ROUTING_LANES = new Set(["codex", "grok", "claude-trivial", "claude-fast", "claude-deep", "other"]);
 export const DEFAULT_MODEL_TABLE_PLACEHOLDER =
   "Engine capability table: run /fusion:config to score your configured engines (intelligence, taste, cost, 1 to 5) and regenerate this block. Until scored, route by the qualitative lane descriptions in this document.";
-export const MODEL_TABLE_PRIORITY_SENTENCE =
+const MODEL_TABLE_PRIORITY_SENTENCE =
   "Scores feed the routing priorities above: intelligence proxies correctness and safety, taste is user facing quality, cost applies only as the final tie breaker.";
-export const MODEL_TABLE_SCORE_SENTENCE = "Scores are user-assigned via /fusion:config; re-score when the model lineup changes.";
+const MODEL_TABLE_SCORE_SENTENCE = "Scores are user-assigned via /fusion:config; re-score when the model lineup changes.";
 
 export function resolveModelRoutingPath(env = process.env) {
   const override = env.FUSION_MODEL_ROUTING;
@@ -20,7 +20,7 @@ export function resolveModelRoutingPath(env = process.env) {
   return path.join(os.homedir(), ".claude", "plugins", "data", "fusion-claude-code-fusion", "model-routing.json");
 }
 
-export function isValidScore(value) {
+function isValidScore(value) {
   return Number.isInteger(value) && value >= 1 && value <= 5;
 }
 
@@ -115,7 +115,7 @@ export function readModelRoutingFile(filePath) {
   }
 }
 
-export function readModelRoutingContents(contents) {
+function readModelRoutingContents(contents) {
   let parsed;
   try {
     parsed = JSON.parse(contents);

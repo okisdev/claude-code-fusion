@@ -64,7 +64,7 @@ function dispatch(box, overrides = {}) {
     transcript_path: box.transcript,
     cwd: box.cwd,
     tool_name: "Agent",
-    tool_input: { subagent_type: "fusion:fast-worker", description: "fix a", prompt: brief(), ...overrides }
+    tool_input: { subagent_type: "fusion:claude-worker", description: "fix a", prompt: brief(), ...overrides }
   };
 }
 
@@ -78,14 +78,14 @@ function createSettleOnlyRecord(box, taskId) {
   const worker = createWorkerRecord({
     taskId,
     sessionId: "session-1",
-    agentType: "fusion:fast-worker",
+    agentType: "fusion:claude-worker",
     workspaceRoot: box.cwd
   }, envFor(box));
   const collectedAt = new Date().toISOString();
   return updateWorkerRecord(worker.taskId, envFor(box), (current) => ({ ...current, transportStatus: "done", collectedAt, collectionMethod: WORKER_COLLECTION_METHODS.SUBAGENT_STOP, awaitingVerdict: true, awaitingVerdictArmedAt: collectedAt }));
 }
 
-function createAcceptedCollectedRecord(box, taskId, agentId, agentType = "fusion:fast-worker") {
+function createAcceptedCollectedRecord(box, taskId, agentId, agentType = "fusion:claude-worker") {
   const worker = createWorkerRecord({
     taskId,
     sessionId: "session-1",
@@ -114,7 +114,7 @@ test("legacy collection methods normalize when worker records load", (t) => {
   const worker = createWorkerRecord({
     taskId: `fusion-${"a".repeat(24)}`,
     sessionId: "session-1",
-    agentType: "fusion:fast-worker",
+    agentType: "fusion:claude-worker",
     workspaceRoot: box.cwd
   }, envFor(box));
   const file = path.join(box.state, "jobs", `${worker.taskId}.json`);
@@ -144,28 +144,22 @@ test("collection method write sites use the canonical set", () => {
   assert.ok(calls.every((line) => line.includes("WORKER_COLLECTION_METHODS.") || line.includes(", collectionMethod, now")));
 });
 
-test("worker limits preserve the default budgets without a sizing hint and retain environment overrides", () => {
-  assert.deepStrictEqual(workerLimits("fusion:fast-worker", {}), {
+test("worker limits preserve the default budgets and expose only the timing seams to the environment", () => {
+  assert.deepStrictEqual(workerLimits("fusion:claude-worker", {}), {
     wallClockMs: 1_200_000,
     stallMs: 300_000,
     maxTurns: 60,
     maxOutputTokens: 48_000,
     maxUncachedTokens: 360_000
   });
-  assert.deepStrictEqual(workerLimits("fusion:fast-worker", {
-    FUSION_WORKER_WALL_CLOCK_MS: "120",
-    FUSION_WORKER_STALL_MS: "60",
-    FUSION_WORKER_MAX_TURNS: "12",
-    FUSION_WORKER_MAX_OUTPUT_TOKENS: "8000",
-    FUSION_WORKER_MAX_UNCACHED_TOKENS: "6000"
-  }), {
+  assert.deepStrictEqual(workerLimits("fusion:claude-worker", { FUSION_WORKER_WALL_CLOCK_MS: "120", FUSION_WORKER_STALL_MS: "60" }), {
     wallClockMs: 120,
     stallMs: 60,
-    maxTurns: 12,
-    maxOutputTokens: 8_000,
-    maxUncachedTokens: 6_000
+    maxTurns: 60,
+    maxOutputTokens: 48_000,
+    maxUncachedTokens: 360_000
   });
-  assert.deepStrictEqual(workerLimits("fusion:claude-worker", {}), workerLimits("fusion:fast-worker", {}));
+  assert.deepStrictEqual(workerLimits("fusion:claude-worker", {}), workerLimits("fusion:claude-worker", {}));
 });
 
 test("the stall budget uses successful-call liveness without changing execution progress telemetry", (t) => {
@@ -178,7 +172,7 @@ test("the stall budget uses successful-call liveness without changing execution 
     cwd: box.cwd,
     transcript_path: box.transcript,
     agent_id: "liveness-1",
-    agent_type: "fusion:fast-worker"
+    agent_type: "fusion:claude-worker"
   }, limits);
 
   const withoutCalls = record(box);
@@ -190,7 +184,7 @@ test("the stall budget uses successful-call liveness without changing execution 
     cwd: box.cwd,
     transcript_path: box.transcript,
     agent_id: "liveness-1",
-    agent_type: "fusion:fast-worker",
+    agent_type: "fusion:claude-worker",
     tool_name: "Read",
     tool_input: { file_path: "src/a.ts" }
   }, limits);
@@ -205,7 +199,7 @@ test("the stall budget uses successful-call liveness without changing execution 
     cwd: box.cwd,
     transcript_path: box.transcript,
     agent_id: "liveness-1",
-    agent_type: "fusion:fast-worker",
+    agent_type: "fusion:claude-worker",
     tool_name: "Write",
     tool_input: { file_path: "src/a.ts" }
   }, limits);
@@ -220,7 +214,7 @@ test("the stall budget uses successful-call liveness without changing execution 
     cwd: box.cwd,
     transcript_path: box.transcript,
     agent_id: "liveness-1",
-    agent_type: "fusion:fast-worker",
+    agent_type: "fusion:claude-worker",
     tool_name: "Write",
     tool_input: { file_path: "src/a.ts" }
   }, limits);
@@ -237,7 +231,7 @@ test("a worker with no tool call history stalls exactly as it did before in-flig
     cwd: box.cwd,
     transcript_path: box.transcript,
     agent_id: "never-called",
-    agent_type: "fusion:fast-worker"
+    agent_type: "fusion:claude-worker"
   }, limits);
   const neverCalled = record(box);
   assert.strictEqual(neverCalled.inFlightSince, undefined);
@@ -255,7 +249,7 @@ test("an in-flight tool call suspends the stall budget but not the wall clock, a
     cwd: box.cwd,
     transcript_path: box.transcript,
     agent_id: "inflight-1",
-    agent_type: "fusion:fast-worker"
+    agent_type: "fusion:claude-worker"
   }, limits);
 
   run(box, {
@@ -264,7 +258,7 @@ test("an in-flight tool call suspends the stall budget but not the wall clock, a
     cwd: box.cwd,
     transcript_path: box.transcript,
     agent_id: "inflight-1",
-    agent_type: "fusion:fast-worker",
+    agent_type: "fusion:claude-worker",
     tool_name: "Bash",
     tool_input: { command: "sleep 600" }
   }, limits);
@@ -279,7 +273,7 @@ test("an in-flight tool call suspends the stall budget but not the wall clock, a
     cwd: box.cwd,
     transcript_path: box.transcript,
     agent_id: "inflight-1",
-    agent_type: "fusion:fast-worker",
+    agent_type: "fusion:claude-worker",
     tool_name: "Bash",
     tool_input: { command: "sleep 600" },
     tool_response: { content: "done" }
@@ -296,7 +290,7 @@ test("an in-flight tool call suspends the stall budget but not the wall clock, a
     cwd: box.cwd,
     transcript_path: box.transcript,
     agent_id: "inflight-1",
-    agent_type: "fusion:fast-worker",
+    agent_type: "fusion:claude-worker",
     tool_name: "Bash",
     tool_input: { command: "false" }
   }, limits);
@@ -308,7 +302,7 @@ test("an in-flight tool call suspends the stall budget but not the wall clock, a
     cwd: box.cwd,
     transcript_path: box.transcript,
     agent_id: "inflight-1",
-    agent_type: "fusion:fast-worker",
+    agent_type: "fusion:claude-worker",
     tool_name: "Bash",
     tool_input: { command: "false" },
     tool_response: { is_error: true }
@@ -335,36 +329,29 @@ test("brief sizing hints scale dispatch limits", (t) => {
 });
 
 test("brief sizing validation rejects invalid and repeated values", () => {
-  const invalid = validateWorkerBrief(`${brief()}sizing: extra-large\n`, "fusion:fast-worker");
+  const invalid = validateWorkerBrief(`${brief()}sizing: extra-large\n`, "fusion:claude-worker");
   assert.strictEqual(invalid.ok, false);
   assert.match(invalid.reason, /small.*standard.*large/);
 
-  const repeated = validateWorkerBrief(`${brief()}sizing: small\nsizing: large\n`, "fusion:fast-worker");
+  const repeated = validateWorkerBrief(`${brief()}sizing: small\nsizing: large\n`, "fusion:claude-worker");
   assert.strictEqual(repeated.ok, false);
   assert.match(repeated.reason, /may appear once/);
 });
 
-test("environment overrides take precedence over brief sizing hints", (t) => {
+test("the timing seams override a brief sizing hint while the token budgets follow the hint", (t) => {
   const box = sandbox(t);
-  const overrides = {
-    FUSION_WORKER_WALL_CLOCK_MS: "120",
-    FUSION_WORKER_STALL_MS: "60",
-    FUSION_WORKER_MAX_TURNS: "12",
-    FUSION_WORKER_MAX_OUTPUT_TOKENS: "8000",
-    FUSION_WORKER_MAX_UNCACHED_TOKENS: "6000"
-  };
-  const launch = run(box, dispatch(box, { prompt: `${brief()}sizing: large\n` }), overrides);
+  const launch = run(box, dispatch(box, { prompt: `${brief()}sizing: large\n` }), { FUSION_WORKER_WALL_CLOCK_MS: "120", FUSION_WORKER_STALL_MS: "60" });
   assert.strictEqual(JSON.parse(launch.stdout).hookSpecificOutput.permissionDecision, "allow");
   assert.deepStrictEqual(record(box).limits, {
     wallClockMs: 120,
     stallMs: 60,
-    maxTurns: 12,
-    maxOutputTokens: 8_000,
-    maxUncachedTokens: 6_000
+    maxTurns: 120,
+    maxOutputTokens: 96_000,
+    maxUncachedTokens: 720_000
   });
 });
 
-test("trivial worker limits raise token budgets and retain environment overrides", () => {
+test("trivial worker limits raise token budgets and scale with the sizing hint", () => {
   assert.deepStrictEqual(workerLimits("fusion:trivial-worker", {}), {
     wallClockMs: 240_000,
     stallMs: 120_000,
@@ -372,35 +359,32 @@ test("trivial worker limits raise token budgets and retain environment overrides
     maxOutputTokens: 24_000,
     maxUncachedTokens: 120_000
   });
-  assert.deepStrictEqual(workerLimits("fusion:trivial-worker", {
-    FUSION_WORKER_MAX_OUTPUT_TOKENS: "17000",
-    FUSION_WORKER_MAX_UNCACHED_TOKENS: "90000"
-  }), {
-    wallClockMs: 240_000,
-    stallMs: 120_000,
-    maxTurns: 16,
-    maxOutputTokens: 17_000,
-    maxUncachedTokens: 90_000
+  assert.deepStrictEqual(workerLimits("fusion:trivial-worker", {}, "small"), {
+    wallClockMs: 120_000,
+    stallMs: 60_000,
+    maxTurns: 8,
+    maxOutputTokens: 12_000,
+    maxUncachedTokens: 60_000
   });
 });
 
 test("package-type envelopes validate, default, and persist their byte length", (t) => {
   for (const packageType of ["implementation", "consult", "review", "research", "design"]) {
     const prompt = `${brief()}package-type: ${packageType}\n`;
-    const validation = validateWorkerBrief(prompt, "fusion:fast-worker");
+    const validation = validateWorkerBrief(prompt, "fusion:claude-worker");
     assert.strictEqual(validation.ok, true);
     assert.strictEqual(validation.packageType, packageType);
     assert.strictEqual(validation.briefBytes, Buffer.byteLength(prompt));
   }
 
-  assert.strictEqual(validateWorkerBrief(brief(), "fusion:fast-worker").packageType, "implementation");
-  assert.strictEqual(validateWorkerBrief("fusion-brief: v1\ncontext-mode: isolated\ngoal: inspect one file\nscope: src/a.ts\nacceptance: identify the behavior\n", "fusion:fast-worker").packageType, "consult");
+  assert.strictEqual(validateWorkerBrief(brief(), "fusion:claude-worker").packageType, "implementation");
+  assert.strictEqual(validateWorkerBrief("fusion-brief: v1\ncontext-mode: isolated\ngoal: inspect one file\nscope: src/a.ts\nacceptance: identify the behavior\n", "fusion:claude-worker").packageType, "consult");
 
-  const duplicate = validateWorkerBrief(`${brief()}package-type: review\npackage-type: research\n`, "fusion:fast-worker");
+  const duplicate = validateWorkerBrief(`${brief()}package-type: review\npackage-type: research\n`, "fusion:claude-worker");
   assert.strictEqual(duplicate.ok, false);
   assert.match(duplicate.reason, /may appear once/);
 
-  const invalid = validateWorkerBrief(`${brief()}package-type: deployment\n`, "fusion:fast-worker");
+  const invalid = validateWorkerBrief(`${brief()}package-type: deployment\n`, "fusion:claude-worker");
   assert.strictEqual(invalid.ok, false);
   assert.match(invalid.reason, /implementation.*consult.*review.*research/);
 
@@ -544,7 +528,7 @@ test("SubagentStart requires verdict envelopes for execution and coverage worker
     cwd: execution.cwd,
     transcript_path: execution.transcript,
     agent_id: "execution-envelope",
-    agent_type: "fusion:fast-worker"
+    agent_type: "fusion:claude-worker"
   });
   const executionInstruction = JSON.parse(executionStart.stdout).hookSpecificOutput.additionalContext;
   assert.match(executionInstruction, /End a successful execution report with separate lines `delivery: complete` and `verification: passed`/);
@@ -597,7 +581,7 @@ test("claude-worker shares the fast worker lifecycle tier and hook matchers", (t
   const launch = run(box, dispatch(box, { subagent_type: "fusion:claude-worker" }));
   assert.strictEqual(JSON.parse(launch.stdout).hookSpecificOutput.permissionDecision, "allow");
   assert.strictEqual(record(box).agentType, "fusion:claude-worker");
-  assert.deepStrictEqual(record(box).limits, workerLimits("fusion:fast-worker", envFor(box)));
+  assert.deepStrictEqual(record(box).limits, workerLimits("fusion:claude-worker", envFor(box)));
 
   const started = run(box, {
     hook_event_name: "SubagentStart",
@@ -612,7 +596,7 @@ test("claude-worker shares the fast worker lifecycle tier and hook matchers", (t
   const hooks = JSON.parse(fs.readFileSync(path.join(repoRoot, "plugins", "fusion", "hooks", "hooks.json"), "utf8")).hooks;
   for (const event of ["SubagentStart", "SubagentStop"]) {
     assert.ok(hooks[event].some((group) => new RegExp(group.matcher).test("fusion:claude-worker")), event);
-    assert.ok(hooks[event].some((group) => new RegExp(group.matcher).test("fusion:fast-worker")), event);
+    assert.ok(hooks[event].some((group) => new RegExp(group.matcher).test("fusion:claude-worker")), event);
   }
 });
 
@@ -640,7 +624,7 @@ test("parallel same-type workers correlate by their injected task ids even when 
       transcript_path: box.transcript,
       agent_transcript_path: agentTranscript,
       agent_id: agentId,
-      agent_type: "fusion:fast-worker"
+      agent_type: "fusion:claude-worker"
     });
   }
 
@@ -915,7 +899,7 @@ test("SubagentStop collects a persisted async result and reclassifies the unexpe
     cwd: box.cwd,
     transcript_path: box.transcript,
     agent_id: "agent-stop-async",
-    agent_type: "fusion:fast-worker"
+    agent_type: "fusion:claude-worker"
   });
   run(box, {
     hook_event_name: "SubagentStop",
@@ -923,7 +907,7 @@ test("SubagentStop collects a persisted async result and reclassifies the unexpe
     cwd: box.cwd,
     transcript_path: box.transcript,
     agent_id: "agent-stop-async",
-    agent_type: "fusion:fast-worker",
+    agent_type: "fusion:claude-worker",
     stop_hook_active: false,
     last_assistant_message: "summary\ndelivery: complete\nverification: passed"
   });
@@ -960,7 +944,7 @@ test("SubagentStop clears stale budget failures after successful completion", (t
       cwd: box.cwd,
       transcript_path: box.transcript,
       agent_id: `recovered-${failureKind}`,
-      agent_type: "fusion:fast-worker"
+      agent_type: "fusion:claude-worker"
     });
     updateWorkerRecord(record(box).taskId, envFor(box), (current) => ({ ...current, failureKind }));
     run(box, {
@@ -969,7 +953,7 @@ test("SubagentStop clears stale budget failures after successful completion", (t
       cwd: box.cwd,
       transcript_path: box.transcript,
       agent_id: `recovered-${failureKind}`,
-      agent_type: "fusion:fast-worker",
+      agent_type: "fusion:claude-worker",
       stop_hook_active: false,
       last_assistant_message: "summary\ndelivery: complete\nverification: passed"
     });
@@ -990,7 +974,7 @@ test("SubagentStop keeps a newly evaluated budget failure instead of recovering 
     cwd: box.cwd,
     transcript_path: box.transcript,
     agent_id: "fresh-budget-failure",
-    agent_type: "fusion:fast-worker"
+    agent_type: "fusion:claude-worker"
   }, limits);
   updateWorkerRecord(record(box).taskId, envFor(box), (current) => ({
     ...current,
@@ -1003,7 +987,7 @@ test("SubagentStop keeps a newly evaluated budget failure instead of recovering 
     cwd: box.cwd,
     transcript_path: box.transcript,
     agent_id: "fresh-budget-failure",
-    agent_type: "fusion:fast-worker",
+    agent_type: "fusion:claude-worker",
     stop_hook_active: false,
     last_assistant_message: "summary\ndelivery: complete\nverification: passed"
   }, limits);
@@ -1025,7 +1009,7 @@ test("SubagentStop retains failed and incomplete workers on their existing colle
     cwd: failed.cwd,
     transcript_path: failed.transcript,
     agent_id: "failed-terminal",
-    agent_type: "fusion:fast-worker"
+    agent_type: "fusion:claude-worker"
   }, limits);
   updateWorkerRecord(record(failed).taskId, envFor(failed), (current) => ({ ...current, startedAt: new Date(Date.now() - 1_000).toISOString() }));
   run(failed, {
@@ -1034,7 +1018,7 @@ test("SubagentStop retains failed and incomplete workers on their existing colle
     cwd: failed.cwd,
     transcript_path: failed.transcript,
     agent_id: "failed-terminal",
-    agent_type: "fusion:fast-worker",
+    agent_type: "fusion:claude-worker",
     stop_hook_active: true,
     last_assistant_message: "partial result"
   }, limits);
@@ -1051,7 +1035,7 @@ test("SubagentStop retains failed and incomplete workers on their existing colle
     cwd: incomplete.cwd,
     transcript_path: incomplete.transcript,
     agent_id: "incomplete-terminal",
-    agent_type: "fusion:fast-worker"
+    agent_type: "fusion:claude-worker"
   });
   run(incomplete, {
     hook_event_name: "SubagentStop",
@@ -1059,7 +1043,7 @@ test("SubagentStop retains failed and incomplete workers on their existing colle
     cwd: incomplete.cwd,
     transcript_path: incomplete.transcript,
     agent_id: "incomplete-terminal",
-    agent_type: "fusion:fast-worker",
+    agent_type: "fusion:claude-worker",
     stop_hook_active: true,
     last_assistant_message: "partial result"
   });
@@ -1177,7 +1161,7 @@ test("Stop emits one TaskStop demand while the harness tracks a cancel-requested
     cwd: box.cwd,
     transcript_path: box.transcript,
     stop_hook_active: false,
-    background_tasks: [{ id: "live-cancellation", type: "subagent", status: "running", agent_type: "fusion:fast-worker" }]
+    background_tasks: [{ id: "live-cancellation", type: "subagent", status: "running", agent_type: "fusion:claude-worker" }]
   });
 
   assert.deepStrictEqual(JSON.parse(stopped.stdout), {
@@ -1192,13 +1176,13 @@ test("Stop emits one combined TaskStop demand and reaped notice for mixed cancel
   const absent = createWorkerRecord({
     taskId: `fusion-${"c".repeat(24)}`,
     sessionId: "session-1",
-    agentType: "fusion:fast-worker",
+    agentType: "fusion:claude-worker",
     workspaceRoot: box.cwd
   }, envFor(box));
   const live = createWorkerRecord({
     taskId: `fusion-${"d".repeat(24)}`,
     sessionId: "session-1",
-    agentType: "fusion:fast-worker",
+    agentType: "fusion:claude-worker",
     workspaceRoot: box.cwd
   }, envFor(box));
   updateWorkerRecord(absent.taskId, envFor(box), (current) => ({ ...current, agentId: "absent-cancellation", backgroundTaskId: "absent-cancellation", transportStatus: "cancel_requested", failureKind: "timeout" }));
@@ -1210,7 +1194,7 @@ test("Stop emits one combined TaskStop demand and reaped notice for mixed cancel
     cwd: box.cwd,
     transcript_path: box.transcript,
     stop_hook_active: true,
-    background_tasks: [{ id: "live-cancellation", type: "subagent", status: "running", agent_type: "fusion:fast-worker" }]
+    background_tasks: [{ id: "live-cancellation", type: "subagent", status: "running", agent_type: "fusion:claude-worker" }]
   });
 
   const output = JSON.parse(stopped.stdout);
@@ -1314,13 +1298,13 @@ test("PreToolUse task tools ignore subagents and stamp only matching active main
   const active = createWorkerRecord({
     taskId: `fusion-${"a".repeat(24)}`,
     sessionId: "session-1",
-    agentType: "fusion:fast-worker",
+    agentType: "fusion:claude-worker",
     workspaceRoot: box.cwd
   }, envFor(box));
   const terminal = createWorkerRecord({
     taskId: `fusion-${"b".repeat(24)}`,
     sessionId: "session-1",
-    agentType: "fusion:fast-worker",
+    agentType: "fusion:claude-worker",
     workspaceRoot: box.cwd
   }, envFor(box));
   updateWorkerRecord(active.taskId, envFor(box), (current) => ({ ...current, agentId: "shared-cancellation", backgroundTaskId: "shared-cancellation", transportStatus: "cancel_requested" }));
@@ -1333,7 +1317,7 @@ test("PreToolUse task tools ignore subagents and stamp only matching active main
       cwd: box.cwd,
       transcript_path: box.transcript,
       agent_id: "calling-worker",
-      agent_type: "fusion:fast-worker",
+      agent_type: "fusion:claude-worker",
       tool_name: toolName,
       tool_input: { task_id: "shared-cancellation" }
     });
@@ -1469,7 +1453,7 @@ test("lifecycle enforcement fails closed when private worker state is unavailabl
     cwd: corruptBox.cwd,
     transcript_path: corruptBox.transcript,
     agent_id: "agent-corrupt",
-    agent_type: "fusion:fast-worker",
+    agent_type: "fusion:claude-worker",
     tool_name: "Read",
     tool_input: { file_path: "src/a.ts" }
   });
@@ -1505,7 +1489,7 @@ test("an armed async worker is collected by SubagentStop and remains verdict gat
     transcript_path: box.transcript,
     stop_hook_active: false,
     last_assistant_message: "done",
-    background_tasks: [{ id: "a1", type: "subagent", status: "running", agent_type: "fusion:fast-worker" }]
+    background_tasks: [{ id: "a1", type: "subagent", status: "running", agent_type: "fusion:claude-worker" }]
   });
   assert.strictEqual(JSON.parse(firstStop.stdout).decision, undefined);
   assert.strictEqual(record(box).awaitingCollection, true);
@@ -1519,7 +1503,7 @@ test("an armed async worker is collected by SubagentStop and remains verdict gat
     transcript_path: box.transcript,
     stop_hook_active: false,
     last_assistant_message: "done",
-    background_tasks: [{ id: "a1", type: "subagent", status: "running", agent_type: "fusion:fast-worker" }]
+    background_tasks: [{ id: "a1", type: "subagent", status: "running", agent_type: "fusion:claude-worker" }]
   });
   assert.strictEqual(secondStop.stdout, "");
   assert.strictEqual(record(box).awaitingCollectionArmedAt, armedAt);
@@ -1533,7 +1517,7 @@ test("an armed async worker is collected by SubagentStop and remains verdict gat
     transcript_path: box.transcript,
     agent_transcript_path: transcriptPath,
     agent_id: "a1",
-    agent_type: "fusion:fast-worker",
+    agent_type: "fusion:claude-worker",
     stop_hook_active: false,
     last_assistant_message: finalMessage
   });
@@ -1554,7 +1538,7 @@ test("an armed async worker is collected by SubagentStop and remains verdict gat
     transcript_path: box.transcript,
     stop_hook_active: false,
     last_assistant_message: "done",
-    background_tasks: [{ id: "a1", type: "subagent", status: "completed", agent_type: "fusion:fast-worker" }]
+    background_tasks: [{ id: "a1", type: "subagent", status: "completed", agent_type: "fusion:claude-worker" }]
   });
   const decision = JSON.parse(terminalStop.stdout);
   assert.strictEqual(decision.decision, undefined);
@@ -1602,7 +1586,7 @@ test("a completed async worker is collected at SubagentStop and remains verdict 
     cwd: box.cwd,
     transcript_path: box.transcript,
     agent_id: "agent-collected",
-    agent_type: "fusion:fast-worker"
+    agent_type: "fusion:claude-worker"
   });
   run(box, {
     hook_event_name: "SubagentStop",
@@ -1611,7 +1595,7 @@ test("a completed async worker is collected at SubagentStop and remains verdict 
     transcript_path: box.transcript,
     agent_transcript_path: transcriptPath,
     agent_id: "agent-collected",
-    agent_type: "fusion:fast-worker",
+    agent_type: "fusion:claude-worker",
     stop_hook_active: false,
     last_assistant_message: finalMessage
   });
@@ -1677,7 +1661,7 @@ test("SubagentStop bounds an oversized final-text artifact to a 72KB payload wit
     cwd: box.cwd,
     transcript_path: box.transcript,
     agent_id: "oversized-final",
-    agent_type: "fusion:fast-worker"
+    agent_type: "fusion:claude-worker"
   });
   const finalMessage = `${"h".repeat(65_536)}${"m".repeat(200_000)}${"t".repeat(130_000)}\ndelivery: complete\nverification: passed`;
   run(box, {
@@ -1686,7 +1670,7 @@ test("SubagentStop bounds an oversized final-text artifact to a 72KB payload wit
     cwd: box.cwd,
     transcript_path: box.transcript,
     agent_id: "oversized-final",
-    agent_type: "fusion:fast-worker",
+    agent_type: "fusion:claude-worker",
     stop_hook_active: false,
     last_assistant_message: finalMessage
   });
@@ -1708,7 +1692,7 @@ test("SubagentStop finalizes the record when the final-text artifact write fails
     cwd: box.cwd,
     transcript_path: box.transcript,
     agent_id: "artifact-write-failure",
-    agent_type: "fusion:fast-worker"
+    agent_type: "fusion:claude-worker"
   });
   const taskId = record(box).taskId;
   fs.mkdirSync(path.join(box.state, "jobs", `${taskId}.final.txt`), { recursive: true });
@@ -1719,7 +1703,7 @@ test("SubagentStop finalizes the record when the final-text artifact write fails
     cwd: box.cwd,
     transcript_path: box.transcript,
     agent_id: "artifact-write-failure",
-    agent_type: "fusion:fast-worker",
+    agent_type: "fusion:claude-worker",
     stop_hook_active: false,
     last_assistant_message: "summary\ndelivery: complete\nverification: passed"
   });
@@ -1860,7 +1844,7 @@ test("Stop in-flight advisory emits only when the in-flight set changes", (t) =>
     hook_event_name: "PostToolUse",
     tool_response: { isAsync: true, status: "async_launched", agentId: "a1", resolvedModel: "claude-sonnet-5" }
   });
-  const backgroundTasks = [{ id: "a1", type: "subagent", status: "running", agent_type: "fusion:fast-worker" }];
+  const backgroundTasks = [{ id: "a1", type: "subagent", status: "running", agent_type: "fusion:claude-worker" }];
 
   const firstStop = run(box, {
     hook_event_name: "Stop",
@@ -1910,7 +1894,7 @@ test("Stop in-flight advisory emits only when the in-flight set changes", (t) =>
     hook_event_name: "PostToolUse",
     tool_response: { isAsync: true, status: "async_launched", agentId: "a2", resolvedModel: "claude-sonnet-5" }
   });
-  const expandedBackgroundTasks = [...backgroundTasks, { id: "a2", type: "subagent", status: "running", agent_type: "fusion:fast-worker" }];
+  const expandedBackgroundTasks = [...backgroundTasks, { id: "a2", type: "subagent", status: "running", agent_type: "fusion:claude-worker" }];
   const changed = run(box, {
     hook_event_name: "Stop",
     session_id: "session-1",
@@ -1958,7 +1942,7 @@ test("Stop in-flight advisory emits only when the in-flight set changes", (t) =>
     transcript_path: box.transcript,
     stop_hook_active: false,
     last_assistant_message: "done",
-    background_tasks: [{ id: "a3", type: "subagent", status: "running", agent_type: "fusion:fast-worker" }]
+    background_tasks: [{ id: "a3", type: "subagent", status: "running", agent_type: "fusion:claude-worker" }]
   });
   assert.match(JSON.parse(newWave.stdout).hookSpecificOutput.additionalContext, /Collection is armed/);
 });
@@ -1972,7 +1956,7 @@ test("Stop re-emits after a terminal task leaves while terminal blocks remain ex
     hook_event_name: "PostToolUse",
     tool_response: { isAsync: true, status: "async_launched", agentId: "a1", resolvedModel: "claude-sonnet-5" }
   });
-  const running = [{ id: "a1", type: "subagent", status: "running", agent_type: "fusion:fast-worker" }];
+  const running = [{ id: "a1", type: "subagent", status: "running", agent_type: "fusion:claude-worker" }];
   const first = run(box, {
     hook_event_name: "Stop",
     session_id: "session-1",
@@ -2002,7 +1986,7 @@ test("Stop re-emits after a terminal task leaves while terminal blocks remain ex
     hook_event_name: "PostToolUse",
     tool_response: { isAsync: true, status: "async_launched", agentId: "a2", resolvedModel: "claude-sonnet-5" }
   });
-  running.push({ id: "a2", type: "subagent", status: "running", agent_type: "fusion:fast-worker" });
+  running.push({ id: "a2", type: "subagent", status: "running", agent_type: "fusion:claude-worker" });
   const grown = run(box, {
     hook_event_name: "Stop",
     session_id: "session-1",
@@ -2080,7 +2064,7 @@ test("a successfully terminal async worker without a final-text artifact demands
     transcript_path: box.transcript,
     stop_hook_active: true,
     last_assistant_message: "done",
-    background_tasks: [{ id: "a1", type: "subagent", status: "completed", agent_type: "fusion:fast-worker" }]
+    background_tasks: [{ id: "a1", type: "subagent", status: "completed", agent_type: "fusion:claude-worker" }]
   });
   const decision = JSON.parse(terminalStop.stdout);
   assert.strictEqual(decision.decision, "block");
@@ -2226,52 +2210,6 @@ test("a Read collects terminal output and captures its peer job footer", (t) => 
   assert.strictEqual(collected.deliveryMode, "harness_async");
   assert.strictEqual(collected.peerJobId, peerJobId);
   assert.strictEqual(collected.peerEngine, "codex");
-});
-
-test("Read collection debug capture writes the raw response when enabled", (t) => {
-  const box = sandbox(t);
-  const toolResponse = { type: "text", text: "worker final message", diagnostics: { source: "Read" } };
-  const peerJobId = "c".repeat(32);
-  const collectorDispatch = dispatch(box, { subagent_type: "fusion:job-collector", prompt: collectorPrompt("codex", peerJobId) });
-  run(box, collectorDispatch);
-  run(box, {
-    ...collectorDispatch,
-    hook_event_name: "PostToolUse",
-    tool_response: { isAsync: true, status: "async_launched", agentId: "debug-read" }
-  });
-  run(box, {
-    hook_event_name: "SubagentStart",
-    session_id: "session-1",
-    cwd: box.cwd,
-    transcript_path: box.transcript,
-    agent_id: "debug-read",
-    agent_type: "fusion:job-collector"
-  });
-  run(box, {
-    hook_event_name: "SubagentStop",
-    session_id: "session-1",
-    cwd: box.cwd,
-    transcript_path: box.transcript,
-    agent_id: "debug-read",
-    agent_type: "fusion:job-collector",
-    stop_hook_active: false,
-    last_assistant_message: `collector: state=done semantic=unverified engine=codex job=${peerJobId} elapsed=1s`
-  });
-  const finalTextFile = record(box).outputFile;
-  assert.strictEqual(record(box).transportStatus, "ready_uncollected");
-
-  const collected = run(box, {
-    hook_event_name: "PostToolUse",
-    session_id: "session-1",
-    cwd: box.cwd,
-    transcript_path: box.transcript,
-    tool_name: "Read",
-    tool_input: { file_path: finalTextFile },
-    tool_response: toolResponse
-  }, { FUSION_WORKER_DEBUG_COLLECTION_RESPONSE: "1" });
-  assert.strictEqual(collected.status, 0, collected.stderr);
-  const debugFile = path.join(box.root, "fusion-data", "worker-collection-response.json");
-  assert.deepStrictEqual(JSON.parse(fs.readFileSync(debugFile, "utf8")), toolResponse);
 });
 
 test("a terminal failed runtimeAsync worker is demanded by Stop and collected by a Read", (t) => {
@@ -2749,7 +2687,7 @@ test("SubagentStop blocks one incomplete report and then records a verified tran
     cwd: box.cwd,
     transcript_path: box.transcript,
     agent_id: "agent-1",
-    agent_type: "fusion:fast-worker"
+    agent_type: "fusion:claude-worker"
   });
   const first = run(box, {
     hook_event_name: "SubagentStop",
@@ -2758,7 +2696,7 @@ test("SubagentStop blocks one incomplete report and then records a verified tran
     transcript_path: box.transcript,
     agent_transcript_path: path.join(box.root, "subagents", "agent-agent-1.jsonl"),
     agent_id: "agent-1",
-    agent_type: "fusion:fast-worker",
+    agent_type: "fusion:claude-worker",
     stop_hook_active: false,
     last_assistant_message: "summary\ndelivery: complete\nverification: passed\nI will run tests next"
   });
@@ -2772,7 +2710,7 @@ test("SubagentStop blocks one incomplete report and then records a verified tran
     transcript_path: box.transcript,
     agent_transcript_path: path.join(box.root, "subagents", "agent-agent-1.jsonl"),
     agent_id: "agent-1",
-    agent_type: "fusion:fast-worker",
+    agent_type: "fusion:claude-worker",
     stop_hook_active: true,
     last_assistant_message: "summary\ndelivery: complete\nverification: passed"
   });
@@ -2789,7 +2727,7 @@ test("SubagentStop blocks one incomplete report and then records a verified tran
     transcript_path: box.transcript,
     agent_transcript_path: path.join(box.root, "subagents", "agent-agent-1.jsonl"),
     agent_id: "agent-1",
-    agent_type: "fusion:fast-worker",
+    agent_type: "fusion:claude-worker",
     stop_hook_active: true,
     last_assistant_message: "summary\ndelivery: complete\nverification: passed"
   });
@@ -3334,7 +3272,7 @@ test("an authorized background worker cannot bypass an unjudged Codex collection
   const backgroundDispatch = dispatch(box, { run_in_background: true });
   backgroundDispatch.tool_use_id = "tool-authorized-background";
   run(box, backgroundDispatch);
-  const backgroundRecord = readWorkerRecords(envFor(box)).find((candidate) => candidate.agentType === "fusion:fast-worker");
+  const backgroundRecord = readWorkerRecords(envFor(box)).find((candidate) => candidate.agentType === "fusion:claude-worker");
   assert.ok(backgroundRecord);
 
   const blocked = run(box, {
@@ -3343,7 +3281,7 @@ test("an authorized background worker cannot bypass an unjudged Codex collection
     cwd: box.cwd,
     transcript_path: box.transcript,
     last_assistant_message: `Background task ${backgroundRecord.taskId} remains available.`,
-    background_tasks: [{ id: "authorized-background", type: "subagent", status: "running", agent_type: "fusion:fast-worker" }]
+    background_tasks: [{ id: "authorized-background", type: "subagent", status: "running", agent_type: "fusion:claude-worker" }]
   });
   assert.strictEqual(JSON.parse(blocked.stdout).decision, "block");
   assert.match(JSON.parse(blocked.stdout).reason, new RegExp(peerJobId));
@@ -3384,7 +3322,7 @@ test("collector judgment gates do not age an unrelated active worker toward canc
     cwd: box.cwd,
     transcript_path: box.transcript,
     agent_id: "worker-independent",
-    agent_type: "fusion:fast-worker"
+    agent_type: "fusion:claude-worker"
   });
   const workerTaskId = readWorkerRecords(envFor(box)).find((candidate) => candidate.agentId === "worker-independent").taskId;
 
@@ -3395,7 +3333,7 @@ test("collector judgment gates do not age an unrelated active worker toward canc
       cwd: box.cwd,
       transcript_path: box.transcript,
       last_assistant_message: "finished",
-      background_tasks: [{ id: "worker-independent", type: "subagent", status: "running", agent_type: "fusion:fast-worker" }]
+      background_tasks: [{ id: "worker-independent", type: "subagent", status: "running", agent_type: "fusion:claude-worker" }]
     });
     assert.strictEqual(JSON.parse(blocked.stdout).decision, "block");
   }
@@ -3507,7 +3445,7 @@ test("worker tool calls are denied after the wall clock budget and cancellation 
     cwd: box.cwd,
     transcript_path: box.transcript,
     agent_id: "budget-1",
-    agent_type: "fusion:fast-worker"
+    agent_type: "fusion:claude-worker"
   }, limits);
   const preTool = run(box, {
     hook_event_name: "PreToolUse",
@@ -3515,7 +3453,7 @@ test("worker tool calls are denied after the wall clock budget and cancellation 
     cwd: box.cwd,
     transcript_path: box.transcript,
     agent_id: "budget-1",
-    agent_type: "fusion:fast-worker",
+    agent_type: "fusion:claude-worker",
     tool_name: "Read",
     tool_input: { file_path: "x" }
   }, limits);
@@ -3532,7 +3470,7 @@ test("a token limit permits exactly one final deliverable Write", (t) => {
     cwd: box.cwd,
     transcript_path: box.transcript,
     agent_id: "token-grace",
-    agent_type: "fusion:fast-worker"
+    agent_type: "fusion:claude-worker"
   });
   const taskId = record(box).taskId;
   updateWorkerRecord(taskId, envFor(box), (current) => ({
@@ -3545,7 +3483,7 @@ test("a token limit permits exactly one final deliverable Write", (t) => {
     cwd: box.cwd,
     transcript_path: box.transcript,
     agent_id: "token-grace",
-    agent_type: "fusion:fast-worker",
+    agent_type: "fusion:claude-worker",
     tool_name: "Write",
     tool_input: { file_path: path.join(box.cwd, "deliverable.md"), content: "deliverable" }
   };
@@ -3584,7 +3522,7 @@ test("an explicitly authorized background worker still requires TaskStop after i
     transcript_path: box.transcript,
     stop_hook_active: false,
     last_assistant_message: record(box).taskId,
-    background_tasks: [{ id: "authorized-budget", type: "subagent", status: "running", agent_type: "fusion:fast-worker" }]
+    background_tasks: [{ id: "authorized-budget", type: "subagent", status: "running", agent_type: "fusion:claude-worker" }]
   }, limits);
   const decision = JSON.parse(stop.stdout);
   assert.strictEqual(decision.decision, "block");
@@ -3611,7 +3549,7 @@ test("advisory in-flight stop rounds do not consume the cancellation budget for 
       transcript_path: box.transcript,
       stop_hook_active: false,
       last_assistant_message: `Fusion task ${taskId} is still in flight.`,
-      background_tasks: [{ id: "harness-async-1", type: "subagent", status: "running", agent_type: "fusion:fast-worker" }]
+      background_tasks: [{ id: "harness-async-1", type: "subagent", status: "running", agent_type: "fusion:claude-worker" }]
     });
     if (count === 0) {
       const output = JSON.parse(stop.stdout);
@@ -3638,7 +3576,7 @@ test("advisory in-flight stop rounds do not consume the cancellation budget for 
     transcript_path: box.transcript,
     stop_hook_active: false,
     last_assistant_message: `Fusion task ${taskId} is still in flight.`,
-    background_tasks: [{ id: "harness-async-1", type: "subagent", status: "running", agent_type: "fusion:fast-worker" }]
+    background_tasks: [{ id: "harness-async-1", type: "subagent", status: "running", agent_type: "fusion:claude-worker" }]
   });
   const expiredOutput = JSON.parse(expired.stdout);
   assert.strictEqual(expiredOutput.decision, "block");
@@ -3656,7 +3594,7 @@ test("Stop does not launder a failed runtime task into success across two rounds
     failureKind: "timeout",
     cancelReason: "wall clock budget reached (1200000ms)"
   }));
-  const backgroundTasks = [{ id: "terminal-fail-1", type: "subagent", status: "failed", agent_type: "fusion:fast-worker" }];
+  const backgroundTasks = [{ id: "terminal-fail-1", type: "subagent", status: "failed", agent_type: "fusion:claude-worker" }];
 
   const firstStop = run(box, {
     hook_event_name: "Stop",
@@ -3709,7 +3647,7 @@ test("an explicitly authorized running worker is not cancelled by repeated Stop 
       transcript_path: box.transcript,
       stop_hook_active: false,
       last_assistant_message: `Background task ${taskId} is running as manual-running.`,
-      background_tasks: [{ id: "manual-running", type: "subagent", status: "running", agent_type: "fusion:fast-worker" }]
+      background_tasks: [{ id: "manual-running", type: "subagent", status: "running", agent_type: "fusion:claude-worker" }]
     });
     if (count === 0) {
       assert.strictEqual(JSON.parse(stop.stdout).decision, undefined);
@@ -3748,7 +3686,7 @@ test("a completed background worker is not timed out while awaiting verdict sett
     cwd: box.cwd,
     transcript_path: box.transcript,
     agent_id: "completed-budget",
-    agent_type: "fusion:fast-worker"
+    agent_type: "fusion:claude-worker"
   }, limits);
   updateWorkerRecord(record(box).taskId, envFor(box), (current) => ({
     ...current,
@@ -3760,7 +3698,7 @@ test("a completed background worker is not timed out while awaiting verdict sett
     cwd: box.cwd,
     transcript_path: box.transcript,
     agent_id: "completed-budget",
-    agent_type: "fusion:fast-worker",
+    agent_type: "fusion:claude-worker",
     stop_hook_active: false,
     last_assistant_message: "summary\ndelivery: complete\nverification: passed"
   }, limits);
@@ -3807,7 +3745,7 @@ test("an explicitly authorized completed worker is collected by SubagentStop bef
     cwd: box.cwd,
     transcript_path: box.transcript,
     agent_id: "manual-ready",
-    agent_type: "fusion:fast-worker"
+    agent_type: "fusion:claude-worker"
   });
   run(box, {
     hook_event_name: "SubagentStop",
@@ -3815,7 +3753,7 @@ test("an explicitly authorized completed worker is collected by SubagentStop bef
     cwd: box.cwd,
     transcript_path: box.transcript,
     agent_id: "manual-ready",
-    agent_type: "fusion:fast-worker",
+    agent_type: "fusion:claude-worker",
     stop_hook_active: false,
     last_assistant_message: "summary\ndelivery: complete\nverification: passed"
   });
@@ -4128,7 +4066,7 @@ test("PostToolUse emits turn wind-down context once at two turns below the cap",
     cwd: box.cwd,
     transcript_path: box.transcript,
     agent_id: "wind-down",
-    agent_type: "fusion:fast-worker"
+    agent_type: "fusion:claude-worker"
   });
   const workerTranscript = path.join(box.root, "agent-wind-down.jsonl");
   fs.writeFileSync(workerTranscript, Array.from({ length: 58 }, (_, index) => JSON.stringify({ type: "assistant", requestId: `turn-${index}`, message: { content: [{ type: "text", text: `turn ${index}` }] } })).join("\n") + "\n", "utf8");
@@ -4138,7 +4076,7 @@ test("PostToolUse emits turn wind-down context once at two turns below the cap",
     cwd: box.cwd,
     transcript_path: workerTranscript,
     agent_id: "wind-down",
-    agent_type: "fusion:fast-worker",
+    agent_type: "fusion:claude-worker",
     tool_name: "Read"
   };
 
@@ -4164,7 +4102,7 @@ test("PostToolUse emits token wind-down context once at 85 percent of the cap", 
     cwd: box.cwd,
     transcript_path: box.transcript,
     agent_id: "token-wind-down",
-    agent_type: "fusion:fast-worker"
+    agent_type: "fusion:claude-worker"
   });
   const workerTranscript = path.join(box.root, "agent-token-wind-down.jsonl");
   fs.writeFileSync(workerTranscript, `${JSON.stringify({ type: "assistant", requestId: "token-before", message: { usage: { output_tokens: 40_799 } } })}\n`, "utf8");
@@ -4174,7 +4112,7 @@ test("PostToolUse emits token wind-down context once at 85 percent of the cap", 
     cwd: box.cwd,
     transcript_path: workerTranscript,
     agent_id: "token-wind-down",
-    agent_type: "fusion:fast-worker",
+    agent_type: "fusion:claude-worker",
     tool_name: "Read"
   };
 
@@ -4209,7 +4147,7 @@ test("Stop keeps terminal collection demands blocking without adding settlement 
   const settling = createWorkerRecord({
     taskId: `fusion-${"2".repeat(24)}`,
     sessionId: "session-1",
-    agentType: "fusion:fast-worker",
+    agentType: "fusion:claude-worker",
     workspaceRoot: box.cwd
   }, envFor(box));
   const collectedAt = new Date().toISOString();
@@ -4240,7 +4178,7 @@ test("Stop advises once without blocking when a collected worker has an in-fligh
   const active = createWorkerRecord({
     taskId: `fusion-${"3".repeat(24)}`,
     sessionId: "session-1",
-    agentType: "fusion:fast-worker",
+    agentType: "fusion:claude-worker",
     workspaceRoot: box.cwd
   }, envFor(box));
   updateWorkerRecord(active.taskId, envFor(box), (current) => ({ ...current, agentId: "wave-active", backgroundTaskId: "wave-active", transportStatus: "pending_async" }));
@@ -4278,7 +4216,7 @@ test("a stale collected settlement blocks despite an in-flight sibling", (t) => 
   const active = createWorkerRecord({
     taskId: `fusion-${"7".repeat(24)}`,
     sessionId: "session-1",
-    agentType: "fusion:fast-worker",
+    agentType: "fusion:claude-worker",
     workspaceRoot: box.cwd
   }, envFor(box));
   updateWorkerRecord(active.taskId, envFor(box), (current) => ({ ...current, agentId: "stale-wave-active", backgroundTaskId: "stale-wave-active", transportStatus: "pending_async" }));
@@ -4289,7 +4227,7 @@ test("a stale collected settlement blocks despite an in-flight sibling", (t) => 
     cwd: box.cwd,
     transcript_path: box.transcript,
     stop_hook_active: false,
-    background_tasks: [{ id: "stale-wave-active", type: "subagent", status: "running", agent_type: "fusion:fast-worker" }]
+    background_tasks: [{ id: "stale-wave-active", type: "subagent", status: "running", agent_type: "fusion:claude-worker" }]
   }, { FUSION_SETTLE_DEMAND_STALE_MS: "1" });
   const output = JSON.parse(blocked.stdout);
   assert.strictEqual(output.decision, "block");
@@ -4353,7 +4291,7 @@ test("malformed parent transcript content does not transition a worker during St
     cwd: box.cwd,
     transcript_path: box.transcript,
     stop_hook_active: true,
-    background_tasks: [{ id: before.agentId, type: "subagent", status: "running", agent_type: "fusion:fast-worker" }]
+    background_tasks: [{ id: before.agentId, type: "subagent", status: "running", agent_type: "fusion:claude-worker" }]
   });
   assert.strictEqual(stopped.status, 0);
   const unchanged = record(box);
@@ -4375,7 +4313,7 @@ test("late SubagentStop payloads preserve an accepted collection", (t) => {
       cwd: box.cwd,
       transcript_path: box.transcript,
       agent_id: settled.agentId,
-      agent_type: "fusion:fast-worker",
+      agent_type: "fusion:claude-worker",
       stop_hook_active: true,
       last_assistant_message: message
     });
@@ -4398,7 +4336,7 @@ test("Stop does not demote a settled record listed as a completed background tas
     cwd: box.cwd,
     transcript_path: box.transcript,
     stop_hook_active: false,
-    background_tasks: [{ id: settled.agentId, type: "subagent", status: "completed", agent_type: "fusion:fast-worker" }]
+    background_tasks: [{ id: settled.agentId, type: "subagent", status: "completed", agent_type: "fusion:claude-worker" }]
   });
   assert.strictEqual(stopped.stdout, "");
   assert.strictEqual(record(box).transportStatus, "done");
@@ -4483,7 +4421,7 @@ test("in-flight advisory re-verification excludes a record collected after the i
   const worker = createWorkerRecord({
     taskId: `fusion-${"b".repeat(24)}`,
     sessionId: "session-1",
-    agentType: "fusion:fast-worker",
+    agentType: "fusion:claude-worker",
     workspaceRoot: box.cwd
   }, envFor(box));
   const candidate = updateWorkerRecord(worker.taskId, envFor(box), (current) => ({ ...current, agentId: "reverify-collected", backgroundTaskId: "reverify-collected", transportStatus: "pending_async" }));
@@ -4506,7 +4444,7 @@ test("cancellation demand re-verification excludes a record that turned done on 
   const worker = createWorkerRecord({
     taskId: `fusion-${"d".repeat(24)}`,
     sessionId: "session-1",
-    agentType: "fusion:fast-worker",
+    agentType: "fusion:claude-worker",
     workspaceRoot: box.cwd
   }, envFor(box));
   const candidate = updateWorkerRecord(worker.taskId, envFor(box), (current) => ({ ...current, agentId: "reverify-cancellation", backgroundTaskId: "reverify-cancellation", transportStatus: "cancel_requested", failureKind: "timeout" }));
@@ -4549,7 +4487,7 @@ test("queued accepted verdicts re-arm settlement after cancelled and incomplete 
     cwd: incomplete.cwd,
     transcript_path: incomplete.transcript,
     agent_id: "queued-incomplete",
-    agent_type: "fusion:fast-worker"
+    agent_type: "fusion:claude-worker"
   });
   recordWorkerAcceptance({ taskId: record(incomplete).taskId, acceptance: "accepted", env: envFor(incomplete), source: "main-loop" });
   run(incomplete, {
@@ -4558,7 +4496,7 @@ test("queued accepted verdicts re-arm settlement after cancelled and incomplete 
     cwd: incomplete.cwd,
     transcript_path: incomplete.transcript,
     agent_id: "queued-incomplete",
-    agent_type: "fusion:fast-worker",
+    agent_type: "fusion:claude-worker",
     stop_hook_active: true,
     last_assistant_message: "partial result"
   });
@@ -4683,7 +4621,7 @@ test("cancellation demand and re-verification agree for an uncollected failed re
   const worker = createWorkerRecord({
     taskId: `fusion-${"e".repeat(24)}`,
     sessionId: "session-1",
-    agentType: "fusion:fast-worker",
+    agentType: "fusion:claude-worker",
     workspaceRoot: box.cwd
   }, envFor(box));
   const candidate = updateWorkerRecord(worker.taskId, envFor(box), (current) => ({ ...current, transportStatus: "failed", stopBlockCount: 6 }));

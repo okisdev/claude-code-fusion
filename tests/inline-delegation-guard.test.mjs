@@ -13,6 +13,7 @@ import {
   resolveLockTimeoutMs,
   resolveTailAllowance,
   resolveTailMaxBytes,
+  resolveUnverifiedCeiling,
   resolveZeroDispatchMaxBytes,
   resolveZeroDispatchWrites
 } from "../plugins/fusion/scripts/inline-delegation-guard.mjs";
@@ -209,7 +210,7 @@ test("writes below the budget are allowed silently and accumulate", (t) => {
   assert.strictEqual(state.writeCount, 4);
 });
 
-test("judgment posture never denies a main loop write, even far past the budget", (t) => {
+test("judgment posture never denies a main loop write below the unverified ceiling", (t) => {
   const sandbox = makeSandbox(t);
   for (let i = 0; i < 30; i += 1) {
     const result = run(sandbox, writePayload(sandbox, { toolName: "Write", filePath: path.join(sandbox.workDir, `file-${i}.txt`), toolInput: { content: "x".repeat(4096) } }));
@@ -225,10 +226,134 @@ test("judgment posture never denies a main loop write, even far past the budget"
   assert.strictEqual(records.filter((record) => record.event === "write").length, 30);
 });
 
+test("judgment posture denies at the unverified ceiling and names both reopening moves", (t) => {
+  const sandbox = makeSandbox(t);
+  const ceilingEnv = { FUSION_INLINE_UNVERIFIED_CEILING: "10" };
+  for (let index = 0; index < 10; index += 1) {
+    const result = run(sandbox, writePayload(sandbox), ceilingEnv);
+    assert.notStrictEqual(JSON.parse(result.stdout || '{"hookSpecificOutput":{"permissionDecision":"allow"}}').hookSpecificOutput.permissionDecision, "deny");
+  }
+
+  for (let index = 0; index < 2; index += 1) {
+    const denied = run(sandbox, writePayload(sandbox), ceilingEnv);
+    const output = JSON.parse(denied.stdout);
+    assert.strictEqual(output.hookSpecificOutput.permissionDecision, "deny");
+    assert.match(output.hookSpecificOutput.permissionDecisionReason, /unverified ceiling/i);
+    assert.match(output.hookSpecificOutput.permissionDecisionReason, /verification command/i);
+    assert.match(output.hookSpecificOutput.permissionDecisionReason, /dispatch the remaining work/i);
+  }
+
+  assert.strictEqual(readState(sandbox, "session-1").writesSinceDispatch, 10);
+  const records = readAuditRecords(sandbox);
+  assert.strictEqual(records.filter((record) => record.event === "write").length, 10);
+  const denies = records.filter((record) => record.event === "deny");
+  assert.strictEqual(denies.length, 2);
+  assert.deepStrictEqual(denies[0], {
+    schemaVersion: 1,
+    at: denies[0].at,
+    session: "session-1",
+    event: "deny",
+    lane: "main",
+    tool: "Edit",
+    path: "file.txt",
+    writeCount: 10,
+    dispatchCount: 0,
+    budget: 5,
+    mode: "advisory",
+    posture: "judgment",
+    reason: "unverified-ceiling",
+    ceiling: 10
+  });
+});
+
+test("a passing verification reopens the window after a ceiling stop", (t) => {
+  const sandbox = makeSandbox(t);
+  const ceilingEnv = { FUSION_INLINE_UNVERIFIED_CEILING: "6" };
+  for (let index = 0; index < 6; index += 1) {
+    run(sandbox, writePayload(sandbox), ceilingEnv);
+  }
+  assert.strictEqual(JSON.parse(run(sandbox, writePayload(sandbox), ceilingEnv).stdout).hookSpecificOutput.permissionDecision, "deny");
+
+  run(sandbox, verificationPayload(sandbox), ceilingEnv);
+  assert.strictEqual(readState(sandbox, "session-1").writesSinceDispatch, 0);
+
+  const reopened = run(sandbox, writePayload(sandbox), ceilingEnv);
+  assert.strictEqual(reopened.stdout, "");
+  assert.strictEqual(readState(sandbox, "session-1").writesSinceDispatch, 1);
+});
+
+test("a dispatch reopens the window after a ceiling stop", (t) => {
+  const sandbox = makeSandbox(t);
+  const ceilingEnv = { FUSION_INLINE_UNVERIFIED_CEILING: "6" };
+  for (let index = 0; index < 6; index += 1) {
+    run(sandbox, writePayload(sandbox), ceilingEnv);
+  }
+  assert.strictEqual(JSON.parse(run(sandbox, writePayload(sandbox), ceilingEnv).stdout).hookSpecificOutput.permissionDecision, "deny");
+
+  run(sandbox, dispatchPayload(sandbox, { subagentType: "fusion:claude-worker" }), ceilingEnv);
+  assert.strictEqual(readState(sandbox, "session-1").writesSinceDispatch, 0);
+
+  const reopened = run(sandbox, writePayload(sandbox), ceilingEnv);
+  assert.strictEqual(reopened.stdout, "");
+  assert.strictEqual(readState(sandbox, "session-1").writesSinceDispatch, 1);
+});
+
+test("the advisory names the ceiling only once the window is within two budgets of it", (t) => {
+  const sandbox = makeSandbox(t);
+  const ceilingEnv = { FUSION_INLINE_UNVERIFIED_CEILING: "20" };
+  const advisories = [];
+  for (let index = 0; index < 20; index += 1) {
+    const result = run(sandbox, writePayload(sandbox), ceilingEnv);
+    if (result.stdout) {
+      advisories.push(JSON.parse(result.stdout).hookSpecificOutput.permissionDecisionReason);
+    }
+  }
+  assert.strictEqual(advisories.length, 4);
+  assert.doesNotMatch(advisories[0], /stops at 20 unverified writes/);
+  for (const advisory of advisories.slice(1)) {
+    assert.match(advisory, /This window stops at 20 unverified writes\./);
+  }
+});
+
+test("the unverified ceiling scales with the write budget and switches off at zero", (t) => {
+  assert.strictEqual(resolveUnverifiedCeiling({}), 40);
+  assert.strictEqual(resolveUnverifiedCeiling({ FUSION_INLINE_WRITE_BUDGET: "3" }), 24);
+  assert.strictEqual(resolveUnverifiedCeiling({ FUSION_INLINE_UNVERIFIED_CEILING: "12" }), 12);
+  assert.strictEqual(resolveUnverifiedCeiling({ FUSION_INLINE_UNVERIFIED_CEILING: "0" }), 0);
+
+  const sandbox = makeSandbox(t);
+  const offEnv = { FUSION_INLINE_UNVERIFIED_CEILING: "0" };
+  for (let index = 0; index < 12; index += 1) {
+    const result = run(sandbox, writePayload(sandbox), offEnv);
+    if (result.stdout) {
+      assert.strictEqual(JSON.parse(result.stdout).hookSpecificOutput.permissionDecision, "allow");
+    }
+  }
+  assert.strictEqual(readAuditRecords(sandbox).filter((record) => record.event === "deny").length, 0);
+});
+
+test("strict posture reaches its budget deny before the unverified ceiling applies", (t) => {
+  const sandbox = makeSandbox(t);
+  const strictEnv = { FUSION_POSTURE: "strict", FUSION_INLINE_UNVERIFIED_CEILING: "6", FUSION_INLINE_ZERO_DISPATCH_WRITES: "0" };
+  run(sandbox, dispatchPayload(sandbox, { subagentType: "fusion:claude-worker" }), strictEnv);
+  for (let index = 0; index < 5; index += 1) {
+    run(sandbox, writePayload(sandbox), strictEnv);
+  }
+  const denied = run(sandbox, writePayload(sandbox, { toolName: "Write", filePath: path.join(sandbox.workDir, "new.txt"), toolInput: { content: "x" } }), strictEnv);
+  const output = JSON.parse(denied.stdout);
+  assert.strictEqual(output.hookSpecificOutput.permissionDecision, "deny");
+  assert.match(output.hookSpecificOutput.permissionDecisionReason, /inline write budget is exhausted/i);
+  assert.doesNotMatch(output.hookSpecificOutput.permissionDecisionReason, /unverified ceiling/i);
+  const denies = readAuditRecords(sandbox).filter((record) => record.event === "deny");
+  assert.strictEqual(denies.length, 1);
+  assert.strictEqual(denies[0].reason, undefined);
+  assert.strictEqual(denies[0].mode, "enforce");
+});
+
 test("strict posture denies writes after the dispatch window budget and audits enforcement until an Agent dispatch", (t) => {
   const sandbox = makeSandbox(t);
   const strictEnv = { FUSION_POSTURE: "strict" };
-  run(sandbox, dispatchPayload(sandbox, { subagentType: "fusion:fast-worker" }), strictEnv);
+  run(sandbox, dispatchPayload(sandbox, { subagentType: "fusion:claude-worker" }), strictEnv);
   for (let i = 0; i < 5; i += 1) {
     const result = run(sandbox, writePayload(sandbox), strictEnv);
     assert.notStrictEqual(JSON.parse(result.stdout || '{"hookSpecificOutput":{"permissionDecision":"allow"}}').hookSpecificOutput.permissionDecision, "deny");
@@ -260,7 +385,7 @@ test("strict posture denies writes after the dispatch window budget and audits e
     posture: "strict"
   });
 
-  run(sandbox, dispatchPayload(sandbox, { subagentType: "fusion:fast-worker" }), strictEnv);
+  run(sandbox, dispatchPayload(sandbox, { subagentType: "fusion:claude-worker" }), strictEnv);
   const allowed = run(sandbox, writePayload(sandbox), strictEnv);
   assert.strictEqual(allowed.stdout, "");
   assert.strictEqual(readState(sandbox, "session-1").writesSinceDispatch, 1);
@@ -269,7 +394,7 @@ test("strict posture denies writes after the dispatch window budget and audits e
 test("a small Edit to a file written in the current window uses one tail slot", (t) => {
   const sandbox = makeSandbox(t);
   const strictEnv = { FUSION_POSTURE: "strict" };
-  run(sandbox, dispatchPayload(sandbox, { subagentType: "fusion:fast-worker" }), strictEnv);
+  run(sandbox, dispatchPayload(sandbox, { subagentType: "fusion:claude-worker" }), strictEnv);
   for (let index = 0; index < 5; index += 1) {
     run(sandbox, writePayload(sandbox, { toolInput: { new_string: "base" } }), strictEnv);
   }
@@ -293,7 +418,7 @@ test("tail allowance denies a new path Write and an oversized Edit", (t) => {
   ]) {
     const sandbox = makeSandbox(t);
     const extraEnv = { FUSION_POSTURE: "strict", FUSION_INLINE_ZERO_DISPATCH_WRITES: "0" };
-    run(sandbox, dispatchPayload(sandbox, { subagentType: "fusion:fast-worker" }), extraEnv);
+    run(sandbox, dispatchPayload(sandbox, { subagentType: "fusion:claude-worker" }), extraEnv);
     for (let index = 0; index < 5; index += 1) {
       run(sandbox, writePayload(sandbox, { toolInput: { new_string: "base" } }), extraEnv);
     }
@@ -306,7 +431,7 @@ test("tail allowance denies a new path Write and an oversized Edit", (t) => {
 test("tail allowance exhausts per window and resets after dispatch", (t) => {
   const sandbox = makeSandbox(t);
   const extraEnv = { FUSION_POSTURE: "strict", FUSION_INLINE_ZERO_DISPATCH_WRITES: "0" };
-  run(sandbox, dispatchPayload(sandbox, { subagentType: "fusion:fast-worker" }), extraEnv);
+  run(sandbox, dispatchPayload(sandbox, { subagentType: "fusion:claude-worker" }), extraEnv);
   for (let index = 0; index < 5; index += 1) {
     run(sandbox, writePayload(sandbox, { toolInput: { new_string: "base" } }), extraEnv);
   }
@@ -317,7 +442,7 @@ test("tail allowance exhausts per window and resets after dispatch", (t) => {
   const denied = run(sandbox, writePayload(sandbox, { toolInput: { new_string: "finish" } }), extraEnv);
   assert.strictEqual(JSON.parse(denied.stdout).hookSpecificOutput.permissionDecision, "deny");
 
-  run(sandbox, dispatchPayload(sandbox, { subagentType: "fusion:fast-worker" }), extraEnv);
+  run(sandbox, dispatchPayload(sandbox, { subagentType: "fusion:claude-worker" }), extraEnv);
   for (let index = 0; index < 5; index += 1) {
     run(sandbox, writePayload(sandbox, { toolInput: { new_string: "base" } }), extraEnv);
   }
@@ -635,7 +760,7 @@ test("tail allowance environment overrides apply and zero disables it", (t) => {
   ]) {
     const env = { FUSION_POSTURE: "strict", ...overrides };
     const sandbox = makeSandbox(t);
-    run(sandbox, dispatchPayload(sandbox, { subagentType: "fusion:fast-worker" }), env);
+    run(sandbox, dispatchPayload(sandbox, { subagentType: "fusion:claude-worker" }), env);
     for (let index = 0; index < 5; index += 1) {
       run(sandbox, writePayload(sandbox, { toolInput: { new_string: "base" } }), env);
     }
@@ -653,7 +778,7 @@ test("a PostToolUse-only dispatch recovers a missing launch and reopens an exhau
   const denied = run(sandbox, writePayload(sandbox), strictEnv);
   assert.strictEqual(JSON.parse(denied.stdout).hookSpecificOutput.permissionDecision, "deny");
 
-  const recovered = runRaw(sandbox, dispatchPayload(sandbox, { subagentType: "fusion:fast-worker", description: "recover the missing launch" }), strictEnv);
+  const recovered = runRaw(sandbox, dispatchPayload(sandbox, { subagentType: "fusion:claude-worker", description: "recover the missing launch" }), strictEnv);
   assert.strictEqual(recovered.status, 0);
   assert.strictEqual(recovered.stdout, "");
   assert.strictEqual(recovered.stderr, "");
@@ -661,7 +786,7 @@ test("a PostToolUse-only dispatch recovers a missing launch and reopens an exhau
   const recoveredState = readState(sandbox, "session-1");
   assert.strictEqual(recoveredState.writesSinceDispatch, 0);
   assert.strictEqual(recoveredState.dispatchEpoch, 1);
-  assert.deepStrictEqual(recoveredState.dispatches, { "fusion:fast-worker": 1 });
+  assert.deepStrictEqual(recoveredState.dispatches, { "fusion:claude-worker": 1 });
   assert.strictEqual(recoveredState.dispatchLog.length, 1);
   assert.strictEqual(recoveredState.dispatchLog[0].phase, "confirmed");
   assert.strictEqual(recoveredState.dispatchLog[0].description, "recover the missing launch");
@@ -673,7 +798,7 @@ test("a PostToolUse-only dispatch recovers a missing launch and reopens an exhau
       at: recoveryWarnings[0].at,
       session: "session-1",
       event: "warn",
-      lane: "fusion:fast-worker",
+      lane: "fusion:claude-worker",
       tool: "Agent",
       reason: "missing-launch-recovered",
       posture: "strict"
@@ -781,7 +906,7 @@ test("no repeat nagging between threshold multiples, a new advisory fires at 2x 
 
 test("advisories count writes since the most recent dispatch and restart after each dispatch", (t) => {
   const sandbox = makeSandbox(t);
-  const dispatchResult = run(sandbox, dispatchPayload(sandbox, { subagentType: "fusion:fast-worker" }));
+  const dispatchResult = run(sandbox, dispatchPayload(sandbox, { subagentType: "fusion:claude-worker" }));
   assert.strictEqual(dispatchResult.status, 0);
   assert.strictEqual(dispatchResult.stdout, "");
 
@@ -812,7 +937,7 @@ test("agent dispatches are bucketed by lane from the subagent_type prefix", (t) 
   run(sandbox, dispatchPayload(sandbox, { subagentType: "grok:grok-rescue" }));
   run(sandbox, dispatchPayload(sandbox, { subagentType: "grok:grok-rescue" }));
   run(sandbox, dispatchPayload(sandbox, { subagentType: "codex:codex-rescue" }));
-  run(sandbox, dispatchPayload(sandbox, { subagentType: "fusion:fast-worker" }));
+  run(sandbox, dispatchPayload(sandbox, { subagentType: "fusion:claude-worker" }));
   run(sandbox, dispatchPayload(sandbox, { subagentType: "fusion:trivial-worker" }));
   run(sandbox, dispatchPayload(sandbox, { subagentType: "Explore" }));
   run(sandbox, dispatchPayload(sandbox, {}));
@@ -821,7 +946,7 @@ test("agent dispatches are bucketed by lane from the subagent_type prefix", (t) 
   assert.deepStrictEqual(state.dispatches, {
     grok: 2,
     codex: 1,
-    "fusion:fast-worker": 1,
+    "fusion:claude-worker": 1,
     "fusion:trivial-worker": 1,
     builtin: 2
   });
@@ -940,7 +1065,7 @@ test("launch timestamps preserve a four-wide fleet wave when confirmations span 
   const sandbox = makeSandbox(t);
   const baseMs = Date.parse("2026-07-21T00:00:00.000Z");
   const payloads = Array.from({ length: 4 }, (_, index) =>
-    dispatchPayload(sandbox, { subagentType: "fusion:fast-worker", description: `package ${index + 1}` })
+    dispatchPayload(sandbox, { subagentType: "fusion:claude-worker", description: `package ${index + 1}` })
   );
 
   for (const [index, payload] of payloads.entries()) {
@@ -1096,7 +1221,7 @@ test("an Agent PreToolUse attempt does not reset the write window before dispatc
   for (let index = 0; index < 5; index += 1) {
     run(sandbox, writePayload(sandbox), strictEnv);
   }
-  const attempted = dispatchPayload(sandbox, { subagentType: "fusion:fast-worker" });
+  const attempted = dispatchPayload(sandbox, { subagentType: "fusion:claude-worker" });
   attempted.hook_event_name = "PreToolUse";
   run(sandbox, attempted, strictEnv);
 
@@ -1206,7 +1331,7 @@ test("state and audit records omit full tool input and redact sensitive descript
   run(sandbox, writePayload(sandbox, { filePath: path.join(sandbox.workDir, "safe", pathSecret) }));
 
   const dispatch = dispatchPayload(sandbox, {
-    subagentType: "fusion:fast-worker",
+    subagentType: "fusion:claude-worker",
     description: `inspect token=${tokenSecret} with Bearer ${"a".repeat(80)}`
   });
   dispatch.tool_input.prompt = promptSecret;
@@ -1309,12 +1434,12 @@ test("dispatch ledger initializes when an existing state file has no dispatchLog
     "utf8"
   );
 
-  run(sandbox, dispatchPayload(sandbox, { toolName: "Task", subagentType: "fusion:fast-worker" }));
+  run(sandbox, dispatchPayload(sandbox, { toolName: "Task", subagentType: "fusion:claude-worker" }));
   const state = readState(sandbox, "session-1");
   assert.strictEqual(state.writeCount, 4);
-  assert.deepStrictEqual(state.dispatches, { grok: 2, "fusion:fast-worker": 1 });
+  assert.deepStrictEqual(state.dispatches, { grok: 2, "fusion:claude-worker": 1 });
   assert.strictEqual(state.dispatchLog.length, 1);
-  assert.strictEqual(state.dispatchLog[0].lane, "fusion:fast-worker");
+  assert.strictEqual(state.dispatchLog[0].lane, "fusion:claude-worker");
 });
 
 test("legacy dispatch ledger entries normalize as confirmed launches", (t) => {
