@@ -6,11 +6,12 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { resolveCodexStateDir, resolveCodexStateRoots } from "./lib/codex-state-roots.mjs";
-import { readWorkerRecords } from "./lib/worker-state.mjs";
+import { canonicalWorkerAgentType, readWorkerRecords } from "./lib/worker-state.mjs";
 
 const GROK_DATA_ENV = "GROK_COMPANION_DATA";
 const LOOKBACK_ENV = "FUSION_BREAKER_LOOKBACK_HOURS";
 const DEFAULT_LOOKBACK_HOURS = 12;
+const WORKER_BREAKER_LANES = ["fusion:claude-worker", "fusion:trivial-worker"];
 const HARD_FAILURE_KINDS = new Set(["quota", "auth", "missing_cli", "protocol", "transport", "sandbox"]);
 const REPEATED_FAILURE_KINDS = new Set(["rate_limited", "timeout", "stall", "process", "died"]);
 const BREAKER_FAILURE_KINDS = new Set([...HARD_FAILURE_KINDS, ...REPEATED_FAILURE_KINDS, "permission"]);
@@ -279,9 +280,9 @@ function workerFailure(record, now, lookbackMs) {
   return { failureKind, timestamp };
 }
 
-function workerBreakerRecords(env) {
+function workerBreakerRecords(env, lane) {
   return readWorkerRecords(env)
-    .filter((record) => record.agentType === "fusion:fast-worker")
+    .filter((record) => canonicalWorkerAgentType(record.agentType) === lane)
     .map((record) => ({ ...record, status: record.transportStatus === "done" ? "done" : ["failed", "incomplete", "owner_ended"].includes(record.transportStatus) ? "failed" : record.transportStatus }));
 }
 
@@ -296,9 +297,11 @@ function run(env = process.env, now = Date.now()) {
   if (codex) {
     lines.push(advisoryLine("codex", codex, now, lookbackMs));
   }
-  const fastWorker = latestBreakerFailure(workerBreakerRecords(env), workerFailure, now, lookbackMs);
-  if (fastWorker) {
-    lines.push(advisoryLine("fusion:fast-worker", fastWorker, now, lookbackMs));
+  for (const lane of WORKER_BREAKER_LANES) {
+    const worker = latestBreakerFailure(workerBreakerRecords(env, lane), workerFailure, now, lookbackMs);
+    if (worker) {
+      lines.push(advisoryLine(lane, worker, now, lookbackMs));
+    }
   }
   if (lines.length > 0) {
     process.stdout.write(`${lines.join("\n")}\n`);
@@ -321,14 +324,4 @@ if (isMain()) {
   main();
 }
 
-export {
-  advisoryLine,
-  codexFailureKind,
-  finishedAtMs,
-  formatAge,
-  resolveCodexStateDir,
-  resolveCodexStateRoots,
-  resolveGrokDataDir,
-  resolveLookbackMs,
-  run
-};
+export { advisoryLine, codexFailureKind, formatAge, resolveCodexStateDir, resolveCodexStateRoots, resolveGrokDataDir, run };
