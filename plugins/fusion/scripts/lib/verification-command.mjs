@@ -2,8 +2,6 @@ const PATTERN_ENV = "FUSION_VERIFICATION_PATTERN";
 const PATTERN_MAX_LENGTH = 512;
 const COMMAND_MAX_LENGTH = 16384;
 
-const SEGMENT_SEPARATOR = /(?:&&|\|\||;|\||\n|\r)+/;
-
 const WRAPPER_HEADS = new Set(["time", "nice", "command", "npx", "bunx", "uvx", "dotenv", "cross-env"]);
 const WRAPPER_SUBCOMMANDS = new Map([
   ["npm", new Set(["exec"])],
@@ -221,23 +219,72 @@ function isVerificationSegment(segment, pattern) {
   return matchesPackageManager(head, tokens) || matchesRunner(head, tokens);
 }
 
-function isVerificationCommand(command, env = process.env) {
+function commandSegments(command) {
+  const segments = [];
+  let start = 0;
+  let quote = null;
+  let escaped = false;
+  for (let index = 0; index < command.length; index += 1) {
+    const character = command[index];
+    if (escaped) {
+      escaped = false;
+      continue;
+    }
+    if (character === "\\") {
+      escaped = true;
+      continue;
+    }
+    if (quote) {
+      if (character === quote) {
+        quote = null;
+      }
+      continue;
+    }
+    if (character === "\"" || character === "'") {
+      quote = character;
+      continue;
+    }
+    const twoCharacterSeparator = command.slice(index, index + 2);
+    const separatorLength = twoCharacterSeparator === "&&" || twoCharacterSeparator === "||" ? 2 : character === "|" || character === ";" || character === "\n" || character === "\r" ? 1 : 0;
+    if (separatorLength === 0) {
+      continue;
+    }
+    const segment = command.slice(start, index).trim();
+    if (segment) {
+      segments.push(segment);
+    }
+    index += separatorLength - 1;
+    start = index + 1;
+  }
+  const segment = command.slice(start).trim();
+  if (segment) {
+    segments.push(segment);
+  }
+  return segments;
+}
+
+function verificationCommand(command, env = process.env) {
   if (typeof command !== "string") {
-    return false;
+    return { recognized: false, observable: false };
   }
   const trimmed = command.trim();
   if (!trimmed || trimmed.length > COMMAND_MAX_LENGTH) {
-    return false;
+    return { recognized: false, observable: false };
   }
-  // Only the final segment's exit status reaches the caller, so a verification anywhere
-  // earlier can fail while the command as a whole reports success.
-  const segments = trimmed
-    .split(SEGMENT_SEPARATOR)
-    .map((segment) => segment.trim())
-    .filter((segment) => segment.length > 0);
-  const last = segments.at(-1);
-  return last !== undefined && isVerificationSegment(last, customPattern(env));
+  const segments = commandSegments(trimmed);
+  const pattern = customPattern(env);
+  const matchingSegments = segments.map((segment) => isVerificationSegment(segment, pattern));
+  return {
+    recognized: matchingSegments.some(Boolean),
+    observable: matchingSegments.at(-1) === true
+  };
+}
+
+function isVerificationCommand(command, env = process.env) {
+  return verificationCommand(command, env).recognized;
 }
 
 export {
-   isVerificationCommand };
+  isVerificationCommand,
+  verificationCommand
+};
