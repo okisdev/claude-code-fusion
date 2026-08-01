@@ -21,13 +21,14 @@ Foreground command output and completed background result output end with a cont
 ```text
 <engine>-session: <session>
 job: <id>
+sandbox: <cwd>
 delivery: foreground|manual|managed
 semantic: accepted|rejected|unverified
 state: done|error|cancelled
 failure: <kind>
 ```
 
-Successful transport outcomes include `state: done`. Failed outcomes include `state: error` and `failure: <kind>`. Cancelled outcomes include `state: cancelled` and `failure: cancelled`. A session line uses the lowercase engine id as the prefix, for example `<engine>-session: <session>`, and appears when the engine returned a resumable session id. A `job: <id>` line appears when a job record exists. Adapters include `delivery` and `semantic` when those dimensions are available in their text protocol; structured JSON always keeps them separate from transport status. Input validation failures that happen before job creation report `state: error` and `failure: input` without a job line. Other preflight failures retain their typed failure kind, such as `missing_cli` or `setup`.
+Successful transport outcomes include `state: done`. Failed outcomes include `state: error` and `failure: <kind>`. Cancelled outcomes include `state: cancelled` and `failure: cancelled`. A session line uses the lowercase engine id as the prefix, for example `<engine>-session: <session>`, and appears when the engine returned a resumable session id. A `job: <id>` line appears when a job record exists. Adapters include `delivery` and `semantic` when those dimensions are available in their text protocol; structured JSON always keeps them separate from transport status. Input validation failures that happen before job creation report `state: error` and `failure: input` without a job line. Both companions reject an implicit task or review working directory below its Git repository root before job creation. Other preflight failures retain their typed failure kind, such as `missing_cli` or `setup`.
 
 ## Failure kinds
 

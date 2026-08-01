@@ -27,6 +27,7 @@ Execution rules:
 
 - Invoke the helper only through foreground `Bash` with `timeout: 600000`.
 - Place every task option before the first prompt token. Use `--` before a prompt that begins with an option shaped token.
+- Task, review, and adversarial review reject an implicit working directory below its repository top level before job creation. Pass `--cwd` with either the repository root or the intended subdirectory to choose the sandbox root explicitly.
 - The companion forwards `--skip-git-repo-check` to Codex exec. Without that flag or the dangerous bypass flag, Codex refuses to start unless the working directory has an ancestor `.git` entry; the projects trust map in `config.toml` is not consulted by exec. A gate failure names `--skip-git-repo-check` as the remedy.
 - Never use Bash background mode. Complexity, duration, and model choice never justify implicit background execution.
 - Pass `--background` only when the received request explicitly contains it. The companion owns detachment and returns a durable job receipt.

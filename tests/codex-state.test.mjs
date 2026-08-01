@@ -4,9 +4,11 @@ import { createHash } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { test } from "node:test";
+import { test as nodeTest } from "node:test";
 
 import { getProcessIdentity, processIdentityMatches } from "../plugins/codex/scripts/lib/codex-exec.mjs";
+import { processInspectionAvailable } from "./lib/companion-harness.mjs";
+import { gitIsolation } from "./lib/git-fixture.mjs";
 
 import {
   DEFAULT_JOB_HISTORY_MAX_BYTES,
@@ -43,6 +45,44 @@ import {
   writeBrief,
   writeJobRecordFile
 } from "../plugins/codex/scripts/lib/state.mjs";
+
+const processInspectionTests = new Set([
+  "job ids contain 128 bits and records expose the canonical Codex fields",
+  "model drift round-trips as optional job record metadata",
+  "state artifacts are private and append-only ledgers retain bounded tails",
+  "terminal records never regress or accept later enrichment",
+  "terminal finalization preserves the first finished timestamp",
+  "terminal finalization preserves acceptance provenance",
+  "terminal collection is an atomic idempotent lifecycle transition",
+  "a cancellation request wins a racing successful completion",
+  "lock-scoped updates see the current record and session aliases stay aligned",
+  "workspace launch reservations serialize",
+  "thread reservations use a data-root-wide lock",
+  "three processes serialize on the same thread lock",
+  "a held thread lock times out a second acquirer within the configured ceiling",
+  "a lock owned by a dead process is reclaimed without an age heuristic",
+  "a dead reaper claim is succeeded without wedging stale lock recovery",
+  "a live PID with a replaced process identity does not retain a lock",
+  "an old holder cannot release a successor lock with a different token",
+  "corrupt JSON records are quarantined without hiding healthy jobs",
+  "semantic failure kinds accept legacy policy records and reject unknown values",
+  "global lookup rejects an id that is ambiguous across workspaces",
+  "job history collection removes oldest records while preserving running jobs, the current resume head, and its predecessor",
+  "job history collection enforces its managed byte quota and reports protected quota excess",
+  "job history collection removes empty managed directories across many disposable workspaces"
+]);
+
+function test(name, callback) {
+  return nodeTest(name, (t) => {
+    if (processInspectionTests.has(name) && !processInspectionAvailable()) {
+      t.skip("process inspection unavailable in this environment");
+      return;
+    }
+    return callback(t);
+  });
+}
+
+test.after = nodeTest.after.bind(nodeTest);
 
 const stateModuleUrl = new URL("../plugins/codex/scripts/lib/state.mjs", import.meta.url).href;
 
@@ -310,7 +350,7 @@ test("workspace and repository identity use the Git root and common directory", 
   const repository = path.join(sandbox.root, "repository");
   const nested = path.join(repository, "src", "nested");
   fs.mkdirSync(nested, { recursive: true });
-  const initialized = spawnSync("git", ["init", "--quiet", repository], { encoding: "utf8" });
+  const initialized = spawnSync("git", ["init", "--quiet", repository], { encoding: "utf8", env: { ...process.env, ...gitIsolation(sandbox.root) } });
   assert.strictEqual(initialized.status, 0, initialized.stderr);
 
   const expectedRoot = fs.realpathSync(repository);

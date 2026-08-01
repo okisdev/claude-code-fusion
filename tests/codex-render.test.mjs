@@ -7,6 +7,7 @@ function record(overrides = {}) {
   return {
     id: "a".repeat(32),
     status: "done",
+    cwd: "/workspace/sandbox-root",
     delivery: "foreground",
     semanticStatus: "unverified",
     resultText: "The sandbox blocked the requested work. No files were changed and verification was not run.",
@@ -19,6 +20,7 @@ test("an unverified done result is labeled as transport completion rather than a
   assert.match(rendered, /^Codex transport completed, but semantic acceptance remains unverified\./);
   assert.match(rendered, /Check the result against the requested completion criteria before relying on it\./);
   assert.match(rendered, /The sandbox blocked the requested work\. No files were changed and verification was not run\./);
+  assert.match(rendered, /job: a{32}\nsandbox: \/workspace\/sandbox-root\ndelivery: foreground/);
   assert.match(rendered, /semantic: unverified\nstate: done\n$/);
 });
 
@@ -81,6 +83,6 @@ test("a cancelled result without partial output is unchanged", () => {
   const rendered = renderTerminalResult(record({ status: "cancelled" }));
   assert.equal(
     rendered,
-    `Codex job was cancelled.\n\njob: ${"a".repeat(32)}\ndelivery: foreground\nsemantic: unverified\nstate: cancelled\nfailure: cancelled\n`
+    `Codex job was cancelled.\n\njob: ${"a".repeat(32)}\nsandbox: /workspace/sandbox-root\ndelivery: foreground\nsemantic: unverified\nstate: cancelled\nfailure: cancelled\n`
   );
 });

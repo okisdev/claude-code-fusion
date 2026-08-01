@@ -53,6 +53,8 @@ The record stores both the canonical workspace path and a repository key derived
 
 Consult tasks use the Codex read-only sandbox. Write tasks require `--write` and use the workspace-write sandbox. Both modes use noninteractive approval policy so an unattended exec run cannot hang on an approval request. Danger full access is not exposed by the companion.
 
+Task, review, and adversarial review reject an implicit working directory below its Git repository top level before job creation. Pass `--cwd` with either the repository root or the intended subdirectory to choose the sandbox root explicitly.
+
 Codex exec refuses to start outside a directory with an ancestor `.git` entry. The `projects` trust map in `config.toml` is not consulted by exec. The companion forwards `--skip-git-repo-check`, and a gate failure names that flag as the remedy. The dangerous bypass flag also skips the gate.
 
 Every Codex exec invocation disables `multi_agent` and `multi_agent_v2`. The adapter also fails the job with `failureKind: "policy"` if the event stream or matching rollout still shows a collaboration tool call. Delegated Codex therefore remains one owned engine execution instead of recursively creating Codex agents.
@@ -76,6 +78,7 @@ Human-readable terminal output ends with a contiguous footer block:
 ```text
 codex-session: <thread-id>
 job: <job-id>
+sandbox: <cwd>
 delivery: foreground|manual|managed
 semantic: accepted|rejected|unverified
 state: done|error|cancelled

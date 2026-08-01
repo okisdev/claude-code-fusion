@@ -4,7 +4,7 @@ import { randomBytes } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import test from "node:test";
+import { test as nodeTest } from "node:test";
 import { pathToFileURL } from "node:url";
 
 import {
@@ -28,6 +28,83 @@ import {
   spawnCompanion,
   waitFor
 } from "./lib/codex-companion-harness.mjs";
+import { processInspectionAvailable } from "./lib/companion-harness.mjs";
+import { gitIsolation } from "./lib/git-fixture.mjs";
+
+const processInspectionTests = new Set([
+  "task accepts an explicit cwd below a repository top level",
+  "task accepts an implicit cwd outside a Git repository",
+  "task accepts an explicit repository top level from a subdirectory",
+  "identity-replaced owners are terminalized without signaling the live replacement",
+  "task stays foreground by default and persists the complete terminal record",
+  "sol foreground write tasks add one diagnostic warning without changing the prompt",
+  "sol warning is limited to foreground write tasks",
+  "task resolves an output schema, forwards it, and records parsed structured output",
+  "task retains a non-JSON agent message and records the structured parsing error",
+  "option shaped text after a task prompt cannot enable background or change execution settings",
+  "single raw task arguments preserve prompt whitespace byte for byte",
+  "structured raw transport preserves shell syntax without evaluating it",
+  "a staged Fusion worktree request selects the Codex cwd and workspace root",
+  "programmatic stdin ingress preserves opaque raw arguments without a staging file",
+  "rescue transport write defaults remain overridable by raw arguments",
+  "task forces safe disabled defaults and rejects network access without write mode",
+  "task proceeds with tested, alpha hotfix, and newer Codex CLI versions",
+  "structured nonzero diagnostics persist typed auth, quota, and rate limit failures",
+  "final response prose cannot promote or reject semantic acceptance",
+  "job records retain request-seeded model and effort without runtime observations",
+  "rollout observations replace request-seeded model and effort",
+  "task records and renders model drift from a brief header",
+  "an explicit task model suppresses header model drift",
+  "a matching task header model does not create model drift",
+  "a task without a header does not create model drift",
+  "task forwards --skip-git-repo-check to Codex",
+  "trusted-directory failures store and render the skip-git remedy",
+  "record-acceptance stores accepted and rejected semantic verdicts",
+  "record-acceptance requires a reason for rejected verdicts",
+  "record-acceptance permits failure kinds only for rejected verdicts",
+  "record-acceptance rejects unknown semantic failure kinds",
+  "record-acceptance stamps default stats provenance",
+  "record-acceptance stamps explicit provenance",
+  "record-acceptance blocks accepted verdicts on failed transport by default",
+  "record-acceptance permits explicit acceptance of failed transport",
+  "foreground timeout persists recovered partial delivery and incomplete cumulative usage",
+  "timeout jobs without a thread do not advertise resumability",
+  "history lists canonical jobs across workspaces with local thread and delivery metadata",
+  "explicit background launch returns a durable receipt and result wait collects it",
+  "managed background delivery remains pending until result collection",
+  "tight history quotas retain a completed background review until result collects it",
+  "result wait leaves a live background job running when its bounded wait expires",
+  "workspace reservation makes simultaneous task launches single flight",
+  "main workspace and a sibling worktree admit concurrent tasks for the same repository",
+  "resume-last uses the current Claude session without claiming an unverifiable usage delta",
+  "resume-last inherits model, effort, and service tier from its thread",
+  "resume applies explicit routing flags per field while inheriting the remaining fields",
+  "fresh tasks do not inherit routing from prior threads",
+  "completed tasks enforce configured history quotas without breaking resume-last",
+  "resume-last never crosses Claude sessions when a session id is available",
+  "resumed usage remains unavailable across workspaces while the thread lease stays reusable",
+  "the same Codex thread cannot resume concurrently across workspaces",
+  "plain native review uses target flags and focus switches to a read only task prompt",
+  "adversarial review is a normal read only task with the explicit review contract",
+  "cancel terminates the supervised process group and terminal state cannot be overwritten",
+  "SIGHUP stays attached until the foreground Codex group is cancelled",
+  "SIGQUIT stays attached until the foreground Codex group is cancelled",
+  "a second interrupt cannot bypass foreground cleanup",
+  "cancel retains a live PID when its ownership identity is unavailable",
+  "an incomplete timeout cleanup retains process evidence for retry",
+  "session-end cancels only jobs owned by the ending Claude session",
+  "status repairs an ownerless running record as died"
+]);
+
+function test(name, callback) {
+  return nodeTest(name, (t) => {
+    if (processInspectionTests.has(name) && !processInspectionAvailable()) {
+      t.skip("process inspection unavailable in this environment");
+      return;
+    }
+    return callback(t);
+  });
+}
 
 function usage(inputTokens, cachedInputTokens, outputTokens, reasoningOutputTokens) {
   return JSON.stringify({
@@ -62,6 +139,14 @@ function createTransport(sandbox, raw, env = envFor(sandbox)) {
   return { ...transport, ownerFile: path.join(path.dirname(transport.file), "owner.json") };
 }
 
+function runGit(sandbox, args, options = {}) {
+  return execFileSync("git", args, {
+    ...options,
+    cwd: options.cwd ?? sandbox.workDir,
+    env: { ...process.env, ...gitIsolation(sandbox.root), ...options.env }
+  });
+}
+
 test("task header parsing captures model and effort only from a pipe-separated header", () => {
   assert.deepEqual(
     parseTaskHeader("\n  lane: codex | MODEL: gpt-5.6-terra | Effort: xhigh | verification: node --test\nImplement the change."),
@@ -72,27 +157,24 @@ test("task header parsing captures model and effort only from a pipe-separated h
   assert.deepEqual(parseTaskHeader("lane: codex | model: gpt-5.6-terra"), { headerModel: "gpt-5.6-terra", headerEffort: null });
 });
 
-test("task warns when an implicit cwd is below a repository top level", (t) => {
+test("task rejects an implicit cwd below a repository top level before creating a job", (t) => {
   const sandbox = makeSandbox(t);
   const subdirectory = path.join(sandbox.workDir, "apps", "api");
   fs.mkdirSync(subdirectory, { recursive: true });
-  execFileSync("git", ["init", "--quiet"], { cwd: sandbox.workDir });
+  runGit(sandbox, ["init", "--quiet"]);
 
-  const cwd = fs.realpathSync(subdirectory);
-  const workspaceRoot = fs.realpathSync(sandbox.workDir);
-  const warning = `Codex cwd ${cwd} sits below repository top level ${workspaceRoot} without an explicit --cwd; the sandbox roots at this subdirectory. Pass --cwd to pin the intended workspace.`;
   const result = runCompanion(["task", "inspect the API"], { cwd: subdirectory, env: envFor(sandbox) });
 
-  assert.equal(result.status, 0, result.stderr);
-  assert.equal(result.stderr, `${warning}\n`);
-  assert.equal(jobRecords(sandbox)[0].diagnostics.filter((diagnostic) => diagnostic.type === "warning" && diagnostic.message === warning).length, 1);
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /is inside repository/);
+  assert.equal(jobRecords(sandbox).length, 0);
 });
 
-test("task does not warn for an explicit cwd below a repository top level", (t) => {
+test("task accepts an explicit cwd below a repository top level", (t) => {
   const sandbox = makeSandbox(t);
   const subdirectory = path.join(sandbox.workDir, "apps", "api");
   fs.mkdirSync(subdirectory, { recursive: true });
-  execFileSync("git", ["init", "--quiet"], { cwd: sandbox.workDir });
+  runGit(sandbox, ["init", "--quiet"]);
 
   const result = runCompanion(["task", "--cwd", ".", "inspect the API"], { cwd: subdirectory, env: envFor(sandbox) });
 
@@ -101,7 +183,7 @@ test("task does not warn for an explicit cwd below a repository top level", (t) 
   assert.equal(jobRecords(sandbox)[0].diagnostics.some((diagnostic) => diagnostic.type === "warning"), false);
 });
 
-test("task does not warn for an implicit cwd outside a Git repository", (t) => {
+test("task accepts an implicit cwd outside a Git repository", (t) => {
   const sandbox = makeSandbox(t);
   const subdirectory = path.join(sandbox.workDir, "apps", "api");
   fs.mkdirSync(subdirectory, { recursive: true });
@@ -113,18 +195,47 @@ test("task does not warn for an implicit cwd outside a Git repository", (t) => {
   assert.equal(jobRecords(sandbox)[0].diagnostics.some((diagnostic) => diagnostic.type === "warning"), false);
 });
 
+test("task accepts an explicit repository top level from a subdirectory", (t) => {
+  const sandbox = makeSandbox(t);
+  const subdirectory = path.join(sandbox.workDir, "apps", "api");
+  fs.mkdirSync(subdirectory, { recursive: true });
+  runGit(sandbox, ["init", "--quiet"]);
+
+  const workspaceRoot = fs.realpathSync(sandbox.workDir);
+  const result = runCompanion(["task", "--cwd", workspaceRoot, "inspect the API"], { cwd: subdirectory, env: envFor(sandbox) });
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(result.stderr, "");
+  assert.equal(jobRecords(sandbox)[0].cwd, workspaceRoot);
+  assert.equal(jobRecords(sandbox)[0].diagnostics.some((diagnostic) => diagnostic.type === "warning"), false);
+});
+
+test("review commands reject an implicit cwd below a repository top level before creating a job", (t) => {
+  const sandbox = makeSandbox(t);
+  const subdirectory = path.join(sandbox.workDir, "apps", "api");
+  fs.mkdirSync(subdirectory, { recursive: true });
+  runGit(sandbox, ["init", "--quiet"]);
+
+  for (const command of ["review", "adversarial-review"]) {
+    const result = runCompanion([command], { cwd: subdirectory, env: envFor(sandbox) });
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /is inside repository/);
+  }
+  assert.equal(jobRecords(sandbox).length, 0);
+});
+
 test("job records capture the repository top level without requiring a Git repository", (t) => {
   const sandbox = makeSandbox(t);
   const repository = path.join(sandbox.root, "repository");
   const nonRepository = path.join(sandbox.root, "non-repository");
   fs.mkdirSync(repository);
   fs.mkdirSync(nonRepository);
-  execFileSync("git", ["init", "--quiet"], { cwd: repository });
+  runGit(sandbox, ["init", "--quiet"], { cwd: repository });
 
   const repositoryRecord = createJobRecord({ cwd: repository, id: "repository-top-level" });
   const nonRepositoryRecord = createJobRecord({ cwd: nonRepository, id: "non-repository-top-level" });
 
-  assert.equal(repositoryRecord.repositoryTopLevel, execFileSync("git", ["rev-parse", "--show-toplevel"], { cwd: repository, encoding: "utf8" }).trim());
+  assert.equal(repositoryRecord.repositoryTopLevel, runGit(sandbox, ["rev-parse", "--show-toplevel"], { cwd: repository, encoding: "utf8" }).trim());
   assert.equal(nonRepositoryRecord.repositoryTopLevel, null);
 });
 
@@ -456,13 +567,9 @@ test("raw transport rejects an unwritten input and removes the verified transpor
 test("a staged Fusion worktree request selects the Codex cwd and workspace root", (t) => {
   const sandbox = makeSandbox(t);
   const sibling = path.join(sandbox.root, "sibling worktree");
-  execFileSync("git", ["init", "-q"], { cwd: sandbox.workDir });
-  execFileSync(
-    "git",
-    ["-c", "user.email=fusion-test@example.com", "-c", "user.name=fusion-test", "commit", "--allow-empty", "-q", "-m", "init"],
-    { cwd: sandbox.workDir }
-  );
-  execFileSync("git", ["worktree", "add", "-q", "-b", "fusion-sibling", sibling], { cwd: sandbox.workDir });
+  runGit(sandbox, ["init", "-q"]);
+  runGit(sandbox, ["-c", "user.email=fusion-test@example.com", "-c", "user.name=fusion-test", "commit", "--allow-empty", "-q", "-m", "init"]);
+  runGit(sandbox, ["worktree", "add", "-q", "-b", "fusion-sibling", sibling]);
   const prompt = "Implement the isolated package and run its verification.";
   const transport = createTransport(sandbox, `--write --cwd ${JSON.stringify(sibling)} -- ${prompt}`);
   const result = runCompanion(["task", "--transport-default-write", "--raw-args-token", transport.token], {
@@ -1280,13 +1387,9 @@ test("workspace reservation makes simultaneous task launches single flight", asy
 test("main workspace and a sibling worktree admit concurrent tasks for the same repository", async (t) => {
   const sandbox = makeSandbox(t);
   const sibling = path.join(sandbox.root, "sibling-worktree");
-  execFileSync("git", ["init", "-q"], { cwd: sandbox.workDir });
-  execFileSync(
-    "git",
-    ["-c", "user.email=fusion-test@example.com", "-c", "user.name=fusion-test", "commit", "--allow-empty", "-q", "-m", "init"],
-    { cwd: sandbox.workDir }
-  );
-  execFileSync("git", ["worktree", "add", "-q", "-b", "sibling-worktree", sibling], { cwd: sandbox.workDir });
+  runGit(sandbox, ["init", "-q"]);
+  runGit(sandbox, ["-c", "user.email=fusion-test@example.com", "-c", "user.name=fusion-test", "commit", "--allow-empty", "-q", "-m", "init"]);
+  runGit(sandbox, ["worktree", "add", "-q", "-b", "sibling-worktree", sibling]);
   const env = envFor(sandbox, { FAKE_CODEX_DELAY_MS: "250" });
   const mainTask = spawnCompanion(["task", "main workspace task"], { cwd: sandbox.workDir, env });
   const siblingTask = spawnCompanion(["task", "sibling worktree task"], { cwd: sibling, env });

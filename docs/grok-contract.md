@@ -99,7 +99,7 @@ Job statuses, liveness, rendered outcome footers, failure kind definitions, back
 ## Degradation
 
 - A missing grok binary fails fast with a message pointing at `/grok:setup`, and the `grok-rescue` agent returns a single `grok unavailable: <reason>` line the orchestrator uses to stop routing to Grok for the session.
-- A bad `--cwd` fails before the companion creates a job record and maps to the shared `input` failure kind.
+- A bad `--cwd`, or an implicit task or review working directory below its Git repository root, fails before the companion creates a job record and maps to the shared `input` failure kind.
 
 ## X content access
 

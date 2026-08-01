@@ -29,6 +29,18 @@ export const grokCompanionCapabilities = [
   "--json-schema",
 ].join(",");
 
+let cachedProcessInspectionAvailability;
+
+export function processInspectionAvailable() {
+  if (process.env.COMPANION_TEST_NO_PROCESS_INSPECTION === "1") {
+    return false;
+  }
+  if (cachedProcessInspectionAvailability === undefined) {
+    cachedProcessInspectionAvailability = getProcessIdentity(process.pid) !== null;
+  }
+  return cachedProcessInspectionAvailability;
+}
+
 export function makeSandbox(t) {
   const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "grok-plugin-test-")));
   const cleanups = [];
@@ -117,7 +129,7 @@ export function envFor(sandbox, extra = {}, options = {}) {
   }
   return {
     ...env,
-    ...(options.git ? gitIsolation : {}),
+    ...(options.git ? gitIsolation(sandbox.root) : {}),
     HOME: homeDir,
     TMPDIR: tempDir,
     GROK_BIN: fakeGrok,

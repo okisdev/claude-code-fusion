@@ -48,6 +48,13 @@ function sandbox(t) {
   return dir;
 }
 
+function runGit(root, args, options = {}) {
+  return spawnSync("git", args, {
+    ...options,
+    env: { ...process.env, ...gitIsolation(root), ...options.env }
+  });
+}
+
 let slugCounter = 0;
 
 function writeCodexJob(stateRoot, workspaceRoot, id, fields) {
@@ -229,9 +236,9 @@ function createSiblingWorktree(root) {
   const main = path.join(root, "main");
   const sibling = path.join(root, "sibling");
   fs.mkdirSync(main, { recursive: true });
-  const initialized = spawnSync("git", ["init", "-q"], { cwd: main, encoding: "utf8", env: { ...process.env, ...gitIsolation } });
+  const initialized = runGit(root, ["init", "-q"], { cwd: main, encoding: "utf8" });
   assert.strictEqual(initialized.status, 0, initialized.stderr);
-  const added = spawnSync("git", ["worktree", "add", "--orphan", sibling], { cwd: main, encoding: "utf8", env: { ...process.env, ...gitIsolation } });
+  const added = runGit(root, ["worktree", "add", "--orphan", sibling], { cwd: main, encoding: "utf8" });
   assert.strictEqual(added.status, 0, added.stderr);
   return { main, sibling };
 }
@@ -521,7 +528,7 @@ test("scopes Codex jobs by Git repository identity across sibling worktrees", (t
   const { main, sibling } = createSiblingWorktree(dir);
   const unrelated = path.join(dir, "unrelated");
   fs.mkdirSync(unrelated, { recursive: true });
-  const initialized = spawnSync("git", ["init", "-q"], { cwd: unrelated, encoding: "utf8" });
+  const initialized = runGit(dir, ["init", "-q"], { cwd: unrelated, encoding: "utf8" });
   assert.strictEqual(initialized.status, 0, initialized.stderr);
   const stateRoot = path.join(dir, "state");
   writeCodexJob(stateRoot, sibling, "sibling-task", { status: "done", jobClass: "task", createdAt: "2026-07-02T06:00:00.000Z" });
@@ -1253,7 +1260,7 @@ test("codex workspace scope resolves the git root and includes descendant worktr
   const stateRoot = path.join(dir, "state");
   fs.mkdirSync(nested, { recursive: true });
   fs.mkdirSync(worktree, { recursive: true });
-  assert.strictEqual(spawnSync("git", ["init", "--quiet", repo]).status, 0);
+  assert.strictEqual(runGit(dir, ["init", "--quiet", repo]).status, 0);
   writeCodexJob(stateRoot, worktree, "worktree-job", { status: "done", jobClass: "task", createdAt: "2026-07-14T00:00:00.000Z" });
 
   const result = run({ cwd: nested, codexState: stateRoot }, ["--json"]);
@@ -1330,7 +1337,7 @@ test("terminal ledger repository identity survives removal of a sibling worktree
       createdAt: "2026-07-14T00:00:00.000Z"
     }
   ]);
-  const removed = spawnSync("git", ["worktree", "remove", "--force", sibling], { cwd: main, encoding: "utf8" });
+  const removed = runGit(dir, ["worktree", "remove", "--force", sibling], { cwd: main, encoding: "utf8" });
   assert.strictEqual(removed.status, 0, removed.stderr);
 
   const stats = codexStats({ env: { FUSION_CODEX_STATE: stateRoot, FUSION_DATA_DIR: path.join(dir, "fusion") }, cwd: main });
@@ -1356,7 +1363,7 @@ test("canonical state repository identity survives removal of a sibling worktree
     finishedAt: "2026-07-14T00:00:01.000Z",
     repositoryKey
   });
-  const removed = spawnSync("git", ["worktree", "remove", "--force", sibling], { cwd: main, encoding: "utf8" });
+  const removed = runGit(dir, ["worktree", "remove", "--force", sibling], { cwd: main, encoding: "utf8" });
   assert.strictEqual(removed.status, 0, removed.stderr);
 
   const stats = codexStats({ env: { FUSION_CODEX_STATE: stateRoot, FUSION_DATA_DIR: path.join(dir, "fusion") }, cwd: main });
@@ -1370,8 +1377,8 @@ test("authoritative terminal ledger repository identity rejects a conflicting pa
   const main = path.join(dir, "main");
   const nested = path.join(main, "nested");
   fs.mkdirSync(nested, { recursive: true });
-  assert.strictEqual(spawnSync("git", ["init", "-q"], { cwd: main }).status, 0);
-  assert.strictEqual(spawnSync("git", ["init", "-q"], { cwd: nested }).status, 0);
+  assert.strictEqual(runGit(dir, ["init", "-q"], { cwd: main }).status, 0);
+  assert.strictEqual(runGit(dir, ["init", "-q"], { cwd: nested }).status, 0);
   const stateRoot = path.join(dir, "state");
   writeTerminalLedger(stateRoot, main, [
     {
@@ -1403,10 +1410,10 @@ test("deleted worktree evidence does not merge with an unrelated repository that
       kind: "task"
     }
   ]);
-  const removed = spawnSync("git", ["worktree", "remove", "--force", sibling], { cwd: main, encoding: "utf8" });
+  const removed = runGit(dir, ["worktree", "remove", "--force", sibling], { cwd: main, encoding: "utf8" });
   assert.strictEqual(removed.status, 0, removed.stderr);
   fs.mkdirSync(sibling, { recursive: true });
-  assert.strictEqual(spawnSync("git", ["init", "-q"], { cwd: sibling }).status, 0);
+  assert.strictEqual(runGit(dir, ["init", "-q"], { cwd: sibling }).status, 0);
   writeCodexJob(stateRoot, sibling, "reused-path-job", { status: "error", jobClass: "task" });
 
   const env = { FUSION_CODEX_STATE: stateRoot, FUSION_DATA_DIR: path.join(dir, "fusion") };
@@ -1467,8 +1474,8 @@ test("Codex acceptance and token observations stay scoped when unrelated reposit
   const secondRoot = path.join(dir, "second");
   fs.mkdirSync(firstRoot, { recursive: true });
   fs.mkdirSync(secondRoot, { recursive: true });
-  assert.strictEqual(spawnSync("git", ["init", "-q"], { cwd: firstRoot }).status, 0);
-  assert.strictEqual(spawnSync("git", ["init", "-q"], { cwd: secondRoot }).status, 0);
+  assert.strictEqual(runGit(dir, ["init", "-q"], { cwd: firstRoot }).status, 0);
+  assert.strictEqual(runGit(dir, ["init", "-q"], { cwd: secondRoot }).status, 0);
   const stateRoot = path.join(dir, "state");
   const fusionData = path.join(dir, "fusion");
   writeCodexJob(stateRoot, firstRoot, "shared-observation-id", { status: "done", jobClass: "task", acceptance: "accepted" });

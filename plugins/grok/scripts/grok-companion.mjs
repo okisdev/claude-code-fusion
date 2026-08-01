@@ -642,6 +642,23 @@ function resolveCwd(options) {
   return cwd;
 }
 
+function bestEffortRealpath(cwd) {
+  try {
+    return fs.realpathSync.native(cwd);
+  } catch {
+    return cwd;
+  }
+}
+
+function validateImplicitRepositoryCwd(options, cwd, repositoryTopLevel) {
+  if (options.cwd !== undefined || repositoryTopLevel === null) {
+    return;
+  }
+  if (bestEffortRealpath(cwd) !== bestEffortRealpath(repositoryTopLevel)) {
+    throw inputError(`Implicit working directory ${cwd} is inside repository ${repositoryTopLevel} but is not its root. Pass --cwd ${repositoryTopLevel} to target the repository root, or pass --cwd ${cwd} to confirm this subdirectory as the sandbox root.`);
+  }
+}
+
 function findRequestedJobRecord(dataDir, jobId, options) {
   if (!JOB_ID_PATTERN.test(String(jobId ?? ""))) {
     throw inputError("Grok job ids must be exactly 32 lowercase hexadecimal characters.");
@@ -1604,6 +1621,8 @@ async function handleTask(argv, transport = {}) {
 
   const jsonSchema = options["json-schema"] === undefined ? null : parseJsonSchema(options["json-schema"]);
   const cwd = resolveCwd(options);
+  const repositoryTopLevel = resolveRepositoryTopLevel(cwd);
+  validateImplicitRepositoryCwd(options, cwd, repositoryTopLevel);
   const dataDir = resolveDataDir();
   const claudeSessionId = currentClaudeSessionId();
 
@@ -1691,7 +1710,7 @@ async function handleTask(argv, transport = {}) {
         ingress: transport.ingress ?? "argv"
       }
     }),
-    repositoryTopLevel: resolveRepositoryTopLevel(cwd)
+    repositoryTopLevel
   };
   createJobRecordFile(jobFile, record);
   try {
@@ -1800,7 +1819,8 @@ async function handleTask(argv, transport = {}) {
           structuredOutputError: result.structuredOutputError,
           schemaRequested: jsonSchema !== null,
           sessionId: result.sessionId,
-          jobId
+          jobId,
+          cwd: final.cwd
         }),
     options.json
   );
@@ -2114,6 +2134,8 @@ async function handleReview(argv, transport = {}) {
   }, transport);
 
   const cwd = resolveCwd(options);
+  const repositoryTopLevel = resolveRepositoryTopLevel(cwd);
+  validateImplicitRepositoryCwd(options, cwd, repositoryTopLevel);
   const dataDir = resolveDataDir();
   const background = transport.defaultBackground ? true : Boolean(options.background);
   ensureGitRepository(cwd);
@@ -2153,7 +2175,7 @@ async function handleReview(argv, transport = {}) {
         ingress: transport.ingress ?? "argv"
       }
     }),
-    repositoryTopLevel: resolveRepositoryTopLevel(cwd)
+    repositoryTopLevel
   };
   createJobRecordFile(jobFile, record);
   try {
@@ -2200,7 +2222,7 @@ async function handleReview(argv, transport = {}) {
   output(
     options.json
       ? payload
-      : renderTaskResult({ text: payload.rendered.trimEnd(), sessionId: payload.sessionId, jobId }),
+      : renderTaskResult({ text: payload.rendered.trimEnd(), sessionId: payload.sessionId, jobId, cwd: record.cwd }),
     options.json
   );
 }
@@ -2446,7 +2468,8 @@ function renderResultRecord(record, dataDir) {
     structuredOutputError: record.structuredOutputError,
     schemaRequested: record.request?.jsonSchema != null,
     sessionId: record.sessionId,
-    jobId: record.id
+    jobId: record.id,
+    cwd: record.cwd
   });
 }
 

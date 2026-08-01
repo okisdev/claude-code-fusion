@@ -1,14 +1,15 @@
 import assert from "node:assert/strict";
-import { spawnSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
-import test from "node:test";
+import { test as nodeTest } from "node:test";
 
 import {
   envFor,
   flagValues,
   jobRecords,
   makeSandbox,
+  processInspectionAvailable,
   readInvocations,
   repoRoot,
   runCompanion
@@ -17,6 +18,31 @@ import { gitIsolation, initCleanRepo } from "./lib/git-fixture.mjs";
 
 const grokExecPath = path.join(repoRoot, "plugins", "grok", "scripts", "lib", "grok-exec.mjs");
 const { extractDeniedToolFromStderr, formatDeniedToolDetail } = await import(grokExecPath);
+
+const processInspectionTests = new Set([
+  "permission death appends denied-tool detail when stderr names a tool",
+  "permission death keeps the generic message when stderr omits a tool name",
+  "permission-cancelled death without a named tool stays generic",
+  "task job records repositoryTopLevel inside a git directory",
+  "task accepts an explicit cwd below a repository top level",
+  "task accepts an implicit cwd outside a Git repository",
+  "task accepts an explicit repository top level from a subdirectory",
+  "task job records null repositoryTopLevel outside a git directory",
+  "task passes an inline JSON schema and renders structured success",
+  "task fails with failure kind error for a structured output error",
+  "task fails with failure kind error for a null structured output",
+  "task parses text compatibility output only when structuredOutput is absent"
+]);
+
+function test(name, callback) {
+  return nodeTest(name, (t) => {
+    if (processInspectionTests.has(name) && !processInspectionAvailable()) {
+      t.skip("process inspection unavailable in this environment");
+      return;
+    }
+    return callback(t);
+  });
+}
 
 function writePermissionDeathGrok(sandbox, { stderrLine, exitCode = 1 } = {}) {
   const file = path.join(sandbox.root, "permission-death-grok.mjs");
@@ -45,10 +71,18 @@ process.exit(${exitCode});
   return file;
 }
 
-function gitTopLevel(cwd) {
+function runGit(sandbox, args, options = {}) {
+  return execFileSync("git", args, {
+    ...options,
+    cwd: options.cwd ?? sandbox.workDir,
+    env: { ...process.env, ...gitIsolation(sandbox.root), ...options.env }
+  });
+}
+
+function gitTopLevel(sandbox, cwd) {
   const result = spawnSync("git", ["-C", cwd, "rev-parse", "--show-toplevel"], {
     encoding: "utf8",
-    env: { ...process.env, ...gitIsolation },
+    env: { ...process.env, ...gitIsolation(sandbox.root) },
     stdio: ["ignore", "pipe", "ignore"]
   });
   assert.equal(result.status, 0, result.stderr);
@@ -125,7 +159,7 @@ test("permission-cancelled death without a named tool stays generic", (t) => {
 test("task job records repositoryTopLevel inside a git directory", (t) => {
   const sandbox = makeSandbox(t);
   initCleanRepo(sandbox.workDir);
-  const expected = gitTopLevel(sandbox.workDir);
+  const expected = gitTopLevel(sandbox, sandbox.workDir);
   const result = runCompanion(["task", "record the repository root"], {
     cwd: sandbox.workDir,
     env: envFor(sandbox)
@@ -134,6 +168,80 @@ test("task job records repositoryTopLevel inside a git directory", (t) => {
   const record = jobRecords(sandbox.dataDir)[0];
   assert.equal(record.cwd, sandbox.workDir);
   assert.equal(record.repositoryTopLevel, expected);
+});
+
+test("task rejects an implicit cwd below a repository top level before creating a job", (t) => {
+  const sandbox = makeSandbox(t);
+  const repositoryTopLevel = fs.realpathSync(sandbox.workDir);
+  const subdirectory = path.join(repositoryTopLevel, "apps", "api");
+  fs.mkdirSync(subdirectory, { recursive: true });
+  const canonicalSubdirectory = fs.realpathSync(subdirectory);
+  runGit(sandbox, ["init", "--quiet"], { cwd: repositoryTopLevel });
+
+  const result = runCompanion(["task", "inspect the API"], { cwd: canonicalSubdirectory, env: envFor(sandbox) });
+
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /is inside repository/);
+  assert.match(result.stderr, /state: error\nfailure: input\n$/);
+  assert.deepEqual(jobRecords(sandbox.dataDir), []);
+});
+
+test("task accepts an explicit cwd below a repository top level", (t) => {
+  const sandbox = makeSandbox(t);
+  const repositoryTopLevel = fs.realpathSync(sandbox.workDir);
+  const subdirectory = path.join(repositoryTopLevel, "apps", "api");
+  fs.mkdirSync(subdirectory, { recursive: true });
+  const canonicalSubdirectory = fs.realpathSync(subdirectory);
+  runGit(sandbox, ["init", "--quiet"], { cwd: repositoryTopLevel });
+
+  const result = runCompanion(["task", "--cwd", ".", "inspect the API"], { cwd: canonicalSubdirectory, env: envFor(sandbox) });
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /job: [a-f0-9]{32}\nsandbox: [^\n]+\nstate: done\n$/);
+  assert.ok(result.stdout.includes(`sandbox: ${canonicalSubdirectory}\n`));
+  assert.equal(jobRecords(sandbox.dataDir)[0].cwd, canonicalSubdirectory);
+});
+
+test("task accepts an implicit cwd outside a Git repository", (t) => {
+  const sandbox = makeSandbox(t);
+  const subdirectory = path.join(fs.realpathSync(sandbox.workDir), "apps", "api");
+  fs.mkdirSync(subdirectory, { recursive: true });
+  const canonicalSubdirectory = fs.realpathSync(subdirectory);
+
+  const result = runCompanion(["task", "inspect the API"], { cwd: canonicalSubdirectory, env: envFor(sandbox) });
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(jobRecords(sandbox.dataDir)[0].cwd, canonicalSubdirectory);
+});
+
+test("task accepts an explicit repository top level from a subdirectory", (t) => {
+  const sandbox = makeSandbox(t);
+  const repositoryTopLevel = fs.realpathSync(sandbox.workDir);
+  const subdirectory = path.join(repositoryTopLevel, "apps", "api");
+  fs.mkdirSync(subdirectory, { recursive: true });
+  const canonicalSubdirectory = fs.realpathSync(subdirectory);
+  runGit(sandbox, ["init", "--quiet"], { cwd: repositoryTopLevel });
+
+  const result = runCompanion(["task", "--cwd", repositoryTopLevel, "inspect the API"], { cwd: canonicalSubdirectory, env: envFor(sandbox) });
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(jobRecords(sandbox.dataDir)[0].cwd, repositoryTopLevel);
+});
+
+test("review rejects an implicit cwd below a repository top level before creating a job", (t) => {
+  const sandbox = makeSandbox(t);
+  const repositoryTopLevel = fs.realpathSync(sandbox.workDir);
+  const subdirectory = path.join(repositoryTopLevel, "apps", "api");
+  fs.mkdirSync(subdirectory, { recursive: true });
+  const canonicalSubdirectory = fs.realpathSync(subdirectory);
+  runGit(sandbox, ["init", "--quiet"], { cwd: repositoryTopLevel });
+
+  const result = runCompanion(["review"], { cwd: canonicalSubdirectory, env: envFor(sandbox) });
+
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /is inside repository/);
+  assert.match(result.stderr, /state: error\nfailure: input\n$/);
+  assert.deepEqual(jobRecords(sandbox.dataDir), []);
 });
 
 test("task job records null repositoryTopLevel outside a git directory", (t) => {
