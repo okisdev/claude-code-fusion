@@ -264,7 +264,7 @@ test("review records a structured validation error without resuming or trusting 
   assert.ok(record.resultText.includes(JSON.stringify(reviewObject)));
   assert.match(record.errorMessage, /failed validation: output does not match the required schema/);
   assert.doesNotMatch(record.errorMessage, /\r?\n/);
-  assert.match(result.stderr, new RegExp(`job: ${record.id}\\nstate: error\\nfailure: error\\n$`));
+  assert.match(result.stderr, new RegExp(`job: ${record.id}\\nsandbox: ${record.cwd}\\nstate: error\\nfailure: error\\n$`));
 });
 
 test("background review records a structured validation failure after one model call", async (t) => {

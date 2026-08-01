@@ -180,7 +180,7 @@ test("foreground task exits nonzero when grok fails", (t) => {
   const [record] = jobRecords(sandbox.dataDir);
   assert.ok(record.errorMessage);
   assert.doesNotMatch(record.errorMessage, /\r?\n/);
-  assert.match(result.stderr, new RegExp(`job: ${record.id}\\nstate: error\\nfailure: error\\n$`));
+  assert.match(result.stderr, new RegExp(`job: ${record.id}\\nsandbox: ${record.cwd}\\nstate: error\\nfailure: error\\n$`));
 });
 
 test("background task creates a job record and result prints the finished output", async (t) => {
@@ -510,7 +510,7 @@ test("background task failure ends in an error record", async (t) => {
   assert.doesNotMatch(failed.errorMessage, /\r?\n/);
   const resultOutput = runCompanion(["result", failed.id], { cwd: sandbox.workDir, env: envFor(sandbox) });
   assert.strictEqual(resultOutput.status, 0, resultOutput.stderr);
-  assert.match(resultOutput.stdout, new RegExp(`job: ${failed.id}\\nstate: error\\nfailure: error\\n$`));
+  assert.match(resultOutput.stdout, new RegExp(`job: ${failed.id}\\nsandbox: ${failed.cwd}\\nstate: error\\nfailure: error\\n$`));
 });
 
 test("a background task records its terminal failure when the job log is unwritable", async (t) => {
@@ -589,7 +589,7 @@ test("cancel kills a hanging worker and its grok process and marks the record ca
   assert.deepStrictEqual(fs.readdirSync(tempDir).filter((entry) => entry.startsWith("grok-companion-stdout-")), []);
   assert.match(
     cancelOutput.stdout,
-    new RegExp(`Check /grok:status for the updated list\\.\\n\\njob: ${running.id}\\nstate: cancelled\\nfailure: cancelled\\n$`),
+    new RegExp(`Check /grok:status for the updated list\\.\\n\\njob: ${running.id}\\nsandbox: ${running.cwd}\\nstate: cancelled\\nfailure: cancelled\\n$`),
   );
 });
 
@@ -623,7 +623,7 @@ test("cancel kills a foreground grok and the record stays cancelled after the co
   assert.notStrictEqual(exitCode, 0);
   assert.match(stderr, /^state: cancelled$/m);
   assert.match(stderr, /^failure: cancelled$/m);
-  assert.match(stderr, new RegExp(`job: ${running.id}\\nstate: cancelled\\nfailure: cancelled\\n$`));
+  assert.match(stderr, new RegExp(`job: ${running.id}\\nsandbox: ${running.cwd}\\nstate: cancelled\\nfailure: cancelled\\n$`));
   const final = jobRecords(sandbox.dataDir)[0];
   assert.strictEqual(final.status, "cancelled");
   assert.strictEqual(final.pid, null);
@@ -810,7 +810,7 @@ test("foreground spawn failure records an error instead of leaving the job runni
   assert.ok(record.errorTail, "Expected an error tail on the failed record.");
   assert.ok(record.errorMessage, "Expected an error summary on the failed record.");
   assert.doesNotMatch(record.errorMessage, /\r?\n/);
-  assert.match(result.stderr, new RegExp(`job: ${record.id}\\nstate: error\\nfailure: missing_cli\\n$`));
+  assert.match(result.stderr, new RegExp(`job: ${record.id}\\nsandbox: ${record.cwd}\\nstate: error\\nfailure: missing_cli\\n$`));
 });
 
 test("background worker failures record a one line error summary", async (t) => {

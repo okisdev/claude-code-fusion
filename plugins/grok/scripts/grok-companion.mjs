@@ -615,14 +615,14 @@ function boundedTextTail(value, maxLines = 20) {
     .join("\n");
 }
 
-function failureOutcomeMessage({ message, detail, jobId, status = "error", failureKind = "error" }) {
+function failureOutcomeMessage({ message, detail, jobId, cwd, status = "error", failureKind = "error" }) {
   const lines = [String(message ?? "").trim() || "Grok companion failed."];
   const diagnostic = String(detail ?? "").trim();
   if (diagnostic && diagnostic !== lines[0]) {
     lines.push("", diagnostic);
   }
   if (jobId) {
-    lines.push("", `job: ${jobId}`);
+    lines.push("", `job: ${jobId}`, `sandbox: ${cwd}`);
   }
   lines.push(`state: ${status}`, `failure: ${failureKind}`);
   return lines.join("\n");
@@ -1250,7 +1250,7 @@ function finishDiedJobRecord(file) {
         failureResultPayload(current, {
           status,
           failureKind,
-          message: failureOutcomeMessage({ message, jobId: current.id, status, failureKind })
+          message: failureOutcomeMessage({ message, jobId: current.id, cwd: current.cwd, status, failureKind })
         })
       ),
       errorMessage: message,
@@ -1480,7 +1480,7 @@ function failJob(jobFile, logFile, result, timeoutMs) {
       : classifyFailure({ result, logTail: tail });
   const message = grokFailureMessage(result, timeoutMs, failureKind);
   const status = failureKind === "cancelled" ? "cancelled" : "error";
-  const renderedMessage = failureOutcomeMessage({ message, detail: tail, jobId: current?.id, status, failureKind });
+  const renderedMessage = failureOutcomeMessage({ message, detail: tail, jobId: current?.id, cwd: current?.cwd, status, failureKind });
   finishJobRecord(jobFile, {
     status,
     pid: null,
@@ -1510,6 +1510,7 @@ function finishTaskStructuredFailure(jobFile, result, evaluation) {
     message,
     detail,
     jobId: current?.id,
+    cwd: current?.cwd,
     status: "error",
     failureKind: "error"
   });
@@ -1541,13 +1542,14 @@ function describeLaunchFailure(error) {
   return error instanceof Error ? error.message : String(error);
 }
 
-function launchFailureError(error, jobId) {
+function launchFailureError(error, jobId, cwd) {
   const failureKind = classifyFailure({ spawnError: error });
   const status = error?.cleanupRequired ? "running" : failureKind === "cancelled" ? "cancelled" : "error";
   const wrapped = errorWithFailure(
     failureOutcomeMessage({
       message: describeLaunchFailure(error),
       jobId,
+      cwd,
       status,
       failureKind
     }),
@@ -1720,7 +1722,7 @@ async function handleTask(argv, transport = {}) {
     }
   } catch (error) {
     recordSpawnFailure(jobFile, error);
-    throw launchFailureError(error, jobId);
+    throw launchFailureError(error, jobId, record.cwd);
   }
 
   if (background) {
@@ -1728,7 +1730,7 @@ async function handleTask(argv, transport = {}) {
       await spawnBackgroundWorker([SELF_PATH, "task-worker", "--job-id", jobId, "--cwd", cwd], jobFile);
     } catch (error) {
       recordSpawnFailure(jobFile, error);
-      throw launchFailureError(error, jobId);
+      throw launchFailureError(error, jobId, record.cwd);
     }
     const payload = {
       jobId,
@@ -1768,7 +1770,7 @@ async function handleTask(argv, transport = {}) {
     });
   } catch (error) {
     recordSpawnFailure(jobFile, error);
-    throw launchFailureError(error, jobId);
+    throw launchFailureError(error, jobId, record.cwd);
   }
 
   if (resultFailed(result)) {
@@ -1804,6 +1806,7 @@ async function handleTask(argv, transport = {}) {
       failureOutcomeMessage({
         message: "Job was cancelled.",
         jobId,
+        cwd: final.cwd,
         status: "cancelled",
         failureKind: "cancelled"
       })
@@ -1899,7 +1902,7 @@ async function handleTaskWorker(argv) {
         : classifyFailure({ result, logTail: tail });
     const message = grokFailureMessage(result, timeoutMs, failureKind);
     const status = failureKind === "cancelled" ? "cancelled" : "error";
-    const renderedMessage = failureOutcomeMessage({ message, detail: tail, jobId: record.id, status, failureKind });
+    const renderedMessage = failureOutcomeMessage({ message, detail: tail, jobId: record.id, cwd: record.cwd, status, failureKind });
     finishJobRecord(found.file, {
       status,
       pid: null,
@@ -2071,7 +2074,7 @@ async function runReviewJob(record, jobFile, options = {}) {
     });
   } catch (error) {
     recordSpawnFailure(jobFile, error);
-    throw launchFailureError(error, record.id);
+    throw launchFailureError(error, record.id, record.cwd);
   }
   if (resultFailed(first)) {
     failJob(jobFile, logFile, first, timeoutMs);
@@ -2182,7 +2185,7 @@ async function handleReview(argv, transport = {}) {
     writeBrief(dataDir, cwd, jobId, prompt);
   } catch (error) {
     recordSpawnFailure(jobFile, error);
-    throw launchFailureError(error, jobId);
+    throw launchFailureError(error, jobId, record.cwd);
   }
 
   if (background) {
@@ -2190,7 +2193,7 @@ async function handleReview(argv, transport = {}) {
       await spawnBackgroundWorker([SELF_PATH, "review-worker", "--job-id", jobId, "--cwd", cwd], jobFile);
     } catch (error) {
       recordSpawnFailure(jobFile, error);
-      throw launchFailureError(error, jobId);
+      throw launchFailureError(error, jobId, record.cwd);
     }
     const payload = {
       jobId,
@@ -2215,6 +2218,7 @@ async function handleReview(argv, transport = {}) {
         message: `Grok review output failed validation: ${payload.parseError}`,
         detail: payload.rendered,
         jobId,
+        cwd: record.cwd,
         failureKind: "error"
       })
     );
@@ -2406,7 +2410,7 @@ function renderFailedResult(record, dataDir) {
   if (tail) {
     lines.push("", "Log tail:", "", "```text", tail, "```");
   }
-  lines.push("", `job: ${record.id}`, "state: error");
+  lines.push("", `job: ${record.id}`, `sandbox: ${record.cwd}`, "state: error");
   if (record.failureKind) {
     lines.push(`failure: ${record.failureKind}`);
   }
@@ -2434,6 +2438,7 @@ function renderNotRunningReport(record) {
     `Job ${record.id} is not running (status: ${record.status}).`,
     "",
     `job: ${record.id}`,
+    `sandbox: ${record.cwd}`,
     `state: ${record.status}`
   ];
   if (record.failureKind) {
@@ -2455,7 +2460,7 @@ function renderResultRecord(record, dataDir) {
   }
 
   if (record.status === "cancelled") {
-    const lines = [`Job ${record.id} was cancelled.`, "", `job: ${record.id}`, "state: cancelled"];
+    const lines = [`Job ${record.id} was cancelled.`, "", `job: ${record.id}`, `sandbox: ${record.cwd}`, "state: cancelled"];
     if (record.failureKind) {
       lines.push(`failure: ${record.failureKind}`);
     }
@@ -2627,6 +2632,7 @@ async function handleCancel(argv, transport = {}) {
           message: failureOutcomeMessage({
             message: "The Grok job was cancelled.",
             jobId: current.id,
+            cwd: current.cwd,
             status: "cancelled",
             failureKind: "cancelled"
           })
@@ -2637,7 +2643,7 @@ async function handleCancel(argv, transport = {}) {
     };
   });
   if (next.status === "running" && next.cleanupRequired) {
-    throw errorWithFailure(failureOutcomeMessage({ message: cleanupMessage, jobId: next.id, status: "running", failureKind: "cancelled" }), "cancelled");
+    throw errorWithFailure(failureOutcomeMessage({ message: cleanupMessage, jobId: next.id, cwd: next.cwd, status: "running", failureKind: "cancelled" }), "cancelled");
   }
   if (next.status !== "cancelled") {
     output(options.json ? next : renderNotRunningReport(next), options.json);

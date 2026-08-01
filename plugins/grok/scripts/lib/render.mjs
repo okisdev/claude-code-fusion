@@ -334,7 +334,11 @@ export function renderJobDetail(job, options = {}) {
   if (job.status === "error" && logTail) {
     lines.push("", "Log tail:", "", "```text", logTail, "```");
   }
-  lines.push("", `job: ${job.id}`, `state: ${job.status}`);
+  lines.push("", `job: ${job.id}`);
+  if (job.status !== "running") {
+    lines.push(`sandbox: ${job.cwd}`);
+  }
+  lines.push(`state: ${job.status}`);
   if (job.failureKind) {
     lines.push(`failure: ${job.failureKind}`);
   }
@@ -489,6 +493,7 @@ export function renderCancelReport(job) {
     "Check /grok:status for the updated list.",
     "",
     `job: ${job.id}`,
+    `sandbox: ${job.cwd}`,
     "state: cancelled"
   ];
   if (job.failureKind === "cancelled") {

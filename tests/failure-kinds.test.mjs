@@ -29,6 +29,7 @@ const processInspectionTests = new Set([
   "turn-limit failures retain the final envelope and reported spend",
   "malformed spend fields in a structured error fail as transport",
   "invalid zero exit JSON envelope records an error with a bounded stdout tail",
+  "recorded failure footers include the sandbox while pre-record input errors omit it",
   "external SIGKILL reports exit code 137 and generic failure",
   "large stderr is capped in the job log and rendered error",
   "timeout yields failure kind timeout",
@@ -303,6 +304,29 @@ test("bad cwd is an input error before a job is created", (t) => {
   assert.deepStrictEqual(jobRecords(sandbox.dataDir), []);
 });
 
+test("recorded failure footers include the sandbox while pre-record input errors omit it", (t) => {
+  const sandbox = makeSandbox(t);
+  const failed = runCompanion(["task", "doomed"], {
+    cwd: sandbox.workDir,
+    env: envFor(sandbox, { FAKE_GROK_MODE: "error" })
+  });
+  assert.notStrictEqual(failed.status, 0);
+  const [record] = jobRecords(sandbox.dataDir);
+  assert.match(
+    failed.stderr,
+    new RegExp(`job: ${record.id}\\nsandbox: ${sandbox.workDir}\\nstate: error\\nfailure: error\\n$`)
+  );
+
+  const missing = path.join(sandbox.root, "missing-work");
+  const rejected = runCompanion(["task", "--cwd", missing, "hello"], {
+    cwd: sandbox.workDir,
+    env: envFor(sandbox)
+  });
+  assert.notStrictEqual(rejected.status, 0);
+  assert.doesNotMatch(rejected.stderr, /^job: |^sandbox: /m);
+  assert.match(rejected.stderr, /state: error\nfailure: input\n$/);
+});
+
 test("prompt file preflight errors are parseable in text and JSON modes", (t) => {
   const sandbox = makeSandbox(t);
   const textResult = runCompanion(["task", "--prompt-file", "missing.md"], {
@@ -431,6 +455,7 @@ test("cancelled background job retains requested model and effort attribution", 
   });
   const cancelOutput = runCompanion(["cancel", running.id], { cwd: sandbox.workDir, env });
   assert.strictEqual(cancelOutput.status, 0, cancelOutput.stderr);
+  assert.match(cancelOutput.stdout, new RegExp(`job: ${running.id}\\nsandbox: ${sandbox.workDir}\\nstate: cancelled\\nfailure: cancelled\\n$`));
   assert.match(cancelOutput.stdout, /^state: cancelled$/m);
   assert.match(cancelOutput.stdout, /^failure: cancelled$/m);
   const cancelled = await waitFor(() => {
@@ -442,5 +467,6 @@ test("cancelled background job retains requested model and effort attribution", 
   assert.strictEqual(cancelled.resolvedEffort, "high");
   const resultOutput = runCompanion(["result", cancelled.id], { cwd: sandbox.workDir, env });
   assert.strictEqual(resultOutput.status, 0, resultOutput.stderr);
+  assert.match(resultOutput.stdout, new RegExp(`job: ${cancelled.id}\\nsandbox: ${sandbox.workDir}\\nstate: cancelled\\nfailure: cancelled\\n$`));
   assert.match(resultOutput.stdout, /^failure: cancelled$/m);
 });
