@@ -393,7 +393,7 @@ test("Grok rules document source verified headless boundaries", () => {
   assert.match(codexContract, /failureKind: "setup".*below the tested minimum 0\.146\.0/);
   assert.match(codexContract, /The tested interval runs from 0\.146\.0 up to but excluding 0\.147\.0; versions at or above 0\.147\.0 remain allowed with the setup compatibility advisory/);
   assert.match(codexContract, /Codex configuration parse failures under `--strict-config`.*failureKind: "process"/);
-  assert.match(sharedContract, /The Grok instance adds `sandbox`[^\n]*`transport`[^\n]*and `policy`/);
+  assert.match(sharedContract, /The Grok instance adds `sandbox`[^\n]*`transport`[^\n]*`policy`[^\n]*and `turn_limit`/);
   assert.match(sharedContract, /`setup`: The installed CLI version or installation lacks a required adapter capability and fails capability preflight/);
   assert.doesNotMatch(sharedContract, /structured output that remains invalid after its corrective retry/);
   assert.match(troubleshooting, /\| setup \| Do not retry the same task against the incompatible CLI surface/);
