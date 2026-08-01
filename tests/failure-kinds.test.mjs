@@ -1,8 +1,52 @@
 import assert from "node:assert";
 import fs from "node:fs";
 import path from "node:path";
-import { test } from "node:test";
-import { envFor, jobLogFiles, jobRecords, killGroups, makeSandbox, runCompanion, waitFor } from "./lib/companion-harness.mjs";
+import { test as nodeTest } from "node:test";
+import { envFor, jobLogFiles, jobRecords, killGroups, makeSandbox, processInspectionAvailable, runCompanion, waitFor } from "./lib/companion-harness.mjs";
+
+const processInspectionTests = new Set([
+  "missing binary yields failure kind missing_cli",
+  "rate limited stderr yields failure kind rate_limited",
+  "auth stderr yields failure kind auth",
+  "hard organization version policy below range death yields failure kind setup",
+  "hard organization version policy above range death yields failure kind setup",
+  "quota stderr yields failure kind quota",
+  "mixed quota and auth stderr yields failure kind quota",
+  "HTTP 402 stderr yields failure kind quota",
+  "Payment Required stderr yields failure kind quota",
+  "balance exhausted stderr yields failure kind quota",
+  "balance is exhausted stderr yields failure kind quota",
+  "exhausted balance stderr yields failure kind quota",
+  "insufficient balance stderr yields failure kind quota",
+  "insufficient account balance stderr yields failure kind quota",
+  "insufficient account credit stderr yields failure kind quota",
+  "insufficient account credits stderr yields failure kind quota",
+  "insufficient account funds stderr yields failure kind quota",
+  "usage limit stderr yields failure kind quota",
+  "generic stderr yields failure kind error",
+  "structured quota errors retain reported usage",
+  "result text 402 errors yield failure kind quota",
+  "turn-limit failures retain the final envelope and reported spend",
+  "malformed spend fields in a structured error fail as transport",
+  "invalid zero exit JSON envelope records an error with a bounded stdout tail",
+  "external SIGKILL reports exit code 137 and generic failure",
+  "large stderr is capped in the job log and rendered error",
+  "timeout yields failure kind timeout",
+  "permission-cancelled turn yields failure kind permission",
+  "permission-cancelled turn names the blocked call when the CLI reports it",
+  "permission-cancelled turn reports explicit absence when the CLI omits the call",
+  "cancelled background job retains requested model and effort attribution"
+]);
+
+function test(name, callback) {
+  return nodeTest(name, (t) => {
+    if (processInspectionTests.has(name) && !processInspectionAvailable()) {
+      t.skip("process inspection unavailable in this environment");
+      return;
+    }
+    return callback(t);
+  });
+}
 
 test("missing binary yields failure kind missing_cli", (t) => {
   const sandbox = makeSandbox(t);

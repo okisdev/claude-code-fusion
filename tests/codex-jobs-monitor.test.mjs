@@ -7,6 +7,7 @@ import path from "node:path";
 import { once } from "node:events";
 import { test } from "node:test";
 import { getProcessIdentity } from "../plugins/codex/scripts/lib/codex-exec.mjs";
+import { gitIsolation } from "./lib/git-fixture.mjs";
 import { inspectCodexRollout } from "../plugins/fusion/scripts/codex-jobs-monitor.mjs";
 import { fusionRepositoryKey, modelAuditSidecarPath, tokenUsageSidecarPath } from "../plugins/fusion/scripts/fusion-stats.mjs";
 import { grokJobsObserverStatePath } from "../plugins/fusion/scripts/grok-jobs-observer.mjs";
@@ -133,8 +134,8 @@ function startMonitor(sandbox, env, { cwd = sandbox.workDir, script = monitorScr
 
 function createSiblingWorktree(sandbox) {
   const sibling = path.join(sandbox.root, "sibling-worktree");
-  execFileSync("git", ["init", "-q"], { cwd: sandbox.workDir });
-  execFileSync("git", ["worktree", "add", "--orphan", sibling], { cwd: sandbox.workDir });
+  execFileSync("git", ["init", "-q"], { cwd: sandbox.workDir, env: { ...process.env, ...gitIsolation(sandbox.root) } });
+  execFileSync("git", ["worktree", "add", "--orphan", sibling], { cwd: sandbox.workDir, env: { ...process.env, ...gitIsolation(sandbox.root) } });
   return sibling;
 }
 
@@ -463,7 +464,7 @@ test("a job in a different workspace stays silent even once terminal", async (t)
 
 test("a monitor started from a subdirectory still matches jobs recorded against the repo root", async (t) => {
   const sandbox = makeSandbox(t);
-  execFileSync("git", ["init", "--quiet"], { cwd: sandbox.workDir });
+  execFileSync("git", ["init", "--quiet"], { cwd: sandbox.workDir, env: { ...process.env, ...gitIsolation(sandbox.root) } });
   const subDir = path.join(sandbox.workDir, "nested", "deeper");
   fs.mkdirSync(subDir, { recursive: true });
 
@@ -770,7 +771,7 @@ test("a stored repository key keeps a removed sibling worktree in monitor scope"
   t.after(() => monitor.child.kill("SIGKILL"));
   await waitUntil(() => readAnnouncedState(sandbox));
 
-  execFileSync("git", ["worktree", "remove", "--force", sibling], { cwd: sandbox.workDir });
+  execFileSync("git", ["worktree", "remove", "--force", sibling], { cwd: sandbox.workDir, env: { ...process.env, ...gitIsolation(sandbox.root) } });
   const finishedAt = new Date().toISOString();
   writeJobRecordFile(file, { ...record, status: "done", finishedAt });
 
