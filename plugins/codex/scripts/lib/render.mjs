@@ -3,7 +3,7 @@ function footer(record) {
   if (record.threadId) {
     lines.push(`codex-session: ${record.threadId}`);
   }
-  lines.push(`job: ${record.id}`, `delivery: ${record.delivery ?? (record.background ? "manual" : "foreground")}`, `semantic: ${record.semanticStatus ?? "unverified"}`);
+  lines.push(`job: ${record.id}`, `sandbox: ${record.cwd}`, `delivery: ${record.delivery ?? (record.background ? "manual" : "foreground")}`, `semantic: ${record.semanticStatus ?? "unverified"}`);
   if (record.request?.outputSchemaFile) {
     lines.push(`structured: ${record.structuredOutputError ? "invalid" : Object.hasOwn(record, "structuredOutput") ? "parsed" : "unavailable"}`);
   }

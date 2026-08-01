@@ -248,7 +248,7 @@ export function renderHistoryReport(history, now = Date.now()) {
   return `${lines.join("\n")}\n`;
 }
 
-export function renderTaskResult({ text, structuredOutput, structuredOutputError, schemaRequested = false, sessionId, jobId }) {
+export function renderTaskResult({ text, structuredOutput, structuredOutputError, schemaRequested = false, sessionId, jobId, cwd }) {
   const lines = [String(text ?? "").trimEnd() || "Grok returned no output."];
   lines.push("");
   if (schemaRequested) {
@@ -264,6 +264,9 @@ export function renderTaskResult({ text, structuredOutput, structuredOutputError
   }
   if (jobId) {
     lines.push(`job: ${jobId}`);
+  }
+  if (cwd) {
+    lines.push(`sandbox: ${cwd}`);
   }
   lines.push("state: done");
   return `${lines.join("\n")}\n`;
