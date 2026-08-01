@@ -148,6 +148,10 @@ function verificationPayload(sandbox, { sessionId = "session-1", command = "node
   };
 }
 
+function testSummary({ tests = 1074, pass = 1073, fail = 0, skipped = 1, failureLine = "" } = {}) {
+  return [failureLine, `ℹ tests ${tests}`, `ℹ pass ${pass}`, `ℹ fail ${fail}`, `ℹ skipped ${skipped}`].filter(Boolean).join("\n");
+}
+
 function stateFileFor(sandbox, sessionId) {
   return path.join(sandbox.stateDir, `${sessionId}.json`);
 }
@@ -519,7 +523,8 @@ test("a passing verification resets the write window and stops the advisory from
       dispatchCount: 0,
       budget: 5,
       mode: "advisory",
-      posture: "judgment"
+      posture: "judgment",
+      evidence: "exit-status"
     }
   ]);
 });
@@ -537,6 +542,86 @@ test("a verification whose exit status is masked by a later segment does not res
     assert.strictEqual(readAuditRecords(sandbox).filter((record) => record.event === "verification").length, 0);
   }
 });
+
+for (const { name, command, output } of [
+  {
+    name: "redirected npm test followed by report filters",
+    command: 'npm test 2>&1 > /tmp/x/suite.log; rg "^✖|not ok|^ℹ (tests|pass|fail|skipped)" /tmp/x/suite.log | head -20',
+    output: testSummary()
+  },
+  {
+    name: "node test piped to tail",
+    command: "node --test --test-timeout=120000 tests/a.test.mjs tests/b.test.mjs 2>&1 | tail -15",
+    output: testSummary()
+  },
+  {
+    name: "node test piped to rg",
+    command: 'node --test --test-timeout=120000 tests/a.test.mjs 2>&1 | rg "^ℹ (tests|pass|fail)"',
+    output: testSummary({ tests: 171, pass: 171, skipped: 0 })
+  },
+  {
+    name: "two node test pipelines after echo segments",
+    command: 'S=/tmp/x; echo RUN-A; node --test tests/a.test.mjs 2>&1 | rg "^ℹ "; echo RUN-B; COMPANION_TEST_NO_PROCESS_INSPECTION=1 node --test tests/a.test.mjs 2>&1 | rg "^ℹ "',
+    output: testSummary({ tests: 171, pass: 171, skipped: 0 })
+  },
+  {
+    name: "npm test after a manifest generator",
+    command: 'node plugins/fusion/scripts/generate-rules-manifest.mjs && npm test 2>&1 | rg "^✖|^ℹ (tests|pass|fail|skipped)"',
+    output: testSummary()
+  }
+]) {
+  test(`an output summary resets an unobservable verification for ${name}`, (t) => {
+    const sandbox = makeSandbox(t);
+    for (let index = 0; index < 5; index += 1) {
+      run(sandbox, writePayload(sandbox));
+    }
+
+    const result = run(sandbox, verificationPayload(sandbox, { command, toolResponse: { is_error: false, output } }));
+    assert.strictEqual(result.stdout, "");
+    assert.strictEqual(readState(sandbox, "session-1").writesSinceDispatch, 0);
+    assert.strictEqual(readAuditRecords(sandbox).filter((record) => record.event === "verification")[0].evidence, "output-summary");
+  });
+}
+
+for (const { name, command, toolResponse } of [
+  {
+    name: "a failing npm summary",
+    command: 'npm test 2>&1 > /tmp/x/suite.log; rg "^✖|not ok|^ℹ (tests|pass|fail|skipped)" /tmp/x/suite.log | head -20',
+    toolResponse: { is_error: false, output: testSummary({ fail: 1 }) }
+  },
+  {
+    name: "a failure marker before a node tail",
+    command: "node --test --test-timeout=120000 tests/a.test.mjs tests/b.test.mjs 2>&1 | tail -15",
+    toolResponse: { is_error: false, output: testSummary({ failureLine: "✖ a failing test" }) }
+  },
+  {
+    name: "a tool error after rg output",
+    command: 'node --test --test-timeout=120000 tests/a.test.mjs 2>&1 | rg "^ℹ (tests|pass|fail)"',
+    toolResponse: { is_error: true, output: testSummary({ tests: 171, pass: 171, skipped: 0 }) }
+  },
+  {
+    name: "a TAP failure after two node pipelines",
+    command: 'S=/tmp/x; echo RUN-A; node --test tests/a.test.mjs 2>&1 | rg "^ℹ "; echo RUN-B; COMPANION_TEST_NO_PROCESS_INSPECTION=1 node --test tests/a.test.mjs 2>&1 | rg "^ℹ "',
+    toolResponse: { is_error: false, output: testSummary({ tests: 171, pass: 171, skipped: 0, failureLine: "not ok 1 - a failing test" }) }
+  },
+  {
+    name: "a failing npm summary after a manifest generator",
+    command: 'node plugins/fusion/scripts/generate-rules-manifest.mjs && npm test 2>&1 | rg "^✖|^ℹ (tests|pass|fail|skipped)"',
+    toolResponse: { is_error: false, output: testSummary({ fail: 1 }) }
+  }
+]) {
+  test(`an unobservable verification does not reset for ${name}`, (t) => {
+    const sandbox = makeSandbox(t);
+    for (let index = 0; index < 5; index += 1) {
+      run(sandbox, writePayload(sandbox));
+    }
+
+    const result = run(sandbox, verificationPayload(sandbox, { command, toolResponse }));
+    assert.strictEqual(result.stdout, "");
+    assert.strictEqual(readState(sandbox, "session-1").writesSinceDispatch, 5);
+    assert.strictEqual(readAuditRecords(sandbox).filter((record) => record.event === "verification").length, 0);
+  });
+}
 
 test("a verification that ends the command resets the window through every separator", (t) => {
   for (const command of ["pnpm lint && npm test", "echo starting; npm run test:unit", "npm test > /tmp/out 2>&1"]) {
@@ -1549,15 +1634,52 @@ test("empty stdin fails open", (t) => {
   assert.strictEqual(result.stdout, "");
 });
 
-test("a write outside the session cwd is not counted", (t) => {
+test("out-of-workspace writes are audited as exempt without entering either posture's window", (t) => {
   const sandbox = makeSandbox(t);
-  const outsidePath = path.join(sandbox.root, "outside", "file.txt");
-  for (let i = 0; i < 8; i += 1) {
-    const result = run(sandbox, writePayload(sandbox, { filePath: outsidePath }));
-    assert.strictEqual(result.status, 0);
-    assert.strictEqual(result.stdout, "");
+  const writes = [
+    { toolName: "Edit", filePath: "/Users/x/.claude/projects/slug/memory/note.md" },
+    { toolName: "Write", filePath: path.join(os.tmpdir(), "raw-args-transport", "payload.json"), toolInput: { content: "[]" } }
+  ];
+  for (const posture of ["judgment", "strict"]) {
+    for (const write of writes) {
+      const result = run(sandbox, writePayload(sandbox, write), { FUSION_POSTURE: posture });
+      assert.strictEqual(result.status, 0);
+      assert.strictEqual(result.stdout, "");
+    }
   }
   assert.strictEqual(fs.existsSync(stateFileFor(sandbox, "session-1")), false);
+  const records = readAuditRecords(sandbox);
+  assert.strictEqual(records.length, 4);
+  assert.ok(records.every((record) => record.event === "write" && record.exempt === "out-of-workspace" && !Object.hasOwn(record, "path")));
+
+  const inWorkspace = run(sandbox, writePayload(sandbox, { filePath: "repo-relative.txt" }));
+  assert.strictEqual(inWorkspace.status, 0);
+  assert.strictEqual(readState(sandbox, "session-1").writesSinceDispatch, 1);
+  assert.deepStrictEqual(readAuditRecords(sandbox).at(-1), {
+    schemaVersion: 1,
+    at: readAuditRecords(sandbox).at(-1).at,
+    session: "session-1",
+    event: "write",
+    lane: "main",
+    tool: "Edit",
+    path: "repo-relative.txt"
+  });
+});
+
+test("the default ceiling counts only in-workspace writes and a verification reopens it", (t) => {
+  const sandbox = makeSandbox(t);
+  run(sandbox, writePayload(sandbox, { filePath: "/Users/x/.claude/projects/slug/memory/note.md" }));
+  run(sandbox, writePayload(sandbox, { toolName: "Write", filePath: path.join(os.tmpdir(), "raw-args-transport", "payload.json"), toolInput: { content: "[]" } }));
+  for (let index = 0; index < 40; index += 1) {
+    const result = run(sandbox, writePayload(sandbox, { filePath: `src/file-${index}.txt` }));
+    assert.strictEqual(result.status, 0);
+  }
+  assert.strictEqual(readState(sandbox, "session-1").writesSinceDispatch, 40);
+  const denied = run(sandbox, writePayload(sandbox, { filePath: "src/ceiling.txt" }));
+  assert.strictEqual(JSON.parse(denied.stdout).hookSpecificOutput.permissionDecision, "deny");
+
+  run(sandbox, verificationPayload(sandbox));
+  assert.strictEqual(readState(sandbox, "session-1").writesSinceDispatch, 0);
 });
 
 test("FUSION_LOCK_TIMEOUT_MS overrides the default lock timeout", () => {

@@ -1585,16 +1585,20 @@ export function buildAuditReport({ env = process.env, sessionId = null, days = 7
   const byEvent = {};
   const eventsByDay = {};
   const dispatchesByLane = {};
+  const verificationByEvidence = {};
   const sessions = new Set();
   for (const event of events) {
     bump(byEvent, event.event);
     const day = event.at.slice(0, 10);
     const counts = eventsByDay[day] ?? { dispatch: 0, write: 0, deny: 0, warn: 0 };
-    counts[event.event] += 1;
+    counts[event.event] = (counts[event.event] ?? 0) + 1;
     eventsByDay[day] = counts;
     sessions.add(event.session);
     if (event.event === "dispatch") {
       bump(dispatchesByLane, event.lane);
+    }
+    if (event.event === "verification" && (event.evidence === "exit-status" || event.evidence === "output-summary")) {
+      bump(verificationByEvidence, event.evidence);
     }
   }
   return {
@@ -1606,6 +1610,7 @@ export function buildAuditReport({ env = process.env, sessionId = null, days = 7
     byEvent,
     eventsByDay,
     dispatchesByLane,
+    verificationByEvidence,
     earliestAt: events[0]?.at ?? null,
     latestAt: events.at(-1)?.at ?? null,
     malformedCount
@@ -1622,11 +1627,12 @@ export function renderAuditReport(report) {
   if (days.length > 0) {
     lines.push("", "Events by day:");
     for (const day of days) {
-      const { dispatch = 0, write = 0, deny = 0, warn = 0 } = report.eventsByDay[day];
-      lines.push(`- ${day}: dispatch ${dispatch}, write ${write}, deny ${deny}, warn ${warn}`);
+      const { dispatch = 0, write = 0, deny = 0, warn = 0, verification = 0 } = report.eventsByDay[day];
+      lines.push(`- ${day}: dispatch ${dispatch}, write ${write}, deny ${deny}, warn ${warn}${verification > 0 ? `, verification ${verification}` : ""}`);
     }
   }
   renderCounts(lines, "Dispatches by lane", report.dispatchesByLane);
+  renderCounts(lines, "Verification evidence", report.verificationByEvidence);
   if (report.malformedCount > 0) {
     lines.push("", `Malformed audit entries skipped: ${report.malformedCount}`);
   }

@@ -2552,6 +2552,24 @@ test("long-term guard audit aggregates recent events without exposing event deta
   assert.doesNotMatch(rendered, /src\/a\.mjs|implement repair|review repair/);
 });
 
+test("audit reports verification evidence without exposing command output", (t) => {
+  const dir = sandbox(t);
+  const auditDir = path.join(dir, "audit");
+  fs.mkdirSync(auditDir, { recursive: true });
+  const events = [
+    { schemaVersion: 1, at: "2026-07-14T00:00:00.000Z", session: "session-a", event: "verification", lane: "main", tool: "Bash", writeCount: 5, dispatchCount: 0, budget: 5, mode: "advisory", evidence: "exit-status" },
+    { schemaVersion: 1, at: "2026-07-14T00:01:00.000Z", session: "session-a", event: "verification", lane: "main", tool: "Bash", writeCount: 3, dispatchCount: 1, budget: 5, mode: "advisory", evidence: "output-summary" }
+  ];
+  fs.writeFileSync(path.join(auditDir, "events-2026-07-14.jsonl"), `${events.map((event) => JSON.stringify(event)).join("\n")}\n`, "utf8");
+
+  const report = buildAuditReport({ env: { FUSION_INLINE_GUARD_AUDIT_DIR: auditDir }, days: 7, now: Date.parse("2026-07-14T00:02:00.000Z") });
+  assert.deepStrictEqual(report.verificationByEvidence, { "exit-status": 1, "output-summary": 1 });
+  assert.deepStrictEqual(report.eventsByDay, { "2026-07-14": { dispatch: 0, write: 0, deny: 0, warn: 0, verification: 2 } });
+  const rendered = renderAuditReport(report);
+  assert.match(rendered, /Verification evidence:\n- exit-status: 1\n- output-summary: 1/);
+  assert.doesNotMatch(rendered, /tests\/|pass 1073|fail 0/);
+});
+
 test("session stats and trace fall back to the long-term audit after short-lived state expires", (t) => {
   const dir = sandbox(t);
   const auditDir = path.join(dir, "audit");

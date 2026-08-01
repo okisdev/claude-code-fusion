@@ -6,7 +6,7 @@ import path from "node:path";
 import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { JUDGMENT_POSTURE, POSTURE_VALUES, STRICT_POSTURE, resolveFusionDataDir, resolvePosture } from "./lib/posture.mjs";
-import { isVerificationCommand } from "./lib/verification-command.mjs";
+import { verificationCommand } from "./lib/verification-command.mjs";
 
 const STATE_ENV = "FUSION_INLINE_GUARD_STATE";
 const BUDGET_ENV = "FUSION_INLINE_WRITE_BUDGET";
@@ -64,6 +64,7 @@ const MISSING_LAUNCH_RECOVERY_REASON = "missing-launch-recovered";
 const TAIL_ALLOW_AUDIT_EVENT = "tail-allowed";
 const ZERO_DISPATCH_SOFTENED_AUDIT_EVENT = "zero-dispatch-softened";
 const UNVERIFIED_CEILING_AUDIT_REASON = "unverified-ceiling";
+const OUT_OF_WORKSPACE_EXEMPTION = "out-of-workspace";
 
 function resolveStateDir(env = process.env) {
   const override = env[STATE_ENV];
@@ -302,6 +303,32 @@ function extractBashCommand(toolInput) {
     return null;
   }
   return typeof toolInput.command === "string" ? toolInput.command.trim() : null;
+}
+
+function appendToolResponseText(value, parts, depth = 0) {
+  if (typeof value === "string") {
+    parts.push(value);
+    return;
+  }
+  if (!value || typeof value !== "object" || depth >= 4) {
+    return;
+  }
+  if (Array.isArray(value)) {
+    for (const entry of value) {
+      appendToolResponseText(entry, parts, depth + 1);
+    }
+    return;
+  }
+  for (const key of ["output", "stdout", "text", "content", "result", "toolUseResult"]) {
+    appendToolResponseText(value[key], parts, depth + 1);
+  }
+}
+
+function verificationOutputPasses(toolResponse) {
+  const parts = [];
+  appendToolResponseText(toolResponse, parts);
+  const output = parts.join("\n");
+  return /^\s*(?:ℹ\s+)?fail\s+0\b/im.test(output) && !/^\s*(?:✖\s|not ok\b)/im.test(output);
 }
 
 function resolvePositiveInteger(env, name, fallback) {
@@ -577,7 +604,16 @@ function normalizeAuditEvent(event) {
   const posture = posturePresent ? { posture: event.posture } : {};
   if (event.event === "write" && WRITE_TOOLS.has(event.tool) && event.lane === MAIN_LANE) {
     const safePath = sanitizeAuditPath(event.path);
-    return { schemaVersion: AUDIT_SCHEMA_VERSION, at: new Date(atMs).toISOString(), session, event: "write", lane: MAIN_LANE, tool: event.tool, ...(safePath ? { path: safePath } : {}) };
+    return {
+      schemaVersion: AUDIT_SCHEMA_VERSION,
+      at: new Date(atMs).toISOString(),
+      session,
+      event: "write",
+      lane: MAIN_LANE,
+      tool: event.tool,
+      ...(safePath ? { path: safePath } : {}),
+      ...(event.exempt === OUT_OF_WORKSPACE_EXEMPTION ? { exempt: OUT_OF_WORKSPACE_EXEMPTION } : {})
+    };
   }
   if (
     event.event === "verification" &&
@@ -602,7 +638,8 @@ function normalizeAuditEvent(event) {
       dispatchCount: event.dispatchCount,
       budget: event.budget,
       mode: event.mode,
-      ...posture
+      ...posture,
+      ...(event.evidence === "exit-status" || event.evidence === "output-summary" ? { evidence: event.evidence } : {})
     };
   }
   if (
@@ -859,17 +896,26 @@ function editReplacementBytes(toolInput) {
 }
 
 function writePathSignature(filePath, cwd) {
-  return createHash("sha256").update(path.resolve(cwd, filePath)).digest("hex");
+  const base = typeof cwd === "string" && cwd ? cwd : process.cwd();
+  const target = typeof filePath === "string" ? filePath : "";
+  return createHash("sha256").update(path.resolve(base, target)).digest("hex");
 }
 
 function isInsideCwd(filePath, cwd) {
-  if (!filePath || !cwd) {
+  if (typeof filePath !== "string" || !filePath || typeof cwd !== "string" || !cwd) {
     return false;
   }
   const resolvedFile = path.resolve(cwd, filePath);
   const resolvedCwd = path.resolve(cwd);
   const relative = path.relative(resolvedCwd, resolvedFile);
-  return relative !== "" && !relative.startsWith("..") && !path.isAbsolute(relative);
+  return !relative.startsWith("..") && !path.isAbsolute(relative);
+}
+
+function isWorkspaceWritePath(filePath, cwd) {
+  if (typeof filePath !== "string" || !filePath || !path.isAbsolute(filePath)) {
+    return true;
+  }
+  return isInsideCwd(filePath, cwd);
 }
 
 function extractAuditWritePath(filePath, cwd) {
@@ -1460,10 +1506,11 @@ function runHook(env = process.env, input = readHookInput()) {
     const command = extractBashCommand(input.tool_input);
     if (input.hook_event_name === "PostToolUse") {
       const toolResponse = input.tool_response;
+      const recognizedVerification = command === null ? null : verificationCommand(command, env);
       if (
         posture !== JUDGMENT_POSTURE ||
         command === null ||
-        !isVerificationCommand(command, env) ||
+        !recognizedVerification.recognized ||
         !toolResponse ||
         typeof toolResponse !== "object" ||
         Array.isArray(toolResponse) ||
@@ -1471,6 +1518,10 @@ function runHook(env = process.env, input = readHookInput()) {
         Boolean(toolResponse.isError) ||
         Boolean(toolResponse.interrupted)
       ) {
+        return;
+      }
+      const evidence = recognizedVerification.observable ? "exit-status" : verificationOutputPasses(toolResponse) ? "output-summary" : null;
+      if (!evidence) {
         return;
       }
       const verification = withStateLock(file, () => {
@@ -1496,7 +1547,8 @@ function runHook(env = process.env, input = readHookInput()) {
             dispatchCount: verification.dispatchCount,
             budget: resolveBudget(env),
             mode: resolveMode(env),
-            posture
+            posture,
+            evidence
           },
           env
         );
@@ -1533,7 +1585,11 @@ function runHook(env = process.env, input = readHookInput()) {
   }
 
   const targetPath = extractWritePath(input.tool_input);
-  if (!isInsideCwd(targetPath, cwd)) {
+  if (!isWorkspaceWritePath(targetPath, cwd)) {
+    recordAuditEvent(
+      { at: now, session: sessionId, event: "write", lane: MAIN_LANE, tool: toolName, exempt: OUT_OF_WORKSPACE_EXEMPTION },
+      env
+    );
     return;
   }
 
@@ -1723,7 +1779,7 @@ function main() {
     runHook(process.env, input);
   } catch {
     const targetPath = extractWritePath(input?.tool_input);
-    if (resolveMode(process.env) === "enforce" && input && !isSubagentPayload(input) && WRITE_TOOLS.has(input.tool_name) && isInsideCwd(targetPath, input.cwd)) {
+    if (resolveMode(process.env) === "enforce" && input && !isSubagentPayload(input) && WRITE_TOOLS.has(input.tool_name) && isWorkspaceWritePath(targetPath, input.cwd)) {
       process.stdout.write(`${JSON.stringify(denyOutput("Fusion inline write state is unavailable. Retry after restoring private guard state access."))}\n`);
     }
   }
