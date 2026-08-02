@@ -20,6 +20,7 @@ import {
   workspaceRootsShareRepository
 } from "./fusion-stats.mjs";
 import { observeGrokJobsSafely } from "./grok-jobs-observer.mjs";
+import { tagMessage } from "./lib/user-messages.mjs";
 
 const TERMINAL_STATUSES = new Set(["done", "error", "cancelled"]);
 const DEFAULT_POLL_INTERVAL_MS = 15000;
@@ -713,7 +714,7 @@ function pruneOldStateFiles(stateRoot, currentFile) {
 
 function safeWriteLine(line) {
   try {
-    process.stdout.write(`${line}\n`);
+    process.stdout.write(`${tagMessage("codex-monitor.job-notification", line)}\n`);
   } catch (error) {
     if (error?.code === "EPIPE") {
       process.exit(0);

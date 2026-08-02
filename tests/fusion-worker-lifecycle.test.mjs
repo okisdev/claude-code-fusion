@@ -6,6 +6,7 @@ import path from "node:path";
 import { test } from "node:test";
 
 import { fusionRepositoryKey } from "../plugins/fusion/scripts/fusion-stats.mjs";
+import { messageTag, tagMessage } from "../plugins/fusion/scripts/lib/user-messages.mjs";
 import { createWorkerRecord, readWorkerSessionState, readWorkerRecords, recordWorkerAcceptance, updateWorkerRecord, WORKER_COLLECTION_METHODS } from "../plugins/fusion/scripts/lib/worker-state.mjs";
 import { needsCancellation, reverifyCancellationRecords, reverifyInFlightRecords, runtimeTaskMissing, settleOnlyRecords, validateWorkerBrief, workerBudgetFailure, workerLimits } from "../plugins/fusion/scripts/worker-lifecycle.mjs";
 
@@ -540,6 +541,7 @@ test("SubagentStart requires verdict envelopes for execution and coverage worker
   assert.match(executionInstruction, /At 85 percent of the output token budget/);
   assert.match(executionInstruction, /exactly one final Write of the deliverable is permitted/);
   assert.match(executionInstruction, /Write your deliverable artifact to a file early, before deep work, and keep updating it; your final message names its path, and a budget death must still leave a readable artifact\./);
+  assert.ok(executionInstruction.endsWith(messageTag("worker-lifecycle.subagent-start-context")));
 
   const coverage = sandbox(t);
   run(coverage, dispatch(coverage, {
@@ -598,6 +600,9 @@ test("claude-worker shares the fast worker lifecycle tier and hook matchers", (t
     assert.ok(hooks[event].some((group) => new RegExp(group.matcher).test("fusion:claude-worker")), event);
     assert.ok(hooks[event].some((group) => new RegExp(group.matcher).test("fusion:claude-worker")), event);
   }
+  const compactCommand = hooks.SessionStart.find((group) => group.matcher === "compact")?.hooks?.[0]?.command;
+  const compactEcho = /^echo '(.+)'$/.exec(compactCommand)?.[1];
+  assert.ok(compactEcho?.endsWith(messageTag("session.compact-reposture")));
 });
 
 test("parallel same-type workers correlate by their injected task ids even when they start out of order", (t) => {
@@ -1166,7 +1171,7 @@ test("Stop emits one TaskStop demand while the harness tracks a cancel-requested
 
   assert.deepStrictEqual(JSON.parse(stopped.stdout), {
     decision: "block",
-    reason: "Call TaskStop for over-budget task live-cancellation and report the cancellation before finishing."
+    reason: tagMessage("worker-lifecycle.over-budget-stop-block", "Call TaskStop for over-budget task live-cancellation and report the cancellation before finishing.")
   });
   assert.strictEqual(record(box).transportStatus, "cancel_requested");
 });
@@ -1200,7 +1205,7 @@ test("Stop emits one combined TaskStop demand and reaped notice for mixed cancel
   const output = JSON.parse(stopped.stdout);
   assert.deepStrictEqual(output, {
     decision: "block",
-    reason: `Call TaskStop for over-budget task live-cancellation and report the cancellation before finishing. Fusion task IDs ${absent.taskId} were settled as task_reaped because the harness no longer tracks their runtime tasks.`
+    reason: tagMessage("worker-lifecycle.over-budget-stop-block", `Call TaskStop for over-budget task live-cancellation and report the cancellation before finishing. Fusion task IDs ${absent.taskId} were settled as task_reaped because the harness no longer tracks their runtime tasks.`)
   });
   const records = readWorkerRecords(envFor(box));
   const settled = records.find((candidate) => candidate.taskId === absent.taskId);
@@ -2862,7 +2867,7 @@ test("an incomplete peer relay receives one transport retry before terminal deli
   assert.strictEqual(retried.stdout.trim().split("\n").length, 1);
   const retryOutput = JSON.parse(retried.stdout);
   assert.strictEqual(retryOutput.decision, "block");
-  assert.strictEqual(retryOutput.reason, "The transport relay is incomplete. Return the companion output verbatim, including its `job:` and `state:` footer lines. This is the only retry.");
+  assert.strictEqual(retryOutput.reason, tagMessage("worker-lifecycle.deliverable-retry-block", "The transport relay is incomplete. Return the companion output verbatim, including its `job:` and `state:` footer lines. This is the only retry."));
   assert.strictEqual(record(box).retryCount, 1);
 
   const exhausted = run(box, stopPayload);
@@ -3490,11 +3495,11 @@ test("a token limit permits exactly one final deliverable Write", (t) => {
 
   const firstWrite = JSON.parse(run(box, write).stdout).hookSpecificOutput;
   assert.strictEqual(firstWrite.permissionDecision, "allow");
-  assert.strictEqual(firstWrite.additionalContext, "Final deliverable write permitted; every further tool call will be denied.");
+  assert.strictEqual(firstWrite.additionalContext, tagMessage("worker-lifecycle.final-deliverable-allow", "Final deliverable write permitted; every further tool call will be denied."));
   const graceUsedAt = record(box).terminalWriteGraceUsedAt;
   assert.ok(graceUsedAt);
 
-  const expectedReason = `Fusion worker ${taskId} must stop: output token budget reached (48000). Return a concise partial result now; do not retry or call more tools. If the deliverable file is not yet written, one final Write is permitted.`;
+  const expectedReason = tagMessage("worker-lifecycle.worker-stop-deny", `Fusion worker ${taskId} must stop: output token budget reached (48000). Return a concise partial result now; do not retry or call more tools. If the deliverable file is not yet written, one final Write is permitted.`);
   const secondWrite = JSON.parse(run(box, write).stdout).hookSpecificOutput;
   assert.strictEqual(secondWrite.permissionDecision, "deny");
   assert.strictEqual(secondWrite.permissionDecisionReason, expectedReason);
@@ -4122,7 +4127,7 @@ test("PostToolUse emits token wind-down context once at 85 percent of the cap", 
 
   fs.appendFileSync(workerTranscript, `${JSON.stringify({ type: "assistant", requestId: "token-threshold", message: { usage: { output_tokens: 1 } } })}\n`, "utf8");
   const threshold = JSON.parse(run(box, payload).stdout).hookSpecificOutput;
-  assert.strictEqual(threshold.additionalContext, "Token budget wind-down: stop making tool calls and write your final deliverable now.");
+  assert.strictEqual(threshold.additionalContext, tagMessage("worker-lifecycle.budget-wind-down", "Token budget wind-down: stop making tool calls and write your final deliverable now."));
   assert.strictEqual(record(box).usage.outputTokens, 40_800);
   const notifiedAt = record(box).tokenWindDownSentAt;
   assert.ok(notifiedAt);

@@ -7,6 +7,7 @@ import { test } from "node:test";
 
 import { buildRulesManifest } from "../plugins/fusion/scripts/generate-rules-manifest.mjs";
 import { hashRulesTemplate, renderRulesContent } from "../plugins/fusion/scripts/lib/rules-template.mjs";
+import { messageTag, tagMessage } from "../plugins/fusion/scripts/lib/user-messages.mjs";
 
 const repoRoot = path.join(import.meta.dirname, "..");
 const script = path.join(repoRoot, "plugins", "fusion", "scripts", "rules-sync.mjs");
@@ -87,7 +88,7 @@ test("Missing live file installs the canonical rules and prints the installed li
   assert.strictEqual(result.status, 0);
   assert.strictEqual(
     result.stdout,
-    "fusion: routing rules installed (run /fusion:setup for the optional permission check)\n"
+    `${tagMessage("rules-sync.rules-installed", "fusion: routing rules installed (run /fusion:setup for the optional permission check)")}\n`
   );
   assert.strictEqual(fs.readFileSync(sandbox.rulesFile, "utf8"), CANONICAL);
 });
@@ -110,7 +111,7 @@ test("Live file matching a manifest hash gets overwritten and prints the updated
   fs.writeFileSync(sandbox.rulesFile, OLD_VERSION, "utf8");
   const result = run(sandbox);
   assert.strictEqual(result.status, 0);
-  assert.strictEqual(result.stdout, "fusion: routing rules updated to the current plugin version\n");
+  assert.strictEqual(result.stdout, `${tagMessage("rules-sync.rules-updated", "fusion: routing rules updated to the current plugin version")}\n`);
   assert.strictEqual(fs.readFileSync(sandbox.rulesFile, "utf8"), CANONICAL);
 });
 
@@ -122,7 +123,7 @@ test("Live file with unknown content is left untouched and prints the local edit
   assert.strictEqual(result.status, 0);
   assert.strictEqual(
     result.stdout,
-    `fusion: ${sandbox.rulesFile} does not match any shipped rules version (local edits or a stale render), run /fusion:setup to reconcile; the scored model table is preserved\n`
+    `${tagMessage("rules-sync.local-edits-notice", `fusion: ${sandbox.rulesFile} does not match any shipped rules version (local edits or a stale render), run /fusion:setup to reconcile; the scored model table is preserved`)}\n`
   );
   assert.strictEqual(fs.readFileSync(sandbox.rulesFile, "utf8"), UNKNOWN_VERSION);
 });
@@ -150,6 +151,7 @@ test("Invalid model routing leaves the existing live table intact and warns", (t
   assert.strictEqual(result.status, 0);
   assert.strictEqual(result.stdout, "");
   assert.match(result.stderr, new RegExp(`^fusion: model routing file invalid at ${sandbox.modelRoutingFile.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}:`));
+  assert.ok(result.stderr.trimEnd().endsWith(messageTag("rules-sync.model-table-warning")));
   assert.strictEqual(fs.readFileSync(sandbox.rulesFile, "utf8"), rendered);
 });
 
@@ -176,7 +178,7 @@ test("Hand edited template content still looks like local edits", (t) => {
   assert.strictEqual(result.status, 0);
   assert.strictEqual(
     result.stdout,
-    `fusion: ${sandbox.rulesFile} does not match any shipped rules version (local edits or a stale render), run /fusion:setup to reconcile; the scored model table is preserved\n`
+    `${tagMessage("rules-sync.local-edits-notice", `fusion: ${sandbox.rulesFile} does not match any shipped rules version (local edits or a stale render), run /fusion:setup to reconcile; the scored model table is preserved`)}\n`
   );
   assert.strictEqual(fs.readFileSync(sandbox.rulesFile, "utf8"), handEdited);
 });
@@ -188,6 +190,7 @@ test("Rules sync logs unexpected failures without blocking the session", (t) => 
   assert.strictEqual(result.status, 0);
   assert.strictEqual(result.stdout, "");
   assert.match(result.stderr, /^fusion: rules sync failed: /);
+  assert.ok(result.stderr.trimEnd().endsWith(messageTag("rules-sync.sync-failed")));
 });
 
 test("Doctor and setup describe template hash comparison for live rules", () => {

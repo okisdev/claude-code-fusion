@@ -20,6 +20,7 @@ import {
   fileBasedEngineStats,
   findDeadWorkspaces,
   fusionRepositoryKey,
+  isStrictDirectReportOrMaintenanceArguments,
   newestCodexCompanion,
   newestGrokCompanion,
   normalizeCollectionMethod,
@@ -36,6 +37,7 @@ import {
 } from "../plugins/fusion/scripts/fusion-stats.mjs";
 import { resolveStateDir as guardResolveStateDir, stateFile as guardStateFile } from "../plugins/fusion/scripts/inline-delegation-guard.mjs";
 import { createRawArgsTransport } from "../plugins/fusion/scripts/lib/raw-args-transport.mjs";
+import { MESSAGE_REGISTRY, messageCode, messageTag } from "../plugins/fusion/scripts/lib/user-messages.mjs";
 import { applyQueuedVerdict, createWorkerRecord, readWorkerRecord, recordWorkerAcceptance, updateWorkerRecord, workerRecordFile } from "../plugins/fusion/scripts/lib/worker-state.mjs";
 import { gitIsolation } from "./lib/git-fixture.mjs";
 
@@ -138,6 +140,24 @@ test("Codex jobs monitor stays silent for an unchanged state directory", (t) => 
   });
 
   assert.strictEqual(result.stdout, "");
+});
+
+test("Codex jobs monitor tags its announce-only notification", (t) => {
+  const dir = sandbox(t);
+  const stateRoot = path.join(dir, "codex-state");
+  writeCodexJob(stateRoot, dir, "monitor-terminal", { status: "done", completedAt: new Date().toISOString() });
+  const result = spawnSync(process.execPath, [CODEX_MONITOR_SCRIPT], {
+    cwd: dir,
+    encoding: "utf8",
+    env: runtimeEnv(
+      { cwd: dir, codexState: stateRoot },
+      { FUSION_CODEX_COMPANION: path.join(dir, "missing-codex-companion.mjs"), CODEX_JOBS_MONITOR_INTERVAL_MS: "1000" }
+    ),
+    timeout: 400,
+    killSignal: "SIGTERM"
+  });
+
+  assert.ok(result.stdout.trimEnd().endsWith(messageTag("codex-monitor.job-notification")));
 });
 
 function writeCodexAcceptanceCompanion(directory) {
@@ -1594,6 +1614,66 @@ test("direct report requests reject duplicate flags", (t) => {
   assert.match(result.stderr, /Fusion stats requests must be supplied through --raw-args-token\./);
 });
 
+test("--messages renders every registry entry with its computed digest", (t) => {
+  const dir = sandbox(t);
+  const first = MESSAGE_REGISTRY[0];
+  const last = MESSAGE_REGISTRY.at(-1);
+
+  const result = runDirect({ cwd: dir, codexState: path.join(dir, "missing") }, ["--messages"]);
+
+  assert.strictEqual(result.status, 0, result.stderr);
+  const lines = result.stdout.trim().split("\n");
+  assert.strictEqual(lines.length, MESSAGE_REGISTRY.length);
+  assert.ok(lines.includes(`[fusion:${messageCode(first.slug)}] ${first.slug} - ${first.description}`));
+  assert.ok(lines.includes(`[fusion:${messageCode(last.slug)}] ${last.slug} - ${last.description}`));
+  assert.deepStrictEqual(lines.map((line) => Number(line.match(/^\[fusion:(\d{4})\]/)?.[1])), [...lines.map((line) => Number(line.match(/^\[fusion:(\d{4})\]/)?.[1]))].sort((left, right) => left - right));
+});
+
+test("--message renders recorded digest occurrences and unrecorded message kinds", (t) => {
+  const dir = sandbox(t);
+  const auditDir = path.join(dir, "inline-guard-audit");
+  const entry = MESSAGE_REGISTRY[0];
+  const unrecorded = MESSAGE_REGISTRY[1];
+  const code = messageCode(entry.slug);
+  writeGuardAuditEvents(auditDir, "2026-08-01", [
+    { schemaVersion: 1, at: "2026-08-01T10:00:00.000Z", session: "session-earlier", event: "warn", messageCode: code },
+    { schemaVersion: 1, at: "2026-08-01T11:00:00.000Z", session: "session-later", event: "deny", messageCode: code },
+    { schemaVersion: 1, at: "2026-08-01T12:00:00.000Z", session: "session-untagged", event: "deny" }
+  ]);
+
+  const env = { FUSION_INLINE_GUARD_AUDIT_DIR: auditDir };
+  const result = runDirect({ cwd: dir, codexState: path.join(dir, "missing") }, ["--message", String(code)], env);
+
+  assert.strictEqual(result.status, 0, result.stderr);
+  assert.strictEqual(result.stdout, `[fusion:${code}] ${entry.slug} - ${entry.description}\nOccurrences: 2\n2026-08-01T11:00:00.000Z  session-later  deny\n2026-08-01T10:00:00.000Z  session-earlier  warn\n`);
+
+  const unrecordedResult = runDirect({ cwd: dir, codexState: path.join(dir, "missing") }, ["--message", String(messageCode(unrecorded.slug))], env);
+
+  assert.strictEqual(unrecordedResult.status, 0, unrecordedResult.stderr);
+  assert.strictEqual(unrecordedResult.stdout, `[fusion:${messageCode(unrecorded.slug)}] ${unrecorded.slug} - ${unrecorded.description}\nOccurrences are not recorded for this message kind.\n`);
+});
+
+test("--message rejects unknown digest codes with a --messages hint", (t) => {
+  const dir = sandbox(t);
+  const codes = new Set(MESSAGE_REGISTRY.map((entry) => messageCode(entry.slug)));
+  let unknownCode = 1000;
+  while (codes.has(unknownCode)) {
+    unknownCode += 1;
+  }
+
+  const result = runDirect({ cwd: dir, codexState: path.join(dir, "missing") }, ["--message", String(unknownCode)]);
+
+  assert.strictEqual(result.status, 1);
+  assert.strictEqual(result.stdout, "");
+  assert.strictEqual(result.stderr, `Unknown fusion message code ${unknownCode}. Run --messages to list every fusion message digest.\n`);
+});
+
+test("message digest direct arguments satisfy the strict report allowlist", () => {
+  assert.strictEqual(isStrictDirectReportOrMaintenanceArguments(["--messages"]), true);
+  assert.strictEqual(isStrictDirectReportOrMaintenanceArguments(["--message", "1234"]), true);
+  assert.strictEqual(isStrictDirectReportOrMaintenanceArguments(["--message", "not-an-integer"]), false);
+});
+
 test("--record settles a Fusion task and its Codex peer with direct strict argv", (t) => {
   const dir = sandbox(t);
   const stateRoot = path.join(dir, "codex-state");
@@ -1712,7 +1792,7 @@ test("--record refuses a rejected strict direct argument", (t) => {
 
   assert.strictEqual(result.status, 1);
   assert.strictEqual(result.stdout, "");
-  assert.strictEqual(result.stderr, "Rejected verdicts require --reason through the raw-args transport. For batch settlements, use --reason-for <id> <text> for each rejected pair.\n");
+  assert.strictEqual(result.stderr, `Rejected verdicts require --reason through the raw-args transport. For batch settlements, use --reason-for <id> <text> for each rejected pair. [fusion:${messageCode("stats.raw-args-required")}]\n`);
   assert.strictEqual(readWorkerRecord(taskId, env).acceptance, "unverified");
 });
 
@@ -3010,7 +3090,6 @@ test("coercion ledger renders every counter in text and JSON", (t) => {
     unverifiedAccumulations: 2,
     inlineSprawlWindows: 0,
     deepestUnverifiedWindow: 0,
-    unverifiedCeilingStops: 0,
     postureMix: {
       judgment: 3,
       strict: 3,
@@ -3026,7 +3105,6 @@ Verification resets: 2
 Unverified accumulations: 2
 Inline sprawl windows: 0
 Deepest unverified window: 0
-Unverified ceiling stops: 0
 
 Posture mix:
 - judgment: 3
@@ -3093,7 +3171,6 @@ test("coercion ledger tolerates legacy audit events without posture or verificat
     unverifiedAccumulations: 0,
     inlineSprawlWindows: 0,
     deepestUnverifiedWindow: 0,
-    unverifiedCeilingStops: 0,
     postureMix: {
       judgment: 0,
       strict: 0,
@@ -3134,7 +3211,6 @@ test("coercion ledger skips malformed lines and unknown event kinds", (t) => {
     unverifiedAccumulations: 0,
     inlineSprawlWindows: 0,
     deepestUnverifiedWindow: 0,
-    unverifiedCeilingStops: 0,
     postureMix: {
       judgment: 0,
       strict: 1,
@@ -3172,7 +3248,7 @@ test("coercion ledger counts inline sprawl windows from advisory depth without a
   assert.match(renderFusionStats(report), /Inline sprawl windows: 1\nDeepest unverified window: 15/);
 });
 
-test("coercion ledger counts unverified ceiling stops apart from other denials", (t) => {
+test("coercion ledger treats historical ceiling denials as ordinary denials", (t) => {
   const dir = sandbox(t);
   const auditDir = path.join(dir, "inline-guard-audit");
   writeGuardAuditEvents(auditDir, "2026-07-31", [
@@ -3206,9 +3282,8 @@ test("coercion ledger counts unverified ceiling stops apart from other denials",
     cwd: dir
   });
 
-  assert.strictEqual(report.coercionLedger.unverifiedCeilingStops, 1);
   assert.strictEqual(report.coercionLedger.unverifiedAccumulations, 2);
-  assert.match(renderFusionStats(report), /Unverified ceiling stops: 1/);
+  assert.doesNotMatch(renderFusionStats(report), /Unverified ceiling stops/);
 });
 
 test("coercion ledger ratio advisory appears only when declines dominate a small fleet count", (t) => {
@@ -3246,7 +3321,6 @@ test("coercion ledger ratio advisory appears only when declines dominate a small
       unverifiedAccumulations: 0,
       inlineSprawlWindows: 0,
       deepestUnverifiedWindow: 0,
-      unverifiedCeilingStops: 0,
       postureMix: {
         judgment: 0,
         strict: 0,

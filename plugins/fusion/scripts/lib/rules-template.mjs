@@ -12,6 +12,7 @@ import {
   renderModelTable,
   resolveModelRoutingPath
 } from "./model-table.mjs";
+import { tagMessage } from "./user-messages.mjs";
 
 const NORMALIZED_MODEL_TABLE_MARKER = "[[fusion:model-table:normalized]]";
 
@@ -59,7 +60,7 @@ export function renderRulesContent(canonical, { routingPath = resolveModelRoutin
     return replaceModelTableRegion(canonical, fallback);
   }
   if (warn) {
-    warn(modelRoutingWarning(routingPath, result.reason));
+    warn(tagMessage("rules-sync.model-table-warning", modelRoutingWarning(routingPath, result.reason)));
   }
   return replaceModelTableRegion(canonical, invalidFallbackText ?? fallback);
 }
@@ -111,7 +112,7 @@ export function syncRulesToLive({ pluginRoot, env = process.env, liveFile = reso
   if (!fs.existsSync(liveFile)) {
     const desired = renderRulesContent(canonical, { routingPath });
     writeAtomic(liveFile, desired);
-    log("fusion: routing rules installed (run /fusion:setup for the optional permission check)");
+    log(tagMessage("rules-sync.rules-installed", "fusion: routing rules installed (run /fusion:setup for the optional permission check)"));
     return { status: "installed", liveFile };
   }
 
@@ -129,12 +130,12 @@ export function syncRulesToLive({ pluginRoot, env = process.env, liveFile = reso
 
   if (readManifestHashes(manifestPath).has(liveTemplateHash)) {
     writeAtomic(liveFile, desired);
-    log("fusion: routing rules updated to the current plugin version");
+    log(tagMessage("rules-sync.rules-updated", "fusion: routing rules updated to the current plugin version"));
     return { status: "updated", liveFile };
   }
 
   log(
-    `fusion: ${displayLiveRulesPath(liveFile, env)} does not match any shipped rules version (local edits or a stale render), run /fusion:setup to reconcile; the scored model table is preserved`
+    tagMessage("rules-sync.local-edits-notice", `fusion: ${displayLiveRulesPath(liveFile, env)} does not match any shipped rules version (local edits or a stale render), run /fusion:setup to reconcile; the scored model table is preserved`)
   );
   return { status: "local-edits", liveFile };
 }
