@@ -6,6 +6,7 @@ import path from "node:path";
 import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { JUDGMENT_POSTURE, POSTURE_VALUES, STRICT_POSTURE, resolveFusionDataDir, resolvePosture } from "./lib/posture.mjs";
+import { messageCode, tagMessage } from "./lib/user-messages.mjs";
 import { verificationCommand } from "./lib/verification-command.mjs";
 
 const STATE_ENV = "FUSION_INLINE_GUARD_STATE";
@@ -14,7 +15,6 @@ const TAIL_MAX_BYTES_ENV = "FUSION_INLINE_TAIL_MAX_BYTES";
 const TAIL_ALLOWANCE_ENV = "FUSION_INLINE_TAIL_ALLOWANCE";
 const ZERO_DISPATCH_MAX_BYTES_ENV = "FUSION_INLINE_ZERO_DISPATCH_MAX_BYTES";
 const ZERO_DISPATCH_WRITES_ENV = "FUSION_INLINE_ZERO_DISPATCH_WRITES";
-const UNVERIFIED_CEILING_ENV = "FUSION_INLINE_UNVERIFIED_CEILING";
 const AUDIT_DIR_ENV = "FUSION_INLINE_GUARD_AUDIT_DIR";
 const AUDIT_RETENTION_DAYS_ENV = "FUSION_INLINE_GUARD_AUDIT_RETENTION_DAYS";
 const AUDIT_MAX_BYTES_ENV = "FUSION_INLINE_GUARD_AUDIT_MAX_BYTES";
@@ -26,8 +26,6 @@ const DEFAULT_TAIL_MAX_BYTES = 1024;
 const DEFAULT_TAIL_ALLOWANCE = 3;
 const DEFAULT_ZERO_DISPATCH_MAX_BYTES = 16384;
 const DEFAULT_ZERO_DISPATCH_WRITES = 10;
-const DEFAULT_UNVERIFIED_CEILING_MULTIPLE = 8;
-const UNVERIFIED_CEILING_WARNING_MULTIPLES = 2;
 const DEFAULT_AUDIT_RETENTION_DAYS = 180;
 const DEFAULT_AUDIT_MAX_BYTES = 2 * 1024 * 1024;
 const DEFAULT_AUDIT_MAX_FILES = 256;
@@ -59,11 +57,20 @@ const NO_OP_HEARTBEAT_REASON = "Fusion tasks are in flight for this session, so 
 const REAPED_WORKER_REDIRECT_AUDIT_DESCRIPTION = "reaped-worker-redirect";
 const NARROW_WAVE_ADVISORY_SUFFIX = "consecutive width one dispatch waves. If the remaining packages are independent, dispatch them together; /fusion:ultra is available when the goal is genuinely wide.";
 const NARROW_WAVE_ADVISORY_REASON = "narrow-wave-advisory";
+const ALLOW_RETIRED_NOTICE_MESSAGE_SLUG = "inline-guard.allow-retired-notice";
+const NARROW_WAVE_ADVISORY_MESSAGE_SLUG = "inline-guard.narrow-wave-advisory";
+const REAPED_WORKER_REDIRECT_MESSAGE_SLUG = "inline-guard.reaped-worker-redirect";
+const NO_OP_HEARTBEAT_DENY_MESSAGE_SLUG = "inline-guard.no-op-heartbeat-deny";
+const WRITE_BUDGET_DENY_MESSAGE_SLUG = "inline-guard.write-budget-deny";
+const TAIL_ALLOWANCE_ADVISORY_MESSAGE_SLUG = "inline-guard.tail-allowance-advisory";
+const ZERO_DISPATCH_ADVISORY_MESSAGE_SLUG = "inline-guard.zero-dispatch-advisory";
+const WRITE_BUDGET_ADVISORY_MESSAGE_SLUG = "inline-guard.write-budget-advisory";
+const UNVERIFIED_ADVISORY_MESSAGE_SLUG = "inline-guard.unverified-advisory";
+const STATE_UNAVAILABLE_DENY_MESSAGE_SLUG = "inline-guard.state-unavailable-deny";
 const TRANSCRIPT_TAIL_MAX_BYTES = 262144;
 const MISSING_LAUNCH_RECOVERY_REASON = "missing-launch-recovered";
 const TAIL_ALLOW_AUDIT_EVENT = "tail-allowed";
 const ZERO_DISPATCH_SOFTENED_AUDIT_EVENT = "zero-dispatch-softened";
-const UNVERIFIED_CEILING_AUDIT_REASON = "unverified-ceiling";
 const OUT_OF_WORKSPACE_EXEMPTION = "out-of-workspace";
 
 function resolveStateDir(env = process.env) {
@@ -102,10 +109,6 @@ function resolveZeroDispatchMaxBytes(env = process.env) {
 
 function resolveZeroDispatchWrites(env = process.env) {
   return resolveNonnegativeInteger(env, ZERO_DISPATCH_WRITES_ENV, DEFAULT_ZERO_DISPATCH_WRITES);
-}
-
-function resolveUnverifiedCeiling(env = process.env) {
-  return resolveNonnegativeInteger(env, UNVERIFIED_CEILING_ENV, resolveBudget(env) * DEFAULT_UNVERIFIED_CEILING_MULTIPLE);
 }
 
 function resolveLockTimeoutMs(env = process.env) {
@@ -290,12 +293,21 @@ function reapedWorkerRedirectReason(record, taskId) {
   const settlementTaskId = typeof record.taskId === "string" && record.taskId.length > 0 ? record.taskId : taskId;
   const settlement = `/fusion:stats --record ${settlementTaskId}=<verdict>`;
   if (typeof record.outputFile === "string" && record.outputFile.length > 0) {
-    return `This worker already completed and was reaped; its result is at ${record.outputFile}; Read that file and settle via ${settlement} instead of probing the reaped agent.`;
+    return tagMessage(
+      REAPED_WORKER_REDIRECT_MESSAGE_SLUG,
+      `This worker already completed and was reaped; its result is at ${record.outputFile}; Read that file and settle via ${settlement} instead of probing the reaped agent.`
+    );
   }
   if (typeof record.transcriptPath === "string" && record.transcriptPath.length > 0) {
-    return `This worker already completed and was reaped; its transcript is at ${record.transcriptPath}; Read that file and settle via ${settlement} instead of probing the reaped agent.`;
+    return tagMessage(
+      REAPED_WORKER_REDIRECT_MESSAGE_SLUG,
+      `This worker already completed and was reaped; its transcript is at ${record.transcriptPath}; Read that file and settle via ${settlement} instead of probing the reaped agent.`
+    );
   }
-  return `This worker already completed and was reaped; settle via ${settlement} instead of probing the reaped agent.`;
+  return tagMessage(
+    REAPED_WORKER_REDIRECT_MESSAGE_SLUG,
+    `This worker already completed and was reaped; settle via ${settlement} instead of probing the reaped agent.`
+  );
 }
 
 function extractBashCommand(toolInput) {
@@ -602,6 +614,7 @@ function normalizeAuditEvent(event) {
     return null;
   }
   const posture = posturePresent ? { posture: event.posture } : {};
+  const digest = Number.isInteger(event.messageCode) && event.messageCode >= 1000 && event.messageCode <= 9999 ? { messageCode: event.messageCode } : {};
   if (event.event === "write" && WRITE_TOOLS.has(event.tool) && event.lane === MAIN_LANE) {
     const safePath = sanitizeAuditPath(event.path);
     return {
@@ -611,6 +624,7 @@ function normalizeAuditEvent(event) {
       event: "write",
       lane: MAIN_LANE,
       tool: event.tool,
+      ...digest,
       ...(safePath ? { path: safePath } : {}),
       ...(event.exempt === OUT_OF_WORKSPACE_EXEMPTION ? { exempt: OUT_OF_WORKSPACE_EXEMPTION } : {})
     };
@@ -639,6 +653,7 @@ function normalizeAuditEvent(event) {
       budget: event.budget,
       mode: event.mode,
       ...posture,
+      ...digest,
       ...(event.evidence === "exit-status" || event.evidence === "output-summary" ? { evidence: event.evidence } : {})
     };
   }
@@ -669,6 +684,7 @@ function normalizeAuditEvent(event) {
         budget: event.budget,
         mode: "enforce",
         ...posture,
+        ...digest,
         remainingTailSlots: event.remainingTailSlots,
         ...(event.suppressed === true ? { suppressed: true } : {})
       };
@@ -693,6 +709,7 @@ function normalizeAuditEvent(event) {
         budget: event.budget,
         mode: "enforce",
         ...posture,
+        ...digest,
         remainingZeroDispatchWrites: event.remainingZeroDispatchWrites,
         remainingZeroDispatchBytes: event.remainingZeroDispatchBytes,
         ...(event.suppressed === true ? { suppressed: true } : {})
@@ -703,7 +720,9 @@ function normalizeAuditEvent(event) {
   if (event.event === "dispatch" && DELEGATION_TOOLS.has(event.tool)) {
     const lane = normalizeLane(event.lane);
     const description = sanitizeAuditText(event.description);
-    return lane ? { schemaVersion: AUDIT_SCHEMA_VERSION, at: new Date(atMs).toISOString(), session, event: "dispatch", lane, tool: event.tool, ...(description ? { description } : {}) } : null;
+    return lane
+      ? { schemaVersion: AUDIT_SCHEMA_VERSION, at: new Date(atMs).toISOString(), session, event: "dispatch", lane, tool: event.tool, ...digest, ...(description ? { description } : {}) }
+      : null;
   }
   if (event.event === "warn" && DELEGATION_TOOLS.has(event.tool) && (event.reason === MISSING_LAUNCH_RECOVERY_REASON || event.reason === NARROW_WAVE_ADVISORY_REASON)) {
     const lane = normalizeLane(event.lane);
@@ -718,6 +737,7 @@ function normalizeAuditEvent(event) {
           tool: event.tool,
           reason: event.reason,
           ...posture,
+          ...digest,
           ...(event.reason === NARROW_WAVE_ADVISORY_REASON && event.declineStated === true ? { declineStated: true } : {}),
           ...(event.reason === NARROW_WAVE_ADVISORY_REASON && pendingIncludedWidth !== null ? { pendingIncludedWidth } : {}),
           ...(event.suppressed === true ? { suppressed: true } : {})
@@ -741,6 +761,7 @@ function normalizeAuditEvent(event) {
       description: REAPED_WORKER_REDIRECT_AUDIT_DESCRIPTION,
       mode: event.mode,
       ...posture,
+      ...digest,
       ...(event.event === "warn" && event.suppressed === true ? { suppressed: true } : {})
     };
   }
@@ -770,9 +791,7 @@ function normalizeAuditEvent(event) {
       budget: event.budget,
       mode: event.mode,
       ...posture,
-      ...(event.event === "deny" && event.reason === UNVERIFIED_CEILING_AUDIT_REASON && Number.isInteger(event.ceiling) && event.ceiling > 0
-        ? { reason: UNVERIFIED_CEILING_AUDIT_REASON, ceiling: event.ceiling }
-        : {}),
+      ...digest,
       ...(event.event === "warn" && event.suppressed === true ? { suppressed: true } : {})
     };
   }
@@ -1298,14 +1317,8 @@ function buildAdvisoryLine(writeCount, dispatchCount) {
   return countSummary + buildLaneHint();
 }
 
-function buildUnverifiedAdvisory(writeCount, ceiling = 0, budget = DEFAULT_BUDGET) {
-  const approaching = ceiling > 0 && writeCount >= ceiling - UNVERIFIED_CEILING_WARNING_MULTIPLES * budget;
-  const ceilingNote = approaching ? ` This window stops at ${ceiling} unverified writes.` : "";
-  return `${buildUnverifiedLine(writeCount)} Run this change's verification command once it is coherent, or hand the remaining work to a lane.${ceilingNote} ${buildLaneHint()}`;
-}
-
-function buildUnverifiedCeilingReason(writeCount) {
-  return `${buildUnverifiedLine(writeCount)} This window has reached its unverified ceiling. Run this change's verification command, or dispatch the remaining work; either one reopens the window. ${buildLaneHint()}`;
+function buildUnverifiedAdvisory(writeCount) {
+  return `${buildUnverifiedLine(writeCount)} Run this change's verification command once it is coherent, or hand the remaining work to a lane. ${buildLaneHint()}`;
 }
 
 function buildTailAllowanceAdvisory(remainingTailSlots) {
@@ -1318,7 +1331,10 @@ function buildZeroDispatchAdvisory(remainingWrites, remainingBytes) {
 
 function runAllowCommand() {
   process.stdout.write(
-    "fusion inline delegation guard: the allow escape hatch is retired; judgment posture never denies a main-loop write, and strict posture opens the next write window with a dispatch; /fusion:config set-posture judgment restores the advisory default\n"
+    `${tagMessage(
+      ALLOW_RETIRED_NOTICE_MESSAGE_SLUG,
+      "fusion inline delegation guard: the allow escape hatch is retired; judgment posture never denies a main-loop write, and strict posture opens the next write window with a dispatch; /fusion:config set-posture judgment restores the advisory default"
+    )}\n`
   );
 }
 
@@ -1462,6 +1478,7 @@ function runHook(env = process.env, input = readHookInput()) {
             tool: toolName,
             reason: NARROW_WAVE_ADVISORY_REASON,
             posture,
+            messageCode: messageCode(NARROW_WAVE_ADVISORY_MESSAGE_SLUG),
             pendingIncludedWidth: confirmation.pendingIncludedWidth,
             ...(declineStated ? { declineStated: true } : {}),
             ...(advisory.suppressed ? { suppressed: true } : {})
@@ -1469,7 +1486,9 @@ function runHook(env = process.env, input = readHookInput()) {
           env
         );
         if (!advisory.suppressed && !declineStated) {
-          process.stdout.write(`${JSON.stringify(postToolAdvisoryOutput(`${confirmation.streak} ${NARROW_WAVE_ADVISORY_SUFFIX}`))}\n`);
+          process.stdout.write(
+            `${JSON.stringify(postToolAdvisoryOutput(tagMessage(NARROW_WAVE_ADVISORY_MESSAGE_SLUG, `${confirmation.streak} ${NARROW_WAVE_ADVISORY_SUFFIX}`)))}\n`
+          );
         }
       }
     }
@@ -1494,7 +1513,8 @@ function runHook(env = process.env, input = readHookInput()) {
         tool: toolName,
         description: REAPED_WORKER_REDIRECT_AUDIT_DESCRIPTION,
         mode: "enforce",
-        posture
+        posture,
+        messageCode: messageCode(REAPED_WORKER_REDIRECT_MESSAGE_SLUG)
       },
       env
     );
@@ -1573,10 +1593,22 @@ function runHook(env = process.env, input = readHookInput()) {
       void 0;
     }
     recordAuditEvent(
-      { at: now, session: sessionId, event: "deny", lane: MAIN_LANE, tool: BASH_TOOL, writeCount, dispatchCount, budget, mode: "enforce", posture },
+      {
+        at: now,
+        session: sessionId,
+        event: "deny",
+        lane: MAIN_LANE,
+        tool: BASH_TOOL,
+        writeCount,
+        dispatchCount,
+        budget,
+        mode: "enforce",
+        posture,
+        messageCode: messageCode(NO_OP_HEARTBEAT_DENY_MESSAGE_SLUG)
+      },
       env
     );
-    process.stdout.write(`${JSON.stringify(denyOutput(NO_OP_HEARTBEAT_REASON))}\n`);
+    process.stdout.write(`${JSON.stringify(denyOutput(tagMessage(NO_OP_HEARTBEAT_DENY_MESSAGE_SLUG, NO_OP_HEARTBEAT_REASON)))}\n`);
     return;
   }
 
@@ -1603,14 +1635,10 @@ function runHook(env = process.env, input = readHookInput()) {
   const tailAllowance = resolveTailAllowance(env);
   const zeroDispatchMaxBytes = resolveZeroDispatchMaxBytes(env);
   const zeroDispatchWrites = resolveZeroDispatchWrites(env);
-  const unverifiedCeiling = resolveUnverifiedCeiling(env);
   const decision = withStateLock(file, () => {
     const state = normalizeState(readState(file), now, resolveFleetWaveGapMs(env));
     const dispatchCount = totalDispatches(state.dispatches);
     let relief = null;
-    if (mode !== "enforce" && unverifiedCeiling > 0 && state.writesSinceDispatch >= unverifiedCeiling) {
-      return { denied: true, ceiling: true, writeCount: state.writesSinceDispatch, dispatchCount };
-    }
     if (mode === "enforce" && state.writesSinceDispatch >= budget) {
       const tailAllowed =
         toolName === "Edit" &&
@@ -1674,13 +1702,14 @@ function runHook(env = process.env, input = readHookInput()) {
         budget,
         mode,
         posture,
-        ...(decision.ceiling ? { reason: UNVERIFIED_CEILING_AUDIT_REASON, ceiling: unverifiedCeiling } : {})
+        messageCode: messageCode(WRITE_BUDGET_DENY_MESSAGE_SLUG)
       },
       env
     );
-    const reason = decision.ceiling
-      ? buildUnverifiedCeilingReason(decision.writeCount)
-      : `${buildAdvisoryLine(decision.writeCount, decision.dispatchCount)} The inline write budget is exhausted. Dispatch an Agent or Task before another main-loop write.`;
+    const reason = tagMessage(
+      WRITE_BUDGET_DENY_MESSAGE_SLUG,
+      `${buildAdvisoryLine(decision.writeCount, decision.dispatchCount)} The inline write budget is exhausted. Dispatch an Agent or Task before another main-loop write.`
+    );
     process.stdout.write(`${JSON.stringify(denyOutput(reason))}\n`);
     return;
   }
@@ -1709,7 +1738,10 @@ function runHook(env = process.env, input = readHookInput()) {
       dispatchCount: decision.dispatchCount,
       budget,
       mode,
-      posture
+      posture,
+      messageCode: messageCode(
+        decision.relief === TAIL_ALLOW_AUDIT_EVENT ? TAIL_ALLOWANCE_ADVISORY_MESSAGE_SLUG : ZERO_DISPATCH_ADVISORY_MESSAGE_SLUG
+      )
     };
     if (decision.relief === TAIL_ALLOW_AUDIT_EVENT) {
       auditEvent.remainingTailSlots = decision.remainingTailSlots;
@@ -1722,10 +1754,13 @@ function runHook(env = process.env, input = readHookInput()) {
     }
     recordAuditEvent(auditEvent, env);
     if (!advisory.suppressed) {
-      const line =
+      const slug = decision.relief === TAIL_ALLOW_AUDIT_EVENT ? TAIL_ALLOWANCE_ADVISORY_MESSAGE_SLUG : ZERO_DISPATCH_ADVISORY_MESSAGE_SLUG;
+      const line = tagMessage(
+        slug,
         decision.relief === TAIL_ALLOW_AUDIT_EVENT
           ? buildTailAllowanceAdvisory(decision.remainingTailSlots)
-          : buildZeroDispatchAdvisory(decision.remainingZeroDispatchWrites, decision.remainingZeroDispatchBytes);
+          : buildZeroDispatchAdvisory(decision.remainingZeroDispatchWrites, decision.remainingZeroDispatchBytes)
+      );
       process.stdout.write(`${JSON.stringify(allowOutput(line, line))}\n`);
     }
     return;
@@ -1740,6 +1775,7 @@ function runHook(env = process.env, input = readHookInput()) {
       (state) => state.dispatchEpoch === decision.candidate.dispatchEpoch && state.advisedMultiples.includes(decision.candidate.multiple)
     );
     if (!advisory.skipped) {
+      const advisorySlug = posture === STRICT_POSTURE ? WRITE_BUDGET_ADVISORY_MESSAGE_SLUG : UNVERIFIED_ADVISORY_MESSAGE_SLUG;
       recordAuditEvent(
         {
           at: now,
@@ -1753,15 +1789,16 @@ function runHook(env = process.env, input = readHookInput()) {
           budget,
           mode,
           posture,
+          messageCode: messageCode(advisorySlug),
           ...(advisory.suppressed ? { suppressed: true } : {})
         },
         env
       );
       if (!advisory.suppressed) {
-        const line =
-          posture === STRICT_POSTURE
-            ? buildAdvisoryLine(decision.writeCount, decision.dispatchCount)
-            : buildUnverifiedAdvisory(decision.writeCount, unverifiedCeiling, budget);
+        const line = tagMessage(
+          advisorySlug,
+          posture === STRICT_POSTURE ? buildAdvisoryLine(decision.writeCount, decision.dispatchCount) : buildUnverifiedAdvisory(decision.writeCount)
+        );
         process.stdout.write(`${JSON.stringify(allowOutput(line))}\n`);
       }
     }
@@ -1780,7 +1817,13 @@ function main() {
   } catch {
     const targetPath = extractWritePath(input?.tool_input);
     if (resolveMode(process.env) === "enforce" && input && !isSubagentPayload(input) && WRITE_TOOLS.has(input.tool_name) && isWorkspaceWritePath(targetPath, input.cwd)) {
-      process.stdout.write(`${JSON.stringify(denyOutput("Fusion inline write state is unavailable. Retry after restoring private guard state access."))}\n`);
+      process.stdout.write(
+        `${JSON.stringify(
+          denyOutput(
+            tagMessage(STATE_UNAVAILABLE_DENY_MESSAGE_SLUG, "Fusion inline write state is unavailable. Retry after restoring private guard state access.")
+          )
+        )}\n`
+      );
     }
   }
 }
@@ -1804,7 +1847,6 @@ export {
   resolveStateDir,
   resolveTailAllowance,
   resolveTailMaxBytes,
-  resolveUnverifiedCeiling,
   resolveZeroDispatchMaxBytes,
   resolveZeroDispatchWrites,
   stateFile,
