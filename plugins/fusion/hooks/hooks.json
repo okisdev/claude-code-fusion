@@ -26,7 +26,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "echo 'Context was compacted. Restate the session execution posture (coordinate, implement, or triage) in your next message. Confirm that every dispatched package is still tracked to collection and verification, and that any main loop work since the last verification still has a verification command to run. Reassess routing for the remaining work: does anything now belong to fusion:deep-reasoner, a peer engine, or the panel?'",
+            "command": "echo 'Context was compacted. Restate the session execution posture (coordinate, implement, or triage) in your next message. Confirm that every dispatched package is still tracked to collection and verification, and that any main loop work since the last verification still has a verification command to run. Reassess routing for the remaining work: does anything now belong to fusion:deep-reasoner, a peer engine, or the panel? [fusion:9902]'",
             "timeout": 5
           }
         ]

@@ -6,6 +6,7 @@ import { fileURLToPath } from "node:url";
 
 import { recordEngineAcceptance } from "./lib/engine-acceptance.mjs";
 import { appendTokenUsageObservation, fusionRepositoryKey } from "./fusion-stats.mjs";
+import { tagMessage } from "./lib/user-messages.mjs";
 import {
   applyQueuedVerdict,
   backfillWorkerTaskOutputTelemetry,
@@ -704,7 +705,7 @@ function handlePreToolUse(input, env) {
     const agentType = input.tool_input?.subagent_type;
     if (PEER_WRAPPER_AGENTS.has(agentType)) {
       if (input.tool_input?.run_in_background === true) {
-        writeOutput(denyTool("Codex and Grok wrapper Agents use foreground delivery. Keep the Agent foreground; an explicitly requested companion `--background` receipt stays inside that foreground wrapper call."));
+        writeOutput(denyTool(tagMessage("worker-lifecycle.foreground-wrapper-deny", "Codex and Grok wrapper Agents use foreground delivery. Keep the Agent foreground; an explicitly requested companion `--background` receipt stays inside that foreground wrapper call.")));
       }
       return;
     }
@@ -715,18 +716,18 @@ function handlePreToolUse(input, env) {
       return;
     }
     if (canonicalWorkerAgentType(agentType) === "fusion:job-collector" && !collectorRequestIdentity(promptText(input.tool_input))) {
-      writeOutput(denyTool("Fusion collector requests must contain exactly one `engine: codex|grok` line and one `job: <32 lowercase hexadecimal characters>` line."));
+      writeOutput(denyTool(tagMessage("worker-lifecycle.collector-request-deny", "Fusion collector requests must contain exactly one `engine: codex|grok` line and one `job: <32 lowercase hexadecimal characters>` line.")));
       return;
     }
     const validation = validateWorkerBrief(promptText(input.tool_input), agentType, env);
     if (!validation.ok) {
-      writeOutput(denyTool(validation.reason));
+      writeOutput(denyTool(tagMessage("worker-lifecycle.brief-validation-deny", validation.reason)));
       return;
     }
     const requestsBackground = input.tool_input?.run_in_background === true;
     const userBackgroundAuthorized = requestsBackground && latestUserRequestedBackground(input.transcript_path);
     if (requestsBackground && !userBackgroundAuthorized) {
-      writeOutput(denyTool("Fusion workers may detach only when the latest user message explicitly contains `--background`. Remove background mode and collect the result in this turn."));
+      writeOutput(denyTool(tagMessage("worker-lifecycle.background-authorization-deny", "Fusion workers may detach only when the latest user message explicitly contains `--background`. Remove background mode and collect the result in this turn.")));
       return;
     }
     const record = createDispatch(input, agentType, userBackgroundAuthorized, env, validation);
@@ -734,7 +735,8 @@ function handlePreToolUse(input, env) {
     if (claimParentContextAdvisory(record, env)) {
       advisories.push("The orchestrator transcript is large. Cache reread cost grows with context size times turns. Consider a fresh session for the next goal.");
     }
-    writeOutput(allowAgentWithTaskId(input.tool_input, record.taskId, advisories.join("\n\n") || null));
+    const additionalContext = advisories.join("\n\n");
+    writeOutput(allowAgentWithTaskId(input.tool_input, record.taskId, additionalContext ? tagMessage("worker-lifecycle.dispatch-advisory", additionalContext) : null));
     return;
   }
   if (!isFusionWorkerAgent(input.agent_type)) {
@@ -762,12 +764,12 @@ function handlePreToolUse(input, env) {
         return { ...current, terminalWriteGraceUsedAt: now };
       });
       if (terminalWriteGraceUsed) {
-        writeOutput({ hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision: "allow", additionalContext: "Final deliverable write permitted; every further tool call will be denied." } });
+        writeOutput({ hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision: "allow", additionalContext: tagMessage("worker-lifecycle.final-deliverable-allow", "Final deliverable write permitted; every further tool call will be denied.") } });
         return;
       }
     }
     const terminalWriteHint = failure.failureKind === "token_limit" ? " If the deliverable file is not yet written, one final Write is permitted." : "";
-    writeOutput(denyTool(`Fusion worker ${refreshed.taskId} must stop: ${failure.reason}. Return a concise partial result now; do not retry or call more tools.${terminalWriteHint}`));
+    writeOutput(denyTool(tagMessage("worker-lifecycle.worker-stop-deny", `Fusion worker ${refreshed.taskId} must stop: ${failure.reason}. Return a concise partial result now; do not retry or call more tools.${terminalWriteHint}`)));
     return;
   }
   const now = new Date().toISOString();
@@ -1256,9 +1258,9 @@ function handlePostToolUse(input, env, failed = false) {
     };
   });
   if (emitTokenWindDown) {
-    writeOutput(hookOutput(input.hook_event_name, "Token budget wind-down: stop making tool calls and write your final deliverable now."));
+    writeOutput(hookOutput(input.hook_event_name, tagMessage("worker-lifecycle.budget-wind-down", "Token budget wind-down: stop making tool calls and write your final deliverable now.")));
   } else if (emitTurnWindDown) {
-    writeOutput(hookOutput(input.hook_event_name, "Turn budget wind-down: stop making tool calls and write your final deliverable now."));
+    writeOutput(hookOutput(input.hook_event_name, tagMessage("worker-lifecycle.budget-wind-down", "Turn budget wind-down: stop making tool calls and write your final deliverable now.")));
   }
 }
 
@@ -1299,7 +1301,7 @@ function handleSubagentStart(input, env) {
   const artifactFirst = EXECUTION_AGENTS.has(canonicalWorkerAgentType(record.agentType))
     ? " Write your deliverable artifact to a file early, before deep work, and keep updating it; your final message names its path, and a budget death must still leave a readable artifact."
     : "";
-  writeOutput(hookOutput("SubagentStart", `Fusion task id: ${record.taskId}. Work only from the supplied isolated brief. Do not request or reconstruct the parent transcript. Budgets: ${limits.wallClockMs}ms wall clock, ${limits.stallMs}ms without successful tool activity, ${limits.maxTurns} turns, ${limits.maxOutputTokens} output tokens, ${limits.maxUncachedTokens} uncached tokens. Retry at most once. At 85 percent of the output token budget, stop making tool calls and write the final deliverable; after the token limit, exactly one final Write of the deliverable is permitted.${artifactFirst} ${delivery}`));
+  writeOutput(hookOutput("SubagentStart", tagMessage("worker-lifecycle.subagent-start-context", `Fusion task id: ${record.taskId}. Work only from the supplied isolated brief. Do not request or reconstruct the parent transcript. Budgets: ${limits.wallClockMs}ms wall clock, ${limits.stallMs}ms without successful tool activity, ${limits.maxTurns} turns, ${limits.maxOutputTokens} output tokens, ${limits.maxUncachedTokens} uncached tokens. Retry at most once. At 85 percent of the output token budget, stop making tool calls and write the final deliverable; after the token limit, exactly one final Write of the deliverable is permitted.${artifactFirst} ${delivery}`)));
 }
 
 function handleSubagentStop(input, env) {
@@ -1345,12 +1347,12 @@ function handleSubagentStop(input, env) {
     const expected = refreshed.expectedPeerEngine && refreshed.expectedPeerJobId
       ? ` Repeat collection for exactly engine=${refreshed.expectedPeerEngine} job=${refreshed.expectedPeerJobId}.`
       : "";
-    writeOutput(blockStop(`The collector returned an invalid or mismatched terminal marker.${expected} Return the exact collector command output with its terminal marker. This is the only retry.`));
+    writeOutput(blockStop(tagMessage("worker-lifecycle.collector-marker-block", `The collector returned an invalid or mismatched terminal marker.${expected} Return the exact collector command output with its terminal marker. This is the only retry.`)));
     return;
   }
   if (!complete && !failure && (refreshed.retryCount ?? 0) < 1 && !input.stop_hook_active) {
     updateLifecycleWorkerRecord(refreshed.taskId, env, (current) => ({ ...current, retryCount: (current.retryCount ?? 0) + 1 }));
-    writeOutput(blockStop(retryInstruction(refreshed)));
+    writeOutput(blockStop(tagMessage("worker-lifecycle.deliverable-retry-block", retryInstruction(refreshed))));
     return;
   }
   const now = new Date().toISOString();
@@ -1862,12 +1864,12 @@ function collectorStopGate(input, env) {
   if (missingFailureReports.length > 0) {
     const commands = missingFailureReports.map(collectorResultCommand).filter(Boolean);
     const commandInstruction = commands.length > 0 ? ` Include ${commands.join(" or ")}.` : "";
-    writeOutput(blockStop(`Collector failure reporting is incomplete for ${missingFailureReports.map((record) => {
+    writeOutput(blockStop(tagMessage("worker-lifecycle.collector-reporting-block", `Collector failure reporting is incomplete for ${missingFailureReports.map((record) => {
       const engine = record.peerEngine ?? record.expectedPeerEngine;
       const jobId = record.peerJobId ?? record.expectedPeerJobId;
       const identity = engine && jobId ? `${engine}:${jobId}` : jobId ? `job=${jobId}` : "peer identity unavailable";
       return `${record.taskId} (${record.failureKind}, ${identity})`;
-    }).join(", ")}. Report each Fusion task id and every available peer job id, and state explicitly that the peer result remains uncollected.${commandInstruction}`));
+    }).join(", ")}. Report each Fusion task id and every available peer job id, and state explicitly that the peer result remains uncollected.${commandInstruction}`)));
     return true;
   }
   const unjudged = unjudgedPeerCollections(input.session_id, env);
@@ -1878,7 +1880,7 @@ function collectorStopGate(input, env) {
       settlementRecords.length > 0 ? `record the judgments in one command: ${settlementCommand(settlementRecords)}` : null,
       ...manualRecords.map((record) => `complete a manual resolution because the collection for Fusion task ${record.taskId} needs manual resolution`)
     ].filter(Boolean);
-    writeOutput(blockStop(`Collected peer transport results still require an explicit semantic judgment before finishing: ${unjudged.map((record) => `${record.peerEngine}:${record.peerJobId} (task=${record.taskId}, transport=${record.peerTransportStatus}, semantic=${record.peerSemanticStatus ?? "unverified"})`).join(", ")}. After checking the requested completion criteria, ${instructions.join("; ")}.`));
+    writeOutput(blockStop(tagMessage("worker-lifecycle.semantic-judgment-block", `Collected peer transport results still require an explicit semantic judgment before finishing: ${unjudged.map((record) => `${record.peerEngine}:${record.peerJobId} (task=${record.taskId}, transport=${record.peerTransportStatus}, semantic=${record.peerSemanticStatus ?? "unverified"})`).join(", ")}. After checking the requested completion criteria, ${instructions.join("; ")}.`)));
     return true;
   }
   return false;
@@ -1890,7 +1892,7 @@ function writeAcceptanceAdvisory(records, env) {
     return;
   }
   const workers = unverified.map((record) => `${record.taskId} (${[record.agentType, record.description].filter((value) => typeof value === "string" && value.trim()).join(", ")})`);
-  writeOutput(hookOutput("Stop", `Acceptance remains unverified for ${unverified.length} collected Fusion worker${unverified.length === 1 ? "" : "s"}: ${workers.join("; ")}. Settle the pending wave in one command: ${settlementCommand(unverified)}. pairs are <id>=<verdict> with id either a fusion task id (fusion- plus 24 lowercase hex) or an engine job id (32 lowercase hex), verdict one of accepted|rejected|unverified.`));
+  writeOutput(hookOutput("Stop", tagMessage("worker-lifecycle.acceptance-advisory", `Acceptance remains unverified for ${unverified.length} collected Fusion worker${unverified.length === 1 ? "" : "s"}: ${workers.join("; ")}. Settle the pending wave in one command: ${settlementCommand(unverified)}. pairs are <id>=<verdict> with id either a fusion task id (fusion- plus 24 lowercase hex) or an engine job id (32 lowercase hex), verdict one of accepted|rejected|unverified.`)));
 }
 
 function terminalCollectionInstruction(record) {
@@ -1929,7 +1931,7 @@ function writeSettlementDemand(records, env) {
   if (current.length === 0) {
     return false;
   }
-  writeOutput(blockStop(`Collected Fusion worker results still require explicit acceptance before finishing. Settle the pending wave in one command: ${settlementCommand(current)}.`));
+  writeOutput(blockStop(tagMessage("worker-lifecycle.acceptance-required-block", `Collected Fusion worker results still require explicit acceptance before finishing. Settle the pending wave in one command: ${settlementCommand(current)}.`)));
   return true;
 }
 
@@ -1942,7 +1944,7 @@ function writeTerminalCollectionPending(records, env) {
   instructions.push(
     "Transport completion remains unverified until the result and verification evidence are reviewed. Record accepted or rejected explicitly through /fusion:stats."
   );
-  writeOutput(blockStop(instructions.join(" ")));
+  writeOutput(blockStop(tagMessage("worker-lifecycle.terminal-collection-block", instructions.join(" "))));
   return true;
 }
 
@@ -2037,7 +2039,7 @@ function writeWrapperApiDeathRedispatchAdvisory(sessionId, env) {
   if (advised.length === 0) {
     return false;
   }
-  writeOutput(hookOutput("Stop", `Fusion wrapper API death: redispatch ${advised.map((record) => `${record.taskId} from ${record.briefFile}`).join("; ")}.`));
+  writeOutput(hookOutput("Stop", tagMessage("worker-lifecycle.wrapper-death-context", `Fusion wrapper API death: redispatch ${advised.map((record) => `${record.taskId} from ${record.briefFile}`).join("; ")}.`)));
   return true;
 }
 
@@ -2106,15 +2108,15 @@ function handleStop(input, env) {
     const reapedSuffix = reapedSentence ? ` ${reapedSentence}` : "";
     const cancelIds = verifiedCancellations.filter((record) => !reapedTaskIds.includes(record.taskId)).map((record) => record.backgroundTaskId ?? record.agentId).filter(Boolean);
     if (cancelIds.length > 0) {
-      writeOutput(blockStop(`Call TaskStop for over-budget task${cancelIds.length === 1 ? "" : "s"} ${cancelIds.join(", ")} and report the cancellation before finishing.${reapedSuffix}`));
+      writeOutput(blockStop(tagMessage("worker-lifecycle.over-budget-stop-block", `Call TaskStop for over-budget task${cancelIds.length === 1 ? "" : "s"} ${cancelIds.join(", ")} and report the cancellation before finishing.${reapedSuffix}`)));
       return;
     }
     if (missingRuntimeIds.length > 0) {
-      writeOutput(blockStop(`Fusion task${missingRuntimeIds.length === 1 ? "" : "s"} ${missingRuntimeIds.map((record) => record.taskId).join(", ")} failed before a runtime task id was available. Report the failure before finishing.${reapedSuffix}`));
+      writeOutput(blockStop(tagMessage("worker-lifecycle.pre-runtime-failure-block", `Fusion task${missingRuntimeIds.length === 1 ? "" : "s"} ${missingRuntimeIds.map((record) => record.taskId).join(", ")} failed before a runtime task id was available. Report the failure before finishing.${reapedSuffix}`)));
       return;
     }
     if (reapedSentence) {
-      writeOutput(hookOutput("Stop", reapedSentence));
+      writeOutput(hookOutput("Stop", tagMessage("worker-lifecycle.task-reaped-context", reapedSentence)));
       return;
     }
   }
@@ -2148,7 +2150,7 @@ function handleStop(input, env) {
     }
     const signature = inFlightAdvisorySignature(verifiedInFlight);
     if (!input.stop_hook_active && claimStopAdvisory(input.session_id, "in-flight", signature, env)) {
-      writeOutput(hookOutput("Stop", `Fusion task${verifiedInFlight.length === 1 ? "" : "s"} ${verifiedInFlight.map((record) => record.taskId).join(", ")} ${verifiedInFlight.length === 1 ? "is" : "are"} still in flight. Collection is armed and will be required after terminal notification.`));
+      writeOutput(hookOutput("Stop", tagMessage("worker-lifecycle.in-flight-context", `Fusion task${verifiedInFlight.length === 1 ? "" : "s"} ${verifiedInFlight.map((record) => record.taskId).join(", ")} ${verifiedInFlight.length === 1 ? "is" : "are"} still in flight. Collection is armed and will be required after terminal notification.`)));
     }
     return;
   }
@@ -2209,9 +2211,9 @@ function main() {
     runHook(input);
   } catch {
     if (input.hook_event_name === "PreToolUse") {
-      writeOutput(denyTool("Fusion lifecycle state is unavailable. Retry after restoring private worker state access."));
+      writeOutput(denyTool(tagMessage("worker-lifecycle.state-unavailable", "Fusion lifecycle state is unavailable. Retry after restoring private worker state access.")));
     } else if (input.hook_event_name === "Stop" || input.hook_event_name === "SubagentStop") {
-      writeOutput(blockStop("Fusion lifecycle state is unavailable. Restore private worker state access before ending this task."));
+      writeOutput(blockStop(tagMessage("worker-lifecycle.state-unavailable", "Fusion lifecycle state is unavailable. Restore private worker state access before ending this task.")));
     }
   }
 }

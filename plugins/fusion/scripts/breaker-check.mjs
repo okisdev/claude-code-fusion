@@ -7,6 +7,7 @@ import { fileURLToPath } from "node:url";
 
 import { resolveCodexStateDir, resolveCodexStateRoots } from "./lib/codex-state-roots.mjs";
 import { canonicalWorkerAgentType, readWorkerRecords } from "./lib/worker-state.mjs";
+import { tagMessage } from "./lib/user-messages.mjs";
 
 const GROK_DATA_ENV = "GROK_COMPANION_DATA";
 const LOOKBACK_ENV = "FUSION_BREAKER_LOOKBACK_HOURS";
@@ -304,7 +305,7 @@ function run(env = process.env, now = Date.now()) {
     }
   }
   if (lines.length > 0) {
-    process.stdout.write(`${lines.join("\n")}\n`);
+    process.stdout.write(`${tagMessage("breaker-check.breaker-advisory", lines.join("\n"))}\n`);
   }
 }
 

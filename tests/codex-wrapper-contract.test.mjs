@@ -5,6 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import { test } from "node:test";
 
+import { tagMessage } from "../plugins/fusion/scripts/lib/user-messages.mjs";
 import { readWorkerRecords } from "../plugins/fusion/scripts/lib/worker-state.mjs";
 
 const repoRoot = path.join(import.meta.dirname, "..");
@@ -142,7 +143,7 @@ test("a codex:codex-rescue final that is truncated forward-looking narration blo
   const first = run(box, stopPayload);
   const firstOutput = JSON.parse(first.stdout);
   assert.strictEqual(firstOutput.decision, "block");
-  assert.strictEqual(firstOutput.reason, "The transport relay is incomplete. Return the companion output verbatim, including its `job:` and `state:` footer lines. This is the only retry.");
+  assert.strictEqual(firstOutput.reason, tagMessage("worker-lifecycle.deliverable-retry-block", "The transport relay is incomplete. Return the companion output verbatim, including its `job:` and `state:` footer lines. This is the only retry."));
   assert.strictEqual(record(box).retryCount, 1);
 
   const second = run(box, stopPayload);
@@ -185,7 +186,7 @@ test("a fusion:claude-worker final without EXECUTION_END_MARKER is still blocked
 
   const blockedOutput = JSON.parse(blocked.stdout);
   assert.strictEqual(blockedOutput.decision, "block");
-  assert.strictEqual(blockedOutput.reason, "The task is not deliverable yet. Complete the requested verification and return the actual result. End with `delivery: complete` plus `verification: passed`. This is the only retry.");
+  assert.strictEqual(blockedOutput.reason, tagMessage("worker-lifecycle.deliverable-retry-block", "The task is not deliverable yet. Complete the requested verification and return the actual result. End with `delivery: complete` plus `verification: passed`. This is the only retry."));
   const stopped = record(box);
   assert.strictEqual(stopped.retryCount, 1);
   assert.strictEqual(stopped.transportStatus, "running");

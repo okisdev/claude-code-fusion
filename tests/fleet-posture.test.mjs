@@ -5,9 +5,11 @@ import os from "node:os";
 import path from "node:path";
 import { test } from "node:test";
 
+import { messageTag, tagMessage } from "../plugins/fusion/scripts/lib/user-messages.mjs";
+
 const repoRoot = path.join(import.meta.dirname, "..");
 const script = path.join(repoRoot, "plugins", "fusion", "scripts", "fleet-posture.mjs");
-const LEGACY_CONTEXT = "fleet-default active: a goal that decomposes into three or more independent work packages convenes /fusion:ultra once bootstrap dependencies are resolved; narrower execution states `fleet-decline: <reason>` visibly in the reply.";
+const LEGACY_CONTEXT = tagMessage("fleet-posture.strict-fleet-reminder", "fleet-default active: a goal that decomposes into three or more independent work packages convenes /fusion:ultra once bootstrap dependencies are resolved; narrower execution states `fleet-decline: <reason>` visibly in the reply.");
 
 function makeSandbox(t) {
   const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "fleet-posture-test-")));
@@ -39,7 +41,7 @@ function writeState(sandbox, state, sessionId = "session-1") {
 }
 
 function judgmentContext(streak) {
-  return `${streak} consecutive width one dispatch waves in this session. If the remaining packages are independent, dispatch them together in one message; /fusion:ultra is available when the goal is genuinely wide.`;
+  return tagMessage("fleet-posture.narrow-wave-reminder", `${streak} consecutive width one dispatch waves in this session. If the remaining packages are independent, dispatch them together in one message; /fusion:ultra is available when the goal is genuinely wide.`);
 }
 
 function run(sandbox, input = hookInput(sandbox), extraEnv = {}) {
@@ -59,6 +61,8 @@ function assertSilent(result) {
 function assertContext(result, additionalContext) {
   assert.strictEqual(result.status, 0);
   assert.strictEqual(result.stderr, "");
+  const slug = additionalContext.includes("fleet-default active") ? "fleet-posture.strict-fleet-reminder" : "fleet-posture.narrow-wave-reminder";
+  assert.ok(additionalContext.endsWith(messageTag(slug)));
   assert.deepStrictEqual(JSON.parse(result.stdout), {
     hookSpecificOutput: { hookEventName: "UserPromptSubmit", additionalContext }
   });

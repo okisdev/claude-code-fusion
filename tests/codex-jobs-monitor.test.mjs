@@ -1,4 +1,7 @@
 import assert from "node:assert";
+import { messageTag } from "../plugins/fusion/scripts/lib/user-messages.mjs";
+
+const MONITOR_TAG = messageTag("codex-monitor.job-notification");
 import { execFileSync, spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import fs from "node:fs";
@@ -244,7 +247,7 @@ test("a Grok observation does not suppress a Codex notification on the same tick
   const lines = await waitUntil(() => (monitor.lines().length > 0 ? monitor.lines() : null));
   await waitUntil(() => readJsonLines(tokenUsageSidecarPath(workspaceRoot, env)).some((observation) => observation.jobId === "grok-same-tick"));
   assert.deepStrictEqual(lines, [
-    `codex job ${record.id} done. collect with /codex:result ${record.id}; completion notices do not replace collection.`
+    `codex job ${record.id} done. collect with /codex:result ${record.id}; completion notices do not replace collection. ${MONITOR_TAG}`
   ]);
 });
 
@@ -260,7 +263,7 @@ test("a non-directory Grok state root leaves Codex announcements unchanged", asy
 
   const lines = await waitUntil(() => (monitor.lines().length > 0 ? monitor.lines() : null));
   assert.deepStrictEqual(lines, [
-    `codex job ${record.id} done. collect with /codex:result ${record.id}; completion notices do not replace collection.`
+    `codex job ${record.id} done. collect with /codex:result ${record.id}; completion notices do not replace collection. ${MONITOR_TAG}`
   ]);
   await assertMonitorStaysAlive(monitor);
 });
@@ -293,7 +296,7 @@ test("a job transitioning to done emits exactly one correctly shaped line", asyn
   assert.strictEqual(lines.length, 1);
   assert.strictEqual(
     lines[0],
-    `codex job ${record.id} done. collect with /codex:result ${record.id}; completion notices do not replace collection.`
+    `codex job ${record.id} done. collect with /codex:result ${record.id}; completion notices do not replace collection. ${MONITOR_TAG}`
   );
 
   await waitForAnnouncedRecord(sandbox, record.id);
@@ -334,7 +337,7 @@ test("a job transitioning to error reports a truncated error message when presen
   assert.strictEqual(lines.length, 1);
   assert.strictEqual(
     lines[0],
-    `codex job ${record.id} error (worker process exited with status 1). collect with /codex:result ${record.id}; completion notices do not replace collection.`
+    `codex job ${record.id} error (worker process exited with status 1). collect with /codex:result ${record.id}; completion notices do not replace collection. ${MONITOR_TAG}`
   );
 });
 
@@ -351,7 +354,7 @@ test("a job transitioning to error with no error message emits no suffix", async
   assert.strictEqual(lines.length, 1);
   assert.strictEqual(
     lines[0],
-    `codex job ${record.id} error. collect with /codex:result ${record.id}; completion notices do not replace collection.`
+    `codex job ${record.id} error. collect with /codex:result ${record.id}; completion notices do not replace collection. ${MONITOR_TAG}`
   );
 });
 
@@ -375,7 +378,7 @@ test("a long error message is truncated to a sane length", async (t) => {
   assert.strictEqual(lines.length, 1);
   assert.strictEqual(
     lines[0],
-    `codex job ${record.id} cancelled (${"x".repeat(80)}...). collect with /codex:result ${record.id}; completion notices do not replace collection.`
+    `codex job ${record.id} cancelled (${"x".repeat(80)}...). collect with /codex:result ${record.id}; completion notices do not replace collection. ${MONITOR_TAG}`
   );
 });
 
@@ -404,12 +407,12 @@ test("session monitors announce their own Claude jobs once and still surface orp
 
   await waitUntil(() => (ownMonitor.lines().length === 2 && otherMonitor.lines().length === 2 ? true : null));
   assert.deepStrictEqual(ownMonitor.lines().sort(), [
-    `codex job ${orphanRecord.id} done. collect with /codex:result ${orphanRecord.id}; completion notices do not replace collection.`,
-    `codex job ${ownRecord.id} done. collect with /codex:result ${ownRecord.id}; completion notices do not replace collection.`
+    `codex job ${orphanRecord.id} done. collect with /codex:result ${orphanRecord.id}; completion notices do not replace collection. ${MONITOR_TAG}`,
+    `codex job ${ownRecord.id} done. collect with /codex:result ${ownRecord.id}; completion notices do not replace collection. ${MONITOR_TAG}`
   ].sort());
   assert.deepStrictEqual(otherMonitor.lines().sort(), [
-    `codex job ${orphanRecord.id} done. collect with /codex:result ${orphanRecord.id}; completion notices do not replace collection.`,
-    `codex job ${otherRecord.id} done. collect with /codex:result ${otherRecord.id}; completion notices do not replace collection.`
+    `codex job ${orphanRecord.id} done. collect with /codex:result ${orphanRecord.id}; completion notices do not replace collection. ${MONITOR_TAG}`,
+    `codex job ${otherRecord.id} done. collect with /codex:result ${otherRecord.id}; completion notices do not replace collection. ${MONITOR_TAG}`
   ].sort());
 
   const { ownLedger, otherLedger } = await waitUntil(() => {
@@ -441,7 +444,7 @@ test("with the session id env var unset, a job from a different session still em
   assert.strictEqual(lines.length, 1);
   assert.strictEqual(
     lines[0],
-    `codex job ${record.id} done. collect with /codex:result ${record.id}; completion notices do not replace collection.`
+    `codex job ${record.id} done. collect with /codex:result ${record.id}; completion notices do not replace collection. ${MONITOR_TAG}`
   );
 });
 
@@ -479,7 +482,7 @@ test("a monitor started from a subdirectory still matches jobs recorded against 
   assert.strictEqual(lines.length, 1);
   assert.strictEqual(
     lines[0],
-    `codex job ${record.id} done. collect with /codex:result ${record.id}; completion notices do not replace collection.`
+    `codex job ${record.id} done. collect with /codex:result ${record.id}; completion notices do not replace collection. ${MONITOR_TAG}`
   );
 });
 
@@ -496,7 +499,7 @@ test("a monitor includes jobs recorded in a worktree beneath the repo root", asy
 
   const lines = await waitUntil(() => (monitor.lines().length > 0 ? monitor.lines() : null));
   assert.deepStrictEqual(lines, [
-    `codex job ${record.id} done. collect with /codex:result ${record.id}; completion notices do not replace collection.`
+    `codex job ${record.id} done. collect with /codex:result ${record.id}; completion notices do not replace collection. ${MONITOR_TAG}`
   ]);
 });
 
@@ -720,7 +723,7 @@ test("a vanished state root mid run does not crash the process and a later tick 
   assert.strictEqual(lines.length, 1);
   assert.strictEqual(
     lines[0],
-    `codex job ${record.id} done. collect with /codex:result ${record.id}; completion notices do not replace collection.`
+    `codex job ${record.id} done. collect with /codex:result ${record.id}; completion notices do not replace collection. ${MONITOR_TAG}`
   );
 });
 
@@ -738,7 +741,7 @@ test("removing an observed workspace state directory does not disable later moni
 
   const lines = await waitUntil(() => (monitor.lines().length > 0 ? monitor.lines() : null));
   assert.deepStrictEqual(lines, [
-    `codex job ${record.id} done. collect with /codex:result ${record.id}; completion notices do not replace collection.`
+    `codex job ${record.id} done. collect with /codex:result ${record.id}; completion notices do not replace collection. ${MONITOR_TAG}`
   ]);
 });
 
@@ -754,7 +757,7 @@ test("a malformed job record does not suppress a healthy job transition", async 
 
   const lines = await waitUntil(() => (monitor.lines().length > 0 ? monitor.lines() : null));
   assert.deepStrictEqual(lines, [
-    `codex job ${record.id} done. collect with /codex:result ${record.id}; completion notices do not replace collection.`
+    `codex job ${record.id} done. collect with /codex:result ${record.id}; completion notices do not replace collection. ${MONITOR_TAG}`
   ]);
 });
 
@@ -777,7 +780,7 @@ test("a stored repository key keeps a removed sibling worktree in monitor scope"
 
   const lines = await waitUntil(() => (monitor.lines().length > 0 ? monitor.lines() : null));
   assert.deepStrictEqual(lines, [
-    `codex job ${record.id} done. collect with /codex:result ${record.id}; completion notices do not replace collection.`
+    `codex job ${record.id} done. collect with /codex:result ${record.id}; completion notices do not replace collection. ${MONITOR_TAG}`
   ]);
   const terminal = await waitUntil(() => {
     try {
@@ -884,7 +887,7 @@ test("restart catch-up announces an unrecorded terminal job owned by the active 
   t.after(() => monitor.child.kill("SIGKILL"));
   const lines = await waitUntil(() => (monitor.lines().length > 0 ? monitor.lines() : null));
   assert.deepStrictEqual(lines, [
-    `codex job ${record.id} done. collect with /codex:result ${record.id}; completion notices do not replace collection.`
+    `codex job ${record.id} done. collect with /codex:result ${record.id}; completion notices do not replace collection. ${MONITOR_TAG}`
   ]);
 });
 
@@ -1288,7 +1291,7 @@ test("canonical terminal records use direct model and token evidence without rol
 
   const lines = await waitUntil(() => (monitor.lines().length > 0 ? monitor.lines() : null));
   assert.deepStrictEqual(lines, [
-    `codex job ${record.id} done. collect with /codex:result ${record.id}; completion notices do not replace collection.`
+    `codex job ${record.id} done. collect with /codex:result ${record.id}; completion notices do not replace collection. ${MONITOR_TAG}`
   ]);
   const terminal = await waitUntil(() => {
     try {
@@ -1347,7 +1350,7 @@ test("canonical foreground jobs are retained for stats without emitting completi
 });
 
 const REPAIR_UNAVAILABLE_LINE =
-  "codex jobs monitor: companion repair unavailable; running in announce-only mode";
+  `codex jobs monitor: companion repair unavailable; running in announce-only mode ${MONITOR_TAG}`;
 
 function installCacheShapedMonitor(sandbox, { version = "0.0.28", includeCodex = true } = {}) {
   const cacheRoot = path.join(sandbox.root, "cache", "claude-code-fusion");
