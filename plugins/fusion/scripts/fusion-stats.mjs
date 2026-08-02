@@ -10,6 +10,7 @@ import { listAuditSegments as listGuardAuditSegments, readAuditEvents as readGua
 import { resolveCodexStateDir, resolveCodexStateRoots } from "./lib/codex-state-roots.mjs";
 import { recordEngineAcceptance } from "./lib/engine-acceptance.mjs";
 import { consumeRawArgsTransport, createRawArgsTransport, resolveRawArgsTransport } from "./lib/raw-args-transport.mjs";
+import { MESSAGE_REGISTRY, messageCode, registryEntry, tagMessage } from "./lib/user-messages.mjs";
 import { canonicalWorkerAgentType, isTerminalWorkerStatus, readWorkerRecord, readWorkerRecords, recordWorkerAcceptance, validateWorkerAcceptance } from "./lib/worker-state.mjs";
 
 export { GrokPluginUpgradeRequiredError, newestCodexCompanion, newestGrokCompanion } from "./lib/engine-acceptance.mjs";
@@ -2253,7 +2254,6 @@ const COERCION_LEDGER_WRITE_TOOLS = new Set(["Edit", "Write", "NotebookEdit", "M
 const COERCION_LEDGER_SMALL_FLEET_SHAPED_WAVES = 10;
 const COERCION_LEDGER_SPRAWL_MULTIPLE = 2;
 const COERCION_LEDGER_DEFAULT_BUDGET = 5;
-const COERCION_LEDGER_CEILING_REASON = "unverified-ceiling";
 
 function emptyFleetUsageStats() {
   return {
@@ -2432,7 +2432,6 @@ function emptyCoercionLedger(fleetShapedWaves = 0) {
     unverifiedAccumulations: 0,
     inlineSprawlWindows: 0,
     deepestUnverifiedWindow: 0,
-    unverifiedCeilingStops: 0,
     postureMix: {
       judgment: 0,
       strict: 0,
@@ -2471,7 +2470,6 @@ function normalizeCoercionAuditEvent(value) {
     narrowWaveAdvisory: value.event === "warn" && value.reason === "narrow-wave-advisory",
     declineStated: value.declineStated === true,
     deniedWrite: value.event === "deny" && value.lane === "main" && COERCION_LEDGER_WRITE_TOOLS.has(value.tool),
-    ceilingStop: value.event === "deny" && value.lane === "main" && value.reason === COERCION_LEDGER_CEILING_REASON,
     unverifiedWindowWrites,
     unverifiedWindowBudget: unverifiedWindowWrites !== null && Number.isInteger(value.budget) && value.budget > 0 ? value.budget : null
   };
@@ -2571,9 +2569,6 @@ function buildCoercionLedger({ env = process.env, fleet = null } = {}) {
     if (event.event === "verification") {
       ledger.verificationResets += 1;
     }
-    if (event.ceilingStop) {
-      ledger.unverifiedCeilingStops += 1;
-    }
     if (event.postureEvent) {
       ledger.postureMix[event.posture ?? "unset"] += 1;
     }
@@ -2587,7 +2582,7 @@ function hasCoercionLedgerData(ledger) {
     return false;
   }
   return (
-    ["fleetDeclines", "narrowWaveAdvisories", "fleetShapedWaves", "verificationResets", "unverifiedAccumulations", "inlineSprawlWindows", "deepestUnverifiedWindow", "unverifiedCeilingStops"].some(
+    ["fleetDeclines", "narrowWaveAdvisories", "fleetShapedWaves", "verificationResets", "unverifiedAccumulations", "inlineSprawlWindows", "deepestUnverifiedWindow"].some(
       (key) => (ledger[key] ?? 0) > 0
     ) || Object.values(ledger.postureMix ?? {}).some((count) => count > 0)
   );
@@ -2605,7 +2600,6 @@ function renderCoercionLedger(lines, ledger) {
   lines.push(`Unverified accumulations: ${ledger.unverifiedAccumulations ?? 0}`);
   lines.push(`Inline sprawl windows: ${ledger.inlineSprawlWindows ?? 0}`);
   lines.push(`Deepest unverified window: ${ledger.deepestUnverifiedWindow ?? 0}`);
-  lines.push(`Unverified ceiling stops: ${ledger.unverifiedCeilingStops ?? 0}`);
   renderCounts(lines, "Posture mix", ledger.postureMix ?? {});
   const fleetDeclines = ledger.fleetDeclines ?? 0;
   const fleetShapedWaves = ledger.fleetShapedWaves ?? 0;
@@ -2728,6 +2722,68 @@ function argumentValue(argv, flag) {
   }
   const value = argv[index + 1];
   return typeof value === "string" && value && !value.startsWith("--") ? value : null;
+}
+
+function isIntegerToken(value) {
+  return typeof value === "string" && /^-?\d+$/.test(value) && Number.isSafeInteger(Number(value));
+}
+
+function messageEntryHeader(entry) {
+  return `[fusion:${entry.code}] ${entry.slug} - ${entry.description}`;
+}
+
+function renderMessageRegistry() {
+  const entries = MESSAGE_REGISTRY
+    .map((entry) => ({ ...entry, code: messageCode(entry.slug) }))
+    .sort((left, right) => left.code - right.code || left.slug.localeCompare(right.slug));
+  return `${entries.map(messageEntryHeader).join("\n")}\n`;
+}
+
+function readMessageOccurrences(code, env) {
+  const occurrences = [];
+  let order = 0;
+  try {
+    const segments = listGuardAuditSegments(resolveGuardAuditDir(env)).sort((left, right) => left.date.localeCompare(right.date) || left.index - right.index);
+    for (const segment of segments) {
+      let text;
+      try {
+        text = fs.readFileSync(segment.file, "utf8");
+      } catch {
+        continue;
+      }
+      for (const line of text.split("\n")) {
+        if (!line.trim()) {
+          continue;
+        }
+        try {
+          const event = JSON.parse(line);
+          const atMs = Date.parse(event?.at ?? "");
+          if (Number.isInteger(event?.messageCode) && event.messageCode === code && Number.isFinite(atMs) && typeof event.session === "string" && event.session && typeof event.event === "string" && event.event) {
+            occurrences.push({ at: event.at, atMs, session: event.session, event: event.event, order });
+          }
+          order += 1;
+        } catch {
+          void 0;
+        }
+      }
+    }
+  } catch {
+    return [];
+  }
+  return occurrences.sort((left, right) => right.atMs - left.atMs || right.order - left.order);
+}
+
+function renderMessageDetails(entry, occurrences) {
+  const lines = [messageEntryHeader(entry)];
+  if (occurrences.length === 0) {
+    lines.push("Occurrences are not recorded for this message kind.");
+  } else {
+    lines.push(`Occurrences: ${occurrences.length}`);
+    for (const occurrence of occurrences.slice(0, 10)) {
+      lines.push(`${occurrence.at}  ${occurrence.session}  ${occurrence.event}`);
+    }
+  }
+  return `${lines.join("\n")}\n`;
 }
 
 function sessionIdFromArgs(argv, env) {
@@ -2946,7 +3002,13 @@ function isStrictDirectRecordArguments(argv) {
   }
 }
 
-function isStrictDirectReportOrMaintenanceArguments(argv) {
+export function isStrictDirectReportOrMaintenanceArguments(argv) {
+  if (argv.length === 1 && argv[0] === "--messages") {
+    return true;
+  }
+  if (argv.length === 2 && argv[0] === "--message" && isIntegerToken(argv[1])) {
+    return true;
+  }
   const flags = new Set(["--json", "--audit", "--all", "--prune-dead"]);
   return argv.every((token) => flags.delete(token));
 }
@@ -3080,6 +3142,27 @@ function settleRecords({ records, source, acceptFailedTransport = false, asJson,
 export function main(argv = process.argv.slice(2), { env = process.env, cwd = process.cwd(), stdout = process.stdout, stderr = process.stderr, rawArgs = false } = {}) {
   const asJson = argv.includes("--json");
 
+  if (argv.includes("--messages")) {
+    stdout.write(renderMessageRegistry());
+    return MESSAGE_REGISTRY;
+  }
+
+  if (argv.includes("--message")) {
+    const codeValue = argv[argv.indexOf("--message") + 1];
+    if (!isIntegerToken(codeValue)) {
+      stderr.write("The --message code must be an integer. Run --messages to list every fusion message digest.\n");
+      return { exitCode: 1 };
+    }
+    const entry = registryEntry(Number(codeValue));
+    if (!entry) {
+      stderr.write(`Unknown fusion message code ${codeValue}. Run --messages to list every fusion message digest.\n`);
+      return { exitCode: 1 };
+    }
+    const occurrences = readMessageOccurrences(entry.code, env);
+    stdout.write(renderMessageDetails(entry, occurrences));
+    return { entry, occurrences };
+  }
+
   if (argv.includes("--audit")) {
     const all = argv.includes("--all");
     const report = buildAuditReport({
@@ -3156,18 +3239,24 @@ function runCli(argv = process.argv.slice(2)) {
   }
   if (isStrictDirectRecordArguments(argv) || isStrictDirectReportOrMaintenanceArguments(argv)) {
     if (hasRejectedRecordPair(argv)) {
-      process.stderr.write("Rejected verdicts require --reason through the raw-args transport. For batch settlements, use --reason-for <id> <text> for each rejected pair.\n");
+      process.stderr.write(`${tagMessage("stats.raw-args-required", "Rejected verdicts require --reason through the raw-args transport. For batch settlements, use --reason-for <id> <text> for each rejected pair.")}\n`);
       process.exitCode = 1;
       return;
     }
-    main(argv);
+    const result = main(argv);
+    if (result?.exitCode) {
+      process.exitCode = result.exitCode;
+    }
     return;
   }
   if (argv[0] !== "--raw-args-token") {
     throw new TypeError("Fusion stats requests must be supplied through --raw-args-token.");
   }
   const transport = resolveRawArgsTransport(argv);
-  main(transport.argv, { rawArgs: true });
+  const result = main(transport.argv, { rawArgs: true });
+  if (result?.exitCode) {
+    process.exitCode = result.exitCode;
+  }
 }
 
 if (isMain()) {
