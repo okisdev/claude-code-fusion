@@ -1488,6 +1488,71 @@ test("semantic acceptance reads the job record and excludes non-terminal transpo
   assert.deepStrictEqual(rejected.byAcceptance, { rejected: 1 });
 });
 
+test("Codex classifies resumable failed attempts as superseded without losing terminal totals", (t) => {
+  const dir = sandbox(t);
+  const stateRoot = path.join(dir, "state");
+  const env = { FUSION_CODEX_STATE: stateRoot, FUSION_DATA_DIR: path.join(dir, "fusion") };
+  writeCodexJob(stateRoot, dir, "timed-out", {
+    status: "error",
+    jobClass: "task",
+    createdAt: "2026-07-14T00:00:00.000Z",
+    threadId: "timeout-thread",
+    failureKind: "timeout"
+  });
+  writeCodexJob(stateRoot, dir, "timed-out-resume", {
+    status: "done",
+    jobClass: "task",
+    createdAt: "2026-07-14T00:01:00.000Z",
+    semanticStatus: "accepted",
+    request: { resumeThreadId: "timeout-thread" }
+  });
+  writeCodexJob(stateRoot, dir, "rejected-timeout", {
+    status: "error",
+    jobClass: "task",
+    createdAt: "2026-07-14T00:02:00.000Z",
+    threadId: "rejected-thread",
+    failureKind: "timeout",
+    semanticStatus: "rejected"
+  });
+  writeCodexJob(stateRoot, dir, "rejected-timeout-resume", {
+    status: "done",
+    jobClass: "task",
+    createdAt: "2026-07-14T00:03:00.000Z",
+    semanticStatus: "accepted",
+    request: { resumeThreadId: "rejected-thread" }
+  });
+  writeCodexJob(stateRoot, dir, "unresumed-timeout", {
+    status: "error",
+    jobClass: "task",
+    createdAt: "2026-07-14T00:04:00.000Z",
+    threadId: "unresumed-thread",
+    failureKind: "timeout"
+  });
+  writeCodexJob(stateRoot, dir, "policy-failure", {
+    status: "error",
+    jobClass: "task",
+    createdAt: "2026-07-14T00:05:00.000Z",
+    threadId: "policy-thread",
+    failureKind: "policy"
+  });
+  writeCodexJob(stateRoot, dir, "policy-resume", {
+    status: "done",
+    jobClass: "task",
+    createdAt: "2026-07-14T00:06:00.000Z",
+    semanticStatus: "accepted",
+    request: { resumeThreadId: "policy-thread" }
+  });
+
+  const stats = codexStats({ env, cwd: dir });
+  assert.deepStrictEqual(stats.byAcceptance, { superseded: 2, accepted: 3, rejected: 1, unverified: 1 });
+  assert.deepStrictEqual(stats.acceptanceAnomalies.doneWithoutAcceptance, []);
+  const terminalCount = Object.entries(stats.byTransportStatus)
+    .filter(([status]) => ["done", "error", "cancelled"].includes(status))
+    .reduce((total, [, count]) => total + count, 0);
+  assert.strictEqual(Object.values(stats.byAcceptance).reduce((total, count) => total + count, 0), terminalCount);
+  assert.match(renderFusionStats({ scope: dir, codex: stats }), /^- superseded: 2$/m);
+});
+
 test("Codex acceptance and token observations stay scoped when unrelated repositories reuse a job id", (t) => {
   const dir = sandbox(t);
   const firstRoot = path.join(dir, "first");
@@ -2190,6 +2255,23 @@ test("--record validates every batch pair before writing", (t) => {
   assert.strictEqual(readWorkerRecord(presentTaskId, env).acceptance, "unverified");
 });
 
+test("--record refuses the derived superseded classification without changing a Codex job", (t) => {
+  const dir = sandbox(t);
+  const stateRoot = path.join(dir, "state");
+  const jobId = "a".repeat(32);
+  const jobFile = writeCodexJob(stateRoot, dir, jobId, { status: "done", jobClass: "task" });
+  const before = fs.readFileSync(jobFile, "utf8");
+
+  const result = run(
+    { cwd: dir, codexState: stateRoot },
+    ["--record", `${jobId}=superseded`]
+  );
+
+  assert.notStrictEqual(result.status, 0);
+  assert.match(result.stderr, /--record verdict must be accepted, rejected, or unverified\./);
+  assert.strictEqual(fs.readFileSync(jobFile, "utf8"), before);
+});
+
 test("Codex reports acceptance anomalies only when the job record and transport state diverge", (t) => {
   const dir = sandbox(t);
   const stateRoot = path.join(dir, "state");
@@ -2208,12 +2290,14 @@ test("Codex reports acceptance anomalies only when the job record and transport 
   assert.match(rendered, /Acceptance anomalies:\n- Accepted ledger entries with error transport: 1 \(eeeeeeee\)\n- Done jobs without acceptance records: 1 \(ffffffffffffffffffffffffffffffff\)/);
 });
 
-test("Codex acceptedWithErrorTransport excludes salvaged timeouts but keeps other error kinds", (t) => {
+test("Codex acceptedWithErrorTransport excludes resumable failures but keeps other error kinds", (t) => {
   const dir = sandbox(t);
   const stateRoot = path.join(dir, "state");
   const fusionData = path.join(dir, "fusion");
   const nonTimeoutAcceptedId = "1".repeat(32);
   const salvagedTimeoutId = "2".repeat(32);
+  const salvagedPolicyId = "3".repeat(32);
+  const salvagedPatchThrashId = "4".repeat(32);
   writeCodexJob(stateRoot, dir, nonTimeoutAcceptedId, {
     status: "error",
     jobClass: "task",
@@ -2226,6 +2310,18 @@ test("Codex acceptedWithErrorTransport excludes salvaged timeouts but keeps othe
     semanticStatus: "accepted",
     failureKind: "timeout"
   });
+  writeCodexJob(stateRoot, dir, salvagedPolicyId, {
+    status: "error",
+    jobClass: "task",
+    semanticStatus: "accepted",
+    failureKind: "policy"
+  });
+  writeCodexJob(stateRoot, dir, salvagedPatchThrashId, {
+    status: "error",
+    jobClass: "task",
+    semanticStatus: "accepted",
+    failureKind: "patch_thrash"
+  });
 
   const stats = codexStats({ env: { FUSION_CODEX_STATE: stateRoot, FUSION_DATA_DIR: fusionData }, cwd: dir });
   assert.deepStrictEqual(stats.acceptanceAnomalies, {
@@ -2233,6 +2329,8 @@ test("Codex acceptedWithErrorTransport excludes salvaged timeouts but keeps othe
     doneWithoutAcceptance: []
   });
   assert.ok(!stats.acceptanceAnomalies.acceptedWithErrorTransport.includes(salvagedTimeoutId));
+  assert.ok(!stats.acceptanceAnomalies.acceptedWithErrorTransport.includes(salvagedPolicyId));
+  assert.ok(!stats.acceptanceAnomalies.acceptedWithErrorTransport.includes(salvagedPatchThrashId));
 });
 
 test("Codex groups pre-epoch acceptance anomalies and falls back from invalid epochs", (t) => {
@@ -2784,6 +2882,7 @@ test("--unsettled lists terminal unverified jobs and preserves Codex acceptance 
   const codexUnsettledId = "a".repeat(32);
   const codexNoProvenanceId = "b".repeat(32);
   const codexSettledId = "c".repeat(32);
+  const codexSupersededId = "d".repeat(32);
 
   writeCodexJob(stateRoot, dir, codexUnsettledId, {
     status: "done",
@@ -2804,6 +2903,20 @@ test("--unsettled lists terminal unverified jobs and preserves Codex acceptance 
     jobClass: "task",
     acceptance: "accepted",
     finishedAt: "2026-07-21T00:04:00.000Z"
+  });
+  writeCodexJob(stateRoot, dir, codexSupersededId, {
+    status: "error",
+    jobClass: "task",
+    createdAt: "2026-07-21T00:04:00.000Z",
+    threadId: "superseded-thread",
+    failureKind: "timeout"
+  });
+  writeCodexJob(stateRoot, dir, "e".repeat(32), {
+    status: "done",
+    jobClass: "task",
+    createdAt: "2026-07-21T00:05:00.000Z",
+    acceptance: "accepted",
+    request: { resumeThreadId: "superseded-thread" }
   });
   writeGrokJob(grokData, dir, "grok-unsettled", {
     status: "done",
@@ -2838,6 +2951,7 @@ test("--unsettled lists terminal unverified jobs and preserves Codex acceptance 
   const withoutProvenance = report.unsettled.find((entry) => entry.id === codexNoProvenanceId);
   assert.strictEqual(Object.hasOwn(withoutProvenance, "acceptanceSource"), false);
   assert.strictEqual(Object.hasOwn(withoutProvenance, "acceptanceRecordedAt"), false);
+  assert.ok(!report.unsettled.some((entry) => entry.id === codexSupersededId));
 
   const rendered = run({ cwd: dir, codexState: stateRoot }, ["--unsettled"], extraEnv);
   assert.strictEqual(rendered.status, 0, rendered.stderr);

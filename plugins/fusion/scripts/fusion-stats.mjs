@@ -28,6 +28,7 @@ const PRUNE_EVIDENCE = Symbol("pruneEvidence");
 const FUSION_TASK_ID_PATTERN = /^fusion-[0-9a-f]{24}$/;
 const ENGINE_JOB_ID_PATTERN = /^[0-9a-f]{32}$/;
 const RECORD_VERDICTS = new Set(["accepted", "rejected", "unverified"]);
+const RESUMABLE_CODEX_FAILURE_KINDS = new Set(["timeout", "policy", "patch_thrash"]);
 const SEMANTIC_FAILURE_KINDS = new Set(["intent_override", "scope_rewrite", "wrong_approach", "style_mismatch"]);
 const RECORD_SOURCES = new Set(["collector", "main-loop"]);
 const FUSION_ACCEPTANCE_EPOCH_ENV = "FUSION_ACCEPTANCE_EPOCH";
@@ -124,9 +125,12 @@ export function normalizeCollectionMethod(value) {
   return normalized;
 }
 
-function semanticAcceptance(raw) {
+function semanticAcceptance(raw, superseded = false) {
   const recorded = raw?.semanticStatus ?? raw?.acceptance;
-  return recorded === "accepted" || recorded === "rejected" ? recorded : "unverified";
+  if (recorded === "accepted" || recorded === "rejected") {
+    return recorded;
+  }
+  return superseded ? "superseded" : "unverified";
 }
 
 function acceptanceProvenance(raw) {
@@ -471,11 +475,13 @@ function terminalLedgerRecord(raw, { workspaceRoot = null, workspaceKey = null, 
   }
   const model = nonEmptyString(raw?.model ?? raw?.request?.model);
   const effort = nonEmptyString(raw?.effort ?? raw?.request?.effort);
+  const resumeThreadId = nonEmptyString(raw?.request?.resumeThreadId);
   return {
     id: jobId,
     status,
     workspaceRoot: nonEmptyString(raw?.workspaceRoot) ?? workspaceRoot,
     sessionId: nonEmptyString(raw?.sessionId),
+    threadId: nonEmptyString(raw?.threadId),
     jobClass: nonEmptyString(raw?.kind ?? raw?.jobClass) ?? "unknown",
     createdAt: raw?.createdAt ?? null,
     startedAt: raw?.startedAt ?? null,
@@ -483,7 +489,7 @@ function terminalLedgerRecord(raw, { workspaceRoot = null, workspaceKey = null, 
     completedAt: raw?.finishedAt ?? raw?.completedAt ?? raw?.observedAt ?? null,
     timeoutMs: raw?.timeoutMs ?? null,
     failureKind: raw?.failureKind ?? null,
-    request: model || effort ? { model, effort } : null,
+    request: model || effort || resumeThreadId ? { model, effort, ...(resumeThreadId ? { resumeThreadId } : {}) } : null,
     _fusionObservedModel: raw?.modelSource === "rollout-turn-context" ? model : null,
     _fusionObservedEffort: raw?.effortSource === "rollout-turn-context" ? effort : null,
     tokenUsage: raw?.tokenUsage ?? null,
@@ -620,14 +626,14 @@ function mergeJobEvidence(preferred, records) {
   const merged = { ...preferred, request: preferred?.request && typeof preferred.request === "object" ? { ...preferred.request } : preferred?.request };
   merged._fusionWorkspaceRoots = [...new Set(records.flatMap((record) => Array.isArray(record?._fusionWorkspaceRoots) ? record._fusionWorkspaceRoots : [record?.workspaceRoot]).filter((value) => typeof value === "string" && value.trim()).map((value) => path.resolve(value)))];
   for (const record of records) {
-    for (const field of ["workspaceRoot", "sessionId", "jobClass", "kind", "createdAt", "startedAt", "finishedAt", "completedAt", "updatedAt", "tokenUsage", "tokenUsageAvailability", "_fusionObservedModel", "_fusionObservedEffort", "_fusionScopeKey", "_fusionRepositoryKey"]) {
+    for (const field of ["workspaceRoot", "sessionId", "threadId", "jobClass", "kind", "createdAt", "startedAt", "finishedAt", "completedAt", "updatedAt", "tokenUsage", "tokenUsageAvailability", "_fusionObservedModel", "_fusionObservedEffort", "_fusionScopeKey", "_fusionRepositoryKey"]) {
       if (merged[field] == null && record?.[field] != null) {
         merged[field] = record[field];
       }
     }
     if (record?.request && typeof record.request === "object") {
       merged.request = merged.request && typeof merged.request === "object" ? merged.request : {};
-      for (const field of ["model", "effort"]) {
+      for (const field of ["model", "effort", "resumeThreadId"]) {
         if (merged.request[field] == null && record.request[field] != null) {
           merged.request[field] = record.request[field];
         }
@@ -776,6 +782,28 @@ export const FILE_ENGINE_DESCRIPTORS = {
 
 function workspaceRootsForJob(raw) {
   return [...new Set([...(Array.isArray(raw?._fusionWorkspaceRoots) ? raw._fusionWorkspaceRoots : []), raw?.workspaceRoot].filter((value) => typeof value === "string" && value.trim()).map((value) => path.resolve(value)))];
+}
+
+function sameCodexWorkspace(left, right) {
+  const rightRoots = new Set(workspaceRootsForJob(right));
+  return workspaceRootsForJob(left).some((workspaceRoot) => rightRoots.has(workspaceRoot));
+}
+
+function isSupersededCodexJob(raw, jobs) {
+  if (raw?.status !== "error" || !RESUMABLE_CODEX_FAILURE_KINDS.has(nonEmptyString(raw?.failureKind))) {
+    return false;
+  }
+  const threadId = nonEmptyString(raw?.threadId);
+  const createdAt = Date.parse(raw?.createdAt ?? "");
+  const recorded = raw?.semanticStatus ?? raw?.acceptance;
+  if (!threadId || !Number.isFinite(createdAt) || recorded === "accepted" || recorded === "rejected") {
+    return false;
+  }
+  return jobs.some((candidate) => {
+    const resumeThreadId = nonEmptyString(candidate?.request?.resumeThreadId);
+    const resumedAt = Date.parse(candidate?.createdAt ?? "");
+    return candidate !== raw && resumeThreadId === threadId && Number.isFinite(resumedAt) && resumedAt > createdAt && sameCodexWorkspace(raw, candidate);
+  });
 }
 
 function observationForJob(raw, env, auditCache) {
@@ -1165,6 +1193,7 @@ export function fileBasedEngineStats(descriptor, { all = false, env = process.en
   let latest = null;
   for (const raw of scoped) {
     const job = descriptor.normalizeJob(raw);
+    const acceptance = descriptor.id === "codex" ? semanticAcceptance(raw, isSupersededCodexJob(raw, scoped)) : null;
     let model = null;
     let effort = null;
     bump(byStatus, job.status);
@@ -1196,7 +1225,7 @@ export function fileBasedEngineStats(descriptor, { all = false, env = process.en
           sku: codexSku(model ?? "unknown", effort),
           createdAtMs,
           terminal: CODEX_TERMINAL_STATUSES.has(job.status),
-          acceptance: semanticAcceptance(raw),
+          acceptance,
           failureKind: nonEmptyString(raw?.failureKind),
           outputTokens: codexUsage.usage?.outputTokens ?? null,
           durationSeconds: job.durationSeconds,
@@ -1207,19 +1236,19 @@ export function fileBasedEngineStats(descriptor, { all = false, env = process.en
     if (descriptor.id === "codex") {
       const jobId = nonEmptyString(raw?.id);
       if (CODEX_TERMINAL_STATUSES.has(job.status)) {
-        bump(byAcceptance, semanticAcceptance(raw));
+        bump(byAcceptance, acceptance);
       } else {
         pendingTransportJobs += 1;
       }
       const historical = Number.isFinite(Date.parse(raw?.finishedAt ?? "")) && Date.parse(raw.finishedAt) < acceptanceEpoch.timestamp;
-      if (jobId && job.status === "error" && semanticAcceptance(raw) === "accepted" && nonEmptyString(raw?.failureKind) !== "timeout") {
+      if (jobId && job.status === "error" && acceptance === "accepted" && !RESUMABLE_CODEX_FAILURE_KINDS.has(nonEmptyString(raw?.failureKind))) {
         if (historical) {
           historicalAcceptanceAnomalies += 1;
         } else {
           acceptedWithErrorTransport.push(jobId);
         }
       }
-      if (jobId && job.status === "done" && semanticAcceptance(raw) === "unverified") {
+      if (jobId && job.status === "done" && acceptance === "unverified") {
         if (historical) {
           historicalAcceptanceAnomalies += 1;
         } else {
@@ -1851,6 +1880,7 @@ function sessionScopedEngineStats(descriptor, sessionId, env) {
         }
       }
     }
+    const codexJobs = descriptor.id === "codex" ? selectPreferredJobs(jobs, descriptor, () => true) : [];
     const scoped = selectPreferredJobs(jobs, descriptor, (raw) => descriptor.sessionOf(raw) === sessionId);
     totalJobs = scoped.length;
     for (const raw of scoped) {
@@ -1858,7 +1888,7 @@ function sessionScopedEngineStats(descriptor, sessionId, env) {
       bump(byStatus, status);
       if (descriptor.id === "codex") {
         if (CODEX_TERMINAL_STATUSES.has(status)) {
-          bump(byAcceptance, semanticAcceptance(raw));
+          bump(byAcceptance, semanticAcceptance(raw, isSupersededCodexJob(raw, codexJobs)));
         } else {
           pendingTransportJobs += 1;
         }
@@ -2671,7 +2701,8 @@ function unsettledEngineEntries(descriptor, env) {
     if (!descriptor.isTerminal(raw)) {
       return [];
     }
-    if (semanticAcceptance(raw) !== "unverified") {
+    const acceptance = descriptor.id === "codex" ? semanticAcceptance(raw, isSupersededCodexJob(raw, scoped)) : semanticAcceptance(raw);
+    if (acceptance !== "unverified") {
       return [];
     }
     const id = nonEmptyString(raw?.id);
