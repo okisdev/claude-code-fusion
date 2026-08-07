@@ -7,6 +7,26 @@ const args = process.argv.slice(2);
 const STDIN_DRAIN_TIMEOUT_MS = 3000;
 const GROUP_CHILD_READY_TIMEOUT_MS = 3000;
 const GROUP_CHILD_READY_POLL_MS = 25;
+const UNMODELLED_SUBCOMMANDS = new Set([
+  "doctor",
+  "plugin",
+  "app-server",
+  "exec-server",
+  "remote-control",
+  "cloud",
+  "archive",
+  "delete",
+  "unarchive",
+  "fork",
+  "features",
+  "sandbox",
+  "apply",
+  "completion",
+  "update",
+  "mcp",
+  "mcp-server",
+  "app"
+]);
 
 async function drainStdin() {
   let prompt = "";
@@ -39,8 +59,13 @@ async function waitForFile(file) {
   }
 }
 
+if (UNMODELLED_SUBCOMMANDS.has(args[0])) {
+  process.stderr.write(`error: subcommand not modelled by fake-codex: ${args[0]}\n`);
+  process.exit(2);
+}
+
 if (args.includes("--version")) {
-  process.stdout.write(`${process.env.FAKE_CODEX_VERSION_OUTPUT || `codex-cli ${process.env.FAKE_CODEX_VERSION || "0.146.0"}`}\n`);
+  process.stdout.write(`${process.env.FAKE_CODEX_VERSION_OUTPUT || `codex-cli ${process.env.FAKE_CODEX_VERSION || "0.147.0"}`}\n`);
   process.exit(0);
 }
 

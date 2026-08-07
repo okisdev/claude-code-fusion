@@ -23,6 +23,7 @@ const processInspectionTests = new Set([
   "permission death appends denied-tool detail when stderr names a tool",
   "permission death keeps the generic message when stderr omits a tool name",
   "permission-cancelled death without a named tool stays generic",
+  "legacy CamelCase Cancelled envelope classifies as a permission-denied stop",
   "task job records repositoryTopLevel inside a git directory",
   "task accepts an explicit cwd below a repository top level",
   "task accepts an implicit cwd outside a Git repository",
@@ -44,7 +45,7 @@ function test(name, callback) {
   });
 }
 
-function writePermissionDeathGrok(sandbox, { stderrLine, exitCode = 1 } = {}) {
+function writePermissionDeathGrok(sandbox, { stderrLine, exitCode = 1, stopReason = null } = {}) {
   const file = path.join(sandbox.root, "permission-death-grok.mjs");
   fs.writeFileSync(
     file,
@@ -62,6 +63,10 @@ if (sandboxIndex >= 0) {
   process.stderr.write("DEBUG xai_grok_agent::builder: tools allowlist applied\\n");
 }
 for await (const chunk of process.stdin) void chunk;
+const stopReason = ${JSON.stringify(stopReason)};
+if (stopReason) {
+  process.stdout.write(JSON.stringify({ text: "", stopReason, sessionId: "99999999-9999-7999-8999-999999999998", requestId: "req-legacy-cancelled" }) + "\\n");
+}
 process.stderr.write(${JSON.stringify(`${stderrLine}\n`)});
 process.exit(${exitCode});
 `,
@@ -154,6 +159,24 @@ test("permission-cancelled death without a named tool stays generic", (t) => {
   const record = jobRecords(sandbox.dataDir)[0];
   assert.equal(record.failureKind, "permission");
   assert.match(record.errorMessage, /blocked call not reported by the CLI/);
+});
+
+test("legacy CamelCase Cancelled envelope classifies as a permission-denied stop", (t) => {
+  const sandbox = makeSandbox(t);
+  const grokBin = writePermissionDeathGrok(sandbox, {
+    stderrLine: "",
+    exitCode: 0,
+    stopReason: "Cancelled"
+  });
+  const result = runCompanion(["task", "doomed"], {
+    cwd: sandbox.workDir,
+    env: envFor(sandbox, { GROK_BIN: grokBin })
+  });
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /^failure: permission$/m);
+  const record = jobRecords(sandbox.dataDir)[0];
+  assert.equal(record.failureKind, "permission");
+  assert.equal(record.stopReason, "Cancelled");
 });
 
 test("task job records repositoryTopLevel inside a git directory", (t) => {

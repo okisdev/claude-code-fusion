@@ -322,8 +322,8 @@ test("Grok rules document source verified headless boundaries", () => {
   assert.match(rules, /Strict requests child process network restriction/);
   assert.match(rules, /event proves profile and configuration application, not actual platform network isolation/);
   assert.match(rules, /GROK_CODEX_\*_ENABLED/);
-  assert.match(rules, /`search_replace` creates new files/);
-  assert.match(rules, /Grok has no `write` tool id/);
+  assert.match(troubleshooting, /`search_replace` remains the write set's file-creation path/);
+  assert.match(rules, /OpenCode-compatible `write` tool id/);
   assert.match(rules, /`usage_is_incomplete` means the usage ledger may have missed open subagents/);
   assert.match(rules, /present values are observed lower bounds/);
   assert.match(rules, /10000000000 ticks per USD/);
@@ -386,6 +386,7 @@ test("Grok rules document source verified headless boundaries", () => {
   assert.match(contract, /single session-id candidate from another cwd is never a fallback/i);
   assert.match(contract, /10000000000 ticks per USD/);
   assert.match(contract, /top-level usage, cost, and flag fields are snake_case/);
+  assert.match(contract, /`cache_creation_input_tokens`/);
   assert.match(contract, /The only incompleteness flags are `usage_is_incomplete` and `cost_is_partial`/);
   assert.match(contract, /no `cancellation-category` field or `model_usage_is_incomplete` field/);
   assert.match(contract, /Upstream appends to `~\/\.grok\/sandbox-events\.jsonl` with no rotation or size cap/);
@@ -393,8 +394,8 @@ test("Grok rules document source verified headless boundaries", () => {
   assert.match(contract, /Upstream wires only `bypassPermissions` at spawn/);
   assert.match(contract, /Upstream ships ACP today/);
   assert.match(contract, /The companion has not adopted ACP yet and continues per-call invocation/);
-  assert.match(codexContract, /failureKind: "setup".*below the tested minimum 0\.146\.0/);
-  assert.match(codexContract, /The tested interval runs from 0\.146\.0 up to but excluding 0\.147\.0; versions at or above 0\.147\.0 remain allowed with the setup compatibility advisory/);
+  assert.match(codexContract, /failureKind: "setup".*below the tested minimum 0\.147\.0/);
+  assert.match(codexContract, /The tested interval runs from 0\.147\.0 up to but excluding 0\.148\.0; versions below 0\.147\.0 fail task and review preflight with a setup error; versions at or above 0\.148\.0 keep running task and review preflight while `\/codex:setup` reports not ready with exit code 1 as the compatibility advisory/);
   assert.match(codexContract, /Codex configuration parse failures under `--strict-config`.*failureKind: "process"/);
   assert.match(sharedContract, /The Grok instance adds `sandbox`[^\n]*`transport`[^\n]*`policy`[^\n]*and `turn_limit`/);
   assert.match(sharedContract, /`setup`: The installed CLI version or installation lacks a required adapter capability and fails capability preflight/);
@@ -403,6 +404,7 @@ test("Grok rules document source verified headless boundaries", () => {
   assert.match(rules, /`failure: setup`[^\n]*Do not retry the same task/);
   assert.match(contract, /required capability preflight failures use `setup`/);
   assert.match(runtime, /missing applicable capability fails before launch with failure kind `setup`/i);
+  assert.match(runtime, /Hosted `x_search` stays outside managed runs because the fixed `--tools` allowlist governs the toolset/);
   assert.match(setup, /failure kind `setup`/);
   assert.match(doctor, /native MCP servers, plugins, or hooks under `~\/\.grok`/);
   assert.match(doctor, /The entire Grok home is read-write under strict/);
@@ -412,8 +414,9 @@ test("Grok rules document source verified headless boundaries", () => {
   assert.match(doctor, /Bash\(grok inspect:\*\)/);
   assert.match(doctor, /Run `grok inspect --json` and review the reported `permissions`, `hooks`, `plugins`, `agents`, `mcpServers`, and `externalCompat` surfaces/);
   assert.match(doctor, /successful Grok collection remains unverified until `\/fusion:stats --record <fusion-task-id>=<accepted\|rejected>`/i);
+  assert.match(doctor, /`GROK_WEB_FETCH` is pinned by web mode, `GROK_AUTO_WAKE` and `GROK_MANAGED_MCP_GATEWAY_TOOLS_ENABLED` are pinned false/);
   for (const text of [readme, security]) {
-    assert.match(text, /Grok 0\.2\.112\+/);
+    assert.match(text, /introduced in 0\.2\.112, verified through 1\.0\.0/);
     assert.match(text, /file that is unlinked (?:immediately after open|as soon as it is opened)/);
     assert.match(text, /all of `\/private\/var\/folders`/);
     assert.match(text, /native MCP servers, plugins, or hooks/);

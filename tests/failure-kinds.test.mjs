@@ -167,6 +167,7 @@ test("structured quota errors retain reported usage", (t) => {
   assert.deepStrictEqual(record.usage, {
     input_tokens: 120,
     cache_read_input_tokens: 30,
+    cache_creation_input_tokens: 0,
     output_tokens: 20,
     reasoning_tokens: 5,
     total_tokens: 170,
@@ -215,12 +216,13 @@ test("turn-limit failures retain the final envelope and reported spend", (t) => 
   assert.strictEqual(record.errorMessage, "Error: max turns reached");
   assert.strictEqual(record.resultText, "FAKE-TURN-LIMIT-PARTIAL");
   assert.strictEqual(record.requestId, "req-max-turns");
-  assert.strictEqual(record.stopReason, "Cancelled");
+  assert.strictEqual(record.stopReason, "cancelled");
   assert.strictEqual(record.resolvedModel, "grok-turn-limit");
   assert.strictEqual(record.resolvedEffort, "xhigh");
   assert.deepStrictEqual(record.usage, {
     input_tokens: 120,
     cache_read_input_tokens: 30,
+    cache_creation_input_tokens: 0,
     output_tokens: 20,
     reasoning_tokens: 5,
     total_tokens: 170
