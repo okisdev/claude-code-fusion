@@ -41,6 +41,7 @@ const LOAD_TOLERANT_POLL_INTERVAL_MS = 25;
 const TIMEOUT_TEST_TIMEOUT_MS = 8000;
 const TIMEOUT_TEST_TERMINATION_GRACE_MS = 8000;
 const COMPANION_WATCHDOG_TIMEOUT_MS = 30000;
+const PATCH_VERIFICATION_FAILURE = "apply_patch verification failed: Failed to find expected lines in target-file";
 
 function fixture(t) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "fusion-codex-exec-"));
@@ -61,9 +62,13 @@ function fixture(t) {
 
 async function runFixture(t, mode, options = {}) {
   const files = fixture(t);
+  const bin = options.script ? path.join(files.dir, "scripted-codex.mjs") : fakeCodex;
+  if (options.script) {
+    fs.writeFileSync(bin, options.script, { mode: 0o700 });
+  }
   const env = {
     ...process.env,
-    CODEX_BIN: fakeCodex,
+    CODEX_BIN: bin,
     FAKE_CODEX_ARGS_FILE: files.argsFile,
     FAKE_CODEX_CHILD_PID_FILE: files.childPidFile,
     FAKE_CODEX_INT_FILE: files.interruptFile,
@@ -110,6 +115,18 @@ async function runFixture(t, mode, options = {}) {
     onCheckpoint: options.onCheckpoint
   });
   return { files, outcome, args };
+}
+
+function scriptedCodex(body) {
+  return `#!/usr/bin/env node
+
+for await (const _chunk of process.stdin) {}
+const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+const emit = (event) => process.stdout.write(JSON.stringify(event) + "\\n");
+const usage = { input_tokens: 1, cached_input_tokens: 0, output_tokens: 1, reasoning_output_tokens: 0 };
+emit({ type: "thread.started", thread_id: "thread-123" });
+emit({ type: "turn.started" });
+${body}`;
 }
 
 async function waitUntil(predicate, timeoutMs = LOAD_TOLERANT_WAIT_TIMEOUT_MS) {
@@ -635,6 +652,67 @@ test("a nonzero exit invalidates an otherwise completed turn", async (t) => {
   assert.equal(outcome.failureKind, "process");
   assert.equal(outcome.terminalEvent, "turn.completed");
   assert.equal(outcome.exitCode, 7);
+});
+
+test("three consecutive apply_patch verification failures terminate as patch_thrash", async (t) => {
+  const { outcome } = await runFixture(t, "hang", {
+    env: { FAKE_CODEX_STDERR: `${PATCH_VERIFICATION_FAILURE}\n`.repeat(3) },
+    terminationGraceMs: 100,
+    timeoutMs: TIMEOUT_TEST_TIMEOUT_MS
+  });
+  assert.equal(outcome.status, "error");
+  assert.equal(outcome.failureKind, "patch_thrash");
+  assert.equal(outcome.timedOut, false);
+  assert.match(outcome.errorMessage, /could not land a patch because its context lines did not match the file on disk after 3 consecutive apply_patch verification failures/i);
+});
+
+test("a completed file_change resets the apply_patch verification failure counter", async (t) => {
+  const { outcome } = await runFixture(t, "scripted", {
+    script: scriptedCodex(`process.stderr.write(${JSON.stringify(`${PATCH_VERIFICATION_FAILURE}\n`.repeat(2))});
+await delay(100);
+emit({ type: "item.completed", item: { id: "patch_1", type: "file_change" } });
+await delay(100);
+process.stderr.write(${JSON.stringify(`${PATCH_VERIFICATION_FAILURE}\n`.repeat(2))});
+await delay(100);
+emit({ type: "turn.completed", usage });`),
+    timeoutMs: TIMEOUT_TEST_TIMEOUT_MS
+  });
+  assert.equal(outcome.status, "done");
+  assert.equal(outcome.failureKind, null);
+  assert.equal(outcome.timedOut, false);
+});
+
+test("a split apply_patch verification failure is counted once", async (t) => {
+  const splitAt = PATCH_VERIFICATION_FAILURE.indexOf("verification");
+  const { outcome } = await runFixture(t, "scripted", {
+    script: scriptedCodex(`process.stderr.write(${JSON.stringify(PATCH_VERIFICATION_FAILURE.slice(0, splitAt))});
+await delay(100);
+process.stderr.write(${JSON.stringify(`${PATCH_VERIFICATION_FAILURE.slice(splitAt)}\n`)});
+await delay(100);
+process.stderr.write(${JSON.stringify(`${PATCH_VERIFICATION_FAILURE}\n`)});
+await delay(100);
+emit({ type: "item.completed", item: { id: "patch_1", type: "file_change" } });
+await delay(100);
+process.stderr.write(${JSON.stringify(`${PATCH_VERIFICATION_FAILURE}\n`.repeat(2))});
+await delay(100);
+emit({ type: "turn.completed", usage });`),
+    timeoutMs: TIMEOUT_TEST_TIMEOUT_MS
+  });
+  assert.equal(outcome.status, "done");
+  assert.equal(outcome.failureKind, null);
+  assert.equal(outcome.timedOut, false);
+});
+
+test("three UnknownProcessId errors terminate as exec_lost", async (t) => {
+  const { outcome } = await runFixture(t, "hang", {
+    env: { FAKE_CODEX_STDERR: "exec_command failed for tool: UnknownProcessId { process_id: 1 }\n".repeat(3) },
+    terminationGraceMs: 100,
+    timeoutMs: TIMEOUT_TEST_TIMEOUT_MS
+  });
+  assert.equal(outcome.status, "error");
+  assert.equal(outcome.failureKind, "exec_lost");
+  assert.equal(outcome.timedOut, false);
+  assert.match(outcome.errorMessage, /sandbox lost the spawned process after 3 UnknownProcessId errors/i);
 });
 
 test("timeout terminates the process group", async (t) => {

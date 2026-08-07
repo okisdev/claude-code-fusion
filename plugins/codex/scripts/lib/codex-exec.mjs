@@ -28,6 +28,9 @@ const DEFAULT_ROLLOUT_TAIL_MAX_BYTES = 16 * 1024 * 1024;
 const MAX_ROLLOUT_SCAN_ENTRIES = 50000;
 const MAX_DIAGNOSTICS = 64;
 const MAX_DIAGNOSTIC_MESSAGE_BYTES = 4096;
+const PATCH_VERIFICATION_FAILURE = "apply_patch verification failed";
+const UNKNOWN_PROCESS_ID = "unknownprocessid";
+const STDERR_PARTIAL_LINE_TAIL_LENGTH = Math.max(PATCH_VERIFICATION_FAILURE.length, UNKNOWN_PROCESS_ID.length) - 1;
 const EFFORT_PATTERN = /^[a-z][a-z0-9_-]{0,31}$/;
 const SERVICE_TIER_PATTERN = /^[a-z][a-z0-9_-]{0,31}$/;
 const THREAD_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
@@ -902,6 +905,34 @@ function boundedBuffer(current, chunk, maxBytes) {
   return combined.length <= maxBytes ? combined : combined.subarray(combined.length - maxBytes);
 }
 
+function stderrPatternOccurrences(text, pattern, previousTailLength) {
+  let count = 0;
+  let offset = 0;
+  for (;;) {
+    const index = text.indexOf(pattern, offset);
+    if (index === -1) {
+      return count;
+    }
+    if (index + pattern.length > previousTailLength) {
+      count += 1;
+    }
+    offset = index + pattern.length;
+  }
+}
+
+function observeStderrPatterns(state, chunk) {
+  const previousTail = state.stderrPartialLine;
+  const text = `${previousTail}${Buffer.from(chunk).toString("utf8")}`;
+  const lowerCaseText = text.toLowerCase();
+  const previousTailLength = previousTail.length;
+  const patchFailures = stderrPatternOccurrences(lowerCaseText, PATCH_VERIFICATION_FAILURE, previousTailLength);
+  const lostProcesses = stderrPatternOccurrences(lowerCaseText, UNKNOWN_PROCESS_ID, previousTailLength);
+  const lastNewline = text.lastIndexOf("\n");
+  const partialLine = lastNewline === -1 ? text : text.slice(lastNewline + 1);
+  state.stderrPartialLine = partialLine.slice(-STDERR_PARTIAL_LINE_TAIL_LENGTH);
+  return { lostProcesses, patchFailures };
+}
+
 function boundedMessage(message) {
   const buffer = Buffer.from(String(message ?? ""));
   return (buffer.length <= MAX_DIAGNOSTIC_MESSAGE_BYTES ? buffer : buffer.subarray(0, MAX_DIAGNOSTIC_MESSAGE_BYTES)).toString("utf8");
@@ -1067,6 +1098,9 @@ function validateEvent(state, event) {
         const tool = observedString(event.item.tool) ?? "unknown collaboration tool";
         state.collaborationViolation = `Delegated Codex execution attempted the disabled ${tool} tool.`;
       }
+      if (event.type === "item.completed" && event.item.type === "file_change") {
+        state.patchFailureCount = 0;
+      }
       if (event.type === "item.completed" && event.item.type === "agent_message" && typeof event.item.text === "string") {
         if (Buffer.byteLength(event.item.text) > state.resultMaxBytes) {
           recordResourceError(state, `Codex final response exceeded the ${state.resultMaxBytes} byte limit.`);
@@ -1153,6 +1187,20 @@ function failureOutcome(state, processOutcome, stderrTail) {
   }
   if (state.collaborationViolation) {
     return { status: "error", failureKind: "policy", errorMessage: state.collaborationViolation };
+  }
+  if (state.patchThrash) {
+    return {
+      status: "error",
+      failureKind: "patch_thrash",
+      errorMessage: `Codex could not land a patch because its context lines did not match the file on disk after ${state.patchFailureCount} consecutive apply_patch verification failures.`
+    };
+  }
+  if (state.execLost) {
+    return {
+      status: "error",
+      failureKind: "exec_lost",
+      errorMessage: `The sandbox lost the spawned process after ${state.lostProcessCount} UnknownProcessId errors.`
+    };
   }
   if (state.cancelled) {
     return { status: "cancelled", failureKind: "cancelled", errorMessage: "Codex execution was cancelled." };
@@ -1242,9 +1290,13 @@ export async function runCodex(options = {}) {
     diagnostics: [],
     eventCount: 0,
     eventsTruncated: false,
+    execLost: false,
     expectedResumeThreadId: typeof options.resumeThreadId === "string" && options.resumeThreadId.trim() ? options.resumeThreadId.trim() : null,
     finalResponse: "",
+    lostProcessCount: 0,
     oversizedEventsSkipped: 0,
+    patchFailureCount: 0,
+    patchThrash: false,
     protocolError: null,
     resourceError: null,
     resumeThreadMismatch: false,
@@ -1257,6 +1309,7 @@ export async function runCodex(options = {}) {
     threadId: null,
     threadStarted: false,
     stdinError: null,
+    stderrPartialLine: "",
     timedOut: false,
     timeoutMs,
     turnFailureMessage: null,
@@ -1397,6 +1450,23 @@ export async function runCodex(options = {}) {
   }, timeoutMs);
   timer.unref?.();
   child.stderr?.on("data", (chunk) => {
+    if (!state.timedOut) {
+      const { lostProcesses, patchFailures } = observeStderrPatterns(state, chunk);
+      if (!state.patchThrash && patchFailures > 0) {
+        state.patchFailureCount = Math.min(3, state.patchFailureCount + patchFailures);
+        if (state.patchFailureCount === 3) {
+          state.patchThrash = true;
+          void requestTermination();
+        }
+      }
+      if (!state.execLost && lostProcesses > 0) {
+        state.lostProcessCount = Math.min(3, state.lostProcessCount + lostProcesses);
+        if (state.lostProcessCount === 3) {
+          state.execLost = true;
+          void requestTermination();
+        }
+      }
+    }
     stderr = boundedBuffer(stderr, chunk, stderrMaxBytes);
     if (options.logFile) {
       try {
@@ -1590,7 +1660,7 @@ export async function runCodex(options = {}) {
     usage.tokenUsageUnavailableReason = null;
   }
   const stderrTail = stderr.toString("utf8");
-  const failure = state.timedOut
+  const failure = state.timedOut && !state.patchThrash && !state.execLost
     ? timeoutOutcome(state)
     : failureOutcome(state, { ...processOutcome, spawnError }, stderrTail);
   const rawErrorMessage = failure.errorMessage;
