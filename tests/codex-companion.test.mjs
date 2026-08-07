@@ -33,11 +33,11 @@ import { gitIsolation } from "./lib/git-fixture.mjs";
 
 const processInspectionTests = new Set([
   "task accepts an explicit cwd below a repository top level",
-  "task accepts an implicit cwd outside a Git repository",
+  "task preflight auto passes the Git bypass for consults and rejects writes outside Git",
   "task accepts an explicit repository top level from a subdirectory",
   "identity-replaced owners are terminalized without signaling the live replacement",
   "task stays foreground by default and persists the complete terminal record",
-  "sol foreground write tasks add one diagnostic warning without changing the prompt",
+  "sol foreground write warning is emitted before execution and recorded",
   "sol warning is limited to foreground write tasks",
   "task resolves an output schema, forwards it, and records parsed structured output",
   "task retains a non-JSON agent message and records the structured parsing error",
@@ -69,12 +69,14 @@ const processInspectionTests = new Set([
   "record-acceptance permits explicit acceptance of failed transport",
   "foreground timeout persists recovered partial delivery and incomplete cumulative usage",
   "timeout jobs without a thread do not advertise resumability",
+  "policy failures with a live thread are resumable while unrelated failures are not",
   "history lists canonical jobs across workspaces with local thread and delivery metadata",
   "explicit background launch returns a durable receipt and result wait collects it",
   "managed background delivery remains pending until result collection",
   "tight history quotas retain a completed background review until result collects it",
   "result wait leaves a live background job running when its bounded wait expires",
   "workspace reservation makes simultaneous task launches single flight",
+  "a single-flight bounce retains staged raw arguments for one retry",
   "main workspace and a sibling worktree admit concurrent tasks for the same repository",
   "resume-last uses the current Claude session without claiming an unverifiable usage delta",
   "resume-last inherits model, effort, and service tier from its thread",
@@ -147,6 +149,10 @@ function runGit(sandbox, args, options = {}) {
   });
 }
 
+function initializeGitRepository(sandbox, cwd = sandbox.workDir) {
+  runGit(sandbox, ["init", "--quiet"], { cwd });
+}
+
 test("task header parsing captures model and effort only from a pipe-separated header", () => {
   assert.deepEqual(
     parseTaskHeader("\n  lane: codex | MODEL: gpt-5.6-terra | Effort: xhigh | verification: node --test\nImplement the change."),
@@ -183,16 +189,26 @@ test("task accepts an explicit cwd below a repository top level", (t) => {
   assert.equal(jobRecords(sandbox)[0].diagnostics.some((diagnostic) => diagnostic.type === "warning"), false);
 });
 
-test("task accepts an implicit cwd outside a Git repository", (t) => {
+test("task preflight auto passes the Git bypass for consults and rejects writes outside Git", (t) => {
   const sandbox = makeSandbox(t);
   const subdirectory = path.join(sandbox.workDir, "apps", "api");
   fs.mkdirSync(subdirectory, { recursive: true });
 
-  const result = runCompanion(["task", "inspect the API"], { cwd: subdirectory, env: envFor(sandbox) });
+  const consult = runCompanion(["task", "inspect the API"], { cwd: subdirectory, env: envFor(sandbox) });
 
-  assert.equal(result.status, 0, result.stderr);
-  assert.equal(result.stderr, "");
-  assert.equal(jobRecords(sandbox)[0].diagnostics.some((diagnostic) => diagnostic.type === "warning"), false);
+  assert.equal(consult.status, 0, consult.stderr);
+  assert.equal(consult.stderr, "");
+  assert.ok(readArgs(sandbox).includes("--skip-git-repo-check"));
+  assert.equal(jobRecords(sandbox)[0].request.skipGitRepoCheck, false);
+  fs.rmSync(sandbox.argsFile);
+
+  const write = runCompanion(["task", "--write", "implement the API"], { cwd: subdirectory, env: envFor(sandbox) });
+
+  assert.equal(write.status, 1);
+  assert.match(write.stderr, /--skip-git-repo-check/);
+  assert.match(write.stderr, /failure: input/);
+  assert.equal(fs.existsSync(sandbox.argsFile), false);
+  assert.equal(jobRecords(sandbox).length, 1);
 });
 
 test("task accepts an explicit repository top level from a subdirectory", (t) => {
@@ -344,6 +360,7 @@ setInterval(() => {}, 1000);`,
 
 test("task stays foreground by default and persists the complete terminal record", (t) => {
   const sandbox = makeSandbox(t);
+  initializeGitRepository(sandbox);
   const env = envFor(sandbox);
   const result = runCompanion(["task", "--write --model gpt-test --effort max --web --network implement this safely"], {
     cwd: sandbox.workDir,
@@ -387,40 +404,50 @@ test("task stays foreground by default and persists the complete terminal record
   assert.equal(fs.statSync(path.dirname(entry.file)).mode & 0o777, 0o700);
 });
 
-test("sol foreground write tasks add one diagnostic warning without changing the prompt", (t) => {
+test("sol foreground write warning is emitted before execution and recorded", (t) => {
   const sandbox = makeSandbox(t);
-  const result = runCompanion(["task", "--write", "--model", "requested-model", "implement the sol-safe change"], {
+  initializeGitRepository(sandbox);
+  const traceCodex = path.join(sandbox.root, "trace-codex");
+  fs.writeFileSync(
+    traceCodex,
+    [
+      "#!/usr/bin/env node",
+      "if (process.argv.includes('--version')) {",
+      "  process.stdout.write('codex-cli 0.146.0\\n');",
+      "  require('node:fs').unlinkSync(process.argv[1]);",
+      "}"
+    ].join("\n"),
+    { mode: 0o755 }
+  );
+  const result = runCompanion(["task", "--write", "--model", "gpt-5.6-sol", "implement the sol-safe change"], {
     cwd: sandbox.workDir,
     env: envFor(sandbox, {
-      CODEX_HOME: path.join(sandbox.root, "codex-home"),
-      FAKE_CODEX_MODE: "rollout-completed",
-      FAKE_CODEX_RESOLVED_MODEL: "gpt-5.6-sol"
+      CODEX_BIN: traceCodex
     })
   });
-  const warning = "warning: sol p90 wall clock exceeds the 600s foreground cap. Split the brief or name gpt-5.6-terra.";
+  const warning = "warning: 41% of foreground gpt-5.6-sol write tasks timed out in the last 7 days. Split the package or use gpt-5.6-terra.";
 
-  assert.equal(result.status, 0, result.stderr);
+  assert.equal(result.status, 1, result.stderr);
   assert.equal(result.stderr, `${warning}\n`);
-  assert.equal(fs.readFileSync(sandbox.stdinFile, "utf8").trim(), "implement the sol-safe change");
   const [record] = jobRecords(sandbox);
+  assert.equal(record.failureKind, "missing_cli");
   assert.equal(record.diagnostics.filter((diagnostic) => diagnostic.type === "warning" && diagnostic.message === warning).length, 1);
 });
 
 test("sol warning is limited to foreground write tasks", async (t) => {
-  const warning = "warning: sol p90 wall clock exceeds the 600s foreground cap. Split the brief or name gpt-5.6-terra.";
+  const warning = "warning: 41% of foreground gpt-5.6-sol write tasks timed out in the last 7 days. Split the package or use gpt-5.6-terra.";
   const cases = [
-    { args: ["task", "--write", "use terra"], model: "gpt-5.6-terra" },
-    { args: ["task", "use sol in consult mode"], model: "gpt-5.6-sol" }
+    { args: ["task", "--write", "--model", "gpt-5.6-terra", "use terra"], write: true },
+    { args: ["task", "--model", "gpt-5.6-sol", "use sol in consult mode"], write: false }
   ];
   for (const entry of cases) {
     const sandbox = makeSandbox(t);
+    if (entry.write) {
+      initializeGitRepository(sandbox);
+    }
     const result = runCompanion(entry.args, {
       cwd: sandbox.workDir,
-      env: envFor(sandbox, {
-        CODEX_HOME: path.join(sandbox.root, "codex-home"),
-        FAKE_CODEX_MODE: "rollout-completed",
-        FAKE_CODEX_RESOLVED_MODEL: entry.model
-      })
+      env: envFor(sandbox)
     });
     assert.equal(result.status, 0, result.stderr);
     assert.equal(result.stderr, "");
@@ -428,12 +455,9 @@ test("sol warning is limited to foreground write tasks", async (t) => {
   }
 
   const background = makeSandbox(t);
-  const env = envFor(background, {
-    CODEX_HOME: path.join(background.root, "codex-home"),
-    FAKE_CODEX_MODE: "rollout-completed",
-    FAKE_CODEX_RESOLVED_MODEL: "gpt-5.6-sol"
-  });
-  const launched = runCompanion(["task", "--background", "--write", "use sol in the background"], { cwd: background.workDir, env });
+  initializeGitRepository(background);
+  const env = envFor(background);
+  const launched = runCompanion(["task", "--background", "--write", "--model", "gpt-5.6-sol", "use sol in the background"], { cwd: background.workDir, env });
   assert.equal(launched.status, 0, launched.stderr);
   assert.equal(launched.stderr, "");
   const completed = await waitFor(() => {
@@ -518,6 +542,7 @@ test("option shaped text after a task prompt cannot enable background or change 
 
 test("single raw task arguments preserve prompt whitespace byte for byte", (t) => {
   const sandbox = makeSandbox(t);
+  initializeGitRepository(sandbox);
   const env = envFor(sandbox);
   const prompt = String.raw`preserve  repeated spaces
 	indentation, "quotes", and \d+`;
@@ -531,6 +556,7 @@ test("single raw task arguments preserve prompt whitespace byte for byte", (t) =
 
 test("structured raw transport preserves shell syntax without evaluating it", (t) => {
   const sandbox = makeSandbox(t);
+  initializeGitRepository(sandbox);
   const markerOne = path.join(sandbox.root, "command-substitution-ran");
   const markerTwo = path.join(sandbox.root, "backtick-ran");
   const prompt = `  inspect $(touch ${markerOne}) and !\`touch ${markerTwo}\`\nEOF\n'outer \"inner\nkeep \\\\ exactly  `;
@@ -673,6 +699,7 @@ test("raw transport rejects expired input and removes the verified transport", (
 
 test("programmatic stdin ingress preserves opaque raw arguments without a staging file", (t) => {
   const sandbox = makeSandbox(t);
+  initializeGitRepository(sandbox);
   const marker = path.join(sandbox.root, "stdin-command-substitution-ran");
   const prompt = `  inspect $(touch ${marker})\nkeep quotes ' " and \\ exactly  `;
   const result = runCompanion(["task", "--transport-default-write", "--request-stdin"], {
@@ -733,6 +760,7 @@ test("transport allocation prunes verified inputs older than the retention windo
 
 test("rescue transport write defaults remain overridable by raw arguments", (t) => {
   const sandbox = makeSandbox(t);
+  initializeGitRepository(sandbox);
   const defaulted = createTransport(sandbox, "modify the file");
   const writeResult = runCompanion(["task", "--transport-default-write", "--raw-args-token", defaulted.token], {
     cwd: sandbox.workDir,
@@ -1250,6 +1278,40 @@ test("timeout jobs without a thread do not advertise resumability", (t) => {
   assert.equal(Object.hasOwn(record, "resumeCommand"), false);
 });
 
+test("policy failures with a live thread are resumable while unrelated failures are not", (t) => {
+  const policySandbox = makeSandbox(t);
+  const policy = runCompanion(["task", "--json", "stop the collaboration violation"], {
+    cwd: policySandbox.workDir,
+    env: envFor(policySandbox, { FAKE_CODEX_MODE: "collab-completed" })
+  });
+
+  assert.equal(policy.status, 1, policy.stderr);
+  const policyRecord = JSON.parse(policy.stdout);
+  assert.equal(policyRecord.failureKind, "policy");
+  assert.equal(policyRecord.threadId, "thread-123");
+
+  const reconciled = runCompanion(["status", "--json"], { cwd: policySandbox.workDir, env: envFor(policySandbox, {}) });
+  assert.equal(reconciled.status, 0, reconciled.stderr);
+  const [settledPolicy] = jobRecords(policySandbox);
+  assert.equal(settledPolicy.status, "error");
+  assert.equal(settledPolicy.failureKind, "policy");
+  assert.equal(settledPolicy.resumable, true);
+  assert.match(settledPolicy.partialResultText, new RegExp(`Resume Codex job ${settledPolicy.id}:`));
+
+  const errorSandbox = makeSandbox(t);
+  const error = runCompanion(["task", "--json", "fail after the thread starts"], {
+    cwd: errorSandbox.workDir,
+    env: envFor(errorSandbox, { FAKE_CODEX_MODE: "failed" })
+  });
+
+  assert.equal(error.status, 1, error.stderr);
+  const errorRecord = JSON.parse(error.stdout);
+  assert.equal(errorRecord.failureKind, "error");
+  assert.equal(errorRecord.threadId, "thread-123");
+  assert.equal(Object.hasOwn(errorRecord, "resumable"), false);
+  assert.equal(Object.hasOwn(errorRecord, "resumeCommand"), false);
+});
+
 test("history lists canonical jobs across workspaces with local thread and delivery metadata", (t) => {
   const sandbox = makeSandbox(t);
   const sibling = path.join(sandbox.root, "sibling");
@@ -1382,6 +1444,31 @@ test("workspace reservation makes simultaneous task launches single flight", asy
   assert.equal(jobRecords(sandbox).length, 1);
   assert.ok(results.some((result) => /already running in this workspace/.test(result.stderr)));
   assert.equal(jobRecords(sandbox)[0].status, "done");
+});
+
+test("a single-flight bounce retains staged raw arguments for one retry", async (t) => {
+  const sandbox = makeSandbox(t);
+  const env = envFor(sandbox, { FAKE_CODEX_DELAY_MS: "250" });
+  const first = spawnCompanion(["task", "first task"], { cwd: sandbox.workDir, env });
+  await waitFor(() => jobRecords(sandbox).some((record) => record.status === "running"));
+  const transport = createTransport(sandbox, "retry this staged task", env);
+
+  const bounced = runCompanion(["task", "--raw-args-token", transport.token], { cwd: sandbox.workDir, env });
+
+  assert.equal(bounced.status, 1);
+  assert.match(bounced.stderr, /already running in this workspace/);
+  assert.equal(fs.existsSync(transport.file), true);
+  assert.equal(fs.existsSync(transport.ownerFile), true);
+  const firstResult = await childResult(first);
+  assert.equal(firstResult.code, 0, firstResult.stderr);
+
+  const retried = runCompanion(["task", "--raw-args-token", transport.token], { cwd: sandbox.workDir, env });
+
+  assert.equal(retried.status, 0, retried.stderr);
+  assert.equal(fs.readFileSync(sandbox.stdinFile, "utf8"), "retry this staged task");
+  assert.equal(fs.existsSync(transport.file), false);
+  assert.equal(fs.existsSync(transport.ownerFile), false);
+  assert.equal(fs.existsSync(path.dirname(transport.file)), false);
 });
 
 test("main workspace and a sibling worktree admit concurrent tasks for the same repository", async (t) => {

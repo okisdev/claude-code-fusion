@@ -211,3 +211,12 @@ test("the SubagentStop matcher matches all seven peer and Claude worker agent na
   }
   assert.doesNotMatch("general-purpose", matcher);
 });
+
+test("the Codex rescue contract resumes every resumable failure kind exactly once", () => {
+  const contract = fs.readFileSync(path.join(repoRoot, "plugins", "codex", "agents", "codex-rescue.md"), "utf8");
+
+  assert.match(contract, /`failure:` value of `timeout`, `policy`, or `patch_thrash`/);
+  assert.match(contract, /exactly one resume per task operation, never chained/);
+  assert.match(contract, /Wind down: do not start new work\. Finish the smallest coherent deliverable from the work already completed and report the files changed and the verification output\./);
+  assert.match(contract, /any second failure, any other failure, or any output without that line is relayed as received/);
+});
