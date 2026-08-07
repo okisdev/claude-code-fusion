@@ -71,6 +71,10 @@ export function normalizeGrokSessionId(value) {
   return SESSION_ID_PATTERN.test(normalized) ? normalized.toLowerCase() : null;
 }
 
+export function normalizeStopReason(value) {
+  return typeof value === "string" ? value.replaceAll("_", "").toLowerCase() : "";
+}
+
 const CONSULT_TOOL_IDS = ["read_file", "grep", "list_dir"];
 const CONSULT_WEB_TOOL_IDS = ["web_search", "web_fetch"];
 const WRITE_TOOL_IDS = ["read_file", "grep", "list_dir", "search_replace", "run_terminal_cmd"];
@@ -193,7 +197,7 @@ function resolveConsultAllowRules(env = process.env) {
     .filter((entry) => /^(?:Read|Grep|WebSearch|WebFetch)(?:\([^(),\r\n]*\))?$/.test(entry));
 }
 
-function buildGrokChildEnv(env = process.env, { memory = false } = {}) {
+function buildGrokChildEnv(env = process.env, { memory = false, web = false } = {}) {
   const childEnv = { ...env };
   for (const key of Object.keys(childEnv)) {
     if (
@@ -207,9 +211,18 @@ function buildGrokChildEnv(env = process.env, { memory = false } = {}) {
   }
   delete childEnv.GROK_CLAUDE_MARKER_OVERRIDE;
   delete childEnv._GROK_CLAUDE_MARKER_OVERRIDE;
+  delete childEnv.GROK_TEST_VERSION;
+  delete childEnv.GROK_SANDBOX;
+  delete childEnv.GROK_LEADER_SOCKET;
+  childEnv.GROK_AUTO_WAKE = "false";
+  delete childEnv.GROK_SUBAGENTS_MAX_DEPTH;
+  delete childEnv.GROK_WEB_FETCH_PROXY;
+  delete childEnv.GROK_WEB_FETCH_ALLOW_LOCAL;
   childEnv.RUST_LOG = GROK_BUILDER_LOG_FILTER;
   childEnv.GROK_DISABLE_AUTOUPDATER = "1";
   childEnv.GROK_MANAGED_MCPS_ENABLED = "false";
+  childEnv.GROK_MANAGED_MCP_GATEWAY_TOOLS_ENABLED = "false";
+  childEnv.GROK_WEB_FETCH = web ? "1" : "0";
   childEnv.GROK_MEMORY = memory ? "1" : "0";
   childEnv.GROK_SUBAGENTS = "0";
   for (const key of COMPATIBILITY_ENV_KEYS) {
@@ -274,6 +287,7 @@ function requireGrokCapabilities(capabilities, flags) {
 
 export function buildGrokArgs(options) {
   const mode = options.mode === "write" ? "write" : "consult";
+  const web = options.web === true;
   const maxTurns = options.maxTurns ?? DEFAULT_MAX_TURNS[mode];
   const capabilities = options.capabilities ?? null;
   const env = options.env ?? process.env;
@@ -302,7 +316,7 @@ export function buildGrokArgs(options) {
   if (supports("--no-wait-for-background")) {
     args.push("--no-wait-for-background");
   }
-  if (!options.web) {
+  if (!web) {
     args.push("--disable-web-search");
   }
   args.push("--max-turns", String(maxTurns));
@@ -332,14 +346,14 @@ export function buildGrokArgs(options) {
       "--permission-mode",
       "default",
       "--tools",
-      [...CONSULT_TOOL_IDS, ...(options.web ? CONSULT_WEB_TOOL_IDS : [])].join(","),
+      [...CONSULT_TOOL_IDS, ...(web ? CONSULT_WEB_TOOL_IDS : [])].join(","),
       "--disallowed-tools",
       disallowedTools.join(",")
     );
     for (const rule of CONSULT_ALLOW_RULES) {
       args.push("--allow", rule);
     }
-    if (options.web) {
+    if (web) {
       for (const rule of CONSULT_WEB_ALLOW_RULES) {
         args.push("--allow", rule);
       }
@@ -357,7 +371,7 @@ export function buildGrokArgs(options) {
     args.push(
       "--always-approve",
       "--tools",
-      [...WRITE_TOOL_IDS, ...(options.web ? CONSULT_WEB_TOOL_IDS : [])].join(","),
+      [...WRITE_TOOL_IDS, ...(web ? CONSULT_WEB_TOOL_IDS : [])].join(","),
       "--disallowed-tools",
       disallowedTools.join(",")
     );
@@ -1037,6 +1051,7 @@ function headlessTokenUsageObservation(value) {
   for (const [field, names] of Object.entries({
     input: ["input_tokens", "inputTokens"],
     cacheRead: ["cache_read_input_tokens", "cacheReadInputTokens", "cachedReadTokens"],
+    cacheCreation: ["cache_creation_input_tokens", "cacheCreationInputTokens"],
     output: ["output_tokens", "outputTokens"],
     reasoning: ["reasoning_tokens", "reasoningTokens"],
     total: ["total_tokens", "totalTokens"]
@@ -1049,14 +1064,14 @@ function headlessTokenUsageObservation(value) {
       usage[field] = metric.value;
     }
   }
-  const complete = Object.keys(usage).length === 5;
+  const complete = ["input", "cacheRead", "output", "reasoning", "total"].every((field) => Object.hasOwn(usage, field));
   if (Object.keys(usage).length === 0) {
     return { error: "Grok returned an empty usage object in its JSON envelope." };
   }
   if (usage.reasoning != null && usage.output != null && usage.reasoning > usage.output) {
     return { error: "Grok returned usage.reasoning_tokens greater than usage.output_tokens in its JSON envelope." };
   }
-  if (complete && BigInt(usage.input) + BigInt(usage.cacheRead) + BigInt(usage.output) !== BigInt(usage.total)) {
+  if (complete && BigInt(usage.input) + BigInt(usage.cacheRead) + BigInt(usage.cacheCreation ?? 0) + BigInt(usage.output) !== BigInt(usage.total)) {
     return { error: "Grok returned inconsistent token totals in its JSON envelope." };
   }
   return { error: null, complete, usage };
@@ -1722,7 +1737,7 @@ export function runGrok(options) {
     } else {
       requireGrokCapabilities(capabilities, ["--always-approve"]);
     }
-    if (!options.web) {
+    if (options.web !== true) {
       requireGrokCapabilities(capabilities, ["--disable-web-search"]);
     }
     if (options.jsonSchema) {
@@ -1731,7 +1746,7 @@ export function runGrok(options) {
     requireGrokCapabilities(capabilities, ["--no-wait-for-background"]);
   }
   const args = options.args ?? buildGrokArgs({ ...options, capabilities, timeoutMs });
-  const childEnv = buildGrokChildEnv(env, { memory: options.memory === true });
+  const childEnv = buildGrokChildEnv(env, { memory: options.memory === true, web: options.web === true });
   const captureProcessIdentity = options.captureProcessIdentity ?? getProcessIdentity;
   let prompt = typeof options.prompt === "string" ? options.prompt : null;
   if (managedRun && prompt == null && options.briefFile) {
@@ -2094,7 +2109,7 @@ export function runGrok(options) {
       );
       const stopReason = validEnvelope ? parsed.stopReason : null;
       const blockedPermissionCall =
-        stopReason === "Cancelled" ? extractBlockedPermissionCall(stdout, validEnvelope ? parsed : null) : null;
+        normalizeStopReason(stopReason) === "cancelled" ? extractBlockedPermissionCall(stdout, validEnvelope ? parsed : null) : null;
       const deniedToolFromStderr = extractDeniedToolFromStderr(stderr);
       const structuredOutput = parsed && Object.hasOwn(parsed, "structuredOutput") ? parsed.structuredOutput : undefined;
       const structuredOutputError = parsed && Object.hasOwn(parsed, "structuredOutputError")

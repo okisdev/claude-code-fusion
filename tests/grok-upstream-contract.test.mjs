@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -8,6 +9,7 @@ import { getProcessIdentity } from "../plugins/grok/scripts/lib/process-identity
 
 import {
   envFor,
+  fakeGrok,
   flagValues,
   grokCompanionCapabilities,
   jobRecords,
@@ -56,6 +58,41 @@ test("capability probes accept every required flag hidden from help", (t) => {
     ["--help"],
     ...requiredCapabilityProbes.map(([, probeFlag]) => [probeFlag, "--help"])
   ]);
+});
+
+test("removed capabilities are rejected by probes and fail managed-run setup", (t) => {
+  const sandbox = makeSandbox(t);
+  const isolatedBin = path.join(sandbox.root, "fake-grok-removed-capability");
+  fs.symlinkSync(fakeGrok, isolatedBin);
+  const env = envFor(sandbox, {
+    GROK_BIN: isolatedBin,
+    FAKE_GROK_REMOVED_CAPABILITIES: "--no-auto-update"
+  });
+  delete env.GROK_COMPANION_CAPABILITIES;
+
+  const capabilities = resolveGrokCapabilities(isolatedBin, env);
+  assert.equal(capabilities.has("--no-auto-update"), false);
+  assert.throws(
+    () => runGrok(directOptions(sandbox, "ok", { env })),
+    (error) => error?.failureKind === "setup" && /--no-auto-update/.test(error.message)
+  );
+  assert.deepEqual(readInvocations(sandbox.argsFile), [
+    ["--help"],
+    ["--no-auto-update", "--help"]
+  ]);
+});
+
+test("fake Grok reports the 1.0.0 version format and supports an output override", () => {
+  const defaultVersion = spawnSync(process.execPath, [fakeGrok, "--version"], { encoding: "utf8", env: {} });
+  assert.equal(defaultVersion.status, 0, defaultVersion.stderr);
+  assert.equal(defaultVersion.stdout, "grok 1.0.0 (0123456789ab)\n");
+
+  const overriddenVersion = spawnSync(process.execPath, [fakeGrok, "--version"], {
+    encoding: "utf8",
+    env: { FAKE_GROK_VERSION_OUTPUT: "grok 1.0.1 (abcdef012345)" }
+  });
+  assert.equal(overriddenVersion.status, 0, overriddenVersion.stderr);
+  assert.equal(overriddenVersion.stdout, "grok 1.0.1 (abcdef012345)\n");
 });
 
 test("exited leader cleanup with no identity signals only the original process group", async () => {
@@ -137,22 +174,32 @@ function directOptions(sandbox, mode, extra = {}) {
   };
 }
 
-test("all managed runs disable Agent through the CLI and environment", () => {
+test("managed runs disable Agent while fixed tool allowlists keep x_search out", () => {
   const env = { GROK_COMPANION_CAPABILITIES: grokCompanionCapabilities };
   const toolSurfaces = {
     consult: "read_file,grep,list_dir",
     write: "read_file,grep,list_dir,search_replace,run_terminal_cmd",
   };
   for (const mode of Object.keys(toolSurfaces)) {
-    const argv = buildGrokArgs({ briefFile: "/tmp/grok-brief.md", mode, timeoutMs: 90000, env });
+    const argv = buildGrokArgs({ briefFile: "/tmp/grok-brief.md", mode, timeoutMs: 90000, web: false, env });
     assert.ok(argv.includes("--no-subagents"), mode);
     assert.deepEqual(
       flagValues(argv, "--disallowed-tools"),
       ["Agent,search_tool,use_tool,ask_user_question"],
       mode
     );
+    assert.equal(flagValues(argv, "--disallowed-tools").join(",").includes("x_search"), false, mode);
     assert.deepEqual(flagValues(argv, "--tools"), [toolSurfaces[mode]], mode);
     assert.ok(argv.includes("--no-wait-for-background"), mode);
+
+    const webArgv = buildGrokArgs({ briefFile: "/tmp/grok-brief.md", mode, timeoutMs: 90000, web: true, env });
+    assert.deepEqual(
+      flagValues(webArgv, "--disallowed-tools"),
+      ["Agent,search_tool,use_tool,ask_user_question"],
+      mode
+    );
+    assert.deepEqual(flagValues(webArgv, "--tools"), [`${toolSurfaces[mode]},web_search,web_fetch`], mode);
+    assert.equal(webArgv.includes("--disable-web-search"), false, mode);
   }
 });
 
@@ -335,6 +382,16 @@ test("Grok child environment removes Claude integration state and disables impli
     _GROK_CLAUDE_MARKER_OVERRIDE: "private-marker-secret",
     GROK_MEMORY: "1",
     GROK_SUBAGENTS: "1",
+    GROK_MANAGED_MCPS_ENABLED: "true",
+    GROK_MANAGED_MCP_GATEWAY_TOOLS_ENABLED: "true",
+    GROK_WEB_FETCH: "1",
+    GROK_TEST_VERSION: "9.9.9",
+    GROK_SANDBOX: "inherited-sandbox",
+    GROK_LEADER_SOCKET: "/tmp/inherited-leader.sock",
+    GROK_AUTO_WAKE: "1",
+    GROK_SUBAGENTS_MAX_DEPTH: "99",
+    GROK_WEB_FETCH_PROXY: "http://proxy.example.test",
+    GROK_WEB_FETCH_ALLOW_LOCAL: "1",
     GROK_COMPANION_CONTINUITY_POLICY: "claude-session",
     RUST_LOG: "off",
     FAKE_GROK_ENV_FILE: envFile,
@@ -352,8 +409,14 @@ test("Grok child environment removes Claude integration state and disables impli
   assert.equal(childEnv.XAI_API_KEY, "xai-test-auth");
   assert.equal(childEnv.GROK_DISABLE_AUTOUPDATER, "1");
   assert.equal(childEnv.GROK_MANAGED_MCPS_ENABLED, "false");
+  assert.equal(childEnv.GROK_MANAGED_MCP_GATEWAY_TOOLS_ENABLED, "false");
+  assert.equal(childEnv.GROK_WEB_FETCH, "0");
   assert.equal(childEnv.GROK_MEMORY, "0");
   assert.equal(childEnv.GROK_SUBAGENTS, "0");
+  assert.equal(childEnv.GROK_AUTO_WAKE, "false");
+  for (const key of ["GROK_TEST_VERSION", "GROK_SANDBOX", "GROK_LEADER_SOCKET", "GROK_SUBAGENTS_MAX_DEPTH", "GROK_WEB_FETCH_PROXY", "GROK_WEB_FETCH_ALLOW_LOCAL"]) {
+    assert.equal(childEnv[key], undefined, key);
+  }
   assert.equal(childEnv.GROK_COMPANION_CONTINUITY_POLICY, undefined);
   assert.equal(childEnv.RUST_LOG, "xai_grok_agent::builder=debug,xai_grok_sandbox=warn");
   assert.equal(path.isAbsolute(childEnv.TMPDIR), true);
@@ -363,6 +426,21 @@ test("Grok child environment removes Claude integration state and disables impli
   for (const key of bridgeEnvironmentKeys) {
     assert.equal(childEnv[key], "false", key);
   }
+});
+
+test("web-enabled managed runs enable Grok web fetch for the child", async (t) => {
+  const sandbox = makeSandbox(t);
+  const envFile = path.join(sandbox.root, "web-child-env.json");
+  const env = envFor(sandbox, {
+    GROK_WEB_FETCH: "0",
+    FAKE_GROK_ENV_FILE: envFile,
+    FAKE_GROK_MODE: "ok"
+  });
+  const result = await runGrok(directOptions(sandbox, "ok", { env, web: true }));
+
+  assert.equal(result.exitCode, 0);
+  const childEnv = JSON.parse(fs.readFileSync(envFile, "utf8"));
+  assert.equal(childEnv.GROK_WEB_FETCH, "1");
 });
 
 test("explicit task memory overrides inherited Grok memory only for that child", async (t) => {
@@ -413,6 +491,32 @@ test("companion persistence classifies tool policy enforcement failures", (t) =>
   const [record] = jobRecords(sandbox.dataDir);
   assert.equal(record.failureKind, "policy");
   assert.match(record.errorMessage, /tool policy enforcement failed/i);
+});
+
+test("an unmatched disallowed tool warning fails a managed run closed", async (t) => {
+  const sandbox = makeSandbox(t);
+  const grokBin = path.join(sandbox.root, "fake-grok-with-unmatched-disallow.cjs");
+  fs.writeFileSync(
+    grokBin,
+    `#!/usr/bin/env node
+const { spawnSync } = require("node:child_process");
+const result = spawnSync(process.execPath, [${JSON.stringify(fakeGrok)}, "--disallowed-tools", "unmodeled_tool", ...process.argv.slice(2)], { stdio: "inherit", env: process.env });
+process.exit(result.status ?? 1);
+`,
+    { mode: 0o755 }
+  );
+
+  const result = await runGrok(directOptions(sandbox, "ok", {
+    env: envFor(sandbox, {
+      GROK_BIN: grokBin,
+      FAKE_GROK_MODE: "ok"
+    })
+  }));
+
+  assert.equal(result.securityFailureKind, "policy");
+  assert.match(result.stderrTail, /WARN disallowedTools entry matched nothing agent=grok-test tool=unmodeled_tool/);
+  assert.match(result.stderrTail, /tools allowlist applied/);
+  assert.match(result.errorMessage, /tool policy enforcement failed/i);
 });
 
 test("sandbox startup failure never receives the managed prompt", async (t) => {
@@ -647,6 +751,30 @@ test("complete headless metrics survive execution, JSON delivery, and job persis
   assert.match(statsMarkdown.stdout, /Exact cost coverage: 1 exact, 0 partial, 0 unreported/);
   assert.match(statsMarkdown.stdout, /Observed exact cost: \$0\.012/);
   assert.match(statsMarkdown.stdout, /Observed exact cost ticks: 120000000/);
+});
+
+test("cache creation input tokens are accepted and retained from an envelope", async (t) => {
+  const directSandbox = makeSandbox(t);
+  const direct = await runGrok(directOptions(directSandbox, "usage-cache-creation"));
+  assert.equal(direct.exitCode, 0);
+  assert.equal(direct.parseError, null);
+  assert.deepEqual(direct.usage, {
+    input_tokens: 120,
+    cache_read_input_tokens: 30,
+    cache_creation_input_tokens: 10,
+    output_tokens: 20,
+    reasoning_tokens: 5,
+    total_tokens: 180
+  });
+
+  const companionSandbox = makeSandbox(t);
+  const result = runCompanion(["task", "--json", "retain cache creation usage"], {
+    cwd: companionSandbox.workDir,
+    env: envFor(companionSandbox, { FAKE_GROK_MODE: "usage-cache-creation" })
+  });
+  assert.equal(result.status, 0, result.stderr);
+  const [record] = jobRecords(companionSandbox.dataDir);
+  assert.equal(record.usage.cache_creation_input_tokens, 10);
 });
 
 for (const [mode, message] of [

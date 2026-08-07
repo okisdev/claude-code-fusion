@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { execFileSync, spawn } from "node:child_process";
+import { execFileSync, spawn, spawnSync } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
@@ -152,6 +152,13 @@ function runGit(sandbox, args, options = {}) {
 function initializeGitRepository(sandbox, cwd = sandbox.workDir) {
   runGit(sandbox, ["init", "--quiet"], { cwd });
 }
+
+test("fake Codex rejects unmodelled top level subcommands", () => {
+  const result = spawnSync(process.execPath, [path.join(repoRoot, "tests", "fake-codex"), "doctor"], { encoding: "utf8" });
+  assert.equal(result.status, 2);
+  assert.equal(result.stdout, "");
+  assert.equal(result.stderr, "error: subcommand not modelled by fake-codex: doctor\n");
+});
 
 test("task header parsing captures model and effort only from a pipe-separated header", () => {
   assert.deepEqual(
@@ -399,7 +406,7 @@ test("task stays foreground by default and persists the complete terminal record
   assert.equal(entry.record.resolvedModel, "gpt-test");
   assert.equal(entry.record.resolvedEffort, "max");
   assert.equal(entry.record.tokenUsageAvailability, "available");
-  assert.equal(entry.record.codexVersion, "0.146.0");
+  assert.equal(entry.record.codexVersion, "0.147.0");
   assert.equal(fs.statSync(entry.file).mode & 0o777, 0o600);
   assert.equal(fs.statSync(path.dirname(entry.file)).mode & 0o777, 0o700);
 });
@@ -413,7 +420,7 @@ test("sol foreground write warning is emitted before execution and recorded", (t
     [
       "#!/usr/bin/env node",
       "if (process.argv.includes('--version')) {",
-      "  process.stdout.write('codex-cli 0.146.0\\n');",
+      "  process.stdout.write('codex-cli 0.147.0\\n');",
       "  require('node:fs').unlinkSync(process.argv[1]);",
       "}"
     ].join("\n"),
@@ -879,32 +886,32 @@ test("task rejects an outdated Codex CLI before execution", (t) => {
   const outdated = makeSandbox(t);
   const outdatedResult = runCompanion(["task", "--json", "do work"], {
     cwd: outdated.workDir,
-    env: envFor(outdated, { FAKE_CODEX_VERSION: "0.145.0" })
+    env: envFor(outdated, { FAKE_CODEX_VERSION: "0.146.0" })
   });
   assert.equal(outdatedResult.status, 1);
   assert.equal(outdatedResult.stdout, "");
   const outdatedFailure = JSON.parse(outdatedResult.stderr);
   assert.equal(outdatedFailure.status, "error");
   assert.equal(outdatedFailure.failureKind, "setup");
-  assert.match(outdatedFailure.message, /Upgrade the Codex CLI to version 0\.146\.0 or later\./);
+  assert.match(outdatedFailure.message, /Upgrade the Codex CLI to version 0\.147\.0 or later\./);
   assert.equal(fs.existsSync(outdated.argsFile), false);
   assert.deepEqual(jobRecords(outdated), []);
 
   const text = makeSandbox(t);
   const textResult = runCompanion(["task", "do work"], {
     cwd: text.workDir,
-    env: envFor(text, { FAKE_CODEX_VERSION: "0.145.0" })
+    env: envFor(text, { FAKE_CODEX_VERSION: "0.146.0" })
   });
   assert.equal(textResult.status, 1);
   assert.equal(textResult.stdout, "");
-  assert.match(textResult.stderr, /Upgrade the Codex CLI to version 0\.146\.0 or later\./);
+  assert.match(textResult.stderr, /Upgrade the Codex CLI to version 0\.147\.0 or later\./);
   assert.match(textResult.stderr, /failure: setup/);
   assert.equal(fs.existsSync(text.argsFile), false);
   assert.deepEqual(jobRecords(text), []);
 });
 
 test("task proceeds with tested, alpha hotfix, and newer Codex CLI versions", (t) => {
-  for (const version of ["0.146.0", "0.146.0-alpha.10", "0.146.0-alpha.10.1", "0.147.0"]) {
+  for (const version of ["0.147.0", "0.147.0-alpha.10", "0.147.0-alpha.10.1", "0.148.0"]) {
     const sandbox = makeSandbox(t);
     const result = runCompanion(["task", "--json", "do work"], {
       cwd: sandbox.workDir,
@@ -1904,13 +1911,13 @@ test("status repairs an ownerless running record as died", async (t) => {
 
 test("setup verifies authentication and the tested Codex version interval", (t) => {
   const sandbox = makeSandbox(t);
-  const ready = runCompanion(["setup", "--json"], { cwd: sandbox.workDir, env: envFor(sandbox, { FAKE_CODEX_VERSION: "0.146.0" }) });
+  const ready = runCompanion(["setup", "--json"], { cwd: sandbox.workDir, env: envFor(sandbox, { FAKE_CODEX_VERSION: "0.147.0" }) });
   assert.equal(ready.status, 0, ready.stderr);
   const readyReport = JSON.parse(ready.stdout);
   assert.equal(readyReport.ready, true);
   assert.equal(readyReport.compatibility, "tested");
   assert.equal(readyReport.authenticated, true);
-  for (const version of ["0.146.0-alpha.10", "0.146.0-alpha.10.1"]) {
+  for (const version of ["0.147.0-alpha.10", "0.147.0-alpha.10.1"]) {
     const alpha = runCompanion(["setup", "--json"], {
       cwd: sandbox.workDir,
       env: envFor(sandbox, { FAKE_CODEX_VERSION: version })
@@ -1928,7 +1935,7 @@ test("setup verifies authentication and the tested Codex version interval", (t) 
   assert.doesNotMatch(JSON.stringify(JSON.parse(redacted.stdout)), /sk-secretvalue123/);
   const redactedVersion = runCompanion(["setup", "--json"], {
     cwd: sandbox.workDir,
-    env: envFor(sandbox, { FAKE_CODEX_VERSION_OUTPUT: "codex-cli 0.146.0 access_token=secretversionvalue" })
+    env: envFor(sandbox, { FAKE_CODEX_VERSION_OUTPUT: "codex-cli 0.147.0 access_token=secretversionvalue" })
   });
   assert.equal(redactedVersion.status, 0, redactedVersion.stderr);
   assert.doesNotMatch(JSON.stringify(JSON.parse(redactedVersion.stdout)), /secretversionvalue/);
@@ -1950,12 +1957,12 @@ test("setup verifies authentication and the tested Codex version interval", (t) 
   assert.doesNotMatch(apiKey.stdout, /codex-test-key/);
   const unsupported = runCompanion(["setup", "--json"], {
     cwd: sandbox.workDir,
-    env: envFor(sandbox, { FAKE_CODEX_VERSION: "0.147.0" })
+    env: envFor(sandbox, { FAKE_CODEX_VERSION: "0.148.0" })
   });
   assert.equal(unsupported.status, 1);
   const unsupportedReport = JSON.parse(unsupported.stdout);
   assert.equal(unsupportedReport.ready, false);
-  assert.match(unsupportedReport.compatibility, /newer than the tested interval \(0\.146\.0 to before 0\.147\.0\)/);
+  assert.match(unsupportedReport.compatibility, /newer than the tested interval \(0\.147\.0 to before 0\.148\.0\)/);
   assert.match(unsupportedReport.nextSteps.join("\n"), /A verification pass is advised\./);
 });
 

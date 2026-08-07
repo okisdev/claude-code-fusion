@@ -978,7 +978,7 @@ test("skips silently when the state root does not exist", async (t) => {
 
 function writeFakePs(sandbox, output) {
   const script = path.join(sandbox.root, "fake-ps");
-  const defaultArgs = typeof output === "string" ? output : "node codex-companion.mjs task --model gpt-5.4 --effort high do work";
+  const defaultArgs = typeof output === "string" ? output : 'codex exec --model gpt-5.4 --config model_reasoning_effort="xhigh" do work';
   fs.writeFileSync(
     script,
     `#!/usr/bin/env node
@@ -1076,8 +1076,10 @@ function turnContext(turnId, model, effort) {
 
 test("argv capture writes exactly one model-audit observation for a running job", async (t) => {
   const sandbox = makeSandbox(t);
-  const { record } = seedJob(sandbox, { status: "running", pid: process.pid });
-  const monitor = startMonitor(sandbox, envForAudit(sandbox));
+  const codexPid = 41234;
+  const fakePsLog = path.join(sandbox.root, "fake-ps.log");
+  const { record } = seedJob(sandbox, { status: "running", pid: process.pid, codexPid });
+  const monitor = startMonitor(sandbox, envForAudit(sandbox, { FAKE_PS_LOG: fakePsLog }));
   t.after(() => monitor.child.kill("SIGKILL"));
 
   const lines = await waitUntil(() => {
@@ -1089,11 +1091,12 @@ test("argv capture writes exactly one model-audit observation for a running job"
   assert.strictEqual(lines[0].jobId, record.id);
   assert.strictEqual(lines[0].engine, "codex");
   assert.strictEqual(lines[0].model, "gpt-5.4");
-  assert.strictEqual(lines[0].effort, "high");
+  assert.strictEqual(lines[0].effort, "xhigh");
   assert.strictEqual(lines[0].source, "argv");
   assert.ok(typeof lines[0].observedAt === "string" && lines[0].observedAt.length > 0);
   assert.ok(!modelAuditPath(sandbox).includes("codex-openai-codex"));
   assert.ok(modelAuditPath(sandbox).startsWith(sandbox.fusionData));
+  assert.deepStrictEqual(readJsonLines(fakePsLog), [["-o", "args=", "-p", String(codexPid)]]);
 });
 
 test("a second poll does not duplicate a model-audit observation", async (t) => {
@@ -1190,6 +1193,77 @@ test("rollout inspection recovers exact turn model and first-turn token usage", 
   assert.strictEqual(inspected.model, "actual-model");
   assert.strictEqual(inspected.effort, "xhigh");
   assert.deepStrictEqual(inspected.tokenUsage, { inputTokens: 120, cachedInputTokens: 70, outputTokens: 30, reasoningOutputTokens: 11, totalTokens: 150 });
+});
+
+test("rollout inspection finds the latest completed turn with only a thread ID", (t) => {
+  const sandbox = makeSandbox(t);
+  const threadId = "thread-latest";
+  writeRollout(sandbox, threadId, [
+    taskEvent("task_started", "turn-previous", "2026-07-14T00:00:00.000Z"),
+    turnContext("turn-previous", "previous-model", "low"),
+    rolloutTokenCount(100, 60, 20, 8, 120),
+    taskEvent("task_complete", "turn-previous", "2026-07-14T00:00:01.000Z"),
+    taskEvent("task_started", "turn-latest", "2026-07-14T00:01:00.000Z"),
+    turnContext("turn-latest", "latest-model", "xhigh"),
+    rolloutTokenCount(175, 105, 45, 19, 220),
+    taskEvent("task_complete", "turn-latest", "2026-07-14T00:01:03.000Z")
+  ]);
+
+  const inspected = inspectCodexRollout({ result: { threadId } }, envFor(sandbox));
+  assert.strictEqual(inspected.availability, "available");
+  assert.strictEqual(inspected.turnId, null);
+  assert.strictEqual(inspected.model, "latest-model");
+  assert.strictEqual(inspected.effort, "xhigh");
+  assert.deepStrictEqual(inspected.tokenUsage, { inputTokens: 75, cachedInputTokens: 45, outputTokens: 25, reasoningOutputTokens: 11, totalTokens: 100 });
+});
+
+test("rollout inspection falls back to the whole file when task boundaries are absent", (t) => {
+  const sandbox = makeSandbox(t);
+  const threadId = "thread-unbracketed";
+  writeRollout(sandbox, threadId, [
+    turnContext("turn-unbracketed", "unbracketed-model", "medium"),
+    rolloutTokenCount(80, 30, 20, 5, 100)
+  ]);
+
+  const inspected = inspectCodexRollout({ result: { threadId } }, envFor(sandbox));
+  assert.strictEqual(inspected.availability, "available");
+  assert.strictEqual(inspected.turnId, null);
+  assert.strictEqual(inspected.model, "unbracketed-model");
+  assert.strictEqual(inspected.effort, "medium");
+  assert.deepStrictEqual(inspected.tokenUsage, { inputTokens: 80, cachedInputTokens: 30, outputTokens: 20, reasoningOutputTokens: 5, totalTokens: 100 });
+});
+
+test("rollout inspection falls back to a still-running single turn without a completion boundary", (t) => {
+  const sandbox = makeSandbox(t);
+  const threadId = "thread-still-running";
+  writeRollout(sandbox, threadId, [
+    taskEvent("task_started", "turn-still-running", "2026-07-14T00:00:00.000Z"),
+    turnContext("turn-still-running", "still-running-model", "high"),
+    rolloutTokenCount(80, 30, 20, 5, 100)
+  ]);
+
+  const inspected = inspectCodexRollout({ result: { threadId } }, envFor(sandbox));
+  assert.strictEqual(inspected.availability, "available");
+  assert.strictEqual(inspected.turnId, null);
+  assert.strictEqual(inspected.model, "still-running-model");
+  assert.strictEqual(inspected.effort, "high");
+  assert.deepStrictEqual(inspected.tokenUsage, { inputTokens: 80, cachedInputTokens: 30, outputTokens: 20, reasoningOutputTokens: 5, totalTokens: 100 });
+});
+
+test("rollout inspection rejects an unbracketed rollout with multiple task starts", (t) => {
+  const sandbox = makeSandbox(t);
+  const threadId = "thread-ambiguous";
+  writeRollout(sandbox, threadId, [
+    taskEvent("task_started", "turn-first", "2026-07-14T00:00:00.000Z"),
+    rolloutTokenCount(80, 30, 20, 5, 100),
+    taskEvent("task_started", "turn-second", "2026-07-14T00:01:00.000Z"),
+    rolloutTokenCount(175, 105, 45, 19, 220)
+  ]);
+
+  const inspected = inspectCodexRollout({ result: { threadId } }, envFor(sandbox));
+  assert.strictEqual(inspected.availability, "unavailable");
+  assert.strictEqual(inspected.reason, "ambiguous_turns");
+  assert.strictEqual(inspected.tokenUsage, null);
 });
 
 test("rollout inspection uses CODEX_HOME sessions when no monitor override is set", (t) => {
@@ -1322,6 +1396,40 @@ test("canonical terminal records use direct model and token evidence without rol
   const tokenAudit = fs.readFileSync(tokenPath, "utf8").trim().split("\n").map((line) => JSON.parse(line));
   assert.strictEqual(tokenAudit.at(-1).source, "job-record");
   assert.deepStrictEqual(tokenAudit.at(-1).tokenUsage, usage);
+});
+
+test("terminal records without canonical observations recover rollout evidence through the monitor", async (t) => {
+  const sandbox = makeSandbox(t);
+  const threadId = "thread-rollout-terminal";
+  const turnId = "turn-rollout-terminal";
+  const usage = { inputTokens: 120, cachedInputTokens: 70, outputTokens: 30, reasoningOutputTokens: 11, totalTokens: 150 };
+  writeRollout(sandbox, threadId, [
+    taskEvent("task_started", turnId, "2026-07-14T00:00:00.000Z"),
+    turnContext(turnId, "rollout-model", "xhigh"),
+    rolloutTokenCount(120, 70, 30, 11, 150),
+    taskEvent("task_complete", turnId, "2026-07-14T00:00:03.000Z")
+  ]);
+  const { file, record } = seedJob(sandbox, { background: true, threadId, turnId });
+  const monitor = startMonitor(sandbox, envFor(sandbox));
+  t.after(() => monitor.child.kill("SIGKILL"));
+  await waitUntil(() => readAnnouncedState(sandbox));
+  writeJobRecordFile(file, { ...record, status: "done", finishedAt: new Date().toISOString() });
+
+  const terminal = await waitUntil(() => readAnnouncedState(sandbox)?.records.find((entry) => entry.jobId === record.id) ?? null);
+  assert.strictEqual(terminal.model, "rollout-model");
+  assert.strictEqual(terminal.modelSource, "rollout-turn-context");
+  assert.strictEqual(terminal.effort, "xhigh");
+  assert.strictEqual(terminal.effortSource, "rollout-turn-context");
+  assert.deepStrictEqual(terminal.tokenUsage, usage);
+  assert.strictEqual(terminal.tokenUsageAvailability, "available");
+
+  const [modelAudit] = readModelAuditLines(sandbox);
+  assert.strictEqual(modelAudit.model, "rollout-model");
+  assert.strictEqual(modelAudit.effort, "xhigh");
+  assert.strictEqual(modelAudit.source, "rollout-turn-context");
+  const [tokenAudit] = readJsonLines(tokenUsageSidecarPath(sandbox.workDir, envFor(sandbox)));
+  assert.strictEqual(tokenAudit.source, "rollout-turn-delta");
+  assert.deepStrictEqual(tokenAudit.tokenUsage, usage);
 });
 
 test("canonical foreground jobs are retained for stats without emitting completion notices", async (t) => {

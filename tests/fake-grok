@@ -4,16 +4,20 @@
   const path = await import("node:path");
   const childProcess = await import("node:child_process");
 
+  const argsFile = process.env.FAKE_GROK_ARGS_FILE;
+  if (argsFile) {
+    fs.appendFileSync(argsFile, JSON.stringify(process.argv.slice(2)) + "\n");
+  }
+  if (process.argv.includes("--version")) {
+    process.stdout.write(`${process.env.FAKE_GROK_VERSION_OUTPUT ?? "grok 1.0.0 (0123456789ab)"}\n`);
+    process.exit(0);
+  }
   if (!process.env.GROK_HOME) {
     process.stderr.write("FAKE_GROK requires GROK_HOME under test.\n");
     process.exit(2);
   }
   const grokHome = path.resolve(process.cwd(), process.env.GROK_HOME);
 
-  const argsFile = process.env.FAKE_GROK_ARGS_FILE;
-  if (argsFile) {
-    fs.appendFileSync(argsFile, JSON.stringify(process.argv.slice(2)) + "\n");
-  }
   if (process.argv[2] === "doctor") {
     if (process.env.FAKE_GROK_DOCTOR_UNAVAILABLE === "1") {
       process.stderr.write("error: unrecognized subcommand 'doctor'\n");
@@ -23,6 +27,19 @@
     process.exit(0);
   }
   if (process.argv.includes("--help")) {
+    const removedCapabilities = new Set(
+      String(process.env.FAKE_GROK_REMOVED_CAPABILITIES ?? "")
+        .split(",")
+        .map((flag) => flag.trim())
+        .filter(Boolean)
+    );
+    const removedFlag = [...removedCapabilities].find((flag) =>
+      process.argv.slice(2).some((argument) => argument === flag || argument.startsWith(`${flag}=`))
+    );
+    if (removedFlag) {
+      process.stderr.write(`error: unexpected argument '${removedFlag}'\n`);
+      process.exit(2);
+    }
     const hiddenCapabilities = new Set(
       String(process.env.FAKE_GROK_HIDDEN_CAPABILITIES ?? "")
         .split(",")
@@ -46,7 +63,7 @@
       "--no-wait-for-background",
       "--json-schema"
     ];
-    process.stdout.write(`${capabilities.filter((flag) => !hiddenCapabilities.has(flag)).join("\n")}\n`);
+    process.stdout.write(`${capabilities.filter((flag) => !hiddenCapabilities.has(flag) && !removedCapabilities.has(flag)).join("\n")}\n`);
     process.exit(0);
   }
   if (process.env.FAKE_GROK_ENV_FILE) {
@@ -67,6 +84,15 @@
           key === "_GROK_CLAUDE_MARKER_OVERRIDE" ||
           key === "GROK_DISABLE_AUTOUPDATER" ||
           key === "GROK_MANAGED_MCPS_ENABLED" ||
+          key === "GROK_MANAGED_MCP_GATEWAY_TOOLS_ENABLED" ||
+          key === "GROK_WEB_FETCH" ||
+          key === "GROK_TEST_VERSION" ||
+          key === "GROK_SANDBOX" ||
+          key === "GROK_LEADER_SOCKET" ||
+          key === "GROK_AUTO_WAKE" ||
+          key === "GROK_SUBAGENTS_MAX_DEPTH" ||
+          key === "GROK_WEB_FETCH_PROXY" ||
+          key === "GROK_WEB_FETCH_ALLOW_LOCAL" ||
           key === "GROK_COMPANION_CONTINUITY_POLICY" ||
           key === "GROK_MEMORY" ||
           key === "GROK_SUBAGENTS" ||
@@ -177,8 +203,36 @@
       process.exit(1);
     }
   }
+  const modeledToolIds = new Set([
+    "read_file",
+    "grep",
+    "list_dir",
+    "search_replace",
+    "run_terminal_cmd",
+    "web_search",
+    "web_fetch",
+    "Agent",
+    "search_tool",
+    "use_tool",
+    "ask_user_question"
+  ]);
+  const disallowedToolIds = [];
+  for (let index = 2; index < process.argv.length; index += 1) {
+    const argument = process.argv[index];
+    if (argument === "--disallowed-tools") {
+      disallowedToolIds.push(process.argv[index + 1] ?? "");
+      index += 1;
+    } else if (argument.startsWith("--disallowed-tools=")) {
+      disallowedToolIds.push(argument.slice("--disallowed-tools=".length));
+    }
+  }
   if (sandboxProfile && !new Set(["tool-allowlist-warning", "tool-disallowed-warning", "tool-policy-no-evidence"]).has(mode)) {
     process.stderr.write("DEBUG xai_grok_agent::builder: tools allowlist applied\n");
+  }
+  for (const toolId of disallowedToolIds.flatMap((value) => value.split(",").map((entry) => entry.trim()).filter(Boolean))) {
+    if (!modeledToolIds.has(toolId)) {
+      process.stderr.write(`WARN disallowedTools entry matched nothing agent=grok-test tool=${toolId}\n`);
+    }
   }
 
   const reviewObject = {
@@ -250,6 +304,7 @@
   const usage = {
     input_tokens: 120,
     cache_read_input_tokens: 30,
+    cache_creation_input_tokens: 0,
     output_tokens: 20,
     reasoning_tokens: 5,
     total_tokens: 170
@@ -274,7 +329,7 @@
   if (mode === "ok") {
     emit({
       text: "FAKE-OK",
-      stopReason: "EndTurn",
+      stopReason: "end_turn",
       sessionId: "11111111-1111-7111-8111-111111111111",
       requestId: "req-1"
     });
@@ -290,7 +345,7 @@
     }
     emit({
       text: "FAKE-RESIDUAL-PROCESS-GROUP",
-      stopReason: "EndTurn",
+      stopReason: "end_turn",
       sessionId: "11111111-1111-7111-8111-111111111120",
       requestId: "req-residual-process-group"
     });
@@ -300,7 +355,7 @@
   if (mode === "malicious-session-id") {
     emit({
       text: "FAKE-MALICIOUS-SESSION",
-      stopReason: "EndTurn",
+      stopReason: "end_turn",
       sessionId: "../../attacker",
       requestId: "req-malicious-session",
       usage,
@@ -314,7 +369,7 @@
   if (mode === "usage-ok") {
     emit({
       text: "FAKE-USAGE-OK",
-      stopReason: "EndTurn",
+      stopReason: "end_turn",
       sessionId: "11111111-1111-7111-8111-111111111112",
       requestId: "req-usage",
       usage,
@@ -326,7 +381,7 @@
   if (mode === "usage-incomplete-ok") {
     emit({
       text: "FAKE-USAGE-INCOMPLETE",
-      stopReason: "EndTurn",
+      stopReason: "end_turn",
       sessionId: "11111111-1111-7111-8111-111111111113",
       requestId: "req-usage-incomplete",
       usage,
@@ -339,10 +394,10 @@
   if (mode === "usage-partial-unflagged") {
     emit({
       text: "FAKE-USAGE-PARTIAL",
-      stopReason: "EndTurn",
+      stopReason: "end_turn",
       sessionId: "11111111-1111-7111-8111-111111111115",
       requestId: "req-usage-partial",
-      usage: { input_tokens: 120, output_tokens: 20 },
+      usage: { input_tokens: 120, cache_creation_input_tokens: 0, output_tokens: 20 },
       modelUsage: { "grok-partial": { inputTokens: 120, outputTokens: 20 } }
     });
     process.exit(0);
@@ -351,7 +406,7 @@
   if (mode === "metrics-complete") {
     emit({
       text: "FAKE-METRICS-COMPLETE",
-      stopReason: "EndTurn",
+      stopReason: "end_turn",
       sessionId: "11111111-1111-7111-8111-111111111116",
       requestId: "req-metrics-complete",
       usage,
@@ -382,6 +437,18 @@
     process.exit(0);
   }
 
+  if (mode === "usage-cache-creation") {
+    emit({
+      text: "FAKE-USAGE-CACHE-CREATION",
+      stopReason: "end_turn",
+      sessionId: "11111111-1111-7111-8111-111111111122",
+      requestId: "req-usage-cache-creation",
+      usage: { ...usage, cache_creation_input_tokens: 10, total_tokens: 180 },
+      modelUsage
+    });
+    process.exit(0);
+  }
+
   const invalidMetricEnvelopes = {
     "metrics-fractional-turns": { num_turns: 1.5 },
     "metrics-lone-cost": { total_cost_usd_ticks: 120000000 },
@@ -391,7 +458,7 @@
   if (invalidMetricEnvelopes[mode]) {
     emit({
       text: "FAKE-INVALID-METRICS",
-      stopReason: "EndTurn",
+      stopReason: "end_turn",
       sessionId: "11111111-1111-7111-8111-111111111119",
       requestId: `req-${mode}`,
       ...invalidMetricEnvelopes[mode]
@@ -412,7 +479,7 @@
   if (malformedSpendEnvelopes[mode]) {
     emit({
       text: "FAKE-MALFORMED-SPEND",
-      stopReason: "EndTurn",
+      stopReason: "end_turn",
       sessionId: "11111111-1111-7111-8111-111111111121",
       requestId: `req-${mode}`,
       ...malformedSpendEnvelopes[mode]
@@ -423,7 +490,7 @@
   if (mode === "large-stdout-json") {
     writeAllSync(1, `${JSON.stringify({
       text: `large-output-begins:${"x".repeat(1536 * 1024)}:large-output-ends`,
-      stopReason: "EndTurn",
+      stopReason: "end_turn",
       sessionId: "11111111-1111-7111-8111-111111111117",
       requestId: "req-large-stdout"
     })}\n`);
@@ -438,7 +505,7 @@
       }
       emit({
         text: "UNSANDBOXED",
-        stopReason: "EndTurn",
+        stopReason: "end_turn",
         sessionId: "11111111-1111-7111-8111-111111111114",
         requestId: "req-sandbox-warning"
       });
@@ -461,7 +528,7 @@
       }
       emit({
         text: "UNSAFE",
-        stopReason: "EndTurn",
+        stopReason: "end_turn",
         sessionId: "11111111-1111-7111-8111-111111111118",
         requestId: "req-safety-warning"
       });
@@ -473,7 +540,7 @@
   if (mode === "tool-policy-no-evidence") {
     emit({
       text: "UNVERIFIED-POLICY",
-      stopReason: "EndTurn",
+      stopReason: "end_turn",
       sessionId: "11111111-1111-7111-8111-111111111119",
       requestId: "req-unverified-policy"
     });
@@ -484,7 +551,7 @@
     emit({
       text: "```json\n" + JSON.stringify(reviewObject) + "\n```",
       ...(process.argv.includes("--json-schema") ? { structuredOutput: reviewObject } : {}),
-      stopReason: "EndTurn",
+      stopReason: "end_turn",
       sessionId: "33333333-3333-7333-8333-333333333333",
       requestId: "req-1"
     });
@@ -495,7 +562,7 @@
     emit({
       text: "The requested task completed.",
       structuredOutput: taskObject,
-      stopReason: "EndTurn",
+      stopReason: "end_turn",
       sessionId: "55555555-5555-7555-8555-555555555555",
       requestId: "req-task-structured-success"
     });
@@ -507,7 +574,7 @@
       text: JSON.stringify(taskObject),
       structuredOutput: null,
       structuredOutputError: "output does not match the requested schema",
-      stopReason: "EndTurn",
+      stopReason: "end_turn",
       sessionId: "56565656-5656-7565-8565-565656565656",
       requestId: "req-task-structured-error"
     });
@@ -518,7 +585,7 @@
     emit({
       text: JSON.stringify(taskObject),
       structuredOutput: null,
-      stopReason: "EndTurn",
+      stopReason: "end_turn",
       sessionId: "57575757-5757-7575-8575-575757575757",
       requestId: "req-task-structured-null"
     });
@@ -528,7 +595,7 @@
   if (mode === "task-structured-absent") {
     emit({
       text: `Here is the result:\n\`\`\`json\n${JSON.stringify(taskObject)}\n\`\`\``,
-      stopReason: "EndTurn",
+      stopReason: "end_turn",
       sessionId: "58585858-5858-7585-8585-585858585858",
       requestId: "req-task-structured-absent"
     });
@@ -540,14 +607,14 @@
     if (count === 0) {
       emit({
         text: "```markdown\nI could not produce the requested object, sorry.\n```",
-        stopReason: "EndTurn",
+        stopReason: "end_turn",
         sessionId: "22222222-2222-7222-8222-222222222222",
         requestId: "req-1"
       });
     } else {
       emit({
         text: "```json\n" + JSON.stringify(reviewObject) + "\n```",
-        stopReason: "EndTurn",
+        stopReason: "end_turn",
         sessionId: "22222222-2222-7222-8222-222222222222",
         requestId: "req-2"
       });
@@ -565,6 +632,7 @@
     const completeUsageA = {
       input_tokens: 10,
       cache_read_input_tokens: 2,
+      cache_creation_input_tokens: 0,
       output_tokens: 3,
       reasoning_tokens: 1,
       total_tokens: 15
@@ -572,13 +640,14 @@
     const completeUsageB = {
       input_tokens: 20,
       cache_read_input_tokens: 4,
+      cache_creation_input_tokens: 0,
       output_tokens: 6,
       reasoning_tokens: 2,
       total_tokens: 30
     };
-    const partialUsageA = { input_tokens: 10, cache_read_input_tokens: 2 };
-    const partialUsageB = { output_tokens: 6, reasoning_tokens: 2, total_tokens: 30 };
-    const sharedPartialUsageB = { input_tokens: 20, output_tokens: 6, total_tokens: 30 };
+    const partialUsageA = { input_tokens: 10, cache_read_input_tokens: 2, cache_creation_input_tokens: 0 };
+    const partialUsageB = { cache_creation_input_tokens: 0, output_tokens: 6, reasoning_tokens: 2, total_tokens: 30 };
+    const sharedPartialUsageB = { input_tokens: 20, cache_creation_input_tokens: 0, output_tokens: 6, total_tokens: 30 };
     const completeModelA = {
       inputTokens: 10,
       cacheReadInputTokens: 2,
@@ -613,7 +682,7 @@
         count === 0
           ? "```markdown\nI could not produce the requested object, sorry.\n```"
           : "```json\n" + JSON.stringify(reviewObject) + "\n```",
-      stopReason: "EndTurn",
+      stopReason: "end_turn",
       sessionId: "23232323-2323-7323-8323-232323232323",
       requestId: count === 0 ? "req-review-usage-1" : "req-review-usage-2",
       usage: count === 0 ? firstUsage : retryUsage,
@@ -626,6 +695,7 @@
     const completeUsage = {
       input_tokens: 10,
       cache_read_input_tokens: 2,
+      cache_creation_input_tokens: 0,
       output_tokens: 3,
       reasoning_tokens: 1,
       total_tokens: 15
@@ -641,7 +711,7 @@
     if (count === 0) {
       emit({
         text: "```markdown\nI could not produce the requested object, sorry.\n```",
-        stopReason: "EndTurn",
+        stopReason: "end_turn",
         sessionId: "24242424-2424-7424-8424-242424242424",
         requestId: "req-review-quota-1",
         usage: completeUsage,
@@ -663,7 +733,7 @@
   if (mode === "badjson") {
     emit({
       text: "```markdown\nI still cannot produce the requested object.\n```",
-      stopReason: "EndTurn",
+      stopReason: "end_turn",
       sessionId: "44444444-4444-7444-8444-444444444444",
       requestId: "req-1"
     });
@@ -673,7 +743,7 @@
   if (mode === "gate-allow") {
     emit({
       text: "ALLOW\nNo blocking issues found.",
-      stopReason: "EndTurn",
+      stopReason: "end_turn",
       sessionId: "55555555-5555-7555-8555-555555555555",
       requestId: "req-1"
     });
@@ -683,7 +753,7 @@
   if (mode === "gate-block") {
     emit({
       text: "BLOCK: reason text\nExtra detail about the defect.",
-      stopReason: "EndTurn",
+      stopReason: "end_turn",
       sessionId: "66666666-6666-7666-8666-666666666666",
       requestId: "req-1"
     });
@@ -693,7 +763,7 @@
   if (mode === "gate-block-preamble") {
     emit({
       text: "Reviewing the diff for concrete defects.\nBLOCK: preamble reason text\nExtra detail about the defect.",
-      stopReason: "EndTurn",
+      stopReason: "end_turn",
       sessionId: "77777777-7777-7777-8777-777777777777",
       requestId: "req-1"
     });
@@ -703,7 +773,7 @@
   if (mode === "gate-block-leading-blank") {
     emit({
       text: "\n\nBLOCK: leading blank reason text\nExtra detail about the defect.",
-      stopReason: "EndTurn",
+      stopReason: "end_turn",
       sessionId: "77777777-7777-7777-8777-777777777778",
       requestId: "req-1"
     });
@@ -713,7 +783,7 @@
   if (mode === "permission-cancelled") {
     emit({
       text: "",
-      stopReason: "Cancelled",
+      stopReason: "cancelled",
       sessionId: "88888888-8888-7888-8888-888888888888",
       requestId: "req-1"
     });
@@ -728,7 +798,7 @@
     });
     emit({
       text: "",
-      stopReason: "Cancelled",
+      stopReason: "cancelled",
       sessionId: "88888888-8888-7888-8888-888888888889",
       requestId: "req-1"
     });
@@ -738,7 +808,7 @@
   if (mode === "max-turns") {
     emit({
       text: "FAKE-TURN-LIMIT-PARTIAL",
-      stopReason: "Cancelled",
+      stopReason: "cancelled",
       sessionId: "99999999-9999-7999-8999-999999999999",
       requestId: "req-max-turns",
       thought: "The partial result is still useful.",
@@ -754,7 +824,6 @@
         summary: "The turn limit stopped further work."
       }
     });
-    process.stdout.write(JSON.stringify({ type: "max_turns_reached" }) + "\n");
     process.stderr.write("Error: max turns reached\n");
     process.exit(1);
   }
@@ -766,8 +835,8 @@
 
   if (mode === "required-version-policy-death") {
     const message = process.env.FAKE_GROK_REQUIRED_VERSION_POLICY === "above"
-      ? "This version of Grok (0.2.113) is newer than the maximum allowed by your organization (0.2.112).\n\nInstall an approved version through your organization's approved method (for example, run `grok update --version 0.2.112`)."
-      : "This version of Grok (0.2.109) is older than the minimum required by your organization (0.2.112).\n\nUpdate to an approved version through your organization's approved method (for example, run `grok update`).";
+      ? "This version of Grok (1.0.1) is newer than the maximum allowed by your organization (1.0.0).\n\nInstall an approved version through your organization's approved method (for example, run `grok update --version 1.0.0`)."
+      : "This version of Grok (0.2.120) is older than the minimum required by your organization (1.0.0).\n\nUpdate to an approved version through your organization's approved method (for example, run `grok update`).";
     process.stderr.write(`${message}\n`);
     process.exit(1);
   }

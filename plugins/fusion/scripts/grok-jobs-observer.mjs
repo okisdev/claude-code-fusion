@@ -32,8 +32,10 @@ function grokTokenUsageObservation(usage) {
   if (!usage || typeof usage !== "object" || Array.isArray(usage)) {
     return null;
   }
+  const inputTokens = tokenField(usage, ["input_tokens", "inputTokens"]);
+  const cacheCreationTokens = tokenField(usage, ["cache_creation_input_tokens", "cacheCreationInputTokens"]);
   return {
-    inputTokens: tokenField(usage, ["input_tokens", "inputTokens"]),
+    inputTokens: inputTokens == null || cacheCreationTokens == null ? inputTokens : nonNegativeInteger(inputTokens + cacheCreationTokens),
     cachedInputTokens: tokenField(usage, ["cache_read_input_tokens", "cacheReadInputTokens", "cachedReadTokens", "cacheReadTokens"]),
     outputTokens: tokenField(usage, ["output_tokens", "outputTokens"]),
     reasoningOutputTokens: tokenField(usage, ["reasoning_tokens", "reasoningTokens"]),

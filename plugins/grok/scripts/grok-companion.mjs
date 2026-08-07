@@ -14,6 +14,7 @@ import {
   formatBlockedPermissionCall,
   formatDeniedToolDetail,
   normalizeGrokSessionId,
+  normalizeStopReason,
   resolveGrokBin,
   resolveGrokCapabilities,
   resolveTimeoutMs,
@@ -1080,7 +1081,7 @@ const REQUIRED_VERSION_POLICY_FAILURE_MESSAGES = {
 };
 
 function isPermissionCancelled(result) {
-  return Boolean(result) && result.exitCode === 0 && !result.timedOut && result.stopReason === "Cancelled";
+  return Boolean(result) && result.exitCode === 0 && !result.timedOut && normalizeStopReason(result.stopReason) === "cancelled";
 }
 
 function permissionFailureMessage(result) {
@@ -2959,7 +2960,7 @@ function handleStats(argv, transport = {}) {
 
 const DOCTOR_PROBE_TIMEOUT_MS = 3000;
 const SHELL_ENVIRONMENT_POLICY_DETAIL =
-  "Grok 0.2.112+ supports [shell_environment_policy] to control which environment variables reach shell tools in write runs.";
+  "Grok supports [shell_environment_policy] (introduced in 0.2.112, verified through 1.0.0) to control which environment variables reach shell tools in write runs.";
 
 function doctorCommandAdvisory(bin, available) {
   if (!available) {

@@ -89,6 +89,7 @@ test("stats aggregates the workspace jobs as markdown and json", (t) => {
   assert.deepStrictEqual(usageRecord.usage, {
     input_tokens: 120,
     cache_read_input_tokens: 30,
+    cache_creation_input_tokens: 0,
     output_tokens: 20,
     reasoning_tokens: 5,
     total_tokens: 170,
