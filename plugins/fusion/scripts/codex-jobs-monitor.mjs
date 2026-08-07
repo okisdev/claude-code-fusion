@@ -259,6 +259,24 @@ function parseModelAndEffortFromArgv(argvLine) {
   const tokens = String(argvLine).trim().split(/\s+/).filter(Boolean);
   let model = null;
   let effort = null;
+  const configEffort = (value) => {
+    const config = String(value ?? "").trim();
+    const prefix = "model_reasoning_effort=";
+    if (!config.startsWith(prefix)) {
+      return null;
+    }
+    const effortValue = config.slice(prefix.length).trim();
+    if (!effortValue) {
+      return null;
+    }
+    if (
+      effortValue.length >= 2 &&
+      ((effortValue.startsWith('"') && effortValue.endsWith('"')) || (effortValue.startsWith("'") && effortValue.endsWith("'")))
+    ) {
+      return effortValue.slice(1, -1) || null;
+    }
+    return effortValue;
+  };
   for (let index = 0; index < tokens.length; index += 1) {
     const token = tokens[index];
     if (token === "--model" || token === "-m") {
@@ -289,6 +307,26 @@ function parseModelAndEffortFromArgv(argvLine) {
       if (value) {
         effort = value;
       }
+      continue;
+    }
+    if (token === "--config" || token === "-c") {
+      const value = configEffort(tokens[index + 1]);
+      if (value) {
+        effort = value;
+      }
+      index += 1;
+      continue;
+    }
+    const config = token.startsWith("--config=")
+      ? token.slice("--config=".length)
+      : token.startsWith("-c=")
+        ? token.slice("-c=".length)
+        : token.startsWith("-cmodel_reasoning_effort=")
+          ? token.slice(2)
+          : null;
+    const value = configEffort(config);
+    if (value) {
+      effort = value;
     }
   }
   if (model == null && effort == null) {
@@ -416,8 +454,8 @@ function subtractUsage(end, start) {
 export function inspectCodexRollout(record, env = process.env, rolloutIndex = null) {
   const threadId = record?.result?.threadId ?? record?.threadId ?? null;
   const turnId = record?.turnId ?? record?.result?.turnId ?? null;
-  if (!threadId || !turnId) {
-    return { availability: "unavailable", reason: "missing_thread_or_turn_id", threadId, turnId, model: null, effort: null, tokenUsage: null };
+  if (!threadId) {
+    return { availability: "unavailable", reason: "missing_thread_id", threadId, turnId, model: null, effort: null, tokenUsage: null };
   }
   const file = findRolloutFile(threadId, env, rolloutIndex);
   if (!file) {
@@ -428,22 +466,58 @@ export function inspectCodexRollout(record, env = process.env, rolloutIndex = nu
   let effort = null;
   let startIndex = -1;
   let endIndex = -1;
-  for (let index = 0; index < entries.length; index += 1) {
-    const entry = entries[index];
-    if (entry?.type === "turn_context" && eventTurnId(entry) === turnId) {
-      model = nonEmptyRequestField(entry.payload.model) ? String(entry.payload.model).trim() : model;
-      effort = nonEmptyRequestField(entry.payload.effort) ? String(entry.payload.effort).trim() : effort;
+  let selectedTurnId = turnId;
+  if (turnId) {
+    for (let index = 0; index < entries.length; index += 1) {
+      const entry = entries[index];
+      if (entry?.type === "turn_context" && eventTurnId(entry) === turnId) {
+        model = nonEmptyRequestField(entry.payload.model) ? String(entry.payload.model).trim() : model;
+        effort = nonEmptyRequestField(entry.payload.effort) ? String(entry.payload.effort).trim() : effort;
+      }
+      if (entry?.type === "event_msg" && entry?.payload?.type === "task_started" && eventTurnId(entry) === turnId) {
+        startIndex = index;
+      }
+      if (startIndex !== -1 && entry?.type === "event_msg" && entry?.payload?.type === "task_complete" && eventTurnId(entry) === turnId) {
+        endIndex = index;
+        break;
+      }
     }
-    if (entry?.type === "event_msg" && entry?.payload?.type === "task_started" && eventTurnId(entry) === turnId) {
-      startIndex = index;
+    if (startIndex === -1 || endIndex === -1) {
+      return { availability: "unavailable", reason: "turn_boundary_not_found", threadId, turnId, model, effort, tokenUsage: null };
     }
-    if (startIndex !== -1 && entry?.type === "event_msg" && entry?.payload?.type === "task_complete" && eventTurnId(entry) === turnId) {
-      endIndex = index;
-      break;
+  } else {
+    let openTurn = null;
+    let taskStartedCount = 0;
+    for (let index = 0; index < entries.length; index += 1) {
+      const entry = entries[index];
+      if (entry?.type === "event_msg" && entry?.payload?.type === "task_started") {
+        taskStartedCount += 1;
+        openTurn = { index, turnId: eventTurnId(entry) };
+      }
+      if (openTurn && entry?.type === "event_msg" && entry?.payload?.type === "task_complete") {
+        const completedTurnId = eventTurnId(entry);
+        if (!openTurn.turnId || !completedTurnId || openTurn.turnId === completedTurnId) {
+          startIndex = openTurn.index;
+          endIndex = index;
+          selectedTurnId = openTurn.turnId ?? completedTurnId;
+          openTurn = null;
+        }
+      }
     }
-  }
-  if (startIndex === -1 || endIndex === -1) {
-    return { availability: "unavailable", reason: "turn_boundary_not_found", threadId, turnId, model, effort, tokenUsage: null };
+    if (startIndex === -1 || endIndex === -1) {
+      if (taskStartedCount > 1) {
+        return { availability: "unavailable", reason: "ambiguous_turns", threadId, turnId, model, effort, tokenUsage: null };
+      }
+      startIndex = -1;
+      endIndex = entries.length;
+      selectedTurnId = null;
+    }
+    for (const entry of entries) {
+      if (entry?.type === "turn_context" && (!selectedTurnId || eventTurnId(entry) === selectedTurnId)) {
+        model = nonEmptyRequestField(entry.payload.model) ? String(entry.payload.model).trim() : model;
+        effort = nonEmptyRequestField(entry.payload.effort) ? String(entry.payload.effort).trim() : effort;
+      }
+    }
   }
   let finalUsage = null;
   for (let index = startIndex + 1; index < endIndex; index += 1) {
@@ -478,7 +552,7 @@ function maybeCaptureModelAudit(record, seenJobIds, sidecarPath, env = process.e
   if (record.status !== "running" || !recordLacksModelOrEffort(record)) {
     return;
   }
-  const argvLine = readProcessArgv(record.pid, env);
+  const argvLine = readProcessArgv(record.codexPid ?? record.pid, env);
   if (!argvLine) {
     return;
   }
@@ -507,7 +581,7 @@ function maybeCaptureModelAudit(record, seenJobIds, sidecarPath, env = process.e
 
 function terminalObservations(record, env = process.env, rolloutIndex = null) {
   const workspaceRoot = record?.workspaceRoot;
-  const rollout = {
+  const unavailableRollout = {
     availability: "unavailable",
     reason: record?.tokenUsageUnavailableReason ?? "job_record_unavailable",
     threadId: record?.threadId ?? record?.result?.threadId ?? null,
@@ -520,9 +594,14 @@ function terminalObservations(record, env = process.env, rolloutIndex = null) {
   const resolvedEffort = nonEmptyRequestField(record?.resolvedEffort) ? String(record.resolvedEffort).trim() : null;
   const requestedModel = nonEmptyRequestField(record?.request?.model) ? String(record.request.model).trim() : null;
   const requestedEffort = nonEmptyRequestField(record?.request?.effort) ? String(record.request.effort).trim() : null;
-  const model = rollout.model ?? resolvedModel ?? requestedModel;
-  const effort = rollout.effort ?? resolvedEffort ?? requestedEffort;
-  const source = rollout.model || rollout.effort ? "rollout-turn-context" : resolvedModel || resolvedEffort ? "job-record" : "job-request";
+  const inlineUsage = normalizeCodexTokenUsage(record?.tokenUsage ?? record?.usage ?? record?.result?.tokenUsage ?? record?.result?.usage);
+  const inspectedRollout = !resolvedModel || !resolvedEffort || !inlineUsage ? inspectCodexRollout(record, env, rolloutIndex) : unavailableRollout;
+  const rollout = inspectedRollout.availability === "available" ? inspectedRollout : unavailableRollout;
+  const model = resolvedModel ?? rollout.model ?? requestedModel;
+  const effort = resolvedEffort ?? rollout.effort ?? requestedEffort;
+  const modelSource = resolvedModel ? "job-record" : rollout.model ? "rollout-turn-context" : requestedModel ? "job-request" : null;
+  const effortSource = resolvedEffort ? "job-record" : rollout.effort ? "rollout-turn-context" : requestedEffort ? "job-request" : null;
+  const source = modelSource === "rollout-turn-context" || effortSource === "rollout-turn-context" ? "rollout-turn-context" : resolvedModel || resolvedEffort ? "job-record" : "job-request";
   if (workspaceRoot && (model || effort)) {
     try {
       appendModelAuditObservation(modelAuditSidecarPath(workspaceRoot, env), {
@@ -542,7 +621,6 @@ function terminalObservations(record, env = process.env, rolloutIndex = null) {
       void 0;
     }
   }
-  const inlineUsage = normalizeCodexTokenUsage(record?.tokenUsage ?? record?.usage ?? record?.result?.tokenUsage ?? record?.result?.usage);
   const tokenUsage = inlineUsage ?? rollout.tokenUsage;
   const availability = tokenUsage ? "available" : "unavailable";
   if (workspaceRoot) {
@@ -567,10 +645,10 @@ function terminalObservations(record, env = process.env, rolloutIndex = null) {
   }
   const existingModel = workspaceRoot ? loadModelAuditObservations(modelAuditSidecarPath(workspaceRoot, env)).get(record.id) : null;
   return {
-    model: model ?? existingModel?.model ?? null,
-    modelSource: rollout.model ? "rollout-turn-context" : resolvedModel ? "job-record" : requestedModel ? "job-request" : existingModel?.source ?? null,
-    effort: effort ?? existingModel?.effort ?? null,
-    effortSource: rollout.effort ? "rollout-turn-context" : resolvedEffort ? "job-record" : requestedEffort ? "job-request" : existingModel?.source ?? null,
+    model: existingModel?.model ?? model ?? null,
+    modelSource: existingModel?.source ?? modelSource,
+    effort: existingModel?.effort ?? effort ?? null,
+    effortSource: existingModel?.source ?? effortSource,
     tokenUsage,
     tokenUsageAvailability: availability
   };
