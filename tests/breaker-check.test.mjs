@@ -394,6 +394,24 @@ test("two consecutive timeouts open the breaker and a later success closes it", 
   assert.strictEqual(run(sandbox).stdout, "");
 });
 
+for (const failureKind of ["patch_thrash", "exec_lost"]) {
+  test(`one ${failureKind} keeps the Codex breaker closed, while a consecutive second occurrence opens it`, (t) => {
+    const sandbox = makeSandbox(t);
+    writeRecord(jobFile(sandbox.codexState, "workspace", `${failureKind}-first`), {
+      status: "error",
+      failureKind,
+      finishedAt: new Date(Date.now() - 3 * 60000).toISOString()
+    });
+    assert.strictEqual(run(sandbox).stdout, "");
+    writeRecord(jobFile(sandbox.codexState, "workspace", `${failureKind}-second`), {
+      status: "error",
+      failureKind,
+      finishedAt: new Date(Date.now() - 2 * 60000).toISOString()
+    });
+    assert.match(run(sandbox).stdout, new RegExp(`codex breaker.*last failure ${failureKind}`));
+  });
+}
+
 test("a successful terminal job closes a previously hard breaker", (t) => {
   const sandbox = makeSandbox(t);
   writeRecord(jobFile(sandbox.codexState, "workspace", "auth-failure"), {

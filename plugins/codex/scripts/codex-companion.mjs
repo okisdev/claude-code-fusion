@@ -99,7 +99,8 @@ const RECORD_ACCEPTANCE_JOB_ID_PATTERN = /^[a-f0-9]{32}$/;
 const RECORD_ACCEPTANCE_VALUES = new Set(["accepted", "rejected", "unverified"]);
 const RECORD_ACCEPTANCE_SOURCES = new Set(["collector", "main-loop", "stats"]);
 const SEMANTIC_FAILURE_KINDS = new Set(["intent_override", "scope_rewrite", "wrong_approach", "style_mismatch"]);
-const SOL_FOREGROUND_WRITE_WARNING = "warning: sol p90 wall clock exceeds the 600s foreground cap. Split the brief or name gpt-5.6-terra.";
+const RESUMABLE_FAILURE_KINDS = new Set(["timeout", "policy", "patch_thrash"]);
+const SOL_FOREGROUND_WRITE_WARNING = "warning: 41% of foreground gpt-5.6-sol write tasks timed out in the last 7 days. Split the package or use gpt-5.6-terra.";
 let activeCommandArgv = null;
 let cachedCompanionVersion = null;
 let companionVersionRead = false;
@@ -235,6 +236,35 @@ function rejectImplicitSubdirectoryCwd(cwd, options) {
   if (toplevel !== cwd) {
     throw new CompanionError(`Implicit working directory ${cwd} is inside repository ${toplevel} but is not its root. Pass --cwd ${toplevel} to target the repository root, or pass --cwd ${cwd} to confirm this subdirectory as the sandbox root.`, "input");
   }
+}
+
+function hasGitAncestor(cwd) {
+  let current = cwd;
+  for (;;) {
+    try {
+      fs.lstatSync(path.join(current, ".git"));
+      return true;
+    } catch (error) {
+      if (error?.code !== "ENOENT") {
+        return true;
+      }
+    }
+    const parent = path.dirname(current);
+    if (parent === current) {
+      return false;
+    }
+    current = parent;
+  }
+}
+
+function taskGitPreflight(cwd, write, skipGitRepoCheck) {
+  if (skipGitRepoCheck || hasGitAncestor(cwd)) {
+    return Boolean(skipGitRepoCheck);
+  }
+  if (write) {
+    throw new CompanionError("Codex write tasks outside a Git repository require --skip-git-repo-check. Pass --skip-git-repo-check to run this write task.", "input");
+  }
+  return true;
 }
 
 function resolveOutputSchemaFile(cwd, value) {
@@ -626,12 +656,14 @@ function consumeRawCommandStdin() {
   }
 }
 
-function consumeRawCommandTransport(token, { allowUnwritten = false } = {}) {
+function consumeRawCommandTransport(token, { allowUnwritten = false, retain = false } = {}) {
   const { directory, file, ownerFile } = transportPaths(token);
   let descriptor;
   let directoryIdentity = null;
   let fileIdentity = null;
   let ownerIdentity = null;
+  let retained = false;
+  const release = () => cleanupVerifiedTransport(directory, file, ownerFile, directoryIdentity, fileIdentity, ownerIdentity);
   try {
     const directoryStats = fs.lstatSync(directory);
     if (!directoryStats.isDirectory() || directoryStats.isSymbolicLink()) {
@@ -674,17 +706,25 @@ function consumeRawCommandTransport(token, { allowUnwritten = false } = {}) {
       throw new CompanionError("The raw command transport file is not private.", "permission");
     }
     const bytes = readBoundedDescriptor(descriptor, MAX_RAW_ARGUMENT_BYTES);
+    let value;
     if (bytes.length === 0) {
       if (allowUnwritten) {
-        return "";
+        value = "";
+      } else {
+        throw new CompanionError("The raw command transport is unwritten.", "input");
       }
-      throw new CompanionError("The raw command transport is unwritten.", "input");
+    } else {
+      try {
+        value = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+      } catch {
+        throw new CompanionError("Raw command arguments must be valid UTF-8.", "input");
+      }
     }
-    try {
-      return new TextDecoder("utf-8", { fatal: true }).decode(bytes);
-    } catch {
-      throw new CompanionError("Raw command arguments must be valid UTF-8.", "input");
+    if (retain) {
+      retained = true;
+      return { release, value };
     }
+    return value;
   } catch (error) {
     if (error instanceof CompanionError) {
       throw error;
@@ -694,11 +734,13 @@ function consumeRawCommandTransport(token, { allowUnwritten = false } = {}) {
     if (descriptor !== undefined) {
       fs.closeSync(descriptor);
     }
-    cleanupVerifiedTransport(directory, file, ownerFile, directoryIdentity, fileIdentity, ownerIdentity);
+    if (!retained) {
+      release();
+    }
   }
 }
 
-function resolveCommandTransport(rawArgv) {
+function resolveCommandTransport(rawArgv, { retainStaged = false } = {}) {
   const defaultWrite = rawArgv[0] === "--transport-default-write";
   const transportArgv = defaultWrite ? rawArgv.slice(1) : rawArgv;
   if (transportArgv[0] === "--request-stdin") {
@@ -716,7 +758,11 @@ function resolveCommandTransport(rawArgv) {
   if (transportArgv.length !== 2) {
     throw new CompanionError("Raw command transport requires exactly one token.", "input");
   }
-  return { argv: [consumeRawCommandTransport(transportArgv[1])], defaultWrite, ingress: "staged_file" };
+  const consumed = consumeRawCommandTransport(transportArgv[1], { retain: retainStaged });
+  if (retainStaged) {
+    return { argv: [consumed.value], defaultWrite, ingress: "staged_file", release: consumed.release };
+  }
+  return { argv: [consumed], defaultWrite, ingress: "staged_file" };
 }
 
 function readTaskPrompt(cwd, options, positionals, positionalText) {
@@ -953,6 +999,20 @@ function signalRecorded(record, prefix) {
   }
 }
 
+function deadOwnerPatch(record) {
+  const message = deadOwnerMessage(record);
+  const recorded = RESUMABLE_FAILURE_KINDS.has(record.failureKind) ? record.failureKind : null;
+  if (!recorded) {
+    return { status: "error", failureKind: "died", errorMessage: message, errorTail: message };
+  }
+  return {
+    status: "error",
+    failureKind: recorded,
+    errorMessage: record.errorMessage ?? message,
+    errorTail: record.errorTail ?? message
+  };
+}
+
 function cleanupRequired(file, failureKind, message) {
   return updateJobRecordFile(file, {
     errorMessage: message,
@@ -1002,14 +1062,8 @@ function currentProcessIdentity() {
   return identity;
 }
 
-function isSolForegroundWriteTask(record) {
-  return (
-    record.jobClass === "task" &&
-    record.delivery === "foreground" &&
-    record.mode === "write" &&
-    typeof record.resolvedModel === "string" &&
-    record.resolvedModel.toLowerCase().includes("sol")
-  );
+function isSolForegroundWriteRequest({ background, model, write }) {
+  return !background && write && typeof model === "string" && model.trim().toLowerCase() === "gpt-5.6-sol";
 }
 
 function shellArgument(value) {
@@ -1025,14 +1079,15 @@ function appendResumeFooter(text, footer) {
   return value.split("\n").includes(footer) ? value : value ? `${value}\n\n${footer}` : footer;
 }
 
-function timeoutResumePatch(record, patch) {
-  const failureKind = patch.failureKind ?? record.failureKind;
-  const threadId = patch.threadId ?? record.threadId ?? record.request?.resumeThreadId;
-  if (failureKind !== "timeout" || typeof threadId !== "string" || !threadId.trim()) {
+function resumableFailurePatch(record, patch) {
+  const next = { ...record, ...patch };
+  const failureKind = next.failureKind;
+  const threadId = next.threadId ?? next.request?.resumeThreadId;
+  if (!RESUMABLE_FAILURE_KINDS.has(failureKind) || typeof threadId !== "string" || !threadId.trim()) {
     return patch;
   }
-  const resumeCommand = timeoutResumeCommand(record, threadId);
-  const footer = `Resume Codex job ${record.id}: ${resumeCommand}`;
+  const resumeCommand = timeoutResumeCommand(next, threadId);
+  const footer = `Resume Codex job ${next.id}: ${resumeCommand}`;
   const resultText = Object.hasOwn(patch, "resultText") ? patch.resultText : record.resultText;
   const partialResultText = Object.hasOwn(patch, "partialResultText") ? patch.partialResultText : record.partialResultText;
   if (typeof resultText === "string" && resultText.trim()) {
@@ -1043,7 +1098,7 @@ function timeoutResumePatch(record, patch) {
 
 function finishJob(file, patch, env = process.env) {
   const existing = readJobRecordFile(file);
-  const record = finishJobRecordFile(file, existing ? timeoutResumePatch(existing, patch) : patch);
+  const record = finishJobRecordFile(file, existing ? resumableFailurePatch(existing, patch) : patch);
   pruneJobState(resolveDataDir(env), { claudeSessionId: record.claudeSessionId, protectedJobFiles: [file], resumeWorkspaceJobFiles: [file] });
   return record;
 }
@@ -1104,13 +1159,7 @@ export function repairRunningRecordSync({ record, file }, env = process.env) {
   if (!cleanupComplete(refreshed)) {
     return cleanupRequired(file, "died", "The companion exited without a terminal outcome, but verified process cleanup did not complete.");
   }
-  const message = deadOwnerMessage(current);
-  return finishJob(file, {
-    status: "error",
-    failureKind: "died",
-    errorMessage: message,
-    errorTail: message
-  });
+  return finishJob(file, deadOwnerPatch(current));
 }
 
 export async function refreshRunningJobRecord(found, env = process.env) {
@@ -1155,13 +1204,7 @@ export async function refreshRunningJobRecord(found, env = process.env) {
   if (!cleanupComplete(refreshed)) {
     return cleanupRequired(found.file, "died", "The companion exited without a terminal outcome, but verified process cleanup did not complete.");
   }
-  const message = deadOwnerMessage(current);
-  return finishJob(found.file, {
-    status: "error",
-    failureKind: "died",
-    errorMessage: message,
-    errorTail: message
-  });
+  return finishJob(found.file, deadOwnerPatch(current));
 }
 
 function latestResumeRecord(dataDir, cwd, claudeSessionId) {
@@ -1233,7 +1276,7 @@ function inheritedRouting(record, options, defaultServiceTier) {
   return { effort, inherited, model, serviceTier };
 }
 
-function createReservedJob({ background, brief, codexVersion, companionVersion, cwd, dataDir, jobClass, mode, request, timeoutMs }) {
+function createReservedJob({ background, brief, codexVersion, companionVersion, cwd, dataDir, diagnostics = [], jobClass, mode, request, timeoutMs }) {
   brief = boundedPrompt(brief);
   const ownerIdentity = background ? null : currentProcessIdentity();
   const reserveWorkspace = (reservedRequest) => withWorkspaceLock(dataDir, cwd, () => {
@@ -1256,6 +1299,7 @@ function createReservedJob({ background, brief, codexVersion, companionVersion, 
       companionVersion,
       cwd,
       delivery: background ? backgroundDelivery() : "foreground",
+      diagnostics,
       eventsFile: jobEventsPath(dataDir, cwd, id),
       jobClass,
       kind: jobClass,
@@ -1305,7 +1349,7 @@ function executionArgs(record) {
     model: request.model,
     serviceTier: Object.hasOwn(request, "serviceTier") ? request.serviceTier : "priority",
     network: Boolean(request.network),
-    skipGitRepoCheck: Boolean(request.skipGitRepoCheck),
+    skipGitRepoCheck: request.transport === "task" ? taskGitPreflight(record.cwd, request.write === true, Boolean(request.skipGitRepoCheck)) : Boolean(request.skipGitRepoCheck),
     web: Boolean(request.web)
   };
   if (request.transport === "native-review") {
@@ -1486,11 +1530,7 @@ async function executeRecord(found) {
     const structured = structuredOutputOutcome(record.request ?? {}, outcome);
     const resolvedModel = outcome.resolvedModel ?? record.resolvedModel;
     const modelDrift = taskModelDrift(record, prompt, resolvedModel);
-    const completedRecord = { ...record, resolvedModel };
-    const diagnostics = outcome.diagnostics.map((diagnostic) => ({ ...diagnostic, message: redactDiagnostic(diagnostic.message) }));
-    if (isSolForegroundWriteTask(completedRecord)) {
-      diagnostics.push({ type: "warning", message: SOL_FOREGROUND_WRITE_WARNING });
-    }
+    const diagnostics = [...record.diagnostics, ...outcome.diagnostics.map((diagnostic) => ({ ...diagnostic, message: redactDiagnostic(diagnostic.message) }))];
     return finishJob(found.file, {
       cumulativeTokenUsage: outcome.cumulativeTokenUsage,
       diagnostics,
@@ -1710,9 +1750,6 @@ async function dispatchJob(found, asJson) {
     return;
   }
   const completed = await executeRecord(found);
-  if (isSolForegroundWriteTask(completed)) {
-    process.stderr.write(`${SOL_FOREGROUND_WRITE_WARNING}\n`);
-  }
   renderRecord(completed, asJson);
   collectRenderedJob(found.file, completed);
   if (completed.status !== "done") {
@@ -1721,60 +1758,78 @@ async function dispatchJob(found, asJson) {
 }
 
 async function handleTask(rawArgv, transport = {}) {
-  const { options, positionals, positionalText } = commandArgs(rawArgv, {
-    booleanOptions: ["background", "fresh", "json", "network", "resume-last", "skip-git-repo-check", "web", "write"],
-    optionsBeforePositionals: true,
-    valueOptions: ["cwd", "effort", "model", "output-schema", "prompt-file", "resume", "service-tier"]
-  });
-  const serviceTier = serviceTierOption(options["service-tier"]);
-  const cwd = resolveCwd(options);
-  rejectImplicitSubdirectoryCwd(cwd, options);
-  const dataDir = resolveDataDir();
-  const resume = resolveResume(dataDir, cwd, options);
-  const routing = resume.threadId ? inheritedRouting(latestJobRecordForThread(dataDir, resume.threadId), options, serviceTier) : inheritedRouting(null, options, serviceTier);
-  const write = options.write ?? Boolean(transport.defaultWrite);
-  const outputSchemaFile = options["output-schema"] ? resolveOutputSchemaFile(cwd, options["output-schema"]) : null;
-  let prompt = readTaskPrompt(cwd, options, positionals, positionalText);
-  if (!prompt.trim() && resume.threadId) {
-    prompt = CONTINUE_PROMPT;
+  let releaseTransport = transport.release;
+  try {
+    const { options, positionals, positionalText } = commandArgs(rawArgv, {
+      booleanOptions: ["background", "fresh", "json", "network", "resume-last", "skip-git-repo-check", "web", "write"],
+      optionsBeforePositionals: true,
+      valueOptions: ["cwd", "effort", "model", "output-schema", "prompt-file", "resume", "service-tier"]
+    });
+    const serviceTier = serviceTierOption(options["service-tier"]);
+    const cwd = resolveCwd(options);
+    rejectImplicitSubdirectoryCwd(cwd, options);
+    const dataDir = resolveDataDir();
+    const resume = resolveResume(dataDir, cwd, options);
+    const routing = resume.threadId ? inheritedRouting(latestJobRecordForThread(dataDir, resume.threadId), options, serviceTier) : inheritedRouting(null, options, serviceTier);
+    const write = options.write ?? Boolean(transport.defaultWrite);
+    const background = Boolean(options.background);
+    const outputSchemaFile = options["output-schema"] ? resolveOutputSchemaFile(cwd, options["output-schema"]) : null;
+    let prompt = readTaskPrompt(cwd, options, positionals, positionalText);
+    if (!prompt.trim() && resume.threadId) {
+      prompt = CONTINUE_PROMPT;
+    }
+    if (!prompt.trim()) {
+      throw new CompanionError("Provide a Codex task prompt or --prompt-file.", "input");
+    }
+    if (options.network && !write) {
+      throw new CompanionError("--network requires --write because network access applies to the workspace-write sandbox.", "input");
+    }
+    const skipGitRepoCheck = Boolean(options["skip-git-repo-check"]);
+    taskGitPreflight(cwd, write, skipGitRepoCheck);
+    const probe = preflightCodex(cwd);
+    const request = {
+      effort: routing.effort,
+      fresh: Boolean(options.fresh),
+      ingress: transport.ingress ?? "argv",
+      model: routing.model,
+      network: Boolean(options.network),
+      outputSchemaFile,
+      resumeSourceJobId: resume.sourceJobId,
+      resumeThreadId: resume.threadId,
+      skipGitRepoCheck,
+      serviceTier: routing.serviceTier,
+      transport: "task",
+      web: Boolean(options.web),
+      write: Boolean(write),
+      ...(routing.inherited ? { inheritedFromThread: true } : {})
+    };
+    validateExecutionRequest(cwd, request);
+    const diagnostics = isSolForegroundWriteRequest({ background, model: request.model, write: request.write }) ? [{ type: "warning", message: SOL_FOREGROUND_WRITE_WARNING }] : [];
+    if (diagnostics.length > 0) {
+      process.stderr.write(`${SOL_FOREGROUND_WRITE_WARNING}\n`);
+    }
+    const found = createReservedJob({
+      background,
+      brief: prompt,
+      codexVersion: probe.version,
+      companionVersion: companionVersion(),
+      cwd,
+      dataDir,
+      diagnostics,
+      jobClass: "task",
+      mode: write ? "write" : "consult",
+      request,
+      timeoutMs: resolveExecutionTimeout(background)
+    });
+    releaseTransport?.();
+    releaseTransport = null;
+    await dispatchJob(found, Boolean(options.json));
+  } catch (error) {
+    if (!/^Codex (?:job|thread) .+ is already running/.test(error?.message ?? "")) {
+      releaseTransport?.();
+    }
+    throw error;
   }
-  if (!prompt.trim()) {
-    throw new CompanionError("Provide a Codex task prompt or --prompt-file.", "input");
-  }
-  if (options.network && !write) {
-    throw new CompanionError("--network requires --write because network access applies to the workspace-write sandbox.", "input");
-  }
-  const probe = preflightCodex(cwd);
-  const request = {
-    effort: routing.effort,
-    fresh: Boolean(options.fresh),
-    ingress: transport.ingress ?? "argv",
-    model: routing.model,
-    network: Boolean(options.network),
-    outputSchemaFile,
-    resumeSourceJobId: resume.sourceJobId,
-    resumeThreadId: resume.threadId,
-    skipGitRepoCheck: Boolean(options["skip-git-repo-check"]),
-    serviceTier: routing.serviceTier,
-    transport: "task",
-    web: Boolean(options.web),
-    write: Boolean(write),
-    ...(routing.inherited ? { inheritedFromThread: true } : {})
-  };
-  validateExecutionRequest(cwd, request);
-  const found = createReservedJob({
-    background: Boolean(options.background),
-    brief: prompt,
-    codexVersion: probe.version,
-    companionVersion: companionVersion(),
-    cwd,
-    dataDir,
-    jobClass: "task",
-    mode: write ? "write" : "consult",
-    request,
-    timeoutMs: resolveExecutionTimeout(Boolean(options.background))
-  });
-  await dispatchJob(found, Boolean(options.json));
 }
 
 function reviewTarget(options) {
@@ -2295,7 +2350,7 @@ async function main() {
     await handleRecordAcceptance(receivedArgv);
     return;
   }
-  const transport = resolveCommandTransport(receivedArgv);
+  const transport = resolveCommandTransport(receivedArgv, { retainStaged: subcommand === "task" });
   if (transport.defaultWrite && subcommand !== "task") {
     throw new CompanionError("The raw command transport write default is valid only for task.", "input");
   }
