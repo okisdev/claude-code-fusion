@@ -2960,7 +2960,7 @@ function handleStats(argv, transport = {}) {
 
 const DOCTOR_PROBE_TIMEOUT_MS = 3000;
 const SHELL_ENVIRONMENT_POLICY_DETAIL =
-  "Grok supports [shell_environment_policy] (introduced in 0.2.112, verified through 1.0.0) to control which environment variables reach shell tools in write runs.";
+  "Grok supports [shell_environment_policy] (introduced in 0.2.112, verified through 1.0.3) to control which environment variables reach shell tools in write runs.";
 
 function doctorCommandAdvisory(bin, available) {
   if (!available) {
