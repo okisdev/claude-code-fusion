@@ -416,7 +416,7 @@ test("Grok rules document source verified headless boundaries", () => {
   assert.match(doctor, /successful Grok collection remains unverified until `\/fusion:stats --record <fusion-task-id>=<accepted\|rejected>`/i);
   assert.match(doctor, /`GROK_WEB_FETCH` is pinned by web mode, `GROK_AUTO_WAKE` and `GROK_MANAGED_MCP_GATEWAY_TOOLS_ENABLED` are pinned false/);
   for (const text of [readme, security]) {
-    assert.match(text, /introduced in 0\.2\.112, verified through 1\.0\.0/);
+    assert.match(text, /introduced in 0\.2\.112, verified through 1\.0\.3/);
     assert.match(text, /file that is unlinked (?:immediately after open|as soon as it is opened)/);
     assert.match(text, /all of `\/private\/var\/folders`/);
     assert.match(text, /native MCP servers, plugins, or hooks/);

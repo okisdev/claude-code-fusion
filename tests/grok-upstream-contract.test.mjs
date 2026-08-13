@@ -85,7 +85,7 @@ test("removed capabilities are rejected by probes and fail managed-run setup", (
 test("fake Grok reports the 1.0.0 version format and supports an output override", () => {
   const defaultVersion = spawnSync(process.execPath, [fakeGrok, "--version"], { encoding: "utf8", env: {} });
   assert.equal(defaultVersion.status, 0, defaultVersion.stderr);
-  assert.equal(defaultVersion.stdout, "grok 1.0.0 (0123456789ab)\n");
+  assert.equal(defaultVersion.stdout, "grok 1.0.3 (0123456789ab)\n");
 
   const overriddenVersion = spawnSync(process.execPath, [fakeGrok, "--version"], {
     encoding: "utf8",
