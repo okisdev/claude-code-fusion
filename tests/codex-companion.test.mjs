@@ -39,6 +39,11 @@ const processInspectionTests = new Set([
   "task stays foreground by default and persists the complete terminal record",
   "sol foreground write warning is emitted before execution and recorded",
   "sol warning is limited to foreground write tasks",
+  "sol warning uses recent job records for its stat",
+  "sol warning falls back below the minimum sample",
+  "sol warning tolerates malformed job files",
+  "sol warning applies the cap after filtering matching records",
+  "sol warning skips oversized job files",
   "task resolves an output schema, forwards it, and records parsed structured output",
   "task retains a non-JSON agent message and records the structured parsing error",
   "option shaped text after a task prompt cannot enable background or change execution settings",
@@ -432,7 +437,7 @@ test("sol foreground write warning is emitted before execution and recorded", (t
       CODEX_BIN: traceCodex
     })
   });
-  const warning = "warning: 41% of foreground gpt-5.6-sol write tasks timed out in the last 7 days. Split the package or use gpt-5.6-terra.";
+  const warning = "warning: foreground gpt-5.6-sol write tasks run against a 570s flight budget. Split the package or use gpt-5.6-terra; volume shapes go to gpt-5.6-luna.";
 
   assert.equal(result.status, 1, result.stderr);
   assert.equal(result.stderr, `${warning}\n`);
@@ -442,7 +447,7 @@ test("sol foreground write warning is emitted before execution and recorded", (t
 });
 
 test("sol warning is limited to foreground write tasks", async (t) => {
-  const warning = "warning: 41% of foreground gpt-5.6-sol write tasks timed out in the last 7 days. Split the package or use gpt-5.6-terra.";
+  const warning = "warning: foreground gpt-5.6-sol write tasks run against a 570s flight budget. Split the package or use gpt-5.6-terra; volume shapes go to gpt-5.6-luna.";
   const cases = [
     { args: ["task", "--write", "--model", "gpt-5.6-terra", "use terra"], write: true },
     { args: ["task", "--model", "gpt-5.6-sol", "use sol in consult mode"], write: false }
@@ -472,6 +477,149 @@ test("sol warning is limited to foreground write tasks", async (t) => {
     return record?.status === "done" ? record : null;
   });
   assert.equal(completed.diagnostics.some((diagnostic) => diagnostic.message === warning), false);
+});
+
+function seedSolJobRecords(sandbox, entries) {
+  const records = [];
+  for (const entry of entries) {
+    const id = randomBytes(16).toString("hex");
+    const request = { background: false, write: true, ...entry.request };
+    const createdAt = entry.createdAt ?? new Date(Date.now() - 1000).toISOString();
+    const record = createJobRecord({
+      background: Boolean(request.background),
+      createdAt,
+      cwd: sandbox.workDir,
+      failureKind: entry.failureKind ?? null,
+      finishedAt: createdAt,
+      id,
+      request,
+      resolvedModel: entry.resolvedModel,
+      status: entry.status ?? (entry.failureKind ? "error" : "done")
+    });
+    const file = jobFilePath(sandbox.dataDir, sandbox.workDir, id);
+    writeJobRecordFile(file, record);
+    records.push({ file, record });
+  }
+  return records;
+}
+
+test("sol warning uses recent job records for its stat", (t) => {
+  const sandbox = makeSandbox(t);
+  initializeGitRepository(sandbox);
+  seedSolJobRecords(sandbox, [
+    { failureKind: "timeout", request: { model: "gpt-5.6-sol" } },
+    { failureKind: "timeout", request: { model: "gpt-5.6-sol" } },
+    { request: {}, resolvedModel: "gpt-5.6-sol" },
+    { request: { model: "gpt-5.6-sol" } }
+  ]);
+  const result = runCompanion(["task", "--write", "--model", "gpt-5.6-sol", "implement the measured change"], {
+    cwd: sandbox.workDir,
+    env: envFor(sandbox)
+  });
+  const warning = "warning: 50% of foreground gpt-5.6-sol write tasks timed out in the last 7 days (2 of 4). Sized to the 570s flight budget? Split the package or use gpt-5.6-terra; volume shapes go to gpt-5.6-luna.";
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(result.stderr, `${warning}\n`);
+  assert.equal(jobRecords(sandbox).filter((record) => record.diagnostics.some((diagnostic) => diagnostic.message === warning)).length, 1);
+});
+
+test("sol warning falls back below the minimum sample", (t) => {
+  const sandbox = makeSandbox(t);
+  initializeGitRepository(sandbox);
+  seedSolJobRecords(sandbox, [
+    { failureKind: "timeout", request: { model: "gpt-5.6-sol" } },
+    { request: { model: "gpt-5.6-sol" } },
+    { request: { model: "gpt-5.6-sol" } }
+  ]);
+  const result = runCompanion(["task", "--write", "--model", "gpt-5.6-sol", "implement the fallback change"], {
+    cwd: sandbox.workDir,
+    env: envFor(sandbox)
+  });
+  const warning = "warning: foreground gpt-5.6-sol write tasks run against a 570s flight budget. Split the package or use gpt-5.6-terra; volume shapes go to gpt-5.6-luna.";
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(result.stderr, `${warning}\n`);
+  assert.equal(jobRecords(sandbox).filter((record) => record.diagnostics.some((diagnostic) => diagnostic.message === warning)).length, 1);
+});
+
+test("sol warning tolerates malformed job files", (t) => {
+  const sandbox = makeSandbox(t);
+  initializeGitRepository(sandbox);
+  seedSolJobRecords(sandbox, [
+    { failureKind: "timeout", request: { model: "gpt-5.6-sol" } },
+    { request: { model: "gpt-5.6-sol" } },
+    { request: { model: "gpt-5.6-sol" } },
+    { request: { model: "gpt-5.6-sol" } }
+  ]);
+  const jobsDirectory = path.dirname(jobFilePath(sandbox.dataDir, sandbox.workDir, "malformed-job"));
+  fs.writeFileSync(path.join(jobsDirectory, "malformed-job.json"), "{not valid json\n");
+  const result = runCompanion(["task", "--write", "--model", "gpt-5.6-sol", "implement despite malformed history"], {
+    cwd: sandbox.workDir,
+    env: envFor(sandbox)
+  });
+  const warning = "warning: 25% of foreground gpt-5.6-sol write tasks timed out in the last 7 days (1 of 4). Sized to the 570s flight budget? Split the package or use gpt-5.6-terra; volume shapes go to gpt-5.6-luna.";
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(result.stderr, `${warning}\n`);
+  assert.equal(jobRecords(sandbox).filter((record) => record.diagnostics.some((diagnostic) => diagnostic.message === warning)).length, 1);
+});
+
+test("sol warning applies the cap after filtering matching records", (t) => {
+  const sandbox = makeSandbox(t);
+  initializeGitRepository(sandbox);
+  const now = Date.now();
+  const solModifiedAt = new Date(now - 2 * 60 * 1000);
+  const nonSolModifiedAt = new Date(now - 60 * 1000);
+  const solRecords = seedSolJobRecords(sandbox, [
+    { createdAt: new Date(now - 2 * 60 * 1000).toISOString(), failureKind: "timeout", request: { model: "gpt-5.6-sol" } },
+    { createdAt: new Date(now - 2 * 60 * 1000).toISOString(), failureKind: "timeout", request: { model: "gpt-5.6-sol" } },
+    { createdAt: new Date(now - 2 * 60 * 1000).toISOString(), request: { model: "gpt-5.6-sol" } },
+    { createdAt: new Date(now - 2 * 60 * 1000).toISOString(), request: { model: "gpt-5.6-sol" } }
+  ]);
+  const nonSolRecords = seedSolJobRecords(
+    sandbox,
+    Array.from({ length: 600 }, () => ({ createdAt: new Date(now - 60 * 1000).toISOString(), request: { model: "gpt-5.6-terra" } }))
+  );
+  for (const { file } of solRecords) {
+    fs.utimesSync(file, solModifiedAt, solModifiedAt);
+  }
+  for (const { file } of nonSolRecords) {
+    fs.utimesSync(file, nonSolModifiedAt, nonSolModifiedAt);
+  }
+
+  const result = runCompanion(["task", "--write", "--model", "gpt-5.6-sol", "calculate from matching history"], {
+    cwd: sandbox.workDir,
+    env: envFor(sandbox)
+  });
+  const warning = "warning: 50% of foreground gpt-5.6-sol write tasks timed out in the last 7 days (2 of 4). Sized to the 570s flight budget? Split the package or use gpt-5.6-terra; volume shapes go to gpt-5.6-luna.";
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(result.stderr, `${warning}\n`);
+});
+
+test("sol warning skips oversized job files", (t) => {
+  const sandbox = makeSandbox(t);
+  initializeGitRepository(sandbox);
+  seedSolJobRecords(sandbox, [
+    { failureKind: "timeout", request: { model: "gpt-5.6-sol" } },
+    { request: { model: "gpt-5.6-sol" } },
+    { request: { model: "gpt-5.6-sol" } },
+    { request: { model: "gpt-5.6-sol" } }
+  ]);
+  const jobsDirectory = path.dirname(jobFilePath(sandbox.dataDir, sandbox.workDir, "oversized-job"));
+  const oversizedFile = path.join(jobsDirectory, "oversized-job.json");
+  fs.writeFileSync(oversizedFile, "");
+  fs.truncateSync(oversizedFile, 16 * 1024 * 1024 + 1);
+  assert.ok(fs.statSync(oversizedFile).size > 16 * 1024 * 1024);
+
+  const result = runCompanion(["task", "--write", "--model", "gpt-5.6-sol", "ignore oversized history"], {
+    cwd: sandbox.workDir,
+    env: envFor(sandbox)
+  });
+  const warning = "warning: 25% of foreground gpt-5.6-sol write tasks timed out in the last 7 days (1 of 4). Sized to the 570s flight budget? Split the package or use gpt-5.6-terra; volume shapes go to gpt-5.6-luna.";
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(result.stderr, `${warning}\n`);
 });
 
 test("task resolves an output schema, forwards it, and records parsed structured output", (t) => {

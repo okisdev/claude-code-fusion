@@ -693,7 +693,7 @@ test("judgment posture uses the exact unverified advisory and the guard omits th
     output.hookSpecificOutput.permissionDecisionReason,
     tagMessage(
       "inline-guard.unverified-advisory",
-      "5 main loop writes are unverified in this window. Run this change's verification command once it is coherent, or hand the remaining work to a lane. Lanes: quick scoped work goes to the codex quick tier gpt-5.6-terra at effort xhigh; trivial or high volume work goes to gpt-5.6-luna at effort xhigh; work needing the Claude Code tool surface goes to fusion:claude-worker."
+      "5 main loop writes are unverified in this window. Run this change's verification command once it is coherent, or hand the remaining work to a lane. Lanes: quick scoped work goes to the codex quick tier gpt-5.6-terra at effort xhigh; trivial or high volume work goes to gpt-5.6-luna at effort xhigh; work needing the Claude Code tool surface goes to fusion:claude-worker. This session has not dispatched yet; if the remaining work splits into independent packages, dispatch them together in one message, and three or more convene /fusion:ultra."
     )
   );
   assert.doesNotMatch(fs.readFileSync(script, "utf8"), /fast-worker/);
@@ -924,6 +924,7 @@ test("advisories count writes since the most recent dispatch and restart after e
   const fifth = run(sandbox, writePayload(sandbox));
   const fifthReason = JSON.parse(fifth.stdout).hookSpecificOutput.permissionDecisionReason;
   assert.match(fifthReason, /^5 main loop writes are unverified in this window\./);
+  assert.doesNotMatch(fifthReason, /This session has not dispatched yet;/);
   assertMessageTagged(fifthReason, "inline-guard.unverified-advisory");
 
   run(sandbox, dispatchPayload(sandbox, { subagentType: "codex:codex-rescue" }));
@@ -934,6 +935,7 @@ test("advisories count writes since the most recent dispatch and restart after e
   const nextFifth = run(sandbox, writePayload(sandbox));
   const nextFifthReason = JSON.parse(nextFifth.stdout).hookSpecificOutput.permissionDecisionReason;
   assert.match(nextFifthReason, /^5 main loop writes are unverified in this window\./);
+  assert.doesNotMatch(nextFifthReason, /This session has not dispatched yet;/);
   assertMessageTagged(nextFifthReason, "inline-guard.unverified-advisory");
 
   const state = readState(sandbox, "session-1");

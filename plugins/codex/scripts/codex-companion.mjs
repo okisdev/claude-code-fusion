@@ -100,7 +100,13 @@ const RECORD_ACCEPTANCE_VALUES = new Set(["accepted", "rejected", "unverified"])
 const RECORD_ACCEPTANCE_SOURCES = new Set(["collector", "main-loop", "stats"]);
 const SEMANTIC_FAILURE_KINDS = new Set(["intent_override", "scope_rewrite", "wrong_approach", "style_mismatch"]);
 const RESUMABLE_FAILURE_KINDS = new Set(["timeout", "policy", "patch_thrash"]);
-const SOL_FOREGROUND_WRITE_WARNING = "warning: 41% of foreground gpt-5.6-sol write tasks timed out in the last 7 days. Split the package or use gpt-5.6-terra.";
+const SOL_MODEL = "gpt-5.6-sol";
+const SOL_WARNING_MIN_SAMPLE = 4;
+const SOL_WARNING_MAX_FILES = 500;
+const SOL_WARNING_MAX_EXAMINED_FILES = 5000;
+const SOL_WARNING_MAX_FILE_BYTES = 16 * 1024 * 1024;
+const SOL_WARNING_WINDOW_MS = 7 * 24 * 60 * 60 * 1000;
+const SOL_FOREGROUND_WRITE_FALLBACK_WARNING = "warning: foreground gpt-5.6-sol write tasks run against a 570s flight budget. Split the package or use gpt-5.6-terra; volume shapes go to gpt-5.6-luna.";
 let activeCommandArgv = null;
 let cachedCompanionVersion = null;
 let companionVersionRead = false;
@@ -1066,6 +1072,91 @@ function isSolForegroundWriteRequest({ background, model, write }) {
   return !background && write && typeof model === "string" && model.trim().toLowerCase() === "gpt-5.6-sol";
 }
 
+function scanSolForegroundWriteStat(dataDir) {
+  try {
+    const now = Date.now();
+    const cutoff = now - SOL_WARNING_WINDOW_MS;
+    const stateRoot = path.join(path.resolve(dataDir), "state");
+    const files = [];
+    for (const workspace of fs.readdirSync(stateRoot, { withFileTypes: true })) {
+      if (!workspace.isDirectory()) {
+        continue;
+      }
+      const directory = path.join(stateRoot, workspace.name, "jobs");
+      let entries;
+      try {
+        entries = fs.readdirSync(directory, { withFileTypes: true });
+      } catch (error) {
+        if (error?.code === "ENOENT") {
+          continue;
+        }
+        return null;
+      }
+      for (const entry of entries) {
+        if (!entry.isFile() || !entry.name.endsWith(".json")) {
+          continue;
+        }
+        const file = path.join(directory, entry.name);
+        try {
+          const stats = fs.statSync(file);
+          files.push({ file, modifiedAt: stats.mtimeMs, size: stats.size });
+        } catch {}
+      }
+    }
+    files.sort((left, right) => right.modifiedAt - left.modifiedAt || left.file.localeCompare(right.file));
+
+    let total = 0;
+    let timeouts = 0;
+    let examined = 0;
+    for (const { file, modifiedAt, size } of files) {
+      if (modifiedAt < cutoff || examined >= SOL_WARNING_MAX_EXAMINED_FILES || total >= SOL_WARNING_MAX_FILES) {
+        break;
+      }
+      examined += 1;
+      if (size > SOL_WARNING_MAX_FILE_BYTES) {
+        continue;
+      }
+      let record;
+      try {
+        record = JSON.parse(fs.readFileSync(file, "utf8"));
+      } catch {
+        continue;
+      }
+      if (!record || typeof record !== "object" || Array.isArray(record)) {
+        continue;
+      }
+      const createdAt = Date.parse(record.createdAt);
+      if (!Number.isFinite(createdAt) || createdAt < cutoff || createdAt > now) {
+        continue;
+      }
+      const request = record.request;
+      if (!request || typeof request !== "object" || Array.isArray(request) || !request.write || request.background || record.background) {
+        continue;
+      }
+      const model = request.model || record.resolvedModel;
+      if (model !== SOL_MODEL) {
+        continue;
+      }
+      total += 1;
+      if (record.failureKind === "timeout") {
+        timeouts += 1;
+      }
+    }
+    return { timeouts, total };
+  } catch {
+    return null;
+  }
+}
+
+function solForegroundWriteWarning(dataDir) {
+  const stat = scanSolForegroundWriteStat(dataDir);
+  if (!stat || stat.total < SOL_WARNING_MIN_SAMPLE) {
+    return SOL_FOREGROUND_WRITE_FALLBACK_WARNING;
+  }
+  const percentage = Math.round((100 * stat.timeouts) / stat.total);
+  return `warning: ${percentage}% of foreground gpt-5.6-sol write tasks timed out in the last 7 days (${stat.timeouts} of ${stat.total}). Sized to the 570s flight budget? Split the package or use gpt-5.6-terra; volume shapes go to gpt-5.6-luna.`;
+}
+
 function shellArgument(value) {
   return `'${String(value).replaceAll("'", "'\\''")}'`;
 }
@@ -1804,9 +1895,10 @@ async function handleTask(rawArgv, transport = {}) {
       ...(routing.inherited ? { inheritedFromThread: true } : {})
     };
     validateExecutionRequest(cwd, request);
-    const diagnostics = isSolForegroundWriteRequest({ background, model: request.model, write: request.write }) ? [{ type: "warning", message: SOL_FOREGROUND_WRITE_WARNING }] : [];
-    if (diagnostics.length > 0) {
-      process.stderr.write(`${SOL_FOREGROUND_WRITE_WARNING}\n`);
+    const warning = isSolForegroundWriteRequest({ background, model: request.model, write: request.write }) ? solForegroundWriteWarning(dataDir) : null;
+    const diagnostics = warning ? [{ type: "warning", message: warning }] : [];
+    if (warning) {
+      process.stderr.write(`${warning}\n`);
     }
     const found = createReservedJob({
       background,
