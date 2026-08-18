@@ -109,6 +109,21 @@ const FLAG_GATED_RUNNERS = new Map([
   ["prettier", new Set(["--check", "-c"])]
 ]);
 
+const PASS_SUMMARY_PATTERNS = [
+  /^\s*(?:Test Files|Tests)\s+\d+\s+passed\b/im,
+  /^\s*Tests:\s*.*\b\d+\s+passed,\s+\d+\s+total\b/im,
+  /\b\d+\s+passed\s+in\s+\S+/i,
+  /^\s*test result:\s+ok\.[^\r\n]*\b0\s+failed\b[^\r\n]*$/im,
+  /^\s*(?:ℹ\s+)?fail\s+0\b/im
+];
+
+const FAILURE_SUMMARY_PATTERNS = [
+  /^\s*(?:✖\s|not ok\b)/im,
+  /[1-9]\d*\s+fail(?:ed|ures?)\b/i,
+  /^\s*FAIL\b/m,
+  /[1-9]\d*\s+error(s)?\b/i
+];
+
 function commandHead(token) {
   const withoutPath = token.split("/").pop() ?? token;
   return withoutPath.toLowerCase();
@@ -284,7 +299,56 @@ function isVerificationCommand(command, env = process.env) {
   return verificationCommand(command, env).recognized;
 }
 
+function appendToolResponseText(value, parts, depth = 0) {
+  if (typeof value === "string") {
+    parts.push(value);
+    return;
+  }
+  if (!value || typeof value !== "object" || depth >= 4) {
+    return;
+  }
+  if (Array.isArray(value)) {
+    for (const entry of value) {
+      appendToolResponseText(entry, parts, depth + 1);
+    }
+    return;
+  }
+  for (const key of ["output", "stdout", "text", "content", "result", "toolUseResult"]) {
+    appendToolResponseText(value[key], parts, depth + 1);
+  }
+}
+
+function verificationOutputPasses(toolResponse) {
+  if (
+    !toolResponse ||
+    typeof toolResponse !== "object" ||
+    Array.isArray(toolResponse) ||
+    Boolean(toolResponse.is_error) ||
+    Boolean(toolResponse.isError) ||
+    Boolean(toolResponse.interrupted)
+  ) {
+    return false;
+  }
+  const parts = [];
+  appendToolResponseText(toolResponse, parts);
+  const output = parts.join("\n");
+  return PASS_SUMMARY_PATTERNS.some((pattern) => pattern.test(output)) && !FAILURE_SUMMARY_PATTERNS.some((pattern) => pattern.test(output));
+}
+
+function verificationEvidence(command, toolResponse, env = process.env) {
+  const verification = verificationCommand(command, env);
+  if (!verification.recognized || !toolResponse || typeof toolResponse !== "object" || Array.isArray(toolResponse)) {
+    return null;
+  }
+  if (Boolean(toolResponse.is_error) || Boolean(toolResponse.isError) || Boolean(toolResponse.interrupted)) {
+    return null;
+  }
+  return verification.observable ? "exit-status" : verificationOutputPasses(toolResponse) ? "output-summary" : null;
+}
+
 export {
   isVerificationCommand,
-  verificationCommand
+  verificationCommand,
+  verificationEvidence,
+  verificationOutputPasses
 };
