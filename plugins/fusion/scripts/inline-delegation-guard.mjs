@@ -1317,8 +1317,9 @@ function buildAdvisoryLine(writeCount, dispatchCount) {
   return countSummary + buildLaneHint();
 }
 
-function buildUnverifiedAdvisory(writeCount) {
-  return `${buildUnverifiedLine(writeCount)} Run this change's verification command once it is coherent, or hand the remaining work to a lane. ${buildLaneHint()}`;
+function buildUnverifiedAdvisory(writeCount, dispatchCount) {
+  const zeroDispatchClause = dispatchCount === 0 ? " This session has not dispatched yet; if the remaining work splits into independent packages, dispatch them together in one message, and three or more convene /fusion:ultra." : "";
+  return `${buildUnverifiedLine(writeCount)} Run this change's verification command once it is coherent, or hand the remaining work to a lane. ${buildLaneHint()}${zeroDispatchClause}`;
 }
 
 function buildTailAllowanceAdvisory(remainingTailSlots) {
@@ -1797,7 +1798,7 @@ function runHook(env = process.env, input = readHookInput()) {
       if (!advisory.suppressed) {
         const line = tagMessage(
           advisorySlug,
-          posture === STRICT_POSTURE ? buildAdvisoryLine(decision.writeCount, decision.dispatchCount) : buildUnverifiedAdvisory(decision.writeCount)
+          posture === STRICT_POSTURE ? buildAdvisoryLine(decision.writeCount, decision.dispatchCount) : buildUnverifiedAdvisory(decision.writeCount, decision.dispatchCount)
         );
         process.stdout.write(`${JSON.stringify(allowOutput(line))}\n`);
       }

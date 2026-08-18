@@ -37,6 +37,7 @@ const MESSAGE_REGISTRY = [
   { slug: "worker-lifecycle.in-flight-context", description: "Notice that tasks are still in flight with collection armed." },
   { slug: "worker-lifecycle.state-unavailable", description: "Fail closed denial or block when lifecycle state is unreadable." },
   { slug: "fleet-posture.strict-fleet-reminder", description: "Strict posture prompt reminder of the fleet default." },
+  { slug: "fleet-posture.session-lanes-reminder", description: "Once per session judgment posture reminder of lane availability and the fan out default." },
   { slug: "fleet-posture.narrow-wave-reminder", description: "Prompt reminder after consecutive width one dispatch waves." },
   { slug: "breaker-check.breaker-advisory", description: "Session start advisory that an engine circuit breaker is open." },
   { slug: "rules-sync.sync-failed", description: "Session start error that rules sync failed." },

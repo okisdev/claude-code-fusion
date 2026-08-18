@@ -12,6 +12,7 @@ const NARROW_WAVE_THRESHOLD_ENV = "FUSION_NARROW_WAVE_THRESHOLD";
 const FLEET_MODE_FILE = "fleet-mode";
 const DEFAULT_NARROW_WAVE_THRESHOLD = 2;
 const ADDITIONAL_CONTEXT = tagMessage("fleet-posture.strict-fleet-reminder", "fleet-default active: a goal that decomposes into three or more independent work packages convenes /fusion:ultra once bootstrap dependencies are resolved; narrower execution states `fleet-decline: <reason>` visibly in the reply.");
+const SESSION_LANES_REMINDER = tagMessage("fleet-posture.session-lanes-reminder", "fusion lanes ready: codex terra/luna for quick and volume packages, grok under its four roles, claude workers for the Claude surface. Independent packages dispatch together in one message; three or more convene /fusion:ultra; a single coherent change stays inline.");
 
 function readHookInput() {
   try {
@@ -42,6 +43,33 @@ function resolveNarrowWaveThreshold(env = process.env) {
   return Number.isInteger(parsed) && parsed > 0 ? parsed : DEFAULT_NARROW_WAVE_THRESHOLD;
 }
 
+function claimSessionLanesReminder(input, env = process.env) {
+  const sessionId = normalizeSessionId(input?.session_id);
+  if (!sessionId) {
+    return false;
+  }
+  const file = path.join(resolveFusionDataDir(env), "fleet-posture", "session-lanes-reminders", `${sessionId}.marker`);
+  const directory = path.dirname(file);
+  fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
+  fs.chmodSync(directory, 0o700);
+  let descriptor;
+  try {
+    descriptor = fs.openSync(file, fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_WRONLY, 0o600);
+    fs.writeFileSync(descriptor, "\n", "utf8");
+    fs.fchmodSync(descriptor, 0o600);
+    return true;
+  } catch (error) {
+    if (error?.code === "EEXIST") {
+      return false;
+    }
+    throw error;
+  } finally {
+    if (descriptor !== undefined) {
+      fs.closeSync(descriptor);
+    }
+  }
+}
+
 function readUnannouncedNarrowWaveStreak(input, env = process.env) {
   const sessionId = normalizeSessionId(input?.session_id);
   if (!sessionId) {
@@ -68,6 +96,10 @@ function main() {
   }
   if (isStrictPosture()) {
     process.stdout.write(`${JSON.stringify({ hookSpecificOutput: { hookEventName: "UserPromptSubmit", additionalContext: ADDITIONAL_CONTEXT } })}\n`);
+    return;
+  }
+  if (claimSessionLanesReminder(input)) {
+    process.stdout.write(`${JSON.stringify({ hookSpecificOutput: { hookEventName: "UserPromptSubmit", additionalContext: SESSION_LANES_REMINDER } })}\n`);
     return;
   }
   const streak = readUnannouncedNarrowWaveStreak(input);

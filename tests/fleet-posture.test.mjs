@@ -10,6 +10,7 @@ import { messageTag, tagMessage } from "../plugins/fusion/scripts/lib/user-messa
 const repoRoot = path.join(import.meta.dirname, "..");
 const script = path.join(repoRoot, "plugins", "fusion", "scripts", "fleet-posture.mjs");
 const LEGACY_CONTEXT = tagMessage("fleet-posture.strict-fleet-reminder", "fleet-default active: a goal that decomposes into three or more independent work packages convenes /fusion:ultra once bootstrap dependencies are resolved; narrower execution states `fleet-decline: <reason>` visibly in the reply.");
+const SESSION_LANES_CONTEXT = tagMessage("fleet-posture.session-lanes-reminder", "fusion lanes ready: codex terra/luna for quick and volume packages, grok under its four roles, claude workers for the Claude surface. Independent packages dispatch together in one message; three or more convene /fusion:ultra; a single coherent change stays inline.");
 
 function makeSandbox(t) {
   const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "fleet-posture-test-")));
@@ -33,6 +34,10 @@ function hookInput(sandbox, sessionId = "session-1") {
 
 function statePath(sandbox, sessionId = "session-1") {
   return path.join(sandbox.stateDir, `${sessionId}.json`);
+}
+
+function sessionLanesReminderPath(sandbox, sessionId = "session-1") {
+  return path.join(sandbox.dataDir, "fleet-posture", "session-lanes-reminders", `${sessionId}.marker`);
 }
 
 function writeState(sandbox, state, sessionId = "session-1") {
@@ -61,23 +66,30 @@ function assertSilent(result) {
 function assertContext(result, additionalContext) {
   assert.strictEqual(result.status, 0);
   assert.strictEqual(result.stderr, "");
-  const slug = additionalContext.includes("fleet-default active") ? "fleet-posture.strict-fleet-reminder" : "fleet-posture.narrow-wave-reminder";
+  const slug = additionalContext.includes("fleet-default active")
+    ? "fleet-posture.strict-fleet-reminder"
+    : additionalContext.includes("fusion lanes ready:")
+      ? "fleet-posture.session-lanes-reminder"
+      : "fleet-posture.narrow-wave-reminder";
   assert.ok(additionalContext.endsWith(messageTag(slug)));
   assert.deepStrictEqual(JSON.parse(result.stdout), {
     hookSpecificOutput: { hookEventName: "UserPromptSubmit", additionalContext }
   });
 }
 
-test("judgment posture is silent without guard state", (t) => {
+test("judgment posture emits the session lanes reminder once without guard state", (t) => {
   const sandbox = makeSandbox(t);
-  const result = run(sandbox);
 
-  assertSilent(result);
+  assertContext(run(sandbox), SESSION_LANES_CONTEXT);
+  assertSilent(run(sandbox));
   assert.strictEqual(fs.existsSync(statePath(sandbox)), false);
+  assert.strictEqual(fs.statSync(sessionLanesReminderPath(sandbox)).mode & 0o777, 0o600);
+  assert.strictEqual(fs.statSync(path.dirname(sessionLanesReminderPath(sandbox))).mode & 0o777, 0o700);
 });
 
 test("judgment posture is silent below the narrow wave threshold", (t) => {
   const sandbox = makeSandbox(t);
+  assertContext(run(sandbox), SESSION_LANES_CONTEXT);
 
   for (const streak of [0, 1]) {
     writeState(sandbox, { consecutiveNarrowWaves: streak });
@@ -90,12 +102,14 @@ test("judgment posture emits the observed narrow wave streak", (t) => {
   writeState(sandbox, { consecutiveNarrowWaves: 2 });
   const original = fs.readFileSync(statePath(sandbox), "utf8");
 
+  assertContext(run(sandbox), SESSION_LANES_CONTEXT);
   assertContext(run(sandbox), judgmentContext(2));
   assert.strictEqual(fs.readFileSync(statePath(sandbox), "utf8"), original);
 });
 
 test("judgment posture honors a valid narrow wave threshold and falls back for malformed values", (t) => {
   const sandbox = makeSandbox(t);
+  assertContext(run(sandbox), SESSION_LANES_CONTEXT);
   writeState(sandbox, { consecutiveNarrowWaves: 2 });
 
   assertSilent(run(sandbox, hookInput(sandbox), { FUSION_NARROW_WAVE_THRESHOLD: "3" }));
@@ -110,6 +124,7 @@ test("strict posture emits the legacy reminder without guard state", (t) => {
 
   assertContext(run(sandbox, hookInput(sandbox), { FUSION_POSTURE: "strict" }), LEGACY_CONTEXT);
   assert.strictEqual(fs.existsSync(statePath(sandbox)), false);
+  assert.strictEqual(fs.existsSync(sessionLanesReminderPath(sandbox)), false);
 });
 
 test("FUSION_FLEET_MODE=off suppresses both postures", (t) => {
@@ -118,6 +133,7 @@ test("FUSION_FLEET_MODE=off suppresses both postures", (t) => {
 
   assertSilent(run(sandbox, hookInput(sandbox), { FUSION_FLEET_MODE: "off" }));
   assertSilent(run(sandbox, hookInput(sandbox), { FUSION_FLEET_MODE: "off", FUSION_POSTURE: "strict" }));
+  assert.strictEqual(fs.existsSync(sessionLanesReminderPath(sandbox)), false);
 });
 
 test("the fleet mode state file suppresses both postures", (t) => {
@@ -128,6 +144,7 @@ test("the fleet mode state file suppresses both postures", (t) => {
 
   assertSilent(run(sandbox));
   assertSilent(run(sandbox, hookInput(sandbox), { FUSION_POSTURE: "strict" }));
+  assert.strictEqual(fs.existsSync(sessionLanesReminderPath(sandbox)), false);
 });
 
 test("an enabled environment mode overrides a disabled state file", (t) => {
@@ -138,11 +155,12 @@ test("an enabled environment mode overrides a disabled state file", (t) => {
   assertContext(run(sandbox, hookInput(sandbox), { FUSION_FLEET_MODE: "on", FUSION_POSTURE: "strict" }), LEGACY_CONTEXT);
 });
 
-test("invalid guard state is silent", (t) => {
+test("invalid guard state is silent after the session lanes reminder", (t) => {
   const sandbox = makeSandbox(t);
 
   fs.mkdirSync(sandbox.stateDir, { recursive: true });
   fs.writeFileSync(statePath(sandbox), "{not json", "utf8");
+  assertContext(run(sandbox), SESSION_LANES_CONTEXT);
   assertSilent(run(sandbox));
   assertSilent(run(sandbox, hookInput(sandbox, undefined)));
   writeState(sandbox, { consecutiveNarrowWaves: "2" });
