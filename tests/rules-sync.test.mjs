@@ -395,9 +395,9 @@ test("Grok rules document source verified headless boundaries", () => {
   assert.match(contract, /Upstream ships ACP today/);
   assert.match(contract, /The companion has not adopted ACP yet and continues per-call invocation/);
   assert.match(codexContract, /failureKind: "setup".*below the tested minimum 0\.147\.0/);
-  assert.match(codexContract, /The tested interval runs from 0\.147\.0 up to but excluding 0\.148\.0; versions below 0\.147\.0 fail task and review preflight with a setup error; versions at or above 0\.148\.0 keep running task and review preflight while `\/codex:setup` reports not ready with exit code 1 as the compatibility advisory/);
+  assert.match(codexContract, /The tested interval runs from 0\.147\.0 up to but excluding 0\.153\.0; versions below 0\.147\.0 fail task and review preflight with a setup error; versions at or above 0\.153\.0 keep running task and review preflight while `\/codex:setup` reports not ready with exit code 1 as the compatibility advisory/);
   assert.match(codexContract, /Codex configuration parse failures under `--strict-config`.*failureKind: "process"/);
-  assert.match(sharedContract, /The Grok instance adds `sandbox`[^\n]*`transport`[^\n]*`policy`[^\n]*and `turn_limit`/);
+  assert.match(sharedContract, /The Grok instance adds `sandbox`[^\n]*`transport`[^\n]*`policy`[^\n]*`turn_limit`[^\n]*and `network`/);
   assert.match(sharedContract, /`setup`: The installed CLI version or installation lacks a required adapter capability and fails capability preflight/);
   assert.doesNotMatch(sharedContract, /structured output that remains invalid after its corrective retry/);
   assert.match(troubleshooting, /\| setup \| Do not retry the same task against the incompatible CLI surface/);
@@ -416,7 +416,7 @@ test("Grok rules document source verified headless boundaries", () => {
   assert.match(doctor, /successful Grok collection remains unverified until `\/fusion:stats --record <fusion-task-id>=<accepted\|rejected>`/i);
   assert.match(doctor, /`GROK_WEB_FETCH` is pinned by web mode, `GROK_AUTO_WAKE` and `GROK_MANAGED_MCP_GATEWAY_TOOLS_ENABLED` are pinned false/);
   for (const text of [readme, security]) {
-    assert.match(text, /introduced in 0\.2\.112, verified through 1\.0\.3/);
+    assert.match(text, /introduced in 0\.2\.112, verified through 1\.0\.13/);
     assert.match(text, /file that is unlinked (?:immediately after open|as soon as it is opened)/);
     assert.match(text, /all of `\/private\/var\/folders`/);
     assert.match(text, /native MCP servers, plugins, or hooks/);
