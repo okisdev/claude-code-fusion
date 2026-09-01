@@ -88,7 +88,7 @@ const BACKGROUND_ABORT_CLAIM_WAIT_MS = 2000;
 const BACKGROUND_ABORT_CLEANUP_CONFIRM_MS = 1000;
 const BACKGROUND_ABORT_CLEANUP_POLL_MS = 50;
 const TESTED_VERSION_MIN = [0, 147, 0];
-const TESTED_VERSION_MAX = [0, 148, 0];
+const TESTED_VERSION_MAX = [0, 153, 0];
 const CONTINUE_PROMPT = "Continue from the current Codex thread state. Complete the next highest value step and continue until the task is resolved.";
 const TRANSPORT_DIRECTORY_PREFIX = "codex-companion-input-";
 const TRANSPORT_TOKEN_PATTERN = /^[a-f0-9]{48}$/;
@@ -98,7 +98,7 @@ const TRANSPORT_MAX_AGE_MS = 60 * 60 * 1000;
 const RECORD_ACCEPTANCE_JOB_ID_PATTERN = /^[a-f0-9]{32}$/;
 const RECORD_ACCEPTANCE_VALUES = new Set(["accepted", "rejected", "unverified"]);
 const RECORD_ACCEPTANCE_SOURCES = new Set(["collector", "main-loop", "stats"]);
-const SEMANTIC_FAILURE_KINDS = new Set(["intent_override", "scope_rewrite", "wrong_approach", "style_mismatch"]);
+const SEMANTIC_FAILURE_KINDS = new Set(["intent_override", "scope_rewrite", "wrong_approach", "style_mismatch", "oversized"]);
 const RESUMABLE_FAILURE_KINDS = new Set(["timeout", "policy", "patch_thrash"]);
 const SOL_MODEL = "gpt-5.6-sol";
 const SOL_WARNING_MIN_SAMPLE = 4;
@@ -193,7 +193,7 @@ function recordAcceptanceArgs(argv) {
     throw new CompanionError("The --acceptance option must be accepted, rejected, or unverified.", "input");
   }
   if (options.failureKind !== undefined && !SEMANTIC_FAILURE_KINDS.has(options.failureKind)) {
-    throw new CompanionError("The --failure-kind option must be intent_override, scope_rewrite, wrong_approach, or style_mismatch.", "input");
+    throw new CompanionError("The --failure-kind option must be intent_override, scope_rewrite, wrong_approach, style_mismatch, or oversized.", "input");
   }
   if (options.failureKind !== undefined && options.acceptance !== "rejected") {
     throw new CompanionError("The --failure-kind option is valid only with --acceptance rejected.", "input");
@@ -1629,6 +1629,7 @@ async function executeRecord(found) {
       errorTail: outcome.status === "done" ? null : errorTail || outcome.errorMessage,
       eventsTruncated: outcome.eventsTruncated,
       exitCode: outcome.exitCode,
+      fileChangeCount: outcome.fileChangeCount,
       failureKind: outcome.failureKind,
       protocolError: outcome.protocolError ? redactDiagnostic(outcome.protocolError) : null,
       partialResultText: outcome.partialResultText ? redactDiagnostic(outcome.partialResultText) : null,

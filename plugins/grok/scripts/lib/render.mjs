@@ -515,6 +515,7 @@ export function renderSetupReport(report) {
     "Checks:",
     `- grok binary (${report.grok.bin}): ${report.grok.available ? report.grok.detail : `unavailable, ${report.grok.detail}`}`,
     `- headless safety capabilities: ${report.capabilities?.ready ? "ready" : `not ready, ${report.capabilities?.detail ?? "not checked"}`}`,
+    `- host environment: ${report.hostEnvironment?.ready ? "ready" : `needs attention, ${report.hostEnvironment?.detail ?? "not checked"}`}`,
     `- data dir: ${report.dataDir.writable ? `writable (${report.dataDir.path})` : `not writable (${report.dataDir.detail})`}`,
     `- stop gate: ${report.stopGate ? "enabled" : "disabled"}`,
     `- continuity: ${report.continuityPolicy ?? "manual"}`,
@@ -527,6 +528,9 @@ export function renderSetupReport(report) {
   }
   if (report.grok.available && !report.capabilities?.ready) {
     nextSteps.push("Upgrade the grok CLI to a build that exposes the required headless safety capabilities.");
+  }
+  if (!report.hostEnvironment?.ready && report.hostEnvironment?.runtimeSocketSymlinks?.length > 0) {
+    nextSteps.push(`Stop the Docker engine that creates ${report.hostEnvironment.runtimeSocketSymlinks.join(", ")}, or remove the symlink. Do not downgrade the sandbox.`);
   }
   if (!report.dataDir.writable) {
     nextSteps.push(`Fix permissions on ${report.dataDir.path}.`);

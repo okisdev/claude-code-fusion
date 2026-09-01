@@ -1099,6 +1099,7 @@ function validateEvent(state, event) {
         state.collaborationViolation = `Delegated Codex execution attempted the disabled ${tool} tool.`;
       }
       if (event.type === "item.completed" && event.item.type === "file_change") {
+        state.fileChangeCount += 1;
         state.patchFailureCount = 0;
       }
       if (event.type === "item.completed" && event.item.type === "agent_message" && typeof event.item.text === "string") {
@@ -1291,6 +1292,7 @@ export async function runCodex(options = {}) {
     eventCount: 0,
     eventsTruncated: false,
     execLost: false,
+    fileChangeCount: 0,
     expectedResumeThreadId: typeof options.resumeThreadId === "string" && options.resumeThreadId.trim() ? options.resumeThreadId.trim() : null,
     finalResponse: "",
     lostProcessCount: 0,
@@ -1695,6 +1697,7 @@ export async function runCodex(options = {}) {
     ...usage,
     eventCount: state.eventCount,
     eventsTruncated: state.eventsTruncated,
+    fileChangeCount: state.fileChangeCount,
     unknownEventCount: state.unknownEventCount,
     diagnostics: state.diagnostics,
     protocolError: state.protocolError,

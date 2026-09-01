@@ -5,6 +5,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { recordEngineAcceptance } from "./lib/engine-acceptance.mjs";
+import { readEngineJobFailureKind } from "./lib/engine-job-state.mjs";
 import { appendTokenUsageObservation, fusionRepositoryKey } from "./fusion-stats.mjs";
 import { tagMessage } from "./lib/user-messages.mjs";
 import {
@@ -91,8 +92,8 @@ export function workerLimits(agentType, env = process.env, sizing) {
     : canonical === "fusion:job-collector"
       ? { wallClockMs: 540_000, stallMs: 540_000, maxTurns: 6, maxOutputTokens: 8_000, maxUncachedTokens: 30_000 }
       : canonical === "fusion:deep-reasoner"
-        ? { wallClockMs: 480_000, stallMs: 300_000, maxTurns: 30, maxOutputTokens: 24_000, maxUncachedTokens: 120_000 }
-        : { wallClockMs: 1_200_000, stallMs: 300_000, maxTurns: 60, maxOutputTokens: 48_000, maxUncachedTokens: 360_000 };
+        ? { wallClockMs: 480_000, stallMs: 600_000, maxTurns: 30, maxOutputTokens: 48_000, maxUncachedTokens: 120_000 }
+        : { wallClockMs: 1_200_000, stallMs: 600_000, maxTurns: 60, maxOutputTokens: 48_000, maxUncachedTokens: 360_000 };
   const multiplier = sizing === "small" ? 0.5 : sizing === "large" ? 2 : 1;
   const scaled = Object.fromEntries(Object.entries(defaults).map(([name, value]) => [name, Math.round(value * multiplier)]));
   return {
@@ -751,6 +752,16 @@ function handlePreToolUse(input, env) {
     return;
   }
   const failure = workerBudgetFailure(refreshed);
+  if (failure?.failureKind === "stall") {
+    const now = new Date().toISOString();
+    updateLifecycleWorkerRecord(refreshed.taskId, env, (current) => {
+      if (!current || isTerminalWorkerStatus(current.transportStatus)) {
+        return null;
+      }
+      return { ...current, lastLivenessAt: now, lastActivityAt: now, inFlightSince: now };
+    });
+    return;
+  }
   if (failure) {
     markBudgetFailure(refreshed, failure, env);
     if (failure.failureKind === "token_limit" && input.tool_name === "Write" && !refreshed.terminalWriteGraceUsedAt) {
@@ -893,6 +904,33 @@ function regularFileExists(file) {
   }
 }
 
+function durableSubagentTranscript(record) {
+  const transcriptPath = typeof record.transcriptPath === "string" && path.isAbsolute(record.transcriptPath) ? path.resolve(record.transcriptPath) : null;
+  const parentTranscriptPath = typeof record.parentTranscriptPath === "string" && path.isAbsolute(record.parentTranscriptPath) ? path.resolve(record.parentTranscriptPath) : null;
+  const agentId = typeof record.agentId === "string" && record.agentId ? path.basename(record.agentId) : null;
+  if (!transcriptPath || !parentTranscriptPath || !agentId || path.basename(path.dirname(transcriptPath)) !== "tasks") {
+    return transcriptPath;
+  }
+  const durablePath = path.join(path.dirname(parentTranscriptPath), "subagents", `agent-${agentId}.jsonl`);
+  return regularFileExists(durablePath) ? durablePath : transcriptPath;
+}
+
+function withDurableCancellationTranscript(record) {
+  if (record.transportStatus !== "cancelled") {
+    return record;
+  }
+  const transcriptPath = durableSubagentTranscript(record);
+  return transcriptPath && transcriptPath !== record.transcriptPath ? { ...record, transcriptPath } : record;
+}
+
+function withPeerFailureKind(record, env) {
+  if (record.peerFailureKind != null || !["codex", "grok"].includes(record.peerEngine) || !ENGINE_JOB_ID_PATTERN.test(record.peerJobId ?? "")) {
+    return record;
+  }
+  const peerFailureKind = readEngineJobFailureKind(record.peerEngine, record.peerJobId, env);
+  return peerFailureKind == null ? record : { ...record, peerFailureKind };
+}
+
 function outputFileFromLaunchResponse(response, nested) {
   const direct = [response.outputFile, response.output_file, nested.outputFile, nested.output_file].map(absoluteOutputFile).find(Boolean);
   if (direct) {
@@ -981,8 +1019,9 @@ function backfillCollectedTaskOutput(record, input) {
 }
 
 function settleQueuedVerdict(record, now, env) {
-  const pendingVerdict = record.pendingVerdict;
-  const settled = applyQueuedVerdict(record, now);
+  const prepared = withPeerFailureKind(withDurableCancellationTranscript(record), env);
+  const pendingVerdict = prepared.pendingVerdict;
+  const settled = applyQueuedVerdict(prepared, now);
   if (!pendingVerdict || settled.pendingVerdict || settled.acceptanceRecordedAt == null) {
     return settled;
   }
@@ -1133,7 +1172,7 @@ function handlePostToolUse(input, env, failed = false) {
             ? capturedPeerIdentity(worker.agentType, collectedResultText, worker.peerEngine)
             : {};
           if (terminalCollectedRecord(worker)) {
-            return peerIdentityBackfill(worker, peerIdentity);
+            return peerIdentityBackfill(worker, peerIdentity, env);
           }
           const transportStatus = input.tool_name === "TaskStop" ? "cancelled" : "done";
           const collectionMethod = input.tool_name === "Read"
@@ -1316,7 +1355,7 @@ function handleSubagentStop(input, env) {
   const message = typeof input.last_assistant_message === "string" ? input.last_assistant_message : "";
   if (terminalCollectedRecord(refreshed)) {
     const peerIdentity = PEER_JOB_FOOTER_AGENTS.has(refreshed.agentType) ? capturedPeerIdentity(refreshed.agentType, message, refreshed.peerEngine) : {};
-    updateLifecycleWorkerRecord(refreshed.taskId, env, (current) => current && terminalCollectedRecord(current) ? peerIdentityBackfill(current, peerIdentity) : null);
+    updateLifecycleWorkerRecord(refreshed.taskId, env, (current) => current && terminalCollectedRecord(current) ? peerIdentityBackfill(current, peerIdentity, env) : null);
     return;
   }
   const failure = workerBudgetFailure(refreshed);
@@ -1363,7 +1402,7 @@ function handleSubagentStop(input, env) {
     const worker = current;
     const peerIdentity = PEER_JOB_FOOTER_AGENTS.has(worker.agentType) ? capturedPeerIdentity(worker.agentType, message, worker.peerEngine) : {};
     if (terminalCollectedRecord(worker)) {
-      return peerIdentityBackfill(worker, peerIdentity);
+      return peerIdentityBackfill(worker, peerIdentity, env);
     }
     const runtimeAsync = worker.runtimeAsync === true;
     const successfulCompletion = complete && !failure && trustedCollectorReport?.kind !== "outcome" && !collectorProtocolFailure;
@@ -1432,9 +1471,12 @@ function terminalCollectedRecord(record) {
   return Boolean(record) && isTerminalWorkerStatus(record.transportStatus) && Boolean(record.collectedAt) && (isSettledWorker(record) || record.awaitingVerdict === true || record.acceptance === "unverified");
 }
 
-function peerIdentityBackfill(record, identity) {
+function peerIdentityBackfill(record, identity, env) {
   const additions = Object.fromEntries(Object.entries(identity).filter(([key, value]) => value != null && record[key] == null));
-  return Object.keys(additions).length > 0 ? { ...record, ...additions } : null;
+  if (Object.keys(additions).length === 0) {
+    return null;
+  }
+  return withPeerFailureKind({ ...record, ...additions }, env);
 }
 
 function taskNotificationTextParts(value) {

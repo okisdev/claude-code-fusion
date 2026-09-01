@@ -148,7 +148,7 @@ test("collection method write sites use the canonical set", () => {
 test("worker limits preserve the default budgets and expose only the timing seams to the environment", () => {
   assert.deepStrictEqual(workerLimits("fusion:claude-worker", {}), {
     wallClockMs: 1_200_000,
-    stallMs: 300_000,
+    stallMs: 600_000,
     maxTurns: 60,
     maxOutputTokens: 48_000,
     maxUncachedTokens: 360_000
@@ -239,6 +239,41 @@ test("a worker with no tool call history stalls exactly as it did before in-flig
   assert.strictEqual(workerBudgetFailure(neverCalled, Date.parse(neverCalled.startedAt) + 60).failureKind, "stall");
 });
 
+test("a surfaced worker tool call receives stall amnesty and refreshes liveness", (t) => {
+  const box = sandbox(t);
+  const limits = { FUSION_WORKER_WALL_CLOCK_MS: "999999", FUSION_WORKER_STALL_MS: "60" };
+  run(box, dispatch(box), limits);
+  run(box, {
+    hook_event_name: "SubagentStart",
+    session_id: "session-1",
+    cwd: box.cwd,
+    transcript_path: box.transcript,
+    agent_id: "surfaced-stall",
+    agent_type: "fusion:claude-worker"
+  }, limits);
+  const staleLivenessAt = new Date(Date.now() - 1_000).toISOString();
+  updateWorkerRecord(record(box).taskId, envFor(box), (current) => ({ ...current, lastLivenessAt: staleLivenessAt }));
+
+  const preTool = run(box, {
+    hook_event_name: "PreToolUse",
+    session_id: "session-1",
+    cwd: box.cwd,
+    transcript_path: box.transcript,
+    agent_id: "surfaced-stall",
+    agent_type: "fusion:claude-worker",
+    tool_name: "Write",
+    tool_input: { file_path: "src/a.ts", content: "done" }
+  }, limits);
+
+  assert.strictEqual(preTool.status, 0, preTool.stderr);
+  assert.strictEqual(preTool.stdout, "");
+  const surfaced = record(box);
+  assert.ok(Date.parse(surfaced.lastLivenessAt) > Date.parse(staleLivenessAt));
+  assert.strictEqual(surfaced.failureKind, null);
+  assert.notStrictEqual(surfaced.transportStatus, "cancel_requested");
+  assert.ok(surfaced.inFlightSince);
+});
+
 test("an in-flight tool call suspends the stall budget but not the wall clock, and stalling resumes once it completes or fails", (t) => {
   const STALL_BUDGET_MS = 600_000;
   const box = sandbox(t);
@@ -316,9 +351,9 @@ test("an in-flight tool call suspends the stall budget but not the wall clock, a
 
 test("brief sizing hints scale dispatch limits", (t) => {
   const cases = [
-    ["SMALL", { wallClockMs: 600_000, stallMs: 150_000, maxTurns: 30, maxOutputTokens: 24_000, maxUncachedTokens: 180_000 }],
-    ["StAnDaRd", { wallClockMs: 1_200_000, stallMs: 300_000, maxTurns: 60, maxOutputTokens: 48_000, maxUncachedTokens: 360_000 }],
-    ["large", { wallClockMs: 2_400_000, stallMs: 600_000, maxTurns: 120, maxOutputTokens: 96_000, maxUncachedTokens: 720_000 }]
+    ["SMALL", { wallClockMs: 600_000, stallMs: 300_000, maxTurns: 30, maxOutputTokens: 24_000, maxUncachedTokens: 180_000 }],
+    ["StAnDaRd", { wallClockMs: 1_200_000, stallMs: 600_000, maxTurns: 60, maxOutputTokens: 48_000, maxUncachedTokens: 360_000 }],
+    ["large", { wallClockMs: 2_400_000, stallMs: 1_200_000, maxTurns: 120, maxOutputTokens: 96_000, maxUncachedTokens: 720_000 }]
   ];
 
   for (const [sizing, limits] of cases) {
@@ -366,6 +401,16 @@ test("trivial worker limits raise token budgets and scale with the sizing hint",
     maxTurns: 8,
     maxOutputTokens: 12_000,
     maxUncachedTokens: 60_000
+  });
+});
+
+test("deep reasoner limits raise the advisory output and stall budgets", () => {
+  assert.deepStrictEqual(workerLimits("fusion:deep-reasoner", {}), {
+    wallClockMs: 480_000,
+    stallMs: 600_000,
+    maxTurns: 30,
+    maxOutputTokens: 48_000,
+    maxUncachedTokens: 120_000
   });
 });
 
@@ -659,6 +704,58 @@ test("an async launch receipt persists its transcript path and starts the worker
   assert.strictEqual(launched.transcriptPath, outputFile);
   assert.strictEqual(launched.outputFile, null);
   assert.ok(Number.isFinite(Date.parse(launched.startedAt)));
+});
+
+test("cancellation settlements replace task temp transcripts with durable subagent transcripts", (t) => {
+  const taskStop = sandbox(t);
+  const taskStopTemp = path.join(taskStop.root, "tasks", "task-stop.output");
+  const taskStopDurable = path.join(path.dirname(taskStop.transcript), "subagents", "agent-task-stop-durable.jsonl");
+  fs.mkdirSync(path.dirname(taskStopTemp), { recursive: true });
+  fs.mkdirSync(path.dirname(taskStopDurable), { recursive: true });
+  fs.writeFileSync(taskStopTemp, "temporary output\n", "utf8");
+  fs.writeFileSync(taskStopDurable, "durable transcript\n", "utf8");
+  const taskStopDispatch = dispatch(taskStop);
+  run(taskStop, taskStopDispatch);
+  run(taskStop, {
+    ...taskStopDispatch,
+    hook_event_name: "PostToolUse",
+    tool_response: { isAsync: true, status: "async_launched", agentId: "task-stop-durable", outputFile: taskStopTemp }
+  });
+  run(taskStop, {
+    hook_event_name: "PostToolUse",
+    session_id: "session-1",
+    cwd: taskStop.cwd,
+    transcript_path: taskStop.transcript,
+    tool_name: "TaskStop",
+    tool_input: { task_id: "task-stop-durable" },
+    tool_response: { status: "cancelled" }
+  });
+  assert.strictEqual(record(taskStop).transcriptPath, taskStopDurable);
+
+  const notification = sandbox(t);
+  const notificationTemp = path.join(notification.root, "tasks", "notification.output");
+  const notificationDurable = path.join(path.dirname(notification.transcript), "subagents", "agent-notification-durable.jsonl");
+  fs.mkdirSync(path.dirname(notificationTemp), { recursive: true });
+  fs.mkdirSync(path.dirname(notificationDurable), { recursive: true });
+  fs.writeFileSync(notificationTemp, "temporary output\n", "utf8");
+  fs.writeFileSync(notificationDurable, "durable transcript\n", "utf8");
+  const notificationDispatch = dispatch(notification);
+  run(notification, notificationDispatch);
+  run(notification, {
+    ...notificationDispatch,
+    hook_event_name: "PostToolUse",
+    tool_response: { isAsync: true, status: "async_launched", agentId: "notification-durable", outputFile: notificationTemp }
+  });
+  fs.appendFileSync(notification.transcript, `${JSON.stringify({ type: "user", message: { content: "<task-notification>\n<task-id>notification-durable</task-id>\n<status>cancelled</status>\n</task-notification>" } })}\n`, "utf8");
+  run(notification, {
+    hook_event_name: "Stop",
+    session_id: "session-1",
+    cwd: notification.cwd,
+    transcript_path: notification.transcript,
+    stop_hook_active: true,
+    background_tasks: []
+  });
+  assert.strictEqual(record(notification).transcriptPath, notificationDurable);
 });
 
 test("peer wrapper Agents reject runtime background mode while the managed review runner remains exempt", (t) => {
@@ -1002,6 +1099,37 @@ test("SubagentStop keeps a newly evaluated budget failure instead of recovering 
   assert.strictEqual(completed.collectionMethod, "subagent_stop");
   assert.ok(completed.collectedAt);
   assert.strictEqual(completed.recoveredFailureKind, undefined);
+});
+
+test("SubagentStop terminalizes a stalled worker that does not surface with a tool call", (t) => {
+  const box = sandbox(t);
+  const limits = { FUSION_WORKER_WALL_CLOCK_MS: "999999", FUSION_WORKER_STALL_MS: "60" };
+  run(box, dispatch(box), limits);
+  run(box, {
+    hook_event_name: "SubagentStart",
+    session_id: "session-1",
+    cwd: box.cwd,
+    transcript_path: box.transcript,
+    agent_id: "subagent-stop-stall",
+    agent_type: "fusion:claude-worker"
+  }, limits);
+  updateWorkerRecord(record(box).taskId, envFor(box), (current) => ({ ...current, lastLivenessAt: new Date(Date.now() - 1_000).toISOString() }));
+
+  run(box, {
+    hook_event_name: "SubagentStop",
+    session_id: "session-1",
+    cwd: box.cwd,
+    transcript_path: box.transcript,
+    agent_id: "subagent-stop-stall",
+    agent_type: "fusion:claude-worker",
+    stop_hook_active: true,
+    last_assistant_message: "partial result"
+  }, limits);
+
+  const stopped = record(box);
+  assert.strictEqual(stopped.transportStatus, "failed");
+  assert.strictEqual(stopped.failureKind, "stall");
+  assert.strictEqual(stopped.collectionMethod, "subagent_stop");
 });
 
 test("SubagentStop retains failed and incomplete workers on their existing collection path", (t) => {
@@ -3128,6 +3256,10 @@ test("an async collector keeps its Read collection requirement", (t) => {
 test("a structured Codex collection persists final text and remains gated until semantic judgment", (t) => {
   const box = sandbox(t);
   const peerJobId = "c".repeat(32);
+  const codexState = path.join(box.root, "codex-state");
+  const peerJobFile = path.join(codexState, "workspace", "jobs", `${peerJobId}.json`);
+  fs.mkdirSync(path.dirname(peerJobFile), { recursive: true });
+  fs.writeFileSync(peerJobFile, `${JSON.stringify({ id: peerJobId, status: "error", failureKind: "timeout" })}\n`, "utf8");
   run(box, dispatch(box, { subagent_type: "fusion:job-collector", prompt: collectorPrompt("codex", peerJobId) }));
   run(box, {
     hook_event_name: "SubagentStart",
@@ -3147,13 +3279,14 @@ test("a structured Codex collection persists final text and remains gated until 
     agent_type: "fusion:job-collector",
     stop_hook_active: false,
     last_assistant_message: finalMessage
-  });
+  }, { FUSION_CODEX_STATE: codexState });
   assert.strictEqual(stopped.stdout, "");
   const collector = record(box);
   assert.strictEqual(collector.transportStatus, "done");
   assert.strictEqual(collector.peerJobId, peerJobId);
   assert.strictEqual(collector.peerTransportStatus, "done");
   assert.strictEqual(collector.peerSemanticStatus, "unverified");
+  assert.strictEqual(collector.peerFailureKind, "timeout");
   assert.strictEqual(collector.acceptanceRecordedAt, undefined);
   assert.strictEqual(fs.readFileSync(collector.outputFile, "utf8"), finalMessage);
 
@@ -3192,8 +3325,9 @@ test("a structured Grok collection remains gated until the main loop records a s
     agent_type: "fusion:job-collector",
     stop_hook_active: false,
     last_assistant_message: `Grok transport completed, but the task still needs verification.\ncollector: state=done semantic=unverified engine=grok job=${peerJobId} elapsed=3s`
-  });
+  }, { GROK_COMPANION_DATA: path.join(box.root, "missing-grok-data") });
   const collector = record(box);
+  assert.strictEqual(collector.peerFailureKind, null);
 
   const blocked = run(box, {
     hook_event_name: "Stop",
@@ -3464,6 +3598,34 @@ test("worker tool calls are denied after the wall clock budget and cancellation 
   }, limits);
   assert.strictEqual(JSON.parse(preTool.stdout).hookSpecificOutput.permissionDecision, "deny");
   assert.strictEqual(record(box).failureKind, "timeout");
+});
+
+test("the parent Stop sweep requests cancellation for a worker that remains stalled", (t) => {
+  const box = sandbox(t);
+  const limits = { FUSION_WORKER_WALL_CLOCK_MS: "999999", FUSION_WORKER_STALL_MS: "60" };
+  const workerDispatch = dispatch(box);
+  run(box, workerDispatch, limits);
+  run(box, {
+    ...workerDispatch,
+    hook_event_name: "PostToolUse",
+    tool_response: { isAsync: true, status: "async_launched", agentId: "parent-stop-stall" }
+  }, limits);
+  updateWorkerRecord(record(box).taskId, envFor(box), (current) => ({ ...current, inFlightSince: undefined, lastLivenessAt: new Date(Date.now() - 1_000).toISOString() }));
+
+  const stopped = run(box, {
+    hook_event_name: "Stop",
+    session_id: "session-1",
+    cwd: box.cwd,
+    transcript_path: box.transcript,
+    stop_hook_active: false,
+    last_assistant_message: "waiting",
+    background_tasks: [{ id: "parent-stop-stall", type: "subagent", status: "running", agent_type: "fusion:claude-worker" }]
+  }, limits);
+
+  assert.strictEqual(JSON.parse(stopped.stdout).decision, "block");
+  assert.match(JSON.parse(stopped.stdout).reason, /TaskStop/);
+  assert.strictEqual(record(box).transportStatus, "cancel_requested");
+  assert.strictEqual(record(box).failureKind, "stall");
 });
 
 test("a token limit permits exactly one final deliverable Write", (t) => {
@@ -3894,6 +4056,10 @@ test("a task notification output file stamps a null transcript path and writes f
 test("a completed task notification captures a Codex peer job footer", (t) => {
   const box = sandbox(t);
   const peerJobId = "f".repeat(32);
+  const codexState = path.join(box.root, "codex-state");
+  const peerJobFile = path.join(codexState, "workspace", "jobs", `${peerJobId}.json`);
+  fs.mkdirSync(path.dirname(peerJobFile), { recursive: true });
+  fs.writeFileSync(peerJobFile, `${JSON.stringify({ id: peerJobId, status: "error", failureKind: "network" })}\n`, "utf8");
   const workerTranscript = path.join(box.root, "notification-codex-rescue.output");
   const finalMessage = `completed rescue\ncodex-session: session-1\njob: ${peerJobId}\nsemantic: unverified\nstate: done`;
   fs.writeFileSync(workerTranscript, `${JSON.stringify({ type: "assistant", message: { content: [{ type: "text", text: finalMessage }] } })}\n`, "utf8");
@@ -3916,7 +4082,7 @@ test("a completed task notification captures a Codex peer job footer", (t) => {
     transcript_path: box.transcript,
     stop_hook_active: true,
     background_tasks: []
-  });
+  }, { FUSION_CODEX_STATE: codexState });
 
   const collected = record(box);
   assert.strictEqual(collected.transcriptPath, workerTranscript);
@@ -3924,6 +4090,7 @@ test("a completed task notification captures a Codex peer job footer", (t) => {
   assert.strictEqual(collected.failureKind, null);
   assert.strictEqual(collected.peerJobId, peerJobId);
   assert.strictEqual(collected.peerEngine, "codex");
+  assert.strictEqual(collected.peerFailureKind, "network");
   assert.strictEqual(collected.peerTransportStatus, undefined);
   assert.strictEqual(collected.peerSemanticStatus, undefined);
 });

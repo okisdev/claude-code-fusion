@@ -29,7 +29,7 @@ const FUSION_TASK_ID_PATTERN = /^fusion-[0-9a-f]{24}$/;
 const ENGINE_JOB_ID_PATTERN = /^[0-9a-f]{32}$/;
 const RECORD_VERDICTS = new Set(["accepted", "rejected", "unverified"]);
 const RESUMABLE_CODEX_FAILURE_KINDS = new Set(["timeout", "policy", "patch_thrash"]);
-const SEMANTIC_FAILURE_KINDS = new Set(["intent_override", "scope_rewrite", "wrong_approach", "style_mismatch"]);
+const SEMANTIC_FAILURE_KINDS = new Set(["intent_override", "scope_rewrite", "wrong_approach", "style_mismatch", "oversized"]);
 const RECORD_SOURCES = new Set(["collector", "main-loop"]);
 const FUSION_ACCEPTANCE_EPOCH_ENV = "FUSION_ACCEPTANCE_EPOCH";
 const DEFAULT_ACCEPTANCE_EPOCH = "2026-07-22T00:00:00Z";
@@ -2898,7 +2898,7 @@ function parseRecordArguments(argv, { allowPerPairReasons = false } = {}) {
         throw new TypeError("--failure-kind-for is available only through the raw-args transport.");
       }
       if (!SEMANTIC_FAILURE_KINDS.has(pairFailureKind)) {
-        throw new TypeError("The --failure-kind value must be one of intent_override, scope_rewrite, wrong_approach, style_mismatch.");
+        throw new TypeError("The --failure-kind value must be one of intent_override, scope_rewrite, wrong_approach, style_mismatch, oversized.");
       }
       if ((!FUSION_TASK_ID_PATTERN.test(id) && !ENGINE_JOB_ID_PATTERN.test(id)) || failureKindsById.has(id)) {
         throw new TypeError("--failure-kind-for requires one record id and one failure kind.");
@@ -2929,7 +2929,7 @@ function parseRecordArguments(argv, { allowPerPairReasons = false } = {}) {
     if (token === "--failure-kind") {
       const candidate = argv[index + 1];
       if (!SEMANTIC_FAILURE_KINDS.has(candidate)) {
-        throw new TypeError("The --failure-kind value must be one of intent_override, scope_rewrite, wrong_approach, style_mismatch.");
+        throw new TypeError("The --failure-kind value must be one of intent_override, scope_rewrite, wrong_approach, style_mismatch, oversized.");
       }
       if (failureKind !== null) {
         throw new TypeError("Duplicate --failure-kind.");

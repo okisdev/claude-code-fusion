@@ -7,6 +7,7 @@ import { envFor, jobLogFiles, jobRecords, killGroups, makeSandbox, processInspec
 const processInspectionTests = new Set([
   "missing binary yields failure kind missing_cli",
   "rate limited stderr yields failure kind rate_limited",
+  "network stderr yields failure kind network before auth",
   "auth stderr yields failure kind auth",
   "hard organization version policy below range death yields failure kind setup",
   "hard organization version policy above range death yields failure kind setup",
@@ -90,6 +91,17 @@ test("auth stderr yields failure kind auth", (t) => {
   const resultOutput = runCompanion(["result", record.id], { cwd: sandbox.workDir, env });
   assert.strictEqual(resultOutput.status, 0, resultOutput.stderr);
   assert.match(resultOutput.stdout, /^failure: auth$/m);
+});
+
+test("network stderr yields failure kind network before auth", (t) => {
+  const sandbox = makeSandbox(t);
+  const env = envFor(sandbox, { FAKE_GROK_MODE: "network-auth-error" });
+  const result = runCompanion(["task", "doomed"], { cwd: sandbox.workDir, env });
+  assert.notStrictEqual(result.status, 0);
+  assert.match(result.stderr, /^failure: network$/m);
+  const record = jobRecords(sandbox.dataDir)[0];
+  assert.strictEqual(record.status, "error");
+  assert.strictEqual(record.failureKind, "network");
 });
 
 for (const [policy, upstreamMessage, remediation] of [

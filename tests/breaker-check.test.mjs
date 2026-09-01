@@ -269,6 +269,37 @@ test("two Grok rate limits inside the configured window open only the Grok break
   assert.strictEqual(result.stderr, "");
 });
 
+test("Grok network failures open only after a consecutive retry and success resets them", (t) => {
+  const sandbox = makeSandbox(t);
+  const stateRoot = path.join(sandbox.grokData, "state");
+  writeRecord(jobFile(stateRoot, "workspace", "network-first"), {
+    status: "error",
+    failureKind: "network",
+    finishedAt: new Date(Date.now() - 4 * 60000).toISOString()
+  });
+  assert.strictEqual(run(sandbox).stdout, "");
+
+  writeRecord(jobFile(stateRoot, "workspace", "network-second"), {
+    status: "error",
+    failureKind: "network",
+    finishedAt: new Date(Date.now() - 3 * 60000).toISOString()
+  });
+  const opened = run(sandbox);
+  assert.strictEqual(opened.status, 0);
+  assert.match(opened.stdout, new RegExp(`^fusion breaker advisory: treat the grok breaker as open unless verified recovered; last failure network \\d+ minutes? ago \\(2 network across 2 terminal jobs, 12h window\\)\\. Route new work to another eligible healthy lane\\. ${ESCAPED_BREAKER_ADVISORY_TAG}\\n$`));
+  assert.strictEqual(opened.stderr, "");
+
+  writeRecord(jobFile(stateRoot, "workspace", "network-recovered"), {
+    status: "done",
+    failureKind: null,
+    finishedAt: new Date(Date.now() - 2 * 60000).toISOString()
+  });
+  const recovered = run(sandbox);
+  assert.strictEqual(recovered.status, 0);
+  assert.strictEqual(recovered.stdout, "");
+  assert.strictEqual(recovered.stderr, "");
+});
+
 test("rate limits outside the configured retry window do not combine", (t) => {
   const sandbox = makeSandbox(t);
   writeRecord(jobFile(sandbox.codexState, "workspace", "rate-limit-first"), {

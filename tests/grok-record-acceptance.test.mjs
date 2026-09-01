@@ -56,6 +56,20 @@ test("record-acceptance stores accepted and rejected semantic verdicts", (t) => 
   assert.equal(record.semanticFailureMessage, "Verification did not pass.");
 });
 
+test("record-acceptance stores oversized rejected semantic verdicts", (t) => {
+  const sandbox = makeSandbox(t);
+  const id = "e".repeat(32);
+  seedTerminalJob(sandbox, { id, status: "done" });
+  const rejected = runCompanion(["record-acceptance", "--job-id", id, "--acceptance", "rejected", "--reason", "The package exceeded the lane budget.", "--failure-kind", "oversized"], {
+    cwd: sandbox.workDir,
+    env: envFor(sandbox)
+  });
+  assert.equal(rejected.status, 0, rejected.stderr);
+  const [record] = jobRecords(sandbox.dataDir);
+  assert.equal(record.semanticStatus, "rejected");
+  assert.equal(record.semanticFailureKind, "oversized");
+});
+
 test("record-acceptance requires a reason for rejected verdicts", (t) => {
   const sandbox = makeSandbox(t);
   const id = "1".repeat(32);
@@ -90,7 +104,7 @@ test("record-acceptance rejects unknown semantic failure kinds", (t) => {
     env: envFor(sandbox)
   });
   assert.equal(result.status, 1);
-  assert.match(result.stderr, /intent_override, scope_rewrite, wrong_approach, or style_mismatch/);
+  assert.match(result.stderr, /intent_override, scope_rewrite, wrong_approach, style_mismatch, or oversized/);
   assert.match(result.stderr, /failure: input/);
 });
 

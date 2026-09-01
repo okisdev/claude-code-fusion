@@ -21,7 +21,7 @@ const STATE_MAX_RECORDS_ENV = "CODEX_COMPANION_HISTORY_MAX_RECORDS";
 const JOB_STATUSES = new Set(["running", "done", "error", "cancelled"]);
 const DELIVERY_MODES = new Set(["foreground", "manual", "managed"]);
 const SEMANTIC_STATUSES = new Set(["accepted", "rejected", "unverified"]);
-const SEMANTIC_FAILURE_KINDS = new Set(["intent_override", "scope_rewrite", "wrong_approach", "style_mismatch"]);
+const SEMANTIC_FAILURE_KINDS = new Set(["intent_override", "scope_rewrite", "wrong_approach", "style_mismatch", "oversized"]);
 const ACCEPTANCE_SOURCES = new Set(["collector", "main-loop", "stats"]);
 const JOB_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 const WORKSPACE_SLUG_PATTERN = /^.+-[a-f0-9]{16}$/;
@@ -466,6 +466,7 @@ function normalizeRecord(record) {
     schemaVersion: record.schemaVersion ?? JOB_SCHEMA_VERSION,
     acceptanceSource: record.acceptanceSource ?? null,
     acceptanceRecordedAt: record.acceptanceRecordedAt ?? null,
+    fileChangeCount: record.fileChangeCount ?? null,
     semanticStatus: record.semanticStatus ?? "unverified",
     semanticFailureKind: record.semanticFailureKind ?? null,
     semanticFailureMessage: record.semanticFailureMessage ?? null,
@@ -731,6 +732,7 @@ export function createJobRecord(fields) {
     protocolError: fields.protocolError ?? null,
     resultSource: fields.resultSource ?? null,
     unknownEventCount: fields.unknownEventCount ?? 0,
+    fileChangeCount: fields.fileChangeCount ?? null,
     eventsTruncated: Boolean(fields.eventsTruncated),
     errorMessage: fields.errorMessage ?? null,
     errorTail: fields.errorTail ?? null,

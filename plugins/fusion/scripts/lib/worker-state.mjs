@@ -22,7 +22,7 @@ const TASK_OUTPUT_TRANSCRIPT_CHUNK_BYTES = 64 * 1024;
 const TASK_OUTPUT_TRANSCRIPT_MAX_LINE_BYTES = 1024 * 1024;
 const TERMINAL_STATUSES = new Set(["done", "incomplete", "failed", "cancelled", "owner_ended"]);
 const ACCEPTANCE_STATES = new Set(["accepted", "rejected", "unverified"]);
-const SEMANTIC_FAILURE_KINDS = new Set(["intent_override", "scope_rewrite", "wrong_approach", "style_mismatch"]);
+const SEMANTIC_FAILURE_KINDS = new Set(["intent_override", "scope_rewrite", "wrong_approach", "style_mismatch", "oversized"]);
 export const WORKER_COLLECTION_METHODS = Object.freeze({
   SUBAGENT_STOP: "subagent_stop",
   TASK_NOTIFICATION: "task_notification",
@@ -303,11 +303,17 @@ function canonicalCollectionMethod(value) {
 }
 
 function normalizeWorkerRecord(value) {
-  if (!Object.hasOwn(value, "collectionMethod")) {
-    return value;
+  let normalized = value;
+  if (Object.hasOwn(normalized, "collectionMethod")) {
+    const collectionMethod = canonicalCollectionMethod(normalized.collectionMethod);
+    if (collectionMethod !== normalized.collectionMethod) {
+      normalized = { ...normalized, collectionMethod };
+    }
   }
-  const collectionMethod = canonicalCollectionMethod(value.collectionMethod);
-  return collectionMethod === value.collectionMethod ? value : { ...value, collectionMethod };
+  if (typeof normalized.taskId === "string" && !Object.hasOwn(normalized, "peerFailureKind")) {
+    normalized = { ...normalized, peerFailureKind: null };
+  }
+  return normalized;
 }
 
 function readWorkerRecordFile(file) {
@@ -411,6 +417,7 @@ export function createWorkerRecord(record, env = process.env) {
       acceptance: "unverified",
       acceptanceFailureKind: record.acceptanceFailureKind ?? null,
       ...(PEER_JOB_FOOTER_AGENT_TYPES.has(record.agentType) ? { peerJobId: null } : {}),
+      peerFailureKind: null,
       failureKind: null,
       deliveryMode: null,
       collectionMethod: null,
@@ -810,7 +817,7 @@ function validatedAcceptanceFields(acceptance, source, reason, failureKind) {
         .slice(0, 240)
     : null;
   if (failureKind != null && !SEMANTIC_FAILURE_KINDS.has(failureKind)) {
-    throw new TypeError("Fusion worker acceptance failure kind must be one of intent_override, scope_rewrite, wrong_approach, style_mismatch.");
+    throw new TypeError("Fusion worker acceptance failure kind must be one of intent_override, scope_rewrite, wrong_approach, style_mismatch, oversized.");
   }
   if (failureKind != null && acceptance !== "rejected") {
     throw new TypeError("Fusion worker acceptance failure kind applies only to rejected acceptance.");
