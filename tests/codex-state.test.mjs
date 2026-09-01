@@ -65,7 +65,6 @@ const processInspectionTests = new Set([
   "a live PID with a replaced process identity does not retain a lock",
   "an old holder cannot release a successor lock with a different token",
   "corrupt JSON records are quarantined without hiding healthy jobs",
-  "semantic failure kinds accept legacy policy records and reject unknown values",
   "global lookup rejects an id that is ambiguous across workspaces",
   "job history collection removes oldest records while preserving running jobs, the current resume head, and its predecessor",
   "job history collection enforces its managed byte quota and reports protected quota excess",
@@ -266,6 +265,7 @@ test("job ids contain 128 bits and records expose the canonical Codex fields", (
   assert.strictEqual(record.resolvedEffort, "high");
   assert.strictEqual(record.timeoutMs, null);
   assert.strictEqual(record.companionVersion, null);
+  assert.strictEqual(record.fileChangeCount, null);
   assert.strictEqual(record.collectedAt, null);
   assert.strictEqual(record.sessionId, "session-one");
   assert.strictEqual(record.claudeSessionId, "session-one");
@@ -679,15 +679,28 @@ test("structurally invalid records are preserved for forward compatibility and f
   assert.deepStrictEqual(listJobRecords(sandbox.dataDir, sandbox.workDir), []);
 });
 
-test("semantic failure kinds accept legacy policy records and reject unknown values", (t) => {
+test("semantic failure kinds accept legacy policy and oversized records and reject unknown values", (t) => {
   const sandbox = makeSandbox(t);
-  const legacy = makeRecord(sandbox, { id: "legacy-policy", semanticFailureKind: "policy" });
-  assert.equal(legacy.record.semanticFailureKind, "policy");
+  const legacy = createJobRecord({ cwd: sandbox.workDir, id: "legacy-policy", semanticFailureKind: "policy" });
+  assert.equal(legacy.semanticFailureKind, "policy");
+  const oversized = createJobRecord({ cwd: sandbox.workDir, id: "oversized", semanticFailureKind: "oversized" });
+  assert.equal(oversized.semanticFailureKind, "oversized");
 
   const invalidFile = jobFilePath(sandbox.dataDir, sandbox.workDir, "invalid-semantic-failure-kind");
+  fs.mkdirSync(path.dirname(invalidFile), { recursive: true });
   const invalid = { ...createJobRecord({ cwd: sandbox.workDir, id: "invalid-semantic-failure-kind" }), semanticFailureKind: "arbitrary" };
   fs.writeFileSync(invalidFile, `${JSON.stringify(invalid)}\n`, { mode: 0o600 });
   assert.equal(readJobRecordFile(invalidFile), null);
+});
+
+test("legacy records normalize missing file change counts to null", (t) => {
+  const sandbox = makeSandbox(t);
+  const file = jobFilePath(sandbox.dataDir, sandbox.workDir, "legacy-file-change-count");
+  const record = createJobRecord({ cwd: sandbox.workDir, id: "legacy-file-change-count" });
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  delete record.fileChangeCount;
+  fs.writeFileSync(file, `${JSON.stringify(record)}\n`, { mode: 0o600 });
+  assert.equal(readJobRecordFile(file).fileChangeCount, null);
 });
 
 test("global lookup rejects an id that is ambiguous across workspaces", (t) => {

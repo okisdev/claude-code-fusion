@@ -37,6 +37,7 @@ const processInspectionTests = new Set([
   "task accepts an explicit repository top level from a subdirectory",
   "identity-replaced owners are terminalized without signaling the live replacement",
   "task stays foreground by default and persists the complete terminal record",
+  "task records completed file changes",
   "sol foreground write warning is emitted before execution and recorded",
   "sol warning is limited to foreground write tasks",
   "sol warning uses recent job records for its stat",
@@ -411,9 +412,20 @@ test("task stays foreground by default and persists the complete terminal record
   assert.equal(entry.record.resolvedModel, "gpt-test");
   assert.equal(entry.record.resolvedEffort, "max");
   assert.equal(entry.record.tokenUsageAvailability, "available");
-  assert.equal(entry.record.codexVersion, "0.147.0");
+  assert.equal(entry.record.codexVersion, "0.152.0");
   assert.equal(fs.statSync(entry.file).mode & 0o777, 0o600);
   assert.equal(fs.statSync(path.dirname(entry.file)).mode & 0o777, 0o700);
+});
+
+test("task records completed file changes", (t) => {
+  const sandbox = makeSandbox(t);
+  const result = runCompanion(["task", "--json", "make two changes"], {
+    cwd: sandbox.workDir,
+    env: envFor(sandbox, { FAKE_CODEX_MODE: "file-changes" })
+  });
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(JSON.parse(result.stdout).fileChangeCount, 2);
+  assert.equal(jobRecords(sandbox)[0].fileChangeCount, 2);
 });
 
 test("sol foreground write warning is emitted before execution and recorded", (t) => {
@@ -1059,7 +1071,7 @@ test("task rejects an outdated Codex CLI before execution", (t) => {
 });
 
 test("task proceeds with tested, alpha hotfix, and newer Codex CLI versions", (t) => {
-  for (const version of ["0.147.0", "0.147.0-alpha.10", "0.147.0-alpha.10.1", "0.148.0"]) {
+  for (const version of ["0.147.0", "0.147.0-alpha.10", "0.147.0-alpha.10.1", "0.148.0", "0.152.0", "0.153.0"]) {
     const sandbox = makeSandbox(t);
     const result = runCompanion(["task", "--json", "do work"], {
       cwd: sandbox.workDir,
@@ -1273,6 +1285,14 @@ test("record-acceptance stores accepted and rejected semantic verdicts", (t) => 
   assert.equal(record.semanticStatus, "rejected");
   assert.equal(record.semanticFailureKind, "intent_override");
   assert.equal(record.semanticFailureMessage, "Verification did not pass.");
+
+  const oversized = runCompanion(["record-acceptance", "--job-id", id, "--acceptance", "rejected", "--reason", "Delivery had no delta.", "--failure-kind", "oversized"], {
+    cwd: sandbox.workDir,
+    env: envFor(sandbox)
+  });
+  assert.equal(oversized.status, 0, oversized.stderr);
+  [record] = jobRecords(sandbox);
+  assert.equal(record.semanticFailureKind, "oversized");
 });
 
 test("record-acceptance requires a reason for rejected verdicts", (t) => {
@@ -1309,7 +1329,7 @@ test("record-acceptance rejects unknown semantic failure kinds", (t) => {
     env: envFor(sandbox)
   });
   assert.equal(result.status, 1);
-  assert.match(result.stderr, /intent_override, scope_rewrite, wrong_approach, or style_mismatch/);
+  assert.match(result.stderr, /intent_override, scope_rewrite, wrong_approach, style_mismatch, or oversized/);
   assert.match(result.stderr, /failure: input/);
 });
 
@@ -2065,7 +2085,7 @@ test("setup verifies authentication and the tested Codex version interval", (t) 
   assert.equal(readyReport.ready, true);
   assert.equal(readyReport.compatibility, "tested");
   assert.equal(readyReport.authenticated, true);
-  for (const version of ["0.147.0-alpha.10", "0.147.0-alpha.10.1"]) {
+  for (const version of ["0.147.0-alpha.10", "0.147.0-alpha.10.1", "0.148.0", "0.152.0"]) {
     const alpha = runCompanion(["setup", "--json"], {
       cwd: sandbox.workDir,
       env: envFor(sandbox, { FAKE_CODEX_VERSION: version })
@@ -2105,12 +2125,12 @@ test("setup verifies authentication and the tested Codex version interval", (t) 
   assert.doesNotMatch(apiKey.stdout, /codex-test-key/);
   const unsupported = runCompanion(["setup", "--json"], {
     cwd: sandbox.workDir,
-    env: envFor(sandbox, { FAKE_CODEX_VERSION: "0.148.0" })
+    env: envFor(sandbox, { FAKE_CODEX_VERSION: "0.153.0" })
   });
   assert.equal(unsupported.status, 1);
   const unsupportedReport = JSON.parse(unsupported.stdout);
   assert.equal(unsupportedReport.ready, false);
-  assert.match(unsupportedReport.compatibility, /newer than the tested interval \(0\.147\.0 to before 0\.148\.0\)/);
+  assert.match(unsupportedReport.compatibility, /newer than the tested interval \(0\.147\.0 to before 0\.153\.0\)/);
   assert.match(unsupportedReport.nextSteps.join("\n"), /A verification pass is advised\./);
 });
 

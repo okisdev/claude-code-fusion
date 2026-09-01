@@ -65,7 +65,7 @@ if (UNMODELLED_SUBCOMMANDS.has(args[0])) {
 }
 
 if (args.includes("--version")) {
-  process.stdout.write(`${process.env.FAKE_CODEX_VERSION_OUTPUT || `codex-cli ${process.env.FAKE_CODEX_VERSION || "0.147.0"}`}\n`);
+  process.stdout.write(`${process.env.FAKE_CODEX_VERSION_OUTPUT || `codex-cli ${process.env.FAKE_CODEX_VERSION || "0.152.0"}`}\n`);
   process.exit(0);
 }
 
@@ -181,6 +181,12 @@ switch (mode) {
     start();
     complete();
     writeRollout({ message: "Codex completed the task." });
+    break;
+  case "file-changes":
+    start();
+    emit({ type: "item.completed", item: { id: "patch_1", type: "file_change" } });
+    emit({ type: "item.completed", item: { id: "patch_2", type: "file_change" } });
+    complete();
     break;
   case "transport-failure-completed":
     start();

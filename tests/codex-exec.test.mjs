@@ -153,12 +153,12 @@ async function waitForProcessExit(pid, ownsProcessGroup = false) {
 
 test("version and availability probe the configured Codex binary", () => {
   const env = { ...process.env, CODEX_BIN: fakeCodex };
-  assert.equal(getCodexVersion({ env }), "0.147.0");
+  assert.equal(getCodexVersion({ env }), "0.152.0");
   assert.deepEqual(getCodexAvailability({ env }), {
     available: true,
     bin: fakeCodex,
-    version: "0.147.0",
-    rawVersion: "codex-cli 0.147.0",
+    version: "0.152.0",
+    rawVersion: "codex-cli 0.152.0",
     exitCode: 0,
     errorMessage: null
   });
@@ -680,6 +680,7 @@ emit({ type: "turn.completed", usage });`),
   assert.equal(outcome.status, "done");
   assert.equal(outcome.failureKind, null);
   assert.equal(outcome.timedOut, false);
+  assert.equal(outcome.fileChangeCount, 1);
 });
 
 test("a split apply_patch verification failure is counted once", async (t) => {
