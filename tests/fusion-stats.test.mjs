@@ -1824,7 +1824,7 @@ test("--record resolves a bare Codex job with a raw transport reason and settles
   createTerminalWorker({ taskId, env, workspaceRoot: dir, peerEngine: "codex", peerJobId: jobId });
 
   const reason = "The result did not satisfy the requested behavior.";
-  const failureKind = "wrong_approach";
+  const failureKind = "oversized";
   const result = run(
     { cwd: dir, codexState: stateRoot },
     ["--record", `${jobId}=rejected`, "--reason", reason, "--failure-kind", failureKind, "--json"],
@@ -1911,7 +1911,7 @@ test("--record rejects invalid semantic failure kinds", (t) => {
   );
 
   assert.notStrictEqual(result.status, 0);
-  assert.match(result.stderr, /The --failure-kind value must be one of intent_override, scope_rewrite, wrong_approach, style_mismatch\./);
+  assert.match(result.stderr, /The --failure-kind value must be one of intent_override, scope_rewrite, wrong_approach, style_mismatch, oversized\./);
   assert.strictEqual(readWorkerRecord(taskId, env).acceptance, "unverified");
 });
 

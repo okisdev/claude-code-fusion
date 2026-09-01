@@ -1,20 +1,19 @@
 #!/usr/bin/env node
 
 import fs from "node:fs";
-import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { resolveCodexStateDir, resolveCodexStateRoots } from "./lib/codex-state-roots.mjs";
+import { resolveGrokDataDir } from "./lib/engine-job-state.mjs";
 import { canonicalWorkerAgentType, readWorkerRecords } from "./lib/worker-state.mjs";
 import { tagMessage } from "./lib/user-messages.mjs";
 
-const GROK_DATA_ENV = "GROK_COMPANION_DATA";
 const LOOKBACK_ENV = "FUSION_BREAKER_LOOKBACK_HOURS";
 const DEFAULT_LOOKBACK_HOURS = 12;
 const WORKER_BREAKER_LANES = ["fusion:claude-worker", "fusion:trivial-worker"];
 const HARD_FAILURE_KINDS = new Set(["quota", "auth", "missing_cli", "protocol", "transport", "sandbox"]);
-const REPEATED_FAILURE_KINDS = new Set(["rate_limited", "timeout", "stall", "process", "died", "patch_thrash", "exec_lost"]);
+const REPEATED_FAILURE_KINDS = new Set(["rate_limited", "timeout", "stall", "network", "process", "died", "patch_thrash", "exec_lost"]);
 const BREAKER_FAILURE_KINDS = new Set([...HARD_FAILURE_KINDS, ...REPEATED_FAILURE_KINDS, "permission"]);
 const GROK_FAILURE_STATUSES = new Set(["error", "failed"]);
 const CODEX_FAILURE_STATUSES = new Set(["error", "failed"]);
@@ -35,14 +34,6 @@ const CODEX_FAILURE_PATTERNS = [
   ["permission", /\b(?:EACCES|EPERM)\b|operation not permitted|permission denied/i]
 ];
 const TRANSPORT_PERMISSION_PATTERN = /(?:sandbox|seatbelt|landlock).*(?:init|initializ|profile|policy)|(?:operation not permitted|\bEACCES\b|\bEPERM\b|permission denied).*(?:brief|prompt|transport|state|plugin|sandbox)|(?:brief|prompt|transport|state|plugin|sandbox).*(?:operation not permitted|\bEACCES\b|\bEPERM\b|permission denied)/i;
-
-function resolveGrokDataDir(env = process.env) {
-  const override = env[GROK_DATA_ENV];
-  if (override && String(override).trim()) {
-    return path.resolve(String(override).trim());
-  }
-  return path.join(os.homedir(), ".claude", "plugins", "data", "grok-claude-code-fusion");
-}
 
 function resolveLookbackMs(env = process.env) {
   const parsed = Number.parseFloat(String(env[LOOKBACK_ENV] ?? ""));

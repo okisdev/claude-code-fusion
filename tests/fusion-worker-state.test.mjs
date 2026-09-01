@@ -12,6 +12,7 @@ import {
   isSettledWorker,
   markWorkerCollected,
   pruneExpiredWorkerRecords,
+  readWorkerRecord,
   recordWorkerAcceptance,
   resolveWorkerRetentionDays,
   updateWorkerRecord
@@ -123,6 +124,20 @@ test("created worker records stamp the Fusion companion version", (t) => {
   assert.strictEqual(record.companionVersion, expectedVersion);
 });
 
+test("worker records create and normalize the nullable peer failure kind", (t) => {
+  const directory = sandbox(t);
+  const env = { FUSION_WORKER_STATE_DIR: path.join(directory, "worker-state") };
+  const taskId = "fusion-peer-failure-kind";
+  const created = createWorkerRecord({ taskId, sessionId: "session-peer-kind", agentType: "fusion:claude-worker", workspaceRoot: directory }, env);
+  assert.strictEqual(created.peerFailureKind, null);
+
+  const file = path.join(env.FUSION_WORKER_STATE_DIR, "jobs", `${taskId}.json`);
+  const stored = JSON.parse(fs.readFileSync(file, "utf8"));
+  delete stored.peerFailureKind;
+  fs.writeFileSync(file, `${JSON.stringify(stored, null, 2)}\n`, "utf8");
+  assert.strictEqual(readWorkerRecord(taskId, env).peerFailureKind, null);
+});
+
 test("markWorkerCollected preserves an already settled acceptance", () => {
   const settled = markWorkerCollected(
     unverifiedRecord({ collectedAt: null, acceptance: "rejected", acceptanceRecordedAt: "2026-07-22T00:01:00.000Z", acceptanceSource: "main-loop", awaitingVerdict: false, awaitingVerdictArmedAt: null }),
@@ -191,8 +206,8 @@ test("worker acceptance preserves semantic failure kinds through settlement and 
   assert.strictEqual(baseline.acceptanceFailureKind, null);
   updateWorkerRecord(settledTaskId, env, (record) => ({ ...record, transportStatus: "done" }));
 
-  const settled = recordWorkerAcceptance({ taskId: settledTaskId, acceptance: "rejected", env, failureKind: "intent_override" });
-  assert.strictEqual(settled.record.acceptanceFailureKind, "intent_override");
+  const settled = recordWorkerAcceptance({ taskId: settledTaskId, acceptance: "rejected", env, failureKind: "oversized" });
+  assert.strictEqual(settled.record.acceptanceFailureKind, "oversized");
 
   createWorkerRecord({ taskId: queuedTaskId, sessionId: "session-semantic", dispatchToolUseId: "tool-semantic-queued", agentType: "fusion:claude-worker", workspaceRoot: directory, limits: {} }, env);
   const queued = recordWorkerAcceptance({ taskId: queuedTaskId, acceptance: "rejected", env, failureKind: "scope_rewrite" });
@@ -202,6 +217,15 @@ test("worker acceptance preserves semantic failure kinds through settlement and 
   const applied = updateWorkerRecord(queuedTaskId, env, (record) => applyQueuedVerdict({ ...record, transportStatus: "done" }, "2026-07-22T00:05:00.000Z"));
   assert.strictEqual(applied.acceptanceFailureKind, "scope_rewrite");
   assert.strictEqual(applied.pendingVerdict, undefined);
+
+  const invalidTaskId = "fusion-semantic-invalid";
+  createWorkerRecord({ taskId: invalidTaskId, sessionId: "session-semantic", agentType: "fusion:claude-worker", workspaceRoot: directory }, env);
+  updateWorkerRecord(invalidTaskId, env, (record) => ({ ...record, transportStatus: "done" }));
+  assert.throws(
+    () => recordWorkerAcceptance({ taskId: invalidTaskId, acceptance: "rejected", env, failureKind: "not_a_kind" }),
+    /intent_override, scope_rewrite, wrong_approach, style_mismatch, oversized/
+  );
+  assert.strictEqual(readWorkerRecord(invalidTaskId, env).acceptance, "unverified");
 });
 
 test("pending settlement clears after recordWorkerAcceptance and applyQueuedVerdict", (t) => {
