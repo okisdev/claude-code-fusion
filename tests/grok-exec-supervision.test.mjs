@@ -5,7 +5,7 @@ import { test } from "node:test";
 
 import { envFor, killGroups, makeSandbox, pidAlive, repoRoot, waitFor } from "./lib/companion-harness.mjs";
 
-const { runGrok } = await import(path.join(repoRoot, "plugins", "grok", "scripts", "lib", "grok-exec.mjs"));
+const { runGrok, runtimeSocketEndpoints, runtimeSocketSymlinkEndpoints } = await import(path.join(repoRoot, "plugins", "grok", "scripts", "lib", "grok-exec.mjs"));
 const {
   createJobRecord,
   createJobRecordFile,
@@ -41,6 +41,41 @@ function createRunningJobFile(sandbox, id) {
   }));
   return file;
 }
+
+test("managed runs reject runtime-socket symlinks before spawn", (t) => {
+  const sandbox = makeSandbox(t);
+  const missingEndpoint = path.join(sandbox.root, "missing.sock");
+  const regularEndpoint = path.join(sandbox.root, "regular.sock");
+  const symlinkEndpoint = path.join(sandbox.root, "symlink.sock");
+  fs.writeFileSync(regularEndpoint, "socket fixture\n", "utf8");
+  fs.symlinkSync(regularEndpoint, symlinkEndpoint);
+
+  assert.deepEqual(runtimeSocketSymlinkEndpoints([missingEndpoint, regularEndpoint]), []);
+  const env = envFor(sandbox, {
+    FAKE_GROK_MODE: "hang",
+    GROK_COMPANION_RUNTIME_SOCKET_CANDIDATES: [missingEndpoint, regularEndpoint, symlinkEndpoint].join(":")
+  });
+  assert.deepEqual(runtimeSocketEndpoints({ env }), [missingEndpoint, regularEndpoint, symlinkEndpoint]);
+
+  let launchCalled = false;
+  assert.throws(
+    () => runGrok(runOptions(sandbox, {
+      env,
+      launchProcess: () => {
+        launchCalled = true;
+      }
+    })),
+    (error) => {
+      assert.equal(error.failureKind, "sandbox");
+      assert.match(error.message, new RegExp(symlinkEndpoint.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+      assert.match(error.message, /runtime-socket deny policy, 1\.0\.4 through 1\.0\.13/);
+      assert.match(error.message, /Do not downgrade the sandbox/);
+      return true;
+    }
+  );
+  assert.equal(launchCalled, false);
+  assert.equal(fs.existsSync(sandbox.argsFile), false);
+});
 
 test("the production launch gate prevents spawning after cancellation wins", async (t) => {
   const sandbox = makeSandbox(t);

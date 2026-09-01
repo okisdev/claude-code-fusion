@@ -18,6 +18,7 @@ const TIMEOUT_ENV = "GROK_COMPANION_TIMEOUT_MS";
 const PIDLESS_RUNNING_GRACE_ENV = "GROK_COMPANION_PIDLESS_RUNNING_GRACE_MS";
 const CONSULT_ALLOW_ENV = "GROK_CONSULT_ALLOW";
 const CAPABILITIES_ENV = "GROK_COMPANION_CAPABILITIES";
+const RUNTIME_SOCKET_CANDIDATES_ENV = "GROK_COMPANION_RUNTIME_SOCKET_CANDIDATES";
 const DEFAULT_FOREGROUND_TIMEOUT_MS = 570000;
 const BACKGROUND_TIMEOUT_CAP_MS = 1800000;
 const DEFAULT_PIDLESS_RUNNING_GRACE_MS = 15000;
@@ -677,6 +678,67 @@ function securityError(kind, message) {
   const error = new Error(message);
   error.failureKind = kind;
   return error;
+}
+
+export function runtimeSocketEndpoints({ env = process.env, platform = process.platform, uid = typeof process.getuid === "function" ? process.getuid() : null } = {}) {
+  if (Object.hasOwn(env, RUNTIME_SOCKET_CANDIDATES_ENV)) {
+    return String(env[RUNTIME_SOCKET_CANDIDATES_ENV] ?? "")
+      .split(":")
+      .filter(Boolean);
+  }
+  const home = typeof env.HOME === "string" && env.HOME.trim() ? env.HOME : os.homedir();
+  const endpoints = [
+    "/run/docker.sock",
+    "/var/run/docker.sock",
+    "/run/podman/podman.sock",
+    "/var/run/podman/podman.sock",
+    "/run/containerd/containerd.sock",
+    "/var/run/containerd/containerd.sock",
+    path.join(home, ".docker", "desktop", "docker.sock"),
+    path.join(home, ".docker", "run", "docker.sock")
+  ];
+  if (platform === "linux" && Number.isInteger(uid) && uid >= 0) {
+    const runtimeDir = `/run/user/${uid}`;
+    endpoints.push(
+      path.join(runtimeDir, "docker.sock"),
+      path.join(runtimeDir, "podman", "podman.sock"),
+      path.join(runtimeDir, "containerd", "containerd.sock")
+    );
+  }
+  return endpoints;
+}
+
+export function runtimeSocketSymlinkEndpoints(candidates, lstat = fs.lstatSync) {
+  const symlinks = [];
+  for (const endpoint of candidates) {
+    try {
+      if (lstat(endpoint).isSymbolicLink()) {
+        symlinks.push(endpoint);
+      }
+    } catch (error) {
+      if (error?.code !== "ENOENT") {
+        throw error;
+      }
+    }
+  }
+  return symlinks;
+}
+
+export function preflightRuntimeSocketEndpoints({ candidates = runtimeSocketEndpoints(), lstat = fs.lstatSync } = {}) {
+  let symlinks;
+  try {
+    symlinks = runtimeSocketSymlinkEndpoints(candidates, lstat);
+  } catch (error) {
+    throw securityError("sandbox", `Unable to inspect Grok runtime-socket deny path: ${error.message}`);
+  }
+  if (symlinks.length > 0) {
+    const endpoint = symlinks[0];
+    throw securityError(
+      "sandbox",
+      `Grok strict sandbox (runtime-socket deny policy, 1.0.4 through 1.0.13) refuses to start while ${endpoint} exists as a symlink. Repair the host environment: stop the Docker engine that creates the symlink or remove it. Do not downgrade the sandbox.`
+    );
+  }
+  return symlinks;
 }
 
 function createManagedRunTempDir() {
@@ -1744,6 +1806,10 @@ export function runGrok(options) {
       requireGrokCapabilities(capabilities, ["--json-schema"]);
     }
     requireGrokCapabilities(capabilities, ["--no-wait-for-background"]);
+    preflightRuntimeSocketEndpoints({
+      candidates: options.runtimeSocketEndpoints ?? runtimeSocketEndpoints({ env }),
+      lstat: options.runtimeSocketLstat ?? fs.lstatSync
+    });
   }
   const args = options.args ?? buildGrokArgs({ ...options, capabilities, timeoutMs });
   const childEnv = buildGrokChildEnv(env, { memory: options.memory === true, web: options.web === true });

@@ -15,6 +15,8 @@ import {
   formatDeniedToolDetail,
   normalizeGrokSessionId,
   normalizeStopReason,
+  runtimeSocketEndpoints,
+  runtimeSocketSymlinkEndpoints,
   resolveGrokBin,
   resolveGrokCapabilities,
   resolveTimeoutMs,
@@ -107,7 +109,7 @@ const DEFAULT_WAIT_POLL_MS = 2000;
 const DEFAULT_WAIT_TIMEOUT_MS = 570000;
 const RECORD_ACCEPTANCE_JOB_ID_PATTERN = /^[a-f0-9]{32}$/;
 const RECORD_ACCEPTANCE_VALUES = new Set(["accepted", "rejected", "unverified"]);
-const SEMANTIC_FAILURE_KINDS = new Set(["intent_override", "scope_rewrite", "wrong_approach", "style_mismatch"]);
+const SEMANTIC_FAILURE_KINDS = new Set(["intent_override", "scope_rewrite", "wrong_approach", "style_mismatch", "oversized"]);
 const MAX_WAIT_TIMEOUT_MS = 570000;
 const CONTINUE_PROMPT =
   "Continue from the current thread state. Pick the next highest-value step and follow through until the task is resolved.";
@@ -133,6 +135,7 @@ const HISTORY_FAILURE_KINDS = new Set([
   "missing_cli",
   "setup",
   "rate_limited",
+  "network",
   "timeout",
   "error",
   "permission",
@@ -189,7 +192,7 @@ function printUsage() {
       "  node scripts/grok-companion.mjs history [--all] [--limit <n>] [--cwd <dir>] [--json]",
       "  node scripts/grok-companion.mjs result <job-id> [--cwd <dir>] [--wait] [--wait-timeout-ms <ms>] [--json]",
       "  node scripts/grok-companion.mjs cancel <job-id> [--cwd <dir>] [--json]",
-      "  node scripts/grok-companion.mjs record-acceptance --job-id <32 lowercase hex> --acceptance <accepted|rejected|unverified> [--reason <text>] [--failure-kind <intent_override|scope_rewrite|wrong_approach|style_mismatch>] [--accept-failed-transport]",
+      "  node scripts/grok-companion.mjs record-acceptance --job-id <32 lowercase hex> --acceptance <accepted|rejected|unverified> [--reason <text>] [--failure-kind <intent_override|scope_rewrite|wrong_approach|style_mismatch|oversized>] [--accept-failed-transport]",
       "  node scripts/grok-companion.mjs stats [--all] [--cwd <dir>] [--json]",
       "  node scripts/grok-companion.mjs setup [--continuity <manual|claude-session>] [--enable-stop-gate] [--disable-stop-gate] [--json]",
       "  node scripts/grok-companion.mjs stop-gate"
@@ -229,7 +232,7 @@ function recordAcceptanceArgs(argv) {
     throw errorWithFailure("The --acceptance option must be accepted, rejected, or unverified.", "input");
   }
   if (options.failureKind !== undefined && !SEMANTIC_FAILURE_KINDS.has(options.failureKind)) {
-    throw errorWithFailure("The --failure-kind option must be intent_override, scope_rewrite, wrong_approach, or style_mismatch.", "input");
+    throw errorWithFailure("The --failure-kind option must be intent_override, scope_rewrite, wrong_approach, style_mismatch, or oversized.", "input");
   }
   if (options.failureKind !== undefined && options.acceptance !== "rejected") {
     throw errorWithFailure("The --failure-kind option is valid only with --acceptance rejected.", "input");
@@ -1140,6 +1143,7 @@ const STDERR_FAILURE_KINDS = [
     /quota|insufficient (?:account )?(?:balance|credit|credits|funds)|balance (?:is )?exhausted|exhausted (?:account )?balance|payment required|usage limit|billing|credit limit|http(?:\/\d(?:\.\d)?)?\s+402|status(?: code)?\s*[:=]?\s*402/i
   ],
   ["rate_limited", /rate.?limit|429|too many requests/i],
+  ["network", /getaddrinfo|ENOTFOUND|EAI_AGAIN|ECONNREFUSED|ECONNRESET|ETIMEDOUT|socket hang up/i],
   ["auth", /auth|unauthori[sz]ed|forbidden|login required/i]
 ];
 
@@ -2960,7 +2964,7 @@ function handleStats(argv, transport = {}) {
 
 const DOCTOR_PROBE_TIMEOUT_MS = 3000;
 const SHELL_ENVIRONMENT_POLICY_DETAIL =
-  "Grok supports [shell_environment_policy] (introduced in 0.2.112, verified through 1.0.3) to control which environment variables reach shell tools in write runs.";
+  "Grok supports [shell_environment_policy] (introduced in 0.2.112, verified through 1.0.13) to control which environment variables reach shell tools in write runs.";
 
 function doctorCommandAdvisory(bin, available) {
   if (!available) {
@@ -3026,6 +3030,25 @@ function shellEnvironmentPolicyAdvisory(env = process.env, cwd = process.cwd()) 
   };
 }
 
+function hostEnvironmentAdvisory(env = process.env) {
+  try {
+    const runtimeSocketSymlinks = runtimeSocketSymlinkEndpoints(runtimeSocketEndpoints({ env }));
+    return {
+      ready: runtimeSocketSymlinks.length === 0,
+      runtimeSocketSymlinks,
+      detail: runtimeSocketSymlinks.length === 0
+        ? "no runtime-socket deny path is a symlink"
+        : `runtime-socket deny path is a symlink: ${runtimeSocketSymlinks.join(", ")}`
+    };
+  } catch (error) {
+    return {
+      ready: false,
+      runtimeSocketSymlinks: [],
+      detail: `unable to inspect runtime-socket deny paths: ${error instanceof Error ? error.message : String(error)}`
+    };
+  }
+}
+
 function handleSetup(argv, transport = {}) {
   const { options } = commandArgs(argv, {
     valueOptions: ["continuity"],
@@ -3082,6 +3105,7 @@ function handleSetup(argv, transport = {}) {
 
   const doctorCommand = doctorCommandAdvisory(bin, available);
   const shellEnvironmentPolicy = shellEnvironmentPolicyAdvisory(process.env);
+  const hostEnvironment = hostEnvironmentAdvisory(process.env);
 
   const dataDir = resolveDataDir();
   let writable = true;
@@ -3104,11 +3128,12 @@ function handleSetup(argv, transport = {}) {
   }
 
   const report = {
-    ready: available && capabilities.ready && writable,
+    ready: available && capabilities.ready && hostEnvironment.ready && writable,
     grok: { available, detail, bin },
     capabilities,
     doctorCommand,
     shellEnvironmentPolicy,
+    hostEnvironment,
     dataDir: { path: dataDir, writable, detail: writeDetail },
     stopGate: Boolean(readConfig(dataDir).stopGate),
     continuityPolicy: continuityPolicy(dataDir)

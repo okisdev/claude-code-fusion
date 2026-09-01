@@ -9,7 +9,7 @@
     fs.appendFileSync(argsFile, JSON.stringify(process.argv.slice(2)) + "\n");
   }
   if (process.argv.includes("--version")) {
-    process.stdout.write(`${process.env.FAKE_GROK_VERSION_OUTPUT ?? "grok 1.0.3 (0123456789ab)"}\n`);
+    process.stdout.write(`${process.env.FAKE_GROK_VERSION_OUTPUT ?? "grok 1.0.13 (0123456789ab)"}\n`);
     process.exit(0);
   }
   if (!process.env.GROK_HOME) {
@@ -909,6 +909,11 @@
 
   if (mode === "auth-error") {
     process.stderr.write("login required, AuthorizationRequired\n");
+    process.exit(1);
+  }
+
+  if (mode === "network-auth-error") {
+    process.stderr.write("getaddrinfo ENOTFOUND api.x.ai while refreshing auth\n");
     process.exit(1);
   }
 
