@@ -16,6 +16,8 @@ import {
   normalizeGrokSessionId,
   normalizeStopReason,
   runtimeSocketEndpoints,
+  runtimeSocketEngine,
+  runtimeSocketRemedy,
   runtimeSocketSymlinkEndpoints,
   resolveGrokBin,
   resolveGrokCapabilities,
@@ -3033,9 +3035,12 @@ function shellEnvironmentPolicyAdvisory(env = process.env, cwd = process.cwd()) 
 function hostEnvironmentAdvisory(env = process.env) {
   try {
     const runtimeSocketSymlinks = runtimeSocketSymlinkEndpoints(runtimeSocketEndpoints({ env }));
+    const engine = runtimeSocketSymlinks.length === 0 ? null : runtimeSocketEngine(runtimeSocketSymlinks[0]);
     return {
       ready: runtimeSocketSymlinks.length === 0,
       runtimeSocketSymlinks,
+      runtimeSocketEngine: engine,
+      remedy: runtimeSocketSymlinks.length === 0 ? null : runtimeSocketRemedy(runtimeSocketSymlinks[0], engine),
       detail: runtimeSocketSymlinks.length === 0
         ? "no runtime-socket deny path is a symlink"
         : `runtime-socket deny path is a symlink: ${runtimeSocketSymlinks.join(", ")}`
@@ -3044,6 +3049,8 @@ function hostEnvironmentAdvisory(env = process.env) {
     return {
       ready: false,
       runtimeSocketSymlinks: [],
+      runtimeSocketEngine: null,
+      remedy: null,
       detail: `unable to inspect runtime-socket deny paths: ${error instanceof Error ? error.message : String(error)}`
     };
   }

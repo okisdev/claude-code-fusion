@@ -5,7 +5,7 @@ import { test } from "node:test";
 
 import { envFor, killGroups, makeSandbox, pidAlive, repoRoot, waitFor } from "./lib/companion-harness.mjs";
 
-const { runGrok, runtimeSocketEndpoints, runtimeSocketSymlinkEndpoints } = await import(path.join(repoRoot, "plugins", "grok", "scripts", "lib", "grok-exec.mjs"));
+const { runGrok, runtimeSocketEndpoints, runtimeSocketEngine, runtimeSocketRemedy, runtimeSocketSymlinkEndpoints } = await import(path.join(repoRoot, "plugins", "grok", "scripts", "lib", "grok-exec.mjs"));
 const {
   createJobRecord,
   createJobRecordFile,
@@ -75,6 +75,49 @@ test("managed runs reject runtime-socket symlinks before spawn", (t) => {
   );
   assert.equal(launchCalled, false);
   assert.equal(fs.existsSync(sandbox.argsFile), false);
+});
+
+test("runtime-socket remedies name the engine that owns the symlink", (t) => {
+  const sandbox = makeSandbox(t);
+  const orbstackTarget = path.join(sandbox.root, "home", ".orbstack", "run", "docker.sock");
+  const desktopTarget = path.join(sandbox.root, "home", ".docker", "run", "docker.sock");
+  const plainTarget = path.join(sandbox.root, "elsewhere", "docker.sock");
+  for (const target of [orbstackTarget, desktopTarget, plainTarget]) {
+    fs.mkdirSync(path.dirname(target), { recursive: true });
+    fs.writeFileSync(target, "socket fixture\n", "utf8");
+  }
+  const orbstackEndpoint = path.join(sandbox.root, "orbstack.sock");
+  const desktopEndpoint = path.join(sandbox.root, "desktop.sock");
+  const plainEndpoint = path.join(sandbox.root, "plain.sock");
+  fs.symlinkSync(orbstackTarget, orbstackEndpoint);
+  fs.symlinkSync(desktopTarget, desktopEndpoint);
+  fs.symlinkSync(plainTarget, plainEndpoint);
+
+  assert.equal(runtimeSocketEngine(orbstackEndpoint), "orbstack");
+  assert.equal(runtimeSocketEngine(desktopEndpoint), "docker-desktop");
+  assert.equal(runtimeSocketEngine(plainEndpoint), null);
+  assert.equal(runtimeSocketEngine(path.join(sandbox.root, "missing.sock")), null);
+  assert.match(runtimeSocketRemedy(orbstackEndpoint, "orbstack"), /orb config set setup\.use_admin false/);
+  assert.ok(runtimeSocketRemedy(orbstackEndpoint, "orbstack").includes(`sudo rm ${orbstackEndpoint}`));
+  assert.match(runtimeSocketRemedy(desktopEndpoint, "docker-desktop"), /Allow the default Docker socket to be used/);
+  assert.equal(runtimeSocketRemedy(plainEndpoint, null), `Stop the Docker engine that creates ${plainEndpoint}, or remove the symlink. Do not downgrade the sandbox.`);
+  for (const remedy of [runtimeSocketRemedy(orbstackEndpoint, "orbstack"), runtimeSocketRemedy(desktopEndpoint, "docker-desktop"), runtimeSocketRemedy(plainEndpoint, null)]) {
+    assert.match(remedy, /Do not downgrade the sandbox\.$/);
+  }
+
+  const env = envFor(sandbox, {
+    FAKE_GROK_MODE: "hang",
+    GROK_COMPANION_RUNTIME_SOCKET_CANDIDATES: orbstackEndpoint
+  });
+  assert.throws(
+    () => runGrok(runOptions(sandbox, { env, launchProcess: () => {} })),
+    (error) => {
+      assert.equal(error.failureKind, "sandbox");
+      assert.match(error.message, /orb config set setup\.use_admin false/);
+      assert.match(error.message, /Do not downgrade the sandbox\.$/);
+      return true;
+    }
+  );
 });
 
 test("the production launch gate prevents spawning after cancellation wins", async (t) => {

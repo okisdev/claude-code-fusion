@@ -530,7 +530,7 @@ export function renderSetupReport(report) {
     nextSteps.push("Upgrade the grok CLI to a build that exposes the required headless safety capabilities.");
   }
   if (!report.hostEnvironment?.ready && report.hostEnvironment?.runtimeSocketSymlinks?.length > 0) {
-    nextSteps.push(`Stop the Docker engine that creates ${report.hostEnvironment.runtimeSocketSymlinks.join(", ")}, or remove the symlink. Do not downgrade the sandbox.`);
+    nextSteps.push(report.hostEnvironment.remedy ?? `Stop the Docker engine that creates ${report.hostEnvironment.runtimeSocketSymlinks.join(", ")}, or remove the symlink. Do not downgrade the sandbox.`);
   }
   if (!report.dataDir.writable) {
     nextSteps.push(`Fix permissions on ${report.dataDir.path}.`);
