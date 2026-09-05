@@ -87,8 +87,8 @@ const BACKGROUND_LAUNCH_POLL_MS = 20;
 const BACKGROUND_ABORT_CLAIM_WAIT_MS = 2000;
 const BACKGROUND_ABORT_CLEANUP_CONFIRM_MS = 1000;
 const BACKGROUND_ABORT_CLEANUP_POLL_MS = 50;
-const TESTED_VERSION_MIN = [0, 147, 0];
-const TESTED_VERSION_MAX = [0, 153, 0];
+const TESTED_VERSION_MIN = [0, 152, 0];
+const TESTED_VERSION_MAX = [0, 154, 0];
 const CONTINUE_PROMPT = "Continue from the current Codex thread state. Complete the next highest value step and continue until the task is resolved.";
 const TRANSPORT_DIRECTORY_PREFIX = "codex-companion-input-";
 const TRANSPORT_TOKEN_PATTERN = /^[a-f0-9]{48}$/;
@@ -100,13 +100,13 @@ const RECORD_ACCEPTANCE_VALUES = new Set(["accepted", "rejected", "unverified"])
 const RECORD_ACCEPTANCE_SOURCES = new Set(["collector", "main-loop", "stats"]);
 const SEMANTIC_FAILURE_KINDS = new Set(["intent_override", "scope_rewrite", "wrong_approach", "style_mismatch", "oversized"]);
 const RESUMABLE_FAILURE_KINDS = new Set(["timeout", "policy", "patch_thrash"]);
-const SOL_MODEL = "gpt-5.6-sol";
-const SOL_WARNING_MIN_SAMPLE = 4;
-const SOL_WARNING_MAX_FILES = 500;
-const SOL_WARNING_MAX_EXAMINED_FILES = 5000;
-const SOL_WARNING_MAX_FILE_BYTES = 16 * 1024 * 1024;
-const SOL_WARNING_WINDOW_MS = 7 * 24 * 60 * 60 * 1000;
-const SOL_FOREGROUND_WRITE_FALLBACK_WARNING = "warning: foreground gpt-5.6-sol write tasks run against a 570s flight budget. Split the package or use gpt-5.6-terra; volume shapes go to gpt-5.6-luna.";
+const FLAGSHIP_MODEL = "gpt-6-astra";
+const FLAGSHIP_WARNING_MIN_SAMPLE = 4;
+const FLAGSHIP_WARNING_MAX_FILES = 500;
+const FLAGSHIP_WARNING_MAX_EXAMINED_FILES = 5000;
+const FLAGSHIP_WARNING_MAX_FILE_BYTES = 16 * 1024 * 1024;
+const FLAGSHIP_WARNING_WINDOW_MS = 7 * 24 * 60 * 60 * 1000;
+const FLAGSHIP_FOREGROUND_WRITE_FALLBACK_WARNING = "warning: foreground gpt-6-astra write tasks run against a 570s flight budget and the flagship's time to first token at max runs into minutes. Keep effort at xhigh, split the package, or use gpt-5.6-terra; volume shapes go to gpt-5.6-luna.";
 let activeCommandArgv = null;
 let cachedCompanionVersion = null;
 let companionVersionRead = false;
@@ -158,6 +158,12 @@ function serviceTierOption(value) {
     return parseServiceTier(value);
   } catch (error) {
     throw new CompanionError(error.message, "input");
+  }
+}
+
+function rejectPersistentEffort(value) {
+  if (typeof value === "string" && value.trim().toLowerCase() === "persistent") {
+    throw new CompanionError("The persistent reasoning effort switches Codex into its open ended persistent mode, which cannot run inside a bounded companion flight. Choose another effort.", "input");
   }
 }
 
@@ -816,7 +822,11 @@ export function parseTaskHeader(prompt) {
 }
 
 function taskModelDrift(record, prompt, resolvedModel) {
-  if (record.jobClass !== "task" || record.request?.model != null || typeof resolvedModel !== "string" || !resolvedModel.trim()) {
+  const requestedModel = record.request?.model;
+  if (typeof requestedModel === "string" && requestedModel.trim() && typeof resolvedModel === "string" && resolvedModel.trim() && requestedModel.trim() !== resolvedModel.trim()) {
+    return { requestedModel, resolvedModel };
+  }
+  if (record.jobClass !== "task" || requestedModel != null || typeof resolvedModel !== "string" || !resolvedModel.trim()) {
     return null;
   }
   const { headerModel, headerEffort } = parseTaskHeader(prompt);
@@ -1068,14 +1078,14 @@ function currentProcessIdentity() {
   return identity;
 }
 
-function isSolForegroundWriteRequest({ background, model, write }) {
-  return !background && write && typeof model === "string" && model.trim().toLowerCase() === "gpt-5.6-sol";
+function isFlagshipForegroundWriteRequest({ background, model, write }) {
+  return !background && write && typeof model === "string" && model.trim().toLowerCase() === FLAGSHIP_MODEL;
 }
 
-function scanSolForegroundWriteStat(dataDir) {
+function scanFlagshipForegroundWriteStat(dataDir) {
   try {
     const now = Date.now();
-    const cutoff = now - SOL_WARNING_WINDOW_MS;
+    const cutoff = now - FLAGSHIP_WARNING_WINDOW_MS;
     const stateRoot = path.join(path.resolve(dataDir), "state");
     const files = [];
     for (const workspace of fs.readdirSync(stateRoot, { withFileTypes: true })) {
@@ -1109,11 +1119,11 @@ function scanSolForegroundWriteStat(dataDir) {
     let timeouts = 0;
     let examined = 0;
     for (const { file, modifiedAt, size } of files) {
-      if (modifiedAt < cutoff || examined >= SOL_WARNING_MAX_EXAMINED_FILES || total >= SOL_WARNING_MAX_FILES) {
+      if (modifiedAt < cutoff || examined >= FLAGSHIP_WARNING_MAX_EXAMINED_FILES || total >= FLAGSHIP_WARNING_MAX_FILES) {
         break;
       }
       examined += 1;
-      if (size > SOL_WARNING_MAX_FILE_BYTES) {
+      if (size > FLAGSHIP_WARNING_MAX_FILE_BYTES) {
         continue;
       }
       let record;
@@ -1134,7 +1144,7 @@ function scanSolForegroundWriteStat(dataDir) {
         continue;
       }
       const model = request.model || record.resolvedModel;
-      if (model !== SOL_MODEL) {
+      if (model !== FLAGSHIP_MODEL) {
         continue;
       }
       total += 1;
@@ -1148,13 +1158,13 @@ function scanSolForegroundWriteStat(dataDir) {
   }
 }
 
-function solForegroundWriteWarning(dataDir) {
-  const stat = scanSolForegroundWriteStat(dataDir);
-  if (!stat || stat.total < SOL_WARNING_MIN_SAMPLE) {
-    return SOL_FOREGROUND_WRITE_FALLBACK_WARNING;
+function flagshipForegroundWriteWarning(dataDir) {
+  const stat = scanFlagshipForegroundWriteStat(dataDir);
+  if (!stat || stat.total < FLAGSHIP_WARNING_MIN_SAMPLE) {
+    return FLAGSHIP_FOREGROUND_WRITE_FALLBACK_WARNING;
   }
   const percentage = Math.round((100 * stat.timeouts) / stat.total);
-  return `warning: ${percentage}% of foreground gpt-5.6-sol write tasks timed out in the last 7 days (${stat.timeouts} of ${stat.total}). Sized to the 570s flight budget? Split the package or use gpt-5.6-terra; volume shapes go to gpt-5.6-luna.`;
+  return `warning: ${percentage}% of foreground gpt-6-astra write tasks timed out in the last 7 days (${stat.timeouts} of ${stat.total}). Sized to the 570s flight budget? Keep effort at xhigh, split the package, or use gpt-5.6-terra; volume shapes go to gpt-5.6-luna.`;
 }
 
 function shellArgument(value) {
@@ -1354,12 +1364,10 @@ function inheritedRouting(record, options, defaultServiceTier) {
     effort = sourceEffort;
     inherited = true;
   }
-  const hasSourceServiceTier = Object.hasOwn(source, "serviceTier") || typeof record?.serviceTier === "string" || typeof record?.appliedServiceTier === "string";
+  const hasSourceServiceTier = Object.hasOwn(source, "serviceTier") || typeof record?.serviceTier === "string";
   const sourceServiceTier = Object.hasOwn(source, "serviceTier")
     ? source.serviceTier
-    : typeof record?.serviceTier === "string"
-      ? record.serviceTier
-      : record?.appliedServiceTier;
+    : record?.serviceTier;
   if (!explicitServiceTier && hasSourceServiceTier) {
     serviceTier = sourceServiceTier === null ? null : serviceTierOption(sourceServiceTier);
     inherited = true;
@@ -1480,10 +1488,10 @@ function failureKindForError(error) {
 }
 
 function semanticOutcome(outcome) {
-  if (outcome.collaborationViolation) {
+  if (outcome.policyViolation) {
     return {
       semanticFailureKind: "policy",
-      semanticFailureMessage: redactDiagnostic(outcome.collaborationViolation),
+      semanticFailureMessage: redactDiagnostic(outcome.policyViolation),
       semanticStatus: "rejected"
     };
   }
@@ -1571,9 +1579,6 @@ async function executeRecord(found) {
           checkpointedThreadId = checkpoint.threadId;
           patch.threadId = checkpoint.threadId;
         }
-        if (checkpoint.appliedServiceTier) {
-          patch.appliedServiceTier = checkpoint.appliedServiceTier;
-        }
         if (Object.keys(patch).length > 0) {
           updateJobRecordFile(found.file, { heartbeatAt: nowIso(), ...patch });
         }
@@ -1633,7 +1638,6 @@ async function executeRecord(found) {
       failureKind: outcome.failureKind,
       protocolError: outcome.protocolError ? redactDiagnostic(outcome.protocolError) : null,
       partialResultText: outcome.partialResultText ? redactDiagnostic(outcome.partialResultText) : null,
-      appliedServiceTier: outcome.appliedServiceTier ?? record.appliedServiceTier,
       resolvedEffort: outcome.resolvedEffort ?? record.resolvedEffort,
       resolvedModel,
       ...(modelDrift ? { modelDrift } : {}),
@@ -1858,11 +1862,13 @@ async function handleTask(rawArgv, transport = {}) {
       valueOptions: ["cwd", "effort", "model", "output-schema", "prompt-file", "resume", "service-tier"]
     });
     const serviceTier = serviceTierOption(options["service-tier"]);
+    rejectPersistentEffort(options.effort);
     const cwd = resolveCwd(options);
     rejectImplicitSubdirectoryCwd(cwd, options);
     const dataDir = resolveDataDir();
     const resume = resolveResume(dataDir, cwd, options);
     const routing = resume.threadId ? inheritedRouting(latestJobRecordForThread(dataDir, resume.threadId), options, serviceTier) : inheritedRouting(null, options, serviceTier);
+    rejectPersistentEffort(routing.effort);
     const write = options.write ?? Boolean(transport.defaultWrite);
     const background = Boolean(options.background);
     const outputSchemaFile = options["output-schema"] ? resolveOutputSchemaFile(cwd, options["output-schema"]) : null;
@@ -1896,7 +1902,7 @@ async function handleTask(rawArgv, transport = {}) {
       ...(routing.inherited ? { inheritedFromThread: true } : {})
     };
     validateExecutionRequest(cwd, request);
-    const warning = isSolForegroundWriteRequest({ background, model: request.model, write: request.write }) ? solForegroundWriteWarning(dataDir) : null;
+    const warning = isFlagshipForegroundWriteRequest({ background, model: request.model, write: request.write }) ? flagshipForegroundWriteWarning(dataDir) : null;
     const diagnostics = warning ? [{ type: "warning", message: warning }] : [];
     if (warning) {
       process.stderr.write(`${warning}\n`);
@@ -1977,6 +1983,7 @@ async function handleReview(rawArgv, adversarial = false, transport = {}) {
   const cwd = resolveCwd(options);
   rejectImplicitSubdirectoryCwd(cwd, options);
   const serviceTier = serviceTierOption(options["service-tier"]);
+  rejectPersistentEffort(options.effort);
   const probe = preflightCodex(cwd);
   const target = reviewTarget(options);
   const positionalFocus = positionalText ?? positionals.join(" ");

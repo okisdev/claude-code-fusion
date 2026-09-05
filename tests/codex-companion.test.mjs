@@ -38,13 +38,13 @@ const processInspectionTests = new Set([
   "identity-replaced owners are terminalized without signaling the live replacement",
   "task stays foreground by default and persists the complete terminal record",
   "task records completed file changes",
-  "sol foreground write warning is emitted before execution and recorded",
-  "sol warning is limited to foreground write tasks",
-  "sol warning uses recent job records for its stat",
-  "sol warning falls back below the minimum sample",
-  "sol warning tolerates malformed job files",
-  "sol warning applies the cap after filtering matching records",
-  "sol warning skips oversized job files",
+  "flagship foreground write warning is emitted before execution and recorded",
+  "flagship warning is limited to foreground write tasks",
+  "flagship warning uses recent job records for its stat",
+  "flagship warning falls back below the minimum sample",
+  "flagship warning tolerates malformed job files",
+  "flagship warning applies the cap after filtering matching records",
+  "flagship warning skips oversized job files",
   "task resolves an output schema, forwards it, and records parsed structured output",
   "task retains a non-JSON agent message and records the structured parsing error",
   "option shaped text after a task prompt cannot enable background or change execution settings",
@@ -59,7 +59,9 @@ const processInspectionTests = new Set([
   "final response prose cannot promote or reject semantic acceptance",
   "job records retain request-seeded model and effort without runtime observations",
   "rollout observations replace request-seeded model and effort",
+  "task fails closed when the rollout shows the persistent reasoning mode",
   "task records and renders model drift from a brief header",
+  "task records model drift when Codex resolves a different model than the explicit request",
   "an explicit task model suppresses header model drift",
   "a matching task header model does not create model drift",
   "a task without a header does not create model drift",
@@ -384,7 +386,7 @@ test("task stays foreground by default and persists the complete terminal record
   assert.equal(result.stderr, "");
   assert.equal(fs.readFileSync(sandbox.stdinFile, "utf8").trim(), "implement this safely");
   const args = readArgs(sandbox);
-  assert.deepEqual(args.slice(0, 13), [
+  assert.deepEqual(args.slice(0, 17), [
     "exec",
     "--strict-config",
     "--json",
@@ -396,6 +398,10 @@ test("task stays foreground by default and persists the complete terminal record
     "multi_agent",
     "--disable",
     "multi_agent_v2",
+    "--disable",
+    "sleep_tool",
+    "--disable",
+    "memories",
     "--model",
     "gpt-test"
   ]);
@@ -412,7 +418,7 @@ test("task stays foreground by default and persists the complete terminal record
   assert.equal(entry.record.resolvedModel, "gpt-test");
   assert.equal(entry.record.resolvedEffort, "max");
   assert.equal(entry.record.tokenUsageAvailability, "available");
-  assert.equal(entry.record.codexVersion, "0.152.0");
+  assert.equal(entry.record.codexVersion, "0.153.4");
   assert.equal(fs.statSync(entry.file).mode & 0o777, 0o600);
   assert.equal(fs.statSync(path.dirname(entry.file)).mode & 0o777, 0o700);
 });
@@ -428,7 +434,7 @@ test("task records completed file changes", (t) => {
   assert.equal(jobRecords(sandbox)[0].fileChangeCount, 2);
 });
 
-test("sol foreground write warning is emitted before execution and recorded", (t) => {
+test("flagship foreground write warning is emitted before execution and recorded", (t) => {
   const sandbox = makeSandbox(t);
   initializeGitRepository(sandbox);
   const traceCodex = path.join(sandbox.root, "trace-codex");
@@ -437,19 +443,19 @@ test("sol foreground write warning is emitted before execution and recorded", (t
     [
       "#!/usr/bin/env node",
       "if (process.argv.includes('--version')) {",
-      "  process.stdout.write('codex-cli 0.147.0\\n');",
+      "  process.stdout.write('codex-cli 0.152.0\\n');",
       "  require('node:fs').unlinkSync(process.argv[1]);",
       "}"
     ].join("\n"),
     { mode: 0o755 }
   );
-  const result = runCompanion(["task", "--write", "--model", "gpt-5.6-sol", "implement the sol-safe change"], {
+  const result = runCompanion(["task", "--write", "--model", "gpt-6-astra", "implement the flagship-safe change"], {
     cwd: sandbox.workDir,
     env: envFor(sandbox, {
       CODEX_BIN: traceCodex
     })
   });
-  const warning = "warning: foreground gpt-5.6-sol write tasks run against a 570s flight budget. Split the package or use gpt-5.6-terra; volume shapes go to gpt-5.6-luna.";
+  const warning = "warning: foreground gpt-6-astra write tasks run against a 570s flight budget and the flagship's time to first token at max runs into minutes. Keep effort at xhigh, split the package, or use gpt-5.6-terra; volume shapes go to gpt-5.6-luna.";
 
   assert.equal(result.status, 1, result.stderr);
   assert.equal(result.stderr, `${warning}\n`);
@@ -458,11 +464,11 @@ test("sol foreground write warning is emitted before execution and recorded", (t
   assert.equal(record.diagnostics.filter((diagnostic) => diagnostic.type === "warning" && diagnostic.message === warning).length, 1);
 });
 
-test("sol warning is limited to foreground write tasks", async (t) => {
-  const warning = "warning: foreground gpt-5.6-sol write tasks run against a 570s flight budget. Split the package or use gpt-5.6-terra; volume shapes go to gpt-5.6-luna.";
+test("flagship warning is limited to foreground write tasks", async (t) => {
+  const warning = "warning: foreground gpt-6-astra write tasks run against a 570s flight budget and the flagship's time to first token at max runs into minutes. Keep effort at xhigh, split the package, or use gpt-5.6-terra; volume shapes go to gpt-5.6-luna.";
   const cases = [
     { args: ["task", "--write", "--model", "gpt-5.6-terra", "use terra"], write: true },
-    { args: ["task", "--model", "gpt-5.6-sol", "use sol in consult mode"], write: false }
+    { args: ["task", "--model", "gpt-6-astra", "use flagship in consult mode"], write: false }
   ];
   for (const entry of cases) {
     const sandbox = makeSandbox(t);
@@ -481,7 +487,7 @@ test("sol warning is limited to foreground write tasks", async (t) => {
   const background = makeSandbox(t);
   initializeGitRepository(background);
   const env = envFor(background);
-  const launched = runCompanion(["task", "--background", "--write", "--model", "gpt-5.6-sol", "use sol in the background"], { cwd: background.workDir, env });
+  const launched = runCompanion(["task", "--background", "--write", "--model", "gpt-6-astra", "use flagship in the background"], { cwd: background.workDir, env });
   assert.equal(launched.status, 0, launched.stderr);
   assert.equal(launched.stderr, "");
   const completed = await waitFor(() => {
@@ -491,7 +497,7 @@ test("sol warning is limited to foreground write tasks", async (t) => {
   assert.equal(completed.diagnostics.some((diagnostic) => diagnostic.message === warning), false);
 });
 
-function seedSolJobRecords(sandbox, entries) {
+function seedFlagshipJobRecords(sandbox, entries) {
   const records = [];
   for (const entry of entries) {
     const id = randomBytes(16).toString("hex");
@@ -515,108 +521,108 @@ function seedSolJobRecords(sandbox, entries) {
   return records;
 }
 
-test("sol warning uses recent job records for its stat", (t) => {
+test("flagship warning uses recent job records for its stat", (t) => {
   const sandbox = makeSandbox(t);
   initializeGitRepository(sandbox);
-  seedSolJobRecords(sandbox, [
-    { failureKind: "timeout", request: { model: "gpt-5.6-sol" } },
-    { failureKind: "timeout", request: { model: "gpt-5.6-sol" } },
-    { request: {}, resolvedModel: "gpt-5.6-sol" },
-    { request: { model: "gpt-5.6-sol" } }
+  seedFlagshipJobRecords(sandbox, [
+    { failureKind: "timeout", request: { model: "gpt-6-astra" } },
+    { failureKind: "timeout", request: { model: "gpt-6-astra" } },
+    { request: {}, resolvedModel: "gpt-6-astra" },
+    { request: { model: "gpt-6-astra" } }
   ]);
-  const result = runCompanion(["task", "--write", "--model", "gpt-5.6-sol", "implement the measured change"], {
+  const result = runCompanion(["task", "--write", "--model", "gpt-6-astra", "implement the measured change"], {
     cwd: sandbox.workDir,
     env: envFor(sandbox)
   });
-  const warning = "warning: 50% of foreground gpt-5.6-sol write tasks timed out in the last 7 days (2 of 4). Sized to the 570s flight budget? Split the package or use gpt-5.6-terra; volume shapes go to gpt-5.6-luna.";
+  const warning = "warning: 50% of foreground gpt-6-astra write tasks timed out in the last 7 days (2 of 4). Sized to the 570s flight budget? Keep effort at xhigh, split the package, or use gpt-5.6-terra; volume shapes go to gpt-5.6-luna.";
 
   assert.equal(result.status, 0, result.stderr);
   assert.equal(result.stderr, `${warning}\n`);
   assert.equal(jobRecords(sandbox).filter((record) => record.diagnostics.some((diagnostic) => diagnostic.message === warning)).length, 1);
 });
 
-test("sol warning falls back below the minimum sample", (t) => {
+test("flagship warning falls back below the minimum sample", (t) => {
   const sandbox = makeSandbox(t);
   initializeGitRepository(sandbox);
-  seedSolJobRecords(sandbox, [
-    { failureKind: "timeout", request: { model: "gpt-5.6-sol" } },
-    { request: { model: "gpt-5.6-sol" } },
-    { request: { model: "gpt-5.6-sol" } }
+  seedFlagshipJobRecords(sandbox, [
+    { failureKind: "timeout", request: { model: "gpt-6-astra" } },
+    { request: { model: "gpt-6-astra" } },
+    { request: { model: "gpt-6-astra" } }
   ]);
-  const result = runCompanion(["task", "--write", "--model", "gpt-5.6-sol", "implement the fallback change"], {
+  const result = runCompanion(["task", "--write", "--model", "gpt-6-astra", "implement the fallback change"], {
     cwd: sandbox.workDir,
     env: envFor(sandbox)
   });
-  const warning = "warning: foreground gpt-5.6-sol write tasks run against a 570s flight budget. Split the package or use gpt-5.6-terra; volume shapes go to gpt-5.6-luna.";
+  const warning = "warning: foreground gpt-6-astra write tasks run against a 570s flight budget and the flagship's time to first token at max runs into minutes. Keep effort at xhigh, split the package, or use gpt-5.6-terra; volume shapes go to gpt-5.6-luna.";
 
   assert.equal(result.status, 0, result.stderr);
   assert.equal(result.stderr, `${warning}\n`);
   assert.equal(jobRecords(sandbox).filter((record) => record.diagnostics.some((diagnostic) => diagnostic.message === warning)).length, 1);
 });
 
-test("sol warning tolerates malformed job files", (t) => {
+test("flagship warning tolerates malformed job files", (t) => {
   const sandbox = makeSandbox(t);
   initializeGitRepository(sandbox);
-  seedSolJobRecords(sandbox, [
-    { failureKind: "timeout", request: { model: "gpt-5.6-sol" } },
-    { request: { model: "gpt-5.6-sol" } },
-    { request: { model: "gpt-5.6-sol" } },
-    { request: { model: "gpt-5.6-sol" } }
+  seedFlagshipJobRecords(sandbox, [
+    { failureKind: "timeout", request: { model: "gpt-6-astra" } },
+    { request: { model: "gpt-6-astra" } },
+    { request: { model: "gpt-6-astra" } },
+    { request: { model: "gpt-6-astra" } }
   ]);
   const jobsDirectory = path.dirname(jobFilePath(sandbox.dataDir, sandbox.workDir, "malformed-job"));
   fs.writeFileSync(path.join(jobsDirectory, "malformed-job.json"), "{not valid json\n");
-  const result = runCompanion(["task", "--write", "--model", "gpt-5.6-sol", "implement despite malformed history"], {
+  const result = runCompanion(["task", "--write", "--model", "gpt-6-astra", "implement despite malformed history"], {
     cwd: sandbox.workDir,
     env: envFor(sandbox)
   });
-  const warning = "warning: 25% of foreground gpt-5.6-sol write tasks timed out in the last 7 days (1 of 4). Sized to the 570s flight budget? Split the package or use gpt-5.6-terra; volume shapes go to gpt-5.6-luna.";
+  const warning = "warning: 25% of foreground gpt-6-astra write tasks timed out in the last 7 days (1 of 4). Sized to the 570s flight budget? Keep effort at xhigh, split the package, or use gpt-5.6-terra; volume shapes go to gpt-5.6-luna.";
 
   assert.equal(result.status, 0, result.stderr);
   assert.equal(result.stderr, `${warning}\n`);
   assert.equal(jobRecords(sandbox).filter((record) => record.diagnostics.some((diagnostic) => diagnostic.message === warning)).length, 1);
 });
 
-test("sol warning applies the cap after filtering matching records", (t) => {
+test("flagship warning applies the cap after filtering matching records", (t) => {
   const sandbox = makeSandbox(t);
   initializeGitRepository(sandbox);
   const now = Date.now();
-  const solModifiedAt = new Date(now - 2 * 60 * 1000);
-  const nonSolModifiedAt = new Date(now - 60 * 1000);
-  const solRecords = seedSolJobRecords(sandbox, [
-    { createdAt: new Date(now - 2 * 60 * 1000).toISOString(), failureKind: "timeout", request: { model: "gpt-5.6-sol" } },
-    { createdAt: new Date(now - 2 * 60 * 1000).toISOString(), failureKind: "timeout", request: { model: "gpt-5.6-sol" } },
-    { createdAt: new Date(now - 2 * 60 * 1000).toISOString(), request: { model: "gpt-5.6-sol" } },
-    { createdAt: new Date(now - 2 * 60 * 1000).toISOString(), request: { model: "gpt-5.6-sol" } }
+  const flagshipModifiedAt = new Date(now - 2 * 60 * 1000);
+  const nonFlagshipModifiedAt = new Date(now - 60 * 1000);
+  const flagshipRecords = seedFlagshipJobRecords(sandbox, [
+    { createdAt: new Date(now - 2 * 60 * 1000).toISOString(), failureKind: "timeout", request: { model: "gpt-6-astra" } },
+    { createdAt: new Date(now - 2 * 60 * 1000).toISOString(), failureKind: "timeout", request: { model: "gpt-6-astra" } },
+    { createdAt: new Date(now - 2 * 60 * 1000).toISOString(), request: { model: "gpt-6-astra" } },
+    { createdAt: new Date(now - 2 * 60 * 1000).toISOString(), request: { model: "gpt-6-astra" } }
   ]);
-  const nonSolRecords = seedSolJobRecords(
+  const nonFlagshipRecords = seedFlagshipJobRecords(
     sandbox,
     Array.from({ length: 600 }, () => ({ createdAt: new Date(now - 60 * 1000).toISOString(), request: { model: "gpt-5.6-terra" } }))
   );
-  for (const { file } of solRecords) {
-    fs.utimesSync(file, solModifiedAt, solModifiedAt);
+  for (const { file } of flagshipRecords) {
+    fs.utimesSync(file, flagshipModifiedAt, flagshipModifiedAt);
   }
-  for (const { file } of nonSolRecords) {
-    fs.utimesSync(file, nonSolModifiedAt, nonSolModifiedAt);
+  for (const { file } of nonFlagshipRecords) {
+    fs.utimesSync(file, nonFlagshipModifiedAt, nonFlagshipModifiedAt);
   }
 
-  const result = runCompanion(["task", "--write", "--model", "gpt-5.6-sol", "calculate from matching history"], {
+  const result = runCompanion(["task", "--write", "--model", "gpt-6-astra", "calculate from matching history"], {
     cwd: sandbox.workDir,
     env: envFor(sandbox)
   });
-  const warning = "warning: 50% of foreground gpt-5.6-sol write tasks timed out in the last 7 days (2 of 4). Sized to the 570s flight budget? Split the package or use gpt-5.6-terra; volume shapes go to gpt-5.6-luna.";
+  const warning = "warning: 50% of foreground gpt-6-astra write tasks timed out in the last 7 days (2 of 4). Sized to the 570s flight budget? Keep effort at xhigh, split the package, or use gpt-5.6-terra; volume shapes go to gpt-5.6-luna.";
 
   assert.equal(result.status, 0, result.stderr);
   assert.equal(result.stderr, `${warning}\n`);
 });
 
-test("sol warning skips oversized job files", (t) => {
+test("flagship warning skips oversized job files", (t) => {
   const sandbox = makeSandbox(t);
   initializeGitRepository(sandbox);
-  seedSolJobRecords(sandbox, [
-    { failureKind: "timeout", request: { model: "gpt-5.6-sol" } },
-    { request: { model: "gpt-5.6-sol" } },
-    { request: { model: "gpt-5.6-sol" } },
-    { request: { model: "gpt-5.6-sol" } }
+  seedFlagshipJobRecords(sandbox, [
+    { failureKind: "timeout", request: { model: "gpt-6-astra" } },
+    { request: { model: "gpt-6-astra" } },
+    { request: { model: "gpt-6-astra" } },
+    { request: { model: "gpt-6-astra" } }
   ]);
   const jobsDirectory = path.dirname(jobFilePath(sandbox.dataDir, sandbox.workDir, "oversized-job"));
   const oversizedFile = path.join(jobsDirectory, "oversized-job.json");
@@ -624,11 +630,11 @@ test("sol warning skips oversized job files", (t) => {
   fs.truncateSync(oversizedFile, 16 * 1024 * 1024 + 1);
   assert.ok(fs.statSync(oversizedFile).size > 16 * 1024 * 1024);
 
-  const result = runCompanion(["task", "--write", "--model", "gpt-5.6-sol", "ignore oversized history"], {
+  const result = runCompanion(["task", "--write", "--model", "gpt-6-astra", "ignore oversized history"], {
     cwd: sandbox.workDir,
     env: envFor(sandbox)
   });
-  const warning = "warning: 25% of foreground gpt-5.6-sol write tasks timed out in the last 7 days (1 of 4). Sized to the 570s flight budget? Split the package or use gpt-5.6-terra; volume shapes go to gpt-5.6-luna.";
+  const warning = "warning: 25% of foreground gpt-6-astra write tasks timed out in the last 7 days (1 of 4). Sized to the 570s flight budget? Keep effort at xhigh, split the package, or use gpt-5.6-terra; volume shapes go to gpt-5.6-luna.";
 
   assert.equal(result.status, 0, result.stderr);
   assert.equal(result.stderr, `${warning}\n`);
@@ -1053,7 +1059,7 @@ test("task rejects an outdated Codex CLI before execution", (t) => {
   const outdatedFailure = JSON.parse(outdatedResult.stderr);
   assert.equal(outdatedFailure.status, "error");
   assert.equal(outdatedFailure.failureKind, "setup");
-  assert.match(outdatedFailure.message, /Upgrade the Codex CLI to version 0\.147\.0 or later\./);
+  assert.match(outdatedFailure.message, /Upgrade the Codex CLI to version 0\.152\.0 or later\./);
   assert.equal(fs.existsSync(outdated.argsFile), false);
   assert.deepEqual(jobRecords(outdated), []);
 
@@ -1064,14 +1070,14 @@ test("task rejects an outdated Codex CLI before execution", (t) => {
   });
   assert.equal(textResult.status, 1);
   assert.equal(textResult.stdout, "");
-  assert.match(textResult.stderr, /Upgrade the Codex CLI to version 0\.147\.0 or later\./);
+  assert.match(textResult.stderr, /Upgrade the Codex CLI to version 0\.152\.0 or later\./);
   assert.match(textResult.stderr, /failure: setup/);
   assert.equal(fs.existsSync(text.argsFile), false);
   assert.deepEqual(jobRecords(text), []);
 });
 
 test("task proceeds with tested, alpha hotfix, and newer Codex CLI versions", (t) => {
-  for (const version of ["0.147.0", "0.147.0-alpha.10", "0.147.0-alpha.10.1", "0.148.0", "0.152.0", "0.153.0"]) {
+  for (const version of ["0.152.0", "0.152.1", "0.153.0-alpha.5.1", "0.153.0", "0.153.2", "0.153.4", "0.154.0"]) {
     const sandbox = makeSandbox(t);
     const result = runCompanion(["task", "--json", "do work"], {
       cwd: sandbox.workDir,
@@ -1155,6 +1161,27 @@ test("rollout observations replace request-seeded model and effort", (t) => {
   assert.equal(record.rolloutRecoveryStatus, "recovered");
 });
 
+test("task fails closed when the rollout shows the persistent reasoning mode", (t) => {
+  const sandbox = makeSandbox(t);
+  const result = runCompanion(["task", "--model", "gpt-test", "inspect"], {
+    cwd: sandbox.workDir,
+    env: envFor(sandbox, {
+      CODEX_HOME: path.join(sandbox.root, "codex-home"),
+      FAKE_CODEX_MODE: "rollout-completed",
+      FAKE_CODEX_RESOLVED_EFFORT: "persistent",
+      FAKE_CODEX_RESOLVED_MODEL: "gpt-test"
+    })
+  });
+  assert.equal(result.status, 1, result.stderr);
+  assert.match(result.stdout, /state: error\nfailure: policy\n$/);
+  const [record] = jobRecords(sandbox);
+  assert.equal(record.status, "error");
+  assert.equal(record.failureKind, "policy");
+  assert.equal(record.semanticStatus, "rejected");
+  assert.match(record.semanticFailureMessage, /persistent reasoning mode/);
+  assert.equal(record.resolvedEffort, "persistent");
+});
+
 test("task records and renders model drift from a brief header", (t) => {
   const sandbox = makeSandbox(t);
   const result = runCompanion(["task", "lane: codex | model: gpt-header | effort: xhigh\nImplement the change."], {
@@ -1179,6 +1206,29 @@ test("task records and renders model drift from a brief header", (t) => {
   assert.equal(rerendered.stdout.split(warning).length - 1, 1);
 });
 
+test("task records model drift when Codex resolves a different model than the explicit request", (t) => {
+  const sandbox = makeSandbox(t);
+  const result = runCompanion(["task", "--model", "gpt-5.6-terra", "Implement the change."], {
+    cwd: sandbox.workDir,
+    env: envFor(sandbox, {
+      CODEX_HOME: path.join(sandbox.root, "codex-home"),
+      FAKE_CODEX_MODE: "rollout-completed",
+      FAKE_CODEX_RESOLVED_MODEL: "gpt-reserve"
+    })
+  });
+  assert.equal(result.status, 0, result.stderr);
+  const warning = "warning: the request named gpt-5.6-terra but the job ran gpt-reserve; Codex substituted the model, which after a Luna Reserve handoff means the account's advanced model allowance is exhausted.";
+  assert.equal(result.stdout.split(warning).length - 1, 1);
+  const [record] = jobRecords(sandbox);
+  assert.deepEqual(record.modelDrift, {
+    requestedModel: "gpt-5.6-terra",
+    resolvedModel: "gpt-reserve"
+  });
+  const rerendered = runCompanion(["result", record.id], { cwd: sandbox.workDir, env: envFor(sandbox) });
+  assert.equal(rerendered.status, 0, rerendered.stderr);
+  assert.equal(rerendered.stdout.split(warning).length - 1, 1);
+});
+
 test("an explicit task model suppresses header model drift", (t) => {
   const sandbox = makeSandbox(t);
   const result = runCompanion(["task", "--model", "gpt-explicit", "lane: codex | model: gpt-header | effort: xhigh\nImplement the change."], {
@@ -1186,7 +1236,7 @@ test("an explicit task model suppresses header model drift", (t) => {
     env: envFor(sandbox, {
       CODEX_HOME: path.join(sandbox.root, "codex-home"),
       FAKE_CODEX_MODE: "rollout-completed",
-      FAKE_CODEX_RESOLVED_MODEL: "gpt-resolved"
+      FAKE_CODEX_RESOLVED_MODEL: "gpt-explicit"
     })
   });
   assert.equal(result.status, 0, result.stderr);
@@ -1222,6 +1272,49 @@ test("a task without a header does not create model drift", (t) => {
   assert.equal(result.status, 0, result.stderr);
   assert.doesNotMatch(result.stdout, /warning: brief header names/);
   assert.equal(Object.hasOwn(jobRecords(sandbox)[0], "modelDrift"), false);
+});
+
+test("task and review reject the persistent reasoning effort before creating a job", (t) => {
+  const sandbox = makeSandbox(t);
+  const message = /persistent mode, which cannot run inside a bounded companion flight/;
+  const task = runCompanion(["task", "--json", "--effort", "persistent", "do work"], { cwd: sandbox.workDir, env: envFor(sandbox) });
+  assert.equal(task.status, 1);
+  assert.equal(task.stdout, "");
+  const failure = JSON.parse(task.stderr);
+  assert.equal(failure.status, "error");
+  assert.equal(failure.failureKind, "input");
+  assert.match(failure.message, message);
+  const review = runCompanion(["review", "--effort", "persistent"], { cwd: sandbox.workDir, env: envFor(sandbox) });
+  assert.equal(review.status, 1);
+  assert.match(review.stderr, message);
+  assert.match(review.stderr, /failure: input/);
+  assert.equal(fs.existsSync(sandbox.argsFile), false);
+  assert.deepEqual(jobRecords(sandbox), []);
+});
+
+test("resume rejects a persistent reasoning effort inherited from the source thread", (t) => {
+  const sandbox = makeSandbox(t);
+  const env = envFor(sandbox);
+  const threadId = "01a06fc6-64d4-7531-8180-4eabc5888d83";
+  const record = createJobRecord({
+    createdAt: new Date(Date.now() - 60000).toISOString(),
+    cwd: sandbox.workDir,
+    id: "persistent-source-job",
+    request: { effort: "persistent", model: "gpt-6-astra", write: false },
+    resolvedEffort: "persistent",
+    resolvedModel: "gpt-6-astra",
+    status: "done",
+    threadId
+  });
+  writeJobRecordFile(jobFilePath(resolveDataDir(env), sandbox.workDir, record.id), record);
+  const result = runCompanion(["task", "--json", "--resume", threadId, "continue the work"], { cwd: sandbox.workDir, env });
+  assert.equal(result.status, 1);
+  assert.equal(result.stdout, "");
+  const failure = JSON.parse(result.stderr);
+  assert.equal(failure.failureKind, "input");
+  assert.match(failure.message, /persistent mode, which cannot run inside a bounded companion flight/);
+  assert.equal(fs.existsSync(sandbox.argsFile), false);
+  assert.deepEqual(jobRecords(sandbox).map((job) => job.id), ["persistent-source-job"]);
 });
 
 test("task forwards --skip-git-repo-check to Codex", (t) => {
@@ -2079,13 +2172,13 @@ test("status repairs an ownerless running record as died", async (t) => {
 
 test("setup verifies authentication and the tested Codex version interval", (t) => {
   const sandbox = makeSandbox(t);
-  const ready = runCompanion(["setup", "--json"], { cwd: sandbox.workDir, env: envFor(sandbox, { FAKE_CODEX_VERSION: "0.147.0" }) });
+  const ready = runCompanion(["setup", "--json"], { cwd: sandbox.workDir, env: envFor(sandbox, { FAKE_CODEX_VERSION: "0.152.0" }) });
   assert.equal(ready.status, 0, ready.stderr);
   const readyReport = JSON.parse(ready.stdout);
   assert.equal(readyReport.ready, true);
   assert.equal(readyReport.compatibility, "tested");
   assert.equal(readyReport.authenticated, true);
-  for (const version of ["0.147.0-alpha.10", "0.147.0-alpha.10.1", "0.148.0", "0.152.0"]) {
+  for (const version of ["0.152.1", "0.153.0-alpha.5.1", "0.153.0", "0.153.2"]) {
     const alpha = runCompanion(["setup", "--json"], {
       cwd: sandbox.workDir,
       env: envFor(sandbox, { FAKE_CODEX_VERSION: version })
@@ -2103,7 +2196,7 @@ test("setup verifies authentication and the tested Codex version interval", (t) 
   assert.doesNotMatch(JSON.stringify(JSON.parse(redacted.stdout)), /sk-secretvalue123/);
   const redactedVersion = runCompanion(["setup", "--json"], {
     cwd: sandbox.workDir,
-    env: envFor(sandbox, { FAKE_CODEX_VERSION_OUTPUT: "codex-cli 0.147.0 access_token=secretversionvalue" })
+    env: envFor(sandbox, { FAKE_CODEX_VERSION_OUTPUT: "codex-cli 0.153.4 access_token=secretversionvalue" })
   });
   assert.equal(redactedVersion.status, 0, redactedVersion.stderr);
   assert.doesNotMatch(JSON.stringify(JSON.parse(redactedVersion.stdout)), /secretversionvalue/);
@@ -2125,12 +2218,12 @@ test("setup verifies authentication and the tested Codex version interval", (t) 
   assert.doesNotMatch(apiKey.stdout, /codex-test-key/);
   const unsupported = runCompanion(["setup", "--json"], {
     cwd: sandbox.workDir,
-    env: envFor(sandbox, { FAKE_CODEX_VERSION: "0.153.0" })
+    env: envFor(sandbox, { FAKE_CODEX_VERSION: "0.154.0" })
   });
   assert.equal(unsupported.status, 1);
   const unsupportedReport = JSON.parse(unsupported.stdout);
   assert.equal(unsupportedReport.ready, false);
-  assert.match(unsupportedReport.compatibility, /newer than the tested interval \(0\.147\.0 to before 0\.153\.0\)/);
+  assert.match(unsupportedReport.compatibility, /newer than the tested interval \(0\.152\.0 to before 0\.154\.0\)/);
   assert.match(unsupportedReport.nextSteps.join("\n"), /A verification pass is advised\./);
 });
 

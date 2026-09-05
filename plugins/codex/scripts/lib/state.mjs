@@ -458,9 +458,10 @@ function ownerSessionId(record) {
 }
 
 function normalizeRecord(record) {
+  const { appliedServiceTier, ...normalizedRecord } = record;
   const sessionId = ownerSessionId(record);
   return {
-    ...record,
+    ...normalizedRecord,
     delivery: record.delivery ?? (record.background ? "manual" : "foreground"),
     deliveryCollectedAt: record.deliveryCollectedAt ?? null,
     schemaVersion: record.schemaVersion ?? JOB_SCHEMA_VERSION,
@@ -471,7 +472,6 @@ function normalizeRecord(record) {
     semanticFailureKind: record.semanticFailureKind ?? null,
     semanticFailureMessage: record.semanticFailureMessage ?? null,
     serviceTier: record.serviceTier ?? record.request?.serviceTier ?? null,
-    appliedServiceTier: record.appliedServiceTier ?? null,
     resolvedModel: record.resolvedModel ?? null,
     resolvedEffort: record.resolvedEffort ?? null,
     timeoutMs: record.timeoutMs ?? null,
@@ -718,7 +718,6 @@ export function createJobRecord(fields) {
     tokenUsageUnavailableReason: fields.tokenUsageUnavailableReason ?? null,
     usageIsIncomplete: fields.usageIsIncomplete ?? null,
     serviceTier: Object.hasOwn(fields, "serviceTier") ? fields.serviceTier : fields.request?.serviceTier ?? null,
-    appliedServiceTier: fields.appliedServiceTier ?? null,
     resolvedModel: fields.resolvedModel ?? fields.request?.model ?? null,
     resolvedEffort: fields.resolvedEffort ?? fields.request?.effort ?? null,
     ...(fields.modelDrift ? { modelDrift: fields.modelDrift } : {}),

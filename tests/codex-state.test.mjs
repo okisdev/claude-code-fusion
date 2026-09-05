@@ -260,7 +260,6 @@ test("job ids contain 128 bits and records expose the canonical Codex fields", (
   assert.strictEqual(record.acceptanceRecordedAt, null);
   assert.strictEqual(record.semanticStatus, "unverified");
   assert.strictEqual(record.serviceTier, null);
-  assert.strictEqual(record.appliedServiceTier, null);
   assert.strictEqual(record.resolvedModel, "gpt-test");
   assert.strictEqual(record.resolvedEffort, "high");
   assert.strictEqual(record.timeoutMs, null);

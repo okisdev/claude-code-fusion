@@ -62,6 +62,22 @@ test("model drift is rendered in every terminal footer and never in a running fo
   assert.doesNotMatch(renderTerminalResult(record()), /warning: brief header names/);
 });
 
+test("explicit model drift is rendered in every terminal footer and never in a running footer", () => {
+  const warning = "warning: the request named gpt-5.6-terra but the job ran gpt-reserve; Codex substituted the model, which after a Luna Reserve handoff means the account's advanced model allowance is exhausted.";
+  const modelDrift = {
+    requestedModel: "gpt-5.6-terra",
+    resolvedModel: "gpt-reserve"
+  };
+  for (const rendered of [
+    renderTerminalResult(record({ modelDrift, status: "error" })),
+    renderJobDetail(record({ modelDrift })),
+    renderCancelReport(record({ modelDrift, status: "cancelled" }))
+  ]) {
+    assert.equal(rendered.split(warning).length - 1, 1);
+  }
+  assert.doesNotMatch(renderJobDetail(record({ modelDrift, status: "running" })), /warning: the request named/);
+});
+
 test("a structured task result renders its parsing status in the footer", () => {
   const request = { outputSchemaFile: "/tmp/verdict.schema.json" };
   assert.match(renderTerminalResult(record({ request, structuredOutput: { verdict: "pass" } })), /semantic: unverified\nstructured: parsed\nstate: done\n$/);
