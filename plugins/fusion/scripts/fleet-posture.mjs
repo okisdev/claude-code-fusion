@@ -12,7 +12,7 @@ const NARROW_WAVE_THRESHOLD_ENV = "FUSION_NARROW_WAVE_THRESHOLD";
 const FLEET_MODE_FILE = "fleet-mode";
 const DEFAULT_NARROW_WAVE_THRESHOLD = 2;
 const ADDITIONAL_CONTEXT = tagMessage("fleet-posture.strict-fleet-reminder", "fleet-default active: a goal that decomposes into three or more independent work packages convenes /fusion:ultra once bootstrap dependencies are resolved; narrower execution states `fleet-decline: <reason>` visibly in the reply.");
-const SESSION_LANES_REMINDER = tagMessage("fleet-posture.session-lanes-reminder", "fusion lanes ready: codex terra/luna for quick and volume packages, grok under its four roles, claude workers for the Claude surface. Independent packages dispatch together in one message; three or more convene /fusion:ultra; a single coherent change stays inline.");
+const SESSION_LANES_REMINDER = tagMessage("fleet-posture.session-lanes-reminder", "fusion lanes ready: codex astra for spec grade and deep review, terra/luna for quick and volume packages, grok under its four roles, claude workers for the Claude surface. Independent packages dispatch together in one message; three or more convene /fusion:ultra; a single coherent change stays inline.");
 
 function readHookInput() {
   try {
