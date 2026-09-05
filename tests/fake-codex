@@ -65,7 +65,7 @@ if (UNMODELLED_SUBCOMMANDS.has(args[0])) {
 }
 
 if (args.includes("--version")) {
-  process.stdout.write(`${process.env.FAKE_CODEX_VERSION_OUTPUT || `codex-cli ${process.env.FAKE_CODEX_VERSION || "0.152.0"}`}\n`);
+  process.stdout.write(`${process.env.FAKE_CODEX_VERSION_OUTPUT || `codex-cli ${process.env.FAKE_CODEX_VERSION || "0.153.4"}`}\n`);
   process.exit(0);
 }
 
@@ -156,7 +156,7 @@ function writeRollout({ message = "Recovered partial Codex output." } = {}) {
       type: "turn_context",
       payload: {
         model: process.env.FAKE_CODEX_RESOLVED_MODEL || "gpt-resolved",
-        collaboration_mode: { settings: { reasoning_effort: process.env.FAKE_CODEX_RESOLVED_EFFORT || "xhigh" } }
+        effort: process.env.FAKE_CODEX_RESOLVED_EFFORT || "xhigh"
       }
     },
     { timestamp: now.toISOString(), type: "event_msg", payload: { type: "agent_message", message, phase: "commentary" } },

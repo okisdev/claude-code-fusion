@@ -12,7 +12,11 @@ function footer(record) {
     lines.push(`failure: ${record.failureKind ?? (record.status === "cancelled" ? "cancelled" : "error")}`);
   }
   if (["done", "error", "cancelled"].includes(record.status) && record.modelDrift) {
-    lines.push(`warning: brief header names ${record.modelDrift.headerModel} but the job ran ${record.modelDrift.resolvedModel}; pass --model to select the model.`);
+    if (Object.hasOwn(record.modelDrift, "requestedModel")) {
+      lines.push(`warning: the request named ${record.modelDrift.requestedModel} but the job ran ${record.modelDrift.resolvedModel}; Codex substituted the model, which after a Luna Reserve handoff means the account's advanced model allowance is exhausted.`);
+    } else {
+      lines.push(`warning: brief header names ${record.modelDrift.headerModel} but the job ran ${record.modelDrift.resolvedModel}; pass --model to select the model.`);
+    }
   }
   return lines.join("\n");
 }

@@ -187,7 +187,11 @@ function baseExecArgs(sandbox, options) {
     "--disable",
     "multi_agent",
     "--disable",
-    "multi_agent_v2"
+    "multi_agent_v2",
+    "--disable",
+    "sleep_tool",
+    "--disable",
+    "memories"
   ];
   appendExplicitSettings(args, options, sandbox);
   return args;
@@ -292,20 +296,6 @@ export function subtractUsage(endValue, startValue) {
 
 function observedString(value) {
   return typeof value === "string" && value.trim() ? value.trim() : null;
-}
-
-function sessionConfiguredServiceTier(event) {
-  if (!["session.configured", "session_configured", "session-configured"].includes(event.type)) {
-    return null;
-  }
-  const metadata = [event, event.config, event.metadata, event.session, event.session_config, event.sessionConfig, event.session_configured, event.sessionConfigured];
-  for (const value of metadata) {
-    const serviceTier = observedString(value?.service_tier ?? value?.serviceTier);
-    if (serviceTier && SERVICE_TIER_PATTERN.test(serviceTier)) {
-      return serviceTier;
-    }
-  }
-  return null;
 }
 
 function codexHome(env) {
@@ -476,7 +466,7 @@ function recoverRolloutObservation(threadId, options = {}) {
     if (entry?.type === "turn_context" && payload && typeof payload === "object") {
       result.matchedTurn = true;
       result.resolvedModel = observedString(payload.model) ?? result.resolvedModel;
-      result.resolvedEffort = observedString(payload.collaboration_mode?.settings?.reasoning_effort ?? payload.reasoning_effort ?? payload.model_reasoning_effort) ?? result.resolvedEffort;
+      result.resolvedEffort = observedString(payload.collaboration_mode?.settings?.reasoning_effort ?? payload.effort ?? payload.reasoning_effort ?? payload.model_reasoning_effort) ?? result.resolvedEffort;
     }
     if (entry?.type === "event_msg" && payload?.type === "token_count") {
       result.matchedTurn = true;
@@ -974,8 +964,7 @@ function outputPaths(options) {
 
 function checkpointState(state, event = null) {
   return {
-    appliedServiceTier: state.appliedServiceTier,
-    collaborationViolation: state.collaborationViolation,
+    policyViolation: state.policyViolation,
     event,
     eventCount: state.eventCount,
     threadId: state.threadId,
@@ -1027,11 +1016,6 @@ function validateEvent(state, event) {
   state.eventCount += 1;
   classifyDiagnostic(state, event);
   switch (event.type) {
-    case "session.configured":
-    case "session_configured":
-    case "session-configured":
-      state.appliedServiceTier = sessionConfiguredServiceTier(event) ?? state.appliedServiceTier;
-      break;
     case "thread.started": {
       if (state.threadStarted || state.turnStarted || state.terminalEvent) {
         recordProtocolError(state, "Codex emitted thread.started outside the initial lifecycle position.");
@@ -1096,7 +1080,7 @@ function validateEvent(state, event) {
       }
       if (event.item.type === "collab_tool_call") {
         const tool = observedString(event.item.tool) ?? "unknown collaboration tool";
-        state.collaborationViolation = `Delegated Codex execution attempted the disabled ${tool} tool.`;
+        state.policyViolation = `Delegated Codex execution attempted the disabled ${tool} tool.`;
       }
       if (event.type === "item.completed" && event.item.type === "file_change") {
         state.fileChangeCount += 1;
@@ -1186,8 +1170,8 @@ function failureOutcome(state, processOutcome, stderrTail) {
       errorMessage: processOutcome.spawnError.message
     };
   }
-  if (state.collaborationViolation) {
-    return { status: "error", failureKind: "policy", errorMessage: state.collaborationViolation };
+  if (state.policyViolation) {
+    return { status: "error", failureKind: "policy", errorMessage: state.policyViolation };
   }
   if (state.patchThrash) {
     return {
@@ -1281,11 +1265,10 @@ export async function runCodex(options = {}) {
     fs.chmodSync(options.eventsFile, PRIVATE_FILE_MODE);
   }
   const state = {
-    appliedServiceTier: null,
     callbackError: null,
     cancelled: false,
     cleanupComplete: true,
-    collaborationViolation: null,
+    policyViolation: null,
     cumulativeTokenUsage: null,
     cumulativeUsageUnavailableReason: null,
     diagnostics: [],
@@ -1529,7 +1512,7 @@ export async function runCodex(options = {}) {
       return;
     }
     validateEvent(state, event);
-    if (state.protocolError || state.resourceError || state.collaborationViolation) {
+    if (state.protocolError || state.resourceError || state.policyViolation) {
       void requestTermination();
     }
     try {
@@ -1644,6 +1627,9 @@ export async function runCodex(options = {}) {
     state.rolloutRecoveryStatus = recovered.matchedTurn ? "recovered" : recovered.found ? "stale" : "not_found";
     state.resolvedModel = recovered.resolvedModel;
     state.resolvedEffort = recovered.resolvedEffort;
+    if (!state.policyViolation && state.resolvedEffort?.trim().toLowerCase() === "persistent") {
+      state.policyViolation = "Delegated Codex execution ran in the persistent reasoning mode.";
+    }
     if (recovered.cumulativeTokenUsage && (!state.cumulativeTokenUsage || state.timedOut || state.cancelled)) {
       state.cumulativeTokenUsage = recovered.cumulativeTokenUsage;
       state.cumulativeUsageUnavailableReason = null;
@@ -1652,8 +1638,8 @@ export async function runCodex(options = {}) {
       state.finalResponse = recovered.partialResultText;
       state.resultSource = "rollout_partial";
     }
-    if (!state.collaborationViolation && recovered.collaborationTool) {
-      state.collaborationViolation = `Delegated Codex execution attempted the disabled ${recovered.collaborationTool} tool.`;
+    if (!state.policyViolation && recovered.collaborationTool) {
+      state.policyViolation = `Delegated Codex execution attempted the disabled ${recovered.collaborationTool} tool.`;
     }
   }
   const usage = usageOutcome(state, { ...options, args });
@@ -1681,18 +1667,17 @@ export async function runCodex(options = {}) {
     timedOut: state.timedOut,
     cancelled: state.cancelled,
     cleanupComplete: state.cleanupComplete,
-    collaborationViolation: state.collaborationViolation,
+    policyViolation: state.policyViolation,
     threadId: state.threadId,
     terminalEvent: state.terminalEvent?.type ?? null,
     finalResponse: state.finalResponse,
     partialResultText: state.timedOut || state.cancelled ? state.finalResponse || null : null,
     resultSource: state.resultSource,
     cumulativeTokenUsage: state.cumulativeTokenUsage,
-    appliedServiceTier: state.appliedServiceTier,
     resolvedEffort: state.resolvedEffort,
     resolvedModel: state.resolvedModel,
     rolloutRecoveryStatus: state.rolloutRecoveryStatus,
-    semanticStatus: state.collaborationViolation ? "rejected" : "unverified",
+    semanticStatus: state.policyViolation ? "rejected" : "unverified",
     usageIsIncomplete: state.timedOut || state.cancelled || state.terminalEvent?.type !== "turn.completed",
     ...usage,
     eventCount: state.eventCount,

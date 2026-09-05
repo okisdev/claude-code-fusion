@@ -394,8 +394,8 @@ test("Grok rules document source verified headless boundaries", () => {
   assert.match(contract, /Upstream wires only `bypassPermissions` at spawn/);
   assert.match(contract, /Upstream ships ACP today/);
   assert.match(contract, /The companion has not adopted ACP yet and continues per-call invocation/);
-  assert.match(codexContract, /failureKind: "setup".*below the tested minimum 0\.147\.0/);
-  assert.match(codexContract, /The tested interval runs from 0\.147\.0 up to but excluding 0\.153\.0; versions below 0\.147\.0 fail task and review preflight with a setup error; versions at or above 0\.153\.0 keep running task and review preflight while `\/codex:setup` reports not ready with exit code 1 as the compatibility advisory/);
+  assert.match(codexContract, /failureKind: "setup".*below the tested minimum 0\.152\.0/);
+  assert.match(codexContract, /The tested interval runs from 0\.152\.0 up to but excluding 0\.154\.0; versions below 0\.152\.0 fail task and review preflight with a setup error; versions at or above 0\.154\.0 keep running task and review preflight while `\/codex:setup` reports not ready with exit code 1 as the compatibility advisory/);
   assert.match(codexContract, /Codex configuration parse failures under `--strict-config`.*failureKind: "process"/);
   assert.match(sharedContract, /The Grok instance adds `sandbox`[^\n]*`transport`[^\n]*`policy`[^\n]*`turn_limit`[^\n]*and `network`/);
   assert.match(sharedContract, /`setup`: The installed CLI version or installation lacks a required adapter capability and fails capability preflight/);

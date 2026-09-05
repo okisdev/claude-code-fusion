@@ -10,7 +10,7 @@ import { messageTag, tagMessage } from "../plugins/fusion/scripts/lib/user-messa
 const repoRoot = path.join(import.meta.dirname, "..");
 const script = path.join(repoRoot, "plugins", "fusion", "scripts", "fleet-posture.mjs");
 const LEGACY_CONTEXT = tagMessage("fleet-posture.strict-fleet-reminder", "fleet-default active: a goal that decomposes into three or more independent work packages convenes /fusion:ultra once bootstrap dependencies are resolved; narrower execution states `fleet-decline: <reason>` visibly in the reply.");
-const SESSION_LANES_CONTEXT = tagMessage("fleet-posture.session-lanes-reminder", "fusion lanes ready: codex terra/luna for quick and volume packages, grok under its four roles, claude workers for the Claude surface. Independent packages dispatch together in one message; three or more convene /fusion:ultra; a single coherent change stays inline.");
+const SESSION_LANES_CONTEXT = tagMessage("fleet-posture.session-lanes-reminder", "fusion lanes ready: codex astra for spec grade and deep review, terra/luna for quick and volume packages, grok under its four roles, claude workers for the Claude surface. Independent packages dispatch together in one message; three or more convene /fusion:ultra; a single coherent change stays inline.");
 
 function makeSandbox(t) {
   const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "fleet-posture-test-")));

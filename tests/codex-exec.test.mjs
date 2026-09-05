@@ -153,12 +153,12 @@ async function waitForProcessExit(pid, ownsProcessGroup = false) {
 
 test("version and availability probe the configured Codex binary", () => {
   const env = { ...process.env, CODEX_BIN: fakeCodex };
-  assert.equal(getCodexVersion({ env }), "0.152.0");
+  assert.equal(getCodexVersion({ env }), "0.153.4");
   assert.deepEqual(getCodexAvailability({ env }), {
     available: true,
     bin: fakeCodex,
-    version: "0.152.0",
-    rawVersion: "codex-cli 0.152.0",
+    version: "0.153.4",
+    rawVersion: "codex-cli 0.153.4",
     exitCode: 0,
     errorMessage: null
   });
@@ -248,6 +248,10 @@ test("task arguments enforce safe headless execution and put global flags before
     "multi_agent",
     "--disable",
     "multi_agent_v2",
+    "--disable",
+    "sleep_tool",
+    "--disable",
+    "memories",
     "--model",
     "gpt-test",
     "-c",
@@ -281,6 +285,10 @@ test("task arguments leave model and effort unset while pinning networked tools 
     "multi_agent",
     "--disable",
     "multi_agent_v2",
+    "--disable",
+    "sleep_tool",
+    "--disable",
+    "memories",
     "-c",
     "service_tier=priority",
     "--config",
@@ -322,6 +330,10 @@ test("native review is read-only and maps review targets", () => {
     "multi_agent",
     "--disable",
     "multi_agent_v2",
+    "--disable",
+    "sleep_tool",
+    "--disable",
+    "memories",
     "-c",
     "service_tier=priority",
     "--config",
@@ -342,6 +354,10 @@ test("native review is read-only and maps review targets", () => {
     "multi_agent",
     "--disable",
     "multi_agent_v2",
+    "--disable",
+    "sleep_tool",
+    "--disable",
+    "memories",
     "-c",
     "service_tier=priority",
     "--config",
@@ -365,7 +381,6 @@ test("companion forwards and records the default service tier without an applied
   assert.equal(argv[serviceTierIndex + 1], "service_tier=priority");
   const record = JSON.parse(result.stdout);
   assert.equal(record.serviceTier, "priority");
-  assert.equal(record.appliedServiceTier, null);
   assert.equal(companionJobRecords(sandbox)[0]?.serviceTier, "priority");
 });
 
@@ -458,7 +473,7 @@ test("a collaboration tool event fails closed even when Codex emits a completed 
   assert.equal(outcome.status, "error");
   assert.equal(outcome.failureKind, "policy");
   assert.equal(outcome.semanticStatus, "rejected");
-  assert.match(outcome.collaborationViolation, /disabled spawn_agent tool/);
+  assert.match(outcome.policyViolation, /disabled spawn_agent tool/);
 });
 
 test("a successful leader exit cleans every remaining process in its owned group", async (t) => {

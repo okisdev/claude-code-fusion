@@ -724,7 +724,33 @@ export function runtimeSocketSymlinkEndpoints(candidates, lstat = fs.lstatSync) 
   return symlinks;
 }
 
-export function preflightRuntimeSocketEndpoints({ candidates = runtimeSocketEndpoints(), lstat = fs.lstatSync } = {}) {
+export function runtimeSocketEngine(endpoint, readlink = fs.readlinkSync) {
+  let target;
+  try {
+    target = String(readlink(endpoint));
+  } catch {
+    return null;
+  }
+  if (target.includes("/.orbstack/")) {
+    return "orbstack";
+  }
+  if (target.includes("/.docker/run/") || target.includes("/.docker/desktop/")) {
+    return "docker-desktop";
+  }
+  return null;
+}
+
+export function runtimeSocketRemedy(endpoint, engine) {
+  if (engine === "orbstack") {
+    return `OrbStack creates ${endpoint} through its admin helper. Run \`orb config set setup.use_admin false\`, remove the symlink with \`sudo rm ${endpoint}\`, and restart OrbStack; the docker CLI keeps working through the orbstack context, while features that need admin, such as host ports below 1024, stop until the setting is restored. Do not downgrade the sandbox.`;
+  }
+  if (engine === "docker-desktop") {
+    return `Docker Desktop creates ${endpoint} while "Allow the default Docker socket to be used" is enabled under Settings, Advanced. Disable it, remove the symlink with \`sudo rm ${endpoint}\`, and restart Docker Desktop; the docker CLI keeps working through the desktop context. Do not downgrade the sandbox.`;
+  }
+  return `Stop the Docker engine that creates ${endpoint}, or remove the symlink. Do not downgrade the sandbox.`;
+}
+
+export function preflightRuntimeSocketEndpoints({ candidates = runtimeSocketEndpoints(), lstat = fs.lstatSync, readlink = fs.readlinkSync } = {}) {
   let symlinks;
   try {
     symlinks = runtimeSocketSymlinkEndpoints(candidates, lstat);
@@ -735,7 +761,7 @@ export function preflightRuntimeSocketEndpoints({ candidates = runtimeSocketEndp
     const endpoint = symlinks[0];
     throw securityError(
       "sandbox",
-      `Grok strict sandbox (runtime-socket deny policy, 1.0.4 through 1.0.13) refuses to start while ${endpoint} exists as a symlink. Repair the host environment: stop the Docker engine that creates the symlink or remove it. Do not downgrade the sandbox.`
+      `Grok strict sandbox (runtime-socket deny policy, 1.0.4 through 1.0.13) refuses to start while ${endpoint} exists as a symlink. ${runtimeSocketRemedy(endpoint, runtimeSocketEngine(endpoint, readlink))}`
     );
   }
   return symlinks;
