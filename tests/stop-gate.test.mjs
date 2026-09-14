@@ -108,12 +108,13 @@ test("stop-gate allows the stop when grok replies ALLOW", (t) => {
   assert.strictEqual(result.status, 0, result.stderr);
   assert.strictEqual(result.stdout, "");
   const invocations = readInvocations(sandbox.argsFile);
-  assert.strictEqual(invocations.length, 1);
-  assert.ok(hasPair(invocations[0], "--max-turns", "15"));
-  assert.ok(hasPair(invocations[0], "--permission-mode", "default"));
-  assert.ok(hasPair(invocations[0], "--sandbox", "strict"));
-  assert.ok(hasPair(invocations[0], "--tools", "read_file,grep,list_dir"));
-  assert.ok(hasPair(invocations[0], "--prompt-file", "/dev/stdin"));
+  assert.strictEqual(invocations.length, 2);
+  assert.deepStrictEqual(invocations[0], ["--version"]);
+  assert.ok(hasPair(invocations[1], "--max-turns", "15"));
+  assert.ok(hasPair(invocations[1], "--permission-mode", "default"));
+  assert.ok(hasPair(invocations[1], "--sandbox", "strict"));
+  assert.ok(hasPair(invocations[1], "--tools", "read_file,grep,list_dir"));
+  assert.ok(hasPair(invocations[1], "--prompt-file", "/dev/stdin"));
   const brief = fs.readFileSync(stdinFile, "utf8");
   assert.ok(brief.includes("export const other = 2;"));
   assert.ok(brief.includes("untracked.txt"));
@@ -179,7 +180,8 @@ test("stop-gate runs when the userConfig env var is true even if the legacy flag
   });
   assert.strictEqual(result.status, 0, result.stderr);
   const invocations = readInvocations(sandbox.argsFile);
-  assert.strictEqual(invocations.length, 1);
+  assert.strictEqual(invocations.length, 2);
+  assert.deepStrictEqual(invocations[0], ["--version"]);
 });
 
 test("stop-gate skips when the userConfig env var is false even if the legacy flag is on", (t) => {
@@ -203,7 +205,7 @@ test("stop-gate falls back to the legacy flag when the userConfig env var is gar
     env: envFor(sandbox, { FAKE_GROK_MODE: "gate-allow", CLAUDE_PLUGIN_OPTION_STOP_GATE: "maybe" }),
   });
   assert.strictEqual(result.status, 0, result.stderr);
-  assert.strictEqual(readInvocations(sandbox.argsFile).length, 1);
+  assert.strictEqual(readInvocations(sandbox.argsFile).length, 2);
 });
 
 test("stop-gate preserves current behavior when the userConfig env var is unset", (t) => {
@@ -216,7 +218,7 @@ test("stop-gate preserves current behavior when the userConfig env var is unset"
   enableGate(sandbox);
   const onResult = runStopGate(sandbox, { env: envFor(sandbox, { FAKE_GROK_MODE: "gate-allow" }) });
   assert.strictEqual(onResult.status, 0, onResult.stderr);
-  assert.strictEqual(readInvocations(sandbox.argsFile).length, 1);
+  assert.strictEqual(readInvocations(sandbox.argsFile).length, 2);
 });
 
 test("stop-gate exits silently when grok fails", (t) => {

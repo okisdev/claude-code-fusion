@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import fs from "node:fs";
+import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -82,10 +83,10 @@ test("removed capabilities are rejected by probes and fail managed-run setup", (
   ]);
 });
 
-test("fake Grok reports the 1.0.13 version format and supports an output override", () => {
+test("fake Grok reports the 1.0.30 version format and supports an output override", () => {
   const defaultVersion = spawnSync(process.execPath, [fakeGrok, "--version"], { encoding: "utf8", env: {} });
   assert.equal(defaultVersion.status, 0, defaultVersion.stderr);
-  assert.equal(defaultVersion.stdout, "grok 1.0.13 (0123456789ab)\n");
+  assert.equal(defaultVersion.stdout, "grok 1.0.30 (0123456789ab)\n");
 
   const overriddenVersion = spawnSync(process.execPath, [fakeGrok, "--version"], {
     encoding: "utf8",
@@ -93,6 +94,24 @@ test("fake Grok reports the 1.0.13 version format and supports an output overrid
   });
   assert.equal(overriddenVersion.status, 0, overriddenVersion.stderr);
   assert.equal(overriddenVersion.stdout, "grok 1.0.1 (abcdef012345)\n");
+});
+
+test("managed runs reject Grok versions below the tested interval before model launch", (t) => {
+  const sandbox = makeSandbox(t);
+  const result = runCompanion(["task", "inspect the repository"], {
+    cwd: sandbox.workDir,
+    env: envFor(sandbox, { FAKE_GROK_VERSION_OUTPUT: "grok 1.0.13 (abcdef012345)" })
+  });
+
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /Grok CLI version 1\.0\.13 is unsupported\. Upgrade Grok to version 1\.0\.14 or later\./);
+  assert.match(result.stderr, /^failure: setup$/m);
+  assert.deepEqual(readInvocations(sandbox.argsFile), [["--version"]]);
+  const records = jobRecords(sandbox.dataDir);
+  assert.equal(records.length, 1);
+  assert.equal(records[0].status, "error");
+  assert.equal(records[0].failureKind, "setup");
+  assert.equal(records[0].grokVersion, "1.0.13");
 });
 
 test("exited leader cleanup with no identity signals only the original process group", async () => {
@@ -238,7 +257,7 @@ test("task schema requests fail preflight when structured output support is miss
 
   assert.notEqual(result.status, 0);
   assert.match(result.stderr, /--json-schema/);
-  assert.deepEqual(readInvocations(sandbox.argsFile), []);
+  assert.deepEqual(readInvocations(sandbox.argsFile), [["--version"]]);
 });
 
 for (const requiredCapability of ["--prompt-file", "--output-format", "--sandbox", "--tools", "--disallowed-tools", "--deny", "--max-turns", "--no-auto-update", "--permission-mode", "--allow", "--disable-web-search"]) {
@@ -255,7 +274,7 @@ for (const requiredCapability of ["--prompt-file", "--output-format", "--sandbox
 
     assert.notEqual(result.status, 0);
     assert.match(result.stderr, new RegExp(requiredCapability));
-    assert.deepEqual(readInvocations(sandbox.argsFile), []);
+    assert.deepEqual(readInvocations(sandbox.argsFile), [["--version"]]);
   });
 }
 
@@ -272,7 +291,7 @@ test("write mode fails closed before launch without always-approve support", (t)
 
   assert.notEqual(result.status, 0);
   assert.match(result.stderr, /--always-approve/);
-  assert.deepEqual(readInvocations(sandbox.argsFile), []);
+  assert.deepEqual(readInvocations(sandbox.argsFile), [["--version"]]);
 });
 
 test("managed runs fail closed when Grok cannot skip background work", (t) => {
@@ -288,7 +307,7 @@ test("managed runs fail closed when Grok cannot skip background work", (t) => {
 
   assert.notEqual(result.status, 0);
   assert.match(result.stderr, /--no-wait-for-background/);
-  assert.deepEqual(readInvocations(sandbox.argsFile), []);
+  assert.deepEqual(readInvocations(sandbox.argsFile), [["--version"]]);
 });
 
 test("setup reports the injected capability verdict without an extra help probe", (t) => {
@@ -301,12 +320,46 @@ test("setup reports the injected capability verdict without an extra help probe"
   assert.equal(result.status, 0, result.stderr);
   const report = JSON.parse(result.stdout);
   assert.equal(report.ready, true);
+  assert.equal(report.compatibility, "tested");
+  assert.deepEqual(report.nextSteps, []);
   assert.equal(report.capabilities.ready, true);
   assert.equal(report.capabilities.flags["--tools"], true);
   assert.equal(report.doctorCommand.available, true);
   assert.equal(report.shellEnvironmentPolicy.available, false);
   assert.equal(report.shellEnvironmentPolicy.present, false);
   assert.deepEqual(readInvocations(sandbox.argsFile), [["--version"], ["doctor", "--help"]]);
+});
+
+test("setup reports newer and older Grok builds outside the tested interval", (t) => {
+  const newerSandbox = makeSandbox(t);
+  const newer = runCompanion(["setup", "--json"], {
+    cwd: newerSandbox.workDir,
+    env: envFor(newerSandbox, { FAKE_GROK_VERSION_OUTPUT: "grok 1.0.31 (abcdef012345)" })
+  });
+  assert.equal(newer.status, 0, newer.stderr);
+  const newerReport = JSON.parse(newer.stdout);
+  assert.equal(newerReport.ready, false);
+  assert.equal(newerReport.compatibility, "newer than the tested interval (1.0.14 to before 1.0.31)");
+  assert.deepEqual(newerReport.nextSteps, ["Grok CLI version 1.0.31 is newer than the tested interval (1.0.14 to before 1.0.31). A verification pass is advised."]);
+
+  const newerRendered = runCompanion(["setup"], {
+    cwd: newerSandbox.workDir,
+    env: envFor(newerSandbox, { FAKE_GROK_VERSION_OUTPUT: "grok 1.0.31 (abcdef012345)" })
+  });
+  assert.equal(newerRendered.status, 0, newerRendered.stderr);
+  assert.match(newerRendered.stdout, /- compatibility: newer than the tested interval \(1\.0\.14 to before 1\.0\.31\)/);
+  assert.match(newerRendered.stdout, /^- Grok CLI version 1\.0\.31 is newer than the tested interval \(1\.0\.14 to before 1\.0\.31\)\. A verification pass is advised\.$/m);
+
+  const olderSandbox = makeSandbox(t);
+  const older = runCompanion(["setup", "--json"], {
+    cwd: olderSandbox.workDir,
+    env: envFor(olderSandbox, { FAKE_GROK_VERSION_OUTPUT: "grok 1.0.13 (abcdef012345)" })
+  });
+  assert.equal(older.status, 0, older.stderr);
+  const olderReport = JSON.parse(older.stdout);
+  assert.equal(olderReport.ready, false);
+  assert.equal(olderReport.compatibility, "outside the tested interval (1.0.14 to before 1.0.31)");
+  assert.deepEqual(olderReport.nextSteps, ["Use a Grok CLI version in the tested interval (1.0.14 to before 1.0.31)."]);
 });
 
 test("setup reports shell environment policy presence without affecting readiness", (t) => {
@@ -337,6 +390,34 @@ test("setup reports shell environment policy presence without affecting readines
   assert.equal(unparseableReport.ready, true);
   assert.equal(unparseableReport.shellEnvironmentPolicy.available, false);
   assert.equal(unparseableReport.shellEnvironmentPolicy.present, false);
+});
+
+test("setup reports an undenied OrbStack socket without changing readiness", async (t) => {
+  const sandbox = makeSandbox(t);
+  const socket = path.join(sandbox.root, "orbstack", "docker.sock");
+  fs.mkdirSync(path.dirname(socket), { recursive: true });
+  const server = net.createServer();
+  await new Promise((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(socket, () => {
+      server.off("error", reject);
+      resolve();
+    });
+  });
+  t.after(() => new Promise((resolve) => server.close(resolve)));
+
+  const env = envFor(sandbox, { GROK_COMPANION_UNDENIED_SOCKET_CANDIDATES: socket });
+  const result = runCompanion(["setup", "--json"], { cwd: sandbox.workDir, env });
+  assert.equal(result.status, 0, result.stderr);
+  const report = JSON.parse(result.stdout);
+  const detail = `no runtime-socket deny path is a symlink; OrbStack docker socket ${socket} is outside grok's runtime-socket deny list, so a strict write shell may still reach that engine`;
+  assert.equal(report.ready, true);
+  assert.deepEqual(report.hostEnvironment.undeniedRuntimeSockets, [socket]);
+  assert.equal(report.hostEnvironment.detail, detail);
+
+  const rendered = runCompanion(["setup"], { cwd: sandbox.workDir, env });
+  assert.equal(rendered.status, 0, rendered.stderr);
+  assert.ok(rendered.stdout.includes(detail));
 });
 
 test("setup reports grok doctor as unavailable when the subcommand is missing", (t) => {
@@ -418,7 +499,7 @@ test("Grok child environment removes Claude integration state and disables impli
     assert.equal(childEnv[key], undefined, key);
   }
   assert.equal(childEnv.GROK_COMPANION_CONTINUITY_POLICY, undefined);
-  assert.equal(childEnv.RUST_LOG, "xai_grok_agent::builder=debug,xai_grok_sandbox=warn");
+  assert.equal(childEnv.RUST_LOG, "xai_grok_agent::builder=debug,xai_grok_sandbox=warn,xai_grok_shell::session::acp_session::turn=warn");
   assert.equal(path.isAbsolute(childEnv.TMPDIR), true);
   assert.equal(path.dirname(childEnv.TMPDIR), fs.realpathSync(os.tmpdir()));
   assert.match(path.basename(childEnv.TMPDIR), /^grok-companion-run-/);
@@ -479,6 +560,24 @@ for (const [mode, warning] of [
     assert.equal(fs.existsSync(sentinel), false);
   });
 }
+
+test("the upstream auth retry warning stops a strict run as an auth failure", async (t) => {
+  const sandbox = makeSandbox(t);
+  const sentinel = path.join(sandbox.root, "auth-retry-loop.sentinel");
+  const result = await runGrok(directOptions(sandbox, "auth-retry-loop", {
+    env: envFor(sandbox, {
+      FAKE_GROK_MODE: "auth-retry-loop",
+      FAKE_GROK_SANDBOX_SENTINEL: sentinel,
+    }),
+  }));
+
+  assert.notEqual(result.exitCode, 0);
+  assert.equal(result.securityFailureKind, "auth");
+  assert.match(result.errorMessage, /re-authentication retry loop/);
+  assert.match(result.errorMessage, /`grok -p ok`/);
+  assert.doesNotMatch(result.errorMessage, /\u001b\[/);
+  assert.equal(fs.existsSync(sentinel), false);
+});
 
 test("companion persistence classifies tool policy enforcement failures", (t) => {
   const sandbox = makeSandbox(t);
@@ -562,9 +661,9 @@ for (const mode of [
 test("sandbox event log rotation fails closed before prompt delivery", async (t) => {
   const sandbox = makeSandbox(t);
   const grokHome = path.join(sandbox.root, "grok-home");
-  const eventFile = path.join(grokHome, "sandbox-events.jsonl");
+  const eventFile = path.join(grokHome, "sessions", "sandbox-events.jsonl");
   const stdinFile = path.join(sandbox.root, "sandbox-rotation-stdin.txt");
-  fs.mkdirSync(grokHome, { recursive: true });
+  fs.mkdirSync(path.dirname(eventFile), { recursive: true });
   fs.writeFileSync(eventFile, `${JSON.stringify({ event_type: "ProfileApplied" })}\n`, "utf8");
 
   const result = await runGrok(directOptions(sandbox, "sandbox-log-rotate", {
@@ -583,9 +682,9 @@ test("sandbox event log rotation fails closed before prompt delivery", async (t)
 test("sandbox event log truncation fails closed before prompt delivery", async (t) => {
   const sandbox = makeSandbox(t);
   const grokHome = path.join(sandbox.root, "grok-home");
-  const eventFile = path.join(grokHome, "sandbox-events.jsonl");
+  const eventFile = path.join(grokHome, "sessions", "sandbox-events.jsonl");
   const stdinFile = path.join(sandbox.root, "sandbox-truncation-stdin.txt");
-  fs.mkdirSync(grokHome, { recursive: true });
+  fs.mkdirSync(path.dirname(eventFile), { recursive: true });
   fs.writeFileSync(eventFile, `${JSON.stringify({ event_type: "ProfileApplied", padding: "x".repeat(1024) })}\n`, "utf8");
 
   const result = await runGrok(directOptions(sandbox, "sandbox-log-truncate", {

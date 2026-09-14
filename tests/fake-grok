@@ -9,7 +9,7 @@
     fs.appendFileSync(argsFile, JSON.stringify(process.argv.slice(2)) + "\n");
   }
   if (process.argv.includes("--version")) {
-    process.stdout.write(`${process.env.FAKE_GROK_VERSION_OUTPUT ?? "grok 1.0.13 (0123456789ab)"}\n`);
+    process.stdout.write(`${process.env.FAKE_GROK_VERSION_OUTPUT ?? "grok 1.0.30 (0123456789ab)"}\n`);
     process.exit(0);
   }
   if (!process.env.GROK_HOME) {
@@ -116,8 +116,8 @@
     if (Number.isFinite(sandboxEventDelayMs) && sandboxEventDelayMs > 0) {
       await new Promise((resolve) => setTimeout(resolve, sandboxEventDelayMs));
     }
-    const eventFile = path.join(grokHome, "sandbox-events.jsonl");
-    fs.mkdirSync(grokHome, { recursive: true });
+    const eventFile = path.join(grokHome, "sessions", "sandbox-events.jsonl");
+    fs.mkdirSync(path.dirname(eventFile), { recursive: true });
     if (mode === "sandbox-log-rotate" && fs.existsSync(eventFile)) {
       fs.renameSync(eventFile, `${eventFile}.rotated`);
     }
@@ -510,6 +510,17 @@
         requestId: "req-sandbox-warning"
       });
       process.exit(0);
+    }, 1000);
+    return;
+  }
+
+  if (mode === "auth-retry-loop") {
+    process.stderr.write("\u001b[2m2026-09-14T04:20:07.612385Z\u001b[0m \u001b[33m WARN\u001b[0m auth 401 retry: no credential was sent; resubmitting uncharged \u001b[3mresubmit\u001b[0m\u001b[2m=\u001b[0m1 \u001b[3mdelay_ms\u001b[0m\u001b[2m=\u001b[0m1000\n");
+    setTimeout(() => {
+      if (process.env.FAKE_GROK_SANDBOX_SENTINEL) {
+        fs.writeFileSync(process.env.FAKE_GROK_SANDBOX_SENTINEL, "retry loop outlived the warning\n", "utf8");
+      }
+      process.exit(1);
     }, 1000);
     return;
   }

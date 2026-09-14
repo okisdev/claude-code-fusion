@@ -40,7 +40,9 @@ const MAX_TURNS_REACHED_PATTERN = /\bmax turns reached\b/i;
 const SANDBOX_FAILURE_PATTERN = /(?:sandbox (?:could not be applied|initialization failed|not supported on this platform)|sandbox enforcement unavailable \(built without ['"]?enforce['"]? feature\)|failed to parse sandbox config)/i;
 const TOOL_POLICY_FAILURE_PATTERN = /(?:tools allowlist had unmappable entries; keeping full grok toolset|disallowedTools entry matched nothing)/i;
 const TOOL_POLICY_APPLIED_PATTERN = /tools? allowlist applied/i;
-const GROK_BUILDER_LOG_FILTER = "xai_grok_agent::builder=debug,xai_grok_sandbox=warn";
+const AUTH_RETRY_FAILURE_PATTERN = /auth 401 retry: no credential was sent/i;
+const AUTH_RETRY_FAILURE_MESSAGE = "Grok sent its model request without a credential and entered its re-authentication retry loop, so the companion stopped it instead of waiting out the retries. Under the strict sandbox this usually means the stored OIDC token expired: grok 1.0.14 and later can write only `~/.grok/sessions` inside the Grok home under strict, so a managed run cannot refresh the token. Run grok once outside the sandbox, for example `grok -p ok`, to refresh it, then rerun.";
+const GROK_BUILDER_LOG_FILTER = "xai_grok_agent::builder=debug,xai_grok_sandbox=warn,xai_grok_shell::session::acp_session::turn=warn";
 const USD_TICKS = 10_000_000_000;
 const STDIN_PROMPT_FILE = "/dev/stdin";
 const SESSION_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -667,7 +669,11 @@ function findSecurityFailure(stderr) {
     return { kind: "sandbox", line: sandbox };
   }
   const toolPolicy = lines.find((line) => TOOL_POLICY_FAILURE_PATTERN.test(line));
-  return toolPolicy ? { kind: "policy", line: toolPolicy } : null;
+  if (toolPolicy) {
+    return { kind: "policy", line: toolPolicy };
+  }
+  const authRetry = lines.find((line) => AUTH_RETRY_FAILURE_PATTERN.test(line));
+  return authRetry ? { kind: "auth", line: authRetry } : null;
 }
 
 function toolPolicyApplied(stderr) {
@@ -761,7 +767,7 @@ export function preflightRuntimeSocketEndpoints({ candidates = runtimeSocketEndp
     const endpoint = symlinks[0];
     throw securityError(
       "sandbox",
-      `Grok strict sandbox (runtime-socket deny policy, 1.0.4 through 1.0.13) refuses to start while ${endpoint} exists as a symlink. ${runtimeSocketRemedy(endpoint, runtimeSocketEngine(endpoint, readlink))}`
+      `Grok strict sandbox (runtime-socket deny policy, 1.0.4 through 1.0.30) refuses to start while ${endpoint} exists as a symlink. ${runtimeSocketRemedy(endpoint, runtimeSocketEngine(endpoint, readlink))}`
     );
   }
   return symlinks;
@@ -825,7 +831,7 @@ function openSandboxEventLog(file) {
 }
 
 function captureSandboxEventLog(grokHome) {
-  const file = path.join(grokHome, "sandbox-events.jsonl");
+  const file = path.join(grokHome, "sessions", "sandbox-events.jsonl");
   try {
     const opened = openSandboxEventLog(file);
     try {
@@ -2189,6 +2195,8 @@ export function runGrok(options) {
         ? `Grok sandbox enforcement failed; refusing the result: ${securityFailure.line}`
         : securityFailure?.kind === "policy"
           ? `Grok tool policy enforcement failed; refusing the result: ${securityFailure.line}`
+        : securityFailure?.kind === "auth"
+          ? AUTH_RETRY_FAILURE_MESSAGE
         : promptTransportError
           ? `Grok prompt transport failed before stdin was accepted: ${promptTransportError.message}`
           : structuredErrorMessage ?? maxTurnsReachedError(stderr);

@@ -59,7 +59,7 @@ if (sandboxIndex >= 0) {
   const profile = process.argv[sandboxIndex + 1];
   const grokHome = Object.hasOwn(process.env, "GROK_HOME") ? path.resolve(process.cwd(), process.env.GROK_HOME) : path.join(os.homedir(), ".grok");
   fs.mkdirSync(grokHome, { recursive: true });
-  fs.appendFileSync(path.join(grokHome, "sandbox-events.jsonl"), JSON.stringify({ event_type: "ProfileApplied", profile, workspace: fs.realpathSync(process.cwd()), enforced: true, restrict_network: profile !== "workspace", read_write_paths: [fs.realpathSync(process.cwd()), grokHome, process.env.TMPDIR].filter(Boolean) }) + "\\n");
+  fs.mkdirSync(path.join(grokHome, "sessions"), { recursive: true });\nfs.appendFileSync(path.join(grokHome, "sessions", "sandbox-events.jsonl"), JSON.stringify({ event_type: "ProfileApplied", profile, workspace: fs.realpathSync(process.cwd()), enforced: true, restrict_network: profile !== "workspace", read_write_paths: [fs.realpathSync(process.cwd()), path.join(grokHome, "sessions"), process.env.TMPDIR].filter(Boolean) }) + "\\n");
   process.stderr.write("DEBUG xai_grok_agent::builder: tools allowlist applied\\n");
 }
 for await (const chunk of process.stdin) void chunk;
@@ -298,7 +298,7 @@ test("task passes an inline JSON schema and renders structured success", (t) => 
 
   assert.equal(result.status, 0, result.stderr);
   const payload = JSON.parse(result.stdout);
-  assert.deepEqual(flagValues(readInvocations(sandbox.argsFile)[0], "--json-schema"), [taskSchema]);
+  assert.deepEqual(flagValues(readInvocations(sandbox.argsFile).at(-1), "--json-schema"), [taskSchema]);
   assert.deepEqual(payload.structuredOutput, {
     status: "completed",
     summary: "The requested task completed.",
@@ -307,6 +307,7 @@ test("task passes an inline JSON schema and renders structured success", (t) => 
   assert.equal(payload.structuredOutputError, null);
   const [record] = jobRecords(sandbox.dataDir);
   assert.equal(record.request.jsonSchema, taskSchema);
+  assert.equal(record.grokVersion, "1.0.30");
   assert.deepEqual(record.structuredOutput, payload.structuredOutput);
 
   const human = runCompanion(["task", "--json-schema", taskSchema, "complete the task"], {

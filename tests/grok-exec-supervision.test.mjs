@@ -68,7 +68,7 @@ test("managed runs reject runtime-socket symlinks before spawn", (t) => {
     (error) => {
       assert.equal(error.failureKind, "sandbox");
       assert.match(error.message, new RegExp(symlinkEndpoint.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
-      assert.match(error.message, /runtime-socket deny policy, 1\.0\.4 through 1\.0\.13/);
+      assert.match(error.message, /runtime-socket deny policy, 1\.0\.4 through 1\.0\.30/);
       assert.match(error.message, /Do not downgrade the sandbox/);
       return true;
     }

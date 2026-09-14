@@ -79,6 +79,7 @@ const ROOT_DIR = path.resolve(path.dirname(SELF_PATH), "..");
 const REVIEW_PROMPT_FILE = path.join(ROOT_DIR, "prompts", "review.md");
 const STOP_GATE_PROMPT_FILE = path.join(ROOT_DIR, "prompts", "stop-gate.md");
 let cachedGrokCompanionVersion;
+const grokVersionCache = new Map();
 
 function resolvePluginRoot(env = process.env) {
   if (env.CLAUDE_PLUGIN_ROOT && env.CLAUDE_PLUGIN_ROOT.trim()) {
@@ -124,6 +125,10 @@ const TRANSPORT_MAX_AGE_MS = 60 * 60 * 1000;
 const JOB_ID_PATTERN = /^[a-f0-9]{32}$/;
 const DEFAULT_HISTORY_LIMIT = 50;
 const MAX_HISTORY_LIMIT = 500;
+const TESTED_VERSION_MIN = [1, 0, 14];
+const TESTED_VERSION_MAX = [1, 0, 31];
+const GROK_VERSION_PROBE_TIMEOUT_MS = 3000;
+const UNDENIED_RUNTIME_SOCKET_CANDIDATES_ENV = "GROK_COMPANION_UNDENIED_SOCKET_CANDIDATES";
 const CONTINUITY_POLICIES = new Set(["manual", "claude-session"]);
 const HISTORY_STATUSES = new Set(["running", "done", "error", "cancelled"]);
 const HISTORY_MODES = new Set(["consult", "write"]);
@@ -262,6 +267,61 @@ function errorWithFailure(message, failureKind) {
   const error = new Error(message);
   error.failureKind = failureKind;
   return error;
+}
+
+function probeGrokVersion(bin, env = process.env) {
+  if (grokVersionCache.has(bin)) {
+    return grokVersionCache.get(bin);
+  }
+  const result = spawnSync(bin, ["--version"], {
+    encoding: "utf8",
+    env,
+    timeout: GROK_VERSION_PROBE_TIMEOUT_MS,
+    windowsHide: true
+  });
+  const rawVersion = String(result.stdout || result.stderr || "").trim();
+  const match = rawVersion.match(/\b\d+\.\d+\.\d+\b/);
+  const probe = {
+    available: !result.error && result.status === 0,
+    bin,
+    version: match?.[0] ?? null,
+    rawVersion: rawVersion || null,
+    exitCode: result.status,
+    errorMessage: result.error?.message || (result.status !== 0 ? rawVersion || `Grok exited with code ${result.status ?? 1}.` : null)
+  };
+  grokVersionCache.set(bin, probe);
+  return probe;
+}
+
+function requireTestedGrokFloor(probe) {
+  const version = parseVersion(probe.version);
+  if (version && compareVersion(version, TESTED_VERSION_MIN) < 0) {
+    throw errorWithFailure(`Grok CLI version ${probe.version} is unsupported. Upgrade Grok to version ${TESTED_VERSION_MIN.join(".")} or later.`, "setup");
+  }
+}
+
+function parseVersion(value) {
+  const match = String(value ?? "").match(/^(\d+)\.(\d+)\.(\d+)/);
+  return match ? match.slice(1).map(Number) : null;
+}
+
+function compareVersion(left, right) {
+  for (let index = 0; index < Math.max(left.length, right.length); index += 1) {
+    const difference = (left[index] ?? 0) - (right[index] ?? 0);
+    if (difference !== 0) {
+      return Math.sign(difference);
+    }
+  }
+  return 0;
+}
+
+function testedVersionInterval() {
+  return `${TESTED_VERSION_MIN.join(".")} to before ${TESTED_VERSION_MAX.join(".")}`;
+}
+
+function supportedVersion(value) {
+  const parsed = parseVersion(value);
+  return Boolean(parsed) && compareVersion(parsed, TESTED_VERSION_MIN) >= 0 && compareVersion(parsed, TESTED_VERSION_MAX) < 0;
 }
 
 function shellSafeTemporaryRoot() {
@@ -1685,6 +1745,7 @@ async function handleTask(argv, transport = {}) {
     prompt = CONTINUE_PROMPT;
   }
   const role = grokRoleFromPrompt(prompt);
+  const grok = probeGrokVersion(resolveGrokBin(), process.env);
 
   const jobId = generateJobId();
   const briefFile = briefPath(dataDir, cwd, jobId);
@@ -1693,6 +1754,7 @@ async function handleTask(argv, transport = {}) {
     ...createJobRecord({
       id: jobId,
       companionVersion: resolveGrokCompanionVersion(),
+      grokVersion: grok.version,
       pid: background ? null : process.pid,
       mode,
       cwd,
@@ -1723,6 +1785,7 @@ async function handleTask(argv, transport = {}) {
   };
   createJobRecordFile(jobFile, record);
   try {
+    requireTestedGrokFloor(grok);
     writeBrief(dataDir, cwd, jobId, prompt);
     if (resumeSessionId) {
       claimResumeSessionLease(dataDir, cwd, resumeSessionId, jobId);
@@ -2161,6 +2224,7 @@ async function handleReview(argv, transport = {}) {
     USER_FOCUS: focus || "No extra focus provided.",
     DIFF: target.diff
   });
+  const grok = probeGrokVersion(resolveGrokBin(), process.env);
 
   const jobId = generateJobId();
   const briefFile = briefPath(dataDir, cwd, jobId);
@@ -2169,6 +2233,7 @@ async function handleReview(argv, transport = {}) {
     ...createJobRecord({
       id: jobId,
       companionVersion: resolveGrokCompanionVersion(),
+      grokVersion: grok.version,
       pid: background ? null : process.pid,
       mode: "consult",
       cwd,
@@ -2189,6 +2254,7 @@ async function handleReview(argv, transport = {}) {
   };
   createJobRecordFile(jobFile, record);
   try {
+    requireTestedGrokFloor(grok);
     writeBrief(dataDir, cwd, jobId, prompt);
   } catch (error) {
     recordSpawnFailure(jobFile, error);
@@ -2966,7 +3032,7 @@ function handleStats(argv, transport = {}) {
 
 const DOCTOR_PROBE_TIMEOUT_MS = 3000;
 const SHELL_ENVIRONMENT_POLICY_DETAIL =
-  "Grok supports [shell_environment_policy] (introduced in 0.2.112, verified through 1.0.13) to control which environment variables reach shell tools in write runs.";
+  "Grok supports [shell_environment_policy] (introduced in 0.2.112, verified through 1.0.30) to control which environment variables reach shell tools in write runs.";
 
 function doctorCommandAdvisory(bin, available) {
   if (!available) {
@@ -3032,23 +3098,52 @@ function shellEnvironmentPolicyAdvisory(env = process.env, cwd = process.cwd()) 
   };
 }
 
+function undeniedRuntimeSocketCandidates(env = process.env) {
+  if (Object.hasOwn(env, UNDENIED_RUNTIME_SOCKET_CANDIDATES_ENV)) {
+    return [...new Set(String(env[UNDENIED_RUNTIME_SOCKET_CANDIDATES_ENV] ?? "").split(":").filter(Boolean))];
+  }
+  const home = typeof env.HOME === "string" && env.HOME.trim() ? env.HOME : os.homedir();
+  return [path.join(home, ".orbstack", "run", "docker.sock")];
+}
+
+function existingUnixSockets(candidates) {
+  const sockets = [];
+  for (const candidate of candidates) {
+    try {
+      if (fs.lstatSync(candidate).isSocket()) {
+        sockets.push(candidate);
+      }
+    } catch (error) {
+      if (error?.code !== "ENOENT") {
+        throw error;
+      }
+    }
+  }
+  return sockets;
+}
+
 function hostEnvironmentAdvisory(env = process.env) {
   try {
     const runtimeSocketSymlinks = runtimeSocketSymlinkEndpoints(runtimeSocketEndpoints({ env }));
+    const undeniedRuntimeSockets = existingUnixSockets(undeniedRuntimeSocketCandidates(env));
     const engine = runtimeSocketSymlinks.length === 0 ? null : runtimeSocketEngine(runtimeSocketSymlinks[0]);
     return {
       ready: runtimeSocketSymlinks.length === 0,
       runtimeSocketSymlinks,
+      undeniedRuntimeSockets,
       runtimeSocketEngine: engine,
       remedy: runtimeSocketSymlinks.length === 0 ? null : runtimeSocketRemedy(runtimeSocketSymlinks[0], engine),
       detail: runtimeSocketSymlinks.length === 0
-        ? "no runtime-socket deny path is a symlink"
+        ? undeniedRuntimeSockets.length > 0
+          ? `no runtime-socket deny path is a symlink; OrbStack docker socket ${undeniedRuntimeSockets[0]} is outside grok's runtime-socket deny list, so a strict write shell may still reach that engine`
+          : "no runtime-socket deny path is a symlink"
         : `runtime-socket deny path is a symlink: ${runtimeSocketSymlinks.join(", ")}`
     };
   } catch (error) {
     return {
       ready: false,
       runtimeSocketSymlinks: [],
+      undeniedRuntimeSockets: [],
       runtimeSocketEngine: null,
       remedy: null,
       detail: `unable to inspect runtime-socket deny paths: ${error instanceof Error ? error.message : String(error)}`
@@ -3068,13 +3163,17 @@ function handleSetup(argv, transport = {}) {
     options.continuity === undefined ? null : parseContinuityPolicy(options.continuity);
 
   const bin = resolveGrokBin();
-  const probe = spawnSync(bin, ["--version"], { encoding: "utf8" });
-  const available = !probe.error && probe.status === 0;
+  const probe = probeGrokVersion(bin, process.env);
+  const available = probe.available;
   const detail = available
-    ? (probe.stdout || probe.stderr).trim() || "ok"
-    : probe.error?.code === "ENOENT"
+    ? probe.rawVersion || "ok"
+    : probe.errorMessage?.includes("ENOENT")
       ? "not found on PATH"
-      : (probe.stderr || probe.stdout || probe.error?.message || `exit ${probe.status}`).trim();
+      : probe.rawVersion || probe.errorMessage || `exit ${probe.exitCode}`;
+  const compatible = available && supportedVersion(probe.version);
+  const installedVersion = parseVersion(probe.version);
+  const newerThanTested = Boolean(installedVersion) && compareVersion(installedVersion, TESTED_VERSION_MAX) >= 0;
+  const testedInterval = testedVersionInterval();
 
   const capabilityFlags = [
     "--prompt-file",
@@ -3134,16 +3233,35 @@ function handleSetup(argv, transport = {}) {
     writeConfig(dataDir, { continuityPolicy: configuredContinuity });
   }
 
+  const nextSteps = [];
+  if (!available) {
+    nextSteps.push("Install the grok CLI and make sure `grok --version` works, or point GROK_BIN at the binary.");
+  }
+  if (available && !capabilities.ready) {
+    nextSteps.push("Upgrade the grok CLI to a build that exposes the required headless safety capabilities.");
+  }
+  if (available && !compatible) {
+    nextSteps.push(newerThanTested ? `Grok CLI version ${probe.version} is newer than the tested interval (${testedInterval}). A verification pass is advised.` : `Use a Grok CLI version in the tested interval (${testedInterval}).`);
+  }
+  if (!hostEnvironment.ready && hostEnvironment.runtimeSocketSymlinks.length > 0) {
+    nextSteps.push(hostEnvironment.remedy ?? `Stop the Docker engine that creates ${hostEnvironment.runtimeSocketSymlinks.join(", ")}, or remove the symlink. Do not downgrade the sandbox.`);
+  }
+  if (!writable) {
+    nextSteps.push(`Fix permissions on ${dataDir}.`);
+  }
+
   const report = {
-    ready: available && capabilities.ready && hostEnvironment.ready && writable,
+    ready: available && capabilities.ready && compatible && hostEnvironment.ready && writable,
     grok: { available, detail, bin },
+    compatibility: compatible ? "tested" : available ? newerThanTested ? `newer than the tested interval (${testedInterval})` : `outside the tested interval (${testedInterval})` : "unknown",
     capabilities,
     doctorCommand,
     shellEnvironmentPolicy,
     hostEnvironment,
     dataDir: { path: dataDir, writable, detail: writeDetail },
     stopGate: Boolean(readConfig(dataDir).stopGate),
-    continuityPolicy: continuityPolicy(dataDir)
+    continuityPolicy: continuityPolicy(dataDir),
+    nextSteps
   };
   output(options.json ? report : renderSetupReport(report), options.json);
 }
@@ -3202,6 +3320,7 @@ async function handleStopGate() {
   const prompt = interpolateTemplate(fs.readFileSync(STOP_GATE_PROMPT_FILE, "utf8"), {
     DIFF: target.diff
   });
+  const grok = probeGrokVersion(resolveGrokBin(), process.env);
 
   const jobId = generateJobId();
   const briefFile = briefPath(dataDir, cwd, jobId);
@@ -3210,6 +3329,7 @@ async function handleStopGate() {
     ...createJobRecord({
       id: jobId,
       companionVersion: resolveGrokCompanionVersion(),
+      grokVersion: grok.version,
       pid: process.pid,
       mode: "consult",
       cwd,
@@ -3226,6 +3346,7 @@ async function handleStopGate() {
     repositoryTopLevel: resolveRepositoryTopLevel(cwd)
   });
   try {
+    requireTestedGrokFloor(grok);
     writeBrief(dataDir, cwd, jobId, prompt);
   } catch (error) {
     recordSpawnFailure(jobFile, error);

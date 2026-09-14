@@ -34,6 +34,7 @@ const CODEX_FAILURE_PATTERNS = [
   ["permission", /\b(?:EACCES|EPERM)\b|operation not permitted|permission denied/i]
 ];
 const TRANSPORT_PERMISSION_PATTERN = /(?:sandbox|seatbelt|landlock).*(?:init|initializ|profile|policy)|(?:operation not permitted|\bEACCES\b|\bEPERM\b|permission denied).*(?:brief|prompt|transport|state|plugin|sandbox)|(?:brief|prompt|transport|state|plugin|sandbox).*(?:operation not permitted|\bEACCES\b|\bEPERM\b|permission denied)/i;
+const VERIFIED_VERSIONS_FILE = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "verified-versions.json");
 
 function resolveLookbackMs(env = process.env) {
   const parsed = Number.parseFloat(String(env[LOOKBACK_ENV] ?? ""));
@@ -141,7 +142,11 @@ function grokFailure(record, now, lookbackMs) {
   if (!supportedBreakerFailure(record, failureKind) || timestamp == null || !isWithinLookback(timestamp, now, lookbackMs)) {
     return null;
   }
-  return { failureKind, timestamp };
+  return {
+    failureKind,
+    timestamp,
+    grokVersion: typeof record.grokVersion === "string" && record.grokVersion.trim() ? record.grokVersion.trim() : null
+  };
 }
 
 function codexFailureKind(errorMessage) {
@@ -194,7 +199,8 @@ function latestBreakerFailure(records, failureReader, now, lookbackMs) {
       outcomes.push({
         failureKind: failure?.failureKind ?? null,
         status: record.status,
-        timestamp
+        timestamp,
+        grokVersion: failure?.grokVersion ?? null
       });
     }
   }
@@ -210,7 +216,7 @@ function latestBreakerFailure(records, failureReader, now, lookbackMs) {
       continue;
     }
     if (HARD_FAILURE_KINDS.has(outcome.failureKind) || outcome.failureKind === "permission") {
-      immediate = { failureKind: outcome.failureKind, timestamp: outcome.timestamp };
+      immediate = { failureKind: outcome.failureKind, timestamp: outcome.timestamp, grokVersion: outcome.grokVersion };
       previousTransientFailure = null;
       repeatedTransientFailure = null;
       continue;
@@ -221,7 +227,7 @@ function latestBreakerFailure(records, failureReader, now, lookbackMs) {
       continue;
     }
     if (previousTransientFailure && previousTransientFailure.failureKind === outcome.failureKind && outcome.timestamp - previousTransientFailure.timestamp <= lookbackMs) {
-      repeatedTransientFailure = { failureKind: outcome.failureKind, timestamp: outcome.timestamp };
+      repeatedTransientFailure = { failureKind: outcome.failureKind, timestamp: outcome.timestamp, grokVersion: outcome.grokVersion };
     }
     previousTransientFailure = outcome;
   }
@@ -255,9 +261,24 @@ function formatLookbackHours(lookbackMs) {
   return hours % 1 === 0 ? String(hours) : hours.toFixed(1);
 }
 
+function verifiedGrokVersion() {
+  try {
+    const versions = JSON.parse(fs.readFileSync(VERIFIED_VERSIONS_FILE, "utf8"));
+    return typeof versions?.grok === "string" && versions.grok.trim() ? versions.grok.trim() : null;
+  } catch {
+    return null;
+  }
+}
+
+function grokVersionAdvisorySuffix(failure) {
+  const installed = typeof failure?.grokVersion === "string" && failure.grokVersion.trim() ? failure.grokVersion.trim() : null;
+  const verified = installed ? verifiedGrokVersion() : null;
+  return installed && verified && installed !== verified ? `; grok ${installed} installed, contract verified on ${verified}` : "";
+}
+
 function advisoryLine(engine, failure, now, lookbackMs = DEFAULT_LOOKBACK_HOURS * 60 * 60 * 1000) {
   const hoursText = formatLookbackHours(lookbackMs);
-  return `fusion breaker advisory: treat the ${engine} breaker as open unless verified recovered; last failure ${failure.failureKind} ${formatAge(failure.timestamp, now)} (${failure.kindCount} ${failure.failureKind} across ${failure.terminalCount} terminal jobs, ${hoursText}h window). Route new work to another eligible healthy lane.`;
+  return `fusion breaker advisory: treat the ${engine} breaker as open unless verified recovered; last failure ${failure.failureKind} ${formatAge(failure.timestamp, now)} (${failure.kindCount} ${failure.failureKind} across ${failure.terminalCount} terminal jobs, ${hoursText}h window). Route new work to another eligible healthy lane.${engine === "grok" ? grokVersionAdvisorySuffix(failure) : ""}`;
 }
 
 function workerFailure(record, now, lookbackMs) {

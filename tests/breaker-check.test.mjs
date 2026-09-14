@@ -9,6 +9,7 @@ import { messageTag } from "../plugins/fusion/scripts/lib/user-messages.mjs";
 
 const repoRoot = path.join(import.meta.dirname, "..");
 const script = path.join(repoRoot, "plugins", "fusion", "scripts", "breaker-check.mjs");
+const verifiedGrokVersion = JSON.parse(fs.readFileSync(new URL("../plugins/fusion/verified-versions.json", import.meta.url), "utf8")).grok;
 const BREAKER_ADVISORY_TAG = messageTag("breaker-check.breaker-advisory");
 const ESCAPED_BREAKER_ADVISORY_TAG = BREAKER_ADVISORY_TAG.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 
@@ -73,6 +74,35 @@ test("an in-window quota failure prints a grok breaker advisory", (t) => {
   assert.match(result.stdout, /last failure quota \d+ minutes? ago \(1 quota across 1 terminal jobs, 12h window\)/);
   assert.ok(result.stdout.endsWith(`${BREAKER_ADVISORY_TAG}\n`));
   assert.strictEqual(result.stderr, "");
+});
+
+test("grok breaker version advice reports only a contract drift", (t) => {
+  const changed = makeSandbox(t);
+  writeRecord(jobFile(path.join(changed.grokData, "state"), "workspace", "changed"), {
+    status: "error",
+    failureKind: "quota",
+    grokVersion: "1.0.99",
+    finishedAt: new Date(Date.now() - 2 * 60000).toISOString()
+  });
+  assert.ok(run(changed).stdout.includes(`; grok 1.0.99 installed, contract verified on ${verifiedGrokVersion} [fusion:`));
+
+  const pinned = makeSandbox(t);
+  writeRecord(jobFile(path.join(pinned.grokData, "state"), "workspace", "pinned"), {
+    status: "error",
+    failureKind: "quota",
+    grokVersion: verifiedGrokVersion,
+    finishedAt: new Date(Date.now() - 2 * 60000).toISOString()
+  });
+  assert.doesNotMatch(run(pinned).stdout, /installed, contract verified on/);
+
+  const unknown = makeSandbox(t);
+  writeRecord(jobFile(path.join(unknown.grokData, "state"), "workspace", "unknown"), {
+    status: "error",
+    failureKind: "quota",
+    grokVersion: null,
+    finishedAt: new Date(Date.now() - 2 * 60000).toISOString()
+  });
+  assert.doesNotMatch(run(unknown).stdout, /installed, contract verified on/);
 });
 
 test("advisoryLine renders kind and terminal proportions with singular and plural counts", () => {

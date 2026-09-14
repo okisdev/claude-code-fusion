@@ -235,7 +235,7 @@ test("Grok rules document source verified headless boundaries", () => {
   const security = fs.readFileSync(path.join(repoRoot, "SECURITY.md"), "utf8");
   const bridgeSentence = "The child sets all eighteen `GROK_CLAUDE_*_ENABLED`, `GROK_CURSOR_*_ENABLED`, and `GROK_CODEX_*_ENABLED` bridge variables to false; upstream currently consumes the six Claude and six Cursor cells plus the Codex sessions cell and reserves the other five Codex cells, and the child also pins `GROK_MANAGED_MCPS_ENABLED=false` because that variable has highest precedence over `[managed_mcps]` in `~/.grok/config.toml` and remote settings.";
   const subagentSentence = "Upstream parses `--no-subagents`, but the single-turn and agent resolvers do not forward it, while the interactive TUI does apply it; the hard Agent tool deny and `GROK_SUBAGENTS=0` are the effective headless controls.";
-  const rustLogSentence = "Every run forces `RUST_LOG=xai_grok_agent::builder=debug,xai_grok_sandbox=warn`.";
+  const rustLogSentence = "Every run forces `RUST_LOG=xai_grok_agent::builder=debug,xai_grok_sandbox=warn,xai_grok_shell::session::acp_session::turn=warn`.";
   const bubblewrapSentence = "On Linux, a strict profile with deny paths re-executes under bubblewrap and refuses to start when `bwrap` is missing or unusable; macOS has no equivalent hard enforcement and relies on Seatbelt application plus best-effort tool denies.";
   const freshSessionSentence = "A new goal after a heavy implementation goal prefers a fresh session because orchestrator cache reread cost is context size times turns; `FUSION_PARENT_CONTEXT_ADVISORY_BYTES` names the parent context advisory threshold.";
   const volumeTierSentence = "Research digests, review triage, doc summaries, and mechanical checks default to gpt-5.6-luna at effort xhigh.";
@@ -354,7 +354,7 @@ test("Grok rules document source verified headless boundaries", () => {
   assert.match(rules, /agent --no-leader stdio/);
   assert.match(troubleshooting, /shared-log disappearance or rotation/);
   assert.match(troubleshooting, /sole candidate from another cwd as a fallback/);
-  assert.match(troubleshooting, /Do not rely on headless `--worktree` or `--worktree-ref`/);
+  assert.match(troubleshooting, /Do not pass headless `--worktree` or `--worktree-ref` in a managed brief: since 1\.0\.19 they create a real worktree/);
   assert.match(runtime, /0600 file that is unlinked immediately after a successful open/);
   assert.match(runtime, /sole candidate from another cwd/);
   assert.match(runtime, /Upstream `model_usage` rows contain only `input`, `output`, `cacheRead`, and `modelCalls`/);
@@ -389,7 +389,7 @@ test("Grok rules document source verified headless boundaries", () => {
   assert.match(contract, /`cache_creation_input_tokens`/);
   assert.match(contract, /The only incompleteness flags are `usage_is_incomplete` and `cost_is_partial`/);
   assert.match(contract, /no `cancellation-category` field or `model_usage_is_incomplete` field/);
-  assert.match(contract, /Upstream appends to `~\/\.grok\/sandbox-events\.jsonl` with no rotation or size cap/);
+  assert.match(contract, /Upstream appends to `~\/\.grok\/sessions\/sandbox-events\.jsonl` with no rotation or size cap/);
   assert.match(contract, /The open-source snapshot is per-crate versioned, unversioned as a release train with no tags/);
   assert.match(contract, /Upstream wires only `bypassPermissions` at spawn/);
   assert.match(contract, /Upstream ships ACP today/);
@@ -407,7 +407,7 @@ test("Grok rules document source verified headless boundaries", () => {
   assert.match(runtime, /Hosted `x_search` stays outside managed runs because the fixed `--tools` allowlist governs the toolset/);
   assert.match(setup, /failure kind `setup`/);
   assert.match(doctor, /native MCP servers, plugins, or hooks under `~\/\.grok`/);
-  assert.match(doctor, /The entire Grok home is read-write under strict/);
+  assert.match(doctor, /The Grok home is readable under strict, but since 1\.0\.14 strict writes only `~\/\.grok\/sessions` inside it/);
   assert.match(doctor, /entire `~\/Library` on macOS/);
   assert.match(doctor, /best-effort Read denies cover `auth\.json`, `mcp_credentials\.json`/);
   assert.match(doctor, /raw path variants, symbolic links, and shell or indirect scripts can bypass/i);
@@ -416,7 +416,7 @@ test("Grok rules document source verified headless boundaries", () => {
   assert.match(doctor, /successful Grok collection remains unverified until `\/fusion:stats --record <fusion-task-id>=<accepted\|rejected>`/i);
   assert.match(doctor, /`GROK_WEB_FETCH` is pinned by web mode, `GROK_AUTO_WAKE` and `GROK_MANAGED_MCP_GATEWAY_TOOLS_ENABLED` are pinned false/);
   for (const text of [readme, security]) {
-    assert.match(text, /introduced in 0\.2\.112, verified through 1\.0\.13/);
+    assert.match(text, /introduced in 0\.2\.112, verified through 1\.0\.30/);
     assert.match(text, /file that is unlinked (?:immediately after open|as soon as it is opened)/);
     assert.match(text, /all of `\/private\/var\/folders`/);
     assert.match(text, /native MCP servers, plugins, or hooks/);
