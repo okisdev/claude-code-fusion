@@ -507,6 +507,10 @@ export function renderRecordAcceptance(record) {
 }
 
 export function renderSetupReport(report) {
+  const host = report.hostEnvironment;
+  const hostLine = host?.ready
+    ? host.undeniedRuntimeSockets?.length > 0 ? `ready, ${host.detail}` : "ready"
+    : `needs attention, ${host?.detail ?? "not checked"}`;
   const lines = [
     "# Grok setup",
     "",
@@ -514,27 +518,16 @@ export function renderSetupReport(report) {
     "",
     "Checks:",
     `- grok binary (${report.grok.bin}): ${report.grok.available ? report.grok.detail : `unavailable, ${report.grok.detail}`}`,
+    `- compatibility: ${report.compatibility ?? "unknown"}`,
     `- headless safety capabilities: ${report.capabilities?.ready ? "ready" : `not ready, ${report.capabilities?.detail ?? "not checked"}`}`,
-    `- host environment: ${report.hostEnvironment?.ready ? "ready" : `needs attention, ${report.hostEnvironment?.detail ?? "not checked"}`}`,
+    `- host environment: ${hostLine}`,
     `- data dir: ${report.dataDir.writable ? `writable (${report.dataDir.path})` : `not writable (${report.dataDir.detail})`}`,
     `- stop gate: ${report.stopGate ? "enabled" : "disabled"}`,
     `- continuity: ${report.continuityPolicy ?? "manual"}`,
     `- grok doctor: ${report.doctorCommand?.available ? "available" : `not available, ${report.doctorCommand?.detail ?? "not checked"}`}`
   ];
 
-  const nextSteps = [];
-  if (!report.grok.available) {
-    nextSteps.push("Install the grok CLI and make sure `grok --version` works, or point GROK_BIN at the binary.");
-  }
-  if (report.grok.available && !report.capabilities?.ready) {
-    nextSteps.push("Upgrade the grok CLI to a build that exposes the required headless safety capabilities.");
-  }
-  if (!report.hostEnvironment?.ready && report.hostEnvironment?.runtimeSocketSymlinks?.length > 0) {
-    nextSteps.push(report.hostEnvironment.remedy ?? `Stop the Docker engine that creates ${report.hostEnvironment.runtimeSocketSymlinks.join(", ")}, or remove the symlink. Do not downgrade the sandbox.`);
-  }
-  if (!report.dataDir.writable) {
-    nextSteps.push(`Fix permissions on ${report.dataDir.path}.`);
-  }
+  const nextSteps = report.nextSteps ?? [];
   if (nextSteps.length > 0) {
     lines.push("", "Next steps:");
     for (const step of nextSteps) {

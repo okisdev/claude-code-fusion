@@ -32,7 +32,7 @@ function writeEnvelopeGrok(sandbox, name, envelope, exitCode = 0) {
   const file = path.join(sandbox.root, `${name}.mjs`);
   fs.writeFileSync(
     file,
-    `#!/usr/bin/env node\nimport fs from "node:fs";\nimport os from "node:os";\nimport path from "node:path";\nif (process.env.FAKE_GROK_ARGS_FILE) fs.appendFileSync(process.env.FAKE_GROK_ARGS_FILE, JSON.stringify(process.argv.slice(2)) + "\\n");\nconst sandboxIndex = process.argv.indexOf("--sandbox");\nif (sandboxIndex >= 0) {\n  const profile = process.argv[sandboxIndex + 1];\n  const grokHome = Object.hasOwn(process.env, "GROK_HOME") ? path.resolve(process.cwd(), process.env.GROK_HOME) : path.join(os.homedir(), ".grok");\n  fs.mkdirSync(grokHome, { recursive: true });\n  fs.appendFileSync(path.join(grokHome, "sandbox-events.jsonl"), JSON.stringify({ event_type: "ProfileApplied", profile, workspace: fs.realpathSync(process.cwd()), enforced: true, restrict_network: profile !== "workspace", read_write_paths: [fs.realpathSync(process.cwd()), grokHome, process.env.TMPDIR].filter(Boolean) }) + "\\n");\n  process.stderr.write("DEBUG xai_grok_agent::builder: tools allowlist applied\\n");\n}\nfor await (const chunk of process.stdin) void chunk;\nprocess.stdout.write(${JSON.stringify(`${JSON.stringify(envelope)}\n`)});\nprocess.exit(${exitCode});\n`,
+    `#!/usr/bin/env node\nimport fs from "node:fs";\nimport os from "node:os";\nimport path from "node:path";\nif (process.env.FAKE_GROK_ARGS_FILE) fs.appendFileSync(process.env.FAKE_GROK_ARGS_FILE, JSON.stringify(process.argv.slice(2)) + "\\n");\nconst sandboxIndex = process.argv.indexOf("--sandbox");\nif (sandboxIndex >= 0) {\n  const profile = process.argv[sandboxIndex + 1];\n  const grokHome = Object.hasOwn(process.env, "GROK_HOME") ? path.resolve(process.cwd(), process.env.GROK_HOME) : path.join(os.homedir(), ".grok");\n  fs.mkdirSync(path.join(grokHome, "sessions"), { recursive: true });\n  fs.appendFileSync(path.join(grokHome, "sessions", "sandbox-events.jsonl"), JSON.stringify({ event_type: "ProfileApplied", profile, workspace: fs.realpathSync(process.cwd()), enforced: true, restrict_network: profile !== "workspace", read_write_paths: [fs.realpathSync(process.cwd()), path.join(grokHome, "sessions"), process.env.TMPDIR].filter(Boolean) }) + "\\n");\n  process.stderr.write("DEBUG xai_grok_agent::builder: tools allowlist applied\\n");\n}\nfor await (const chunk of process.stdin) void chunk;\nprocess.stdout.write(${JSON.stringify(`${JSON.stringify(envelope)}\n`)});\nprocess.exit(${exitCode});\n`,
     "utf8"
   );
   fs.chmodSync(file, 0o755);
@@ -49,10 +49,11 @@ test("review passes the output contract as an inline JSON schema and renders the
   });
   assert.strictEqual(result.status, 0, result.stderr);
   const invocations = readInvocations(sandbox.argsFile);
-  assert.strictEqual(invocations.length, 1);
-  const briefFile = flagValues(invocations[0], "--prompt-file")[0];
+  assert.strictEqual(invocations.length, 2);
+  assert.deepStrictEqual(invocations[0], ["--version"]);
+  const briefFile = flagValues(invocations[1], "--prompt-file")[0];
   assert.strictEqual(briefFile, "/dev/stdin");
-  const schema = JSON.parse(flagValues(invocations[0], "--json-schema")[0]);
+  const schema = JSON.parse(flagValues(invocations[1], "--json-schema")[0]);
   assert.deepStrictEqual(schema.required, ["verdict", "findings", "next_steps"]);
   assert.deepStrictEqual(schema.properties.verdict.enum, ["approve", "needs-attention"]);
   assert.strictEqual(schema.properties.findings.items.additionalProperties, false);
@@ -81,7 +82,7 @@ test("review fails closed before launch without structured output support", (t) 
 
   assert.notStrictEqual(result.status, 0);
   assert.match(result.stderr, /--json-schema/);
-  assert.deepStrictEqual(readInvocations(sandbox.argsFile), []);
+  assert.deepStrictEqual(readInvocations(sandbox.argsFile), [["--version"]]);
 });
 
 test("review trusts validated structured output without resuming when the text is not JSON", (t) => {
@@ -100,8 +101,9 @@ test("review trusts validated structured output without resuming when the text i
   });
   assert.strictEqual(result.status, 0, result.stderr);
   const invocations = readInvocations(sandbox.argsFile);
-  assert.strictEqual(invocations.length, 1);
-  assert.ok(!invocations[0].includes("-r"));
+  assert.strictEqual(invocations.length, 2);
+  assert.deepStrictEqual(invocations[0], ["--version"]);
+  assert.ok(!invocations[1].includes("-r"));
   assert.ok(result.stdout.includes("needs-attention"));
   assert.ok(result.stdout.includes("Example finding"));
 });
@@ -140,7 +142,7 @@ test("review records one structured turn's usage without a corrective model call
   const env = envFor(sandbox, { GROK_BIN: grokBin });
   const result = runCompanion(["review"], { cwd: sandbox.workDir, env });
   assert.strictEqual(result.status, 0, result.stderr);
-  assert.strictEqual(readInvocations(sandbox.argsFile).length, 1);
+  assert.strictEqual(readInvocations(sandbox.argsFile).length, 2);
   const [record] = jobRecords(sandbox.dataDir);
   assert.strictEqual(record.status, "done");
   assert.strictEqual(record.usageIsIncomplete, false);
@@ -170,7 +172,7 @@ test("review falls back to local text parsing for an older Grok envelope", (t) =
     env: envFor(sandbox, { GROK_BIN: grokBin })
   });
   assert.strictEqual(result.status, 0, result.stderr);
-  assert.strictEqual(readInvocations(sandbox.argsFile).length, 1);
+  assert.strictEqual(readInvocations(sandbox.argsFile).length, 2);
   assert.match(result.stdout, /Example finding/);
 });
 
@@ -254,8 +256,9 @@ test("review records a structured validation error without resuming or trusting 
   });
   assert.notStrictEqual(result.status, 0);
   const invocations = readInvocations(sandbox.argsFile);
-  assert.strictEqual(invocations.length, 1);
-  assert.ok(!invocations[0].includes("-r"));
+  assert.strictEqual(invocations.length, 2);
+  assert.deepStrictEqual(invocations[0], ["--version"]);
+  assert.ok(!invocations[1].includes("-r"));
   assert.ok(result.stderr.includes("did not return a valid review JSON object"));
   assert.ok(result.stderr.includes("output does not match the required schema"));
   const [record] = jobRecords(sandbox.dataDir);
@@ -285,7 +288,7 @@ test("background review records a structured validation failure after one model 
     const current = jobRecords(sandbox.dataDir)[0];
     return current?.status === "error" ? current : null;
   });
-  assert.strictEqual(readInvocations(sandbox.argsFile).length, 1);
+  assert.strictEqual(readInvocations(sandbox.argsFile).length, 2);
   assert.strictEqual(record.failureKind, "error");
   assert.ok(record.resultText.includes("I could not produce the requested object."));
   assert.match(record.errorMessage, /failed validation: output does not match the required schema/);

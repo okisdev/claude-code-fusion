@@ -97,6 +97,7 @@ export function createJobRecord(fields) {
     schemaVersion: 1,
     engine: "grok",
     companionVersion: fields.companionVersion ?? null,
+    grokVersion: typeof fields.grokVersion === "string" && fields.grokVersion.trim() ? fields.grokVersion.trim() : null,
     id: fields.id,
     pid,
     pidIdentity: Object.hasOwn(fields, "pidIdentity") ? fields.pidIdentity : pid ? getProcessIdentity(pid) : null,
@@ -652,7 +653,11 @@ export function readJobRecordFile(file) {
     return null;
   }
   try {
-    return JSON.parse(fs.readFileSync(file, "utf8"));
+    const record = JSON.parse(fs.readFileSync(file, "utf8"));
+    if (record && typeof record === "object" && !Array.isArray(record) && typeof record.id === "string") {
+      return { ...record, grokVersion: typeof record.grokVersion === "string" && record.grokVersion.trim() ? record.grokVersion.trim() : null };
+    }
+    return record;
   } catch {
     return null;
   }

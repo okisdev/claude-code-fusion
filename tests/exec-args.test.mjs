@@ -52,8 +52,9 @@ function readInvocations(argsFile) {
 
 function singleInvocation(sandbox) {
   const invocations = readInvocations(sandbox.argsFile);
-  assert.strictEqual(invocations.length, 1);
-  return invocations[0];
+  assert.strictEqual(invocations.length, 2);
+  assert.deepStrictEqual(invocations[0], ["--version"]);
+  return invocations[1];
 }
 
 function seedFinishedSessionJob(sandbox, fields) {

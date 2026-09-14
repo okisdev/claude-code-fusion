@@ -157,7 +157,7 @@ test("task option shaped prompt suffixes cannot enable background, write, cwd, o
   assert.equal(record.mode, "consult");
   assert.equal(record.cwd, sandbox.workDir);
   assert.equal(record.request.outputJson, false);
-  const [argv] = readInvocations(sandbox.argsFile);
+  const argv = readInvocations(sandbox.argsFile).at(-1);
   assert.equal(flagValues(argv, "--sandbox")[0], "strict");
 });
 
@@ -421,7 +421,7 @@ test("invalid Grok session identifiers fail as transport errors and cannot reach
   });
   assert.notEqual(resume.status, 0);
   assert.match(resume.stderr, /^failure: input$/m);
-  assert.equal(readInvocations(sandbox.argsFile).length, 1);
+  assert.equal(readInvocations(sandbox.argsFile).length, 2);
 });
 
 test("staged review focus stays data while managed delivery is collected", async (t) => {
@@ -479,7 +479,7 @@ for (const scenario of [
     });
 
     assert.equal(result.status, 0, result.stderr);
-    const [argv] = readInvocations(sandbox.argsFile);
+    const argv = readInvocations(sandbox.argsFile).at(-1);
     assert.deepEqual(flagValues(argv, "--prompt-file"), ["/dev/stdin"]);
     assert.equal(argv.includes(prompt), false);
     assert.equal(fs.readFileSync(stdinFile, "utf8"), prompt);
@@ -514,10 +514,12 @@ test("resume and write runs retain stdin prompt transport and the requested sand
   assert.equal(write.status, 0, write.stderr);
 
   const invocations = readInvocations(sandbox.argsFile);
-  assert.equal(invocations.length, 3);
-  assert.ok(invocations.every((argv) => flagValues(argv, "--prompt-file")[0] === "/dev/stdin"));
-  assert.ok(invocations[1].includes("-r"));
-  assert.deepEqual(invocations.map((argv) => flagValues(argv, "--sandbox")[0]), ["strict", "strict", "strict"]);
+  assert.equal(invocations.length, 6);
+  assert.ok(invocations.filter((_, index) => index % 2 === 0).every((argv) => argv.length === 1 && argv[0] === "--version"));
+  const modelInvocations = invocations.filter((argv) => !argv.includes("--version"));
+  assert.ok(modelInvocations.every((argv) => flagValues(argv, "--prompt-file")[0] === "/dev/stdin"));
+  assert.ok(modelInvocations[1].includes("-r"));
+  assert.deepEqual(modelInvocations.map((argv) => flagValues(argv, "--sandbox")[0]), ["strict", "strict", "strict"]);
   const prompts = fs.readFileSync(stdinLog, "utf8").trim().split("\n").map((line) => JSON.parse(line));
   assert.deepEqual(prompts, ["first consult", "resume consult", "change the repository"]);
 });
