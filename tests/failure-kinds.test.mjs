@@ -3,6 +3,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { test as nodeTest } from "node:test";
 import { envFor, jobLogFiles, jobRecords, killGroups, makeSandbox, processInspectionAvailable, runCompanion, waitFor } from "./lib/companion-harness.mjs";
+import { envFor as codexEnvFor, jobRecords as codexJobRecords, makeSandbox as makeCodexSandbox, runCompanion as runCodexCompanion } from "./lib/codex-companion-harness.mjs";
 
 const processInspectionTests = new Set([
   "missing binary yields failure kind missing_cli",
@@ -77,6 +78,23 @@ test("rate limited stderr yields failure kind rate_limited", (t) => {
   const resultOutput = runCompanion(["result", record.id], { cwd: sandbox.workDir, env });
   assert.strictEqual(resultOutput.status, 0, resultOutput.stderr);
   assert.match(resultOutput.stdout, /^failure: rate_limited$/m);
+});
+
+test("a Codex refusal turn failure yields failure kind refused", (t) => {
+  const sandbox = makeCodexSandbox(t);
+  const env = codexEnvFor(sandbox, {
+    FAKE_CODEX_MODE: "failed",
+    FAKE_CODEX_TURN_FAILURE_MESSAGE: "This request violated the misalignment policy."
+  });
+  const result = runCodexCompanion(["task", "doomed"], { cwd: sandbox.workDir, env });
+  assert.notStrictEqual(result.status, 0);
+  assert.match(result.stdout, /^failure: refused$/m);
+  const [record] = codexJobRecords(sandbox);
+  assert.strictEqual(record.status, "error");
+  assert.strictEqual(record.failureKind, "refused");
+  const resultOutput = runCodexCompanion(["result", record.id], { cwd: sandbox.workDir, env });
+  assert.strictEqual(resultOutput.status, 1, resultOutput.stderr);
+  assert.match(resultOutput.stdout, /^failure: refused$/m);
 });
 
 test("auth stderr yields failure kind auth", (t) => {

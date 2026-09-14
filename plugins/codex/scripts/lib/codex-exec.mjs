@@ -3,6 +3,7 @@ import { createHash } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import * as zlib from "node:zlib";
 
 export const DEFAULT_TIMEOUT_MS = 570000;
 export const DEFAULT_TERMINATION_GRACE_MS = 2000;
@@ -25,6 +26,7 @@ const DEFAULT_PROMPT_MAX_BYTES = 4 * 1024 * 1024;
 const DEFAULT_RESULT_MAX_BYTES = 1024 * 1024;
 const DEFAULT_ROLLOUT_HEAD_MAX_BYTES = 8 * 1024 * 1024;
 const DEFAULT_ROLLOUT_TAIL_MAX_BYTES = 16 * 1024 * 1024;
+const MAX_COMPRESSED_ROLLOUT_BYTES = 64 * 1024 * 1024;
 const MAX_ROLLOUT_SCAN_ENTRIES = 50000;
 const MAX_DIAGNOSTICS = 64;
 const MAX_DIAGNOSTIC_MESSAGE_BYTES = 4096;
@@ -191,7 +193,9 @@ function baseExecArgs(sandbox, options) {
     "--disable",
     "sleep_tool",
     "--disable",
-    "memories"
+    "memories",
+    "--disable",
+    "goals"
   ];
   appendExplicitSettings(args, options, sandbox);
   return args;
@@ -314,18 +318,31 @@ function recentRolloutDirectories(env) {
   return [...directories];
 }
 
-function matchingRolloutInDirectory(directory, suffix) {
+function escapedRegExp(value) {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function preferredRolloutCandidate(latest, candidate) {
+  if (!latest) {
+    return candidate;
+  }
+  if (latest.compressed !== candidate.compressed) {
+    return candidate.compressed ? latest : candidate;
+  }
+  return candidate.mtimeMs > latest.mtimeMs ? candidate : latest;
+}
+
+function matchingRolloutInDirectory(directory, namePattern) {
   let latest = null;
   try {
     for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
-      if (!entry.isFile() || !entry.name.endsWith(suffix)) {
+      const compressed = entry.name.endsWith(".zst");
+      if (!entry.isFile() || !namePattern.test(entry.name) || (compressed && typeof zlib.zstdDecompressSync !== "function")) {
         continue;
       }
       const file = path.join(directory, entry.name);
       const stats = fs.statSync(file);
-      if (!latest || stats.mtimeMs > latest.mtimeMs) {
-        latest = { file, mtimeMs: stats.mtimeMs };
-      }
+      latest = preferredRolloutCandidate(latest, { compressed, file, mtimeMs: stats.mtimeMs });
     }
   } catch {}
   return latest;
@@ -335,12 +352,13 @@ function findRolloutPath(threadId, env, allowHistoricalScan = false) {
   if (!THREAD_ID_PATTERN.test(threadId)) {
     return null;
   }
-  const suffix = `-${threadId}.jsonl`;
+  const escapedThreadId = escapedRegExp(threadId);
+  const namePattern = new RegExp(`^rollout-.+-${escapedThreadId}(?:_[0-9a-fA-F-]+)?\\.jsonl(?:\\.zst)?$`);
   let latest = null;
   for (const directory of recentRolloutDirectories(env)) {
-    const candidate = matchingRolloutInDirectory(directory, suffix);
-    if (candidate && (!latest || candidate.mtimeMs > latest.mtimeMs)) {
-      latest = candidate;
+    const candidate = matchingRolloutInDirectory(directory, namePattern);
+    if (candidate) {
+      latest = preferredRolloutCandidate(latest, candidate);
     }
   }
   if (latest || !allowHistoricalScan) {
@@ -367,14 +385,13 @@ function findRolloutPath(threadId, env, allowHistoricalScan = false) {
           stack.push(candidate);
           continue;
         }
-        if (!entry.isFile() || !entry.name.endsWith(suffix)) {
+        const compressed = entry.name.endsWith(".zst");
+        if (!entry.isFile() || !namePattern.test(entry.name) || (compressed && typeof zlib.zstdDecompressSync !== "function")) {
           continue;
         }
         try {
           const stats = fs.statSync(candidate);
-          if (!latest || stats.mtimeMs > latest.mtimeMs) {
-            latest = { file: candidate, mtimeMs: stats.mtimeMs };
-          }
+          latest = preferredRolloutCandidate(latest, { compressed, file: candidate, mtimeMs: stats.mtimeMs });
         } catch {}
       }
     }
@@ -407,25 +424,55 @@ function boundedObservedText(value, maxBytes) {
   return (buffer.length <= maxBytes ? buffer : buffer.subarray(0, maxBytes)).toString("utf8");
 }
 
+function boundedRolloutLines(buffer, headMaxBytes, tailMaxBytes) {
+  if (buffer.length <= headMaxBytes + tailMaxBytes) {
+    return completeJsonlLines(buffer);
+  }
+  const head = buffer.subarray(0, headMaxBytes);
+  const tailStart = Math.max(headMaxBytes, buffer.length - tailMaxBytes);
+  const tail = buffer.subarray(tailStart);
+  return [
+    ...completeJsonlLines(head, { dropTrailing: true }),
+    ...completeJsonlLines(tail, { dropLeading: true })
+  ];
+}
+
 function rolloutLines(file, options = {}) {
   const headMaxBytes = options.headMaxBytes ?? DEFAULT_ROLLOUT_HEAD_MAX_BYTES;
   const tailMaxBytes = options.tailMaxBytes ?? DEFAULT_ROLLOUT_TAIL_MAX_BYTES;
+  if (file.endsWith(".zst")) {
+    if (typeof zlib.zstdDecompressSync !== "function") {
+      return null;
+    }
+    try {
+      if (fs.statSync(file).size > MAX_COMPRESSED_ROLLOUT_BYTES) {
+        return null;
+      }
+      const buffer = zlib.zstdDecompressSync(fs.readFileSync(file));
+      return { compressed: true, lines: boundedRolloutLines(buffer, headMaxBytes, tailMaxBytes) };
+    } catch {
+      return null;
+    }
+  }
   let descriptor;
   try {
     descriptor = fs.openSync(file, "r");
     const size = fs.fstatSync(descriptor).size;
     if (size <= headMaxBytes + tailMaxBytes) {
-      return completeJsonlLines(readFileSlice(descriptor, 0, size));
+      return { compressed: false, lines: completeJsonlLines(readFileSlice(descriptor, 0, size)) };
     }
     const head = readFileSlice(descriptor, 0, headMaxBytes);
     const tailStart = Math.max(headMaxBytes, size - tailMaxBytes);
     const tail = readFileSlice(descriptor, tailStart, size - tailStart);
-    return [
-      ...completeJsonlLines(head, { dropTrailing: true }),
-      ...completeJsonlLines(tail, { dropLeading: true })
-    ];
+    return {
+      compressed: false,
+      lines: [
+        ...completeJsonlLines(head, { dropTrailing: true }),
+        ...completeJsonlLines(tail, { dropLeading: true })
+      ]
+    };
   } catch {
-    return [];
+    return null;
   } finally {
     if (descriptor !== undefined) {
       fs.closeSync(descriptor);
@@ -449,8 +496,12 @@ function recoverRolloutObservation(threadId, options = {}) {
     return result;
   }
   result.found = true;
-  result.source = "local_rollout";
-  for (const line of rolloutLines(file, options)) {
+  const rollout = rolloutLines(file, options);
+  if (!rollout) {
+    return result;
+  }
+  result.source = rollout.compressed ? "local_rollout_zst" : "local_rollout";
+  for (const line of rollout.lines) {
     let entry;
     try {
       entry = JSON.parse(line);
@@ -1142,6 +1193,9 @@ function classifiedFailureKind(message, fallback = "error") {
   }
   if (/rate[ _-]?limit|too many requests|http(?:\/\d(?:\.\d)?)?\s+429|status(?: code)?\s*[:=]?\s*429/i.test(text)) {
     return "rate_limited";
+  }
+  if (/misalignment policy|cyber policy|violat(?:ed|es|ion of) (?:the |our |an? )?[a-z ]{0,40}policy|content policy/i.test(text)) {
+    return "refused";
   }
   if (/unauthori[sz]ed|unauthenticated|authentication|login required|invalid api key|api key/i.test(text)) {
     return "auth";
