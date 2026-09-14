@@ -525,8 +525,8 @@ test("a zstd rollout recovers its observation without a plain sibling", async (t
 test("a plain rollout outranks a newer zstd sibling", async (t) => {
   const files = fixture(t);
   const directory = path.join(files.dir, "codex-home", "sessions");
-  const plain = path.join(directory, "rollout-sibling-thread-123.jsonl");
-  const compressed = path.join(directory, "rollout-sibling-thread-123.jsonl.zst");
+  const plain = path.join(directory, "rollout-thread-123.jsonl");
+  const compressed = path.join(directory, "rollout-thread-123.jsonl.zst");
   writeRollout(plain, "gpt-plain");
   if (typeof zlib.zstdCompressSync === "function") {
     writeRollout(compressed, "gpt-zstd", true);

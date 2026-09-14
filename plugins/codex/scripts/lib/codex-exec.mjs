@@ -353,7 +353,7 @@ function findRolloutPath(threadId, env, allowHistoricalScan = false) {
     return null;
   }
   const escapedThreadId = escapedRegExp(threadId);
-  const namePattern = new RegExp(`^rollout-.+-${escapedThreadId}(?:_[0-9a-fA-F-]+)?\\.jsonl(?:\\.zst)?$`);
+  const namePattern = new RegExp(`^rollout-(?:.*-)?${escapedThreadId}(?:_[0-9a-fA-F-]+)?\\.jsonl(?:\\.zst)?$`);
   let latest = null;
   for (const directory of recentRolloutDirectories(env)) {
     const candidate = matchingRolloutInDirectory(directory, namePattern);
