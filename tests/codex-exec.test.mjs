@@ -5,6 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import * as zlib from "node:zlib";
 
 import {
   BASH_TOOL_TIMEOUT_MS,
@@ -58,6 +59,13 @@ function fixture(t) {
     stdinFile: path.join(dir, "stdin.txt"),
     termFile: path.join(dir, "term.signal")
   };
+}
+
+function writeRollout(file, model, compressed = false) {
+  const timestamp = new Date().toISOString();
+  const contents = Buffer.from(`${JSON.stringify({ timestamp, type: "turn_context", payload: { model, effort: "xhigh" } })}\n`);
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.writeFileSync(file, compressed ? zlib.zstdCompressSync(contents) : contents);
 }
 
 async function runFixture(t, mode, options = {}) {
@@ -153,12 +161,12 @@ async function waitForProcessExit(pid, ownsProcessGroup = false) {
 
 test("version and availability probe the configured Codex binary", () => {
   const env = { ...process.env, CODEX_BIN: fakeCodex };
-  assert.equal(getCodexVersion({ env }), "0.153.4");
+  assert.equal(getCodexVersion({ env }), "0.154.0");
   assert.deepEqual(getCodexAvailability({ env }), {
     available: true,
     bin: fakeCodex,
-    version: "0.153.4",
-    rawVersion: "codex-cli 0.153.4",
+    version: "0.154.0",
+    rawVersion: "codex-cli 0.154.0",
     exitCode: 0,
     errorMessage: null
   });
@@ -252,6 +260,8 @@ test("task arguments enforce safe headless execution and put global flags before
     "sleep_tool",
     "--disable",
     "memories",
+    "--disable",
+    "goals",
     "--model",
     "gpt-test",
     "-c",
@@ -289,6 +299,8 @@ test("task arguments leave model and effort unset while pinning networked tools 
     "sleep_tool",
     "--disable",
     "memories",
+    "--disable",
+    "goals",
     "-c",
     "service_tier=priority",
     "--config",
@@ -334,6 +346,8 @@ test("native review is read-only and maps review targets", () => {
     "sleep_tool",
     "--disable",
     "memories",
+    "--disable",
+    "goals",
     "-c",
     "service_tier=priority",
     "--config",
@@ -358,6 +372,8 @@ test("native review is read-only and maps review targets", () => {
     "sleep_tool",
     "--disable",
     "memories",
+    "--disable",
+    "goals",
     "-c",
     "service_tier=priority",
     "--config",
@@ -466,6 +482,67 @@ test("rollout observation records resolved model and effort without treating req
   assert.equal(outcome.resolvedModel, "gpt-resolved");
   assert.equal(outcome.resolvedEffort, "xhigh");
   assert.equal(outcome.rolloutRecoveryStatus, "recovered");
+});
+
+test("a newer suffixed historical rollout is preferred over its bare predecessor", async (t) => {
+  const files = fixture(t);
+  const directory = path.join(files.dir, "codex-home", "sessions", "2000", "01", "01");
+  const bare = path.join(directory, "rollout-2000-01-01-thread-123.jsonl");
+  const suffixed = path.join(directory, "rollout-2000-01-01-thread-123_deadbeef.jsonl");
+  writeRollout(bare, "gpt-bare");
+  writeRollout(suffixed, "gpt-suffixed");
+  const now = Date.now();
+  fs.utimesSync(bare, now / 1000 - 2, now / 1000 - 2);
+  fs.utimesSync(suffixed, now / 1000, now / 1000);
+
+  const { outcome } = await runFixture(t, "completed", {
+    env: { CODEX_HOME: path.join(files.dir, "codex-home") },
+    resumeThreadId: "thread-123"
+  });
+
+  assert.equal(outcome.rolloutRecoveryStatus, "recovered");
+  assert.equal(outcome.resolvedModel, "gpt-suffixed");
+});
+
+test("a zstd rollout recovers its observation without a plain sibling", async (t) => {
+  if (typeof zlib.zstdCompressSync !== "function") {
+    t.skip("zstd compression is unavailable in this Node runtime");
+    return;
+  }
+  const files = fixture(t);
+  const file = path.join(files.dir, "codex-home", "sessions", "rollout-zstd-thread-123.jsonl.zst");
+  writeRollout(file, "gpt-zstd", true);
+
+  const { outcome } = await runFixture(t, "completed", {
+    env: { CODEX_HOME: path.join(files.dir, "codex-home") }
+  });
+
+  assert.equal(outcome.rolloutRecoveryStatus, "recovered");
+  assert.equal(outcome.resolvedModel, "gpt-zstd");
+  assert.equal(outcome.resolvedEffort, "xhigh");
+});
+
+test("a plain rollout outranks a newer zstd sibling", async (t) => {
+  const files = fixture(t);
+  const directory = path.join(files.dir, "codex-home", "sessions");
+  const plain = path.join(directory, "rollout-thread-123.jsonl");
+  const compressed = path.join(directory, "rollout-thread-123.jsonl.zst");
+  writeRollout(plain, "gpt-plain");
+  if (typeof zlib.zstdCompressSync === "function") {
+    writeRollout(compressed, "gpt-zstd", true);
+  } else {
+    writeRollout(compressed, "gpt-zstd");
+  }
+  const now = Date.now();
+  fs.utimesSync(plain, now / 1000 - 2, now / 1000 - 2);
+  fs.utimesSync(compressed, now / 1000, now / 1000);
+
+  const { outcome } = await runFixture(t, "completed", {
+    env: { CODEX_HOME: path.join(files.dir, "codex-home") }
+  });
+
+  assert.equal(outcome.rolloutRecoveryStatus, "recovered");
+  assert.equal(outcome.resolvedModel, "gpt-plain");
 });
 
 test("a collaboration tool event fails closed even when Codex emits a completed turn", async (t) => {

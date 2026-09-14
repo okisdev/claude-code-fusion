@@ -395,6 +395,21 @@ test("a collaboration policy violation is treated as a protocol breaker but an o
   assert.match(run(sandbox).stdout, /last failure protocol/);
 });
 
+test("a Codex refusal neither opens nor counts toward the breaker", (t) => {
+  const sandbox = makeSandbox(t);
+  writeRecord(jobFile(sandbox.codexState, "workspace", "refused"), {
+    status: "error",
+    failureKind: "refused",
+    errorMessage: "This request violated the misalignment policy.",
+    finishedAt: new Date(Date.now() - 2 * 60000).toISOString()
+  });
+
+  const result = run(sandbox);
+  assert.strictEqual(result.status, 0);
+  assert.strictEqual(result.stdout, "");
+  assert.strictEqual(result.stderr, "");
+});
+
 test("the actual disabled collaboration tool diagnostic opens the Codex breaker", (t) => {
   const sandbox = makeSandbox(t);
   writeRecord(jobFile(sandbox.codexState, "workspace", "disabled-collaboration-tool"), {

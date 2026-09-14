@@ -65,7 +65,7 @@ if (UNMODELLED_SUBCOMMANDS.has(args[0])) {
 }
 
 if (args.includes("--version")) {
-  process.stdout.write(`${process.env.FAKE_CODEX_VERSION_OUTPUT || `codex-cli ${process.env.FAKE_CODEX_VERSION || "0.153.4"}`}\n`);
+  process.stdout.write(`${process.env.FAKE_CODEX_VERSION_OUTPUT || `codex-cli ${process.env.FAKE_CODEX_VERSION || "0.154.0"}`}\n`);
   process.exit(0);
 }
 
@@ -203,7 +203,7 @@ switch (mode) {
     break;
   case "failed":
     start();
-    emit({ type: "turn.failed", error: { message: "model execution failed" } });
+    emit({ type: "turn.failed", error: { message: process.env.FAKE_CODEX_TURN_FAILURE_MESSAGE || "model execution failed" } });
     process.exitCode = 1;
     break;
   case "pre-turn-warning-completed":
