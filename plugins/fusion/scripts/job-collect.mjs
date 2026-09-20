@@ -6,6 +6,7 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
+import { ENGINES, engineIdChoices, isEngineId } from "./lib/engines.mjs";
 import { consumeRawArgsTransport, createRawArgsTransport } from "./lib/raw-args-transport.mjs";
 
 export class UsageError extends Error {}
@@ -17,7 +18,6 @@ const MAX_CAP_MS = 540_000;
 const STDERR_TAIL_LINES = 20;
 const JOB_ID_PATTERN = /^[a-f0-9]{32}$/;
 const TOKEN_PATTERN = /^[a-f0-9]{48}$/;
-const ENGINES = new Set(["codex", "grok"]);
 const TERMINAL_STATES = new Set(["done", "error", "cancelled", "completed", "failed"]);
 const SEMANTIC_STATES = new Set(["accepted", "rejected", "unverified"]);
 const FOOTER_FIELD = /^\s*(?:[a-z][a-z0-9_-]*-session|job|delivery|semantic|state|failure)\s*:\s*/i;
@@ -36,13 +36,13 @@ function regularFile(file) {
 }
 
 function companionMetadata(engine) {
-  if (!ENGINES.has(engine)) {
-    throw new UsageError("The collection engine must be codex or grok.");
+  if (!isEngineId(engine)) {
+    throw new UsageError(`The collection engine must be ${engineIdChoices()}.`);
   }
-  const upper = engine.toUpperCase();
+  const { companionEnv: environmentKey, companionFile: filename } = ENGINES[engine];
   return {
-    environmentKey: `FUSION_${upper}_COMPANION`,
-    filename: `${engine}-companion.mjs`
+    environmentKey,
+    filename
   };
 }
 
@@ -116,8 +116,8 @@ function parseCollectionRequest(raw) {
       throw new UsageError(`Unknown collection request field ${field}.`);
     }
   }
-  if (!ENGINES.has(request.engine)) {
-    throw new UsageError("The collection request engine must be codex or grok.");
+  if (!isEngineId(request.engine)) {
+    throw new UsageError(`The collection request engine must be ${engineIdChoices()}.`);
   }
   if (typeof request.jobId !== "string" || !JOB_ID_PATTERN.test(request.jobId)) {
     throw new UsageError("The collection request jobId must be exactly 32 lowercase hexadecimal characters.");

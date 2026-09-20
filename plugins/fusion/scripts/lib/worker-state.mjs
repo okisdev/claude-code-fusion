@@ -4,6 +4,8 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
+import { PEER_JOB_FOOTER_AGENTS } from "./engines.mjs";
+
 const DATA_DIR_ENV = "FUSION_DATA_DIR";
 const WORKER_STATE_ENV = "FUSION_WORKER_STATE_DIR";
 const RETENTION_DAYS_ENV = "FUSION_WORKER_RETENTION_DAYS";
@@ -44,7 +46,7 @@ const COLLECTION_METHODS_BY_KEY = new Map([
   ["reaped", WORKER_COLLECTION_METHODS.TASK_REAPED],
   ["taskreaped", WORKER_COLLECTION_METHODS.TASK_REAPED]
 ]);
-const PEER_JOB_FOOTER_AGENT_TYPES = new Set(["codex:codex-rescue", "grok:grok-rescue", "grok:grok-review-runner"]);
+const PEER_JOB_FOOTER_AGENT_TYPES = PEER_JOB_FOOTER_AGENTS;
 const AGENT_TYPES = new Map([
   ["fusion:fast-worker", "fusion:fast-worker"],
   ["fast-worker", "fusion:fast-worker"],

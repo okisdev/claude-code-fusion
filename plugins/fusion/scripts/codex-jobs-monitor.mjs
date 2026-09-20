@@ -20,9 +20,10 @@ import {
   workspaceRootsShareRepository
 } from "./fusion-stats.mjs";
 import { observeGrokJobsSafely } from "./grok-jobs-observer.mjs";
+import { ENGINE_TERMINAL_STATUSES, engineResultCommand } from "./lib/engines.mjs";
 import { tagMessage } from "./lib/user-messages.mjs";
 
-const TERMINAL_STATUSES = new Set(["done", "error", "cancelled"]);
+const TERMINAL_STATUSES = ENGINE_TERMINAL_STATUSES;
 const DEFAULT_POLL_INTERVAL_MS = 15000;
 const INTERVAL_ENV = "CODEX_JOBS_MONITOR_INTERVAL_MS";
 const PS_COMMAND_ENV = "CODEX_JOBS_MONITOR_PS_COMMAND";
@@ -201,7 +202,7 @@ function formatOutcomeLine(record) {
   const truncated = isFailureLike && record.errorMessage ? truncateErrorMessage(record.errorMessage) : "";
   const failureMessage = truncated.endsWith("...") ? truncated : truncated.replace(/[.!?]+$/, "");
   const failureSuffix = failureMessage ? ` (${failureMessage})` : "";
-  return `codex job ${record.id} ${record.status}${failureSuffix}. collect with /codex:result ${record.id}; completion notices do not replace collection.`;
+  return `codex job ${record.id} ${record.status}${failureSuffix}. collect with ${engineResultCommand("codex", record.id)}; completion notices do not replace collection.`;
 }
 
 function shouldAnnounceTerminal(record) {
