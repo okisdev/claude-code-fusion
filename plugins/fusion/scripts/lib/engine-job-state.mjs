@@ -3,6 +3,7 @@ import os from "node:os";
 import path from "node:path";
 
 import { resolveCodexStateRoots } from "./codex-state-roots.mjs";
+import { ENGINES } from "./engines.mjs";
 
 const GROK_DATA_ENV = "GROK_COMPANION_DATA";
 const ENGINE_JOB_ID_PATTERN = /^[0-9a-f]{32}$/;
@@ -19,17 +20,16 @@ function homeDir(env) {
 }
 
 export function resolveGrokDataDir(env = process.env) {
-  return configuredPath(env[GROK_DATA_ENV]) ?? path.join(homeDir(env), ".claude", "plugins", "data", "grok-claude-code-fusion");
+  return configuredPath(env[GROK_DATA_ENV]) ?? path.join(homeDir(env), ".claude", "plugins", "data", ENGINES.grok.dataDirName);
 }
 
+const ENGINE_STATE_ROOT_RESOLVERS = new Map([
+  [ENGINES.codex.id, (env) => resolveCodexStateRoots(env)],
+  [ENGINES.grok.id, (env) => [path.join(resolveGrokDataDir(env), "state")]]
+]);
+
 export function resolveEngineStateRoots(engine, env = process.env) {
-  if (engine === "codex") {
-    return resolveCodexStateRoots(env);
-  }
-  if (engine === "grok") {
-    return [path.join(resolveGrokDataDir(env), "state")];
-  }
-  return [];
+  return ENGINE_STATE_ROOT_RESOLVERS.get(engine)?.(env) ?? [];
 }
 
 export function readEngineJobRecord(engine, jobId, env = process.env) {

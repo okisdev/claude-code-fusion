@@ -10,7 +10,7 @@ export const DEFAULT_TERMINATION_GRACE_MS = 2000;
 export const DEFAULT_TERMINATION_POLL_MS = 25;
 export const BASH_TOOL_TIMEOUT_MS = 600000;
 export const TIMEOUT_PATH_MARGIN_MS = 15000;
-const FORCED_CLOSE_MS = 50;
+export const FORCED_CLOSE_MS = 2000;
 const DEFAULT_TIMEOUT_ESCALATION_MS =
   DEFAULT_TERMINATION_GRACE_MS * 2 + DEFAULT_TERMINATION_POLL_MS * 3 + FORCED_CLOSE_MS;
 export const DEFAULT_TIMEOUT_PATH_MAX_MS = DEFAULT_TIMEOUT_MS + DEFAULT_TIMEOUT_ESCALATION_MS;
@@ -1360,6 +1360,7 @@ export async function runCodex(options = {}) {
   let spawnError = null;
   let terminationPromise = null;
   let closeResolved = false;
+  let forcedCloseTimer = null;
   let resolveForcedClose;
   const forcedClosePromise = new Promise((resolve) => {
     resolveForcedClose = resolve;
@@ -1403,16 +1404,16 @@ export async function runCodex(options = {}) {
         requireIdentity: Boolean(childIdentity)
       }).then((terminated) => {
         state.cleanupComplete = terminated;
-        setTimeout(() => {
-          if (!closeResolved) {
+        if (!closeResolved) {
+          forcedCloseTimer = setTimeout(() => {
             state.cleanupComplete = false;
             child.stdin?.destroy();
             child.stdout?.destroy();
             child.stderr?.destroy();
             child.unref();
             resolveForcedClose({ code: null, exitCode: null, forced: true, signal: null });
-          }
-        }, FORCED_CLOSE_MS);
+          }, FORCED_CLOSE_MS);
+        }
         return terminated;
       });
     }
@@ -1450,6 +1451,7 @@ export async function runCodex(options = {}) {
   const closePromise = new Promise((resolve) => {
     child.once("close", (code, signal) => {
       closeResolved = true;
+      clearTimeout(forcedCloseTimer);
       resolve({
         code,
         exitCode: Number.isInteger(code) ? code : signalExitCode(signal),

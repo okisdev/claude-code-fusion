@@ -5,6 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
+import { ENGINE_IDS, isEngineId } from "./lib/engines.mjs";
 import { JUDGMENT_POSTURE, POSTURE_VALUES, STRICT_POSTURE, resolveFusionDataDir, resolvePosture } from "./lib/posture.mjs";
 import { messageCode, tagMessage } from "./lib/user-messages.mjs";
 import { verificationCommand } from "./lib/verification-command.mjs";
@@ -949,11 +950,10 @@ function laneForSubagentType(subagentType) {
   if (typeof subagentType !== "string" || subagentType.length === 0) {
     return BUILTIN_LANE;
   }
-  if (subagentType.startsWith("grok:")) {
-    return "grok";
-  }
-  if (subagentType.startsWith("codex:")) {
-    return "codex";
+  for (const engineId of ENGINE_IDS) {
+    if (subagentType.startsWith(`${engineId}:`)) {
+      return engineId;
+    }
   }
   if (subagentType.startsWith("fusion:")) {
     return normalizeLane(subagentType) ?? BUILTIN_LANE;
@@ -985,7 +985,7 @@ function sanitizeIdentifier(value, maxLength = DESCRIPTION_MAX_LENGTH) {
 }
 
 function normalizeLane(value) {
-  if (value === BUILTIN_LANE || value === "grok" || value === "codex") {
+  if (value === BUILTIN_LANE || isEngineId(value)) {
     return value;
   }
   return typeof value === "string" && value.startsWith("fusion:") ? sanitizeIdentifier(value, 80) : null;

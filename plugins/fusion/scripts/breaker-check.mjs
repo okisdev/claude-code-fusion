@@ -15,10 +15,9 @@ const WORKER_BREAKER_LANES = ["fusion:claude-worker", "fusion:trivial-worker"];
 const HARD_FAILURE_KINDS = new Set(["quota", "auth", "missing_cli", "protocol", "transport", "sandbox"]);
 const REPEATED_FAILURE_KINDS = new Set(["rate_limited", "timeout", "stall", "network", "process", "died", "patch_thrash", "exec_lost"]);
 const BREAKER_FAILURE_KINDS = new Set([...HARD_FAILURE_KINDS, ...REPEATED_FAILURE_KINDS, "permission"]);
-const GROK_FAILURE_STATUSES = new Set(["error", "failed"]);
-const CODEX_FAILURE_STATUSES = new Set(["error", "failed"]);
+const FAILURE_STATUSES = new Set(["error", "failed"]);
 const SUCCESS_STATUSES = new Set(["done", "completed"]);
-const TERMINAL_STATUSES = new Set([...GROK_FAILURE_STATUSES, ...SUCCESS_STATUSES, "cancelled"]);
+const TERMINAL_STATUSES = new Set([...FAILURE_STATUSES, ...SUCCESS_STATUSES, "cancelled"]);
 const CODEX_FAILURE_PATTERNS = [
   [
     "quota",
@@ -134,7 +133,7 @@ function normalizedRecordedFailureKind(record, value) {
 }
 
 function grokFailure(record, now, lookbackMs) {
-  if (!GROK_FAILURE_STATUSES.has(record.status)) {
+  if (!FAILURE_STATUSES.has(record.status)) {
     return null;
   }
   const failureKind = normalizedRecordedFailureKind(record, record.failureKind);
@@ -162,7 +161,7 @@ function codexFailureKind(errorMessage) {
 }
 
 function codexFailure(record, now, lookbackMs) {
-  if (!CODEX_FAILURE_STATUSES.has(record.status)) {
+  if (!FAILURE_STATUSES.has(record.status)) {
     return null;
   }
   const failureKind = normalizedRecordedFailureKind(record, record.failureKind);

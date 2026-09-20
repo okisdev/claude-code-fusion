@@ -39,7 +39,7 @@ Any change to `plugins/fusion/rules/orchestration.md` or `plugins/fusion/rules/t
 
 ## Code changes
 
-Tests use Node's built in runner (`node --test`) and live under `tests/`. Keep the repository's zero comment default: only retain a comment when it records a non obvious invariant or constraint that the code alone cannot convey. The capability table between the model table sentinels is config generated. Routing prose may name concrete peer model IDs only when every named ID appears in the capability table, and `/fusion:doctor` checks that consistency; live model listings and the `/fusion:config` capability table remain the source of truth for engine defaults and scores.
+Tests use Node's built in runner (`node --test`) and live under `tests/`. Keep the repository's zero comment default: only retain a comment when it records a non obvious invariant or constraint that the code alone cannot convey. The capability table between the model table sentinels is config generated. Routing prose may name concrete peer model IDs only when every named ID appears in the capability table, and `/fusion:doctor` checks that consistency; live model listings and the `/fusion:config` capability table remain the source of truth for engine defaults and scores. Engine identity (ids, display names, peer agent types, companion file and environment names, data directory names) lives only in `plugins/fusion/scripts/lib/engines.mjs`; `tests/engines.test.mjs` fails when another fusion script repeats one of those literals or when `hooks.json` wires a peer agent the registry does not know. Engine specific behavior, such as failure patterns, acceptance ledgers, and monitors, stays in its own module.
 
 ## Releases
 

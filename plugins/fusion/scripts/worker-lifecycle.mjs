@@ -5,6 +5,17 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { recordEngineAcceptance } from "./lib/engine-acceptance.mjs";
+import {
+  ENGINE_ID_ALTERNATION,
+  PEER_JOB_FOOTER_AGENTS,
+  PEER_MANAGED_AGENTS,
+  PEER_MANAGED_AGENT_NAMES,
+  PEER_RESCUE_AGENT_NAMES,
+  engineDisplayNameList,
+  engineForAgentType,
+  engineResultCommand,
+  isEngineId
+} from "./lib/engines.mjs";
 import { readEngineJobFailureKind } from "./lib/engine-job-state.mjs";
 import { appendTokenUsageObservation, fusionRepositoryKey } from "./fusion-stats.mjs";
 import { tagMessage } from "./lib/user-messages.mjs";
@@ -51,14 +62,13 @@ const FINAL_TEXT_TAIL_BYTES = 48 * 1024;
 const EXECUTION_END_MARKER = /(?:^|\n)delivery:\s*complete\s*\r?\nverification:\s*passed\s*$/i;
 const COVERAGE_END_MARKER = /(?:^|\n)delivery:\s*complete\s*\r?\ncoverage:\s*complete\s*$/i;
 const COLLECTOR_END_MARKER = /(?:^|\n)collector:\s*(?:state=|timeout\b|dead\b|status-error\b).*$/i;
-const COLLECTOR_TERMINAL_MARKER = /^collector:\s*state=(done|error|cancelled|completed|failed)\s+semantic=(accepted|rejected|unverified)\s+engine=(codex|grok)\s+job=([a-f0-9]{32})\s+elapsed=(\d+)s$/i;
-const COLLECTOR_OUTCOME_MARKER = /^collector:\s*(timeout|dead|status-error)\s+engine=(codex|grok)\s+job=([a-f0-9]{32})\s+elapsed=(\d+)s$/i;
+const COLLECTOR_TERMINAL_MARKER = new RegExp(String.raw`^collector:\s*state=(done|error|cancelled|completed|failed)\s+semantic=(accepted|rejected|unverified)\s+engine=(${ENGINE_ID_ALTERNATION})\s+job=([a-f0-9]{32})\s+elapsed=(\d+)s$`, "i");
+const COLLECTOR_OUTCOME_MARKER = new RegExp(String.raw`^collector:\s*(timeout|dead|status-error)\s+engine=(${ENGINE_ID_ALTERNATION})\s+job=([a-f0-9]{32})\s+elapsed=(\d+)s$`, "i");
 const READ_ONLY_TOOLS = new Set(["Read", "Grep", "Glob", "LS", "WebSearch", "WebFetch"]);
 const EXECUTION_AGENTS = new Set(["fusion:claude-worker", "fusion:trivial-worker"]);
 const BRIEF_AGENTS = new Set(["fusion:claude-worker", "fusion:trivial-worker", "fusion:deep-reasoner"]);
-const PEER_WRAPPER_AGENTS = new Set(["codex:codex-rescue", "codex-rescue", "grok:grok-rescue", "grok-rescue"]);
-const MANAGED_PEER_AGENTS = new Set(["grok:grok-review-runner", "grok-review-runner"]);
-const PEER_JOB_FOOTER_AGENTS = new Set(["codex:codex-rescue", "grok:grok-rescue", "grok:grok-review-runner"]);
+const PEER_WRAPPER_AGENTS = PEER_RESCUE_AGENT_NAMES;
+const MANAGED_PEER_AGENTS = PEER_MANAGED_AGENT_NAMES;
 const TERMINAL_RUNTIME_TASK_STATUSES = new Set(["completed", "complete", "done", "failed", "error", "cancelled", "canceled", "stopped", "terminated", "timed_out", "timeout"]);
 const SUCCESSFUL_TASK_NOTIFICATION_STATUSES = new Set(["completed", "complete", "done"]);
 const CANCELLED_TASK_NOTIFICATION_STATUSES = new Set(["killed", "cancelled", "canceled", "stopped", "terminated"]);
@@ -379,7 +389,7 @@ function collectorRequestIdentity(prompt) {
   if (engineLines.length !== 1 || jobLines.length !== 1) {
     return null;
   }
-  const engine = engineLines[0].match(/^engine:\s*(codex|grok)\s*$/)?.[1] ?? null;
+  const engine = engineLines[0].match(new RegExp(String.raw`^engine:\s*(${ENGINE_ID_ALTERNATION})\s*$`))?.[1] ?? null;
   const jobId = jobLines[0].match(/^job:\s*([a-f0-9]{32})\s*$/)?.[1] ?? null;
   return engine && jobId ? { expectedPeerEngine: engine, expectedPeerJobId: jobId } : null;
 }
@@ -609,7 +619,7 @@ function completedReport(record, message) {
     return COLLECTOR_END_MARKER.test(normalized);
   }
   if (record.completionContract === "transport" || PEER_JOB_FOOTER_AGENTS.has(record.agentType)) {
-    return record.agentType === "grok:grok-review-runner" || peerJobIdFromCollectedResult(normalized) != null;
+    return PEER_MANAGED_AGENTS.has(record.agentType) || peerJobIdFromCollectedResult(normalized) != null;
   }
   if (record.completionContract === "coverage" || canonicalWorkerAgentType(record.agentType) === "fusion:deep-reasoner") {
     return COVERAGE_END_MARKER.test(normalized);
@@ -706,7 +716,7 @@ function handlePreToolUse(input, env) {
     const agentType = input.tool_input?.subagent_type;
     if (PEER_WRAPPER_AGENTS.has(agentType)) {
       if (input.tool_input?.run_in_background === true) {
-        writeOutput(denyTool(tagMessage("worker-lifecycle.foreground-wrapper-deny", "Codex and Grok wrapper Agents use foreground delivery. Keep the Agent foreground; an explicitly requested companion `--background` receipt stays inside that foreground wrapper call.")));
+        writeOutput(denyTool(tagMessage("worker-lifecycle.foreground-wrapper-deny", `${engineDisplayNameList()} wrapper Agents use foreground delivery. Keep the Agent foreground; an explicitly requested companion \`--background\` receipt stays inside that foreground wrapper call.`)));
       }
       return;
     }
@@ -717,7 +727,7 @@ function handlePreToolUse(input, env) {
       return;
     }
     if (canonicalWorkerAgentType(agentType) === "fusion:job-collector" && !collectorRequestIdentity(promptText(input.tool_input))) {
-      writeOutput(denyTool(tagMessage("worker-lifecycle.collector-request-deny", "Fusion collector requests must contain exactly one `engine: codex|grok` line and one `job: <32 lowercase hexadecimal characters>` line.")));
+      writeOutput(denyTool(tagMessage("worker-lifecycle.collector-request-deny", `Fusion collector requests must contain exactly one \`engine: ${ENGINE_ID_ALTERNATION}\` line and one \`job: <32 lowercase hexadecimal characters>\` line.`)));
       return;
     }
     const validation = validateWorkerBrief(promptText(input.tool_input), agentType, env);
@@ -924,7 +934,7 @@ function withDurableCancellationTranscript(record) {
 }
 
 function withPeerFailureKind(record, env) {
-  if (record.peerFailureKind != null || !["codex", "grok"].includes(record.peerEngine) || !ENGINE_JOB_ID_PATTERN.test(record.peerJobId ?? "")) {
+  if (record.peerFailureKind != null || !isEngineId(record.peerEngine) || !ENGINE_JOB_ID_PATTERN.test(record.peerJobId ?? "")) {
     return record;
   }
   const peerFailureKind = readEngineJobFailureKind(record.peerEngine, record.peerJobId, env);
@@ -988,13 +998,7 @@ function peerJobIdFromCollectedResult(text) {
 }
 
 function peerEngineFromAgentType(agentType) {
-  if (agentType === "codex:codex-rescue") {
-    return "codex";
-  }
-  if (agentType === "grok:grok-rescue" || agentType === "grok:grok-review-runner") {
-    return "grok";
-  }
-  return null;
+  return engineForAgentType(agentType);
 }
 
 function capturedPeerIdentity(agentType, text, peerEngine) {
@@ -1026,7 +1030,7 @@ function settleQueuedVerdict(record, now, env) {
     return settled;
   }
   const peerJobId = typeof settled.peerJobId === "string" && ENGINE_JOB_ID_PATTERN.test(settled.peerJobId) ? settled.peerJobId : null;
-  const peerEngine = settled.peerEngine === "codex" || settled.peerEngine === "grok" ? settled.peerEngine : null;
+  const peerEngine = isEngineId(settled.peerEngine) ? settled.peerEngine : null;
   if (!peerJobId || !peerEngine) {
     return settled;
   }
@@ -1876,7 +1880,7 @@ function unreportedCollectorFailures(sessionId, env) {
 function collectorResultCommand(record) {
   const engine = record.peerEngine ?? record.expectedPeerEngine;
   const jobId = record.peerJobId ?? record.expectedPeerJobId;
-  return ["codex", "grok"].includes(engine) && /^[a-f0-9]{32}$/.test(jobId ?? "") ? `/${engine}:result ${jobId}` : null;
+  return isEngineId(engine) && /^[a-f0-9]{32}$/.test(jobId ?? "") ? engineResultCommand(engine, jobId) : null;
 }
 
 function settlementCommand(records) {
@@ -1916,8 +1920,8 @@ function collectorStopGate(input, env) {
   }
   const unjudged = unjudgedPeerCollections(input.session_id, env);
   if (unjudged.length > 0) {
-    const settlementRecords = unjudged.filter((record) => ["codex", "grok"].includes(record.peerEngine));
-    const manualRecords = unjudged.filter((record) => !["codex", "grok"].includes(record.peerEngine));
+    const settlementRecords = unjudged.filter((record) => isEngineId(record.peerEngine));
+    const manualRecords = unjudged.filter((record) => !isEngineId(record.peerEngine));
     const instructions = [
       settlementRecords.length > 0 ? `record the judgments in one command: ${settlementCommand(settlementRecords)}` : null,
       ...manualRecords.map((record) => `complete a manual resolution because the collection for Fusion task ${record.taskId} needs manual resolution`)

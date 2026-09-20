@@ -9,16 +9,17 @@ import { fileURLToPath } from "node:url";
 import { listAuditSegments as listGuardAuditSegments, readAuditEvents as readGuardAuditEvents, resolveAuditDir as resolveGuardAuditDir, resolveStateDir as resolveGuardStateDir, stateFile as guardStateFile } from "./inline-delegation-guard.mjs";
 import { resolveCodexStateDir, resolveCodexStateRoots } from "./lib/codex-state-roots.mjs";
 import { recordEngineAcceptance } from "./lib/engine-acceptance.mjs";
+import { ENGINES, ENGINE_IDS, ENGINE_TERMINAL_STATUSES, engineDisplayName, engineDisplayNameList, isEngineId } from "./lib/engines.mjs";
+import { resolveGrokDataDir } from "./lib/engine-job-state.mjs";
 import { consumeRawArgsTransport, createRawArgsTransport, resolveRawArgsTransport } from "./lib/raw-args-transport.mjs";
 import { MESSAGE_REGISTRY, messageCode, registryEntry, tagMessage } from "./lib/user-messages.mjs";
 import { canonicalWorkerAgentType, isTerminalWorkerStatus, readWorkerRecord, readWorkerRecords, recordWorkerAcceptance, validateWorkerAcceptance } from "./lib/worker-state.mjs";
 
 export { GrokPluginUpgradeRequiredError, newestCodexCompanion, newestGrokCompanion } from "./lib/engine-acceptance.mjs";
 
-const GROK_DATA_DIR_ENV = "GROK_COMPANION_DATA";
 const FUSION_DATA_DIR_ENV = "FUSION_DATA_DIR";
-const CODEX_TERMINAL_STATUSES = new Set(["done", "error", "cancelled"]);
-const GROK_TERMINAL_STATUSES = new Set(["done", "error", "cancelled"]);
+const CODEX_TERMINAL_STATUSES = ENGINE_TERMINAL_STATUSES;
+const GROK_TERMINAL_STATUSES = ENGINE_TERMINAL_STATUSES;
 const CODEX_ACCEPTANCE_STATES = new Set(["accepted", "rejected", "unverified"]);
 const TOKEN_USAGE_FILENAME = "token-usage.jsonl";
 const TERMINAL_LEDGER_PREFIX = "codex-jobs-monitor-announced";
@@ -374,14 +375,6 @@ function grokStats({ all = false, env = process.env, cwd = process.cwd() } = {})
   return fileBasedEngineStats(FILE_ENGINE_DESCRIPTORS.grok, { all, env, cwd });
 }
 
-function resolveGrokDataDir(env = process.env) {
-  const override = env[GROK_DATA_DIR_ENV];
-  if (override && override.trim()) {
-    return path.resolve(override.trim());
-  }
-  return path.join(os.homedir(), ".claude", "plugins", "data", "grok-claude-code-fusion");
-}
-
 function grokStateRoots(env = process.env) {
   return [path.join(resolveGrokDataDir(env), "state")];
 }
@@ -405,19 +398,20 @@ function codexJobExists(jobId, env) {
   return readCodexJobEvidence(resolveCodexStateDir(env), { env }).some((job) => nonEmptyString(job?.id) === jobId);
 }
 
+const ENGINE_JOB_LOOKUPS = {
+  codex: codexJobExists,
+  grok: (jobId, env) => grokJobById(jobId, env) !== null
+};
+
 function resolveEngineJob(jobId, env) {
-  const codexFound = codexJobExists(jobId, env);
-  const grokFound = grokJobById(jobId, env) !== null;
-  if (codexFound && grokFound) {
-    throw new Error(`Engine job ${jobId} exists in both Codex and Grok state.`);
+  const found = ENGINE_IDS.filter((engine) => ENGINE_JOB_LOOKUPS[engine]?.(jobId, env) === true);
+  if (found.length > 1) {
+    throw new Error(`Engine job ${jobId} exists in both ${engineDisplayNameList()} state.`);
   }
-  if (codexFound) {
-    return "codex";
+  if (found.length === 1) {
+    return found[0];
   }
-  if (grokFound) {
-    return "grok";
-  }
-  throw new Error(`Engine job ${jobId} was not found in Codex or Grok state.`);
+  throw new Error(`Engine job ${jobId} was not found in ${engineDisplayNameList("disjunction")} state.`);
 }
 
 function bump(map, key) {
@@ -1517,7 +1511,7 @@ function readJobFilesInWorkspace(stateRoot, workspace) {
 export const WORKSPACE_ENGINE_DESCRIPTORS = [
   {
     id: "grok",
-    displayName: "Grok",
+    displayName: ENGINES.grok.displayName,
     unavailableReason: "grok plugin job state not found; the grok plugin may not be installed",
     resolveRoot: (env) => path.join(resolveGrokDataDir(env), "state"),
     cwdOf: (raw) => (typeof raw.cwd === "string" ? raw.cwd : null),
@@ -1526,7 +1520,7 @@ export const WORKSPACE_ENGINE_DESCRIPTORS = [
   },
   {
     id: "codex",
-    displayName: "Codex",
+    displayName: ENGINES.codex.displayName,
     unavailableReason: FILE_ENGINE_DESCRIPTORS.codex.unavailableReason,
     resolveRoot: (env) => resolveStateRoot(FILE_ENGINE_DESCRIPTORS.codex, env),
     cwdOf: (raw) => (typeof raw.workspaceRoot === "string" ? raw.workspaceRoot : null),
@@ -2141,12 +2135,12 @@ export const STATS_PROVIDER_REGISTRY = [
   },
   {
     id: "grok",
-    displayName: "Grok",
+    displayName: ENGINES.grok.displayName,
     collect: (options) => fileBasedEngineStats(FILE_ENGINE_DESCRIPTORS.grok, options)
   },
   {
     id: "codex",
-    displayName: "Codex",
+    displayName: ENGINES.codex.displayName,
     collect: (options) => fileBasedEngineStats(FILE_ENGINE_DESCRIPTORS.codex, options)
   }
 ];
@@ -3064,7 +3058,7 @@ function writeRecordConfirmation({ kind, engine = null, jobId = null, worker = n
     return;
   }
   if (kind === "engine") {
-    stdout.write(`Recorded ${worker.acceptance} for ${engine === "codex" ? "Codex" : "Grok"} job ${jobId}.\n`);
+    stdout.write(`Recorded ${worker.acceptance} for ${engineDisplayName(engine)} job ${jobId}.\n`);
     return;
   }
   if (queued) {
@@ -3084,19 +3078,19 @@ function settleWorkerRecord({ taskId, verdict, source, reason, failureKind, acce
     return [worker];
   }
   validateWorkerAcceptance({ record: current, taskId, acceptance: verdict, source, reason, failureKind, acceptFailedTransport });
-  const engine = current.peerEngine === "codex" || current.peerEngine === "grok" ? current.peerEngine : resolveEngineJob(peerJobId, env);
+  const engine = isEngineId(current.peerEngine) ? current.peerEngine : resolveEngineJob(peerJobId, env);
   try {
     recordEngineAcceptance({ engine, jobId: peerJobId, acceptance: verdict, source, reason, failureKind, acceptFailedTransport, workspaceRoot, asJson, env });
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    throw new Error(`Engine settlement failed for ${engine === "codex" ? "Codex" : "Grok"} job ${peerJobId}: ${message}`);
+    throw new Error(`Engine settlement failed for ${engineDisplayName(engine)} job ${peerJobId}: ${message}`);
   }
   let settlement;
   try {
     settlement = recordWorkerAcceptance({ taskId, acceptance: verdict, env, source, reason, failureKind, acceptFailedTransport });
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    throw new Error(`Engine settlement succeeded for ${engine === "codex" ? "Codex" : "Grok"} job ${peerJobId}, but Fusion worker task ${taskId} was not settled: ${message}`);
+    throw new Error(`Engine settlement succeeded for ${engineDisplayName(engine)} job ${peerJobId}, but Fusion worker task ${taskId} was not settled: ${message}`);
   }
   const worker = settlement.record;
   if (settlement.queued) {
@@ -3126,7 +3120,7 @@ function validateWorkerSettlement({ taskId, verdict, source, reason, failureKind
   const current = readWorkerRecord(taskId, env);
   validateWorkerAcceptance({ record: current, taskId, acceptance: verdict, source, reason, failureKind, acceptFailedTransport });
   const peerJobId = isTerminalWorkerStatus(current?.transportStatus) && typeof current.peerJobId === "string" && ENGINE_JOB_ID_PATTERN.test(current.peerJobId) ? current.peerJobId : null;
-  if (peerJobId && current.peerEngine !== "codex" && current.peerEngine !== "grok") {
+  if (peerJobId && !isEngineId(current.peerEngine)) {
     resolveEngineJob(peerJobId, env);
   }
 }

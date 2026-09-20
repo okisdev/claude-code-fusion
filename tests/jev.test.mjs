@@ -38,7 +38,7 @@ function envFor(endpoint, { key = true } = {}) {
 test("askJev is silent without a key", async (t) => {
   const server = await startServer(t, (_request, response) => response.end('{"answers":{}}'));
 
-  assert.strictEqual(await askJev("state", {}, envFor(server.endpoint, { key: false })), null);
+  assert.strictEqual(await askJev("state", {}, { env: envFor(server.endpoint, { key: false }) }), null);
   assert.strictEqual(server.requests.length, 0);
 });
 
@@ -48,7 +48,7 @@ test("askJev sends the pinned model and returns answers", async (t) => {
   const state = "A peer brief";
   const questions = { q: { type: "noul", instructions: "Is it ready?" } };
 
-  assert.deepStrictEqual(await askJev(state, questions, envFor(server.endpoint)), expectedAnswers);
+  assert.deepStrictEqual(await askJev(state, questions, { env: envFor(server.endpoint) }), expectedAnswers);
   assert.strictEqual(server.requests.length, 1);
   const [request] = server.requests;
   assert.strictEqual(request.method, "POST");
@@ -57,10 +57,17 @@ test("askJev sends the pinned model and returns answers", async (t) => {
   assert.deepStrictEqual(JSON.parse(request.body), { model: "jev-1.13.0", state, questions });
 });
 
+test("askJev sends a candidate model when one is given", async (t) => {
+  const server = await startServer(t, (_request, response) => response.end('{"answers":{}}'));
+
+  await askJev("state", {}, { env: envFor(server.endpoint), model: "jev-9.9.9" });
+  assert.strictEqual(JSON.parse(server.requests[0].body).model, "jev-9.9.9");
+});
+
 test("askJev truncates state to 24000 characters", async (t) => {
   const server = await startServer(t, (_request, response) => response.end('{"answers":{}}'));
 
-  await askJev("x".repeat(30_000), {}, envFor(server.endpoint));
+  await askJev("x".repeat(30_000), {}, { env: envFor(server.endpoint) });
   assert.strictEqual(JSON.parse(server.requests[0].body).state.length, 24_000);
 });
 
@@ -70,14 +77,14 @@ test("askJev fails open for API status responses", async (t) => {
       response.writeHead(status);
       response.end();
     });
-    assert.strictEqual(await askJev("state", {}, envFor(server.endpoint)), null);
+    assert.strictEqual(await askJev("state", {}, { env: envFor(server.endpoint) }), null);
   }
 });
 
 test("askJev rejects malformed answer payloads", async (t) => {
   for (const body of ["not json", "{}", '{"answers":[]}']) {
     const server = await startServer(t, (_request, response) => response.end(body));
-    assert.strictEqual(await askJev("state", {}, envFor(server.endpoint)), null);
+    assert.strictEqual(await askJev("state", {}, { env: envFor(server.endpoint) }), null);
   }
 });
 
@@ -87,7 +94,7 @@ test("askJev fails open for a refused local connection", async (t) => {
   const { port } = server.address();
   await closeServer(server);
 
-  assert.strictEqual(await askJev("state", {}, envFor(`http://127.0.0.1:${port}`)), null);
+  assert.strictEqual(await askJev("state", {}, { env: envFor(`http://127.0.0.1:${port}`) }), null);
 });
 
 test("askJev times out before a delayed response", async (t) => {
@@ -97,6 +104,6 @@ test("askJev times out before a delayed response", async (t) => {
   });
   const startedAt = performance.now();
 
-  assert.strictEqual(await askJev("state", {}, envFor(server.endpoint)), null);
+  assert.strictEqual(await askJev("state", {}, { env: envFor(server.endpoint) }), null);
   assert.ok(performance.now() - startedAt < 3_400);
 });

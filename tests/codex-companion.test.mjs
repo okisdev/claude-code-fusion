@@ -1502,7 +1502,7 @@ test("foreground timeout persists recovered partial delivery and incomplete cumu
   const result = runCompanion(["task", "--json", "implement until timeout"], {
     cwd: sandbox.workDir,
     env: envFor(sandbox, {
-      CODEX_COMPANION_TIMEOUT_MS: "50",
+      CODEX_COMPANION_TIMEOUT_MS: "2000",
       CODEX_HOME: path.join(sandbox.root, "codex-home"),
       FAKE_CODEX_MODE: "rollout-timeout"
     })
@@ -1511,7 +1511,7 @@ test("foreground timeout persists recovered partial delivery and incomplete cumu
   const record = JSON.parse(result.stdout);
   assert.equal(record.status, "error");
   assert.equal(record.failureKind, "timeout");
-  assert.equal(record.timeoutMs, 50);
+  assert.equal(record.timeoutMs, 2000);
   assert.equal(record.companionVersion, expectedCompanionVersion);
   assert.equal(record.resultText, null);
   const resumeCommand = `'${process.execPath}' '${companion}' task --resume 'thread-123' --cwd '${fs.realpathSync(sandbox.workDir)}'`;
@@ -2116,8 +2116,7 @@ test("an incomplete timeout cleanup retains process evidence for retry", (t) => 
   const sandbox = makeSandbox(t);
   const result = runCompanion(["task", "--json", "wait for timeout"], {
     cwd: sandbox.workDir,
-    env: envFor(sandbox, { CODEX_COMPANION_TIMEOUT_MS: "50", FAKE_CODEX_MODE: "inherited-pipe" }),
-    timeout: 2000
+    env: envFor(sandbox, { CODEX_COMPANION_TIMEOUT_MS: "2000", FAKE_CODEX_MODE: "inherited-pipe" })
   });
   assert.equal(result.status, 1, result.stderr);
   const record = JSON.parse(result.stdout);

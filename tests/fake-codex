@@ -316,7 +316,7 @@ switch (mode) {
     break;
   }
   case "inherited-pipe": {
-    const holder = spawn(process.execPath, ["-e", "setTimeout(() => {}, 500)"], {
+    const holder = spawn(process.execPath, ["-e", "setTimeout(() => {}, 15000)"], {
       detached: true,
       stdio: ["ignore", process.stdout, process.stderr]
     });

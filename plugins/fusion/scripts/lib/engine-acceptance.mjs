@@ -4,6 +4,8 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
+import { ENGINES } from "./engines.mjs";
+
 export class GrokPluginUpgradeRequiredError extends Error {
   constructor(message) {
     super(message);
@@ -25,43 +27,17 @@ function regularFile(file) {
   }
 }
 
-function siblingCompanion(engine) {
-  return path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..", "..", engine, "scripts", `${engine}-companion.mjs`);
-}
-
-export function newestGrokCompanion(env = process.env) {
-  const override = typeof env.FUSION_GROK_COMPANION === "string" ? env.FUSION_GROK_COMPANION.trim() : "";
+function newestCompanion(engine, env = process.env) {
+  const { companionEnv, companionFile, id } = ENGINES[engine];
+  const override = typeof env[companionEnv] === "string" ? env[companionEnv].trim() : "";
   if (override && path.isAbsolute(override) && regularFile(override)) {
     return override;
   }
-  const base = path.join(configuredHome(env), ".claude", "plugins", "cache", "claude-code-fusion", "grok");
+  const base = path.join(configuredHome(env), ".claude", "plugins", "cache", "claude-code-fusion", id);
   try {
     const candidates = fs
       .readdirSync(base)
-      .map((version) => path.join(base, version, "scripts", "grok-companion.mjs"))
-      .filter((candidate) => fs.existsSync(candidate))
-      .map((candidate) => ({ candidate, mtime: fs.statSync(candidate).mtimeMs }))
-      .sort((left, right) => right.mtime - left.mtime);
-    if (candidates.length > 0) {
-      return candidates[0].candidate;
-    }
-  } catch {
-    void 0;
-  }
-  const sibling = siblingCompanion("grok");
-  return fs.existsSync(sibling) ? sibling : null;
-}
-
-export function newestCodexCompanion(env = process.env) {
-  const override = typeof env.FUSION_CODEX_COMPANION === "string" ? env.FUSION_CODEX_COMPANION.trim() : "";
-  if (override && path.isAbsolute(override) && regularFile(override)) {
-    return override;
-  }
-  const base = path.join(configuredHome(env), ".claude", "plugins", "cache", "claude-code-fusion", "codex");
-  try {
-    const candidates = fs
-      .readdirSync(base)
-      .map((version) => path.join(base, version, "scripts", "codex-companion.mjs"))
+      .map((version) => path.join(base, version, "scripts", companionFile))
       .filter((candidate) => fs.existsSync(candidate))
       .map((candidate) => ({ candidate, mtime: fs.statSync(candidate).mtimeMs }))
       .sort((left, right) => right.mtime - left.mtime || left.candidate.localeCompare(right.candidate));
@@ -71,8 +47,16 @@ export function newestCodexCompanion(env = process.env) {
   } catch {
     void 0;
   }
-  const sibling = siblingCompanion("codex");
+  const sibling = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..", "..", id, "scripts", companionFile);
   return fs.existsSync(sibling) ? sibling : null;
+}
+
+export function newestGrokCompanion(env = process.env) {
+  return newestCompanion(ENGINES.grok.id, env);
+}
+
+export function newestCodexCompanion(env = process.env) {
+  return newestCompanion(ENGINES.codex.id, env);
 }
 
 function companionFailureMessage(result) {
@@ -128,7 +112,7 @@ function recordGrokCompanionAcceptance({ jobId, acceptance, reason, failureKind,
 }
 
 export function recordEngineAcceptance({ engine, jobId, acceptance, source, reason, failureKind, acceptFailedTransport = false, workspaceRoot, asJson = false, env = process.env, requireUpdate = true }) {
-  if (engine === "grok") {
+  if (engine === ENGINES.grok.id) {
     return recordGrokCompanionAcceptance({ jobId, acceptance, reason, failureKind, acceptFailedTransport, workspaceRoot, asJson, env });
   }
   const result = recordCodexCompanionAcceptance({ jobId, acceptance, source, reason, failureKind, acceptFailedTransport, workspaceRoot, env });

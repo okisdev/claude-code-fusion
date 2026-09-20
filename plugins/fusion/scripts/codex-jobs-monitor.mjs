@@ -20,9 +20,10 @@ import {
   workspaceRootsShareRepository
 } from "./fusion-stats.mjs";
 import { observeGrokJobsSafely } from "./grok-jobs-observer.mjs";
+import { ENGINE_TERMINAL_STATUSES, engineResultCommand } from "./lib/engines.mjs";
 import { tagMessage } from "./lib/user-messages.mjs";
 
-const TERMINAL_STATUSES = new Set(["done", "error", "cancelled"]);
+const TERMINAL_STATUSES = ENGINE_TERMINAL_STATUSES;
 const DEFAULT_POLL_INTERVAL_MS = 15000;
 const INTERVAL_ENV = "CODEX_JOBS_MONITOR_INTERVAL_MS";
 const PS_COMMAND_ENV = "CODEX_JOBS_MONITOR_PS_COMMAND";
@@ -201,7 +202,7 @@ function formatOutcomeLine(record) {
   const truncated = isFailureLike && record.errorMessage ? truncateErrorMessage(record.errorMessage) : "";
   const failureMessage = truncated.endsWith("...") ? truncated : truncated.replace(/[.!?]+$/, "");
   const failureSuffix = failureMessage ? ` (${failureMessage})` : "";
-  return `codex job ${record.id} ${record.status}${failureSuffix}. collect with /codex:result ${record.id}; completion notices do not replace collection.`;
+  return `codex job ${record.id} ${record.status}${failureSuffix}. collect with ${engineResultCommand("codex", record.id)}; completion notices do not replace collection.`;
 }
 
 function shouldAnnounceTerminal(record) {
@@ -801,9 +802,9 @@ function safeWriteLine(line) {
   }
 }
 
-function installExitHandlers(timer) {
+function installExitHandlers(stopPolling) {
   const shutdown = () => {
-    clearInterval(timer);
+    stopPolling();
     process.exit(0);
   };
   process.on("SIGTERM", shutdown);
@@ -811,7 +812,7 @@ function installExitHandlers(timer) {
   process.on("SIGHUP", shutdown);
   process.stdout.on("error", (error) => {
     if (error?.code === "EPIPE") {
-      clearInterval(timer);
+      stopPolling();
       process.exit(0);
     }
   });
@@ -916,6 +917,9 @@ async function main() {
     startupPending = false;
   };
 
+  let timer = null;
+  installExitHandlers(() => clearInterval(timer));
+
   try {
     const initialSnapshot = readWorkspaceJobsSnapshot(root, workspaceRoot, repositoryCache);
     processSnapshot(initialSnapshot);
@@ -927,7 +931,7 @@ async function main() {
     observeGrokJobsSafely();
   } catch {}
 
-  const timer = setInterval(() => {
+  timer = setInterval(() => {
     try {
       processSnapshot(readWorkspaceJobsSnapshot(root, workspaceRoot, repositoryCache));
     } catch {}
@@ -935,8 +939,6 @@ async function main() {
       observeGrokJobsSafely();
     } catch {}
   }, resolvePollIntervalMs());
-
-  installExitHandlers(timer);
 }
 
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {

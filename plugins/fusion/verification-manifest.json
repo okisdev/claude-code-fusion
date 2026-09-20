@@ -64,11 +64,60 @@
   {
     "paths": [
       "plugins/fusion/scripts/brief-sensor.mjs",
-      "plugins/fusion/scripts/lib/jev.mjs"
+      "plugins/fusion/scripts/lib/jev.mjs",
+      "bench/jev/**/*"
     ],
     "suites": [
       "tests/brief-sensor.test.mjs",
-      "tests/jev.test.mjs"
+      "tests/jev.test.mjs",
+      "tests/bench-jev-calibrate.test.mjs"
+    ]
+  },
+  {
+    "paths": [
+      "plugins/fusion/scripts/lib/engines.mjs"
+    ],
+    "suites": [
+      "tests/engines.test.mjs",
+      "tests/fusion-worker-lifecycle.test.mjs",
+      "tests/fusion-worker-state.test.mjs",
+      "tests/fusion-stats.test.mjs",
+      "tests/job-collect.test.mjs",
+      "tests/fusion-job-collect.test.mjs",
+      "tests/breaker-check.test.mjs",
+      "tests/codex-jobs-monitor.test.mjs",
+      "tests/grok-jobs-observer.test.mjs",
+      "tests/inline-delegation-guard.test.mjs",
+      "tests/brief-sensor.test.mjs"
+    ]
+  },
+  {
+    "paths": [
+      "plugins/fusion/scripts/job-collect.mjs",
+      "plugins/fusion/scripts/lib/engine-job-state.mjs"
+    ],
+    "suites": [
+      "tests/job-collect.test.mjs",
+      "tests/fusion-job-collect.test.mjs",
+      "tests/fusion-worker-lifecycle.test.mjs"
+    ]
+  },
+  {
+    "paths": [
+      "plugins/fusion/scripts/breaker-check.mjs"
+    ],
+    "suites": [
+      "tests/breaker-check.test.mjs"
+    ]
+  },
+  {
+    "paths": [
+      "plugins/fusion/scripts/codex-jobs-monitor.mjs",
+      "plugins/fusion/scripts/grok-jobs-observer.mjs"
+    ],
+    "suites": [
+      "tests/codex-jobs-monitor.test.mjs",
+      "tests/grok-jobs-observer.test.mjs"
     ]
   }
 ]

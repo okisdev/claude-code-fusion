@@ -4,8 +4,9 @@ import fs from "node:fs";
 import path from "node:path";
 
 import { FILE_ENGINE_DESCRIPTORS, appendModelAuditObservation, appendTokenUsageObservation, fusionRepositoryKey, modelAuditSidecarPath, resolveFusionDataDir, tokenUsageSidecarPath } from "./fusion-stats.mjs";
+import { ENGINE_TERMINAL_STATUSES } from "./lib/engines.mjs";
 
-const TERMINAL_STATUSES = new Set(["done", "error", "cancelled"]);
+const TERMINAL_STATUSES = ENGINE_TERMINAL_STATUSES;
 const DEFAULT_UNAVAILABLE_TTL_MS = 6 * 60 * 60 * 1000;
 const UNAVAILABLE_TTL_ENV = "GROK_JOBS_OBSERVER_UNAVAILABLE_TTL_MS";
 const STATE_SCHEMA_VERSION = 2;

@@ -3,10 +3,10 @@
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { PEER_RESCUE_AGENTS } from "./lib/engines.mjs";
 import { askJev } from "./lib/jev.mjs";
 import { tagMessage } from "./lib/user-messages.mjs";
 
-const PEER_BRIEF_AGENTS = new Set(["codex:codex-rescue", "grok:grok-rescue"]);
 const BRIEF_MIN_CHARS = 200;
 const FLAG_THRESHOLD = 0.7;
 const CHECKS = [
@@ -51,7 +51,7 @@ function readHookInput() {
 }
 
 function peerBrief(input) {
-  if (input?.hook_event_name !== "PreToolUse" || !["Agent", "Task"].includes(input.tool_name) || !PEER_BRIEF_AGENTS.has(input.tool_input?.subagent_type)) {
+  if (input?.hook_event_name !== "PreToolUse" || !["Agent", "Task"].includes(input.tool_name) || !PEER_RESCUE_AGENTS.has(input.tool_input?.subagent_type)) {
     return null;
   }
   const prompt = typeof input.tool_input.prompt === "string" ? input.tool_input.prompt.trim() : "";
@@ -88,4 +88,4 @@ if (isMain()) {
   main().catch(() => void 0);
 }
 
-export { briefAdvisory, peerBrief };
+export { FLAG_THRESHOLD, QUESTIONS, briefAdvisory, peerBrief };

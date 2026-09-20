@@ -1,6 +1,8 @@
 import os from "node:os";
 import path from "node:path";
 
+import { ENGINES } from "./engines.mjs";
+
 const CANONICAL_STATE_ENV = "FUSION_CODEX_STATE";
 const COMPATIBILITY_STATE_ENV = "FUSION_CODEX_STATE_DIR";
 const DATA_ENV = "CODEX_COMPANION_DATA";
@@ -27,7 +29,7 @@ export function resolveCodexStateRoots(env = process.env) {
     return [path.join(dataOverride, "state")];
   }
   const dataRoot = path.join(homeDir(env), ".claude", "plugins", "data");
-  return [path.join(dataRoot, "codex-claude-code-fusion", "state")];
+  return [path.join(dataRoot, ENGINES.codex.dataDirName, "state")];
 }
 
 export function resolveCodexStateDir(env = process.env) {

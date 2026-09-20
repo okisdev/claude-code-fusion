@@ -16,6 +16,7 @@ import {
   DEFAULT_TIMEOUT_MS,
   DEFAULT_TIMEOUT_PATH_MAX_MS,
   DEFAULT_TIMEOUT_PATH_WITH_MARGIN_MS,
+  FORCED_CLOSE_MS,
   TIMEOUT_PATH_MARGIN_MS,
   getCodexAvailability,
   getCodexVersion,
@@ -761,9 +762,9 @@ test("three consecutive apply_patch verification failures terminate as patch_thr
 test("a completed file_change resets the apply_patch verification failure counter", async (t) => {
   const { outcome } = await runFixture(t, "scripted", {
     script: scriptedCodex(`process.stderr.write(${JSON.stringify(`${PATCH_VERIFICATION_FAILURE}\n`.repeat(2))});
-await delay(100);
+await delay(500);
 emit({ type: "item.completed", item: { id: "patch_1", type: "file_change" } });
-await delay(100);
+await delay(500);
 process.stderr.write(${JSON.stringify(`${PATCH_VERIFICATION_FAILURE}\n`.repeat(2))});
 await delay(100);
 emit({ type: "turn.completed", usage });`),
@@ -871,8 +872,7 @@ test("default timeout timing leaves the Bash tool margin after every escalation 
   const terminateGraceMs = DEFAULT_TERMINATION_GRACE_MS - interruptGraceMs;
   const killConfirmationMs = DEFAULT_TERMINATION_GRACE_MS;
   const pollOvershootMs = DEFAULT_TERMINATION_POLL_MS * 3;
-  const forcedCloseMs = 50;
-  const escalationMs = interruptGraceMs + terminateGraceMs + killConfirmationMs + pollOvershootMs + forcedCloseMs;
+  const escalationMs = interruptGraceMs + terminateGraceMs + killConfirmationMs + pollOvershootMs + FORCED_CLOSE_MS;
 
   assert.equal(DEFAULT_TIMEOUT_PATH_MAX_MS, DEFAULT_TIMEOUT_MS + escalationMs);
   assert.equal(DEFAULT_TIMEOUT_PATH_WITH_MARGIN_MS, DEFAULT_TIMEOUT_PATH_MAX_MS + TIMEOUT_PATH_MARGIN_MS);
