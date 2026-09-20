@@ -60,5 +60,15 @@
       "tests/bench-runner.test.mjs",
       "tests/bench-selftest.test.mjs"
     ]
+  },
+  {
+    "paths": [
+      "plugins/fusion/scripts/brief-sensor.mjs",
+      "plugins/fusion/scripts/lib/jev.mjs"
+    ],
+    "suites": [
+      "tests/brief-sensor.test.mjs",
+      "tests/jev.test.mjs"
+    ]
   }
 ]
