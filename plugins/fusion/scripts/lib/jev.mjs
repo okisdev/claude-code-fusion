@@ -10,7 +10,7 @@ function configured(value) {
   return text || null;
 }
 
-async function askJev(state, questions, env = process.env) {
+async function askJev(state, questions, { env = process.env, model = PINNED_MODEL } = {}) {
   const key = configured(env[KEY_ENV]);
   if (!key) {
     return null;
@@ -20,7 +20,7 @@ async function askJev(state, questions, env = process.env) {
       method: "POST",
       headers: { authorization: `Bearer ${key}`, "content-type": "application/json" },
       signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
-      body: JSON.stringify({ model: PINNED_MODEL, state: String(state).slice(0, STATE_MAX_CHARS), questions })
+      body: JSON.stringify({ model, state: String(state).slice(0, STATE_MAX_CHARS), questions })
     });
     if (!response.ok) {
       return null;
@@ -32,4 +32,4 @@ async function askJev(state, questions, env = process.env) {
   }
 }
 
-export { askJev };
+export { PINNED_MODEL, askJev };

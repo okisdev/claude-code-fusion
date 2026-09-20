@@ -1,0 +1,50 @@
+[
+  {
+    "label": "mixedConcern",
+    "brief": "lane: codex | verification: npm test\nThe login test has been flaky since last week and nobody knows why. Figure out what is causing it and fix it. Files are somewhere under src/auth. Done when npm test passes ten times in a row."
+  },
+  {
+    "label": "mixedConcern",
+    "brief": "lane: codex | verification: node --test tests/stats.test.mjs\nfusion-stats sometimes double counts grok jobs. Investigate the root cause, then implement the fix and add a regression test in tests/stats.test.mjs."
+  },
+  {
+    "label": "tasteAsProse",
+    "brief": "lane: codex | verification: npm run build\nRewrite the error messages in src/cli/errors.ts so they feel friendly, elegant, and on brand. Make the naming cleaner and more idiomatic. Done when npm run build passes."
+  },
+  {
+    "label": "tasteAsProse",
+    "brief": "lane: grok consult | grok-role: burst\nRedesign the README intro so it reads beautifully and has a confident modern voice. Edit README.md only. Verification: markdownlint README.md."
+  },
+  {
+    "label": "noDoneCriteria",
+    "brief": "lane: codex\nPlease improve the caching layer in src/cache/index.ts. It should be better and faster than it is now. You have write permission for that file."
+  },
+  {
+    "label": "noDoneCriteria",
+    "brief": "Look at plugins/grok/scripts/lib/state.mjs and clean things up a bit where it makes sense."
+  },
+  {
+    "label": "unbounded",
+    "brief": "lane: codex | acceptance: report lists findings\nAudit the entire repository for dead code, unused exports, inconsistent naming, and missing tests, across every plugin and every script. Report everything you find."
+  },
+  {
+    "label": "unbounded",
+    "brief": "lane: grok consult | grok-role: large-context | acceptance: a list of issues\nReview the whole codebase for security problems, performance problems, and documentation drift. Cover all packages."
+  },
+  {
+    "label": "clean",
+    "brief": "lane: codex | model gpt-5.6-terra effort xhigh | verification: node --test tests/model-table.test.mjs\nYou have write permission for exactly plugins/fusion/scripts/lib/model-table.mjs and tests/model-table.test.mjs. Add a lane value `other-api` to MODEL_ROUTING_LANES and a test asserting validateLane accepts it. MUST NOT change any other export. Done when the verification command passes. Return the real result in this same turn."
+  },
+  {
+    "label": "clean",
+    "brief": "lane: codex | model gpt-5.6-luna effort xhigh | verification: node --test tests/user-messages.test.mjs\nIn plugins/fusion/scripts/lib/user-messages.mjs add one registry entry with slug `breaker-check.version-advisory` and the description `Session start advisory that a peer CLI is newer than the tested interval.` Mirror the existing entries exactly. Do not touch other files. Done when the verification command passes."
+  },
+  {
+    "label": "clean",
+    "brief": "lane: grok consult | grok-role: live-web | read only | acceptance: every claim carries a source URL and date, not found is reported as not found\nResearch whether grok CLI 1.0.34 changed the sandbox-events.jsonl location. Report the release note URL and the relevant line."
+  },
+  {
+    "label": "clean",
+    "brief": "lane: codex | verification: node --test tests/codex-args.test.mjs\nDiagnosis only, change no files. In plugins/codex/scripts/lib/args.mjs explain why parseServiceTier rejects the value `flex`. Report the exact line and the condition. Acceptance: the report names file, line, and the failing predicate."
+  }
+]
