@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -124,38 +124,98 @@ function runDirect(env, extraArgs = [], extraEnv = {}) {
   });
 }
 
-test("Codex jobs monitor stays silent for an unchanged state directory", (t) => {
+function runMonitorUntil(cwd, env, { stateRoot, notification } = {}) {
+  return new Promise((resolve, reject) => {
+    let stdout = "";
+    let ready = false;
+    let settled = false;
+    let pollTimer;
+    const child = spawn(process.execPath, [CODEX_MONITOR_SCRIPT], { cwd, env, stdio: ["ignore", "pipe", "ignore"] });
+    const finish = () => {
+      if (ready || settled) {
+        return;
+      }
+      ready = true;
+      clearTimeout(pollTimer);
+      child.kill("SIGTERM");
+    };
+    const fail = (error) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      clearTimeout(pollTimer);
+      if (!child.killed) {
+        child.kill("SIGTERM");
+      }
+      reject(error);
+    };
+    child.stdout.setEncoding("utf8");
+    child.stdout.on("data", (chunk) => {
+      stdout += chunk;
+      if (notification && stdout.includes(notification)) {
+        finish();
+      }
+    });
+    const waitForStateFile = () => {
+      if (settled || ready) {
+        return;
+      }
+      try {
+        if (fs.readdirSync(stateRoot).some((entry) => entry.startsWith("codex-jobs-monitor-announced"))) {
+          finish();
+          return;
+        }
+      } catch (error) {
+        fail(error);
+        return;
+      }
+      pollTimer = setTimeout(waitForStateFile, 10);
+    };
+    child.once("error", fail);
+    child.once("close", (status, signal) => {
+      if (!ready) {
+        fail(new Error(`codex jobs monitor exited before announcing readiness: ${status ?? signal}`));
+        return;
+      }
+      settled = true;
+      clearTimeout(pollTimer);
+      resolve({ status, signal, stdout });
+    });
+    if (stateRoot) {
+      waitForStateFile();
+    }
+  });
+}
+
+test("Codex jobs monitor stays silent for an unchanged state directory", async (t) => {
   const dir = sandbox(t);
   const stateRoot = path.join(dir, "codex-state");
   fs.mkdirSync(stateRoot, { recursive: true });
-  const result = spawnSync(process.execPath, [CODEX_MONITOR_SCRIPT], {
-    cwd: dir,
-    encoding: "utf8",
-    env: runtimeEnv(
+  const result = await runMonitorUntil(
+    dir,
+    runtimeEnv(
       { cwd: dir, codexState: stateRoot },
       { FUSION_CODEX_COMPANION: path.join(dir, "missing-codex-companion.mjs"), CODEX_JOBS_MONITOR_INTERVAL_MS: "1000" }
     ),
-    timeout: 400,
-    killSignal: "SIGTERM"
-  });
+    { stateRoot }
+  );
 
   assert.strictEqual(result.stdout, "");
 });
 
-test("Codex jobs monitor tags its announce-only notification", (t) => {
+test("Codex jobs monitor tags its announce-only notification", async (t) => {
   const dir = sandbox(t);
   const stateRoot = path.join(dir, "codex-state");
   writeCodexJob(stateRoot, dir, "monitor-terminal", { status: "done", completedAt: new Date().toISOString() });
-  const result = spawnSync(process.execPath, [CODEX_MONITOR_SCRIPT], {
-    cwd: dir,
-    encoding: "utf8",
-    env: runtimeEnv(
+  const result = await runMonitorUntil(
+    dir,
+    runtimeEnv(
       { cwd: dir, codexState: stateRoot },
       { FUSION_CODEX_COMPANION: path.join(dir, "missing-codex-companion.mjs"), CODEX_JOBS_MONITOR_INTERVAL_MS: "1000" }
     ),
-    timeout: 400,
-    killSignal: "SIGTERM"
-  });
+    { notification: messageTag("codex-monitor.job-notification") }
+  );
 
   assert.ok(result.stdout.trimEnd().endsWith(messageTag("codex-monitor.job-notification")));
 });
