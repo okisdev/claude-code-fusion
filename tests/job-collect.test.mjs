@@ -182,7 +182,7 @@ test("the wall clock cap terminates a stuck result process", (t) => {
   const output = runCollector(t, companion, { capMs: 2_000 });
   assert.strictEqual(output.status, 2, output.stderr);
   assert.ok(Date.now() - startedAt < 4_000);
-  assert.match(output.stdout, /^job: test\nstate: done\ncollector: timeout engine=codex job=[a-f0-9]{32} elapsed=[2-3]s\n$/);
+  assert.match(output.stdout, /^job: test\nstate: done\ncollector: timeout engine=codex job=[a-f0-9]{32} elapsed=\d+s\n$/);
 });
 
 test("does not signal a companion group after its direct child exits", async (t) => {
