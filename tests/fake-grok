@@ -123,7 +123,7 @@
     }
     if (mode === "sandbox-log-truncate" && fs.existsSync(eventFile)) {
       fs.truncateSync(eventFile, 0);
-      await new Promise((resolve) => setTimeout(resolve, 60));
+      await new Promise((resolve) => setTimeout(resolve, 2000));
     }
     const sandboxFailures = {
       "sandbox-warning": "Sandbox could not be applied, continuing without sandbox",

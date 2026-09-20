@@ -95,7 +95,7 @@ function childEnv(extra = {}) {
     LANG: "C",
     LC_ALL: "C",
     TZ: "UTC",
-    GROK_COMPANION_LOCK_TIMEOUT_MS: "10000",
+    GROK_COMPANION_LOCK_TIMEOUT_MS: "20000",
     ...extra,
     PATH: [processIdentityBin, extra.PATH ?? process.env.PATH].filter(Boolean).join(path.delimiter),
   };

@@ -529,8 +529,9 @@ test("with the session id env var unset, a job from a different session still em
 
 test("a vanished jobs directory mid run does not crash the process and a later tick still emits", async (t) => {
   const sandbox = makeSandbox(t);
+  seedJob(sandbox, { status: "running", background: true });
   const monitor = startMonitor(sandbox, envFor(sandbox));
-  await new Promise((resolve) => setTimeout(resolve, 300));
+  await waitUntil(() => readAnnouncedLedger(sandbox));
 
   const dir = jobsDir(sandbox.dataDir, sandbox.workDir);
   fs.rmSync(dir, { recursive: true, force: true });
@@ -668,8 +669,9 @@ test("announcement state files older than 30 days are pruned", async (t) => {
 
 test("exits 0 on SIGTERM", async (t) => {
   const sandbox = makeSandbox(t);
+  seedJob(sandbox, { status: "running", background: true });
   const monitor = startMonitor(sandbox, envFor(sandbox));
-  await new Promise((resolve) => setTimeout(resolve, 200));
+  await waitUntil(() => readAnnouncedLedger(sandbox));
   monitor.child.kill("SIGTERM");
   const [code] = await once(monitor.child, "close");
   assert.strictEqual(code, 0);

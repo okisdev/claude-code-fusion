@@ -648,7 +648,7 @@ for (const mode of [
       env: envFor(sandbox, {
         FAKE_GROK_MODE: mode,
         FAKE_GROK_STDIN_FILE: stdinFile,
-        GROK_COMPANION_SANDBOX_HANDSHAKE_MS: "100",
+        GROK_COMPANION_SANDBOX_HANDSHAKE_MS: "2000",
       }),
     }));
 
@@ -705,7 +705,7 @@ test("parallel runs in one workspace bind sandbox evidence to their private TMPD
   const grokHome = path.join(sandbox.root, "shared-grok-home");
   const sharedEnv = {
     GROK_HOME: grokHome,
-    FAKE_GROK_SANDBOX_EVENT_DELAY_MS: "75"
+    FAKE_GROK_SANDBOX_EVENT_DELAY_MS: "2000"
   };
   const [first, second] = await Promise.all([
     runGrok(directOptions(sandbox, "parallel-first", {
@@ -730,7 +730,7 @@ test("another parallel run's sandbox failure cannot poison valid startup evidenc
   const grokHome = path.join(sandbox.root, "shared-failure-grok-home");
   const sharedEnv = {
     GROK_HOME: grokHome,
-    FAKE_GROK_SANDBOX_EVENT_DELAY_MS: "75"
+    FAKE_GROK_SANDBOX_EVENT_DELAY_MS: "2000"
   };
   const [failed, valid] = await Promise.all([
     runGrok(directOptions(sandbox, "parallel-failed", {
