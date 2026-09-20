@@ -517,7 +517,8 @@ function seedFlagshipJobRecords(sandbox, entries) {
       status: entry.status ?? (entry.failureKind ? "error" : "done")
     });
     const file = jobFilePath(sandbox.dataDir, sandbox.workDir, id);
-    writeJobRecordFile(file, record);
+    fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
+    fs.writeFileSync(file, `${JSON.stringify(record, null, 2)}\n`, { mode: 0o600 });
     records.push({ file, record });
   }
   return records;
@@ -1602,7 +1603,7 @@ test("history lists canonical jobs across workspaces with local thread and deliv
 
 test("explicit background launch returns a durable receipt and result wait collects it", async (t) => {
   const sandbox = makeSandbox(t);
-  const env = envFor(sandbox, { FAKE_CODEX_DELAY_MS: "250" });
+  const env = envFor(sandbox, { FAKE_CODEX_DELAY_MS: "2000" });
   const launched = runCompanion(["task", "--background do work"], { cwd: sandbox.workDir, env });
   assert.equal(launched.status, 0, launched.stderr);
   assert.match(launched.stdout, /started in the background/);
@@ -1706,7 +1707,7 @@ test("result wait leaves a live background job running when its bounded wait exp
 
 test("workspace reservation makes simultaneous task launches single flight", async (t) => {
   const sandbox = makeSandbox(t);
-  const env = envFor(sandbox, { FAKE_CODEX_DELAY_MS: "250" });
+  const env = envFor(sandbox, { FAKE_CODEX_DELAY_MS: "2000" });
   const first = spawnCompanion(["task", "first task"], { cwd: sandbox.workDir, env });
   const second = spawnCompanion(["task", "second task"], { cwd: sandbox.workDir, env });
   const results = await Promise.all([childResult(first), childResult(second)]);
@@ -1718,7 +1719,7 @@ test("workspace reservation makes simultaneous task launches single flight", asy
 
 test("a single-flight bounce retains staged raw arguments for one retry", async (t) => {
   const sandbox = makeSandbox(t);
-  const env = envFor(sandbox, { FAKE_CODEX_DELAY_MS: "250" });
+  const env = envFor(sandbox, { FAKE_CODEX_DELAY_MS: "2000" });
   const first = spawnCompanion(["task", "first task"], { cwd: sandbox.workDir, env });
   await waitFor(() => jobRecords(sandbox).some((record) => record.status === "running"));
   const transport = createTransport(sandbox, "retry this staged task", env);
@@ -1747,7 +1748,7 @@ test("main workspace and a sibling worktree admit concurrent tasks for the same 
   runGit(sandbox, ["init", "-q"]);
   runGit(sandbox, ["-c", "user.email=fusion-test@example.com", "-c", "user.name=fusion-test", "commit", "--allow-empty", "-q", "-m", "init"]);
   runGit(sandbox, ["worktree", "add", "-q", "-b", "sibling-worktree", sibling]);
-  const env = envFor(sandbox, { FAKE_CODEX_DELAY_MS: "250" });
+  const env = envFor(sandbox, { FAKE_CODEX_DELAY_MS: "2000" });
   const mainTask = spawnCompanion(["task", "main workspace task"], { cwd: sandbox.workDir, env });
   const siblingTask = spawnCompanion(["task", "sibling worktree task"], { cwd: sibling, env });
   const resultsPromise = Promise.all([childResult(mainTask), childResult(siblingTask)]);
@@ -2078,7 +2079,8 @@ test("a second interrupt cannot bypass foreground cleanup", async (t) => {
   }
   const sandbox = makeSandbox(t);
   const readyFile = path.join(sandbox.root, "codex-ready");
-  const env = envFor(sandbox, { FAKE_CODEX_MODE: "ignore-term", FAKE_CODEX_READY_FILE: readyFile });
+  const interruptFile = path.join(sandbox.root, "codex-interrupt");
+  const env = envFor(sandbox, { FAKE_CODEX_INT_FILE: interruptFile, FAKE_CODEX_MODE: "ignore-term", FAKE_CODEX_READY_FILE: readyFile });
   const companionProcess = spawnCompanion(["task", "wait for interrupts"], { cwd: sandbox.workDir, env });
   const running = await waitFor(() => {
     const record = jobRecords(sandbox)[0];
@@ -2086,7 +2088,7 @@ test("a second interrupt cannot bypass foreground cleanup", async (t) => {
   });
   await waitFor(() => (fs.existsSync(readyFile) ? true : null));
   process.kill(companionProcess.pid, "SIGINT");
-  await new Promise((resolve) => setTimeout(resolve, 100));
+  await waitFor(() => (fs.existsSync(interruptFile) ? true : null));
   process.kill(companionProcess.pid, "SIGINT");
   const result = await childResult(companionProcess);
   assert.equal(result.code, 1, result.stderr);

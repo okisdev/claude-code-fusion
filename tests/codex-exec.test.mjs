@@ -766,7 +766,7 @@ await delay(500);
 emit({ type: "item.completed", item: { id: "patch_1", type: "file_change" } });
 await delay(500);
 process.stderr.write(${JSON.stringify(`${PATCH_VERIFICATION_FAILURE}\n`.repeat(2))});
-await delay(100);
+await delay(500);
 emit({ type: "turn.completed", usage });`),
     timeoutMs: TIMEOUT_TEST_TIMEOUT_MS
   });
@@ -780,15 +780,15 @@ test("a split apply_patch verification failure is counted once", async (t) => {
   const splitAt = PATCH_VERIFICATION_FAILURE.indexOf("verification");
   const { outcome } = await runFixture(t, "scripted", {
     script: scriptedCodex(`process.stderr.write(${JSON.stringify(PATCH_VERIFICATION_FAILURE.slice(0, splitAt))});
-await delay(100);
+await delay(500);
 process.stderr.write(${JSON.stringify(`${PATCH_VERIFICATION_FAILURE.slice(splitAt)}\n`)});
-await delay(100);
+await delay(500);
 process.stderr.write(${JSON.stringify(`${PATCH_VERIFICATION_FAILURE}\n`)});
-await delay(100);
+await delay(500);
 emit({ type: "item.completed", item: { id: "patch_1", type: "file_change" } });
-await delay(100);
+await delay(500);
 process.stderr.write(${JSON.stringify(`${PATCH_VERIFICATION_FAILURE}\n`.repeat(2))});
-await delay(100);
+await delay(500);
 emit({ type: "turn.completed", usage });`),
     timeoutMs: TIMEOUT_TEST_TIMEOUT_MS
   });

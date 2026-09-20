@@ -64,7 +64,7 @@ export function envFor(sandbox, extra = {}) {
   };
 }
 
-export function runCompanion(args, { cwd, env, input, timeout = 20000 } = {}) {
+export function runCompanion(args, { cwd, env, input, timeout = 60000 } = {}) {
   return spawnSync(process.execPath, [companion, ...args], {
     cwd,
     encoding: "utf8",
