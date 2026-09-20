@@ -86,7 +86,7 @@ if (Number.isFinite(delayMs) && delayMs > 0) {
 let prompt = "";
 if (process.env.FAKE_CODEX_CLOSE_STDIN === "true") {
   process.stdin.destroy();
-  await new Promise((resolve) => setTimeout(resolve, 25));
+  await new Promise((resolve) => setTimeout(resolve, 2000));
 } else {
   prompt = await drainStdin();
 }

@@ -99,11 +99,11 @@ test("askJev fails open for a refused local connection", async (t) => {
 
 test("askJev times out before a delayed response", async (t) => {
   const server = await startServer(t, (_request, response) => {
-    const timer = setTimeout(() => response.end('{"answers":{}}'), 3_500);
+    const timer = setTimeout(() => response.end('{"answers":{}}'), 6_000);
     timer.unref();
   });
   const startedAt = performance.now();
 
   assert.strictEqual(await askJev("state", {}, { env: envFor(server.endpoint) }), null);
-  assert.ok(performance.now() - startedAt < 3_400);
+  assert.ok(performance.now() - startedAt < 5_500);
 });

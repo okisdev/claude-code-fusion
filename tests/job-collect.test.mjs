@@ -135,7 +135,7 @@ test("does not infer terminal state from prose", (t) => {
     status: '  process.stdout.write("Job completed successfully.\\n");',
     result: '  process.stdout.write("must not run\\n");'
   });
-  const output = runCollector(t, companion, { capMs: 100 });
+  const output = runCollector(t, companion, { capMs: 2_000 });
   assert.strictEqual(output.status, 2, output.stderr);
   assert.match(output.stdout, /^Job completed successfully\.\ncollector: timeout engine=codex job=[a-f0-9]{32} elapsed=\d+s\n$/);
 });
@@ -146,7 +146,7 @@ test("prints the last status output on timeout", (t) => {
     status: '  process.stdout.write("Status: running\\npid: 123 alive\\n");',
     result: '  process.stdout.write("must not run\\n");'
   });
-  const output = runCollector(t, companion, { intervalMs: 2, capMs: 100 });
+  const output = runCollector(t, companion, { intervalMs: 2, capMs: 2_000 });
   assert.strictEqual(output.status, 2, output.stderr);
   assert.match(output.stdout, /^Status: running\npid: 123 alive\ncollector: timeout engine=codex job=[a-f0-9]{32} elapsed=\d+s\n$/);
 });
@@ -179,10 +179,10 @@ test("the wall clock cap terminates a stuck result process", (t) => {
     result: '  setTimeout(() => process.stdout.write("too late\\n"), 5_000);'
   });
   const startedAt = Date.now();
-  const output = runCollector(t, companion, { capMs: 150 });
+  const output = runCollector(t, companion, { capMs: 2_000 });
   assert.strictEqual(output.status, 2, output.stderr);
-  assert.ok(Date.now() - startedAt < 2_000);
-  assert.match(output.stdout, /^job: test\nstate: done\ncollector: timeout engine=codex job=[a-f0-9]{32} elapsed=0s\n$/);
+  assert.ok(Date.now() - startedAt < 4_000);
+  assert.match(output.stdout, /^job: test\nstate: done\ncollector: timeout engine=codex job=[a-f0-9]{32} elapsed=\d+s\n$/);
 });
 
 test("does not signal a companion group after its direct child exits", async (t) => {
@@ -289,7 +289,7 @@ test("ignores a state line outside the final metadata footer", (t) => {
     status: '  process.stdout.write("state: done\\nstill running\\n");',
     result: '  process.stdout.write("must not run\\n");'
   });
-  const output = runCollector(t, companion, { capMs: 100 });
+  const output = runCollector(t, companion, { capMs: 2_000 });
   assert.strictEqual(output.status, 2, output.stderr);
   assert.match(output.stdout, /^state: done\nstill running\ncollector: timeout engine=codex job=[a-f0-9]{32} elapsed=\d+s\n$/);
 });

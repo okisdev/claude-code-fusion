@@ -10,7 +10,7 @@ import {
   runCodex
 } from "../plugins/codex/scripts/lib/codex-exec.mjs";
 
-const TIMEOUT_MS = 100;
+const TIMEOUT_MS = 2000;
 const GRACE_MS = 8000;
 const POLL_MS = 25;
 

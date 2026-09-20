@@ -3586,6 +3586,7 @@ test("worker tool calls are denied after the wall clock budget and cancellation 
     agent_id: "budget-1",
     agent_type: "fusion:claude-worker"
   }, limits);
+  updateWorkerRecord(record(box).taskId, envFor(box), (current) => ({ ...current, startedAt: new Date(Date.now() - 1_000).toISOString() }));
   const preTool = run(box, {
     hook_event_name: "PreToolUse",
     session_id: "session-1",
@@ -3682,6 +3683,7 @@ test("an explicitly authorized background worker still requires TaskStop after i
     hook_event_name: "PostToolUse",
     tool_response: { isAsync: true, status: "async_launched", agentId: "authorized-budget" }
   }, limits);
+  updateWorkerRecord(record(box).taskId, envFor(box), (current) => ({ ...current, startedAt: new Date(Date.now() - 1_000).toISOString() }));
   const stop = run(box, {
     hook_event_name: "Stop",
     session_id: "session-1",
