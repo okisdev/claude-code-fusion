@@ -213,9 +213,9 @@ function safeWriteLine(line) {
   }
 }
 
-function installExitHandlers(timer) {
+function installExitHandlers(stopPolling) {
   const shutdown = () => {
-    clearInterval(timer);
+    stopPolling();
     process.exit(0);
   };
   process.on("SIGTERM", shutdown);
@@ -223,7 +223,7 @@ function installExitHandlers(timer) {
   process.on("SIGHUP", shutdown);
   process.stdout.on("error", (error) => {
     if (error?.code === "EPIPE") {
-      clearInterval(timer);
+      stopPolling();
       process.exit(0);
     }
   });
@@ -319,6 +319,9 @@ function main() {
     }
   };
 
+  let timer = null;
+  installExitHandlers(() => clearInterval(timer));
+
   try {
     const initialSnapshot = readSnapshot();
     processSnapshot(initialSnapshot);
@@ -327,13 +330,11 @@ function main() {
     }
   } catch {}
 
-  const timer = setInterval(() => {
+  timer = setInterval(() => {
     try {
       processSnapshot(readSnapshot());
     } catch {}
   }, resolvePollIntervalMs());
-
-  installExitHandlers(timer);
 }
 
 main();

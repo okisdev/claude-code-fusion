@@ -802,9 +802,9 @@ function safeWriteLine(line) {
   }
 }
 
-function installExitHandlers(timer) {
+function installExitHandlers(stopPolling) {
   const shutdown = () => {
-    clearInterval(timer);
+    stopPolling();
     process.exit(0);
   };
   process.on("SIGTERM", shutdown);
@@ -812,7 +812,7 @@ function installExitHandlers(timer) {
   process.on("SIGHUP", shutdown);
   process.stdout.on("error", (error) => {
     if (error?.code === "EPIPE") {
-      clearInterval(timer);
+      stopPolling();
       process.exit(0);
     }
   });
@@ -917,6 +917,9 @@ async function main() {
     startupPending = false;
   };
 
+  let timer = null;
+  installExitHandlers(() => clearInterval(timer));
+
   try {
     const initialSnapshot = readWorkspaceJobsSnapshot(root, workspaceRoot, repositoryCache);
     processSnapshot(initialSnapshot);
@@ -928,7 +931,7 @@ async function main() {
     observeGrokJobsSafely();
   } catch {}
 
-  const timer = setInterval(() => {
+  timer = setInterval(() => {
     try {
       processSnapshot(readWorkspaceJobsSnapshot(root, workspaceRoot, repositoryCache));
     } catch {}
@@ -936,8 +939,6 @@ async function main() {
       observeGrokJobsSafely();
     } catch {}
   }, resolvePollIntervalMs());
-
-  installExitHandlers(timer);
 }
 
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
