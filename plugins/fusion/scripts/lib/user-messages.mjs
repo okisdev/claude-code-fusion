@@ -36,6 +36,7 @@ const MESSAGE_REGISTRY = [
   { slug: "worker-lifecycle.task-reaped-context", description: "Notice that harness reaped tasks were settled as task_reaped." },
   { slug: "worker-lifecycle.in-flight-context", description: "Notice that tasks are still in flight with collection armed." },
   { slug: "worker-lifecycle.state-unavailable", description: "Fail closed denial or block when lifecycle state is unreadable." },
+  { slug: "brief-sensor.readiness-advisory", description: "Dispatch time advisory that the Jev classifier flagged a peer brief as not ready." },
   { slug: "fleet-posture.strict-fleet-reminder", description: "Strict posture prompt reminder of the fleet default." },
   { slug: "fleet-posture.session-lanes-reminder", description: "Once per session judgment posture reminder of lane availability and the fan out default." },
   { slug: "fleet-posture.narrow-wave-reminder", description: "Prompt reminder after consecutive width one dispatch waves." },

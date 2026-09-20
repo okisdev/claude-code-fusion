@@ -71,6 +71,11 @@
             "type": "command",
             "command": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/inline-delegation-guard.mjs\"",
             "timeout": 10
+          },
+          {
+            "type": "command",
+            "command": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/brief-sensor.mjs\"",
+            "timeout": 10
           }
         ]
       },
