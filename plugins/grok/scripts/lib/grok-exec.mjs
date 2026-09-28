@@ -42,6 +42,8 @@ const TOOL_POLICY_FAILURE_PATTERN = /(?:tools allowlist had unmappable entries; 
 const TOOL_POLICY_APPLIED_PATTERN = /tools? allowlist applied/i;
 const AUTH_RETRY_FAILURE_PATTERN = /auth 401 retry: no credential was sent/i;
 const AUTH_RETRY_FAILURE_MESSAGE = "Grok sent its model request without a credential and entered its re-authentication retry loop, so the companion stopped it instead of waiting out the retries. Under the strict sandbox this usually means the stored OIDC token expired: grok 1.0.14 and later can write only `~/.grok/sessions` inside the Grok home under strict, so a managed run cannot refresh the token. Run grok once outside the sandbox, for example `grok -p ok`, to refresh it, then rerun.";
+const AUTH_REFRESH_FAILURE_MESSAGE = "The companion ran `grok models` outside the sandbox to refresh the stored token and it did not refresh, so the refresh token itself may have expired: run `grok login` once, then rerun.";
+const AUTH_STALE_MS = 5 * 60 * 60 * 1000;
 const GROK_BUILDER_LOG_FILTER = "xai_grok_agent::builder=debug,xai_grok_sandbox=warn,xai_grok_shell::session::acp_session::turn=warn";
 const USD_TICKS = 10_000_000_000;
 const STDIN_PROMPT_FILE = "/dev/stdin";
@@ -767,7 +769,7 @@ export function preflightRuntimeSocketEndpoints({ candidates = runtimeSocketEndp
     const endpoint = symlinks[0];
     throw securityError(
       "sandbox",
-      `Grok strict sandbox (runtime-socket deny policy, 1.0.4 through 1.0.30) refuses to start while ${endpoint} exists as a symlink. ${runtimeSocketRemedy(endpoint, runtimeSocketEngine(endpoint, readlink))}`
+      `Grok strict sandbox (runtime-socket deny policy, 1.0.4 through 1.0.41) refuses to start while ${endpoint} exists as a symlink. ${runtimeSocketRemedy(endpoint, runtimeSocketEngine(endpoint, readlink))}`
     );
   }
   return symlinks;
@@ -808,6 +810,44 @@ function resolveChildGrokHome(env, cwd) {
     ? path.resolve(cwd, env.HOME.trim())
     : os.homedir();
   return path.join(home, ".grok");
+}
+
+export function grokAuthStatus(env = process.env, cwd = process.cwd()) {
+  const file = typeof env.GROK_AUTH_PATH === "string" && env.GROK_AUTH_PATH.trim()
+    ? path.resolve(cwd, env.GROK_AUTH_PATH.trim())
+    : path.join(resolveChildGrokHome(env, cwd), "auth.json");
+  try {
+    const ageMs = Math.max(0, Date.now() - fs.statSync(file).mtimeMs);
+    return { file, ageSeconds: Math.floor(ageMs / 1000), stale: ageMs > AUTH_STALE_MS };
+  } catch {
+    return { file, ageSeconds: null, stale: true };
+  }
+}
+
+function refreshGrokAuth({ bin, env, cwd, capabilities, reason }) {
+  const { file } = grokAuthStatus(env, cwd);
+  let beforeMtime = null;
+  try {
+    beforeMtime = fs.statSync(file).mtimeMs;
+  } catch {}
+  const attemptedAt = new Date().toISOString();
+  const args = capabilities.has("--no-auto-update") ? ["--no-auto-update", "models"] : ["models"];
+  const refreshDir = createManagedRunTempDir();
+  try {
+    spawnSync(bin, args, {
+      cwd: refreshDir,
+      env: { ...env, TMPDIR: refreshDir },
+      stdio: "ignore",
+      timeout: 30000
+    });
+  } finally {
+    removeManagedRunTempDir(refreshDir);
+  }
+  let refreshed = false;
+  try {
+    refreshed = beforeMtime !== null && fs.statSync(file).mtimeMs > beforeMtime;
+  } catch {}
+  return { attemptedAt, refreshed, reason };
 }
 
 function openSandboxEventLog(file) {
@@ -1853,6 +1893,7 @@ export function runGrok(options) {
   if (managedRun && prompt == null) {
     throw capabilityError("A managed Grok run requires a prompt for /dev/stdin transport.");
   }
+  let authRefresh = options.authRefresh ?? null;
   let managedTempDir = null;
   let sandboxLogSnapshot = null;
   let stdoutSpool = null;
@@ -1860,6 +1901,12 @@ export function runGrok(options) {
     if (managedRun) {
       managedTempDir = createManagedRunTempDir();
       childEnv.TMPDIR = managedTempDir;
+      if (!options.authRetry && !authRefresh) {
+        const auth = grokAuthStatus(childEnv, options.cwd);
+        if (auth.ageSeconds !== null && auth.stale) {
+          authRefresh = refreshGrokAuth({ bin, env: childEnv, cwd: options.cwd, capabilities, reason: "stale" });
+        }
+      }
       sandboxLogSnapshot = captureSandboxEventLog(resolveChildGrokHome(childEnv, options.cwd));
     }
     stdoutSpool = createStdoutSpool();
@@ -2259,5 +2306,33 @@ export function runGrok(options) {
     } else {
       sendPrompt();
     }
+  }).then(async (result) => {
+    const failed = result.exitCode !== 0 || result.timedOut || Boolean(result.errorMessage || result.parseError);
+    const authEvidence = [result.stderrTail, result.errorMessage].filter(Boolean).join("\n");
+    const authFailure = result.securityFailureKind === "auth" || (
+      failed && !result.securityFailureKind && !result.timedOut && !result.parseError && !result.cancelledByCompanion &&
+      /auth|unauthori[sz]ed|forbidden|login required/i.test(authEvidence) &&
+      !/getaddrinfo|ENOTFOUND|EAI_AGAIN|ECONNREFUSED|ECONNRESET|ETIMEDOUT|socket hang up|quota|balance|billing|payment required|\b402\b|rate.?limit|\b429\b/i.test(authEvidence)
+    );
+    if (!managedRun || !authFailure) {
+      return { ...result, ...(authRefresh ? { authRefresh } : {}), ...(options.authRetry ? { authRetry: true } : {}) };
+    }
+    if (!authRefresh && !options.authRetry) {
+      authRefresh = refreshGrokAuth({ bin, env: childEnv, cwd: options.cwd, capabilities, reason: "auth-failure" });
+      if (authRefresh.refreshed && (result.securityFailureKind === "auth" || options.mode !== "write")) {
+        const retry = await runGrok({ ...options, authRefresh, authRetry: true });
+        if (retry.exitCode === 0 && !retry.timedOut && !retry.errorMessage && !retry.parseError) {
+          return retry;
+        }
+        result = retry;
+      }
+    }
+    return {
+      ...result,
+      securityFailureKind: "auth",
+      errorMessage: `${AUTH_RETRY_FAILURE_MESSAGE} ${AUTH_REFRESH_FAILURE_MESSAGE}`,
+      authRefresh,
+      ...(options.authRetry || result.authRetry ? { authRetry: true } : {})
+    };
   });
 }

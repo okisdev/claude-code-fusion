@@ -83,10 +83,10 @@ test("removed capabilities are rejected by probes and fail managed-run setup", (
   ]);
 });
 
-test("fake Grok reports the 1.0.30 version format and supports an output override", () => {
+test("fake Grok reports the 1.0.41 version format and supports an output override", () => {
   const defaultVersion = spawnSync(process.execPath, [fakeGrok, "--version"], { encoding: "utf8", env: {} });
   assert.equal(defaultVersion.status, 0, defaultVersion.stderr);
-  assert.equal(defaultVersion.stdout, "grok 1.0.30 (0123456789ab)\n");
+  assert.equal(defaultVersion.stdout, "grok 1.0.41 (0123456789ab)\n");
 
   const overriddenVersion = spawnSync(process.execPath, [fakeGrok, "--version"], {
     encoding: "utf8",
@@ -310,8 +310,16 @@ test("managed runs fail closed when Grok cannot skip background work", (t) => {
   assert.deepEqual(readInvocations(sandbox.argsFile), [["--version"]]);
 });
 
+function writeFreshAuth(sandbox) {
+  const file = path.join(sandbox.root, "grok-home", "auth.json");
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.writeFileSync(file, "fixture");
+  return file;
+}
+
 test("setup reports the injected capability verdict without an extra help probe", (t) => {
   const sandbox = makeSandbox(t);
+  writeFreshAuth(sandbox);
   const result = runCompanion(["setup", "--json"], {
     cwd: sandbox.workDir,
     env: envFor(sandbox),
@@ -332,25 +340,27 @@ test("setup reports the injected capability verdict without an extra help probe"
 
 test("setup reports newer and older Grok builds outside the tested interval", (t) => {
   const newerSandbox = makeSandbox(t);
+  writeFreshAuth(newerSandbox);
   const newer = runCompanion(["setup", "--json"], {
     cwd: newerSandbox.workDir,
-    env: envFor(newerSandbox, { FAKE_GROK_VERSION_OUTPUT: "grok 1.0.31 (abcdef012345)" })
+    env: envFor(newerSandbox, { FAKE_GROK_VERSION_OUTPUT: "grok 1.0.42 (abcdef012345)" })
   });
   assert.equal(newer.status, 0, newer.stderr);
   const newerReport = JSON.parse(newer.stdout);
   assert.equal(newerReport.ready, false);
-  assert.equal(newerReport.compatibility, "newer than the tested interval (1.0.14 to before 1.0.31)");
-  assert.deepEqual(newerReport.nextSteps, ["Grok CLI version 1.0.31 is newer than the tested interval (1.0.14 to before 1.0.31). A verification pass is advised."]);
+  assert.equal(newerReport.compatibility, "newer than the tested interval (1.0.14 to before 1.0.42)");
+  assert.deepEqual(newerReport.nextSteps, ["Grok CLI version 1.0.42 is newer than the tested interval (1.0.14 to before 1.0.42). A verification pass is advised."]);
 
   const newerRendered = runCompanion(["setup"], {
     cwd: newerSandbox.workDir,
-    env: envFor(newerSandbox, { FAKE_GROK_VERSION_OUTPUT: "grok 1.0.31 (abcdef012345)" })
+    env: envFor(newerSandbox, { FAKE_GROK_VERSION_OUTPUT: "grok 1.0.42 (abcdef012345)" })
   });
   assert.equal(newerRendered.status, 0, newerRendered.stderr);
-  assert.match(newerRendered.stdout, /- compatibility: newer than the tested interval \(1\.0\.14 to before 1\.0\.31\)/);
-  assert.match(newerRendered.stdout, /^- Grok CLI version 1\.0\.31 is newer than the tested interval \(1\.0\.14 to before 1\.0\.31\)\. A verification pass is advised\.$/m);
+  assert.match(newerRendered.stdout, /- compatibility: newer than the tested interval \(1\.0\.14 to before 1\.0\.42\)/);
+  assert.match(newerRendered.stdout, /^- Grok CLI version 1\.0\.42 is newer than the tested interval \(1\.0\.14 to before 1\.0\.42\)\. A verification pass is advised\.$/m);
 
   const olderSandbox = makeSandbox(t);
+  writeFreshAuth(olderSandbox);
   const older = runCompanion(["setup", "--json"], {
     cwd: olderSandbox.workDir,
     env: envFor(olderSandbox, { FAKE_GROK_VERSION_OUTPUT: "grok 1.0.13 (abcdef012345)" })
@@ -358,8 +368,8 @@ test("setup reports newer and older Grok builds outside the tested interval", (t
   assert.equal(older.status, 0, older.stderr);
   const olderReport = JSON.parse(older.stdout);
   assert.equal(olderReport.ready, false);
-  assert.equal(olderReport.compatibility, "outside the tested interval (1.0.14 to before 1.0.31)");
-  assert.deepEqual(olderReport.nextSteps, ["Use a Grok CLI version in the tested interval (1.0.14 to before 1.0.31)."]);
+  assert.equal(olderReport.compatibility, "outside the tested interval (1.0.14 to before 1.0.42)");
+  assert.deepEqual(olderReport.nextSteps, ["Use a Grok CLI version in the tested interval (1.0.14 to before 1.0.42)."]);
 });
 
 test("setup reports shell environment policy presence without affecting readiness", (t) => {

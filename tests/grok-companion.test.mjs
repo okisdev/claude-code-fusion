@@ -307,7 +307,7 @@ test("task passes an inline JSON schema and renders structured success", (t) => 
   assert.equal(payload.structuredOutputError, null);
   const [record] = jobRecords(sandbox.dataDir);
   assert.equal(record.request.jsonSchema, taskSchema);
-  assert.equal(record.grokVersion, "1.0.30");
+  assert.equal(record.grokVersion, "1.0.41");
   assert.deepEqual(record.structuredOutput, payload.structuredOutput);
 
   const human = runCompanion(["task", "--json-schema", taskSchema, "complete the task"], {

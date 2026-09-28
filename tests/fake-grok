@@ -9,7 +9,7 @@
     fs.appendFileSync(argsFile, JSON.stringify(process.argv.slice(2)) + "\n");
   }
   if (process.argv.includes("--version")) {
-    process.stdout.write(`${process.env.FAKE_GROK_VERSION_OUTPUT ?? "grok 1.0.30 (0123456789ab)"}\n`);
+    process.stdout.write(`${process.env.FAKE_GROK_VERSION_OUTPUT ?? "grok 1.0.41 (0123456789ab)"}\n`);
     process.exit(0);
   }
   if (!process.env.GROK_HOME) {
@@ -66,7 +66,7 @@
     process.stdout.write(`${capabilities.filter((flag) => !hiddenCapabilities.has(flag) && !removedCapabilities.has(flag)).join("\n")}\n`);
     process.exit(0);
   }
-  if (process.env.FAKE_GROK_ENV_FILE) {
+  if (process.env.FAKE_GROK_ENV_FILE || (process.env.FAKE_GROK_MODELS_ENV_FILE && process.argv.includes("models"))) {
     const trackedEnv = Object.fromEntries(
       Object.entries(process.env)
         .filter(([key]) =>
@@ -102,7 +102,21 @@
         )
         .sort(([left], [right]) => left.localeCompare(right))
     );
-    fs.writeFileSync(process.env.FAKE_GROK_ENV_FILE, `${JSON.stringify(trackedEnv, null, 2)}\n`, "utf8");
+    const envFile = process.argv.includes("models") && process.env.FAKE_GROK_MODELS_ENV_FILE
+      ? process.env.FAKE_GROK_MODELS_ENV_FILE
+      : process.env.FAKE_GROK_ENV_FILE;
+    fs.writeFileSync(envFile, `${JSON.stringify(trackedEnv, null, 2)}\n`, "utf8");
+  }
+
+  if (process.argv.includes("models")) {
+    if (process.env.FAKE_GROK_MODELS_CWD_FILE) {
+      fs.writeFileSync(process.env.FAKE_GROK_MODELS_CWD_FILE, process.cwd(), "utf8");
+    }
+    if (process.env.FAKE_GROK_MODELS_TOUCH) {
+      const now = new Date(Date.now() + 1000);
+      fs.utimesSync(process.env.FAKE_GROK_MODELS_TOUCH, now, now);
+    }
+    process.exit(0);
   }
 
   const mode = process.env.FAKE_GROK_MODE || "ok";
@@ -327,6 +341,24 @@
   };
 
   if (mode === "ok") {
+    emit({
+      text: "FAKE-OK",
+      stopReason: "end_turn",
+      sessionId: "11111111-1111-7111-8111-111111111111",
+      requestId: "req-1"
+    });
+    process.exit(0);
+  }
+
+  if (mode === "auth-once" || mode === "auth-once-then-error") {
+    if (nextAttempt() === 0) {
+      process.stderr.write("login required, AuthorizationRequired\n");
+      process.exit(1);
+    }
+    if (mode === "auth-once-then-error") {
+      process.stderr.write("upstream failed after retry\n");
+      process.exit(1);
+    }
     emit({
       text: "FAKE-OK",
       stopReason: "end_turn",
