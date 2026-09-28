@@ -687,8 +687,32 @@ function parentTranscriptByteSize(record, input) {
 }
 
 function clearContinuationRequest(record) {
-  const { continuationRequestedAt, continuationRequestedTranscriptBytes, ...rest } = record;
+  const { continuationRequestedAt, continuationRequestedTranscriptBytes, continuationRequestedStatus, ...rest } = record;
   return rest;
+}
+
+function sendMessageResumed(response, recordedStatus) {
+  if (typeof response === "string") {
+    try {
+      response = JSON.parse(response);
+    } catch {
+      response = null;
+    }
+  }
+  if (response && typeof response === "object") {
+    if (typeof response.resumedAgentId === "string" && response.resumedAgentId) {
+      return true;
+    }
+    if (typeof response.message === "string") {
+      if (/^(?:Resuming agent|Resumed agent)/.test(response.message)) {
+        return true;
+      }
+      if (response.message.startsWith("Message queued")) {
+        return false;
+      }
+    }
+  }
+  return isTerminalWorkerStatus(recordedStatus) || recordedStatus === "ready_uncollected";
 }
 
 function findSessionWorkerRecord(predicate, sessionId, env) {
@@ -950,13 +974,13 @@ function handlePreToolUse(input, env) {
     const record = findSessionWorkerRecord((candidate) => (PEER_RESCUE_AGENT_NAMES.has(candidate.agentType) || isFusionWorkerAgent(candidate.agentType)) && [candidate.agentId, candidate.backgroundTaskId].includes(recipient), input.session_id, env);
     if (record) {
       updateLifecycleWorkerRecord(record.taskId, env, (current) => {
-        if (!current || current.sessionId !== input.session_id || ![current.agentId, current.backgroundTaskId].includes(recipient) || (!isTerminalWorkerStatus(current.transportStatus) && current.transportStatus !== "ready_uncollected")) {
+        if (!current || current.sessionId !== input.session_id || ![current.agentId, current.backgroundTaskId].includes(recipient)) {
           return null;
         }
         const finishedAt = Date.parse(current.finishedAt ?? "");
         const lastContinuedAt = Date.parse(current.lastContinuedAt ?? "");
         const requestedAt = new Date(Math.max(Date.now(), Number.isFinite(finishedAt) ? finishedAt + 1 : 0, Number.isFinite(lastContinuedAt) ? lastContinuedAt + 1 : 0)).toISOString();
-        return { ...current, continuationRequestedAt: requestedAt, continuationRequestedTranscriptBytes: parentTranscriptByteSize(current, input) };
+        return { ...current, continuationRequestedAt: requestedAt, continuationRequestedTranscriptBytes: parentTranscriptByteSize(current, input), continuationRequestedStatus: current.transportStatus };
       });
       const injection = PEER_RESCUE_AGENT_NAMES.has(record.agentType) ? injectedPeerDefaults(input.tool_input?.message, record.agentType, env) : null;
       if (injection) {
@@ -1358,9 +1382,6 @@ function settleReapedIfActive(taskId, now, env, extraGuard) {
 function handlePostToolUse(input, env, failed = false) {
   if (input.tool_name === "SendMessage" && typeof input.tool_input?.to === "string") {
     const recipient = input.tool_input.to;
-    if (!failed) {
-      reconcileTaskNotifications(input, env);
-    }
     const record = findSessionWorkerRecord((candidate) => (PEER_RESCUE_AGENT_NAMES.has(candidate.agentType) || isFusionWorkerAgent(candidate.agentType)) && [candidate.agentId, candidate.backgroundTaskId].includes(recipient), input.session_id, env);
     if (record) {
       const at = new Date().toISOString();
@@ -1368,13 +1389,22 @@ function handlePostToolUse(input, env, failed = false) {
         if (!current || current.sessionId !== input.session_id || ![current.agentId, current.backgroundTaskId].includes(recipient)) {
           return null;
         }
+        if (failed || !sendMessageResumed(input.tool_response, current.continuationRequestedStatus)) {
+          return current.continuationRequestedAt ? clearContinuationRequest(current) : null;
+        }
         const requestAt = Date.parse(current.continuationRequestedAt ?? "");
         const alreadyReopened = Number.isFinite(requestAt) && Date.parse(current.lastContinuedAt ?? "") >= requestAt;
-        const next = !failed && isTerminalWorkerStatus(current.transportStatus) && !alreadyReopened
-          ? reopenWorkerContinuation(current, at, parentTranscriptByteSize(current, input))
+        const collected = current.transportStatus === "ready_uncollected"
+          ? taskNotificationTransition(current, { status: "completed" }, at, env)
           : current;
+        const next = isTerminalWorkerStatus(collected.transportStatus) && !alreadyReopened
+          ? reopenWorkerContinuation(collected, at, current.continuationRequestedTranscriptBytes ?? parentTranscriptByteSize(current, input))
+          : collected;
         return current.continuationRequestedAt ? clearContinuationRequest(next) : next === current ? null : next;
       });
+    }
+    if (!failed) {
+      reconcileTaskNotifications(input, env);
     }
     return;
   }
