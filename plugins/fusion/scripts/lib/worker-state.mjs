@@ -251,6 +251,96 @@ export function isTerminalWorkerStatus(value) {
   return TERMINAL_STATUSES.has(value);
 }
 
+export function reopenWorkerContinuation(record, at = new Date().toISOString(), notificationFloor = 0) {
+  if (!isTerminalWorkerStatus(record.transportStatus)) {
+    return record;
+  }
+  const fusionWorker = isFusionWorkerAgent(record.agentType);
+  const settled = record.acceptance === "accepted" || record.acceptance === "rejected";
+  const previousIds = new Set((record.continuations ?? []).flatMap((round) => round.peerJobIds ?? []));
+  const peerJobIds = [...new Set([...(record.peerJobIds ?? []), record.peerJobId].filter((id) => typeof id === "string" && !previousIds.has(id)))];
+  const collectionMethod = record.collectionMethod ?? null;
+  const continuation = settled ? {
+    at,
+    peerJobId: record.peerJobId ?? null,
+    peerJobIds,
+    acceptance: record.acceptance,
+    acceptanceReason: record.acceptanceReason ?? null,
+    acceptanceFailureKind: record.acceptanceFailureKind ?? null,
+    acceptanceSource: record.acceptanceSource ?? null,
+    acceptanceRecordedAt: record.acceptanceRecordedAt ?? null,
+    collectedAt: record.collectedAt ?? null,
+    collectionMethod,
+    transportStatus: record.transportStatus,
+    failureKind: record.failureKind ?? null,
+    peerFailureKind: record.peerFailureKind ?? null,
+    infraFailure: record.infraFailure ?? null
+  } : null;
+  return {
+    ...record,
+    continuations: continuation ? [...(record.continuations ?? []), continuation] : record.continuations ?? [],
+    continuationCount: (record.continuationCount ?? 0) + 1,
+    lastContinuedAt: at,
+    continuationNotificationFloor: notificationFloor,
+    transportStatus: "running",
+    runtimeAsync: true,
+    finishedAt: null,
+    collectedAt: null,
+    collectionMethod: null,
+    outputFile: null,
+    transcriptPath: fusionWorker ? record.transcriptPath ?? null : null,
+    transcriptOffset: fusionWorker ? record.transcriptOffset ?? 0 : 0,
+    transcriptCarry: fusionWorker ? record.transcriptCarry ?? "" : "",
+    transcriptSkippingLine: fusionWorker && record.transcriptSkippingLine === true,
+    transcriptBacklogBytes: 0,
+    peerJobId: settled ? null : record.peerJobId ?? null,
+    acceptance: "unverified",
+    acceptanceReason: null,
+    acceptanceFailureKind: null,
+    acceptanceSource: null,
+    acceptanceRecordedAt: null,
+    pendingVerdict: null,
+    pendingVerdictError: null,
+    awaitingCollection: false,
+    awaitingCollectionArmedAt: null,
+    awaitingVerdict: false,
+    awaitingVerdictArmedAt: null,
+    failureKind: null,
+    peerFailureKind: null,
+    infraFailure: null,
+    deliveryMode: null,
+    stopBlockCount: 0,
+    cancelAttemptCount: 0,
+    retryCount: 0,
+    terminalWriteGraceUsedAt: null,
+    cancelReason: null,
+    cancelRequestedAt: null,
+    windDownContextSentAt: null,
+    tokenWindDownSentAt: null,
+    uncachedWindDownSentAt: null,
+    lastActivityAt: at,
+    inFlightSince: at,
+    ...(fusionWorker ? {
+      budgetBaseline: {
+        at,
+        turns: record.turns ?? 0,
+        outputTokens: record.usage?.outputTokens ?? 0,
+        uncachedTokens: record.usage?.uncachedTokens ?? 0,
+        toolCalls: record.toolCalls ?? 0,
+        usage: Object.fromEntries(USAGE_KEYS.map((key) => [key, integer(record.usage?.[key])]))
+      },
+      transcriptRoundPrefix: { turns: 0, toolCalls: 0, usage: emptyWorkerUsage() },
+      usageMessages: {},
+      turnIds: [],
+      toolUseIds: [],
+      usageSource: null,
+      toolCallsSource: null,
+      usageAvailability: "unreported",
+      lastLivenessAt: at
+    } : {})
+  };
+}
+
 export function workerRecordFile(taskId, env = process.env) {
   if (typeof taskId !== "string" || !/^[a-z0-9][a-z0-9-]{7,79}$/.test(taskId)) {
     throw new TypeError("Fusion worker task id is invalid.");
@@ -306,6 +396,12 @@ function canonicalCollectionMethod(value) {
 
 function normalizeWorkerRecord(value) {
   let normalized = value;
+  if (typeof normalized.outputFile === "string" && path.basename(path.dirname(normalized.outputFile)) === "tasks" && normalized.outputFile.endsWith(".output")) {
+    normalized = { ...normalized, transcriptPath: normalized.outputFile, outputFile: null };
+  }
+  if (PEER_JOB_FOOTER_AGENT_TYPES.has(normalized.agentType) && !Array.isArray(normalized.peerJobIds)) {
+    normalized = { ...normalized, peerJobIds: [] };
+  }
   if (Object.hasOwn(normalized, "collectionMethod")) {
     const collectionMethod = canonicalCollectionMethod(normalized.collectionMethod);
     if (collectionMethod !== normalized.collectionMethod) {
@@ -396,6 +492,10 @@ export function createWorkerRecord(record, env = process.env) {
   } catch {
     void 0;
   }
+  const sessionState = readWorkerSessionState(record.sessionId, env);
+  if (sessionState && !Array.isArray(sessionState.taskIds)) {
+    readSessionWorkerRecords(env, record.sessionId);
+  }
   return withLock(file, () => {
     if (readWorkerRecordFile(file)) {
       throw new Error(`Fusion worker task ${record.taskId} already exists.`);
@@ -418,7 +518,7 @@ export function createWorkerRecord(record, env = process.env) {
       transportStatus: "dispatching",
       acceptance: "unverified",
       acceptanceFailureKind: record.acceptanceFailureKind ?? null,
-      ...(PEER_JOB_FOOTER_AGENT_TYPES.has(record.agentType) ? { peerJobId: null } : {}),
+      ...(PEER_JOB_FOOTER_AGENT_TYPES.has(record.agentType) ? { peerJobId: null, peerJobIds: [] } : {}),
       peerFailureKind: null,
       failureKind: null,
       deliveryMode: null,
@@ -445,7 +545,7 @@ export function createWorkerRecord(record, env = process.env) {
       turnIds: [],
       toolUseIds: [],
       transcriptPath: null,
-      outputFile: record.outputFile ?? null,
+      outputFile: null,
       transcriptOffset: 0,
       transcriptCarry: "",
       transcriptSkippingLine: false,
@@ -453,6 +553,7 @@ export function createWorkerRecord(record, env = process.env) {
       usageAvailability: "unreported",
       parentTranscriptPath: record.parentTranscriptPath ?? null,
       parentTranscriptBytesAtDispatch: Number.isSafeInteger(record.parentTranscriptBytesAtDispatch) ? record.parentTranscriptBytesAtDispatch : null,
+      parentContextTokensAtDispatch: Number.isSafeInteger(record.parentContextTokensAtDispatch) ? record.parentContextTokensAtDispatch : null,
       packageType: record.packageType ?? "consult",
       briefBytes: Number.isSafeInteger(record.briefBytes) ? record.briefBytes : null,
       briefFile: record.briefFile ?? null,
@@ -467,6 +568,10 @@ export function createWorkerRecord(record, env = process.env) {
       updatedAt: now,
       limits: record.limits ?? null
     };
+    updateWorkerSessionState(record.sessionId, env, (current) => ({
+      ...(current ?? {}),
+      taskIds: [...new Set([...(Array.isArray(current?.taskIds) ? current.taskIds : []), record.taskId])]
+    }));
     writePrivateJson(file, value);
     return value;
   });
@@ -492,6 +597,45 @@ export function readWorkerRecords(env = process.env, { strict = false } = {}) {
       }
       return record ? [record] : [];
     });
+}
+
+export function readSessionWorkerRecords(env = process.env, sessionId, { strict = false } = {}) {
+  let taskIds = readWorkerSessionState(sessionId, env)?.taskIds;
+  if (!Array.isArray(taskIds)) {
+    const records = readWorkerRecords(env, { strict }).filter((record) => record.sessionId === sessionId);
+    updateWorkerSessionState(sessionId, env, (current) => ({
+      ...(current ?? {}),
+      taskIds: [...new Set([...(Array.isArray(current?.taskIds) ? current.taskIds : []), ...records.map((record) => record.taskId)])]
+    }));
+    return records;
+  }
+  return [...new Set(taskIds)].flatMap((taskId) => {
+    let file;
+    try {
+      file = workerRecordFile(taskId, env);
+    } catch (error) {
+      if (strict) {
+        throw error;
+      }
+      return [];
+    }
+    const record = readWorkerRecordFile(file);
+    if (record) {
+      return record.sessionId === sessionId ? [record] : [];
+    }
+    if (strict) {
+      try {
+        fs.statSync(file);
+      } catch (error) {
+        if (error?.code === "ENOENT") {
+          return [];
+        }
+        throw error;
+      }
+      throw new Error(`Fusion worker record ${path.basename(file)} is unreadable.`);
+    }
+    return [];
+  });
 }
 
 export function findWorkerRecord(predicate, env = process.env, options = {}) {
@@ -593,12 +737,38 @@ function transcriptChunk(file, offset, carry, skippingLine) {
   }
 }
 
+function sameTranscriptFile(left, right) {
+  if (typeof left !== "string" || typeof right !== "string" || !left || !right) {
+    return false;
+  }
+  try {
+    return fs.realpathSync(left) === fs.realpathSync(right);
+  } catch {
+    return false;
+  }
+}
+
+function transcriptUsageTotal(entries) {
+  return entries.reduce((totals, [, usage]) => {
+    for (const key of USAGE_KEYS) {
+      totals[key] += integer(usage?.[key]);
+    }
+    return totals;
+  }, emptyWorkerUsage());
+}
+
 export function refreshWorkerTranscript(record, transcriptPath) {
   const selectedPath = typeof transcriptPath === "string" && transcriptPath ? transcriptPath : record.transcriptPath;
   if (!selectedPath) {
     return record;
   }
-  const sameTranscript = selectedPath === record.transcriptPath;
+  const sameTranscript = selectedPath === record.transcriptPath || sameTranscriptFile(selectedPath, record.transcriptPath);
+  const roundBaseline = record.budgetBaseline;
+  const roundPrefix = roundBaseline ? {
+    turns: integer(record.transcriptRoundPrefix?.turns),
+    toolCalls: integer(record.transcriptRoundPrefix?.toolCalls),
+    usage: Object.fromEntries(USAGE_KEYS.map((key) => [key, integer(record.transcriptRoundPrefix?.usage?.[key])]))
+  } : null;
   const snapshot = {
     ...record,
     transcriptPath: selectedPath,
@@ -636,26 +806,30 @@ export function refreshWorkerTranscript(record, transcriptPath) {
       break;
     }
   }
+  if (roundPrefix) {
+    roundPrefix.turns += Math.max(0, snapshot.turnIds.length - 512);
+    roundPrefix.toolCalls += Math.max(0, snapshot.toolUseIds.length - 2048);
+  }
   snapshot.turnIds = snapshot.turnIds.slice(-512);
   snapshot.toolUseIds = snapshot.toolUseIds.slice(-2048);
-  const usageEntries = Object.entries(snapshot.usageMessages).slice(-512);
-  snapshot.usageMessages = Object.fromEntries(usageEntries);
-  snapshot.turns = Math.max(integer(record.turns), snapshot.turnIds.length);
-  if (record.toolCallsSource !== "tool-response") {
-    snapshot.toolCalls = snapshot.toolUseIds.length;
-    snapshot.toolCallsSource = snapshot.toolUseIds.length > 0 ? "agent-transcript" : record.toolCallsSource;
+  const allUsageEntries = Object.entries(snapshot.usageMessages);
+  const usageEntries = allUsageEntries.slice(-512);
+  if (roundPrefix) {
+    const evictedUsage = transcriptUsageTotal(allUsageEntries.slice(0, -512));
+    for (const key of USAGE_KEYS) {
+      roundPrefix.usage[key] += evictedUsage[key];
+    }
+    snapshot.transcriptRoundPrefix = roundPrefix;
   }
-  const transcriptUsage = usageEntries.reduce(
-    (totals, [, usage]) => {
-      for (const key of Object.keys(totals)) {
-        totals[key] += integer(usage?.[key]);
-      }
-      return totals;
-    },
-    { inputTokens: 0, cacheCreationInputTokens: 0, cacheReadInputTokens: 0, outputTokens: 0, totalTokens: 0, uncachedTokens: 0 }
-  );
-  if (record.usageSource !== "tool-response") {
-    snapshot.usage = transcriptUsage;
+  snapshot.usageMessages = Object.fromEntries(usageEntries);
+  snapshot.turns = Math.max(integer(record.turns), roundBaseline ? integer(roundBaseline.turns) + roundPrefix.turns + snapshot.turnIds.length : snapshot.turnIds.length);
+  if (roundBaseline || record.toolCallsSource !== "tool-response") {
+    snapshot.toolCalls = roundBaseline ? Math.max(integer(record.toolCalls), integer(roundBaseline.toolCalls) + roundPrefix.toolCalls + snapshot.toolUseIds.length) : snapshot.toolUseIds.length;
+    snapshot.toolCallsSource = (roundPrefix?.toolCalls ?? 0) + snapshot.toolUseIds.length > 0 ? "agent-transcript" : record.toolCallsSource;
+  }
+  const transcriptUsage = transcriptUsageTotal(usageEntries);
+  if (roundBaseline || record.usageSource !== "tool-response") {
+    snapshot.usage = roundBaseline ? Object.fromEntries(USAGE_KEYS.map((key) => [key, Math.max(integer(record.usage?.[key]), integer(roundBaseline.usage?.[key]) + roundPrefix.usage[key] + transcriptUsage[key])])) : transcriptUsage;
     snapshot.usageSource = usageEntries.length > 0 ? "agent-transcript" : record.usageSource;
     snapshot.usageAvailability = partial || snapshot.transcriptBacklogBytes > 0 || snapshot.transcriptSkippingLine ? "partial" : usageEntries.length > 0 ? "available" : "unreported";
   }

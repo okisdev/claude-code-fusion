@@ -95,6 +95,7 @@ test("every executable private transport surface follows its declared Write tran
       assert.match(content, /a value free report or maintenance request made only of any combination of `--json`, `--audit`, `--all`, and `--prune-dead`, each at most once/, file);
       assert.match(content, /Anything else, including every `--reason` text value, every `--failure-kind` and `--failure-kind-for` value, and `--session <id>`, still uses the raw-args transport exactly as described above\./, file);
       assert.match(content, /Within a raw-transport request, `--reason-for <id> <text>` may appear anywhere in the argument list and binds to its matching `--record` id; `--reason <text>` applies to every rejected pair without a per-pair `--reason-for`\./, file);
+      assert.match(content, /`--failure-kind-for <id> <kind>` may appear anywhere in the argument list and binds to its matching rejected `--record` id; `--failure-kind <kind>` applies to every rejected pair without its own `--failure-kind-for`\./, file);
     }
   }
 });

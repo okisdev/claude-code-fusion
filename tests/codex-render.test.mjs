@@ -41,7 +41,7 @@ test("a model drift warning is rendered once in a terminal result footer", () =>
     }
   }));
   assert.equal(rendered.split(warning).length - 1, 1);
-  assert.match(rendered, /state: done\nwarning: brief header names gpt-header but the job ran gpt-resolved; pass --model to select the model\.\n$/);
+  assert.match(rendered, /warning: brief header names gpt-header but the job ran gpt-resolved; pass --model to select the model\.\nstate: done\n$/);
 });
 
 test("model drift is rendered in every terminal footer and never in a running footer", () => {
@@ -60,6 +60,21 @@ test("model drift is rendered in every terminal footer and never in a running fo
   }
   assert.doesNotMatch(renderJobDetail(record({ modelDrift, status: "running" })), /warning: brief header names/);
   assert.doesNotMatch(renderTerminalResult(record()), /warning: brief header names/);
+});
+
+test("a resumed job names its valid source immediately after its job id", () => {
+  const sourceJobId = "b".repeat(32);
+  const rendered = renderTerminalResult(record({ request: { resumeSourceJobId: sourceJobId } }));
+  assert.match(rendered, new RegExp(`job: ${"a".repeat(32)}\\nresumed-from: ${sourceJobId}\\nsandbox:`));
+  assert.doesNotMatch(renderTerminalResult(record({ request: { resumeSourceJobId: "source-job" } })), /resumed-from:/);
+});
+
+test("model drift warnings precede the terminal state and failure", () => {
+  const modelDrift = { headerModel: "gpt-header", resolvedModel: "gpt-resolved" };
+  for (const status of ["error", "cancelled"]) {
+    const rendered = renderTerminalResult(record({ modelDrift, status }));
+    assert.match(rendered, new RegExp(`warning: brief header names.*\\nstate: ${status}\\nfailure: ${status === "cancelled" ? "cancelled" : "error"}\\n$`));
+  }
 });
 
 test("explicit model drift is rendered in every terminal footer and never in a running footer", () => {

@@ -4,6 +4,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { isStrictPosture, resolveFusionDataDir } from "./lib/posture.mjs";
+import { readRoutingDefaults } from "./lib/model-table.mjs";
 import { normalizeSessionId, resolveStateDir, stateFile } from "./inline-delegation-guard.mjs";
 import { tagMessage } from "./lib/user-messages.mjs";
 
@@ -12,7 +13,11 @@ const NARROW_WAVE_THRESHOLD_ENV = "FUSION_NARROW_WAVE_THRESHOLD";
 const FLEET_MODE_FILE = "fleet-mode";
 const DEFAULT_NARROW_WAVE_THRESHOLD = 2;
 const ADDITIONAL_CONTEXT = tagMessage("fleet-posture.strict-fleet-reminder", "fleet-default active: a goal that decomposes into three or more independent work packages convenes /fusion:ultra once bootstrap dependencies are resolved; narrower execution states `fleet-decline: <reason>` visibly in the reply.");
-const SESSION_LANES_REMINDER = tagMessage("fleet-posture.session-lanes-reminder", "fusion lanes ready: codex astra for spec grade and deep review, terra/luna for quick and volume packages, grok under its four roles, claude workers for the Claude surface. Independent packages dispatch together in one message; three or more convene /fusion:ultra; a single coherent change stays inline.");
+
+function sessionLanesReminder(env = process.env) {
+  const { flagship, quick, volume } = readRoutingDefaults(env).codex;
+  return tagMessage("fleet-posture.session-lanes-reminder", `fusion lanes ready: codex ${flagship.model} for spec grade and deep review, ${quick.model} and ${volume.model} for quick and volume packages, grok under its four roles on the routing table's lane defaults, claude workers for the Claude surface. Independent packages dispatch together in one message; three or more convene /fusion:ultra; a single coherent change stays inline.`);
+}
 
 function readHookInput() {
   try {
@@ -43,12 +48,12 @@ function resolveNarrowWaveThreshold(env = process.env) {
   return Number.isInteger(parsed) && parsed > 0 ? parsed : DEFAULT_NARROW_WAVE_THRESHOLD;
 }
 
-function claimSessionLanesReminder(input, env = process.env) {
+function claimReminder(input, markerDirectory, suffix = "", env = process.env) {
   const sessionId = normalizeSessionId(input?.session_id);
   if (!sessionId) {
     return false;
   }
-  const file = path.join(resolveFusionDataDir(env), "fleet-posture", "session-lanes-reminders", `${sessionId}.marker`);
+  const file = path.join(resolveFusionDataDir(env), "fleet-posture", markerDirectory, `${sessionId}${suffix}.marker`);
   const directory = path.dirname(file);
   fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
   fs.chmodSync(directory, 0o700);
@@ -98,12 +103,15 @@ function main() {
     process.stdout.write(`${JSON.stringify({ hookSpecificOutput: { hookEventName: "UserPromptSubmit", additionalContext: ADDITIONAL_CONTEXT } })}\n`);
     return;
   }
-  if (claimSessionLanesReminder(input)) {
-    process.stdout.write(`${JSON.stringify({ hookSpecificOutput: { hookEventName: "UserPromptSubmit", additionalContext: SESSION_LANES_REMINDER } })}\n`);
+  if (claimReminder(input, "session-lanes-reminders")) {
+    process.stdout.write(`${JSON.stringify({ hookSpecificOutput: { hookEventName: "UserPromptSubmit", additionalContext: sessionLanesReminder() } })}\n`);
     return;
   }
   const streak = readUnannouncedNarrowWaveStreak(input);
   if (streak === null || streak < resolveNarrowWaveThreshold()) {
+    return;
+  }
+  if (!claimReminder(input, "narrow-wave-reminders", `-${streak}`)) {
     return;
   }
   const additionalContext = tagMessage("fleet-posture.narrow-wave-reminder", `${streak} consecutive width one dispatch waves in this session. If the remaining packages are independent, dispatch them together in one message; /fusion:ultra is available when the goal is genuinely wide.`);

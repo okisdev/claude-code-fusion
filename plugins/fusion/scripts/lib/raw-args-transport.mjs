@@ -230,7 +230,7 @@ export function splitRawArgs(value) {
       started = true;
       continue;
     }
-    if (character === "'" || character === "\"") {
+    if (!started && (character === "'" || character === "\"")) {
       quote = character;
       started = true;
       continue;

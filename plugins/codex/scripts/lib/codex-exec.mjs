@@ -195,7 +195,25 @@ function baseExecArgs(sandbox, options) {
     "--disable",
     "memories",
     "--disable",
-    "goals"
+    "goals",
+    "--disable",
+    "computer_use",
+    "--disable",
+    "browser_use",
+    "--disable",
+    "browser_use_external",
+    "--disable",
+    "in_app_browser",
+    "--disable",
+    "image_generation",
+    "--disable",
+    "apps",
+    "--disable",
+    "plugins",
+    "--disable",
+    "remote_plugin",
+    "--config",
+    "agents.enabled=false"
   ];
   appendExplicitSettings(args, options, sandbox);
   return args;

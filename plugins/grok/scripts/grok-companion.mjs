@@ -13,6 +13,7 @@ import {
   buildGrokArgs,
   formatBlockedPermissionCall,
   formatDeniedToolDetail,
+  grokAuthStatus,
   normalizeGrokSessionId,
   normalizeStopReason,
   runtimeSocketEndpoints,
@@ -126,7 +127,7 @@ const JOB_ID_PATTERN = /^[a-f0-9]{32}$/;
 const DEFAULT_HISTORY_LIMIT = 50;
 const MAX_HISTORY_LIMIT = 500;
 const TESTED_VERSION_MIN = [1, 0, 14];
-const TESTED_VERSION_MAX = [1, 0, 31];
+const TESTED_VERSION_MAX = [1, 0, 42];
 const GROK_VERSION_PROBE_TIMEOUT_MS = 3000;
 const UNDENIED_RUNTIME_SOCKET_CANDIDATES_ENV = "GROK_COMPANION_UNDENIED_SOCKET_CANDIDATES";
 const CONTINUITY_POLICIES = new Set(["manual", "claude-session"]);
@@ -1473,7 +1474,9 @@ function resultSpendPatch(result) {
     usageIsIncomplete,
     modelUsageIsIncomplete,
     structuredOutput: result?.structuredOutput,
-    structuredOutputError: result?.structuredOutputError
+    structuredOutputError: result?.structuredOutputError,
+    ...(result?.authRefresh ? { authRefresh: result.authRefresh } : {}),
+    ...(result?.authRetry ? { authRetry: true } : {})
   };
 }
 
@@ -3212,6 +3215,7 @@ function handleSetup(argv, transport = {}) {
   const doctorCommand = doctorCommandAdvisory(bin, available);
   const shellEnvironmentPolicy = shellEnvironmentPolicyAdvisory(process.env);
   const hostEnvironment = hostEnvironmentAdvisory(process.env);
+  const auth = grokAuthStatus(process.env);
 
   const dataDir = resolveDataDir();
   let writable = true;
@@ -3249,6 +3253,9 @@ function handleSetup(argv, transport = {}) {
   if (!writable) {
     nextSteps.push(`Fix permissions on ${dataDir}.`);
   }
+  if (auth.stale) {
+    nextSteps.push("Run `grok models` once outside the sandbox to refresh the stored Grok token.");
+  }
 
   const report = {
     ready: available && capabilities.ready && compatible && hostEnvironment.ready && writable,
@@ -3258,6 +3265,7 @@ function handleSetup(argv, transport = {}) {
     doctorCommand,
     shellEnvironmentPolicy,
     hostEnvironment,
+    auth,
     dataDir: { path: dataDir, writable, detail: writeDetail },
     stopGate: Boolean(readConfig(dataDir).stopGate),
     continuityPolicy: continuityPolicy(dataDir),

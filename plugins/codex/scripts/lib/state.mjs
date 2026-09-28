@@ -931,11 +931,12 @@ export function listAllJobRecords(dataDir) {
   });
 }
 
-export function latestJobRecordForThread(dataDir, threadId) {
+export function latestJobRecordForThread(dataDir, threadId, cwd = null) {
   if (typeof threadId !== "string" || !threadId.trim()) {
     return null;
   }
-  const candidates = listAllJobRecords(dataDir).map(({ record }) => record).filter((record) => record.jobClass === "task" && (record.threadId === threadId || record.request?.resumeThreadId === threadId));
+  const records = cwd ? listJobRecords(dataDir, cwd) : listAllJobRecords(dataDir).map(({ record }) => record);
+  const candidates = records.filter((record) => record.jobClass === "task" && (record.threadId === threadId || (!cwd && record.request?.resumeThreadId === threadId)));
   candidates.sort((left, right) => {
     const timestamp = String(right.finishedAt ?? right.updatedAt ?? right.createdAt ?? "").localeCompare(String(left.finishedAt ?? left.updatedAt ?? left.createdAt ?? ""));
     return timestamp || String(right.createdAt ?? "").localeCompare(String(left.createdAt ?? "")) || String(left.id ?? "").localeCompare(String(right.id ?? ""));
