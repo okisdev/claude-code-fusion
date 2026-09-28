@@ -102,6 +102,45 @@ test("Rescore writes the data file and refreshes the live rules", (t) => {
   assert.match(live, /^\| codex \| codex \| 5 \| 4 \| 5 \| primary implementation lane \|$/m);
 });
 
+test("Set-default writes a lane choice and refreshes the live rules", (t) => {
+  const box = sandbox(t);
+  assert.strictEqual(
+    run(box, ["rescore", "gpt-6-sol", "--intelligence", "5", "--taste", "4", "--cost", "4", "--lane", "codex"]).status,
+    0
+  );
+  const result = run(box, ["set-default", "codex", "quick", "gpt-6-sol", "high"]);
+  assert.strictEqual(result.status, 0, result.stderr);
+  assert.match(result.stdout, /Updated codex quick default to gpt-6-sol@high\./);
+  const data = JSON.parse(fs.readFileSync(box.modelRoutingFile, "utf8"));
+  assert.deepStrictEqual(data.defaults, { codex: { quick: { model: "gpt-6-sol", effort: "high" } } });
+  assert.match(fs.readFileSync(box.rulesFile, "utf8"), /^Lane defaults: codex quick gpt-6-sol@high, volume gpt-6-luna@xhigh/m);
+  assert.strictEqual(
+    run(box, ["rescore", "grok-4.7", "--intelligence", "5", "--taste", "4", "--cost", "4", "--lane", "grok"]).status,
+    0
+  );
+  assert.deepStrictEqual(JSON.parse(fs.readFileSync(box.modelRoutingFile, "utf8")).defaults, data.defaults);
+});
+
+test("Set-default rejects invalid choices and leaves the routing file unchanged", (t) => {
+  const box = sandbox(t);
+  assert.strictEqual(
+    run(box, ["rescore", "gpt-6-sol", "--intelligence", "5", "--taste", "4", "--cost", "4", "--lane", "codex"]).status,
+    0
+  );
+  const before = fs.readFileSync(box.modelRoutingFile, "utf8");
+  for (const [args, reason] of [
+    [["grok", "quick", "gpt-6-sol", "high"], /Expected a codex role/],
+    [["codex", "quick", "gpt-6-sol", "ultra"], /defaults\.codex\.quick\.effort/],
+    [["grok", "burst", "gpt-6-sol", "low"], /match a model in the grok lane/],
+    [["codex", "quick", "missing", "high"], /match a model in the codex lane/]
+  ]) {
+    const result = run(box, ["set-default", ...args]);
+    assert.strictEqual(result.status, 1);
+    assert.match(result.stderr, reason);
+    assert.strictEqual(fs.readFileSync(box.modelRoutingFile, "utf8"), before);
+  }
+});
+
 test("Show json parses after a score is configured", (t) => {
   const box = sandbox(t);
   assert.strictEqual(
@@ -259,6 +298,7 @@ test("Audit reports configured Codex listing drift and gpt newcomers", (t) => {
     run(box, ["rescore", "grok-4-missing", "--intelligence", "4", "--taste", "4", "--cost", "5", "--lane", "grok"]).status,
     0
   );
+  assert.strictEqual(run(box, ["set-default", "codex", "quick", "gpt-5.6-terra", "high"]).status, 0);
   fs.writeFileSync(
     box.codexModelsCacheFile,
     `${JSON.stringify({ models: [{ slug: "gpt-5.6-terra" }, { slug: "gpt-5.7-new" }, { slug: "o3" }] })}\n`,
@@ -272,8 +312,17 @@ test("Audit reports configured Codex listing drift and gpt newcomers", (t) => {
   assert.strictEqual(report.listing.path, box.codexModelsCacheFile);
   assert.strictEqual(report.listing.mtime, fs.statSync(box.codexModelsCacheFile).mtime.toISOString());
   assert.deepStrictEqual(report.configuredButAbsent, ["gpt-5.5-missing"]);
+  assert.deepStrictEqual(report.defaults.codex.quick, { model: "gpt-5.6-terra", effort: "high" });
+  assert.deepStrictEqual(report.defaults.grok.burst, { model: "grok-4.7-build-fast", effort: "low" });
+  assert.deepStrictEqual(report.codexDefaultsAbsent, [
+    { role: "volume", model: "gpt-6-luna" },
+    { role: "flagship", model: "gpt-6-astra" }
+  ]);
   assert.deepStrictEqual(report.unconfiguredGptModels, ["gpt-5.7-new"]);
   assert.strictEqual(fs.readFileSync(box.modelRoutingFile, "utf8"), routingBeforeAudit);
+  const text = run(box, ["audit"]);
+  assert.match(text.stdout, /codex defaults: quick gpt-5\.6-terra@high/);
+  assert.match(text.stdout, /Codex defaults absent: volume gpt-6-luna, flagship gpt-6-astra/);
 });
 
 test("Audit reports an unavailable Codex model listing without failing", (t) => {
@@ -281,4 +330,5 @@ test("Audit reports an unavailable Codex model listing without failing", (t) => 
   const result = run(box, ["audit"]);
   assert.strictEqual(result.status, 0, result.stderr);
   assert.match(result.stdout, /Codex model listing: listing unavailable/);
+  assert.match(result.stdout, /grok defaults: burst grok-4\.7-build-fast@low/);
 });

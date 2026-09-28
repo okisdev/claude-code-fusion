@@ -6,6 +6,20 @@ export const MODEL_TABLE_START = "<!-- fusion:model-table:start -->";
 export const MODEL_TABLE_END = "<!-- fusion:model-table:end -->";
 export const MODEL_ROUTING_SCHEMA_VERSION = 1;
 export const MODEL_ROUTING_LANES = new Set(["codex", "grok", "claude-trivial", "claude-fast", "claude-deep", "other"]);
+export const DEFAULT_ROUTING_DEFAULTS = {
+  codex: {
+    quick: { model: "gpt-6-sol", effort: "xhigh" },
+    volume: { model: "gpt-6-luna", effort: "xhigh" },
+    flagship: { model: "gpt-6-astra", effort: "xhigh" }
+  },
+  grok: {
+    burst: { model: "grok-4.7-build-fast", effort: "low" },
+    independence: { model: "grok-4.7-build-fast", effort: "high" },
+    "live-web": { model: "grok-4.7-build-fast", effort: "high" },
+    "large-context": { model: "grok-4.6", effort: "medium" }
+  }
+};
+const ROUTING_DEFAULT_EFFORTS = new Set(["low", "medium", "high", "xhigh", "max"]);
 export const DEFAULT_MODEL_TABLE_PLACEHOLDER =
   "Engine capability table: run /fusion:config to score your configured engines (intelligence, taste, cost, 1 to 5) and regenerate this block. Until scored, route by the qualitative lane descriptions in this document.";
 const MODEL_TABLE_PRIORITY_SENTENCE =
@@ -93,15 +107,70 @@ export function validateModelRoutingData(value) {
     models.push(sanitized);
   }
 
+  let defaults;
+  if (value.defaults !== undefined) {
+    if (!value.defaults || typeof value.defaults !== "object" || Array.isArray(value.defaults)) {
+      return invalid("Expected defaults to be an object.");
+    }
+    defaults = {};
+    for (const [lane, roles] of Object.entries(value.defaults)) {
+      if (!Object.hasOwn(DEFAULT_ROUTING_DEFAULTS, lane)) {
+        return invalid(`Expected defaults lane to be one of ${Object.keys(DEFAULT_ROUTING_DEFAULTS).join(", ")}.`);
+      }
+      if (!roles || typeof roles !== "object" || Array.isArray(roles)) {
+        return invalid(`Expected defaults.${lane} to be an object.`);
+      }
+      defaults[lane] = {};
+      for (const [role, choice] of Object.entries(roles)) {
+        if (!Object.hasOwn(DEFAULT_ROUTING_DEFAULTS[lane], role)) {
+          return invalid(`Expected defaults.${lane} role to be one of ${Object.keys(DEFAULT_ROUTING_DEFAULTS[lane]).join(", ")}.`);
+        }
+        if (!choice || typeof choice !== "object" || Array.isArray(choice)) {
+          return invalid(`Expected defaults.${lane}.${role} to be an object.`);
+        }
+        if (!validateId(choice.model)) {
+          return invalid(`Expected defaults.${lane}.${role}.model to be a non-empty string.`);
+        }
+        if (!ROUTING_DEFAULT_EFFORTS.has(choice.effort)) {
+          return invalid(`Expected defaults.${lane}.${role}.effort to be one of ${[...ROUTING_DEFAULT_EFFORTS].join(", ")}.`);
+        }
+        const model = choice.model.trim();
+        if (!models.some((row) => row.lane === lane && row.id === model)) {
+          return invalid(`Expected defaults.${lane}.${role}.model to match a model in the ${lane} lane.`);
+        }
+        defaults[lane][role] = { model, effort: choice.effort };
+      }
+    }
+  }
+
   return {
     ok: true,
     data: {
       schemaVersion: MODEL_ROUTING_SCHEMA_VERSION,
       updatedAt: value.updatedAt,
       costProfile: value.costProfile,
-      models
+      models,
+      ...(defaults === undefined ? {} : { defaults })
     }
   };
+}
+
+function mergeRoutingDefaults(defaults = {}) {
+  return Object.fromEntries(
+    Object.entries(DEFAULT_ROUTING_DEFAULTS).map(([lane, roles]) => [
+      lane,
+      Object.fromEntries(Object.entries(roles).map(([role, seed]) => [role, defaults[lane]?.[role] ?? { ...seed }]))
+    ])
+  );
+}
+
+export function readRoutingDefaults(env = process.env, { warn = console.error } = {}) {
+  const filePath = resolveModelRoutingPath(env);
+  const result = readModelRoutingFile(filePath);
+  if (!result.ok && !result.missing && warn) {
+    warn(modelRoutingWarning(filePath, result.reason));
+  }
+  return mergeRoutingDefaults(result.ok ? result.data.defaults : undefined);
 }
 
 export function readModelRoutingFile(filePath) {
@@ -142,7 +211,15 @@ export function renderModelTable(data) {
       `| ${tableCell(model.id)} | ${tableCell(model.lane)} | ${model.intelligence} | ${model.taste} | ${model.cost} | ${tableCell(model.notes ?? "")} |`
     );
   }
-  lines.push("", MODEL_TABLE_PRIORITY_SENTENCE, MODEL_TABLE_SCORE_SENTENCE);
+  const defaults = mergeRoutingDefaults(data.defaults);
+  const choice = (lane, role) => `${tableCell(defaults[lane][role].model)}@${defaults[lane][role].effort}`;
+  lines.push(
+    "",
+    `Lane defaults: codex quick ${choice("codex", "quick")}, volume ${choice("codex", "volume")}, flagship ${choice("codex", "flagship")}; grok burst ${choice("grok", "burst")}, independence ${choice("grok", "independence")}, live-web ${choice("grok", "live-web")}, large-context ${choice("grok", "large-context")}.`,
+    "",
+    MODEL_TABLE_PRIORITY_SENTENCE,
+    MODEL_TABLE_SCORE_SENTENCE
+  );
   return lines.join("\n");
 }
 

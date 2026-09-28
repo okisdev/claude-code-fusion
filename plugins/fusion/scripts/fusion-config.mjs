@@ -7,9 +7,11 @@ import { fileURLToPath } from "node:url";
 
 import {
   DEFAULT_MODEL_TABLE_PLACEHOLDER,
+  DEFAULT_ROUTING_DEFAULTS,
   MODEL_ROUTING_SCHEMA_VERSION,
   MODEL_ROUTING_LANES,
   readModelRoutingFile,
+  readRoutingDefaults,
   renderModelTable,
   resolveModelRoutingPath,
   validateId,
@@ -37,6 +39,7 @@ function usage() {
     "  node scripts/fusion-config.mjs show [--json]",
     "  node scripts/fusion-config.mjs audit [--json]",
     "  node scripts/fusion-config.mjs rescore <id> --intelligence N --taste N --cost N [--lane L] [--notes S]",
+    "  node scripts/fusion-config.mjs set-default <lane> <role> <model> <effort>",
     "  node scripts/fusion-config.mjs remove <id>",
     "  node scripts/fusion-config.mjs set-cost-profile <text>",
     "  node scripts/fusion-config.mjs set-posture <judgment|strict>",
@@ -165,12 +168,19 @@ function auditModelDrift(env) {
   const configuredModelIds = routing.ok ? [...new Set(routing.data.models.map((model) => model.id))] : [];
   const configuredCodexModelIds = routing.ok ? [...new Set(routing.data.models.filter((model) => model.lane === "codex").map((model) => model.id))] : [];
   const listedModelIds = new Set(listing.available ? listing.modelIds : []);
+  const defaults = readRoutingDefaults(env, { warn: null });
   return {
     modelRoutingFile,
     configured: !routing.missing,
     valid: Boolean(routing.ok),
     error: routing.ok || routing.missing ? null : routing.reason,
+    defaults,
     listing,
+    codexDefaultsAbsent: listing.available
+      ? Object.entries(defaults.codex)
+          .filter(([, choice]) => !listedModelIds.has(choice.model))
+          .map(([role, choice]) => ({ role, model: choice.model }))
+      : [],
     configuredButAbsent: listing.available && routing.ok ? configuredCodexModelIds.filter((id) => !listedModelIds.has(id)) : [],
     unconfiguredGptModels: listing.available && routing.ok ? listing.modelIds.filter((id) => id.startsWith("gpt-") && !configuredModelIds.includes(id)) : []
   };
@@ -296,6 +306,9 @@ function auditCommand(options, env, stdout) {
   } else if (!report.valid) {
     lines.push(`Invalid model routing file: ${report.error}`);
   }
+  for (const [lane, roles] of Object.entries(report.defaults)) {
+    lines.push(`${lane} defaults: ${Object.entries(roles).map(([role, choice]) => `${role} ${choice.model}@${choice.effort}`).join(", ")}`);
+  }
   if (!report.listing.available) {
     lines.push(`Codex model listing: listing unavailable (${report.listing.reason})`);
     stdout.write(`${lines.join("\n")}\n`);
@@ -305,9 +318,30 @@ function auditCommand(options, env, stdout) {
     `Codex model listing: ${report.listing.path}`,
     `Listing mtime: ${report.listing.mtime}`,
     `Configured but absent: ${report.configuredButAbsent.length ? report.configuredButAbsent.join(", ") : "none"}`,
+    `Codex defaults absent: ${report.codexDefaultsAbsent.length ? report.codexDefaultsAbsent.map(({ role, model }) => `${role} ${model}`).join(", ") : "none"}`,
     `Unconfigured gpt-* newcomers: ${report.unconfiguredGptModels.length ? report.unconfiguredGptModels.join(", ") : "none"}`
   );
   stdout.write(`${lines.join("\n")}\n`);
+}
+
+function setDefaultCommand(positionals, options, env, stdout) {
+  ensureOnlyOptions(options, new Set(), "set-default");
+  if (positionals.length !== 4) {
+    throw new UsageError("Expected set-default <lane> <role> <model> <effort>.");
+  }
+  const [lane, role, rawModel, effort] = positionals;
+  if (!Object.hasOwn(DEFAULT_ROUTING_DEFAULTS, lane) || !Object.hasOwn(DEFAULT_ROUTING_DEFAULTS[lane], role)) {
+    throw new UsageError("Expected a codex role (quick, volume, flagship) or grok role (burst, independence, live-web, large-context).");
+  }
+  const model = requireId(rawModel);
+  const filePath = resolveModelRoutingPath(env);
+  const data = loadEditableData(filePath);
+  data.defaults ??= {};
+  data.defaults[lane] ??= {};
+  data.defaults[lane][role] = { model, effort };
+  writeModelRoutingData(filePath, data);
+  refreshLiveRules(env, stdout);
+  stdout.write(`Updated ${lane} ${role} default to ${model}@${effort}.\n`);
 }
 
 function rescoreCommand(positionals, options, env, stdout) {
@@ -438,6 +472,9 @@ export function main(argv = process.argv.slice(2), { env = process.env, stdout =
         return 0;
       case "rescore":
         rescoreCommand(positionals, options, env, stdout);
+        return 0;
+      case "set-default":
+        setDefaultCommand(positionals, options, env, stdout);
         return 0;
       case "remove":
         removeCommand(positionals, options, env, stdout);

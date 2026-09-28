@@ -10,7 +10,7 @@ import { messageTag, tagMessage } from "../plugins/fusion/scripts/lib/user-messa
 const repoRoot = path.join(import.meta.dirname, "..");
 const script = path.join(repoRoot, "plugins", "fusion", "scripts", "fleet-posture.mjs");
 const LEGACY_CONTEXT = tagMessage("fleet-posture.strict-fleet-reminder", "fleet-default active: a goal that decomposes into three or more independent work packages convenes /fusion:ultra once bootstrap dependencies are resolved; narrower execution states `fleet-decline: <reason>` visibly in the reply.");
-const SESSION_LANES_CONTEXT = tagMessage("fleet-posture.session-lanes-reminder", "fusion lanes ready: codex astra for spec grade and deep review, terra/luna for quick and volume packages, grok under its four roles, claude workers for the Claude surface. Independent packages dispatch together in one message; three or more convene /fusion:ultra; a single coherent change stays inline.");
+const SESSION_LANES_CONTEXT = tagMessage("fleet-posture.session-lanes-reminder", "fusion lanes ready: codex gpt-6-astra for spec grade and deep review, gpt-6-sol and gpt-6-luna for quick and volume packages, grok under its four roles on the routing table's lane defaults, claude workers for the Claude surface. Independent packages dispatch together in one message; three or more convene /fusion:ultra; a single coherent change stays inline.");
 
 function makeSandbox(t) {
   const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "fleet-posture-test-")));
@@ -19,7 +19,7 @@ function makeSandbox(t) {
 }
 
 function envFor(sandbox, extra = {}) {
-  const env = { ...process.env, FUSION_DATA_DIR: sandbox.dataDir, FUSION_INLINE_GUARD_STATE: sandbox.stateDir, ...extra };
+  const env = { ...process.env, FUSION_DATA_DIR: sandbox.dataDir, FUSION_INLINE_GUARD_STATE: sandbox.stateDir, FUSION_MODEL_ROUTING: path.join(sandbox.root, "missing-model-routing.json"), ...extra };
   for (const name of ["FUSION_FLEET_MODE", "FUSION_POSTURE", "FUSION_NARROW_WAVE_THRESHOLD"]) {
     if (!Object.hasOwn(extra, name)) {
       delete env[name];
@@ -38,6 +38,10 @@ function statePath(sandbox, sessionId = "session-1") {
 
 function sessionLanesReminderPath(sandbox, sessionId = "session-1") {
   return path.join(sandbox.dataDir, "fleet-posture", "session-lanes-reminders", `${sessionId}.marker`);
+}
+
+function narrowWaveReminderPath(sandbox, streak, sessionId = "session-1") {
+  return path.join(sandbox.dataDir, "fleet-posture", "narrow-wave-reminders", `${sessionId}-${streak}.marker`);
 }
 
 function writeState(sandbox, state, sessionId = "session-1") {
@@ -104,7 +108,39 @@ test("judgment posture emits the observed narrow wave streak", (t) => {
 
   assertContext(run(sandbox), SESSION_LANES_CONTEXT);
   assertContext(run(sandbox), judgmentContext(2));
+  assertSilent(run(sandbox));
+  assert.strictEqual(fs.statSync(narrowWaveReminderPath(sandbox, 2)).mode & 0o777, 0o600);
+  assert.strictEqual(fs.statSync(path.dirname(narrowWaveReminderPath(sandbox, 2))).mode & 0o777, 0o700);
   assert.strictEqual(fs.readFileSync(statePath(sandbox), "utf8"), original);
+});
+
+test("narrow wave reminders fire once per streak value per session", (t) => {
+  const sandbox = makeSandbox(t);
+  assertContext(run(sandbox), SESSION_LANES_CONTEXT);
+  writeState(sandbox, { consecutiveNarrowWaves: 2 });
+  assertContext(run(sandbox), judgmentContext(2));
+  assertSilent(run(sandbox));
+  writeState(sandbox, { consecutiveNarrowWaves: 3 });
+  assertContext(run(sandbox), judgmentContext(3));
+  writeState(sandbox, { consecutiveNarrowWaves: 2 });
+  assertSilent(run(sandbox));
+  assertContext(run(sandbox, hookInput(sandbox, "session-2")), SESSION_LANES_CONTEXT);
+  writeState(sandbox, { consecutiveNarrowWaves: 2 }, "session-2");
+  assertContext(run(sandbox, hookInput(sandbox, "session-2")), judgmentContext(2));
+});
+
+test("session lanes reminder renders the routing table's codex defaults", (t) => {
+  const sandbox = makeSandbox(t);
+  const routingFile = path.join(sandbox.root, "model-routing.json");
+  const models = ["quick-choice", "volume-choice", "flagship-choice"].map((id) => ({ id, lane: "codex", intelligence: 5, taste: 4, cost: 3 }));
+  fs.writeFileSync(routingFile, JSON.stringify({
+    schemaVersion: 1,
+    updatedAt: "2026-07-04T00:00:00.000Z",
+    costProfile: "",
+    models,
+    defaults: { codex: { quick: { model: "quick-choice", effort: "high" }, volume: { model: "volume-choice", effort: "low" }, flagship: { model: "flagship-choice", effort: "max" } } }
+  }), "utf8");
+  assertContext(run(sandbox, hookInput(sandbox), { FUSION_MODEL_ROUTING: routingFile }), tagMessage("fleet-posture.session-lanes-reminder", "fusion lanes ready: codex flagship-choice for spec grade and deep review, quick-choice and volume-choice for quick and volume packages, grok under its four roles on the routing table's lane defaults, claude workers for the Claude surface. Independent packages dispatch together in one message; three or more convene /fusion:ultra; a single coherent change stays inline."));
 });
 
 test("judgment posture honors a valid narrow wave threshold and falls back for malformed values", (t) => {
