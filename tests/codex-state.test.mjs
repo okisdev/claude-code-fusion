@@ -625,6 +625,7 @@ test("a held thread lock times out a second acquirer within the configured ceili
   assert.strictEqual(result.exitCode, 0, result.stderr);
   const outcome = JSON.parse(result.stdout);
   assert.match(outcome.message, /Timed out waiting for the job record lock at/);
+  assert.match(outcome.message, new RegExp(`Held by pid ${holder.child.pid} \\(alive\\) for \\d+(\\.\\d)?s: \\S`));
   assert.ok(outcome.elapsedMs >= timeoutMs, `Expected the waiter to wait for at least ${timeoutMs}ms, took ${outcome.elapsedMs}ms.`);
   assert.ok(outcome.elapsedMs <= timeoutMs + 500, `Expected the waiter to finish near ${timeoutMs}ms, took ${outcome.elapsedMs}ms.`);
 

@@ -383,6 +383,32 @@ function releaseLock(lockDir, token) {
   return true;
 }
 
+function lockHolderCommand(pid) {
+  try {
+    if (process.platform === "linux") {
+      return fs.readFileSync(`/proc/${pid}/cmdline`, "utf8").split("\0").filter(Boolean).join(" ");
+    }
+    const result = spawnSync("ps", ["-ww", "-p", String(pid), "-o", "command="], { encoding: "utf8", timeout: 2000, windowsHide: true });
+    return result.status === 0 ? String(result.stdout ?? "").trim() : "";
+  } catch {
+    return "";
+  }
+}
+
+function describeLockHolder(lockDir, observed) {
+  if (!observed) {
+    return " No owner record was readable.";
+  }
+  let heldSeconds = null;
+  try {
+    heldSeconds = Math.round((Date.now() - fs.statSync(lockOwnerDir(lockDir, observed.token)).mtimeMs) / 100) / 10;
+  } catch {}
+  const alive = directLockOwnerAlive(observed.ownerPid);
+  const state = !alive ? "not running" : processIdentityMatches(observed.ownerPid, observed.ownerIdentity) ? "alive" : "alive with a different identity";
+  const command = alive ? lockHolderCommand(observed.ownerPid).slice(0, 200) : "";
+  return ` Held by pid ${observed.ownerPid} (${state})${heldSeconds == null ? "" : ` for ${heldSeconds}s`}${command ? `: ${command}` : ""}.`;
+}
+
 function withRecordLock(file, callback, timeoutMs = resolveLockTimeoutMs()) {
   ensurePrivateDir(path.dirname(file));
   const lockDir = `${file}.lock`;
@@ -416,7 +442,7 @@ function withRecordLock(file, callback, timeoutMs = resolveLockTimeoutMs()) {
         }
       }
       if (Date.now() >= deadline) {
-        throw new Error(`Timed out waiting for the job record lock at ${file}.`);
+        throw new Error(`Timed out waiting for the job record lock at ${file}.${describeLockHolder(lockDir, readLockRecord(lockDir))}`);
       }
       sleepMs(LOCK_RETRY_MS);
       if (publishPreparedLock(lockDir, candidateDir)) {
