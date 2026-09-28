@@ -251,10 +251,11 @@ export function isTerminalWorkerStatus(value) {
   return TERMINAL_STATUSES.has(value);
 }
 
-export function reopenWorkerContinuation(record, at = new Date().toISOString()) {
+export function reopenWorkerContinuation(record, at = new Date().toISOString(), notificationFloor = 0) {
   if (!isTerminalWorkerStatus(record.transportStatus)) {
     return record;
   }
+  const fusionWorker = isFusionWorkerAgent(record.agentType);
   const settled = record.acceptance === "accepted" || record.acceptance === "rejected";
   const previousIds = new Set((record.continuations ?? []).flatMap((round) => round.peerJobIds ?? []));
   const peerJobIds = [...new Set([...(record.peerJobIds ?? []), record.peerJobId].filter((id) => typeof id === "string" && !previousIds.has(id)))];
@@ -280,16 +281,17 @@ export function reopenWorkerContinuation(record, at = new Date().toISOString()) 
     continuations: continuation ? [...(record.continuations ?? []), continuation] : record.continuations ?? [],
     continuationCount: (record.continuationCount ?? 0) + 1,
     lastContinuedAt: at,
+    continuationNotificationFloor: notificationFloor,
     transportStatus: "running",
     runtimeAsync: true,
     finishedAt: null,
     collectedAt: null,
     collectionMethod: null,
     outputFile: null,
-    transcriptPath: null,
-    transcriptOffset: 0,
-    transcriptCarry: "",
-    transcriptSkippingLine: false,
+    transcriptPath: fusionWorker ? record.transcriptPath ?? null : null,
+    transcriptOffset: fusionWorker ? record.transcriptOffset ?? 0 : 0,
+    transcriptCarry: fusionWorker ? record.transcriptCarry ?? "" : "",
+    transcriptSkippingLine: fusionWorker && record.transcriptSkippingLine === true,
     transcriptBacklogBytes: 0,
     peerJobId: settled ? null : record.peerJobId ?? null,
     acceptance: "unverified",
@@ -307,22 +309,33 @@ export function reopenWorkerContinuation(record, at = new Date().toISOString()) 
     peerFailureKind: null,
     infraFailure: null,
     deliveryMode: null,
+    stopBlockCount: 0,
+    cancelAttemptCount: 0,
+    retryCount: 0,
+    terminalWriteGraceUsedAt: null,
+    cancelReason: null,
+    cancelRequestedAt: null,
+    windDownContextSentAt: null,
+    tokenWindDownSentAt: null,
+    uncachedWindDownSentAt: null,
     lastActivityAt: at,
     inFlightSince: at,
-    ...(isFusionWorkerAgent(record.agentType) ? {
+    ...(fusionWorker ? {
       budgetBaseline: {
         at,
         turns: record.turns ?? 0,
         outputTokens: record.usage?.outputTokens ?? 0,
-        uncachedTokens: record.usage?.uncachedTokens ?? 0
+        uncachedTokens: record.usage?.uncachedTokens ?? 0,
+        toolCalls: record.toolCalls ?? 0,
+        usage: Object.fromEntries(USAGE_KEYS.map((key) => [key, integer(record.usage?.[key])]))
       },
-      retryCount: 0,
-      terminalWriteGraceUsedAt: null,
-      cancelReason: null,
-      cancelRequestedAt: null,
-      windDownContextSentAt: null,
-      tokenWindDownSentAt: null,
-      uncachedWindDownSentAt: null,
+      transcriptRoundPrefix: { turns: 0, toolCalls: 0, usage: emptyWorkerUsage() },
+      usageMessages: {},
+      turnIds: [],
+      toolUseIds: [],
+      usageSource: null,
+      toolCallsSource: null,
+      usageAvailability: "unreported",
       lastLivenessAt: at
     } : {})
   };
@@ -724,12 +737,38 @@ function transcriptChunk(file, offset, carry, skippingLine) {
   }
 }
 
+function sameTranscriptFile(left, right) {
+  if (typeof left !== "string" || typeof right !== "string" || !left || !right) {
+    return false;
+  }
+  try {
+    return fs.realpathSync(left) === fs.realpathSync(right);
+  } catch {
+    return false;
+  }
+}
+
+function transcriptUsageTotal(entries) {
+  return entries.reduce((totals, [, usage]) => {
+    for (const key of USAGE_KEYS) {
+      totals[key] += integer(usage?.[key]);
+    }
+    return totals;
+  }, emptyWorkerUsage());
+}
+
 export function refreshWorkerTranscript(record, transcriptPath) {
   const selectedPath = typeof transcriptPath === "string" && transcriptPath ? transcriptPath : record.transcriptPath;
   if (!selectedPath) {
     return record;
   }
-  const sameTranscript = selectedPath === record.transcriptPath;
+  const sameTranscript = selectedPath === record.transcriptPath || sameTranscriptFile(selectedPath, record.transcriptPath);
+  const roundBaseline = record.budgetBaseline;
+  const roundPrefix = roundBaseline ? {
+    turns: integer(record.transcriptRoundPrefix?.turns),
+    toolCalls: integer(record.transcriptRoundPrefix?.toolCalls),
+    usage: Object.fromEntries(USAGE_KEYS.map((key) => [key, integer(record.transcriptRoundPrefix?.usage?.[key])]))
+  } : null;
   const snapshot = {
     ...record,
     transcriptPath: selectedPath,
@@ -767,26 +806,30 @@ export function refreshWorkerTranscript(record, transcriptPath) {
       break;
     }
   }
+  if (roundPrefix) {
+    roundPrefix.turns += Math.max(0, snapshot.turnIds.length - 512);
+    roundPrefix.toolCalls += Math.max(0, snapshot.toolUseIds.length - 2048);
+  }
   snapshot.turnIds = snapshot.turnIds.slice(-512);
   snapshot.toolUseIds = snapshot.toolUseIds.slice(-2048);
-  const usageEntries = Object.entries(snapshot.usageMessages).slice(-512);
-  snapshot.usageMessages = Object.fromEntries(usageEntries);
-  snapshot.turns = Math.max(integer(record.turns), snapshot.turnIds.length);
-  if (record.toolCallsSource !== "tool-response") {
-    snapshot.toolCalls = snapshot.toolUseIds.length;
-    snapshot.toolCallsSource = snapshot.toolUseIds.length > 0 ? "agent-transcript" : record.toolCallsSource;
+  const allUsageEntries = Object.entries(snapshot.usageMessages);
+  const usageEntries = allUsageEntries.slice(-512);
+  if (roundPrefix) {
+    const evictedUsage = transcriptUsageTotal(allUsageEntries.slice(0, -512));
+    for (const key of USAGE_KEYS) {
+      roundPrefix.usage[key] += evictedUsage[key];
+    }
+    snapshot.transcriptRoundPrefix = roundPrefix;
   }
-  const transcriptUsage = usageEntries.reduce(
-    (totals, [, usage]) => {
-      for (const key of Object.keys(totals)) {
-        totals[key] += integer(usage?.[key]);
-      }
-      return totals;
-    },
-    { inputTokens: 0, cacheCreationInputTokens: 0, cacheReadInputTokens: 0, outputTokens: 0, totalTokens: 0, uncachedTokens: 0 }
-  );
-  if (record.usageSource !== "tool-response") {
-    snapshot.usage = transcriptUsage;
+  snapshot.usageMessages = Object.fromEntries(usageEntries);
+  snapshot.turns = Math.max(integer(record.turns), roundBaseline ? integer(roundBaseline.turns) + roundPrefix.turns + snapshot.turnIds.length : snapshot.turnIds.length);
+  if (roundBaseline || record.toolCallsSource !== "tool-response") {
+    snapshot.toolCalls = roundBaseline ? Math.max(integer(record.toolCalls), integer(roundBaseline.toolCalls) + roundPrefix.toolCalls + snapshot.toolUseIds.length) : snapshot.toolUseIds.length;
+    snapshot.toolCallsSource = (roundPrefix?.toolCalls ?? 0) + snapshot.toolUseIds.length > 0 ? "agent-transcript" : record.toolCallsSource;
+  }
+  const transcriptUsage = transcriptUsageTotal(usageEntries);
+  if (roundBaseline || record.usageSource !== "tool-response") {
+    snapshot.usage = roundBaseline ? Object.fromEntries(USAGE_KEYS.map((key) => [key, Math.max(integer(record.usage?.[key]), integer(roundBaseline.usage?.[key]) + roundPrefix.usage[key] + transcriptUsage[key])])) : transcriptUsage;
     snapshot.usageSource = usageEntries.length > 0 ? "agent-transcript" : record.usageSource;
     snapshot.usageAvailability = partial || snapshot.transcriptBacklogBytes > 0 || snapshot.transcriptSkippingLine ? "partial" : usageEntries.length > 0 ? "available" : "unreported";
   }

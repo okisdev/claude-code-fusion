@@ -15,6 +15,7 @@ import {
   readWorkerRecord,
   readWorkerSessionState,
   readSessionWorkerRecords,
+  refreshWorkerTranscript,
   reopenWorkerContinuation,
   recordWorkerAcceptance,
   resolveWorkerRetentionDays,
@@ -197,6 +198,8 @@ test("Fusion worker continuation resets round state and records its budget basel
     acceptance: "accepted",
     turns: 62,
     usage: { outputTokens: 97_000, uncachedTokens: 721_000 },
+    stopBlockCount: 6,
+    cancelAttemptCount: 2,
     retryCount: 1,
     terminalWriteGraceUsedAt: "2026-09-27T00:00:00.000Z",
     cancelReason: "old budget",
@@ -206,9 +209,11 @@ test("Fusion worker continuation resets round state and records its budget basel
     uncachedWindDownSentAt: "2026-09-27T00:00:00.000Z",
     lastLivenessAt: "2026-09-27T00:00:00.000Z"
   });
-  const reopened = reopenWorkerContinuation(prior, at);
+  const reopened = reopenWorkerContinuation(prior, at, 1024);
 
-  assert.deepStrictEqual(reopened.budgetBaseline, { at, turns: 62, outputTokens: 97_000, uncachedTokens: 721_000 });
+  assert.deepStrictEqual(reopened.budgetBaseline, { at, turns: 62, outputTokens: 97_000, uncachedTokens: 721_000, toolCalls: 0, usage: { inputTokens: 0, cacheCreationInputTokens: 0, cacheReadInputTokens: 0, outputTokens: 97_000, totalTokens: 0, uncachedTokens: 721_000 } });
+  assert.strictEqual(reopened.continuationNotificationFloor, 1024);
+  assert.deepStrictEqual([reopened.stopBlockCount, reopened.cancelAttemptCount], [0, 0]);
   assert.strictEqual(reopened.transportStatus, "running");
   assert.strictEqual(reopened.lastLivenessAt, at);
   assert.deepStrictEqual(Object.fromEntries(["terminalWriteGraceUsedAt", "cancelReason", "cancelRequestedAt", "windDownContextSentAt", "tokenWindDownSentAt", "uncachedWindDownSentAt"].map((key) => [key, reopened[key]])), {
@@ -222,6 +227,89 @@ test("Fusion worker continuation resets round state and records its budget basel
   assert.strictEqual(reopened.retryCount, 0);
   assert.strictEqual(reopened.continuations[0].acceptance, "accepted");
   assert.strictEqual(reopened.continuations[0].transportStatus, "done");
+});
+
+test("reopened Fusion worker keeps its transcript cursor and counts only appended messages", (t) => {
+  const directory = sandbox(t);
+  const transcript = path.join(directory, "agent.jsonl");
+  const line = (id, outputTokens = 2) => `${JSON.stringify({ type: "assistant", requestId: id, message: { id, usage: { input_tokens: 3, output_tokens: outputTokens }, content: [{ type: "tool_use", id: `tool-${id}` }] } })}\n`;
+  fs.writeFileSync(transcript, line("old"));
+  const prior = refreshWorkerTranscript(unverifiedRecord({ agentType: "fusion:claude-worker", turns: 0, toolCalls: 0, usage: {} }), transcript);
+  const reopened = reopenWorkerContinuation(prior, "2026-09-27T00:01:00.000Z");
+  assert.strictEqual(reopened.transcriptPath, transcript);
+  assert.strictEqual(reopened.transcriptOffset, prior.transcriptOffset);
+  assert.deepStrictEqual([reopened.usageMessages, reopened.turnIds, reopened.toolUseIds], [{}, [], []]);
+  assert.deepStrictEqual([reopened.turns, reopened.toolCalls, reopened.usage.outputTokens, reopened.usage.uncachedTokens], [1, 1, 2, 5]);
+  assert.deepStrictEqual(refreshWorkerTranscript(reopened, transcript), { ...reopened, transcriptBacklogBytes: 0 });
+  fs.appendFileSync(transcript, line("new"));
+  const refreshed = refreshWorkerTranscript(reopened, transcript);
+  assert.deepStrictEqual([refreshed.turns, refreshed.toolCalls, refreshed.usage.outputTokens, refreshed.usage.uncachedTokens], [2, 2, 4, 10]);
+  assert.deepStrictEqual(Object.keys(refreshed.usageMessages), ["new"]);
+  assert.deepStrictEqual([refreshed.turnIds, refreshed.toolUseIds], [["new"], ["tool-new"]]);
+  assert.deepStrictEqual(refreshWorkerTranscript(refreshed, transcript), refreshed);
+  const alias = path.join(directory, "agent-alias.jsonl");
+  fs.symlinkSync(transcript, alias);
+  const aliased = refreshWorkerTranscript(refreshed, alias);
+  assert.strictEqual(aliased.transcriptOffset, refreshed.transcriptOffset);
+  assert.deepStrictEqual([aliased.turns, aliased.toolCalls, aliased.usage.outputTokens, aliased.usage.uncachedTokens], [2, 2, 4, 10]);
+  const otherTranscript = path.join(directory, "other.jsonl");
+  fs.writeFileSync(otherTranscript, line("new") + line("other", 4));
+  const switched = refreshWorkerTranscript(refreshed, otherTranscript);
+  assert.strictEqual(switched.transcriptOffset, fs.statSync(otherTranscript).size);
+  assert.deepStrictEqual([switched.turns, switched.toolCalls, switched.usage.outputTokens, switched.usage.uncachedTokens], [3, 3, 8, 17]);
+  assert.deepStrictEqual(switched.turnIds, ["new", "other"]);
+});
+
+test("reopened Fusion worker totals advance after message and tool windows fill", (t) => {
+  const directory = sandbox(t);
+  const transcript = path.join(directory, "agent.jsonl");
+  const prior = unverifiedRecord({
+    agentType: "fusion:claude-worker",
+    transcriptPath: transcript,
+    turns: 2_100,
+    toolCalls: 2_100,
+    usage: { inputTokens: 6_300, cacheCreationInputTokens: 0, cacheReadInputTokens: 0, outputTokens: 4_200, totalTokens: 10_500, uncachedTokens: 10_500 },
+    usageMessages: Object.fromEntries(Array.from({ length: 512 }, (_, index) => [`old-${index}`, { inputTokens: 3, cacheCreationInputTokens: 0, cacheReadInputTokens: 0, outputTokens: 2, totalTokens: 5, uncachedTokens: 5 }])),
+    turnIds: Array.from({ length: 512 }, (_, index) => `old-${index}`),
+    toolUseIds: Array.from({ length: 2_048 }, (_, index) => `old-tool-${index}`)
+  });
+  fs.writeFileSync(transcript, `${JSON.stringify({ type: "assistant", requestId: "old", message: { id: "old", usage: { output_tokens: 99 } } })}\n`);
+  prior.transcriptOffset = fs.statSync(transcript).size;
+  let current = reopenWorkerContinuation(prior, "2026-09-27T00:01:00.000Z");
+  const lines = Array.from({ length: 2_060 }, (_, index) => JSON.stringify({ type: "assistant", requestId: `new-${index}`, message: { id: `new-${index}`, usage: { input_tokens: 3, output_tokens: 2 }, content: [{ type: "tool_use", id: `new-tool-${index}` }] } }));
+  fs.appendFileSync(transcript, `${lines.slice(0, 520).join("\n")}\n`);
+  current = refreshWorkerTranscript(current, transcript);
+  assert.deepStrictEqual([current.turns, current.toolCalls, current.usage.outputTokens, current.usage.uncachedTokens], [2_620, 2_620, 5_240, 13_100]);
+  fs.appendFileSync(transcript, `${lines.slice(520).join("\n")}\n`);
+  current = refreshWorkerTranscript(current, transcript);
+  assert.deepStrictEqual([current.turns, current.toolCalls, current.usage.outputTokens, current.usage.uncachedTokens], [4_160, 4_160, 8_320, 20_800]);
+  assert.deepStrictEqual([Object.keys(current.usageMessages).length, current.turnIds.length, current.toolUseIds.length], [512, 512, 2_048]);
+  assert.deepStrictEqual([current.transcriptRoundPrefix.turns, current.transcriptRoundPrefix.toolCalls, current.transcriptRoundPrefix.usage.outputTokens], [1_548, 12, 3_096]);
+  assert.deepStrictEqual(refreshWorkerTranscript(current, transcript), current);
+});
+
+test("reopened tool-response worker counts new transcript usage above its prior totals", (t) => {
+  const directory = sandbox(t);
+  const transcript = path.join(directory, "agent.jsonl");
+  fs.writeFileSync(transcript, `${JSON.stringify({ type: "assistant", requestId: "next", message: { id: "next", usage: { input_tokens: 4, output_tokens: 6 }, content: [{ type: "tool_use", id: "next-tool" }] } })}\n`);
+  const prior = unverifiedRecord({ agentType: "fusion:claude-worker", turns: 3, toolCalls: 7, toolCallsSource: "tool-response", usageSource: "tool-response", usage: { inputTokens: 10, cacheCreationInputTokens: 20, cacheReadInputTokens: 80, outputTokens: 6, totalTokens: 116, uncachedTokens: 36 } });
+  const reopened = reopenWorkerContinuation(prior, "2026-09-27T00:01:00.000Z");
+  const refreshed = refreshWorkerTranscript(reopened, transcript);
+  assert.deepStrictEqual([refreshed.turns, refreshed.toolCalls, refreshed.usage.outputTokens, refreshed.usage.uncachedTokens], [4, 8, 12, 46]);
+  assert.strictEqual(refreshed.usageSource, "agent-transcript");
+  assert.strictEqual(refreshed.toolCallsSource, "agent-transcript");
+  assert.deepStrictEqual(refreshWorkerTranscript(refreshed, transcript), refreshed);
+});
+
+test("peer continuation resets round counters without adding a Fusion budget baseline", () => {
+  const at = "2026-09-27T00:01:00.000Z";
+  const prior = unverifiedRecord({ agentType: "codex:codex-rescue", transcriptPath: "/tmp/peer.jsonl", transcriptOffset: 512, transcriptCarry: "partial", transcriptSkippingLine: true, stopBlockCount: 6, cancelAttemptCount: 2, retryCount: 1, terminalWriteGraceUsedAt: at, cancelReason: "old round", cancelRequestedAt: at, windDownContextSentAt: at, tokenWindDownSentAt: at, uncachedWindDownSentAt: at });
+  const reopened = reopenWorkerContinuation(prior, at, 2048);
+  assert.strictEqual(reopened.continuationNotificationFloor, 2048);
+  assert.deepStrictEqual([reopened.transcriptPath, reopened.transcriptOffset, reopened.transcriptCarry, reopened.transcriptSkippingLine], [null, 0, "", false]);
+  assert.deepStrictEqual([reopened.stopBlockCount, reopened.cancelAttemptCount, reopened.retryCount], [0, 0, 0]);
+  assert.deepStrictEqual([reopened.terminalWriteGraceUsedAt, reopened.cancelReason, reopened.cancelRequestedAt, reopened.windDownContextSentAt, reopened.tokenWindDownSentAt, reopened.uncachedWindDownSentAt], [null, null, null, null, null, null]);
+  assert.strictEqual(reopened.budgetBaseline, undefined);
 });
 
 test("unsettled continuation keeps its job id available for the next verdict", () => {
