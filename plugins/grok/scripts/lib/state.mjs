@@ -325,34 +325,42 @@ function linkedPathExists(linkPath) {
   }
 }
 
-function acquireReaperClaim(ownerDir) {
+function reaperClaimSlot(lockDir, token) {
+  return `${lockDir}.reap.${token}`;
+}
+
+function claimTeardownError(error) {
+  return ["ENOENT", "EINVAL", "ENOTDIR", "ENOTEMPTY"].includes(error?.code);
+}
+
+function acquireReaperClaim(lockDir, ownerToken) {
   const claim = {
     version: 1,
     token: randomBytes(16).toString("hex"),
     ownerPid: process.pid,
     ownerIdentity: lockOwnerIdentity()
   };
-  let slot = path.join(ownerDir, ".reap");
+  const primarySlot = reaperClaimSlot(lockDir, ownerToken);
+  let slot = primarySlot;
   const observedTokens = new Set();
   for (;;) {
     const existing = readLockRecord(slot);
     if (!existing) {
-      if (linkedPathExists(slot)) {
-        return null;
-      }
-      let candidate;
       try {
-        candidate = createLinkedOwner(slot, claim);
+        if (linkedPathExists(slot)) {
+          return null;
+        }
+        const candidate = createLinkedOwner(slot, claim);
+        if (candidate.published) {
+          return { slot, token: claim.token };
+        }
+        fs.rmSync(candidate.ownerDir, { recursive: true, force: true });
       } catch (error) {
-        if (error?.code === "ENOENT") {
+        if (claimTeardownError(error)) {
           return null;
         }
         throw error;
       }
-      if (candidate.published) {
-        return { slot, token: claim.token };
-      }
-      fs.rmSync(candidate.ownerDir, { recursive: true, force: true });
       continue;
     }
     if (!lockTargetsToken(slot, existing.token) || !lockOwnerWasReplaced(existing)) {
@@ -362,7 +370,26 @@ function acquireReaperClaim(ownerDir) {
       return null;
     }
     observedTokens.add(existing.token);
-    slot = path.join(ownerDir, `.reap-successor-${existing.token}`);
+    slot = `${primarySlot}.successor-${existing.token}`;
+  }
+}
+
+function cleanupReaperClaims(lockDir, ownerToken) {
+  const dir = path.dirname(lockDir);
+  const prefix = path.basename(reaperClaimSlot(lockDir, ownerToken));
+  let entries;
+  try {
+    entries = fs.readdirSync(dir);
+  } catch {
+    return;
+  }
+  for (const entry of entries) {
+    if (entry !== prefix && !entry.startsWith(`${prefix}.`)) {
+      continue;
+    }
+    try {
+      fs.rmSync(path.join(dir, entry), { recursive: true, force: true });
+    } catch {}
   }
 }
 
@@ -370,7 +397,7 @@ function reclaimReplacedLock(lockDir, observed) {
   if (!observed || !lockOwnerWasReplaced(observed)) {
     return false;
   }
-  const claim = acquireReaperClaim(lockOwnerDir(lockDir, observed.token));
+  const claim = acquireReaperClaim(lockDir, observed.token);
   if (!claim) {
     return false;
   }
@@ -392,7 +419,12 @@ function reclaimReplacedLock(lockDir, observed) {
     }
     throw error;
   } finally {
-    if (!reaped) {
+    if (reaped) {
+      try {
+        releaseLock(claim.slot, claim.token);
+      } catch {}
+      cleanupReaperClaims(lockDir, observed.token);
+    } else {
       releaseLock(claim.slot, claim.token);
     }
   }
