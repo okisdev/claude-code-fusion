@@ -132,12 +132,31 @@ test("Rendered model scores do not look like local edits", (t) => {
   const sandbox = makeSandbox(t);
   writeModelRouting(sandbox.modelRoutingFile);
   const rendered = renderRulesContent(CANONICAL, { routingPath: sandbox.modelRoutingFile });
+  assert.match(rendered, /^Lane defaults: codex quick gpt-6-sol@xhigh, volume gpt-6-luna@xhigh, flagship gpt-6-astra@xhigh; grok burst grok-4\.7-build-fast@low, independence grok-4\.7-build-fast@high, live-web grok-4\.7-build-fast@high, large-context grok-4\.6@medium\.$/m);
+  assert.strictEqual(hashRulesTemplate(rendered), hashRulesTemplate(CANONICAL));
   fs.mkdirSync(path.dirname(sandbox.rulesFile), { recursive: true });
   fs.writeFileSync(sandbox.rulesFile, rendered, "utf8");
   const result = run(sandbox);
   assert.strictEqual(result.status, 0);
   assert.strictEqual(result.stdout, "");
   assert.strictEqual(fs.readFileSync(sandbox.rulesFile, "utf8"), rendered);
+});
+
+test("Changing a lane default updates the live table without changing the rules template hash", (t) => {
+  const sandbox = makeSandbox(t);
+  writeModelRouting(sandbox.modelRoutingFile);
+  const before = renderRulesContent(CANONICAL, { routingPath: sandbox.modelRoutingFile });
+  fs.mkdirSync(path.dirname(sandbox.rulesFile), { recursive: true });
+  fs.writeFileSync(sandbox.rulesFile, before, "utf8");
+  const routing = JSON.parse(fs.readFileSync(sandbox.modelRoutingFile, "utf8"));
+  routing.defaults = { codex: { quick: { model: "codex", effort: "max" } } };
+  fs.writeFileSync(sandbox.modelRoutingFile, `${JSON.stringify(routing)}\n`, "utf8");
+  const result = run(sandbox);
+  assert.strictEqual(result.status, 0, result.stderr);
+  assert.strictEqual(result.stdout, "");
+  const after = fs.readFileSync(sandbox.rulesFile, "utf8");
+  assert.match(after, /^Lane defaults: codex quick codex@max, volume gpt-6-luna@xhigh/m);
+  assert.strictEqual(hashRulesTemplate(after), hashRulesTemplate(before));
 });
 
 test("Invalid model routing leaves the existing live table intact and warns", (t) => {
@@ -237,8 +256,8 @@ test("Grok rules document source verified headless boundaries", () => {
   const subagentSentence = "Upstream parses `--no-subagents`, but the single-turn and agent resolvers do not forward it, while the interactive TUI does apply it; the hard Agent tool deny and `GROK_SUBAGENTS=0` are the effective headless controls.";
   const rustLogSentence = "Every run forces `RUST_LOG=xai_grok_agent::builder=debug,xai_grok_sandbox=warn,xai_grok_shell::session::acp_session::turn=warn`.";
   const bubblewrapSentence = "On Linux, a strict profile with deny paths re-executes under bubblewrap and refuses to start when `bwrap` is missing or unusable; macOS has no equivalent hard enforcement and relies on Seatbelt application plus best-effort tool denies.";
-  const freshSessionSentence = "A new goal after a heavy implementation goal prefers a fresh session because orchestrator cache reread cost is context size times turns; `FUSION_PARENT_CONTEXT_ADVISORY_BYTES` names the parent context advisory threshold.";
-  const volumeTierSentence = "Research digests, review triage, doc summaries, and mechanical checks default to gpt-5.6-luna at effort xhigh.";
+  const freshSessionSentence = "A new goal after a heavy implementation goal prefers a fresh session because orchestrator cache reread cost is context size times turns; `FUSION_PARENT_CONTEXT_ADVISORY_TOKENS` names the parent context advisory threshold in context tokens.";
+  const volumeTierSentence = "Research digests, review triage, doc summaries, and mechanical checks default to the codex volume lane default.";
   const volumePeerOffloadSentence = "Independent bounded packages overflow to Grok under `burst` when the Codex slot is busy.";
   const volumeRoutingDefectSentence = "Leaving the volume tiers idle while this work runs on premium lanes is a routing defect.";
   const balanceCheckSentence = "Balance check: on a delegating project, peer lanes carry a meaningful share of implementation output. A session where Claude worker lanes absorb spec grade or quick scoped packages while Codex sits idle is a routing defect.";
@@ -394,8 +413,8 @@ test("Grok rules document source verified headless boundaries", () => {
   assert.match(contract, /Upstream wires only `bypassPermissions` at spawn/);
   assert.match(contract, /Upstream ships ACP today/);
   assert.match(contract, /The companion has not adopted ACP yet and continues per-call invocation/);
-  assert.match(codexContract, /failureKind: "setup".*below the tested minimum 0\.152\.0/);
-  assert.match(codexContract, /The tested interval runs from 0\.152\.0 up to but excluding 0\.155\.0; versions below 0\.152\.0 fail task and review preflight with a setup error; versions at or above 0\.155\.0 keep running task and review preflight while `\/codex:setup` reports not ready with exit code 1 as the compatibility advisory/);
+  assert.match(codexContract, /failureKind: "setup".*below the tested minimum 0\.154\.0/);
+  assert.match(codexContract, /The tested interval runs from 0\.154\.0 up to but excluding 0\.158\.0; versions below 0\.154\.0 fail task and review preflight with a setup error; versions at or above 0\.158\.0 keep running task and review preflight while `\/codex:setup` reports not ready with exit code 1 as the compatibility advisory/);
   assert.match(codexContract, /Codex configuration parse failures under `--strict-config`.*failureKind: "process"/);
   assert.match(sharedContract, /The Grok instance adds `sandbox`[^\n]*`transport`[^\n]*`policy`[^\n]*`turn_limit`[^\n]*and `network`/);
   assert.match(sharedContract, /`setup`: The installed CLI version or installation lacks a required adapter capability and fails capability preflight/);
@@ -416,7 +435,7 @@ test("Grok rules document source verified headless boundaries", () => {
   assert.match(doctor, /successful Grok collection remains unverified until `\/fusion:stats --record <fusion-task-id>=<accepted\|rejected>`/i);
   assert.match(doctor, /`GROK_WEB_FETCH` is pinned by web mode, `GROK_AUTO_WAKE` and `GROK_MANAGED_MCP_GATEWAY_TOOLS_ENABLED` are pinned false/);
   for (const text of [readme, security]) {
-    assert.match(text, /introduced in 0\.2\.112, verified through 1\.0\.30/);
+    assert.match(text, /introduced in 0\.2\.112, verified through 1\.0\.41/);
     assert.match(text, /file that is unlinked (?:immediately after open|as soon as it is opened)/);
     assert.match(text, /all of `\/private\/var\/folders`/);
     assert.match(text, /native MCP servers, plugins, or hooks/);
