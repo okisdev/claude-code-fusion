@@ -655,17 +655,43 @@ function digest(value) {
   return createHash("sha256").update(String(value)).digest("hex");
 }
 
+let cachedBootMarker = null;
+let cachedOwnProcessIdentity = null;
+
+function hostBootMarker(env) {
+  if (cachedBootMarker) {
+    return cachedBootMarker;
+  }
+  if (process.platform === "linux") {
+    try {
+      cachedBootMarker = fs.readFileSync("/proc/sys/kernel/random/boot_id", "utf8").trim() || null;
+    } catch {
+      return null;
+    }
+    return cachedBootMarker;
+  }
+  const boot = process.platform === "darwin"
+    ? spawnSync("sysctl", ["-n", "kern.boottime"], { encoding: "utf8", env, timeout: 2000, windowsHide: true })
+    : spawnSync("uptime", ["-s"], { encoding: "utf8", env, timeout: 2000, windowsHide: true });
+  const bootValue = String(boot.stdout ?? "").trim();
+  if (boot.status !== 0 || !bootValue) {
+    return null;
+  }
+  const darwinBoot = process.platform === "darwin" ? bootValue.match(/\bsec\s*=\s*(\d+)\s*,\s*usec\s*=\s*(\d+)\b/) : null;
+  cachedBootMarker = darwinBoot ? `${darwinBoot[1]}.${darwinBoot[2]}` : digest(bootValue);
+  return cachedBootMarker;
+}
+
 function linuxProcessIdentity(pid) {
   let stat;
-  let bootId;
   let command;
   try {
     stat = fs.readFileSync(`/proc/${pid}/stat`, "utf8");
-    bootId = fs.readFileSync("/proc/sys/kernel/random/boot_id", "utf8").trim();
     command = fs.readFileSync(`/proc/${pid}/cmdline`);
   } catch {
     return null;
   }
+  const bootId = hostBootMarker();
   const commandEnd = stat.lastIndexOf(")");
   if (commandEnd === -1 || !bootId) {
     return null;
@@ -698,20 +724,16 @@ function bsdProcessIdentity(pid) {
     timeout: 2000,
     windowsHide: true
   });
-  const boot = process.platform === "darwin"
-    ? spawnSync("sysctl", ["-n", "kern.boottime"], { encoding: "utf8", env, timeout: 2000, windowsHide: true })
-    : spawnSync("uptime", ["-s"], { encoding: "utf8", env, timeout: 2000, windowsHide: true });
   const startMarker = String(started.stdout ?? "").trim().replace(/\s+/g, " ");
   const commandValue = String(command.stdout ?? "").trim();
-  const bootValue = String(boot.stdout ?? "").trim();
-  if (started.status !== 0 || command.status !== 0 || boot.status !== 0 || !startMarker || !commandValue || !bootValue) {
+  const bootMarker = hostBootMarker(env);
+  if (started.status !== 0 || command.status !== 0 || !bootMarker || !startMarker || !commandValue) {
     return null;
   }
-  const darwinBoot = process.platform === "darwin" ? bootValue.match(/\bsec\s*=\s*(\d+)\s*,\s*usec\s*=\s*(\d+)\b/) : null;
   return {
     version: 1,
     platform: process.platform,
-    bootMarker: darwinBoot ? `${darwinBoot[1]}.${darwinBoot[2]}` : digest(bootValue),
+    bootMarker,
     startMarker,
     commandHash: digest(commandValue)
   };
@@ -731,16 +753,22 @@ function validProcessIdentity(value) {
 }
 
 export function getProcessIdentity(pid) {
+  if (pid === process.pid && cachedOwnProcessIdentity) {
+    return cachedOwnProcessIdentity;
+  }
   if (!directProcessAlive(pid)) {
     return null;
   }
+  let identity = null;
   if (process.platform === "linux") {
-    return linuxProcessIdentity(pid);
+    identity = linuxProcessIdentity(pid);
+  } else if (process.platform === "darwin" || process.platform === "freebsd" || process.platform === "openbsd") {
+    identity = bsdProcessIdentity(pid);
   }
-  if (process.platform === "darwin" || process.platform === "freebsd" || process.platform === "openbsd") {
-    return bsdProcessIdentity(pid);
+  if (pid === process.pid && identity) {
+    cachedOwnProcessIdentity = identity;
   }
-  return null;
+  return identity;
 }
 
 export function processIdentityMatches(pid, expectedIdentity) {

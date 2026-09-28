@@ -25,6 +25,9 @@ const SEMANTIC_FAILURE_KINDS = new Set(["intent_override", "scope_rewrite", "wro
 const ACCEPTANCE_SOURCES = new Set(["collector", "main-loop", "stats"]);
 const JOB_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 const WORKSPACE_SLUG_PATTERN = /^.+-[a-f0-9]{16}$/;
+const GIT_CACHE_TTL_MS = 3000;
+const GIT_CACHE_MAX_ENTRIES = 128;
+const gitValueCache = new Map();
 
 export const DEFAULT_JOB_HISTORY_MAX_BYTES = 512 * 1024 * 1024;
 export const DEFAULT_JOB_HISTORY_MAX_RECORDS = 256;
@@ -58,6 +61,12 @@ function canonicalPath(value) {
 }
 
 function gitValue(cwd, args) {
+  const key = `${cwd}\0${args.join("\0")}`;
+  const cached = gitValueCache.get(key);
+  if (cached && cached.expiresAt > Date.now()) {
+    return cached.value;
+  }
+  gitValueCache.delete(key);
   const result = spawnSync("git", ["-C", cwd, ...args], {
     encoding: "utf8",
     stdio: ["ignore", "pipe", "ignore"]
@@ -66,6 +75,12 @@ function gitValue(cwd, args) {
     return null;
   }
   const value = String(result.stdout ?? "").trim();
+  if (value) {
+    if (gitValueCache.size >= GIT_CACHE_MAX_ENTRIES) {
+      gitValueCache.delete(gitValueCache.keys().next().value);
+    }
+    gitValueCache.set(key, { value, expiresAt: Date.now() + GIT_CACHE_TTL_MS });
+  }
   return value || null;
 }
 
@@ -95,7 +110,7 @@ function fsyncDirectory(dir) {
   }
 }
 
-function atomicWriteFile(file, content) {
+function atomicWriteFile(file, content, retryMissingDirectory = true) {
   const dir = path.dirname(file);
   const temp = `${file}.${process.pid}.${randomBytes(8).toString("hex")}.tmp`;
   const deadline = Date.now() + resolveLockTimeoutMs();
@@ -106,7 +121,7 @@ function atomicWriteFile(file, content) {
         ensurePrivateDir(dir);
         descriptor = fs.openSync(temp, "wx", PRIVATE_FILE_MODE);
       } catch (error) {
-        if (error?.code !== "ENOENT" || Date.now() >= deadline) {
+        if (error?.code !== "ENOENT" || !retryMissingDirectory || Date.now() >= deadline) {
           throw error;
         }
         sleepMs(LOCK_RETRY_MS);
@@ -234,11 +249,11 @@ function publishPreparedLock(lockDir, ownerDir) {
   }
 }
 
-function createLinkedOwner(linkPath, record) {
+function createLinkedOwner(linkPath, record, retryMissingDirectory = true) {
   const ownerDir = lockOwnerDir(linkPath, record.token);
   fs.mkdirSync(ownerDir, { mode: PRIVATE_DIR_MODE });
   try {
-    atomicWriteFile(path.join(ownerDir, "owner.json"), `${JSON.stringify(record)}\n`);
+    atomicWriteFile(path.join(ownerDir, "owner.json"), `${JSON.stringify(record)}\n`, retryMissingDirectory);
     return { ownerDir, published: publishPreparedLock(linkPath, ownerDir) };
   } catch (error) {
     try {
@@ -268,34 +283,42 @@ function linkedPathExists(linkPath) {
   }
 }
 
-function acquireReaperClaim(ownerDir) {
+function acquireReaperClaim(lockDir, deadToken) {
   const claim = {
     version: 1,
     token: randomBytes(16).toString("hex"),
     ownerPid: process.pid,
     ownerIdentity: lockOwnerIdentity()
   };
-  let slot = path.join(ownerDir, ".reap");
+  const claimBase = `${lockOwnerDir(lockDir, deadToken)}.reap`;
+  let slot = claimBase;
   const observedTokens = new Set();
+  const predecessors = [];
   for (;;) {
+    if (!lockTargetsToken(lockDir, deadToken)) {
+      return null;
+    }
     const existing = readLockRecord(slot);
     if (!existing) {
-      if (linkedPathExists(slot)) {
-        return null;
-      }
-      let candidate;
       try {
-        candidate = createLinkedOwner(slot, claim);
+        if (linkedPathExists(slot)) {
+          return null;
+        }
+        const candidate = createLinkedOwner(slot, claim, false);
+        if (candidate.published) {
+          if (!lockTargetsToken(lockDir, deadToken)) {
+            releaseLock(slot, claim.token);
+            return null;
+          }
+          return { slot, token: claim.token, predecessors };
+        }
+        fs.rmSync(candidate.ownerDir, { recursive: true, force: true });
       } catch (error) {
-        if (error?.code === "ENOENT") {
+        if (["ENOENT", "EINVAL", "ENOTDIR", "ENOTEMPTY"].includes(error?.code)) {
           return null;
         }
         throw error;
       }
-      if (candidate.published) {
-        return { slot, token: claim.token };
-      }
-      fs.rmSync(candidate.ownerDir, { recursive: true, force: true });
       continue;
     }
     if (!lockTargetsToken(slot, existing.token) || !lockOwnerWasReplaced(existing)) {
@@ -305,7 +328,8 @@ function acquireReaperClaim(ownerDir) {
       return null;
     }
     observedTokens.add(existing.token);
-    slot = path.join(ownerDir, `.reap-successor-${existing.token}`);
+    predecessors.push({ slot, token: existing.token });
+    slot = `${claimBase}-successor-${existing.token}`;
   }
 }
 
@@ -313,7 +337,7 @@ function reclaimReplacedLock(lockDir, observed) {
   if (!observed || !lockOwnerWasReplaced(observed)) {
     return false;
   }
-  const claim = acquireReaperClaim(lockOwnerDir(lockDir, observed.token));
+  const claim = acquireReaperClaim(lockDir, observed.token);
   if (!claim) {
     return false;
   }
@@ -333,8 +357,11 @@ function reclaimReplacedLock(lockDir, observed) {
     }
     throw error;
   } finally {
-    if (!reaped) {
-      releaseLock(claim.slot, claim.token);
+    releaseLock(claim.slot, claim.token);
+    if (reaped) {
+      for (const predecessor of claim.predecessors) {
+        releaseLock(predecessor.slot, predecessor.token);
+      }
     }
   }
 }

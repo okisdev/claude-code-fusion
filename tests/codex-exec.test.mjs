@@ -205,6 +205,48 @@ process.stdout.write(JSON.stringify(getProcessIdentity(Number(pid))));
   assert.deepEqual(JSON.parse(west.stdout), JSON.parse(east.stdout));
 });
 
+test("foreign process identities reuse one host boot marker", (t) => {
+  if (!["darwin", "freebsd", "openbsd"].includes(process.platform)) {
+    t.skip("ps-backed process identities are unavailable on this platform");
+    return;
+  }
+  if (!getProcessIdentity(process.pid)) {
+    t.skip("process inspection unavailable in this environment");
+    return;
+  }
+  const files = fixture(t);
+  const bin = path.join(files.dir, "bin");
+  const psTrace = path.join(files.dir, "ps.log");
+  const bootTrace = path.join(files.dir, "boot.log");
+  const realPs = spawnSync("sh", ["-c", "command -v ps"], { encoding: "utf8" }).stdout.trim();
+  const bootCommand = process.platform === "darwin" ? "sysctl" : "uptime";
+  const realBoot = spawnSync("sh", ["-c", `command -v ${bootCommand}`], { encoding: "utf8" }).stdout.trim();
+  fs.mkdirSync(bin);
+  fs.writeFileSync(path.join(bin, "ps"), '#!/bin/sh\nprintf "%s\\n" "$*" >> "$CODEX_PS_TRACE"\nexec "$CODEX_REAL_PS" "$@"\n', { mode: 0o755 });
+  fs.writeFileSync(path.join(bin, bootCommand), '#!/bin/sh\nprintf "%s\\n" "$*" >> "$CODEX_BOOT_TRACE"\nexec "$CODEX_REAL_BOOT" "$@"\n', { mode: 0o755 });
+  const source = `
+const [moduleUrl, parentPid] = process.argv.slice(1);
+const { getProcessIdentity } = await import(moduleUrl);
+process.stdout.write(JSON.stringify([
+  getProcessIdentity(process.pid),
+  getProcessIdentity(Number(parentPid)),
+  getProcessIdentity(Number(parentPid))
+]));
+`;
+  const result = spawnSync(process.execPath, ["--input-type=module", "--eval", source, codexExecModuleUrl, String(process.pid)], {
+    encoding: "utf8",
+    env: { ...process.env, PATH: `${bin}${path.delimiter}${process.env.PATH}`, CODEX_PS_TRACE: psTrace, CODEX_REAL_PS: realPs, CODEX_BOOT_TRACE: bootTrace, CODEX_REAL_BOOT: realBoot }
+  });
+  assert.equal(result.status, 0, result.stderr);
+  const [own, first, second] = JSON.parse(result.stdout);
+  assert.ok(own);
+  assert.ok(first);
+  assert.deepEqual(second, first);
+  assert.equal(own.bootMarker, first.bootMarker);
+  assert.equal(fs.readFileSync(psTrace, "utf8").trim().split("\n").length, 6);
+  assert.equal(fs.readFileSync(bootTrace, "utf8").trim().split("\n").length, 1);
+});
+
 test("a persisted leader identity cannot authorize signaling a leaderless process group", async (t) => {
   if (process.platform === "win32") {
     t.skip("POSIX process groups are unavailable on Windows.");
@@ -1060,7 +1102,7 @@ test("timeout escalates from INT through TERM to KILL when Codex ignores INT and
 test("incomplete timeout cleanup remains nonterminal with process evidence", async (t) => {
   const startedAt = Date.now();
   const { outcome } = await runFixture(t, "inherited-pipe", {
-    timeoutMs: 50,
+    timeoutMs: 2000,
     terminationGraceMs: 50,
     waitForReady: true
   });

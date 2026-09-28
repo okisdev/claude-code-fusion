@@ -1128,7 +1128,9 @@ function scanFlagshipForegroundWriteStat(dataDir) {
         const file = path.join(directory, entry.name);
         try {
           const stats = fs.statSync(file);
-          files.push({ file, modifiedAt: stats.mtimeMs, size: stats.size });
+          if (stats.mtimeMs >= cutoff) {
+            files.push({ file, modifiedAt: stats.mtimeMs, size: stats.size });
+          }
         } catch {}
       }
     }
