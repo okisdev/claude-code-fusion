@@ -4,7 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
 
-import { getProcessIdentity, processIdentityMatches } from "./codex-exec.mjs";
+import { getProcessIdentity, isProcessAlive, processIdentityMatches } from "./codex-exec.mjs";
 
 const DATA_DIR_ENV = "CODEX_COMPANION_DATA";
 const JOB_SCHEMA_VERSION = 1;
@@ -203,15 +203,7 @@ function sameLockIdentity(left, right) {
 }
 
 function directLockOwnerAlive(pid) {
-  if (!Number.isInteger(pid) || pid <= 1) {
-    return false;
-  }
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (error) {
-    return error?.code === "EPERM";
-  }
+  return isProcessAlive(pid, null, false);
 }
 
 function lockOwnerWasReplaced(record) {
@@ -404,7 +396,8 @@ function describeLockHolder(lockDir, observed) {
     heldSeconds = Math.round((Date.now() - fs.statSync(lockOwnerDir(lockDir, observed.token)).mtimeMs) / 100) / 10;
   } catch {}
   const alive = directLockOwnerAlive(observed.ownerPid);
-  const state = !alive ? "not running" : processIdentityMatches(observed.ownerPid, observed.ownerIdentity) ? "alive" : "alive with a different identity";
+  const current = alive ? getProcessIdentity(observed.ownerPid) : null;
+  const state = !alive ? "not running" : !current ? "alive, identity unreadable" : processIdentityMatches(observed.ownerPid, observed.ownerIdentity) ? "alive" : "alive with a different identity";
   const command = alive ? lockHolderCommand(observed.ownerPid).slice(0, 200) : "";
   return ` Held by pid ${observed.ownerPid} (${state})${heldSeconds == null ? "" : ` for ${heldSeconds}s`}${command ? `: ${command}` : ""}.`;
 }

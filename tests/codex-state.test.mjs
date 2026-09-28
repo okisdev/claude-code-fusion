@@ -602,6 +602,52 @@ test("three processes serialize on the same thread lock", async (t) => {
   assert.strictEqual(fs.existsSync(`${traceFile}.guard`), false);
 });
 
+test("a lock whose dead owner is not yet reaped is reclaimed on Linux", (t) => {
+  if (process.platform !== "linux") {
+    t.skip("Linux only: a zombie keeps answering signal 0 while its identity reads as gone.");
+    return;
+  }
+  const sandbox = makeSandbox(t);
+  const record = createJobRecord({ id: "zombie-owner", cwd: sandbox.workDir, status: "running" });
+  const file = jobFilePath(sandbox.dataDir, sandbox.workDir, record.id);
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  writeJobRecordFile(file, record);
+  const lockedFile = path.join(sandbox.root, "zombie-owner-locked");
+  const child = spawn(process.execPath, ["--input-type=module", "-e", `
+    import fs from "node:fs";
+    const state = await import(${JSON.stringify(stateModuleUrl)});
+    state.updateJobRecordFileWithCurrent(${JSON.stringify(file)}, () => {
+      fs.writeFileSync(${JSON.stringify(lockedFile)}, "locked");
+      process.exit(0);
+    });
+  `], { stdio: "ignore" });
+  const zombie = () => {
+    try {
+      const stat = fs.readFileSync(`/proc/${child.pid}/stat`, "utf8");
+      return stat.slice(stat.lastIndexOf(")") + 2).startsWith("Z");
+    } catch {
+      return false;
+    }
+  };
+  const deadline = Date.now() + 15000;
+  while (!(fs.existsSync(lockedFile) && zombie()) && Date.now() < deadline) {
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10);
+  }
+  assert.ok(fs.existsSync(lockedFile) && zombie(), "Expected the lock owner to exit holding the lock and stay unreaped.");
+  const previous = process.env.CODEX_COMPANION_LOCK_TIMEOUT_MS;
+  process.env.CODEX_COMPANION_LOCK_TIMEOUT_MS = "3000";
+  try {
+    const updated = updateJobRecordFileWithCurrent(file, () => ({ phase: "reclaimed" }));
+    assert.strictEqual(updated.phase, "reclaimed");
+  } finally {
+    if (previous === undefined) {
+      delete process.env.CODEX_COMPANION_LOCK_TIMEOUT_MS;
+    } else {
+      process.env.CODEX_COMPANION_LOCK_TIMEOUT_MS = previous;
+    }
+  }
+});
+
 test("a held thread lock times out a second acquirer within the configured ceiling", async (t) => {
   const sandbox = makeSandbox(t);
   const threadId = "contended-thread";
