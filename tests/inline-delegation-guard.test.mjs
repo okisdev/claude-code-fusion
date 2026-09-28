@@ -45,6 +45,7 @@ function envFor(sandbox, extra = {}) {
     FUSION_INLINE_GUARD_STATE: sandbox.stateDir,
     FUSION_INLINE_GUARD_AUDIT_DIR: sandbox.auditDir,
     FUSION_DATA_DIR: sandbox.dataDir,
+    FUSION_MODEL_ROUTING: path.join(sandbox.root, "missing-model-routing.json"),
     ...extra
   };
   if (extra.FUSION_TEST_NOW) {
@@ -134,6 +135,26 @@ function dispatchPayload(sandbox, { sessionId = "session-1", toolName = "Agent",
     payload.agent_type = "Explore";
   }
   return payload;
+}
+
+function writeDispatchTranscript(sandbox, groups) {
+  fs.writeFileSync(path.join(sandbox.root, "transcript.jsonl"), `${groups.map(({ messageId, payloads }) => JSON.stringify({
+    type: "assistant",
+    message: { id: messageId, content: payloads.map((payload) => ({ type: "tool_use", id: payload.tool_use_id })) }
+  })).join("\n")}\n`, "utf8");
+}
+
+function writeRoutingFixture(sandbox) {
+  const file = path.join(sandbox.root, "model-routing.json");
+  const models = ["quick-choice", "volume-choice", "flagship-choice"].map((id) => ({ id, lane: "codex", intelligence: 5, taste: 4, cost: 3 }));
+  fs.writeFileSync(file, JSON.stringify({
+    schemaVersion: 1,
+    updatedAt: "2026-07-04T00:00:00.000Z",
+    costProfile: "",
+    models,
+    defaults: { codex: { quick: { model: "quick-choice", effort: "high" }, volume: { model: "volume-choice", effort: "low" }, flagship: { model: "flagship-choice", effort: "max" } } }
+  }), "utf8");
+  return file;
 }
 
 function verificationPayload(sandbox, { sessionId = "session-1", command = "node --test", toolResponse = {} } = {}) {
@@ -623,7 +644,7 @@ test("strict posture ignores a passing verification and preserves the strict den
     JSON.parse(sixth.stdout).hookSpecificOutput.permissionDecisionReason,
     tagMessage(
       "inline-guard.write-budget-deny",
-      "5 inline writes happened this session with zero dispatches. Lanes: quick scoped work goes to the codex quick tier gpt-5.6-terra at effort xhigh; trivial or high volume work goes to gpt-5.6-luna at effort xhigh; work needing the Claude Code tool surface goes to fusion:claude-worker. The inline write budget is exhausted. Dispatch an Agent or Task before another main-loop write."
+      "5 inline writes happened this session with zero dispatches. Lanes: quick scoped work goes to the codex quick default gpt-6-sol at effort xhigh; trivial or high volume work goes to the codex volume default gpt-6-luna at effort xhigh; work needing the Claude Code tool surface goes to fusion:claude-worker. The inline write budget is exhausted. Dispatch an Agent or Task before another main-loop write."
     )
   );
   assert.strictEqual(readAuditRecords(sandbox).filter((record) => record.event === "verification").length, 0);
@@ -693,10 +714,22 @@ test("judgment posture uses the exact unverified advisory and the guard omits th
     output.hookSpecificOutput.permissionDecisionReason,
     tagMessage(
       "inline-guard.unverified-advisory",
-      "5 main loop writes are unverified in this window. Run this change's verification command once it is coherent, or hand the remaining work to a lane. Lanes: quick scoped work goes to the codex quick tier gpt-5.6-terra at effort xhigh; trivial or high volume work goes to gpt-5.6-luna at effort xhigh; work needing the Claude Code tool surface goes to fusion:claude-worker. This session has not dispatched yet; if the remaining work splits into independent packages, dispatch them together in one message, and three or more convene /fusion:ultra."
+      "5 main loop writes are unverified in this window. Run this change's verification command once it is coherent, or hand the remaining work to a lane. Lanes: quick scoped work goes to the codex quick default gpt-6-sol at effort xhigh; trivial or high volume work goes to the codex volume default gpt-6-luna at effort xhigh; work needing the Claude Code tool surface goes to fusion:claude-worker. This session has not dispatched yet; if the remaining work splits into independent packages, dispatch them together in one message, and three or more convene /fusion:ultra."
     )
   );
   assert.doesNotMatch(fs.readFileSync(script, "utf8"), /fast-worker/);
+});
+
+test("lane hints render the configured codex quick and volume defaults", (t) => {
+  const sandbox = makeSandbox(t);
+  const routingFile = writeRoutingFixture(sandbox);
+  const env = { FUSION_MODEL_ROUTING: routingFile };
+  for (let index = 0; index < 4; index += 1) {
+    assert.strictEqual(run(sandbox, writePayload(sandbox), env).stdout, "");
+  }
+  const result = run(sandbox, writePayload(sandbox), env);
+  const context = JSON.parse(result.stdout).hookSpecificOutput.permissionDecisionReason;
+  assert.match(context, /Lanes: quick scoped work goes to the codex quick default quick-choice at effort high; trivial or high volume work goes to the codex volume default volume-choice at effort low; work needing the Claude Code tool surface goes to fusion:claude-worker\./);
 });
 
 test("audit normalization accepts verification posture and every legacy event category", () => {
@@ -749,6 +782,16 @@ test("audit normalization accepts verification posture and every legacy event ca
   assert.ok(legacyEvents.every((event) => !Object.hasOwn(normalizeAuditEvent(event), "posture")));
   assert.ok(legacyEvents.every((event) => normalizeAuditEvent({ ...event, messageCode: 1000 }).messageCode === 1000));
   assert.ok(legacyEvents.every((event) => normalizeAuditEvent({ ...event, messageCode: 9999 }).messageCode === 9999));
+});
+
+test("dispatch audit keeps only valid assistant message IDs", () => {
+  const event = { at: "2026-07-30T00:00:00.000Z", session: "session-1", event: "dispatch", lane: "codex", tool: "SendMessage" };
+  for (const messageId of ["message_123-abc", "x".repeat(128)]) {
+    assert.strictEqual(normalizeAuditEvent({ ...event, messageId }).messageId, messageId);
+  }
+  for (const messageId of ["", "x".repeat(129), "contains.dot", "has space", "has\nnewline", 42]) {
+    assert.ok(!Object.hasOwn(normalizeAuditEvent({ ...event, messageId }), "messageId"));
+  }
 });
 
 test("tail allowance environment overrides apply and zero disables it", (t) => {
@@ -1292,6 +1335,133 @@ test("Agent and Task dispatches append ledger entries with their computed lane",
     subagentType: "codex:codex-rescue",
     description: "implement the repair"
   });
+});
+
+test("assistant message IDs group dispatches fifteen seconds apart and split distinct messages within the gap", (t) => {
+  const sandbox = makeSandbox(t);
+  const first = dispatchPayload(sandbox, { subagentType: "codex:codex-rescue" });
+  const second = dispatchPayload(sandbox, { subagentType: "grok:grok-rescue" });
+  const third = dispatchPayload(sandbox, { subagentType: "codex:codex-rescue" });
+  writeDispatchTranscript(sandbox, [
+    { messageId: "wave_one", payloads: [first, second] },
+    { messageId: "wave_two", payloads: [third] }
+  ]);
+  const baseMs = Date.parse("2026-07-21T00:00:00.000Z");
+  const at = (offset) => ({ FUSION_FLEET_WAVE_GAP_MS: "10000", FUSION_TEST_NOW: new Date(baseMs + offset).toISOString() });
+
+  assert.strictEqual(run(sandbox, first, at(0)).stdout, "");
+  assert.strictEqual(run(sandbox, second, at(15000)).stdout, "");
+  let state = readState(sandbox, "session-1");
+  assert.strictEqual(state.fleetWaveWidth, 2);
+  assert.strictEqual(state.consecutiveNarrowWaves, 0);
+  assert.deepStrictEqual(state.dispatchLog.map((entry) => entry.messageId), ["wave_one", "wave_one"]);
+
+  assert.strictEqual(run(sandbox, third, at(16000)).stdout, "");
+  state = readState(sandbox, "session-1");
+  assert.strictEqual(state.fleetWaveWidth, 1);
+  assert.strictEqual(state.consecutiveNarrowWaves, 1);
+  assert.deepStrictEqual(readAuditRecords(sandbox).filter((event) => event.event === "dispatch").map((event) => event.messageId), ["wave_one", "wave_one", "wave_two"]);
+});
+
+test("missing transcripts and invalid assistant IDs leave messageId absent", (t) => {
+  const sandbox = makeSandbox(t);
+  const missing = dispatchPayload(sandbox);
+  assert.strictEqual(run(sandbox, missing).stdout, "");
+  const invalid = dispatchPayload(sandbox);
+  writeDispatchTranscript(sandbox, [{ messageId: "invalid.id", payloads: [invalid] }]);
+  assert.strictEqual(run(sandbox, invalid).stdout, "");
+  assert.ok(readState(sandbox, "session-1").dispatchLog.every((entry) => !Object.hasOwn(entry, "messageId")));
+  assert.ok(readAuditRecords(sandbox).filter((event) => event.event === "dispatch").every((event) => !Object.hasOwn(event, "messageId")));
+});
+
+test("different message IDs form narrow waves even without a time gap", (t) => {
+  const sandbox = makeSandbox(t);
+  const payloads = Array.from({ length: 3 }, () => dispatchPayload(sandbox));
+  writeDispatchTranscript(sandbox, payloads.map((payload, index) => ({ messageId: `message_${index}`, payloads: [payload] })));
+  const baseMs = Date.parse("2026-07-21T00:00:00.000Z");
+  const outputs = payloads.map((payload, index) => run(sandbox, payload, {
+    FUSION_FLEET_WAVE_GAP_MS: "10000",
+    FUSION_TEST_NOW: new Date(baseMs + index * 1000).toISOString()
+  }).stdout);
+  assert.deepStrictEqual(outputs.slice(0, 2), ["", ""]);
+  assert.match(JSON.parse(outputs[2]).hookSpecificOutput.additionalContext, /^2 consecutive width one dispatch waves/);
+  assert.strictEqual(readState(sandbox, "session-1").consecutiveNarrowWaves, 2);
+});
+
+test("an idless dispatch bridges different message IDs within the wave gap", (t) => {
+  const sandbox = makeSandbox(t);
+  const first = dispatchPayload(sandbox);
+  const middle = dispatchPayload(sandbox);
+  const last = dispatchPayload(sandbox);
+  writeDispatchTranscript(sandbox, [
+    { messageId: "A", payloads: [first] },
+    { messageId: "B", payloads: [last] }
+  ]);
+  const baseMs = Date.parse("2026-07-21T00:00:00.000Z");
+  const at = (offset) => ({ FUSION_FLEET_WAVE_GAP_MS: "10000", FUSION_TEST_NOW: new Date(baseMs + offset).toISOString() });
+
+  assert.strictEqual(run(sandbox, first, at(0)).stdout, "");
+  assert.strictEqual(run(sandbox, middle, at(1000)).stdout, "");
+  assert.strictEqual(run(sandbox, last, at(2000)).stdout, "");
+  const state = readState(sandbox, "session-1");
+  assert.deepStrictEqual(state.dispatchLog.map((entry) => entry.messageId ?? null), ["A", null, "B"]);
+  assert.strictEqual(state.fleetWaveWidth, 3);
+  assert.strictEqual(state.consecutiveNarrowWaves, 0);
+});
+
+test("SendMessage continuations of same-session rescue wrappers count as dispatches", (t) => {
+  const sandbox = makeSandbox(t);
+  const jobsDir = path.join(sandbox.root, "workers", "jobs");
+  fs.mkdirSync(jobsDir, { recursive: true });
+  fs.writeFileSync(path.join(jobsDir, "fusion-codex.json"), JSON.stringify({ taskId: "fusion-codex", sessionId: "session-1", agentType: "codex:codex-rescue", agentId: "codex-agent", backgroundTaskId: "codex-task", transportStatus: "done" }));
+  fs.writeFileSync(path.join(jobsDir, "fusion-claude.json"), JSON.stringify({ taskId: "fusion-claude", sessionId: "session-1", agentType: "fusion:claude-worker", agentId: "claude-agent", transportStatus: "done" }));
+  fs.writeFileSync(path.join(jobsDir, "fusion-other.json"), JSON.stringify({ taskId: "fusion-other", sessionId: "other-session", agentType: "grok:grok-rescue", agentId: "other-agent", transportStatus: "done" }));
+  const env = { FUSION_WORKER_STATE_DIR: path.dirname(jobsDir) };
+  const continuation = { ...dispatchPayload(sandbox, { toolName: "SendMessage" }), tool_input: { to: "codex-task", message: "continue" } };
+  const agentContinuation = { ...dispatchPayload(sandbox, { toolName: "SendMessage" }), tool_input: { to: "codex-agent", message: "continue again" } };
+  writeDispatchTranscript(sandbox, [{ messageId: "continuation_1", payloads: [continuation, agentContinuation] }]);
+
+  for (const to of ["other-agent", "unknown-agent"]) {
+    const ignored = { ...continuation, tool_input: { to, message: "continue" } };
+    assert.strictEqual(runRaw(sandbox, { ...ignored, hook_event_name: "PreToolUse" }, env).stdout, "");
+    assert.strictEqual(runRaw(sandbox, ignored, env).stdout, "");
+  }
+  assert.strictEqual(fs.existsSync(stateFileFor(sandbox, "session-1")), false);
+
+  assert.strictEqual(runRaw(sandbox, { ...continuation, hook_event_name: "PreToolUse" }, env).stdout, "");
+  assert.strictEqual(runRaw(sandbox, continuation, env).stdout, "");
+  assert.strictEqual(runRaw(sandbox, { ...agentContinuation, hook_event_name: "PreToolUse" }, env).stdout, "");
+  assert.strictEqual(runRaw(sandbox, agentContinuation, env).stdout, "");
+  const state = readState(sandbox, "session-1");
+  assert.deepStrictEqual(state.dispatches, { codex: 2 });
+  assert.strictEqual(state.fleetWaveWidth, 2);
+  assert.strictEqual(state.dispatchLog[0].lane, "codex");
+  assert.strictEqual(state.dispatchLog[0].messageId, "continuation_1");
+  assert.deepStrictEqual(readAuditRecords(sandbox).filter((event) => event.event === "dispatch").map((event) => ({ tool: event.tool, lane: event.lane, messageId: event.messageId })), [
+    { tool: "SendMessage", lane: "codex", messageId: "continuation_1" },
+    { tool: "SendMessage", lane: "codex", messageId: "continuation_1" }
+  ]);
+});
+
+test("same-session Fusion worker SendMessage continuation counts as a dispatch", (t) => {
+  const sandbox = makeSandbox(t);
+  const jobsDir = path.join(sandbox.root, "workers", "jobs");
+  fs.mkdirSync(jobsDir, { recursive: true });
+  fs.writeFileSync(path.join(jobsDir, "fusion-claude.json"), JSON.stringify({ taskId: "fusion-claude", sessionId: "session-1", agentType: "fusion:claude-worker", agentId: "claude-agent", backgroundTaskId: "claude-task", transportStatus: "done" }));
+  const env = { FUSION_WORKER_STATE_DIR: path.dirname(jobsDir) };
+  const continuation = { ...dispatchPayload(sandbox, { toolName: "SendMessage" }), tool_input: { to: "claude-task", message: "continue" } };
+  writeDispatchTranscript(sandbox, [{ messageId: "fusion_continuation", payloads: [continuation] }]);
+
+  assert.strictEqual(runRaw(sandbox, { ...continuation, hook_event_name: "PreToolUse" }, env).stdout, "");
+  assert.strictEqual(runRaw(sandbox, continuation, env).stdout, "");
+  const state = readState(sandbox, "session-1");
+  assert.strictEqual(state.dispatchLog.length, 1);
+  assert.strictEqual(state.dispatchLog[0].subagentType, "fusion:claude-worker");
+  assert.strictEqual(state.dispatchLog[0].messageId, "fusion_continuation");
+  assert.strictEqual(state.fleetWaveWidth, 1);
+  assert.deepStrictEqual(readAuditRecords(sandbox).filter((event) => event.event === "dispatch").map((event) => ({ tool: event.tool, lane: event.lane, messageId: event.messageId })), [
+    { tool: "SendMessage", lane: "fusion:claude-worker", messageId: "fusion_continuation" }
+  ]);
 });
 
 test("writes and dispatches append minimal long-term audit records", (t) => {
@@ -1840,6 +2010,21 @@ test("in-flight worker tasks deny no-op Bash true with the heartbeat reason", (t
   assert.strictEqual(output.hookSpecificOutput.permissionDecisionReason, NO_OP_HEARTBEAT_REASON);
 });
 
+test("in-flight signature follows the session index without reading other sessions", (t) => {
+  const sandbox = makeSandbox(t);
+  const ownTaskId = "fusion-indexed-worker";
+  const otherTaskId = "fusion-other-worker";
+  seedInFlightWorker(sandbox, { taskId: ownTaskId });
+  seedInFlightWorker(sandbox, { taskId: otherTaskId, sessionId: "session-2" });
+  const sessionsDir = path.join(sandbox.root, "workers", "sessions");
+  fs.mkdirSync(sessionsDir, { recursive: true });
+  fs.writeFileSync(path.join(sessionsDir, "session-1.json"), JSON.stringify({ taskIds: [ownTaskId] }));
+  fs.writeFileSync(path.join(sandbox.root, "workers", "jobs", `${otherTaskId}.json`), "not json");
+  const result = run(sandbox, bashPayload(sandbox, { command: "true" }), workerStateEnv(sandbox));
+  assert.strictEqual(result.status, 0);
+  assert.strictEqual(JSON.parse(result.stdout).hookSpecificOutput.permissionDecisionReason, NO_OP_HEARTBEAT_REASON);
+});
+
 test("in-flight worker tasks allow a real Bash command untouched", (t) => {
   const sandbox = makeSandbox(t);
   seedInFlightWorker(sandbox);
@@ -1998,7 +2183,7 @@ test("the terminal TaskOutput redirect denies in strict posture too", (t) => {
   assert.strictEqual(denials[0].posture, "strict");
 });
 
-test("hooks configuration wires PreToolUse write tools, Bash, Agent, Task, TaskOutput, and TaskStop through the inline guard", () => {
+test("hooks configuration wires PreToolUse write tools, Bash, dispatch tools, TaskOutput, and TaskStop through the inline guard", () => {
   const hooks = JSON.parse(fs.readFileSync(path.join(repoRoot, "plugins", "fusion", "hooks", "hooks.json"), "utf8")).hooks;
   const preToolHandlers = hooks.PreToolUse.flatMap((group) => group.hooks.map((hook) => ({ matcher: group.matcher, command: hook.command }))).filter((hook) => hook.command?.includes("inline-delegation-guard.mjs"));
   assert.deepStrictEqual(preToolHandlers, [
@@ -2011,6 +2196,10 @@ test("hooks configuration wires PreToolUse write tools, Bash, Agent, Task, TaskO
       command: 'node "${CLAUDE_PLUGIN_ROOT}/scripts/inline-delegation-guard.mjs"'
     },
     {
+      matcher: "^SendMessage$",
+      command: 'node "${CLAUDE_PLUGIN_ROOT}/scripts/inline-delegation-guard.mjs"'
+    },
+    {
       matcher: "^(TaskOutput|TaskStop)$",
       command: 'node "${CLAUDE_PLUGIN_ROOT}/scripts/inline-delegation-guard.mjs"'
     }
@@ -2018,7 +2207,7 @@ test("hooks configuration wires PreToolUse write tools, Bash, Agent, Task, TaskO
   const postToolHandlers = hooks.PostToolUse.flatMap((group) => group.hooks.map((hook) => ({ matcher: group.matcher, command: hook.command }))).filter((hook) => hook.command?.includes("inline-delegation-guard.mjs"));
   assert.deepStrictEqual(postToolHandlers, [
     {
-      matcher: "^(Agent|Task|Bash)$",
+      matcher: "^(Agent|Task|Bash|SendMessage)$",
       command: 'node "${CLAUDE_PLUGIN_ROOT}/scripts/inline-delegation-guard.mjs"'
     }
   ]);

@@ -5,8 +5,10 @@ import os from "node:os";
 import path from "node:path";
 import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
-import { ENGINE_IDS, isEngineId } from "./lib/engines.mjs";
-import { JUDGMENT_POSTURE, POSTURE_VALUES, STRICT_POSTURE, resolveFusionDataDir, resolvePosture } from "./lib/posture.mjs";
+import { ENGINE_IDS, PEER_RESCUE_AGENT_NAMES, isEngineId } from "./lib/engines.mjs";
+import { readRoutingDefaults } from "./lib/model-table.mjs";
+import { JUDGMENT_POSTURE, POSTURE_VALUES, STRICT_POSTURE, resolvePosture } from "./lib/posture.mjs";
+import { isFusionWorkerAgent, readSessionWorkerRecords } from "./lib/worker-state.mjs";
 import { messageCode, tagMessage } from "./lib/user-messages.mjs";
 import { verificationCommand } from "./lib/verification-command.mjs";
 
@@ -20,7 +22,6 @@ const AUDIT_DIR_ENV = "FUSION_INLINE_GUARD_AUDIT_DIR";
 const AUDIT_RETENTION_DAYS_ENV = "FUSION_INLINE_GUARD_AUDIT_RETENTION_DAYS";
 const AUDIT_MAX_BYTES_ENV = "FUSION_INLINE_GUARD_AUDIT_MAX_BYTES";
 const AUDIT_MAX_FILES_ENV = "FUSION_INLINE_GUARD_AUDIT_MAX_FILES";
-const WORKER_STATE_DIR_ENV = "FUSION_WORKER_STATE_DIR";
 const FLEET_WAVE_GAP_ENV = "FUSION_FLEET_WAVE_GAP_MS";
 const DEFAULT_BUDGET = 5;
 const DEFAULT_TAIL_MAX_BYTES = 1024;
@@ -45,7 +46,7 @@ const AUDIT_PATH_MAX_LENGTH = 240;
 const AUDIT_FILE_PATTERN = /^events-(\d{4}-\d{2}-\d{2})(?:\.(\d+))?\.jsonl$/;
 const SESSION_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 const WRITE_TOOLS = new Set(["Edit", "Write", "NotebookEdit", "MultiEdit"]);
-const DELEGATION_TOOLS = new Set(["Agent", "Task"]);
+const DELEGATION_TOOLS = new Set(["Agent", "Task", "SendMessage"]);
 const BASH_TOOL = "Bash";
 const ENFORCEMENT_AUDIT_TOOLS = new Set([...WRITE_TOOLS, BASH_TOOL]);
 const TASK_CONTROL_TOOLS = new Set(["TaskOutput", "TaskStop"]);
@@ -147,16 +148,16 @@ function isExternalUserMessage(entry) {
   );
 }
 
-function hasFleetDeclineAfterLastUserMessage(transcriptPath) {
+function readTranscriptTail(transcriptPath) {
   if (typeof transcriptPath !== "string" || !transcriptPath) {
-    return false;
+    return [];
   }
   let descriptor;
   try {
     descriptor = fs.openSync(transcriptPath, "r");
     const stat = fs.fstatSync(descriptor);
     if (!stat.isFile() || stat.size === 0) {
-      return false;
+      return [];
     }
     const bytesToRead = Math.min(TRANSCRIPT_TAIL_MAX_BYTES, stat.size);
     const start = stat.size - bytesToRead;
@@ -178,24 +179,9 @@ function hasFleetDeclineAfterLastUserMessage(transcriptPath) {
         void 0;
       }
     }
-    const lastUserIndex = entries.findLastIndex(isExternalUserMessage);
-    if (lastUserIndex === -1) {
-      return false;
-    }
-    const assistantText = [];
-    for (const entry of entries.slice(lastUserIndex + 1)) {
-      if (entry?.type !== "assistant") {
-        continue;
-      }
-      for (const block of transcriptEntryContent(entry)) {
-        if (block?.type === "text" && typeof block.text === "string") {
-          assistantText.push(block.text);
-        }
-      }
-    }
-    return /^\s*fleet-decline:/mi.test(assistantText.join("\n"));
+    return entries;
   } catch {
-    return false;
+    return [];
   } finally {
     if (descriptor != null) {
       try {
@@ -207,6 +193,42 @@ function hasFleetDeclineAfterLastUserMessage(transcriptPath) {
   }
 }
 
+function hasFleetDeclineAfterLastUserMessage(transcriptPath) {
+  const entries = readTranscriptTail(transcriptPath);
+  const lastUserIndex = entries.findLastIndex(isExternalUserMessage);
+  if (lastUserIndex === -1) {
+    return false;
+  }
+  const assistantText = [];
+  for (const entry of entries.slice(lastUserIndex + 1)) {
+    if (entry?.type !== "assistant") {
+      continue;
+    }
+    for (const block of transcriptEntryContent(entry)) {
+      if (block?.type === "text" && typeof block.text === "string") {
+        assistantText.push(block.text);
+      }
+    }
+  }
+  return /^\s*fleet-decline:/mi.test(assistantText.join("\n"));
+}
+
+function normalizeMessageId(value) {
+  return typeof value === "string" && value.length > 0 && value.length <= 128 && /^[A-Za-z0-9_-]+$/.test(value) ? value : null;
+}
+
+function messageIdForToolUse(transcriptPath, toolUseId) {
+  if (!toolUseId) {
+    return null;
+  }
+  for (const entry of readTranscriptTail(transcriptPath).toReversed()) {
+    if (entry?.type === "assistant" && transcriptEntryContent(entry).some((block) => block?.type === "tool_use" && block.id === toolUseId)) {
+      return normalizeMessageId(entry.message?.id);
+    }
+  }
+  return null;
+}
+
 function resolveAuditDir(env = process.env) {
   const override = env[AUDIT_DIR_ENV];
   if (override && String(override).trim()) {
@@ -215,43 +237,10 @@ function resolveAuditDir(env = process.env) {
   return path.join(os.homedir(), ".claude", "plugins", "data", "fusion-claude-code-fusion", "inline-guard-audit");
 }
 
-function resolveWorkerStateDir(env = process.env) {
-  const override = env[WORKER_STATE_DIR_ENV];
-  if (override && String(override).trim()) {
-    return path.resolve(String(override).trim());
-  }
-  return path.join(resolveFusionDataDir(env), "workers");
-}
-
 function inFlightWorkerTaskSignature(sessionId, env = process.env) {
-  const jobsDir = path.join(resolveWorkerStateDir(env), "jobs");
-  let entries;
-  try {
-    entries = fs.readdirSync(jobsDir, { withFileTypes: true });
-  } catch {
-    return null;
-  }
-  const workers = [];
-  for (const entry of entries) {
-    if (!entry.isFile() || !entry.name.startsWith("fusion-") || !entry.name.endsWith(".json")) {
-      continue;
-    }
-    try {
-      const record = JSON.parse(fs.readFileSync(path.join(jobsDir, entry.name), "utf8"));
-      if (!record || typeof record !== "object" || Array.isArray(record)) {
-        continue;
-      }
-      if (record.sessionId !== sessionId) {
-        continue;
-      }
-      const status = record.transportStatus;
-      if (typeof status === "string" && !WORKER_TERMINAL_STATUSES.has(status)) {
-        workers.push(`${record.taskId ?? entry.name}:${status}`);
-      }
-    } catch {
-      continue;
-    }
-  }
+  const workers = readSessionWorkerRecords(env, sessionId)
+    .filter((record) => typeof record.transportStatus === "string" && !WORKER_TERMINAL_STATUSES.has(record.transportStatus))
+    .map((record) => `${record.taskId}:${record.transportStatus}`);
   return workers.length > 0 ? workers.sort().join(",") : null;
 }
 
@@ -262,31 +251,9 @@ function extractTaskControlId(toolInput) {
   return typeof toolInput.task_id === "string" && toolInput.task_id.length > 0 ? toolInput.task_id : null;
 }
 
-function findWorkerRecordForTaskControlId(taskId, env = process.env) {
-  const jobsDir = path.join(resolveWorkerStateDir(env), "jobs");
-  let entries;
-  try {
-    entries = fs.readdirSync(jobsDir, { withFileTypes: true });
-  } catch {
-    return null;
-  }
-  const matches = [];
-  for (const entry of entries) {
-    if (!entry.isFile() || !entry.name.startsWith("fusion-") || !entry.name.endsWith(".json")) {
-      continue;
-    }
-    try {
-      const record = JSON.parse(fs.readFileSync(path.join(jobsDir, entry.name), "utf8"));
-      if (!record || typeof record !== "object" || Array.isArray(record)) {
-        continue;
-      }
-      if (record.backgroundTaskId === taskId || record.agentId === taskId) {
-        matches.push(record);
-      }
-    } catch {
-      continue;
-    }
-  }
+function findWorkerRecordForTaskControlId(taskId, env = process.env, sessionId) {
+  const matches = readSessionWorkerRecords(env, sessionId)
+    .filter((record) => record.backgroundTaskId === taskId || record.agentId === taskId);
   return matches.find((record) => !REAPED_WORKER_TERMINAL_STATUSES.has(record.transportStatus)) ?? matches[0] ?? null;
 }
 
@@ -721,8 +688,9 @@ function normalizeAuditEvent(event) {
   if (event.event === "dispatch" && DELEGATION_TOOLS.has(event.tool)) {
     const lane = normalizeLane(event.lane);
     const description = sanitizeAuditText(event.description);
+    const messageId = normalizeMessageId(event.messageId);
     return lane
-      ? { schemaVersion: AUDIT_SCHEMA_VERSION, at: new Date(atMs).toISOString(), session, event: "dispatch", lane, tool: event.tool, ...digest, ...(description ? { description } : {}) }
+      ? { schemaVersion: AUDIT_SCHEMA_VERSION, at: new Date(atMs).toISOString(), session, event: "dispatch", lane, tool: event.tool, ...digest, ...(messageId ? { messageId } : {}), ...(description ? { description } : {}) }
       : null;
   }
   if (event.event === "warn" && DELEGATION_TOOLS.has(event.tool) && (event.reason === MISSING_LAUNCH_RECOVERY_REASON || event.reason === NARROW_WAVE_ADVISORY_REASON)) {
@@ -1079,12 +1047,14 @@ function normalizeDispatchLog(value) {
     const subagentType = sanitizeIdentifier(raw.subagentType);
     const description = sanitizeAuditText(raw.description);
     const toolUseId = sanitizeIdentifier(raw.toolUseId, 200);
+    const messageId = normalizeMessageId(raw.messageId);
     const phase = raw.phase === "launched" ? "launched" : "confirmed";
     entries.push({
       at: Number.isFinite(atMs) ? new Date(atMs).toISOString() : null,
       lane,
       phase,
       ...(toolUseId ? { toolUseId } : {}),
+      ...(messageId ? { messageId } : {}),
       ...(subagentType ? { subagentType } : {}),
       ...(description ? { description } : {})
     });
@@ -1161,19 +1131,20 @@ function findLaunchedDispatch(dispatchLog, toolUseId, lane) {
   return dispatchLog.findLast((entry) => entry.phase === "launched" && entry.lane === lane) ?? null;
 }
 
+function sameFleetWave(left, right, waveGapMs) {
+  if (left.messageId && right.messageId) {
+    return left.messageId === right.messageId;
+  }
+  return Math.abs(Date.parse(left.at) - Date.parse(right.at)) <= waveGapMs;
+}
+
 function deriveFleetWaveState(dispatchLog, waveGapMs) {
   let fleetWaveWidth = 0;
   let consecutiveNarrowWaves = 0;
-  let previousDispatchAtMs = null;
-  for (const entry of dispatchLog) {
-    if (entry.phase !== "confirmed") {
-      continue;
-    }
-    const dispatchAtMs = Date.parse(entry.at);
-    if (!Number.isFinite(dispatchAtMs)) {
-      continue;
-    }
-    if (previousDispatchAtMs !== null && Math.abs(dispatchAtMs - previousDispatchAtMs) <= waveGapMs) {
+  let previousDispatch = null;
+  const confirmed = dispatchLog.filter((entry) => entry.phase === "confirmed" && Number.isFinite(Date.parse(entry.at))).sort((left, right) => Date.parse(left.at) - Date.parse(right.at));
+  for (const entry of confirmed) {
+    if (previousDispatch && sameFleetWave(previousDispatch, entry, waveGapMs)) {
       fleetWaveWidth += 1;
     } else {
       if (fleetWaveWidth > 0) {
@@ -1181,7 +1152,7 @@ function deriveFleetWaveState(dispatchLog, waveGapMs) {
       }
       fleetWaveWidth = 1;
     }
-    previousDispatchAtMs = dispatchAtMs;
+    previousDispatch = entry;
   }
   return { fleetWaveWidth, consecutiveNarrowWaves };
 }
@@ -1192,19 +1163,19 @@ function deriveInclusiveFleetWaveWidth(dispatchLog, waveGapMs, currentEntry) {
       return false;
     }
     return Number.isFinite(Date.parse(entry.at));
-  });
+  }).sort((left, right) => Date.parse(left.at) - Date.parse(right.at));
   const currentIndex = entries.indexOf(currentEntry);
   if (currentIndex < 0) {
     return 0;
   }
 
   let firstIndex = currentIndex;
-  while (firstIndex > 0 && Math.abs(Date.parse(entries[firstIndex].at) - Date.parse(entries[firstIndex - 1].at)) <= waveGapMs) {
+  while (firstIndex > 0 && sameFleetWave(entries[firstIndex - 1], entries[firstIndex], waveGapMs)) {
     firstIndex -= 1;
   }
 
   let lastIndex = currentIndex;
-  while (lastIndex < entries.length - 1 && Math.abs(Date.parse(entries[lastIndex + 1].at) - Date.parse(entries[lastIndex].at)) <= waveGapMs) {
+  while (lastIndex < entries.length - 1 && sameFleetWave(entries[lastIndex], entries[lastIndex + 1], waveGapMs)) {
     lastIndex += 1;
   }
 
@@ -1305,21 +1276,22 @@ function buildUnverifiedLine(writeCount) {
   return `${writeCount} main loop ${writeCount === 1 ? "write is" : "writes are"} unverified in this window.`;
 }
 
-function buildLaneHint() {
-  return "Lanes: quick scoped work goes to the codex quick tier gpt-5.6-terra at effort xhigh; trivial or high volume work goes to gpt-5.6-luna at effort xhigh; work needing the Claude Code tool surface goes to fusion:claude-worker.";
+function buildLaneHint(env = process.env) {
+  const { quick, volume } = readRoutingDefaults(env).codex;
+  return `Lanes: quick scoped work goes to the codex quick default ${quick.model} at effort ${quick.effort}; trivial or high volume work goes to the codex volume default ${volume.model} at effort ${volume.effort}; work needing the Claude Code tool surface goes to fusion:claude-worker.`;
 }
 
-function buildAdvisoryLine(writeCount, dispatchCount) {
+function buildAdvisoryLine(writeCount, dispatchCount, env = process.env) {
   const countSummary =
     dispatchCount === 0
       ? `${writeCount} inline writes happened this session with zero dispatches. `
       : `${writeCount} inline writes happened since the most recent dispatch; this session has ${dispatchCount} dispatch${dispatchCount === 1 ? "" : "es"}. `;
-  return countSummary + buildLaneHint();
+  return countSummary + buildLaneHint(env);
 }
 
-function buildUnverifiedAdvisory(writeCount, dispatchCount) {
+function buildUnverifiedAdvisory(writeCount, dispatchCount, env = process.env) {
   const zeroDispatchClause = dispatchCount === 0 ? " This session has not dispatched yet; if the remaining work splits into independent packages, dispatch them together in one message, and three or more convene /fusion:ultra." : "";
-  return `${buildUnverifiedLine(writeCount)} Run this change's verification command once it is coherent, or hand the remaining work to a lane. ${buildLaneHint()}${zeroDispatchClause}`;
+  return `${buildUnverifiedLine(writeCount)} Run this change's verification command once it is coherent, or hand the remaining work to a lane. ${buildLaneHint(env)}${zeroDispatchClause}`;
 }
 
 function buildTailAllowanceAdvisory(remainingTailSlots) {
@@ -1363,11 +1335,17 @@ function runHook(env = process.env, input = readHookInput()) {
     if (input.hook_event_name && input.hook_event_name !== "PreToolUse" && input.hook_event_name !== "PostToolUse") {
       return;
     }
-    const subagentType = extractSubagentType(input.tool_input);
+    const recipient = toolName === "SendMessage" ? input.tool_input?.to : null;
+    const record = typeof recipient === "string" && recipient ? findWorkerRecordForTaskControlId(recipient, env, sessionId) : null;
+    if (toolName === "SendMessage" && (record?.sessionId !== sessionId || !(PEER_RESCUE_AGENT_NAMES.has(record.agentType) || isFusionWorkerAgent(record.agentType)))) {
+      return;
+    }
+    const subagentType = toolName === "SendMessage" ? record.agentType : extractSubagentType(input.tool_input);
     const safeSubagentType = sanitizeIdentifier(subagentType);
     const lane = laneForSubagentType(subagentType);
     const description = extractDispatchDescription(input.tool_input);
     const toolUseId = extractToolUseId(input);
+    const messageId = input.hook_event_name === "PreToolUse" ? null : messageIdForToolUse(input.transcript_path, input.tool_use_id);
     const waveGapMs = resolveFleetWaveGapMs(env);
 
     if (input.hook_event_name === "PreToolUse") {
@@ -1399,6 +1377,7 @@ function runHook(env = process.env, input = readHookInput()) {
           lane,
           phase: "confirmed",
           ...(toolUseId ? { toolUseId } : {}),
+          ...(messageId ? { messageId } : {}),
           ...(safeSubagentType ? { subagentType: safeSubagentType } : {}),
           ...(description ? { description } : {})
         };
@@ -1408,14 +1387,16 @@ function runHook(env = process.env, input = readHookInput()) {
         }
       } else {
         launched.phase = "confirmed";
+        if (messageId) {
+          launched.messageId = messageId;
+        }
         if (description) {
           launched.description = description;
         }
       }
       const pendingIncludedWidth = deriveInclusiveFleetWaveWidth(state.dispatchLog, waveGapMs, launched) || state.fleetWaveWidth;
-      const previousDispatchAtMs = Date.parse(state.lastDispatchAt);
-      const currentDispatchAtMs = Date.parse(launched.at);
-      const sameWave = Number.isFinite(previousDispatchAtMs) && Number.isFinite(currentDispatchAtMs) && Math.abs(currentDispatchAtMs - previousDispatchAtMs) <= waveGapMs;
+      const previousDispatch = state.dispatchLog.findLast((entry) => entry !== launched && entry.phase === "confirmed");
+      const sameWave = previousDispatch && sameFleetWave(previousDispatch, launched, waveGapMs);
       const previousFleetWaveWidth = state.fleetWaveWidth;
       state.fleetWaveWidth = pendingIncludedWidth;
       if (pendingIncludedWidth > 2) {
@@ -1445,6 +1426,7 @@ function runHook(env = process.env, input = readHookInput()) {
         pendingIncludedWidth,
         dispatchEpoch: state.dispatchEpoch,
         lane: launched.lane,
+        messageId: launched.messageId,
         description: launched.description ?? description,
         recoveredMissingLaunch
       };
@@ -1456,7 +1438,7 @@ function runHook(env = process.env, input = readHookInput()) {
       );
     }
     recordAuditEvent(
-      { at: now, session: sessionId, event: "dispatch", lane: confirmation.lane, tool: toolName, ...(confirmation.description ? { description: confirmation.description } : {}) },
+      { at: now, session: sessionId, event: "dispatch", lane: confirmation.lane, tool: toolName, ...(confirmation.messageId ? { messageId: confirmation.messageId } : {}), ...(confirmation.description ? { description: confirmation.description } : {}) },
       env
     );
     if (confirmation.shouldAdvise) {
@@ -1501,7 +1483,7 @@ function runHook(env = process.env, input = readHookInput()) {
       return;
     }
     const taskId = extractTaskControlId(input.tool_input);
-    const record = taskId ? findWorkerRecordForTaskControlId(taskId, env) : null;
+    const record = taskId ? findWorkerRecordForTaskControlId(taskId, env, sessionId) : null;
     if (!record || !REAPED_WORKER_TERMINAL_STATUSES.has(record.transportStatus)) {
       return;
     }
@@ -1709,7 +1691,7 @@ function runHook(env = process.env, input = readHookInput()) {
     );
     const reason = tagMessage(
       WRITE_BUDGET_DENY_MESSAGE_SLUG,
-      `${buildAdvisoryLine(decision.writeCount, decision.dispatchCount)} The inline write budget is exhausted. Dispatch an Agent or Task before another main-loop write.`
+      `${buildAdvisoryLine(decision.writeCount, decision.dispatchCount, env)} The inline write budget is exhausted. Dispatch an Agent or Task before another main-loop write.`
     );
     process.stdout.write(`${JSON.stringify(denyOutput(reason))}\n`);
     return;
@@ -1798,7 +1780,7 @@ function runHook(env = process.env, input = readHookInput()) {
       if (!advisory.suppressed) {
         const line = tagMessage(
           advisorySlug,
-          posture === STRICT_POSTURE ? buildAdvisoryLine(decision.writeCount, decision.dispatchCount) : buildUnverifiedAdvisory(decision.writeCount, decision.dispatchCount)
+          posture === STRICT_POSTURE ? buildAdvisoryLine(decision.writeCount, decision.dispatchCount, env) : buildUnverifiedAdvisory(decision.writeCount, decision.dispatchCount, env)
         );
         process.stdout.write(`${JSON.stringify(allowOutput(line))}\n`);
       }

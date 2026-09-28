@@ -251,6 +251,83 @@ export function isTerminalWorkerStatus(value) {
   return TERMINAL_STATUSES.has(value);
 }
 
+export function reopenWorkerContinuation(record, at = new Date().toISOString()) {
+  if (!isTerminalWorkerStatus(record.transportStatus)) {
+    return record;
+  }
+  const settled = record.acceptance === "accepted" || record.acceptance === "rejected";
+  const previousIds = new Set((record.continuations ?? []).flatMap((round) => round.peerJobIds ?? []));
+  const peerJobIds = [...new Set([...(record.peerJobIds ?? []), record.peerJobId].filter((id) => typeof id === "string" && !previousIds.has(id)))];
+  const collectionMethod = record.collectionMethod ?? null;
+  const continuation = settled ? {
+    at,
+    peerJobId: record.peerJobId ?? null,
+    peerJobIds,
+    acceptance: record.acceptance,
+    acceptanceReason: record.acceptanceReason ?? null,
+    acceptanceFailureKind: record.acceptanceFailureKind ?? null,
+    acceptanceSource: record.acceptanceSource ?? null,
+    acceptanceRecordedAt: record.acceptanceRecordedAt ?? null,
+    collectedAt: record.collectedAt ?? null,
+    collectionMethod,
+    transportStatus: record.transportStatus,
+    failureKind: record.failureKind ?? null,
+    peerFailureKind: record.peerFailureKind ?? null,
+    infraFailure: record.infraFailure ?? null
+  } : null;
+  return {
+    ...record,
+    continuations: continuation ? [...(record.continuations ?? []), continuation] : record.continuations ?? [],
+    continuationCount: (record.continuationCount ?? 0) + 1,
+    lastContinuedAt: at,
+    transportStatus: "running",
+    runtimeAsync: true,
+    finishedAt: null,
+    collectedAt: null,
+    collectionMethod: null,
+    outputFile: null,
+    transcriptPath: null,
+    transcriptOffset: 0,
+    transcriptCarry: "",
+    transcriptSkippingLine: false,
+    transcriptBacklogBytes: 0,
+    peerJobId: settled ? null : record.peerJobId ?? null,
+    acceptance: "unverified",
+    acceptanceReason: null,
+    acceptanceFailureKind: null,
+    acceptanceSource: null,
+    acceptanceRecordedAt: null,
+    pendingVerdict: null,
+    pendingVerdictError: null,
+    awaitingCollection: false,
+    awaitingCollectionArmedAt: null,
+    awaitingVerdict: false,
+    awaitingVerdictArmedAt: null,
+    failureKind: null,
+    peerFailureKind: null,
+    infraFailure: null,
+    deliveryMode: null,
+    lastActivityAt: at,
+    inFlightSince: at,
+    ...(isFusionWorkerAgent(record.agentType) ? {
+      budgetBaseline: {
+        at,
+        turns: record.turns ?? 0,
+        outputTokens: record.usage?.outputTokens ?? 0,
+        uncachedTokens: record.usage?.uncachedTokens ?? 0
+      },
+      retryCount: 0,
+      terminalWriteGraceUsedAt: null,
+      cancelReason: null,
+      cancelRequestedAt: null,
+      windDownContextSentAt: null,
+      tokenWindDownSentAt: null,
+      uncachedWindDownSentAt: null,
+      lastLivenessAt: at
+    } : {})
+  };
+}
+
 export function workerRecordFile(taskId, env = process.env) {
   if (typeof taskId !== "string" || !/^[a-z0-9][a-z0-9-]{7,79}$/.test(taskId)) {
     throw new TypeError("Fusion worker task id is invalid.");
@@ -306,6 +383,12 @@ function canonicalCollectionMethod(value) {
 
 function normalizeWorkerRecord(value) {
   let normalized = value;
+  if (typeof normalized.outputFile === "string" && path.basename(path.dirname(normalized.outputFile)) === "tasks" && normalized.outputFile.endsWith(".output")) {
+    normalized = { ...normalized, transcriptPath: normalized.outputFile, outputFile: null };
+  }
+  if (PEER_JOB_FOOTER_AGENT_TYPES.has(normalized.agentType) && !Array.isArray(normalized.peerJobIds)) {
+    normalized = { ...normalized, peerJobIds: [] };
+  }
   if (Object.hasOwn(normalized, "collectionMethod")) {
     const collectionMethod = canonicalCollectionMethod(normalized.collectionMethod);
     if (collectionMethod !== normalized.collectionMethod) {
@@ -396,6 +479,10 @@ export function createWorkerRecord(record, env = process.env) {
   } catch {
     void 0;
   }
+  const sessionState = readWorkerSessionState(record.sessionId, env);
+  if (sessionState && !Array.isArray(sessionState.taskIds)) {
+    readSessionWorkerRecords(env, record.sessionId);
+  }
   return withLock(file, () => {
     if (readWorkerRecordFile(file)) {
       throw new Error(`Fusion worker task ${record.taskId} already exists.`);
@@ -418,7 +505,7 @@ export function createWorkerRecord(record, env = process.env) {
       transportStatus: "dispatching",
       acceptance: "unverified",
       acceptanceFailureKind: record.acceptanceFailureKind ?? null,
-      ...(PEER_JOB_FOOTER_AGENT_TYPES.has(record.agentType) ? { peerJobId: null } : {}),
+      ...(PEER_JOB_FOOTER_AGENT_TYPES.has(record.agentType) ? { peerJobId: null, peerJobIds: [] } : {}),
       peerFailureKind: null,
       failureKind: null,
       deliveryMode: null,
@@ -445,7 +532,7 @@ export function createWorkerRecord(record, env = process.env) {
       turnIds: [],
       toolUseIds: [],
       transcriptPath: null,
-      outputFile: record.outputFile ?? null,
+      outputFile: null,
       transcriptOffset: 0,
       transcriptCarry: "",
       transcriptSkippingLine: false,
@@ -453,6 +540,7 @@ export function createWorkerRecord(record, env = process.env) {
       usageAvailability: "unreported",
       parentTranscriptPath: record.parentTranscriptPath ?? null,
       parentTranscriptBytesAtDispatch: Number.isSafeInteger(record.parentTranscriptBytesAtDispatch) ? record.parentTranscriptBytesAtDispatch : null,
+      parentContextTokensAtDispatch: Number.isSafeInteger(record.parentContextTokensAtDispatch) ? record.parentContextTokensAtDispatch : null,
       packageType: record.packageType ?? "consult",
       briefBytes: Number.isSafeInteger(record.briefBytes) ? record.briefBytes : null,
       briefFile: record.briefFile ?? null,
@@ -467,6 +555,10 @@ export function createWorkerRecord(record, env = process.env) {
       updatedAt: now,
       limits: record.limits ?? null
     };
+    updateWorkerSessionState(record.sessionId, env, (current) => ({
+      ...(current ?? {}),
+      taskIds: [...new Set([...(Array.isArray(current?.taskIds) ? current.taskIds : []), record.taskId])]
+    }));
     writePrivateJson(file, value);
     return value;
   });
@@ -492,6 +584,45 @@ export function readWorkerRecords(env = process.env, { strict = false } = {}) {
       }
       return record ? [record] : [];
     });
+}
+
+export function readSessionWorkerRecords(env = process.env, sessionId, { strict = false } = {}) {
+  let taskIds = readWorkerSessionState(sessionId, env)?.taskIds;
+  if (!Array.isArray(taskIds)) {
+    const records = readWorkerRecords(env, { strict }).filter((record) => record.sessionId === sessionId);
+    updateWorkerSessionState(sessionId, env, (current) => ({
+      ...(current ?? {}),
+      taskIds: [...new Set([...(Array.isArray(current?.taskIds) ? current.taskIds : []), ...records.map((record) => record.taskId)])]
+    }));
+    return records;
+  }
+  return [...new Set(taskIds)].flatMap((taskId) => {
+    let file;
+    try {
+      file = workerRecordFile(taskId, env);
+    } catch (error) {
+      if (strict) {
+        throw error;
+      }
+      return [];
+    }
+    const record = readWorkerRecordFile(file);
+    if (record) {
+      return record.sessionId === sessionId ? [record] : [];
+    }
+    if (strict) {
+      try {
+        fs.statSync(file);
+      } catch (error) {
+        if (error?.code === "ENOENT") {
+          return [];
+        }
+        throw error;
+      }
+      throw new Error(`Fusion worker record ${path.basename(file)} is unreadable.`);
+    }
+    return [];
+  });
 }
 
 export function findWorkerRecord(predicate, env = process.env, options = {}) {

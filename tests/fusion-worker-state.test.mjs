@@ -13,6 +13,9 @@ import {
   markWorkerCollected,
   pruneExpiredWorkerRecords,
   readWorkerRecord,
+  readWorkerSessionState,
+  readSessionWorkerRecords,
+  reopenWorkerContinuation,
   recordWorkerAcceptance,
   resolveWorkerRetentionDays,
   updateWorkerRecord
@@ -37,6 +40,65 @@ function unverifiedRecord(overrides = {}) {
     ...overrides
   };
 }
+
+test("session index records each created task once and isolates strict reads", (t) => {
+  const directory = sandbox(t);
+  const env = { FUSION_WORKER_STATE_DIR: path.join(directory, "workers") };
+  const first = createWorkerRecord({ taskId: "fusion-session-first", sessionId: "session-a", agentType: "fusion:claude-worker", workspaceRoot: directory }, env);
+  const second = createWorkerRecord({ taskId: "fusion-session-second", sessionId: "session-a", agentType: "fusion:claude-worker", workspaceRoot: directory }, env);
+  createWorkerRecord({ taskId: "fusion-other-session", sessionId: "session-b", agentType: "fusion:claude-worker", workspaceRoot: directory }, env);
+  assert.deepStrictEqual(readWorkerSessionState("session-a", env).taskIds, [first.taskId, second.taskId]);
+  fs.writeFileSync(path.join(env.FUSION_WORKER_STATE_DIR, "jobs", "fusion-other-session.json"), "not json");
+  assert.deepStrictEqual(readSessionWorkerRecords(env, "session-a", { strict: true }).map((record) => record.taskId), [first.taskId, second.taskId]);
+  fs.rmSync(path.join(env.FUSION_WORKER_STATE_DIR, "jobs", `${second.taskId}.json`));
+  assert.deepStrictEqual(readSessionWorkerRecords(env, "session-a", { strict: true }).map((record) => record.taskId), [first.taskId]);
+  fs.writeFileSync(path.join(env.FUSION_WORKER_STATE_DIR, "jobs", `${first.taskId}.json`), "not json");
+  assert.throws(() => readSessionWorkerRecords(env, "session-a", { strict: true }), /unreadable/);
+});
+
+test("worker creation indexes the task before publishing its record", (t) => {
+  const directory = sandbox(t);
+  const env = { FUSION_WORKER_STATE_DIR: path.join(directory, "workers") };
+  const taskId = "fusion-index-before-record";
+  const originalRename = fs.renameSync;
+  fs.renameSync = (source, target) => {
+    if (target === path.join(env.FUSION_WORKER_STATE_DIR, "jobs", `${taskId}.json`)) {
+      assert.deepStrictEqual(readWorkerSessionState("session-order", env).taskIds, [taskId]);
+      throw new Error("simulated crash before record publication");
+    }
+    return originalRename(source, target);
+  };
+  try {
+    assert.throws(() => createWorkerRecord({ taskId, sessionId: "session-order", agentType: "fusion:claude-worker", workspaceRoot: directory }, env), /simulated crash/);
+  } finally {
+    fs.renameSync = originalRename;
+  }
+  assert.strictEqual(readWorkerRecord(taskId, env), null);
+  assert.deepStrictEqual(readSessionWorkerRecords(env, "session-order", { strict: true }), []);
+});
+
+test("session read scans legacy records once and backfills the index", (t) => {
+  const directory = sandbox(t);
+  const env = { FUSION_WORKER_STATE_DIR: path.join(directory, "workers") };
+  const first = createWorkerRecord({ taskId: "fusion-legacy-first", sessionId: "session-legacy", agentType: "fusion:claude-worker", workspaceRoot: directory }, env);
+  createWorkerRecord({ taskId: "fusion-legacy-other", sessionId: "session-other", agentType: "fusion:claude-worker", workspaceRoot: directory }, env);
+  const sessionFile = path.join(env.FUSION_WORKER_STATE_DIR, "sessions", "session-legacy.json");
+  fs.writeFileSync(sessionFile, JSON.stringify({ parentContextAdvisorySent: true }));
+  assert.deepStrictEqual(readSessionWorkerRecords(env, "session-legacy").map((record) => record.taskId), [first.taskId]);
+  assert.deepStrictEqual(readWorkerSessionState("session-legacy", env), { parentContextAdvisorySent: true, taskIds: [first.taskId] });
+  fs.writeFileSync(path.join(env.FUSION_WORKER_STATE_DIR, "jobs", "fusion-legacy-other.json"), "not json");
+  assert.deepStrictEqual(readSessionWorkerRecords(env, "session-legacy", { strict: true }).map((record) => record.taskId), [first.taskId]);
+});
+
+test("new dispatch preserves older records when a session index needs migration", (t) => {
+  const directory = sandbox(t);
+  const env = { FUSION_WORKER_STATE_DIR: path.join(directory, "workers") };
+  const first = createWorkerRecord({ taskId: "fusion-before-index", sessionId: "session-legacy", agentType: "fusion:claude-worker", workspaceRoot: directory }, env);
+  fs.writeFileSync(path.join(env.FUSION_WORKER_STATE_DIR, "sessions", "session-legacy.json"), "{}");
+  const second = createWorkerRecord({ taskId: "fusion-after-index", sessionId: "session-legacy", agentType: "fusion:claude-worker", workspaceRoot: directory }, env);
+  assert.deepStrictEqual(readWorkerSessionState("session-legacy", env).taskIds, [first.taskId, second.taskId]);
+  assert.deepStrictEqual(readSessionWorkerRecords(env, "session-legacy", { strict: true }).map((record) => record.taskId), [first.taskId, second.taskId]);
+});
 
 test("retired agent types still canonicalize so historical ledger records stay readable", () => {
   assert.strictEqual(canonicalWorkerAgentType("fusion:fast-worker"), "fusion:fast-worker");
@@ -114,6 +176,72 @@ test("settlement seam identifies pending and settled worker records", () => {
   assert.strictEqual(isSettledWorker(settled), true);
 });
 
+test("continuation snapshots keep each round's job ids and verdict separate", () => {
+  const firstId = "a".repeat(32);
+  const secondId = "b".repeat(32);
+  const first = reopenWorkerContinuation(unverifiedRecord({ peerJobId: firstId, peerJobIds: [firstId], acceptance: "accepted", acceptanceRecordedAt: "2026-09-27T00:00:00.000Z" }), "2026-09-27T00:01:00.000Z");
+  assert.deepStrictEqual(first.continuations[0].peerJobIds, [firstId]);
+  assert.deepStrictEqual(first.peerJobIds, [firstId]);
+  assert.strictEqual(first.peerJobId, null);
+  const second = reopenWorkerContinuation({ ...first, transportStatus: "done", peerJobId: secondId, peerJobIds: [firstId, secondId], acceptance: "rejected", acceptanceRecordedAt: "2026-09-27T00:02:00.000Z" }, "2026-09-27T00:03:00.000Z");
+  assert.deepStrictEqual(second.continuations.map((round) => round.peerJobIds), [[firstId], [secondId]]);
+  assert.deepStrictEqual(second.continuations.map((round) => round.acceptance), ["accepted", "rejected"]);
+  assert.deepStrictEqual(second.peerJobIds, [firstId, secondId]);
+  assert.strictEqual(second.continuationCount, 2);
+});
+
+test("Fusion worker continuation resets round state and records its budget baseline", () => {
+  const at = "2026-09-27T00:01:00.000Z";
+  const prior = unverifiedRecord({
+    agentType: "fusion:claude-worker",
+    acceptance: "accepted",
+    turns: 62,
+    usage: { outputTokens: 97_000, uncachedTokens: 721_000 },
+    retryCount: 1,
+    terminalWriteGraceUsedAt: "2026-09-27T00:00:00.000Z",
+    cancelReason: "old budget",
+    cancelRequestedAt: "2026-09-27T00:00:00.000Z",
+    windDownContextSentAt: "2026-09-27T00:00:00.000Z",
+    tokenWindDownSentAt: "2026-09-27T00:00:00.000Z",
+    uncachedWindDownSentAt: "2026-09-27T00:00:00.000Z",
+    lastLivenessAt: "2026-09-27T00:00:00.000Z"
+  });
+  const reopened = reopenWorkerContinuation(prior, at);
+
+  assert.deepStrictEqual(reopened.budgetBaseline, { at, turns: 62, outputTokens: 97_000, uncachedTokens: 721_000 });
+  assert.strictEqual(reopened.transportStatus, "running");
+  assert.strictEqual(reopened.lastLivenessAt, at);
+  assert.deepStrictEqual(Object.fromEntries(["terminalWriteGraceUsedAt", "cancelReason", "cancelRequestedAt", "windDownContextSentAt", "tokenWindDownSentAt", "uncachedWindDownSentAt"].map((key) => [key, reopened[key]])), {
+    terminalWriteGraceUsedAt: null,
+    cancelReason: null,
+    cancelRequestedAt: null,
+    windDownContextSentAt: null,
+    tokenWindDownSentAt: null,
+    uncachedWindDownSentAt: null
+  });
+  assert.strictEqual(reopened.retryCount, 0);
+  assert.strictEqual(reopened.continuations[0].acceptance, "accepted");
+  assert.strictEqual(reopened.continuations[0].transportStatus, "done");
+});
+
+test("unsettled continuation keeps its job id available for the next verdict", () => {
+  const jobId = "c".repeat(32);
+  const reopened = reopenWorkerContinuation(unverifiedRecord({ peerJobId: jobId, peerJobIds: [jobId], infraFailure: true }), "2026-09-27T00:01:00.000Z");
+  assert.deepStrictEqual(reopened.continuations, []);
+  assert.strictEqual(reopened.peerJobId, jobId);
+  assert.deepStrictEqual(reopened.peerJobIds, [jobId]);
+  assert.strictEqual(reopened.transportStatus, "running");
+  assert.strictEqual(reopened.infraFailure, null);
+});
+
+test("settled continuation archives infrastructure failure without carrying it forward", () => {
+  const reopened = reopenWorkerContinuation(unverifiedRecord({ acceptance: "rejected", infraFailure: true }));
+  assert.strictEqual(reopened.continuations[0].infraFailure, true);
+  assert.strictEqual(reopened.infraFailure, null);
+  const successfulLaterRound = { ...reopened, transportStatus: "done", acceptance: "accepted" };
+  assert.notStrictEqual(successfulLaterRound.infraFailure, true);
+});
+
 test("created worker records stamp the Fusion companion version", (t) => {
   const directory = sandbox(t);
   const env = { FUSION_WORKER_STATE_DIR: path.join(directory, "worker-state") };
@@ -136,6 +264,21 @@ test("worker records create and normalize the nullable peer failure kind", (t) =
   delete stored.peerFailureKind;
   fs.writeFileSync(file, `${JSON.stringify(stored, null, 2)}\n`, "utf8");
   assert.strictEqual(readWorkerRecord(taskId, env).peerFailureKind, null);
+});
+
+test("peer wrapper records start with an empty job history and older records load one", (t) => {
+  const directory = sandbox(t);
+  const env = { FUSION_WORKER_STATE_DIR: path.join(directory, "worker-state") };
+  for (const [index, agentType] of ["codex:codex-rescue", "grok:grok-rescue", "grok:grok-review-runner"].entries()) {
+    const taskId = `fusion-peer-history-${index}`;
+    const created = createWorkerRecord({ taskId, sessionId: "session-peer-history", agentType, workspaceRoot: directory }, env);
+    assert.deepStrictEqual(created.peerJobIds, []);
+    const file = path.join(env.FUSION_WORKER_STATE_DIR, "jobs", `${taskId}.json`);
+    const stored = JSON.parse(fs.readFileSync(file, "utf8"));
+    delete stored.peerJobIds;
+    fs.writeFileSync(file, `${JSON.stringify(stored)}\n`, "utf8");
+    assert.deepStrictEqual(readWorkerRecord(taskId, env).peerJobIds, []);
+  }
 });
 
 test("markWorkerCollected preserves an already settled acceptance", () => {
