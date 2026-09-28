@@ -542,7 +542,7 @@
         requestId: "req-sandbox-warning"
       });
       process.exit(0);
-    }, 1000);
+    }, 5000);
     return;
   }
 
@@ -553,7 +553,7 @@
         fs.writeFileSync(process.env.FAKE_GROK_SANDBOX_SENTINEL, "retry loop outlived the warning\n", "utf8");
       }
       process.exit(1);
-    }, 1000);
+    }, 5000);
     return;
   }
 
@@ -576,7 +576,7 @@
         requestId: "req-safety-warning"
       });
       process.exit(0);
-    }, 1000);
+    }, 5000);
     return;
   }
 
