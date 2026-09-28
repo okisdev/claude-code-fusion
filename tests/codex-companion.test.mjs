@@ -41,6 +41,7 @@ const processInspectionTests = new Set([
   "flagship foreground write warning is emitted before execution and recorded",
   "flagship warning is limited to foreground write tasks",
   "flagship warning uses recent job records for its stat",
+  "flagship warning ignores old file mtimes while counting recent records",
   "flagship warning falls back below the minimum sample",
   "flagship warning tolerates malformed job files",
   "flagship warning applies the cap after filtering matching records",
@@ -670,6 +671,56 @@ test("flagship warning uses recent job records for its stat", (t) => {
   assert.equal(result.status, 0, result.stderr);
   assert.equal(result.stderr, `${warning}\n`);
   assert.equal(jobRecords(sandbox).filter((record) => record.diagnostics.some((diagnostic) => diagnostic.message === warning)).length, 1);
+});
+
+test("flagship warning ignores old file mtimes while counting recent records", (t) => {
+  const sandbox = makeSandbox(t);
+  initializeGitRepository(sandbox);
+  const [old, ...recent] = seedFlagshipJobRecords(sandbox, [
+    { failureKind: "timeout", request: { model: "gpt-6-astra" } },
+    { failureKind: "timeout", request: { model: "gpt-6-astra" } },
+    { request: { model: "gpt-6-astra" } },
+    { request: { model: "gpt-6-astra" } },
+    { request: { model: "gpt-6-astra" } }
+  ]);
+  const oldMtime = new Date(Date.now() - 8 * 24 * 60 * 60 * 1000);
+  fs.utimesSync(old.file, oldMtime, oldMtime);
+  assert.ok(fs.statSync(old.file).mtimeMs < Date.now() - 7 * 24 * 60 * 60 * 1000);
+  assert.equal(recent.length, 4);
+
+  const result = runCompanion(["task", "--write", "--model", "gpt-6-astra", "count recent history"], {
+    cwd: sandbox.workDir,
+    env: envFor(sandbox)
+  });
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stderr, /25% of foreground gpt-6-astra write tasks timed out in the last 7 days \(1 of 4\)/);
+});
+
+test("workspace reservation probes Git a bounded number of times across many jobs", (t) => {
+  const sandbox = makeSandbox(t);
+  initializeGitRepository(sandbox);
+  seedFlagshipJobRecords(sandbox, Array.from({ length: 120 }, () => ({ request: { model: "gpt-test" } })));
+  const bin = path.join(sandbox.root, "bin");
+  const traceFile = path.join(sandbox.root, "git.log");
+  const realGit = spawnSync("sh", ["-c", "command -v git"], { encoding: "utf8" }).stdout.trim();
+  fs.mkdirSync(bin);
+  fs.writeFileSync(path.join(bin, "git"), '#!/bin/sh\nprintf "%s\\n" "$*" >> "$CODEX_GIT_TRACE"\nexec "$CODEX_REAL_GIT" "$@"\n', { mode: 0o755 });
+  fs.writeFileSync(path.join(bin, "ps"), '#!/bin/sh\npid=""\nwhile [ "$#" -gt 0 ]; do\n  if [ "$1" = "-p" ]; then pid="$2"; shift 2; else shift; fi\ndone\nprintf "process-%s\\n" "$pid"\n', { mode: 0o755 });
+  fs.writeFileSync(path.join(bin, "sysctl"), '#!/bin/sh\nprintf "{ sec = 1, usec = 0 }\\n"\n', { mode: 0o755 });
+
+  const result = runCompanion(["task", "reserve a workspace with many completed jobs"], {
+    cwd: sandbox.workDir,
+    env: envFor(sandbox, {
+      PATH: `${bin}${path.delimiter}${process.env.PATH}`,
+      CODEX_GIT_TRACE: traceFile,
+      CODEX_REAL_GIT: realGit
+    })
+  });
+  assert.equal(result.status, 0, result.stderr);
+  const calls = fs.readFileSync(traceFile, "utf8").trim().split("\n");
+  assert.ok(calls.length > 0);
+  assert.ok(calls.length <= 10, `Expected at most 10 Git calls, saw ${calls.length}.`);
+  assert.equal(jobRecords(sandbox).length, 121);
 });
 
 test("flagship warning falls back below the minimum sample", (t) => {

@@ -328,6 +328,8 @@ test("setup reports the injected capability verdict without an extra help probe"
   assert.equal(result.status, 0, result.stderr);
   const report = JSON.parse(result.stdout);
   assert.equal(report.ready, true);
+  assert.equal(report.writeReady, true);
+  assert.equal(report.hostEnvironment.writeReady, true);
   assert.equal(report.compatibility, "tested");
   assert.deepEqual(report.nextSteps, []);
   assert.equal(report.capabilities.ready, true);
@@ -402,9 +404,7 @@ test("setup reports shell environment policy presence without affecting readines
   assert.equal(unparseableReport.shellEnvironmentPolicy.present, false);
 });
 
-test("setup reports an undenied OrbStack socket without changing readiness", async (t) => {
-  const sandbox = makeSandbox(t);
-  const socket = path.join(sandbox.root, "orbstack", "docker.sock");
+async function listenUnixSocket(t, socket) {
   fs.mkdirSync(path.dirname(socket), { recursive: true });
   const server = net.createServer();
   await new Promise((resolve, reject) => {
@@ -415,19 +415,83 @@ test("setup reports an undenied OrbStack socket without changing readiness", asy
     });
   });
   t.after(() => new Promise((resolve) => server.close(resolve)));
+}
 
+test("managed write runs refuse an undenied runtime socket before spawning Grok", async (t) => {
+  const sandbox = makeSandbox(t);
+  const socket = path.join(sandbox.root, "orbstack", "docker.sock");
+  await listenUnixSocket(t, socket);
   const env = envFor(sandbox, { GROK_COMPANION_UNDENIED_SOCKET_CANDIDATES: socket });
+  let launchCalled = false;
+
+  assert.throws(
+    () => runGrok(directOptions(sandbox, "ok", {
+      mode: "write",
+      env,
+      launchProcess: () => { launchCalled = true; }
+    })),
+    (error) => {
+      assert.equal(error.failureKind, "sandbox");
+      assert.ok(error.message.includes(socket));
+      assert.match(error.message, /strict runtime-socket deny list does not cover/);
+      assert.match(error.message, /write shell could drive that container engine and write outside the workspace/);
+      assert.match(error.message, /orb stop/);
+      assert.match(error.message, /route the package to Codex, whose sandbox blocks the connect/);
+      assert.doesNotMatch(error.message, /downgrade/i);
+      return true;
+    }
+  );
+  assert.equal(launchCalled, false);
+  assert.deepEqual(readInvocations(sandbox.argsFile), []);
+});
+
+test("managed consult runs proceed with an undenied runtime socket", async (t) => {
+  const sandbox = makeSandbox(t);
+  const socket = path.join(sandbox.root, "orbstack", "docker.sock");
+  await listenUnixSocket(t, socket);
+  const env = envFor(sandbox, { GROK_COMPANION_UNDENIED_SOCKET_CANDIDATES: socket, FAKE_GROK_MODE: "ok" });
+
+  const result = await runGrok(directOptions(sandbox, "ok", { env }));
+  assert.equal(result.exitCode, 0);
+  assert.equal(result.securityFailureKind, null);
+  assert.equal(readInvocations(sandbox.argsFile).length, 1);
+});
+
+test("setup reports write readiness for an undenied OrbStack socket", async (t) => {
+  const sandbox = makeSandbox(t);
+  writeFreshAuth(sandbox);
+  const socket = path.join(sandbox.root, "orbstack", "docker.sock");
+  const env = envFor(sandbox, { GROK_COMPANION_UNDENIED_SOCKET_CANDIDATES: socket });
+  const withoutSocket = runCompanion(["setup", "--json"], { cwd: sandbox.workDir, env });
+  assert.equal(withoutSocket.status, 0, withoutSocket.stderr);
+  const withoutSocketReport = JSON.parse(withoutSocket.stdout);
+  assert.equal(withoutSocketReport.ready, true);
+  assert.equal(withoutSocketReport.writeReady, true);
+  assert.equal(withoutSocketReport.hostEnvironment.writeReady, true);
+  assert.deepEqual(withoutSocketReport.hostEnvironment.undeniedRuntimeSockets, []);
+  assert.deepEqual(withoutSocketReport.nextSteps, []);
+
+  await listenUnixSocket(t, socket);
+
   const result = runCompanion(["setup", "--json"], { cwd: sandbox.workDir, env });
   assert.equal(result.status, 0, result.stderr);
   const report = JSON.parse(result.stdout);
-  const detail = `no runtime-socket deny path is a symlink; OrbStack docker socket ${socket} is outside grok's runtime-socket deny list, so a strict write shell may still reach that engine`;
   assert.equal(report.ready, true);
+  assert.equal(report.writeReady, false);
+  assert.equal(report.hostEnvironment.writeReady, false);
   assert.deepEqual(report.hostEnvironment.undeniedRuntimeSockets, [socket]);
-  assert.equal(report.hostEnvironment.detail, detail);
+  assert.ok(report.hostEnvironment.detail.includes(socket));
+  assert.match(report.hostEnvironment.detail, /write runs are refused/);
+  assert.match(report.hostEnvironment.remedy, /write runs are refused/);
+  assert.match(report.hostEnvironment.remedy, /orb stop/);
+  assert.match(report.hostEnvironment.remedy, /Codex/);
+  assert.deepEqual(report.nextSteps, [report.hostEnvironment.remedy]);
 
   const rendered = runCompanion(["setup"], { cwd: sandbox.workDir, env });
   assert.equal(rendered.status, 0, rendered.stderr);
-  assert.ok(rendered.stdout.includes(detail));
+  assert.match(rendered.stdout, /host environment: consult ready, write runs refused/);
+  assert.ok(rendered.stdout.includes(report.hostEnvironment.detail));
+  assert.ok(rendered.stdout.includes(report.hostEnvironment.remedy));
 });
 
 test("setup reports grok doctor as unavailable when the subcommand is missing", (t) => {

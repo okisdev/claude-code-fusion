@@ -77,6 +77,34 @@ test("managed runs reject runtime-socket symlinks before spawn", (t) => {
   assert.equal(fs.existsSync(sandbox.argsFile), false);
 });
 
+test("managed write preflight refuses a socket while consult reaches Grok", async (t) => {
+  const sandbox = makeSandbox(t);
+  const socket = path.join(sandbox.root, "orbstack", "docker.sock");
+  const env = envFor(sandbox, {
+    FAKE_GROK_MODE: "ok",
+    GROK_COMPANION_UNDENIED_SOCKET_CANDIDATES: socket
+  });
+  const originalLstat = fs.lstatSync;
+  fs.lstatSync = (candidate, ...args) => candidate === socket ? { isSocket: () => true } : originalLstat(candidate, ...args);
+  let consult;
+  try {
+    let launchCalled = false;
+    assert.throws(
+      () => runGrok(runOptions(sandbox, { mode: "write", env, launchProcess: () => { launchCalled = true; } })),
+      (error) => error.failureKind === "sandbox" && error.message.includes(socket)
+    );
+    assert.equal(launchCalled, false);
+    assert.equal(fs.existsSync(sandbox.argsFile), false);
+    consult = runGrok(runOptions(sandbox, { env }));
+  } finally {
+    fs.lstatSync = originalLstat;
+  }
+  const result = await consult;
+  assert.equal(result.exitCode, 0);
+  assert.equal(result.securityFailureKind, null);
+  assert.equal(fs.existsSync(sandbox.argsFile), true);
+});
+
 test("runtime-socket remedies name the engine that owns the symlink", (t) => {
   const sandbox = makeSandbox(t);
   const orbstackTarget = path.join(sandbox.root, "home", ".orbstack", "run", "docker.sock");

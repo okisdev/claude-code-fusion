@@ -4,7 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
 
-import { getProcessIdentity, processIdentityMatches } from "./codex-exec.mjs";
+import { getProcessIdentity, isProcessAlive, processIdentityMatches } from "./codex-exec.mjs";
 
 const DATA_DIR_ENV = "CODEX_COMPANION_DATA";
 const JOB_SCHEMA_VERSION = 1;
@@ -25,6 +25,9 @@ const SEMANTIC_FAILURE_KINDS = new Set(["intent_override", "scope_rewrite", "wro
 const ACCEPTANCE_SOURCES = new Set(["collector", "main-loop", "stats"]);
 const JOB_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 const WORKSPACE_SLUG_PATTERN = /^.+-[a-f0-9]{16}$/;
+const GIT_CACHE_TTL_MS = 3000;
+const GIT_CACHE_MAX_ENTRIES = 128;
+const gitValueCache = new Map();
 
 export const DEFAULT_JOB_HISTORY_MAX_BYTES = 512 * 1024 * 1024;
 export const DEFAULT_JOB_HISTORY_MAX_RECORDS = 256;
@@ -58,6 +61,12 @@ function canonicalPath(value) {
 }
 
 function gitValue(cwd, args) {
+  const key = `${cwd}\0${args.join("\0")}`;
+  const cached = gitValueCache.get(key);
+  if (cached && cached.expiresAt > Date.now()) {
+    return cached.value;
+  }
+  gitValueCache.delete(key);
   const result = spawnSync("git", ["-C", cwd, ...args], {
     encoding: "utf8",
     stdio: ["ignore", "pipe", "ignore"]
@@ -66,6 +75,12 @@ function gitValue(cwd, args) {
     return null;
   }
   const value = String(result.stdout ?? "").trim();
+  if (value) {
+    if (gitValueCache.size >= GIT_CACHE_MAX_ENTRIES) {
+      gitValueCache.delete(gitValueCache.keys().next().value);
+    }
+    gitValueCache.set(key, { value, expiresAt: Date.now() + GIT_CACHE_TTL_MS });
+  }
   return value || null;
 }
 
@@ -95,7 +110,7 @@ function fsyncDirectory(dir) {
   }
 }
 
-function atomicWriteFile(file, content) {
+function atomicWriteFile(file, content, retryMissingDirectory = true) {
   const dir = path.dirname(file);
   const temp = `${file}.${process.pid}.${randomBytes(8).toString("hex")}.tmp`;
   const deadline = Date.now() + resolveLockTimeoutMs();
@@ -106,7 +121,7 @@ function atomicWriteFile(file, content) {
         ensurePrivateDir(dir);
         descriptor = fs.openSync(temp, "wx", PRIVATE_FILE_MODE);
       } catch (error) {
-        if (error?.code !== "ENOENT" || Date.now() >= deadline) {
+        if (error?.code !== "ENOENT" || !retryMissingDirectory || Date.now() >= deadline) {
           throw error;
         }
         sleepMs(LOCK_RETRY_MS);
@@ -188,15 +203,7 @@ function sameLockIdentity(left, right) {
 }
 
 function directLockOwnerAlive(pid) {
-  if (!Number.isInteger(pid) || pid <= 1) {
-    return false;
-  }
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (error) {
-    return error?.code === "EPERM";
-  }
+  return isProcessAlive(pid, null, false);
 }
 
 function lockOwnerWasReplaced(record) {
@@ -234,11 +241,11 @@ function publishPreparedLock(lockDir, ownerDir) {
   }
 }
 
-function createLinkedOwner(linkPath, record) {
+function createLinkedOwner(linkPath, record, retryMissingDirectory = true) {
   const ownerDir = lockOwnerDir(linkPath, record.token);
   fs.mkdirSync(ownerDir, { mode: PRIVATE_DIR_MODE });
   try {
-    atomicWriteFile(path.join(ownerDir, "owner.json"), `${JSON.stringify(record)}\n`);
+    atomicWriteFile(path.join(ownerDir, "owner.json"), `${JSON.stringify(record)}\n`, retryMissingDirectory);
     return { ownerDir, published: publishPreparedLock(linkPath, ownerDir) };
   } catch (error) {
     try {
@@ -268,34 +275,42 @@ function linkedPathExists(linkPath) {
   }
 }
 
-function acquireReaperClaim(ownerDir) {
+function acquireReaperClaim(lockDir, deadToken) {
   const claim = {
     version: 1,
     token: randomBytes(16).toString("hex"),
     ownerPid: process.pid,
     ownerIdentity: lockOwnerIdentity()
   };
-  let slot = path.join(ownerDir, ".reap");
+  const claimBase = `${lockOwnerDir(lockDir, deadToken)}.reap`;
+  let slot = claimBase;
   const observedTokens = new Set();
+  const predecessors = [];
   for (;;) {
+    if (!lockTargetsToken(lockDir, deadToken)) {
+      return null;
+    }
     const existing = readLockRecord(slot);
     if (!existing) {
-      if (linkedPathExists(slot)) {
-        return null;
-      }
-      let candidate;
       try {
-        candidate = createLinkedOwner(slot, claim);
+        if (linkedPathExists(slot)) {
+          return null;
+        }
+        const candidate = createLinkedOwner(slot, claim, false);
+        if (candidate.published) {
+          if (!lockTargetsToken(lockDir, deadToken)) {
+            releaseLock(slot, claim.token);
+            return null;
+          }
+          return { slot, token: claim.token, predecessors };
+        }
+        fs.rmSync(candidate.ownerDir, { recursive: true, force: true });
       } catch (error) {
-        if (error?.code === "ENOENT") {
+        if (["ENOENT", "EINVAL", "ENOTDIR", "ENOTEMPTY"].includes(error?.code)) {
           return null;
         }
         throw error;
       }
-      if (candidate.published) {
-        return { slot, token: claim.token };
-      }
-      fs.rmSync(candidate.ownerDir, { recursive: true, force: true });
       continue;
     }
     if (!lockTargetsToken(slot, existing.token) || !lockOwnerWasReplaced(existing)) {
@@ -305,7 +320,8 @@ function acquireReaperClaim(ownerDir) {
       return null;
     }
     observedTokens.add(existing.token);
-    slot = path.join(ownerDir, `.reap-successor-${existing.token}`);
+    predecessors.push({ slot, token: existing.token });
+    slot = `${claimBase}-successor-${existing.token}`;
   }
 }
 
@@ -313,7 +329,7 @@ function reclaimReplacedLock(lockDir, observed) {
   if (!observed || !lockOwnerWasReplaced(observed)) {
     return false;
   }
-  const claim = acquireReaperClaim(lockOwnerDir(lockDir, observed.token));
+  const claim = acquireReaperClaim(lockDir, observed.token);
   if (!claim) {
     return false;
   }
@@ -333,8 +349,11 @@ function reclaimReplacedLock(lockDir, observed) {
     }
     throw error;
   } finally {
-    if (!reaped) {
-      releaseLock(claim.slot, claim.token);
+    releaseLock(claim.slot, claim.token);
+    if (reaped) {
+      for (const predecessor of claim.predecessors) {
+        releaseLock(predecessor.slot, predecessor.token);
+      }
     }
   }
 }
@@ -354,6 +373,33 @@ function releaseLock(lockDir, token) {
   }
   fs.rmSync(lockOwnerDir(lockDir, token), { recursive: true, force: true });
   return true;
+}
+
+function lockHolderCommand(pid) {
+  try {
+    if (process.platform === "linux") {
+      return fs.readFileSync(`/proc/${pid}/cmdline`, "utf8").split("\0").filter(Boolean).join(" ");
+    }
+    const result = spawnSync("ps", ["-ww", "-p", String(pid), "-o", "command="], { encoding: "utf8", timeout: 2000, windowsHide: true });
+    return result.status === 0 ? String(result.stdout ?? "").trim() : "";
+  } catch {
+    return "";
+  }
+}
+
+function describeLockHolder(lockDir, observed) {
+  if (!observed) {
+    return " No owner record was readable.";
+  }
+  let heldSeconds = null;
+  try {
+    heldSeconds = Math.round((Date.now() - fs.statSync(lockOwnerDir(lockDir, observed.token)).mtimeMs) / 100) / 10;
+  } catch {}
+  const alive = directLockOwnerAlive(observed.ownerPid);
+  const current = alive ? getProcessIdentity(observed.ownerPid) : null;
+  const state = !alive ? "not running" : !current ? "alive, identity unreadable" : processIdentityMatches(observed.ownerPid, observed.ownerIdentity) ? "alive" : "alive with a different identity";
+  const command = alive ? lockHolderCommand(observed.ownerPid).slice(0, 200) : "";
+  return ` Held by pid ${observed.ownerPid} (${state})${heldSeconds == null ? "" : ` for ${heldSeconds}s`}${command ? `: ${command}` : ""}.`;
 }
 
 function withRecordLock(file, callback, timeoutMs = resolveLockTimeoutMs()) {
@@ -389,7 +435,7 @@ function withRecordLock(file, callback, timeoutMs = resolveLockTimeoutMs()) {
         }
       }
       if (Date.now() >= deadline) {
-        throw new Error(`Timed out waiting for the job record lock at ${file}.`);
+        throw new Error(`Timed out waiting for the job record lock at ${file}.${describeLockHolder(lockDir, readLockRecord(lockDir))}`);
       }
       sleepMs(LOCK_RETRY_MS);
       if (publishPreparedLock(lockDir, candidateDir)) {

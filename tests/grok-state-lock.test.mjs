@@ -254,6 +254,81 @@ process.stdout.write(JSON.stringify(getProcessIdentity(Number(pid))));
   assert.deepEqual(JSON.parse(west.stdout), JSON.parse(east.stdout));
 });
 
+test("repeated lock acquisitions probe the current process and host boot once", (t) => {
+  if (!["darwin", "freebsd", "openbsd"].includes(process.platform)) {
+    t.skip("ps based identity is only used on BSD hosts");
+    return;
+  }
+  const sandbox = makeSandbox(t);
+  const jobFile = makeRecord(sandbox, "cached-own-identity");
+  const bin = path.join(sandbox.root, "bin");
+  fs.mkdirSync(bin);
+  const psLog = path.join(sandbox.root, "ps.log");
+  const bootLog = path.join(sandbox.root, "boot.log");
+  const bootCommand = process.platform === "darwin" ? "sysctl" : "uptime";
+  const realPs = ["/bin/ps", "/usr/bin/ps"].find((candidate) => fs.existsSync(candidate));
+  const realBoot = [`/usr/sbin/${bootCommand}`, `/usr/bin/${bootCommand}`, `/sbin/${bootCommand}`, `/bin/${bootCommand}`].find((candidate) => fs.existsSync(candidate));
+  assert.ok(realPs);
+  assert.ok(realBoot);
+  fs.writeFileSync(path.join(bin, "ps"), `#!/bin/sh\nprintf '%s\\n' "$*" >> "$PS_CALL_LOG"\nexec "${realPs}" "$@"\n`);
+  fs.writeFileSync(path.join(bin, bootCommand), `#!/bin/sh\nprintf '%s\\n' "$*" >> "$BOOT_CALL_LOG"\nexec "${realBoot}" "$@"\n`);
+  fs.chmodSync(path.join(bin, "ps"), 0o755);
+  fs.chmodSync(path.join(bin, bootCommand), 0o755);
+  const source = `
+const [stateUrl, jobFile] = process.argv.slice(1);
+const state = await import(stateUrl);
+for (let revision = 1; revision <= 3; revision += 1) {
+  state.updateJobRecordFile(jobFile, { revision });
+}
+`;
+  const result = spawnSync(process.execPath, ["--input-type=module", "--eval", source, stateModulePath, jobFile], {
+    encoding: "utf8",
+    env: { ...process.env, LANG: "C", LC_ALL: "C", TZ: "UTC", PATH: `${bin}${path.delimiter}${process.env.PATH}`, PS_CALL_LOG: psLog, BOOT_CALL_LOG: bootLog }
+  });
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(fs.readFileSync(psLog, "utf8").trim().split("\n").length, 2);
+  assert.equal(fs.readFileSync(bootLog, "utf8").trim().split("\n").length, 1);
+  assert.equal(readJobRecordFile(jobFile).revision, 3);
+});
+
+test("a failed own identity probe is retried before it is cached", (t) => {
+  if (!["darwin", "freebsd", "openbsd"].includes(process.platform)) {
+    t.skip("ps based identity is only used on BSD hosts");
+    return;
+  }
+  const sandbox = makeSandbox(t);
+  const bin = path.join(sandbox.root, "bin");
+  fs.mkdirSync(bin);
+  const psLog = path.join(sandbox.root, "ps.log");
+  const bootLog = path.join(sandbox.root, "boot.log");
+  const failedFile = path.join(sandbox.root, "ps-failed");
+  const bootCommand = process.platform === "darwin" ? "sysctl" : "uptime";
+  const bootOutput = process.platform === "darwin" ? "{ sec = 1, usec = 0 }" : "2020-01-01 00:00:00";
+  fs.writeFileSync(path.join(bin, "ps"), `#!/bin/sh\nprintf 'call\\n' >> "$PS_CALL_LOG"\nif [ ! -e "$PS_FAILED_FILE" ]; then\n  : > "$PS_FAILED_FILE"\n  exit 1\nfi\nexec "${path.join(processIdentityBin, "ps")}" "$@"\n`);
+  fs.writeFileSync(path.join(bin, bootCommand), `#!/bin/sh\nprintf 'call\\n' >> "$BOOT_CALL_LOG"\nprintf '${bootOutput}\\n'\n`);
+  fs.chmodSync(path.join(bin, "ps"), 0o755);
+  fs.chmodSync(path.join(bin, bootCommand), 0o755);
+  const source = `
+const [identityUrl] = process.argv.slice(1);
+const { getProcessIdentity } = await import(identityUrl);
+const first = getProcessIdentity(process.pid);
+const second = getProcessIdentity(process.pid);
+const third = getProcessIdentity(process.pid);
+process.stdout.write(JSON.stringify({ first, second, third }));
+`;
+  const result = spawnSync(process.execPath, ["--input-type=module", "--eval", source, processIdentityModuleUrl], {
+    encoding: "utf8",
+    env: { ...process.env, PATH: `${bin}${path.delimiter}${process.env.PATH}`, PS_CALL_LOG: psLog, PS_FAILED_FILE: failedFile, BOOT_CALL_LOG: bootLog }
+  });
+  assert.equal(result.status, 0, result.stderr);
+  const { first, second, third } = JSON.parse(result.stdout);
+  assert.equal(first, null);
+  assert.ok(second);
+  assert.deepEqual(third, second);
+  assert.equal(fs.readFileSync(psLog, "utf8").trim().split("\n").length, 4);
+  assert.equal(fs.readFileSync(bootLog, "utf8").trim().split("\n").length, 1);
+});
+
 test("concurrent reapers serialize after a lock owner is killed", async (t) => {
   const sandbox = makeSandbox(t);
   const jobFile = makeRecord(sandbox, "concurrent-reapers");
@@ -294,6 +369,48 @@ test("concurrent reapers serialize after a lock owner is killed", async (t) => {
   assert.equal(readJobRecordFile(jobFile).revision, 4);
   assert.equal(fs.existsSync(`${jobFile}.lock`), false);
   assert.equal(fs.existsSync(guardFile), false);
+  assert.deepEqual(fs.readdirSync(path.dirname(jobFile)).filter((entry) => entry.startsWith(`${path.basename(jobFile)}.lock.reap.`)), []);
+});
+
+test("a vanished reaper claim staging directory is a lost race", (t) => {
+  const sandbox = makeSandbox(t);
+  const source = `
+import fs from "node:fs";
+import path from "node:path";
+const [stateUrl, identityUrl, jobFile, failureCode] = process.argv.slice(1);
+const state = await import(stateUrl);
+const { getProcessIdentity } = await import(identityUrl);
+const lockDir = jobFile + ".lock";
+const token = "a".repeat(32);
+const ownerDir = lockDir + ".owner." + token;
+const ownerIdentity = { ...getProcessIdentity(process.pid), commandHash: "0".repeat(64) };
+fs.mkdirSync(ownerDir);
+fs.writeFileSync(path.join(ownerDir, "owner.json"), JSON.stringify({ version: 1, token, ownerPid: process.pid, ownerIdentity }) + "\\n");
+fs.symlinkSync(path.basename(ownerDir), lockDir, "dir");
+const originalRenameSync = fs.renameSync;
+let injected = false;
+fs.renameSync = function renameWithoutStaging(from, to) {
+  if (!injected && String(from).includes(".reap.") && String(from).endsWith(".tmp")) {
+    injected = true;
+    fs.rmSync(path.dirname(from), { recursive: true, force: true });
+    if (failureCode !== "ENOENT") {
+      const error = new Error("claim staging disappeared");
+      error.code = failureCode;
+      throw error;
+    }
+  }
+  return originalRenameSync.call(this, from, to);
+};
+const record = state.updateJobRecordFile(jobFile, { revision: 1 });
+const leftovers = fs.readdirSync(path.dirname(lockDir)).filter((entry) => entry.startsWith(path.basename(lockDir) + ".reap."));
+process.stdout.write(JSON.stringify({ injected, revision: record.revision, leftovers }));
+`;
+  for (const code of ["ENOENT", "EINVAL", "ENOTDIR", "ENOTEMPTY"]) {
+    const jobFile = makeRecord(sandbox, `vanished-reaper-staging-${code.toLowerCase()}`);
+    const result = runChildSync(source, [stateModulePath, processIdentityModuleUrl, jobFile, code]);
+    assert.equal(result.status, 0, `${code}: ${result.stderr}`);
+    assert.deepEqual(JSON.parse(result.stdout), { injected: true, revision: 1, leftovers: [] }, code);
+  }
 });
 
 test("a dead reaper claim is succeeded without wedging recovery", async (t) => {
@@ -309,7 +426,7 @@ test("a dead reaper claim is succeeded without wedging recovery", async (t) => {
   holder.child.kill("SIGKILL");
   await holder.completion;
 
-  const claimSlot = path.join(ownerDir, ".reap");
+  const claimSlot = `${lockDir}.reap.${owner.token}`;
   const claimToken = "c".repeat(32);
   const claimOwnerDir = `${claimSlot}.owner.${claimToken}`;
   fs.mkdirSync(claimOwnerDir);
@@ -319,6 +436,8 @@ test("a dead reaper claim is succeeded without wedging recovery", async (t) => {
   assert.equal(updateRecordInChild(jobFile, { revision: 1 }).record.revision, 1);
   assert.equal(fs.existsSync(lockDir), false);
   assert.equal(fs.existsSync(ownerDir), false);
+  assert.equal(fs.existsSync(claimSlot), false);
+  assert.equal(fs.existsSync(claimOwnerDir), false);
 });
 
 test("a reused live PID cannot retain a replaced owner identity", (t) => {

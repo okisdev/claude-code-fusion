@@ -57,11 +57,13 @@ const processInspectionTests = new Set([
   "terminal collection is an atomic idempotent lifecycle transition",
   "a cancellation request wins a racing successful completion",
   "lock-scoped updates see the current record and session aliases stay aligned",
+  "multiple locked record writes probe the owner identity once",
   "workspace launch reservations serialize",
   "thread reservations use a data-root-wide lock",
   "three processes serialize on the same thread lock",
   "a held thread lock times out a second acquirer within the configured ceiling",
   "a lock owned by a dead process is reclaimed without an age heuristic",
+  "concurrent reapers serialize after a lock owner is killed",
   "a dead reaper claim is succeeded without wedging stale lock recovery",
   "a live PID with a replaced process identity does not retain a lock",
   "an old holder cannot release a successor lock with a different token",
@@ -381,6 +383,40 @@ test("workspace and repository identity use the Git root and common directory", 
   assert.strictEqual(workspaceSlug(nested), workspaceSlug(repository));
 });
 
+test("Git probes expire and failed probes see a repository created later", (t) => {
+  const sandbox = makeSandbox(t);
+  const bin = path.join(sandbox.root, "bin");
+  const traceFile = path.join(sandbox.root, "git.log");
+  const realGit = spawnSync("sh", ["-c", "command -v git"], { encoding: "utf8" }).stdout.trim();
+  fs.mkdirSync(bin);
+  fs.writeFileSync(path.join(bin, "git"), '#!/bin/sh\nprintf "%s\\n" "$*" >> "$CODEX_GIT_TRACE"\nexec "$CODEX_REAL_GIT" "$@"\n', { mode: 0o755 });
+  const source = `
+import { spawnSync } from "node:child_process";
+const [stateUrl, cwd, realGit] = process.argv.slice(1);
+const { canonicalWorkspaceRoot, repositoryIdentity } = await import(stateUrl);
+const realNow = Date.now;
+let now = realNow();
+Date.now = () => now;
+canonicalWorkspaceRoot(cwd);
+canonicalWorkspaceRoot(cwd);
+const init = spawnSync(realGit, ["init", "--quiet", cwd], { encoding: "utf8" });
+if (init.status !== 0) throw new Error(init.stderr);
+canonicalWorkspaceRoot(cwd);
+canonicalWorkspaceRoot(cwd);
+const identity = repositoryIdentity(cwd);
+if (identity !== cwd + "/.git" || repositoryIdentity(cwd) !== identity) throw new Error("Repository identity did not update after git init.");
+now += 3001;
+canonicalWorkspaceRoot(cwd);
+repositoryIdentity(cwd);
+`;
+  const result = spawnSync(process.execPath, ["--input-type=module", "--eval", source, stateModuleUrl, sandbox.workDir, realGit], {
+    encoding: "utf8",
+    env: { ...process.env, PATH: `${bin}${path.delimiter}${process.env.PATH}`, CODEX_GIT_TRACE: traceFile, CODEX_REAL_GIT: realGit }
+  });
+  assert.strictEqual(result.status, 0, result.stderr);
+  assert.strictEqual(fs.readFileSync(traceFile, "utf8").trim().split("\n").length, 6);
+});
+
 test("state artifacts are private and append-only ledgers retain bounded tails", (t) => {
   const sandbox = makeSandbox(t);
   const { file, record } = makeRecord(sandbox);
@@ -493,6 +529,38 @@ test("lock-scoped updates see the current record and session aliases stay aligne
   assert.strictEqual(updated.claudeSessionId, "session-two");
 });
 
+test("multiple locked record writes probe the owner identity once", (t) => {
+  if (!["darwin", "freebsd", "openbsd"].includes(process.platform)) {
+    t.skip("ps-backed process identities are unavailable on this platform");
+    return;
+  }
+  const sandbox = makeSandbox(t);
+  const bin = path.join(sandbox.root, "bin");
+  const traceFile = path.join(sandbox.root, "ps.log");
+  const realPs = spawnSync("sh", ["-c", "command -v ps"], { encoding: "utf8" }).stdout.trim();
+  fs.mkdirSync(bin);
+  fs.writeFileSync(path.join(bin, "ps"), '#!/bin/sh\nprintf "%s\\n" "$*" >> "$CODEX_PS_TRACE"\nexec "$CODEX_REAL_PS" "$@"\n', { mode: 0o755 });
+  const source = `
+const [stateUrl, dataDir, workDir] = process.argv.slice(1);
+const { createJobRecord, jobFilePath, writeJobRecordFile, updateJobRecordFile } = await import(stateUrl);
+const id = "1".repeat(32);
+const file = jobFilePath(dataDir, workDir, id);
+writeJobRecordFile(file, createJobRecord({ id, cwd: workDir }));
+for (let index = 0; index < 3; index += 1) {
+  updateJobRecordFile(file, { phase: \`phase-\${index}\` });
+}
+`;
+  const result = spawnSync(process.execPath, ["--input-type=module", "--eval", source, stateModuleUrl, sandbox.dataDir, sandbox.workDir], {
+    encoding: "utf8",
+    env: { ...process.env, PATH: `${bin}${path.delimiter}${process.env.PATH}`, CODEX_PS_TRACE: traceFile, CODEX_REAL_PS: realPs }
+  });
+  assert.equal(result.status, 0, result.stderr);
+  const calls = fs.readFileSync(traceFile, "utf8").trim().split("\n");
+  assert.equal(calls.length, 2);
+  assert.ok(calls.some((call) => call.includes("lstart=")));
+  assert.ok(calls.some((call) => call.includes("command=")));
+});
+
 test("workspace launch reservations serialize", (t) => {
   const sandbox = makeSandbox(t);
   const result = withWorkspaceLock(sandbox.dataDir, sandbox.workDir, () => "reserved");
@@ -534,6 +602,52 @@ test("three processes serialize on the same thread lock", async (t) => {
   assert.strictEqual(fs.existsSync(`${traceFile}.guard`), false);
 });
 
+test("a lock whose dead owner is not yet reaped is reclaimed on Linux", (t) => {
+  if (process.platform !== "linux") {
+    t.skip("Linux only: a zombie keeps answering signal 0 while its identity reads as gone.");
+    return;
+  }
+  const sandbox = makeSandbox(t);
+  const record = createJobRecord({ id: "zombie-owner", cwd: sandbox.workDir, status: "running" });
+  const file = jobFilePath(sandbox.dataDir, sandbox.workDir, record.id);
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  writeJobRecordFile(file, record);
+  const lockedFile = path.join(sandbox.root, "zombie-owner-locked");
+  const child = spawn(process.execPath, ["--input-type=module", "-e", `
+    import fs from "node:fs";
+    const state = await import(${JSON.stringify(stateModuleUrl)});
+    state.updateJobRecordFileWithCurrent(${JSON.stringify(file)}, () => {
+      fs.writeFileSync(${JSON.stringify(lockedFile)}, "locked");
+      process.exit(0);
+    });
+  `], { stdio: "ignore" });
+  const zombie = () => {
+    try {
+      const stat = fs.readFileSync(`/proc/${child.pid}/stat`, "utf8");
+      return stat.slice(stat.lastIndexOf(")") + 2).startsWith("Z");
+    } catch {
+      return false;
+    }
+  };
+  const deadline = Date.now() + 15000;
+  while (!(fs.existsSync(lockedFile) && zombie()) && Date.now() < deadline) {
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10);
+  }
+  assert.ok(fs.existsSync(lockedFile) && zombie(), "Expected the lock owner to exit holding the lock and stay unreaped.");
+  const previous = process.env.CODEX_COMPANION_LOCK_TIMEOUT_MS;
+  process.env.CODEX_COMPANION_LOCK_TIMEOUT_MS = "3000";
+  try {
+    const updated = updateJobRecordFileWithCurrent(file, () => ({ phase: "reclaimed" }));
+    assert.strictEqual(updated.phase, "reclaimed");
+  } finally {
+    if (previous === undefined) {
+      delete process.env.CODEX_COMPANION_LOCK_TIMEOUT_MS;
+    } else {
+      process.env.CODEX_COMPANION_LOCK_TIMEOUT_MS = previous;
+    }
+  }
+});
+
 test("a held thread lock times out a second acquirer within the configured ceiling", async (t) => {
   const sandbox = makeSandbox(t);
   const threadId = "contended-thread";
@@ -557,6 +671,7 @@ test("a held thread lock times out a second acquirer within the configured ceili
   assert.strictEqual(result.exitCode, 0, result.stderr);
   const outcome = JSON.parse(result.stdout);
   assert.match(outcome.message, /Timed out waiting for the job record lock at/);
+  assert.match(outcome.message, new RegExp(`Held by pid ${holder.child.pid} \\(alive\\) for \\d+(\\.\\d)?s: \\S`));
   assert.ok(outcome.elapsedMs >= timeoutMs, `Expected the waiter to wait for at least ${timeoutMs}ms, took ${outcome.elapsedMs}ms.`);
   assert.ok(outcome.elapsedMs <= timeoutMs + 500, `Expected the waiter to finish near ${timeoutMs}ms, took ${outcome.elapsedMs}ms.`);
 
@@ -591,6 +706,135 @@ test("a lock owned by a dead process is reclaimed without an age heuristic", asy
   assert.strictEqual(fs.existsSync(lockDir), false);
 });
 
+test("concurrent reapers serialize after a lock owner is killed", async (t) => {
+  const sandbox = makeSandbox(t);
+  const threadId = "concurrent-reapers-thread";
+  const readyFile = path.join(sandbox.root, "reaper-holder-ready");
+  const releaseFile = path.join(sandbox.root, "reaper-holder-release");
+  const holder = runLockChild(heldLockChild, [stateModuleUrl, sandbox.dataDir, threadId, readyFile, releaseFile], identityChildEnv());
+  t.after(() => {
+    if (holder.child.exitCode === null && holder.child.signalCode === null) {
+      holder.child.kill("SIGKILL");
+    }
+  });
+  await waitForPath(readyFile);
+  const lockDir = threadLockDir(sandbox.dataDir, threadId);
+  const owner = JSON.parse(fs.readFileSync(path.join(lockDir, "owner.json"), "utf8"));
+  holder.child.kill("SIGKILL");
+  const holderResult = await holder.completion;
+  assert.strictEqual(holderResult.signal, "SIGKILL", holderResult.stderr);
+  assert.strictEqual(processIdentityMatches(owner.ownerPid, owner.ownerIdentity), false);
+
+  const traceFile = path.join(sandbox.root, "reaper-trace.log");
+  const children = ["one", "two", "three", "four", "five", "six"].map((name) => runLockChild(serialLockChild, [stateModuleUrl, sandbox.dataDir, threadId, traceFile, name, "10"], identityChildEnv()));
+  t.after(() => {
+    for (const { child } of children) {
+      if (child.exitCode === null && child.signalCode === null) {
+        child.kill("SIGKILL");
+      }
+    }
+  });
+  const results = await Promise.all(children.map(({ completion }) => completion));
+  for (const result of results) {
+    assert.strictEqual(result.exitCode, 0, result.stderr);
+  }
+  const lines = fs.readFileSync(traceFile, "utf8").trim().split("\n");
+  assert.strictEqual(lines.length, 12);
+  for (let index = 0; index < lines.length; index += 2) {
+    assert.match(lines[index], /^(one|two|three|four|five|six):enter$/);
+    assert.strictEqual(lines[index + 1], `${lines[index].split(":")[0]}:exit`);
+  }
+  assert.strictEqual(fs.existsSync(lockDir), false);
+  assert.deepStrictEqual(fs.readdirSync(path.dirname(lockDir)).filter((name) => name.startsWith(path.basename(lockDir) + ".owner.")), []);
+});
+
+test("a disappearing reaper claim staging directory is a lost race", (t) => {
+  const sandbox = makeSandbox(t);
+  const source = `
+import fs from "node:fs";
+import path from "node:path";
+const [stateUrl, identityUrl, dataDir, threadId, lockDir] = process.argv.slice(1);
+const { withThreadLock } = await import(stateUrl);
+const { getProcessIdentity } = await import(identityUrl);
+const token = "a".repeat(32);
+const ownerDir = lockDir + ".owner." + token;
+fs.mkdirSync(ownerDir, { recursive: true });
+const ownerIdentity = { ...getProcessIdentity(process.pid), commandHash: "0".repeat(64) };
+fs.writeFileSync(path.join(ownerDir, "owner.json"), JSON.stringify({ version: 1, token, ownerPid: process.pid, ownerIdentity }) + "\\n");
+fs.symlinkSync(path.basename(ownerDir), lockDir, "dir");
+const originalOpenSync = fs.openSync;
+const originalRenameSync = fs.renameSync;
+let removedAtOpen = false;
+let removedAtRename = false;
+fs.openSync = function openWithoutStaging(target, ...args) {
+  if (!removedAtOpen && typeof target === "string" && target.includes(".reap.owner.") && target.endsWith(".tmp")) {
+    removedAtOpen = true;
+    fs.rmSync(path.dirname(target), { recursive: true, force: true });
+  }
+  return originalOpenSync.call(this, target, ...args);
+};
+fs.renameSync = function renameWithoutStaging(source, destination) {
+  if (!removedAtRename && destination.includes(".reap.owner.") && destination.endsWith("/owner.json")) {
+    removedAtRename = true;
+    fs.rmSync(path.dirname(destination), { recursive: true, force: true });
+  }
+  return originalRenameSync.call(this, source, destination);
+};
+const value = withThreadLock(dataDir, threadId, () => "recovered");
+process.stdout.write(JSON.stringify({ removedAtOpen, removedAtRename, value, lockExists: fs.existsSync(lockDir) }));
+`;
+  const result = spawnSync(process.execPath, ["--input-type=module", "--eval", source, stateModuleUrl, new URL("../plugins/codex/scripts/lib/codex-exec.mjs", import.meta.url).href, sandbox.dataDir, "disappearing-claim-thread", threadLockDir(sandbox.dataDir, "disappearing-claim-thread")], {
+    encoding: "utf8",
+    env: identityChildEnv()
+  });
+  assert.strictEqual(result.status, 0, result.stderr);
+  assert.deepStrictEqual(JSON.parse(result.stdout), { removedAtOpen: true, removedAtRename: true, value: "recovered", lockExists: false });
+});
+
+test("reaper claim publication races retry without crashing", (t) => {
+  const sandbox = makeSandbox(t);
+  const source = `
+import fs from "node:fs";
+import path from "node:path";
+const [stateUrl, identityUrl, dataDir, lockDirsJson] = process.argv.slice(1);
+const { withThreadLock } = await import(stateUrl);
+const { getProcessIdentity } = await import(identityUrl);
+const lockDirs = JSON.parse(lockDirsJson);
+const codes = ["ENOENT", "EINVAL", "ENOTDIR", "ENOTEMPTY"];
+for (let index = 0; index < codes.length; index += 1) {
+  const lockDir = lockDirs[index];
+  const token = "a".repeat(32);
+  const ownerDir = lockDir + ".owner." + token;
+  fs.mkdirSync(ownerDir, { recursive: true });
+  const ownerIdentity = { ...getProcessIdentity(process.pid), commandHash: "0".repeat(64) };
+  fs.writeFileSync(path.join(ownerDir, "owner.json"), JSON.stringify({ version: 1, token, ownerPid: process.pid, ownerIdentity }) + "\\n");
+  fs.symlinkSync(path.basename(ownerDir), lockDir, "dir");
+  const originalSymlinkSync = fs.symlinkSync;
+  let injected = false;
+  fs.symlinkSync = function publishWithRace(target, linkPath, ...args) {
+    if (!injected && linkPath.includes(".reap")) {
+      injected = true;
+      const error = new Error("claim publication lost");
+      error.code = codes[index];
+      throw error;
+    }
+    return originalSymlinkSync.call(this, target, linkPath, ...args);
+  };
+  const value = withThreadLock(dataDir, "claim-publication-" + index, () => "recovered");
+  fs.symlinkSync = originalSymlinkSync;
+  if (!injected || value !== "recovered" || fs.existsSync(lockDir)) throw new Error(codes[index] + " was not recovered");
+}
+process.stdout.write(JSON.stringify(codes));
+`;
+  const lockDirs = Array.from({ length: 4 }, (_, index) => threadLockDir(sandbox.dataDir, `claim-publication-${index}`));
+  const result = spawnSync(process.execPath, ["--input-type=module", "--eval", source, stateModuleUrl, new URL("../plugins/codex/scripts/lib/codex-exec.mjs", import.meta.url).href, sandbox.dataDir, JSON.stringify(lockDirs)], {
+    encoding: "utf8",
+    env: identityChildEnv()
+  });
+  assert.strictEqual(result.status, 0, result.stderr);
+  assert.deepStrictEqual(JSON.parse(result.stdout), ["ENOENT", "EINVAL", "ENOTDIR", "ENOTEMPTY"]);
+});
+
 test("a dead reaper claim is succeeded without wedging stale lock recovery", async (t) => {
   const sandbox = makeSandbox(t);
   const threadId = "dead-reaper-thread";
@@ -611,7 +855,7 @@ test("a dead reaper claim is succeeded without wedging stale lock recovery", asy
   const holderResult = await holder.completion;
   assert.strictEqual(holderResult.signal, "SIGKILL", holderResult.stderr);
 
-  const claimSlot = path.join(ownerDir, ".reap");
+  const claimSlot = `${ownerDir}.reap`;
   const claimToken = "c".repeat(32);
   const claimOwnerDir = `${claimSlot}.owner.${claimToken}`;
   fs.mkdirSync(claimOwnerDir, { mode: 0o700 });
@@ -621,6 +865,8 @@ test("a dead reaper claim is succeeded without wedging stale lock recovery", asy
   assert.strictEqual(withThreadLock(sandbox.dataDir, threadId, () => "recovered"), "recovered");
   assert.strictEqual(fs.existsSync(lockDir), false);
   assert.strictEqual(fs.existsSync(ownerDir), false);
+  assert.strictEqual(fs.existsSync(claimSlot), false);
+  assert.strictEqual(fs.existsSync(claimOwnerDir), false);
 });
 
 test("a live PID with a replaced process identity does not retain a lock", (t) => {

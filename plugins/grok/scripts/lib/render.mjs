@@ -509,7 +509,7 @@ export function renderRecordAcceptance(record) {
 export function renderSetupReport(report) {
   const host = report.hostEnvironment;
   const hostLine = host?.ready
-    ? host.undeniedRuntimeSockets?.length > 0 ? `ready, ${host.detail}` : "ready"
+    ? host.writeReady ? "ready" : `consult ready, write runs refused, ${host.detail}`
     : `needs attention, ${host?.detail ?? "not checked"}`;
   const lines = [
     "# Grok setup",

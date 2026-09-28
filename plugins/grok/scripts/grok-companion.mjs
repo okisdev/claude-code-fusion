@@ -11,6 +11,7 @@ import { fileURLToPath } from "node:url";
 import { parseArgs, parseRawArgs, rawBooleanOptionRequested } from "./lib/args.mjs";
 import {
   buildGrokArgs,
+  existingUnixSockets,
   formatBlockedPermissionCall,
   formatDeniedToolDetail,
   grokAuthStatus,
@@ -20,6 +21,8 @@ import {
   runtimeSocketEngine,
   runtimeSocketRemedy,
   runtimeSocketSymlinkEndpoints,
+  undeniedRuntimeSocketCandidates,
+  undeniedRuntimeSocketRemedy,
   resolveGrokBin,
   resolveGrokCapabilities,
   resolveTimeoutMs,
@@ -129,7 +132,6 @@ const MAX_HISTORY_LIMIT = 500;
 const TESTED_VERSION_MIN = [1, 0, 14];
 const TESTED_VERSION_MAX = [1, 0, 42];
 const GROK_VERSION_PROBE_TIMEOUT_MS = 3000;
-const UNDENIED_RUNTIME_SOCKET_CANDIDATES_ENV = "GROK_COMPANION_UNDENIED_SOCKET_CANDIDATES";
 const CONTINUITY_POLICIES = new Set(["manual", "claude-session"]);
 const HISTORY_STATUSES = new Set(["running", "done", "error", "cancelled"]);
 const HISTORY_MODES = new Set(["consult", "write"]);
@@ -3101,30 +3103,6 @@ function shellEnvironmentPolicyAdvisory(env = process.env, cwd = process.cwd()) 
   };
 }
 
-function undeniedRuntimeSocketCandidates(env = process.env) {
-  if (Object.hasOwn(env, UNDENIED_RUNTIME_SOCKET_CANDIDATES_ENV)) {
-    return [...new Set(String(env[UNDENIED_RUNTIME_SOCKET_CANDIDATES_ENV] ?? "").split(":").filter(Boolean))];
-  }
-  const home = typeof env.HOME === "string" && env.HOME.trim() ? env.HOME : os.homedir();
-  return [path.join(home, ".orbstack", "run", "docker.sock")];
-}
-
-function existingUnixSockets(candidates) {
-  const sockets = [];
-  for (const candidate of candidates) {
-    try {
-      if (fs.lstatSync(candidate).isSocket()) {
-        sockets.push(candidate);
-      }
-    } catch (error) {
-      if (error?.code !== "ENOENT") {
-        throw error;
-      }
-    }
-  }
-  return sockets;
-}
-
 function hostEnvironmentAdvisory(env = process.env) {
   try {
     const runtimeSocketSymlinks = runtimeSocketSymlinkEndpoints(runtimeSocketEndpoints({ env }));
@@ -3132,19 +3110,21 @@ function hostEnvironmentAdvisory(env = process.env) {
     const engine = runtimeSocketSymlinks.length === 0 ? null : runtimeSocketEngine(runtimeSocketSymlinks[0]);
     return {
       ready: runtimeSocketSymlinks.length === 0,
+      writeReady: runtimeSocketSymlinks.length === 0 && undeniedRuntimeSockets.length === 0,
       runtimeSocketSymlinks,
       undeniedRuntimeSockets,
       runtimeSocketEngine: engine,
-      remedy: runtimeSocketSymlinks.length === 0 ? null : runtimeSocketRemedy(runtimeSocketSymlinks[0], engine),
+      remedy: runtimeSocketSymlinks.length > 0 ? runtimeSocketRemedy(runtimeSocketSymlinks[0], engine) : undeniedRuntimeSockets.length > 0 ? undeniedRuntimeSocketRemedy() : null,
       detail: runtimeSocketSymlinks.length === 0
         ? undeniedRuntimeSockets.length > 0
-          ? `no runtime-socket deny path is a symlink; OrbStack docker socket ${undeniedRuntimeSockets[0]} is outside grok's runtime-socket deny list, so a strict write shell may still reach that engine`
+          ? `no runtime-socket deny path is a symlink; socket ${undeniedRuntimeSockets[0]} is outside grok's strict runtime-socket deny list, so write runs are refused while it could drive that container engine and write outside the workspace`
           : "no runtime-socket deny path is a symlink"
         : `runtime-socket deny path is a symlink: ${runtimeSocketSymlinks.join(", ")}`
     };
   } catch (error) {
     return {
       ready: false,
+      writeReady: false,
       runtimeSocketSymlinks: [],
       undeniedRuntimeSockets: [],
       runtimeSocketEngine: null,
@@ -3250,6 +3230,9 @@ function handleSetup(argv, transport = {}) {
   if (!hostEnvironment.ready && hostEnvironment.runtimeSocketSymlinks.length > 0) {
     nextSteps.push(hostEnvironment.remedy ?? `Stop the Docker engine that creates ${hostEnvironment.runtimeSocketSymlinks.join(", ")}, or remove the symlink. Do not downgrade the sandbox.`);
   }
+  if (hostEnvironment.ready && !hostEnvironment.writeReady) {
+    nextSteps.push(hostEnvironment.remedy);
+  }
   if (!writable) {
     nextSteps.push(`Fix permissions on ${dataDir}.`);
   }
@@ -3257,8 +3240,10 @@ function handleSetup(argv, transport = {}) {
     nextSteps.push("Run `grok models` once outside the sandbox to refresh the stored Grok token.");
   }
 
+  const ready = available && capabilities.ready && compatible && hostEnvironment.ready && writable;
   const report = {
-    ready: available && capabilities.ready && compatible && hostEnvironment.ready && writable,
+    ready,
+    writeReady: ready && hostEnvironment.writeReady,
     grok: { available, detail, bin },
     compatibility: compatible ? "tested" : available ? newerThanTested ? `newer than the tested interval (${testedInterval})` : `outside the tested interval (${testedInterval})` : "unknown",
     capabilities,
