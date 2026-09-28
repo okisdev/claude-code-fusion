@@ -19,6 +19,7 @@ const PIDLESS_RUNNING_GRACE_ENV = "GROK_COMPANION_PIDLESS_RUNNING_GRACE_MS";
 const CONSULT_ALLOW_ENV = "GROK_CONSULT_ALLOW";
 const CAPABILITIES_ENV = "GROK_COMPANION_CAPABILITIES";
 const RUNTIME_SOCKET_CANDIDATES_ENV = "GROK_COMPANION_RUNTIME_SOCKET_CANDIDATES";
+const UNDENIED_RUNTIME_SOCKET_CANDIDATES_ENV = "GROK_COMPANION_UNDENIED_SOCKET_CANDIDATES";
 const DEFAULT_FOREGROUND_TIMEOUT_MS = 570000;
 const BACKGROUND_TIMEOUT_CAP_MS = 1800000;
 const DEFAULT_PIDLESS_RUNNING_GRACE_MS = 15000;
@@ -714,6 +715,34 @@ export function runtimeSocketEndpoints({ env = process.env, platform = process.p
     );
   }
   return endpoints;
+}
+
+export function undeniedRuntimeSocketCandidates(env = process.env) {
+  if (Object.hasOwn(env, UNDENIED_RUNTIME_SOCKET_CANDIDATES_ENV)) {
+    return [...new Set(String(env[UNDENIED_RUNTIME_SOCKET_CANDIDATES_ENV] ?? "").split(":").filter(Boolean))];
+  }
+  const home = typeof env.HOME === "string" && env.HOME.trim() ? env.HOME : os.homedir();
+  return [path.join(home, ".orbstack", "run", "docker.sock")];
+}
+
+export function existingUnixSockets(candidates, lstat = fs.lstatSync) {
+  const sockets = [];
+  for (const candidate of candidates) {
+    try {
+      if (lstat(candidate).isSocket()) {
+        sockets.push(candidate);
+      }
+    } catch (error) {
+      if (error?.code !== "ENOENT") {
+        throw error;
+      }
+    }
+  }
+  return sockets;
+}
+
+export function undeniedRuntimeSocketRemedy() {
+  return "Quit the container engine (for OrbStack, run `orb stop`), or route the package to Codex, whose sandbox blocks the connect. Grok write runs are refused while the socket exists.";
 }
 
 export function runtimeSocketSymlinkEndpoints(candidates, lstat = fs.lstatSync) {
@@ -1882,6 +1911,17 @@ export function runGrok(options) {
       candidates: options.runtimeSocketEndpoints ?? runtimeSocketEndpoints({ env }),
       lstat: options.runtimeSocketLstat ?? fs.lstatSync
     });
+    if (requestedMode === "write") {
+      let sockets;
+      try {
+        sockets = existingUnixSockets(undeniedRuntimeSocketCandidates(env));
+      } catch (error) {
+        throw securityError("sandbox", `Unable to inspect undenied Grok runtime sockets: ${error.message}`);
+      }
+      if (sockets.length > 0) {
+        throw securityError("sandbox", `Grok's strict runtime-socket deny list does not cover ${sockets[0]}, so a write shell could drive that container engine and write outside the workspace. ${undeniedRuntimeSocketRemedy()}`);
+      }
+    }
   }
   const args = options.args ?? buildGrokArgs({ ...options, capabilities, timeoutMs });
   const childEnv = buildGrokChildEnv(env, { memory: options.memory === true, web: options.web === true });
