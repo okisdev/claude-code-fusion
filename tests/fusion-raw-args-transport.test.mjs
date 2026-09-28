@@ -7,6 +7,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { consumeRawArgsTransport, createRawArgsTransport, resolveRawArgsTransport, splitRawArgs } from "../plugins/fusion/scripts/lib/raw-args-transport.mjs";
+import { messageCode } from "../plugins/fusion/scripts/lib/user-messages.mjs";
 
 const SCRIPT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "plugins", "fusion", "scripts", "fusion-stats.mjs");
 
@@ -25,6 +26,28 @@ test("raw argument parsing preserves quoted values without evaluating shell synt
     "literal $(touch /tmp/never); `id`; $HOME",
     "--json"
   ]);
+});
+
+test("quotes inside a token are literal and opening quotes still require closure", () => {
+  assert.deepStrictEqual(splitRawArgs(`--reason worker's "quoted phrase" --source main-loop`), ["--reason", "worker's", "quoted phrase", "--source", "main-loop"]);
+  assert.deepStrictEqual(splitRawArgs(`--reason word"inside'word`), ["--reason", `word"inside'word`]);
+  assert.deepStrictEqual(splitRawArgs('--reason "worker\'s result"'), ["--reason", "worker's result"]);
+  assert.throws(() => splitRawArgs('--reason "unterminated'), /unterminated escape or quote/);
+});
+
+test("the stats CLI reports consumed raw request errors without a stack trace", (t) => {
+  const directory = sandbox(t);
+  const env = { ...process.env, CLAUDE_CODE_SESSION_ID: "stats-request-error-test" };
+  const created = spawnSync(process.execPath, [SCRIPT, "transport-create"], { cwd: directory, env, encoding: "utf8" });
+  assert.strictEqual(created.status, 0, created.stderr);
+  const transport = JSON.parse(created.stdout);
+  fs.writeFileSync(transport.file, '--record "unterminated');
+
+  const result = spawnSync(process.execPath, [SCRIPT, "--raw-args-token", transport.token], { cwd: directory, env, encoding: "utf8" });
+  assert.strictEqual(result.status, 1);
+  assert.strictEqual(result.stdout, "");
+  assert.strictEqual(result.stderr, `Fusion input arguments contain an unterminated escape or quote. The transport token was consumed; run transport-create again before retrying. [fusion:${messageCode("stats.request-error")}]\n`);
+  assert.strictEqual(fs.existsSync(transport.file), false);
 });
 
 test("private argument transports are session bound and consumed once", (t) => {

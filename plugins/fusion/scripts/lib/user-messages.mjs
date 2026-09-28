@@ -15,10 +15,12 @@ const MESSAGE_REGISTRY = [
   { slug: "inline-guard.state-unavailable-deny", description: "Strict posture fail closed denial when guard state is unreadable." },
   { slug: "inline-guard.allow-retired-notice", description: "Notice that the allow escape hatch subcommand is retired." },
   { slug: "worker-lifecycle.foreground-wrapper-deny", description: "Denial of background delivery for a peer wrapper Agent." },
+  { slug: "worker-lifecycle.lane-default-injection", description: "Notice naming routing table options filled for a peer wrapper request." },
   { slug: "worker-lifecycle.collector-request-deny", description: "Denial of a collector request missing its engine and job lines." },
   { slug: "worker-lifecycle.brief-validation-deny", description: "Denial of a worker brief that fails envelope validation." },
   { slug: "worker-lifecycle.background-authorization-deny", description: "Denial of background execution without explicit user authorization." },
   { slug: "worker-lifecycle.dispatch-advisory", description: "Dispatch time advisory on verification suites, sizing, or transcript size." },
+  { slug: "worker-lifecycle.launch-cap-advisory", description: "Notice after the harness refuses a subagent launch at its concurrency cap." },
   { slug: "worker-lifecycle.final-deliverable-allow", description: "Permission for a stopping worker's final deliverable write." },
   { slug: "worker-lifecycle.worker-stop-deny", description: "Instruction that a stopping worker must return a concise partial result." },
   { slug: "worker-lifecycle.budget-wind-down", description: "Wind down instruction as a worker approaches its token or turn budget." },
@@ -48,7 +50,8 @@ const MESSAGE_REGISTRY = [
   { slug: "rules-sync.model-table-warning", description: "Warning that the model routing table could not be rendered." },
   { slug: "session.compact-reposture", description: "Post compaction instruction to restate posture and recheck dispatch tracking." },
   { slug: "codex-monitor.job-notification", description: "Monitor line reporting a detached Codex job transition or observation." },
-  { slug: "stats.raw-args-required", description: "Stats error that free text arguments must ride the raw args transport." }
+  { slug: "stats.raw-args-required", description: "Stats error that free text arguments must ride the raw args transport." },
+  { slug: "stats.request-error", description: "Stats request error from invalid arguments or raw args transport." }
 ];
 
 const CODE_BY_SLUG = new Map(
