@@ -26,6 +26,7 @@ import {
   jobEventsPath,
   jobFilePath,
   jobLogPath,
+  latestJobRecordForThread,
   listAllJobRecords,
   listJobRecords,
   markJobCollectedFile,
@@ -240,6 +241,26 @@ function makeRecord(sandbox, fields = {}) {
   writeJobRecordFile(file, record);
   return { file, record: readJobRecordFile(file) };
 }
+
+test("thread source lookup can require an exact thread in one workspace", (t) => {
+  const sandbox = makeSandbox(t);
+  const threadId = "thread-source";
+  const seed = (fields) => {
+    const record = createJobRecord({ status: "done", ...fields });
+    const file = jobFilePath(sandbox.dataDir, fields.cwd, record.id);
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, JSON.stringify(record));
+    return record;
+  };
+  seed({ id: "1".repeat(32), cwd: sandbox.workDir, threadId, updatedAt: "2026-01-01T00:00:00.000Z" });
+  const source = seed({ id: "2".repeat(32), cwd: sandbox.workDir, threadId, updatedAt: "2026-01-02T00:00:00.000Z" });
+  seed({ id: "3".repeat(32), cwd: sandbox.workDir, threadId: "other-thread", request: { resumeThreadId: threadId }, updatedAt: "2026-01-03T00:00:00.000Z" });
+  const sibling = path.join(sandbox.root, "sibling");
+  fs.mkdirSync(sibling);
+  seed({ id: "4".repeat(32), cwd: sibling, threadId, updatedAt: "2026-01-04T00:00:00.000Z" });
+  assert.equal(latestJobRecordForThread(sandbox.dataDir, threadId, sandbox.workDir)?.id, source.id);
+  assert.equal(latestJobRecordForThread(sandbox.dataDir, "missing-thread", sandbox.workDir), null);
+});
 
 test("job ids contain 128 bits and records expose the canonical Codex fields", (t) => {
   const sandbox = makeSandbox(t);

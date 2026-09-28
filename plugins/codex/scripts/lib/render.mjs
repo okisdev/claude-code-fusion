@@ -3,13 +3,13 @@ function footer(record) {
   if (record.threadId) {
     lines.push(`codex-session: ${record.threadId}`);
   }
-  lines.push(`job: ${record.id}`, `sandbox: ${record.cwd}`, `delivery: ${record.delivery ?? (record.background ? "manual" : "foreground")}`, `semantic: ${record.semanticStatus ?? "unverified"}`);
+  lines.push(`job: ${record.id}`);
+  if (/^[a-f0-9]{32}$/.test(record.request?.resumeSourceJobId ?? "")) {
+    lines.push(`resumed-from: ${record.request.resumeSourceJobId}`);
+  }
+  lines.push(`sandbox: ${record.cwd}`, `delivery: ${record.delivery ?? (record.background ? "manual" : "foreground")}`, `semantic: ${record.semanticStatus ?? "unverified"}`);
   if (record.request?.outputSchemaFile) {
     lines.push(`structured: ${record.structuredOutputError ? "invalid" : Object.hasOwn(record, "structuredOutput") ? "parsed" : "unavailable"}`);
-  }
-  lines.push(`state: ${record.status}`);
-  if (record.status === "error" || record.status === "cancelled") {
-    lines.push(`failure: ${record.failureKind ?? (record.status === "cancelled" ? "cancelled" : "error")}`);
   }
   if (["done", "error", "cancelled"].includes(record.status) && record.modelDrift) {
     if (Object.hasOwn(record.modelDrift, "requestedModel")) {
@@ -17,6 +17,10 @@ function footer(record) {
     } else {
       lines.push(`warning: brief header names ${record.modelDrift.headerModel} but the job ran ${record.modelDrift.resolvedModel}; pass --model to select the model.`);
     }
+  }
+  lines.push(`state: ${record.status}`);
+  if (record.status === "error" || record.status === "cancelled") {
+    lines.push(`failure: ${record.failureKind ?? (record.status === "cancelled" ? "cancelled" : "error")}`);
   }
   return lines.join("\n");
 }

@@ -176,6 +176,7 @@ test("task header parsing captures model and effort only from a pipe-separated h
   assert.deepEqual(parseTaskHeader("Implement the change."), { headerModel: null, headerEffort: null });
   assert.deepEqual(parseTaskHeader("model: gpt-5.6-terra"), { headerModel: null, headerEffort: null });
   assert.deepEqual(parseTaskHeader("lane: codex | model: gpt-5.6-terra"), { headerModel: "gpt-5.6-terra", headerEffort: null });
+  assert.deepEqual(parseTaskHeader("Environment note from the Codex companion: SwiftPM cannot nest its own sandbox-exec inside this sandbox, so run SwiftPM with --disable-sandbox, for example swift build --disable-sandbox and swift test --disable-sandbox.\n\nlane: codex | model: gpt-5.6-terra"), { headerModel: "gpt-5.6-terra", headerEffort: null });
 });
 
 test("task rejects an implicit cwd below a repository top level before creating a job", (t) => {
@@ -224,6 +225,115 @@ test("task preflight auto passes the Git bypass for consults and rejects writes 
   assert.match(write.stderr, /failure: input/);
   assert.equal(fs.existsSync(sandbox.argsFile), false);
   assert.equal(jobRecords(sandbox).length, 1);
+});
+
+test("explicit cwd automatically bypasses the Git check for write tasks outside Git", (t) => {
+  const sandbox = makeSandbox(t);
+  const result = runCompanion(["task", "--write", "--cwd", sandbox.workDir, "implement the API"], { cwd: sandbox.workDir, env: envFor(sandbox) });
+  assert.equal(result.status, 0, result.stderr);
+  assert.ok(readArgs(sandbox).includes("--skip-git-repo-check"));
+  assert.equal(jobRecords(sandbox)[0].request.skipGitRepoCheck, true);
+  assert.equal(jobRecords(sandbox)[0].request.skipGitRepoCheckSource, "auto");
+});
+
+test("SwiftPM write tasks receive the sandbox instruction from cwd or repository root", (t) => {
+  const note = "Environment note from the Codex companion: SwiftPM cannot nest its own sandbox-exec inside this sandbox, so run SwiftPM with --disable-sandbox, for example swift build --disable-sandbox and swift test --disable-sandbox.";
+  for (const packageAtRoot of [false, true]) {
+    const sandbox = makeSandbox(t);
+    const cwd = packageAtRoot ? path.join(sandbox.workDir, "Sources", "App") : sandbox.workDir;
+    fs.mkdirSync(cwd, { recursive: true });
+    if (packageAtRoot) {
+      initializeGitRepository(sandbox);
+    }
+    fs.writeFileSync(path.join(sandbox.workDir, "Package.swift"), "// swift-tools-version: 6.0\n");
+    const result = runCompanion(["task", "--write", "--cwd", cwd, "build the package"], { cwd, env: envFor(sandbox) });
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(fs.readFileSync(sandbox.stdinFile, "utf8"), `${note}\n\nbuild the package`);
+    const consult = runCompanion(["task", "--cwd", cwd, "inspect the package"], { cwd, env: envFor(sandbox) });
+    assert.equal(consult.status, 0, consult.stderr);
+    assert.equal(fs.readFileSync(sandbox.stdinFile, "utf8"), "inspect the package");
+  }
+});
+
+test("SwiftPM write tasks find packages between cwd and repository root", (t) => {
+  const sandbox = makeSandbox(t);
+  initializeGitRepository(sandbox);
+  const packageRoot = path.join(sandbox.workDir, "Packages", "Foo");
+  const cwd = path.join(packageRoot, "Sources", "App");
+  const unrelatedCwd = path.join(sandbox.workDir, "Packages", "Bar", "Sources", "App");
+  fs.mkdirSync(cwd, { recursive: true });
+  fs.mkdirSync(unrelatedCwd, { recursive: true });
+  fs.writeFileSync(path.join(packageRoot, "Package.swift"), "// swift-tools-version: 6.0\n");
+  const note = "Environment note from the Codex companion: SwiftPM cannot nest its own sandbox-exec inside this sandbox, so run SwiftPM with --disable-sandbox, for example swift build --disable-sandbox and swift test --disable-sandbox.";
+
+  const packageTask = runCompanion(["task", "--write", "--cwd", cwd, "build Foo"], { cwd, env: envFor(sandbox) });
+  assert.equal(packageTask.status, 0, packageTask.stderr);
+  assert.equal(fs.readFileSync(sandbox.stdinFile, "utf8"), `${note}\n\nbuild Foo`);
+
+  const unrelatedTask = runCompanion(["task", "--write", "--cwd", unrelatedCwd, "build Bar"], { cwd: unrelatedCwd, env: envFor(sandbox) });
+  assert.equal(unrelatedTask.status, 0, unrelatedTask.stderr);
+  assert.equal(fs.readFileSync(sandbox.stdinFile, "utf8"), "build Bar");
+});
+
+test("SwiftPM detection checks only cwd outside a repository", (t) => {
+  const sandbox = makeSandbox(t);
+  fs.writeFileSync(path.join(sandbox.root, "Package.swift"), "// swift-tools-version: 6.0\n");
+  const result = runCompanion(["task", "--write", "--cwd", sandbox.workDir, "build here"], { cwd: sandbox.workDir, env: envFor(sandbox) });
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(fs.readFileSync(sandbox.stdinFile, "utf8"), "build here");
+});
+
+test("SwiftPM note is prepended only when a write task starts a thread", (t) => {
+  const sandbox = makeSandbox(t);
+  initializeGitRepository(sandbox);
+  fs.writeFileSync(path.join(sandbox.workDir, "Package.swift"), "// swift-tools-version: 6.0\n");
+  const env = envFor(sandbox, { FAKE_CODEX_THREAD_ID: "swift-thread" });
+  const note = "Environment note from the Codex companion: SwiftPM cannot nest its own sandbox-exec inside this sandbox, so run SwiftPM with --disable-sandbox, for example swift build --disable-sandbox and swift test --disable-sandbox.";
+
+  const first = runCompanion(["task", "--write", "start the package"], { cwd: sandbox.workDir, env });
+  assert.equal(first.status, 0, first.stderr);
+  assert.equal(fs.readFileSync(sandbox.stdinFile, "utf8"), `${note}\n\nstart the package`);
+
+  const explicit = runCompanion(["task", "--write", "--resume", "swift-thread", "continue explicitly"], { cwd: sandbox.workDir, env });
+  assert.equal(explicit.status, 0, explicit.stderr);
+  assert.equal(fs.readFileSync(sandbox.stdinFile, "utf8"), "continue explicitly");
+
+  const latest = runCompanion(["task", "--write", "--resume-last", "continue latest"], { cwd: sandbox.workDir, env });
+  assert.equal(latest.status, 0, latest.stderr);
+  assert.equal(fs.readFileSync(sandbox.stdinFile, "utf8"), "continue latest");
+
+  const fresh = runCompanion(["task", "--write", "--fresh", "start a fresh thread"], {
+    cwd: sandbox.workDir,
+    env: envFor(sandbox, { FAKE_CODEX_THREAD_ID: "swift-fresh-thread" })
+  });
+  assert.equal(fresh.status, 0, fresh.stderr);
+  assert.equal(fs.readFileSync(sandbox.stdinFile, "utf8"), `${note}\n\nstart a fresh thread`);
+});
+
+test("SwiftPM note is not repeated by the printed write resume command", (t) => {
+  const sandbox = makeSandbox(t);
+  initializeGitRepository(sandbox);
+  fs.writeFileSync(path.join(sandbox.workDir, "Package.swift"), "// swift-tools-version: 6.0\n");
+  const note = "Environment note from the Codex companion: SwiftPM cannot nest its own sandbox-exec inside this sandbox, so run SwiftPM with --disable-sandbox, for example swift build --disable-sandbox and swift test --disable-sandbox.";
+  const timedOut = runCompanion(["task", "--json", "--write", "start before timeout"], {
+    cwd: sandbox.workDir,
+    env: envFor(sandbox, { CODEX_COMPANION_TIMEOUT_MS: "2000", FAKE_CODEX_MODE: "rollout-timeout" })
+  });
+  assert.equal(timedOut.status, 1, timedOut.stderr);
+  assert.ok(timedOut.stdout, timedOut.stderr);
+  const record = JSON.parse(timedOut.stdout);
+  assert.equal(record.failureKind, "timeout");
+  assert.equal(fs.readFileSync(sandbox.stdinFile, "utf8"), `${note}\n\nstart before timeout`);
+  assert.match(record.resumeCommand, / --write$/);
+
+  const resumed = spawnSync("sh", ["-c", `${record.resumeCommand} 'continue after timeout'`], {
+    cwd: sandbox.workDir,
+    encoding: "utf8",
+    env: envFor(sandbox),
+    timeout: 60000
+  });
+  assert.equal(resumed.status, 0, resumed.stderr);
+  assert.equal(fs.readFileSync(sandbox.stdinFile, "utf8"), "continue after timeout");
 });
 
 test("task accepts an explicit repository top level from a subdirectory", (t) => {
@@ -386,7 +496,7 @@ test("task stays foreground by default and persists the complete terminal record
   assert.equal(result.stderr, "");
   assert.equal(fs.readFileSync(sandbox.stdinFile, "utf8").trim(), "implement this safely");
   const args = readArgs(sandbox);
-  assert.deepEqual(args.slice(0, 19), [
+  assert.deepEqual(args.slice(0, 37), [
     "exec",
     "--strict-config",
     "--json",
@@ -404,6 +514,24 @@ test("task stays foreground by default and persists the complete terminal record
     "memories",
     "--disable",
     "goals",
+    "--disable",
+    "computer_use",
+    "--disable",
+    "browser_use",
+    "--disable",
+    "browser_use_external",
+    "--disable",
+    "in_app_browser",
+    "--disable",
+    "image_generation",
+    "--disable",
+    "apps",
+    "--disable",
+    "plugins",
+    "--disable",
+    "remote_plugin",
+    "--config",
+    "agents.enabled=false",
     "--model",
     "gpt-test"
   ]);
@@ -420,7 +548,7 @@ test("task stays foreground by default and persists the complete terminal record
   assert.equal(entry.record.resolvedModel, "gpt-test");
   assert.equal(entry.record.resolvedEffort, "max");
   assert.equal(entry.record.tokenUsageAvailability, "available");
-  assert.equal(entry.record.codexVersion, "0.154.0");
+  assert.equal(entry.record.codexVersion, "0.157.1");
   assert.equal(fs.statSync(entry.file).mode & 0o777, 0o600);
   assert.equal(fs.statSync(path.dirname(entry.file)).mode & 0o777, 0o700);
 });
@@ -445,7 +573,7 @@ test("flagship foreground write warning is emitted before execution and recorded
     [
       "#!/usr/bin/env node",
       "if (process.argv.includes('--version')) {",
-      "  process.stdout.write('codex-cli 0.152.0\\n');",
+      "  process.stdout.write('codex-cli 0.154.0\\n');",
       "  require('node:fs').unlinkSync(process.argv[1]);",
       "}"
     ].join("\n"),
@@ -457,7 +585,7 @@ test("flagship foreground write warning is emitted before execution and recorded
       CODEX_BIN: traceCodex
     })
   });
-  const warning = "warning: foreground gpt-6-astra write tasks run against a 570s flight budget and the flagship's time to first token at max runs into minutes. Keep effort at xhigh, split the package, or use gpt-5.6-terra; volume shapes go to gpt-5.6-luna.";
+  const warning = "warning: foreground gpt-6-astra write tasks run against a 570s flight budget and the flagship's time to first token at max runs into minutes. Keep effort at xhigh, split the package, or route quick shapes to the Codex quick default and volume shapes to the volume default in the Fusion routing table.";
 
   assert.equal(result.status, 1, result.stderr);
   assert.equal(result.stderr, `${warning}\n`);
@@ -467,7 +595,7 @@ test("flagship foreground write warning is emitted before execution and recorded
 });
 
 test("flagship warning is limited to foreground write tasks", async (t) => {
-  const warning = "warning: foreground gpt-6-astra write tasks run against a 570s flight budget and the flagship's time to first token at max runs into minutes. Keep effort at xhigh, split the package, or use gpt-5.6-terra; volume shapes go to gpt-5.6-luna.";
+  const warning = "warning: foreground gpt-6-astra write tasks run against a 570s flight budget and the flagship's time to first token at max runs into minutes. Keep effort at xhigh, split the package, or route quick shapes to the Codex quick default and volume shapes to the volume default in the Fusion routing table.";
   const cases = [
     { args: ["task", "--write", "--model", "gpt-5.6-terra", "use terra"], write: true },
     { args: ["task", "--model", "gpt-6-astra", "use flagship in consult mode"], write: false }
@@ -537,7 +665,7 @@ test("flagship warning uses recent job records for its stat", (t) => {
     cwd: sandbox.workDir,
     env: envFor(sandbox)
   });
-  const warning = "warning: 50% of foreground gpt-6-astra write tasks timed out in the last 7 days (2 of 4). Sized to the 570s flight budget? Keep effort at xhigh, split the package, or use gpt-5.6-terra; volume shapes go to gpt-5.6-luna.";
+  const warning = "warning: 50% of foreground gpt-6-astra write tasks timed out in the last 7 days (2 of 4). Sized to the 570s flight budget? Keep effort at xhigh, split the package, or route quick shapes to the Codex quick default and volume shapes to the volume default in the Fusion routing table.";
 
   assert.equal(result.status, 0, result.stderr);
   assert.equal(result.stderr, `${warning}\n`);
@@ -556,7 +684,7 @@ test("flagship warning falls back below the minimum sample", (t) => {
     cwd: sandbox.workDir,
     env: envFor(sandbox)
   });
-  const warning = "warning: foreground gpt-6-astra write tasks run against a 570s flight budget and the flagship's time to first token at max runs into minutes. Keep effort at xhigh, split the package, or use gpt-5.6-terra; volume shapes go to gpt-5.6-luna.";
+  const warning = "warning: foreground gpt-6-astra write tasks run against a 570s flight budget and the flagship's time to first token at max runs into minutes. Keep effort at xhigh, split the package, or route quick shapes to the Codex quick default and volume shapes to the volume default in the Fusion routing table.";
 
   assert.equal(result.status, 0, result.stderr);
   assert.equal(result.stderr, `${warning}\n`);
@@ -578,7 +706,7 @@ test("flagship warning tolerates malformed job files", (t) => {
     cwd: sandbox.workDir,
     env: envFor(sandbox)
   });
-  const warning = "warning: 25% of foreground gpt-6-astra write tasks timed out in the last 7 days (1 of 4). Sized to the 570s flight budget? Keep effort at xhigh, split the package, or use gpt-5.6-terra; volume shapes go to gpt-5.6-luna.";
+  const warning = "warning: 25% of foreground gpt-6-astra write tasks timed out in the last 7 days (1 of 4). Sized to the 570s flight budget? Keep effort at xhigh, split the package, or route quick shapes to the Codex quick default and volume shapes to the volume default in the Fusion routing table.";
 
   assert.equal(result.status, 0, result.stderr);
   assert.equal(result.stderr, `${warning}\n`);
@@ -612,7 +740,7 @@ test("flagship warning applies the cap after filtering matching records", (t) =>
     cwd: sandbox.workDir,
     env: envFor(sandbox)
   });
-  const warning = "warning: 50% of foreground gpt-6-astra write tasks timed out in the last 7 days (2 of 4). Sized to the 570s flight budget? Keep effort at xhigh, split the package, or use gpt-5.6-terra; volume shapes go to gpt-5.6-luna.";
+  const warning = "warning: 50% of foreground gpt-6-astra write tasks timed out in the last 7 days (2 of 4). Sized to the 570s flight budget? Keep effort at xhigh, split the package, or route quick shapes to the Codex quick default and volume shapes to the volume default in the Fusion routing table.";
 
   assert.equal(result.status, 0, result.stderr);
   assert.equal(result.stderr, `${warning}\n`);
@@ -637,7 +765,7 @@ test("flagship warning skips oversized job files", (t) => {
     cwd: sandbox.workDir,
     env: envFor(sandbox)
   });
-  const warning = "warning: 25% of foreground gpt-6-astra write tasks timed out in the last 7 days (1 of 4). Sized to the 570s flight budget? Keep effort at xhigh, split the package, or use gpt-5.6-terra; volume shapes go to gpt-5.6-luna.";
+  const warning = "warning: 25% of foreground gpt-6-astra write tasks timed out in the last 7 days (1 of 4). Sized to the 570s flight budget? Keep effort at xhigh, split the package, or route quick shapes to the Codex quick default and volume shapes to the volume default in the Fusion routing table.";
 
   assert.equal(result.status, 0, result.stderr);
   assert.equal(result.stderr, `${warning}\n`);
@@ -1055,32 +1183,32 @@ test("task rejects an outdated Codex CLI before execution", (t) => {
   const outdated = makeSandbox(t);
   const outdatedResult = runCompanion(["task", "--json", "do work"], {
     cwd: outdated.workDir,
-    env: envFor(outdated, { FAKE_CODEX_VERSION: "0.146.0" })
+    env: envFor(outdated, { FAKE_CODEX_VERSION: "0.153.4" })
   });
   assert.equal(outdatedResult.status, 1);
   assert.equal(outdatedResult.stdout, "");
   const outdatedFailure = JSON.parse(outdatedResult.stderr);
   assert.equal(outdatedFailure.status, "error");
   assert.equal(outdatedFailure.failureKind, "setup");
-  assert.match(outdatedFailure.message, /Upgrade the Codex CLI to version 0\.152\.0 or later\./);
+  assert.match(outdatedFailure.message, /Upgrade the Codex CLI to version 0\.154\.0 or later\./);
   assert.equal(fs.existsSync(outdated.argsFile), false);
   assert.deepEqual(jobRecords(outdated), []);
 
   const text = makeSandbox(t);
   const textResult = runCompanion(["task", "do work"], {
     cwd: text.workDir,
-    env: envFor(text, { FAKE_CODEX_VERSION: "0.146.0" })
+    env: envFor(text, { FAKE_CODEX_VERSION: "0.153.4" })
   });
   assert.equal(textResult.status, 1);
   assert.equal(textResult.stdout, "");
-  assert.match(textResult.stderr, /Upgrade the Codex CLI to version 0\.152\.0 or later\./);
+  assert.match(textResult.stderr, /Upgrade the Codex CLI to version 0\.154\.0 or later\./);
   assert.match(textResult.stderr, /failure: setup/);
   assert.equal(fs.existsSync(text.argsFile), false);
   assert.deepEqual(jobRecords(text), []);
 });
 
 test("task proceeds with tested, alpha hotfix, and newer Codex CLI versions", (t) => {
-  for (const version of ["0.152.0", "0.152.1", "0.153.0-alpha.5.1", "0.153.0", "0.153.2", "0.153.4", "0.154.0-alpha.6.2", "0.154.0", "0.155.0"]) {
+  for (const version of ["0.154.0", "0.154.1", "0.155.0-alpha.5.1", "0.155.0", "0.156.0", "0.157.1", "0.158.0"]) {
     const sandbox = makeSandbox(t);
     const result = runCompanion(["task", "--json", "do work"], {
       cwd: sandbox.workDir,
@@ -1530,6 +1658,27 @@ test("foreground timeout persists recovered partial delivery and incomplete cumu
   assert.equal(record.resolvedEffort, "xhigh");
 });
 
+test("a timed out write task prints a write mode resume command", (t) => {
+  const sandbox = makeSandbox(t);
+  initializeGitRepository(sandbox);
+  const result = runCompanion(["task", "--json", "--write", "implement until timeout"], {
+    cwd: sandbox.workDir,
+    env: envFor(sandbox, {
+      CODEX_COMPANION_TIMEOUT_MS: "2000",
+      CODEX_HOME: path.join(sandbox.root, "codex-home"),
+      FAKE_CODEX_MODE: "rollout-timeout"
+    })
+  });
+  assert.equal(result.status, 1, result.stderr);
+  assert.ok(result.stdout, result.stderr);
+  const record = JSON.parse(result.stdout);
+  assert.equal(record.mode, "write");
+  assert.equal(record.failureKind, "timeout");
+  const resumeCommand = `'${process.execPath}' '${companion}' task --resume 'thread-123' --cwd '${fs.realpathSync(sandbox.workDir)}' --write`;
+  assert.equal(record.resumeCommand, resumeCommand);
+  assert.match(record.partialResultText, new RegExp(`Resume Codex job ${record.id}: .* --write$`));
+});
+
 test("timeout jobs without a thread do not advertise resumability", (t) => {
   const sandbox = makeSandbox(t);
   const result = runCompanion(["task", "--json", "timeout before the thread starts"], {
@@ -1789,6 +1938,28 @@ test("resume-last uses the current Claude session without claiming an unverifiab
   assert.equal(resumed.tokenUsage, null);
   assert.equal(resumed.tokenUsageAvailability, "unavailable");
   assert.equal(resumed.tokenUsageUnavailableReason, "resume_continuity_unverifiable");
+});
+
+test("explicit resume names the newest source job in the same workspace", (t) => {
+  const sandbox = makeSandbox(t);
+  const threadId = "thread-explicit-resume";
+  const sibling = path.join(sandbox.root, "sibling");
+  fs.mkdirSync(sibling);
+  for (const [id, cwd, updatedAt, recordThreadId, resumeThreadId] of [
+    ["1".repeat(32), sandbox.workDir, "2026-01-01T00:00:00.000Z", threadId, null],
+    ["2".repeat(32), sandbox.workDir, "2026-01-02T00:00:00.000Z", threadId, null],
+    ["3".repeat(32), sandbox.workDir, "2026-01-03T00:00:00.000Z", "other-thread", threadId],
+    ["4".repeat(32), sibling, "2026-01-04T00:00:00.000Z", threadId, null]
+  ]) {
+    const record = createJobRecord({ id, cwd, createdAt: updatedAt, updatedAt, finishedAt: updatedAt, request: { resumeThreadId }, status: "done", threadId: recordThreadId });
+    writeJobRecordFile(jobFilePath(sandbox.dataDir, cwd, id), record);
+  }
+  const result = runCompanion(["task", "--resume", threadId, "continue the work"], { cwd: sandbox.workDir, env: envFor(sandbox, { FAKE_CODEX_THREAD_ID: threadId }) });
+  assert.equal(result.status, 0, result.stdout || result.stderr);
+  const sourceIds = new Set(["1", "2", "3", "4"].map((digit) => digit.repeat(32)));
+  const resumed = jobRecords(sandbox).find((record) => !sourceIds.has(record.id));
+  assert.equal(resumed.request.resumeSourceJobId, "2".repeat(32));
+  assert.match(result.stdout, new RegExp(`job: ${resumed.id}\\nresumed-from: ${"2".repeat(32)}\\nsandbox:`));
 });
 
 function seedThreadRoutingRecord(sandbox, overrides = {}) {
@@ -2175,13 +2346,13 @@ test("status repairs an ownerless running record as died", async (t) => {
 
 test("setup verifies authentication and the tested Codex version interval", (t) => {
   const sandbox = makeSandbox(t);
-  const ready = runCompanion(["setup", "--json"], { cwd: sandbox.workDir, env: envFor(sandbox, { FAKE_CODEX_VERSION: "0.152.0" }) });
+  const ready = runCompanion(["setup", "--json"], { cwd: sandbox.workDir, env: envFor(sandbox, { FAKE_CODEX_VERSION: "0.154.0" }) });
   assert.equal(ready.status, 0, ready.stderr);
   const readyReport = JSON.parse(ready.stdout);
   assert.equal(readyReport.ready, true);
   assert.equal(readyReport.compatibility, "tested");
   assert.equal(readyReport.authenticated, true);
-  for (const version of ["0.152.1", "0.153.0-alpha.5.1", "0.153.0", "0.153.2", "0.154.0"]) {
+  for (const version of ["0.154.1", "0.155.0-alpha.5.1", "0.155.0", "0.156.0", "0.157.1"]) {
     const alpha = runCompanion(["setup", "--json"], {
       cwd: sandbox.workDir,
       env: envFor(sandbox, { FAKE_CODEX_VERSION: version })
@@ -2199,7 +2370,7 @@ test("setup verifies authentication and the tested Codex version interval", (t) 
   assert.doesNotMatch(JSON.stringify(JSON.parse(redacted.stdout)), /sk-secretvalue123/);
   const redactedVersion = runCompanion(["setup", "--json"], {
     cwd: sandbox.workDir,
-    env: envFor(sandbox, { FAKE_CODEX_VERSION_OUTPUT: "codex-cli 0.154.0 access_token=secretversionvalue" })
+    env: envFor(sandbox, { FAKE_CODEX_VERSION_OUTPUT: "codex-cli 0.157.1 access_token=secretversionvalue" })
   });
   assert.equal(redactedVersion.status, 0, redactedVersion.stderr);
   assert.doesNotMatch(JSON.stringify(JSON.parse(redactedVersion.stdout)), /secretversionvalue/);
@@ -2221,12 +2392,12 @@ test("setup verifies authentication and the tested Codex version interval", (t) 
   assert.doesNotMatch(apiKey.stdout, /codex-test-key/);
   const unsupported = runCompanion(["setup", "--json"], {
     cwd: sandbox.workDir,
-    env: envFor(sandbox, { FAKE_CODEX_VERSION: "0.155.0" })
+    env: envFor(sandbox, { FAKE_CODEX_VERSION: "0.158.0" })
   });
   assert.equal(unsupported.status, 1);
   const unsupportedReport = JSON.parse(unsupported.stdout);
   assert.equal(unsupportedReport.ready, false);
-  assert.match(unsupportedReport.compatibility, /newer than the tested interval \(0\.152\.0 to before 0\.155\.0\)/);
+  assert.match(unsupportedReport.compatibility, /newer than the tested interval \(0\.154\.0 to before 0\.158\.0\)/);
   assert.match(unsupportedReport.nextSteps.join("\n"), /A verification pass is advised\./);
 });
 

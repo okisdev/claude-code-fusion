@@ -87,8 +87,8 @@ const BACKGROUND_LAUNCH_POLL_MS = 20;
 const BACKGROUND_ABORT_CLAIM_WAIT_MS = 2000;
 const BACKGROUND_ABORT_CLEANUP_CONFIRM_MS = 1000;
 const BACKGROUND_ABORT_CLEANUP_POLL_MS = 50;
-const TESTED_VERSION_MIN = [0, 152, 0];
-const TESTED_VERSION_MAX = [0, 155, 0];
+const TESTED_VERSION_MIN = [0, 154, 0];
+const TESTED_VERSION_MAX = [0, 158, 0];
 const CONTINUE_PROMPT = "Continue from the current Codex thread state. Complete the next highest value step and continue until the task is resolved.";
 const TRANSPORT_DIRECTORY_PREFIX = "codex-companion-input-";
 const TRANSPORT_TOKEN_PATTERN = /^[a-f0-9]{48}$/;
@@ -106,7 +106,8 @@ const FLAGSHIP_WARNING_MAX_FILES = 500;
 const FLAGSHIP_WARNING_MAX_EXAMINED_FILES = 5000;
 const FLAGSHIP_WARNING_MAX_FILE_BYTES = 16 * 1024 * 1024;
 const FLAGSHIP_WARNING_WINDOW_MS = 7 * 24 * 60 * 60 * 1000;
-const FLAGSHIP_FOREGROUND_WRITE_FALLBACK_WARNING = "warning: foreground gpt-6-astra write tasks run against a 570s flight budget and the flagship's time to first token at max runs into minutes. Keep effort at xhigh, split the package, or use gpt-5.6-terra; volume shapes go to gpt-5.6-luna.";
+const FLAGSHIP_FOREGROUND_WRITE_FALLBACK_WARNING = "warning: foreground gpt-6-astra write tasks run against a 570s flight budget and the flagship's time to first token at max runs into minutes. Keep effort at xhigh, split the package, or route quick shapes to the Codex quick default and volume shapes to the volume default in the Fusion routing table.";
+const SWIFTPM_SANDBOX_NOTE = "Environment note from the Codex companion: SwiftPM cannot nest its own sandbox-exec inside this sandbox, so run SwiftPM with --disable-sandbox, for example swift build --disable-sandbox and swift test --disable-sandbox.";
 let activeCommandArgv = null;
 let cachedCompanionVersion = null;
 let companionVersionRead = false;
@@ -277,6 +278,24 @@ function taskGitPreflight(cwd, write, skipGitRepoCheck) {
     throw new CompanionError("Codex write tasks outside a Git repository require --skip-git-repo-check. Pass --skip-git-repo-check to run this write task.", "input");
   }
   return true;
+}
+
+function hasSwiftPackage(cwd) {
+  const repositoryRoot = canonicalWorkspaceRoot(cwd);
+  for (let directory = cwd;; directory = path.dirname(directory)) {
+    try {
+      if (fs.statSync(path.join(directory, "Package.swift")).isFile()) {
+        return true;
+      }
+    } catch (error) {
+      if (error?.code !== "ENOENT") {
+        throw error;
+      }
+    }
+    if (directory === repositoryRoot) {
+      return false;
+    }
+  }
 }
 
 function resolveOutputSchemaFile(cwd, value) {
@@ -801,7 +820,7 @@ function readTaskPrompt(cwd, options, positionals, positionalText) {
 }
 
 export function parseTaskHeader(prompt) {
-  const line = String(prompt ?? "").split(/\r?\n/).find((candidate) => candidate.trim());
+  const line = String(prompt ?? "").split(/\r?\n/).find((candidate) => candidate.trim() && candidate !== SWIFTPM_SANDBOX_NOTE);
   if (!line || !line.includes("|")) {
     return { headerModel: null, headerEffort: null };
   }
@@ -1164,7 +1183,7 @@ function flagshipForegroundWriteWarning(dataDir) {
     return FLAGSHIP_FOREGROUND_WRITE_FALLBACK_WARNING;
   }
   const percentage = Math.round((100 * stat.timeouts) / stat.total);
-  return `warning: ${percentage}% of foreground gpt-6-astra write tasks timed out in the last 7 days (${stat.timeouts} of ${stat.total}). Sized to the 570s flight budget? Keep effort at xhigh, split the package, or use gpt-5.6-terra; volume shapes go to gpt-5.6-luna.`;
+  return `warning: ${percentage}% of foreground gpt-6-astra write tasks timed out in the last 7 days (${stat.timeouts} of ${stat.total}). Sized to the 570s flight budget? Keep effort at xhigh, split the package, or route quick shapes to the Codex quick default and volume shapes to the volume default in the Fusion routing table.`;
 }
 
 function shellArgument(value) {
@@ -1172,7 +1191,7 @@ function shellArgument(value) {
 }
 
 function timeoutResumeCommand(record, threadId) {
-  return `${shellArgument(process.execPath)} ${shellArgument(SELF_PATH)} task --resume ${shellArgument(threadId)} --cwd ${shellArgument(record.cwd)}`;
+  return `${shellArgument(process.execPath)} ${shellArgument(SELF_PATH)} task --resume ${shellArgument(threadId)} --cwd ${shellArgument(record.cwd)}${record.mode === "write" ? " --write" : ""}`;
 }
 
 function appendResumeFooter(text, footer) {
@@ -1337,6 +1356,8 @@ function resolveResume(dataDir, cwd, options) {
     const candidate = latestResumeRecord(dataDir, cwd, currentClaudeSessionId());
     threadId = candidate.threadId;
     sourceJobId = candidate.id;
+  } else if (threadId) {
+    sourceJobId = latestJobRecordForThread(dataDir, threadId, cwd)?.id ?? null;
   }
   return {
     threadId,
@@ -1882,8 +1903,12 @@ async function handleTask(rawArgv, transport = {}) {
     if (options.network && !write) {
       throw new CompanionError("--network requires --write because network access applies to the workspace-write sandbox.", "input");
     }
-    const skipGitRepoCheck = Boolean(options["skip-git-repo-check"]);
+    const autoSkipGitRepoCheck = write && options.cwd != null && !hasGitAncestor(cwd) && !options["skip-git-repo-check"];
+    const skipGitRepoCheck = Boolean(options["skip-git-repo-check"] || autoSkipGitRepoCheck);
     taskGitPreflight(cwd, write, skipGitRepoCheck);
+    if (write && !resume.threadId && hasSwiftPackage(cwd)) {
+      prompt = `${SWIFTPM_SANDBOX_NOTE}\n\n${prompt}`;
+    }
     const probe = preflightCodex(cwd);
     const request = {
       effort: routing.effort,
@@ -1895,6 +1920,7 @@ async function handleTask(rawArgv, transport = {}) {
       resumeSourceJobId: resume.sourceJobId,
       resumeThreadId: resume.threadId,
       skipGitRepoCheck,
+      ...(autoSkipGitRepoCheck ? { skipGitRepoCheckSource: "auto" } : {}),
       serviceTier: routing.serviceTier,
       transport: "task",
       web: Boolean(options.web),

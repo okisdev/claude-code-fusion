@@ -65,7 +65,7 @@ if (UNMODELLED_SUBCOMMANDS.has(args[0])) {
 }
 
 if (args.includes("--version")) {
-  process.stdout.write(`${process.env.FAKE_CODEX_VERSION_OUTPUT || `codex-cli ${process.env.FAKE_CODEX_VERSION || "0.154.0"}`}\n`);
+  process.stdout.write(`${process.env.FAKE_CODEX_VERSION_OUTPUT || `codex-cli ${process.env.FAKE_CODEX_VERSION || "0.157.1"}`}\n`);
   process.exit(0);
 }
 
