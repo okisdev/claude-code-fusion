@@ -651,13 +651,44 @@ function recordForAgent(input, env) {
     return null;
   }
   const taskId = attributedTaskId(input, env);
+  let record = null;
   if (taskId) {
     const exact = readSessionWorkerRecords(env, input.session_id, { strict: true }).find((record) => record.taskId === taskId && canonicalWorkerAgentType(record.agentType) === canonicalWorkerAgentType(input.agent_type));
     if (exact) {
-      return updateLifecycleWorkerRecord(exact.taskId, env, (current) => ({ ...current, agentId: input.agent_id }));
+      record = updateLifecycleWorkerRecord(exact.taskId, env, (current) => ({ ...current, agentId: input.agent_id }));
     }
   }
-  return findSessionWorkerRecord((record) => record.agentId === input.agent_id, input.session_id, env);
+  record ??= findSessionWorkerRecord((candidate) => candidate.agentId === input.agent_id, input.session_id, env);
+  if (!record || !isFusionWorkerAgent(input.agent_type) || !isTerminalWorkerStatus(record.transportStatus)) {
+    return record;
+  }
+  return updateLifecycleWorkerRecord(record.taskId, env, (current) => {
+    if (!current || current.sessionId !== input.session_id || current.agentId !== input.agent_id || !isTerminalWorkerStatus(current.transportStatus) || !continuationRequestIsNewer(current)) {
+      return null;
+    }
+    return reopenWorkerContinuation(current, new Date(Math.max(Date.now(), Date.parse(current.continuationRequestedAt))).toISOString(), current.continuationRequestedTranscriptBytes);
+  });
+}
+
+function continuationRequestIsNewer(record) {
+  const requestedAt = Date.parse(record.continuationRequestedAt ?? "");
+  const finishedAt = Date.parse(record.finishedAt ?? "");
+  const lastContinuedAt = Date.parse(record.lastContinuedAt ?? "");
+  return Number.isFinite(requestedAt) && (!Number.isFinite(lastContinuedAt) || lastContinuedAt < requestedAt) && (!Number.isFinite(finishedAt) || requestedAt > finishedAt);
+}
+
+function parentTranscriptByteSize(record, input) {
+  const transcriptPath = record.parentTranscriptPath ?? input.transcript_path;
+  try {
+    return typeof transcriptPath === "string" && path.isAbsolute(transcriptPath) ? fs.statSync(transcriptPath).size : 0;
+  } catch {
+    return 0;
+  }
+}
+
+function clearContinuationRequest(record) {
+  const { continuationRequestedAt, continuationRequestedTranscriptBytes, ...rest } = record;
+  return rest;
 }
 
 function findSessionWorkerRecord(predicate, sessionId, env) {
@@ -916,9 +947,18 @@ function handlePreToolUse(input, env) {
   }
   if (input.tool_name === "SendMessage" && typeof input.tool_input?.to === "string") {
     const recipient = input.tool_input.to;
-    const record = findSessionWorkerRecord((candidate) => PEER_RESCUE_AGENT_NAMES.has(candidate.agentType) && [candidate.agentId, candidate.backgroundTaskId].includes(recipient), input.session_id, env);
+    const record = findSessionWorkerRecord((candidate) => (PEER_RESCUE_AGENT_NAMES.has(candidate.agentType) || isFusionWorkerAgent(candidate.agentType)) && [candidate.agentId, candidate.backgroundTaskId].includes(recipient), input.session_id, env);
     if (record) {
-      const injection = injectedPeerDefaults(input.tool_input?.message, record.agentType, env);
+      updateLifecycleWorkerRecord(record.taskId, env, (current) => {
+        if (!current || current.sessionId !== input.session_id || ![current.agentId, current.backgroundTaskId].includes(recipient) || (!isTerminalWorkerStatus(current.transportStatus) && current.transportStatus !== "ready_uncollected")) {
+          return null;
+        }
+        const finishedAt = Date.parse(current.finishedAt ?? "");
+        const lastContinuedAt = Date.parse(current.lastContinuedAt ?? "");
+        const requestedAt = new Date(Math.max(Date.now(), Number.isFinite(finishedAt) ? finishedAt + 1 : 0, Number.isFinite(lastContinuedAt) ? lastContinuedAt + 1 : 0)).toISOString();
+        return { ...current, continuationRequestedAt: requestedAt, continuationRequestedTranscriptBytes: parentTranscriptByteSize(current, input) };
+      });
+      const injection = PEER_RESCUE_AGENT_NAMES.has(record.agentType) ? injectedPeerDefaults(input.tool_input?.message, record.agentType, env) : null;
       if (injection) {
         writeOutput({ hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision: "allow", updatedInput: { ...input.tool_input, message: injection.prompt }, additionalContext: injection.context } });
       }
@@ -1316,14 +1356,25 @@ function settleReapedIfActive(taskId, now, env, extraGuard) {
 }
 
 function handlePostToolUse(input, env, failed = false) {
-  if (!failed && input.tool_name === "SendMessage" && typeof input.tool_input?.to === "string") {
+  if (input.tool_name === "SendMessage" && typeof input.tool_input?.to === "string") {
     const recipient = input.tool_input.to;
+    if (!failed) {
+      reconcileTaskNotifications(input, env);
+    }
     const record = findSessionWorkerRecord((candidate) => (PEER_RESCUE_AGENT_NAMES.has(candidate.agentType) || isFusionWorkerAgent(candidate.agentType)) && [candidate.agentId, candidate.backgroundTaskId].includes(recipient), input.session_id, env);
-    if (record && isTerminalWorkerStatus(record.transportStatus)) {
+    if (record) {
       const at = new Date().toISOString();
-      updateLifecycleWorkerRecord(record.taskId, env, (current) => current && current.sessionId === input.session_id && (PEER_RESCUE_AGENT_NAMES.has(current.agentType) || isFusionWorkerAgent(current.agentType)) && [current.agentId, current.backgroundTaskId].includes(recipient) && isTerminalWorkerStatus(current.transportStatus)
-        ? reopenWorkerContinuation(current, at)
-        : null);
+      updateLifecycleWorkerRecord(record.taskId, env, (current) => {
+        if (!current || current.sessionId !== input.session_id || ![current.agentId, current.backgroundTaskId].includes(recipient)) {
+          return null;
+        }
+        const requestAt = Date.parse(current.continuationRequestedAt ?? "");
+        const alreadyReopened = Number.isFinite(requestAt) && Date.parse(current.lastContinuedAt ?? "") >= requestAt;
+        const next = !failed && isTerminalWorkerStatus(current.transportStatus) && !alreadyReopened
+          ? reopenWorkerContinuation(current, at, parentTranscriptByteSize(current, input))
+          : current;
+        return current.continuationRequestedAt ? clearContinuationRequest(next) : next === current ? null : next;
+      });
     }
     return;
   }
@@ -1834,7 +1885,7 @@ function scanTaskNotifications(transcriptPath, requestedOffset) {
         }
         if (!skippingLongLine && pending.length > 0) {
           for (const notification of taskNotificationsFromTranscriptLine(pending.toString("utf8").replace(/\r$/, ""))) {
-            notifications.set(notification.taskId, notification);
+            notifications.set(notification.taskId, { ...notification, byteOffset: chunkStart + lineEnd + 1 });
           }
         }
         pending = Buffer.alloc(0);
@@ -1986,7 +2037,7 @@ function taskNotificationTransition(record, notification, now, env) {
       ? capturedPeerIdentity(refreshed.agentType, finalText ?? boundedTranscriptTailText(refreshed.transcriptPath), refreshed.peerEngine, refreshed)
       : {};
     if (!finalText) {
-      const turnLimited = refreshed.failureKind === "turn_limit" || (refreshed.turns ?? 0) >= (refreshed.limits?.maxTurns ?? Number.POSITIVE_INFINITY);
+      const turnLimited = refreshed.failureKind === "turn_limit" || workerRoundUsage(refreshed).turns >= (refreshed.limits?.maxTurns ?? Number.POSITIVE_INFINITY);
       return settleQueuedVerdict({
         ...refreshed,
         transportStatus: "incomplete",
@@ -2058,7 +2109,7 @@ function reconcileTaskNotifications(input, env) {
     for (const [taskId, notification] of scanned.notifications) {
       for (const record of candidates.filter((candidate) => [candidate.backgroundTaskId, candidate.agentId].includes(taskId))) {
         const stamped = updateLifecycleWorkerRecord(record.taskId, env, (current) => {
-          if (!current || current.sessionId !== input.session_id || isTerminalWorkerStatus(current.transportStatus) || ![current.backgroundTaskId, current.agentId].includes(taskId)) {
+          if (!current || current.sessionId !== input.session_id || isTerminalWorkerStatus(current.transportStatus) || ![current.backgroundTaskId, current.agentId].includes(taskId) || notification.byteOffset <= (current.continuationNotificationFloor ?? 0)) {
             return null;
           }
           const currentTranscriptExists = regularFileExists(current.transcriptPath);
@@ -2069,11 +2120,11 @@ function reconcileTaskNotifications(input, env) {
             ...(notification.statusDetail ? { statusDetail: notification.statusDetail } : {})
           };
         });
-        if (!stamped || stamped.sessionId !== input.session_id || isTerminalWorkerStatus(stamped.transportStatus) || ![stamped.backgroundTaskId, stamped.agentId].includes(taskId)) {
+        if (!stamped || stamped.sessionId !== input.session_id || isTerminalWorkerStatus(stamped.transportStatus) || ![stamped.backgroundTaskId, stamped.agentId].includes(taskId) || notification.byteOffset <= (stamped.continuationNotificationFloor ?? 0)) {
           continue;
         }
         updateLifecycleWorkerRecord(record.taskId, env, (current) => {
-          if (!current || current.sessionId !== input.session_id || isTerminalWorkerStatus(current.transportStatus) || ![current.backgroundTaskId, current.agentId].includes(taskId)) {
+          if (!current || current.sessionId !== input.session_id || isTerminalWorkerStatus(current.transportStatus) || ![current.backgroundTaskId, current.agentId].includes(taskId) || notification.byteOffset <= (current.continuationNotificationFloor ?? 0)) {
             return null;
           }
           return taskNotificationTransition(current, notification, now, env);

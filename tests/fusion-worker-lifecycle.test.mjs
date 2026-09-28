@@ -7,7 +7,7 @@ import { test } from "node:test";
 
 import { fusionRepositoryKey } from "../plugins/fusion/scripts/fusion-stats.mjs";
 import { messageTag, tagMessage } from "../plugins/fusion/scripts/lib/user-messages.mjs";
-import { createWorkerRecord, readWorkerSessionState, readWorkerRecords, recordWorkerAcceptance, updateWorkerRecord, WORKER_COLLECTION_METHODS } from "../plugins/fusion/scripts/lib/worker-state.mjs";
+import { createWorkerRecord, readWorkerSessionState, readWorkerRecords, recordWorkerAcceptance, refreshWorkerTranscript, updateWorkerRecord, WORKER_COLLECTION_METHODS } from "../plugins/fusion/scripts/lib/worker-state.mjs";
 import { needsCancellation, reverifyCancellationRecords, reverifyInFlightRecords, runtimeTaskMissing, settleOnlyRecords, validateWorkerBrief, workerBudgetFailure, workerLimits } from "../plugins/fusion/scripts/worker-lifecycle.mjs";
 
 const repoRoot = path.join(import.meta.dirname, "..");
@@ -901,7 +901,8 @@ test("SendMessage reopens a settled peer round and notification collects the nex
   const message = "lane: codex quick\ngoal: continue";
   const sent = run(box, { hook_event_name: "PreToolUse", session_id: "session-1", cwd: box.cwd, tool_name: "SendMessage", tool_input: { to: "continued-peer", message } }, routing);
   assert.strictEqual(JSON.parse(sent.stdout).hookSpecificOutput.updatedInput.message, `--model gpt-6-sol --effort high -- ${message}`);
-  assert.deepStrictEqual(record(box), settled);
+  assert.strictEqual(record(box).continuationRequestedTranscriptBytes, 0);
+  assert.ok(Date.parse(record(box).continuationRequestedAt) > Date.parse(settled.finishedAt));
   const delivered = run(box, { hook_event_name: "PostToolUse", session_id: "session-1", cwd: box.cwd, tool_name: "SendMessage", tool_input: { to: "continued-peer", message } }, routing);
   assert.strictEqual(delivered.status, 0, delivered.stderr);
   const reopened = record(box);
@@ -947,6 +948,80 @@ test("SendMessage reopens a settled peer round and notification collects the nex
   assert.deepStrictEqual(collected.continuations, reopened.continuations);
 });
 
+test("SendMessage collects an unscanned peer round before reopening and keeps the next job", (t) => {
+  const box = sandbox(t);
+  const taskId = `fusion-${"8".repeat(24)}`;
+  const firstJobId = "a".repeat(32);
+  const nextJobId = "b".repeat(32);
+  const firstTranscript = path.join(box.root, "first-peer.jsonl");
+  const nextTranscript = path.join(box.root, "next-peer.jsonl");
+  fs.writeFileSync(firstTranscript, `${JSON.stringify({ type: "assistant", message: { content: [{ type: "text", text: `first result\njob: ${firstJobId}\nstate: done` }] } })}\n`);
+  fs.writeFileSync(nextTranscript, `${JSON.stringify({ type: "assistant", message: { content: [{ type: "text", text: `next result\njob: ${nextJobId}\nstate: done` }] } })}\n`);
+  createWorkerRecord({ taskId, sessionId: "session-1", agentType: "codex:codex-rescue", workspaceRoot: box.cwd }, envFor(box));
+  updateWorkerRecord(taskId, envFor(box), (current) => ({ ...current, agentId: "uncollected-peer", backgroundTaskId: "uncollected-peer", transportStatus: "ready_uncollected", finishedAt: "2026-09-27T00:00:00.000Z", parentTranscriptPath: box.transcript, transcriptPath: firstTranscript, peerEngine: "codex", peerJobId: firstJobId, peerJobIds: [firstJobId], acceptance: "accepted", acceptanceRecordedAt: "2026-09-27T00:00:00.000Z" }));
+  fs.appendFileSync(box.transcript, `${JSON.stringify({ type: "user", message: { content: `<task-notification>\n<task-id>uncollected-peer</task-id>\n<status>completed</status>\n<output-file>${firstTranscript}</output-file>\n</task-notification>` } })}\n`);
+  const toolInput = { to: "uncollected-peer", message: "lane: codex quick\ngoal: continue" };
+  const pre = run(box, { hook_event_name: "PreToolUse", session_id: "session-1", cwd: box.cwd, transcript_path: box.transcript, tool_name: "SendMessage", tool_input: toolInput }, routingFixture(box));
+  assert.strictEqual(JSON.parse(pre.stdout).hookSpecificOutput.updatedInput.message, `--model gpt-6-sol --effort high -- ${toolInput.message}`);
+  assert.strictEqual(record(box).transportStatus, "ready_uncollected");
+  assert.strictEqual(record(box).continuationRequestedTranscriptBytes, fs.statSync(box.transcript).size);
+  const post = run(box, { hook_event_name: "PostToolUse", session_id: "session-1", cwd: box.cwd, transcript_path: box.transcript, tool_name: "SendMessage", tool_input: toolInput });
+  assert.strictEqual(post.status, 0, post.stderr);
+  const reopened = record(box);
+  assert.strictEqual(reopened.transportStatus, "running");
+  assert.strictEqual(reopened.continuationNotificationFloor, fs.statSync(box.transcript).size);
+  assert.strictEqual(reopened.continuations[0].collectionMethod, "task_notification");
+  assert.deepStrictEqual(reopened.continuations[0].peerJobIds, [firstJobId]);
+  assert.strictEqual(reopened.continuationRequestedAt, undefined);
+  fs.appendFileSync(box.transcript, `${JSON.stringify({ type: "user", message: { content: `<task-notification>\n<task-id>uncollected-peer</task-id>\n<status>completed</status>\n<output-file>${nextTranscript}</output-file>\n</task-notification>` } })}\n`);
+  stop(box);
+  const collected = record(box);
+  assert.strictEqual(collected.transportStatus, "done");
+  assert.deepStrictEqual(collected.peerJobIds, [firstJobId, nextJobId]);
+  assert.strictEqual(collected.peerJobId, nextJobId);
+});
+
+test("an unscanned prior notification cannot collect a continued Fusion worker", (t) => {
+  const box = sandbox(t);
+  const taskId = `fusion-${"9".repeat(24)}`;
+  createAcceptedCollectedRecord(box, taskId, "stale-notification-worker");
+  fs.appendFileSync(box.transcript, `${JSON.stringify({ type: "user", message: { content: "<task-notification>\n<task-id>stale-notification-worker</task-id>\n<status>completed</status>\n</task-notification>" } })}\n`);
+  const oldNotificationEnd = fs.statSync(box.transcript).size;
+  const toolInput = { to: "stale-notification-worker", message: "continue" };
+  run(box, { hook_event_name: "PreToolUse", session_id: "session-1", cwd: box.cwd, transcript_path: box.transcript, tool_name: "SendMessage", tool_input: toolInput });
+  assert.strictEqual(record(box).continuationRequestedTranscriptBytes, oldNotificationEnd);
+  run(box, { hook_event_name: "PostToolUse", session_id: "session-1", cwd: box.cwd, transcript_path: box.transcript, tool_name: "SendMessage", tool_input: toolInput });
+  assert.strictEqual(record(box).continuationNotificationFloor, oldNotificationEnd);
+  stop(box);
+  assert.strictEqual(record(box).collectedAt, null);
+  assert.notStrictEqual(record(box).transportStatus, "done");
+  const finalMessage = "new round result\ndelivery: complete\nverification: passed";
+  const subagentStop = run(box, { hook_event_name: "SubagentStop", session_id: "session-1", cwd: box.cwd, agent_id: "stale-notification-worker", agent_type: "fusion:claude-worker", last_assistant_message: finalMessage });
+  assert.strictEqual(subagentStop.status, 0, subagentStop.stderr);
+  assert.strictEqual(record(box).transportStatus, "done");
+  assert.strictEqual(record(box).collectionMethod, "subagent_stop");
+  assert.strictEqual(fs.readFileSync(record(box).outputFile, "utf8"), finalMessage);
+});
+
+test("a notification after continuation collects the new Fusion worker round", (t) => {
+  const box = sandbox(t);
+  const taskId = `fusion-${"a".repeat(24)}`;
+  createAcceptedCollectedRecord(box, taskId, "new-notification-worker");
+  fs.appendFileSync(box.transcript, `${JSON.stringify({ type: "user", message: { content: "<task-notification>\n<task-id>new-notification-worker</task-id>\n<status>completed</status>\n</task-notification>" } })}\n`);
+  const toolInput = { to: "new-notification-worker", message: "continue" };
+  run(box, { hook_event_name: "PostToolUse", session_id: "session-1", cwd: box.cwd, transcript_path: box.transcript, tool_name: "SendMessage", tool_input: toolInput });
+  const floor = record(box).continuationNotificationFloor;
+  const workerTranscript = path.join(box.root, "new-round.jsonl");
+  const finalMessage = "new notification result\ndelivery: complete\nverification: passed";
+  fs.writeFileSync(workerTranscript, `${JSON.stringify({ type: "assistant", message: { content: [{ type: "text", text: finalMessage }] } })}\n`);
+  fs.appendFileSync(box.transcript, `${JSON.stringify({ type: "user", message: { content: `<task-notification>\n<task-id>new-notification-worker</task-id>\n<status>completed</status>\n<output-file>${workerTranscript}</output-file>\n</task-notification>` } })}\n`);
+  assert.ok(fs.statSync(box.transcript).size > floor);
+  stop(box);
+  assert.strictEqual(record(box).transportStatus, "done");
+  assert.strictEqual(record(box).collectionMethod, "task_notification");
+  assert.strictEqual(fs.readFileSync(record(box).outputFile, "utf8"), finalMessage);
+});
+
 test("failed SendMessage leaves a terminal peer round untouched", (t) => {
   const box = sandbox(t);
   const taskId = `fusion-${"3".repeat(24)}`;
@@ -955,7 +1030,10 @@ test("failed SendMessage leaves a terminal peer round untouched", (t) => {
   run(box, { hook_event_name: "PreToolUse", session_id: "session-1", cwd: box.cwd, tool_name: "SendMessage", tool_input: toolInput }, routingFixture(box));
   const failed = run(box, { hook_event_name: "PostToolUseFailure", session_id: "session-1", cwd: box.cwd, tool_name: "SendMessage", tool_input: toolInput, error: "delivery failed" });
   assert.strictEqual(failed.status, 0, failed.stderr);
-  assert.deepStrictEqual(record(box), terminal);
+  const cleared = record(box);
+  assert.strictEqual(cleared.continuationRequestedAt, undefined);
+  assert.strictEqual(cleared.continuationRequestedTranscriptBytes, undefined);
+  assert.deepStrictEqual({ ...cleared, updatedAt: terminal.updatedAt }, terminal);
 });
 
 test("SendMessage reopens a settled Fusion worker with a fresh round budget", (t) => {
@@ -975,14 +1053,15 @@ test("SendMessage reopens a settled Fusion worker with a fresh round budget", (t
   const pre = run(box, { hook_event_name: "PreToolUse", session_id: "session-1", cwd: box.cwd, tool_name: "SendMessage", tool_input: toolInput });
   assert.strictEqual(pre.status, 0, pre.stderr);
   assert.strictEqual(pre.stdout, "");
-  assert.deepStrictEqual(record(box), settled);
+  assert.strictEqual(record(box).continuationRequestedTranscriptBytes, 0);
+  assert.ok(record(box).continuationRequestedAt);
 
   const sent = run(box, { hook_event_name: "PostToolUse", session_id: "session-1", cwd: box.cwd, tool_name: "SendMessage", tool_input: toolInput });
   assert.strictEqual(sent.status, 0, sent.stderr);
   const reopened = record(box);
   assert.strictEqual(reopened.transportStatus, "running");
   assert.strictEqual(reopened.runtimeAsync, true);
-  assert.deepStrictEqual(reopened.budgetBaseline, { at: reopened.lastContinuedAt, turns: settled.turns, outputTokens: settled.usage.outputTokens, uncachedTokens: settled.usage.uncachedTokens });
+  assert.deepStrictEqual(reopened.budgetBaseline, { at: reopened.lastContinuedAt, turns: settled.turns, outputTokens: settled.usage.outputTokens, uncachedTokens: settled.usage.uncachedTokens, toolCalls: settled.toolCalls, usage: settled.usage });
   assert.strictEqual(reopened.retryCount, 0);
   assert.strictEqual(reopened.lastLivenessAt, reopened.lastContinuedAt);
   assert.strictEqual(reopened.continuations.length, 1);
@@ -999,6 +1078,74 @@ test("SendMessage reopens a settled Fusion worker with a fresh round budget", (t
   const denied = run(box, call);
   assert.strictEqual(JSON.parse(denied.stdout).hookSpecificOutput.permissionDecision, "deny");
   assert.strictEqual(record(box).failureKind, "token_limit");
+});
+
+test("reopened Fusion worker enforces each round budget beyond retained transcript windows", (t) => {
+  const box = sandbox(t);
+  const taskId = `fusion-${"e".repeat(24)}`;
+  createAcceptedCollectedRecord(box, taskId, "long-round-worker");
+  updateWorkerRecord(taskId, envFor(box), (current) => ({
+    ...current,
+    turns: 2_100,
+    toolCalls: 2_100,
+    usage: { inputTokens: 6_300, cacheCreationInputTokens: 0, cacheReadInputTokens: 0, outputTokens: 4_200, totalTokens: 10_500, uncachedTokens: 10_500 },
+    usageMessages: Object.fromEntries(Array.from({ length: 512 }, (_, index) => [`old-${index}`, { inputTokens: 3, cacheCreationInputTokens: 0, cacheReadInputTokens: 0, outputTokens: 2, totalTokens: 5, uncachedTokens: 5 }])),
+    turnIds: Array.from({ length: 512 }, (_, index) => `old-${index}`),
+    toolUseIds: Array.from({ length: 2_048 }, (_, index) => `old-tool-${index}`)
+  }));
+  const sent = run(box, { hook_event_name: "PostToolUse", session_id: "session-1", cwd: box.cwd, tool_name: "SendMessage", tool_input: { to: "long-round-worker", message: "continue" } });
+  assert.strictEqual(sent.status, 0, sent.stderr);
+  let current = record(box);
+  assert.deepStrictEqual([Object.keys(current.usageMessages).length, current.turnIds.length, current.toolUseIds.length], [0, 0, 0]);
+  const transcript = path.join(box.root, "agent-long-round-worker.jsonl");
+  const lines = Array.from({ length: 2_060 }, (_, index) => JSON.stringify({ type: "assistant", requestId: `round-${index}`, message: { id: `round-${index}`, usage: { input_tokens: 3, output_tokens: 2 }, content: [{ type: "tool_use", id: `round-tool-${index}` }] } }));
+  fs.writeFileSync(transcript, `${lines.slice(0, -1).join("\n")}\n`);
+  current = refreshWorkerTranscript(current, transcript);
+  const at = Date.parse(current.budgetBaseline.at);
+  const limits = { wallClockMs: 1_200_000, stallMs: 600_000, maxTurns: 2_060, maxOutputTokens: 4_120, maxUncachedTokens: 10_300 };
+  const isolatedLimits = [
+    [{ ...limits, maxOutputTokens: Infinity, maxUncachedTokens: Infinity }, "turn_limit"],
+    [{ ...limits, maxTurns: Infinity, maxUncachedTokens: Infinity }, "token_limit"],
+    [{ ...limits, maxTurns: Infinity, maxOutputTokens: Infinity }, "token_limit"]
+  ];
+  assert.deepStrictEqual([current.turns, current.toolCalls, current.usage.outputTokens, current.usage.uncachedTokens], [4_159, 4_159, 8_318, 20_795]);
+  for (const [onlyLimit] of isolatedLimits) {
+    assert.strictEqual(workerBudgetFailure({ ...current, limits: onlyLimit }, at), null);
+  }
+  fs.appendFileSync(transcript, `${lines.at(-1)}\n`);
+  current = refreshWorkerTranscript(current, transcript);
+  assert.deepStrictEqual([current.turns, current.toolCalls, current.usage.outputTokens, current.usage.uncachedTokens], [4_160, 4_160, 8_320, 20_800]);
+  for (const [onlyLimit, failureKind] of isolatedLimits) {
+    assert.strictEqual(workerBudgetFailure({ ...current, limits: onlyLimit }, at)?.failureKind, failureKind);
+  }
+});
+
+test("synchronous tool-response usage becomes transcript accounting after Fusion worker reopen", (t) => {
+  const box = sandbox(t);
+  const workerDispatch = dispatch(box);
+  run(box, workerDispatch);
+  run(box, {
+    ...workerDispatch,
+    hook_event_name: "PostToolUse",
+    tool_response: { status: "completed", agentId: "sync-continued-worker", totalToolUseCount: 7, usage: { input_tokens: 10, cache_creation_input_tokens: 20, cache_read_input_tokens: 80, output_tokens: 6 } }
+  });
+  const firstRound = record(box);
+  assert.strictEqual(firstRound.usageSource, "tool-response");
+  updateWorkerRecord(firstRound.taskId, envFor(box), (current) => ({ ...current, limits: { wallClockMs: 1_200_000, stallMs: 600_000, maxTurns: 60, maxOutputTokens: 6, maxUncachedTokens: 100 } }));
+  const sent = run(box, { hook_event_name: "PostToolUse", session_id: "session-1", cwd: box.cwd, tool_name: "SendMessage", tool_input: { to: "sync-continued-worker", message: "continue" } });
+  assert.strictEqual(sent.status, 0, sent.stderr);
+  const reopened = record(box);
+  assert.strictEqual(reopened.usageSource, null);
+  assert.deepStrictEqual([reopened.toolCalls, reopened.usage.outputTokens, reopened.usage.uncachedTokens], [7, 6, 36]);
+  const transcript = path.join(box.root, "agent-sync-continued-worker.jsonl");
+  fs.writeFileSync(transcript, `${JSON.stringify({ type: "assistant", requestId: "next", message: { id: "next", usage: { input_tokens: 4, output_tokens: 6 }, content: [{ type: "tool_use", id: "next-tool" }] } })}\n`);
+  const call = { hook_event_name: "PreToolUse", session_id: "session-1", cwd: box.cwd, transcript_path: transcript, agent_id: "sync-continued-worker", agent_type: "fusion:claude-worker", tool_name: "Read" };
+  const denied = run(box, call);
+  assert.strictEqual(JSON.parse(denied.stdout).hookSpecificOutput.permissionDecision, "deny");
+  const updated = record(box);
+  assert.deepStrictEqual([updated.turns, updated.toolCalls, updated.usage.outputTokens, updated.usage.uncachedTokens], [1, 8, 12, 46]);
+  assert.strictEqual(updated.usageSource, "agent-transcript");
+  assert.strictEqual(updated.failureKind, "token_limit");
 });
 
 test("reopened Fusion worker budgets and wind-down use only the current round", (t) => {
@@ -1058,14 +1205,85 @@ test("reopened Fusion worker SubagentStop retries its marker then collects the f
   assert.strictEqual(completed.continuations[0].acceptance, "accepted");
 });
 
+test("resumed Fusion worker SubagentStop wins the SendMessage PostToolUse race", (t) => {
+  const box = sandbox(t);
+  const taskId = `fusion-${"b".repeat(24)}`;
+  createAcceptedCollectedRecord(box, taskId, "racing-worker");
+  const toolInput = { to: "racing-worker", message: "finish the next round" };
+  run(box, { hook_event_name: "PreToolUse", session_id: "session-1", cwd: box.cwd, transcript_path: box.transcript, tool_name: "SendMessage", tool_input: toolInput });
+  const requestedAt = record(box).continuationRequestedAt;
+  assert.ok(requestedAt);
+  const stopPayload = { hook_event_name: "SubagentStop", session_id: "session-1", cwd: box.cwd, agent_id: "racing-worker", agent_type: "fusion:claude-worker" };
+  const blocked = run(box, { ...stopPayload, last_assistant_message: "work remains" });
+  assert.strictEqual(JSON.parse(blocked.stdout).decision, "block");
+  assert.strictEqual(record(box).continuationCount, 1);
+  assert.strictEqual(record(box).retryCount, 1);
+  const finalMessage = "race result\ndelivery: complete\nverification: passed";
+  const completed = run(box, { ...stopPayload, stop_hook_active: true, last_assistant_message: finalMessage });
+  assert.strictEqual(completed.status, 0, completed.stderr);
+  assert.strictEqual(completed.stdout, "");
+  const beforePost = record(box);
+  assert.strictEqual(beforePost.transportStatus, "done");
+  assert.strictEqual(beforePost.collectionMethod, "subagent_stop");
+  assert.strictEqual(fs.readFileSync(beforePost.outputFile, "utf8"), finalMessage);
+  run(box, { ...stopPayload, stop_hook_active: true, last_assistant_message: finalMessage });
+  assert.strictEqual(record(box).continuationCount, 1);
+  const post = run(box, { hook_event_name: "PostToolUse", session_id: "session-1", cwd: box.cwd, transcript_path: box.transcript, tool_name: "SendMessage", tool_input: toolInput });
+  assert.strictEqual(post.status, 0, post.stderr);
+  const afterPost = record(box);
+  assert.strictEqual(afterPost.transportStatus, "done");
+  assert.strictEqual(afterPost.continuationCount, 1);
+  assert.strictEqual(afterPost.continuationRequestedAt, undefined);
+  assert.strictEqual(afterPost.outputFile, beforePost.outputFile);
+});
+
+test("reopened round counters do not cancel or reap a resumed worker at Stop", (t) => {
+  const box = sandbox(t);
+  const taskId = `fusion-${"c".repeat(24)}`;
+  createAcceptedCollectedRecord(box, taskId, "counter-worker");
+  updateWorkerRecord(taskId, envFor(box), (current) => ({ ...current, stopBlockCount: 6, cancelAttemptCount: 2, retryCount: 1 }));
+  run(box, { hook_event_name: "PostToolUse", session_id: "session-1", cwd: box.cwd, transcript_path: box.transcript, tool_name: "SendMessage", tool_input: { to: "counter-worker", message: "continue" } });
+  const reopened = record(box);
+  assert.deepStrictEqual([reopened.stopBlockCount, reopened.cancelAttemptCount, reopened.retryCount], [0, 0, 0]);
+  const stopped = stop(box);
+  assert.strictEqual(stopped.status, 0, stopped.stderr);
+  const afterStop = record(box);
+  assert.notStrictEqual(afterStop.transportStatus, "cancel_requested");
+  assert.notStrictEqual(afterStop.transportStatus, "failed");
+  assert.strictEqual(afterStop.cancelAttemptCount, 0);
+});
+
+test("notification recovery uses reopened round turns for missing final text", (t) => {
+  const box = sandbox(t);
+  const taskId = `fusion-${"d".repeat(24)}`;
+  createAcceptedCollectedRecord(box, taskId, "no-final-worker");
+  updateWorkerRecord(taskId, envFor(box), (current) => ({ ...current, turns: 70, limits: { ...current.limits, maxTurns: 60 } }));
+  run(box, { hook_event_name: "PostToolUse", session_id: "session-1", cwd: box.cwd, transcript_path: box.transcript, tool_name: "SendMessage", tool_input: { to: "no-final-worker", message: "continue" } });
+  const reopened = record(box);
+  assert.strictEqual(reopened.budgetBaseline.turns, 70);
+  const workerTranscript = path.join(box.root, "no-final-worker.jsonl");
+  fs.writeFileSync(workerTranscript, `${JSON.stringify({ type: "assistant", message: { content: [{ type: "tool_use", id: "tool-1" }] } })}\n`);
+  fs.appendFileSync(box.transcript, `${JSON.stringify({ type: "user", message: { content: `<task-notification>\n<task-id>no-final-worker</task-id>\n<status>completed</status>\n<output-file>${workerTranscript}</output-file>\n</task-notification>` } })}\n`);
+  stop(box);
+  const incomplete = record(box);
+  assert.strictEqual(incomplete.transportStatus, "incomplete");
+  assert.strictEqual(incomplete.failureKind, "missing_final_text");
+  assert.strictEqual(incomplete.turns, 70);
+});
+
 test("failed SendMessage leaves a terminal Fusion worker round untouched", (t) => {
   const box = sandbox(t);
   const taskId = `fusion-${"7".repeat(24)}`;
   const terminal = createAcceptedCollectedRecord(box, taskId, "failed-message-worker");
   const toolInput = { to: "failed-message-worker", message: "continue" };
+  run(box, { hook_event_name: "PreToolUse", session_id: "session-1", cwd: box.cwd, tool_name: "SendMessage", tool_input: toolInput });
+  assert.ok(record(box).continuationRequestedAt);
   const failed = run(box, { hook_event_name: "PostToolUseFailure", session_id: "session-1", cwd: box.cwd, tool_name: "SendMessage", tool_input: toolInput, error: "delivery failed" });
   assert.strictEqual(failed.status, 0, failed.stderr);
-  assert.deepStrictEqual(record(box), terminal);
+  const cleared = record(box);
+  assert.strictEqual(cleared.continuationRequestedAt, undefined);
+  assert.strictEqual(cleared.continuationRequestedTranscriptBytes, undefined);
+  assert.deepStrictEqual({ ...cleared, updatedAt: terminal.updatedAt }, terminal);
 });
 
 test("peer wrapper Agents reject runtime background mode while the managed review runner remains exempt", (t) => {
