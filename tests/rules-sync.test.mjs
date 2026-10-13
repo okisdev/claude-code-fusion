@@ -351,7 +351,8 @@ test("Grok rules document source verified headless boundaries", () => {
   assert.match(rules, /not the only writable temporary surface/);
   assert.match(rules, /sandbox still permits consult `read_file` to reach `~\/\.grok\/auth\.json`/i);
   assert.match(rules, /native MCP servers, plugins, or hooks/);
-  assert.match(rules, /bridge variables disable compatibility imports, not native Grok configuration/);
+  assert.match(rules, /bridge variables gate only loose compatibility imports, not native Grok configuration and not the Claude Code plugins that `~\/\.claude\/settings\.json` enables/);
+  assert.match(rules, /`\[claude_compat\] imported = true` or lists them in `\[plugins\] disabled`/);
   for (const sentence of [
     freshSessionSentence,
     volumeTierSentence,
@@ -414,7 +415,7 @@ test("Grok rules document source verified headless boundaries", () => {
   assert.match(contract, /Upstream ships ACP today/);
   assert.match(contract, /The companion has not adopted ACP yet and continues per-call invocation/);
   assert.match(codexContract, /failureKind: "setup".*below the tested minimum 0\.154\.0/);
-  assert.match(codexContract, /The tested interval runs from 0\.154\.0 up to but excluding 0\.158\.0; versions below 0\.154\.0 fail task and review preflight with a setup error; versions at or above 0\.158\.0 keep running task and review preflight while `\/codex:setup` reports not ready with exit code 1 as the compatibility advisory/);
+  assert.match(codexContract, /The tested interval runs from 0\.154\.0 up to but excluding 0\.163\.0; versions below 0\.154\.0 fail task and review preflight with a setup error; versions at or above 0\.163\.0 keep running task and review preflight while `\/codex:setup` reports not ready with exit code 1 as the compatibility advisory/);
   assert.match(codexContract, /Codex configuration parse failures under `--strict-config`.*failureKind: "process"/);
   assert.match(sharedContract, /The Grok instance adds `sandbox`[^\n]*`transport`[^\n]*`policy`[^\n]*`turn_limit`[^\n]*and `network`/);
   assert.match(sharedContract, /`setup`: The installed CLI version or installation lacks a required adapter capability and fails capability preflight/);
@@ -433,7 +434,8 @@ test("Grok rules document source verified headless boundaries", () => {
   assert.match(doctor, /Bash\(grok inspect:\*\)/);
   assert.match(doctor, /Run `grok inspect --json` and review the reported `permissions`, `hooks`, `plugins`, `agents`, `mcpServers`, and `externalCompat` surfaces/);
   assert.match(doctor, /successful Grok collection remains unverified until `\/fusion:stats --record <fusion-task-id>=<accepted\|rejected>`/i);
-  assert.match(doctor, /`GROK_WEB_FETCH` is pinned by web mode, `GROK_AUTO_WAKE` and `GROK_MANAGED_MCP_GATEWAY_TOOLS_ENABLED` are pinned false/);
+  assert.match(doctor, /`GROK_WEB_FETCH` is pinned by web mode, `GROK_AUTO_WAKE`, `GROK_MANAGED_MCP_GATEWAY_TOOLS_ENABLED`, `GROK_TURN_SUMMARY`, and `GROK_FILE_ACCELERATION` are pinned false/);
+  assert.match(doctor, /`GROK_SANDBOX_MODE`, `GROK_ARTIFACTS_BIND_REMOUNT`, `GROK_FILE_ACCELERATION_ROUTES`, `GROK_CURSOR_WORKER_API_BASE`, and `GROK_CURSOR_WORKER_COMMAND` are removed/);
   for (const text of [readme, security]) {
     assert.match(text, /introduced in 0\.2\.112, verified through 1\.0\.41/);
     assert.match(text, /file that is unlinked (?:immediately after open|as soon as it is opened)/);
