@@ -459,6 +459,44 @@ test("worker acceptance preserves semantic failure kinds through settlement and 
   assert.strictEqual(readWorkerRecord(invalidTaskId, env).acceptance, "unverified");
 });
 
+test("collector acceptance requires a verified registered peer identity", (t) => {
+  const directory = sandbox(t);
+  const env = { FUSION_WORKER_STATE_DIR: path.join(directory, "worker-state") };
+  for (const [index, engine] of ["grok", "cursor"].entries()) {
+    const taskId = `fusion-collector-${engine}`;
+    createWorkerRecord({ taskId, sessionId: "session-collectors", agentType: "fusion:job-collector", workspaceRoot: directory }, env);
+    updateWorkerRecord(taskId, env, (record) => ({
+      ...record,
+      completionContract: "collector",
+      transportStatus: "done",
+      peerEngine: engine,
+      peerJobId: String(index + 1).repeat(32),
+      peerTransportStatus: "done"
+    }));
+    const result = recordWorkerAcceptance({ taskId, acceptance: "accepted", env });
+    assert.strictEqual(result.record.acceptance, "accepted");
+    assert.ok(result.record.acceptanceRecordedAt);
+  }
+
+  const taskId = "fusion-collector-invalid";
+  createWorkerRecord({ taskId, sessionId: "session-collectors", agentType: "fusion:job-collector", workspaceRoot: directory }, env);
+  for (const peerIdentity of [
+    { peerEngine: "unknown", peerJobId: "a".repeat(32), peerTransportStatus: "done" },
+    { peerEngine: "cursor", peerJobId: "invalid", peerTransportStatus: "done" },
+    { peerEngine: "cursor", peerJobId: "a".repeat(32), peerTransportStatus: null }
+  ]) {
+    updateWorkerRecord(taskId, env, (record) => ({ ...record, completionContract: "collector", transportStatus: "done", ...peerIdentity }));
+    assert.throws(() => recordWorkerAcceptance({ taskId, acceptance: "accepted", env }), /verified peer collection identity/);
+    assert.strictEqual(readWorkerRecord(taskId, env).acceptance, "unverified");
+  }
+
+  const ledgerTaskId = "fusion-collector-codex";
+  createWorkerRecord({ taskId: ledgerTaskId, sessionId: "session-collectors", agentType: "fusion:job-collector", workspaceRoot: directory }, env);
+  updateWorkerRecord(ledgerTaskId, env, (record) => ({ ...record, completionContract: "collector", transportStatus: "done", peerEngine: "codex", peerJobId: "c".repeat(32), peerTransportStatus: "done" }));
+  assert.throws(() => recordWorkerAcceptance({ taskId: ledgerTaskId, acceptance: "accepted", env }), /must be recorded through the Codex acceptance ledger/);
+  assert.strictEqual(readWorkerRecord(ledgerTaskId, env).acceptance, "unverified");
+});
+
 test("pending settlement clears after recordWorkerAcceptance and applyQueuedVerdict", (t) => {
   const directory = sandbox(t);
   const env = { FUSION_WORKER_STATE_DIR: path.join(directory, "worker-state") };

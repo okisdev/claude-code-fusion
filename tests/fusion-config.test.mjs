@@ -30,12 +30,18 @@ function sandbox(t) {
     `${JSON.stringify({ format: 2, hashes: [hashRulesTemplate(CANONICAL)] }, null, 2)}\n`,
     "utf8"
   );
+  const companions = Object.fromEntries(["codex", "grok", "cursor"].map((engine) => {
+    const file = path.join(root, `${engine}-companion.mjs`);
+    const models = engine === "codex" ? ["gpt-5.6-terra", "gpt-5.7-new", "o3"] : engine === "grok" ? ["grok-4.7-build-fast", "grok-new"] : ["muse-spark-1.3-xhigh", "composer-2.5", "cursor-new"];
+    fs.writeFileSync(file, `if (process.argv.slice(2).join(" ") !== "models --json") process.exit(2);\nprocess.stdout.write(JSON.stringify(${JSON.stringify({ engine, models: models.map((id) => ({ id, displayName: id })), source: "test listing" })}));\n`);
+    return [engine, file];
+  }));
   return {
     root,
     pluginRoot,
     fusionData: path.join(root, "fusion-data"),
     modelRoutingFile: path.join(root, "model-routing.json"),
-    codexModelsCacheFile: path.join(root, "models_cache.json"),
+    companions,
     rulesFile: path.join(root, "live", "orchestration.md"),
     postureFile: path.join(root, "fusion-data", "posture")
   };
@@ -52,7 +58,9 @@ function run(sandbox, args, overrides = {}) {
       FUSION_DATA_DIR: sandbox.fusionData,
       FUSION_MODEL_ROUTING: sandbox.modelRoutingFile,
       FUSION_RULES_FILE: sandbox.rulesFile,
-      FUSION_CODEX_MODELS_CACHE: sandbox.codexModelsCacheFile,
+      FUSION_CODEX_COMPANION: sandbox.companions.codex,
+      FUSION_GROK_COMPANION: sandbox.companions.grok,
+      FUSION_CURSOR_COMPANION: sandbox.companions.cursor,
       ...overrides
     }
   });
@@ -99,7 +107,7 @@ test("Rescore writes the data file and refreshes the live rules", (t) => {
     assert.strictEqual(fs.statSync(box.modelRoutingFile).mode & 0o777, 0o600);
   }
   const live = fs.readFileSync(box.rulesFile, "utf8");
-  assert.match(live, /^\| codex \| codex \| 5 \| 4 \| 5 \| primary implementation lane \|$/m);
+  assert.match(live, /^\| codex \| codex \| openai \| 5 \| 4 \| 5 \| primary implementation lane \|$/m);
 });
 
 test("Set-default writes a lane choice and refreshes the live rules", (t) => {
@@ -129,7 +137,7 @@ test("Set-default rejects invalid choices and leaves the routing file unchanged"
   );
   const before = fs.readFileSync(box.modelRoutingFile, "utf8");
   for (const [args, reason] of [
-    [["grok", "quick", "gpt-6-sol", "high"], /Expected a codex role/],
+    [["grok", "quick", "gpt-6-sol", "high"], /Expected codex role/],
     [["codex", "quick", "gpt-6-sol", "ultra"], /defaults\.codex\.quick\.effort/],
     [["grok", "burst", "gpt-6-sol", "low"], /match a model in the grok lane/],
     [["codex", "quick", "missing", "high"], /match a model in the codex lane/]
@@ -154,7 +162,7 @@ test("Show json parses after a score is configured", (t) => {
   assert.strictEqual(data.configured, true);
   assert.strictEqual(data.valid, true);
   assert.strictEqual(data.data.models[0].id, "grok-fast");
-  assert.match(data.table, /^\| grok-fast \| grok \| 3 \| 3 \| 5 \|  \|$/m);
+  assert.match(data.table, /^\| grok-fast \| grok \| xai \| 3 \| 3 \| 5 \|  \|$/m);
 });
 
 test("Show reports an invalid model routing file explicitly", (t) => {
@@ -284,7 +292,7 @@ test("Reset defaults leaves the posture file intact", (t) => {
   assert.deepStrictEqual(shown.posture, { value: "strict", source: "file" });
 });
 
-test("Audit reports configured Codex listing drift and gpt newcomers", (t) => {
+test("Audit reports listing drift, unscored models, and Cursor variants per engine", (t) => {
   const box = sandbox(t);
   assert.strictEqual(
     run(box, ["rescore", "gpt-5.6-terra", "--intelligence", "5", "--taste", "4", "--cost", "4", "--lane", "codex"]).status,
@@ -298,37 +306,73 @@ test("Audit reports configured Codex listing drift and gpt newcomers", (t) => {
     run(box, ["rescore", "grok-4-missing", "--intelligence", "4", "--taste", "4", "--cost", "5", "--lane", "grok"]).status,
     0
   );
+  assert.strictEqual(run(box, ["rescore", "muse-spark-1.3", "--intelligence", "4", "--taste", "5", "--cost", "3", "--lane", "cursor", "--family", "anthropic"]).status, 0);
+  assert.strictEqual(run(box, ["rescore", "composer-2.5", "--intelligence", "4", "--taste", "4", "--cost", "4", "--lane", "cursor", "--family", "cursor"]).status, 0);
   assert.strictEqual(run(box, ["set-default", "codex", "quick", "gpt-5.6-terra", "high"]).status, 0);
-  fs.writeFileSync(
-    box.codexModelsCacheFile,
-    `${JSON.stringify({ models: [{ slug: "gpt-5.6-terra" }, { slug: "gpt-5.7-new" }, { slug: "o3" }] })}\n`,
-    "utf8"
-  );
+  assert.strictEqual(run(box, ["set-default", "cursor", "diversity", "muse-spark-1.3", "xhigh"]).status, 0);
+  assert.strictEqual(run(box, ["set-default", "cursor", "burst", "composer-2.5", "default"]).status, 0);
   const routingBeforeAudit = fs.readFileSync(box.modelRoutingFile, "utf8");
   const result = run(box, ["audit", "--json"]);
   assert.strictEqual(result.status, 0, result.stderr);
   const report = JSON.parse(result.stdout);
-  assert.strictEqual(report.listing.available, true);
-  assert.strictEqual(report.listing.path, box.codexModelsCacheFile);
-  assert.strictEqual(report.listing.mtime, fs.statSync(box.codexModelsCacheFile).mtime.toISOString());
-  assert.deepStrictEqual(report.configuredButAbsent, ["gpt-5.5-missing"]);
+  assert.strictEqual(report.engines.codex.listing.available, true);
+  assert.strictEqual(report.engines.codex.listing.source, "test listing");
+  assert.deepStrictEqual(report.engines.codex.configuredButAbsent, ["gpt-5.5-missing"]);
   assert.deepStrictEqual(report.defaults.codex.quick, { model: "gpt-5.6-terra", effort: "high" });
   assert.deepStrictEqual(report.defaults.grok.burst, { model: "grok-4.7-build-fast", effort: "low" });
-  assert.deepStrictEqual(report.codexDefaultsAbsent, [
+  assert.deepStrictEqual(report.engines.codex.defaultsAbsent, [
     { role: "volume", model: "gpt-6-luna" },
     { role: "flagship", model: "gpt-6-astra" }
   ]);
-  assert.deepStrictEqual(report.unconfiguredGptModels, ["gpt-5.7-new"]);
+  assert.deepStrictEqual(report.engines.codex.unscored, ["gpt-5.7-new", "o3"]);
+  assert.deepStrictEqual(report.engines.grok.configuredButAbsent, ["grok-4-missing"]);
+  assert.deepStrictEqual(report.engines.grok.unscored, ["grok-4.7-build-fast", "grok-new"]);
+  assert.deepStrictEqual(report.engines.cursor.configuredButAbsent, []);
+  assert.deepStrictEqual(report.engines.cursor.defaultsAbsent, []);
+  assert.deepStrictEqual(report.engines.cursor.unscored, ["cursor-new"]);
   assert.strictEqual(fs.readFileSync(box.modelRoutingFile, "utf8"), routingBeforeAudit);
   const text = run(box, ["audit"]);
   assert.match(text.stdout, /codex defaults: quick gpt-5\.6-terra@high/);
   assert.match(text.stdout, /Codex defaults absent: volume gpt-6-luna, flagship gpt-6-astra/);
+  assert.match(text.stdout, /Unconfigured gpt-\* newcomers: gpt-5\.7-new/);
+  assert.match(text.stdout, /Cursor unscored models \(no routing seat\): cursor-new/);
 });
 
-test("Audit reports an unavailable Codex model listing without failing", (t) => {
+test("Audit reports an unavailable companion and continues with other engines", (t) => {
   const box = sandbox(t);
-  const result = run(box, ["audit"]);
+  const result = run(box, ["audit"], { FUSION_GROK_COMPANION: path.join(box.root, "missing.mjs") });
   assert.strictEqual(result.status, 0, result.stderr);
-  assert.match(result.stdout, /Codex model listing: listing unavailable/);
+  assert.match(result.stdout, /Grok listing unavailable: companion missing/);
+  assert.match(result.stdout, /Codex model listing: test listing/);
+  assert.match(result.stdout, /Cursor model listing: test listing/);
   assert.match(result.stdout, /grok defaults: burst grok-4\.7-build-fast@low/);
+});
+
+test("Audit lists catalog models without a configured routing file", (t) => {
+  const box = sandbox(t);
+  const report = JSON.parse(run(box, ["audit", "--json"]).stdout);
+  assert.strictEqual(report.configured, false);
+  assert.deepStrictEqual(report.engines.codex.unscored, ["gpt-5.6-terra", "gpt-5.7-new", "o3"]);
+  assert.deepStrictEqual(report.engines.cursor.unscored, ["muse-spark-1.3-xhigh", "composer-2.5", "cursor-new"]);
+});
+
+test("Audit isolates invalid JSON and failed companion exits", (t) => {
+  const box = sandbox(t);
+  fs.writeFileSync(box.companions.codex, "process.stdout.write('{invalid');\n");
+  fs.writeFileSync(box.companions.cursor, "process.stderr.write('catalog failed'); process.exit(3);\n");
+  const report = JSON.parse(run(box, ["audit", "--json"]).stdout);
+  assert.match(report.engines.codex.listing.reason, /invalid JSON/);
+  assert.strictEqual(report.engines.grok.listing.available, true);
+  assert.strictEqual(report.engines.cursor.listing.reason, "catalog failed");
+});
+
+test("Cursor rescore requires family and accepts default effort", (t) => {
+  const box = sandbox(t);
+  const args = ["rescore", "composer-2.5", "--intelligence", "4", "--taste", "4", "--cost", "4", "--lane", "cursor"];
+  const invalid = run(box, args);
+  assert.strictEqual(invalid.status, 1);
+  assert.match(invalid.stderr, /models\[0\]\.family/);
+  assert.strictEqual(run(box, [...args, "--family", "cursor"]).status, 0);
+  assert.strictEqual(run(box, ["set-default", "cursor", "burst", "composer-2.5", "default"]).status, 0);
+  assert.match(fs.readFileSync(box.rulesFile, "utf8"), /\| composer-2\.5 \| cursor \| cursor \| 4 \| 4 \| 4 \|/);
 });

@@ -1,6 +1,6 @@
 # Contributing
 
-This repository ships the Claude Code plugins that make multi model orchestration work in practice. The fusion plugin owns routing rules, tier agents, configuration, doctor, panel, ultra, and stats. The Codex and Grok plugins are the hosted peer companions for their local CLIs. Alongside them live a bench harness under `bench/` and a Node test suite under `tests/`.
+This repository ships the Claude Code plugins that make multi model orchestration work in practice. The fusion plugin owns routing rules, tier agents, configuration, doctor, panel, ultra, and stats. The Codex, Grok, and Cursor plugins are the hosted peer companions for their local CLIs; a new engine joins through an entry in `plugins/fusion/scripts/lib/engines.mjs` and a companion that implements [docs/companion-contract.md](docs/companion-contract.md). Alongside them live a bench harness under `bench/` and a Node test suite under `tests/`.
 
 Plugin behavior is driven by prose rules as much as by code. `plugins/fusion/rules/orchestration.md` is synced to `~/.claude/rules/` and loaded into every orchestrated session. `plugins/fusion/rules/troubleshooting.md` ships with the fusion plugin and is consulted on demand when delegation fails. Together they decide which lanes fire, when collection is required, and how posture and the question policy gate the main loop. Treat wording changes in those files as production changes.
 
@@ -12,8 +12,9 @@ Any change to `plugins/fusion/rules/orchestration.md` or `plugins/fusion/rules/t
 2. Check that the load bearing invariants survived the edit:
    - The main Claude session is the only control plane and final judge. It owns ambiguity resolution, decomposition, integration, semantic acceptance, and user communication, while work packages execute in delegated lanes.
    - Codex owns ordinary implementation by default. Grok remains implementation capable only through its four protected roles (`burst`, `independence`, `live-web`, `large-context`) or an explicit user choice; it is not a generic alternative merely because it is idle.
-   - Codex admission order is the current workspace, an isolated worktree for an independent eligible package, then Grok under `burst`, then the matching Claude fallback. Packages with overlapping files, shared generated state, or ordering dependencies are consolidated or sequenced instead of parallel overflow.
-   - Routing stays capability first: capability monopolies (X and live platform reads on Grok `live-web`, Claude tool surface and privacy on Claude workers, judgment dense authorship in the main session) hard route ahead of every task type default, and the judgment dense authorship rule keeps policy text, public naming, API shape, and UX copy authored in the main session with only the mechanical spread dispatched.
+   - Codex admission order is the current workspace, an isolated worktree for an independent eligible package, then Grok or Cursor under `burst`, then the matching Claude fallback. Packages with overlapping files, shared generated state, or ordering dependencies are consolidated or sequenced instead of parallel overflow.
+   - Cursor remains a multi family breadth lane with two protected roles, `diversity` (a read only consult on a model family no other installed lane serves) and `burst` (Composer implementation in orchestrator owned worktrees). It never runs Auto, never serves the Claude family, and stands in for another family's native lane only while that lane's breaker is open on quota or rate limits.
+   - Routing stays capability first: capability monopolies (X and live platform reads on Grok `live-web`, model families no other installed lane serves on Cursor, Claude tool surface and privacy on Claude workers, judgment dense authorship in the main session) hard route ahead of every task type default, and the judgment dense authorship rule keeps policy text, public naming, API shape, and UX copy authored in the main session with only the mechanical spread dispatched.
    - Claude worker and Grok dispatches are background Agents. Codex is the foreground Agent exception: its rescue Agent and companion Bash call stay foreground regardless of complexity or expected duration unless the incoming user request already contains `--background`.
    - A Codex package that cannot fit the foreground cap is split or routed elsewhere. Complexity and duration never silently detach it.
    - Independent packages fan out in a single message rather than being queued one at a time. Dependence is never removed by switching engines.
@@ -30,6 +31,7 @@ Any change to `plugins/fusion/rules/orchestration.md` or `plugins/fusion/rules/t
    node plugins/fusion/scripts/generate-rules-manifest.mjs
    claude plugin validate plugins/codex
    claude plugin validate plugins/grok
+   claude plugin validate plugins/cursor
    claude plugin validate plugins/fusion
    claude plugin validate .
    npm test
@@ -43,4 +45,4 @@ Tests use Node's built in runner (`node --test`) and live under `tests/`. Keep t
 
 ## Releases
 
-Bump all plugin versions and the marketplace versions together: `plugins/codex/.claude-plugin/plugin.json`, `plugins/fusion/.claude-plugin/plugin.json`, `plugins/grok/.claude-plugin/plugin.json`, and `.claude-plugin/marketplace.json` (marketplace root version plus each plugin entry). Add a `CHANGELOG.md` entry at the top in the repo's existing lowercase bullet style (lowercase prose, proper nouns and acronyms kept, one bullet per behavioral change, motivation clauses when a change was forced by measured regression).
+Bump all plugin versions and the marketplace versions together: `plugins/codex/.claude-plugin/plugin.json`, `plugins/cursor/.claude-plugin/plugin.json`, `plugins/fusion/.claude-plugin/plugin.json`, `plugins/grok/.claude-plugin/plugin.json`, and `.claude-plugin/marketplace.json` (marketplace root version plus each plugin entry). Add a `CHANGELOG.md` entry at the top in the repo's existing lowercase bullet style (lowercase prose, proper nouns and acronyms kept, one bullet per behavioral change, motivation clauses when a change was forced by measured regression).

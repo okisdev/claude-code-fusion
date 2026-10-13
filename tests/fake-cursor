@@ -1,0 +1,138 @@
+#!/usr/bin/env node
+import { spawn } from "node:child_process";
+import fs from "node:fs";
+import path from "node:path";
+
+const args = process.argv.slice(2);
+if (args.includes("--version")) {
+  process.stdout.write(`${process.env.FAKE_CURSOR_VERSION || "2026.10.01-e373342"}\n`);
+  process.exit(0);
+}
+if (args[0] === "status") {
+  process.stdout.write("Authenticated\n");
+  process.exit(0);
+}
+if (args.includes("models")) {
+  process.stdout.write("Available models\n\nauto - Auto (default)\ncomposer-2.5 - Composer 2.5 (current)\ncomposer-2.5-fast - Composer 2.5 Fast\nmuse-spark-1.3-high - Muse Spark 1.3 1M\nmuse-spark-1.3-xhigh - Muse Spark 1.3 1M Extra High\ngrok-4.7-high - Grok 4.7  High\ngrok-4.7-high-fast - Grok 4.7  High Fast\ngemini-3.1-pro - Gemini 3.1 Pro\ngpt-5.5-extra-high - GPT-5.5 1M Extra High\n\nTip: Choose a model with --model.\n");
+  process.exit(0);
+}
+if (!args.includes("-p")) {
+  process.stderr.write("Expected -p.\n");
+  process.exit(2);
+}
+
+let fixture = {};
+try {
+  fixture = JSON.parse(fs.readFileSync(path.join(path.dirname(process.env.NODE_COMPILE_CACHE), "fake-cursor-config.json"), "utf8"));
+} catch {}
+if (fixture.execMarker) fs.writeFileSync(fixture.execMarker, String(process.pid));
+let brief = "";
+for await (const chunk of process.stdin) {
+  brief += chunk;
+}
+if (fixture.log || process.env.FAKE_CURSOR_LOG) {
+  fs.appendFileSync(fixture.log || process.env.FAKE_CURSOR_LOG, `${JSON.stringify({
+    argv: args,
+    cwd: process.cwd(),
+    stdin: brief,
+    HOME: process.env.HOME,
+    NODE_COMPILE_CACHE: process.env.NODE_COMPILE_CACHE,
+    cursorConfigDirPresent: Object.hasOwn(process.env, "CURSOR_CONFIG_DIR")
+  })}\n`);
+}
+
+const scenario = fixture.scenario || process.env.FAKE_CURSOR_SCENARIO || "success";
+const fail = {
+  auth: "Error: Authentication required. Please run 'cursor-agent login' first, or set CURSOR_API_KEY environment variable.",
+  quota: "Usage limit reached for this account",
+  rate_limit: "Rate limit exceeded. Too many requests (429)",
+  network: "fetch failed: getaddrinfo ENOTFOUND cursor.com",
+  sandbox_unavailable: "Sandbox mode is enabled but not available",
+  bad_model: "Cannot use this model: x. Available models: composer-2.5",
+  bad_tools: "Invalid --allowed-tools value(s): unknown_tool_call"
+};
+if (fail[scenario]) {
+  process.stderr.write(`${fail[scenario]}\n`);
+  process.exit(1);
+}
+const emit = (event) => process.stdout.write(`${JSON.stringify(event)}\n`);
+const sessionId = "11111111-2222-4333-8444-555555555555";
+const init = { type: "system", subtype: "init", session_id: sessionId, model: "Composer 2.5", cwd: process.cwd(), apiKeySource: "env", permissionMode: "ask" };
+const result = { type: "result", subtype: "success", is_error: false, result: "fake result", session_id: sessionId, request_id: "fake-request-1", duration_ms: 10, usage: { inputTokens: 12, outputTokens: 3, cacheReadTokens: 2, cacheWriteTokens: 1 } };
+if (scenario === "review_ok") result.result = `Review complete. ${JSON.stringify({ verdict: "request_changes", summary: "A material issue remains.", findings: [{ severity: "high", file: "sample.txt", line: 1, title: "Missing check", body: "An unchecked value can fail; validate it before use." }] })}`;
+if (scenario === "review_invalid") result.result = "The review found nothing actionable.";
+if (scenario === "garbage") {
+  process.stdout.write("not json\n");
+  process.exit(0);
+}
+const forbidden = { type: "tool_call", subtype: "started", call_id: "call-1", tool_call: { taskToolCall: { description: "forbidden" }, hookAdditionalContexts: [], toolCallId: "tool-1", startedAtMs: "1" } };
+const forbiddenLints = { type: "tool_call", subtype: "started", call_id: "call-1", tool_call: { readLintsToolCall: { args: {} }, hookAdditionalContexts: [], toolCallId: "tool-1", startedAtMs: "1" } };
+if (scenario === "forbidden_before_init") {
+  emit(forbidden);
+  setInterval(() => {}, 1000);
+} else {
+if (scenario === "invalid_init_session") init.session_id = "../..";
+if (scenario === "invalid_result_session") result.session_id = "a/../../b";
+if (scenario === "slow_init") setInterval(() => {}, 1000);
+else {
+emit(init);
+if (scenario === "no_result") process.exit(0);
+if (scenario === "hang") {
+  setInterval(() => {}, 1000);
+} else if (scenario === "forbidden_tool") {
+  emit(forbidden);
+  setInterval(() => {}, 1000);
+} else if (scenario === "forbidden_lints") {
+  emit(forbiddenLints);
+  setInterval(() => {}, 1000);
+} else if (scenario === "forbidden_after_result") {
+  emit(result);
+  emit(forbidden);
+  setInterval(() => {}, 1000);
+} else if (scenario === "late_close") {
+  emit(result);
+  setTimeout(() => {}, 60000);
+} else if (scenario === "near_deadline") {
+  setTimeout(() => {
+    emit(result);
+    setTimeout(() => process.exit(0), 250);
+  }, 850);
+} else if (scenario === "near_deadline_late_close") {
+  setTimeout(() => emit(result), 850);
+  setInterval(() => {}, 1000);
+} else if (scenario === "escape_stdio") {
+  const helper = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { detached: true, stdio: ["ignore", 1, "ignore"] });
+  helper.unref();
+  if (fixture.helperPidFile || process.env.FAKE_CURSOR_HELPER_PID_FILE) fs.writeFileSync(fixture.helperPidFile || process.env.FAKE_CURSOR_HELPER_PID_FILE, String(helper.pid));
+  emit(result);
+} else if (scenario === "resistant_group") {
+  const helperPidFile = fixture.helperPidFile || process.env.FAKE_CURSOR_HELPER_PID_FILE;
+  const helper = spawn(process.execPath, ["-e", "process.on('SIGTERM', () => {}); require('fs').writeFileSync(process.argv[1], String(process.pid)); setInterval(() => {}, 1000)", helperPidFile], { stdio: "ignore" });
+  helper.unref();
+  setInterval(() => {}, 1000);
+} else if (scenario === "split_utf8") {
+  const line = Buffer.from(`${JSON.stringify({ ...result, result: "é 中文" })}\n`);
+  const split = line.indexOf(0xc3) + 1;
+  fs.writeSync(1, line.subarray(0, split));
+  fs.writeSync(2, Buffer.from([0xc3]));
+  setTimeout(() => {
+    fs.writeSync(1, line.subarray(split));
+    fs.writeSync(2, Buffer.from([0xa9, 0x0a]));
+  }, 20);
+} else if (scenario === "spawn_helper") {
+  const helper = spawn(process.execPath, ["-e", "setTimeout(() => {}, 60000)"], { stdio: "ignore" });
+  helper.unref();
+  if (fixture.helperPidFile || process.env.FAKE_CURSOR_HELPER_PID_FILE) {
+    fs.writeFileSync(fixture.helperPidFile || process.env.FAKE_CURSOR_HELPER_PID_FILE, String(helper.pid));
+  }
+  emit(result);
+} else {
+  emit({ type: "user", message: "brief received" });
+  emit({ type: "thinking", subtype: "delta", text: "thinking" });
+  emit({ type: "tool_call", subtype: "started", call_id: "call-1", tool_call: { readToolCall: { args: { path: "README.md" } }, hookAdditionalContexts: [], toolCallId: "tool-1", startedAtMs: "1" } });
+  emit({ type: "tool_call", subtype: "completed", call_id: "call-1", tool_call: { readToolCall: { args: { path: "README.md" }, result: { success: { content: "fake" } } }, hookAdditionalContexts: [], toolCallId: "tool-1", startedAtMs: "1", completedAtMs: "2" } });
+  emit({ type: "assistant", message: "fake result" });
+  emit(result);
+}
+}
+}

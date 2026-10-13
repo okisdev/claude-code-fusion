@@ -11,7 +11,7 @@ const canonicalJobId = "b".repeat(32);
 
 function isolatedEnv(root, extra = {}) {
   const inherited = Object.fromEntries(
-    Object.entries(process.env).filter(([key]) => key !== "HOME" && key !== "CLAUDE_CODE_SESSION_ID" && !/^(?:FUSION|GROK|CODEX)_/.test(key))
+    Object.entries(process.env).filter(([key]) => key !== "HOME" && key !== "CLAUDE_CODE_SESSION_ID" && !/^(?:FUSION|GROK|CODEX|CURSOR)_/.test(key))
   );
   const runtimeRoot = path.join(root, "runtime");
   return {
@@ -25,6 +25,7 @@ function isolatedEnv(root, extra = {}) {
     FUSION_CODEX_STATE: path.join(runtimeRoot, "codex-state"),
     FUSION_CODEX_STATE_DIR: path.join(runtimeRoot, "codex-state-compat"),
     GROK_COMPANION_DATA: path.join(runtimeRoot, "grok-data"),
+    CURSOR_COMPANION_DATA: path.join(runtimeRoot, "cursor-data"),
     GROK_HOME: path.join(runtimeRoot, "grok-home"),
     CODEX_COMPANION_DATA: path.join(runtimeRoot, "codex-data"),
     CODEX_HOME: path.join(runtimeRoot, "codex-home"),
@@ -60,10 +61,26 @@ test("delivery and semantic metadata remain inside the collected terminal footer
   assert.match(output.stdout, /^collected result\ncollector: state=done semantic=unverified engine=codex job=[a-f0-9]{32} elapsed=\d+s\n$/);
 });
 
+test("Cursor collector resolves the configured companion and carries the terminal footer", (t) => {
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "fusion-job-collect-cursor-test-")));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const companion = path.join(root, "fake-cursor-companion.mjs");
+  fs.writeFileSync(companion, `const [command, jobId] = process.argv.slice(2);\nif (jobId !== "${canonicalJobId}") process.exit(90);\nif (command === "status") process.stdout.write("cursor-session: session-1\\njob: ${canonicalJobId}\\nsemantic: unverified\\nstate: done\\n");\nelse if (command === "result") process.stdout.write("cursor result\\n");\nelse process.exit(91);\n`);
+  const env = isolatedEnv(root, { CLAUDE_CODE_SESSION_ID: `fusion-job-collect-cursor-${process.pid}`, FUSION_CURSOR_COMPANION: companion });
+  const created = spawnSync(process.execPath, [collector, "transport-create"], { encoding: "utf8", env, timeout: 10_000 });
+  assert.strictEqual(created.status, 0, created.stderr);
+  const transport = JSON.parse(created.stdout);
+  t.after(() => fs.rmSync(path.dirname(transport.file), { recursive: true, force: true }));
+  fs.writeFileSync(transport.file, JSON.stringify({ engine: "cursor", jobId: canonicalJobId, json: false, intervalMs: 10, capMs: 5_000, deadRerunStatus: false }));
+  const output = spawnSync(process.execPath, [collector, "--raw-args-token", transport.token], { encoding: "utf8", env, timeout: 15_000 });
+  assert.strictEqual(output.status, 0, output.stderr);
+  assert.match(output.stdout, /^cursor result\ncollector: state=done semantic=unverified engine=cursor job=[a-f0-9]{32} elapsed=\d+s\n$/);
+});
+
 test("collector agent stages a closed request schema instead of executable text", () => {
   const agent = fs.readFileSync(path.join(repoRoot, "plugins", "fusion", "agents", "job-collector.md"), "utf8");
   assert.match(agent, /tools: Bash, Read, Write/);
-  assert.match(agent, /exactly one standalone `engine: codex\|grok` line/);
+  assert.match(agent, /exactly one standalone `engine: codex\|grok\|cursor` line/);
   assert.match(agent, /exactly one standalone `job: <32 lowercase hexadecimal characters>` line/);
   assert.match(agent, /exactly one JSON object containing only `engine`, `jobId`, `json`, `intervalMs`, `capMs`, and `deadRerunStatus`/);
   assert.match(agent, /transport-discard --raw-args-token TOKEN/);

@@ -4,16 +4,16 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { resolveCodexStateDir, resolveCodexStateRoots } from "./lib/codex-state-roots.mjs";
-import { resolveGrokDataDir } from "./lib/engine-job-state.mjs";
+import { ENGINES, ENGINE_IDS, engineStateRoots } from "./lib/engines.mjs";
 import { canonicalWorkerAgentType, readWorkerRecords } from "./lib/worker-state.mjs";
 import { tagMessage } from "./lib/user-messages.mjs";
 
 const LOOKBACK_ENV = "FUSION_BREAKER_LOOKBACK_HOURS";
 const DEFAULT_LOOKBACK_HOURS = 12;
 const WORKER_BREAKER_LANES = ["fusion:claude-worker", "fusion:trivial-worker"];
-const HARD_FAILURE_KINDS = new Set(["quota", "auth", "missing_cli", "protocol", "transport", "sandbox"]);
+const HARD_FAILURE_KINDS = new Set(["quota", "auth", "missing_cli", "setup", "protocol", "transport", "sandbox"]);
 const REPEATED_FAILURE_KINDS = new Set(["rate_limited", "timeout", "stall", "network", "process", "died", "patch_thrash", "exec_lost"]);
+const POOL_SCOPED_KINDS = new Set(["quota", "rate_limited"]);
 const BREAKER_FAILURE_KINDS = new Set([...HARD_FAILURE_KINDS, ...REPEATED_FAILURE_KINDS, "permission"]);
 const FAILURE_STATUSES = new Set(["error", "failed"]);
 const SUCCESS_STATUSES = new Set(["done", "completed"]);
@@ -132,19 +132,20 @@ function normalizedRecordedFailureKind(record, value) {
   return failureKind;
 }
 
-function grokFailure(record, now, lookbackMs) {
+function engineFailure(engine, record, now, lookbackMs) {
   if (!FAILURE_STATUSES.has(record.status)) {
     return null;
   }
   const failureKind = normalizedRecordedFailureKind(record, record.failureKind);
-  const timestamp = finishedAtMs(record.finishedAt);
+  const timestamp = recordTimestamp(record);
   if (!supportedBreakerFailure(record, failureKind) || timestamp == null || !isWithinLookback(timestamp, now, lookbackMs)) {
     return null;
   }
+  const version = record[ENGINES[engine].versionField];
   return {
     failureKind,
     timestamp,
-    grokVersion: typeof record.grokVersion === "string" && record.grokVersion.trim() ? record.grokVersion.trim() : null
+    version: typeof version === "string" && version.trim() ? version.trim() : null
   };
 }
 
@@ -158,18 +159,6 @@ function codexFailureKind(errorMessage) {
     }
   }
   return null;
-}
-
-function codexFailure(record, now, lookbackMs) {
-  if (!FAILURE_STATUSES.has(record.status)) {
-    return null;
-  }
-  const failureKind = normalizedRecordedFailureKind(record, record.failureKind);
-  const timestamp = finishedAtMs(record.finishedAt ?? record.completedAt ?? record.updatedAt);
-  if (!supportedBreakerFailure(record, failureKind) || timestamp == null || !isWithinLookback(timestamp, now, lookbackMs)) {
-    return null;
-  }
-  return { failureKind, timestamp };
 }
 
 function recordTimestamp(record) {
@@ -186,7 +175,7 @@ function newerFailure(left, right) {
   return right.timestamp > left.timestamp ? right : left;
 }
 
-function latestBreakerFailure(records, failureReader, now, lookbackMs) {
+function latestBreakerFailure(records, failureReader, now, lookbackMs, includesFailure = () => true) {
   const outcomes = [];
   for (const record of records) {
     const timestamp = recordTimestamp(record);
@@ -195,11 +184,13 @@ function latestBreakerFailure(records, failureReader, now, lookbackMs) {
     }
     const failure = failureReader(record, now, lookbackMs);
     if (TERMINAL_STATUSES.has(record.status)) {
+      const ignored = FAILURE_STATUSES.has(record.status) && !includesFailure(failure?.failureKind ?? normalizedRecordedFailureKind(record, record.failureKind));
       outcomes.push({
-        failureKind: failure?.failureKind ?? null,
+        failureKind: ignored ? null : failure?.failureKind ?? null,
+        ignored,
         status: record.status,
         timestamp,
-        grokVersion: failure?.grokVersion ?? null
+        version: failure?.version ?? null
       });
     }
   }
@@ -214,8 +205,11 @@ function latestBreakerFailure(records, failureReader, now, lookbackMs) {
       repeatedTransientFailure = null;
       continue;
     }
+    if (outcome.ignored) {
+      continue;
+    }
     if (HARD_FAILURE_KINDS.has(outcome.failureKind) || outcome.failureKind === "permission") {
-      immediate = { failureKind: outcome.failureKind, timestamp: outcome.timestamp, grokVersion: outcome.grokVersion };
+      immediate = { failureKind: outcome.failureKind, timestamp: outcome.timestamp, version: outcome.version };
       previousTransientFailure = null;
       repeatedTransientFailure = null;
       continue;
@@ -226,7 +220,7 @@ function latestBreakerFailure(records, failureReader, now, lookbackMs) {
       continue;
     }
     if (previousTransientFailure && previousTransientFailure.failureKind === outcome.failureKind && outcome.timestamp - previousTransientFailure.timestamp <= lookbackMs) {
-      repeatedTransientFailure = { failureKind: outcome.failureKind, timestamp: outcome.timestamp, grokVersion: outcome.grokVersion };
+      repeatedTransientFailure = { failureKind: outcome.failureKind, timestamp: outcome.timestamp, version: outcome.version };
     }
     previousTransientFailure = outcome;
   }
@@ -260,24 +254,25 @@ function formatLookbackHours(lookbackMs) {
   return hours % 1 === 0 ? String(hours) : hours.toFixed(1);
 }
 
-function verifiedGrokVersion() {
+function verifiedEngineVersion(engine) {
   try {
     const versions = JSON.parse(fs.readFileSync(VERIFIED_VERSIONS_FILE, "utf8"));
-    return typeof versions?.grok === "string" && versions.grok.trim() ? versions.grok.trim() : null;
+    const version = versions?.[ENGINES[engine]?.verifiedVersionKey];
+    return typeof version === "string" && version.trim() ? version.trim() : null;
   } catch {
     return null;
   }
 }
 
-function grokVersionAdvisorySuffix(failure) {
-  const installed = typeof failure?.grokVersion === "string" && failure.grokVersion.trim() ? failure.grokVersion.trim() : null;
-  const verified = installed ? verifiedGrokVersion() : null;
-  return installed && verified && installed !== verified ? `; grok ${installed} installed, contract verified on ${verified}` : "";
+function versionAdvisorySuffix(engine, failure) {
+  const installed = typeof failure?.version === "string" && failure.version.trim() ? failure.version.trim() : null;
+  const verified = installed ? verifiedEngineVersion(engine) : null;
+  return installed && verified && installed !== verified ? `; ${engine} ${installed} installed, contract verified on ${verified}` : "";
 }
 
-function advisoryLine(engine, failure, now, lookbackMs = DEFAULT_LOOKBACK_HOURS * 60 * 60 * 1000) {
+function advisoryLine(engine, failure, now, lookbackMs = DEFAULT_LOOKBACK_HOURS * 60 * 60 * 1000, pool = null) {
   const hoursText = formatLookbackHours(lookbackMs);
-  return `fusion breaker advisory: treat the ${engine} breaker as open unless verified recovered; last failure ${failure.failureKind} ${formatAge(failure.timestamp, now)} (${failure.kindCount} ${failure.failureKind} across ${failure.terminalCount} terminal jobs, ${hoursText}h window). Route new work to another eligible healthy lane.${engine === "grok" ? grokVersionAdvisorySuffix(failure) : ""}`;
+  return `fusion breaker advisory: treat the ${engine}${pool === null ? "" : ` ${pool} pool`} breaker as open unless verified recovered; last failure ${failure.failureKind} ${formatAge(failure.timestamp, now)} (${failure.kindCount} ${failure.failureKind} across ${failure.terminalCount} terminal jobs, ${hoursText}h window). Route new work to another eligible healthy lane.${versionAdvisorySuffix(engine, failure)}`;
 }
 
 function workerFailure(record, now, lookbackMs) {
@@ -300,15 +295,40 @@ function workerBreakerRecords(env, lane) {
 
 function run(env = process.env, now = Date.now()) {
   const lookbackMs = resolveLookbackMs(env);
-  const grok = latestBreakerFailure(readJobRecords(path.join(resolveGrokDataDir(env), "state")), grokFailure, now, lookbackMs);
-  const codex = latestBreakerFailure(readDeduplicatedJobRecords(resolveCodexStateRoots(env)), codexFailure, now, lookbackMs);
-  const lines = [];
-  if (grok) {
-    lines.push(advisoryLine("grok", grok, now, lookbackMs));
+  const engineLines = new Map();
+  for (const engine of ENGINE_IDS) {
+    const lines = [];
+    const records = readDeduplicatedJobRecords(engineStateRoots(engine, env));
+    const failureReader = (record, at, window) => engineFailure(engine, record, at, window);
+    const pools = new Map();
+    for (const record of records) {
+      const pool = typeof record.billingPool === "string" ? record.billingPool : null;
+      if (!pools.has(pool)) {
+        pools.set(pool, []);
+      }
+      pools.get(pool).push(record);
+    }
+    if (!pools.size || (pools.size === 1 && pools.has(null))) {
+      const failure = latestBreakerFailure(records, failureReader, now, lookbackMs);
+      if (failure) {
+        lines.push(advisoryLine(engine, failure, now, lookbackMs));
+      }
+      engineLines.set(engine, lines);
+      continue;
+    }
+    const engineFailureResult = latestBreakerFailure(records, failureReader, now, lookbackMs, (kind) => !POOL_SCOPED_KINDS.has(kind));
+    if (engineFailureResult) {
+      lines.push(advisoryLine(engine, engineFailureResult, now, lookbackMs));
+    }
+    for (const [pool, poolRecords] of pools) {
+      const poolFailure = latestBreakerFailure(poolRecords, failureReader, now, lookbackMs, (kind) => POOL_SCOPED_KINDS.has(kind));
+      if (poolFailure) {
+        lines.push(advisoryLine(engine, poolFailure, now, lookbackMs, pool));
+      }
+    }
+    engineLines.set(engine, lines);
   }
-  if (codex) {
-    lines.push(advisoryLine("codex", codex, now, lookbackMs));
-  }
+  const lines = [...(engineLines.get("grok") ?? []), ...ENGINE_IDS.filter((engine) => engine !== "grok").flatMap((engine) => engineLines.get(engine) ?? [])];
   for (const lane of WORKER_BREAKER_LANES) {
     const worker = latestBreakerFailure(workerBreakerRecords(env, lane), workerFailure, now, lookbackMs);
     if (worker) {
@@ -336,4 +356,4 @@ if (isMain()) {
   main();
 }
 
-export { advisoryLine, codexFailureKind, formatAge, resolveCodexStateDir, resolveCodexStateRoots, resolveGrokDataDir, run };
+export { advisoryLine, codexFailureKind, formatAge, run };

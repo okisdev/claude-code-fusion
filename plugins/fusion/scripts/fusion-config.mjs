@@ -1,13 +1,12 @@
 #!/usr/bin/env node
 
+import { spawnSync } from "node:child_process";
 import fs from "node:fs";
-import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 import {
   DEFAULT_MODEL_TABLE_PLACEHOLDER,
-  DEFAULT_ROUTING_DEFAULTS,
   MODEL_ROUTING_SCHEMA_VERSION,
   MODEL_ROUTING_LANES,
   readModelRoutingFile,
@@ -26,19 +25,21 @@ import {
   readPostureFile,
   resolvePosture
 } from "./lib/posture.mjs";
+import { newestEngineCompanion } from "./lib/engine-acceptance.mjs";
+import { ENGINES, ENGINE_IDS, isEngineId } from "./lib/engines.mjs";
 import { syncRulesToLive } from "./lib/rules-template.mjs";
 
 class UsageError extends Error {}
 
 const BOOLEAN_OPTIONS = new Set(["json", "yes"]);
-const VALUE_OPTIONS = new Set(["intelligence", "taste", "cost", "lane", "notes"]);
+const VALUE_OPTIONS = new Set(["intelligence", "taste", "cost", "lane", "family", "notes"]);
 
 function usage() {
   return [
     "Usage:",
     "  node scripts/fusion-config.mjs show [--json]",
     "  node scripts/fusion-config.mjs audit [--json]",
-    "  node scripts/fusion-config.mjs rescore <id> --intelligence N --taste N --cost N [--lane L] [--notes S]",
+    "  node scripts/fusion-config.mjs rescore <id> --intelligence N --taste N --cost N [--lane L] [--family F] [--notes S]",
     "  node scripts/fusion-config.mjs set-default <lane> <role> <model> <effort>",
     "  node scripts/fusion-config.mjs remove <id>",
     "  node scripts/fusion-config.mjs set-cost-profile <text>",
@@ -116,73 +117,56 @@ function resolvePluginRoot(env) {
   return path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 }
 
-function resolveCodexModelsCachePath(env) {
-  const override = env.FUSION_CODEX_MODELS_CACHE;
-  if (override && override.trim()) {
-    return path.resolve(override.trim());
+function readEngineModelListing(engine, env) {
+  const override = typeof env[ENGINES[engine].companionEnv] === "string" ? env[ENGINES[engine].companionEnv].trim() : "";
+  if (override && (!path.isAbsolute(override) || !fs.existsSync(override) || !fs.statSync(override).isFile())) {
+    return { available: false, reason: `companion missing at ${override}` };
   }
-  return path.join(os.homedir(), ".codex", "models_cache.json");
-}
-
-function listedModelId(value) {
-  if (typeof value === "string") {
-    return value.trim() || null;
+  const companion = newestEngineCompanion(engine, env);
+  if (!companion) {
+    return { available: false, reason: "companion missing" };
   }
-  if (!value || typeof value !== "object" || Array.isArray(value)) {
-    return null;
+  const result = spawnSync(process.execPath, [companion, "models", "--json"], { encoding: "utf8", env, timeout: 60_000 });
+  if (result.error || result.status !== 0) {
+    return { available: false, reason: result.error?.message || result.stderr.trim() || `exit ${result.status}` };
   }
-  for (const key of ["slug", "id"]) {
-    if (typeof value[key] === "string" && value[key].trim()) {
-      return value[key].trim();
-    }
-  }
-  return null;
-}
-
-function readCodexModelListing(filePath) {
   try {
-    const stats = fs.statSync(filePath);
-    const data = JSON.parse(fs.readFileSync(filePath, "utf8"));
-    if (!data || typeof data !== "object" || Array.isArray(data) || !Array.isArray(data.models)) {
-      throw new Error("Expected a JSON object with a models array.");
+    const data = JSON.parse(result.stdout);
+    if (!data || data.engine !== engine || !Array.isArray(data.models) || typeof data.source !== "string" || !data.models.every((model) => model && typeof model.id === "string" && model.id.trim() && (model.displayName === null || typeof model.displayName === "string"))) {
+      throw new Error("expected an engine model listing with engine, models, and source");
     }
-    return {
-      available: true,
-      path: filePath,
-      mtime: stats.mtime.toISOString(),
-      modelIds: [...new Set(data.models.map(listedModelId).filter(Boolean))]
-    };
+    return { available: true, source: data.source, modelIds: [...new Set(data.models.map((model) => model.id.trim()))] };
   } catch (error) {
-    return {
-      available: false,
-      path: filePath,
-      reason: error instanceof Error ? error.message : String(error)
-    };
+    return { available: false, reason: `invalid JSON: ${error instanceof Error ? error.message : String(error)}` };
   }
+}
+
+function matchesListing(engine, id, listedIds) {
+  return listedIds.some((listed) => listed === id || (engine === "cursor" && listed.startsWith(`${id}-`)));
 }
 
 function auditModelDrift(env) {
   const modelRoutingFile = resolveModelRoutingPath(env);
   const routing = readModelRoutingFile(modelRoutingFile);
-  const listing = readCodexModelListing(resolveCodexModelsCachePath(env));
-  const configuredModelIds = routing.ok ? [...new Set(routing.data.models.map((model) => model.id))] : [];
-  const configuredCodexModelIds = routing.ok ? [...new Set(routing.data.models.filter((model) => model.lane === "codex").map((model) => model.id))] : [];
-  const listedModelIds = new Set(listing.available ? listing.modelIds : []);
   const defaults = readRoutingDefaults(env, { warn: null });
+  const engines = Object.fromEntries(ENGINE_IDS.map((engine) => {
+    const listing = readEngineModelListing(engine, env);
+    const scored = routing.ok ? [...new Set(routing.data.models.filter((row) => row.lane === engine).map((row) => row.id))] : [];
+    const listedIds = listing.available ? listing.modelIds : [];
+    return [engine, {
+      listing,
+      configuredButAbsent: listing.available && routing.ok ? scored.filter((id) => !matchesListing(engine, id, listedIds)) : [],
+      defaultsAbsent: listing.available ? Object.entries(defaults[engine]).filter(([, choice]) => !matchesListing(engine, choice.model, listedIds)).map(([role, choice]) => ({ role, model: choice.model })) : [],
+      unscored: listing.available ? listedIds.filter((id) => !scored.some((base) => matchesListing(engine, base, [id]))) : []
+    }];
+  }));
   return {
     modelRoutingFile,
     configured: !routing.missing,
     valid: Boolean(routing.ok),
     error: routing.ok || routing.missing ? null : routing.reason,
     defaults,
-    listing,
-    codexDefaultsAbsent: listing.available
-      ? Object.entries(defaults.codex)
-          .filter(([, choice]) => !listedModelIds.has(choice.model))
-          .map(([role, choice]) => ({ role, model: choice.model }))
-      : [],
-    configuredButAbsent: listing.available && routing.ok ? configuredCodexModelIds.filter((id) => !listedModelIds.has(id)) : [],
-    unconfiguredGptModels: listing.available && routing.ok ? listing.modelIds.filter((id) => id.startsWith("gpt-") && !configuredModelIds.includes(id)) : []
+    engines
   };
 }
 
@@ -309,18 +293,24 @@ function auditCommand(options, env, stdout) {
   for (const [lane, roles] of Object.entries(report.defaults)) {
     lines.push(`${lane} defaults: ${Object.entries(roles).map(([role, choice]) => `${role} ${choice.model}@${choice.effort}`).join(", ")}`);
   }
-  if (!report.listing.available) {
-    lines.push(`Codex model listing: listing unavailable (${report.listing.reason})`);
-    stdout.write(`${lines.join("\n")}\n`);
-    return;
+  for (const engine of ENGINE_IDS) {
+    const { listing, configuredButAbsent, defaultsAbsent, unscored } = report.engines[engine];
+    const name = ENGINES[engine].displayName;
+    if (!listing.available) {
+      lines.push(`${name} listing unavailable: ${listing.reason}`);
+      continue;
+    }
+    lines.push(
+      `${name} model listing: ${listing.source}`,
+      `${name} configured but absent: ${configuredButAbsent.length ? configuredButAbsent.join(", ") : "none"}`,
+      `${name} defaults absent: ${defaultsAbsent.length ? defaultsAbsent.map(({ role, model }) => `${role} ${model}`).join(", ") : "none"}`,
+      `${name} unscored models (no routing seat): ${unscored.length ? unscored.join(", ") : "none"}`
+    );
+    if (engine === "codex") {
+      const newcomers = unscored.filter((id) => id.startsWith("gpt-"));
+      lines.push(`Unconfigured gpt-* newcomers: ${newcomers.length ? newcomers.join(", ") : "none"}`);
+    }
   }
-  lines.push(
-    `Codex model listing: ${report.listing.path}`,
-    `Listing mtime: ${report.listing.mtime}`,
-    `Configured but absent: ${report.configuredButAbsent.length ? report.configuredButAbsent.join(", ") : "none"}`,
-    `Codex defaults absent: ${report.codexDefaultsAbsent.length ? report.codexDefaultsAbsent.map(({ role, model }) => `${role} ${model}`).join(", ") : "none"}`,
-    `Unconfigured gpt-* newcomers: ${report.unconfiguredGptModels.length ? report.unconfiguredGptModels.join(", ") : "none"}`
-  );
   stdout.write(`${lines.join("\n")}\n`);
 }
 
@@ -330,8 +320,8 @@ function setDefaultCommand(positionals, options, env, stdout) {
     throw new UsageError("Expected set-default <lane> <role> <model> <effort>.");
   }
   const [lane, role, rawModel, effort] = positionals;
-  if (!Object.hasOwn(DEFAULT_ROUTING_DEFAULTS, lane) || !Object.hasOwn(DEFAULT_ROUTING_DEFAULTS[lane], role)) {
-    throw new UsageError("Expected a codex role (quick, volume, flagship) or grok role (burst, independence, live-web, large-context).");
+  if (!isEngineId(lane) || !ENGINES[lane].roles.includes(role)) {
+    throw new UsageError(`Expected ${ENGINE_IDS.map((id) => `${id} role (${ENGINES[id].roles.join(", ")})`).join(" or ")}.`);
   }
   const model = requireId(rawModel);
   const filePath = resolveModelRoutingPath(env);
@@ -345,7 +335,7 @@ function setDefaultCommand(positionals, options, env, stdout) {
 }
 
 function rescoreCommand(positionals, options, env, stdout) {
-  ensureOnlyOptions(options, new Set(["intelligence", "taste", "cost", "lane", "notes"]), "rescore");
+  ensureOnlyOptions(options, new Set(["intelligence", "taste", "cost", "lane", "family", "notes"]), "rescore");
   if (positionals.length !== 1) {
     throw new UsageError("Expected rescore <id>.");
   }
@@ -368,6 +358,9 @@ function rescoreCommand(positionals, options, env, stdout) {
     taste,
     cost
   };
+  if (options.family != null) {
+    next.family = options.family;
+  }
   if (options.notes != null) {
     const notes = options.notes.trim();
     if (notes) {

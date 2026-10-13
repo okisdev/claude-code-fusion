@@ -50,10 +50,10 @@ test("Renders configured model scores", (t) => {
   const table = renderModelTableFromFile(file);
   assert.strictEqual(renderModelTableFromContents(fs.readFileSync(file, "utf8")), table);
   assert.match(table, /^Cost profile: peer subscriptions flat rate$/m);
-  assert.match(table, /^\| Engine \| Lane \| Intelligence \| Taste \| Cost \| Notes \|$/m);
-  assert.match(table, /^\| codex \| codex \| 5 \| 4 \| 5 \| primary implementation lane \|$/m);
-  assert.match(table, /^Lane defaults: codex quick gpt-6-sol@xhigh, volume gpt-6-luna@xhigh, flagship gpt-6-astra@xhigh; grok burst grok-4\.7-build-fast@low, independence grok-4\.7-build-fast@high, live-web grok-4\.7-build-fast@high, large-context grok-4\.6@medium\.$/m);
-  assert.match(table, /\| grok-fast \| grok \| 3 \| 3 \| 5 \|  \|\n\nLane defaults: [^\n]+\n\nScores feed/);
+  assert.match(table, /^\| Engine \| Lane \| Family \| Intelligence \| Taste \| Cost \| Notes \|$/m);
+  assert.match(table, /^\| codex \| codex \| openai \| 5 \| 4 \| 5 \| primary implementation lane \|$/m);
+  assert.match(table, /^Lane defaults: codex quick gpt-6-sol@xhigh, volume gpt-6-luna@xhigh, flagship gpt-6-astra@xhigh; grok burst grok-4\.7-build-fast@low, independence grok-4\.7-build-fast@high, live-web grok-4\.7-build-fast@high, large-context grok-4\.6@medium; cursor diversity muse-spark-1\.3@xhigh, burst composer-2\.5@default\.$/m);
+  assert.match(table, /\| grok-fast \| grok \| xai \| 3 \| 3 \| 5 \|  \|\n\nLane defaults: [^\n]+\n\nScores feed/);
   assert.match(
     table,
     /^Scores feed the routing priorities above: intelligence proxies correctness and safety, taste is user facing quality, cost applies only as the final tie breaker\.$/m
@@ -79,9 +79,41 @@ test("Routing defaults merge file choices over the seed and preserve only suppor
   });
   assert.deepStrictEqual(readRoutingDefaults({ FUSION_MODEL_ROUTING: file }), {
     codex: { ...DEFAULT_ROUTING_DEFAULTS.codex, quick: { model: "gpt-6-sol", effort: "high" } },
-    grok: { ...DEFAULT_ROUTING_DEFAULTS.grok, independence: { model: "grok-4.7", effort: "max" } }
+    grok: { ...DEFAULT_ROUTING_DEFAULTS.grok, independence: { model: "grok-4.7", effort: "max" } },
+    cursor: DEFAULT_ROUTING_DEFAULTS.cursor
   });
   assert.match(renderModelTableFromFile(file), /Lane defaults: codex quick gpt-6-sol@high, volume gpt-6-luna@xhigh, flagship gpt-6-astra@xhigh; grok burst grok-4\.7-build-fast@low, independence grok-4\.7@max/);
+});
+
+test("Cursor requires a valid family and declared families survive sanitization", () => {
+  const row = { id: "muse-spark-1.3", lane: "cursor", intelligence: 4, taste: 5, cost: 3 };
+  for (const family of [undefined, "OpenAI", "two words", "", "-x", 5]) {
+    const result = validateModelRoutingData({ ...ROUTING, models: [...ROUTING.models, { ...row, ...(family === undefined ? {} : { family }) }] });
+    assert.strictEqual(result.ok, false);
+    assert.match(result.reason, /models\[2\]\.family/);
+  }
+  const valid = validateModelRoutingData({ ...ROUTING, models: [...ROUTING.models, { ...row, family: "anthropic", ignored: true }] });
+  assert.strictEqual(valid.ok, true);
+  assert.strictEqual(valid.data.models[2].family, "anthropic");
+  assert.strictEqual(Object.hasOwn(valid.data.models[0], "family"), false);
+  assert.strictEqual(Object.hasOwn(valid.data.models[2], "ignored"), false);
+});
+
+test("Rendering uses declared and effective model families", () => {
+  const rows = [
+    { id: "codex-model", lane: "codex" },
+    { id: "grok-model", lane: "grok" },
+    { id: "claude-model", lane: "claude-fast" },
+    { id: "cursor-model", lane: "cursor", family: "anthropic" },
+    { id: "other-model", lane: "other" },
+    { id: "override", lane: "codex", family: "custom-family" }
+  ].map((row) => ({ ...row, intelligence: 3, taste: 3, cost: 3 }));
+  const validated = validateModelRoutingData({ ...ROUTING, models: rows });
+  assert.strictEqual(validated.ok, true);
+  const table = renderModelTableFromContents(JSON.stringify(validated.data));
+  for (const [id, lane, family] of [["codex-model", "codex", "openai"], ["grok-model", "grok", "xai"], ["claude-model", "claude-fast", "anthropic"], ["cursor-model", "cursor", "anthropic"], ["other-model", "other", ""], ["override", "codex", "custom-family"]]) {
+    assert.ok(table.includes(`| ${id} | ${lane} | ${family} | 3 | 3 | 3 |`));
+  }
 });
 
 test("Routing default validation rejects malformed lanes, roles, choices, efforts, and row mismatches", () => {

@@ -41,11 +41,14 @@ function routingFixture(box) {
     costProfile: "test",
     models: [
       ...["gpt-6-sol", "gpt-6-luna", "gpt-6-astra"].map((id) => ({ id, lane: "codex", intelligence: 5, taste: 5, cost: 5 })),
-      ...["grok-4.7-build-fast", "grok-4.7", "grok-4.6"].map((id) => ({ id, lane: "grok", intelligence: 5, taste: 5, cost: 5 }))
+      ...["grok-4.7-build-fast", "grok-4.7", "grok-4.6"].map((id) => ({ id, lane: "grok", intelligence: 5, taste: 5, cost: 5 })),
+      { id: "muse-spark-1.3", lane: "cursor", family: "meta", intelligence: 5, taste: 5, cost: 5 },
+      { id: "composer-2.5", lane: "cursor", family: "cursor", intelligence: 5, taste: 5, cost: 5 }
     ],
     defaults: {
       codex: { quick: { model: "gpt-6-sol", effort: "high" }, volume: { model: "gpt-6-luna", effort: "medium" }, flagship: { model: "gpt-6-astra", effort: "max" } },
-      grok: { burst: { model: "grok-4.7-build-fast", effort: "low" }, independence: { model: "grok-4.7", effort: "xhigh" } }
+      grok: { burst: { model: "grok-4.7-build-fast", effort: "low" }, independence: { model: "grok-4.7", effort: "xhigh" } },
+      cursor: { diversity: { model: "muse-spark-1.3", effort: "xhigh" }, burst: { model: "composer-2.5", effort: "default" } }
     }
   }));
   return { FUSION_MODEL_ROUTING: file };
@@ -872,6 +875,25 @@ test("Fusion peer dispatches fill missing routing options without changing expli
     ["grok:grok-rescue", `${Array.from({ length: 12 }, (_, index) => index === 0 ? "lane: grok" : `header-${index}: value`).join("\n")}\ngrok-role: independence`]
   ]) {
     assert.strictEqual(run(box, dispatch(box, { subagent_type: agentType, prompt }), routing).stdout, "");
+  }
+});
+
+test("Cursor dispatches fill role defaults and preserve explicit model choices", (t) => {
+  const box = sandbox(t);
+  const routing = routingFixture(box);
+  for (const [agentType, prompt, expected] of [
+    ["cursor:cursor-rescue", "lane: cursor diversity | goal: consult", "--model muse-spark-1.3 --effort xhigh -- lane: cursor diversity | goal: consult"],
+    ["cursor-rescue", "cursor-role: diversity\ngoal: consult", "--model muse-spark-1.3 --effort xhigh -- cursor-role: diversity\ngoal: consult"],
+    ["cursor:cursor-rescue", "lane: cursor burst\ngoal: implement", "--model composer-2.5 --effort default -- lane: cursor burst\ngoal: implement"],
+    ["cursor:cursor-rescue", "--model composer-2.5-fast -- lane: cursor diversity", "--effort xhigh --model composer-2.5-fast -- lane: cursor diversity"],
+    ["cursor:cursor-rescue", "--model composer-2.5 -- lane: cursor diversity", "--effort default --model composer-2.5 -- lane: cursor diversity"]
+  ]) {
+    const result = run(box, dispatch(box, { subagent_type: agentType, prompt }), routing);
+    assert.strictEqual(result.status, 0, result.stderr);
+    assert.strictEqual(JSON.parse(result.stdout).hookSpecificOutput.updatedInput.prompt, expected);
+  }
+  for (const prompt of ["goal: consult", "lane: cursor\ngoal: consult", "cursor-role: unknown\ngoal: consult"]) {
+    assert.strictEqual(run(box, dispatch(box, { subagent_type: "cursor:cursor-rescue", prompt }), routing).stdout, "");
   }
 });
 
@@ -4121,6 +4143,59 @@ test("a structured Grok collection remains gated until the main loop records a s
     cwd: box.cwd,
     transcript_path: box.transcript,
     last_assistant_message: "reported accepted delivery",
+    background_tasks: []
+  });
+  assert.strictEqual(allowed.stdout, "");
+});
+
+test("a Cursor collection reads companion state and accepts a verified semantic judgment", (t) => {
+  const box = sandbox(t);
+  const peerJobId = "9".repeat(32);
+  const cursorData = path.join(box.root, "cursor-data");
+  const jobFile = path.join(cursorData, "state", "workspace", "jobs", `${peerJobId}.json`);
+  fs.mkdirSync(path.dirname(jobFile), { recursive: true });
+  fs.writeFileSync(jobFile, JSON.stringify({ engine: "cursor", id: peerJobId, status: "done", failureKind: "timeout" }));
+  run(box, dispatch(box, { subagent_type: "fusion:job-collector", prompt: collectorPrompt("cursor", peerJobId) }));
+  run(box, {
+    hook_event_name: "SubagentStart",
+    session_id: "session-1",
+    cwd: box.cwd,
+    transcript_path: box.transcript,
+    agent_id: "collector-cursor-semantic",
+    agent_type: "fusion:job-collector"
+  });
+  const stopped = run(box, {
+    hook_event_name: "SubagentStop",
+    session_id: "session-1",
+    cwd: box.cwd,
+    transcript_path: box.transcript,
+    agent_id: "collector-cursor-semantic",
+    agent_type: "fusion:job-collector",
+    stop_hook_active: false,
+    last_assistant_message: `Cursor transport completed.\ncollector: state=done semantic=unverified engine=cursor job=${peerJobId} elapsed=3s`
+  }, { CURSOR_COMPANION_DATA: cursorData });
+  assert.strictEqual(stopped.status, 0, stopped.stderr);
+  const collector = record(box);
+  assert.strictEqual(collector.peerEngine, "cursor");
+  assert.strictEqual(collector.peerJobId, peerJobId);
+  assert.strictEqual(collector.peerFailureKind, "timeout");
+  assert.strictEqual(collector.acceptanceRecordedAt, undefined);
+  const blocked = run(box, {
+    hook_event_name: "Stop",
+    session_id: "session-1",
+    cwd: box.cwd,
+    transcript_path: box.transcript,
+    last_assistant_message: "finished",
+    background_tasks: []
+  });
+  assert.strictEqual(JSON.parse(blocked.stdout).decision, "block");
+  recordWorkerAcceptance({ taskId: collector.taskId, acceptance: "rejected", env: envFor(box), source: "main-loop", failureKind: "wrong_approach" });
+  const allowed = run(box, {
+    hook_event_name: "Stop",
+    session_id: "session-1",
+    cwd: box.cwd,
+    transcript_path: box.transcript,
+    last_assistant_message: "reported rejected delivery",
     background_tasks: []
   });
   assert.strictEqual(allowed.stdout, "");

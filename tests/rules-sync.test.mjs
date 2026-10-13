@@ -132,7 +132,7 @@ test("Rendered model scores do not look like local edits", (t) => {
   const sandbox = makeSandbox(t);
   writeModelRouting(sandbox.modelRoutingFile);
   const rendered = renderRulesContent(CANONICAL, { routingPath: sandbox.modelRoutingFile });
-  assert.match(rendered, /^Lane defaults: codex quick gpt-6-sol@xhigh, volume gpt-6-luna@xhigh, flagship gpt-6-astra@xhigh; grok burst grok-4\.7-build-fast@low, independence grok-4\.7-build-fast@high, live-web grok-4\.7-build-fast@high, large-context grok-4\.6@medium\.$/m);
+  assert.match(rendered, /^Lane defaults: codex quick gpt-6-sol@xhigh, volume gpt-6-luna@xhigh, flagship gpt-6-astra@xhigh; grok burst grok-4\.7-build-fast@low, independence grok-4\.7-build-fast@high, live-web grok-4\.7-build-fast@high, large-context grok-4\.6@medium; cursor diversity muse-spark-1\.3@xhigh, burst composer-2\.5@default\.$/m);
   assert.strictEqual(hashRulesTemplate(rendered), hashRulesTemplate(CANONICAL));
   fs.mkdirSync(path.dirname(sandbox.rulesFile), { recursive: true });
   fs.writeFileSync(sandbox.rulesFile, rendered, "utf8");
@@ -234,7 +234,7 @@ test("background collection distinguishes explicit Fusion receipts from foregrou
   assert.match(rules, /Grok companion calls also remain foreground inside their owning Agent; expected duration does not authorize managed detachment/);
   assert.match(rules, /A width one Claude worker dispatch may instead pass `run_in_background: false` so the deliverable returns synchronously inside the tool result; the lifecycle records it as an ordinary foreground worker\./);
   assert.doesNotMatch(rules, /Managed Grok detachment is different/);
-  assert.match(rules, /Direct Codex and Grok slash commands with explicit `--background` return manual receipts for the user to inspect and collect through their status and result commands/);
+  assert.match(rules, /Direct Codex, Grok, and Cursor slash commands with explicit `--background` return manual receipts for the user to inspect and collect through their status and result commands/);
   assert.match(task, /Direct users inspect progress through `\/codex:status` and collect the deliverable through `\/codex:result`; when Fusion is installed, its monitor can notify them of completion/);
   assert.match(rescue, /Direct users inspect progress through `\/codex:status` and collect the deliverable through `\/codex:result`; when Fusion is installed, its monitor can notify them of completion/);
 });

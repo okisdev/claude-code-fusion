@@ -34,7 +34,8 @@
       "plugins/codex/**/*.mjs"
     ],
     "suites": [
-      "tests/codex-companion.test.mjs"
+      "tests/codex-companion.test.mjs",
+      "tests/codex-models.test.mjs"
     ]
   },
   {
@@ -47,7 +48,8 @@
       "tests/grok-record-acceptance.test.mjs",
       "tests/grok-state-lock.test.mjs",
       "tests/grok-transport.test.mjs",
-      "tests/grok-upstream-contract.test.mjs"
+      "tests/grok-upstream-contract.test.mjs",
+      "tests/grok-models.test.mjs"
     ]
   },
   {
@@ -86,9 +88,11 @@
       "tests/fusion-job-collect.test.mjs",
       "tests/breaker-check.test.mjs",
       "tests/codex-jobs-monitor.test.mjs",
-      "tests/grok-jobs-observer.test.mjs",
+      "tests/engine-jobs-observer.test.mjs",
       "tests/inline-delegation-guard.test.mjs",
-      "tests/brief-sensor.test.mjs"
+      "tests/brief-sensor.test.mjs",
+      "tests/model-table.test.mjs",
+      "tests/fusion-config.test.mjs"
     ]
   },
   {
@@ -113,11 +117,25 @@
   {
     "paths": [
       "plugins/fusion/scripts/codex-jobs-monitor.mjs",
-      "plugins/fusion/scripts/grok-jobs-observer.mjs"
+      "plugins/fusion/scripts/engine-jobs-observer.mjs"
     ],
     "suites": [
       "tests/codex-jobs-monitor.test.mjs",
-      "tests/grok-jobs-observer.test.mjs"
+      "tests/engine-jobs-observer.test.mjs"
+    ]
+  },
+  {
+    "paths": [
+      "plugins/cursor/**/*.mjs",
+      "tests/fake-cursor"
+    ],
+    "suites": [
+      "tests/cursor-companion.test.mjs",
+      "tests/cursor-exec.test.mjs",
+      "tests/cursor-home.test.mjs",
+      "tests/cursor-models.test.mjs",
+      "tests/cursor-render.test.mjs",
+      "tests/cursor-state.test.mjs"
     ]
   }
 ]
