@@ -2,10 +2,12 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
+import { ENGINES, ENGINE_IDS, isEngineId } from "./engines.mjs";
+
 export const MODEL_TABLE_START = "<!-- fusion:model-table:start -->";
 export const MODEL_TABLE_END = "<!-- fusion:model-table:end -->";
 export const MODEL_ROUTING_SCHEMA_VERSION = 1;
-export const MODEL_ROUTING_LANES = new Set(["codex", "grok", "claude-trivial", "claude-fast", "claude-deep", "other"]);
+export const MODEL_ROUTING_LANES = new Set([...ENGINE_IDS, "claude-trivial", "claude-fast", "claude-deep", "other"]);
 export const DEFAULT_ROUTING_DEFAULTS = {
   codex: {
     quick: { model: "gpt-6-sol", effort: "xhigh" },
@@ -17,9 +19,17 @@ export const DEFAULT_ROUTING_DEFAULTS = {
     independence: { model: "grok-4.7-build-fast", effort: "high" },
     "live-web": { model: "grok-4.7-build-fast", effort: "high" },
     "large-context": { model: "grok-4.6", effort: "medium" }
+  },
+  cursor: {
+    diversity: { model: "muse-spark-1.3", effort: "xhigh" },
+    burst: { model: "composer-2.5", effort: "default" }
   }
 };
 const ROUTING_DEFAULT_EFFORTS = new Set(["low", "medium", "high", "xhigh", "max"]);
+
+function laneEfforts(lane) {
+  return isEngineId(lane) ? new Set(ENGINES[lane].efforts) : ROUTING_DEFAULT_EFFORTS;
+}
 export const DEFAULT_MODEL_TABLE_PLACEHOLDER =
   "Engine capability table: run /fusion:config to score your configured engines (intelligence, taste, cost, 1 to 5) and regenerate this block. Until scored, route by the qualitative lane descriptions in this document.";
 const MODEL_TABLE_PRIORITY_SENTENCE =
@@ -82,6 +92,12 @@ export function validateModelRoutingData(value) {
     if (!validateLane(model.lane)) {
       return invalid(`Expected models[${index}].lane to be one of ${[...MODEL_ROUTING_LANES].join(", ")}.`);
     }
+    if (model.family !== undefined && (typeof model.family !== "string" || !/^[a-z][a-z0-9-]*$/.test(model.family))) {
+      return invalid(`Expected models[${index}].family to be a lowercase slug.`);
+    }
+    if (model.lane === "cursor" && model.family === undefined) {
+      return invalid(`Expected models[${index}].family for the cursor lane.`);
+    }
     if (!isValidScore(model.intelligence)) {
       return invalid(`Expected models[${index}].intelligence to be an integer from 1 to 5.`);
     }
@@ -97,6 +113,7 @@ export function validateModelRoutingData(value) {
     const sanitized = {
       id: model.id.trim(),
       lane: model.lane,
+      ...(model.family === undefined ? {} : { family: model.family }),
       intelligence: model.intelligence,
       taste: model.taste,
       cost: model.cost
@@ -114,16 +131,16 @@ export function validateModelRoutingData(value) {
     }
     defaults = {};
     for (const [lane, roles] of Object.entries(value.defaults)) {
-      if (!Object.hasOwn(DEFAULT_ROUTING_DEFAULTS, lane)) {
-        return invalid(`Expected defaults lane to be one of ${Object.keys(DEFAULT_ROUTING_DEFAULTS).join(", ")}.`);
+      if (!isEngineId(lane)) {
+        return invalid(`Expected defaults lane to be one of ${ENGINE_IDS.join(", ")}.`);
       }
       if (!roles || typeof roles !== "object" || Array.isArray(roles)) {
         return invalid(`Expected defaults.${lane} to be an object.`);
       }
       defaults[lane] = {};
       for (const [role, choice] of Object.entries(roles)) {
-        if (!Object.hasOwn(DEFAULT_ROUTING_DEFAULTS[lane], role)) {
-          return invalid(`Expected defaults.${lane} role to be one of ${Object.keys(DEFAULT_ROUTING_DEFAULTS[lane]).join(", ")}.`);
+        if (!ENGINES[lane].roles.includes(role)) {
+          return invalid(`Expected defaults.${lane} role to be one of ${ENGINES[lane].roles.join(", ")}.`);
         }
         if (!choice || typeof choice !== "object" || Array.isArray(choice)) {
           return invalid(`Expected defaults.${lane}.${role} to be an object.`);
@@ -131,8 +148,8 @@ export function validateModelRoutingData(value) {
         if (!validateId(choice.model)) {
           return invalid(`Expected defaults.${lane}.${role}.model to be a non-empty string.`);
         }
-        if (!ROUTING_DEFAULT_EFFORTS.has(choice.effort)) {
-          return invalid(`Expected defaults.${lane}.${role}.effort to be one of ${[...ROUTING_DEFAULT_EFFORTS].join(", ")}.`);
+        if (!laneEfforts(lane).has(choice.effort)) {
+          return invalid(`Expected defaults.${lane}.${role}.effort to be one of ${[...laneEfforts(lane)].join(", ")}.`);
         }
         const model = choice.model.trim();
         if (!models.some((row) => row.lane === lane && row.id === model)) {
@@ -157,9 +174,9 @@ export function validateModelRoutingData(value) {
 
 function mergeRoutingDefaults(defaults = {}) {
   return Object.fromEntries(
-    Object.entries(DEFAULT_ROUTING_DEFAULTS).map(([lane, roles]) => [
+    ENGINE_IDS.map((lane) => [
       lane,
-      Object.fromEntries(Object.entries(roles).map(([role, seed]) => [role, defaults[lane]?.[role] ?? { ...seed }]))
+      Object.fromEntries(ENGINES[lane].roles.map((role) => [role, defaults[lane]?.[role] ?? { ...DEFAULT_ROUTING_DEFAULTS[lane][role] }]))
     ])
   );
 }
@@ -204,18 +221,19 @@ export function renderModelTable(data) {
   if (costProfile) {
     lines.push(`Cost profile: ${tableCell(costProfile)}`, "");
   }
-  lines.push("| Engine | Lane | Intelligence | Taste | Cost | Notes |");
-  lines.push("|---|---|---:|---:|---:|---|");
+  lines.push("| Engine | Lane | Family | Intelligence | Taste | Cost | Notes |");
+  lines.push("|---|---|---|---:|---:|---:|---|");
   for (const model of data.models) {
+    const family = model.family ?? (isEngineId(model.lane) ? ENGINES[model.lane].family : model.lane.startsWith("claude-") ? "anthropic" : null);
     lines.push(
-      `| ${tableCell(model.id)} | ${tableCell(model.lane)} | ${model.intelligence} | ${model.taste} | ${model.cost} | ${tableCell(model.notes ?? "")} |`
+      `| ${tableCell(model.id)} | ${tableCell(model.lane)} | ${tableCell(family ?? "")} | ${model.intelligence} | ${model.taste} | ${model.cost} | ${tableCell(model.notes ?? "")} |`
     );
   }
   const defaults = mergeRoutingDefaults(data.defaults);
-  const choice = (lane, role) => `${tableCell(defaults[lane][role].model)}@${defaults[lane][role].effort}`;
+  const defaultSentence = ENGINE_IDS.map((lane) => ENGINES[lane].roles.map((role, index) => `${index === 0 ? `${lane} ` : ""}${role} ${tableCell(defaults[lane][role].model)}@${defaults[lane][role].effort}`).join(", ")).join("; ");
   lines.push(
     "",
-    `Lane defaults: codex quick ${choice("codex", "quick")}, volume ${choice("codex", "volume")}, flagship ${choice("codex", "flagship")}; grok burst ${choice("grok", "burst")}, independence ${choice("grok", "independence")}, live-web ${choice("grok", "live-web")}, large-context ${choice("grok", "large-context")}.`,
+    `Lane defaults: ${defaultSentence}.`,
     "",
     MODEL_TABLE_PRIORITY_SENTENCE,
     MODEL_TABLE_SCORE_SENTENCE

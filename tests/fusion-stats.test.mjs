@@ -22,8 +22,7 @@ import {
   findDeadWorkspaces,
   fusionRepositoryKey,
   isStrictDirectReportOrMaintenanceArguments,
-  newestCodexCompanion,
-  newestGrokCompanion,
+  newestEngineCompanion,
   normalizeCollectionMethod,
   normalizeCodexTokenUsage,
   pruneDeadWorkspaces,
@@ -81,9 +80,15 @@ function writeGrokJob(dataDir, cwd, id, fields) {
   fs.writeFileSync(path.join(dir, `${id}.json`), JSON.stringify({ id, cwd, ...fields }));
 }
 
+function writeCursorJob(dataDir, cwd, id, fields) {
+  const dir = path.join(dataDir, "state", grokWorkspaceSlug(cwd), "jobs");
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(path.join(dir, `${id}.json`), JSON.stringify({ id, engine: "cursor", cwd, ...fields }));
+}
+
 function runtimeEnv(env, extraEnv = {}) {
   const inherited = Object.fromEntries(
-    Object.entries(process.env).filter(([key]) => key !== "HOME" && key !== "CLAUDE_CODE_SESSION_ID" && !/^(?:FUSION|GROK|CODEX)_/.test(key))
+    Object.entries(process.env).filter(([key]) => key !== "HOME" && key !== "CLAUDE_CODE_SESSION_ID" && !/^(?:FUSION|GROK|CODEX|CURSOR)_/.test(key))
   );
   const root = path.join(path.resolve(env.cwd), ".fusion-stats-runtime");
   return {
@@ -97,7 +102,9 @@ function runtimeEnv(env, extraEnv = {}) {
     FUSION_CODEX_STATE: env.codexState,
     FUSION_CODEX_STATE_DIR: path.join(root, "codex-state-compat"),
     FUSION_GROK_COMPANION: "/nonexistent/grok-companion.mjs",
+    FUSION_CURSOR_COMPANION: "/nonexistent/cursor-companion.mjs",
     GROK_COMPANION_DATA: path.join(root, "grok-data"),
+    CURSOR_COMPANION_DATA: path.join(root, "cursor-data"),
     GROK_HOME: path.join(root, "grok-home"),
     CODEX_COMPANION_DATA: path.join(root, "codex-data"),
     CODEX_HOME: path.join(root, "codex-home"),
@@ -281,6 +288,16 @@ function writeGrokAcceptanceCompanion(directory) {
   return companion;
 }
 
+function writeCursorAcceptanceCompanion(directory) {
+  const companion = path.join(directory, "cursor-companion.mjs");
+  fs.writeFileSync(companion, [
+    'import fs from "node:fs";',
+    'fs.writeFileSync(process.env.FUSION_TEST_CURSOR_COMPANION_ARGS, JSON.stringify(process.argv.slice(2)));',
+    'process.stdout.write("Recorded Cursor acceptance.\\n");'
+  ].join("\n"));
+  return companion;
+}
+
 function writeCacheCompanion(home, engine, version, modifiedAt) {
   const companion = path.join(home, ".claude", "plugins", "cache", "claude-code-fusion", engine, version, "scripts", `${engine}-companion.mjs`);
   fs.mkdirSync(path.dirname(companion), { recursive: true });
@@ -303,14 +320,14 @@ test("acceptance companion resolvers use the newest cache entry and ignore inval
   fs.mkdirSync(grokDirectory);
   fs.mkdirSync(codexDirectory);
 
-  assert.strictEqual(newestGrokCompanion({ HOME: home }), newerGrok);
-  assert.strictEqual(newestCodexCompanion({ HOME: home }), newerCodex);
+  assert.strictEqual(newestEngineCompanion("grok", { HOME: home }), newerGrok);
+  assert.strictEqual(newestEngineCompanion("codex", { HOME: home }), newerCodex);
   assert.notStrictEqual(olderGrok, newerGrok);
   assert.notStrictEqual(olderCodex, newerCodex);
-  assert.strictEqual(newestGrokCompanion({ HOME: home, FUSION_GROK_COMPANION: "grok-companion.mjs" }), newerGrok);
-  assert.strictEqual(newestGrokCompanion({ HOME: home, FUSION_GROK_COMPANION: grokDirectory }), newerGrok);
-  assert.strictEqual(newestCodexCompanion({ HOME: home, FUSION_CODEX_COMPANION: "codex-companion.mjs" }), newerCodex);
-  assert.strictEqual(newestCodexCompanion({ HOME: home, FUSION_CODEX_COMPANION: codexDirectory }), newerCodex);
+  assert.strictEqual(newestEngineCompanion("grok", { HOME: home, FUSION_GROK_COMPANION: "grok-companion.mjs" }), newerGrok);
+  assert.strictEqual(newestEngineCompanion("grok", { HOME: home, FUSION_GROK_COMPANION: grokDirectory }), newerGrok);
+  assert.strictEqual(newestEngineCompanion("codex", { HOME: home, FUSION_CODEX_COMPANION: "codex-companion.mjs" }), newerCodex);
+  assert.strictEqual(newestEngineCompanion("codex", { HOME: home, FUSION_CODEX_COMPANION: codexDirectory }), newerCodex);
 });
 
 function createSiblingWorktree(root) {
@@ -324,12 +341,13 @@ function createSiblingWorktree(root) {
   return { main, sibling };
 }
 
-test("reports both engines unavailable when neither has data", (t) => {
+test("reports every engine unavailable when none has data", (t) => {
   const dir = sandbox(t);
   const result = run({ cwd: dir, codexState: path.join(dir, "missing") });
   assert.strictEqual(result.status, 0, result.stderr);
   assert.match(result.stdout, /## Grok\n\nUnavailable:/);
   assert.match(result.stdout, /## Codex\n\nUnavailable:/);
+  assert.match(result.stdout, /## Cursor\n\nUnavailable: cursor plugin job state not found/);
 });
 
 test("aggregates codex job state scoped to the workspace", (t) => {
@@ -727,12 +745,54 @@ test("Grok job records contribute resolved and unknown models without a companio
 });
 
 test("file-based engine stats use the descriptor registry", () => {
-  assert.ok(FILE_ENGINE_DESCRIPTORS.grok);
-  assert.ok(FILE_ENGINE_DESCRIPTORS.codex);
+  assert.deepStrictEqual(Object.keys(FILE_ENGINE_DESCRIPTORS), ["grok", "codex", "cursor"]);
   assert.strictEqual(FILE_ENGINE_DESCRIPTORS.codex.stateEnvVar, "FUSION_CODEX_STATE");
   assert.strictEqual(FILE_ENGINE_DESCRIPTORS.codex.defaultStateRoot({}), path.join(os.homedir(), ".claude", "plugins", "data", "codex-claude-code-fusion", "state"));
   assert.strictEqual(FILE_ENGINE_DESCRIPTORS.codex.defaultStateRoot({ CODEX_COMPANION_DATA: "/adapter-data" }), "/adapter-data/state");
   assert.strictEqual(typeof fileBasedEngineStats, "function");
+});
+
+test("Cursor stats report models, billing pools, and exact token coverage", (t) => {
+  const dir = sandbox(t);
+  const dataDir = path.join(dir, "cursor-data");
+  writeCursorJob(dataDir, dir, "cursor-done", {
+    status: "done", mode: "consult", role: "diversity", resolvedModel: "muse-spark-1.3-xhigh",
+    claudeSessionId: "cursor-session", createdAt: "2026-10-13T00:00:00.000Z",
+    requestedEffort: "xhigh", effortApplied: true, billingPool: "api",
+    usage: { inputTokens: 12, outputTokens: 5, cacheReadTokens: 3, cacheWriteTokens: 2 }
+  });
+  writeCursorJob(dataDir, dir, "cursor-quota", {
+    status: "error", mode: "write", resolvedModel: "composer-2.5", requestedEffort: "high",
+    effortApplied: false, billingPool: "api", failureKind: "quota",
+    usage: { inputTokens: 4, outputTokens: 1 }
+  });
+  writeCursorJob(dataDir, dir, "cursor-unreported", {
+    status: "done", mode: "consult", resolvedModel: "composer-2.5-fast", effortApplied: false
+  });
+  const result = run({ cwd: dir, codexState: path.join(dir, "missing-codex") }, ["--json"], { CURSOR_COMPANION_DATA: dataDir });
+  assert.strictEqual(result.status, 0, result.stderr);
+  const stats = JSON.parse(result.stdout).cursor;
+  assert.strictEqual(stats.available, true);
+  assert.strictEqual(stats.totalJobs, 3);
+  assert.deepStrictEqual(stats.byKind, { diversity: 1, write: 1, consult: 1 });
+  assert.deepStrictEqual(stats.byModel, { "muse-spark-1.3-xhigh@xhigh (api)": 1, "composer-2.5 (api)": 1, "composer-2.5-fast": 1 });
+  assert.deepStrictEqual(stats.byFailureKind, { quota: 1 });
+  assert.deepStrictEqual(stats.tokenUsage, {
+    availability: "partial", scope: "terminal jobs only", jobsWithUsage: 1,
+    jobsWithIncompleteUsage: 1, jobsWithoutUsage: 2, jobsWithUnreportedUsage: 1,
+    totals: { inputTokens: 12, outputTokens: 5, cacheReadTokens: 3, cacheWriteTokens: 2, totalTokens: 22 }
+  });
+  assert.match(renderFusionStats(JSON.parse(result.stdout)), /## Cursor[\s\S]*- muse-spark-1\.3-xhigh@xhigh \(api\): 1/);
+  assert.match(renderFusionStats(JSON.parse(result.stdout)), /Observed tokens: 22 total, 12 input, 3 cache read, 2 cache write, 5 output/);
+  const session = run({ cwd: dir, codexState: path.join(dir, "missing-codex") }, ["--session", "cursor-session", "--json"], { CURSOR_COMPANION_DATA: dataDir });
+  assert.strictEqual(session.status, 0, session.stderr);
+  assert.deepStrictEqual(JSON.parse(session.stdout).engines.cursor.byStatus, { done: 1 });
+  const trace = run({ cwd: dir, codexState: path.join(dir, "missing-codex") }, ["--trace", "--session", "cursor-session", "--json"], { CURSOR_COMPANION_DATA: dataDir });
+  assert.strictEqual(trace.status, 0, trace.stderr);
+  assert.deepStrictEqual(JSON.parse(trace.stdout).timeline.filter((entry) => entry.engine === "cursor").map((entry) => [entry.model, entry.effort, entry.join]), [["muse-spark-1.3-xhigh", "xhigh", "exact"]]);
+  const unsettled = run({ cwd: dir, codexState: path.join(dir, "missing-codex") }, ["--unsettled", "--json"], { CURSOR_COMPANION_DATA: dataDir });
+  assert.strictEqual(unsettled.status, 0, unsettled.stderr);
+  assert.deepStrictEqual(JSON.parse(unsettled.stdout).unsettled.filter((entry) => entry.engine === "cursor").map((entry) => entry.id).sort(), ["cursor-done", "cursor-quota", "cursor-unreported"]);
 });
 
 test("Codex token normalization rejects inconsistent counters", () => {
@@ -1125,9 +1185,9 @@ test("pruneDeadWorkspaces never touches a workspace with any running job even wi
   assert.ok(fs.existsSync(path.join(grokDataDir, "state", grokWorkspaceSlug(goneCwd))));
 });
 
-test("WORKSPACE_ENGINE_DESCRIPTORS covers both peer engines", () => {
+test("WORKSPACE_ENGINE_DESCRIPTORS covers every peer engine", () => {
   const ids = WORKSPACE_ENGINE_DESCRIPTORS.map((descriptor) => descriptor.id);
-  assert.deepStrictEqual(ids.sort(), ["codex", "grok"]);
+  assert.deepStrictEqual(ids.sort(), ["codex", "cursor", "grok"]);
 });
 
 test("prune-dead treats any unreadable job record as unsafe for the whole workspace", (t) => {
@@ -1209,6 +1269,7 @@ test("--session explicitly reports unavailable data when the session id is unset
   assert.match(report.reason, /CLAUDE_CODE_SESSION_ID is unset/);
   assert.strictEqual(report.engines.codex.available, false);
   assert.strictEqual(report.engines.grok.available, false);
+  assert.strictEqual(report.engines.cursor.available, false);
   const rendered = renderSessionReport(report);
   assert.match(rendered, /Session data unavailable: CLAUDE_CODE_SESSION_ID is unset/);
   assert.doesNotMatch(rendered, /Total jobs: 0/);
@@ -1964,7 +2025,7 @@ test("--record resolves a bare Codex job with a raw transport reason and settles
     { kind: "engine", engine: "codex", jobId, acceptance: "rejected" },
     { kind: "worker", taskId, acceptance: "rejected" }
   ]);
-  assert.deepStrictEqual(JSON.parse(fs.readFileSync(argsFile, "utf8")), ["record-acceptance", "--job-id", jobId, "--acceptance", "rejected", "--source", "main-loop", "--reason", reason, "--failure-kind", failureKind]);
+  assert.deepStrictEqual(JSON.parse(fs.readFileSync(argsFile, "utf8")), ["record-acceptance", "--job-id", jobId, "--acceptance", "rejected", "--source", "main-loop", "--reason", reason, "--failure-kind", failureKind, "--json"]);
   assert.strictEqual(readWorkerRecord(taskId, env).acceptance, "rejected");
   assert.strictEqual(readWorkerRecord(taskId, env).acceptanceReason, reason);
   assert.strictEqual(readWorkerRecord(taskId, env).acceptanceFailureKind, failureKind);
@@ -2063,26 +2124,44 @@ test("--record resolves a bare Grok job and settles matching worker rows", (t) =
 
   assert.strictEqual(result.status, 0, result.stderr);
   assert.strictEqual(result.stdout, `Recorded unverified for Grok job ${jobId}.\nRecorded unverified for Fusion worker task ${taskId}.\n`);
-  assert.deepStrictEqual(JSON.parse(fs.readFileSync(argsFile, "utf8")), ["record-acceptance", "--job-id", jobId, "--acceptance", "unverified"]);
+  assert.deepStrictEqual(JSON.parse(fs.readFileSync(argsFile, "utf8")), ["record-acceptance", "--job-id", jobId, "--acceptance", "unverified", "--source", "main-loop"]);
   assert.strictEqual(readWorkerRecord(taskId, env).acceptance, "unverified");
 });
 
-test("--record rejects an engine id that exists in both peer states", (t) => {
+test("--record rejects an engine id that exists in multiple peer states", (t) => {
   const dir = sandbox(t);
   const stateRoot = path.join(dir, "codex-state");
   const grokData = path.join(dir, "grok-data");
+  const cursorData = path.join(dir, "cursor-data");
   const jobId = "1".repeat(32);
   writeCodexJob(stateRoot, dir, jobId, { status: "done", jobClass: "task" });
   writeGrokJob(grokData, dir, jobId, { status: "done", mode: "consult" });
+  writeCursorJob(cursorData, dir, jobId, { status: "done", mode: "consult" });
 
   const result = runDirect(
     { cwd: dir, codexState: stateRoot },
     ["--record", `${jobId}=accepted`],
-    { GROK_COMPANION_DATA: grokData, FUSION_CODEX_COMPANION: writeCodexAcceptanceCompanion(dir), FUSION_GROK_COMPANION: writeGrokAcceptanceCompanion(dir) }
+    { GROK_COMPANION_DATA: grokData, CURSOR_COMPANION_DATA: cursorData, FUSION_CODEX_COMPANION: writeCodexAcceptanceCompanion(dir), FUSION_GROK_COMPANION: writeGrokAcceptanceCompanion(dir) }
   );
 
   assert.notStrictEqual(result.status, 0);
-  assert.match(result.stderr, /exists in both Codex and Grok state/);
+  assert.match(result.stderr, /exists in Codex, Grok, and Cursor state/);
+});
+
+test("--record routes Cursor jobs to the Cursor companion", (t) => {
+  const dir = sandbox(t);
+  const cursorData = path.join(dir, "cursor-data");
+  const argsFile = path.join(dir, "cursor-companion-args.json");
+  const jobId = "9".repeat(32);
+  writeCursorJob(cursorData, dir, jobId, { status: "done", mode: "consult" });
+  const result = runDirect(
+    { cwd: dir, codexState: path.join(dir, "missing-codex") },
+    ["--record", `${jobId}=unverified`],
+    { CURSOR_COMPANION_DATA: cursorData, FUSION_CURSOR_COMPANION: writeCursorAcceptanceCompanion(dir), FUSION_TEST_CURSOR_COMPANION_ARGS: argsFile }
+  );
+  assert.strictEqual(result.status, 0, result.stderr);
+  assert.strictEqual(result.stdout, `Recorded unverified for Cursor job ${jobId}.\n`);
+  assert.deepStrictEqual(JSON.parse(fs.readFileSync(argsFile, "utf8")), ["record-acceptance", "--job-id", jobId, "--acceptance", "unverified", "--source", "main-loop"]);
 });
 
 test("--record batches mixed verdicts with per-pair rejection reasons and failure kinds", (t) => {

@@ -14,6 +14,7 @@ import {
   engineDisplayNameList,
   engineForAgentType,
   engineResultCommand,
+  engineRoleFromBrief,
   isEngineId
 } from "./lib/engines.mjs";
 import { readEngineJobFailureKind } from "./lib/engine-job-state.mjs";
@@ -176,36 +177,29 @@ function injectedPeerDefaults(prompt, agentType, env) {
   }
   const { options, brief, separated } = leadingCompanionOptions(prompt);
   const header = brief.split(/\r?\n/).find((line) => line.trim())?.trim() ?? "";
-  if (!/^lane:/i.test(header) && !/^grok-role:/i.test(header) && !/\|\s*grok-role:/i.test(header)) {
+  const roleField = new RegExp(`(?:^|\\|\\s*)(?:${ENGINE_ID_ALTERNATION})-role:`, "i");
+  if (!/^lane:/i.test(header) && !roleField.test(header)) {
+    return null;
+  }
+  const engine = engineForAgentType(agentType);
+  const role = engineRoleFromBrief(engine, brief);
+  if (role === null) {
     return null;
   }
   const defaults = readRoutingDefaults(env, { warn: null });
-  const engine = engineForAgentType(agentType) ?? (agentType === "codex-rescue" ? "codex" : agentType === "grok-rescue" ? "grok" : null);
-  let lane;
-  let choice;
-  const model = optionValue(options, "--model");
-  const effort = optionValue(options, "--effort");
-  if (engine === "codex") {
-    const tier = header.match(/^lane:\s*codex\s+(quick|volume|flagship)(?:\s|[;|]|$)/i)?.[1]?.toLowerCase() ?? "quick";
-    lane = `codex ${tier}`;
-    choice = defaults.codex[tier];
-  } else if (engine === "grok") {
-    const role = brief.split(/\r?\n/).slice(0, 12).map((line) => line.match(/\bgrok-role:\s*([^\s;,|]+)/i)?.[1]).find(Boolean);
-    if (!Object.hasOwn(defaults.grok, role ?? "")) {
-      return null;
-    }
-    lane = `grok ${role}`;
-    choice = defaults.grok[role];
-  } else {
+  const choice = defaults[engine]?.[role];
+  if (!choice) {
     return null;
   }
+  const lane = `${engine} ${role}`;
+  const model = optionValue(options, "--model");
+  const effort = optionValue(options, "--effort");
   const filled = [];
   if (model === null) {
     filled.push("--model", choice.model);
   }
   if (effort === null) {
-    const codexModel = model ?? choice.model;
-    const matched = engine === "codex" ? Object.values(defaults.codex).find((entry) => entry.model === codexModel) : null;
+    const matched = Object.values(defaults[engine]).find((entry) => entry.model === (model ?? choice.model));
     filled.push("--effort", matched?.effort ?? choice.effort);
   }
   if (filled.length === 0) {

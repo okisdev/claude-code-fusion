@@ -4,7 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { PEER_JOB_FOOTER_AGENTS } from "./engines.mjs";
+import { ENGINES, PEER_JOB_FOOTER_AGENTS, isEngineId } from "./engines.mjs";
 
 const DATA_DIR_ENV = "FUSION_DATA_DIR";
 const WORKER_STATE_ENV = "FUSION_WORKER_STATE_DIR";
@@ -1003,11 +1003,11 @@ function validatedAcceptanceFields(acceptance, source, reason, failureKind) {
 
 function workerAcceptanceGate(record, taskId, acceptance, acceptFailedTransport) {
   const collector = canonicalWorkerAgentType(record.agentType) === "fusion:job-collector" || record.completionContract === "collector";
-  if (collector && record.peerEngine === "codex") {
-    throw new Error(`Fusion collector task ${taskId} acceptance must be recorded through the Codex acceptance ledger.`);
+  if (collector && isEngineId(record.peerEngine) && ENGINES[record.peerEngine].acceptanceLedger) {
+    throw new Error(`Fusion collector task ${taskId} acceptance must be recorded through the ${ENGINES[record.peerEngine].displayName} acceptance ledger.`);
   }
-  if (collector && (record.peerEngine !== "grok" || !/^[a-f0-9]{32}$/.test(record.peerJobId ?? "") || !record.peerTransportStatus)) {
-    throw new Error(`Fusion collector task ${taskId} does not contain a verified Grok collection identity.`);
+  if (collector && (!isEngineId(record.peerEngine) || !/^[a-f0-9]{32}$/.test(record.peerJobId ?? "") || !record.peerTransportStatus)) {
+    throw new Error(`Fusion collector task ${taskId} does not contain a verified peer collection identity.`);
   }
   if (acceptance === "accepted" && record.transportStatus === "failed" && !acceptFailedTransport) {
     throw new Error(`Fusion worker task ${taskId} has transport status failed. Pass --accept-failed-transport to record accepted.`);
@@ -1131,30 +1131,4 @@ export function recordWorkerAcceptance({ taskId, acceptance, env = process.env, 
     }
   });
   return workerAcceptanceResult(result.record, result.queued);
-}
-
-function recordCodexCollectorAcceptance({ taskId, jobId, sessionId, acceptance, env = process.env, source = "main-loop", reason = null, failureKind = null }) {
-  if (typeof jobId !== "string" || !/^[a-f0-9]{32}$/.test(jobId)) {
-    throw new TypeError("Codex collector job id is invalid.");
-  }
-  if (typeof sessionId !== "string" || !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(sessionId)) {
-    throw new TypeError("Codex collector session id is invalid.");
-  }
-  const { safeReason, safeFailureKind } = validatedAcceptanceFields(acceptance, source, reason, failureKind);
-  return updateWorkerAcceptance({
-    taskId,
-    acceptance,
-    env,
-    source,
-    safeReason,
-    safeFailureKind,
-    validateRecord(record) {
-      if (canonicalWorkerAgentType(record.agentType) !== "fusion:job-collector" || record.completionContract !== "collector") {
-        throw new Error(`Fusion worker task ${taskId} is not a Codex collector.`);
-      }
-      if (record.sessionId !== sessionId || record.peerEngine !== "codex" || record.peerJobId !== jobId) {
-        throw new Error(`Fusion collector task ${taskId} does not match the Codex acceptance identity.`);
-      }
-    }
-  }).record;
 }

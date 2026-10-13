@@ -13,7 +13,7 @@ import { getProcessIdentity } from "../plugins/codex/scripts/lib/codex-exec.mjs"
 import { gitIsolation } from "./lib/git-fixture.mjs";
 import { inspectCodexRollout } from "../plugins/fusion/scripts/codex-jobs-monitor.mjs";
 import { fusionRepositoryKey, modelAuditSidecarPath, tokenUsageSidecarPath } from "../plugins/fusion/scripts/fusion-stats.mjs";
-import { grokJobsObserverStatePath } from "../plugins/fusion/scripts/grok-jobs-observer.mjs";
+import { engineJobsObserverStatePath } from "../plugins/fusion/scripts/engine-jobs-observer.mjs";
 
 const repoRoot = path.join(import.meta.dirname, "..");
 const monitorScript = path.join(repoRoot, "plugins", "fusion", "scripts", "codex-jobs-monitor.mjs");
@@ -24,13 +24,15 @@ function makeSandbox(t) {
   const workDir = path.join(root, "work");
   const fusionData = path.join(root, "fusion-data");
   const grokData = path.join(root, "grok-data");
+  const cursorData = path.join(root, "cursor-data");
   const sessionsDir = path.join(root, "sessions");
   fs.mkdirSync(stateRoot, { recursive: true });
   fs.mkdirSync(workDir, { recursive: true });
   fs.mkdirSync(fusionData, { recursive: true });
   fs.mkdirSync(grokData, { recursive: true });
+  fs.mkdirSync(cursorData, { recursive: true });
   fs.mkdirSync(sessionsDir, { recursive: true });
-  const sandbox = { root, stateRoot, workDir, fusionData, grokData, sessionsDir, children: new Set() };
+  const sandbox = { root, stateRoot, workDir, fusionData, grokData, cursorData, sessionsDir, children: new Set() };
   t.after(async () => {
     const closing = [...sandbox.children].map((child) => {
       if (child.exitCode != null || child.signalCode != null) {
@@ -55,13 +57,19 @@ function writeJobRecordFile(file, record) {
   fs.writeFileSync(file, `${JSON.stringify(record, null, 2)}\n`, "utf8");
 }
 
-function grokWorkspaceSlug(cwd) {
+function engineWorkspaceSlug(cwd) {
   const absolute = path.resolve(cwd);
   return `${path.basename(absolute)}-${createHash("sha256").update(absolute).digest("hex").slice(0, 16)}`;
 }
 
 function writeGrokJob(sandbox, cwd, id, fields) {
-  const jobsDir = path.join(sandbox.grokData, "state", grokWorkspaceSlug(cwd), "jobs");
+  const jobsDir = path.join(sandbox.grokData, "state", engineWorkspaceSlug(cwd), "jobs");
+  fs.mkdirSync(jobsDir, { recursive: true });
+  fs.writeFileSync(path.join(jobsDir, `${id}.json`), `${JSON.stringify({ id, cwd, ...fields })}\n`);
+}
+
+function writeCursorJob(sandbox, cwd, id, fields) {
+  const jobsDir = path.join(sandbox.cursorData, "state", engineWorkspaceSlug(cwd), "jobs");
   fs.mkdirSync(jobsDir, { recursive: true });
   fs.writeFileSync(path.join(jobsDir, `${id}.json`), `${JSON.stringify({ id, cwd, ...fields })}\n`);
 }
@@ -101,6 +109,7 @@ function envFor(sandbox, extra = {}) {
     FUSION_CODEX_STATE: sandbox.stateRoot,
     FUSION_DATA_DIR: sandbox.fusionData,
     GROK_COMPANION_DATA: sandbox.grokData,
+    CURSOR_COMPANION_DATA: sandbox.cursorData,
     CODEX_JOBS_MONITOR_SESSIONS_DIR: sandbox.sessionsDir,
     CODEX_JOBS_MONITOR_INTERVAL_MS: "200",
     ...extra,
@@ -225,7 +234,7 @@ test("the merged monitor observes a terminal Grok job in its recorded workspace"
     repositoryKey,
     source: "grok-job-record"
   });
-  assert.deepStrictEqual(JSON.parse(fs.readFileSync(grokJobsObserverStatePath(env), "utf8")).observedJobIds, ["grok-terminal"]);
+  assert.deepStrictEqual(JSON.parse(fs.readFileSync(engineJobsObserverStatePath("grok", env), "utf8")).observedJobIds, ["grok-terminal"]);
 });
 
 test("a Grok observation does not suppress a Codex notification on the same tick", async (t) => {
@@ -278,8 +287,27 @@ test("a Grok observation produces no stdout", async (t) => {
   const monitor = startMonitor(sandbox, env);
   t.after(() => monitor.child.kill("SIGKILL"));
 
-  await waitUntil(() => fs.existsSync(grokJobsObserverStatePath(env)));
+  await waitUntil(() => fs.existsSync(engineJobsObserverStatePath("grok", env)));
   assert.deepStrictEqual(monitor.lines(), []);
+});
+
+test("Cursor terminal jobs announce their result commands once", async (t) => {
+  const sandbox = makeSandbox(t);
+  const env = envFor(sandbox, { CLAUDE_CODE_SESSION_ID: "own-session" });
+  writeCursorJob(sandbox, sandbox.workDir, "cursor-done", { status: "done", claudeSessionId: "own-session", usage: { inputTokens: 10 } });
+  writeCursorJob(sandbox, sandbox.workDir, "cursor-error", { status: "error", claudeSessionId: "own-session", errorMessage: "request failed", usage: { inputTokens: 2 } });
+  writeCursorJob(sandbox, sandbox.workDir, "cursor-other", { status: "done", claudeSessionId: "other-session", usage: { inputTokens: 3 } });
+  const monitor = startMonitor(sandbox, env);
+  t.after(() => monitor.child.kill("SIGKILL"));
+
+  const lines = await waitUntil(() => monitor.lines().length === 2 ? monitor.lines() : null);
+  assert.deepStrictEqual(lines, [
+    `cursor job cursor-done done. collect with /cursor:result cursor-done; completion notices do not replace collection. ${MONITOR_TAG}`,
+    `cursor job cursor-error error (request failed). collect with /cursor:result cursor-error; completion notices do not replace collection. ${MONITOR_TAG}`
+  ]);
+  await waitUntil(() => readJsonLines(tokenUsageSidecarPath(sandbox.workDir, env)).length === 3);
+  await new Promise((resolve) => setTimeout(resolve, 450));
+  assert.deepStrictEqual(monitor.lines(), lines);
 });
 
 test("a job transitioning to done emits exactly one correctly shaped line", async (t) => {

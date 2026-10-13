@@ -35,6 +35,7 @@ function collectorEnvironment(companion, extra = {}) {
     CLAUDE_CODE_SESSION_ID: `job-collector-test-${process.pid}-${sessionSequence}`,
     FUSION_CODEX_COMPANION: companion,
     FUSION_GROK_COMPANION: companion,
+    FUSION_CURSOR_COMPANION: companion,
     ...extra
   };
 }
@@ -107,6 +108,18 @@ test("supports Grok and JSON companion output", (t) => {
   const output = runCollector(t, companion, { engine: "grok", json: true });
   assert.strictEqual(output.status, 0, output.stderr);
   assert.match(output.stdout, /^\{"status":"done","result":"grok result"\}\ncollector: state=done semantic=unverified engine=grok job=[a-f0-9]{32} elapsed=\d+s\n$/);
+});
+
+test("resolves and collects Cursor through its companion override", (t) => {
+  const root = makeSandbox(t);
+  const companion = writeCompanion(root, {
+    status: '  process.stdout.write("cursor-session: session-1\\njob: " + jobId + "\\nsemantic: unverified\\nstate: done\\n");',
+    result: '  process.stdout.write("cursor result\\n");'
+  });
+  assert.strictEqual(resolveCompanion("cursor", { env: { FUSION_CURSOR_COMPANION: companion } }), companion);
+  const output = runCollector(t, companion, { engine: "cursor" });
+  assert.strictEqual(output.status, 0, output.stderr);
+  assert.match(output.stdout, /^cursor result\ncollector: state=done semantic=unverified engine=cursor job=[a-f0-9]{32} elapsed=\d+s\n$/);
 });
 
 test("accepts engine metadata in the terminal footer", (t) => {

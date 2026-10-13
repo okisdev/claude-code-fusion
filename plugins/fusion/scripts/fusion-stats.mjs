@@ -7,15 +7,14 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { listAuditSegments as listGuardAuditSegments, readAuditEvents as readGuardAuditEvents, resolveAuditDir as resolveGuardAuditDir, resolveStateDir as resolveGuardStateDir, stateFile as guardStateFile } from "./inline-delegation-guard.mjs";
-import { resolveCodexStateDir, resolveCodexStateRoots } from "./lib/codex-state-roots.mjs";
 import { recordEngineAcceptance } from "./lib/engine-acceptance.mjs";
-import { ENGINES, ENGINE_IDS, ENGINE_TERMINAL_STATUSES, engineDisplayName, engineDisplayNameList, isEngineId } from "./lib/engines.mjs";
-import { readEngineJobRecord, resolveGrokDataDir } from "./lib/engine-job-state.mjs";
+import { ENGINES, ENGINE_IDS, ENGINE_TERMINAL_STATUSES, engineDataDir, engineDisplayName, engineDisplayNameList, engineStateRoots, isEngineId } from "./lib/engines.mjs";
+import { readEngineJobRecord } from "./lib/engine-job-state.mjs";
 import { RawArgsTransportError, consumeRawArgsTransport, createRawArgsTransport, splitRawArgs } from "./lib/raw-args-transport.mjs";
 import { MESSAGE_REGISTRY, messageCode, registryEntry, tagMessage } from "./lib/user-messages.mjs";
 import { canonicalWorkerAgentType, isTerminalWorkerStatus, readWorkerRecord, readWorkerRecords, recordWorkerAcceptance, validateWorkerAcceptance } from "./lib/worker-state.mjs";
 
-export { GrokPluginUpgradeRequiredError, newestCodexCompanion, newestGrokCompanion } from "./lib/engine-acceptance.mjs";
+export { EnginePluginUpgradeRequiredError, newestEngineCompanion } from "./lib/engine-acceptance.mjs";
 
 const FUSION_DATA_DIR_ENV = "FUSION_DATA_DIR";
 const CODEX_TERMINAL_STATUSES = ENGINE_TERMINAL_STATUSES;
@@ -440,42 +439,11 @@ export function workspaceRootsShareRepository(leftRoot, rightRoot, cache = new M
   return workspaceRootInScope(leftRoot, rightRoot) || workspaceRootInScope(rightRoot, leftRoot);
 }
 
-function grokStats({ all = false, env = process.env, cwd = process.cwd() } = {}) {
-  return fileBasedEngineStats(FILE_ENGINE_DESCRIPTORS.grok, { all, env, cwd });
-}
-
-function grokStateRoots(env = process.env) {
-  return [path.join(resolveGrokDataDir(env), "state")];
-}
-
-function resolveGrokStateRoot(env = process.env) {
-  return grokStateRoots(env)[0];
-}
-
-function grokJobById(jobId, env) {
-  for (const stateRoot of grokStateRoots(env)) {
-    for (const job of readWorkspaceJobFiles(stateRoot)) {
-      if (nonEmptyString(job?.id) === jobId) {
-        return job;
-      }
-    }
-  }
-  return null;
-}
-
-function codexJobExists(jobId, env) {
-  return readCodexJobEvidence(resolveCodexStateDir(env), { env }).some((job) => nonEmptyString(job?.id) === jobId);
-}
-
-const ENGINE_JOB_LOOKUPS = {
-  codex: codexJobExists,
-  grok: (jobId, env) => grokJobById(jobId, env) !== null
-};
-
 function resolveEngineJob(jobId, env) {
-  const found = ENGINE_IDS.filter((engine) => ENGINE_JOB_LOOKUPS[engine]?.(jobId, env) === true);
+  const found = ENGINE_IDS.filter((engine) => FILE_ENGINE_DESCRIPTORS[engine].enumerateJobs(engineStateRoots(engine, env)[0], { env }).some((job) => nonEmptyString(job?.id) === jobId));
   if (found.length > 1) {
-    throw new Error(`Engine job ${jobId} exists in both ${engineDisplayNameList()} state.`);
+    const names = new Intl.ListFormat("en", { type: "conjunction" }).format(found.map((engine) => engineDisplayName(engine)));
+    throw new Error(`Engine job ${jobId} exists in ${names} state.`);
   }
   if (found.length === 1) {
     return found[0];
@@ -488,8 +456,7 @@ function bump(map, key) {
 }
 
 function resolveStateRoot(descriptor, env) {
-  const override = env[descriptor.stateEnvVar];
-  return override || descriptor.defaultStateRoot(env);
+  return engineStateRoots(descriptor.id, env)[0];
 }
 
 function readWorkspaceJobFiles(stateRoot) {
@@ -594,7 +561,7 @@ function readCodexTerminalLedgerFiles(stateRoot) {
 }
 
 function readCodexJobEvidence(stateRoot, options = {}) {
-  const roots = Object.hasOwn(options, "env") ? resolveCodexStateRoots(options.env) : [stateRoot];
+  const roots = Object.hasOwn(options, "env") ? engineStateRoots("codex", options.env) : [stateRoot];
   return roots.flatMap((root) => [...readWorkspaceJobFiles(root), ...readCodexTerminalLedgerFiles(root)]);
 }
 
@@ -746,10 +713,13 @@ function selectPreferredJobs(jobs, descriptor, include) {
 export const FILE_ENGINE_DESCRIPTORS = {
   grok: {
     id: "grok",
-    defaultStateRoot: resolveGrokStateRoot,
+    displayOrder: 0,
+    defaultStateRoot: (env) => path.join(engineDataDir("grok", env), "state"),
     unavailableReason: "grok plugin job state not found; the grok plugin may not be installed",
     note: "read best effort from Grok job state; totals are lower bounds",
     enumerateJobs: readGrokJobEvidence,
+    requiresJobs: true,
+    requiresScopedJobs: true,
     resolveScope: resolveGitWorkspaceRoot,
     matchesWorkspace(raw, cwd, workspaceRoot, repositoryCache) {
       return workspaceRootsShareRepository(raw?.cwd, workspaceRoot, repositoryCache);
@@ -795,11 +765,18 @@ export const FILE_ENGINE_DESCRIPTORS = {
   },
   codex: {
     id: "codex",
+    displayOrder: 1,
     stateEnvVar: "FUSION_CODEX_STATE",
-    defaultStateRoot: resolveCodexStateDir,
+    defaultStateRoot: (env) => path.join(engineDataDir("codex", env), "state"),
     unavailableReason: "codex plugin job state not found; the codex plugin may not be installed",
     note: "read best effort from Codex job state and retained Fusion terminal ledgers; totals are lower bounds",
     enumerateJobs: readCodexJobEvidence,
+    multiRootState: true,
+    usesAcceptanceEpoch: true,
+    usesSupersededJobs: true,
+    usesSkuTelemetry: true,
+    exposesTransportStatus: true,
+    exposesEvidence: true,
     resolveScope: resolveGitWorkspaceRoot,
     matchesWorkspace(raw, cwd, workspaceRoot, repositoryCache) {
       if (raw?._fusionRepositoryKey) {
@@ -840,6 +817,62 @@ export const FILE_ENGINE_DESCRIPTORS = {
     resolveEffort(raw, observation) {
       return resolveCodexJobEffort(raw, observation);
     }
+  },
+  cursor: {
+    id: "cursor",
+    displayOrder: 2,
+    defaultStateRoot: (env) => path.join(engineDataDir("cursor", env), "state"),
+    unavailableReason: "cursor plugin job state not found; the cursor plugin may not be installed",
+    note: "read best effort from Cursor job state; totals are lower bounds",
+    enumerateJobs: readGrokJobEvidence,
+    requiresJobs: true,
+    requiresScopedJobs: true,
+    resolveScope: resolveGitWorkspaceRoot,
+    matchesWorkspace(raw, cwd, workspaceRoot, repositoryCache) {
+      return workspaceRootsShareRepository(raw?.cwd, workspaceRoot, repositoryCache);
+    },
+    includeByModel: true,
+    includeTokenUsage: true,
+    dedupeById: true,
+    isTerminal: (raw) => ENGINE_TERMINAL_STATUSES.has(raw.status),
+    normalizeJob(raw) {
+      const finished = raw.finishedAt ?? raw.completedAt ?? raw.updatedAt ?? null;
+      let durationSeconds = null;
+      if (raw.status === "done" && raw.createdAt && finished) {
+        const span = (Date.parse(finished) - Date.parse(raw.createdAt)) / 1000;
+        if (Number.isFinite(span) && span >= 0) {
+          durationSeconds = span;
+        }
+      }
+      return {
+        status: raw.status ?? "unknown",
+        kind: raw.role ?? raw.mode ?? raw.jobClass ?? "unknown",
+        createdAt: raw.createdAt ?? null,
+        durationSeconds,
+        evidence: "state"
+      };
+    },
+    resolveModel(raw) {
+      return nonEmptyString(raw?.resolvedModel) ?? "unknown";
+    },
+    resolveEffort(raw) {
+      return raw?.effortApplied === true ? nonEmptyString(raw?.requestedEffort) : null;
+    },
+    resolveMode(raw) {
+      return nonEmptyString(raw?.mode) ?? "unknown";
+    },
+    resolveFailureKind(raw) {
+      if (raw?.status !== "error" && raw?.status !== "cancelled") {
+        return null;
+      }
+      return nonEmptyString(raw?.failureKind) ?? (raw.status === "cancelled" ? "cancelled" : "error");
+    },
+    resolveTokenUsage: cursorTokenUsageForJob,
+    emptyTokenTotals: { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, totalTokens: 0 },
+    resolveBillingPool(raw) {
+      return nonEmptyString(raw?.billingPool);
+    },
+    tokenUsageScope: "terminal jobs only"
   }
 };
 
@@ -1076,6 +1109,30 @@ function grokTokenUsageForJob(raw) {
   return { availability: raw?.usage != null || raw?.modelUsage != null ? "partial" : "unavailable", usage: null };
 }
 
+function cursorTokenUsageForJob(raw) {
+  const value = raw?.usage;
+  if (value == null) {
+    return { availability: "unavailable", usage: null };
+  }
+  if (typeof value !== "object" || Array.isArray(value)) {
+    return { availability: "partial", usage: null };
+  }
+  const fields = ["inputTokens", "outputTokens", "cacheReadTokens", "cacheWriteTokens"].map((field) => integerTokenField(value[field]));
+  if (fields.some((field) => field == null)) {
+    return { availability: "partial", usage: null };
+  }
+  const [input, output, cacheRead, cacheWrite] = fields;
+  const fullInput = BigInt(input) + BigInt(cacheRead) + BigInt(cacheWrite);
+  const total = fullInput + BigInt(output);
+  if (total > BigInt(Number.MAX_SAFE_INTEGER)) {
+    return { availability: "partial", usage: null };
+  }
+  return {
+    availability: "available",
+    usage: { inputTokens: input, outputTokens: output, cacheReadTokens: cacheRead, cacheWriteTokens: cacheWrite, totalTokens: Number(total) }
+  };
+}
+
 function normalizeClaudeWorkerUsage(value) {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
     return null;
@@ -1204,7 +1261,7 @@ function summarizeCodexSkuTelemetry(entries) {
 
 export function fileBasedEngineStats(descriptor, { all = false, env = process.env, cwd = process.cwd() } = {}) {
   const root = resolveStateRoot(descriptor, env);
-  const availableRoots = descriptor.id === "codex" ? resolveCodexStateRoots(env) : [root];
+  const availableRoots = descriptor.multiRootState ? engineStateRoots(descriptor.id, env) : [root];
   if (!availableRoots.some((candidate) => fs.existsSync(candidate))) {
     return { available: false, reason: descriptor.unavailableReason };
   }
@@ -1214,7 +1271,7 @@ export function fileBasedEngineStats(descriptor, { all = false, env = process.en
   } catch (error) {
     return { available: false, reason: error instanceof Error ? error.message : String(error) };
   }
-  if (descriptor.id === "grok" && jobs.length === 0) {
+  if (descriptor.requiresJobs && jobs.length === 0) {
     return { available: false, reason: descriptor.unavailableReason };
   }
   const workspaceRoot = typeof descriptor.resolveScope === "function" ? descriptor.resolveScope(cwd) : cwd;
@@ -1224,7 +1281,7 @@ export function fileBasedEngineStats(descriptor, { all = false, env = process.en
     ? jobs
     : jobs.map((job) => include(job) && !job?._fusionScopeKey ? { ...job, _fusionScopeKey: fusionWorkspaceKey(workspaceRoot) } : job);
   const scoped = selectPreferredJobs(candidates, descriptor, include);
-  if (descriptor.id === "grok" && !all && scoped.length === 0) {
+  if (descriptor.requiresScopedJobs && !all && scoped.length === 0) {
     return { available: false, reason: descriptor.unavailableReason };
   }
   const byStatus = {};
@@ -1241,7 +1298,7 @@ export function fileBasedEngineStats(descriptor, { all = false, env = process.en
   const auditCache = new Map();
   const tokenObservations = descriptor.usesTokenUsageObservations ? loadAllObservationCandidates(env, TOKEN_USAGE_FILENAME, loadTokenUsageObservations) : new Map();
   const observationRepositoryCache = new Map();
-  let tokenTotals = { inputTokens: 0, cachedInputTokens: 0, outputTokens: 0, reasoningOutputTokens: 0, totalTokens: 0 };
+  let tokenTotals = { ...(descriptor.emptyTokenTotals ?? { inputTokens: 0, cachedInputTokens: 0, outputTokens: 0, reasoningOutputTokens: 0, totalTokens: 0 }) };
   let tokenAggregationOverflow = false;
   let jobsWithTokenUsage = 0;
   let jobsWithIncompleteTokenUsage = 0;
@@ -1251,7 +1308,7 @@ export function fileBasedEngineStats(descriptor, { all = false, env = process.en
   const acceptedWithErrorTransport = [];
   const doneWithoutAcceptance = [];
   let historicalAcceptanceAnomalies = 0;
-  const acceptanceEpoch = descriptor.id === "codex" ? resolveAcceptanceEpoch(env) : null;
+  const acceptanceEpoch = descriptor.usesAcceptanceEpoch ? resolveAcceptanceEpoch(env) : null;
   const codexSkuTelemetryEntries = [];
   let durationSum = 0;
   let durationCount = 0;
@@ -1259,7 +1316,7 @@ export function fileBasedEngineStats(descriptor, { all = false, env = process.en
   let latest = null;
   for (const raw of scoped) {
     const job = descriptor.normalizeJob(raw);
-    const acceptance = resolvedEngineAcceptance(raw, descriptor.id, verdicts, descriptor.id === "codex" && isSupersededCodexJob(raw, scoped));
+    const acceptance = resolvedEngineAcceptance(raw, descriptor.id, verdicts, descriptor.usesSupersededJobs && isSupersededCodexJob(raw, scoped));
     const infrastructureKind = verdicts.get(descriptor.id)?.get(raw?.id)?.infrastructureKind ?? null;
     let model = null;
     let effort = null;
@@ -1279,11 +1336,13 @@ export function fileBasedEngineStats(descriptor, { all = false, env = process.en
       const observation = descriptor.usesModelAudit ? observationForJob(raw, env, auditCache) : null;
       model = descriptor.resolveModel(raw, observation);
       effort = typeof descriptor.resolveEffort === "function" ? descriptor.resolveEffort(raw, observation) : null;
-      bump(byModel, effort ? `${model}@${effort}` : model);
+      const modelKey = effort ? `${model}@${effort}` : model;
+      const billingPool = descriptor.resolveBillingPool?.(raw);
+      bump(byModel, billingPool ? `${modelKey} (${billingPool})` : modelKey);
       bump(byEffort, effort ?? "unavailable");
     }
     let codexUsage = null;
-    if (descriptor.id === "codex") {
+    if (descriptor.usesSkuTelemetry) {
       const observation = raw?.id ? scopedObservationForJob(tokenObservations, raw, observationRepositoryCache) : null;
       codexUsage = tokenUsageForJob(raw, observation);
       const createdAtMs = Date.parse(job.createdAt ?? "");
@@ -1291,7 +1350,7 @@ export function fileBasedEngineStats(descriptor, { all = false, env = process.en
         codexSkuTelemetryEntries.push({
           sku: codexSku(model ?? "unknown", effort),
           createdAtMs,
-          terminal: CODEX_TERMINAL_STATUSES.has(job.status),
+          terminal: descriptor.isTerminal(raw),
           acceptance,
           infrastructureKind,
           failureKind: nonEmptyString(raw?.failureKind),
@@ -1311,7 +1370,7 @@ export function fileBasedEngineStats(descriptor, { all = false, env = process.en
     } else {
       pendingTransportJobs += 1;
     }
-    if (descriptor.id === "codex") {
+    if (descriptor.usesAcceptanceEpoch) {
       const jobId = nonEmptyString(raw?.id);
       const historical = Number.isFinite(Date.parse(raw?.finishedAt ?? "")) && Date.parse(raw.finishedAt) < acceptanceEpoch.timestamp;
       if (jobId && job.status === "error" && acceptance === "accepted" && !RESUMABLE_CODEX_FAILURE_KINDS.has(nonEmptyString(raw?.failureKind))) {
@@ -1365,7 +1424,7 @@ export function fileBasedEngineStats(descriptor, { all = false, env = process.en
       }
     }
   }
-  const codexSkuTelemetry = descriptor.id === "codex" ? summarizeCodexSkuTelemetry(codexSkuTelemetryEntries) : null;
+  const codexSkuTelemetry = descriptor.usesSkuTelemetry ? summarizeCodexSkuTelemetry(codexSkuTelemetryEntries) : null;
   return {
     available: true,
     scope: all ? "all" : workspaceRoot,
@@ -1374,7 +1433,7 @@ export function fileBasedEngineStats(descriptor, { all = false, env = process.en
     byAcceptance,
     infrastructureDeaths,
     judgedExcludingInfrastructure,
-    ...(descriptor.id === "codex"
+    ...(descriptor.usesAcceptanceEpoch
       ? {
           byTransportStatus: { ...byStatus },
           acceptanceScope: "terminal transport jobs only",
@@ -1405,7 +1464,7 @@ export function fileBasedEngineStats(descriptor, { all = false, env = process.en
             totals: jobsWithTokenUsage > 0 && !tokenAggregationOverflow ? tokenTotals : null,
             ...(tokenAggregationOverflow ? { aggregationOverflow: true } : {})
           },
-          ...(descriptor.id === "codex"
+          ...(descriptor.exposesEvidence
             ? {
                 evidence: {
                   bySource: byEvidence,
@@ -1581,31 +1640,15 @@ function listWorkspaceEntries(stateRoot) {
     .map((entry) => entry.name);
 }
 
-function readJobFilesInWorkspace(stateRoot, workspace) {
-  const dir = path.join(stateRoot, workspace, "jobs");
-  if (!fs.existsSync(dir)) {
-    return [];
-  }
-  const jobs = [];
-  for (const entry of fs.readdirSync(dir)) {
-    if (!entry.endsWith(".json")) {
-      continue;
-    }
-    try {
-      jobs.push(JSON.parse(fs.readFileSync(path.join(dir, entry), "utf8")));
-    } catch {
-      void 0;
-    }
-  }
-  return jobs;
-}
-
 export const WORKSPACE_ENGINE_DESCRIPTORS = [
   {
     id: "grok",
     displayName: ENGINES.grok.displayName,
-    unavailableReason: "grok plugin job state not found; the grok plugin may not be installed",
-    resolveRoot: (env) => path.join(resolveGrokDataDir(env), "state"),
+    unavailableReason: FILE_ENGINE_DESCRIPTORS.grok.unavailableReason,
+    resolveRoot: (env) => engineStateRoots("grok", env)[0],
+    enumerateJobs: readGrokJobEvidence,
+    traceModel: (raw) => nonEmptyString(raw?.request?.model),
+    traceEffort: (raw) => nonEmptyString(raw?.request?.effort),
     cwdOf: (raw) => (typeof raw.cwd === "string" ? raw.cwd : null),
     sessionOf: (raw) => (typeof raw.claudeSessionId === "string" ? raw.claudeSessionId : null),
     isLive: (raw) => !GROK_TERMINAL_STATUSES.has(raw.status)
@@ -1614,12 +1657,31 @@ export const WORKSPACE_ENGINE_DESCRIPTORS = [
     id: "codex",
     displayName: ENGINES.codex.displayName,
     unavailableReason: FILE_ENGINE_DESCRIPTORS.codex.unavailableReason,
-    resolveRoot: (env) => resolveStateRoot(FILE_ENGINE_DESCRIPTORS.codex, env),
+    resolveRoot: (env) => engineStateRoots("codex", env)[0],
+    enumerateJobs: readCodexJobEvidence,
+    multiRootState: true,
+    usesSupersededJobs: true,
+    exposesTransportStatus: true,
+    traceApproximate: true,
+    traceModel: (raw, env, auditCache) => resolveCodexJobModel(raw, observationForJob(raw, env, auditCache)),
+    traceEffort: (raw, env, auditCache) => resolveCodexJobEffort(raw, observationForJob(raw, env, auditCache)),
     cwdOf: (raw) => (typeof raw.workspaceRoot === "string" ? raw.workspaceRoot : null),
     sessionOf: (raw) => nonEmptyString(raw?.sessionId) ?? nonEmptyString(raw?.claudeSessionId),
     isLive: (raw) => !CODEX_TERMINAL_STATUSES.has(raw.status),
     dedupeById: true,
     isTerminal: (raw) => CODEX_TERMINAL_STATUSES.has(raw.status)
+  },
+  {
+    id: "cursor",
+    displayName: ENGINES.cursor.displayName,
+    unavailableReason: FILE_ENGINE_DESCRIPTORS.cursor.unavailableReason,
+    resolveRoot: (env) => engineStateRoots("cursor", env)[0],
+    enumerateJobs: readGrokJobEvidence,
+    traceModel: (raw) => nonEmptyString(raw?.resolvedModel),
+    traceEffort: (raw) => raw?.effortApplied === true ? nonEmptyString(raw?.requestedEffort) : null,
+    cwdOf: (raw) => (typeof raw.cwd === "string" ? raw.cwd : null),
+    sessionOf: (raw) => (typeof raw.claudeSessionId === "string" ? raw.claudeSessionId : null),
+    isLive: (raw) => !ENGINE_TERMINAL_STATUSES.has(raw.status)
   }
 ];
 
@@ -1789,19 +1851,12 @@ function traceWorkspaceJobs(descriptor, env) {
     return [];
   }
   const root = descriptor.resolveRoot(env);
-  const availableRoots = descriptor.id === "codex" ? resolveCodexStateRoots(env) : [root];
+  const availableRoots = descriptor.multiRootState ? engineStateRoots(descriptor.id, env) : [root];
   if (!availableRoots.some((candidate) => fs.existsSync(candidate))) {
     return [];
   }
   try {
-    if (descriptor.id === "codex") {
-      return readCodexJobEvidence(root, { env });
-    }
-    const jobs = [];
-    for (const workspace of listWorkspaceEntries(root)) {
-      jobs.push(...readJobFilesInWorkspace(root, workspace));
-    }
-    return jobs;
+    return descriptor.enumerateJobs(root, { env });
   } catch {
     return [];
   }
@@ -1878,39 +1933,23 @@ export function buildTraceReport({ env = process.env, cwd = process.cwd(), sessi
       status: record.transportStatus ?? "unknown"
     });
   }
-  const grokDescriptor = WORKSPACE_ENGINE_DESCRIPTORS.find((descriptor) => descriptor.id === "grok");
-  if (grokDescriptor) {
-    for (const raw of traceWorkspaceJobs(grokDescriptor, env)) {
-      if (raw?.claudeSessionId !== sessionId) {
-        continue;
-      }
-      const model = nonEmptyString(raw?.request?.model);
-      const effort = nonEmptyString(raw?.request?.effort);
-      const entry = engineTraceEntry(raw, { engine: "grok", join: "exact", model, effort });
-      if (entry) {
-        timeline.push(entry);
-      }
-    }
-  }
-
   const span = traceSpan(dispatches);
-  const codexDescriptor = WORKSPACE_ENGINE_DESCRIPTORS.find((descriptor) => descriptor.id === "codex");
-  if (codexDescriptor) {
+  for (const descriptor of WORKSPACE_ENGINE_DESCRIPTORS) {
     const repositoryCache = new Map();
-    const codexJobs = traceWorkspaceJobs(codexDescriptor, env).filter((raw) => FILE_ENGINE_DESCRIPTORS.codex.matchesWorkspace(raw, cwd, gitRoot, repositoryCache));
+    const jobs = traceWorkspaceJobs(descriptor, env).filter((raw) => !descriptor.traceApproximate || FILE_ENGINE_DESCRIPTORS[descriptor.id].matchesWorkspace(raw, cwd, gitRoot, repositoryCache));
     const auditCache = new Map();
-    for (const raw of selectPreferredJobs(codexJobs, FILE_ENGINE_DESCRIPTORS.codex, () => true)) {
-      const recordedSessionId = nonEmptyString(raw?.sessionId) ?? nonEmptyString(raw?.claudeSessionId);
+    const selected = descriptor.traceApproximate ? selectPreferredJobs(jobs, FILE_ENGINE_DESCRIPTORS[descriptor.id], () => true) : jobs;
+    for (const raw of selected) {
+      const recordedSessionId = descriptor.sessionOf(raw);
       const createdAt = traceTimestamp(raw?.createdAt);
       const exact = recordedSessionId === sessionId;
-      const approximate = !recordedSessionId && span && createdAt != null && createdAt >= span.start && createdAt <= span.end;
+      const approximate = descriptor.traceApproximate && !recordedSessionId && span && createdAt != null && createdAt >= span.start && createdAt <= span.end;
       if (!exact && !approximate) {
         continue;
       }
-      const observation = observationForJob(raw, env, auditCache);
-      const model = resolveCodexJobModel(raw, observation);
-      const effort = resolveCodexJobEffort(raw, observation);
-      const entry = engineTraceEntry(raw, { engine: "codex", join: exact ? "exact" : "approximate", model, effort });
+      const model = descriptor.traceModel(raw, env, auditCache);
+      const effort = descriptor.traceEffort(raw, env, auditCache);
+      const entry = engineTraceEntry(raw, { engine: descriptor.id, join: exact ? "exact" : "approximate", model, effort });
       if (entry) {
         timeline.push(entry);
       }
@@ -1946,7 +1985,7 @@ function renderTraceReport(report) {
 
 function sessionScopedEngineStats(descriptor, sessionId, env) {
   const root = descriptor.resolveRoot(env);
-  const availableRoots = descriptor.id === "codex" ? resolveCodexStateRoots(env) : [root];
+  const availableRoots = descriptor.multiRootState ? engineStateRoots(descriptor.id, env) : [root];
   if (!availableRoots.some((candidate) => fs.existsSync(candidate))) {
     return { available: false, reason: descriptor.unavailableReason };
   }
@@ -1958,25 +1997,15 @@ function sessionScopedEngineStats(descriptor, sessionId, env) {
   let totalJobs = 0;
   let pendingTransportJobs = 0;
   if (sessionId) {
-    let jobs;
-    if (descriptor.id === "codex") {
-      jobs = readCodexJobEvidence(root, { env });
-    } else {
-      jobs = [];
-      for (const workspace of listWorkspaceEntries(root)) {
-        for (const raw of readJobFilesInWorkspace(root, workspace)) {
-          jobs.push(raw);
-        }
-      }
-    }
-    const codexJobs = descriptor.id === "codex" ? selectPreferredJobs(jobs, descriptor, () => true) : [];
+    const jobs = descriptor.enumerateJobs(root, { env });
+    const preferredJobs = descriptor.usesSupersededJobs ? selectPreferredJobs(jobs, descriptor, () => true) : [];
     const scoped = selectPreferredJobs(jobs, descriptor, (raw) => descriptor.sessionOf(raw) === sessionId);
     totalJobs = scoped.length;
     for (const raw of scoped) {
       const status = raw.status ?? "unknown";
       bump(byStatus, status);
-      if ((descriptor.id === "codex" ? CODEX_TERMINAL_STATUSES : GROK_TERMINAL_STATUSES).has(status)) {
-        const acceptance = resolvedEngineAcceptance(raw, descriptor.id, verdicts, descriptor.id === "codex" && isSupersededCodexJob(raw, codexJobs));
+      if (ENGINE_TERMINAL_STATUSES.has(status)) {
+        const acceptance = resolvedEngineAcceptance(raw, descriptor.id, verdicts, descriptor.usesSupersededJobs && isSupersededCodexJob(raw, preferredJobs));
         const infrastructureKind = verdicts.get(descriptor.id)?.get(raw?.id)?.infrastructureKind ?? null;
         bump(byAcceptance, acceptance);
         countJudged(judgedExcludingInfrastructure, acceptance, infrastructureKind);
@@ -1998,7 +2027,7 @@ function sessionScopedEngineStats(descriptor, sessionId, env) {
     judgedExcludingInfrastructure,
     acceptanceScope: "terminal transport jobs only",
     pendingTransportJobs,
-    ...(descriptor.id === "codex" ? { byTransportStatus: { ...byStatus } } : {})
+    ...(descriptor.exposesTransportStatus ? { byTransportStatus: { ...byStatus } } : {})
   };
 }
 
@@ -2240,16 +2269,11 @@ export const STATS_PROVIDER_REGISTRY = [
     displayName: "Claude workers",
     collect: (options) => claudeWorkerStats(options)
   },
-  {
-    id: "grok",
-    displayName: ENGINES.grok.displayName,
-    collect: (options) => fileBasedEngineStats(FILE_ENGINE_DESCRIPTORS.grok, options)
-  },
-  {
-    id: "codex",
-    displayName: ENGINES.codex.displayName,
-    collect: (options) => fileBasedEngineStats(FILE_ENGINE_DESCRIPTORS.codex, options)
-  }
+  ...ENGINE_IDS.map((id) => ({
+    id,
+    displayName: ENGINES[id].displayName,
+    collect: (options) => fileBasedEngineStats(FILE_ENGINE_DESCRIPTORS[id], options)
+  })).sort((left, right) => FILE_ENGINE_DESCRIPTORS[left.id].displayOrder - FILE_ENGINE_DESCRIPTORS[right.id].displayOrder)
 ];
 
 function renderCounts(lines, title, map) {
@@ -2359,7 +2383,10 @@ function renderEngine(lines, name, stats) {
     const unreported = stats.tokenUsage.jobsWithUnreportedUsage ?? Math.max(0, stats.tokenUsage.jobsWithoutUsage - incomplete);
     lines.push("", `Exact token usage coverage${scope}: ${stats.tokenUsage.availability} (${stats.tokenUsage.jobsWithUsage} complete, ${incomplete} incomplete, ${unreported} unreported)`);
     if (stats.tokenUsage.totals) {
-      lines.push(`Observed tokens: ${stats.tokenUsage.totals.totalTokens} total, ${stats.tokenUsage.totals.inputTokens} input, ${stats.tokenUsage.totals.cachedInputTokens} cached input, ${stats.tokenUsage.totals.outputTokens} output, ${stats.tokenUsage.totals.reasoningOutputTokens} reasoning output`);
+      const totals = stats.tokenUsage.totals;
+      lines.push(Object.hasOwn(totals, "cacheWriteTokens")
+        ? `Observed tokens: ${totals.totalTokens} total, ${totals.inputTokens} input, ${totals.cacheReadTokens} cache read, ${totals.cacheWriteTokens} cache write, ${totals.outputTokens} output`
+        : `Observed tokens: ${totals.totalTokens} total, ${totals.inputTokens} input, ${totals.cachedInputTokens} cached input, ${totals.outputTokens} output, ${totals.reasoningOutputTokens} reasoning output`);
     }
   }
   if (stats.usageCoverage || Object.hasOwn(stats, "usage")) {
@@ -2784,7 +2811,9 @@ export function renderFusionStats(report) {
       renderEngine(lines, provider.displayName, report[provider.id]);
     }
   }
-  renderLaneSignalDrift(lines, report.codex?.laneSignalDrift);
+  for (const provider of STATS_PROVIDER_REGISTRY) {
+    renderLaneSignalDrift(lines, report[provider.id]?.laneSignalDrift);
+  }
   renderFleetUsageStats(lines, report.fleet);
   renderCoercionLedger(lines, report.coercionLedger);
   lines.push("", "Peer token totals include only jobs with exact reported usage. Unavailable jobs are never estimated.");
@@ -2825,7 +2854,7 @@ function unsettledEngineEntries(descriptor, env) {
     if (!descriptor.isTerminal(raw)) {
       return [];
     }
-    const acceptance = descriptor.id === "codex" ? semanticAcceptance(raw, isSupersededCodexJob(raw, scoped)) : semanticAcceptance(raw);
+    const acceptance = semanticAcceptance(raw, descriptor.usesSupersededJobs && isSupersededCodexJob(raw, scoped));
     if (acceptance !== "unverified") {
       return [];
     }
@@ -2839,7 +2868,7 @@ function unsettledEngineEntries(descriptor, env) {
       kind: descriptor.normalizeJob(raw).kind,
       finishedAt: unsettledFinishedAt(raw),
       acceptance: "unverified",
-      ...(descriptor.id === "codex" ? acceptanceProvenance(raw) : {})
+      ...(descriptor.usesSupersededJobs ? acceptanceProvenance(raw) : {})
     }];
   });
 }
@@ -2847,8 +2876,7 @@ function unsettledEngineEntries(descriptor, env) {
 function buildUnsettledReport({ env = process.env } = {}) {
   const unsettled = [
     ...unsettledWorkerEntries(env),
-    ...unsettledEngineEntries(FILE_ENGINE_DESCRIPTORS.grok, env),
-    ...unsettledEngineEntries(FILE_ENGINE_DESCRIPTORS.codex, env)
+    ...ENGINE_IDS.flatMap((id) => unsettledEngineEntries(FILE_ENGINE_DESCRIPTORS[id], env))
   ].sort((left, right) => unsettledTimestamp(right) - unsettledTimestamp(left));
   return { unsettled };
 }

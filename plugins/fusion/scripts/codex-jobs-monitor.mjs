@@ -19,8 +19,8 @@ import {
   tokenUsageSidecarPath,
   workspaceRootsShareRepository
 } from "./fusion-stats.mjs";
-import { observeGrokJobsSafely } from "./grok-jobs-observer.mjs";
-import { ENGINE_TERMINAL_STATUSES, engineResultCommand } from "./lib/engines.mjs";
+import { observeEngineJobsSafely } from "./engine-jobs-observer.mjs";
+import { ENGINES, ENGINE_IDS, ENGINE_TERMINAL_STATUSES, engineResultCommand } from "./lib/engines.mjs";
 import { tagMessage } from "./lib/user-messages.mjs";
 
 const TERMINAL_STATUSES = ENGINE_TERMINAL_STATUSES;
@@ -197,12 +197,23 @@ function truncateErrorMessage(message) {
   return `${firstLine.slice(0, ERROR_MESSAGE_MAX_LENGTH)}...`;
 }
 
-function formatOutcomeLine(record) {
+function formatOutcomeLine(record, engine = "codex") {
   const isFailureLike = record.status === "error" || record.status === "failed" || record.status === "cancelled";
   const truncated = isFailureLike && record.errorMessage ? truncateErrorMessage(record.errorMessage) : "";
   const failureMessage = truncated.endsWith("...") ? truncated : truncated.replace(/[.!?]+$/, "");
   const failureSuffix = failureMessage ? ` (${failureMessage})` : "";
-  return `codex job ${record.id} ${record.status}${failureSuffix}. collect with ${engineResultCommand("codex", record.id)}; completion notices do not replace collection.`;
+  return `${ENGINES[engine].displayName.toLowerCase()} job ${record.id} ${record.status}${failureSuffix}. collect with ${engineResultCommand(engine, record.id)}; completion notices do not replace collection.`;
+}
+
+function observePeerJobs() {
+  for (const engine of ENGINE_IDS) {
+    if (engine === "codex") {
+      continue;
+    }
+    observeEngineJobsSafely(engine, {
+      notify: ENGINES[engine].ownMonitor ? undefined : (record) => safeWriteLine(formatOutcomeLine(record, engine))
+    });
+  }
 }
 
 function shouldAnnounceTerminal(record) {
@@ -928,7 +939,7 @@ async function main() {
     }
   } catch {}
   try {
-    observeGrokJobsSafely();
+    observePeerJobs();
   } catch {}
 
   timer = setInterval(() => {
@@ -936,7 +947,7 @@ async function main() {
       processSnapshot(readWorkspaceJobsSnapshot(root, workspaceRoot, repositoryCache));
     } catch {}
     try {
-      observeGrokJobsSafely();
+      observePeerJobs();
     } catch {}
   }, resolvePollIntervalMs());
 }

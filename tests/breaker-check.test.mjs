@@ -4,7 +4,8 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { test } from "node:test";
-import { advisoryLine, codexFailureKind, resolveCodexStateDir, resolveCodexStateRoots } from "../plugins/fusion/scripts/breaker-check.mjs";
+import { advisoryLine, codexFailureKind } from "../plugins/fusion/scripts/breaker-check.mjs";
+import { engineStateRoots } from "../plugins/fusion/scripts/lib/engines.mjs";
 import { messageTag } from "../plugins/fusion/scripts/lib/user-messages.mjs";
 
 const repoRoot = path.join(import.meta.dirname, "..");
@@ -22,6 +23,7 @@ function makeSandbox(t) {
     workerState: path.join(root, "worker-state"),
     dataDir: path.join(root, "fusion-data"),
     grokData: path.join(root, "grok-data"),
+    cursorData: path.join(root, "cursor-data"),
     codexState: path.join(root, "codex-state")
   };
 }
@@ -38,7 +40,7 @@ function writeRecord(file, record) {
 function envFor(sandbox, extra = {}) {
   const inherited = Object.fromEntries(
     Object.entries(process.env).filter(
-      ([key]) => key !== "HOME" && key !== "CLAUDE_CODE_SESSION_ID" && !/^(?:FUSION|GROK|CODEX)_/.test(key)
+      ([key]) => key !== "HOME" && key !== "CLAUDE_CODE_SESSION_ID" && !/^(?:FUSION|GROK|CODEX|CURSOR)_/.test(key)
     )
   );
   return {
@@ -49,6 +51,7 @@ function envFor(sandbox, extra = {}) {
     FUSION_CODEX_STATE: sandbox.codexState,
     FUSION_CODEX_STATE_DIR: sandbox.codexState,
     GROK_COMPANION_DATA: sandbox.grokData,
+    CURSOR_COMPANION_DATA: sandbox.cursorData,
     ...extra
   };
 }
@@ -278,6 +281,22 @@ test("rate limits from different providers do not combine", (t) => {
   assert.strictEqual(result.status, 0);
   assert.strictEqual(result.stdout, "");
   assert.strictEqual(result.stderr, "");
+});
+
+test("Grok and Codex advisories retain their existing order", (t) => {
+  const sandbox = makeSandbox(t);
+  const finishedAt = new Date(Date.now() - 2 * 60000).toISOString();
+  writeRecord(jobFile(path.join(sandbox.grokData, "state"), "workspace", "grok-auth"), {
+    status: "error",
+    failureKind: "auth",
+    finishedAt
+  });
+  writeRecord(jobFile(sandbox.codexState, "workspace", "codex-auth"), {
+    status: "error",
+    failureKind: "auth",
+    finishedAt
+  });
+  assert.match(run(sandbox).stdout, /^fusion breaker advisory: treat the grok breaker.*\nfusion breaker advisory: treat the codex breaker/);
 });
 
 test("two Grok rate limits inside the configured window open only the Grok breaker", (t) => {
@@ -531,14 +550,127 @@ test("a typed non-breaker Codex error is not reclassified from diagnostic text",
 });
 
 test("Codex state resolution uses configured canonical state sources", () => {
-  assert.strictEqual(resolveCodexStateDir({ FUSION_CODEX_STATE: "/canonical" }), "/canonical");
-  assert.strictEqual(resolveCodexStateDir({ CODEX_COMPANION_DATA: "/adapter-data" }), "/adapter-data/state");
-  assert.strictEqual(resolveCodexStateDir({}), path.join(os.homedir(), ".claude", "plugins", "data", "codex-claude-code-fusion", "state"));
-  assert.deepStrictEqual(resolveCodexStateRoots({ HOME: "/test-home" }), ["/test-home/.claude/plugins/data/codex-claude-code-fusion/state"]);
-  assert.deepStrictEqual(resolveCodexStateRoots({ HOME: "/test-home", FUSION_CODEX_STATE: "/override" }), ["/override"]);
-  assert.deepStrictEqual(resolveCodexStateRoots({ HOME: "/test-home", CODEX_COMPANION_DATA: "/adapter" }), ["/adapter/state"]);
-  assert.deepStrictEqual(resolveCodexStateRoots({ HOME: "/test-home", FUSION_CODEX_STATE: "relative-override" }), ["/test-home/.claude/plugins/data/codex-claude-code-fusion/state"]);
-  assert.deepStrictEqual(resolveCodexStateRoots({ HOME: "/test-home", CODEX_COMPANION_DATA: "relative-adapter" }), ["/test-home/.claude/plugins/data/codex-claude-code-fusion/state"]);
+  assert.strictEqual(engineStateRoots("codex", { FUSION_CODEX_STATE: "/canonical" })[0], "/canonical");
+  assert.strictEqual(engineStateRoots("codex", { CODEX_COMPANION_DATA: "/adapter-data" })[0], "/adapter-data/state");
+  assert.strictEqual(engineStateRoots("codex", {})[0], path.join(os.homedir(), ".claude", "plugins", "data", "codex-claude-code-fusion", "state"));
+  assert.deepStrictEqual(engineStateRoots("codex", { HOME: "/test-home" }), ["/test-home/.claude/plugins/data/codex-claude-code-fusion/state"]);
+  assert.deepStrictEqual(engineStateRoots("codex", { HOME: "/test-home", FUSION_CODEX_STATE: "/override" }), ["/override"]);
+  assert.deepStrictEqual(engineStateRoots("codex", { HOME: "/test-home", CODEX_COMPANION_DATA: "/adapter" }), ["/adapter/state"]);
+  assert.deepStrictEqual(engineStateRoots("codex", { HOME: "/test-home", FUSION_CODEX_STATE: "relative-override" }), ["/test-home/.claude/plugins/data/codex-claude-code-fusion/state"]);
+  assert.deepStrictEqual(engineStateRoots("codex", { HOME: "/test-home", CODEX_COMPANION_DATA: "relative-adapter" }), ["/test-home/.claude/plugins/data/codex-claude-code-fusion/state"]);
+});
+
+test("Cursor quota opens only its billing pool until that pool succeeds", (t) => {
+  const sandbox = makeSandbox(t);
+  const root = engineStateRoots("cursor", envFor(sandbox))[0];
+  writeRecord(jobFile(root, "workspace", "api-quota"), {
+    id: "api-quota",
+    status: "error",
+    failureKind: "quota",
+    billingPool: "api",
+    finishedAt: new Date(Date.now() - 4 * 60000).toISOString()
+  });
+  const opened = run(sandbox);
+  assert.strictEqual(opened.status, 0);
+  assert.match(opened.stdout, /treat the cursor api pool breaker as open.*last failure quota.*1 quota across 1 terminal jobs/);
+  assert.doesNotMatch(opened.stdout, /treat the cursor breaker as open|first-party pool breaker/);
+
+  writeRecord(jobFile(root, "workspace", "first-party-success"), {
+    id: "first-party-success",
+    status: "done",
+    billingPool: "first-party",
+    finishedAt: new Date(Date.now() - 3 * 60000).toISOString()
+  });
+  assert.match(run(sandbox).stdout, /treat the cursor api pool breaker as open.*1 quota across 1 terminal jobs/);
+
+  writeRecord(jobFile(root, "workspace", "api-success"), {
+    id: "api-success",
+    status: "done",
+    billingPool: "api",
+    finishedAt: new Date(Date.now() - 2 * 60000).toISOString()
+  });
+  assert.strictEqual(run(sandbox).stdout, "");
+});
+
+test("Cursor rate limits require two failures in one pool", (t) => {
+  const sandbox = makeSandbox(t);
+  const root = engineStateRoots("cursor", envFor(sandbox))[0];
+  for (const [id, billingPool, minutesAgo] of [["api-first", "api", 4], ["first-party", "first-party", 3], ["api-second", "api", 2]]) {
+    writeRecord(jobFile(root, "workspace", id), {
+      status: "error",
+      failureKind: "rate_limited",
+      billingPool,
+      finishedAt: new Date(Date.now() - minutesAgo * 60000).toISOString()
+    });
+    if (id !== "api-second") {
+      assert.strictEqual(run(sandbox).stdout, "");
+    }
+  }
+  const result = run(sandbox);
+  assert.match(result.stdout, /treat the cursor api pool breaker as open.*2 rate_limited across 2 terminal jobs/);
+  assert.doesNotMatch(result.stdout, /first-party pool breaker|treat the cursor breaker as open/);
+});
+
+test("An engine failure does not interrupt a pool's rate limit sequence", (t) => {
+  const sandbox = makeSandbox(t);
+  const root = engineStateRoots("cursor", envFor(sandbox))[0];
+  for (const [id, failureKind, minutesAgo] of [["rate-first", "rate_limited", 4], ["auth", "auth", 3], ["rate-second", "rate_limited", 2]]) {
+    writeRecord(jobFile(root, "workspace", id), {
+      status: "error",
+      failureKind,
+      billingPool: "api",
+      finishedAt: new Date(Date.now() - minutesAgo * 60000).toISOString()
+    });
+  }
+  const result = run(sandbox);
+  assert.match(result.stdout, /treat the cursor breaker as open.*last failure auth/);
+  assert.match(result.stdout, /treat the cursor api pool breaker as open.*2 rate_limited across 3 terminal jobs/);
+});
+
+test("Cursor authentication failure opens the engine breaker across pools", (t) => {
+  const sandbox = makeSandbox(t);
+  const root = engineStateRoots("cursor", envFor(sandbox))[0];
+  writeRecord(jobFile(root, "workspace", "auth"), {
+    status: "error",
+    failureKind: "auth",
+    billingPool: "api",
+    finishedAt: new Date(Date.now() - 3 * 60000).toISOString()
+  });
+  assert.match(run(sandbox).stdout, /treat the cursor breaker as open.*last failure auth/);
+  writeRecord(jobFile(root, "workspace", "recovered"), {
+    status: "done",
+    billingPool: "first-party",
+    finishedAt: new Date(Date.now() - 2 * 60000).toISOString()
+  });
+  assert.strictEqual(run(sandbox).stdout, "");
+});
+
+test("Cursor setup failure opens immediately and version drift is reported", (t) => {
+  const sandbox = makeSandbox(t);
+  const root = engineStateRoots("cursor", envFor(sandbox))[0];
+  writeRecord(jobFile(root, "workspace", "setup"), {
+    status: "error",
+    failureKind: "setup",
+    billingPool: "api",
+    cursorVersion: "2026.10.02-abcdef0",
+    finishedAt: new Date(Date.now() - 2 * 60000).toISOString()
+  });
+  const result = run(sandbox);
+  assert.strictEqual(result.status, 0);
+  assert.match(result.stdout, /treat the cursor breaker as open.*last failure setup.*1 setup across 1 terminal jobs/);
+  assert.match(result.stdout, /; cursor 2026\.10\.02-abcdef0 installed, contract verified on 2026\.10\.01-e373342/);
+  assert.doesNotMatch(result.stdout, /cursor api pool breaker/);
+});
+
+test("Codex version drift uses the registry verified version key", (t) => {
+  const sandbox = makeSandbox(t);
+  writeRecord(jobFile(sandbox.codexState, "workspace", "auth"), {
+    status: "error",
+    failureKind: "auth",
+    codexVersion: "0.158.0",
+    finishedAt: new Date(Date.now() - 2 * 60000).toISOString()
+  });
+  assert.match(run(sandbox).stdout, /; codex 0\.158\.0 installed, contract verified on 0\.157\.1/);
 });
 
 test("a failure outside the lookback window is silent", (t) => {
