@@ -116,7 +116,13 @@
       const now = new Date(Date.now() + 1000);
       fs.utimesSync(process.env.FAKE_GROK_MODELS_TOUCH, now, now);
     }
-    process.exit(0);
+    if (process.env.FAKE_GROK_MODELS_OUTPUT) {
+      process.stdout.write(process.env.FAKE_GROK_MODELS_OUTPUT);
+    }
+    if (process.env.FAKE_GROK_MODELS_STDERR) {
+      process.stderr.write(process.env.FAKE_GROK_MODELS_STDERR);
+    }
+    process.exit(Number(process.env.FAKE_GROK_MODELS_EXIT_CODE ?? "0"));
   }
 
   const mode = process.env.FAKE_GROK_MODE || "ok";

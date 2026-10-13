@@ -131,6 +131,7 @@ function printUsage() {
       "  node scripts/codex-companion.mjs cancel <job-id> [--cwd <dir>] [--json]",
       "  node scripts/codex-companion.mjs record-acceptance --job-id <32 lowercase hex> --acceptance <accepted|rejected|unverified> [--reason <text>] [--failure-kind <intent_override|scope_rewrite|wrong_approach|style_mismatch>] [--source <collector|main-loop|stats>] [--accept-failed-transport]",
       "  node scripts/codex-companion.mjs history [--json]",
+      "  node scripts/codex-companion.mjs models [--json]",
       "  node scripts/codex-companion.mjs setup [--cwd <dir>] [--json]"
     ].join("\n") + "\n"
   );
@@ -172,16 +173,17 @@ function recordAcceptanceArgs(argv) {
   const options = {};
   for (let index = 0; index < argv.length; index += 1) {
     const token = argv[index];
-    if (token === "--accept-failed-transport") {
-      if (options.acceptFailedTransport) {
-        throw new CompanionError("The --accept-failed-transport option may be provided only once.", "input");
+    if (token === "--accept-failed-transport" || token === "--json") {
+      const flag = token === "--json" ? "json" : "acceptFailedTransport";
+      if (options[flag]) {
+        throw new CompanionError(`The ${token} option may be provided only once.`, "input");
       }
-      options.acceptFailedTransport = true;
+      options[flag] = true;
       continue;
     }
     const key = token === "--job-id" ? "jobId" : token === "--acceptance" ? "acceptance" : token === "--reason" ? "reason" : token === "--failure-kind" ? "failureKind" : token === "--source" ? "source" : null;
     if (!key) {
-      throw new CompanionError("The record-acceptance command accepts only --job-id, --acceptance, --reason, --failure-kind, --source, and --accept-failed-transport.", "input");
+      throw new CompanionError("The record-acceptance command accepts only --job-id, --acceptance, --reason, --failure-kind, --source, --accept-failed-transport, and --json.", "input");
     }
     if (Object.hasOwn(options, key)) {
       throw new CompanionError(`${token} may be provided only once.`, "input");
@@ -221,6 +223,41 @@ function output(value, asJson = false) {
     return;
   }
   process.stdout.write(String(value));
+}
+
+function handleModels(argv) {
+  if (argv.length > 1 || (argv.length === 1 && argv[0] !== "--json")) {
+    throw new CompanionError("The models command accepts only --json.", "input");
+  }
+  const override = process.env.FUSION_CODEX_MODELS_CACHE;
+  const filePath = override?.trim() ? path.resolve(override.trim()) : path.join(os.homedir(), ".codex", "models_cache.json");
+  let data;
+  try {
+    data = JSON.parse(fs.readFileSync(filePath, "utf8"));
+    if (!data || typeof data !== "object" || Array.isArray(data) || !Array.isArray(data.models)) {
+      throw new Error("Expected a JSON object with a models array.");
+    }
+  } catch (error) {
+    const message = `Could not read Codex models cache ${filePath}: ${error.message}`;
+    process.stderr.write(argv[0] === "--json" ? `${JSON.stringify({ status: "error", failureKind: "input", message }, null, 2)}\n` : `${message}\nstate: error\nfailure: input\n`);
+    process.exitCode = 1;
+    return;
+  }
+  const models = new Map();
+  for (const entry of data.models) {
+    const id = typeof entry === "string" ? entry.trim() : entry && typeof entry === "object" && !Array.isArray(entry)
+      ? [entry.slug, entry.id].find((value) => typeof value === "string" && value.trim())?.trim()
+      : null;
+    if (!id) {
+      continue;
+    }
+    const displayName = [entry?.display_name, entry?.displayName, entry?.name].find((value) => typeof value === "string" && value.trim())?.trim() ?? null;
+    if (!models.has(id) || (!models.get(id).displayName && displayName)) {
+      models.set(id, { id, displayName });
+    }
+  }
+  const listing = [...models.values()];
+  output(argv[0] === "--json" ? { engine: "codex", models: listing, source: filePath } : `${listing.map((model) => model.id).join("\n")}${listing.length ? "\n" : ""}`, argv[0] === "--json");
 }
 
 function resolveCwd(options = {}) {
@@ -2287,7 +2324,7 @@ async function handleCancel(rawArgv) {
 }
 
 async function handleRecordAcceptance(argv) {
-  const { acceptance, acceptFailedTransport, failureKind, jobId, reason, source } = recordAcceptanceArgs(argv);
+  const { acceptance, acceptFailedTransport, failureKind, jobId, json, reason, source } = recordAcceptanceArgs(argv);
   const found = findJobRecordById(resolveDataDir(), jobId);
   if (!found) {
     throw new CompanionError(`No job record found for ${jobId}.`, "input");
@@ -2313,6 +2350,10 @@ async function handleRecordAcceptance(argv) {
       semanticStatus: acceptance
     };
   }, { allowTerminal: true });
+  if (json) {
+    output(`${JSON.stringify({ id: record.id, semanticStatus: record.semanticStatus, semanticFailureKind: record.semanticFailureKind ?? null, acceptanceSource: record.acceptanceSource ?? null }, null, 2)}\n`);
+    return;
+  }
   output(`Recorded verdict for Codex job ${record.id}: ${record.semanticStatus}.\n`);
 }
 
@@ -2502,6 +2543,9 @@ async function main() {
       break;
     case "history":
       await handleHistory(rawArgv);
+      break;
+    case "models":
+      handleModels(rawArgv);
       break;
     case "result":
       await handleResult(rawArgv);
