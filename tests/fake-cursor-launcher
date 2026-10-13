@@ -1,0 +1,3 @@
+#!/bin/bash
+sleep 0.5
+exec -a "$0" node "$(dirname "$0")/fake-cursor" "$@"

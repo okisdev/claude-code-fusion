@@ -1,0 +1,20 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-plugin-manifest.json",
+  "name": "cursor",
+  "displayName": "Cursor Companion",
+  "version": "0.0.63",
+  "description": "Local Cursor Agent CLI delegation: multi family consults, Composer implementation in owned worktrees, review, resumable history, background jobs, and setup health checks.",
+  "author": {
+    "name": "Harry Yep"
+  },
+  "homepage": "https://github.com/okisdev/claude-code-fusion",
+  "repository": "https://github.com/okisdev/claude-code-fusion",
+  "license": "MIT",
+  "keywords": [
+    "cursor",
+    "multi-model",
+    "delegation",
+    "code-review",
+    "orchestration"
+  ]
+}
