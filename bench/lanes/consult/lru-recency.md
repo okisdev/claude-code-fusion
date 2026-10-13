@@ -1,0 +1,3 @@
+The library in this workspace is a TTL aware LRU cache exported from index.js. A user reports that capacity eviction does not follow least recently used order. With maxSize 2, if they set a to 1, set b to 2, get a, then set c to 3, they expect has(a) and get(a) to still work and b to be gone, but a disappears and b stays. With maxSize 3, touching one key several times before adding a new key evicts the hot key instead of a cold one.
+
+Find the root cause. This is a read only consult: do not edit or create any file. Report every defect you can demonstrate, each with its file and line, the concrete calls that show it, the expected and actual results, and the minimal fix. If you find no defect, say so. Keep the report under 60 lines.
