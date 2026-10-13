@@ -41,7 +41,14 @@ test("models uses the scrubbed Grok child environment", (t) => {
     FAKE_GROK_MODELS_ENV_FILE: envFile,
     ANTHROPIC_API_KEY: "must-be-scrubbed",
     XAI_API_KEY: "retained-for-auth",
-    CLAUDE_PLUGIN_ROOT: "must-be-scrubbed"
+    CLAUDE_PLUGIN_ROOT: "must-be-scrubbed",
+    GROK_TURN_SUMMARY: "true",
+    GROK_FILE_ACCELERATION: "true",
+    GROK_FILE_ACCELERATION_ROUTES: "inherited-routes",
+    GROK_SANDBOX_MODE: "inherited-mode",
+    GROK_ARTIFACTS_BIND_REMOUNT: "inherited-remount",
+    GROK_CURSOR_WORKER_API_BASE: "https://worker.example.test",
+    GROK_CURSOR_WORKER_COMMAND: "inherited-worker"
   }) });
   assert.equal(result.status, 0, result.stderr);
   const childEnv = JSON.parse(fs.readFileSync(envFile, "utf8"));
@@ -50,6 +57,11 @@ test("models uses the scrubbed Grok child environment", (t) => {
   assert.equal(childEnv.XAI_API_KEY, "retained-for-auth");
   assert.equal(childEnv.GROK_DISABLE_AUTOUPDATER, "1");
   assert.equal(childEnv.GROK_MEMORY, "0");
+  assert.equal(childEnv.GROK_TURN_SUMMARY, "false");
+  assert.equal(childEnv.GROK_FILE_ACCELERATION, "false");
+  for (const key of ["GROK_FILE_ACCELERATION_ROUTES", "GROK_SANDBOX_MODE", "GROK_ARTIFACTS_BIND_REMOUNT", "GROK_CURSOR_WORKER_API_BASE", "GROK_CURSOR_WORKER_COMMAND"]) {
+    assert.equal(childEnv[key], undefined, key);
+  }
 });
 
 test("models classifies CLI, auth, setup, and listing failures", (t) => {

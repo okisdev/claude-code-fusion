@@ -42,7 +42,14 @@ test("direct managed execution records a stale pre-run refresh", async (t) => {
     FAKE_GROK_MODELS_TOUCH: file,
     FAKE_GROK_MODELS_ENV_FILE: modelsEnvFile,
     ANTHROPIC_API_KEY: "must-be-scrubbed",
-    XAI_API_KEY: "retained-for-auth"
+    XAI_API_KEY: "retained-for-auth",
+    GROK_TURN_SUMMARY: "true",
+    GROK_FILE_ACCELERATION: "true",
+    GROK_FILE_ACCELERATION_ROUTES: "inherited-routes",
+    GROK_SANDBOX_MODE: "inherited-mode",
+    GROK_ARTIFACTS_BIND_REMOUNT: "inherited-remount",
+    GROK_CURSOR_WORKER_API_BASE: "https://worker.example.test",
+    GROK_CURSOR_WORKER_COMMAND: "inherited-worker"
   })));
   assert.equal(result.exitCode, 0);
   assert.equal(result.authRefresh.reason, "stale");
@@ -52,6 +59,11 @@ test("direct managed execution records a stale pre-run refresh", async (t) => {
   const childEnv = JSON.parse(fs.readFileSync(modelsEnvFile, "utf8"));
   assert.equal(childEnv.ANTHROPIC_API_KEY, undefined);
   assert.equal(childEnv.XAI_API_KEY, "retained-for-auth");
+  assert.equal(childEnv.GROK_TURN_SUMMARY, "false");
+  assert.equal(childEnv.GROK_FILE_ACCELERATION, "false");
+  for (const key of ["GROK_FILE_ACCELERATION_ROUTES", "GROK_SANDBOX_MODE", "GROK_ARTIFACTS_BIND_REMOUNT", "GROK_CURSOR_WORKER_API_BASE", "GROK_CURSOR_WORKER_COMMAND"]) {
+    assert.equal(childEnv[key], undefined, key);
+  }
 });
 
 test("direct managed execution retries after auth refresh", async (t) => {
@@ -144,6 +156,13 @@ test("stale auth runs one unsandboxed models refresh with the scrubbed child env
     ANTHROPIC_API_KEY: "must-be-scrubbed",
     XAI_API_KEY: "retained-for-auth",
     GROK_MANAGED_MCPS_ENABLED: "true",
+    GROK_TURN_SUMMARY: "true",
+    GROK_FILE_ACCELERATION: "true",
+    GROK_FILE_ACCELERATION_ROUTES: "inherited-routes",
+    GROK_SANDBOX_MODE: "inherited-mode",
+    GROK_ARTIFACTS_BIND_REMOUNT: "inherited-remount",
+    GROK_CURSOR_WORKER_API_BASE: "https://worker.example.test",
+    GROK_CURSOR_WORKER_COMMAND: "inherited-worker",
     CLAUDE_CODE_SESSION_ID: "must-be-scrubbed"
   });
   const result = runCompanion(["task", "inspect the repository"], { cwd: sandbox.workDir, env });
@@ -155,6 +174,11 @@ test("stale auth runs one unsandboxed models refresh with the scrubbed child env
   assert.equal(childEnv.CLAUDE_CODE_SESSION_ID, undefined);
   assert.equal(childEnv.XAI_API_KEY, "retained-for-auth");
   assert.equal(childEnv.GROK_MANAGED_MCPS_ENABLED, "false");
+  assert.equal(childEnv.GROK_TURN_SUMMARY, "false");
+  assert.equal(childEnv.GROK_FILE_ACCELERATION, "false");
+  for (const key of ["GROK_FILE_ACCELERATION_ROUTES", "GROK_SANDBOX_MODE", "GROK_ARTIFACTS_BIND_REMOUNT", "GROK_CURSOR_WORKER_API_BASE", "GROK_CURSOR_WORKER_COMMAND"]) {
+    assert.equal(childEnv[key], undefined, key);
+  }
   const [record] = jobRecords(sandbox.dataDir);
   assert.equal(record.authRefresh.reason, "stale");
   assert.equal(record.authRefresh.refreshed, true);

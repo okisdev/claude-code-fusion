@@ -220,7 +220,14 @@ function buildGrokChildEnv(env = process.env, { memory = false, web = false } = 
   delete childEnv.GROK_TEST_VERSION;
   delete childEnv.GROK_SANDBOX;
   delete childEnv.GROK_LEADER_SOCKET;
+  delete childEnv.GROK_FILE_ACCELERATION_ROUTES;
+  delete childEnv.GROK_SANDBOX_MODE;
+  delete childEnv.GROK_ARTIFACTS_BIND_REMOUNT;
+  delete childEnv.GROK_CURSOR_WORKER_API_BASE;
+  delete childEnv.GROK_CURSOR_WORKER_COMMAND;
   childEnv.GROK_AUTO_WAKE = "false";
+  childEnv.GROK_TURN_SUMMARY = "false";
+  childEnv.GROK_FILE_ACCELERATION = "false";
   delete childEnv.GROK_SUBAGENTS_MAX_DEPTH;
   delete childEnv.GROK_WEB_FETCH_PROXY;
   delete childEnv.GROK_WEB_FETCH_ALLOW_LOCAL;

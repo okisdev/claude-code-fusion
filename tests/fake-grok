@@ -90,6 +90,13 @@
           key === "GROK_SANDBOX" ||
           key === "GROK_LEADER_SOCKET" ||
           key === "GROK_AUTO_WAKE" ||
+          key === "GROK_TURN_SUMMARY" ||
+          key === "GROK_FILE_ACCELERATION" ||
+          key === "GROK_FILE_ACCELERATION_ROUTES" ||
+          key === "GROK_SANDBOX_MODE" ||
+          key === "GROK_ARTIFACTS_BIND_REMOUNT" ||
+          key === "GROK_CURSOR_WORKER_API_BASE" ||
+          key === "GROK_CURSOR_WORKER_COMMAND" ||
           key === "GROK_SUBAGENTS_MAX_DEPTH" ||
           key === "GROK_WEB_FETCH_PROXY" ||
           key === "GROK_WEB_FETCH_ALLOW_LOCAL" ||
