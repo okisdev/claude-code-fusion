@@ -97,6 +97,29 @@ test("a Codex refusal turn failure yields failure kind refused", (t) => {
   assert.match(resultOutput.stdout, /^failure: refused$/m);
 });
 
+for (const [message, failureKind] of [
+  ["Flex capacity unavailable.", "rate_limited"],
+  ["stream disconnected before completion: Incomplete response returned, reason: content_filter", "refused"],
+  ["This request has been flagged for possible cybersecurity risk.", "refused"],
+  ["This content was flagged for possible biological risk.", "refused"],
+  ["The local disk has capacity for this request.", "error"]
+]) {
+  test(`a Codex turn failure saying ${JSON.stringify(message)} yields failure kind ${failureKind}`, (t) => {
+    const sandbox = makeCodexSandbox(t);
+    const env = codexEnvFor(sandbox, {
+      FAKE_CODEX_MODE: "failed",
+      FAKE_CODEX_TURN_FAILURE_MESSAGE: message
+    });
+    const result = runCodexCompanion(["task", "doomed"], { cwd: sandbox.workDir, env });
+    assert.notStrictEqual(result.status, 0);
+    assert.match(result.stdout, new RegExp(`^failure: ${failureKind}$`, "m"));
+    const [record] = codexJobRecords(sandbox);
+    assert.strictEqual(record.status, "error");
+    assert.strictEqual(record.failureKind, failureKind);
+    assert.strictEqual(record.errorMessage, message);
+  });
+}
+
 test("auth stderr yields failure kind auth", (t) => {
   const sandbox = makeSandbox(t);
   const env = envFor(sandbox, { FAKE_GROK_MODE: "auth-error" });
