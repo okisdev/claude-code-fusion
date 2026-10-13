@@ -334,7 +334,7 @@ function reviewWorkspace(h) {
     assert.equal(result.status, 0, result.stderr);
     return result.stdout.trim();
   };
-  git(["init", "-q"]);
+  git(["init", "-q", "--initial-branch=main"]);
   const tree = git(["mktree"]);
   const commit = git(["-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit-tree", tree, "-m", "seed"]);
   git(["update-ref", "refs/heads/main", commit]);
