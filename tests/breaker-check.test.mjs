@@ -667,10 +667,10 @@ test("Codex version drift uses the registry verified version key", (t) => {
   writeRecord(jobFile(sandbox.codexState, "workspace", "auth"), {
     status: "error",
     failureKind: "auth",
-    codexVersion: "0.158.0",
+    codexVersion: "0.163.0",
     finishedAt: new Date(Date.now() - 2 * 60000).toISOString()
   });
-  assert.match(run(sandbox).stdout, /; codex 0\.158\.0 installed, contract verified on 0\.157\.1/);
+  assert.match(run(sandbox).stdout, /; codex 0\.163\.0 installed, contract verified on 0\.162\.1/);
 });
 
 test("a failure outside the lookback window is silent", (t) => {

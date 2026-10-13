@@ -7,6 +7,7 @@ import path from "node:path";
 import test from "node:test";
 
 import { getProcessIdentity } from "../plugins/grok/scripts/lib/process-identity.mjs";
+import { initFixtureRepo } from "./lib/git-fixture.mjs";
 
 import {
   envFor,
@@ -515,73 +516,90 @@ test("setup reports grok doctor as unavailable when the subcommand is missing", 
   assert.match(rendered.stdout, /grok doctor: not available/);
 });
 
-test("Grok child environment removes Claude integration state and disables implicit context bridges", async (t) => {
-  const sandbox = makeSandbox(t);
-  const envFile = path.join(sandbox.root, "child-env.json");
-  const enabledBridges = Object.fromEntries(bridgeEnvironmentKeys.map((key) => [key, "true"]));
-  const env = envFor(sandbox, {
-    ...enabledBridges,
-    CLAUDE_CODE_SESSION_ID: "claude-session-secret",
-    CLAUDE_CODE_PRIVATE_TOKEN: "claude-code-secret",
-    CLAUDE_PLUGIN_ROOT: "/private/plugin/root",
-    CLAUDE_PLUGIN_PRIVATE_TOKEN: "claude-plugin-secret",
-    ANTHROPIC_API_KEY: "anthropic-secret",
-    CODEX_API_KEY: "codex-secret",
-    OPENAI_API_KEY: "openai-secret",
-    XAI_API_KEY: "xai-test-auth",
-    DATABASE_URL: "postgres://user:password@db.example.test/app",
-    REDIS_URL: "redis://user:password@redis.example.test/0",
-    SENTRY_DSN: "https://public:secret@sentry.example.test/1",
-    SSH_AUTH_SOCK: "/private/ssh-agent.sock",
-    GROK_CLAUDE_MARKER_OVERRIDE: "marker-secret",
-    _GROK_CLAUDE_MARKER_OVERRIDE: "private-marker-secret",
-    GROK_MEMORY: "1",
-    GROK_SUBAGENTS: "1",
-    GROK_MANAGED_MCPS_ENABLED: "true",
-    GROK_MANAGED_MCP_GATEWAY_TOOLS_ENABLED: "true",
-    GROK_WEB_FETCH: "1",
-    GROK_TEST_VERSION: "9.9.9",
-    GROK_SANDBOX: "inherited-sandbox",
-    GROK_LEADER_SOCKET: "/tmp/inherited-leader.sock",
-    GROK_AUTO_WAKE: "1",
-    GROK_SUBAGENTS_MAX_DEPTH: "99",
-    GROK_WEB_FETCH_PROXY: "http://proxy.example.test",
-    GROK_WEB_FETCH_ALLOW_LOCAL: "1",
-    GROK_COMPANION_CONTINUITY_POLICY: "claude-session",
-    RUST_LOG: "off",
-    FAKE_GROK_ENV_FILE: envFile,
-    FAKE_GROK_MODE: "ok",
+for (const mode of ["consult", "write", "review"]) {
+  test(`${mode} child environment removes inherited Grok controls and disables implicit context bridges`, async (t) => {
+    const sandbox = makeSandbox(t);
+    if (mode === "review") {
+      initFixtureRepo(sandbox.workDir);
+    }
+    const enabledBridges = Object.fromEntries(bridgeEnvironmentKeys.map((key) => [key, "true"]));
+    const parentEnv = {
+      ...enabledBridges,
+      CLAUDE_CODE_SESSION_ID: "claude-session-secret",
+      CLAUDE_CODE_PRIVATE_TOKEN: "claude-code-secret",
+      CLAUDE_PLUGIN_ROOT: "/private/plugin/root",
+      CLAUDE_PLUGIN_PRIVATE_TOKEN: "claude-plugin-secret",
+      ANTHROPIC_API_KEY: "anthropic-secret",
+      CODEX_API_KEY: "codex-secret",
+      OPENAI_API_KEY: "openai-secret",
+      XAI_API_KEY: "xai-test-auth",
+      DATABASE_URL: "postgres://user:password@db.example.test/app",
+      REDIS_URL: "redis://user:password@redis.example.test/0",
+      SENTRY_DSN: "https://public:secret@sentry.example.test/1",
+      SSH_AUTH_SOCK: "/private/ssh-agent.sock",
+      GROK_CLAUDE_MARKER_OVERRIDE: "marker-secret",
+      _GROK_CLAUDE_MARKER_OVERRIDE: "private-marker-secret",
+      GROK_MEMORY: "1",
+      GROK_SUBAGENTS: "1",
+      GROK_MANAGED_MCPS_ENABLED: "true",
+      GROK_MANAGED_MCP_GATEWAY_TOOLS_ENABLED: "true",
+      GROK_WEB_FETCH: "1",
+      GROK_TEST_VERSION: "9.9.9",
+      GROK_SANDBOX: "inherited-sandbox",
+      GROK_LEADER_SOCKET: "/tmp/inherited-leader.sock",
+      GROK_AUTO_WAKE: "1",
+      GROK_TURN_SUMMARY: "true",
+      GROK_FILE_ACCELERATION: "true",
+      GROK_FILE_ACCELERATION_ROUTES: "inherited-routes",
+      GROK_SANDBOX_MODE: "inherited-mode",
+      GROK_ARTIFACTS_BIND_REMOUNT: "inherited-remount",
+      GROK_CURSOR_WORKER_API_BASE: "https://worker.example.test",
+      GROK_CURSOR_WORKER_COMMAND: "inherited-worker",
+      GROK_SUBAGENTS_MAX_DEPTH: "99",
+      GROK_WEB_FETCH_PROXY: "http://proxy.example.test",
+      GROK_WEB_FETCH_ALLOW_LOCAL: "1",
+      GROK_COMPANION_CONTINUITY_POLICY: "claude-session",
+      RUST_LOG: "off",
+    };
+    const envFile = path.join(sandbox.root, `${mode}-child-env.json`);
+    const env = envFor(sandbox, { ...parentEnv, FAKE_GROK_ENV_FILE: envFile, FAKE_GROK_MODE: mode === "review" ? "review-ok" : "ok" });
+    if (mode === "review") {
+      const result = runCompanion(["review", "--json"], { cwd: sandbox.workDir, env });
+      assert.equal(result.status, 0, result.stderr);
+    } else {
+      const result = await runGrok(directOptions(sandbox, "ok", { mode, env }));
+      assert.equal(result.exitCode, 0, result.errorMessage);
+    }
+    const childEnv = JSON.parse(fs.readFileSync(envFile, "utf8"));
+    assert.ok(!Object.keys(childEnv).some((key) => key.startsWith("CLAUDE_CODE_")));
+    assert.ok(!Object.keys(childEnv).some((key) => key.startsWith("CLAUDE_PLUGIN_")));
+    for (const key of ["ANTHROPIC_API_KEY", "CODEX_API_KEY", "OPENAI_API_KEY", "DATABASE_URL", "REDIS_URL", "SENTRY_DSN", "SSH_AUTH_SOCK", "GROK_CLAUDE_MARKER_OVERRIDE", "_GROK_CLAUDE_MARKER_OVERRIDE"]) {
+      assert.equal(childEnv[key], undefined, key);
+    }
+    assert.equal(childEnv.XAI_API_KEY, "xai-test-auth");
+    assert.equal(childEnv.GROK_DISABLE_AUTOUPDATER, "1");
+    assert.equal(childEnv.GROK_MANAGED_MCPS_ENABLED, "false");
+    assert.equal(childEnv.GROK_MANAGED_MCP_GATEWAY_TOOLS_ENABLED, "false");
+    assert.equal(childEnv.GROK_WEB_FETCH, "0");
+    assert.equal(childEnv.GROK_MEMORY, "0");
+    assert.equal(childEnv.GROK_SUBAGENTS, "0");
+    assert.equal(childEnv.GROK_AUTO_WAKE, "false");
+    assert.equal(childEnv.GROK_TURN_SUMMARY, "false");
+    assert.equal(childEnv.GROK_FILE_ACCELERATION, "false");
+    for (const key of ["GROK_TEST_VERSION", "GROK_SANDBOX", "GROK_LEADER_SOCKET", "GROK_FILE_ACCELERATION_ROUTES", "GROK_SANDBOX_MODE", "GROK_ARTIFACTS_BIND_REMOUNT", "GROK_CURSOR_WORKER_API_BASE", "GROK_CURSOR_WORKER_COMMAND", "GROK_SUBAGENTS_MAX_DEPTH", "GROK_WEB_FETCH_PROXY", "GROK_WEB_FETCH_ALLOW_LOCAL"]) {
+      assert.equal(childEnv[key], undefined, key);
+    }
+    assert.equal(childEnv.GROK_COMPANION_CONTINUITY_POLICY, undefined);
+    assert.equal(childEnv.RUST_LOG, "xai_grok_agent::builder=debug,xai_grok_sandbox=warn,xai_grok_shell::session::acp_session::turn=warn");
+    assert.equal(path.isAbsolute(childEnv.TMPDIR), true);
+    assert.equal(path.dirname(childEnv.TMPDIR), fs.realpathSync(mode === "review" ? env.TMPDIR : os.tmpdir()));
+    assert.match(path.basename(childEnv.TMPDIR), /^grok-companion-run-/);
+    assert.equal(fs.existsSync(childEnv.TMPDIR), false);
+    for (const key of bridgeEnvironmentKeys) {
+      assert.equal(childEnv[key], "false", key);
+    }
   });
-  const result = await runGrok(directOptions(sandbox, "ok", { env }));
-
-  assert.equal(result.exitCode, 0);
-  const childEnv = JSON.parse(fs.readFileSync(envFile, "utf8"));
-  assert.ok(!Object.keys(childEnv).some((key) => key.startsWith("CLAUDE_CODE_")));
-  assert.ok(!Object.keys(childEnv).some((key) => key.startsWith("CLAUDE_PLUGIN_")));
-  for (const key of ["ANTHROPIC_API_KEY", "CODEX_API_KEY", "OPENAI_API_KEY", "DATABASE_URL", "REDIS_URL", "SENTRY_DSN", "SSH_AUTH_SOCK", "GROK_CLAUDE_MARKER_OVERRIDE", "_GROK_CLAUDE_MARKER_OVERRIDE"]) {
-    assert.equal(childEnv[key], undefined, key);
-  }
-  assert.equal(childEnv.XAI_API_KEY, "xai-test-auth");
-  assert.equal(childEnv.GROK_DISABLE_AUTOUPDATER, "1");
-  assert.equal(childEnv.GROK_MANAGED_MCPS_ENABLED, "false");
-  assert.equal(childEnv.GROK_MANAGED_MCP_GATEWAY_TOOLS_ENABLED, "false");
-  assert.equal(childEnv.GROK_WEB_FETCH, "0");
-  assert.equal(childEnv.GROK_MEMORY, "0");
-  assert.equal(childEnv.GROK_SUBAGENTS, "0");
-  assert.equal(childEnv.GROK_AUTO_WAKE, "false");
-  for (const key of ["GROK_TEST_VERSION", "GROK_SANDBOX", "GROK_LEADER_SOCKET", "GROK_SUBAGENTS_MAX_DEPTH", "GROK_WEB_FETCH_PROXY", "GROK_WEB_FETCH_ALLOW_LOCAL"]) {
-    assert.equal(childEnv[key], undefined, key);
-  }
-  assert.equal(childEnv.GROK_COMPANION_CONTINUITY_POLICY, undefined);
-  assert.equal(childEnv.RUST_LOG, "xai_grok_agent::builder=debug,xai_grok_sandbox=warn,xai_grok_shell::session::acp_session::turn=warn");
-  assert.equal(path.isAbsolute(childEnv.TMPDIR), true);
-  assert.equal(path.dirname(childEnv.TMPDIR), fs.realpathSync(os.tmpdir()));
-  assert.match(path.basename(childEnv.TMPDIR), /^grok-companion-run-/);
-  assert.equal(fs.existsSync(childEnv.TMPDIR), false);
-  for (const key of bridgeEnvironmentKeys) {
-    assert.equal(childEnv[key], "false", key);
-  }
-});
+}
 
 test("web-enabled managed runs enable Grok web fetch for the child", async (t) => {
   const sandbox = makeSandbox(t);

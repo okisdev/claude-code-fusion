@@ -162,12 +162,12 @@ async function waitForProcessExit(pid, ownsProcessGroup = false) {
 
 test("version and availability probe the configured Codex binary", () => {
   const env = { ...process.env, CODEX_BIN: fakeCodex };
-  assert.equal(getCodexVersion({ env }), "0.157.1");
+  assert.equal(getCodexVersion({ env }), "0.162.1");
   assert.deepEqual(getCodexAvailability({ env }), {
     available: true,
     bin: fakeCodex,
-    version: "0.157.1",
-    rawVersion: "codex-cli 0.157.1",
+    version: "0.162.1",
+    rawVersion: "codex-cli 0.162.1",
     exitCode: 0,
     errorMessage: null
   });

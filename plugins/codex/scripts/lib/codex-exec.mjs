@@ -1237,10 +1237,14 @@ function classifiedFailureKind(message, fallback = "error") {
   if (/quota|insufficient (?:account )?(?:balance|credit|credits|funds)|balance (?:is )?exhausted|payment required|usage limit|billing|http(?:\/\d(?:\.\d)?)?\s+402|status(?: code)?\s*[:=]?\s*402/i.test(text)) {
     return "quota";
   }
-  if (/rate[ _-]?limit|too many requests|http(?:\/\d(?:\.\d)?)?\s+429|status(?: code)?\s*[:=]?\s*429/i.test(text)) {
+  if (/rate[ _-]?limit|too many requests|http(?:\/\d(?:\.\d)?)?\s+429|status(?: code)?\s*[:=]?\s*429/i.test(text) || text.includes("Flex capacity unavailable.")) {
     return "rate_limited";
   }
-  if (/misalignment policy|cyber policy|violat(?:ed|es|ion of) (?:the |our |an? )?[a-z ]{0,40}policy|content policy/i.test(text)) {
+  if (/misalignment policy|cyber policy|violat(?:ed|es|ion of) (?:the |our |an? )?[a-z ]{0,40}policy|content policy/i.test(text) || [
+    "stream disconnected before completion: Incomplete response returned, reason: content_filter",
+    "This request has been flagged for possible cybersecurity risk.",
+    "This content was flagged for possible biological risk."
+  ].some((message) => text.includes(message))) {
     return "refused";
   }
   if (/unauthori[sz]ed|unauthenticated|authentication|login required|invalid api key|api key/i.test(text)) {
