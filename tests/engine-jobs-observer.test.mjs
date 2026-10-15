@@ -275,6 +275,39 @@ test("observer scans reread changed files and forget deleted files", (t) => {
   }
 });
 
+test("observer reads atomic record replacement with unchanged size and mtime", (t) => {
+  const root = sandbox(t);
+  const cwd = path.join(root, "work");
+  const data = path.join(root, "grok");
+  const env = { GROK_COMPANION_DATA: data, FUSION_DATA_DIR: path.join(root, "fusion") };
+  fs.mkdirSync(cwd);
+  const initial = { id: "atomic-replace-job", cwd, status: "running", marker: "x" };
+  writeEngineJob(data, cwd, initial.id, { status: initial.status, marker: initial.marker });
+  const file = path.join(data, "state", engineWorkspaceSlug(cwd), "jobs", `${initial.id}.json`);
+  const fixedMtime = new Date("2020-01-01T00:00:00.000Z");
+  fs.utimesSync(file, fixedMtime, fixedMtime);
+  assert.equal(observeEngineJobs("grok", { env }), 0);
+  const previousStat = fs.statSync(file);
+
+  const updated = { ...initial, status: "done", marker: "long" };
+  const temporaryFile = `${file}.tmp`;
+  const updatedContents = `${JSON.stringify(updated)}\n`;
+  assert.equal(Buffer.byteLength(updatedContents), previousStat.size);
+  fs.writeFileSync(temporaryFile, updatedContents, "utf8");
+  fs.renameSync(temporaryFile, file);
+  fs.utimesSync(file, fixedMtime, fixedMtime);
+  const replacedStat = fs.statSync(file);
+  assert.equal(replacedStat.size, previousStat.size);
+  assert.equal(replacedStat.mtimeMs, previousStat.mtimeMs);
+  assert.notEqual(replacedStat.ino, previousStat.ino);
+
+  const notified = [];
+  assert.equal(observeEngineJobs("grok", { env, notify: (record) => notified.push(record) }), 1);
+  assert.equal(notified.length, 1);
+  assert.equal(notified[0].status, "done");
+  assert.equal(notified[0].marker, "long");
+});
+
 test("observer prunes missing observed and notified ids after 30 days without idle rewrites", (t) => {
   const root = sandbox(t);
   const cwd = path.join(root, "work");

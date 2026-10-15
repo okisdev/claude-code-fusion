@@ -655,6 +655,7 @@ export function finishSuccessfulJobRecordFile(file, successPatch) {
           requestId: success.requestId ?? existing.requestId ?? null,
           resolvedModel: terminalAttribution.resolvedModel ?? success.resolvedModel ?? existing.resolvedModel ?? null,
           observedModel: terminalAttribution.observedModel ?? success.observedModel ?? existing.observedModel ?? null,
+          modelDrift: success.modelDrift ?? existing.modelDrift ?? null,
           effortApplied: terminalAttribution.effortApplied ?? success.effortApplied ?? existing.effortApplied ?? null,
           resultText: success.resultText ?? null,
           usage: success.usage ?? existing.usage ?? null,

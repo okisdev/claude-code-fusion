@@ -160,13 +160,13 @@ function terminalRecords(engine, env) {
           const previous = cache.files.get(file);
           let cached = previous;
           let sourceRecord = null;
-          if (reconcile || !previous || previous.mtimeMs !== stat.mtimeMs || previous.size !== stat.size) {
+          if (reconcile || !previous || previous.mtimeMs !== stat.mtimeMs || previous.size !== stat.size || previous.ino !== stat.ino) {
             let record = null;
             try {
               sourceRecord = JSON.parse(fs.readFileSync(file, "utf8"));
               record = observerRecordSummary(sourceRecord);
             } catch {}
-            cached = { mtimeMs: stat.mtimeMs, size: stat.size, record };
+            cached = { mtimeMs: stat.mtimeMs, size: stat.size, ino: stat.ino, record };
             cache.files.set(file, cached);
           }
           if (cached.record) {

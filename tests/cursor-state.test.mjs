@@ -158,6 +158,16 @@ test("successful finish respects an already requested cancellation", (t) => {
   assert.deepEqual(record.usage, { outputTokens: 2 });
 });
 
+test("successful finish preserves model drift when cancellation was requested", (t) => {
+  const { file } = recordFile(t);
+  assert.equal(readJobRecordFile(file).status, "running");
+  updateJobRecordFile(file, { cancelRequestedAt: new Date().toISOString() });
+  const modelDrift = { requested: "composer-2.5", observed: "Composer 2.5" };
+  const record = finishSuccessfulJobRecordFile(file, { status: "done", modelDrift });
+  assert.equal(record.status, "cancelled");
+  assert.deepEqual(record.modelDrift, modelDrift);
+});
+
 test("a live owner lock times out at the configured ceiling", async (t) => {
   const { file, root } = recordFile(t);
   const ready = path.join(root, "ready");

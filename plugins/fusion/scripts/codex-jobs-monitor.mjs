@@ -186,12 +186,12 @@ function readWorkspaceJobsSnapshot(root, workspaceRoot, repositoryCache = new Ma
           const previous = cache.files.get(recordFile);
           let cached = previous;
           let sourceRecord = null;
-          if (reconcile || !previous || previous.mtimeMs !== stat.mtimeMs || previous.size !== stat.size) {
+          if (reconcile || !previous || previous.mtimeMs !== stat.mtimeMs || previous.size !== stat.size || previous.ino !== stat.ino) {
             try {
               sourceRecord = JSON.parse(fs.readFileSync(recordFile, "utf8"));
-              cached = { mtimeMs: stat.mtimeMs, size: stat.size, record: monitorRecordSummary(sourceRecord) };
+              cached = { mtimeMs: stat.mtimeMs, size: stat.size, ino: stat.ino, record: monitorRecordSummary(sourceRecord) };
             } catch {
-              cached = { mtimeMs: stat.mtimeMs, size: stat.size, record: null };
+              cached = { mtimeMs: stat.mtimeMs, size: stat.size, ino: stat.ino, record: null };
             }
             cache.files.set(recordFile, cached);
           }

@@ -1608,3 +1608,31 @@ fs.readdirSync = function (dir, ...args) {
   await waitUntil(() => count("R") >= 3);
   assert.equal(count("R"), 3, monitor.stderr());
 });
+
+test("monitor observes atomic record replacement with unchanged size and mtime", async (t) => {
+  const sandbox = makeSandbox(t);
+  const { file, record } = seedJob(sandbox, { id: "atomic-replace-job", marker: "x" });
+  const fixedMtime = new Date("2020-01-01T00:00:00.000Z");
+  fs.utimesSync(file, fixedMtime, fixedMtime);
+  const monitor = startMonitor(sandbox, envFor(sandbox, {
+    FUSION_CODEX_COMPANION: path.join(sandbox.root, "missing-companion.mjs")
+  }));
+  t.after(() => monitor.child.kill("SIGKILL"));
+
+  await waitUntil(() => readAnnouncedState(sandbox));
+  const previousStat = fs.statSync(file);
+  const updated = { ...record, status: "done", marker: "long" };
+  const temporaryFile = `${file}.tmp`;
+  const updatedContents = `${JSON.stringify(updated, null, 2)}\n`;
+  assert.equal(Buffer.byteLength(updatedContents), previousStat.size);
+  fs.writeFileSync(temporaryFile, updatedContents, "utf8");
+  fs.renameSync(temporaryFile, file);
+  fs.utimesSync(file, fixedMtime, fixedMtime);
+  const replacedStat = fs.statSync(file);
+  assert.equal(replacedStat.size, previousStat.size);
+  assert.equal(replacedStat.mtimeMs, previousStat.mtimeMs);
+  assert.notEqual(replacedStat.ino, previousStat.ino);
+
+  const completion = await waitUntil(() => monitor.lines().find((line) => line.includes(`${record.id} done.`)));
+  assert.ok(completion, monitor.stderr());
+});
