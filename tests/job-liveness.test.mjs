@@ -16,6 +16,11 @@ import {
 } from "../plugins/cursor/scripts/lib/process-identity.mjs";
 import { processGroupAlive, validProcessIdentity } from "../plugins/codex/scripts/lib/process-identity.mjs";
 import {
+  processGroupAlive as grokExecGroupAlive,
+  recordedProcessState as grokRecordedProcessState,
+  runningJobLiveness as grokRunningJobLiveness
+} from "../plugins/grok/scripts/lib/grok-exec.mjs";
+import {
   isProcessAlive as codexIsProcessAlive,
   processIdentitiesMatch as codexProcessIdentitiesMatch,
   processIdentityMatches as codexProcessIdentityMatches
@@ -115,11 +120,17 @@ test("Linux zombie leaders and empty process groups are not alive", (t) => {
     assert.equal(cursorProcessIsDirectlyAlive(leader), false);
     assert.equal(codexIsProcessAlive(leader, null, false), false);
     assert.equal(processGroupAlive(leader), false, "Only a zombie remains in the group.");
+    const recorded = { version: 1, platform: "linux", bootMarker: "boot", startMarker: "1", commandHash: "hash" };
+    assert.equal(grokExecGroupAlive(leader), false, "Grok's group probe agrees with the zombie aware identity.");
+    assert.equal(grokRecordedProcessState(leader, recorded), "absent");
+    assert.equal(grokRunningJobLiveness({ status: "running", pid: leader, pidIdentity: recorded }).alive, false);
     assert.equal(grokIdentityGroupAlive(leader), false);
     assert.equal(cursorIdentityGroupAlive(leader), false);
     assert.equal(codexIsProcessAlive(leader), false);
     memberGroup = leader;
     assert.equal(processGroupAlive(leader), true, "A live member keeps the group alive.");
+    assert.equal(grokExecGroupAlive(leader), true);
+    assert.equal(grokRecordedProcessState(leader, recorded), "unverified", "A live member of an unverifiable group keeps cleanup pending.");
     memberGroup = leader + 2;
     fs.readdirSync = (directory, ...args) => directory === "/proc"
       ? [String(member)]

@@ -10,7 +10,7 @@ import { parseArgs, parseRawArgs, rawBooleanOptionRequested } from "./lib/args.m
 import { resolveCursorBin, probeCursorVersion, compareCursorVersion, TESTED_CURSOR_INTERVAL, buildCursorArgs, buildCursorChildEnv, runCursor, classifyCursorFailure, reapPrivateHomeHelpers } from "./lib/cursor-exec.mjs";
 import { buildPrivateHome, copyChatForResume, cursorChatDir, projectHookFiles, CURSOR_SESSION_ID_PATTERN } from "./lib/cursor-home.mjs";
 import { readModelCatalog, resolveCursorModel } from "./lib/cursor-models.mjs";
-import { getProcessIdentity, processIdentityMatches, processIsDirectlyAlive } from "./lib/process-identity.mjs";
+import { getProcessIdentity, processGroupAlive, processIdentityMatches, processIsDirectlyAlive } from "./lib/process-identity.mjs";
 import { extractFirstJsonObject, validateReviewOutput, renderReviewResult, renderBackgroundLaunch, renderTaskResult, renderStatusTable, renderJobDetail, renderHistoryReport, renderCancelReport, renderRecordAcceptance, renderSetupReport } from "./lib/render.mjs";
 import { SESSION_ID_ENV, resolveDataDir, runHomeDir, homeRetentionExpired, sweepCursorHomes, generateJobId, nowIso, createJobRecord, createJobRecordFile, updateJobRecordFile, updateJobRecordFileWithCurrent, finishSuccessfulJobRecordFile, launchRunningJobProcess, listJobRecords, listAllJobRecords, findJobRecordById, jobFilePath, jobLogPath, briefPath, readJobRecordFile, writeBrief, appendJobLog, readLogTail, markDeliveryCollectedFile, claimResumeSessionLease } from "./lib/state.mjs";
 
@@ -465,9 +465,7 @@ function processOwned(pid, identity) {
 }
 
 function cursorGroupAlive(pid) {
-  if (!Number.isInteger(pid) || pid <= 1) return false;
-  try { process.kill(-pid, 0); return true; }
-  catch (error) { return error.code === "EPERM"; }
+  return processGroupAlive(pid);
 }
 
 function runningAlive(record) {

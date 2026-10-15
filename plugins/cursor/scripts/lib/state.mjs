@@ -7,6 +7,7 @@ import { createRecordLock } from "./record-lock.mjs";
 
 import {
   getProcessIdentity,
+  processGroupAlive,
   processIdentitiesMatch,
   processIsDirectlyAlive,
   validProcessIdentity
@@ -451,12 +452,7 @@ function recordedResumeOwnerProcessIsAlive(pid, identity) {
 }
 
 function processGroupIsDirectlyAlive(pid) {
-  try {
-    process.kill(-pid, 0);
-    return true;
-  } catch (error) {
-    return error?.code === "EPERM";
-  }
+  return processGroupAlive(pid);
 }
 
 function resumeOwnerMayStillRun(record, now = Date.now()) {

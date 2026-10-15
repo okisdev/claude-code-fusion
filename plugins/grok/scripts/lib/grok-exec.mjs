@@ -6,6 +6,7 @@ import { isDeepStrictEqual } from "node:util";
 
 import {
   getProcessIdentity,
+  processGroupAlive as liveProcessGroup,
   processIdentitiesMatch,
   processIdentityMatches,
   processIsDirectlyAlive,
@@ -1698,28 +1699,15 @@ export function processGroupAlive(pid) {
   if (!Number.isInteger(pid) || pid <= 1) {
     return false;
   }
-  try {
-    process.kill(-pid, 0);
-    return true;
-  } catch (groupError) {
-    if (groupError?.code === "EPERM") {
-      return true;
-    }
-    try {
-      process.kill(pid, 0);
-      return true;
-    } catch (pidError) {
-      if (pidError?.code === "EPERM") {
-        return true;
-      }
-      return false;
-    }
-  }
+  return liveProcessGroup(pid) || processIsDirectlyAlive(pid);
 }
 
-function exitedLeaderProcessGroupAlive(pid, kill = process.kill.bind(process)) {
+function exitedLeaderProcessGroupAlive(pid, kill = null) {
   if (!Number.isInteger(pid) || pid <= 1) {
     return false;
+  }
+  if (!kill) {
+    return liveProcessGroup(pid);
   }
   try {
     kill(-pid, 0);
@@ -1736,7 +1724,7 @@ export async function terminateExitedLeaderProcessGroup(pid, identity = null, op
   const graceMs = options.graceMs ?? TERMINATION_GRACE_MS;
   const pollMs = options.pollMs ?? TERMINATION_POLL_MS;
   const kill = options.kill ?? process.kill.bind(process);
-  const targetAlive = () => exitedLeaderProcessGroupAlive(pid, kill);
+  const targetAlive = () => exitedLeaderProcessGroupAlive(pid, options.kill);
   const signalGroup = (signal) => signalProcessGroup(pid, signal, identity, {
     allowExitedLeader: true,
     fallbackToPid: false,
