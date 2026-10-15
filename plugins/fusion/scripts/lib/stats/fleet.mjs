@@ -238,51 +238,51 @@ function readCoercionAuditEvents(env) {
   return events.sort((left, right) => left.atMs - right.atMs || left.order - right.order);
 }
 
+function inlineWindowFor(windows, session) {
+  if (!windows.has(session)) {
+    windows.set(session, { denied: false, sprawl: false });
+  }
+  return windows.get(session);
+}
+
+function closeInlineWindow(summary, window, countAccumulation) {
+  if (countAccumulation && window.denied) {
+    summary.unverifiedAccumulations += 1;
+  }
+  if (window.sprawl) {
+    summary.inlineSprawlWindows += 1;
+  }
+  window.denied = false;
+  window.sprawl = false;
+}
+
 function summarizeInlineWindows(events) {
   const windows = new Map();
-  let unverifiedAccumulations = 0;
-  let inlineSprawlWindows = 0;
-  let deepestUnverifiedWindow = 0;
-  const windowFor = (session) => {
-    if (!windows.has(session)) {
-      windows.set(session, { denied: false, sprawl: false });
-    }
-    return windows.get(session);
-  };
-  const close = (window, countAccumulation) => {
-    if (countAccumulation && window.denied) {
-      unverifiedAccumulations += 1;
-    }
-    if (window.sprawl) {
-      inlineSprawlWindows += 1;
-    }
-    window.denied = false;
-    window.sprawl = false;
-  };
+  const summary = { unverifiedAccumulations: 0, inlineSprawlWindows: 0, deepestUnverifiedWindow: 0 };
   for (const event of events) {
-    const window = windowFor(event.session);
+    const window = inlineWindowFor(windows, event.session);
     if (event.event === "verification") {
-      close(window, false);
+      closeInlineWindow(summary, window, false);
       continue;
     }
     if (event.event === "dispatch") {
-      close(window, true);
+      closeInlineWindow(summary, window, true);
       continue;
     }
     if (event.deniedWrite) {
       window.denied = true;
     }
     if (event.unverifiedWindowWrites !== null) {
-      deepestUnverifiedWindow = Math.max(deepestUnverifiedWindow, event.unverifiedWindowWrites);
+      summary.deepestUnverifiedWindow = Math.max(summary.deepestUnverifiedWindow, event.unverifiedWindowWrites);
       window.sprawl =
         window.sprawl ||
         event.unverifiedWindowWrites >= COERCION_LEDGER_SPRAWL_MULTIPLE * (event.unverifiedWindowBudget ?? COERCION_LEDGER_DEFAULT_BUDGET);
     }
   }
   for (const window of windows.values()) {
-    close(window, true);
+    closeInlineWindow(summary, window, true);
   }
-  return { unverifiedAccumulations, inlineSprawlWindows, deepestUnverifiedWindow };
+  return summary;
 }
 
 export function buildCoercionLedger({ env = process.env, fleet = null } = {}) {

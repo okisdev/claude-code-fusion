@@ -1384,14 +1384,9 @@ function recentSweepCanSkip(dataDir, stamp, limits, now) {
     stamp.afterLightRecords + newRecords <= limits.recordMaxRecords * 1.1;
 }
 
-export function pruneJobState(dataDir, options = {}) {
-  const defaults = resolveJobHistoryLimits(options.env ?? process.env);
-  const maxBytes = retentionLimit(options.maxBytes, defaults.maxBytes);
-  const maxRecords = retentionLimit(options.maxRecords, defaults.maxRecords);
-  const recordMaxRecords = retentionLimit(options.recordMaxRecords, defaults.recordMaxRecords);
-  const recordRetentionDays = retentionLimit(options.recordRetentionDays, defaults.recordRetentionDays);
-  const limits = { maxBytes, maxRecords, recordMaxRecords, recordRetentionDays };
-  const failure = (error) => ({
+function failure(limits, error) {
+  const { maxBytes, maxRecords, recordMaxRecords, recordRetentionDays } = limits;
+  return {
     afterBytes: null,
     afterRecords: null,
     deletedBytes: 0,
@@ -1404,7 +1399,16 @@ export function pruneJobState(dataDir, options = {}) {
     ok: false,
     quotaSatisfied: false,
     unrecognizedRecords: null
-  });
+  };
+}
+
+export function pruneJobState(dataDir, options = {}) {
+  const defaults = resolveJobHistoryLimits(options.env ?? process.env);
+  const maxBytes = retentionLimit(options.maxBytes, defaults.maxBytes);
+  const maxRecords = retentionLimit(options.maxRecords, defaults.maxRecords);
+  const recordMaxRecords = retentionLimit(options.recordMaxRecords, defaults.recordMaxRecords);
+  const recordRetentionDays = retentionLimit(options.recordRetentionDays, defaults.recordRetentionDays);
+  const limits = { maxBytes, maxRecords, recordMaxRecords, recordRetentionDays };
   try {
     return withRecordLock(path.join(path.resolve(dataDir), "locks", "history-gc"), () => {
       const stampFile = path.join(path.resolve(dataDir), "history-gc-stamp.json");
@@ -1492,7 +1496,7 @@ export function pruneJobState(dataDir, options = {}) {
       return { ...result, recordFiles: undefined };
     }, 0);
   } catch (error) {
-    return failure(error);
+    return failure(limits, error);
   }
 }
 

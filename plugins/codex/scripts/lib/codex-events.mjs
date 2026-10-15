@@ -231,94 +231,99 @@ export function validateEvent(state, event) {
   }
 }
 
-export function parseCodexEventStream({ child, state, spawnCheckpointPromise, options, eventLineMaxBytes, writeEventLine, requestTermination }) {
-  const processLine = async (lineBuffer) => {
-    const line = (lineBuffer.at(-1) === 13 ? lineBuffer.subarray(0, -1) : lineBuffer).toString("utf8");
-    writeEventLine(lineBuffer);
-    let event;
+async function processLine(ctx, lineBuffer) {
+  const { state, writeEventLine, requestTermination, options } = ctx;
+  const line = (lineBuffer.at(-1) === 13 ? lineBuffer.subarray(0, -1) : lineBuffer).toString("utf8");
+  writeEventLine(lineBuffer);
+  let event;
+  try {
+    event = JSON.parse(line);
+  } catch {
+    recordProtocolError(state, `Codex emitted malformed JSONL at event ${state.eventCount + 1}.`);
+    void requestTermination();
     try {
-      event = JSON.parse(line);
-    } catch {
-      recordProtocolError(state, `Codex emitted malformed JSONL at event ${state.eventCount + 1}.`);
-      void requestTermination();
-      try {
-        await options.onCheckpoint?.(checkpointState(state));
-      } catch (error) {
-        state.callbackError = error instanceof Error ? error : new Error(String(error));
-      }
-      return;
-    }
-    validateEvent(state, event);
-    if (state.protocolError || state.resourceError || state.policyViolation) {
-      void requestTermination();
-    }
-    try {
-      await options.onCheckpoint?.(checkpointState(state, event));
+      await options.onCheckpoint?.(checkpointState(state));
     } catch (error) {
       state.callbackError = error instanceof Error ? error : new Error(String(error));
-      void requestTermination();
     }
-  };
-  return (async () => {
-    if (!child.stdout) {
-      recordProtocolError(state, "Codex process did not expose stdout.");
-      void requestTermination();
-      return;
-    }
-    await spawnCheckpointPromise;
-    let segments = [];
-    let segmentBytes = 0;
-    let skippingOversizedEvent = false;
-    try {
-      for await (const rawChunk of child.stdout) {
-        const chunk = Buffer.from(rawChunk);
-        let offset = 0;
-        while (offset < chunk.length) {
-          const newline = chunk.indexOf(10, offset);
-          const end = newline === -1 ? chunk.length : newline;
-          const segment = chunk.subarray(offset, end);
-          if (skippingOversizedEvent) {
-            if (newline === -1) {
-              break;
-            }
-            skippingOversizedEvent = false;
-            offset = newline + 1;
-            continue;
-          }
-          if (segmentBytes + segment.length > eventLineMaxBytes) {
-            state.oversizedEventsSkipped += 1;
-            if (state.oversizedEventsSkipped === 1) {
-              recordDiagnostic(state, { type: "warning", message: `Skipped a JSONL event larger than the ${eventLineMaxBytes} byte limit.` });
-            }
-            segments = [];
-            segmentBytes = 0;
-            if (newline === -1) {
-              skippingOversizedEvent = true;
-              break;
-            }
-            offset = newline + 1;
-            continue;
-          }
-          if (segment.length > 0) {
-            segments.push(segment);
-            segmentBytes += segment.length;
-          }
+    return;
+  }
+  validateEvent(state, event);
+  if (state.protocolError || state.resourceError || state.policyViolation) {
+    void requestTermination();
+  }
+  try {
+    await options.onCheckpoint?.(checkpointState(state, event));
+  } catch (error) {
+    state.callbackError = error instanceof Error ? error : new Error(String(error));
+    void requestTermination();
+  }
+}
+
+async function consumeCodexEventStream(ctx) {
+  const { child, state, spawnCheckpointPromise, eventLineMaxBytes, requestTermination } = ctx;
+  if (!child.stdout) {
+    recordProtocolError(state, "Codex process did not expose stdout.");
+    void requestTermination();
+    return;
+  }
+  await spawnCheckpointPromise;
+  let segments = [];
+  let segmentBytes = 0;
+  let skippingOversizedEvent = false;
+  try {
+    for await (const rawChunk of child.stdout) {
+      const chunk = Buffer.from(rawChunk);
+      let offset = 0;
+      while (offset < chunk.length) {
+        const newline = chunk.indexOf(10, offset);
+        const end = newline === -1 ? chunk.length : newline;
+        const segment = chunk.subarray(offset, end);
+        if (skippingOversizedEvent) {
           if (newline === -1) {
             break;
           }
-          await processLine(Buffer.concat(segments, segmentBytes));
+          skippingOversizedEvent = false;
+          offset = newline + 1;
+          continue;
+        }
+        if (segmentBytes + segment.length > eventLineMaxBytes) {
+          state.oversizedEventsSkipped += 1;
+          if (state.oversizedEventsSkipped === 1) {
+            recordDiagnostic(state, { type: "warning", message: `Skipped a JSONL event larger than the ${eventLineMaxBytes} byte limit.` });
+          }
           segments = [];
           segmentBytes = 0;
+          if (newline === -1) {
+            skippingOversizedEvent = true;
+            break;
+          }
           offset = newline + 1;
+          continue;
         }
-      }
-    } catch (error) {
-      if ((state.cleanupComplete && !state.outputAbandoned) || error?.code !== "ERR_STREAM_PREMATURE_CLOSE") {
-        state.callbackError = error instanceof Error ? error : new Error(String(error));
+        if (segment.length > 0) {
+          segments.push(segment);
+          segmentBytes += segment.length;
+        }
+        if (newline === -1) {
+          break;
+        }
+        await processLine(ctx, Buffer.concat(segments, segmentBytes));
+        segments = [];
+        segmentBytes = 0;
+        offset = newline + 1;
       }
     }
-    if (segmentBytes > 0) {
-      await processLine(Buffer.concat(segments, segmentBytes));
+  } catch (error) {
+    if ((state.cleanupComplete && !state.outputAbandoned) || error?.code !== "ERR_STREAM_PREMATURE_CLOSE") {
+      state.callbackError = error instanceof Error ? error : new Error(String(error));
     }
-  })();
+  }
+  if (segmentBytes > 0) {
+    await processLine(ctx, Buffer.concat(segments, segmentBytes));
+  }
+}
+
+export function parseCodexEventStream({ child, state, spawnCheckpointPromise, options, eventLineMaxBytes, writeEventLine, requestTermination }) {
+  return consumeCodexEventStream({ child, state, spawnCheckpointPromise, options, eventLineMaxBytes, writeEventLine, requestTermination });
 }
