@@ -260,7 +260,7 @@ async function processLine(ctx, lineBuffer) {
   }
 }
 
-async function consumeCodexEventStream(ctx) {
+export async function parseCodexEventStream(ctx) {
   const { child, state, spawnCheckpointPromise, eventLineMaxBytes, requestTermination } = ctx;
   if (!child.stdout) {
     recordProtocolError(state, "Codex process did not expose stdout.");
@@ -324,6 +324,3 @@ async function consumeCodexEventStream(ctx) {
   }
 }
 
-export function parseCodexEventStream({ child, state, spawnCheckpointPromise, options, eventLineMaxBytes, writeEventLine, requestTermination }) {
-  return consumeCodexEventStream({ child, state, spawnCheckpointPromise, options, eventLineMaxBytes, writeEventLine, requestTermination });
-}
