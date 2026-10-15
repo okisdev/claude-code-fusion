@@ -260,7 +260,7 @@ test("reopened Fusion worker keeps its transcript cursor and counts only appende
   assert.deepStrictEqual(switched.turnIds, ["new", "other"]);
 });
 
-test("reopened Fusion worker totals advance after message and tool windows fill", (t) => {
+test("reopened Fusion worker totals advance after compact 64-entry message and tool windows fill", (t) => {
   const directory = sandbox(t);
   const transcript = path.join(directory, "agent.jsonl");
   const prior = unverifiedRecord({
@@ -283,8 +283,8 @@ test("reopened Fusion worker totals advance after message and tool windows fill"
   fs.appendFileSync(transcript, `${lines.slice(520).join("\n")}\n`);
   current = refreshWorkerTranscript(current, transcript);
   assert.deepStrictEqual([current.turns, current.toolCalls, current.usage.outputTokens, current.usage.uncachedTokens], [4_160, 4_160, 8_320, 20_800]);
-  assert.deepStrictEqual([Object.keys(current.usageMessages).length, current.turnIds.length, current.toolUseIds.length], [512, 512, 2_048]);
-  assert.deepStrictEqual([current.transcriptRoundPrefix.turns, current.transcriptRoundPrefix.toolCalls, current.transcriptRoundPrefix.usage.outputTokens], [1_548, 12, 3_096]);
+  assert.deepStrictEqual([Object.keys(current.usageMessages).length, current.turnIds.length, current.toolUseIds.length], [64, 64, 64]);
+  assert.deepStrictEqual([current.transcriptRoundPrefix.turns, current.transcriptRoundPrefix.toolCalls, current.transcriptRoundPrefix.usage.outputTokens], [1_996, 1_996, 3_992]);
   assert.deepStrictEqual(refreshWorkerTranscript(current, transcript), current);
 });
 

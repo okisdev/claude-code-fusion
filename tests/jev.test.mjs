@@ -1,8 +1,12 @@
 import assert from "node:assert";
+import { spawn } from "node:child_process";
 import http from "node:http";
+import { fileURLToPath } from "node:url";
 import { test } from "node:test";
 
 import { askJev } from "../plugins/fusion/scripts/lib/jev.mjs";
+
+const BRIEF_SENSOR_PATH = fileURLToPath(new URL("../plugins/fusion/scripts/brief-sensor.mjs", import.meta.url));
 
 function closeServer(server) {
   return new Promise((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
@@ -105,5 +109,34 @@ test("askJev times out before a delayed response", async (t) => {
   const startedAt = performance.now();
 
   assert.strictEqual(await askJev("state", {}, { env: envFor(server.endpoint) }), null);
-  assert.ok(performance.now() - startedAt < 5_500);
+  const elapsed = performance.now() - startedAt;
+  assert.ok(elapsed >= 1_000 && elapsed < 2_000, `expected timeout near 1.2 s, got ${elapsed.toFixed(0)} ms`);
+});
+
+test("brief sensor exits silently when Jev never responds", async (t) => {
+  const server = await startServer(t, () => {});
+  const input = {
+    hook_event_name: "PreToolUse",
+    tool_name: "Agent",
+    tool_input: {
+      subagent_type: "codex:codex-rescue",
+      prompt: "Review the current implementation, identify the relevant behavior, and explain the concrete evidence and verification steps for this task. Include the expected result and any constraints that matter. Keep the recommendation actionable and state what should happen next."
+    }
+  };
+  const startedAt = performance.now();
+  const child = spawn(process.execPath, [BRIEF_SENSOR_PATH], { env: envFor(server.endpoint), stdio: ["pipe", "pipe", "pipe"] });
+  child.stdin.end(JSON.stringify(input));
+  let stdout = "";
+  let stderr = "";
+  child.stdout.setEncoding("utf8").on("data", (chunk) => { stdout += chunk; });
+  child.stderr.setEncoding("utf8").on("data", (chunk) => { stderr += chunk; });
+  const result = await new Promise((resolve, reject) => {
+    child.once("error", reject);
+    child.once("close", (code, signal) => resolve({ code, signal }));
+  });
+
+  assert.strictEqual(result.code, 0, stderr);
+  assert.strictEqual(result.signal, null);
+  assert.strictEqual(stdout, "");
+  assert.ok(performance.now() - startedAt < 2_000);
 });

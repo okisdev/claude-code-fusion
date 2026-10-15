@@ -287,8 +287,8 @@ function workerFailure(record, now, lookbackMs) {
   return { failureKind, timestamp };
 }
 
-function workerBreakerRecords(env, lane) {
-  return readWorkerRecords(env)
+function workerBreakerRecords(records, lane) {
+  return records
     .filter((record) => canonicalWorkerAgentType(record.agentType) === lane)
     .map((record) => ({ ...record, status: record.transportStatus === "done" ? "done" : ["failed", "incomplete", "owner_ended"].includes(record.transportStatus) ? "failed" : record.transportStatus }));
 }
@@ -329,8 +329,9 @@ function run(env = process.env, now = Date.now()) {
     engineLines.set(engine, lines);
   }
   const lines = [...(engineLines.get("grok") ?? []), ...ENGINE_IDS.filter((engine) => engine !== "grok").flatMap((engine) => engineLines.get(engine) ?? [])];
+  const workerRecords = readWorkerRecords(env, { modifiedSinceMs: now - lookbackMs, modifiedBeforeMs: now });
   for (const lane of WORKER_BREAKER_LANES) {
-    const worker = latestBreakerFailure(workerBreakerRecords(env, lane), workerFailure, now, lookbackMs);
+    const worker = latestBreakerFailure(workerBreakerRecords(workerRecords, lane), workerFailure, now, lookbackMs);
     if (worker) {
       lines.push(advisoryLine(lane, worker, now, lookbackMs));
     }

@@ -6,7 +6,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/rules-sync.mjs\"",
+            "command": "command -v node >/dev/null 2>&1 || exit 0; node \"${CLAUDE_PLUGIN_ROOT}/scripts/rules-sync.mjs\"",
             "timeout": 10
           }
         ]
@@ -16,7 +16,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/breaker-check.mjs\"",
+            "command": "command -v node >/dev/null 2>&1 || exit 0; node \"${CLAUDE_PLUGIN_ROOT}/scripts/breaker-check.mjs\"",
             "timeout": 10
           }
         ]
@@ -26,7 +26,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "echo 'Context was compacted. Restate the session execution posture (coordinate, implement, or triage) in your next message. Confirm that every dispatched package is still tracked to collection and verification, and that any main loop work since the last verification still has a verification command to run. Reassess routing for the remaining work: does anything now belong to fusion:deep-reasoner, a peer engine, or the panel? [fusion:9902]'",
+            "command": "echo 'Context was compacted. In one line, restate the execution posture and every in-flight Fusion task still owed collection, verification, or settlement. [fusion:9902]'",
             "timeout": 5
           }
         ]
@@ -37,7 +37,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/fleet-posture.mjs\"",
+            "command": "command -v node >/dev/null 2>&1 || exit 0; node \"${CLAUDE_PLUGIN_ROOT}/scripts/fleet-posture.mjs\"",
             "timeout": 10
           }
         ]
@@ -45,11 +45,11 @@
     ],
     "PreToolUse": [
       {
-        "matcher": "*",
+        "matcher": "^(?!(?:Edit|Write|NotebookEdit|MultiEdit|Bash|Agent|Task|SendMessage|TaskOutput|TaskStop)$).*$",
         "hooks": [
           {
             "type": "command",
-            "command": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/worker-lifecycle.mjs\"",
+            "command": "command -v node >/dev/null 2>&1 || exit 0; node \"${CLAUDE_PLUGIN_ROOT}/scripts/worker-lifecycle.mjs\"",
             "timeout": 10
           }
         ]
@@ -59,7 +59,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/inline-delegation-guard.mjs\"",
+            "command": "command -v node >/dev/null 2>&1 || exit 0; node \"${CLAUDE_PLUGIN_ROOT}/scripts/fusion-hook.mjs\"",
             "timeout": 10
           }
         ]
@@ -69,12 +69,12 @@
         "hooks": [
           {
             "type": "command",
-            "command": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/inline-delegation-guard.mjs\"",
+            "command": "command -v node >/dev/null 2>&1 || exit 0; node \"${CLAUDE_PLUGIN_ROOT}/scripts/fusion-hook.mjs\"",
             "timeout": 10
           },
           {
             "type": "command",
-            "command": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/brief-sensor.mjs\"",
+            "command": "command -v node >/dev/null 2>&1 || exit 0; node \"${CLAUDE_PLUGIN_ROOT}/scripts/brief-sensor.mjs\"",
             "timeout": 10
           }
         ]
@@ -84,7 +84,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/inline-delegation-guard.mjs\"",
+            "command": "command -v node >/dev/null 2>&1 || exit 0; node \"${CLAUDE_PLUGIN_ROOT}/scripts/fusion-hook.mjs\"",
             "timeout": 10
           }
         ]
@@ -94,7 +94,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/inline-delegation-guard.mjs\"",
+            "command": "command -v node >/dev/null 2>&1 || exit 0; node \"${CLAUDE_PLUGIN_ROOT}/scripts/fusion-hook.mjs\"",
             "timeout": 10
           }
         ]
@@ -102,11 +102,11 @@
     ],
     "PostToolUse": [
       {
-        "matcher": "*",
+        "matcher": "^(?!(?:Agent|Task|Bash|SendMessage|Edit|Write|NotebookEdit|MultiEdit)$).*$",
         "hooks": [
           {
             "type": "command",
-            "command": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/worker-lifecycle.mjs\"",
+            "command": "command -v node >/dev/null 2>&1 || exit 0; node \"${CLAUDE_PLUGIN_ROOT}/scripts/worker-lifecycle.mjs\"",
             "timeout": 10
           }
         ]
@@ -116,7 +116,17 @@
         "hooks": [
           {
             "type": "command",
-            "command": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/inline-delegation-guard.mjs\"",
+            "command": "command -v node >/dev/null 2>&1 || exit 0; node \"${CLAUDE_PLUGIN_ROOT}/scripts/fusion-hook.mjs\"",
+            "timeout": 10
+          }
+        ]
+      },
+      {
+        "matcher": "^(Edit|Write|NotebookEdit|MultiEdit)$",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "command -v node >/dev/null 2>&1 || exit 0; node \"${CLAUDE_PLUGIN_ROOT}/scripts/fusion-hook.mjs\"",
             "timeout": 10
           }
         ]
@@ -124,11 +134,21 @@
     ],
     "PostToolUseFailure": [
       {
-        "matcher": "*",
+        "matcher": "^(?!(?:Edit|Write|NotebookEdit|MultiEdit)$).*$",
         "hooks": [
           {
             "type": "command",
-            "command": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/worker-lifecycle.mjs\"",
+            "command": "command -v node >/dev/null 2>&1 || exit 0; node \"${CLAUDE_PLUGIN_ROOT}/scripts/worker-lifecycle.mjs\"",
+            "timeout": 10
+          }
+        ]
+      },
+      {
+        "matcher": "^(Edit|Write|NotebookEdit|MultiEdit)$",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "command -v node >/dev/null 2>&1 || exit 0; node \"${CLAUDE_PLUGIN_ROOT}/scripts/fusion-hook.mjs\"",
             "timeout": 10
           }
         ]
@@ -140,7 +160,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/worker-lifecycle.mjs\"",
+            "command": "command -v node >/dev/null 2>&1 || exit 0; node \"${CLAUDE_PLUGIN_ROOT}/scripts/worker-lifecycle.mjs\"",
             "timeout": 10
           }
         ]
@@ -152,7 +172,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/worker-lifecycle.mjs\"",
+            "command": "command -v node >/dev/null 2>&1 || exit 0; node \"${CLAUDE_PLUGIN_ROOT}/scripts/worker-lifecycle.mjs\"",
             "timeout": 10
           }
         ]
@@ -163,7 +183,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/worker-lifecycle.mjs\"",
+            "command": "command -v node >/dev/null 2>&1 || exit 0; node \"${CLAUDE_PLUGIN_ROOT}/scripts/worker-lifecycle.mjs\"",
             "timeout": 10
           }
         ]
@@ -174,7 +194,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/worker-lifecycle.mjs\"",
+            "command": "command -v node >/dev/null 2>&1 || exit 0; node \"${CLAUDE_PLUGIN_ROOT}/scripts/worker-lifecycle.mjs\"",
             "timeout": 10
           }
         ]

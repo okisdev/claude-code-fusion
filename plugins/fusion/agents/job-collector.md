@@ -2,6 +2,8 @@
 name: job-collector
 description: Internal forwarder that collects one detached peer companion job from a validated engine and job id, dispatched by the orchestrator instead of polling companion state in the main loop. Not for general work.
 model: sonnet
+effort: low
+omitClaudeMd: true
 background: false
 tools: Bash, Read, Write
 ---

@@ -41,6 +41,7 @@ const MUTATING_SUBCOMMANDS = new Set([
 ]);
 
 const VERIFICATION_SCRIPTS = new Set([
+  "build",
   "check",
   "checks",
   "coverage",
@@ -100,7 +101,7 @@ const CONDITIONAL_RUNNERS = new Map([
   ["playwright", new Set(["test"])],
   ["rake", new Set(["spec", "test"])],
   ["ruff", new Set(["check"])],
-  ["swift", new Set(["test"])],
+  ["swift", new Set(["build", "test"])],
   ["xcodebuild", new Set(["test"])]
 ]);
 
@@ -193,6 +194,12 @@ function matchesPackageManager(head, tokens) {
 }
 
 function matchesRunner(head, tokens) {
+  if (head === "git" && tokens[1]?.toLowerCase() === "diff" && tokens.slice(2).includes("--check")) {
+    return true;
+  }
+  if ((head === "python" || head === "python3") && tokens[1] === "-m" && tokens[2]?.toLowerCase() === "pytest") {
+    return true;
+  }
   if (UNCONDITIONAL_RUNNERS.has(head)) {
     return true;
   }
@@ -323,9 +330,7 @@ function verificationOutputPasses(toolResponse) {
     !toolResponse ||
     typeof toolResponse !== "object" ||
     Array.isArray(toolResponse) ||
-    Boolean(toolResponse.is_error) ||
-    Boolean(toolResponse.isError) ||
-    Boolean(toolResponse.interrupted)
+    verificationResponseFailed(toolResponse)
   ) {
     return false;
   }
@@ -335,20 +340,29 @@ function verificationOutputPasses(toolResponse) {
   return PASS_SUMMARY_PATTERNS.some((pattern) => pattern.test(output)) && !FAILURE_SUMMARY_PATTERNS.some((pattern) => pattern.test(output));
 }
 
+function verificationResponseFailed(toolResponse) {
+  return Boolean(toolResponse.is_error) || Boolean(toolResponse.isError) || Boolean(toolResponse.interrupted) ||
+    ["exitCode", "exit_code", "code", "returnCode"].some((key) =>
+      typeof toolResponse[key] === "number" && toolResponse[key] !== 0
+    );
+}
+
 function verificationEvidence(command, toolResponse, env = process.env) {
   const verification = verificationCommand(command, env);
   if (!verification.recognized || !toolResponse || typeof toolResponse !== "object" || Array.isArray(toolResponse)) {
     return null;
   }
-  if (Boolean(toolResponse.is_error) || Boolean(toolResponse.isError) || Boolean(toolResponse.interrupted)) {
+  if (verificationResponseFailed(toolResponse)) {
     return null;
   }
   return verification.observable ? "exit-status" : verificationOutputPasses(toolResponse) ? "output-summary" : null;
 }
 
 export {
+  appendToolResponseText,
   isVerificationCommand,
   verificationCommand,
   verificationEvidence,
-  verificationOutputPasses
+  verificationOutputPasses,
+  verificationResponseFailed
 };

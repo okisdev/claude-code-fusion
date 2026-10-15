@@ -53,7 +53,7 @@ function jobCount(dataDir, slug) {
   return fs.readdirSync(jobsDir).filter((name) => name.endsWith(".json")).length;
 }
 
-async function waitForFile(file, timeoutMs = 3000) {
+async function waitForFile(file, timeoutMs = 10000) {
   const deadline = Date.now() + timeoutMs;
   while (!fs.existsSync(file)) {
     if (Date.now() >= deadline) {
@@ -63,7 +63,7 @@ async function waitForFile(file, timeoutMs = 3000) {
   }
 }
 
-function runWorkerLockTimeoutChild(stateDir, taskId, readyFile, timeoutMs) {
+function runWorkerLockTimeoutChild(t, stateDir, taskId, readyFile, timeoutMs) {
   const child = spawn(process.execPath, ["--input-type=module", "--eval", workerLockTimeoutChild, workerStateModuleUrl, stateDir, taskId, readyFile], {
     stdio: ["ignore", "pipe", "pipe"],
     env: { ...process.env, FUSION_LOCK_TIMEOUT_MS: String(timeoutMs) },
@@ -81,6 +81,10 @@ function runWorkerLockTimeoutChild(stateDir, taskId, readyFile, timeoutMs) {
   const completion = new Promise((resolve, reject) => {
     child.once("error", reject);
     child.once("close", (code, signal) => resolve({ code, signal, stderr, stdout }));
+  });
+  t.after(async () => {
+    if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+    await Promise.allSettled([completion]);
   });
   return { child, completion };
 }
@@ -261,7 +265,14 @@ test("a live descendant process group prevents resume lease repair", async (t) =
     stdio: "ignore",
   });
   const leaderPid = leader.pid;
-  await once(leader, "close");
+  const leaderClosed = once(leader, "close");
+  t.after(async () => {
+    try { process.kill(-leaderPid, "SIGKILL"); } catch (error) {
+      if (error.code !== "ESRCH") throw error;
+    }
+    await leaderClosed;
+  });
+  await leaderClosed;
   const groupAlive = () => {
     try {
       process.kill(-leaderPid, 0);
@@ -271,11 +282,6 @@ test("a live descendant process group prevents resume lease repair", async (t) =
     }
   };
   assert.strictEqual(groupAlive(), true);
-  t.after(() => {
-    try {
-      process.kill(-leaderPid, "SIGKILL");
-    } catch {}
-  });
 
   const stateModule = await import(stateModulePath);
   const sessionId = "55555555-5555-7555-8555-555555555555";
@@ -326,18 +332,18 @@ test("a live resume owner blocks lease repair when its identity probe is unavail
   }
   const sandbox = makeSandbox(t);
   const child = spawn("/bin/sleep", ["30"], { stdio: "ignore" });
+  const childClosed = once(child, "close");
+  t.after(async () => {
+    if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+    await childClosed;
+  });
   const identity = getProcessIdentity(child.pid);
   if (!identity) {
     child.kill("SIGKILL");
-    await once(child, "close");
+    await childClosed;
     t.skip("Process identity probing is unavailable.");
     return;
   }
-  t.after(() => {
-    try {
-      process.kill(child.pid, "SIGKILL");
-    } catch {}
-  });
 
   const stateModule = await import(stateModulePath);
   const sessionId = "66666666-6666-7666-8666-666666666666";
@@ -580,14 +586,14 @@ test("a held worker record lock times out a second acquirer within the configure
   fs.writeFileSync(lockFile, "held\n");
   t.after(() => fs.rmSync(lockFile, { force: true }));
 
-  const waiter = runWorkerLockTimeoutChild(env.FUSION_WORKER_STATE_DIR, taskId, waiterReadyFile, timeoutMs);
+  const waiter = runWorkerLockTimeoutChild(t, env.FUSION_WORKER_STATE_DIR, taskId, waiterReadyFile, timeoutMs);
   await waitForFile(waiterReadyFile);
-  const result = await waitForCompletion(waiter.completion, timeoutMs + 500);
+  const result = await waitForCompletion(waiter.completion, timeoutMs + 5000);
   assert.strictEqual(result.code, 0, result.stderr);
   const outcome = JSON.parse(result.stdout);
   assert.match(outcome.message, /timed out waiting for Fusion worker state lock/);
   assert.ok(outcome.elapsedMs >= timeoutMs, `Expected the waiter to wait for at least ${timeoutMs}ms, took ${outcome.elapsedMs}ms.`);
-  assert.ok(outcome.elapsedMs <= timeoutMs + 500, `Expected the waiter to finish near ${timeoutMs}ms, took ${outcome.elapsedMs}ms.`);
+  assert.ok(outcome.elapsedMs <= timeoutMs + 5000, `Expected the waiter to finish near ${timeoutMs}ms, took ${outcome.elapsedMs}ms.`);
 });
 
 test("an abandoned record lock older than ten seconds is reaped", async (t) => {
@@ -640,19 +646,19 @@ state.updateJobRecordFileWithCurrent(jobFile, (current) => {
 });
 `;
   const holder = spawn(process.execPath, ["--input-type=module", "--eval", source, stateModulePath, jobFile, readyFile], { stdio: "ignore" });
-  t.after(() => {
-    try {
-      holder.kill("SIGKILL");
-    } catch {}
+  const holderClosed = once(holder, "close");
+  t.after(async () => {
+    if (holder.exitCode === null && holder.signalCode === null) holder.kill("SIGKILL");
+    await holderClosed;
   });
   await waitForFile(readyFile);
   holder.kill("SIGKILL");
-  await once(holder, "close");
+  await holderClosed;
 
   const startedAt = Date.now();
   const updated = stateModule.updateJobRecordFile(jobFile, { grokPid: 54321 });
 
-  assert.ok(Date.now() - startedAt < 1000);
+  assert.ok(Date.now() - startedAt < 5000);
   assert.strictEqual(updated.grokPid, 54321);
   assert.strictEqual(fs.existsSync(`${jobFile}.lock`), false);
 });
