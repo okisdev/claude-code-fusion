@@ -42,7 +42,7 @@ function linuxProcessGroupHasLiveMember(pgid) {
   return false;
 }
 
-function directProcessAlive(pid) {
+export function processIsDirectlyAlive(pid) {
   if (!Number.isInteger(pid) || pid <= 1) {
     return false;
   }
@@ -82,9 +82,9 @@ export function isProcessAlive(pid, identity = null, ownsProcessGroup = true) {
     return processIdentityMatches(pid, identity);
   }
   if (process.platform === "win32" || !ownsProcessGroup) {
-    return directProcessAlive(pid);
+    return processIsDirectlyAlive(pid);
   }
-  return directProcessAlive(pid) || processGroupAlive(pid);
+  return processIsDirectlyAlive(pid) || processGroupAlive(pid);
 }
 
 function linuxProcessIdentity(pid) {
@@ -188,7 +188,7 @@ export function validProcessIdentity(identity) {
 }
 
 export function getProcessIdentity(pid) {
-  if (!directProcessAlive(pid)) {
+  if (!processIsDirectlyAlive(pid)) {
     return null;
   }
   if (pid === process.pid && cachedOwnIdentity) {
@@ -212,8 +212,4 @@ export function processIdentitiesMatch(currentIdentity, expectedIdentity) {
 
 export function processIdentityMatches(pid, expectedIdentity) {
   return processIdentitiesMatch(getProcessIdentity(pid), expectedIdentity);
-}
-
-export function processIsDirectlyAlive(pid) {
-  return directProcessAlive(pid);
 }

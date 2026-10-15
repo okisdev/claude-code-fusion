@@ -5,7 +5,7 @@ import path from "node:path";
 import { isatty } from "node:tty";
 import { fileURLToPath } from "node:url";
 
-import { createRawTransport } from "./lib/raw-transport.mjs";
+import { configureRawTransport, createRawCommandTransport as allocateRawCommandTransport, consumeRawCommandTransport, cleanupRawCommandTransportsForSession, resolveCommandTransport } from "./lib/raw-transport.mjs";
 import { parseArgs, parseRawArgs, rawBooleanOptionRequested } from "./lib/args.mjs";
 import { resolveCursorBin, probeCursorVersion, compareCursorVersion, TESTED_CURSOR_INTERVAL, buildCursorArgs, buildCursorChildEnv, runCursor, classifyCursorFailure, reapPrivateHomeHelpers } from "./lib/cursor-exec.mjs";
 import { buildPrivateHome, copyChatForResume, cursorChatDir, projectHookFiles, CURSOR_SESSION_ID_PATTERN } from "./lib/cursor-home.mjs";
@@ -49,7 +49,7 @@ function currentClaudeSessionId() {
   return process.env[SESSION_ID_ENV] ?? null;
 }
 
-const { createRawCommandTransport: allocateRawCommandTransport, consumeRawCommandTransport, cleanupRawCommandTransportsForSession, resolveCommandTransport } = createRawTransport({
+configureRawTransport({
   engineName: "cursor",
   sessionIdEnv: SESSION_ID_ENV,
   makeError: errorWithFailure,

@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 import path from "node:path";
-import { createRawTransport } from "./lib/raw-transport.mjs";
+import { configureRawTransport, createRawCommandTransport as allocateRawCommandTransport, consumeRawCommandTransport, cleanupRawCommandTransportsForSession, resolveCommandTransport } from "./lib/raw-transport.mjs";
 import { rawBooleanOptionRequested } from "./lib/args.mjs";
 import { SESSION_ID_ENV } from "./lib/state.mjs";
 import { commandContext, output, errorWithFailure } from "./lib/companion/base.mjs";
@@ -34,7 +34,7 @@ function printUsage() {
   );
 }
 
-const { createRawCommandTransport: allocateRawCommandTransport, consumeRawCommandTransport, cleanupRawCommandTransportsForSession, resolveCommandTransport } = createRawTransport({
+configureRawTransport({
   engineName: "grok",
   sessionIdEnv: SESSION_ID_ENV,
   makeError: errorWithFailure,

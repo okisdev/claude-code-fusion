@@ -3,7 +3,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
-import { createRecordLock } from "./record-lock.mjs";
+import { configureRecordLock, withRecordLock } from "./record-lock.mjs";
 
 import {
   getProcessIdentity,
@@ -267,7 +267,7 @@ export function hardenPrivateStateFile(file) {
   return file;
 }
 
-const withRecordLock = createRecordLock({ atomicWriteFile, ensurePrivateDir, ensurePrivateStatePath, resolveLockTimeoutMs });
+configureRecordLock({ atomicWriteFile, ensurePrivateDir, ensurePrivateStatePath, resolveLockTimeoutMs });
 
 function deliveryStatusFor(record) {
   if (record.deliveryCollectedAt) {

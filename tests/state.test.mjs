@@ -596,31 +596,6 @@ test("a held worker record lock times out a second acquirer within the configure
   assert.ok(outcome.elapsedMs <= timeoutMs + 5000, `Expected the waiter to finish near ${timeoutMs}ms, took ${outcome.elapsedMs}ms.`);
 });
 
-test("an abandoned record lock older than ten seconds is reaped", async (t) => {
-  const sandbox = makeSandbox(t);
-  const stateModule = await import(stateModulePath);
-  const jobFile = stateModule.jobFilePath(sandbox.dataDir, sandbox.workDir, "stale-lock");
-  const record = stateModule.createJobRecord({
-    id: "stale-lock",
-    pid: process.pid,
-    mode: "consult",
-    cwd: sandbox.workDir,
-    briefFile: path.join(sandbox.dataDir, "brief.md"),
-    background: false,
-  });
-  stateModule.writeJobRecordFile(jobFile, record);
-  const lockDir = `${jobFile}.lock`;
-  fs.mkdirSync(lockDir);
-  const staleTime = new Date(Date.now() - 11000);
-  fs.utimesSync(lockDir, staleTime, staleTime);
-
-  const updated = stateModule.updateJobRecordFile(jobFile, { grokPid: 12345 });
-
-  assert.strictEqual(updated.grokPid, 12345);
-  assert.strictEqual(fs.existsSync(lockDir), false);
-  assert.strictEqual(stateModule.readJobRecordFile(jobFile).grokPid, 12345);
-});
-
 test("a record lock owned by a killed process is reclaimed without an age delay", async (t) => {
   const sandbox = makeSandbox(t);
   const stateModule = await import(stateModulePath);

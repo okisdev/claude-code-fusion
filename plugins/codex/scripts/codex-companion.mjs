@@ -7,7 +7,7 @@ import path from "node:path";
 import { isatty } from "node:tty";
 import { fileURLToPath } from "node:url";
 
-import { createRawTransport } from "./lib/raw-transport.mjs";
+import { configureRawTransport, createRawCommandTransport as allocateRawCommandTransport, consumeRawCommandTransport, pruneRawCommandTransports, resolveCommandTransport } from "./lib/raw-transport.mjs";
 import { parseArgs, parseRawArgs, parseServiceTier, splitRawArgumentString } from "./lib/args.mjs";
 import {
   buildReviewArgs,
@@ -492,7 +492,7 @@ function boundedPrompt(value) {
   return text;
 }
 
-const { createRawCommandTransport: allocateRawCommandTransport, consumeRawCommandTransport, pruneRawCommandTransports, resolveCommandTransport } = createRawTransport({
+configureRawTransport({
   engineName: "codex",
   sessionIdEnv: SESSION_ID_ENV,
   makeError: (message, kind) => new CompanionError(message, kind),
