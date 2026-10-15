@@ -2,11 +2,12 @@ import { createHash, randomBytes } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { prunePrivateHome, removePrivateHome } from "./cursor-home.mjs";
+import { createRecordLock } from "./record-lock.mjs";
 
 import {
   getProcessIdentity,
   processIdentitiesMatch,
-  processIdentityMatches,
   processIsDirectlyAlive,
   validProcessIdentity
 } from "./process-identity.mjs";
@@ -15,12 +16,15 @@ const DATA_DIR_ENV = "CURSOR_COMPANION_DATA";
 const JOB_LOG_MAX_BYTES = 1024 * 1024;
 const LOG_TAIL_MAX_BYTES = 64 * 1024;
 const LOCK_TIMEOUT_ENV = "CURSOR_COMPANION_LOCK_TIMEOUT_MS";
-const LOCK_RETRY_MS = 20;
-const LOCK_STALE_MS = 10000;
 const RESUME_OWNER_LAUNCH_GRACE_MS = 15000;
 const PRIVATE_DIR_MODE = 0o700;
 const PRIVATE_FILE_MODE = 0o600;
 const TERMINAL_STATUSES = new Set(["done", "error", "cancelled"]);
+const ORPHAN_AGE_MS = 60 * 60 * 1000;
+const HOME_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
+const SWEEP_INTERVAL_MS = 10 * 60 * 1000;
+const NPM_CACHE_MAX_BYTES = 256 * 1024 * 1024;
+const NPM_CACHE_CLEAR_INTERVAL_MS = 24 * 60 * 60 * 1000;
 
 export const SESSION_ID_ENV = "CLAUDE_CODE_SESSION_ID";
 export const DEFAULT_LOCK_TIMEOUT_MS = 5000;
@@ -50,6 +54,70 @@ export function resolveDataDir(env = process.env) {
 
 export function runHomeDir(dataDir, jobId) {
   return path.join(dataDir, "runs", jobId, "home");
+}
+
+export function homeRetentionExpired(record, now = Date.now()) {
+  const finished = Date.parse(record.finishedAt ?? record.createdAt ?? "");
+  return TERMINAL_STATUSES.has(record.status) && Number.isFinite(finished) && now - finished >= HOME_RETENTION_MS;
+}
+
+function maintainTerminalHome(file, record) {
+  if (!TERMINAL_STATUSES.has(record.status)) return;
+  const dataDir = path.resolve(path.dirname(file), "../../..");
+  if (record.homeDir !== runHomeDir(dataDir, record.id)) return;
+  if (homeRetentionExpired(record)) removePrivateHome(record.homeDir);
+  else prunePrivateHome(record.homeDir, record.cwd, record.sessionId);
+}
+
+function directoryBytes(directory, limit) {
+  let bytes = 0;
+  for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
+    const child = path.join(directory, entry.name);
+    const stats = fs.lstatSync(child);
+    bytes += stats.isDirectory() && !stats.isSymbolicLink() ? directoryBytes(child, limit - bytes) : stats.size;
+    if (bytes > limit) break;
+  }
+  return bytes;
+}
+
+function maintainNpmCache(dataDir, records, now) {
+  const cache = path.join(dataDir, "npm-cache");
+  const stats = fs.lstatSync(cache, { throwIfNoEntry: false });
+  if (!stats || !stats.isDirectory() || stats.isSymbolicLink()) return;
+  const marker = path.join(dataDir, ".cursor-npm-cache-clear.json");
+  const last = readJobRecordFile(marker)?.clearedAt;
+  if (Number.isFinite(last) && now - last < NPM_CACHE_CLEAR_INTERVAL_MS) return;
+  if (records.some((record) => record.status === "running")) return;
+  if (directoryBytes(cache, NPM_CACHE_MAX_BYTES) <= NPM_CACHE_MAX_BYTES) return;
+  removePrivateHome(cache);
+  fs.mkdirSync(cache, { mode: PRIVATE_DIR_MODE });
+  atomicWriteFile(marker, `${JSON.stringify({ clearedAt: now })}\n`);
+}
+
+export function sweepCursorHomes(dataDir, now = Date.now()) {
+  const marker = path.join(dataDir, ".cursor-home-sweep.json");
+  return withRecordLock(marker, () => {
+    const records = listAllJobRecords(dataDir).map(({ record }) => record);
+    maintainNpmCache(dataDir, records, now);
+    const last = readJobRecordFile(marker)?.sweptAt;
+    if (Number.isFinite(last) && now - last < SWEEP_INTERVAL_MS) return false;
+    const recorded = new Set(records.map((record) => record.id));
+    for (const record of records) {
+      if (!TERMINAL_STATUSES.has(record.status) || record.homeDir !== runHomeDir(dataDir, record.id)) continue;
+      if (homeRetentionExpired(record, now)) removePrivateHome(record.homeDir);
+      else prunePrivateHome(record.homeDir, record.cwd, record.sessionId);
+    }
+    const runs = path.join(dataDir, "runs");
+    if (fs.lstatSync(runs, { throwIfNoEntry: false })?.isDirectory()) {
+      for (const entry of fs.readdirSync(runs, { withFileTypes: true })) {
+        if (!entry.isDirectory() || recorded.has(entry.name)) continue;
+        const directory = path.join(runs, entry.name);
+        if (now - fs.statSync(directory).mtimeMs >= ORPHAN_AGE_MS) removePrivateHome(directory);
+      }
+    }
+    atomicWriteFile(marker, `${JSON.stringify({ id: "cursor-home-sweep", sweptAt: now })}\n`);
+    return true;
+  });
 }
 
 export function workspaceSlug(cwd) {
@@ -128,6 +196,7 @@ export function createJobRecord(fields) {
     requestedModel: fields.requestedModel ?? null,
     resolvedModel: fields.resolvedModel ?? null,
     observedModel: fields.observedModel ?? null,
+    modelDrift: fields.modelDrift ?? null,
     requestedEffort: fields.requestedEffort ?? null,
     effortApplied: fields.effortApplied ?? null,
     billingPool: fields.billingPool ?? null,
@@ -147,10 +216,6 @@ export function createJobRecord(fields) {
     jobClass: fields.jobClass ?? "unknown",
     request: fields.request ?? null
   });
-}
-
-function sleepMs(ms) {
-  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
 }
 
 function ensurePrivateDir(dir) {
@@ -193,6 +258,18 @@ function ensurePrivateStatePath(target) {
   ensurePrivateDir(absolute);
 }
 
+function fsyncDirectory(dir) {
+  let descriptor;
+  try {
+    descriptor = fs.openSync(dir, "r");
+    fs.fsyncSync(descriptor);
+  } catch {
+    return;
+  } finally {
+    if (descriptor !== undefined) fs.closeSync(descriptor);
+  }
+}
+
 function atomicWriteFile(file, content) {
   ensurePrivateStatePath(path.dirname(file));
   const temp = `${file}.${process.pid}.${randomBytes(6).toString("hex")}.tmp`;
@@ -201,9 +278,11 @@ function atomicWriteFile(file, content) {
     descriptor = fs.openSync(temp, "wx", PRIVATE_FILE_MODE);
     fs.writeFileSync(descriptor, content, "utf8");
     fs.chmodSync(temp, PRIVATE_FILE_MODE);
+    fs.fsyncSync(descriptor);
     fs.closeSync(descriptor);
     descriptor = undefined;
     fs.renameSync(temp, file);
+    fsyncDirectory(path.dirname(file));
   } finally {
     if (descriptor !== undefined) {
       try {
@@ -230,367 +309,7 @@ export function hardenPrivateStateFile(file) {
   return file;
 }
 
-function lockOwnerDir(lockDir, token) {
-  return `${lockDir}.owner.${token}`;
-}
-
-function validLockRecord(record) {
-  return Boolean(
-    record &&
-      typeof record === "object" &&
-      !Array.isArray(record) &&
-      record.version === 1 &&
-      typeof record.token === "string" &&
-      /^[a-f0-9]{32}$/.test(record.token) &&
-      Number.isInteger(record.ownerPid) &&
-      record.ownerPid > 1 &&
-      validProcessIdentity(record.ownerIdentity)
-  );
-}
-
-function lockOwnerIdentity() {
-  const identity = getProcessIdentity(process.pid);
-  if (!validProcessIdentity(identity)) {
-    throw new Error(`Unable to verify lock owner process ${process.pid}.`);
-  }
-  return identity;
-}
-
-function readLockRecord(lockDir) {
-  try {
-    const record = JSON.parse(fs.readFileSync(path.join(lockDir, "owner.json"), "utf8"));
-    return validLockRecord(record) ? record : null;
-  } catch {
-    return null;
-  }
-}
-
-function lockOwnerWasReplaced(record) {
-  if (processIdentityMatches(record.ownerPid, record.ownerIdentity)) {
-    return false;
-  }
-  const currentIdentity = getProcessIdentity(record.ownerPid);
-  if (currentIdentity) {
-    return !processIdentitiesMatch(currentIdentity, record.ownerIdentity);
-  }
-  return !processIsDirectlyAlive(record.ownerPid);
-}
-
-function lockTargetsToken(lockDir, token) {
-  try {
-    return fs.lstatSync(lockDir).isSymbolicLink() && path.resolve(path.dirname(lockDir), fs.readlinkSync(lockDir)) === lockOwnerDir(lockDir, token);
-  } catch {
-    return false;
-  }
-}
-
-function publishPreparedLock(lockDir, ownerDir) {
-  try {
-    fs.symlinkSync(path.basename(ownerDir), lockDir, "dir");
-    return true;
-  } catch (error) {
-    if (error?.code === "EEXIST") {
-      return false;
-    }
-    throw error;
-  }
-}
-
-function createLinkedOwner(linkPath, record) {
-  const ownerDir = lockOwnerDir(linkPath, record.token);
-  const preparedDir = `${ownerDir}.prepare.${process.pid}.${randomBytes(8).toString("hex")}`;
-  ensurePrivateDir(preparedDir);
-  try {
-    atomicWriteFile(path.join(preparedDir, "owner.json"), `${JSON.stringify(record)}\n`);
-    fs.renameSync(preparedDir, ownerDir);
-    return { ownerDir, published: publishPreparedLock(linkPath, ownerDir) };
-  } catch (error) {
-    try {
-      fs.rmSync(ownerDir, { recursive: true, force: true });
-    } catch {}
-    try {
-      fs.rmSync(preparedDir, { recursive: true, force: true });
-    } catch {}
-    throw error;
-  }
-}
-
-function publishLockCandidate(lockDir, record) {
-  const candidate = createLinkedOwner(lockDir, record);
-  if (candidate.published) {
-    return null;
-  }
-  return candidate.ownerDir;
-}
-
-function linkedPathExists(linkPath) {
-  try {
-    fs.lstatSync(linkPath);
-    return true;
-  } catch (error) {
-    if (error?.code === "ENOENT") {
-      return false;
-    }
-    throw error;
-  }
-}
-
-function reaperClaimSlot(lockDir, token) {
-  return `${lockDir}.reap.${token}`;
-}
-
-function claimTeardownError(error) {
-  return ["ENOENT", "EINVAL", "ENOTDIR", "ENOTEMPTY"].includes(error?.code);
-}
-
-function acquireReaperClaim(lockDir, ownerToken) {
-  const claim = {
-    version: 1,
-    token: randomBytes(16).toString("hex"),
-    ownerPid: process.pid,
-    ownerIdentity: lockOwnerIdentity()
-  };
-  const primarySlot = reaperClaimSlot(lockDir, ownerToken);
-  let slot = primarySlot;
-  const observedTokens = new Set();
-  for (;;) {
-    const existing = readLockRecord(slot);
-    if (!existing) {
-      try {
-        if (linkedPathExists(slot)) {
-          return null;
-        }
-        const candidate = createLinkedOwner(slot, claim);
-        if (candidate.published) {
-          return { slot, token: claim.token };
-        }
-        fs.rmSync(candidate.ownerDir, { recursive: true, force: true });
-      } catch (error) {
-        if (claimTeardownError(error)) {
-          return null;
-        }
-        throw error;
-      }
-      continue;
-    }
-    if (!lockTargetsToken(slot, existing.token) || !lockOwnerWasReplaced(existing)) {
-      return null;
-    }
-    if (observedTokens.has(existing.token)) {
-      return null;
-    }
-    observedTokens.add(existing.token);
-    slot = `${primarySlot}.successor-${existing.token}`;
-  }
-}
-
-function cleanupReaperClaims(lockDir, ownerToken) {
-  const dir = path.dirname(lockDir);
-  const prefix = path.basename(reaperClaimSlot(lockDir, ownerToken));
-  let entries;
-  try {
-    entries = fs.readdirSync(dir);
-  } catch {
-    return;
-  }
-  for (const entry of entries) {
-    if (entry !== prefix && !entry.startsWith(`${prefix}.`)) {
-      continue;
-    }
-    try {
-      fs.rmSync(path.join(dir, entry), { recursive: true, force: true });
-    } catch {}
-  }
-}
-
-function reclaimReplacedLock(lockDir, observed) {
-  if (!observed || !lockOwnerWasReplaced(observed)) {
-    return false;
-  }
-  const claim = acquireReaperClaim(lockDir, observed.token);
-  if (!claim) {
-    return false;
-  }
-  let reaped = false;
-  try {
-    const current = readLockRecord(lockDir);
-    if (current?.token !== observed.token || !lockTargetsToken(lockDir, observed.token) || !lockOwnerWasReplaced(current)) {
-      return false;
-    }
-    fs.unlinkSync(lockDir);
-    reaped = true;
-    try {
-      fs.rmSync(lockOwnerDir(lockDir, observed.token), { recursive: true, force: true });
-    } catch {}
-    return true;
-  } catch (error) {
-    if (error?.code === "ENOENT") {
-      return true;
-    }
-    throw error;
-  } finally {
-    if (reaped) {
-      try {
-        releaseLock(claim.slot, claim.token);
-      } catch {}
-      cleanupReaperClaims(lockDir, observed.token);
-    } else {
-      releaseLock(claim.slot, claim.token);
-    }
-  }
-}
-
-function reclaimLegacyLock(lockDir) {
-  try {
-    const stats = fs.lstatSync(lockDir);
-    if (!stats.isDirectory() || stats.isSymbolicLink() || Date.now() - stats.mtimeMs < LOCK_STALE_MS) {
-      return false;
-    }
-    fs.rmdirSync(lockDir);
-    return true;
-  } catch (error) {
-    return error?.code === "ENOENT";
-  }
-}
-
-function linkedOwnerDir(linkPath) {
-  try {
-    if (!fs.lstatSync(linkPath).isSymbolicLink()) {
-      return null;
-    }
-    const ownerDir = path.resolve(path.dirname(linkPath), fs.readlinkSync(linkPath));
-    if (path.dirname(ownerDir) !== path.dirname(linkPath) || !path.basename(ownerDir).startsWith(`${path.basename(linkPath)}.owner.`)) {
-      return null;
-    }
-    return ownerDir;
-  } catch {
-    return null;
-  }
-}
-
-function scavengeOrphanOwnerDirs(lockDir) {
-  const dir = path.dirname(lockDir);
-  const prefix = `${path.basename(lockDir)}.owner.`;
-  const activeOwner = linkedOwnerDir(lockDir);
-  let entries;
-  try {
-    entries = fs.readdirSync(dir);
-  } catch {
-    return;
-  }
-  for (const entry of entries) {
-    if (!entry.startsWith(prefix)) {
-      continue;
-    }
-    const ownerDir = path.join(dir, entry);
-    if (ownerDir === activeOwner) {
-      continue;
-    }
-    let stats;
-    try {
-      stats = fs.lstatSync(ownerDir);
-    } catch {
-      continue;
-    }
-    if (Date.now() - stats.mtimeMs < LOCK_STALE_MS) {
-      continue;
-    }
-    const prepared = entry.includes(".prepare.");
-    const released = fs.existsSync(path.join(ownerDir, ".released"));
-    const record = readLockRecord(ownerDir);
-    if (!prepared && !released && (!record || !lockOwnerWasReplaced(record))) {
-      continue;
-    }
-    if (linkedOwnerDir(lockDir) === ownerDir) {
-      continue;
-    }
-    const claimedDir = `${ownerDir}.scavenged.${randomBytes(8).toString("hex")}`;
-    try {
-      fs.renameSync(ownerDir, claimedDir);
-      fs.rmSync(claimedDir, { recursive: true, force: true });
-    } catch {}
-  }
-}
-
-function releaseLock(lockDir, token) {
-  const ownerDir = lockOwnerDir(lockDir, token);
-  try {
-    fs.writeFileSync(path.join(ownerDir, ".released"), `${token}\n`, { flag: "wx", mode: PRIVATE_FILE_MODE });
-  } catch {}
-  if (!lockTargetsToken(lockDir, token)) {
-    try {
-      fs.rmSync(ownerDir, { recursive: true, force: true });
-    } catch {}
-    return false;
-  }
-  try {
-    fs.unlinkSync(lockDir);
-  } catch (error) {
-    if (error?.code === "ENOENT") {
-      return false;
-    }
-    throw error;
-  }
-  try {
-    fs.rmSync(ownerDir, { recursive: true, force: true });
-  } catch {}
-  return true;
-}
-
-function withRecordLock(file, fn) {
-  ensurePrivateStatePath(path.dirname(file));
-  const lockDir = `${file}.lock`;
-  scavengeOrphanOwnerDirs(lockDir);
-  const deadline = Date.now() + resolveLockTimeoutMs();
-  const token = randomBytes(16).toString("hex");
-  const record = {
-    version: 1,
-    token,
-    ownerPid: process.pid,
-    ownerIdentity: lockOwnerIdentity()
-  };
-  let candidateDir = publishLockCandidate(lockDir, record);
-  try {
-    while (candidateDir) {
-      const observed = readLockRecord(lockDir);
-      if (reclaimReplacedLock(lockDir, observed) || (!observed && reclaimLegacyLock(lockDir))) {
-        if (publishPreparedLock(lockDir, candidateDir)) {
-          candidateDir = null;
-          break;
-        }
-      }
-      if (Date.now() >= deadline) {
-        throw new Error(`Timed out waiting for the job record lock at ${file}.`);
-      }
-      sleepMs(LOCK_RETRY_MS);
-      if (publishPreparedLock(lockDir, candidateDir)) {
-        candidateDir = null;
-      }
-    }
-    let callbackError = null;
-    try {
-      return fn();
-    } catch (error) {
-      callbackError = error;
-      throw error;
-    } finally {
-      try {
-        releaseLock(lockDir, token);
-      } catch (error) {
-        if (!callbackError) {
-          throw error;
-        }
-      }
-    }
-  } finally {
-    if (candidateDir) {
-      try {
-        fs.rmSync(candidateDir, { recursive: true, force: true });
-      } catch {}
-    }
-    scavengeOrphanOwnerDirs(lockDir);
-  }
-}
+const withRecordLock = createRecordLock({ atomicWriteFile, ensurePrivateDir, ensurePrivateStatePath, resolveLockTimeoutMs });
 
 function deliveryStatusFor(record) {
   if (record.deliveryCollectedAt) {
@@ -648,13 +367,16 @@ function resourceError(message) {
 }
 
 export function createJobRecordFile(file, record) {
-  return withRecordLock(file, () => {
-    if (fs.existsSync(file)) {
-      throw resourceError(`Job record already exists at ${file}.`);
-    }
-    atomicWriteFile(file, `${JSON.stringify(record, null, 2)}\n`);
-    return file;
-  });
+  const dataDir = path.resolve(path.dirname(file), "../../..");
+  return withRecordLock(path.join(dataDir, ".cursor-home-sweep.json"), () =>
+    withRecordLock(file, () => {
+      if (fs.existsSync(file)) {
+        throw resourceError(`Job record already exists at ${file}.`);
+      }
+      atomicWriteFile(file, `${JSON.stringify(record, null, 2)}\n`);
+      return file;
+    })
+  );
 }
 
 export function writeJobRecordFile(file, record) {
@@ -662,6 +384,7 @@ export function writeJobRecordFile(file, record) {
     const existing = readJobRecordFile(file);
     const next = preserveTerminalRecord(existing, record);
     atomicWriteFile(file, `${JSON.stringify(next, null, 2)}\n`);
+    maintainTerminalHome(file, next);
   });
   return file;
 }
@@ -769,7 +492,7 @@ function repairDeadResumeOwner(file, sessionId) {
   });
 }
 
-export function claimResumeSessionLease(dataDir, cwd, sessionId, ownerJobId) {
+export function claimResumeSessionLease(dataDir, cwd, sessionId, ownerJobId, { preflight = false } = {}) {
   const file = resumeSessionLeasePath(dataDir, cwd, sessionId);
   return withRecordLock(file, () => {
     const exists = fs.existsSync(file);
@@ -789,10 +512,16 @@ export function claimResumeSessionLease(dataDir, cwd, sessionId, ownerJobId) {
     }
     if (existing) {
       const owner = readJobRecord(dataDir, cwd, existing.ownerJobId);
-      if (!owner || owner.id !== existing.ownerJobId || (owner.status !== "running" && !TERMINAL_STATUSES.has(owner.status))) {
+      if (!owner && Number.isInteger(existing.ownerPid) && recordedResumeOwnerProcessIsAlive(existing.ownerPid, existing.ownerPidIdentity)) {
+        throw resourceError(`Cursor session ${sessionId} is already being resumed by running job ${existing.ownerJobId} in this workspace. Inspect it with /cursor:status ${existing.ownerJobId}, then collect or cancel it before retrying.`);
+      }
+      if (owner && (owner.id !== existing.ownerJobId || (owner.status !== "running" && !TERMINAL_STATUSES.has(owner.status)))) {
         throw resourceError(`The resume session lease for ${sessionId} has an invalid owner record.`);
       }
-      if (owner.status === "running") {
+      if (!owner && !Number.isInteger(existing.ownerPid)) {
+        throw resourceError(`The resume session lease for ${sessionId} has an invalid owner record.`);
+      }
+      if (owner?.status === "running") {
         const repaired = repairDeadResumeOwner(jobFilePath(dataDir, cwd, existing.ownerJobId), sessionId);
         if (repaired.status === "running") {
           throw resourceError(`Cursor session ${sessionId} is already being resumed by running job ${existing.ownerJobId} in this workspace. Inspect it with /cursor:status ${existing.ownerJobId}, then collect or cancel it before retrying.`);
@@ -800,13 +529,14 @@ export function claimResumeSessionLease(dataDir, cwd, sessionId, ownerJobId) {
       }
     }
     const nextOwner = readJobRecord(dataDir, cwd, ownerJobId);
-    if (!nextOwner || nextOwner.id !== ownerJobId || nextOwner.status !== "running") {
+    if ((!preflight || nextOwner) && (!nextOwner || nextOwner.id !== ownerJobId || nextOwner.status !== "running")) {
       throw resourceError(`Cursor session ${sessionId} cannot be leased to invalid job ${ownerJobId}.`);
     }
     const next = {
       version: 1,
       sessionId,
       ownerJobId,
+      ...(preflight ? { ownerPid: process.pid, ownerPidIdentity: getProcessIdentity(process.pid) } : {}),
       claimedAt: nowIso()
     };
     atomicWriteFile(file, `${JSON.stringify(next, null, 2)}\n`);
@@ -825,6 +555,7 @@ export function updateJobRecordFile(file, patch) {
     }
     const next = preserveTerminalRecord(existing, { ...existing, ...patch });
     atomicWriteFile(file, `${JSON.stringify(next, null, 2)}\n`);
+    if (!TERMINAL_STATUSES.has(existing.status)) maintainTerminalHome(file, next);
     return next;
   });
 }
@@ -900,6 +631,7 @@ export function updateJobRecordFileWithCurrent(file, updater, options = {}) {
       return existing;
     }
     atomicWriteFile(file, `${JSON.stringify(next, null, 2)}\n`);
+    if (!TERMINAL_STATUSES.has(existing.status)) maintainTerminalHome(file, next);
     return next;
   });
 }
@@ -939,6 +671,7 @@ export function finishSuccessfulJobRecordFile(file, successPatch) {
       : { ...success, cancelRequestedAt: null };
     const next = preserveTerminalRecord(existing, { ...existing, ...patch });
     atomicWriteFile(file, `${JSON.stringify(next, null, 2)}\n`);
+    maintainTerminalHome(file, next);
     return next;
   });
 }

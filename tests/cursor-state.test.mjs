@@ -183,7 +183,7 @@ try {
 } catch (error) {
   process.stdout.write(error.message);
 }
-`, [stateUrl, file], { ...process.env, CURSOR_COMPANION_LOCK_TIMEOUT_MS: "100" });
+`, [stateUrl, file], { ...process.env, CURSOR_COMPANION_LOCK_TIMEOUT_MS: "3000" });
   const result = await waiter.completion;
   assert.equal(result.code, 0, result.stderr);
   assert.match(result.stdout, /Timed out waiting for the job record lock/);
@@ -222,4 +222,25 @@ test("a resume lease recovers a dead pidless owner", (t) => {
   assert.equal(lease.ownerJobId, "second");
   assert.equal(readJobRecordFile(resumeSessionLeasePath(dataDir, cwd, "session-1")).ownerJobId, "second");
   assert.equal(readJobRecordFile(first).failureKind, "died");
+});
+
+test("Cursor atomic job writes sync the file before rename and directory after", (t) => {
+  const { file } = recordFile(t, "durable-write");
+  const originalSync = fs.fsyncSync;
+  const originalRename = fs.renameSync;
+  const events = [];
+  fs.fsyncSync = function(fd) {
+    events.push(fs.fstatSync(fd).isDirectory() ? "dir" : "file");
+    return originalSync.call(this, fd);
+  };
+  fs.renameSync = function(from, to) {
+    if (to === file) events.push("rename");
+    return originalRename.call(this, from, to);
+  };
+  try { writeJobRecordFile(file, { ...readJobRecordFile(file), revision: 1 }); }
+  finally { fs.fsyncSync = originalSync; fs.renameSync = originalRename; }
+  const rename = events.indexOf("rename");
+  assert.ok(rename > 0, JSON.stringify(events));
+  assert.equal(events[rename - 1], "file");
+  assert.equal(events[rename + 1], "dir");
 });

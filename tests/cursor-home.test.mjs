@@ -26,7 +26,7 @@ test("private homes isolate configuration and choose each mode's sandbox", (t) =
     assert.deepEqual(config, {
       version: 1,
       approvalMode: "allowlist",
-      sandbox: { mode: "enabled", networkAccess: "user_config_only", readBoundary: "workspace" },
+      sandbox: { mode: "enabled", networkAccess: "user_config_only", networkAllowlist: [], readBoundary: "workspace" },
       autoAcceptWebSearch: false,
       attribution: { attributeCommitsToAgent: false, attributePRsToAgent: false },
       permissions: { allow: [], deny: mode === "write" ? [] : ["Write(**)"] }
@@ -34,6 +34,9 @@ test("private homes isolate configuration and choose each mode's sandbox", (t) =
     assert.equal(sandbox.type, mode === "write" ? "workspace_readwrite" : "workspace_readonly");
     assert.equal(sandbox.readBoundary, "workspace");
     assert.deepEqual(sandbox.networkPolicy, { default: "deny" });
+    assert.equal(config.sandbox.networkAccess, "user_config_only");
+    assert.deepEqual(config.sandbox.networkAllowlist, []);
+    assert.equal(sandbox.networkPolicy.default, "deny");
     assert.equal(fs.readlinkSync(path.join(homeDir, "Library", "Keychains")), path.join(realHome, "Library", "Keychains"));
     for (const name of ["plugins", "skills-cursor"]) {
       const directory = path.join(homeDir, ".cursor", name);
@@ -47,6 +50,27 @@ test("private homes isolate configuration and choose each mode's sandbox", (t) =
   buildPrivateHome({ homeDir: linuxHome, mode: "consult", cwd: root, realHome, platform: "linux" });
   assert.equal(fs.existsSync(path.join(linuxHome, "Library")), false);
   removePrivateHome(linuxHome);
+});
+
+test("private homes share one private npm cache and replace a legacy local cache", (t) => {
+  const root = fixture(t);
+  const data = path.join(root, "data");
+  const homes = ["first", "second"].map((id) => path.join(data, "runs", id, "home"));
+  const cache = path.join(data, "npm-cache");
+  fs.mkdirSync(path.join(homes[0], ".npm"), { recursive: true });
+  fs.writeFileSync(path.join(homes[0], ".npm", "old"), "old");
+  for (const homeDir of homes) {
+    buildPrivateHome({ homeDir, mode: "consult", cwd: root, realHome: root });
+    const link = path.join(homeDir, ".npm");
+    assert.equal(fs.lstatSync(link).isSymbolicLink(), true);
+    assert.equal(fs.readlinkSync(link), cache);
+    assert.equal(fs.statSync(cache).mode & 0o777, 0o700);
+  }
+  assert.equal(fs.existsSync(path.join(cache, "old")), false);
+  fs.writeFileSync(path.join(homes[0], ".npm", "shared"), "cache");
+  assert.equal(fs.readFileSync(path.join(homes[1], ".npm", "shared"), "utf8"), "cache");
+  removePrivateHome(homes[0]);
+  assert.equal(fs.readFileSync(path.join(cache, "shared"), "utf8"), "cache");
 });
 
 test("write sandbox adds installed runtimes and linked worktree Git directories", (t) => {

@@ -13,7 +13,7 @@ const companion = path.join(root, "plugins/cursor/scripts/cursor-companion.mjs")
 const fake = path.join(root, "tests/fake-cursor");
 const launcher = path.join(root, "tests/fake-cursor-launcher");
 
-function harness(t, extraEnv = {}) {
+function harness(t, extraEnv = {}, { withoutHelper = false } = {}) {
   const temp = fs.mkdtempSync(path.join(os.tmpdir(), "cursor-companion-test-"));
   t.after(() => {
     if (extraEnv.CURSOR_AGENT_BIN === launcher) {
@@ -34,12 +34,17 @@ function harness(t, extraEnv = {}) {
   fs.mkdirSync(home);
   fs.mkdirSync(cwd);
   fs.mkdirSync(identityBin);
+  const helperlessBin = path.join(temp, "cursor-agent");
+  if (withoutHelper) {
+    fs.copyFileSync(fake, helperlessBin);
+    fs.chmodSync(helperlessBin, 0o755);
+  }
   if (["darwin", "freebsd", "openbsd"].includes(process.platform)) {
     fs.writeFileSync(path.join(identityBin, "ps"), "#!/bin/sh\nif [ -z \"$FAKE_CURSOR_EXEC_MARKER\" ] && /bin/ps -p $$ >/dev/null 2>&1; then exec /bin/ps \"$@\"; fi\npid=\nfield=\nwhile [ \"$#\" -gt 0 ]; do\n  if [ \"$1\" = \"-p\" ]; then pid=\"$2\"; shift 2; elif [ \"$1\" = \"-o\" ]; then field=\"$2\"; shift 2; else shift; fi\ndone\nif [ -n \"$pid\" ] && kill -0 \"$pid\" 2>/dev/null; then\n  if [ \"$field\" = \"command=\" ] && [ -f \"$FAKE_CURSOR_EXEC_MARKER\" ] && [ \"$(cat \"$FAKE_CURSOR_EXEC_MARKER\")\" = \"$pid\" ]; then printf 'node-%s\\n' \"$pid\"; else printf 'process-%s\\n' \"$pid\"; fi\nelse exit 1; fi\n");
     fs.writeFileSync(path.join(identityBin, "sysctl"), "#!/bin/sh\nif /usr/sbin/sysctl -n kern.boottime >/dev/null 2>&1; then exec /usr/sbin/sysctl \"$@\"; fi\nprintf '{ sec = 1, usec = 0 }\\n'\n");
     for (const name of ["ps", "sysctl"]) fs.chmodSync(path.join(identityBin, name), 0o755);
   }
-  const env = { ...process.env, HOME: home, PATH: `${identityBin}${path.delimiter}${process.env.PATH}`, CURSOR_AGENT_BIN: fake, CURSOR_COMPANION_DATA: data, FAKE_CURSOR_LOG: log, ...extraEnv, ...(execMarker ? { FAKE_CURSOR_EXEC_MARKER: execMarker } : {}) };
+  const env = { ...process.env, HOME: home, PATH: `${identityBin}${path.delimiter}${process.env.PATH}`, CURSOR_AGENT_BIN: withoutHelper ? helperlessBin : fake, CURSOR_COMPANION_DATA: data, FAKE_CURSOR_LOG: log, ...extraEnv, ...(execMarker ? { FAKE_CURSOR_EXEC_MARKER: execMarker } : {}) };
   fs.mkdirSync(data);
   fs.writeFileSync(path.join(data, "fake-cursor-config.json"), JSON.stringify({ scenario: extraEnv.FAKE_CURSOR_SCENARIO, log, helperPidFile: extraEnv.FAKE_CURSOR_HELPER_PID_FILE, execMarker }));
   const run = (args, input = "") => spawnSync(process.execPath, [companion, ...args], { cwd, env, input, encoding: "utf8", timeout: 30000 });
@@ -304,7 +309,7 @@ for (const [signal, exitCode] of [["SIGTERM", 143], ["SIGINT", 130]]) {
 }
 
 test("models and setup report the fake CLI", (t) => {
-  const h = harness(t);
+  const h = harness(t, {}, { withoutHelper: true });
   const models = JSON.parse(h.run(["models", "--json"]).stdout);
   assert.equal(models.engine, "cursor");
   assert.equal(models.source, "cli");

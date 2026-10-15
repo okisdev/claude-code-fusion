@@ -39,7 +39,7 @@ export function readModelCatalog({ dataDir, bin, env = process.env, maxAgeMs = 3
       spawnError: result.error,
       protocolError: null
     });
-    error.failureKind = ["auth", "network", "missing_cli"].includes(kind) ? kind : "error";
+    error.failureKind = ["auth", "network", "missing_cli", "quota", "rate_limited"].includes(kind) ? kind : "error";
     throw error;
   }
   const catalog = { models, fetchedAt: now };

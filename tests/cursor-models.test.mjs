@@ -74,3 +74,14 @@ test("missing effort fails when variants exist and exact unsuffixed models remai
   assert.throws(() => resolveCursorModel({ catalog, model: "atlas-fast", effort: "medium" }), (error) => error.failureKind === "input" && /atlas-high/.test(error.message));
   assert.deepEqual(resolveCursorModel({ catalog, model: "gemini-pro", effort: "low" }), { variant: "gemini-pro", effortApplied: false, billingPool: "api" });
 });
+
+test("catalog listing preserves quota and rate_limited failure kinds", (t) => {
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "cursor-model-quota-test-"));
+  t.after(() => fs.rmSync(dataDir, { recursive: true, force: true }));
+  for (const [message, kind] of [
+    ["usage limit reached", "quota"],
+    ["rate limit exceeded", "rate_limited"]
+  ]) {
+    assert.throws(() => readModelCatalog({ dataDir, bin, run: () => ({ status: 1, stderr: message }) }), (error) => error.failureKind === kind);
+  }
+});

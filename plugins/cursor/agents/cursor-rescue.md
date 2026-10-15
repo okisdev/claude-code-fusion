@@ -2,6 +2,8 @@
 name: cursor-rescue
 description: Cursor's multi family breadth lane. Use for a package explicitly routed under `diversity` (a read only consult on a model family that no other installed lane serves) or `burst` (Composer implementation inside an orchestrator owned worktree). It is never the default for ordinary implementation.
 model: sonnet
+effort: low
+omitClaudeMd: true
 background: false
 tools: Bash, Read, Write
 skills:

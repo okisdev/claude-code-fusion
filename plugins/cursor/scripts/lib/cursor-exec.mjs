@@ -378,17 +378,19 @@ export function runCursor({ bin, args, cwd, env, brief, timeoutMs = 540000, exit
 export function classifyCursorFailure(outcome) {
   const message = String(outcome.stderrTail || "");
   if (outcome.cancelled) return "cancelled";
-  if ((outcome.spawnError?.code && ["ENOENT", "EACCES", "ENOEXEC"].includes(outcome.spawnError.code)) || /\bENOENT\b|command not found/i.test(message)) return "missing_cli";
+  const spawnCode = outcome.spawnError?.code;
+  if (spawnCode && ["ENOENT", "EACCES", "ENOEXEC"].includes(spawnCode)) return "missing_cli";
+  if (outcome.exitCode === 127 && /command not found/i.test(message)) return "missing_cli";
   if (outcome.policyViolation) return "policy";
   if (outcome.timedOut) return "timeout";
   if (outcome.protocolError || (outcome.exitCode === 0 && (!outcome.initSeen || !outcome.resultSeen))) return "protocol";
   if (outcome.resultSeen && outcome.initSeen && (outcome.exitCode === 0 || outcome.lateClose)) return null;
-  if (/Invalid --allowed-tools value|Cannot use this model|unknown (?:option|argument)|unrecognized (?:option|argument)/i.test(message)) return "setup";
   if (/Authentication required|Not logged in|Unauthorized|\b(?:401|403)\b/i.test(message)) return "auth";
   if (/usage limit|quota|spend limit|insufficient credit|\b402\b/i.test(message)) return "quota";
   if (/rate.?limit|too many requests|\b429\b/i.test(message)) return "rate_limited";
+  if (/Invalid --allowed-tools value|Cannot use this model|unknown (?:option|argument)|unrecognized (?:option|argument)/i.test(message)) return "setup";
   if (/ENOTFOUND|EAI_AGAIN|ECONNREFUSED|ECONNRESET|DNS|fetch fail|network|socket hang up/i.test(message)) return "network";
-  if (/Sandbox mode is enabled but not available|sandbox helper fail/i.test(message)) return "sandbox";
+  if (/Sandbox mode is enabled but not available|sandbox helper fail|sandbox denied|sandbox unavailable|operation not permitted by sandbox/i.test(message)) return "sandbox";
   if (outcome.signal || outcome.exitCode === 143) return "process";
   return outcome.exitCode === 0 ? null : "error";
 }
