@@ -97,8 +97,8 @@ function writeResultsDir(root, name, { records, env, extraLine } = {}) {
       codexCliVersion: "test",
       codexModel: "test",
       fixtureCommit: "abc123",
-      manifestHash: "hash-a",
-      taskManifestHash: "hash-a",
+      manifestHash: "a".repeat(64),
+      taskManifestHash: "a".repeat(64),
       taskTags: {},
       nodeVersion: process.version,
       os: process.platform,
@@ -192,8 +192,8 @@ test("summarize marks a task and condition comparable once 2 of 3 pass", (t) => 
 test("summarize refuses to compare two dirs with different manifest hashes", (t) => {
   const root = makeSandbox(t);
   const records = [baseRecord()];
-  const dirA = writeResultsDir(root, "run-a", { records, env: { manifestHash: "hash-a" } });
-  const dirB = writeResultsDir(root, "run-b", { records, env: { manifestHash: "hash-b" } });
+  const dirA = writeResultsDir(root, "run-a", { records, env: { manifestHash: "a".repeat(64) } });
+  const dirB = writeResultsDir(root, "run-b", { records: [baseRecord({ taskManifestHash: "b".repeat(64) })], env: { manifestHash: "b".repeat(64), taskManifestHash: "b".repeat(64) } });
 
   const result = runSummarize([dirA, dirB]);
   assert.notStrictEqual(result.status, 0);
@@ -203,8 +203,8 @@ test("summarize refuses to compare two dirs with different manifest hashes", (t)
 test("summarize compares two dirs sharing the same manifest hash", (t) => {
   const root = makeSandbox(t);
   const records = [baseRecord()];
-  const dirA = writeResultsDir(root, "run-a", { records, env: { manifestHash: "hash-same" } });
-  const dirB = writeResultsDir(root, "run-b", { records, env: { manifestHash: "hash-same" } });
+  const dirA = writeResultsDir(root, "run-a", { records });
+  const dirB = writeResultsDir(root, "run-b", { records });
 
   const result = runSummarize([dirA, dirB]);
   assert.strictEqual(result.status, 0, result.stderr);
@@ -324,4 +324,34 @@ test("summarize accepts B2 records with all-null peerDefaults", (t) => {
   assert.strictEqual(result.status, 0, result.stderr);
   assert.doesNotMatch(result.stdout, /peerDefaults/);
   assert.match(result.stdout, /\| T01-first \| B2 \|/);
+});
+
+test("summarize refuses mixed task revisions in one directory", (t) => {
+  const root = makeSandbox(t);
+  const dir = writeResultsDir(root, "mixed", { records: [baseRecord(), baseRecord({ repetition: 2, taskManifestHash: "b".repeat(64) })] });
+  const result = runSummarize([dir]);
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /conflicting manifest pins/);
+  assert.match(result.stderr, /a{64}/);
+  assert.match(result.stderr, /b{64}/);
+});
+
+test("summarize refuses disagreement between env.json pins", (t) => {
+  const root = makeSandbox(t);
+  const dir = writeResultsDir(root, "mixed-env", { records: [baseRecord()], env: { taskManifestHash: "b".repeat(64) } });
+  const result = runSummarize([dir]);
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /conflicting manifest pins/);
+  assert.match(result.stderr, /a{64}/);
+  assert.match(result.stderr, /b{64}/);
+});
+
+test("summarize refuses a record with different peer defaults from env.json", (t) => {
+  const root = makeSandbox(t);
+  const peerDefaults = { grok: { model: "pinned", effort: null }, codex: { model: null, effort: null } };
+  const dir = writeResultsDir(root, "mixed-peer", { records: [baseRecord()], env: { peerDefaults } });
+  const result = runSummarize([dir]);
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /conflicting environment pin peerDefaults/);
+  assert.match(result.stderr, /pinned/);
 });

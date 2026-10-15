@@ -182,13 +182,22 @@ test("calibration rejects unknown flags before requesting", async (t) => {
 
 function retainedSandbox(t) {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), "bench-jev-retained-"));
+  const home = path.join(directory, "home");
+  const workerData = path.join(directory, "worker-data");
   const grokData = path.join(directory, "grok-data");
   const grokState = path.join(grokData, "state");
+  const codexData = path.join(directory, "codex-data");
   const codexState = path.join(directory, "codex-state");
+  const cursorData = path.join(directory, "cursor-data");
+  fs.mkdirSync(home);
   fs.mkdirSync(grokState, { recursive: true });
   fs.mkdirSync(codexState, { recursive: true });
+  for (const [engine, id] of [["codex", "a"], ["grok", "b"], ["cursor", "c"]]) {
+    const defaultState = path.join(home, ".claude", "plugins", "data", `${engine}-claude-code-fusion`, "state");
+    writeRetainedRecord(defaultState, { id: id.repeat(32), cwd: repoRoot, status: "done", semanticStatus: "accepted" }, retainedBrief(`RETAINED-HOME-${engine}`, 300));
+  }
   t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
-  return { directory, grokData, grokState, codexState };
+  return { directory, home, workerData, grokData, grokState, codexData, codexState, cursorData };
 }
 
 function writeRetainedRecord(stateRoot, record, brief) {
@@ -206,8 +215,13 @@ function retainedBrief(marker, length, prefix = "") {
 
 function retainedEnv(endpoint, sandbox) {
   const env = envFor(endpoint);
+  env.HOME = sandbox.home;
+  env.FUSION_WORKER_DATA = sandbox.workerData;
   env.GROK_COMPANION_DATA = sandbox.grokData;
+  env.CODEX_COMPANION_DATA = sandbox.codexData;
   env.FUSION_CODEX_STATE = sandbox.codexState;
+  env.FUSION_CODEX_STATE_DIR = sandbox.codexState;
+  env.CURSOR_COMPANION_DATA = sandbox.cursorData;
   return env;
 }
 

@@ -3,6 +3,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { assertManifestPins } from "./lib.mjs";
 
 const SELF_PATH = fileURLToPath(import.meta.url);
 const BENCH_DIR = path.dirname(SELF_PATH);
@@ -624,6 +625,14 @@ function buildSuiteAggregate(nonExcludedRecords) {
 function buildReportForDir(schema, resultsDir) {
   const env = readEnv(resultsDir);
   const { records, malformed } = readRunsJsonl(schema, resultsDir);
+  assertManifestPins(env, records, resultsDir);
+  if (env.peerDefaults !== undefined) {
+    for (const [index, record] of records.entries()) {
+      if (JSON.stringify(record.peerDefaults) !== JSON.stringify(env.peerDefaults)) {
+        throw new Error(`${resultsDir}: conflicting environment pin peerDefaults: env.json=${JSON.stringify(env.peerDefaults)} vs valid record ${index + 1}=${JSON.stringify(record.peerDefaults)}`);
+      }
+    }
+  }
   const nonExcluded = records.filter((record) => !record.excluded);
   const groups = groupRecords(nonExcluded);
 
@@ -684,4 +693,9 @@ function main() {
   console.log(["# Benchmark summary", "", ...sections].join("\n"));
 }
 
-main();
+try {
+  main();
+} catch (error) {
+  process.stderr.write(`${error.message}\n`);
+  process.exitCode = 1;
+}
