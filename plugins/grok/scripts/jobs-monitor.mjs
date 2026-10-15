@@ -19,6 +19,7 @@ const INTERVAL_ENV = "GROK_JOBS_MONITOR_INTERVAL_MS";
 const MANAGED_GRACE_ENV = "GROK_JOBS_MONITOR_MANAGED_GRACE_MS";
 const DEFAULT_MANAGED_GRACE_MS = 60000;
 const RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
+const RECONCILE_INTERVAL_MS = 10 * 60 * 1000;
 const ANNOUNCED_LEDGER_VERSION = 2;
 
 function resolvePollIntervalMs(env = process.env) {
@@ -42,7 +43,15 @@ function validMonitorRecord(record) {
   );
 }
 
-function readJobsSnapshot(dir) {
+function monitorSummary(record) {
+  const {
+    id, status, cwd, claudeSessionId, delivery, deliveryCollectedAt,
+    finishedAt, createdAt, background, failureKind,
+  } = record;
+  return { id, status, cwd, claudeSessionId, delivery, deliveryCollectedAt, finishedAt, createdAt, background, failureKind };
+}
+
+function readJobsSnapshot(dir, cache, forceReparse, seenFiles) {
   let stats;
   try {
     stats = fs.statSync(dir);
@@ -56,7 +65,25 @@ function readJobsSnapshot(dir) {
     const records = [];
     const unreadableIds = new Set();
     for (const entry of fs.readdirSync(dir).filter((name) => name.endsWith(".json"))) {
-      const record = readJobRecordFile(path.join(dir, entry));
+      const file = path.join(dir, entry);
+      seenFiles.add(file);
+      let stats;
+      try {
+        stats = fs.statSync(file);
+      } catch {
+        cache.delete(file);
+        unreadableIds.add(path.basename(entry, ".json"));
+        continue;
+      }
+      const cached = cache.get(file);
+      let record;
+      if (!forceReparse && cached?.mtimeMs === stats.mtimeMs && cached.size === stats.size) {
+        record = cached.summary;
+      } else {
+        const parsed = readJobRecordFile(file);
+        record = validMonitorRecord(parsed) ? monitorSummary(parsed) : null;
+        cache.set(file, { mtimeMs: stats.mtimeMs, size: stats.size, summary: record });
+      }
       if (!validMonitorRecord(record)) {
         unreadableIds.add(path.basename(entry, ".json"));
         continue;
@@ -69,7 +96,7 @@ function readJobsSnapshot(dir) {
   }
 }
 
-function readSessionJobsSnapshot(dataDir) {
+function readSessionJobsSnapshot(dataDir, cache, forceReparse, seenFiles) {
   const stateRoot = path.join(dataDir, "state");
   let workspaces;
   try {
@@ -86,7 +113,7 @@ function readSessionJobsSnapshot(dataDir) {
   let available = false;
   let complete = true;
   for (const workspace of workspaces) {
-    const snapshot = readJobsSnapshot(path.join(stateRoot, workspace, "jobs"));
+    const snapshot = readJobsSnapshot(path.join(stateRoot, workspace, "jobs"), cache, forceReparse, seenFiles);
     complete &&= snapshot.complete;
     if (!snapshot.available) {
       continue;
@@ -240,7 +267,25 @@ function main() {
   const announced = loaded.announced;
   let resetPending = loaded.reset;
   const managedGraceMs = resolveManagedGraceMs();
-  const readSnapshot = ownSessionId ? () => readSessionJobsSnapshot(dataDir) : () => readJobsSnapshot(dir);
+  const cache = new Map();
+  let lastFullReparseAt = Date.now();
+  const readSnapshot = () => {
+    const now = Date.now();
+    const forceReparse = now - lastFullReparseAt >= RECONCILE_INTERVAL_MS;
+    if (forceReparse) {
+      lastFullReparseAt = now;
+    }
+    const seenFiles = new Set();
+    const snapshot = ownSessionId
+      ? readSessionJobsSnapshot(dataDir, cache, forceReparse, seenFiles)
+      : readJobsSnapshot(dir, cache, forceReparse, seenFiles);
+    for (const file of cache.keys()) {
+      if (!seenFiles.has(file)) {
+        cache.delete(file);
+      }
+    }
+    return snapshot;
+  };
   let startupPending = true;
 
   pruneOldStateFiles(stateDir, stateFile);

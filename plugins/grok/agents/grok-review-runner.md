@@ -2,6 +2,7 @@
 name: grok-review-runner
 description: Internal forwarder that runs one Grok companion review command and returns its typed output verbatim. Dispatched by /grok:review; not for general work packages.
 model: haiku
+omitClaudeMd: true
 background: true
 tools: Bash, Read, Write
 ---

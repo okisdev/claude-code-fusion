@@ -32,7 +32,7 @@ function writeEnvelopeGrok(sandbox, name, envelope, exitCode = 0) {
   const file = path.join(sandbox.root, `${name}.mjs`);
   fs.writeFileSync(
     file,
-    `#!/usr/bin/env node\nimport fs from "node:fs";\nimport os from "node:os";\nimport path from "node:path";\nif (process.env.FAKE_GROK_ARGS_FILE) fs.appendFileSync(process.env.FAKE_GROK_ARGS_FILE, JSON.stringify(process.argv.slice(2)) + "\\n");\nconst sandboxIndex = process.argv.indexOf("--sandbox");\nif (sandboxIndex >= 0) {\n  const profile = process.argv[sandboxIndex + 1];\n  const grokHome = Object.hasOwn(process.env, "GROK_HOME") ? path.resolve(process.cwd(), process.env.GROK_HOME) : path.join(os.homedir(), ".grok");\n  fs.mkdirSync(path.join(grokHome, "sessions"), { recursive: true });\n  fs.appendFileSync(path.join(grokHome, "sessions", "sandbox-events.jsonl"), JSON.stringify({ event_type: "ProfileApplied", profile, workspace: fs.realpathSync(process.cwd()), enforced: true, restrict_network: profile !== "workspace", read_write_paths: [fs.realpathSync(process.cwd()), path.join(grokHome, "sessions"), process.env.TMPDIR].filter(Boolean) }) + "\\n");\n  process.stderr.write("DEBUG xai_grok_agent::builder: tools allowlist applied\\n");\n}\nfor await (const chunk of process.stdin) void chunk;\nprocess.stdout.write(${JSON.stringify(`${JSON.stringify(envelope)}\n`)});\nprocess.exit(${exitCode});\n`,
+    `#!/usr/bin/env node\nimport fs from "node:fs";\nimport os from "node:os";\nimport path from "node:path";\nif (process.env.FAKE_GROK_ARGS_FILE) fs.appendFileSync(process.env.FAKE_GROK_ARGS_FILE, JSON.stringify(process.argv.slice(2)) + "\\n");\nif (process.argv.includes("--version")) {\n  process.stdout.write("grok 1.0.41 (0123456789ab)\\n");\n  process.exit(0);\n}\nconst sandboxIndex = process.argv.indexOf("--sandbox");\nif (sandboxIndex >= 0) {\n  const profile = process.argv[sandboxIndex + 1];\n  const grokHome = Object.hasOwn(process.env, "GROK_HOME") ? path.resolve(process.cwd(), process.env.GROK_HOME) : path.join(os.homedir(), ".grok");\n  fs.mkdirSync(path.join(grokHome, "sessions"), { recursive: true });\n  fs.appendFileSync(path.join(grokHome, "sessions", "sandbox-events.jsonl"), JSON.stringify({ event_type: "ProfileApplied", profile, workspace: fs.realpathSync(process.cwd()), enforced: true, restrict_network: profile !== "workspace", read_write_paths: [fs.realpathSync(process.cwd()), path.join(grokHome, "sessions"), process.env.TMPDIR].filter(Boolean) }) + "\\n");\n  process.stderr.write("DEBUG xai_grok_agent::builder: tools allowlist applied\\n");\n}\nfor await (const chunk of process.stdin) void chunk;\nprocess.stdout.write(${JSON.stringify(`${JSON.stringify(envelope)}\n`)});\nprocess.exit(${exitCode});\n`,
     "utf8"
   );
   fs.chmodSync(file, 0o755);
@@ -60,7 +60,7 @@ test("review passes the output contract as an inline JSON schema and renders the
   assert.deepStrictEqual(schema.properties.findings.items.required, ["severity", "title", "body"]);
   const brief = fs.readFileSync(stdinFile, "utf8");
   assert.ok(brief.includes("export const other = 2;"));
-  assert.ok(brief.includes("untracked.txt"));
+  assert.ok(brief.includes('- "untracked.txt"\nnew file'));
   assert.ok(brief.includes("check the error handling"));
   assert.ok(result.stdout.includes("needs-attention"));
   assert.ok(result.stdout.includes("Example finding"));
@@ -267,7 +267,7 @@ test("review records a structured validation error without resuming or trusting 
   assert.ok(record.resultText.includes(JSON.stringify(reviewObject)));
   assert.match(record.errorMessage, /failed validation: output does not match the required schema/);
   assert.doesNotMatch(record.errorMessage, /\r?\n/);
-  assert.match(result.stderr, new RegExp(`job: ${record.id}\\nsandbox: ${record.cwd}\\nstate: error\\nfailure: error\\n$`));
+  assert.match(result.stderr, new RegExp(`job: ${record.id}\\nsandbox: ${record.cwd}\\ndelivery: foreground\\nsemantic: unverified\\nstate: error\\nfailure: error\\n$`));
 });
 
 test("background review records a structured validation failure after one model call", async (t) => {

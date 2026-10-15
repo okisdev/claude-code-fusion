@@ -248,7 +248,7 @@ export function renderHistoryReport(history, now = Date.now()) {
   return `${lines.join("\n")}\n`;
 }
 
-export function renderTaskResult({ text, structuredOutput, structuredOutputError, schemaRequested = false, sessionId, jobId, cwd }) {
+export function renderTaskResult({ text, structuredOutput, structuredOutputError, schemaRequested = false, sessionId, jobId, cwd, delivery = "foreground", semanticStatus = "unverified" }) {
   const lines = [String(text ?? "").trimEnd() || "Grok returned no output."];
   lines.push("");
   if (schemaRequested) {
@@ -263,11 +263,9 @@ export function renderTaskResult({ text, structuredOutput, structuredOutputError
     lines.push(`grok-session: ${sessionId}`);
   }
   if (jobId) {
-    lines.push(`job: ${jobId}`);
+    lines.push(`job: ${jobId}`, `sandbox: ${cwd}`);
   }
-  if (cwd) {
-    lines.push(`sandbox: ${cwd}`);
-  }
+  lines.push(`delivery: ${delivery}`, `semantic: ${semanticStatus}`);
   lines.push("state: done");
   return `${lines.join("\n")}\n`;
 }
@@ -335,9 +333,9 @@ export function renderJobDetail(job, options = {}) {
     lines.push("", "Log tail:", "", "```text", logTail, "```");
   }
   lines.push("", `job: ${job.id}`);
-  if (job.status !== "running") {
-    lines.push(`sandbox: ${job.cwd}`);
-  }
+  lines.push(`sandbox: ${job.cwd}`);
+  lines.push(`delivery: ${job.delivery ?? (job.background ? "manual" : "foreground")}`);
+  lines.push(`semantic: ${job.semanticStatus ?? "unverified"}`);
   lines.push(`state: ${job.status}`);
   if (job.failureKind) {
     lines.push(`failure: ${job.failureKind}`);

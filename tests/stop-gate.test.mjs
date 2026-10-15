@@ -117,7 +117,7 @@ test("stop-gate allows the stop when grok replies ALLOW", (t) => {
   assert.ok(hasPair(invocations[1], "--prompt-file", "/dev/stdin"));
   const brief = fs.readFileSync(stdinFile, "utf8");
   assert.ok(brief.includes("export const other = 2;"));
-  assert.ok(brief.includes("untracked.txt"));
+  assert.ok(brief.includes('- "untracked.txt"\nnew file'));
   const records = jobRecords(sandbox.dataDir);
   assert.strictEqual(records.length, 1);
   assert.strictEqual(records[0].status, "done");

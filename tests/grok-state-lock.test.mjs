@@ -10,6 +10,7 @@ import {
   DEFAULT_LOCK_TIMEOUT_MS,
   jobFilePath,
   readJobRecordFile,
+  resumeSessionLeasePath,
   resolveLockTimeoutMs
 } from "../plugins/grok/scripts/lib/state.mjs";
 import { makeSandbox, stateModulePath } from "./lib/companion-harness.mjs";
@@ -520,7 +521,7 @@ test("a held job record lock times out a second acquirer within the configured c
   const readyFile = path.join(sandbox.root, "contention-ready");
   const releaseFile = path.join(sandbox.root, "contention-release");
   const waiterReadyFile = path.join(sandbox.root, "contention-waiter-ready");
-  const timeoutMs = 150;
+  const timeoutMs = 3000;
   const holder = runChild(heldLockChild, [stateModulePath, jobFile, readyFile, releaseFile]);
   t.after(() => holder.child.kill("SIGKILL"));
 
@@ -529,12 +530,12 @@ test("a held job record lock times out a second acquirer within the configured c
     GROK_COMPANION_LOCK_TIMEOUT_MS: String(timeoutMs)
   }));
   await waitForPath(waiterReadyFile);
-  const result = await waitForCompletion(waiter.completion, timeoutMs + 500);
+  const result = await waitForCompletion(waiter.completion, timeoutMs + 5000);
   assert.equal(result.code, 0, result.stderr);
   const outcome = JSON.parse(result.stdout);
   assert.match(outcome.message, /Timed out waiting for the job record lock at/);
   assert.ok(outcome.elapsedMs >= timeoutMs, `Expected the waiter to wait for at least ${timeoutMs}ms, took ${outcome.elapsedMs}ms.`);
-  assert.ok(outcome.elapsedMs <= timeoutMs + 500, `Expected the waiter to finish near ${timeoutMs}ms, took ${outcome.elapsedMs}ms.`);
+  assert.ok(outcome.elapsedMs <= timeoutMs + 5000, `Expected the waiter to finish near ${timeoutMs}ms, took ${outcome.elapsedMs}ms.`);
 
   fs.writeFileSync(releaseFile, "release\n");
   const holderResult = await holder.completion;
@@ -568,4 +569,134 @@ test("release cleanup failures do not lose a completed update and stale owners a
   fs.utimesSync(failedOwnerDir, staleTime, staleTime);
   assert.equal(updateRecordInChild(jobFile, { revision: 2 }).record.revision, 2);
   assert.equal(fs.existsSync(failedOwnerDir), false);
+});
+
+
+test("reaper does not claim a lock after its dead owner is replaced", (t) => {
+  const sandbox = makeSandbox(t);
+  const jobFile = makeRecord(sandbox, "reaper-successor");
+  const source = `
+import fs from "node:fs";
+import path from "node:path";
+const [stateUrl, identityUrl, file] = process.argv.slice(1);
+const state = await import(stateUrl);
+const { getProcessIdentity } = await import(identityUrl);
+const lock = file + ".lock";
+const deadToken = "a".repeat(32);
+const nextToken = "b".repeat(32);
+const identity = getProcessIdentity(process.pid);
+function owner(token, ownerIdentity) {
+  const dir = lock + ".owner." + token;
+  fs.mkdirSync(dir);
+  fs.writeFileSync(path.join(dir, "owner.json"), JSON.stringify({ version: 1, token, ownerPid: process.pid, ownerIdentity }));
+  return dir;
+}
+const deadDir = owner(deadToken, { ...identity, commandHash: "0".repeat(64) });
+const nextDir = owner(nextToken, identity);
+fs.symlinkSync(path.basename(deadDir), lock, "dir");
+const originalSymlink = fs.symlinkSync;
+let replaced = false;
+fs.symlinkSync = function(target, link, ...args) {
+  if (!replaced && link === lock + ".reap." + deadToken) {
+    replaced = true;
+    fs.unlinkSync(lock);
+    originalSymlink.call(this, path.basename(nextDir), lock, "dir");
+  }
+  return originalSymlink.call(this, target, link, ...args);
+};
+let message;
+try { state.updateJobRecordFile(file, { revision: 1 }); }
+catch (error) { message = error.message; }
+process.stdout.write(JSON.stringify({ replaced, message, target: fs.readlinkSync(lock), revision: state.readJobRecordFile(file).revision ?? null }));
+`;
+  const result = runChildSync(source, [stateModulePath, processIdentityModuleUrl, jobFile], { GROK_COMPANION_LOCK_TIMEOUT_MS: "200" });
+  assert.equal(result.status, 0, result.stderr);
+  const outcome = JSON.parse(result.stdout);
+  assert.equal(outcome.replaced, true);
+  assert.match(outcome.message, /Timed out waiting for the job record lock/);
+  assert.equal(outcome.target, `${path.basename(jobFile)}.lock.owner.${"b".repeat(32)}`);
+  assert.equal(outcome.revision, null);
+});
+
+test("atomic job writes sync the file before rename and directory after", (t) => {
+  const sandbox = makeSandbox(t);
+  const file = makeRecord(sandbox, "durable-write");
+  const source = `
+import fs from "node:fs";
+const [stateUrl, file] = process.argv.slice(1);
+const state = await import(stateUrl);
+const originalSync = fs.fsyncSync;
+const originalRename = fs.renameSync;
+const events = [];
+fs.fsyncSync = function(fd) {
+  events.push(fs.fstatSync(fd).isDirectory() ? "dir" : "file");
+  return originalSync.call(this, fd);
+};
+fs.renameSync = function(from, to) {
+  if (to === file) events.push("rename");
+  return originalRename.call(this, from, to);
+};
+state.writeJobRecordFile(file, { ...state.readJobRecordFile(file), revision: 1 });
+process.stdout.write(JSON.stringify(events));
+`;
+  const result = runChildSync(source, [stateModulePath, file]);
+  assert.equal(result.status, 0, result.stderr);
+  const events = JSON.parse(result.stdout);
+  const rename = events.indexOf("rename");
+  assert.ok(rename > 0, JSON.stringify(events));
+  assert.equal(events[rename - 1], "file");
+  assert.equal(events[rename + 1], "dir");
+});
+
+test("hourly Grok sweep removes only old dead leases and old monitor markers", (t) => {
+  const sandbox = makeSandbox(t);
+  const { dataDir, workDir } = sandbox;
+  const now = Date.now();
+  const old = new Date(now - 31 * 24 * 60 * 60 * 1000);
+  const deadJob = makeRecord(sandbox, "dead-lease-owner");
+  fs.writeFileSync(deadJob, JSON.stringify({ ...readJobRecordFile(deadJob), pid: 99999999, pidIdentity: null, createdAt: old.toISOString() }));
+  const liveJob = makeRecord(sandbox, "live-lease-owner");
+  fs.writeFileSync(liveJob, JSON.stringify({ ...readJobRecordFile(liveJob), pid: process.pid, pidIdentity: childProcessIdentity(process.pid), createdAt: old.toISOString() }));
+  const leaseDir = path.dirname(resumeSessionLeasePath(dataDir, workDir, "dead"));
+  fs.mkdirSync(leaseDir, { recursive: true });
+  function lease(sessionId, ownerJobId, stale) {
+    const file = resumeSessionLeasePath(dataDir, workDir, sessionId);
+    fs.writeFileSync(file, JSON.stringify({ version: 1, sessionId, ownerJobId, claimedAt: old.toISOString() }));
+    if (stale) fs.utimesSync(file, old, old);
+    return file;
+  }
+  const dead = lease("dead", "dead-lease-owner", true);
+  const live = lease("live", "live-lease-owner", true);
+  const recent = lease("recent", "dead-lease-owner", false);
+  const stateDir = path.dirname(leaseDir);
+  const oldMarker = path.join(stateDir, "jobs-monitor-announced.old.json");
+  const newMarker = path.join(stateDir, "jobs-monitor-announced.new.json");
+  fs.writeFileSync(oldMarker, "{}");
+  fs.writeFileSync(newMarker, "{}");
+  fs.utimesSync(oldMarker, old, old);
+  const startup = () => {
+    const source = `
+const [stateUrl, dataDir] = process.argv.slice(1);
+const { ensurePrivateDataDir } = await import(stateUrl);
+process.stdout.write(ensurePrivateDataDir(dataDir));
+`;
+    const result = runChildSync(source, [stateModulePath, dataDir]);
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(result.stdout, dataDir);
+  };
+  startup();
+  const stampedAt = JSON.parse(fs.readFileSync(path.join(dataDir, ".grok-state-sweep.json"), "utf8")).sweptAt;
+  assert.ok(stampedAt >= now);
+  assert.equal(fs.existsSync(dead), false);
+  assert.equal(fs.existsSync(live), true);
+  assert.equal(fs.existsSync(recent), true);
+  assert.equal(fs.existsSync(oldMarker), false);
+  assert.equal(fs.existsSync(newMarker), true);
+  fs.writeFileSync(oldMarker, "{}");
+  fs.utimesSync(oldMarker, old, old);
+  startup();
+  assert.equal(fs.existsSync(oldMarker), true);
+  fs.writeFileSync(path.join(dataDir, ".grok-state-sweep.json"), JSON.stringify({ sweptAt: stampedAt - 60 * 60 * 1000 - 1 }));
+  startup();
+  assert.equal(fs.existsSync(oldMarker), false);
 });

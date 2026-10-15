@@ -54,6 +54,10 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 if (process.env.FAKE_GROK_ARGS_FILE) fs.appendFileSync(process.env.FAKE_GROK_ARGS_FILE, JSON.stringify(process.argv.slice(2)) + "\\n");
+if (process.argv.includes("--version")) {
+  process.stdout.write("grok 1.0.41 (0123456789ab)\\n");
+  process.exit(0);
+}
 const sandboxIndex = process.argv.indexOf("--sandbox");
 if (sandboxIndex >= 0) {
   const profile = process.argv[sandboxIndex + 1];
@@ -220,7 +224,7 @@ test("task accepts an explicit cwd below a repository top level", (t) => {
   const result = runCompanion(["task", "--cwd", ".", "inspect the API"], { cwd: canonicalSubdirectory, env: envFor(sandbox) });
 
   assert.equal(result.status, 0, result.stderr);
-  assert.match(result.stdout, /job: [a-f0-9]{32}\nsandbox: [^\n]+\nstate: done\n$/);
+  assert.match(result.stdout, /job: [a-f0-9]{32}\nsandbox: [^\n]+\ndelivery: foreground\nsemantic: unverified\nstate: done\n$/);
   assert.ok(result.stdout.includes(`sandbox: ${canonicalSubdirectory}\n`));
   assert.equal(jobRecords(sandbox.dataDir)[0].cwd, canonicalSubdirectory);
 });
