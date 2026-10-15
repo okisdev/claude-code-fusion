@@ -402,9 +402,11 @@ test("died detection cleans a surviving Cursor process group", async (t) => {
   const deadline = Date.now() + 10000;
   while ((!h.jobs()[0]?.cursorPid || !fs.existsSync(helperPidFile)) && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 25));
   const record = h.jobs()[0];
-  assert.ok(record.cursorPid && fs.existsSync(helperPidFile));
+  assert.ok(record.cursorPid && record.pidIdentity && fs.existsSync(helperPidFile));
   t.after(() => { try { process.kill(-record.cursorPid, "SIGKILL"); } catch {} });
   process.kill(record.pid, "SIGKILL");
+  const exitDeadline = Date.now() + 10000;
+  while (processIdentityMatches(record.pid, record.pidIdentity) && Date.now() < exitDeadline) await new Promise((resolve) => setTimeout(resolve, 25));
   const status = h.run(["status", record.id, "--json"]);
   assert.equal(status.status, 0, status.stdout + status.stderr);
   assert.equal(JSON.parse(status.stdout).status, "error");
