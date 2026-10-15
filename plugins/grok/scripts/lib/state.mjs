@@ -281,7 +281,7 @@ function deliveryStatusFor(record) {
 
 function withStructuredStatuses(record) {
   const transportStatus = record.status;
-  const semanticStatus = record.semanticStatus ?? "unverified";
+  const semanticStatus = record.semanticStatus;
   const deliveryStatus = deliveryStatusFor(record);
   const resultPayload = record.resultPayload && typeof record.resultPayload === "object" && !Array.isArray(record.resultPayload)
     ? {
@@ -373,9 +373,15 @@ export function readJobRecordFile(file) {
   }
   try {
     const record = JSON.parse(fs.readFileSync(file, "utf8"));
-    if (record && typeof record === "object" && !Array.isArray(record) && typeof record.id === "string") {
-      return { ...record, grokVersion: typeof record.grokVersion === "string" && record.grokVersion.trim() ? record.grokVersion.trim() : null };
-    }
+    if (record && typeof record === "object" && !Array.isArray(record) && Object.hasOwn(record, "id") && (
+      record.schemaVersion !== 1 || record.engine !== "grok" || typeof record.id !== "string" ||
+      !Object.hasOwn(record, "jobClass") || !Object.hasOwn(record, "delivery") ||
+      !Object.hasOwn(record, "semanticStatus") || !Object.hasOwn(record, "request") ||
+      !Object.hasOwn(record, "pidIdentity") || !Object.hasOwn(record, "grokPidIdentity") ||
+      !Object.hasOwn(record, "grokVersion") || !Object.hasOwn(record, "deliveryStatus") ||
+      !Object.hasOwn(record, "transportStatus") || !Object.hasOwn(record, "resultPayload") ||
+      !Object.hasOwn(record, "cleanupRequired")
+    )) return null;
     return record;
   } catch {
     return null;
@@ -395,17 +401,13 @@ function recordedResumeOwnerProcessIsAlive(pid, identity) {
     return false;
   }
   if (!validProcessIdentity(identity)) {
-    return processIsDirectlyAlive(pid) || processGroupIsDirectlyAlive(pid);
+    return processIsDirectlyAlive(pid) || processGroupAlive(pid);
   }
   const currentIdentity = getProcessIdentity(pid);
   if (currentIdentity) {
     return processIdentitiesMatch(currentIdentity, identity);
   }
-  return processIsDirectlyAlive(pid) || processGroupIsDirectlyAlive(pid);
-}
-
-function processGroupIsDirectlyAlive(pid) {
-  return processGroupAlive(pid);
+  return processIsDirectlyAlive(pid) || processGroupAlive(pid);
 }
 
 function resumeOwnerMayStillRun(record, now = Date.now()) {

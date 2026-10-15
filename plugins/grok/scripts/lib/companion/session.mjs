@@ -7,28 +7,9 @@ function inputError(message) {
   return error;
 }
 
-function ordinaryTaskRequest(request) {
-  return (
-    request &&
-    typeof request === "object" &&
-    !Array.isArray(request) &&
-    Object.hasOwn(request, "model") &&
-    Object.hasOwn(request, "effort") &&
-    Object.hasOwn(request, "web") &&
-    Object.hasOwn(request, "resumeSessionId")
-  );
-}
-
 function jobClassForRecord(job) {
-  const request = job?.request;
-  if (request && typeof request === "object" && !Array.isArray(request) && typeof request.reviewTargetLabel === "string") {
-    return "review";
-  }
-  if (job?.jobClass === "review" || job?.jobClass === "stop_gate") {
+  if (job?.jobClass === "task" || job?.jobClass === "review" || job?.jobClass === "stop_gate") {
     return job.jobClass;
-  }
-  if ((job?.jobClass === "task" || job?.jobClass == null) && ordinaryTaskRequest(request)) {
-    return "task";
   }
   return "unknown";
 }
@@ -149,4 +130,4 @@ function validateResumeSessionId(dataDir, cwd, sessionId, mode, memory = false) 
   return normalizeGrokSessionId(validateResumeSession(dataDir, cwd, sessionId, mode, memory).sessionId);
 }
 
-export { inputError, ordinaryTaskRequest, jobClassForRecord, memoryEnabledForRecord, terminalJob, resumeCompatible, newestFirst, sessionMemoryModes, resumableJobs, resolveLastSessionJob, resolveLastSessionId, validateResumeSession, validateResumeSessionId };
+export { inputError, jobClassForRecord, memoryEnabledForRecord, terminalJob, resumeCompatible, newestFirst, sessionMemoryModes, resumableJobs, resolveLastSessionJob, resolveLastSessionId, validateResumeSession, validateResumeSessionId };

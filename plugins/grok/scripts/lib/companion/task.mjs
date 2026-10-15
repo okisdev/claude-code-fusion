@@ -126,7 +126,7 @@ async function handleTask(argv, transport = {}) {
     }
   } catch (error) {
     recordSpawnFailure(jobFile, error);
-    throw launchFailureError(error, jobId, record.cwd);
+    throw launchFailureError(error, record);
   }
 
   if (background) {
@@ -134,7 +134,7 @@ async function handleTask(argv, transport = {}) {
       await spawnBackgroundWorker([SELF_PATH, "task-worker", "--job-id", jobId, "--cwd", cwd], jobFile);
     } catch (error) {
       recordSpawnFailure(jobFile, error);
-      throw launchFailureError(error, jobId, record.cwd);
+      throw launchFailureError(error, record);
     }
     const payload = {
       jobId,
@@ -177,7 +177,7 @@ async function handleTask(argv, transport = {}) {
     });
   } catch (error) {
     recordSpawnFailure(jobFile, error);
-    throw launchFailureError(error, jobId, record.cwd);
+    throw launchFailureError(error, record);
   }
 
   if (resultFailed(result)) {
@@ -213,8 +213,7 @@ async function handleTask(argv, transport = {}) {
     throw new Error(
       failureOutcomeMessage({
         message: "Job was cancelled.",
-        jobId,
-        cwd: final.cwd,
+        record: final,
         status: "cancelled",
         failureKind: "cancelled"
       })
@@ -316,7 +315,7 @@ async function handleTaskWorker(argv) {
         : classifyFailure({ result, logTail: tail });
     const message = grokFailureMessage(result, timeoutMs, failureKind, tail);
     const status = failureKind === "cancelled" ? "cancelled" : "error";
-    const renderedMessage = failureOutcomeMessage({ message, detail: tail, jobId: record.id, cwd: record.cwd, status, failureKind });
+    const renderedMessage = failureOutcomeMessage({ message, detail: tail, record: current ?? record, status, failureKind });
     finishJobRecord(found.file, {
       status,
       pid: null,

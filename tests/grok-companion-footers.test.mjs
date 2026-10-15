@@ -4,7 +4,8 @@ import path from "node:path";
 import { test } from "node:test";
 
 import { renderJobDetail, renderTaskResult } from "../plugins/grok/scripts/lib/render.mjs";
-import { createJobRecord, createJobRecordFile, finishSuccessfulJobRecordFile, jobFilePath, jobLogPath } from "../plugins/grok/scripts/lib/state.mjs";
+import { failureOutcomeMessage } from "../plugins/grok/scripts/lib/companion/base.mjs";
+import { createJobRecord, createJobRecordFile, finishSuccessfulJobRecordFile, jobFilePath } from "../plugins/grok/scripts/lib/state.mjs";
 import { envFor, makeSandbox, runCompanion } from "./lib/companion-harness.mjs";
 import { initCleanRepo } from "./lib/git-fixture.mjs";
 
@@ -35,10 +36,12 @@ function withIdentityPath(sandbox, action) {
 test("task and job detail footers retain contract order and pair job with sandbox", () => {
   const task = renderTaskResult({ text: "answer", schemaRequested: true, structuredOutput: {}, sessionId: "session-1", jobId: "job-1", cwd: "/work", delivery: "managed", semanticStatus: "accepted" });
   assert.deepEqual(footerLines(task), ["structured: parsed", "grok-session: session-1", "job: job-1", "sandbox: /work", "delivery: managed", "semantic: accepted", "state: done"]);
-  const detail = renderJobDetail({ id: "job-2", status: "running", mode: "consult", cwd: "/work", background: true, createdAt: "now" });
+  const detail = renderJobDetail(createJobRecord({ id: "job-2", status: "running", mode: "consult", cwd: "/work", background: true, createdAt: "now" }));
   assert.deepEqual(footerLines(detail), ["job: job-2", "sandbox: /work", "delivery: manual", "semantic: unverified", "state: running"]);
   const failed = renderJobDetail({ id: "job-3", status: "error", mode: "write", cwd: "/work", delivery: "foreground", semanticStatus: "rejected", failureKind: "quota", createdAt: "now" });
   assert.deepEqual(footerLines(failed), ["job: job-3", "sandbox: /work", "delivery: foreground", "semantic: rejected", "state: error", "failure: quota"]);
+  const managed = { ...createJobRecord({ id: "job-4", mode: "consult", cwd: "/work", background: true, delivery: "managed" }), semanticStatus: "rejected" };
+  assert.deepEqual(footerLines(failureOutcomeMessage({ message: "failed", record: managed, failureKind: "quota" })), ["job: job-4", "sandbox: /work", "delivery: managed", "semantic: rejected", "state: error", "failure: quota"]);
 });
 
 test("cancelled success keeps observed turns, cost, usage, and model usage", (t) => {
@@ -59,25 +62,6 @@ test("cancelled success keeps observed turns, cost, usage, and model usage", (t)
     assert.equal(final.costIsPartial, false);
     assert.deepEqual(final.usage, usage);
     assert.deepEqual(final.modelUsage, modelUsage);
-  });
-});
-
-test("stats classifies generic errors from only the last 64 KiB of the log", (t) => {
-  const sandbox = makeSandbox(t);
-  withIdentityPath(sandbox, () => {
-    const file = jobFilePath(sandbox.dataDir, sandbox.workDir, "legacy");
-    createJobRecordFile(file, { ...createJobRecord({ id: "legacy", cwd: sandbox.workDir, mode: "consult" }), status: "error", failureKind: "error", errorMessage: "generic failure", errorTail: "generic failure" });
-    const log = jobLogPath(sandbox.dataDir, sandbox.workDir, "legacy");
-    const quota = "API error (status 402 Payment Required): usage balance exhausted\n";
-    fs.writeFileSync(log, quota + "x".repeat(70 * 1024));
-    const env = envFor(sandbox);
-    const first = runCompanion(["stats", "--json"], { cwd: sandbox.workDir, env });
-    assert.equal(first.status, 0, first.stderr);
-    assert.deepEqual(JSON.parse(first.stdout).byFailureKind, { error: 1 });
-    fs.writeFileSync(log, "x".repeat(70 * 1024) + quota);
-    const second = runCompanion(["stats", "--json"], { cwd: sandbox.workDir, env });
-    assert.equal(second.status, 0, second.stderr);
-    assert.deepEqual(JSON.parse(second.stdout).byFailureKind, { quota: 1 });
   });
 });
 

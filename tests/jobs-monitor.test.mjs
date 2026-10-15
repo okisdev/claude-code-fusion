@@ -413,11 +413,11 @@ test("a session monitor observes a managed job launched in another workspace", a
   ]);
 });
 
-test("a session monitor announces duplicate legacy ids in each workspace with explicit cwd values", async (t) => {
+test("a session monitor announces duplicate ids in each workspace with explicit cwd values", async (t) => {
   const sandbox = makeSandbox(t);
   const otherCwd = path.join(sandbox.root, "other-workspace");
   fs.mkdirSync(otherCwd, { recursive: true });
-  const id = "duplicate-legacy-id";
+  const id = "duplicate-job-id";
   const { file: ownFile, record: ownRecord } = seedJob(sandbox, {
     id,
     status: "running",
@@ -582,13 +582,13 @@ test("restart with persisted dedup state does not re-announce a background done 
   assert.deepStrictEqual(second.lines(), []);
 });
 
-test("an old announcement ledger version is reset instead of suppressing a namespaced notification", async (t) => {
+test("an invalid announcement ledger is reset instead of suppressing a namespaced notification", async (t) => {
   const sandbox = makeSandbox(t);
   const { file, record } = seedJob(sandbox, { status: "running", background: true });
   const stateFile = announcedPath(sandbox);
   fs.writeFileSync(
     stateFile,
-    `${JSON.stringify({ version: 1, keys: [announcedKey(sandbox.workDir, record.id, "done")] })}\n`,
+    "{invalid json\n",
     "utf8",
   );
   const monitor = startMonitor(sandbox, envFor(sandbox));
@@ -711,7 +711,7 @@ fs.readFileSync = function (file, ...args) {
 }
 
 function seedTracedJob(sandbox) {
-  const record = { id: generateJobId(), status: "running", cwd: sandbox.workDir, background: true };
+  const record = createJobRecord({ id: generateJobId(), status: "running", mode: "consult", cwd: sandbox.workDir, background: true });
   const file = jobFilePath(sandbox.dataDir, sandbox.workDir, record.id);
   fs.mkdirSync(path.dirname(file), { recursive: true });
   fs.writeFileSync(file, `${JSON.stringify(record)}\n`);

@@ -47,15 +47,15 @@ function boundedTextTail(value, maxLines = 20) {
     .join("\n");
 }
 
-function failureOutcomeMessage({ message, detail, jobId, cwd, delivery = "foreground", semanticStatus = "unverified", status = "error", failureKind = "error" }) {
+function failureOutcomeMessage({ message, detail, record, status = "error", failureKind = "error" }) {
   const lines = [String(message ?? "").trim() || "Grok companion failed."];
   const diagnostic = String(detail ?? "").trim();
   if (diagnostic && diagnostic !== lines[0]) {
     lines.push("", diagnostic);
   }
-  if (jobId) {
-    lines.push("", `job: ${jobId}`, `sandbox: ${cwd}`);
-    lines.push(`delivery: ${delivery}`, `semantic: ${semanticStatus}`);
+  if (record) {
+    lines.push("", `job: ${record.id}`, `sandbox: ${record.cwd}`);
+    lines.push(`delivery: ${record.delivery}`, `semantic: ${record.semanticStatus}`);
   }
   lines.push(`state: ${status}`, `failure: ${failureKind}`);
   return lines.join("\n");

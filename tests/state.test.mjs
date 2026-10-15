@@ -174,6 +174,17 @@ test("creating a job record never overwrites an existing record", async (t) => {
   assert.strictEqual(stateModule.readJobRecordFile(jobFile).companionVersion, "0.0.41");
 });
 
+test("an incomplete job record is unreadable", async (t) => {
+  const sandbox = makeSandbox(t);
+  const stateModule = await import(stateModulePath);
+  const jobId = stateModule.generateJobId();
+  const jobFile = stateModule.jobFilePath(sandbox.dataDir, sandbox.workDir, jobId);
+  fs.mkdirSync(path.dirname(jobFile), { recursive: true });
+  fs.writeFileSync(jobFile, JSON.stringify({ schemaVersion: 1, engine: "grok", id: jobId, status: "done" }));
+  assert.strictEqual(stateModule.readJobRecordFile(jobFile), null);
+  assert.deepStrictEqual(stateModule.listJobRecords(sandbox.dataDir, sandbox.workDir), []);
+});
+
 test("a running resume owner holds the workspace lease until it becomes terminal", async (t) => {
   const sandbox = makeSandbox(t);
   const stateModule = await import(stateModulePath);

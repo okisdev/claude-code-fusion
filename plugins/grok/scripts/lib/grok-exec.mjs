@@ -393,6 +393,10 @@ function requireGrokCapabilities(capabilities, flags) {
   }
 }
 
+function supportsCapability(capabilities, flag) {
+  return capabilities == null || capabilities.has(flag);
+}
+
 export function buildGrokArgs(options) {
   const mode = options.mode === "write" ? "write" : "consult";
   const web = options.web === true;
@@ -400,7 +404,6 @@ export function buildGrokArgs(options) {
   const capabilities = options.capabilities ?? null;
   const env = options.env ?? process.env;
   const cwd = options.cwd ?? process.cwd();
-  const supports = (flag) => capabilities == null || capabilities.has(flag);
   const args = [];
 
   if (options.resumeSessionId) {
@@ -415,13 +418,13 @@ export function buildGrokArgs(options) {
     "--sandbox",
     sandboxProfileForMode(mode)
   );
-  if (supports("--no-auto-update")) {
+  if (supportsCapability(capabilities, "--no-auto-update")) {
     args.push("--no-auto-update");
   }
-  if (supports("--no-subagents")) {
+  if (supportsCapability(capabilities, "--no-subagents")) {
     args.push("--no-subagents");
   }
-  if (supports("--no-wait-for-background")) {
+  if (supportsCapability(capabilities, "--no-wait-for-background")) {
     args.push("--no-wait-for-background");
   }
   if (!web) {
@@ -437,7 +440,7 @@ export function buildGrokArgs(options) {
   }
 
   if (options.jsonSchema) {
-    if (!supports("--json-schema")) {
+    if (!supportsCapability(capabilities, "--json-schema")) {
       throw capabilityError("The installed Grok CLI does not support required structured output through --json-schema.");
     }
     const schema = typeof options.jsonSchema === "string" ? options.jsonSchema : JSON.stringify(options.jsonSchema);
@@ -1672,19 +1675,22 @@ export function terminalRecordAttribution(record, patch = {}, env = process.env)
   };
 }
 
+function canSignalProcess(pid, identity, allowExitedLeader) {
+  return identity == null || processIdentityMatches(pid, identity) || (allowExitedLeader && !processIsDirectlyAlive(pid));
+}
+
 function signalProcessGroup(pid, signal, identity = null, options = {}) {
   const allowExitedLeader = options.allowExitedLeader === true;
   const fallbackToPid = options.fallbackToPid !== false;
   const kill = options.kill ?? process.kill.bind(process);
-  const canSignal = () => identity == null || processIdentityMatches(pid, identity) || (allowExitedLeader && !processIsDirectlyAlive(pid));
-  if (!Number.isInteger(pid) || pid <= 1 || !canSignal()) {
+  if (!Number.isInteger(pid) || pid <= 1 || !canSignalProcess(pid, identity, allowExitedLeader)) {
     return false;
   }
   try {
     kill(-pid, signal);
     return true;
   } catch {
-    if (!canSignal() || !fallbackToPid) {
+    if (!canSignalProcess(pid, identity, allowExitedLeader) || !fallbackToPid) {
       return false;
     }
     try {
@@ -1725,35 +1731,29 @@ export async function terminateExitedLeaderProcessGroup(pid, identity = null, op
   const graceMs = options.graceMs ?? TERMINATION_GRACE_MS;
   const pollMs = options.pollMs ?? TERMINATION_POLL_MS;
   const kill = options.kill ?? process.kill.bind(process);
-  const targetAlive = () => exitedLeaderProcessGroupAlive(pid, options.kill);
-  const signalGroup = (signal) => signalProcessGroup(pid, signal, identity, {
-    allowExitedLeader: true,
-    fallbackToPid: false,
-    kill
-  });
-  if (!targetAlive()) {
+  if (!exitedLeaderProcessGroupAlive(pid, options.kill)) {
     return true;
   }
-  if (!signalGroup("SIGTERM")) {
-    return !targetAlive();
+  if (!signalProcessGroup(pid, "SIGTERM", identity, { allowExitedLeader: true, fallbackToPid: false, kill })) {
+    return !exitedLeaderProcessGroupAlive(pid, options.kill);
   }
   const deadline = Date.now() + graceMs;
   while (Date.now() < deadline) {
-    if (!targetAlive()) {
+    if (!exitedLeaderProcessGroupAlive(pid, options.kill)) {
       return true;
     }
     await waitMs(pollMs);
   }
-  if (targetAlive() && !signalGroup("SIGKILL")) {
-    return !targetAlive();
+  if (exitedLeaderProcessGroupAlive(pid, options.kill) && !signalProcessGroup(pid, "SIGKILL", identity, { allowExitedLeader: true, fallbackToPid: false, kill })) {
+    return !exitedLeaderProcessGroupAlive(pid, options.kill);
   }
   while (Date.now() < deadline + graceMs) {
-    if (!targetAlive()) {
+    if (!exitedLeaderProcessGroupAlive(pid, options.kill)) {
       return true;
     }
     await waitMs(pollMs);
   }
-  return !targetAlive();
+  return !exitedLeaderProcessGroupAlive(pid, options.kill);
 }
 
 function normalizedPid(value) {
@@ -1767,16 +1767,13 @@ export function recordedProcessState(pid, identity = null) {
   }
   const currentIdentity = getProcessIdentity(pid);
   if (currentIdentity) {
-    if (identity == null) {
-      return "legacy";
-    }
     if (!validProcessIdentity(identity)) {
       return "unverified";
     }
     return processIdentityMatches(pid, identity) ? "owned" : "replaced";
   }
   if (processIsDirectlyAlive(pid) || processGroupAlive(pid)) {
-    return identity == null ? "legacy" : "unverified";
+    return "unverified";
   }
   return "absent";
 }
@@ -1880,6 +1877,17 @@ function settleProcessIdentitySync(pid, capture, options = {}) {
   return previous;
 }
 
+function terminationTargetAlive(pid, identity) {
+  if (identity == null) {
+    return processGroupAlive(pid);
+  }
+  const currentIdentity = getProcessIdentity(pid);
+  if (currentIdentity) {
+    return processIdentityMatches(pid, identity);
+  }
+  return processGroupAlive(pid);
+}
+
 export function terminateProcessGroupSync(pid, options = {}) {
   if (!Number.isInteger(pid) || pid <= 1) {
     return false;
@@ -1887,39 +1895,29 @@ export function terminateProcessGroupSync(pid, options = {}) {
   const graceMs = options.graceMs ?? TERMINATION_GRACE_MS;
   const pollMs = options.pollMs ?? TERMINATION_POLL_MS;
   const identity = options.identity ?? null;
-  const targetAlive = () => {
-    if (identity == null) {
-      return processGroupAlive(pid);
-    }
-    const currentIdentity = getProcessIdentity(pid);
-    if (currentIdentity) {
-      return processIdentityMatches(pid, identity);
-    }
-    return processGroupAlive(pid);
-  };
   if (!signalProcessGroup(pid, "SIGTERM", identity)) {
-    return !targetAlive();
+    return !terminationTargetAlive(pid, identity);
   }
   const deadline = Date.now() + graceMs;
   while (Date.now() < deadline) {
-    if (!targetAlive()) {
+    if (!terminationTargetAlive(pid, identity)) {
       return true;
     }
     waitSync(pollMs);
   }
   if (options.gracefulOnly === true) {
-    return !targetAlive();
+    return !terminationTargetAlive(pid, identity);
   }
-  if (targetAlive() && !signalProcessGroup(pid, "SIGKILL", identity)) {
-    return !targetAlive();
+  if (terminationTargetAlive(pid, identity) && !signalProcessGroup(pid, "SIGKILL", identity)) {
+    return !terminationTargetAlive(pid, identity);
   }
   while (Date.now() < deadline + graceMs) {
-    if (!targetAlive()) {
+    if (!terminationTargetAlive(pid, identity)) {
       return true;
     }
     waitSync(pollMs);
   }
-  return !targetAlive();
+  return !terminationTargetAlive(pid, identity);
 }
 
 export async function terminateProcessGroup(pid, options = {}) {
@@ -1929,39 +1927,29 @@ export async function terminateProcessGroup(pid, options = {}) {
   const graceMs = options.graceMs ?? TERMINATION_GRACE_MS;
   const pollMs = options.pollMs ?? TERMINATION_POLL_MS;
   const identity = options.identity ?? null;
-  const targetAlive = () => {
-    if (identity == null) {
-      return processGroupAlive(pid);
-    }
-    const currentIdentity = getProcessIdentity(pid);
-    if (currentIdentity) {
-      return processIdentityMatches(pid, identity);
-    }
-    return processGroupAlive(pid);
-  };
   if (!signalProcessGroup(pid, "SIGTERM", identity)) {
-    return !targetAlive();
+    return !terminationTargetAlive(pid, identity);
   }
   const deadline = Date.now() + graceMs;
   while (Date.now() < deadline) {
-    if (!targetAlive()) {
+    if (!terminationTargetAlive(pid, identity)) {
       return true;
     }
     await waitMs(pollMs);
   }
   if (options.gracefulOnly === true) {
-    return !targetAlive();
+    return !terminationTargetAlive(pid, identity);
   }
-  if (targetAlive() && !signalProcessGroup(pid, "SIGKILL", identity)) {
-    return !targetAlive();
+  if (terminationTargetAlive(pid, identity) && !signalProcessGroup(pid, "SIGKILL", identity)) {
+    return !terminationTargetAlive(pid, identity);
   }
   while (Date.now() < deadline + graceMs) {
-    if (!targetAlive()) {
+    if (!terminationTargetAlive(pid, identity)) {
       return true;
     }
     await waitMs(pollMs);
   }
-  return !targetAlive();
+  return !terminationTargetAlive(pid, identity);
 }
 
 export function terminateRecordedProcessGroupsSync(record, options = {}) {
@@ -1970,7 +1958,7 @@ export function terminateRecordedProcessGroupsSync(record, options = {}) {
     if (state === "absent" || state === "replaced") {
       return true;
     }
-    if (state === "unverified" || state === "legacy") {
+    if (state === "unverified") {
       return false;
     }
     return terminateProcessGroupSync(pid, {
@@ -1988,7 +1976,7 @@ export async function terminateRecordedProcessGroups(record, options = {}) {
     if (state === "absent" || state === "replaced") {
       return true;
     }
-    if (state === "unverified" || state === "legacy") {
+    if (state === "unverified") {
       return false;
     }
     return terminateProcessGroup(pid, {

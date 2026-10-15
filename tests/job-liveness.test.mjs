@@ -248,7 +248,7 @@ test("died repair treats a process identity mismatch as PID reuse without signal
   assert.ok(pidAlive(child.pid), "Expected the reused PID to remain alive.");
 });
 
-test("unverifiable legacy cleanup leaves died repair running and cleanup required", async (t) => {
+test("unverifiable process identity cleanup leaves died repair running and cleanup required", async (t) => {
   const sandbox = makeSandbox(t);
   const deadPid = await makeDeadPid();
   const grokChild = spawn(process.execPath, ["-e", "process.on('SIGTERM', () => {}); process.stdout.write('ready'); setInterval(() => {}, 1000)"], {
@@ -276,7 +276,7 @@ test("unverifiable legacy cleanup leaves died repair running and cleanup require
   assert.strictEqual(updated.grokPid, grokChild.pid);
   assert.strictEqual(updated.pidIdentity, null);
   assert.strictEqual(updated.grokPidIdentity, null);
-  assert.ok(pidAlive(grokChild.pid), "Expected legacy cleanup not to escalate to SIGKILL.");
+  assert.ok(pidAlive(grokChild.pid), "Expected unverified cleanup not to escalate to SIGKILL.");
 
   const immediate = runCompanion(["result", record.id], {
     cwd: sandbox.workDir,

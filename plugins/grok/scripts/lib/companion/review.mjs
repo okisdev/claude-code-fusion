@@ -224,7 +224,7 @@ async function runReviewJob(record, jobFile, options = {}) {
     });
   } catch (error) {
     recordSpawnFailure(jobFile, error);
-    throw launchFailureError(error, record.id, record.cwd);
+    throw launchFailureError(error, record);
   }
   if (resultFailed(first)) {
     failJob(jobFile, logFile, first, timeoutMs);
@@ -340,7 +340,7 @@ async function handleReview(argv, transport = {}) {
     writeBrief(dataDir, cwd, jobId, prompt);
   } catch (error) {
     recordSpawnFailure(jobFile, error);
-    throw launchFailureError(error, jobId, record.cwd);
+    throw launchFailureError(error, record);
   }
 
   if (background) {
@@ -348,7 +348,7 @@ async function handleReview(argv, transport = {}) {
       await spawnBackgroundWorker([SELF_PATH, "review-worker", "--job-id", jobId, "--cwd", cwd], jobFile);
     } catch (error) {
       recordSpawnFailure(jobFile, error);
-      throw launchFailureError(error, jobId, record.cwd);
+      throw launchFailureError(error, record);
     }
     const payload = {
       jobId,
@@ -372,8 +372,7 @@ async function handleReview(argv, transport = {}) {
       failureOutcomeMessage({
         message: `Grok review output failed validation: ${payload.parseError}`,
         detail: payload.rendered,
-        jobId,
-        cwd: record.cwd,
+        record,
         failureKind: "error"
       })
     );

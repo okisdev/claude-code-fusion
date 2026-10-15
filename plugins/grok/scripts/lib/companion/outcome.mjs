@@ -58,7 +58,7 @@ function finishDiedJobRecord(file) {
         failureResultPayload(current, {
           status,
           failureKind,
-          message: failureOutcomeMessage({ message, jobId: current.id, cwd: current.cwd, status, failureKind })
+          message: failureOutcomeMessage({ message, record: current, status, failureKind })
         })
       ),
       errorMessage: message,
@@ -276,7 +276,7 @@ function failJob(jobFile, logFile, result, timeoutMs) {
       : classifyFailure({ result, logTail: tail });
   const message = grokFailureMessage(result, timeoutMs, failureKind, tail);
   const status = failureKind === "cancelled" ? "cancelled" : "error";
-  const renderedMessage = failureOutcomeMessage({ message, detail: tail, jobId: current?.id, cwd: current?.cwd, status, failureKind });
+  const renderedMessage = failureOutcomeMessage({ message, detail: tail, record: current, status, failureKind });
   finishJobRecord(jobFile, {
     status,
     pid: null,
@@ -305,8 +305,7 @@ function finishTaskStructuredFailure(jobFile, result, evaluation) {
   const renderedMessage = failureOutcomeMessage({
     message,
     detail,
-    jobId: current?.id,
-    cwd: current?.cwd,
+    record: current,
     status: "error",
     failureKind: "error"
   });
@@ -338,14 +337,13 @@ function describeLaunchFailure(error) {
   return error instanceof Error ? error.message : String(error);
 }
 
-function launchFailureError(error, jobId, cwd) {
+function launchFailureError(error, record) {
   const failureKind = classifyFailure({ spawnError: error });
   const status = error?.cleanupRequired ? "running" : failureKind === "cancelled" ? "cancelled" : "error";
   const wrapped = errorWithFailure(
     failureOutcomeMessage({
       message: describeLaunchFailure(error),
-      jobId,
-      cwd,
+      record,
       status,
       failureKind
     }),

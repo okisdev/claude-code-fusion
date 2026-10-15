@@ -240,20 +240,113 @@ function safeWriteLine(line) {
   }
 }
 
+function shutdown(stopPolling) {
+  stopPolling();
+  process.exit(0);
+}
+
 function installExitHandlers(stopPolling) {
-  const shutdown = () => {
-    stopPolling();
-    process.exit(0);
-  };
-  process.on("SIGTERM", shutdown);
-  process.on("SIGINT", shutdown);
-  process.on("SIGHUP", shutdown);
+  process.on("SIGTERM", () => shutdown(stopPolling));
+  process.on("SIGINT", () => shutdown(stopPolling));
+  process.on("SIGHUP", () => shutdown(stopPolling));
   process.stdout.on("error", (error) => {
     if (error?.code === "EPIPE") {
       stopPolling();
       process.exit(0);
     }
   });
+}
+
+function readSnapshot({ dataDir, dir, ownSessionId, cache, state }) {
+  const now = Date.now();
+  const forceReparse = now - state.lastFullReparseAt >= RECONCILE_INTERVAL_MS;
+  if (forceReparse) {
+    state.lastFullReparseAt = now;
+  }
+  const seenFiles = new Set();
+  const snapshot = ownSessionId
+    ? readSessionJobsSnapshot(dataDir, cache, forceReparse, seenFiles)
+    : readJobsSnapshot(dir, cache, forceReparse, seenFiles);
+  for (const file of cache.keys()) {
+    if (!seenFiles.has(file)) {
+      cache.delete(file);
+    }
+  }
+  return snapshot;
+}
+
+function processSnapshot(snapshot, { ownSessionId, managedGraceMs, cwd, loaded, announced, state, stateFile }) {
+  if (!snapshot.available) {
+    return;
+  }
+  const liveKeys = new Set();
+  const duplicateWorkspacesById = new Map();
+  for (const record of snapshot.records) {
+    if (!record?.id) {
+      continue;
+    }
+    const workspace = workspaceKey(record);
+    liveKeys.add(liveKey(record));
+    if (workspace == null) {
+      continue;
+    }
+    const workspaces = duplicateWorkspacesById.get(record.id) ?? new Set();
+    workspaces.add(workspace);
+    duplicateWorkspacesById.set(record.id, workspaces);
+  }
+  const duplicateIds = new Set(
+    [...duplicateWorkspacesById].filter(([, workspaces]) => workspaces.size > 1).map(([id]) => id),
+  );
+  let dirty = state.resetPending;
+  for (const record of snapshot.records) {
+    if (!record?.id) {
+      continue;
+    }
+    if (ownSessionId && record.claudeSessionId !== ownSessionId) {
+      continue;
+    }
+    if (!TERMINAL_STATUSES.has(record.status)) {
+      continue;
+    }
+    if (managedDeliveryIsPending(record, managedGraceMs)) {
+      continue;
+    }
+    const key = announcementKey(record);
+    if (announced.has(key)) {
+      continue;
+    }
+    if (state.startupPending && !loaded.exists && record.delivery !== "managed") {
+      announced.add(key);
+      dirty = true;
+      continue;
+    }
+    if (record.background !== true) {
+      announced.add(key);
+      dirty = true;
+      continue;
+    }
+    if (record.delivery === "managed" && record.deliveryCollectedAt) {
+      announced.add(key);
+      dirty = true;
+      continue;
+    }
+    safeWriteLine(formatOutcomeLine(record, cwd, duplicateIds.has(record.id)));
+    announced.add(key);
+    dirty = true;
+  }
+  if (snapshot.complete && pruneAnnounced(announced, liveKeys, snapshot.unreadableIds)) {
+    dirty = true;
+  }
+  if (state.startupPending && !loaded.exists) {
+    dirty = true;
+  }
+  if (dirty) {
+    saveAnnounced(stateFile, announced);
+    state.resetPending = false;
+  }
+  if (snapshot.complete) {
+    state.startupPending = false;
+  }
 }
 
 function main() {
@@ -265,119 +358,27 @@ function main() {
   const stateFile = announcedStatePath(stateDir, ownSessionId);
   const loaded = loadAnnounced(stateFile);
   const announced = loaded.announced;
-  let resetPending = loaded.reset;
   const managedGraceMs = resolveManagedGraceMs();
   const cache = new Map();
-  let lastFullReparseAt = Date.now();
-  const readSnapshot = () => {
-    const now = Date.now();
-    const forceReparse = now - lastFullReparseAt >= RECONCILE_INTERVAL_MS;
-    if (forceReparse) {
-      lastFullReparseAt = now;
-    }
-    const seenFiles = new Set();
-    const snapshot = ownSessionId
-      ? readSessionJobsSnapshot(dataDir, cache, forceReparse, seenFiles)
-      : readJobsSnapshot(dir, cache, forceReparse, seenFiles);
-    for (const file of cache.keys()) {
-      if (!seenFiles.has(file)) {
-        cache.delete(file);
-      }
-    }
-    return snapshot;
-  };
-  let startupPending = true;
+  const state = { resetPending: loaded.reset, startupPending: true, lastFullReparseAt: Date.now() };
+  const context = { dataDir, dir, ownSessionId, cache, state, managedGraceMs, cwd, loaded, announced, stateFile };
 
   pruneOldStateFiles(stateDir, stateFile);
-
-  const processSnapshot = (snapshot) => {
-    if (!snapshot.available) {
-      return;
-    }
-    const liveKeys = new Set();
-    const duplicateWorkspacesById = new Map();
-    for (const record of snapshot.records) {
-      if (!record?.id) {
-        continue;
-      }
-      const workspace = workspaceKey(record);
-      liveKeys.add(liveKey(record));
-      if (workspace == null) {
-        continue;
-      }
-      const workspaces = duplicateWorkspacesById.get(record.id) ?? new Set();
-      workspaces.add(workspace);
-      duplicateWorkspacesById.set(record.id, workspaces);
-    }
-    const duplicateIds = new Set(
-      [...duplicateWorkspacesById].filter(([, workspaces]) => workspaces.size > 1).map(([id]) => id),
-    );
-    let dirty = resetPending;
-    for (const record of snapshot.records) {
-      if (!record?.id) {
-        continue;
-      }
-      if (ownSessionId && record.claudeSessionId !== ownSessionId) {
-        continue;
-      }
-      if (!TERMINAL_STATUSES.has(record.status)) {
-        continue;
-      }
-      if (managedDeliveryIsPending(record, managedGraceMs)) {
-        continue;
-      }
-      const key = announcementKey(record);
-      if (announced.has(key)) {
-        continue;
-      }
-      if (startupPending && !loaded.exists && record.delivery !== "managed") {
-        announced.add(key);
-        dirty = true;
-        continue;
-      }
-      if (record.background !== true) {
-        announced.add(key);
-        dirty = true;
-        continue;
-      }
-      if (record.delivery === "managed" && record.deliveryCollectedAt) {
-        announced.add(key);
-        dirty = true;
-        continue;
-      }
-      safeWriteLine(formatOutcomeLine(record, cwd, duplicateIds.has(record.id)));
-      announced.add(key);
-      dirty = true;
-    }
-    if (snapshot.complete && pruneAnnounced(announced, liveKeys, snapshot.unreadableIds)) {
-      dirty = true;
-    }
-    if (startupPending && !loaded.exists) {
-      dirty = true;
-    }
-    if (dirty) {
-      saveAnnounced(stateFile, announced);
-      resetPending = false;
-    }
-    if (snapshot.complete) {
-      startupPending = false;
-    }
-  };
 
   let timer = null;
   installExitHandlers(() => clearInterval(timer));
 
   try {
-    const initialSnapshot = readSnapshot();
-    processSnapshot(initialSnapshot);
+    const initialSnapshot = readSnapshot(context);
+    processSnapshot(initialSnapshot, context);
     if (!initialSnapshot.available && initialSnapshot.complete) {
-      startupPending = false;
+      state.startupPending = false;
     }
   } catch {}
 
   timer = setInterval(() => {
     try {
-      processSnapshot(readSnapshot());
+      processSnapshot(readSnapshot(context), context);
     } catch {}
   }, resolvePollIntervalMs());
 }

@@ -5,7 +5,7 @@ import { jobFilePath, jobLogPath, listAllJobRecords, listJobRecords, markDeliver
 import { JOB_ID_PATTERN, DEFAULT_HISTORY_LIMIT, HISTORY_STATUSES, HISTORY_MODES, HISTORY_DELIVERIES, HISTORY_DELIVERY_STATUSES, HISTORY_SEMANTIC_STATUSES, HISTORY_FAILURE_KINDS } from "./config.mjs";
 import { output, errorWithFailure, failureOutcomeMessage, resolveCwd, findRequestedJobRecord, currentClaudeSessionId, parseHistoryLimit, commandArgs, resolveWaitPollMs, resolveWaitTimeoutMs, delayMs } from "./base.mjs";
 import { inputError, jobClassForRecord, memoryEnabledForRecord, terminalJob, sessionMemoryModes } from "./session.mjs";
-import { cleanupRequiredPatch, refreshRunningJobRecord, outcomeFields, observableRecord, taskSuccessPayload, failureResultPayload, retainedResultPayload } from "./outcome.mjs";
+import { cleanupRequiredPatch, refreshRunningJobRecord, outcomeFields, observableRecord, failureResultPayload, retainedResultPayload } from "./outcome.mjs";
 
 function handleStatus(argv, transport = {}) {
   const { options, positionals } = commandArgs(argv, {
@@ -137,7 +137,7 @@ function renderFailedResult(record, dataDir) {
   if (tail) {
     lines.push("", "Log tail:", "", "```text", tail, "```");
   }
-  lines.push("", `job: ${record.id}`, `sandbox: ${record.cwd}`, `delivery: ${record.delivery ?? (record.background ? "manual" : "foreground")}`, `semantic: ${record.semanticStatus ?? "unverified"}`, "state: error");
+  lines.push("", `job: ${record.id}`, `sandbox: ${record.cwd}`, `delivery: ${record.delivery}`, `semantic: ${record.semanticStatus}`, "state: error");
   if (record.failureKind) {
     lines.push(`failure: ${record.failureKind}`);
   }
@@ -150,13 +150,13 @@ function renderRunningWaitResult(record) {
     if (record.errorMessage) {
       lines.push("", record.errorMessage);
     }
-    lines.push("phase: cleanup-required", "", `job: ${record.id}`, `sandbox: ${record.cwd}`, `delivery: ${record.delivery ?? (record.background ? "manual" : "foreground")}`, `semantic: ${record.semanticStatus ?? "unverified"}`, "state: running");
+    lines.push("phase: cleanup-required", "", `job: ${record.id}`, `sandbox: ${record.cwd}`, `delivery: ${record.delivery}`, `semantic: ${record.semanticStatus}`, "state: running");
     if (record.failureKind) {
       lines.push(`failure: ${record.failureKind}`);
     }
     return `${lines.join("\n")}\n`;
   }
-  return [`Job ${record.id}`, "", "Status: running", "", `job: ${record.id}`, `sandbox: ${record.cwd}`, `delivery: ${record.delivery ?? (record.background ? "manual" : "foreground")}`, `semantic: ${record.semanticStatus ?? "unverified"}`, "state: running"].join("\n") + "\n";
+  return [`Job ${record.id}`, "", "Status: running", "", `job: ${record.id}`, `sandbox: ${record.cwd}`, `delivery: ${record.delivery}`, `semantic: ${record.semanticStatus}`, "state: running"].join("\n") + "\n";
 }
 
 function renderNotRunningReport(record) {
@@ -165,8 +165,8 @@ function renderNotRunningReport(record) {
     "",
     `job: ${record.id}`,
     `sandbox: ${record.cwd}`,
-    `delivery: ${record.delivery ?? (record.background ? "manual" : "foreground")}`,
-    `semantic: ${record.semanticStatus ?? "unverified"}`,
+    `delivery: ${record.delivery}`,
+    `semantic: ${record.semanticStatus}`,
     `state: ${record.status}`
   ];
   if (record.failureKind) {
@@ -188,7 +188,7 @@ function renderResultRecord(record, dataDir) {
   }
 
   if (record.status === "cancelled") {
-    const lines = [`Job ${record.id} was cancelled.`, "", `job: ${record.id}`, `sandbox: ${record.cwd}`, `delivery: ${record.delivery ?? (record.background ? "manual" : "foreground")}`, `semantic: ${record.semanticStatus ?? "unverified"}`, "state: cancelled"];
+    const lines = [`Job ${record.id} was cancelled.`, "", `job: ${record.id}`, `sandbox: ${record.cwd}`, `delivery: ${record.delivery}`, `semantic: ${record.semanticStatus}`, "state: cancelled"];
     if (record.failureKind) {
       lines.push(`failure: ${record.failureKind}`);
     }
@@ -203,12 +203,12 @@ function renderResultRecord(record, dataDir) {
     sessionId: record.sessionId,
     jobId: record.id,
     cwd: record.cwd,
-    delivery: record.delivery ?? (record.background ? "manual" : "foreground"),
+    delivery: record.delivery,
     semanticStatus: record.semanticStatus
   });
 }
 
-function jsonResultPayload(record, dataDir, options = {}) {
+function jsonResultPayload(record, options = {}) {
   const deliveryView = observableRecord(
     options.collecting ? { ...record, deliveryCollectedAt: nowIso() } : record
   );
@@ -219,33 +219,11 @@ function jsonResultPayload(record, dataDir, options = {}) {
     return {
       ...record.resultPayload,
       ...outcomeFields(deliveryView, record.status),
-      jobClass: deliveryView.jobClass,
-      memoryEnabled: deliveryView.memoryEnabled,
-      resolvedModel: record.resolvedModel ?? record.resultPayload.resolvedModel ?? null,
-      resolvedEffort: record.resolvedEffort ?? record.resultPayload.resolvedEffort ?? null
+      resolvedModel: record.resolvedModel ?? null,
+      resolvedEffort: record.resolvedEffort ?? null
     };
   }
-  if (record.status === "done") {
-    return taskSuccessPayload(deliveryView, {
-      exitCode: record.exitCode,
-      sessionId: record.sessionId,
-      stopReason: record.stopReason ?? null,
-      resolvedModel: record.resolvedModel ?? null,
-      resolvedEffort: record.resolvedEffort ?? null,
-      usage: record.usage,
-      modelUsage: record.modelUsage,
-      usageIsIncomplete: record.usageIsIncomplete,
-      modelUsageIsIncomplete: record.modelUsageIsIncomplete,
-      text: record.resultText ?? ""
-    });
-  }
-  const failureKind = record.failureKind ?? (record.status === "cancelled" ? "cancelled" : "error");
-  return failureResultPayload(deliveryView, {
-    status: record.status,
-    failureKind,
-    message: renderResultRecord(record, dataDir).trimEnd(),
-    result: record
-  });
+  return deliveryView;
 }
 
 async function waitForResultRecord(found, options) {
@@ -291,7 +269,7 @@ async function handleResult(argv, transport = {}) {
     process.exitCode = 1;
   }
   if (options.json) {
-    output(jsonResultPayload(record, dataDir, { collecting: markCollected }), true);
+    output(jsonResultPayload(record, { collecting: markCollected }), true);
     if (markCollected) {
       markDeliveryCollectedFile(found.file);
     }
@@ -361,8 +339,7 @@ async function handleCancel(argv, transport = {}) {
           failureKind: "cancelled",
           message: failureOutcomeMessage({
             message: "The Grok job was cancelled.",
-            jobId: current.id,
-            cwd: current.cwd,
+            record: current,
             status: "cancelled",
             failureKind: "cancelled"
           })
@@ -373,7 +350,7 @@ async function handleCancel(argv, transport = {}) {
     };
   });
   if (next.status === "running" && next.cleanupRequired) {
-    throw errorWithFailure(failureOutcomeMessage({ message: cleanupMessage, jobId: next.id, cwd: next.cwd, status: "running", failureKind: "cancelled" }), "cancelled");
+    throw errorWithFailure(failureOutcomeMessage({ message: cleanupMessage, record: next, status: "running", failureKind: "cancelled" }), "cancelled");
   }
   if (next.status !== "cancelled") {
     output(options.json ? next : renderNotRunningReport(next), options.json);

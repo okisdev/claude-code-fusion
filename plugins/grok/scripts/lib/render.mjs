@@ -334,8 +334,8 @@ export function renderJobDetail(job, options = {}) {
   }
   lines.push("", `job: ${job.id}`);
   lines.push(`sandbox: ${job.cwd}`);
-  lines.push(`delivery: ${job.delivery ?? (job.background ? "manual" : "foreground")}`);
-  lines.push(`semantic: ${job.semanticStatus ?? "unverified"}`);
+  lines.push(`delivery: ${job.delivery}`);
+  lines.push(`semantic: ${job.semanticStatus}`);
   lines.push(`state: ${job.status}`);
   if (job.failureKind) {
     lines.push(`failure: ${job.failureKind}`);

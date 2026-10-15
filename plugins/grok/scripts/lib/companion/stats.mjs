@@ -1,7 +1,6 @@
 import { renderStatsReport } from "../render.mjs";
-import { jobFilePath, jobLogPath, listAllJobRecords, listJobRecords, readLogTail, resolveDataDir } from "../state.mjs";
+import { jobFilePath, listAllJobRecords, listJobRecords, resolveDataDir } from "../state.mjs";
 import { output, resolveCwd, commandArgs } from "./base.mjs";
-import { classifyFailure } from "./execution.mjs";
 import { refreshRunningJobRecord, TOKEN_USAGE_METRICS, optionalBoolean, tokenUsageObservation } from "./outcome.mjs";
 
 function increment(counts, key) {
@@ -22,45 +21,8 @@ function addTokenUsage(target, usage) {
   return true;
 }
 
-function tokenUsageFromModels(value) {
-  if (!value || typeof value !== "object" || Array.isArray(value)) {
-    return { coverage: "unreported", usage: null };
-  }
-  const entries = Object.values(value);
-  if (entries.length === 0) {
-    return { coverage: "unreported", usage: null };
-  }
-  const combined = {
-    inputTokens: 0,
-    cacheReadInputTokens: 0,
-    outputTokens: 0,
-    reasoningTokens: 0,
-    totalTokens: 0
-  };
-  let completeEntries = 0;
-  let incompleteEntry = false;
-  for (const entry of entries) {
-    const observed = tokenUsageObservation(entry, { allowFullInput: true });
-    if (observed.coverage === "complete") {
-      if (!addTokenUsage(combined, observed.usage)) {
-        return { coverage: "incomplete", usage: null };
-      }
-      completeEntries += 1;
-    } else if (observed.coverage === "incomplete") {
-      incompleteEntry = true;
-    }
-  }
-  if (completeEntries === entries.length) {
-    return { coverage: "complete", usage: combined };
-  }
-  if (completeEntries > 0 || incompleteEntry) {
-    return { coverage: "incomplete", usage: null };
-  }
-  return { coverage: "unreported", usage: null };
-}
-
 function tokenUsageForRecord(record) {
-  const usageIsIncomplete = record.usageIsIncomplete === true || record.usage_is_incomplete === true;
+  const usageIsIncomplete = record.usageIsIncomplete === true;
   const modelUsageIsIncomplete = optionalBoolean(record.modelUsageIsIncomplete);
   const direct = tokenUsageObservation(record.usage, {
     allowFullInput: Boolean(record.usage) && !Object.hasOwn(record.usage, "input_tokens") && Object.hasOwn(record.usage, "inputTokens")
@@ -68,12 +30,7 @@ function tokenUsageForRecord(record) {
   if (direct.coverage === "complete" && !usageIsIncomplete) {
     return direct;
   }
-  const byModel = tokenUsageFromModels(record.modelUsage);
-  const modelBlocked = usageIsIncomplete || modelUsageIsIncomplete === true;
-  if (byModel.coverage === "complete" && !modelBlocked) {
-    return byModel;
-  }
-  return usageIsIncomplete || modelUsageIsIncomplete === true || direct.coverage === "incomplete" || byModel.coverage === "incomplete"
+  return usageIsIncomplete || modelUsageIsIncomplete === true || direct.coverage === "incomplete"
     ? { coverage: "incomplete", usage: null }
     : { coverage: "unreported", usage: null };
 }
@@ -105,31 +62,14 @@ function resolvedModelForRecord(record) {
   return "unknown";
 }
 
-function historicalFailureKind(record, dataDir) {
-  const stored = typeof record.failureKind === "string" ? record.failureKind.trim() : "";
-  if (stored && stored !== "error") {
-    return stored;
-  }
-  const recordSummary = [record.errorMessage, record.errorTail]
-    .filter((value) => typeof value === "string" && value.trim())
-    .join("\n");
-  const recordClassification = classifyFailure({ logTail: recordSummary });
-  if (recordClassification !== "error") {
-    return recordClassification;
-  }
-  const logTail = record?.cwd && record?.id ? readLogTail(jobLogPath(dataDir, record.cwd, record.id), 64 * 1024) : "";
-  const classified = classifyFailure({ logTail });
-  return classified === "error" ? stored || "error" : classified;
-}
-
 const USD_TICKS = 10_000_000_000;
 
 function exactCostTicksForRecord(record) {
-  const costIsPartial = record.costIsPartial === true || record.cost_is_partial === true;
-  const usageIsIncomplete = record.usageIsIncomplete === true || record.usage_is_incomplete === true;
+  const costIsPartial = record.costIsPartial === true;
+  const usageIsIncomplete = record.usageIsIncomplete === true;
   const modelUsageIsIncomplete = record.modelUsageIsIncomplete === true;
-  const totalCostUsdTicks = record.totalCostUsdTicks ?? record.total_cost_usd_ticks;
-  const totalCostUsd = record.totalCostUsd ?? record.total_cost_usd;
+  const totalCostUsdTicks = record.totalCostUsdTicks;
+  const totalCostUsd = record.totalCostUsd;
   if (
     costIsPartial ||
     usageIsIncomplete ||
@@ -146,7 +86,7 @@ function exactCostTicksForRecord(record) {
   return Math.abs(totalCostUsd - derivedUsd) <= tolerance ? totalCostUsdTicks : null;
 }
 
-function aggregateJobStats(records, dataDir) {
+function aggregateJobStats(records) {
   const byStatus = {};
   const byMode = {};
   const byFailureKind = {};
@@ -201,7 +141,7 @@ function aggregateJobStats(records, dataDir) {
     } else {
       usageCoverage.unreportedJobs += 1;
     }
-    const numTurns = record.numTurns ?? record.num_turns;
+    const numTurns = record.numTurns;
     if (Number.isSafeInteger(numTurns) && numTurns >= 0) {
       headlessMetrics.turnsReportedJobs += 1;
       const totalTurns = headlessMetrics.totalTurns + numTurns;
@@ -212,10 +152,10 @@ function aggregateJobStats(records, dataDir) {
       }
     }
     const costTicks = exactCostTicksForRecord(record);
-    const costIsPartial = record.costIsPartial === true || record.cost_is_partial === true;
-    const usageIsIncomplete = record.usageIsIncomplete === true || record.usage_is_incomplete === true;
+    const costIsPartial = record.costIsPartial === true;
+    const usageIsIncomplete = record.usageIsIncomplete === true;
     const modelUsageIsIncomplete = record.modelUsageIsIncomplete === true;
-    const hasAnyCost = record.totalCostUsd != null || record.totalCostUsdTicks != null || record.total_cost_usd != null || record.total_cost_usd_ticks != null;
+    const hasAnyCost = record.totalCostUsd != null || record.totalCostUsdTicks != null;
     if (costTicks != null) {
       headlessMetrics.exactCostJobs += 1;
       const totalCostUsdTicks = headlessMetrics.totalCostUsdTicks + costTicks;
@@ -230,7 +170,7 @@ function aggregateJobStats(records, dataDir) {
       headlessMetrics.unreportedCostJobs += 1;
     }
     if (record.status === "error" || record.status === "cancelled") {
-      increment(byFailureKind, record.status === "cancelled" ? record.failureKind ?? "cancelled" : historicalFailureKind(record, dataDir));
+      increment(byFailureKind, record.status === "cancelled" ? record.failureKind ?? "cancelled" : record.failureKind ?? "error");
     }
     const created = Date.parse(record.createdAt ?? "");
     if (Number.isFinite(created)) {
@@ -304,9 +244,9 @@ function handleStats(argv, transport = {}) {
   const stats = {
     scope: options.all ? "all" : "workspace",
     cwd: options.all ? null : cwd,
-    ...aggregateJobStats(records, dataDir)
+    ...aggregateJobStats(records)
   };
   output(options.json ? stats : renderStatsReport(stats), options.json);
 }
 
-export { increment, addTokenUsage, tokenUsageFromModels, tokenUsageForRecord, modelNamesForRecord, resolvedModelForRecord, historicalFailureKind, USD_TICKS, exactCostTicksForRecord, aggregateJobStats, handleStats };
+export { increment, addTokenUsage, tokenUsageForRecord, modelNamesForRecord, resolvedModelForRecord, USD_TICKS, exactCostTicksForRecord, aggregateJobStats, handleStats };
