@@ -180,7 +180,7 @@ test("foreground task exits nonzero when grok fails", (t) => {
   const [record] = jobRecords(sandbox.dataDir);
   assert.ok(record.errorMessage);
   assert.doesNotMatch(record.errorMessage, /\r?\n/);
-  assert.match(result.stderr, new RegExp(`job: ${record.id}\\nsandbox: ${record.cwd}\\nstate: error\\nfailure: error\\n$`));
+  assert.match(result.stderr, new RegExp(`job: ${record.id}\\nsandbox: ${record.cwd}\\ndelivery: foreground\\nsemantic: unverified\\nstate: error\\nfailure: error\\n$`));
 });
 
 test("background task creates a job record and result prints the finished output", async (t) => {
@@ -319,53 +319,6 @@ test("managed JSON task collection preserves the terminal task envelope", async 
   const [record] = jobRecords(sandbox.dataDir);
   assert.deepStrictEqual(record.resultPayload, payload);
   assert.ok(record.deliveryCollectedAt);
-});
-
-test("legacy stored JSON results receive current derived class and memory fields", (t) => {
-  const sandbox = makeSandbox(t);
-  const jobId = generateJobId();
-  const briefFile = writeBrief(sandbox.dataDir, sandbox.workDir, jobId, "legacy stored result");
-  writeJobRecordFile(jobFilePath(sandbox.dataDir, sandbox.workDir, jobId), {
-    ...createJobRecord({
-      id: jobId,
-      pid: null,
-      mode: "consult",
-      cwd: sandbox.workDir,
-      briefFile,
-      background: false,
-      jobClass: "task",
-      request: {
-        model: null,
-        effort: null,
-        web: false,
-        memory: false,
-        resumeSessionId: null,
-        sandboxProfile: "strict",
-        outputJson: true,
-      },
-    }),
-    status: "done",
-    finishedAt: nowIso(),
-    exitCode: 0,
-    sessionId: "21212121-2121-7121-8121-212121212121",
-    resultText: "legacy result",
-    resultPayload: {
-      jobId,
-      status: "done",
-      jobClass: "review",
-      memoryEnabled: true,
-      text: "legacy result",
-    },
-  });
-
-  const result = runCompanion(["result", jobId, "--json"], {
-    cwd: sandbox.workDir,
-    env: envFor(sandbox),
-  });
-  assert.strictEqual(result.status, 0, result.stderr);
-  const payload = JSON.parse(result.stdout);
-  assert.strictEqual(payload.jobClass, "task");
-  assert.strictEqual(payload.memoryEnabled, false);
 });
 
 test("managed JSON task failure preserves a typed terminal envelope", async (t) => {
@@ -510,7 +463,7 @@ test("background task failure ends in an error record", async (t) => {
   assert.doesNotMatch(failed.errorMessage, /\r?\n/);
   const resultOutput = runCompanion(["result", failed.id], { cwd: sandbox.workDir, env: envFor(sandbox) });
   assert.strictEqual(resultOutput.status, 0, resultOutput.stderr);
-  assert.match(resultOutput.stdout, new RegExp(`job: ${failed.id}\\nsandbox: ${failed.cwd}\\nstate: error\\nfailure: error\\n$`));
+  assert.match(resultOutput.stdout, new RegExp(`job: ${failed.id}\\nsandbox: ${failed.cwd}\\ndelivery: manual\\nsemantic: unverified\\nstate: error\\nfailure: error\\n$`));
 });
 
 test("a background task records its terminal failure when the job log is unwritable", async (t) => {
@@ -623,7 +576,7 @@ test("cancel kills a foreground grok and the record stays cancelled after the co
   assert.notStrictEqual(exitCode, 0);
   assert.match(stderr, /^state: cancelled$/m);
   assert.match(stderr, /^failure: cancelled$/m);
-  assert.match(stderr, new RegExp(`job: ${running.id}\\nsandbox: ${running.cwd}\\nstate: cancelled\\nfailure: cancelled\\n$`));
+  assert.match(stderr, new RegExp(`job: ${running.id}\\nsandbox: ${running.cwd}\\ndelivery: foreground\\nsemantic: unverified\\nstate: cancelled\\nfailure: cancelled\\n$`));
   const final = jobRecords(sandbox.dataDir)[0];
   assert.strictEqual(final.status, "cancelled");
   assert.strictEqual(final.pid, null);
@@ -688,7 +641,7 @@ test("cancel treats a process identity mismatch as PID reuse without signalling 
   assert.ok(pidAlive(child.pid), "Expected the reused PID to remain alive.");
 });
 
-test("cancel keeps a legacy record running when graceful cleanup cannot be verified", async (t) => {
+test("cancel keeps an unverified process record running when graceful cleanup cannot be verified", async (t) => {
   const sandbox = makeSandbox(t);
   const child = spawn(process.execPath, ["-e", "process.on('SIGTERM', () => {}); process.stdout.write('ready'); setInterval(() => {}, 1000)"], {
     detached: true,
@@ -698,7 +651,7 @@ test("cancel keeps a legacy record running when graceful cleanup cannot be verif
   await once(child.stdout, "data");
   t.after(() => killGroups(child.pid));
   const jobId = generateJobId();
-  const briefFile = writeBrief(sandbox.dataDir, sandbox.workDir, jobId, "seeded legacy pid");
+  const briefFile = writeBrief(sandbox.dataDir, sandbox.workDir, jobId, "seeded unverified pid");
   writeJobRecordFile(jobFilePath(sandbox.dataDir, sandbox.workDir, jobId), createJobRecord({
     id: jobId,
     pid: child.pid,
@@ -719,7 +672,7 @@ test("cancel keeps a legacy record running when graceful cleanup cannot be verif
   assert.strictEqual(record.pid, child.pid);
   assert.strictEqual(record.pidIdentity, null);
   assert.strictEqual(record.failureKind, "cancelled");
-  assert.ok(pidAlive(child.pid), "Expected legacy cleanup not to escalate to SIGKILL.");
+  assert.ok(pidAlive(child.pid), "Expected unverified cleanup not to escalate to SIGKILL.");
 });
 
 test("background timeout marks the record error and result reports the failure", async (t) => {
@@ -810,7 +763,7 @@ test("foreground spawn failure records an error instead of leaving the job runni
   assert.ok(record.errorTail, "Expected an error tail on the failed record.");
   assert.ok(record.errorMessage, "Expected an error summary on the failed record.");
   assert.doesNotMatch(record.errorMessage, /\r?\n/);
-  assert.match(result.stderr, new RegExp(`job: ${record.id}\\nsandbox: ${record.cwd}\\nstate: error\\nfailure: missing_cli\\n$`));
+  assert.match(result.stderr, new RegExp(`job: ${record.id}\\nsandbox: ${record.cwd}\\ndelivery: foreground\\nsemantic: unverified\\nstate: error\\nfailure: missing_cli\\n$`));
 });
 
 test("background worker failures record a one line error summary", async (t) => {
@@ -853,7 +806,7 @@ test("explicit cwd scopes id lookups while omitted cwd keeps global lookup", (t)
   }
 });
 
-test("global id lookup rejects an ambiguous legacy collision", (t) => {
+test("global id lookup rejects an ambiguous id collision", (t) => {
   const sandbox = makeSandbox(t);
   const otherCwd = path.join(sandbox.root, "other-workspace");
   fs.mkdirSync(otherCwd, { recursive: true });

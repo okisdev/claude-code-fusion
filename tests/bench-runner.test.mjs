@@ -4,6 +4,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { test } from "node:test";
+import { runBounded } from "../bench/lib.mjs";
 
 const repoRoot = path.join(import.meta.dirname, "..");
 const runner = path.join(repoRoot, "bench", "run.mjs");
@@ -123,7 +124,8 @@ function runBench(sandbox, options = {}) {
       "--task-root",
       sandbox.taskRoot,
       "--claude-bin",
-      fakeClaude
+      options.claudeBin ?? fakeClaude,
+      ...(options.extra ?? [])
     ],
     {
       cwd: repoRoot,
@@ -356,7 +358,7 @@ test("runner writes env.json with manifest and cheap version capture", (t) => {
   const codexPlugin = JSON.parse(
     fs.readFileSync(path.join(repoRoot, "plugins", "codex", ".claude-plugin", "plugin.json"), "utf8"),
   );
-  assert.strictEqual(env.pluginVersions["claude-code-fusion"], marketplace.version ?? marketplace.metadata?.version);
+  assert.strictEqual(env.pluginVersions["claude-code-fusion"], marketplace.version);
   assert.strictEqual(env.pluginVersions.fusion, fusionPlugin.version);
   assert.strictEqual(env.pluginVersions.grok, grokPlugin.version);
   assert.strictEqual(env.pluginVersions.codex, codexPlugin.version);
@@ -534,4 +536,65 @@ test("runner ignores stale external Codex plugin cache entries", (t) => {
   const env = JSON.parse(fs.readFileSync(sandbox.envFile, "utf8"));
   const codexPlugin = JSON.parse(fs.readFileSync(path.join(repoRoot, "plugins", "codex", ".claude-plugin", "plugin.json"), "utf8"));
   assert.strictEqual(env.pluginVersions.codex, codexPlugin.version);
+});
+
+test("Claude timeout kills its process group and records an infrastructure failure", (t) => {
+  const sandbox = makeSandbox(t);
+  const bin = path.join(sandbox.root, "hanging-claude");
+  const pidFile = path.join(sandbox.root, "claude.pid");
+  fs.writeFileSync(bin, `#!${process.execPath}\nif (process.argv.includes('--version')) { process.stdout.write('fake version\\n'); process.exit(0); } const fs = require('node:fs'); const { spawn } = require('node:child_process'); fs.writeFileSync(process.env.FAKE_HANG_PID, String(process.pid)); spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore' }); setInterval(() => {}, 1000);\n`);
+  fs.chmodSync(bin, 0o755);
+  const result = runBench(sandbox, { claudeBin: bin, extra: ["--claude-timeout-ms", "200"], env: { FAKE_HANG_PID: pidFile } });
+  assert.equal(result.status, 1, result.stderr);
+  const [record] = readRecords(sandbox);
+  assert.equal(record.verdict, "infra_failure");
+  assert.equal(record.infraFailure.kind, "timeout");
+  assert.match(record.infraFailure.message, /Claude timed out after 200 ms/);
+  assert.equal(record.verifyExit, null);
+  assert.throws(() => process.kill(Number(fs.readFileSync(pidFile, "utf8")), 0), { code: "ESRCH" });
+});
+
+test("verifier timeout is an infrastructure failure", (t) => {
+  const sandbox = makeSandbox(t);
+  const pidFile = path.join(sandbox.root, "verify.pid");
+  fs.writeFileSync(path.join(sandbox.taskRoot, sandbox.taskId, "verify.sh"), "#!/usr/bin/env bash\nnode -e 'require(\"node:fs\").writeFileSync(process.env.FAKE_HANG_PID, String(process.pid)); setInterval(() => {}, 1000)'\n");
+  const result = runBench(sandbox, { extra: ["--verify-timeout-ms", "300"], env: { FAKE_HANG_PID: pidFile } });
+  assert.equal(result.status, 1, result.stderr);
+  const [record] = readRecords(sandbox);
+  assert.equal(record.verdict, "infra_failure");
+  assert.equal(record.infraFailure.kind, "timeout");
+  assert.match(record.infraFailure.message, /Verifier timed out after 300 ms/);
+  assert.throws(() => process.kill(Number(fs.readFileSync(pidFile, "utf8")), 0), { code: "ESRCH" });
+});
+
+test("bounded capture truncates stdout and stderr independently", async () => {
+  const result = await runBounded(process.execPath, ["-e", "process.stdout.write(Buffer.alloc(9 * 1024 * 1024, 65)); process.stderr.write(Buffer.alloc(9 * 1024 * 1024, 66));"], { cwd: repoRoot, env: process.env, timeoutMs: 10000, label: "Capture test" });
+  assert.equal(result.exitCode, 0);
+  for (const output of [result.stdout, result.stderr]) {
+    assert.equal(Buffer.byteLength(output), 8 * 1024 * 1024);
+    assert.match(output, /\[output truncated after 8388608 bytes\]\n$/);
+  }
+});
+
+test("runner preserves env.json when task manifest changes", (t) => {
+  const sandbox = makeSandbox(t);
+  assert.equal(runBench(sandbox).status, 0);
+  const initial = fs.readFileSync(sandbox.envFile, "utf8");
+  fs.appendFileSync(path.join(sandbox.taskRoot, sandbox.taskId, "brief.md"), "Revision two.\n");
+  const result = runBench(sandbox);
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /conflicting manifest pins/);
+  assert.equal(fs.readFileSync(sandbox.envFile, "utf8"), initial);
+  assert.equal(readRecords(sandbox).length, 1);
+});
+
+test("runner refuses a changed peer defaults environment pin", (t) => {
+  const sandbox = makeSandbox(t);
+  assert.equal(runBench(sandbox, { env: { HOME: sandbox.root } }).status, 0);
+  fs.mkdirSync(path.join(sandbox.root, ".codex"), { recursive: true });
+  fs.writeFileSync(path.join(sandbox.root, ".codex", "config.toml"), 'model = "changed-model"\n');
+  const result = runBench(sandbox, { env: { HOME: sandbox.root } });
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /conflicting environment pin peerDefaults/);
+  assert.equal(readRecords(sandbox).length, 1);
 });

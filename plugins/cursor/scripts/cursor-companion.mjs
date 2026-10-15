@@ -1,26 +1,21 @@
 import { spawn, spawnSync } from "node:child_process";
-import { createHash, randomBytes } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { isatty } from "node:tty";
 import { fileURLToPath } from "node:url";
 
+import { configureRawTransport, createRawCommandTransport as allocateRawCommandTransport, consumeRawCommandTransport, cleanupRawCommandTransportsForSession, resolveCommandTransport } from "./lib/raw-transport.mjs";
 import { parseArgs, parseRawArgs, rawBooleanOptionRequested } from "./lib/args.mjs";
 import { resolveCursorBin, probeCursorVersion, compareCursorVersion, TESTED_CURSOR_INTERVAL, buildCursorArgs, buildCursorChildEnv, runCursor, classifyCursorFailure, reapPrivateHomeHelpers } from "./lib/cursor-exec.mjs";
-import { buildPrivateHome, copyChatForResume, projectHookFiles, CURSOR_SESSION_ID_PATTERN } from "./lib/cursor-home.mjs";
+import { buildPrivateHome, copyChatForResume, cursorChatDir, projectHookFiles, CURSOR_SESSION_ID_PATTERN } from "./lib/cursor-home.mjs";
 import { readModelCatalog, resolveCursorModel } from "./lib/cursor-models.mjs";
-import { getProcessIdentity, processIdentityMatches, processIsDirectlyAlive } from "./lib/process-identity.mjs";
+import { getProcessIdentity, processGroupAlive, processIdentityMatches, processIsDirectlyAlive } from "./lib/process-identity.mjs";
 import { extractFirstJsonObject, validateReviewOutput, renderReviewResult, renderBackgroundLaunch, renderTaskResult, renderStatusTable, renderJobDetail, renderHistoryReport, renderCancelReport, renderRecordAcceptance, renderSetupReport } from "./lib/render.mjs";
-import { SESSION_ID_ENV, resolveDataDir, runHomeDir, generateJobId, nowIso, createJobRecord, createJobRecordFile, updateJobRecordFile, updateJobRecordFileWithCurrent, finishSuccessfulJobRecordFile, launchRunningJobProcess, listJobRecords, listAllJobRecords, findJobRecordById, jobFilePath, jobLogPath, briefPath, readJobRecordFile, writeBrief, appendJobLog, readLogTail, markDeliveryCollectedFile, claimResumeSessionLease } from "./lib/state.mjs";
+import { SESSION_ID_ENV, resolveDataDir, runHomeDir, homeRetentionExpired, sweepCursorHomes, generateJobId, nowIso, createJobRecord, createJobRecordFile, updateJobRecordFile, updateJobRecordFileWithCurrent, finishSuccessfulJobRecordFile, launchRunningJobProcess, listJobRecords, listAllJobRecords, findJobRecordById, jobFilePath, jobLogPath, briefPath, readJobRecordFile, writeBrief, appendJobLog, readLogTail, markDeliveryCollectedFile, claimResumeSessionLease } from "./lib/state.mjs";
 
 const SELF_PATH = fileURLToPath(import.meta.url);
-const MAX_RAW_ARGUMENT_BYTES = 4 * 1024 * 1024 + 64 * 1024;
-const TRANSPORT_DIRECTORY_PREFIX = "cursor-companion-input-";
-const TRANSPORT_TOKEN_PATTERN = /^[a-f0-9]{48}$/;
-const TRANSPORT_OWNER_FILE = "owner.json";
-const TRANSPORT_OWNER_MAX_BYTES = 4096;
-const TRANSPORT_MAX_AGE_MS = 60 * 60 * 1000;
+const COMPANION_VERSION = JSON.parse(fs.readFileSync(new URL("../.claude-plugin/plugin.json", import.meta.url), "utf8")).version;
 const JOB_ID_PATTERN = /^[a-f0-9]{32}$/;
 const ACCEPTANCE_VALUES = new Set(["accepted", "rejected", "unverified"]);
 const ACCEPTANCE_SOURCES = new Set(["collector", "main-loop", "stats"]);
@@ -36,6 +31,16 @@ function errorWithFailure(message, failureKind = "input") {
   return error;
 }
 
+function sandboxHelperPath(probe) {
+  return path.join(path.dirname(probe.buildPath), "cursorsandbox");
+}
+
+function requireSandboxHelper(probe) {
+  if (!fs.existsSync(sandboxHelperPath(probe))) {
+    throw errorWithFailure(`Cursor sandbox helper is missing at ${sandboxHelperPath(probe)}. Run /cursor:setup and repair or reinstall Cursor Agent.`, "sandbox");
+  }
+}
+
 function output(value, json = false) {
   process.stdout.write(json ? `${JSON.stringify(value, null, 2)}\n` : String(value));
 }
@@ -44,344 +49,17 @@ function currentClaudeSessionId() {
   return process.env[SESSION_ID_ENV] ?? null;
 }
 
-function shellSafeTemporaryRoot() {
-  const candidates = [os.tmpdir(), process.platform === "win32" ? "C:\\Windows\\Temp" : "/private/tmp", "/tmp"];
-  for (const candidate of candidates) {
-    if (typeof candidate !== "string" || !path.isAbsolute(candidate) || !/^[A-Za-z0-9_./:\\-]+$/.test(candidate)) {
-      continue;
-    }
-    try {
-      const stats = fs.lstatSync(candidate);
-      if (!stats.isDirectory() || stats.isSymbolicLink()) {
-        continue;
-      }
-      fs.accessSync(candidate, fs.constants.R_OK | fs.constants.W_OK | fs.constants.X_OK);
-      return candidate;
-    } catch {}
-  }
-  throw errorWithFailure("No private shell safe temporary directory is available for raw command transport.", "resource");
-}
+configureRawTransport({
+  engineName: "cursor",
+  sessionIdEnv: SESSION_ID_ENV,
+  makeError: errorWithFailure,
+  maxRawArgumentBytes: 4 * 1024 * 1024 + 64 * 1024
+});
 
-function transportPaths(token) {
-  if (!TRANSPORT_TOKEN_PATTERN.test(token)) {
-    throw errorWithFailure("The raw command transport token is invalid.", "input");
-  }
-  const directory = path.join(shellSafeTemporaryRoot(), `${TRANSPORT_DIRECTORY_PREFIX}${token}`);
-  return { directory, file: path.join(directory, "request"), ownerFile: path.join(directory, TRANSPORT_OWNER_FILE) };
-}
-
-function validateOwnedPath(stats, label) {
-  if (typeof process.getuid === "function" && Number.isInteger(stats.uid) && stats.uid !== process.getuid()) {
-    throw errorWithFailure(`${label} is not owned by the current user.`, "permission");
-  }
-}
-
-function transportSessionHash(sessionId) {
-  return typeof sessionId === "string" && sessionId.trim()
-    ? createHash("sha256").update(sessionId.trim()).digest("hex")
-    : null;
-}
-
-function sameFileIdentity(left, right) {
-  return left && right && left.dev === right.dev && left.ino === right.ino;
-}
-
-function readTransportOwner(ownerFile) {
-  let descriptor;
-  try {
-    const pathStats = fs.lstatSync(ownerFile);
-    if (!pathStats.isFile() || pathStats.isSymbolicLink() || pathStats.nlink !== 1 || pathStats.size > TRANSPORT_OWNER_MAX_BYTES) {
-      throw errorWithFailure("The raw command transport owner record is invalid.", "permission");
-    }
-    validateOwnedPath(pathStats, "The raw command transport owner record");
-    if (process.platform !== "win32" && (pathStats.mode & 0o077) !== 0) {
-      throw errorWithFailure("The raw command transport owner record is not private.", "permission");
-    }
-    descriptor = fs.openSync(ownerFile, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0));
-    const openedStats = fs.fstatSync(descriptor);
-    if (!openedStats.isFile() || openedStats.nlink !== 1 || !sameFileIdentity(openedStats, pathStats)) {
-      throw errorWithFailure("The raw command transport owner record changed before it could be read.", "permission");
-    }
-    const buffer = Buffer.alloc(TRANSPORT_OWNER_MAX_BYTES + 1);
-    const bytesRead = fs.readSync(descriptor, buffer, 0, buffer.length, 0);
-    if (bytesRead > TRANSPORT_OWNER_MAX_BYTES) {
-      throw errorWithFailure("The raw command transport owner record is invalid.", "permission");
-    }
-    const record = JSON.parse(buffer.subarray(0, bytesRead).toString("utf8"));
-    if (!Number.isSafeInteger(record?.createdAt) || record.createdAt <= 0 || (record.sessionHash !== null && !/^[a-f0-9]{64}$/.test(record.sessionHash))) {
-      throw errorWithFailure("The raw command transport owner record is invalid.", "permission");
-    }
-    return { identity: pathStats, record };
-  } catch (error) {
-    if (error?.failureKind) {
-      throw error;
-    }
-    throw errorWithFailure(`Could not read raw command transport owner record: ${error.message}`, "permission");
-  } finally {
-    if (descriptor !== undefined) {
-      fs.closeSync(descriptor);
-    }
-  }
-}
-
-function cleanupVerifiedTransport(directory, file, ownerFile, directoryIdentity, fileIdentity, ownerIdentity, options = {}) {
-  if (!directoryIdentity || !fileIdentity || !ownerIdentity) {
-    return;
-  }
-  try {
-    const currentDirectory = fs.lstatSync(directory);
-    if (!currentDirectory.isDirectory() || currentDirectory.isSymbolicLink() || !sameFileIdentity(currentDirectory, directoryIdentity)) {
-      return;
-    }
-    validateOwnedPath(currentDirectory, "The raw command transport directory");
-    if (process.platform !== "win32" && (currentDirectory.mode & 0o077) !== 0) {
-      return;
-    }
-    const currentFile = fs.lstatSync(file);
-    if (!currentFile.isFile() || currentFile.isSymbolicLink() || currentFile.nlink !== 1 || !sameFileIdentity(currentFile, fileIdentity)) {
-      return;
-    }
-    validateOwnedPath(currentFile, "The raw command transport file");
-    if (options.requirePrivateFile && process.platform !== "win32" && (currentFile.mode & 0o077) !== 0) {
-      return;
-    }
-    const currentOwner = fs.lstatSync(ownerFile);
-    if (!currentOwner.isFile() || currentOwner.isSymbolicLink() || currentOwner.nlink !== 1 || !sameFileIdentity(currentOwner, ownerIdentity)) {
-      return;
-    }
-    validateOwnedPath(currentOwner, "The raw command transport owner record");
-    if (process.platform !== "win32" && (currentOwner.mode & 0o077) !== 0) {
-      return;
-    }
-    fs.unlinkSync(file);
-    fs.unlinkSync(ownerFile);
-    fs.rmdirSync(directory);
-  } catch {}
-}
-
-function cleanupRawCommandTransports(options = {}) {
-  let root;
-  let entries;
-  try {
-    root = shellSafeTemporaryRoot();
-    entries = fs.readdirSync(root, { withFileTypes: true });
-  } catch {
-    return;
-  }
-  const sessionHash = options.sessionHash ?? null;
-  const now = Date.now();
-  for (const entry of entries) {
-    if (!entry.isDirectory() || !entry.name.startsWith(TRANSPORT_DIRECTORY_PREFIX)) {
-      continue;
-    }
-    const token = entry.name.slice(TRANSPORT_DIRECTORY_PREFIX.length);
-    if (!TRANSPORT_TOKEN_PATTERN.test(token)) {
-      continue;
-    }
-    const { directory, file, ownerFile } = transportPaths(token);
-    try {
-      const directoryIdentity = fs.lstatSync(directory);
-      if (!directoryIdentity.isDirectory() || directoryIdentity.isSymbolicLink()) {
-        continue;
-      }
-      validateOwnedPath(directoryIdentity, "The raw command transport directory");
-      if (process.platform !== "win32" && (directoryIdentity.mode & 0o077) !== 0) {
-        continue;
-      }
-      const { identity: ownerIdentity, record } = readTransportOwner(ownerFile);
-      const fileIdentity = fs.lstatSync(file);
-      if (!fileIdentity.isFile() || fileIdentity.isSymbolicLink() || fileIdentity.nlink !== 1) {
-        continue;
-      }
-      validateOwnedPath(fileIdentity, "The raw command transport file");
-      if (process.platform !== "win32" && (fileIdentity.mode & 0o077) !== 0) {
-        continue;
-      }
-      if (options.expiredOnly) {
-        const ageMs = now - record.createdAt;
-        if (ageMs < 0 || ageMs <= TRANSPORT_MAX_AGE_MS) {
-          continue;
-        }
-      } else if (!sessionHash || record.sessionHash !== sessionHash) {
-        continue;
-      }
-      cleanupVerifiedTransport(directory, file, ownerFile, directoryIdentity, fileIdentity, ownerIdentity, {
-        requirePrivateFile: true
-      });
-    } catch {}
-  }
-}
-
-export function cleanupRawCommandTransportsForSession(sessionId) {
-  const sessionHash = transportSessionHash(sessionId);
-  if (!sessionHash) {
-    return;
-  }
-  cleanupRawCommandTransports({ sessionHash });
-}
+export { cleanupRawCommandTransportsForSession };
 
 function createRawCommandTransport() {
-  cleanupRawCommandTransports({ expiredOnly: true });
-  for (let attempt = 0; attempt < 8; attempt += 1) {
-    const token = randomBytes(24).toString("hex");
-    const { directory, file, ownerFile } = transportPaths(token);
-    let directoryCreated = false;
-    let fileCreated = false;
-    let ownerCreated = false;
-    try {
-      fs.mkdirSync(directory, { mode: 0o700 });
-      directoryCreated = true;
-      fs.chmodSync(directory, 0o700);
-      const descriptor = fs.openSync(file, "wx", 0o600);
-      fileCreated = true;
-      fs.closeSync(descriptor);
-      fs.chmodSync(file, 0o600);
-      fs.writeFileSync(ownerFile, `${JSON.stringify({ createdAt: Date.now(), sessionHash: transportSessionHash(currentClaudeSessionId()) })}\n`, {
-        flag: "wx",
-        mode: 0o600
-      });
-      ownerCreated = true;
-      fs.chmodSync(ownerFile, 0o600);
-      output({ file, token }, true);
-      return;
-    } catch (error) {
-      if (ownerCreated || directoryCreated) {
-        try {
-          fs.unlinkSync(ownerFile);
-        } catch {}
-      }
-      if (fileCreated) {
-        try {
-          fs.unlinkSync(file);
-        } catch {}
-      }
-      if (directoryCreated) {
-        try {
-          fs.rmdirSync(directory);
-        } catch {}
-      }
-      if (error?.code !== "EEXIST") {
-        throw errorWithFailure(`Could not create private raw command transport: ${error.message}`, "permission");
-      }
-    }
-  }
-  throw errorWithFailure("Could not allocate a unique raw command transport.", "resource");
-}
-
-function readBoundedDescriptor(descriptor, limit) {
-  const chunks = [];
-  let total = 0;
-  for (;;) {
-    const buffer = Buffer.alloc(Math.min(64 * 1024, limit + 1 - total));
-    const bytesRead = fs.readSync(descriptor, buffer, 0, buffer.length, null);
-    if (bytesRead === 0) {
-      break;
-    }
-    total += bytesRead;
-    if (total > limit) {
-      throw errorWithFailure(`Raw command arguments exceeded the ${limit} byte limit.`, "resource");
-    }
-    chunks.push(buffer.subarray(0, bytesRead));
-  }
-  return Buffer.concat(chunks, total);
-}
-
-function consumeRawCommandTransport(token) {
-  const { directory, file, ownerFile } = transportPaths(token);
-  let descriptor;
-  let directoryIdentity = null;
-  let fileIdentity = null;
-  let ownerIdentity = null;
-  try {
-    const directoryStats = fs.lstatSync(directory);
-    if (!directoryStats.isDirectory() || directoryStats.isSymbolicLink()) {
-      throw errorWithFailure("The raw command transport directory is invalid.", "permission");
-    }
-    validateOwnedPath(directoryStats, "The raw command transport directory");
-    if (process.platform !== "win32" && (directoryStats.mode & 0o077) !== 0) {
-      throw errorWithFailure("The raw command transport directory is not private.", "permission");
-    }
-    directoryIdentity = directoryStats;
-    const owner = readTransportOwner(ownerFile);
-    ownerIdentity = owner.identity;
-    if (owner.record.sessionHash !== transportSessionHash(currentClaudeSessionId())) {
-      throw errorWithFailure("The raw command transport belongs to another Claude session.", "permission");
-    }
-    const pathStats = fs.lstatSync(file);
-    if (!pathStats.isFile() || pathStats.isSymbolicLink() || pathStats.nlink !== 1) {
-      throw errorWithFailure("The raw command transport must be a regular private file.", "permission");
-    }
-    validateOwnedPath(pathStats, "The raw command transport file");
-    fileIdentity = pathStats;
-    const transportAgeMs = Date.now() - owner.record.createdAt;
-    if (transportAgeMs < 0 || transportAgeMs > TRANSPORT_MAX_AGE_MS) {
-      throw errorWithFailure("The raw command transport has expired.", "input");
-    }
-    if (process.platform !== "win32" && (pathStats.mode & 0o077) !== 0) {
-      throw errorWithFailure("The raw command transport file is not private.", "permission");
-    }
-    if (pathStats.size > MAX_RAW_ARGUMENT_BYTES) {
-      throw errorWithFailure(`Raw command arguments exceeded the ${MAX_RAW_ARGUMENT_BYTES} byte limit.`, "resource");
-    }
-    descriptor = fs.openSync(file, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0));
-    const openedStats = fs.fstatSync(descriptor);
-    if (!openedStats.isFile() || openedStats.nlink !== 1 || !sameFileIdentity(openedStats, pathStats)) {
-      throw errorWithFailure("The raw command transport changed before it could be read.", "permission");
-    }
-    validateOwnedPath(openedStats, "The raw command transport file");
-    if (process.platform !== "win32" && (openedStats.mode & 0o077) !== 0) {
-      throw errorWithFailure("The raw command transport file is not private.", "permission");
-    }
-    const bytes = readBoundedDescriptor(descriptor, MAX_RAW_ARGUMENT_BYTES);
-    try {
-      return new TextDecoder("utf-8", { fatal: true }).decode(bytes);
-    } catch {
-      throw errorWithFailure("Raw command arguments must be valid UTF-8.", "input");
-    }
-  } catch (error) {
-    if (error?.failureKind) {
-      throw error;
-    }
-    throw errorWithFailure(`Could not read raw command transport: ${error.message}`, error?.code === "ENOENT" ? "input" : "permission");
-  } finally {
-    if (descriptor !== undefined) {
-      fs.closeSync(descriptor);
-    }
-    cleanupVerifiedTransport(directory, file, ownerFile, directoryIdentity, fileIdentity, ownerIdentity);
-  }
-}
-
-function resolveCommandTransport(rawArgv) {
-  const defaults = { defaultBackground: false, defaultWrite: false };
-  const transportArgv = [...rawArgv];
-  while (
-    transportArgv[0] === "--transport-default-write" ||
-    transportArgv[0] === "--transport-default-background"
-  ) {
-    const option = transportArgv.shift();
-    const key = option === "--transport-default-write"
-      ? "defaultWrite"
-      : "defaultBackground";
-    defaults[key] = true;
-  }
-  if (transportArgv[0] !== "--raw-args-token") {
-    if (
-      transportArgv.some((value) => value === "--raw-args-token") ||
-      defaults.defaultWrite ||
-      defaults.defaultBackground
-    ) {
-      throw errorWithFailure("Raw command transport options must not be combined with normal arguments.", "input");
-    }
-    return { argv: rawArgv, defaultBackground: false, defaultWrite: false, ingress: "argv" };
-  }
-  if (transportArgv.length !== 2) {
-    throw errorWithFailure("Raw command transport requires exactly one token.", "input");
-  }
-  return {
-    argv: [consumeRawCommandTransport(transportArgv[1])],
-    ...defaults,
-    ingress: "staged_file"
-  };
+  output(allocateRawCommandTransport(), true);
 }
 
 function commandArgs(argv, config, transport = {}) {
@@ -478,11 +156,13 @@ function resumeSource(dataDir, cwd, mode, options) {
   if (options.resume) {
     const source = eligible.find((record) => record.sessionId === options.resume);
     if (!source) throw errorWithFailure(`No finished ${mode} Cursor task owns session ${options.resume} in this workspace.`);
+    if (homeRetentionExpired(source) || !fs.lstatSync(cursorChatDir(source.homeDir, cwd, source.sessionId), { throwIfNoEntry: false })?.isDirectory()) throw errorWithFailure(`Cursor chat ${source.sessionId} is no longer retained.`);
     return source;
   }
   const sessionId = currentClaudeSessionId();
   const source = eligible.find((record) => !sessionId || record.claudeSessionId === sessionId);
   if (!source) throw errorWithFailure(`No finished ${mode} Cursor task can be resumed in this workspace.`);
+  if (homeRetentionExpired(source) || !fs.lstatSync(cursorChatDir(source.homeDir, cwd, source.sessionId), { throwIfNoEntry: false })?.isDirectory()) throw errorWithFailure(`Cursor chat ${source.sessionId} is no longer retained.`);
   return source;
 }
 
@@ -493,7 +173,8 @@ function taskPayload(record) {
     jobClass: record.jobClass, mode: record.mode, background: record.background, exitCode: record.exitCode,
     sessionId: record.sessionId, requestId: record.requestId, resumedFromJobId: record.resumedFromJobId ?? null,
     requestedModel: record.requestedModel,
-    resolvedModel: record.resolvedModel, observedModel: record.observedModel,
+    resolvedModel: record.resolvedModel, observedModel: record.observedModel, modelDrift: record.modelDrift,
+    companionVersion: record.companionVersion,
     requestedEffort: record.requestedEffort, resolvedEffort: record.requestedEffort,
     effortApplied: record.effortApplied, billingPool: record.billingPool, usage: record.usage,
     usageIsIncomplete: record.usageIsIncomplete, warnings: record.warnings,
@@ -510,12 +191,12 @@ function renderOutcome(record) {
   return renderTaskResult({ text: `Job ${record.id} failed.\n\n${record.errorMessage ?? "Cursor returned an error."}${tail}`, record });
 }
 
-function finishFailure(file, outcome, kind, warnings) {
+function finishFailure(file, outcome, kind, warnings, modelDrift) {
   const message = outcome.policyViolation ? `Cursor called forbidden tool ${outcome.policyViolation}.` : outcome.protocolError || outcome.stderrTail?.trim() || outcome.spawnError?.message || `Cursor exited with ${outcome.exitCode ?? outcome.signal ?? "an error"}.`;
   return finishSuccessfulJobRecordFile(file, {
     status: "error", finishedAt: nowIso(), exitCode: outcome.exitCode, sessionId: outcome.sessionId,
     requestId: outcome.requestId, resultText: outcome.resultText, observedModel: outcome.observedModel,
-    usage: outcome.usage, usageIsIncomplete: outcome.usage == null, warnings,
+    usage: outcome.usage, usageIsIncomplete: outcome.usage == null, warnings, modelDrift,
     failureKind: kind, errorMessage: message.split(/\r?\n/)[0], errorTail: String(outcome.stderrTail || message).slice(-65536)
   });
 }
@@ -529,7 +210,6 @@ async function runRecordedJob(record, file) {
     const sourceId = record.request?.resumeSourceJobId;
     const source = sourceId ? readJobRecordFile(jobFilePath(dataDir, record.cwd, sourceId)) : null;
     if (sourceId && (!source || !CURSOR_SESSION_ID_PATTERN.test(source.sessionId) || source.sessionId !== record.request.resumeSessionId)) throw errorWithFailure("The resume source is unavailable.");
-    if (source) claimResumeSessionLease(dataDir, record.cwd, source.sessionId, record.id);
     buildPrivateHome({ homeDir: record.homeDir, mode: record.mode, cwd: record.cwd, realHome: realUserHome() });
     if (source && !copyChatForResume({ fromHome: source.homeDir, toHome: record.homeDir, cwd: record.cwd, sessionId: source.sessionId })) {
       throw errorWithFailure(`Cursor chat ${source.sessionId} was not found in the parent private home.`);
@@ -558,14 +238,19 @@ async function runRecordedJob(record, file) {
   } catch (error) {
     outcome = { exitCode: null, stderrTail: error.message, spawnError: error, initSeen: false, resultSeen: false };
   }
+  const modelDrift = outcome.observedModel && outcome.observedModel !== record.resolvedModel && outcome.observedModel !== record.request?.catalogDisplayName
+    ? { requested: record.resolvedModel, observed: outcome.observedModel } : null;
+  const warnings = [...record.warnings];
+  if (outcome.lateClose) warnings.push("late_close");
+  if (modelDrift) warnings.push(`model drift: requested ${modelDrift.requested}, observed ${modelDrift.observed}`);
   if (signalExitCode !== null) {
-    finishSuccessfulJobRecordFile(file, { status: "cancelled", finishedAt: nowIso(), exitCode: outcome.exitCode, failureKind: "cancelled", errorMessage: "The Cursor job was cancelled." });
+    finishSuccessfulJobRecordFile(file, { status: "cancelled", finishedAt: nowIso(), exitCode: outcome.exitCode,
+      observedModel: outcome.observedModel, modelDrift, warnings, failureKind: "cancelled", errorMessage: "The Cursor job was cancelled." });
     process.exit(signalExitCode);
   }
   if (outcome.stderrTail) appendJobLog(jobLogPath(dataDir, record.cwd, record.id), outcome.stderrTail);
   const kind = outcome.spawnError?.failureKind ?? classifyCursorFailure(outcome);
-  const warnings = outcome.lateClose ? [...record.warnings, "late_close"] : record.warnings;
-  if (kind) return finishFailure(file, outcome, kind, warnings);
+  if (kind) return finishFailure(file, outcome, kind, warnings, modelDrift);
   if (record.jobClass === "review") {
     const parsed = extractFirstJsonObject(outcome.resultText);
     const validation = parsed ? validateReviewOutput(parsed) : { valid: false, error: "No JSON object found in the reply." };
@@ -573,18 +258,18 @@ async function runRecordedJob(record, file) {
       const message = `Cursor review output failed validation: ${validation.error}`;
       return finishSuccessfulJobRecordFile(file, { status: "error", finishedAt: nowIso(), exitCode: outcome.exitCode,
         sessionId: outcome.sessionId, requestId: outcome.requestId, observedModel: outcome.observedModel,
-        usage: outcome.usage, usageIsIncomplete: outcome.usage == null, warnings, failureKind: "error",
+        usage: outcome.usage, usageIsIncomplete: outcome.usage == null, warnings, modelDrift, failureKind: "error",
         errorMessage: message, errorTail: outcome.resultText?.slice(-65536) || message, parseError: validation.error });
     }
     return finishSuccessfulJobRecordFile(file, { status: "done", finishedAt: nowIso(), exitCode: outcome.exitCode,
       sessionId: outcome.sessionId, requestId: outcome.requestId, observedModel: outcome.observedModel,
-      usage: outcome.usage, usageIsIncomplete: outcome.usage == null, warnings, failureKind: null,
+      usage: outcome.usage, usageIsIncomplete: outcome.usage == null, warnings, modelDrift, failureKind: null,
       review: validation.value, resultText: renderReviewResult(validation.value, { targetLabel: record.request.reviewTargetLabel }) });
   }
   return finishSuccessfulJobRecordFile(file, {
     status: "done", finishedAt: nowIso(), exitCode: outcome.exitCode, sessionId: outcome.sessionId,
     requestId: outcome.requestId, resultText: outcome.resultText, observedModel: outcome.observedModel,
-    usage: outcome.usage, usageIsIncomplete: outcome.usage == null, warnings, failureKind: null
+    usage: outcome.usage, usageIsIncomplete: outcome.usage == null, warnings, modelDrift, failureKind: null
   });
 }
 
@@ -634,6 +319,7 @@ async function handleTask(argv, transport) {
   validateImplicitCwd(options, cwd);
   const mode = (options.write ?? transport.defaultWrite) ? "write" : "consult";
   const dataDir = resolveDataDir();
+  sweepCursorHomes(dataDir);
   const source = resumeSource(dataDir, cwd, mode, options);
   const brief = (positionalText ?? positionals.join(" ")).trim() || readStdinIfPiped().trim();
   if (!brief) throw errorWithFailure("Provide a brief after -- or on stdin.");
@@ -642,6 +328,7 @@ async function handleTask(argv, transport) {
   if (compareCursorVersion(probe.version, TESTED_CURSOR_INTERVAL.floor) < 0) {
     throw errorWithFailure(`Cursor CLI ${probe.version} is below tested floor ${TESTED_CURSOR_INTERVAL.floor}.`, "setup");
   }
+  requireSandboxHelper(probe);
   const requestedModel = options.model || selectedModel();
   if (!requestedModel) throw errorWithFailure("Select a Cursor model in ~/.cursor/cli-config.json or pass --model.");
   const catalog = readModelCatalog({ dataDir, bin: probe.buildPath });
@@ -649,15 +336,16 @@ async function handleTask(argv, transport) {
   const resolved = resolveCursorModel({ catalog, model: requestedModel, effort: requestedEffort });
   const warnings = projectHookFiles(cwd).map((file) => `project hooks run outside the Cursor sandbox: ${file}`);
   const id = generateJobId();
+  if (source) claimResumeSessionLease(dataDir, cwd, source.sessionId, id, { preflight: true });
   const homeDir = runHomeDir(dataDir, id);
   const briefFile = briefPath(dataDir, cwd, id);
   const file = jobFilePath(dataDir, cwd, id);
   const background = Boolean(options.background);
-  const record = createJobRecord({ id, cursorVersion: probe.version, cursorBuildPath: probe.buildPath, pid: background ? null : process.pid,
+  const record = createJobRecord({ id, companionVersion: COMPANION_VERSION, cursorVersion: probe.version, cursorBuildPath: probe.buildPath, pid: background ? null : process.pid,
     mode, cwd, briefFile, background, claudeSessionId: currentClaudeSessionId(), jobClass: "task",
     role: taskRole(brief), requestedModel, resolvedModel: resolved.variant, requestedEffort, effortApplied: resolved.effortApplied,
     billingPool: resolved.billingPool, homeDir, warnings,
-    request: { model: requestedModel, effort: requestedEffort, resumeSessionId: source?.sessionId ?? null,
+    request: { model: requestedModel, effort: requestedEffort, catalogDisplayName: catalog.models.find((item) => item.id === resolved.variant)?.displayName ?? null, resumeSessionId: source?.sessionId ?? null,
       resumeSourceJobId: source?.id ?? null, outputJson: Boolean(options.json), ingress: transport.ingress } });
   if (source) record.resumedFromJobId = source.id;
   createJobRecordFile(file, record);
@@ -731,8 +419,10 @@ async function handleReview(argv, transport) {
     TARGET_LABEL: target.label, USER_FOCUS: options.focus?.trim() || "No extra focus provided.", DIFF: target.diff
   })[key] ?? match);
   const dataDir = resolveDataDir();
+  sweepCursorHomes(dataDir);
   const probe = probeCursorVersion(resolveCursorBin());
   if (compareCursorVersion(probe.version, TESTED_CURSOR_INTERVAL.floor) < 0) throw errorWithFailure(`Cursor CLI ${probe.version} is below tested floor ${TESTED_CURSOR_INTERVAL.floor}.`, "setup");
+  requireSandboxHelper(probe);
   const requestedModel = options.model || selectedModel();
   if (!requestedModel) throw errorWithFailure("Select a Cursor model in ~/.cursor/cli-config.json or pass --model.");
   const catalog = readModelCatalog({ dataDir, bin: probe.buildPath });
@@ -743,11 +433,11 @@ async function handleReview(argv, transport) {
   const background = Boolean(options.background || transport.defaultBackground);
   const briefFile = briefPath(dataDir, cwd, id);
   const file = jobFilePath(dataDir, cwd, id);
-  const record = createJobRecord({ id, cursorVersion: probe.version, cursorBuildPath: probe.buildPath, pid: background ? null : process.pid,
+  const record = createJobRecord({ id, companionVersion: COMPANION_VERSION, cursorVersion: probe.version, cursorBuildPath: probe.buildPath, pid: background ? null : process.pid,
     mode: "review", cwd, briefFile, background, claudeSessionId: currentClaudeSessionId(), jobClass: "review",
     requestedModel, resolvedModel: resolved.variant, requestedEffort, effortApplied: resolved.effortApplied,
     billingPool: resolved.billingPool, homeDir: runHomeDir(dataDir, id), warnings,
-    request: { model: requestedModel, effort: requestedEffort, reviewTargetLabel: target.label,
+    request: { model: requestedModel, effort: requestedEffort, catalogDisplayName: catalog.models.find((item) => item.id === resolved.variant)?.displayName ?? null, reviewTargetLabel: target.label,
       outputJson: Boolean(options.json), ingress: transport.ingress } });
   createJobRecordFile(file, record);
   try { writeBrief(dataDir, cwd, id, prompt); }
@@ -774,12 +464,6 @@ function processOwned(pid, identity) {
   return Number.isInteger(pid) && pid > 1 && identity && processIdentityMatches(pid, identity);
 }
 
-function cursorGroupAlive(pid) {
-  if (!Number.isInteger(pid) || pid <= 1) return false;
-  try { process.kill(-pid, 0); return true; }
-  catch (error) { return error.code === "EPERM"; }
-}
-
 function runningAlive(record) {
   if (record.status !== "running") return false;
   if (record.pid) return processOwned(record.pid, record.pidIdentity);
@@ -797,7 +481,7 @@ function terminateOwned(record) {
   let safe = true;
   for (const [pid, identity, group] of targets) {
     if (!Number.isInteger(pid) || pid <= 1 || pid === process.pid) continue;
-    if (group ? !cursorGroupAlive(pid) : !processIsDirectlyAlive(pid)) continue;
+    if (group ? !processGroupAlive(pid) : !processIsDirectlyAlive(pid)) continue;
     if (processIsDirectlyAlive(pid) && !processOwned(pid, identity)) continue;
     try { process.kill(group ? -pid : pid, "SIGTERM"); }
     catch (error) { if (error.code !== "ESRCH") safe = false; }
@@ -805,24 +489,27 @@ function terminateOwned(record) {
   return safe;
 }
 
+function cleanupProcessesAlive(record) {
+  return processGroupAlive(record.cursorPid) || (record.pid !== process.pid && processIsDirectlyAlive(record.pid));
+}
+
 async function waitForCleanup(record) {
   const deadline = Date.now() + 12000;
-  const alive = () => cursorGroupAlive(record.cursorPid) || (record.pid !== process.pid && processIsDirectlyAlive(record.pid));
   while (Date.now() < deadline) {
-    if (!alive()) {
+    if (!cleanupProcessesAlive(record)) {
       await reapPrivateHomeHelpers(record.homeDir);
       return true;
     }
     await new Promise((resolve) => setTimeout(resolve, 50));
   }
   for (const [pid, group] of [[record.cursorPid, true], [record.pid, record.background]]) {
-    if (pid !== process.pid && (group ? cursorGroupAlive(pid) : processIsDirectlyAlive(pid)) && (!processIsDirectlyAlive(pid) || processOwned(pid, pid === record.pid ? record.pidIdentity : record.cursorPidIdentity))) {
+    if (pid !== process.pid && (group ? processGroupAlive(pid) : processIsDirectlyAlive(pid)) && (!processIsDirectlyAlive(pid) || processOwned(pid, pid === record.pid ? record.pidIdentity : record.cursorPidIdentity))) {
       try { process.kill(group ? -pid : pid, "SIGKILL"); } catch (error) { if (error.code !== "ESRCH") return false; }
     }
   }
   const killDeadline = Date.now() + 500;
-  while (alive() && Date.now() < killDeadline) await new Promise((resolve) => setTimeout(resolve, 25));
-  if (alive()) return false;
+  while (cleanupProcessesAlive(record) && Date.now() < killDeadline) await new Promise((resolve) => setTimeout(resolve, 25));
+  if (cleanupProcessesAlive(record)) return false;
   await reapPrivateHomeHelpers(record.homeDir);
   return true;
 }
@@ -862,8 +549,8 @@ async function handleStatus(argv, transport) {
 
 function historyEntry(record) {
   const sessionId = typeof record.sessionId === "string" ? record.sessionId : null;
-  const mode = ["consult", "write", "review"].includes(record.mode) ? record.mode : "unknown";
-  const resumable = terminal(record) && record.jobClass === "task" && CURSOR_SESSION_ID_PATTERN.test(sessionId) && Boolean(record.homeDir) && mode !== "unknown";
+  const mode = record.mode;
+  const resumable = terminal(record) && !homeRetentionExpired(record) && record.jobClass === "task" && CURSOR_SESSION_ID_PATTERN.test(sessionId) && Boolean(record.homeDir);
   return {
     jobId: record.id, sessionId, cwd: record.cwd, status: record.status, jobClass: record.jobClass, mode,
     background: Boolean(record.background), delivery: record.delivery, deliveryStatus: record.deliveryStatus,
@@ -965,7 +652,8 @@ function handleSetup(argv, transport) {
     try { catalog = readModelCatalog({ dataDir, bin: probe.buildPath, maxAgeMs: 0 }); }
     catch (error) { nextSteps.push(error.message); }
   }
-  const sandboxHelper = probe ? fs.existsSync(path.join(path.dirname(probe.buildPath), "cursorsandbox")) : false;
+  const sandboxHelper = probe ? fs.existsSync(sandboxHelperPath(probe)) : false;
+  if (probe && !sandboxHelper) nextSteps.push(`Repair or reinstall Cursor Agent so ${sandboxHelperPath(probe)} is available.`);
   let dataWritable = false;
   let dataDetail = null;
   try { fs.mkdirSync(dataDir, { recursive: true, mode: 0o700 }); fs.accessSync(dataDir, fs.constants.W_OK); dataWritable = true; }
@@ -976,7 +664,7 @@ function handleSetup(argv, transport) {
     ready: Boolean(probe && namedCursorAgent && compatibility !== "older than the tested interval" && auth.authenticated && catalog && sandboxHelper && dataWritable),
     cursor: { available: Boolean(probe), bin, buildPath: probe?.buildPath ?? null, version: probe?.version ?? null, namedCursorAgent, detail: detail ?? probe?.version ?? null },
     compatibility, testedInterval: TESTED_CURSOR_INTERVAL, auth, catalogSize: catalog?.models.length ?? 0,
-    sandboxHelper: { present: sandboxHelper, path: probe ? path.join(path.dirname(probe.buildPath), "cursorsandbox") : null },
+    sandboxHelper: { present: sandboxHelper, path: probe ? sandboxHelperPath(probe) : null },
     projectHookFiles: hookFiles, projectHookWarnings: hookFiles.map((file) => `project hooks run outside the Cursor sandbox: ${file}`),
     dataDir: { path: dataDir, writable: dataWritable, detail: dataDetail }, nextSteps
   };

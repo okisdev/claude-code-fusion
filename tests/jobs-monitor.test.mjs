@@ -413,11 +413,11 @@ test("a session monitor observes a managed job launched in another workspace", a
   ]);
 });
 
-test("a session monitor announces duplicate legacy ids in each workspace with explicit cwd values", async (t) => {
+test("a session monitor announces duplicate ids in each workspace with explicit cwd values", async (t) => {
   const sandbox = makeSandbox(t);
   const otherCwd = path.join(sandbox.root, "other-workspace");
   fs.mkdirSync(otherCwd, { recursive: true });
-  const id = "duplicate-legacy-id";
+  const id = "duplicate-job-id";
   const { file: ownFile, record: ownRecord } = seedJob(sandbox, {
     id,
     status: "running",
@@ -582,13 +582,13 @@ test("restart with persisted dedup state does not re-announce a background done 
   assert.deepStrictEqual(second.lines(), []);
 });
 
-test("an old announcement ledger version is reset instead of suppressing a namespaced notification", async (t) => {
+test("an invalid announcement ledger is reset instead of suppressing a namespaced notification", async (t) => {
   const sandbox = makeSandbox(t);
   const { file, record } = seedJob(sandbox, { status: "running", background: true });
   const stateFile = announcedPath(sandbox);
   fs.writeFileSync(
     stateFile,
-    `${JSON.stringify({ version: 1, keys: [announcedKey(sandbox.workDir, record.id, "done")] })}\n`,
+    "{invalid json\n",
     "utf8",
   );
   const monitor = startMonitor(sandbox, envFor(sandbox));
@@ -685,4 +685,120 @@ test("skips silently when the jobs directory does not exist", async (t) => {
   assert.deepStrictEqual(monitor.lines(), []);
   assert.strictEqual(monitor.stderr(), "");
   assert.strictEqual(fs.existsSync(sandbox.dataDir), false);
+});
+
+function tracedMonitor(sandbox, file) {
+  const preload = path.join(sandbox.root, "trace-record-reads.mjs");
+  const trace = path.join(sandbox.root, "record-reads.log");
+  fs.writeFileSync(preload, `
+import fs from "node:fs";
+const originalRead = fs.readFileSync;
+fs.readFileSync = function (file, ...args) {
+  if (String(file) === process.env.MONITOR_READ_TARGET_FILE) {
+    fs.appendFileSync(process.env.MONITOR_READ_TRACE_FILE, "read\\n");
+  }
+  return originalRead.call(this, file, ...args);
+};
+`);
+  const monitor = startMonitor(sandbox, envFor(sandbox, {
+    GROK_JOBS_MONITOR_INTERVAL_MS: "100",
+    NODE_OPTIONS: `--import=${pathToFileURL(preload).href}`,
+    MONITOR_READ_TARGET_FILE: file,
+    MONITOR_READ_TRACE_FILE: trace,
+  }));
+  const readCount = () => fs.existsSync(trace) ? fs.readFileSync(trace, "utf8").trim().split("\n").length : 0;
+  return { monitor, readCount };
+}
+
+function seedTracedJob(sandbox) {
+  const record = createJobRecord({ id: generateJobId(), status: "running", mode: "consult", cwd: sandbox.workDir, background: true });
+  const file = jobFilePath(sandbox.dataDir, sandbox.workDir, record.id);
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.writeFileSync(file, `${JSON.stringify(record)}\n`);
+  return { file, record };
+}
+
+test("an unchanged job record is not reparsed on the next ticks", async (t) => {
+  const sandbox = makeSandbox(t);
+  const { file } = seedTracedJob(sandbox);
+  const { monitor, readCount } = tracedMonitor(sandbox, file);
+  await waitUntil(() => readCount() === 1 && readAnnouncedLedger(sandbox));
+
+  await new Promise((resolve) => setTimeout(resolve, 500));
+  assert.strictEqual(readCount(), 1);
+  assert.strictEqual(monitor.child.exitCode, null);
+  assert.strictEqual(monitor.stderr(), "");
+});
+
+test("a changed job record is reparsed on the next tick", async (t) => {
+  const sandbox = makeSandbox(t);
+  const { file, record } = seedTracedJob(sandbox);
+  const { monitor, readCount } = tracedMonitor(sandbox, file);
+  await waitUntil(() => readCount() === 1 && readAnnouncedLedger(sandbox));
+
+  fs.writeFileSync(file, `${JSON.stringify({ ...record, status: "done", finishedAt: new Date().toISOString() })}\n`);
+  await waitForAnnouncement(sandbox, announcedKey(sandbox.workDir, record.id, "done"));
+  assert.strictEqual(readCount(), 2);
+  assert.strictEqual(monitor.lines().length, 1);
+});
+
+test("a record with changed mtime and unchanged size is reparsed", async (t) => {
+  const sandbox = makeSandbox(t);
+  const { file, record } = seedTracedJob(sandbox);
+  const { readCount } = tracedMonitor(sandbox, file);
+  await waitUntil(() => readCount() === 1 && readAnnouncedLedger(sandbox));
+
+  const before = fs.statSync(file);
+  const replacement = `${file}.replacement`;
+  fs.writeFileSync(replacement, `${JSON.stringify({ ...record, status: "pending" })}\n`);
+  const later = new Date(before.mtimeMs + 5000);
+  fs.utimesSync(replacement, later, later);
+  fs.renameSync(replacement, file);
+  assert.strictEqual(fs.statSync(file).size, before.size);
+  await waitUntil(() => readCount() === 2);
+});
+
+test("an atomic replacement with unchanged mtime and size reports the new status", async (t) => {
+  const sandbox = makeSandbox(t);
+  const { file, record } = seedTracedJob(sandbox);
+  const oldTime = new Date(Date.now() - 5000);
+  fs.utimesSync(file, oldTime, oldTime);
+  const { monitor, readCount } = tracedMonitor(sandbox, file);
+  await waitUntil(() => readCount() === 1 && readAnnouncedLedger(sandbox));
+
+  const before = fs.statSync(file);
+  const replacement = `${file}.replacement`;
+  const contents = `${JSON.stringify({ ...record, status: "done" }).padEnd(before.size - 1, " ")}\n`;
+  assert.strictEqual(Buffer.byteLength(contents), before.size);
+  fs.writeFileSync(replacement, contents);
+  fs.renameSync(replacement, file);
+  fs.utimesSync(file, before.atime, before.mtime);
+  const after = fs.statSync(file);
+  assert.strictEqual(after.size, before.size);
+  assert.strictEqual(after.mtimeMs, before.mtimeMs);
+  assert.notStrictEqual(after.ino, before.ino);
+
+  await waitForAnnouncement(sandbox, announcedKey(sandbox.workDir, record.id, "done"));
+  assert.strictEqual(readCount(), 2);
+  assert.match(monitor.lines()[0], new RegExp(`grok job ${record.id} done`));
+});
+
+test("a record with changed size and unchanged mtime is reparsed", async (t) => {
+  const sandbox = makeSandbox(t);
+  const { file, record } = seedTracedJob(sandbox);
+  const originalTime = new Date(Date.now() - 5000);
+  fs.utimesSync(file, originalTime, originalTime);
+  const { readCount } = tracedMonitor(sandbox, file);
+  await waitUntil(() => readCount() === 1 && readAnnouncedLedger(sandbox));
+
+  const before = fs.statSync(file);
+  const replacement = `${file}.replacement`;
+  fs.writeFileSync(replacement, `${JSON.stringify({ ...record, status: "done", finishedAt: new Date().toISOString() })}\n`);
+  fs.utimesSync(replacement, originalTime, originalTime);
+  fs.renameSync(replacement, file);
+  const after = fs.statSync(file);
+  assert.strictEqual(after.mtimeMs, before.mtimeMs);
+  assert.notStrictEqual(after.size, before.size);
+  await waitForAnnouncement(sandbox, announcedKey(sandbox.workDir, record.id, "done"));
+  assert.strictEqual(readCount(), 2);
 });

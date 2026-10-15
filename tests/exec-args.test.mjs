@@ -112,12 +112,12 @@ test("help and runtime skill list history, cancel, and setup flags", (t) => {
   assert.strictEqual(help.status, 0, help.stderr);
   assert.ok(help.stdout.includes("cancel <job-id> [--cwd <dir>] [--json]"));
   assert.ok(help.stdout.includes("history [--all] [--limit <n>] [--cwd <dir>] [--json]"));
-  assert.ok(help.stdout.includes("setup [--continuity <manual|claude-session>] [--enable-stop-gate] [--disable-stop-gate] [--json]"));
+  assert.ok(help.stdout.includes("setup [--continuity <manual|claude-session>] [--enable-stop-gate] [--disable-stop-gate] [--clear-quota-cooldown] [--json]"));
   const skill = fs.readFileSync(cliRuntimeSkill, "utf8");
   assert.ok(skill.includes("status [job-id] [--cwd <dir>] [--json]"));
   assert.ok(skill.includes("cancel <job-id> [--cwd <dir>] [--json]"));
   assert.ok(skill.includes("history [--all] [--limit <n>] [--cwd <dir>] [--json]"));
-  assert.ok(skill.includes("setup [--continuity <manual|claude-session>] [--enable-stop-gate] [--disable-stop-gate] [--json]"));
+  assert.ok(skill.includes("setup [--continuity <manual|claude-session>] [--enable-stop-gate] [--disable-stop-gate] [--clear-quota-cooldown] [--json]"));
 });
 
 test("consult task argv pins the strict sandbox and hard read-only tool surface", (t) => {

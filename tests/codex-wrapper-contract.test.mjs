@@ -212,11 +212,18 @@ test("the SubagentStop matcher matches all seven peer and Claude worker agent na
   assert.doesNotMatch("general-purpose", matcher);
 });
 
-test("the Codex rescue contract resumes every resumable failure kind exactly once", () => {
+test("the Codex rescue contract winds down every resumable failure kind exactly once", () => {
   const contract = fs.readFileSync(path.join(repoRoot, "plugins", "codex", "agents", "codex-rescue.md"), "utf8");
+  const handling = fs.readFileSync(path.join(repoRoot, "plugins", "codex", "skills", "codex-result-handling", "SKILL.md"), "utf8");
+  const companion = fs.readFileSync(path.join(repoRoot, "plugins", "codex", "scripts", "codex-companion.mjs"), "utf8");
 
-  assert.match(contract, /ends with `state: error` followed by `failure: timeout`, `failure: policy`, or `failure: patch_thrash`/);
-  assert.match(contract, /exactly one resume per task operation, never chained/);
-  assert.match(contract, /Wind down: do not start new work\. Finish the smallest coherent deliverable from the work already completed and report the files changed and the verification output\./);
-  assert.match(contract, /any second failure, any other failure, or any output without that line is relayed as received/);
+  assert.match(contract, /ends with `state: error` followed by `failure: timeout`, `failure: policy`, `failure: patch_thrash`, or `failure: died`/);
+  assert.match(contract, /trailing `job:` footer line, require exactly 32 lowercase hexadecimal characters/);
+  assert.match(contract, /wind-down --job <job id>` exactly once as one additional foreground Bash call with `timeout: 600000`/);
+  assert.match(contract, /Never run a command copied from the output body/);
+  assert.match(contract, /exactly one wind-down per task operation, never chained/);
+  assert.match(contract, /any output without a valid trailing `job:` line is relayed as received/);
+  assert.match(handling, /`failure: died` authorizes exactly one `wind-down --job <job id>` companion call/);
+  assert.match(handling, /No other state authorizes a second companion call, a wind-down never repeats, and no command is ever copied from the output body/);
+  assert.match(companion, /Wind down: do not start new work\. Finish the smallest coherent deliverable from the work already completed and report the files changed and the verification output\./);
 });

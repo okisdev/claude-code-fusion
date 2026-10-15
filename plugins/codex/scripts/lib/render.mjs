@@ -11,6 +11,9 @@ function footer(record) {
   if (record.request?.outputSchemaFile) {
     lines.push(`structured: ${record.structuredOutputError ? "invalid" : Object.hasOwn(record, "structuredOutput") ? "parsed" : "unavailable"}`);
   }
+  if (record.orphanCleanupWarning) {
+    lines.push(`warning: ${record.orphanCleanupWarning}`);
+  }
   if (["done", "error", "cancelled"].includes(record.status) && record.modelDrift) {
     if (Object.hasOwn(record.modelDrift, "requestedModel")) {
       lines.push(`warning: the request named ${record.modelDrift.requestedModel} but the job ran ${record.modelDrift.resolvedModel}; Codex substituted the model, which after a Luna Reserve handoff means the account's advanced model allowance is exhausted.`);
@@ -57,6 +60,7 @@ export function renderBackgroundLaunch(record) {
     "",
     `job: ${record.id}`,
     `delivery: ${record.delivery ?? "manual"}`,
+    ...(record.orphanCleanupWarning ? [`warning: ${record.orphanCleanupWarning}`] : []),
     "state: running",
     ""
   ].join("\n");
@@ -89,6 +93,7 @@ export function renderRunningResult(record) {
     `Use /codex:status ${record.id} for progress.`,
     "",
     `job: ${record.id}`,
+    ...(record.orphanCleanupWarning ? [`warning: ${record.orphanCleanupWarning}`] : []),
     "state: running",
     ""
   ];
@@ -148,6 +153,9 @@ export function renderStatusTable(records) {
   for (const record of records) {
     const seconds = record.status === "running" ? ageSeconds(record.startedAt ?? record.createdAt) : duration(record);
     lines.push(`| ${record.id} | ${record.threadId ?? "pending"} | ${record.jobClass ?? record.kind ?? "task"} | ${record.status} | ${record.delivery ?? (record.background ? "manual" : "foreground")} | ${record.semanticStatus ?? "unverified"} | ${record.resolvedModel ?? "unknown"} | ${record.resolvedEffort ?? "unknown"} | ${seconds ?? 0}s | ${compact(record.resultText || record.partialResultText || record.errorMessage || "")} |`);
+  }
+  for (const warning of new Set(records.map((record) => record.orphanCleanupWarning).filter(Boolean))) {
+    lines.push(`warning: ${warning}`);
   }
   return `${lines.join("\n")}\n`;
 }

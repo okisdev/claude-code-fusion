@@ -5,7 +5,26 @@ import fs from "node:fs";
 import { test } from "node:test";
 import { pathToFileURL } from "node:url";
 import { companion, envFor as companionEnvFor, killGroups, makeSandbox, pidAlive, runCompanion, stateModulePath, waitFor } from "./lib/companion-harness.mjs";
-import { getProcessIdentity } from "../plugins/grok/scripts/lib/process-identity.mjs";
+import {
+  getProcessIdentity,
+  processGroupAlive as grokIdentityGroupAlive,
+  processIsDirectlyAlive as grokProcessIsDirectlyAlive
+} from "../plugins/grok/scripts/lib/process-identity.mjs";
+import {
+  processGroupAlive as cursorIdentityGroupAlive,
+  processIsDirectlyAlive as cursorProcessIsDirectlyAlive
+} from "../plugins/cursor/scripts/lib/process-identity.mjs";
+import { processGroupAlive, validProcessIdentity } from "../plugins/codex/scripts/lib/process-identity.mjs";
+import {
+  processGroupAlive as grokExecGroupAlive,
+  recordedProcessState as grokRecordedProcessState,
+  runningJobLiveness as grokRunningJobLiveness
+} from "../plugins/grok/scripts/lib/grok-exec.mjs";
+import {
+  isProcessAlive as codexIsProcessAlive,
+  processIdentitiesMatch as codexProcessIdentitiesMatch,
+  processIdentityMatches as codexProcessIdentityMatches
+} from "../plugins/codex/scripts/lib/codex-exec.mjs";
 
 const { refreshRunningJobRecord } = await import(pathToFileURL(companion).href);
 const {
@@ -50,6 +69,81 @@ process.stdout.write(String(child.pid));
 function replacedIdentity(identity) {
   return { ...identity, startMarker: `${identity.startMarker}-replaced` };
 }
+
+test("Codex rejects identities with empty markers", () => {
+  const identity = {
+    version: 1,
+    platform: "linux",
+    bootMarker: "boot",
+    startMarker: "123",
+    commandHash: "hash"
+  };
+  assert.equal(validProcessIdentity(identity), true);
+  assert.equal(codexProcessIdentitiesMatch(identity, { ...identity }), true);
+  for (const field of ["platform", "bootMarker", "startMarker", "commandHash"]) {
+    const invalid = { ...identity, [field]: "" };
+    assert.equal(validProcessIdentity(invalid), false, field);
+    assert.equal(codexProcessIdentitiesMatch(identity, invalid), false, field);
+    assert.equal(codexProcessIdentityMatches(process.pid, invalid), false, field);
+    assert.equal(codexIsProcessAlive(process.pid, invalid), false, field);
+  }
+});
+
+test("Linux zombie leaders and empty process groups are not alive", (t) => {
+  if (process.platform !== "linux" || !fs.existsSync("/proc/self/stat")) {
+    t.skip("Linux /proc process state is unavailable.");
+    return;
+  }
+  const leader = 987654321;
+  const member = leader + 1;
+  const originalKill = process.kill;
+  const originalReadFileSync = fs.readFileSync;
+  const originalReaddirSync = fs.readdirSync;
+  let memberGroup = leader + 2;
+  const stat = (pid, state, group) => `${pid} (fixture) ${state} 1 ${group} 1\n`;
+  try {
+    process.kill = (pid, signal) => {
+      assert.equal(signal, 0);
+      assert.ok(pid === leader || pid === -leader);
+      return true;
+    };
+    fs.readFileSync = (file, ...args) => {
+      if (file === `/proc/${leader}/stat`) return stat(leader, "Z", leader);
+      if (file === `/proc/${member}/stat`) return stat(member, "S", memberGroup);
+      return originalReadFileSync(file, ...args);
+    };
+    fs.readdirSync = (directory, ...args) => directory === "/proc"
+      ? [String(leader), String(member)]
+      : originalReaddirSync(directory, ...args);
+
+    assert.equal(grokProcessIsDirectlyAlive(leader), false);
+    assert.equal(cursorProcessIsDirectlyAlive(leader), false);
+    assert.equal(codexIsProcessAlive(leader, null, false), false);
+    assert.equal(processGroupAlive(leader), false, "Only a zombie remains in the group.");
+    const recorded = { version: 1, platform: "linux", bootMarker: "boot", startMarker: "1", commandHash: "hash" };
+    assert.equal(grokExecGroupAlive(leader), false, "Grok's group probe agrees with the zombie aware identity.");
+    assert.equal(grokRecordedProcessState(leader, recorded), "absent");
+    assert.equal(grokRunningJobLiveness({ status: "running", pid: leader, pidIdentity: recorded }).alive, false);
+    assert.equal(grokIdentityGroupAlive(leader), false);
+    assert.equal(cursorIdentityGroupAlive(leader), false);
+    assert.equal(codexIsProcessAlive(leader), false);
+    memberGroup = leader;
+    assert.equal(processGroupAlive(leader), true, "A live member keeps the group alive.");
+    assert.equal(grokExecGroupAlive(leader), true);
+    assert.equal(grokRecordedProcessState(leader, recorded), "unverified", "A live member of an unverifiable group keeps cleanup pending.");
+    memberGroup = leader + 2;
+    fs.readdirSync = (directory, ...args) => directory === "/proc"
+      ? [String(member)]
+      : originalReaddirSync(directory, ...args);
+    assert.equal(processGroupAlive(leader), false, "A signalable group without members is dead.");
+    assert.equal(grokIdentityGroupAlive(leader), false);
+    assert.equal(cursorIdentityGroupAlive(leader), false);
+  } finally {
+    process.kill = originalKill;
+    fs.readFileSync = originalReadFileSync;
+    fs.readdirSync = originalReaddirSync;
+  }
+});
 
 function seedJob(sandbox, fields = {}) {
   const id = fields.id ?? generateJobId();
@@ -154,7 +248,7 @@ test("died repair treats a process identity mismatch as PID reuse without signal
   assert.ok(pidAlive(child.pid), "Expected the reused PID to remain alive.");
 });
 
-test("unverifiable legacy cleanup leaves died repair running and cleanup required", async (t) => {
+test("unverifiable process identity cleanup leaves died repair running and cleanup required", async (t) => {
   const sandbox = makeSandbox(t);
   const deadPid = await makeDeadPid();
   const grokChild = spawn(process.execPath, ["-e", "process.on('SIGTERM', () => {}); process.stdout.write('ready'); setInterval(() => {}, 1000)"], {
@@ -182,7 +276,7 @@ test("unverifiable legacy cleanup leaves died repair running and cleanup require
   assert.strictEqual(updated.grokPid, grokChild.pid);
   assert.strictEqual(updated.pidIdentity, null);
   assert.strictEqual(updated.grokPidIdentity, null);
-  assert.ok(pidAlive(grokChild.pid), "Expected legacy cleanup not to escalate to SIGKILL.");
+  assert.ok(pidAlive(grokChild.pid), "Expected unverified cleanup not to escalate to SIGKILL.");
 
   const immediate = runCompanion(["result", record.id], {
     cwd: sandbox.workDir,

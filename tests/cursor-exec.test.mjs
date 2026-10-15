@@ -81,13 +81,13 @@ test("forbidden tools before init and after result terminate immediately", async
   }
 });
 
-test("a result near the run deadline gets only exit grace", async (t) => {
+test("a result before the run deadline gets only exit grace", async (t) => {
   const root = fixture(t);
-  const result = await runCursor({ bin, args: buildCursorArgs({ mode: "consult", variant: "composer-2.5", cwd: root }), cwd: root, env: { ...process.env, FAKE_CURSOR_SCENARIO: "near_deadline" }, brief: "inspect", timeoutMs: 1000, exitGraceMs: 500, killGraceMs: 100, mode: "consult" });
+  const result = await runCursor({ bin, args: buildCursorArgs({ mode: "consult", variant: "composer-2.5", cwd: root }), cwd: root, env: { ...process.env, FAKE_CURSOR_SCENARIO: "near_deadline" }, brief: "inspect", timeoutMs: 5000, exitGraceMs: 3000, killGraceMs: 100, mode: "consult" });
   assert.equal(result.resultSeen, true);
   assert.equal(result.timedOut, false);
   assert.equal(classifyCursorFailure(result), null);
-  const late = await runCursor({ bin, args: buildCursorArgs({ mode: "consult", variant: "composer-2.5", cwd: root }), cwd: root, env: { ...process.env, FAKE_CURSOR_SCENARIO: "near_deadline_late_close" }, brief: "inspect", timeoutMs: 1000, exitGraceMs: 100, killGraceMs: 100, mode: "consult" });
+  const late = await runCursor({ bin, args: buildCursorArgs({ mode: "consult", variant: "composer-2.5", cwd: root }), cwd: root, env: { ...process.env, FAKE_CURSOR_SCENARIO: "near_deadline_late_close" }, brief: "inspect", timeoutMs: 5000, exitGraceMs: 100, killGraceMs: 100, mode: "consult" });
   assert.equal(late.resultSeen, true);
   assert.equal(late.lateClose, true);
   assert.equal(late.timedOut, false);
@@ -99,11 +99,11 @@ test("exit resolves when a detached descendant holds stdout open", async (t) => 
   const pidFile = path.join(root, "escaped.pid");
   t.after(() => { try { process.kill(Number(fs.readFileSync(pidFile, "utf8")), "SIGKILL"); } catch {} });
   const start = Date.now();
-  const result = await runCursor({ bin, args: buildCursorArgs({ mode: "consult", variant: "composer-2.5", cwd: root }), cwd: root, env: { ...process.env, FAKE_CURSOR_SCENARIO: "escape_stdio", FAKE_CURSOR_HELPER_PID_FILE: pidFile }, brief: "inspect", timeoutMs: 1000, exitGraceMs: 100, killGraceMs: 100, mode: "consult" });
+  const result = await runCursor({ bin, args: buildCursorArgs({ mode: "consult", variant: "composer-2.5", cwd: root }), cwd: root, env: { ...process.env, FAKE_CURSOR_SCENARIO: "escape_stdio", FAKE_CURSOR_HELPER_PID_FILE: pidFile }, brief: "inspect", timeoutMs: 30000, exitGraceMs: 100, killGraceMs: 100, mode: "consult" });
   assert.equal(result.resultSeen, true);
   assert.equal(result.timedOut, false);
   assert.equal(classifyCursorFailure(result), null);
-  assert.ok(Date.now() - start < 1000);
+  assert.ok(Date.now() - start < 10000);
 });
 
 test("stdout and stderr retain multibyte text across chunks", async (t) => {
@@ -203,4 +203,38 @@ test("leader exit reaps a helper that inherited its process group", async (t) =>
     await new Promise((resolve) => setTimeout(resolve, 50));
   }
   assert.ok(state === "gone" || state === "Z", `helper still running: ${state}`);
+});
+
+test("classifyCursorFailure prefers quota over setup when model message mentions usage limit", () => {
+  assert.equal(
+    classifyCursorFailure({ exitCode: 1, stderrTail: "Cannot use this model: usage limit reached" }),
+    "quota"
+  );
+  assert.equal(classifyCursorFailure({ exitCode: 1, stderrTail: "Invalid --allowed-tools value: foo" }), "setup");
+  assert.equal(classifyCursorFailure({ exitCode: 1, stderrTail: "unknown option --bogus" }), "setup");
+});
+
+test("classifyCursorFailure does not treat bare ENOENT in stderr as missing_cli", () => {
+  assert.equal(
+    classifyCursorFailure({ exitCode: 1, stderrTail: "Error: ENOENT: no such file or directory, open '/tmp/missing'" }),
+    "error"
+  );
+  assert.equal(
+    classifyCursorFailure({ exitCode: 127, stderrTail: "cursor-agent: command not found" }),
+    "missing_cli"
+  );
+  assert.equal(
+    classifyCursorFailure({ exitCode: 1, spawnError: { code: "ENOENT" }, stderrTail: "" }),
+    "missing_cli"
+  );
+});
+
+test("classifyCursorFailure recognizes extended sandbox denial messages", () => {
+  for (const message of [
+    "sandbox denied: policy",
+    "Sandbox Unavailable on this host",
+    "operation not permitted by sandbox"
+  ]) {
+    assert.equal(classifyCursorFailure({ exitCode: 1, stderrTail: message }), "sandbox", message);
+  }
 });

@@ -369,7 +369,7 @@ test("recorded failure footers include the sandbox while pre-record input errors
   const [record] = jobRecords(sandbox.dataDir);
   assert.match(
     failed.stderr,
-    new RegExp(`job: ${record.id}\\nsandbox: ${sandbox.workDir}\\nstate: error\\nfailure: error\\n$`)
+    new RegExp(`job: ${record.id}\\nsandbox: ${sandbox.workDir}\\ndelivery: foreground\\nsemantic: unverified\\nstate: error\\nfailure: error\\n$`)
   );
 
   const missing = path.join(sandbox.root, "missing-work");
@@ -522,6 +522,6 @@ test("cancelled background job retains requested model and effort attribution", 
   assert.strictEqual(cancelled.resolvedEffort, "high");
   const resultOutput = runCompanion(["result", cancelled.id], { cwd: sandbox.workDir, env });
   assert.strictEqual(resultOutput.status, 0, resultOutput.stderr);
-  assert.match(resultOutput.stdout, new RegExp(`job: ${cancelled.id}\\nsandbox: ${sandbox.workDir}\\nstate: cancelled\\nfailure: cancelled\\n$`));
+  assert.match(resultOutput.stdout, new RegExp(`job: ${cancelled.id}\\nsandbox: ${sandbox.workDir}\\ndelivery: manual\\nsemantic: unverified\\nstate: cancelled\\nfailure: cancelled\\n$`));
   assert.match(resultOutput.stdout, /^failure: cancelled$/m);
 });

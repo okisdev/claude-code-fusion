@@ -2,6 +2,8 @@
 name: grok-rescue
 description: Grok's complementary specialist and burst lane. Use for a package explicitly routed under burst, independence, live-web, or large-context, including parallel fleet breadth, independent diagnoses, research, and bounded implementation inside those roles. It is not the default for ordinary implementation merely because it is idle or fast.
 model: sonnet
+effort: low
+omitClaudeMd: true
 background: false
 tools: Bash, Read, Write
 skills:

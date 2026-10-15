@@ -1,7 +1,7 @@
 ---
 name: setup
 description: Check whether the local Grok CLI is ready for the companion runtime. Use when validating or changing the local companion setup.
-argument-hint: '[--continuity <manual|claude-session>] [--enable-stop-gate | --disable-stop-gate] [--json]'
+argument-hint: '[--continuity <manual|claude-session>] [--enable-stop-gate | --disable-stop-gate] [--clear-quota-cooldown] [--json]'
 disable-model-invocation: true
 allowed-tools: Bash(node:*), Read, Write
 ---
@@ -17,6 +17,7 @@ Present the setup output to the user.
 - Preserve the advisory line covering whether a `grok doctor` subcommand is available, probed with a short bounded spawn regardless of its output format. It is informational only and never changes top-level `ready`.
 - A CLI installation, version, or required capability preflight failure persists and renders failure kind `setup`. Preserve its upgrade or repair guidance and tell the user to rerun `/grok:setup`; do not retry the unchanged task against the incompatible surface.
 - The primary switch for the stop-time review gate is the plugin's `Stop gate review` setting in Claude Code's plugin configuration: when enabled, the Stop hook asks Grok to review the working tree diff whenever Claude Code stops with uncommitted changes. Only `BLOCK: <reason>` on the first nonempty reply line blocks the stop; a preamble before `BLOCK` and infrastructure failures fail open. SessionEnd attempts verified process cleanup for jobs owned by that Claude session and removes verified unused raw transports, but it does not delete terminal job records, briefs, or logs. `--enable-stop-gate` and `--disable-stop-gate` remain as a scripting fallback that persists the same toggle locally; they only take effect when the plugin setting is left unset. The report shows the current gate state.
+- Preserve the quota cooldown line when present. After a run fails with failure kind `quota`, the companion fails later managed runs fast until the cooldown expires (one hour by default; `GROK_QUOTA_COOLDOWN_MS` overrides it and `0` disables it). `/grok:setup --clear-quota-cooldown` clears it once the xAI balance is restored, and any successful managed run clears it too.
 - Native Grok sessions are retained by upstream storage for 30 days by default. `~/.grok/config.toml` accepts a positive integer at `[storage] cleanup_ttl_days`; `0` falls back to the default 30 days. The companion does not promise automatic garbage collection for its own job ledger under `~/.claude/plugins/data/grok-claude-code-fusion/`; clearing that ledger requires manually deleting the data directory after no jobs need collection or resume evidence.
 
 The opaque raw request begins after the next newline and continues to the end of this command prompt:

@@ -1,14 +1,13 @@
 #!/usr/bin/env node
 
 import { randomUUID } from "node:crypto";
-import { spawn } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { performance } from "node:perf_hooks";
 import { fileURLToPath } from "node:url";
 import { buildManifest } from "./manifest.mjs";
-import { cliVersion, collectPluginVersions, readJsonFile } from "./lib.mjs";
+import { assertEnvironmentPins, assertManifestPins, cliVersion, collectPluginVersions, readJsonFile, runBounded } from "./lib.mjs";
 
 const SELF_PATH = fileURLToPath(import.meta.url);
 const BENCH_DIR = path.dirname(SELF_PATH);
@@ -21,6 +20,7 @@ const EXPECTED_CONDITION_PLUGINS = {
   B2: ["codex@claude-code-fusion", "fusion@claude-code-fusion", "grok@claude-code-fusion"],
   B3: ["fusion@claude-code-fusion"]
 };
+const USAGE = "Usage: node bench/run.mjs --task <id> --condition <A|B1|B2|B3> --repetition <n> --results <dir> --claude-config <dir> [--task-root <dir>] [--claude-bin <bin>] [--claude-timeout-ms <n>] [--verify-timeout-ms <n>] (env: BENCH_CLAUDE_TIMEOUT_MS, BENCH_VERIFY_TIMEOUT_MS; defaults: 2700000, 600000 ms)";
 const TOKEN_FIELDS = [
   "input_tokens",
   "output_tokens",
@@ -69,6 +69,14 @@ function required(options, key) {
   return value;
 }
 
+function timeout(raw, key, envKey, fallback) {
+  const value = raw[key] ?? process.env[envKey] ?? String(fallback);
+  if (!/^[1-9]\d*$/.test(value) || !Number.isSafeInteger(Number(value)) || Number(value) > 2147483647) {
+    throw new Error(`Invalid --${key}: ${value}`);
+  }
+  return Number(value);
+}
+
 function normalizeOptions(raw) {
   const taskId = required(raw, "task");
   const condition = required(raw, "condition");
@@ -86,7 +94,9 @@ function normalizeOptions(raw) {
     resultsDir: path.resolve(required(raw, "results")),
     claudeConfigDir: path.resolve(required(raw, "claude-config")),
     taskRoot: path.resolve(raw["task-root"] ?? DEFAULT_TASK_ROOT),
-    claudeBin: raw["claude-bin"] ?? process.env.CLAUDE_BIN ?? "claude"
+    claudeBin: raw["claude-bin"] ?? process.env.CLAUDE_BIN ?? "claude",
+    claudeTimeoutMs: timeout(raw, "claude-timeout-ms", "BENCH_CLAUDE_TIMEOUT_MS", 2700000),
+    verifyTimeoutMs: timeout(raw, "verify-timeout-ms", "BENCH_VERIFY_TIMEOUT_MS", 600000)
   };
 }
 
@@ -129,58 +139,6 @@ function cleanupTempRoot(tempRoot) {
     fs.rmSync(tempRoot, { recursive: true, force: true });
   } catch {
   }
-}
-
-function signalExitCode(signal) {
-  if (signal === "SIGINT") {
-    return 130;
-  }
-  if (signal === "SIGTERM") {
-    return 143;
-  }
-  return 1;
-}
-
-function runProcess(bin, args, options) {
-  return new Promise((resolve, reject) => {
-    const child = spawn(bin, args, {
-      cwd: options.cwd,
-      env: options.env,
-      stdio: ["ignore", "pipe", "pipe"]
-    });
-    let stdout = "";
-    let stderr = "";
-    let settled = false;
-    child.stdout.on("data", (chunk) => {
-      stdout += chunk;
-    });
-    child.stderr.on("data", (chunk) => {
-      stderr += chunk;
-    });
-    child.on("error", (error) => {
-      if (settled) {
-        return;
-      }
-      settled = true;
-      if (error.code === "ENOENT") {
-        reject(new Error(`${options.label} binary not found: ${bin}`));
-        return;
-      }
-      reject(new Error(`${options.label} failed to start: ${error.message}`));
-    });
-    child.on("close", (code, signal) => {
-      if (settled) {
-        return;
-      }
-      settled = true;
-      resolve({
-        stdout,
-        stderr,
-        exitCode: code ?? signalExitCode(signal),
-        signal
-      });
-    });
-  });
 }
 
 function collectEngineCliVersions(options) {
@@ -357,7 +315,17 @@ function writeEnv(options, manifest) {
     taskTags: taskTags(manifest)
   };
   fs.mkdirSync(options.resultsDir, { recursive: true });
-  fs.writeFileSync(path.join(options.resultsDir, "env.json"), `${JSON.stringify(env, null, 2)}\n`, "utf8");
+  const file = path.join(options.resultsDir, "env.json");
+  if (fs.existsSync(file)) {
+    const existing = JSON.parse(fs.readFileSync(file, "utf8"));
+    assertManifestPins(existing, [], options.resultsDir);
+    if (existing.manifestHash !== manifest.manifestHash) {
+      throw new Error(`${file}: conflicting manifest pins: existing=${JSON.stringify(existing.manifestHash)} vs current=${JSON.stringify(manifest.manifestHash)}`);
+    }
+    assertEnvironmentPins(existing, env, options.resultsDir);
+    return existing;
+  }
+  fs.writeFileSync(file, `${JSON.stringify(env, null, 2)}\n`, { flag: "wx" });
   return env;
 }
 
@@ -636,6 +604,9 @@ function verdictFromVerify(verifyExit) {
 
 function classifyInfraFailure(error) {
   const message = oneLine(error?.message);
+  if (/timed out/i.test(message)) {
+    return "timeout";
+  }
   if (/ambiguous/i.test(message) && /transcript/i.test(message)) {
     return "ambiguous_transcript";
   }
@@ -717,16 +688,20 @@ async function executeAttempt(options, context) {
   let claudeResult = null;
   let verifyResult = null;
   try {
-    claudeResult = await runProcess(options.claudeBin, claudeArgs, {
+    claudeResult = await runBounded(options.claudeBin, claudeArgs, {
       cwd: workDir,
       env: claudeEnv,
-      label: "Claude"
+      label: "Claude",
+      timeoutMs: options.claudeTimeoutMs
     });
-    verifyResult = await runProcess("bash", ["verify.sh", workDir], {
+    if (claudeResult.timedOut) throw new Error(`Claude timed out after ${options.claudeTimeoutMs} ms`);
+    verifyResult = await runBounded("bash", ["verify.sh", workDir], {
       cwd: task.taskDir,
       env: process.env,
-      label: "Verifier"
+      label: "Verifier",
+      timeoutMs: options.verifyTimeoutMs
     });
+    if (verifyResult.timedOut) throw new Error(`Verifier timed out after ${options.verifyTimeoutMs} ms`);
     const wallClockSeconds = (performance.now() - wallStart) / 1000;
     const headlessOutput = parseHeadlessOutput(claudeResult.stdout);
     const sessionId = findSessionId(headlessOutput);
@@ -765,7 +740,7 @@ async function main() {
   try {
     options = normalizeOptions(parseArgs(process.argv.slice(2)));
   } catch (error) {
-    process.stderr.write(`${oneLine(error.message)}\n`);
+    process.stderr.write(`${oneLine(error.message)}\n${USAGE}\n`);
     process.exitCode = 1;
     return;
   }

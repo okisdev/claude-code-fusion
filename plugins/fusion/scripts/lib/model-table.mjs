@@ -82,6 +82,7 @@ export function validateModelRoutingData(value) {
   }
 
   const models = [];
+  const modelKeys = new Set();
   for (const [index, model] of value.models.entries()) {
     if (!model || typeof model !== "object" || Array.isArray(model)) {
       return invalid(`Expected models[${index}] to be an object.`);
@@ -121,6 +122,11 @@ export function validateModelRoutingData(value) {
     if (model.notes != null && model.notes.trim()) {
       sanitized.notes = model.notes.trim();
     }
+    const modelKey = `${sanitized.lane}\0${sanitized.id}`;
+    if (modelKeys.has(modelKey)) {
+      return invalid(`Duplicate model routing row for lane ${sanitized.lane} and id ${sanitized.id}.`);
+    }
+    modelKeys.add(modelKey);
     models.push(sanitized);
   }
 
@@ -215,23 +221,24 @@ function tableCell(value) {
   return String(value).replace(/\r?\n/g, " ").replace(/\|/g, "\\|").trim();
 }
 
-export function renderModelTable(data) {
+export function renderModelTable(data, { includeNotes = false } = {}) {
   const lines = [];
   const costProfile = data.costProfile.trim();
   if (costProfile) {
     lines.push(`Cost profile: ${tableCell(costProfile)}`, "");
   }
-  lines.push("| Engine | Lane | Family | Intelligence | Taste | Cost | Notes |");
-  lines.push("|---|---|---|---:|---:|---:|---|");
+  lines.push(`| Engine | Lane | Family | Intelligence | Taste | Cost |${includeNotes ? " Notes |" : ""}`);
+  lines.push(`|---|---|---|---:|---:|---:|${includeNotes ? "---|" : ""}`);
   for (const model of data.models) {
     const family = model.family ?? (isEngineId(model.lane) ? ENGINES[model.lane].family : model.lane.startsWith("claude-") ? "anthropic" : null);
     lines.push(
-      `| ${tableCell(model.id)} | ${tableCell(model.lane)} | ${tableCell(family ?? "")} | ${model.intelligence} | ${model.taste} | ${model.cost} | ${tableCell(model.notes ?? "")} |`
+      `| ${tableCell(model.id)} | ${tableCell(model.lane)} | ${tableCell(family ?? "")} | ${model.intelligence} | ${model.taste} | ${model.cost} |${includeNotes ? ` ${tableCell(model.notes ?? "")} |` : ""}`
     );
   }
   const defaults = mergeRoutingDefaults(data.defaults);
   const defaultSentence = ENGINE_IDS.map((lane) => ENGINES[lane].roles.map((role, index) => `${index === 0 ? `${lane} ` : ""}${role} ${tableCell(defaults[lane][role].model)}@${defaults[lane][role].effort}`).join(", ")).join("; ");
   lines.push(
+    ...(includeNotes ? [] : ["Model notes (benchmarks, prices, latency) live in model-routing.json; `/fusion:config` shows them."]),
     "",
     `Lane defaults: ${defaultSentence}.`,
     "",

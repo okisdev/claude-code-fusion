@@ -10,6 +10,7 @@ import path from "node:path";
 import { once } from "node:events";
 import { test } from "node:test";
 import { getProcessIdentity } from "../plugins/codex/scripts/lib/codex-exec.mjs";
+import { createJobRecord } from "../plugins/codex/scripts/lib/state.mjs";
 import { gitIsolation } from "./lib/git-fixture.mjs";
 import { inspectCodexRollout } from "../plugins/fusion/scripts/codex-jobs-monitor.mjs";
 import { fusionRepositoryKey, modelAuditSidecarPath, tokenUsageSidecarPath } from "../plugins/fusion/scripts/fusion-stats.mjs";
@@ -17,6 +18,19 @@ import { engineJobsObserverStatePath } from "../plugins/fusion/scripts/engine-jo
 
 const repoRoot = path.join(import.meta.dirname, "..");
 const monitorScript = path.join(repoRoot, "plugins", "fusion", "scripts", "codex-jobs-monitor.mjs");
+
+async function spawnProbeChild(t) {
+  const child = spawn(process.execPath, ["-e", "process.stdout.write('ready\\n'); process.stdin.resume()"], { stdio: ["pipe", "pipe", "ignore"] });
+  t.after(() => { if (child.exitCode == null && child.signalCode == null) child.kill("SIGKILL"); });
+  await once(child.stdout, "data");
+  return child;
+}
+
+async function releaseProbeChild(child) {
+  const exited = once(child, "exit");
+  child.stdin.end();
+  await exited;
+}
 
 function makeSandbox(t) {
   const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "codex-monitor-test-")));
@@ -84,17 +98,14 @@ function readJsonLines(file) {
 
 function seedJob(sandbox, fields = {}, { workspace = "ws", workspaceRoot } = {}) {
   const id = fields.id ?? `task-${Math.random().toString(36).slice(2, 8)}`;
+  const root = workspaceRoot ?? sandbox.workDir;
   const record = {
-    id,
-    status: "running",
-    workspaceRoot: workspaceRoot ?? sandbox.workDir,
-    jobClass: "task",
-    kind: "task",
-    createdAt: new Date().toISOString(),
-    updatedAt: new Date().toISOString(),
+    ...createJobRecord({ id, cwd: root, workspaceRoot: root, background: fields.background ?? true, ...fields }),
     ...fields,
     id,
   };
+  // Preserve the monitor fixtures' repository matching path when no key was supplied.
+  if (!Object.hasOwn(fields, "repositoryKey")) delete record.repositoryKey;
   const file = path.join(jobsDirFor(sandbox, workspace), `${id}.json`);
   writeJobRecordFile(file, record);
   return { file, record };
@@ -414,15 +425,13 @@ test("session monitors announce their own Claude jobs once and still surface orp
   const sandbox = makeSandbox(t);
   const { file: ownFile, record: ownRecord } = seedJob(sandbox, {
     status: "running",
-    sessionId: "codex-own",
     claudeSessionId: "session-own"
   });
   const { file: otherFile, record: otherRecord } = seedJob(sandbox, {
     status: "running",
-    sessionId: "codex-other",
     claudeSessionId: "session-other"
   });
-  const { file: orphanFile, record: orphanRecord } = seedJob(sandbox, { status: "running", sessionId: "codex-orphan" });
+  const { file: orphanFile, record: orphanRecord } = seedJob(sandbox, { status: "running" });
   const ownMonitor = startMonitor(sandbox, envFor(sandbox, { CLAUDE_CODE_SESSION_ID: "session-own" }));
   const otherMonitor = startMonitor(sandbox, envFor(sandbox, { CLAUDE_CODE_SESSION_ID: "session-other" }));
   t.after(() => ownMonitor.child.kill("SIGKILL"));
@@ -461,7 +470,7 @@ test("session monitors announce their own Claude jobs once and still surface orp
 
 test("with the session id env var unset, a job from a different session still emits", async (t) => {
   const sandbox = makeSandbox(t);
-  const { file, record } = seedJob(sandbox, { status: "running", sessionId: "session-other" });
+  const { file, record } = seedJob(sandbox, { status: "running", claudeSessionId: "session-other" });
   const monitor = startMonitor(sandbox, envFor(sandbox));
   t.after(() => monitor.child.kill("SIGKILL"));
   await waitUntil(() => readAnnouncedState(sandbox));
@@ -533,11 +542,11 @@ test("a monitor includes jobs recorded in a worktree beneath the repo root", asy
 
 test("a running job whose pid has vanished is terminalized and announced exactly once", async (t) => {
   const sandbox = makeSandbox(t);
-  const shortLivedChild = spawn(process.execPath, ["-e", "setTimeout(() => {}, 0)"]);
+  const shortLivedChild = await spawnProbeChild(t);
   const pid = shortLivedChild.pid;
   const pidIdentity = getProcessIdentity(pid);
   assert.ok(pidIdentity, "Process identity probing is unavailable for the tracked child.");
-  await once(shortLivedChild, "exit");
+  await releaseProbeChild(shortLivedChild);
 
   const { file, record } = seedJob(sandbox, { createdAt: new Date(Date.now() - 1000).toISOString(), status: "running", pid, pidIdentity });
   const monitor = startMonitor(sandbox, envFor(sandbox, { CODEX_COMPANION_PIDLESS_RUNNING_GRACE_MS: "0" }));
@@ -700,11 +709,11 @@ test("a terminal worktree copy suppresses a dead alarm for its stale running mir
   const sandbox = makeSandbox(t);
   const worktreeRoot = path.join(sandbox.workDir, ".claude", "worktrees", "agent-test");
   fs.mkdirSync(worktreeRoot, { recursive: true });
-  const shortLivedChild = spawn(process.execPath, ["-e", "setTimeout(() => {}, 0)"]);
+  const shortLivedChild = await spawnProbeChild(t);
   const pid = shortLivedChild.pid;
   const pidIdentity = getProcessIdentity(pid);
   assert.ok(pidIdentity, "Process identity probing is unavailable for the tracked child.");
-  await once(shortLivedChild, "exit");
+  await releaseProbeChild(shortLivedChild);
   const id = "mirrored-job";
   seedJob(sandbox, { id, status: "running", pid, pidIdentity }, { workspace: "parent-ws", workspaceRoot: sandbox.workDir });
   seedJob(
@@ -868,12 +877,12 @@ test("workspace-scoped dedup lets identical job ids announce independently and p
   const sharedId = "shared-job-id";
   const firstJob = seedJob(
     sandbox,
-    { id: sharedId, status: "running", sessionId: "shared-session" },
+    { id: sharedId, status: "running", claudeSessionId: "shared-session" },
     { workspace: "workspace-a", workspaceRoot: sandbox.workDir }
   );
   const secondJob = seedJob(
     sandbox,
-    { id: sharedId, status: "running", sessionId: "shared-session" },
+    { id: sharedId, status: "running", claudeSessionId: "shared-session" },
     { workspace: "workspace-b", workspaceRoot: otherWorkDir }
   );
   const env = envFor(sandbox, { CLAUDE_CODE_SESSION_ID: "shared-session" });
@@ -902,28 +911,27 @@ test("workspace-scoped dedup lets identical job ids announce independently and p
   assert.strictEqual(fs.readFileSync(firstStateFile, "utf8"), firstState);
 });
 
-test("restart catch-up announces an unrecorded terminal job owned by the active session", async (t) => {
+test("old announcement state follows the missing-state startup path", async (t) => {
   const sandbox = makeSandbox(t);
   const { record } = seedJob(sandbox, {
     status: "done",
-    sessionId: "session-own",
+    claudeSessionId: "session-own",
     finishedAt: new Date().toISOString()
   });
   fs.writeFileSync(announcedPath(sandbox, "session-own"), "[]\n", "utf8");
 
   const monitor = startMonitor(sandbox, envFor(sandbox, { CLAUDE_CODE_SESSION_ID: "session-own" }));
   t.after(() => monitor.child.kill("SIGKILL"));
-  const lines = await waitUntil(() => (monitor.lines().length > 0 ? monitor.lines() : null));
-  assert.deepStrictEqual(lines, [
-    `codex job ${record.id} done. collect with /codex:result ${record.id}; completion notices do not replace collection. ${MONITOR_TAG}`
-  ]);
+  await waitUntil(() => readAnnouncedState(sandbox, "session-own")?.schemaVersion === 3);
+  assert.deepStrictEqual(monitor.lines(), []);
+  assert.deepStrictEqual(readAnnouncedState(sandbox, "session-own").keys, [`${record.id}:done`]);
 });
 
 test("an unavailable jobs snapshot neither prunes nor persists announcement state", async (t) => {
   const sandbox = makeSandbox(t);
   const { record } = seedJob(sandbox, { status: "running" });
   const stateFile = announcedPath(sandbox);
-  fs.writeFileSync(stateFile, `${JSON.stringify([`${record.id}:done`])}\n`, "utf8");
+  fs.writeFileSync(stateFile, `${JSON.stringify({ schemaVersion: 3, keys: [`${record.id}:done`], records: [] })}\n`, "utf8");
   const monitor = startMonitor(sandbox, envFor(sandbox));
   t.after(() => monitor.child.kill("SIGKILL"));
   await waitUntil(() => readAnnouncedState(sandbox)?.schemaVersion === 3);
@@ -954,11 +962,11 @@ test("announcement state files older than 30 days are pruned", async (t) => {
 
 test("malformed dedup state is quarantined and dead running jobs are terminalized silently", async (t) => {
   const sandbox = makeSandbox(t);
-  const shortLivedChild = spawn(process.execPath, ["-e", "setTimeout(() => {}, 0)"]);
+  const shortLivedChild = await spawnProbeChild(t);
   const pid = shortLivedChild.pid;
   const pidIdentity = getProcessIdentity(pid);
   assert.ok(pidIdentity, "Process identity probing is unavailable for the tracked child.");
-  await once(shortLivedChild, "exit");
+  await releaseProbeChild(shortLivedChild);
   const { file, record } = seedJob(sandbox, { createdAt: new Date(Date.now() - 1000).toISOString(), status: "running", pid, pidIdentity });
   const stateFile = announcedPath(sandbox);
   fs.writeFileSync(stateFile, "{ malformed", "utf8");
@@ -1127,6 +1135,24 @@ test("argv capture writes exactly one model-audit observation for a running job"
   assert.deepStrictEqual(readJsonLines(fakePsLog), [["-o", "args=", "-p", String(codexPid)]]);
 });
 
+test("a terminal backlog captures each model in one sidecar on its first tick", async (t) => {
+  const sandbox = makeSandbox(t);
+  for (let index = 0; index < 8; index += 1) {
+    seedJob(sandbox, {
+      id: `terminal-${index}`,
+      status: "done",
+      resolvedModel: `model-${index}`,
+      resolvedEffort: "high",
+      tokenUsage: { inputTokens: 1, cachedInputTokens: 0, outputTokens: 1, reasoningOutputTokens: 0, totalTokens: 2 }
+    });
+  }
+  const monitor = startMonitor(sandbox, envFor(sandbox));
+  t.after(() => monitor.child.kill("SIGKILL"));
+  const lines = await waitUntil(() => readModelAuditLines(sandbox).length === 8 ? readModelAuditLines(sandbox) : null);
+  assert.deepStrictEqual(lines.map((entry) => entry.model), Array.from({ length: 8 }, (_, index) => `model-${index}`));
+  assert.strictEqual(monitor.stderr(), "");
+});
+
 test("a second poll does not duplicate a model-audit observation", async (t) => {
   const sandbox = makeSandbox(t);
   seedJob(sandbox, { status: "running", pid: process.pid });
@@ -1180,11 +1206,11 @@ test("a job whose record already carries request.model is not probed", async (t)
 
 test("dead pid and unparseable argv are skipped without error for model audit", async (t) => {
   const sandbox = makeSandbox(t);
-  const shortLivedChild = spawn(process.execPath, ["-e", "setTimeout(() => {}, 0)"]);
+  const shortLivedChild = await spawnProbeChild(t);
   const deadPid = shortLivedChild.pid;
   const deadPidIdentity = getProcessIdentity(deadPid);
   assert.ok(deadPidIdentity, "Process identity probing is unavailable for the tracked child.");
-  await once(shortLivedChild, "exit");
+  await releaseProbeChild(shortLivedChild);
 
   seedJob(sandbox, { id: "dead-job", status: "running", pid: deadPid, pidIdentity: deadPidIdentity });
   seedJob(sandbox, { id: "bad-argv-job", status: "running", pid: process.pid });
@@ -1533,4 +1559,75 @@ test("installed cache layout without codex companion starts in announce-only mod
   await assertMonitorStaysAlive(monitor);
   assert.strictEqual(monitor.child.exitCode, null);
   assert.ok(monitor.lines().includes(REPAIR_UNAVAILABLE_LINE));
+});
+
+test("monitor scans parse only changed files and forget deleted file signatures", async (t) => {
+  const sandbox = makeSandbox(t);
+  const { file, record } = seedJob(sandbox, { id: "scan-job", request: { model: "gpt-5", effort: "high" } });
+  const preload = path.join(sandbox.root, "count-job-reads.mjs");
+  const log = path.join(sandbox.root, "reads.log");
+  fs.writeFileSync(preload, `import fs from "node:fs";
+const target = process.env.MONITOR_TEST_RECORD;
+const log = process.env.MONITOR_TEST_LOG;
+const read = fs.readFileSync;
+const readdir = fs.readdirSync;
+fs.readFileSync = function (file, ...args) {
+  if (file === target) fs.appendFileSync(log, "R\\n");
+  return read.call(this, file, ...args);
+};
+fs.readdirSync = function (dir, ...args) {
+  if (dir === process.env.MONITOR_TEST_JOBS_DIR) fs.appendFileSync(log, "S\\n");
+  return readdir.call(this, dir, ...args);
+};
+`);
+  const monitor = startMonitor(sandbox, envFor(sandbox, {
+    FUSION_CODEX_COMPANION: path.join(sandbox.root, "missing-companion.mjs"),
+    MONITOR_TEST_RECORD: file,
+    MONITOR_TEST_JOBS_DIR: path.dirname(file),
+    MONITOR_TEST_LOG: log,
+    NODE_OPTIONS: `${process.env.NODE_OPTIONS ?? ""} --import=${preload}`,
+    CODEX_JOBS_MONITOR_INTERVAL_MS: "100"
+  }));
+  const count = (mark) => fs.existsSync(log) ? fs.readFileSync(log, "utf8").split("\n").filter((line) => line === mark).length : 0;
+  await waitUntil(() => count("S") >= 3);
+  assert.equal(count("R"), 1, monitor.stderr());
+  const changed = { ...record, status: "done", resolvedModel: "gpt-5", resolvedEffort: "high", tokenUsage: { inputTokens: 1, outputTokens: 1 } };
+  writeJobRecordFile(file, changed);
+  await waitUntil(() => count("R") >= 2);
+  const changedStat = fs.statSync(file);
+  fs.rmSync(file);
+  const scansBeforeDeletion = count("S");
+  await waitUntil(() => count("S") >= scansBeforeDeletion + 2);
+  writeJobRecordFile(file, changed);
+  fs.utimesSync(file, changedStat.atime, changedStat.mtime);
+  await waitUntil(() => count("R") >= 3);
+  assert.equal(count("R"), 3, monitor.stderr());
+});
+
+test("monitor observes atomic record replacement with unchanged size and mtime", async (t) => {
+  const sandbox = makeSandbox(t);
+  const { file, record } = seedJob(sandbox, { id: "atomic-replace-job", marker: "x" });
+  const fixedMtime = new Date("2020-01-01T00:00:00.000Z");
+  fs.utimesSync(file, fixedMtime, fixedMtime);
+  const monitor = startMonitor(sandbox, envFor(sandbox, {
+    FUSION_CODEX_COMPANION: path.join(sandbox.root, "missing-companion.mjs")
+  }));
+  t.after(() => monitor.child.kill("SIGKILL"));
+
+  await waitUntil(() => readAnnouncedState(sandbox));
+  const previousStat = fs.statSync(file);
+  const updated = { ...record, status: "done", marker: "long" };
+  const temporaryFile = `${file}.tmp`;
+  const updatedContents = `${JSON.stringify(updated, null, 2)}\n`;
+  assert.equal(Buffer.byteLength(updatedContents), previousStat.size);
+  fs.writeFileSync(temporaryFile, updatedContents, "utf8");
+  fs.renameSync(temporaryFile, file);
+  fs.utimesSync(file, fixedMtime, fixedMtime);
+  const replacedStat = fs.statSync(file);
+  assert.equal(replacedStat.size, previousStat.size);
+  assert.equal(replacedStat.mtimeMs, previousStat.mtimeMs);
+  assert.notEqual(replacedStat.ino, previousStat.ino);
+
+  const completion = await waitUntil(() => monitor.lines().find((line) => line.includes(`${record.id} done.`)));
+  assert.ok(completion, monitor.stderr());
 });

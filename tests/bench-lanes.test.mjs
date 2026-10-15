@@ -51,6 +51,40 @@ function records(s) {
   return fs.readFileSync(path.join(s.results, "runs.jsonl"), "utf8").trim().split("\n").map((line) => JSON.parse(line));
 }
 
+function laneRecord({ engine = "codex", model, verdict, wallClockSeconds = 10 }) {
+  return {
+    schema: "fusion-bench-lane/v1",
+    taskId: "T01-test",
+    engine,
+    model,
+    effort: "xhigh",
+    verdict,
+    wallClockSeconds,
+    taskManifestHash: "a".repeat(64)
+  };
+}
+
+function writeSummaryData(s, laneRecords) {
+  fs.mkdirSync(s.results, { recursive: true });
+  fs.writeFileSync(path.join(s.results, "runs.jsonl"), `${laneRecords.map((record) => JSON.stringify(record)).join("\n")}\n`);
+  fs.writeFileSync(path.join(s.results, "env.json"), JSON.stringify({ manifestHash: "a".repeat(64), taskManifestHash: "a".repeat(64) }));
+}
+
+function writeRoutingFile(s, models) {
+  const file = path.join(s.root, "model-routing.json");
+  fs.writeFileSync(file, JSON.stringify({
+    schemaVersion: 1,
+    updatedAt: "2026-10-15T00:00:00.000Z",
+    costProfile: "test",
+    models: models.map(({ lane = "codex", id, intelligence }) => ({ id, lane, intelligence, taste: 3, cost: 3 }))
+  }));
+  return file;
+}
+
+function summarizeProposals(s, routing) {
+  return spawnSync(process.execPath, [summarizer, "--results", s.results, "--propose", ...(routing ? ["--routing", routing] : [])], { cwd: repoRoot, encoding: "utf8" });
+}
+
 test("write pass records a staged diff and requested lane", (t) => {
   const s = sandbox(t);
   const result = run(s);
@@ -200,4 +234,135 @@ test("summarizer groups records and normalizes token shapes", (t) => {
   assert.equal(table.status, 0, table.stderr);
   assert.match(table.stdout, /median wall clock seconds/);
   assert.match(table.stdout, /quota:1/);
+});
+
+test("delayed job record is read after the companion exits", (t) => {
+  const s = sandbox(t);
+  const result = run(s, { fakeMode: "delayed-record" });
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(records(s)[0].verdict, "pass");
+  assert.equal(records(s)[0].infrastructureFailure, null);
+});
+
+test("lane verifier timeout kills its process group and records infrastructure failure", (t) => {
+  const s = sandbox(t);
+  s.taskRoot = path.join(s.root, "tasks");
+  fs.cpSync(path.join(fixtureRoot, "tasks"), s.taskRoot, { recursive: true });
+  const pidFile = path.join(s.root, "verifier.pid");
+  fs.writeFileSync(path.join(s.taskRoot, "T01-test", "verify.sh"), "#!/usr/bin/env bash\nnode -e 'require(\"node:fs\").writeFileSync(process.env.FAKE_VERIFY_PID, String(process.pid)); setInterval(() => {}, 1000)'\n");
+  const result = run(s, { extra: ["--verify-timeout-ms", "300"], env: { FAKE_VERIFY_PID: pidFile } });
+  assert.equal(result.status, 0, result.stderr);
+  const [record] = records(s);
+  assert.equal(record.verdict, "infra_failure");
+  assert.equal(record.infrastructureFailure.type, "timeout");
+  assert.equal(record.verifyExit, null);
+  assert.throws(() => process.kill(Number(fs.readFileSync(pidFile, "utf8")), 0), { code: "ESRCH" });
+});
+
+test("lane summary rejects mixed record and environment manifest pins", (t) => {
+  const s = sandbox(t);
+  assert.equal(run(s).status, 0);
+  const file = path.join(s.results, "runs.jsonl");
+  const record = records(s)[0];
+  fs.appendFileSync(file, `${JSON.stringify({ ...record, taskManifestHash: "b".repeat(64) })}\n`);
+  const result = spawnSync(process.execPath, [summarizer, "--results", s.results, "--json"], { cwd: repoRoot, encoding: "utf8" });
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /conflicting manifest pins/);
+  assert.match(result.stderr, new RegExp(record.taskManifestHash));
+  assert.match(result.stderr, /bbbbbbbb/);
+});
+
+test("lane summary rejects a changed env.json pin", (t) => {
+  const s = sandbox(t);
+  assert.equal(run(s).status, 0);
+  const file = path.join(s.results, "env.json");
+  const env = JSON.parse(fs.readFileSync(file, "utf8"));
+  env.taskManifestHash = "b".repeat(64);
+  fs.writeFileSync(file, JSON.stringify(env));
+  const result = spawnSync(process.execPath, [summarizer, "--results", s.results], { cwd: repoRoot, encoding: "utf8" });
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /conflicting manifest pins/);
+  assert.match(result.stderr, /bbbbbbbb/);
+});
+
+test("lane runner refuses a changed CLI version pin", (t) => {
+  const s = sandbox(t);
+  assert.equal(run(s).status, 0);
+  const envFile = path.join(s.results, "env.json");
+  const initial = fs.readFileSync(envFile, "utf8");
+  const bin = s.env.PATH.split(path.delimiter)[0];
+  fs.writeFileSync(path.join(bin, "codex"), "#!/usr/bin/env bash\nprintf '%s\\n' 'changed version'\n");
+  const result = run(s);
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /conflicting environment pin engineCliVersions/);
+  assert.equal(fs.readFileSync(envFile, "utf8"), initial);
+  assert.equal(records(s).length, 1);
+});
+
+test("proposal reports model evidence and suggests a one-step rescore without writing", (t) => {
+  const s = sandbox(t);
+  const laneRecords = [
+    ...Array.from({ length: 3 }, () => laneRecord({ model: "leader", verdict: "pass" })),
+    ...Array.from({ length: 3 }, () => laneRecord({ model: "peer", verdict: "fail" }))
+  ];
+  writeSummaryData(s, laneRecords);
+  const routing = writeRoutingFile(s, [
+    { id: "leader", intelligence: 3 },
+    { id: "peer", intelligence: 3 }
+  ]);
+  const originalRouting = fs.readFileSync(routing, "utf8");
+  const result = summarizeProposals(s, routing);
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /Suggestions require human review; this command does not write any files\./);
+  assert.match(result.stdout, /\| codex \| leader \| 3 \| 100\.0% \| 10 \| 50\.0% \| \/fusion:config rescore leader --intelligence 4 \|/);
+  assert.match(result.stdout, /\| codex \| peer \| 3 \| 0\.0% \| 10 \| 50\.0% \| \/fusion:config rescore peer --intelligence 2 \|/);
+  assert.equal(fs.readFileSync(routing, "utf8"), originalRouting);
+});
+
+test("proposal does not suggest a score change below 25 percentage points", (t) => {
+  const s = sandbox(t);
+  writeSummaryData(s, [
+    ...Array.from({ length: 3 }, () => laneRecord({ model: "leader", verdict: "pass" })),
+    laneRecord({ model: "peer", verdict: "pass" }),
+    laneRecord({ model: "peer", verdict: "pass" }),
+    laneRecord({ model: "peer", verdict: "fail" })
+  ]);
+  const result = summarizeProposals(s);
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /\| codex \| leader \| 3 \| 100\.0% \| 10 \| 83\.3% \| - \|/);
+  assert.match(result.stdout, /\| codex \| peer \| 3 \| 66\.7% \| 10 \| 83\.3% \| - \|/);
+  assert.doesNotMatch(result.stdout, /\/fusion:config rescore/);
+});
+
+test("proposal excludes models with fewer than three judged runs", (t) => {
+  const s = sandbox(t);
+  writeSummaryData(s, [
+    laneRecord({ model: "short", verdict: "pass" }),
+    laneRecord({ model: "short", verdict: "fail" }),
+    ...Array.from({ length: 3 }, () => laneRecord({ model: "steady", verdict: "pass" }))
+  ]);
+  const result = summarizeProposals(s);
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /\| codex \| steady \| 3 \| 100\.0% \| 10 \| 100\.0% \| - \|/);
+  assert.doesNotMatch(result.stdout, /short/);
+});
+
+test("proposal clamps intelligence suggestions to the 1 to 5 range", (t) => {
+  const s = sandbox(t);
+  writeSummaryData(s, [
+    ...Array.from({ length: 3 }, () => laneRecord({ model: "ceiling", verdict: "pass" })),
+    ...Array.from({ length: 3 }, () => laneRecord({ model: "codex-peer", verdict: "fail" })),
+    ...Array.from({ length: 3 }, () => laneRecord({ engine: "grok", model: "floor", verdict: "fail" })),
+    ...Array.from({ length: 3 }, () => laneRecord({ engine: "grok", model: "grok-peer", verdict: "pass" }))
+  ]);
+  const routing = writeRoutingFile(s, [
+    { id: "ceiling", intelligence: 5 },
+    { id: "codex-peer", intelligence: 3 },
+    { id: "floor", lane: "grok", intelligence: 1 },
+    { id: "grok-peer", lane: "grok", intelligence: 3 }
+  ]);
+  const result = summarizeProposals(s, routing);
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /\/fusion:config rescore ceiling --intelligence 5/);
+  assert.match(result.stdout, /\/fusion:config rescore floor --intelligence 1/);
 });

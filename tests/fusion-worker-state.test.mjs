@@ -260,7 +260,7 @@ test("reopened Fusion worker keeps its transcript cursor and counts only appende
   assert.deepStrictEqual(switched.turnIds, ["new", "other"]);
 });
 
-test("reopened Fusion worker totals advance after message and tool windows fill", (t) => {
+test("reopened Fusion worker totals advance after compact 64-entry message and tool windows fill", (t) => {
   const directory = sandbox(t);
   const transcript = path.join(directory, "agent.jsonl");
   const prior = unverifiedRecord({
@@ -283,8 +283,8 @@ test("reopened Fusion worker totals advance after message and tool windows fill"
   fs.appendFileSync(transcript, `${lines.slice(520).join("\n")}\n`);
   current = refreshWorkerTranscript(current, transcript);
   assert.deepStrictEqual([current.turns, current.toolCalls, current.usage.outputTokens, current.usage.uncachedTokens], [4_160, 4_160, 8_320, 20_800]);
-  assert.deepStrictEqual([Object.keys(current.usageMessages).length, current.turnIds.length, current.toolUseIds.length], [512, 512, 2_048]);
-  assert.deepStrictEqual([current.transcriptRoundPrefix.turns, current.transcriptRoundPrefix.toolCalls, current.transcriptRoundPrefix.usage.outputTokens], [1_548, 12, 3_096]);
+  assert.deepStrictEqual([Object.keys(current.usageMessages).length, current.turnIds.length, current.toolUseIds.length], [64, 64, 64]);
+  assert.deepStrictEqual([current.transcriptRoundPrefix.turns, current.transcriptRoundPrefix.toolCalls, current.transcriptRoundPrefix.usage.outputTokens], [1_996, 1_996, 3_992]);
   assert.deepStrictEqual(refreshWorkerTranscript(current, transcript), current);
 });
 
@@ -340,31 +340,23 @@ test("created worker records stamp the Fusion companion version", (t) => {
   assert.strictEqual(record.companionVersion, expectedVersion);
 });
 
-test("worker records create and normalize the nullable peer failure kind", (t) => {
+test("worker records create a nullable peer failure kind", (t) => {
   const directory = sandbox(t);
   const env = { FUSION_WORKER_STATE_DIR: path.join(directory, "worker-state") };
   const taskId = "fusion-peer-failure-kind";
   const created = createWorkerRecord({ taskId, sessionId: "session-peer-kind", agentType: "fusion:claude-worker", workspaceRoot: directory }, env);
   assert.strictEqual(created.peerFailureKind, null);
 
-  const file = path.join(env.FUSION_WORKER_STATE_DIR, "jobs", `${taskId}.json`);
-  const stored = JSON.parse(fs.readFileSync(file, "utf8"));
-  delete stored.peerFailureKind;
-  fs.writeFileSync(file, `${JSON.stringify(stored, null, 2)}\n`, "utf8");
   assert.strictEqual(readWorkerRecord(taskId, env).peerFailureKind, null);
 });
 
-test("peer wrapper records start with an empty job history and older records load one", (t) => {
+test("peer wrapper records start with an empty job history", (t) => {
   const directory = sandbox(t);
   const env = { FUSION_WORKER_STATE_DIR: path.join(directory, "worker-state") };
   for (const [index, agentType] of ["codex:codex-rescue", "grok:grok-rescue", "grok:grok-review-runner"].entries()) {
     const taskId = `fusion-peer-history-${index}`;
     const created = createWorkerRecord({ taskId, sessionId: "session-peer-history", agentType, workspaceRoot: directory }, env);
     assert.deepStrictEqual(created.peerJobIds, []);
-    const file = path.join(env.FUSION_WORKER_STATE_DIR, "jobs", `${taskId}.json`);
-    const stored = JSON.parse(fs.readFileSync(file, "utf8"));
-    delete stored.peerJobIds;
-    fs.writeFileSync(file, `${JSON.stringify(stored)}\n`, "utf8");
     assert.deepStrictEqual(readWorkerRecord(taskId, env).peerJobIds, []);
   }
 });

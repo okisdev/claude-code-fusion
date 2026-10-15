@@ -151,6 +151,11 @@ function engineStateRoots(id, env = process.env) {
   return [path.join(engineDataDir(id, env), "state")];
 }
 
+function knownRole(value, roles) {
+  const role = typeof value === "string" ? value.toLowerCase() : "";
+  return roles.includes(role) ? role : null;
+}
+
 function engineRoleFromBrief(id, brief) {
   if (!isEngineId(id) || typeof brief !== "string") {
     return null;
@@ -158,18 +163,14 @@ function engineRoleFromBrief(id, brief) {
   const { defaultRole, roles } = ENGINES[id];
   const lines = brief.split(/\r?\n/).filter((line) => line.trim()).slice(0, ROLE_HEADER_LINES);
   const header = lines[0]?.trim() ?? "";
-  const known = (value) => {
-    const role = typeof value === "string" ? value.toLowerCase() : "";
-    return roles.includes(role) ? role : null;
-  };
-  const lane = known(header.match(new RegExp(`^lane:\\s*${id}\\s+([a-z][a-z-]*)(?=$|[\\s;,|])`, "i"))?.[1]);
+  const lane = knownRole(header.match(new RegExp(`^lane:\\s*${id}\\s+([a-z][a-z-]*)(?=$|[\\s;,|])`, "i"))?.[1], roles);
   if (lane) {
     return lane;
   }
   for (const line of lines) {
     const field = line.match(new RegExp(`(?:^|[\\s;,|])${id}-role:\\s*([^\\s;,|]+)`, "i"));
     if (field) {
-      return known(field[1]);
+      return knownRole(field[1], roles);
     }
   }
   return /^lane:/i.test(header) ? defaultRole : null;

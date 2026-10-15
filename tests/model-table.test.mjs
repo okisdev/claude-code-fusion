@@ -34,7 +34,7 @@ function writeRouting(file, data) {
   fs.writeFileSync(file, `${JSON.stringify(data, null, 2)}\n`, "utf8");
 }
 
-test("Renders configured model scores", (t) => {
+test("Rules table renders scores without Notes and points to config", (t) => {
   const dir = sandbox(t);
   const file = path.join(dir, "model-routing.json");
   writeRouting(file, {
@@ -50,10 +50,12 @@ test("Renders configured model scores", (t) => {
   const table = renderModelTableFromFile(file);
   assert.strictEqual(renderModelTableFromContents(fs.readFileSync(file, "utf8")), table);
   assert.match(table, /^Cost profile: peer subscriptions flat rate$/m);
-  assert.match(table, /^\| Engine \| Lane \| Family \| Intelligence \| Taste \| Cost \| Notes \|$/m);
-  assert.match(table, /^\| codex \| codex \| openai \| 5 \| 4 \| 5 \| primary implementation lane \|$/m);
+  assert.match(table, /^\| Engine \| Lane \| Family \| Intelligence \| Taste \| Cost \|$/m);
+  assert.match(table, /^\|---\|---\|---\|---:\|---:\|---:\|$/m);
+  assert.match(table, /^\| codex \| codex \| openai \| 5 \| 4 \| 5 \|$/m);
+  assert.doesNotMatch(table, /primary implementation lane|\| Notes \|/);
   assert.match(table, /^Lane defaults: codex quick gpt-6-sol@xhigh, volume gpt-6-luna@xhigh, flagship gpt-6-astra@xhigh; grok burst grok-4\.7-build-fast@low, independence grok-4\.7-build-fast@high, live-web grok-4\.7-build-fast@high, large-context grok-4\.6@medium; cursor diversity muse-spark-1\.3@xhigh, burst composer-2\.5@default\.$/m);
-  assert.match(table, /\| grok-fast \| grok \| xai \| 3 \| 3 \| 5 \|  \|\n\nLane defaults: [^\n]+\n\nScores feed/);
+  assert.match(table, /\| grok-fast \| grok \| xai \| 3 \| 3 \| 5 \|\nModel notes \(benchmarks, prices, latency\) live in model-routing\.json; `\/fusion:config` shows them\.\n\nLane defaults: [^\n]+\n\nScores feed/);
   assert.match(
     table,
     /^Scores feed the routing priorities above: intelligence proxies correctness and safety, taste is user facing quality, cost applies only as the final tie breaker\.$/m
@@ -161,4 +163,24 @@ test("Invalid model routing file renders the supplied fallback and warns", (t) =
   assert.strictEqual(renderModelTableFromFile(file, "existing scored region", { warn: (message) => warnings.push(message) }), "existing scored region");
   assert.strictEqual(warnings.length, 1);
   assert.ok(warnings[0].startsWith(`fusion: model routing file invalid at ${file}:`));
+});
+
+test("Model routing validation rejects duplicate lane and id pairs", () => {
+  const duplicate = validateModelRoutingData({
+    ...ROUTING,
+    models: [
+      ...ROUTING.models,
+      { id: "gpt-6-sol", lane: "codex", intelligence: 3, taste: 3, cost: 3 }
+    ]
+  });
+  assert.strictEqual(duplicate.ok, false);
+  assert.match(duplicate.reason, /Duplicate model routing row for lane codex and id gpt-6-sol/);
+  const distinctLanes = validateModelRoutingData({
+    ...ROUTING,
+    models: [
+      ...ROUTING.models,
+      { id: "gpt-6-sol", lane: "other", intelligence: 3, taste: 3, cost: 3 }
+    ]
+  });
+  assert.strictEqual(distinctLanes.ok, true);
 });

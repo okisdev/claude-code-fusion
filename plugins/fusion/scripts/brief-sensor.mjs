@@ -1,6 +1,5 @@
 #!/usr/bin/env node
 
-import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { PEER_RESCUE_AGENTS } from "./lib/engines.mjs";
@@ -37,9 +36,14 @@ const CHECKS = [
 ];
 const QUESTIONS = Object.fromEntries(CHECKS.map(({ id, instructions }) => [id, { type: "noul", instructions }]));
 
-function readHookInput() {
+async function readHookInput() {
   try {
-    const raw = fs.readFileSync(0, "utf8").trim();
+    process.stdin.setEncoding("utf8");
+    let raw = "";
+    for await (const chunk of process.stdin) {
+      raw += chunk;
+    }
+    raw = raw.trim();
     if (!raw) {
       return null;
     }
@@ -70,7 +74,7 @@ function briefAdvisory(answers) {
 }
 
 async function main() {
-  const brief = peerBrief(readHookInput());
+  const brief = peerBrief(await readHookInput());
   if (!brief) {
     return;
   }
@@ -85,7 +89,9 @@ function isMain() {
 }
 
 if (isMain()) {
-  main().catch(() => void 0);
+  const deadline = setTimeout(() => process.exit(0), 1_500);
+  deadline.unref();
+  main().catch(() => void 0).finally(() => clearTimeout(deadline));
 }
 
 export { FLAG_THRESHOLD, QUESTIONS, briefAdvisory, peerBrief };

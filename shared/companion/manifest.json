@@ -1,0 +1,20 @@
+{
+  "process-identity.mjs": [
+    "plugins/grok/scripts/lib/process-identity.mjs",
+    "plugins/cursor/scripts/lib/process-identity.mjs",
+    "plugins/codex/scripts/lib/process-identity.mjs"
+  ],
+  "record-lock.mjs": [
+    "plugins/grok/scripts/lib/record-lock.mjs",
+    "plugins/cursor/scripts/lib/record-lock.mjs"
+  ],
+  "raw-transport.mjs": [
+    "plugins/grok/scripts/lib/raw-transport.mjs",
+    "plugins/cursor/scripts/lib/raw-transport.mjs",
+    "plugins/codex/scripts/lib/raw-transport.mjs"
+  ],
+  "args.mjs": [
+    "plugins/grok/scripts/lib/args.mjs",
+    "plugins/cursor/scripts/lib/args.mjs"
+  ]
+}

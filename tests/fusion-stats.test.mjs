@@ -11,6 +11,7 @@ import {
   STATS_PROVIDER_REGISTRY,
   WORKSPACE_ENGINE_DESCRIPTORS,
   buildAuditReport,
+  appendModelAuditObservations,
   buildFleetUsageStats,
   clusterDispatchBursts,
   buildFusionStats,
@@ -26,6 +27,7 @@ import {
   normalizeCollectionMethod,
   normalizeCodexTokenUsage,
   pruneDeadWorkspaces,
+  pruneOldObservationSidecars,
   resolveCodexJobEffort,
   resolveCodexJobModel,
   resolveGitRepositoryCommonDir,
@@ -66,6 +68,17 @@ function writeCodexJob(stateRoot, workspaceRoot, id, fields) {
   const file = path.join(dir, `${id}.json`);
   fs.writeFileSync(file, JSON.stringify({ id, workspaceRoot, ...fields }));
   return file;
+}
+
+function writeModelRouting(file, models, defaults = {}) {
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.writeFileSync(file, JSON.stringify({
+    schemaVersion: 1,
+    updatedAt: new Date().toISOString(),
+    costProfile: "",
+    models: models.map((id) => ({ id, lane: "codex", intelligence: 3, taste: 3, cost: 3 })),
+    defaults
+  }));
 }
 
 function grokWorkspaceSlug(cwd) {
@@ -450,21 +463,25 @@ test("Codex reports lane signal drift only for SKUs that cross an advisory thres
   const dir = sandbox(t);
   const stateRoot = path.join(dir, "state");
   const fusionData = path.join(dir, "fusion");
+  const routing = path.join(dir, "model-routing.json");
+  writeModelRouting(routing, ["gpt-drift", "gpt-healthy", "gpt-trailing"]);
+  const today = Date.now();
   for (let index = 0; index < 10; index += 1) {
     const rejected = index >= 6;
     writeCodexJob(stateRoot, dir, `drift-${index}`, {
       status: rejected ? "error" : "done",
       jobClass: "task",
       acceptance: rejected ? "rejected" : "accepted",
+      ...(rejected ? { acceptanceSource: "main-loop" } : {}),
       failureKind: index >= 6 && index < 9 ? "timeout" : undefined,
-      createdAt: `2026-07-20T00:${String(index).padStart(2, "0")}:00.000Z`,
+      createdAt: new Date(today - 60_000 * (120 - index)).toISOString(),
       request: { model: "gpt-drift", effort: "xhigh" }
     });
     writeCodexJob(stateRoot, dir, `healthy-${index}`, {
       status: "done",
       jobClass: "task",
       acceptance: "accepted",
-      createdAt: `2026-07-20T01:${String(index).padStart(2, "0")}:00.000Z`,
+      createdAt: new Date(today - 60_000 * (100 - index)).toISOString(),
       request: { model: "gpt-healthy", effort: "high" }
     });
   }
@@ -474,12 +491,12 @@ test("Codex reports lane signal drift only for SKUs that cross an advisory thres
       status: rejected ? "error" : "done",
       jobClass: "task",
       acceptance: rejected ? "rejected" : "accepted",
-      createdAt: new Date(Date.parse("2026-07-18T00:00:00.000Z") + index * 60_000).toISOString(),
+      createdAt: new Date(today - 60_000 * (80 - index)).toISOString(),
       request: { model: "gpt-trailing", effort: "medium" }
     });
   }
 
-  const stats = codexStats({ env: { FUSION_CODEX_STATE: stateRoot, FUSION_DATA_DIR: fusionData }, cwd: dir });
+  const stats = codexStats({ env: { FUSION_CODEX_STATE: stateRoot, FUSION_DATA_DIR: fusionData, FUSION_MODEL_ROUTING: routing }, cwd: dir });
   assert.deepStrictEqual(stats.laneSignalDrift, [{ sku: "gpt-drift@xhigh", acceptanceRate: 0.6, timeoutShare: 0.3 }]);
   const rendered = renderFusionStats({ scope: dir, codex: stats });
   assert.match(rendered, /## Lane signal drift\n- gpt-drift@xhigh: judged acceptance 60\.0%, timeout share 30\.0%; re-score via \/fusion:config/);
@@ -492,13 +509,39 @@ test("Codex reports lane signal drift only for SKUs that cross an advisory thres
       status: "done",
       jobClass: "task",
       acceptance: "accepted",
-      createdAt: `2026-07-20T02:${String(index).padStart(2, "0")}:00.000Z`,
+      createdAt: new Date(today - 60_000 * (40 - index)).toISOString(),
       request: { model: "gpt-healthy", effort: "high" }
     });
   }
-  const healthyStats = codexStats({ env: { FUSION_CODEX_STATE: healthyRoot, FUSION_DATA_DIR: fusionData }, cwd: dir });
+  const healthyStats = codexStats({ env: { FUSION_CODEX_STATE: healthyRoot, FUSION_DATA_DIR: fusionData, FUSION_MODEL_ROUTING: routing }, cwd: dir });
   assert.strictEqual(healthyStats.laneSignalDrift, undefined);
   assert.doesNotMatch(renderFusionStats({ scope: dir, codex: healthyStats }), /## Lane signal drift/);
+});
+
+test("lane signal drift excludes old and retired SKUs while retaining configured defaults", (t) => {
+  const dir = sandbox(t);
+  const stateRoot = path.join(dir, "state");
+  const routing = path.join(dir, "model-routing.json");
+  writeModelRouting(routing, ["gpt-active", "gpt-old", "gpt-future"], {
+    codex: { quick: { model: "gpt-active", effort: "xhigh" } }
+  });
+  for (let index = 0; index < 10; index += 1) {
+    for (const [model, ageDays] of [["gpt-active", 1], ["gpt-old", 31], ["gpt-future", -1], ["gpt-retired", 1]]) {
+      writeCodexJob(stateRoot, dir, `${model}-${index}`, {
+        status: "error",
+        jobClass: "task",
+        acceptance: "rejected",
+        acceptanceSource: "main-loop",
+        failureKind: "timeout",
+        createdAt: new Date(Date.now() - ageDays * 24 * 60 * 60 * 1000 + index * 1000).toISOString(),
+        request: { model, effort: "xhigh" }
+      });
+    }
+  }
+  const env = { FUSION_CODEX_STATE: stateRoot, FUSION_DATA_DIR: path.join(dir, "fusion"), FUSION_MODEL_ROUTING: routing };
+  assert.deepStrictEqual(codexStats({ env, cwd: dir }).laneSignalDrift, [{ sku: "gpt-active@xhigh", acceptanceRate: 0, timeoutShare: 1 }]);
+  writeModelRouting(routing, ["gpt-old"]);
+  assert.strictEqual(codexStats({ env, cwd: dir }).laneSignalDrift, undefined);
 });
 
 test("Codex renders per-SKU trends from the seven days ending at the newest record", (t) => {
@@ -1169,6 +1212,94 @@ test("--prune-dead lists and removes unused acceptance observations", (t) => {
   assert.strictEqual(fs.existsSync(file), false);
 });
 
+test("prune-dead lists old dead observation directories and orphan Cursor runs, then removes only those", (t) => {
+  const dir = sandbox(t);
+  const state = path.join(dir, "state");
+  const fusion = path.join(dir, "fusion");
+  const cursor = path.join(dir, "cursor");
+  const gone = path.join(dir, "gone");
+  const old = new Date(Date.now() - 40 * 24 * 60 * 60 * 1000);
+  const hourOld = new Date(Date.now() - 2 * 60 * 60 * 1000);
+  const observationDir = path.join(fusion, "observations", "dead-key");
+  fs.mkdirSync(observationDir, { recursive: true });
+  const observationFile = path.join(observationDir, "model-audit.jsonl");
+  fs.writeFileSync(observationFile, `${JSON.stringify({ jobId: "removed-job", workspaceRoot: gone })}\n`);
+  fs.utimesSync(observationFile, old, old);
+  fs.utimesSync(observationDir, old, old);
+  const liveObservationDir = path.join(fusion, "observations", "live-key");
+  fs.mkdirSync(liveObservationDir, { recursive: true });
+  const liveObservationFile = path.join(liveObservationDir, "model-audit.jsonl");
+  fs.writeFileSync(liveObservationFile, `${JSON.stringify({ jobId: "live-job", workspaceRoot: dir })}\n`);
+  fs.utimesSync(liveObservationFile, old, old);
+  fs.utimesSync(liveObservationDir, old, old);
+  const orphan = path.join(cursor, "runs", "orphan");
+  const retained = path.join(cursor, "runs", "retained");
+  fs.mkdirSync(orphan, { recursive: true });
+  fs.mkdirSync(retained, { recursive: true });
+  fs.utimesSync(orphan, hourOld, hourOld);
+  fs.utimesSync(retained, hourOld, hourOld);
+  writeCursorJob(cursor, dir, "retained", { status: "done" });
+  const env = { FUSION_DATA_DIR: fusion, CURSOR_COMPANION_DATA: cursor };
+  const dry = run({ cwd: dir, codexState: state }, ["--prune-dead", "--json"], env);
+  assert.strictEqual(dry.status, 0, dry.stderr);
+  assert.deepStrictEqual(JSON.parse(dry.stdout).dead.observations.map((item) => item.dir), [observationDir]);
+  assert.deepStrictEqual(JSON.parse(dry.stdout).dead.cursorRuns.map((item) => item.dir), [orphan]);
+  assert.match(renderPruneReport(JSON.parse(dry.stdout)), /dead-key/);
+  assert.match(renderPruneReport(JSON.parse(dry.stdout)), /orphan/);
+  assert.ok(fs.existsSync(observationDir) && fs.existsSync(orphan));
+  const yes = run({ cwd: dir, codexState: state }, ["--prune-dead", "--yes", "--json"], env);
+  assert.strictEqual(yes.status, 0, yes.stderr);
+  assert.ok(!fs.existsSync(observationDir) && !fs.existsSync(orphan));
+  assert.ok(fs.existsSync(retained));
+  assert.ok(fs.existsSync(liveObservationDir));
+});
+
+test("automatic sidecar retention runs once per day and spares recorded jobs", (t) => {
+  const dir = sandbox(t);
+  const state = path.join(dir, "state");
+  const fusion = path.join(dir, "fusion");
+  const old = new Date(Date.now() - 100 * 24 * 60 * 60 * 1000);
+  const add = (key, id) => {
+    const folder = path.join(fusion, "observations", key);
+    fs.mkdirSync(folder, { recursive: true });
+    const file = path.join(folder, "model-audit.jsonl");
+    fs.writeFileSync(file, `${JSON.stringify({ jobId: id, workspaceRoot: dir })}\n`);
+    fs.utimesSync(file, old, old);
+    fs.utimesSync(folder, old, old);
+    return folder;
+  };
+  const stale = add("stale", "missing");
+  const live = add("live", "c".repeat(32));
+  writeCodexJob(state, dir, "c".repeat(32), { status: "done" });
+  const env = { FUSION_CODEX_STATE: state, FUSION_DATA_DIR: fusion, GROK_COMPANION_DATA: path.join(dir, "grok"), CURSOR_COMPANION_DATA: path.join(dir, "cursor") };
+  assert.deepStrictEqual(pruneOldObservationSidecars(env).map((item) => item.dir), [stale]);
+  assert.ok(!fs.existsSync(stale) && fs.existsSync(live));
+  const later = add("later", "later-missing");
+  assert.deepStrictEqual(pruneOldObservationSidecars(env), []);
+  assert.ok(fs.existsSync(later));
+});
+
+test("model audit batch loads and rewrites a sidecar once while preserving rank", (t) => {
+  const dir = sandbox(t);
+  const file = path.join(dir, "observations", "model-audit.jsonl");
+  const read = fs.readFileSync;
+  const write = fs.writeFileSync;
+  let reads = 0;
+  let writes = 0;
+  fs.readFileSync = function (...args) { if (args[0] === file) reads += 1; return read.apply(this, args); };
+  fs.writeFileSync = function (...args) { if (String(args[0]).startsWith(`${file}.`)) writes += 1; return write.apply(this, args); };
+  try {
+    assert.strictEqual(appendModelAuditObservations(file, [
+      { jobId: "one", source: "argv", model: "a" },
+      { jobId: "one", source: "rollout-turn-context", model: "b" },
+      { jobId: "two", source: "argv", model: "c" }
+    ]), true);
+  } finally { fs.readFileSync = read; fs.writeFileSync = write; }
+  assert.strictEqual(reads, 1);
+  assert.strictEqual(writes, 1);
+  assert.deepStrictEqual(fs.readFileSync(file, "utf8").trim().split("\n").map((line) => JSON.parse(line).model), ["b", "c"]);
+});
+
 test("pruneDeadWorkspaces never touches a workspace with any running job even without a live cwd", (t) => {
   const dir = sandbox(t);
   const grokDataDir = path.join(dir, "grok-data");
@@ -1482,10 +1613,10 @@ test("peer worker ids resolve pruned Codex jobs, continuations, and unverified d
 
   const stats = codexStats({ env, cwd: dir });
   assert.deepStrictEqual(stats.byAcceptance, { accepted: 2, rejected: 1, untracked: 1, unverified: 1 });
-  assert.deepStrictEqual(stats.acceptanceAnomalies.doneWithoutAcceptance, [unverifiedId]);
+  assert.deepStrictEqual(stats.acceptanceAnomalies.doneWithoutAcceptance, [untrackedId, unverifiedId]);
   assert.strictEqual(stats.last7DaysBySku[0].salvagedTimeouts, 1);
   assert.deepStrictEqual(stats.judgedExcludingInfrastructure, { accepted: 2, judged: 3, rate: 2 / 3 });
-  assert.match(renderFusionStats({ scope: dir, codex: stats }), /Done jobs without acceptance records: 1/);
+  assert.match(renderFusionStats({ scope: dir, codex: stats }), /Done jobs without acceptance records: 2/);
 });
 
 test("collector expected peer ids join jobs without a captured peer job id", (t) => {
@@ -1841,13 +1972,13 @@ test("direct --session requires the raw-args transport", (t) => {
   assert.strictEqual(result.stderr, `Fusion stats requests must be supplied through --raw-args-token. [fusion:${messageCode("stats.request-error")}]\n`);
 });
 
-test("direct --source without --record requires the raw-args transport", (t) => {
+test("direct --source without --record fails argument validation", (t) => {
   const dir = sandbox(t);
 
   const result = runDirect({ cwd: dir, codexState: path.join(dir, "missing") }, ["--source", "main-loop"]);
 
-  assert.notStrictEqual(result.status, 0);
-  assert.match(result.stderr, /Fusion stats requests must be supplied through --raw-args-token\./);
+  assert.strictEqual(result.status, 2);
+  assert.strictEqual(result.stderr, "Usage: --source: cannot be used with this request\n");
 });
 
 test("direct report requests reject unsupported flags", (t) => {
@@ -1856,7 +1987,41 @@ test("direct report requests reject unsupported flags", (t) => {
   const result = runDirect({ cwd: dir, codexState: path.join(dir, "missing") }, ["--json", "--bogus"]);
 
   assert.notStrictEqual(result.status, 0);
-  assert.match(result.stderr, /Fusion stats requests must be supplied through --raw-args-token\./);
+  assert.strictEqual(result.status, 2);
+  assert.strictEqual(result.stderr, "Usage: --bogus: unknown argument\n");
+});
+
+test("stats validates all arguments before reading state or writing a verdict", (t) => {
+  const dir = sandbox(t);
+  const state = path.join(dir, "state");
+  const id = "a".repeat(32);
+  const file = writeCodexJob(state, dir, id, { status: "done" });
+  const before = fs.readFileSync(file, "utf8");
+  for (const args of [["--audit", "--bogus"], ["--audit", "--record", `${id}=accepted`], ["--record", `${id}=accepted`, "--bogus"], ["--record", "bad=accepted"], ["--record"], ["--audit", "--days"]]) {
+    const result = run({ cwd: dir, codexState: state }, args);
+    assert.strictEqual(result.status, 2, result.stderr);
+    assert.match(result.stderr, /^Usage: /);
+    assert.strictEqual(result.stderr.trim().split("\n").length, 1);
+    assert.strictEqual(result.stdout, "");
+    assert.strictEqual(fs.readFileSync(file, "utf8"), before);
+  }
+});
+
+test("nonterminal Codex and Grok settlements explain when to retry", (t) => {
+  const dir = sandbox(t);
+  const state = path.join(dir, "state");
+  const grok = path.join(dir, "grok");
+  const codexId = "a".repeat(32);
+  const grokId = "b".repeat(32);
+  const file = writeCodexJob(state, dir, codexId, { status: "running" });
+  writeGrokJob(grok, dir, grokId, { status: "running" });
+  for (const [id, engine] of [[codexId, "Codex"], [grokId, "Grok"]]) {
+    const result = run({ cwd: dir, codexState: state }, ["--record", `${id}=accepted`], { GROK_COMPANION_DATA: grok });
+    assert.strictEqual(result.status, 1, result.stderr);
+    assert.match(result.stderr, new RegExp(`${engine} job ${id} is not terminal`));
+    assert.strictEqual(result.stderr.trim().split("\n").length, 1);
+  }
+  assert.strictEqual(JSON.parse(fs.readFileSync(file, "utf8")).acceptance, undefined);
 });
 
 test("direct report requests reject duplicate flags", (t) => {
@@ -2722,7 +2887,7 @@ test("--record refuses the derived superseded classification without changing a 
   assert.strictEqual(fs.readFileSync(jobFile, "utf8"), before);
 });
 
-test("Codex reports acceptance anomalies only when the job record and transport state diverge", (t) => {
+test("Codex reports direct done jobs without acceptance as anomalies", (t) => {
   const dir = sandbox(t);
   const stateRoot = path.join(dir, "state");
   const fusionData = path.join(dir, "fusion");
@@ -2734,11 +2899,11 @@ test("Codex reports acceptance anomalies only when the job record and transport 
   const stats = codexStats({ env: { FUSION_CODEX_STATE: stateRoot, FUSION_DATA_DIR: fusionData }, cwd: dir });
   assert.deepStrictEqual(stats.acceptanceAnomalies, {
     acceptedWithErrorTransport: [acceptedErrorId],
-    doneWithoutAcceptance: []
+    doneWithoutAcceptance: [doneWithoutAcceptanceId]
   });
   const rendered = renderFusionStats({ scope: dir, codex: stats });
   assert.match(rendered, /Acceptance anomalies:\n- Accepted ledger entries with error transport: 1 \(eeeeeeee\)/);
-  assert.doesNotMatch(rendered, /Done jobs without acceptance records/);
+  assert.match(rendered, /Done jobs without acceptance records: 1/);
 });
 
 test("Codex acceptedWithErrorTransport excludes resumable failures but keeps other error kinds", (t) => {
@@ -2784,7 +2949,7 @@ test("Codex acceptedWithErrorTransport excludes resumable failures but keeps oth
   assert.ok(!stats.acceptanceAnomalies.acceptedWithErrorTransport.includes(salvagedPatchThrashId));
 });
 
-test("Codex groups pre-epoch acceptance anomalies and falls back from invalid epochs", (t) => {
+test("Codex acceptance anomalies include terminal jobs regardless of date", (t) => {
   const dir = sandbox(t);
   const stateRoot = path.join(dir, "state");
   const fusionData = path.join(dir, "fusion");
@@ -2800,27 +2965,12 @@ test("Codex groups pre-epoch acceptance anomalies and falls back from invalid ep
   const baseEnv = { FUSION_CODEX_STATE: stateRoot, FUSION_DATA_DIR: fusionData };
   const defaultStats = codexStats({ env: baseEnv, cwd: dir });
   assert.deepStrictEqual(defaultStats.acceptanceAnomalies, {
-    acceptedWithErrorTransport: [currentAccepted],
-    doneWithoutAcceptance: [],
-    historicalPreEpoch: 1,
-    historicalEpoch: "2026-07-22T00:00:00Z"
+    acceptedWithErrorTransport: [historicalAccepted, currentAccepted],
+    doneWithoutAcceptance: [historicalUnverified, currentUnverified]
   });
   const rendered = renderFusionStats({ scope: dir, codex: defaultStats });
-  assert.match(rendered, /Accepted ledger entries with error transport: 1 \(cccccccc\)/);
-  assert.doesNotMatch(rendered, /Done jobs without acceptance records/);
-  assert.match(rendered, /historical pre-epoch \(before 2026-07-22T00:00:00Z\): 1/);
-  assert.doesNotMatch(rendered, /aaaaaaaa|bbbbbbbb/);
-
-  const fallbackStats = codexStats({ env: { ...baseEnv, FUSION_ACCEPTANCE_EPOCH: "not-an-epoch" }, cwd: dir });
-  assert.deepStrictEqual(fallbackStats.acceptanceAnomalies, defaultStats.acceptanceAnomalies);
-
-  const overriddenStats = codexStats({ env: { ...baseEnv, FUSION_ACCEPTANCE_EPOCH: "2026-07-23T00:00:00Z" }, cwd: dir });
-  assert.deepStrictEqual(overriddenStats.acceptanceAnomalies, {
-    acceptedWithErrorTransport: [],
-    doneWithoutAcceptance: [],
-    historicalPreEpoch: 2,
-    historicalEpoch: "2026-07-23T00:00:00Z"
-  });
+  assert.match(rendered, /Accepted ledger entries with error transport: 2/);
+  assert.match(rendered, /Done jobs without acceptance records: 2/);
 });
 
 test("generic worker acceptance rejects Codex collectors", (t) => {
@@ -3352,12 +3502,88 @@ test("infrastructure deaths stay outside judged acceptance for workers and joine
   assert.match(rendered, /Infrastructure deaths: 1[\s\S]*Judged acceptance excluding infrastructure: 1\/1 \(100\.0%\)/);
 });
 
-test("Claude worker stats normalize legacy collection methods for grouping and display", (t) => {
+test("R1 stats invocation reads each live worker record once for all providers", (t) => {
+  const dir = sandbox(t);
+  const env = runtimeEnv({ cwd: dir, codexState: path.join(dir, "codex-state") });
+  const taskId = `fusion-${"1".repeat(24)}`;
+  createTerminalWorker({ taskId, env, workspaceRoot: dir, peerEngine: "codex", peerJobId: "1".repeat(32) });
+  writeCodexJob(env.FUSION_CODEX_STATE, dir, "1".repeat(32), { status: "done", jobClass: "task", createdAt: "2026-07-25T00:00:00Z" });
+  const workerFile = workerRecordFile(taskId, env);
+  const original = fs.readFileSync;
+  let reads = 0;
+  fs.readFileSync = function (...args) {
+    if (args[0] === workerFile) reads += 1;
+    return original.apply(this, args);
+  };
+  let report;
+  try {
+    report = buildFusionStats({ all: true, env, cwd: dir });
+  } finally {
+    fs.readFileSync = original;
+  }
+  assert.strictEqual(reads, 1);
+  assert.strictEqual(report.claudeWorkers.totalJobs, 1);
+  assert.strictEqual(report.codex.acceptanceGaps.unsettled, 1);
+});
+
+test("R2 acceptance gaps separate linked and direct terminal peers", (t) => {
+  const dir = sandbox(t);
+  const stateRoot = path.join(dir, "codex-state");
+  const env = { FUSION_CODEX_STATE: stateRoot, FUSION_WORKER_STATE_DIR: path.join(dir, "workers"), FUSION_DATA_DIR: path.join(dir, "fusion") };
+  const ids = [1, 2, 3, 4].map((value) => value.toString(16).padStart(32, "0"));
+  for (const [index, id] of ids.entries()) {
+    writeCodexJob(stateRoot, dir, id, { status: index === 3 ? "running" : "done", jobClass: "task", createdAt: index === 2 ? "2026-07-21T00:00:00Z" : "2026-07-25T00:00:00Z" });
+  }
+  createTerminalWorker({ taskId: `fusion-${"a".repeat(24)}`, env, workspaceRoot: dir, peerEngine: "codex", peerJobId: ids[0] });
+  const stats = codexStats({ env, cwd: dir });
+  assert.deepStrictEqual(stats.acceptanceGaps, { unsettled: 1, direct: 2 });
+  assert.deepStrictEqual(stats.byAcceptance, { unverified: 1, untracked: 2 });
+  assert.deepStrictEqual(stats.acceptanceAnomalies.doneWithoutAcceptance, ids.slice(0, 3));
+  const rendered = renderFusionStats({ scope: dir, codex: stats });
+  assert.match(rendered, /unsettled \(linked Fusion worker\): 1/);
+  assert.match(rendered, /direct \(no worker link\): 2/);
+});
+
+test("R3 sourced Grok rejection stays in judged acceptance", (t) => {
+  const dir = sandbox(t);
+  const grokData = path.join(dir, "grok-data");
+  const env = { GROK_COMPANION_DATA: grokData, FUSION_WORKER_STATE_DIR: path.join(dir, "workers") };
+  writeGrokJob(grokData, dir, "judged", { status: "error", semanticStatus: "rejected", failureKind: "network", acceptanceSource: "main-loop" });
+  writeGrokJob(grokData, dir, "accepted", { status: "done", semanticStatus: "accepted" });
+  const stats = fileBasedEngineStats(FILE_ENGINE_DESCRIPTORS.grok, { env, cwd: dir });
+  assert.deepStrictEqual(stats.infrastructureDeaths, { total: 0, byKind: {} });
+  assert.deepStrictEqual(stats.judgedExcludingInfrastructure, { accepted: 1, judged: 2, rate: 0.5 });
+  assert.deepStrictEqual(stats.byAcceptance, { rejected: 1, accepted: 1 });
+});
+
+test("R4 --all reports retired worker rollups separately from live workers", (t) => {
+  const dir = sandbox(t);
+  const env = runtimeEnv({ cwd: dir, codexState: path.join(dir, "missing-codex") });
+  createTerminalWorker({ taskId: `fusion-${"b".repeat(24)}`, env, workspaceRoot: dir });
+  fs.mkdirSync(env.FUSION_WORKER_STATE_DIR, { recursive: true });
+  fs.writeFileSync(path.join(env.FUSION_WORKER_STATE_DIR, "rollup.jsonl"), [
+    { schemaVersion: 1, agentType: "fusion:claude-worker", acceptance: "accepted", failureKind: null, count: 2, outputTokensSum: 20, uncachedTokensSum: 30, cacheReadInputTokensSum: 40 },
+    { schemaVersion: 1, agentType: "fusion:reviewer", acceptance: "rejected", failureKind: "timeout", count: 1, outputTokensSum: 5, uncachedTokensSum: 6, cacheReadInputTokensSum: 7 }
+  ].map((row) => JSON.stringify(row)).join("\n") + "\n");
+  const all = buildFusionStats({ all: true, env, cwd: dir });
+  assert.strictEqual(all.claudeWorkers.totalJobs, 1);
+  assert.deepStrictEqual(all.retiredWorkers, {
+    totalJobs: 3,
+    byAgent: { "fusion:claude-worker": 2, "fusion:reviewer": 1 },
+    byAcceptance: { accepted: 2, rejected: 1 },
+    byFailureKind: { none: 2, timeout: 1 },
+    tokenSums: { outputTokens: 25, uncachedTokens: 36, cacheReadInputTokens: 47 }
+  });
+  assert.match(renderFusionStats(all), /## Retired Claude workers[\s\S]*Total jobs: 3[\s\S]*Token sums: 25 output, 36 uncached, 47 cache read input/);
+  assert.strictEqual(buildFusionStats({ env, cwd: dir }).retiredWorkers, undefined);
+});
+
+test("Claude worker stats group current collection methods for display", (t) => {
   const dir = sandbox(t);
   const env = { FUSION_WORKER_STATE_DIR: path.join(dir, "worker-state") };
   const workers = [
-    ["fusion-legacy-stop", "SubagentStop"],
-    ["fusion-legacy-agent", "Agent"]
+    ["fusion-method-stop", "subagent_stop"],
+    ["fusion-method-agent", "agent_result"]
   ];
   for (const [taskId, collectionMethod] of workers) {
     createWorkerRecord({ taskId, sessionId: "session-workers", dispatchToolUseId: taskId, agentType: "fusion:claude-worker", workspaceRoot: dir, limits: {} }, env);
@@ -3365,9 +3591,9 @@ test("Claude worker stats normalize legacy collection methods for grouping and d
   }
 
   const stats = claudeWorkerStats({ all: true, env, cwd: dir });
-  assert.strictEqual(normalizeCollectionMethod("SubagentStop"), "subagent_stop");
-  assert.strictEqual(normalizeCollectionMethod("Agent"), "agent_result");
-  assert.strictEqual(normalizeCollectionMethod("aGeNt"), "agent_result");
+  assert.strictEqual(normalizeCollectionMethod("subagent_stop"), "subagent_stop");
+  assert.strictEqual(normalizeCollectionMethod("agent_result"), "agent_result");
+  assert.strictEqual(normalizeCollectionMethod("Agent"), null);
   assert.deepStrictEqual(stats.byCollectionMethod, { subagent_stop: 1, agent_result: 1 });
   assert.deepStrictEqual(stats.identities.map((identity) => identity.collectionMethod).sort(), ["agent_result", "subagent_stop"]);
   assert.match(renderFusionStats({ scope: dir, claudeWorkers: stats }), /By collection method:\n- agent_result: 1\n- subagent_stop: 1/);
@@ -3470,9 +3696,9 @@ test("Claude worker stats report completed harness async deliveries separately f
   updateWorkerRecord("fusion-async-pending", env, (record) => ({ ...record, transportStatus: "pending_async", failureKind: "unexpected_async" }));
 
   const stats = claudeWorkerStats({ all: true, env, cwd: dir });
-  assert.strictEqual(stats.harnessAsyncDeliveries, 2);
-  assert.deepStrictEqual(stats.byFailureKind, { unexpected_async: 1 });
-  assert.match(renderFusionStats({ scope: dir, claudeWorkers: stats }), /Harness async deliveries: 2/);
+  assert.strictEqual(stats.harnessAsyncDeliveries, 1);
+  assert.deepStrictEqual(stats.byFailureKind, { unexpected_async: 2 });
+  assert.match(renderFusionStats({ scope: dir, claudeWorkers: stats }), /Harness async deliveries: 1/);
 });
 
 test("Claude worker stats fail closed on malformed complete usage and aggregate overflow", (t) => {
@@ -3677,7 +3903,7 @@ test("fleet usage surface reports zeros without error when the audit dir is empt
   assert.match(rendered, /Widest burst: none/);
 });
 
-test("fleet usage surface watches sessions with eight narrow dispatch waves", (t) => {
+test("fleet usage surface keeps daily lines behind --by-day and watches narrow dispatch waves", (t) => {
   const dir = sandbox(t);
   const auditDir = path.join(dir, "inline-guard-audit");
   const day = "2026-07-16";
@@ -3694,9 +3920,61 @@ test("fleet usage surface watches sessions with eight narrow dispatch waves", (t
   const fleet = buildFleetUsageStats({ env: { FUSION_INLINE_GUARD_AUDIT_DIR: auditDir } });
   assert.deepStrictEqual(fleet.narrowWaveWatch, [{ day, session: narrowSession, dispatches: 8 }]);
   const rendered = renderFusionStats({ scope: dir, fleet });
-  assert.match(rendered, /By day:[\s\S]*- 2026-07-16:/);
+  assert.doesNotMatch(rendered, /By day:/);
+  assert.match(renderFusionStats({ scope: dir, fleet }, { byDay: true }), /By day:[\s\S]*- 2026-07-16:/);
   assert.match(rendered, /Narrow-wave watch:\n- 2026-07-16, session-narrow, 8, all width 1/);
   assert.doesNotMatch(rendered, /session-wide, 16, all width 1/);
+});
+
+test("default markdown stays under 8 KB with 205 workers across 65 days; direct and raw flags restore detail", (t) => {
+  const dir = sandbox(t);
+  const stateRoot = path.join(dir, "codex-state");
+  const workerState = path.join(dir, "workers");
+  const auditDir = path.join(dir, "audit");
+  const env = { FUSION_WORKER_STATE_DIR: workerState };
+  const dayMs = 24 * 60 * 60 * 1000;
+  const start = Date.parse("2026-01-01T10:00:00.000Z");
+  for (let index = 0; index < 205; index += 1) {
+    const taskId = `fusion-${index.toString(16).padStart(24, "0")}`;
+    createWorkerRecord({ taskId, sessionId: `session-${index}`, dispatchToolUseId: `tool-${index}`, agentType: "fusion:claude-worker", workspaceRoot: dir, limits: {} }, env);
+    updateWorkerRecord(taskId, env, (record) => ({ ...record, createdAt: new Date(start + (index % 65) * dayMs).toISOString(), transportStatus: "done" }));
+  }
+  for (let index = 0; index < 65; index += 1) {
+    const at = new Date(start + index * dayMs).toISOString();
+    const dispatch = { schemaVersion: 1, at, session: `session-${index}`, event: "dispatch", lane: "codex", tool: "Agent" };
+    writeGuardAuditEvents(auditDir, at.slice(0, 10), index === 0 ? [dispatch, dispatch, dispatch] : [dispatch]);
+  }
+  const args = { cwd: dir, codexState: stateRoot };
+  const extraEnv = { FUSION_WORKER_STATE_DIR: workerState, FUSION_INLINE_GUARD_AUDIT_DIR: auditDir };
+  const compact = runDirect(args, [], extraEnv);
+  assert.strictEqual(compact.status, 0, compact.stderr);
+  assert.ok(Buffer.byteLength(compact.stdout) < 8 * 1024, `report is ${Buffer.byteLength(compact.stdout)} bytes`);
+  for (const header of ["## Claude workers", "## Codex", "## Grok", "## Cursor", "## Ultra usage surface", "## Coercion ledger"]) {
+    assert.ok(compact.stdout.includes(header), header);
+  }
+  assert.doesNotMatch(compact.stdout, /Task identity map:|By day:/);
+  const identitiesOnly = runDirect(args, ["--identities"], extraEnv);
+  assert.strictEqual(identitiesOnly.status, 0, identitiesOnly.stderr);
+  assert.match(identitiesOnly.stdout, /Task identity map:/);
+  assert.doesNotMatch(identitiesOnly.stdout, /By day:/);
+  const byDayOnly = runDirect(args, ["--by-day"], extraEnv);
+  assert.strictEqual(byDayOnly.status, 0, byDayOnly.stderr);
+  assert.match(byDayOnly.stdout, /By day:/);
+  assert.doesNotMatch(byDayOnly.stdout, /Task identity map:/);
+  const detailed = runDirect(args, ["--identities", "--by-day"], extraEnv);
+  assert.strictEqual(detailed.status, 0, detailed.stderr);
+  assert.match(detailed.stdout, /Task identity map:/);
+  assert.match(detailed.stdout, /By day:/);
+  assert.strictEqual(detailed.stdout.match(/^fusion-[0-9a-f]{24} \|/gm)?.length, 100);
+  assert.strictEqual(detailed.stdout.match(/^- 2026-\d\d-\d\d: \d+ burst/gm)?.length, 65);
+  const raw = run(args, ["--identities", "--by-day"], extraEnv);
+  assert.strictEqual(raw.status, 0, raw.stderr);
+  assert.strictEqual(raw.stdout, detailed.stdout);
+  const plainJson = runDirect(args, ["--json"], extraEnv);
+  const flaggedJson = runDirect(args, ["--json", "--identities", "--by-day"], extraEnv);
+  assert.strictEqual(plainJson.status, 0, plainJson.stderr);
+  assert.strictEqual(flaggedJson.status, 0, flaggedJson.stderr);
+  assert.deepStrictEqual(JSON.parse(flaggedJson.stdout), JSON.parse(plainJson.stdout));
 });
 
 test("coercion ledger renders every counter in text and JSON", (t) => {

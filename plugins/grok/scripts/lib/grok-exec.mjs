@@ -6,12 +6,13 @@ import { isDeepStrictEqual } from "node:util";
 
 import {
   getProcessIdentity,
+  processGroupAlive as liveProcessGroup,
   processIdentitiesMatch,
   processIdentityMatches,
   processIsDirectlyAlive,
   validProcessIdentity
 } from "./process-identity.mjs";
-import { appendJobLog } from "./state.mjs";
+import { appendJobLog, resolveDataDir, writePrivateDataFile } from "./state.mjs";
 
 const BIN_ENV = "GROK_BIN";
 const TIMEOUT_ENV = "GROK_COMPANION_TIMEOUT_MS";
@@ -25,6 +26,7 @@ const BACKGROUND_TIMEOUT_CAP_MS = 1800000;
 const DEFAULT_PIDLESS_RUNNING_GRACE_MS = 15000;
 const TERMINATION_GRACE_MS = 2000;
 const TERMINATION_POLL_MS = 50;
+const MANAGED_CLEANUP_RESERVE_MS = 200;
 const STDOUT_CAPTURE_MAX_BYTES = 32 * 1024 * 1024;
 const STDOUT_TAIL_MAX_BYTES = 8192;
 const STDERR_CAPTURE_MAX_BYTES = 64 * 1024;
@@ -45,11 +47,14 @@ const AUTH_RETRY_FAILURE_PATTERN = /auth 401 retry: no credential was sent/i;
 const AUTH_RETRY_FAILURE_MESSAGE = "Grok sent its model request without a credential and entered its re-authentication retry loop, so the companion stopped it instead of waiting out the retries. Under the strict sandbox this usually means the stored OIDC token expired: grok 1.0.14 and later can write only `~/.grok/sessions` inside the Grok home under strict, so a managed run cannot refresh the token. Run grok once outside the sandbox, for example `grok -p ok`, to refresh it, then rerun.";
 const AUTH_REFRESH_FAILURE_MESSAGE = "The companion ran `grok models` outside the sandbox to refresh the stored token and it did not refresh, so the refresh token itself may have expired: run `grok login` once, then rerun.";
 const AUTH_STALE_MS = 5 * 60 * 60 * 1000;
+const AUTH_REFRESH_RETRY_MS = 30 * 60 * 1000;
+const AUTH_REFRESH_ATTEMPT_FILE = "auth-refresh-attempt.json";
 const GROK_BUILDER_LOG_FILTER = "xai_grok_agent::builder=debug,xai_grok_sandbox=warn,xai_grok_shell::session::acp_session::turn=warn";
 const USD_TICKS = 10_000_000_000;
 const STDIN_PROMPT_FILE = "/dev/stdin";
 const SESSION_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const CAPABILITY_PATTERN = /--[a-z0-9][a-z0-9-]*/gi;
+const CAPABILITY_CACHE_FILE = "capabilities.json";
 const REQUIRED_CAPABILITY_PROBES = [
   ["--prompt-file", "--prompt-file=/dev/null"],
   ["--output-format", "--output-format=json"],
@@ -68,6 +73,48 @@ const REQUIRED_CAPABILITY_PROBES = [
 ];
 
 const capabilityCache = new Map();
+const directCapabilityIdentity = new Map();
+
+function deadlineRemaining(deadline) {
+  return deadline == null ? Infinity : Math.max(0, deadline - Date.now());
+}
+
+function runTimeoutError() {
+  const error = new Error("The managed Grok run exceeded its deadline.");
+  error.failureKind = "timeout";
+  return error;
+}
+
+function requireDeadline(deadline) {
+  if (deadlineRemaining(deadline) <= 0) throw runTimeoutError();
+}
+
+function probeTimeout(deadline, capMs) {
+  requireDeadline(deadline);
+  return Math.max(1, Math.min(capMs, deadlineRemaining(deadline)));
+}
+
+function cleanupGraceMs(deadline) {
+  return Math.min(TERMINATION_GRACE_MS, Math.floor(deadlineRemaining(deadline) / 2));
+}
+
+function resolvedBinaryIdentity(bin, env, cwd) {
+  const candidates = path.isAbsolute(bin) || bin.includes(path.sep)
+    ? [path.resolve(cwd, bin)]
+    : String(env.PATH ?? process.env.PATH ?? "").split(path.delimiter).map((dir) => path.resolve(cwd, dir || ".", bin));
+  for (const candidate of candidates) {
+    try {
+      const resolved = fs.realpathSync(candidate);
+      const stats = fs.statSync(resolved);
+      if (stats.isFile() && (stats.mode & 0o111) !== 0) {
+        return { path: resolved, mtimeMs: stats.mtimeMs, size: stats.size };
+      }
+    } catch {}
+  }
+  const error = capabilityError(`Unable to locate the Grok CLI binary: ${bin}`);
+  error.failureKind = "missing_cli";
+  throw error;
+}
 
 export function normalizeGrokSessionId(value) {
   if (typeof value !== "string") {
@@ -259,21 +306,59 @@ function parseCapabilityList(value) {
   );
 }
 
-export function resolveGrokCapabilities(bin, env = process.env) {
+export function resolveGrokCapabilities(bin, env = process.env, deadline = null, cwd = process.cwd(), required = []) {
   if (Object.hasOwn(env, CAPABILITIES_ENV)) {
     return parseCapabilityList(env[CAPABILITIES_ENV]);
   }
-  if (capabilityCache.has(bin)) {
+  const probeEnv = buildGrokChildEnv(env);
+  if (deadline == null && capabilityCache.has(bin)) {
     return capabilityCache.get(bin);
   }
-  const probeEnv = buildGrokChildEnv(env);
+  // A preceding direct probe can fail a run closed without launching another probe.
+  // Successful managed runs still validate the version and disk cache key below.
+  if (deadline != null && required.length > 0) {
+    const direct = capabilityCache.get(bin);
+    if (direct instanceof Set && required.some((flag) => !direct.has(flag)) &&
+        isDeepStrictEqual(directCapabilityIdentity.get(bin), resolvedBinaryIdentity(bin, env, cwd))) {
+      return direct;
+    }
+  }
+  let key = null;
+  let dataDir = null;
+  let cacheFile = null;
+  if (deadline != null) {
+    const identity = resolvedBinaryIdentity(bin, env, cwd);
+    const versionProbe = spawnSync(bin, ["--version"], {
+      encoding: "utf8", cwd, env: probeEnv, timeout: probeTimeout(deadline, 5000), maxBuffer: 2 * 1024 * 1024
+    });
+    requireDeadline(deadline);
+    if (versionProbe.error || versionProbe.status !== 0) {
+      throw capabilityError(`Unable to inspect Grok CLI version: ${versionProbe.error?.message ?? String(versionProbe.stderr || versionProbe.stdout || "command failed").trim()}`);
+    }
+    key = { ...identity, version: String(versionProbe.stdout || versionProbe.stderr || "").trim() };
+    dataDir = resolveDataDir(env);
+    cacheFile = path.join(dataDir, CAPABILITY_CACHE_FILE);
+    let cached = capabilityCache.get(cacheFile);
+    if (!cached) {
+      try {
+        cached = JSON.parse(fs.readFileSync(cacheFile, "utf8"));
+      } catch {}
+    }
+    if (cached && isDeepStrictEqual(cached.key, key) && Array.isArray(cached.flags) &&
+        cached.flags.every((flag) => /^--[a-z0-9][a-z0-9-]*$/i.test(flag))) {
+      capabilityCache.set(cacheFile, cached);
+      return new Set(cached.flags);
+    }
+  }
   const probeOptions = {
     encoding: "utf8",
+    cwd,
     env: probeEnv,
-    timeout: 5000,
+    timeout: probeTimeout(deadline, 5000),
     maxBuffer: 2 * 1024 * 1024
   };
   const probe = spawnSync(bin, ["--help"], probeOptions);
+  requireDeadline(deadline);
   if (probe.error) {
     throw capabilityError(`Unable to inspect Grok CLI capabilities: ${probe.error.message}`);
   }
@@ -283,11 +368,21 @@ export function resolveGrokCapabilities(bin, env = process.env) {
   }
   const capabilities = new Set(`${probe.stdout ?? ""}\n${probe.stderr ?? ""}`.match(CAPABILITY_PATTERN) ?? []);
   for (const [flag, probeFlag] of REQUIRED_CAPABILITY_PROBES) {
-    if (!capabilities.has(flag) && spawnSync(bin, [probeFlag, "--help"], probeOptions).status === 0) {
+    if (!capabilities.has(flag) && spawnSync(bin, [probeFlag, "--help"], { ...probeOptions, timeout: probeTimeout(deadline, 5000) }).status === 0) {
       capabilities.add(flag);
     }
+    requireDeadline(deadline);
   }
-  capabilityCache.set(bin, capabilities);
+  if (deadline == null) {
+    capabilityCache.set(bin, capabilities);
+    try {
+      directCapabilityIdentity.set(bin, resolvedBinaryIdentity(bin, env, cwd));
+    } catch {}
+  } else {
+    const entry = { key, flags: [...capabilities] };
+    writePrivateDataFile(dataDir, CAPABILITY_CACHE_FILE, `${JSON.stringify(entry)}\n`);
+    capabilityCache.set(cacheFile, entry);
+  }
   return capabilities;
 }
 
@@ -298,6 +393,10 @@ function requireGrokCapabilities(capabilities, flags) {
   }
 }
 
+function supportsCapability(capabilities, flag) {
+  return capabilities == null || capabilities.has(flag);
+}
+
 export function buildGrokArgs(options) {
   const mode = options.mode === "write" ? "write" : "consult";
   const web = options.web === true;
@@ -305,7 +404,6 @@ export function buildGrokArgs(options) {
   const capabilities = options.capabilities ?? null;
   const env = options.env ?? process.env;
   const cwd = options.cwd ?? process.cwd();
-  const supports = (flag) => capabilities == null || capabilities.has(flag);
   const args = [];
 
   if (options.resumeSessionId) {
@@ -320,13 +418,13 @@ export function buildGrokArgs(options) {
     "--sandbox",
     sandboxProfileForMode(mode)
   );
-  if (supports("--no-auto-update")) {
+  if (supportsCapability(capabilities, "--no-auto-update")) {
     args.push("--no-auto-update");
   }
-  if (supports("--no-subagents")) {
+  if (supportsCapability(capabilities, "--no-subagents")) {
     args.push("--no-subagents");
   }
-  if (supports("--no-wait-for-background")) {
+  if (supportsCapability(capabilities, "--no-wait-for-background")) {
     args.push("--no-wait-for-background");
   }
   if (!web) {
@@ -342,7 +440,7 @@ export function buildGrokArgs(options) {
   }
 
   if (options.jsonSchema) {
-    if (!supports("--json-schema")) {
+    if (!supportsCapability(capabilities, "--json-schema")) {
       throw capabilityError("The installed Grok CLI does not support required structured output through --json-schema.");
     }
     const schema = typeof options.jsonSchema === "string" ? options.jsonSchema : JSON.stringify(options.jsonSchema);
@@ -848,6 +946,27 @@ function resolveChildGrokHome(env, cwd) {
   return path.join(home, ".grok");
 }
 
+function resolveGrokAuthPaths(env, cwd) {
+  const resolved = { ...env };
+  for (const key of ["GROK_HOME", "GROK_AUTH_PATH"]) {
+    if (typeof resolved[key] === "string" && resolved[key].trim()) {
+      resolved[key] = path.resolve(cwd, resolved[key].trim());
+    }
+  }
+  return resolved;
+}
+
+function staleRefreshRecentlyFailed(dataDir, file) {
+  try {
+    const attempt = JSON.parse(fs.readFileSync(path.join(dataDir, AUTH_REFRESH_ATTEMPT_FILE), "utf8"));
+    const elapsed = Date.now() - Date.parse(attempt.attemptedAt);
+    return attempt.file === file && attempt.outcome === "failed" &&
+      Number.isFinite(elapsed) && elapsed >= 0 && elapsed < AUTH_REFRESH_RETRY_MS;
+  } catch {
+    return false;
+  }
+}
+
 export function grokAuthStatus(env = process.env, cwd = process.cwd()) {
   const file = typeof env.GROK_AUTH_PATH === "string" && env.GROK_AUTH_PATH.trim()
     ? path.resolve(cwd, env.GROK_AUTH_PATH.trim())
@@ -860,7 +979,8 @@ export function grokAuthStatus(env = process.env, cwd = process.cwd()) {
   }
 }
 
-function refreshGrokAuth({ bin, env, cwd, capabilities, reason }) {
+function refreshGrokAuth({ bin, env, cwd, capabilities, reason, deadline }) {
+  requireDeadline(deadline);
   const { file } = grokAuthStatus(env, cwd);
   let beforeMtime = null;
   try {
@@ -874,7 +994,7 @@ function refreshGrokAuth({ bin, env, cwd, capabilities, reason }) {
       cwd: refreshDir,
       env: { ...env, TMPDIR: refreshDir },
       stdio: "ignore",
-      timeout: 30000
+      timeout: probeTimeout(deadline, 30000)
     });
   } finally {
     removeManagedRunTempDir(refreshDir);
@@ -913,6 +1033,7 @@ function captureSandboxEventLog(grokHome) {
     try {
       const markerLength = Math.min(opened.stats.size, SANDBOX_EVENT_MARKER_MAX_BYTES);
       const marker = Buffer.alloc(markerLength);
+      const markerPosition = opened.stats.size - markerLength;
       let markerOffset = 0;
       while (markerOffset < marker.length) {
         const read = fs.readSync(
@@ -920,7 +1041,7 @@ function captureSandboxEventLog(grokHome) {
           marker,
           markerOffset,
           marker.length - markerOffset,
-          opened.stats.size - marker.length + markerOffset
+          markerPosition + markerOffset
         );
         if (read === 0) {
           break;
@@ -934,6 +1055,9 @@ function captureSandboxEventLog(grokHome) {
         file,
         identity: { dev: opened.stats.dev, ino: opened.stats.ino },
         offset: opened.stats.size,
+        scanned: 0,
+        partial: Buffer.alloc(0),
+        markerPosition,
         marker
       };
     } finally {
@@ -941,7 +1065,7 @@ function captureSandboxEventLog(grokHome) {
     }
   } catch (error) {
     if (error?.code === "ENOENT") {
-      return { file, identity: null, offset: 0, marker: Buffer.alloc(0) };
+      return { file, identity: null, offset: 0, scanned: 0, partial: Buffer.alloc(0), markerPosition: 0, marker: Buffer.alloc(0) };
     }
     throw securityError("sandbox", `Unable to snapshot the Grok sandbox event log: ${error.message}`);
   }
@@ -979,7 +1103,7 @@ function readSandboxEventDelta(snapshot) {
         marker,
         0,
         marker.length,
-        snapshot.offset - marker.length
+        snapshot.markerPosition
       );
       if (read !== marker.length || !marker.equals(snapshot.marker)) {
         throw securityError("sandbox", "The Grok sandbox event log was truncated or rewritten during startup.");
@@ -989,7 +1113,7 @@ function readSandboxEventDelta(snapshot) {
     if (length === 0) {
       return null;
     }
-    if (length > SANDBOX_EVENT_DELTA_MAX_BYTES) {
+    if (snapshot.scanned + length > SANDBOX_EVENT_DELTA_MAX_BYTES) {
       throw securityError("sandbox", "The Grok sandbox event log grew beyond the startup verification limit.");
     }
     const bytes = Buffer.alloc(length);
@@ -1004,7 +1128,9 @@ function readSandboxEventDelta(snapshot) {
     if (offset !== bytes.length) {
       throw securityError("sandbox", "Unable to read the complete Grok sandbox startup evidence.");
     }
-    return bytes.toString("utf8");
+    snapshot.offset += length;
+    snapshot.scanned += length;
+    return bytes;
   } finally {
     fs.closeSync(opened.descriptor);
   }
@@ -1023,12 +1149,11 @@ function inspectSandboxStartupEvidence(snapshot, expected) {
   if (!delta) {
     return { status: "pending" };
   }
-  const complete = delta.endsWith("\n");
-  const lines = delta.split(/\r?\n/);
-  if (!complete) {
-    lines.pop();
-  }
-  for (const line of lines) {
+  const bytes = snapshot.partial.length ? Buffer.concat([snapshot.partial, delta]) : delta;
+  let start = 0;
+  for (let end = bytes.indexOf(10, start); end !== -1; end = bytes.indexOf(10, start)) {
+    const line = bytes.subarray(start, end).toString("utf8").replace(/\r$/, "");
+    start = end + 1;
     if (!line.trim()) {
       continue;
     }
@@ -1060,6 +1185,7 @@ function inspectSandboxStartupEvidence(snapshot, expected) {
     }
     return { status: "verified" };
   }
+  snapshot.partial = Buffer.from(bytes.subarray(start));
   return { status: "pending" };
 }
 
@@ -1155,15 +1281,6 @@ function objectField(value, ...keys) {
     const field = value?.[key];
     if (field && typeof field === "object" && !Array.isArray(field)) {
       return field;
-    }
-  }
-  return null;
-}
-
-function booleanField(value, ...keys) {
-  for (const key of keys) {
-    if (typeof value?.[key] === "boolean") {
-      return value[key];
     }
   }
   return null;
@@ -1558,19 +1675,22 @@ export function terminalRecordAttribution(record, patch = {}, env = process.env)
   };
 }
 
+function canSignalProcess(pid, identity, allowExitedLeader) {
+  return identity == null || processIdentityMatches(pid, identity) || (allowExitedLeader && !processIsDirectlyAlive(pid));
+}
+
 function signalProcessGroup(pid, signal, identity = null, options = {}) {
   const allowExitedLeader = options.allowExitedLeader === true;
   const fallbackToPid = options.fallbackToPid !== false;
   const kill = options.kill ?? process.kill.bind(process);
-  const canSignal = () => identity == null || processIdentityMatches(pid, identity) || (allowExitedLeader && !processIsDirectlyAlive(pid));
-  if (!Number.isInteger(pid) || pid <= 1 || !canSignal()) {
+  if (!Number.isInteger(pid) || pid <= 1 || !canSignalProcess(pid, identity, allowExitedLeader)) {
     return false;
   }
   try {
     kill(-pid, signal);
     return true;
   } catch {
-    if (!canSignal() || !fallbackToPid) {
+    if (!canSignalProcess(pid, identity, allowExitedLeader) || !fallbackToPid) {
       return false;
     }
     try {
@@ -1586,28 +1706,15 @@ export function processGroupAlive(pid) {
   if (!Number.isInteger(pid) || pid <= 1) {
     return false;
   }
-  try {
-    process.kill(-pid, 0);
-    return true;
-  } catch (groupError) {
-    if (groupError?.code === "EPERM") {
-      return true;
-    }
-    try {
-      process.kill(pid, 0);
-      return true;
-    } catch (pidError) {
-      if (pidError?.code === "EPERM") {
-        return true;
-      }
-      return false;
-    }
-  }
+  return liveProcessGroup(pid) || processIsDirectlyAlive(pid);
 }
 
-function exitedLeaderProcessGroupAlive(pid, kill = process.kill.bind(process)) {
+function exitedLeaderProcessGroupAlive(pid, kill = null) {
   if (!Number.isInteger(pid) || pid <= 1) {
     return false;
+  }
+  if (!kill) {
+    return liveProcessGroup(pid);
   }
   try {
     kill(-pid, 0);
@@ -1624,35 +1731,29 @@ export async function terminateExitedLeaderProcessGroup(pid, identity = null, op
   const graceMs = options.graceMs ?? TERMINATION_GRACE_MS;
   const pollMs = options.pollMs ?? TERMINATION_POLL_MS;
   const kill = options.kill ?? process.kill.bind(process);
-  const targetAlive = () => exitedLeaderProcessGroupAlive(pid, kill);
-  const signalGroup = (signal) => signalProcessGroup(pid, signal, identity, {
-    allowExitedLeader: true,
-    fallbackToPid: false,
-    kill
-  });
-  if (!targetAlive()) {
+  if (!exitedLeaderProcessGroupAlive(pid, options.kill)) {
     return true;
   }
-  if (!signalGroup("SIGTERM")) {
-    return !targetAlive();
+  if (!signalProcessGroup(pid, "SIGTERM", identity, { allowExitedLeader: true, fallbackToPid: false, kill })) {
+    return !exitedLeaderProcessGroupAlive(pid, options.kill);
   }
   const deadline = Date.now() + graceMs;
   while (Date.now() < deadline) {
-    if (!targetAlive()) {
+    if (!exitedLeaderProcessGroupAlive(pid, options.kill)) {
       return true;
     }
     await waitMs(pollMs);
   }
-  if (targetAlive() && !signalGroup("SIGKILL")) {
-    return !targetAlive();
+  if (exitedLeaderProcessGroupAlive(pid, options.kill) && !signalProcessGroup(pid, "SIGKILL", identity, { allowExitedLeader: true, fallbackToPid: false, kill })) {
+    return !exitedLeaderProcessGroupAlive(pid, options.kill);
   }
   while (Date.now() < deadline + graceMs) {
-    if (!targetAlive()) {
+    if (!exitedLeaderProcessGroupAlive(pid, options.kill)) {
       return true;
     }
     await waitMs(pollMs);
   }
-  return !targetAlive();
+  return !exitedLeaderProcessGroupAlive(pid, options.kill);
 }
 
 function normalizedPid(value) {
@@ -1666,16 +1767,13 @@ export function recordedProcessState(pid, identity = null) {
   }
   const currentIdentity = getProcessIdentity(pid);
   if (currentIdentity) {
-    if (identity == null) {
-      return "legacy";
-    }
     if (!validProcessIdentity(identity)) {
       return "unverified";
     }
     return processIdentityMatches(pid, identity) ? "owned" : "replaced";
   }
   if (processIsDirectlyAlive(pid) || processGroupAlive(pid)) {
-    return identity == null ? "legacy" : "unverified";
+    return "unverified";
   }
   return "absent";
 }
@@ -1748,13 +1846,28 @@ function settleProcessIdentitySync(pid, capture, options = {}) {
   const intervalMs = options.intervalMs ?? 4;
   let previous = capture(pid);
   if (!previous) {
-    return previous;
+    for (let attempt = 0; attempt < 4 && processIsDirectlyAlive(pid); attempt += 1) {
+      waitSync(50);
+      if (!processIsDirectlyAlive(pid)) {
+        return null;
+      }
+      previous = capture(pid);
+      if (previous) {
+        break;
+      }
+    }
+    if (!previous) {
+      return null;
+    }
   }
   for (let attempt = 0; attempt < retries; attempt += 1) {
     waitSync(intervalMs);
     const current = capture(pid);
     if (!current) {
-      return current;
+      if (!processIsDirectlyAlive(pid)) {
+        return null;
+      }
+      continue;
     }
     if (processIdentitiesMatch(current, previous)) {
       return current;
@@ -1764,6 +1877,17 @@ function settleProcessIdentitySync(pid, capture, options = {}) {
   return previous;
 }
 
+function terminationTargetAlive(pid, identity) {
+  if (identity == null) {
+    return processGroupAlive(pid);
+  }
+  const currentIdentity = getProcessIdentity(pid);
+  if (currentIdentity) {
+    return processIdentityMatches(pid, identity);
+  }
+  return processGroupAlive(pid);
+}
+
 export function terminateProcessGroupSync(pid, options = {}) {
   if (!Number.isInteger(pid) || pid <= 1) {
     return false;
@@ -1771,39 +1895,29 @@ export function terminateProcessGroupSync(pid, options = {}) {
   const graceMs = options.graceMs ?? TERMINATION_GRACE_MS;
   const pollMs = options.pollMs ?? TERMINATION_POLL_MS;
   const identity = options.identity ?? null;
-  const targetAlive = () => {
-    if (identity == null) {
-      return processGroupAlive(pid);
-    }
-    const currentIdentity = getProcessIdentity(pid);
-    if (currentIdentity) {
-      return processIdentityMatches(pid, identity);
-    }
-    return processGroupAlive(pid);
-  };
   if (!signalProcessGroup(pid, "SIGTERM", identity)) {
-    return !targetAlive();
+    return !terminationTargetAlive(pid, identity);
   }
   const deadline = Date.now() + graceMs;
   while (Date.now() < deadline) {
-    if (!targetAlive()) {
+    if (!terminationTargetAlive(pid, identity)) {
       return true;
     }
     waitSync(pollMs);
   }
   if (options.gracefulOnly === true) {
-    return !targetAlive();
+    return !terminationTargetAlive(pid, identity);
   }
-  if (targetAlive() && !signalProcessGroup(pid, "SIGKILL", identity)) {
-    return !targetAlive();
+  if (terminationTargetAlive(pid, identity) && !signalProcessGroup(pid, "SIGKILL", identity)) {
+    return !terminationTargetAlive(pid, identity);
   }
   while (Date.now() < deadline + graceMs) {
-    if (!targetAlive()) {
+    if (!terminationTargetAlive(pid, identity)) {
       return true;
     }
     waitSync(pollMs);
   }
-  return !targetAlive();
+  return !terminationTargetAlive(pid, identity);
 }
 
 export async function terminateProcessGroup(pid, options = {}) {
@@ -1813,39 +1927,29 @@ export async function terminateProcessGroup(pid, options = {}) {
   const graceMs = options.graceMs ?? TERMINATION_GRACE_MS;
   const pollMs = options.pollMs ?? TERMINATION_POLL_MS;
   const identity = options.identity ?? null;
-  const targetAlive = () => {
-    if (identity == null) {
-      return processGroupAlive(pid);
-    }
-    const currentIdentity = getProcessIdentity(pid);
-    if (currentIdentity) {
-      return processIdentityMatches(pid, identity);
-    }
-    return processGroupAlive(pid);
-  };
   if (!signalProcessGroup(pid, "SIGTERM", identity)) {
-    return !targetAlive();
+    return !terminationTargetAlive(pid, identity);
   }
   const deadline = Date.now() + graceMs;
   while (Date.now() < deadline) {
-    if (!targetAlive()) {
+    if (!terminationTargetAlive(pid, identity)) {
       return true;
     }
     await waitMs(pollMs);
   }
   if (options.gracefulOnly === true) {
-    return !targetAlive();
+    return !terminationTargetAlive(pid, identity);
   }
-  if (targetAlive() && !signalProcessGroup(pid, "SIGKILL", identity)) {
-    return !targetAlive();
+  if (terminationTargetAlive(pid, identity) && !signalProcessGroup(pid, "SIGKILL", identity)) {
+    return !terminationTargetAlive(pid, identity);
   }
   while (Date.now() < deadline + graceMs) {
-    if (!targetAlive()) {
+    if (!terminationTargetAlive(pid, identity)) {
       return true;
     }
     await waitMs(pollMs);
   }
-  return !targetAlive();
+  return !terminationTargetAlive(pid, identity);
 }
 
 export function terminateRecordedProcessGroupsSync(record, options = {}) {
@@ -1860,7 +1964,7 @@ export function terminateRecordedProcessGroupsSync(record, options = {}) {
     return terminateProcessGroupSync(pid, {
       ...options,
       identity: state === "owned" ? identity : null,
-      gracefulOnly: state === "legacy"
+      gracefulOnly: false
     });
   });
   return results.every(Boolean);
@@ -1878,7 +1982,7 @@ export async function terminateRecordedProcessGroups(record, options = {}) {
     return terminateProcessGroup(pid, {
       ...options,
       identity: state === "owned" ? identity : null,
-      gracefulOnly: state === "legacy"
+      gracefulOnly: false
     });
   }));
   return results.every(Boolean);
@@ -1892,28 +1996,467 @@ function exitCodeFromSignal(signal) {
   return Number.isInteger(signalNumber) ? 128 + signalNumber : 1;
 }
 
+function spawnChild(run) {
+  run.child = spawn(run.bin, run.args, {
+    cwd: run.options.cwd,
+    env: run.childEnv,
+    stdio: [run.prompt == null ? "ignore" : "pipe", "pipe", "pipe"],
+    detached: true
+  });
+  run.childIdentity = Number.isInteger(run.child.pid)
+    ? settleProcessIdentitySync(run.child.pid, run.captureProcessIdentity) : null;
+  return { child: run.child, pid: run.child.pid ?? null, identity: run.childIdentity };
+}
+
+function cleanup(run) {
+  if (run.timer) {
+    clearTimeout(run.timer);
+  }
+  if (run.sandboxPollTimer) {
+    clearTimeout(run.sandboxPollTimer);
+  }
+  process.removeListener("SIGTERM", run.forwardTermination);
+  process.removeListener("SIGINT", run.forwardTermination);
+  removeManagedRunTempDir(run.managedTempDir);
+  run.managedTempDir = null;
+}
+
+function cleanupFailure(run, { residual = false } = {}) {
+  const message = !run.childIdentity
+    ? "Grok process identity could not be verified; process cleanup requires manual inspection."
+    : residual
+      ? "Verified Grok process-group cleanup did not complete after the CLI exited."
+      : "Verified Grok process cleanup did not complete after the run was aborted.";
+  const error = new Error(message);
+  error.failureKind = run.timedOut ? "timeout" : run.cancelledByCompanion ? "cancelled" : run.supervisionError?.failureKind ?? "error";
+  error.cleanupRequired = true;
+  error.processRole = "grok";
+  error.pid = run.child.pid ?? null;
+  error.pidIdentity = residual ? null : run.childIdentity;
+  return error;
+}
+
+function finishReject(run, error) {
+  if (run.settled) {
+    return;
+  }
+  run.settled = true;
+  cleanup(run);
+  run.child.stdout?.destroy();
+  run.child.stderr?.destroy();
+  run.child.unref();
+  removeStdoutSpool(run.stdoutSpool);
+  run.reject(error);
+}
+
+function terminationFailed() {
+  return false;
+}
+
+function terminateChild(run) {
+  if (!Number.isInteger(run.child.pid) || run.child.pid <= 1) {
+    run.terminationPromise ??= Promise.resolve(true);
+    return run.terminationPromise;
+  }
+  run.terminationPromise ??= terminateProcessGroup(
+    run.child.pid,
+    { ...(run.childIdentity ? { identity: run.childIdentity } : {}),
+      ...(run.managedRun ? { graceMs: cleanupGraceMs(run.deadline) } : {}) }
+  ).catch(terminationFailed);
+  void run.terminationPromise.then((cleaned) => finishTermination(run, cleaned));
+  return run.terminationPromise;
+}
+
+function finishTermination(run, cleaned) {
+  if (!cleaned) {
+    finishReject(run, cleanupFailure(run));
+  }
+}
+
+function forwardTermination(run) {
+  run.cancelledByCompanion = true;
+  terminateChild(run);
+}
+
+function expireGrokRun(run) {
+  run.timedOut = true;
+  terminateChild(run);
+}
+
+function recordPromptTransportError(run, error) {
+  if (!run.promptTransportError) {
+    run.promptTransportError = error instanceof Error ? error : new Error(String(error));
+    terminateChild(run);
+  }
+}
+
+function finishPromptWrite(run, error) {
+  if (error) {
+    recordPromptTransportError(run, error);
+  }
+}
+
+function sendPrompt(run) {
+  if (run.prompt == null) {
+    return;
+  }
+  if (!run.child.stdin) {
+    recordPromptTransportError(run, new Error("Grok stdin is unavailable for prompt transport."));
+    return;
+  }
+  run.child.stdin.once("error", (error) => recordPromptTransportError(run, error));
+  run.child.stdin.end(run.prompt, "utf8", (error) => finishPromptWrite(run, error));
+}
+
+function failSandboxHandshake(run, reason) {
+  if (!run.securityFailure) {
+    run.securityFailure = { kind: "sandbox", line: reason };
+  }
+  terminateChild(run);
+}
+
+function pollSandboxHandshake(run) {
+  if (run.settled || run.sandboxVerified || run.securityFailure) {
+    return;
+  }
+  let evidence;
+  try {
+    evidence = inspectSandboxStartupEvidence(run.sandboxLogSnapshot, run.expectedSandbox);
+  } catch (error) {
+    failSandboxHandshake(run, error instanceof Error ? error.message : String(error));
+    return;
+  }
+  if (evidence.status === "verified") {
+    run.sandboxVerified = true;
+    sendPrompt(run);
+    return;
+  }
+  if (evidence.status === "failed") {
+    failSandboxHandshake(run, evidence.reason);
+    return;
+  }
+  if (Date.now() >= run.sandboxDeadline) {
+    failSandboxHandshake(run, "Grok did not publish verified sandbox startup evidence before the handshake deadline.");
+    return;
+  }
+  run.sandboxPollTimer = setTimeout(() => pollSandboxHandshake(run), SANDBOX_HANDSHAKE_POLL_MS);
+  run.sandboxPollTimer.unref?.();
+}
+
+function appendFilteredStderrLog(run, chunk = "", flush = false) {
+  run.stderrLogRemainder += chunk.toString();
+  const boundary = flush ? run.stderrLogRemainder.length : run.stderrLogRemainder.lastIndexOf("\n") + 1;
+  if (boundary === 0) {
+    if (Buffer.byteLength(run.stderrLogRemainder) > STDERR_CAPTURE_MAX_BYTES) {
+      appendJobLog(run.options.logFile, run.stderrLogRemainder);
+      run.stderrLogRemainder = "";
+    }
+    return;
+  }
+  const complete = run.stderrLogRemainder.slice(0, boundary);
+  run.stderrLogRemainder = run.stderrLogRemainder.slice(boundary);
+  let filtered = "";
+  let offset = 0;
+  while (offset < complete.length) {
+    const newline = complete.indexOf("\n", offset);
+    const end = newline === -1 ? complete.length : newline + 1;
+    const line = complete.slice(offset, end);
+    if (!TOOL_POLICY_APPLIED_PATTERN.test(line)) {
+      filtered += line;
+    }
+    offset = end;
+  }
+  if (filtered) {
+    appendJobLog(run.options.logFile, filtered);
+  }
+}
+
+function observeGrokStdout(run, chunk) {
+  run.stdoutTailBuffer = appendBounded(run.stdoutTailBuffer, chunk, STDOUT_TAIL_MAX_BYTES);
+  if (run.supervisionError) {
+    return;
+  }
+  if (run.stdoutSpool.bytes + chunk.length > STDOUT_CAPTURE_MAX_BYTES) {
+    run.supervisionError = new Error(`Grok stdout exceeded the ${STDOUT_CAPTURE_MAX_BYTES}-byte capture limit.`);
+    run.supervisionError.failureKind = "transport";
+    terminateChild(run);
+    return;
+  }
+  try {
+    appendStdoutSpool(run.stdoutSpool, chunk);
+  } catch (error) {
+    run.supervisionError = error;
+    run.supervisionError.failureKind ??= "transport";
+    terminateChild(run);
+  }
+}
+
+function observeGrokStderr(run, chunk) {
+  const securityWindow = `${run.securityScanRemainder}${chunk.toString()}`;
+  run.securityScanRemainder = securityWindow.slice(-512);
+  run.stderr = appendBounded(run.stderr, chunk, STDERR_CAPTURE_MAX_BYTES);
+  if (!run.policyApplied && toolPolicyApplied(securityWindow)) {
+    run.policyApplied = true;
+  }
+  const detectedSecurityFailure = run.securityFailure ?? findSecurityFailure(securityWindow);
+  if (!run.securityFailure && detectedSecurityFailure) {
+    run.securityFailure = detectedSecurityFailure;
+    terminateChild(run);
+  }
+  if (!run.supervisionError) {
+    try {
+      appendFilteredStderrLog(run, chunk);
+    } catch (error) {
+      run.supervisionError = error;
+      terminateChild(run);
+    }
+  }
+}
+
+async function closeGrokChild(run, code, signal) {
+  if (run.settled) {
+    return;
+  }
+  if (run.managedRun && !run.sandboxVerified && !run.securityFailure) {
+    run.securityFailure = {
+      kind: "sandbox",
+      line: "Grok exited before publishing verified sandbox startup evidence."
+    };
+  }
+  if (run.managedRun && run.sandboxVerified && !run.policyApplied && !run.securityFailure) {
+    run.securityFailure = {
+      kind: "policy",
+      line: "Grok exited without confirming that the requested tool allowlist was applied."
+    };
+  }
+  if (!run.supervisionError) {
+    try {
+      appendFilteredStderrLog(run, "", true);
+    } catch (error) {
+      run.supervisionError = error;
+    }
+  }
+  cleanup(run);
+  if (run.terminationPromise && !(await run.terminationPromise)) {
+    finishReject(run, cleanupFailure(run));
+    return;
+  }
+  if (!run.terminationPromise && Number.isInteger(run.child.pid) && run.child.pid > 1) {
+    const cleaned = await terminateExitedLeaderProcessGroup(run.child.pid, run.childIdentity,
+      run.managedRun ? { graceMs: cleanupGraceMs(run.deadline) } : {}).catch(terminationFailed);
+    if (!cleaned) {
+      finishReject(run, cleanupFailure(run, { residual: true }));
+      return;
+    }
+  }
+  if (run.supervisionError) {
+    finishReject(run, run.supervisionError);
+    return;
+  }
+  let stdout;
+  try {
+    stdout = readStdoutSpool(run.stdoutSpool);
+  } catch (error) {
+    error.failureKind ??= "transport";
+    finishReject(run, error);
+    return;
+  } finally {
+    removeStdoutSpool(run.stdoutSpool);
+  }
+  const parsed = parseGrokOutput(stdout);
+  const exitCode = code ?? exitCodeFromSignal(signal);
+  const turnLimitReached = MAX_TURNS_REACHED_PATTERN.test(run.stderr) || maxTurnsReachedEvent(stdout);
+  const envelopeShapeIsValid = isGrokEnvelope(parsed);
+  const reportedSessionValue = parsed?.sessionId ?? parsed?.session_id;
+  const sessionId = normalizeGrokSessionId(reportedSessionValue);
+  const invalidSessionId =
+    envelopeShapeIsValid &&
+    reportedSessionValue !== undefined &&
+    reportedSessionValue !== null &&
+    reportedSessionValue !== "" &&
+    !sessionId;
+  const validEnvelope = envelopeShapeIsValid && !invalidSessionId;
+  const structuredErrorMessage =
+    parsed?.type === "error" && typeof parsed.message === "string" && parsed.message.trim()
+      ? parsed.message.trim()
+      : null;
+  const recognizedEnvelope = envelopeShapeIsValid || structuredErrorMessage != null;
+  const metrics = recognizedEnvelope ? headlessMetricsObservation(parsed) : { error: null };
+  const resolved = resolvedOutputMetadata(parsed, run.options.cwd, run.childEnv);
+  const errorMessage = run.securityFailure?.kind === "sandbox"
+    ? `Grok sandbox enforcement failed; refusing the result: ${run.securityFailure.line}`
+    : run.securityFailure?.kind === "policy"
+      ? `Grok tool policy enforcement failed; refusing the result: ${run.securityFailure.line}`
+    : run.securityFailure?.kind === "auth"
+      ? AUTH_RETRY_FAILURE_MESSAGE
+    : run.promptTransportError
+      ? `Grok prompt transport failed before stdin was accepted: ${run.promptTransportError.message}`
+      : structuredErrorMessage ?? maxTurnsReachedError(run.stderr);
+  const parseError = metrics.error ?? (
+    exitCode === 0 && !run.timedOut && !errorMessage && expectsJsonOutput(run.args) && !validEnvelope
+      ? invalidSessionId
+        ? "Grok returned an invalid session identifier in its JSON envelope."
+        : "Grok did not return a valid JSON envelope for --output-format json."
+      : null
+  );
+  const stopReason = validEnvelope ? parsed.stopReason : null;
+  const blockedPermissionCall =
+    normalizeStopReason(stopReason) === "cancelled" ? extractBlockedPermissionCall(stdout, validEnvelope ? parsed : null) : null;
+  const deniedToolFromStderr = extractDeniedToolFromStderr(run.stderr);
+  const structuredOutput = parsed && Object.hasOwn(parsed, "structuredOutput") ? parsed.structuredOutput : undefined;
+  const structuredOutputError = parsed && Object.hasOwn(parsed, "structuredOutputError")
+    ? parsed.structuredOutputError
+    : structuredOutput !== undefined
+      ? null
+      : undefined;
+  run.settled = true;
+  run.resolve({
+    text: validEnvelope ? parsed.text : stdoutTail(stdout),
+    sessionId: validEnvelope ? sessionId : null,
+    requestId: recognizedEnvelope ? stringField(parsed, "requestId", "request_id") : null,
+    stopReason,
+    thought: validEnvelope ? stringField(parsed, "thought") : null,
+    usage: objectField(parsed, "usage"),
+    modelUsage: objectField(parsed, "modelUsage", "model_usage"),
+    numTurns: metrics.numTurns ?? null,
+    totalCostUsd: metrics.totalCostUsd ?? null,
+    totalCostUsdTicks: metrics.totalCostUsdTicks ?? null,
+    costIsPartial: metrics.costIsPartial ?? null,
+    resolvedModel: resolved.model,
+    resolvedEffort: resolved.effort,
+    usageIsIncomplete: metrics.usageIsIncomplete ?? null,
+    structuredOutput,
+    structuredOutputError,
+    errorMessage,
+    securityFailureKind: run.securityFailure?.kind ?? null,
+    hasJsonEnvelope: validEnvelope,
+    exitCode,
+    timedOut: run.timedOut,
+    turnLimitReached,
+    parseError,
+    stdoutTail: stdoutTail(run.stdoutTailBuffer),
+    stderrTail: stdoutTail(run.stderr),
+    cancelledByCompanion: run.cancelledByCompanion,
+    promptTransportError: Boolean(run.promptTransportError),
+    blockedPermissionCall,
+    deniedToolFromStderr
+  });
+}
+
+function startGrokRun(run, resolve, reject) {
+  run.resolve = resolve;
+  run.reject = reject;
+  if (deadlineRemaining(run.deadline) <= 0) {
+    removeStdoutSpool(run.stdoutSpool);
+    removeManagedRunTempDir(run.managedTempDir);
+    reject(runTimeoutError());
+    return;
+  }
+  try {
+    if (typeof run.options.launchProcess === "function") {
+      const launched = run.options.launchProcess(() => spawnChild(run));
+      run.child = launched?.child ?? run.child;
+      run.childIdentity = launched?.identity ?? run.childIdentity;
+    } else {
+      const launched = spawnChild(run);
+      const publication = run.options.onSpawn?.(launched.pid, launched.identity);
+      if (publication?.status && publication.status !== "running") {
+        const error = new Error(`Grok process ownership could not be recorded because job ${publication.id ?? "unknown"} is already ${publication.status}.`);
+        error.failureKind = publication.failureKind ?? (publication.status === "cancelled" ? "cancelled" : "error");
+        throw error;
+      }
+    }
+  } catch (error) {
+    run.launchError = error;
+  }
+  if (!run.child) {
+    removeStdoutSpool(run.stdoutSpool);
+    removeManagedRunTempDir(run.managedTempDir);
+    reject(run.launchError ?? new Error("Grok process launch did not create a child process."));
+    return;
+  }
+
+  run.forwardTermination = () => forwardTermination(run);
+  process.once("SIGTERM", run.forwardTermination);
+  process.once("SIGINT", run.forwardTermination);
+  run.timer = setTimeout(() => expireGrokRun(run), run.managedRun
+    ? Math.max(0, deadlineRemaining(run.deadline) - MANAGED_CLEANUP_RESERVE_MS) : run.timeoutMs);
+  run.timer.unref?.();
+
+  run.sandboxDeadline = Math.min(Date.now() + sandboxHandshakeTimeoutMs(run.env), run.deadline ?? Infinity);
+  run.child.stdout.on("data", (chunk) => observeGrokStdout(run, chunk));
+  run.child.stderr.on("data", (chunk) => observeGrokStderr(run, chunk));
+  run.child.on("error", (error) => finishReject(run, error));
+  run.child.on("close", (code, signal) => closeGrokChild(run, code, signal));
+
+  if (run.launchError) {
+    run.supervisionError = run.launchError;
+    terminateChild(run);
+  } else if (run.managedRun) {
+    pollSandboxHandshake(run);
+  } else {
+    sendPrompt(run);
+  }
+}
+
+async function finishGrokResult(run, result) {
+  const failed = result.exitCode !== 0 || result.timedOut || Boolean(result.errorMessage || result.parseError);
+  const authEvidence = [result.stderrTail, result.errorMessage].filter(Boolean).join("\n");
+  const authFailure = result.securityFailureKind === "auth" || (
+    failed && !result.securityFailureKind && !result.timedOut && !result.parseError && !result.cancelledByCompanion &&
+    /auth|unauthori[sz]ed|forbidden|login required/i.test(authEvidence) &&
+    !/getaddrinfo|ENOTFOUND|EAI_AGAIN|ECONNREFUSED|ECONNRESET|ETIMEDOUT|socket hang up|quota|balance|billing|payment required|\b402\b|rate.?limit|\b429\b/i.test(authEvidence)
+  );
+  if (!run.managedRun || !authFailure) {
+    return { ...result, ...(run.authRefresh ? { authRefresh: run.authRefresh } : {}), ...(run.options.authRetry ? { authRetry: true } : {}) };
+  }
+  if (deadlineRemaining(run.deadline) <= 0) {
+    return { ...result, timedOut: true, ...(run.authRefresh ? { authRefresh: run.authRefresh } : {}) };
+  }
+  if (!run.authRefresh && !run.options.authRetry) {
+    run.authRefresh = refreshGrokAuth({ bin: run.bin, env: run.childEnv, cwd: run.options.cwd, capabilities: run.capabilities, reason: "auth-failure", deadline: run.deadline });
+    if (run.authRefresh.refreshed && (result.securityFailureKind === "auth" || run.options.mode !== "write")) {
+      const retry = await runGrok({ ...run.options, authRefresh: run.authRefresh, authRetry: true, managedDeadline: run.deadline });
+      if (retry.exitCode === 0 && !retry.timedOut && !retry.errorMessage && !retry.parseError) {
+        return retry;
+      }
+      result = retry;
+    }
+  }
+  return {
+    ...result,
+    securityFailureKind: "auth",
+    errorMessage: `${AUTH_RETRY_FAILURE_MESSAGE} ${AUTH_REFRESH_FAILURE_MESSAGE}`,
+    authRefresh: run.authRefresh,
+    ...(run.options.authRetry || result.authRetry ? { authRetry: true } : {})
+  };
+}
+
 export function runGrok(options) {
-  const env = options.env ?? process.env;
+  const startedAt = Date.now();
+  const env = resolveGrokAuthPaths(options.env ?? process.env, options.cwd ?? process.cwd());
   const bin = options.bin ?? resolveGrokBin(env);
   const timeoutMs = options.timeoutMs ?? resolveTimeoutMs({ background: Boolean(options.background), env });
   const managedRun = !options.args;
+  const deadline = managedRun ? options.managedDeadline ?? startedAt + timeoutMs : null;
+  requireDeadline(deadline);
   const requestedMode = options.mode === "write" ? "write" : "consult";
   let capabilities = null;
   if (managedRun) {
-    capabilities = resolveGrokCapabilities(bin, env);
-    requireGrokCapabilities(capabilities, ["--prompt-file", "--output-format", "--sandbox", "--tools", "--disallowed-tools", "--deny", "--max-turns", "--no-auto-update"]);
+    const required = ["--prompt-file", "--output-format", "--sandbox", "--tools", "--disallowed-tools", "--deny", "--max-turns", "--no-auto-update", "--no-wait-for-background"];
     if (requestedMode === "consult") {
-      requireGrokCapabilities(capabilities, ["--permission-mode", "--allow"]);
+      required.push("--permission-mode", "--allow");
     } else {
-      requireGrokCapabilities(capabilities, ["--always-approve"]);
+      required.push("--always-approve");
     }
     if (options.web !== true) {
-      requireGrokCapabilities(capabilities, ["--disable-web-search"]);
+      required.push("--disable-web-search");
     }
     if (options.jsonSchema) {
-      requireGrokCapabilities(capabilities, ["--json-schema"]);
+      required.push("--json-schema");
     }
-    requireGrokCapabilities(capabilities, ["--no-wait-for-background"]);
+    capabilities = resolveGrokCapabilities(bin, env, deadline, options.cwd ?? process.cwd(), required);
+    requireGrokCapabilities(capabilities, required);
     preflightRuntimeSocketEndpoints({
       candidates: options.runtimeSocketEndpoints ?? runtimeSocketEndpoints({ env }),
       lstat: options.runtimeSocketLstat ?? fs.lstatSync
@@ -1929,6 +2472,7 @@ export function runGrok(options) {
         throw securityError("sandbox", `Grok's strict runtime-socket deny list does not cover ${sockets[0]}, so a write shell could drive that container engine and write outside the workspace. ${undeniedRuntimeSocketRemedy()}`);
       }
     }
+    requireDeadline(deadline);
   }
   const args = options.args ?? buildGrokArgs({ ...options, capabilities, timeoutMs });
   const childEnv = buildGrokChildEnv(env, { memory: options.memory === true, web: options.web === true });
@@ -1950,13 +2494,19 @@ export function runGrok(options) {
       childEnv.TMPDIR = managedTempDir;
       if (!options.authRetry && !authRefresh) {
         const auth = grokAuthStatus(childEnv, options.cwd);
-        if (auth.ageSeconds !== null && auth.stale) {
-          authRefresh = refreshGrokAuth({ bin, env: childEnv, cwd: options.cwd, capabilities, reason: "stale" });
+        const dataDir = resolveDataDir(env);
+        if (auth.ageSeconds !== null && auth.stale && !staleRefreshRecentlyFailed(dataDir, auth.file)) {
+          authRefresh = refreshGrokAuth({ bin, env: childEnv, cwd: options.cwd, capabilities, reason: "stale", deadline });
+          const outcome = authRefresh.refreshed ? "refreshed" : "failed";
+          writePrivateDataFile(dataDir, AUTH_REFRESH_ATTEMPT_FILE, `${JSON.stringify({ file: auth.file, ...authRefresh, outcome })}\n`);
+          requireDeadline(deadline);
         }
       }
       sandboxLogSnapshot = captureSandboxEventLog(resolveChildGrokHome(childEnv, options.cwd));
     }
+    requireDeadline(deadline);
     stdoutSpool = createStdoutSpool();
+    requireDeadline(deadline);
   } catch (error) {
     removeManagedRunTempDir(managedTempDir);
     if (stdoutSpool) {
@@ -1974,412 +2524,18 @@ export function runGrok(options) {
       }
     : null;
 
-  return new Promise((resolve, reject) => {
-    let child = null;
-    let childIdentity = null;
-    let launchError = null;
-    const spawnChild = () => {
-      child = spawn(bin, args, {
-        cwd: options.cwd,
-        env: childEnv,
-        stdio: [prompt == null ? "ignore" : "pipe", "pipe", "pipe"],
-        detached: true
-      });
-      childIdentity = Number.isInteger(child.pid) ? settleProcessIdentitySync(child.pid, captureProcessIdentity) : null;
-      return { child, pid: child.pid ?? null, identity: childIdentity };
-    };
-    try {
-      if (typeof options.launchProcess === "function") {
-        const launched = options.launchProcess(spawnChild);
-        child = launched?.child ?? child;
-        childIdentity = launched?.identity ?? childIdentity;
-      } else {
-        const launched = spawnChild();
-        const publication = options.onSpawn?.(launched.pid, launched.identity);
-        if (publication?.status && publication.status !== "running") {
-          const error = new Error(`Grok process ownership could not be recorded because job ${publication.id ?? "unknown"} is already ${publication.status}.`);
-          error.failureKind = publication.failureKind ?? (publication.status === "cancelled" ? "cancelled" : "error");
-          throw error;
-        }
-      }
-    } catch (error) {
-      launchError = error;
-    }
-    if (!child) {
-      removeStdoutSpool(stdoutSpool);
-      removeManagedRunTempDir(managedTempDir);
-      reject(launchError ?? new Error("Grok process launch did not create a child process."));
-      return;
-    }
-
-    let stdoutTailBuffer = "";
-    let stderr = "";
-    let securityScanRemainder = "";
-    let stderrLogRemainder = "";
-    let securityFailure = null;
-    let promptTransportError = null;
-    let supervisionError = null;
-    let terminationPromise = null;
-    let timedOut = false;
-    let cancelledByCompanion = false;
-    let settled = false;
-    let timer = null;
-    let sandboxPollTimer = null;
-    let sandboxVerified = !managedRun;
-    let policyApplied = !managedRun;
-    const cleanup = () => {
-      if (timer) {
-        clearTimeout(timer);
-      }
-      if (sandboxPollTimer) {
-        clearTimeout(sandboxPollTimer);
-      }
-      process.removeListener("SIGTERM", forwardTermination);
-      process.removeListener("SIGINT", forwardTermination);
-      removeManagedRunTempDir(managedTempDir);
-      managedTempDir = null;
-    };
-    const cleanupFailure = ({ residual = false } = {}) => {
-      const error = new Error(residual
-        ? "Verified Grok process-group cleanup did not complete after the CLI exited."
-        : "Verified Grok process cleanup did not complete after the run was aborted.");
-      error.failureKind = timedOut ? "timeout" : cancelledByCompanion ? "cancelled" : supervisionError?.failureKind ?? "error";
-      error.cleanupRequired = true;
-      error.processRole = "grok";
-      error.pid = child.pid ?? null;
-      error.pidIdentity = residual ? null : childIdentity;
-      return error;
-    };
-    const finishReject = (error) => {
-      if (settled) {
-        return;
-      }
-      settled = true;
-      cleanup();
-      child.stdout?.destroy();
-      child.stderr?.destroy();
-      child.unref();
-      removeStdoutSpool(stdoutSpool);
-      reject(error);
-    };
-    const terminateChild = () => {
-      if (!Number.isInteger(child.pid) || child.pid <= 1) {
-        terminationPromise ??= Promise.resolve(true);
-        return terminationPromise;
-      }
-      terminationPromise ??= terminateProcessGroup(
-        child.pid,
-        childIdentity ? { identity: childIdentity } : {}
-      ).catch(() => false);
-      void terminationPromise.then((cleaned) => {
-        if (!cleaned) {
-          finishReject(cleanupFailure());
-        }
-      });
-      return terminationPromise;
-    };
-    const forwardTermination = () => {
-      cancelledByCompanion = true;
-      terminateChild();
-    };
-    process.once("SIGTERM", forwardTermination);
-    process.once("SIGINT", forwardTermination);
-    timer = setTimeout(() => {
-      timedOut = true;
-      terminateChild();
-    }, timeoutMs);
-    timer.unref?.();
-
-    const recordPromptTransportError = (error) => {
-      if (!promptTransportError) {
-        promptTransportError = error instanceof Error ? error : new Error(String(error));
-        terminateChild();
-      }
-    };
-    const sendPrompt = () => {
-      if (prompt == null) {
-        return;
-      }
-      if (!child.stdin) {
-        recordPromptTransportError(new Error("Grok stdin is unavailable for prompt transport."));
-        return;
-      }
-      child.stdin.once("error", recordPromptTransportError);
-      child.stdin.end(prompt, "utf8", (error) => {
-        if (error) {
-          recordPromptTransportError(error);
-        }
-      });
-    };
-    const failSandboxHandshake = (reason) => {
-      if (!securityFailure) {
-        securityFailure = { kind: "sandbox", line: reason };
-      }
-      terminateChild();
-    };
-    const sandboxDeadline = Date.now() + sandboxHandshakeTimeoutMs(env);
-    const pollSandboxHandshake = () => {
-      if (settled || sandboxVerified || securityFailure) {
-        return;
-      }
-      let evidence;
-      try {
-        evidence = inspectSandboxStartupEvidence(sandboxLogSnapshot, expectedSandbox);
-      } catch (error) {
-        failSandboxHandshake(error instanceof Error ? error.message : String(error));
-        return;
-      }
-      if (evidence.status === "verified") {
-        sandboxVerified = true;
-        sendPrompt();
-        return;
-      }
-      if (evidence.status === "failed") {
-        failSandboxHandshake(evidence.reason);
-        return;
-      }
-      if (Date.now() >= sandboxDeadline) {
-        failSandboxHandshake("Grok did not publish verified sandbox startup evidence before the handshake deadline.");
-        return;
-      }
-      sandboxPollTimer = setTimeout(pollSandboxHandshake, SANDBOX_HANDSHAKE_POLL_MS);
-      sandboxPollTimer.unref?.();
-    };
-    const appendFilteredStderrLog = (chunk = "", flush = false) => {
-      stderrLogRemainder += chunk.toString();
-      const boundary = flush ? stderrLogRemainder.length : stderrLogRemainder.lastIndexOf("\n") + 1;
-      if (boundary === 0) {
-        if (Buffer.byteLength(stderrLogRemainder) > STDERR_CAPTURE_MAX_BYTES) {
-          appendJobLog(options.logFile, stderrLogRemainder);
-          stderrLogRemainder = "";
-        }
-        return;
-      }
-      const complete = stderrLogRemainder.slice(0, boundary);
-      stderrLogRemainder = stderrLogRemainder.slice(boundary);
-      let filtered = "";
-      let offset = 0;
-      while (offset < complete.length) {
-        const newline = complete.indexOf("\n", offset);
-        const end = newline === -1 ? complete.length : newline + 1;
-        const line = complete.slice(offset, end);
-        if (!TOOL_POLICY_APPLIED_PATTERN.test(line)) {
-          filtered += line;
-        }
-        offset = end;
-      }
-      if (filtered) {
-        appendJobLog(options.logFile, filtered);
-      }
-    };
-
-    child.stdout.on("data", (chunk) => {
-      stdoutTailBuffer = appendBounded(stdoutTailBuffer, chunk, STDOUT_TAIL_MAX_BYTES);
-      if (supervisionError) {
-        return;
-      }
-      if (stdoutSpool.bytes + chunk.length > STDOUT_CAPTURE_MAX_BYTES) {
-        supervisionError = new Error(`Grok stdout exceeded the ${STDOUT_CAPTURE_MAX_BYTES}-byte capture limit.`);
-        supervisionError.failureKind = "transport";
-        terminateChild();
-        return;
-      }
-      try {
-        appendStdoutSpool(stdoutSpool, chunk);
-      } catch (error) {
-        supervisionError = error;
-        supervisionError.failureKind ??= "transport";
-        terminateChild();
-      }
-    });
-    child.stderr.on("data", (chunk) => {
-      const securityWindow = `${securityScanRemainder}${chunk.toString()}`;
-      securityScanRemainder = securityWindow.slice(-512);
-      stderr = appendBounded(stderr, chunk, STDERR_CAPTURE_MAX_BYTES);
-      if (!policyApplied && toolPolicyApplied(securityWindow)) {
-        policyApplied = true;
-      }
-      const detectedSecurityFailure = securityFailure ?? findSecurityFailure(securityWindow);
-      if (!securityFailure && detectedSecurityFailure) {
-        securityFailure = detectedSecurityFailure;
-        terminateChild();
-      }
-      if (!supervisionError) {
-        try {
-          appendFilteredStderrLog(chunk);
-        } catch (error) {
-          supervisionError = error;
-          terminateChild();
-        }
-      }
-    });
-    child.on("error", (error) => {
-      finishReject(error);
-    });
-    child.on("close", async (code, signal) => {
-      if (settled) {
-        return;
-      }
-      if (managedRun && !sandboxVerified && !securityFailure) {
-        securityFailure = {
-          kind: "sandbox",
-          line: "Grok exited before publishing verified sandbox startup evidence."
-        };
-      }
-      if (managedRun && sandboxVerified && !policyApplied && !securityFailure) {
-        securityFailure = {
-          kind: "policy",
-          line: "Grok exited without confirming that the requested tool allowlist was applied."
-        };
-      }
-      if (!supervisionError) {
-        try {
-          appendFilteredStderrLog("", true);
-        } catch (error) {
-          supervisionError = error;
-        }
-      }
-      cleanup();
-      if (terminationPromise && !(await terminationPromise)) {
-        finishReject(cleanupFailure());
-        return;
-      }
-      if (!terminationPromise && Number.isInteger(child.pid) && child.pid > 1) {
-        const cleaned = await terminateExitedLeaderProcessGroup(child.pid, childIdentity).catch(() => false);
-        if (!cleaned) {
-          finishReject(cleanupFailure({ residual: true }));
-          return;
-        }
-      }
-      if (supervisionError) {
-        finishReject(supervisionError);
-        return;
-      }
-      let stdout;
-      try {
-        stdout = readStdoutSpool(stdoutSpool);
-      } catch (error) {
-        error.failureKind ??= "transport";
-        finishReject(error);
-        return;
-      } finally {
-        removeStdoutSpool(stdoutSpool);
-      }
-      const parsed = parseGrokOutput(stdout);
-      const exitCode = code ?? exitCodeFromSignal(signal);
-      const turnLimitReached = MAX_TURNS_REACHED_PATTERN.test(stderr) || maxTurnsReachedEvent(stdout);
-      const envelopeShapeIsValid = isGrokEnvelope(parsed);
-      const reportedSessionValue = parsed?.sessionId ?? parsed?.session_id;
-      const sessionId = normalizeGrokSessionId(reportedSessionValue);
-      const invalidSessionId =
-        envelopeShapeIsValid &&
-        reportedSessionValue !== undefined &&
-        reportedSessionValue !== null &&
-        reportedSessionValue !== "" &&
-        !sessionId;
-      const validEnvelope = envelopeShapeIsValid && !invalidSessionId;
-      const structuredErrorMessage =
-        parsed?.type === "error" && typeof parsed.message === "string" && parsed.message.trim()
-          ? parsed.message.trim()
-          : null;
-      const recognizedEnvelope = envelopeShapeIsValid || structuredErrorMessage != null;
-      const metrics = recognizedEnvelope ? headlessMetricsObservation(parsed) : { error: null };
-      const resolved = resolvedOutputMetadata(parsed, options.cwd, childEnv);
-      const errorMessage = securityFailure?.kind === "sandbox"
-        ? `Grok sandbox enforcement failed; refusing the result: ${securityFailure.line}`
-        : securityFailure?.kind === "policy"
-          ? `Grok tool policy enforcement failed; refusing the result: ${securityFailure.line}`
-        : securityFailure?.kind === "auth"
-          ? AUTH_RETRY_FAILURE_MESSAGE
-        : promptTransportError
-          ? `Grok prompt transport failed before stdin was accepted: ${promptTransportError.message}`
-          : structuredErrorMessage ?? maxTurnsReachedError(stderr);
-      const parseError = metrics.error ?? (
-        exitCode === 0 && !timedOut && !errorMessage && expectsJsonOutput(args) && !validEnvelope
-          ? invalidSessionId
-            ? "Grok returned an invalid session identifier in its JSON envelope."
-            : "Grok did not return a valid JSON envelope for --output-format json."
-          : null
-      );
-      const stopReason = validEnvelope ? parsed.stopReason : null;
-      const blockedPermissionCall =
-        normalizeStopReason(stopReason) === "cancelled" ? extractBlockedPermissionCall(stdout, validEnvelope ? parsed : null) : null;
-      const deniedToolFromStderr = extractDeniedToolFromStderr(stderr);
-      const structuredOutput = parsed && Object.hasOwn(parsed, "structuredOutput") ? parsed.structuredOutput : undefined;
-      const structuredOutputError = parsed && Object.hasOwn(parsed, "structuredOutputError")
-        ? parsed.structuredOutputError
-        : structuredOutput !== undefined
-          ? null
-          : undefined;
-      settled = true;
-      resolve({
-        text: validEnvelope ? parsed.text : stdoutTail(stdout),
-        sessionId: validEnvelope ? sessionId : null,
-        requestId: recognizedEnvelope ? stringField(parsed, "requestId", "request_id") : null,
-        stopReason,
-        thought: validEnvelope ? stringField(parsed, "thought") : null,
-        usage: objectField(parsed, "usage"),
-        modelUsage: objectField(parsed, "modelUsage", "model_usage"),
-        numTurns: metrics.numTurns ?? null,
-        totalCostUsd: metrics.totalCostUsd ?? null,
-        totalCostUsdTicks: metrics.totalCostUsdTicks ?? null,
-        costIsPartial: metrics.costIsPartial ?? null,
-        resolvedModel: resolved.model,
-        resolvedEffort: resolved.effort,
-        usageIsIncomplete: metrics.usageIsIncomplete ?? null,
-        structuredOutput,
-        structuredOutputError,
-        errorMessage,
-        securityFailureKind: securityFailure?.kind ?? null,
-        hasJsonEnvelope: validEnvelope,
-        exitCode,
-        timedOut,
-        turnLimitReached,
-        parseError,
-        stdoutTail: stdoutTail(stdoutTailBuffer),
-        stderrTail: stdoutTail(stderr),
-        cancelledByCompanion,
-        promptTransportError: Boolean(promptTransportError),
-        blockedPermissionCall,
-        deniedToolFromStderr
-      });
-    });
-
-    if (launchError) {
-      supervisionError = launchError;
-      terminateChild();
-    } else if (managedRun) {
-      pollSandboxHandshake();
-    } else {
-      sendPrompt();
-    }
-  }).then(async (result) => {
-    const failed = result.exitCode !== 0 || result.timedOut || Boolean(result.errorMessage || result.parseError);
-    const authEvidence = [result.stderrTail, result.errorMessage].filter(Boolean).join("\n");
-    const authFailure = result.securityFailureKind === "auth" || (
-      failed && !result.securityFailureKind && !result.timedOut && !result.parseError && !result.cancelledByCompanion &&
-      /auth|unauthori[sz]ed|forbidden|login required/i.test(authEvidence) &&
-      !/getaddrinfo|ENOTFOUND|EAI_AGAIN|ECONNREFUSED|ECONNRESET|ETIMEDOUT|socket hang up|quota|balance|billing|payment required|\b402\b|rate.?limit|\b429\b/i.test(authEvidence)
-    );
-    if (!managedRun || !authFailure) {
-      return { ...result, ...(authRefresh ? { authRefresh } : {}), ...(options.authRetry ? { authRetry: true } : {}) };
-    }
-    if (!authRefresh && !options.authRetry) {
-      authRefresh = refreshGrokAuth({ bin, env: childEnv, cwd: options.cwd, capabilities, reason: "auth-failure" });
-      if (authRefresh.refreshed && (result.securityFailureKind === "auth" || options.mode !== "write")) {
-        const retry = await runGrok({ ...options, authRefresh, authRetry: true });
-        if (retry.exitCode === 0 && !retry.timedOut && !retry.errorMessage && !retry.parseError) {
-          return retry;
-        }
-        result = retry;
-      }
-    }
-    return {
-      ...result,
-      securityFailureKind: "auth",
-      errorMessage: `${AUTH_RETRY_FAILURE_MESSAGE} ${AUTH_REFRESH_FAILURE_MESSAGE}`,
-      authRefresh,
-      ...(options.authRetry || result.authRetry ? { authRetry: true } : {})
-    };
-  });
+  const run = {
+    options, env, bin, timeoutMs, managedRun, deadline, capabilities, args, childEnv,
+    captureProcessIdentity, prompt, authRefresh, managedTempDir, sandboxLogSnapshot,
+    stdoutSpool, expectedSandbox,
+    resolve: null, reject: null,
+    child: null, childIdentity: null, launchError: null,
+    stdoutTailBuffer: "", stderr: "", securityScanRemainder: "", stderrLogRemainder: "",
+    securityFailure: null, promptTransportError: null, supervisionError: null,
+    terminationPromise: null, timedOut: false, cancelledByCompanion: false, settled: false,
+    timer: null, sandboxPollTimer: null, sandboxDeadline: null, forwardTermination: null,
+    sandboxVerified: !managedRun, policyApplied: !managedRun
+  };
+  return new Promise((resolve, reject) => startGrokRun(run, resolve, reject))
+    .then((result) => finishGrokResult(run, result));
 }

@@ -115,6 +115,33 @@ test("Live file matching a manifest hash gets overwritten and prints the updated
   assert.strictEqual(fs.readFileSync(sandbox.rulesFile, "utf8"), CANONICAL);
 });
 
+test("An installed earlier template with a Notes table upgrades from its manifest hash", (t) => {
+  const sandbox = makeSandbox(t);
+  writeModelRouting(sandbox.modelRoutingFile);
+  const previous = CANONICAL
+    .replace("canonical rules content", "previous shipped rules content")
+    .replace(
+      "Engine capability table: run /fusion:config to score your configured engines (intelligence, taste, cost, 1 to 5) and regenerate this block. Until scored, route by the qualitative lane descriptions in this document.",
+      "| Engine | Lane | Family | Intelligence | Taste | Cost | Notes |\n|---|---|---|---:|---:|---:|---|\n| codex | codex | openai | 5 | 4 | 5 | primary implementation lane |"
+    );
+  assert.notStrictEqual(hashRulesTemplate(previous), hashRulesTemplate(CANONICAL));
+  const manifestPath = path.join(sandbox.pluginRoot, "rules-manifest.json");
+  const manifest = JSON.parse(fs.readFileSync(manifestPath, "utf8"));
+  manifest.hashes.push(hashRulesTemplate(previous));
+  fs.writeFileSync(manifestPath, `${JSON.stringify(manifest)}\n`);
+  fs.mkdirSync(path.dirname(sandbox.rulesFile), { recursive: true });
+  fs.writeFileSync(sandbox.rulesFile, previous);
+
+  const result = run(sandbox);
+  assert.strictEqual(result.status, 0, result.stderr);
+  assert.strictEqual(result.stdout, `${tagMessage("rules-sync.rules-updated", "fusion: routing rules updated to the current plugin version")}\n`);
+  const updated = fs.readFileSync(sandbox.rulesFile, "utf8");
+  assert.strictEqual(updated, renderRulesContent(CANONICAL, { routingPath: sandbox.modelRoutingFile }));
+  assert.match(updated, /^\| codex \| codex \| openai \| 5 \| 4 \| 5 \|$/m);
+  assert.match(updated, /^Model notes \(benchmarks, prices, latency\) live in model-routing\.json; `\/fusion:config` shows them\.$/m);
+  assert.doesNotMatch(updated, /\| Notes \|/);
+});
+
 test("Live file with unknown content is left untouched and prints the local edits line", (t) => {
   const sandbox = makeSandbox(t);
   fs.mkdirSync(path.dirname(sandbox.rulesFile), { recursive: true });
@@ -229,12 +256,12 @@ test("background collection distinguishes explicit Fusion receipts from foregrou
   const task = fs.readFileSync(path.join(repoRoot, "plugins", "codex", "skills", "task", "SKILL.md"), "utf8");
   const rescue = fs.readFileSync(path.join(repoRoot, "plugins", "codex", "skills", "rescue", "SKILL.md"), "utf8");
   assert.match(rules, /this obligation applies to a manual receipt that crosses into the main session from a detached job launched by Fusion orchestration/);
-  assert.match(rules, /closed direct prompt containing exactly one standalone `engine: codex\|grok` line and one standalone `job: <32 lowercase hexadecimal characters>` line/);
-  assert.match(rules, /The lifecycle binds the collected marker to this dispatch identity\./);
-  assert.match(rules, /Grok companion calls also remain foreground inside their owning Agent; expected duration does not authorize managed detachment/);
-  assert.match(rules, /A width one Claude worker dispatch may instead pass `run_in_background: false` so the deliverable returns synchronously inside the tool result; the lifecycle records it as an ordinary foreground worker\./);
+  assert.match(rules, /closed direct prompt containing exactly one standalone `engine: codex\|grok\|cursor` line and one standalone `job: <32 lowercase hexadecimal characters>` line/);
+  assert.match(fs.readFileSync(path.join(repoRoot, "plugins", "fusion", "rules", "troubleshooting.md"), "utf8"), /The lifecycle binds the collected marker to this dispatch identity\./);
+  assert.match(fs.readFileSync(path.join(repoRoot, "plugins", "fusion", "rules", "troubleshooting.md"), "utf8"), /Grok companion calls also remain foreground inside their owning Agent; expected duration does not authorize managed detachment/);
+  assert.match(fs.readFileSync(path.join(repoRoot, "plugins", "fusion", "rules", "troubleshooting.md"), "utf8"), /A width one Claude worker dispatch may instead pass `run_in_background: false` so the deliverable returns synchronously inside the tool result; the lifecycle records it as an ordinary foreground worker\./);
   assert.doesNotMatch(rules, /Managed Grok detachment is different/);
-  assert.match(rules, /Direct Codex, Grok, and Cursor slash commands with explicit `--background` return manual receipts for the user to inspect and collect through their status and result commands/);
+  assert.match(fs.readFileSync(path.join(repoRoot, "plugins", "fusion", "rules", "troubleshooting.md"), "utf8"), /Direct Codex, Grok, and Cursor slash commands with explicit `--background` return manual receipts for the user to inspect and collect through their status and result commands/);
   assert.match(task, /Direct users inspect progress through `\/codex:status` and collect the deliverable through `\/codex:result`; when Fusion is installed, its monitor can notify them of completion/);
   assert.match(rescue, /Direct users inspect progress through `\/codex:status` and collect the deliverable through `\/codex:result`; when Fusion is installed, its monitor can notify them of completion/);
 });
@@ -268,13 +295,17 @@ test("Grok rules document source verified headless boundaries", () => {
   const settlementTransportSentence = "Strict record forms may pass as direct arguments, and anything carrying free text still uses the raw-args transport.";
   const releaseCadenceSentence = "After each release, `/fusion:stats --prune-dead` runs as part of the release cadence.";
 
-  for (const text of [rules, troubleshooting, runtime, contract, readme, security, doctor]) {
+  for (const text of [troubleshooting, runtime, contract, readme, security, doctor]) {
     assert.ok(text.includes(bridgeSentence), "Grok bridge isolation wording must stay synchronized");
   }
 
-  for (const text of [rules, troubleshooting, runtime, contract, readme, security]) {
+  for (const text of [troubleshooting, runtime, contract, readme, security]) {
     assert.ok(text.includes(subagentSentence), "Grok headless subagent wording must stay synchronized");
   }
+
+  assert.match(rules, /--sandbox strict/);
+  assert.match(rules, /no silent downgrade to workspace/);
+  assert.match(rules, /troubleshooting rules/);
 
   for (const text of [contract, troubleshooting]) {
     assert.ok(text.includes(rustLogSentence), "Grok builder tracing filter wording must stay synchronized");
@@ -284,7 +315,7 @@ test("Grok rules document source verified headless boundaries", () => {
     assert.ok(text.includes(bubblewrapSentence), "Grok platform sandbox wording must stay synchronized");
   }
 
-  for (const text of [rules, troubleshooting, runtime, contract]) {
+  for (const text of [troubleshooting, runtime, contract]) {
     assert.match(text, /--no-subagents/);
     assert.match(text, /--disallowed-tools Agent/);
     assert.match(text, /--no-wait-for-background/);
@@ -294,13 +325,13 @@ test("Grok rules document source verified headless boundaries", () => {
     assert.match(text, /ask_user_question/);
   }
 
-  for (const text of [rules, troubleshooting, runtime, contract, readme, security]) {
+  for (const text of [troubleshooting, runtime, contract, readme, security]) {
     assert.match(text, /--sandbox strict/);
     assert.doesNotMatch(text, /--sandbox workspace/);
     assert.match(text, /(?:never|no silent)[^\n.]*downgrade[^\n.]*workspace/i);
   }
 
-  for (const text of [rules, troubleshooting, runtime, contract, readme, security]) {
+  for (const text of [troubleshooting, runtime, contract, readme, security]) {
     assert.match(text, /ProfileApplied/);
     assert.match(text, /ApplyFailed/);
     assert.match(text, /sandbox-events\.jsonl/);
@@ -338,21 +369,21 @@ test("Grok rules document source verified headless boundaries", () => {
     assert.match(text, /Narrower exposure (?:requires|needs) a dedicated sandbox profile, an isolated Grok home, an authentication broker, or upstream path-level authorization/);
   }
 
-  assert.match(rules, /Strict requests child process network restriction/);
-  assert.match(rules, /event proves profile and configuration application, not actual platform network isolation/);
-  assert.match(rules, /GROK_CODEX_\*_ENABLED/);
+  assert.match(fs.readFileSync(path.join(repoRoot, "plugins", "fusion", "rules", "troubleshooting.md"), "utf8"), /Strict requests child process network restriction/);
+  assert.match(fs.readFileSync(path.join(repoRoot, "plugins", "fusion", "rules", "troubleshooting.md"), "utf8"), /event proves profile and configuration application, not actual platform network isolation/);
+  assert.match(fs.readFileSync(path.join(repoRoot, "plugins", "fusion", "rules", "troubleshooting.md"), "utf8"), /GROK_CODEX_\*_ENABLED/);
   assert.match(troubleshooting, /`search_replace` remains the write set's file-creation path/);
-  assert.match(rules, /OpenCode-compatible `write` tool id/);
-  assert.match(rules, /`usage_is_incomplete` means the usage ledger may have missed open subagents/);
-  assert.match(rules, /present values are observed lower bounds/);
-  assert.match(rules, /10000000000 ticks per USD/);
-  assert.match(rules, /always (?:permits|include) `\/tmp` and `\/var\/tmp`/);
-  assert.match(rules, /all of `\/private\/var\/folders`/);
-  assert.match(rules, /not the only writable temporary surface/);
-  assert.match(rules, /sandbox still permits consult `read_file` to reach `~\/\.grok\/auth\.json`/i);
-  assert.match(rules, /native MCP servers, plugins, or hooks/);
-  assert.match(rules, /bridge variables gate only loose compatibility imports, not native Grok configuration and not the Claude Code plugins that `~\/\.claude\/settings\.json` enables/);
-  assert.match(rules, /`\[claude_compat\] imported = true` or lists them in `\[plugins\] disabled`/);
+  assert.match(fs.readFileSync(path.join(repoRoot, "plugins", "fusion", "rules", "troubleshooting.md"), "utf8"), /OpenCode-compatible `write` tool id/);
+  assert.match(fs.readFileSync(path.join(repoRoot, "plugins", "fusion", "rules", "troubleshooting.md"), "utf8"), /`usage_is_incomplete` means the usage ledger may have missed open subagents/);
+  assert.match(fs.readFileSync(path.join(repoRoot, "plugins", "fusion", "rules", "troubleshooting.md"), "utf8"), /present values are observed lower bounds/);
+  assert.match(fs.readFileSync(path.join(repoRoot, "plugins", "fusion", "rules", "troubleshooting.md"), "utf8"), /10000000000 ticks per USD/);
+  assert.match(fs.readFileSync(path.join(repoRoot, "plugins", "fusion", "rules", "troubleshooting.md"), "utf8"), /always (?:permits|include) `\/tmp` and `\/var\/tmp`/);
+  assert.match(fs.readFileSync(path.join(repoRoot, "plugins", "fusion", "rules", "troubleshooting.md"), "utf8"), /all of `\/private\/var\/folders`/);
+  assert.match(fs.readFileSync(path.join(repoRoot, "plugins", "fusion", "rules", "troubleshooting.md"), "utf8"), /not the only writable temporary surface/);
+  assert.match(fs.readFileSync(path.join(repoRoot, "plugins", "fusion", "rules", "troubleshooting.md"), "utf8"), /sandbox still permits consult `read_file` to reach `~\/\.grok\/auth\.json`/i);
+  assert.match(fs.readFileSync(path.join(repoRoot, "plugins", "fusion", "rules", "troubleshooting.md"), "utf8"), /native MCP servers, plugins, or hooks/);
+  assert.match(fs.readFileSync(path.join(repoRoot, "plugins", "fusion", "rules", "troubleshooting.md"), "utf8"), /bridge variables gate only loose compatibility imports, not native Grok configuration and not the Claude Code plugins that `~\/\.claude\/settings\.json` enables/);
+  assert.match(fs.readFileSync(path.join(repoRoot, "plugins", "fusion", "rules", "troubleshooting.md"), "utf8"), /`\[claude_compat\] imported = true` or lists them in `\[plugins\] disabled`/);
   for (const sentence of [
     freshSessionSentence,
     volumeTierSentence,
@@ -366,12 +397,12 @@ test("Grok rules document source verified headless boundaries", () => {
     settlementTransportSentence,
     releaseCadenceSentence
   ]) {
-    assert.ok(rules.includes(sentence), `Rules policy sentence must stay synchronized: ${sentence}`);
+    assert.ok(`${rules}\n${troubleshooting}`.includes(sentence), `Rules policy sentence must stay synchronized: ${sentence}`);
   }
   assert.match(rules, /Record accepted only when the verification command or explicit acceptance criteria pass\./);
   assert.match(rules, /literal state `uncollected`/);
-  assert.match(rules, /one process pool per canonical cwd and sandbox profile/);
-  assert.match(rules, /agent --no-leader stdio/);
+  assert.match(fs.readFileSync(path.join(repoRoot, "plugins", "fusion", "rules", "troubleshooting.md"), "utf8"), /one process pool per canonical cwd and sandbox profile/);
+  assert.match(fs.readFileSync(path.join(repoRoot, "plugins", "fusion", "rules", "troubleshooting.md"), "utf8"), /agent --no-leader stdio/);
   assert.match(troubleshooting, /shared-log disappearance or rotation/);
   assert.match(troubleshooting, /sole candidate from another cwd as a fallback/);
   assert.match(troubleshooting, /Do not pass headless `--worktree` or `--worktree-ref` in a managed brief: since 1\.0\.19 they create a real worktree/);

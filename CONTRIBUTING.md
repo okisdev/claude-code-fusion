@@ -46,3 +46,5 @@ Tests use Node's built in runner (`node --test`) and live under `tests/`. Keep t
 ## Releases
 
 Bump all plugin versions and the marketplace versions together: `plugins/codex/.claude-plugin/plugin.json`, `plugins/cursor/.claude-plugin/plugin.json`, `plugins/fusion/.claude-plugin/plugin.json`, `plugins/grok/.claude-plugin/plugin.json`, and `.claude-plugin/marketplace.json` (marketplace root version plus each plugin entry). Add a `CHANGELOG.md` entry at the top in the repo's existing lowercase bullet style (lowercase prose, proper nouns and acronyms kept, one bullet per behavioral change, motivation clauses when a change was forced by measured regression).
+
+Edit shared companion code under `shared/companion`, then run `node shared/sync.mjs` before committing. CI fails if the vendored plugin copies drift from the shared sources.

@@ -11,6 +11,8 @@ const WORKER_STATE_ENV = "FUSION_WORKER_STATE_DIR";
 const RETENTION_DAYS_ENV = "FUSION_WORKER_RETENTION_DAYS";
 const DEFAULT_RETENTION_DAYS = 90;
 const DAY_MS = 24 * 60 * 60 * 1000;
+const RETENTION_SWEEP_INTERVAL_MS = 6 * 60 * 60 * 1000;
+const RETENTION_STAMP = ".retention-sweep";
 const RECORD_SIDECAR_SUFFIXES = ["final.txt", "brief.txt"];
 const LOCK_STALE_MS = 30_000;
 const LOCK_WAIT_MS = 10;
@@ -18,11 +20,12 @@ export const DEFAULT_LOCK_TIMEOUT_MS = 5_000;
 const LOCK_TIMEOUT_ENV = "FUSION_LOCK_TIMEOUT_MS";
 const TRANSCRIPT_CHUNK_BYTES = 1024 * 1024;
 const TRANSCRIPT_REFRESH_BYTES = 8 * TRANSCRIPT_CHUNK_BYTES;
-const TRANSCRIPT_CARRY_BYTES = 256 * 1024;
+const TRANSCRIPT_CARRY_BYTES = 64 * 1024;
+const TRANSCRIPT_HISTORY_ENTRIES = 64;
 const TASK_OUTPUT_TRANSCRIPT_MAX_BYTES = 50 * 1024 * 1024;
 const TASK_OUTPUT_TRANSCRIPT_CHUNK_BYTES = 64 * 1024;
 const TASK_OUTPUT_TRANSCRIPT_MAX_LINE_BYTES = 1024 * 1024;
-const TERMINAL_STATUSES = new Set(["done", "incomplete", "failed", "cancelled", "owner_ended"]);
+export const WORKER_TERMINAL_STATUSES = new Set(["done", "incomplete", "failed", "cancelled", "owner_ended"]);
 const ACCEPTANCE_STATES = new Set(["accepted", "rejected", "unverified"]);
 const SEMANTIC_FAILURE_KINDS = new Set(["intent_override", "scope_rewrite", "wrong_approach", "style_mismatch", "oversized"]);
 export const WORKER_COLLECTION_METHODS = Object.freeze({
@@ -34,19 +37,7 @@ export const WORKER_COLLECTION_METHODS = Object.freeze({
   TASK_STOP: "task_stop",
   TASK_REAPED: "task_reaped"
 });
-const COLLECTION_METHODS_BY_KEY = new Map([
-  ["subagentstop", WORKER_COLLECTION_METHODS.SUBAGENT_STOP],
-  ["tasknotification", WORKER_COLLECTION_METHODS.TASK_NOTIFICATION],
-  ["taskoutput", WORKER_COLLECTION_METHODS.TASK_OUTPUT],
-  ["read", WORKER_COLLECTION_METHODS.OUTPUT_FILE_READ],
-  ["outputfileread", WORKER_COLLECTION_METHODS.OUTPUT_FILE_READ],
-  ["agent", WORKER_COLLECTION_METHODS.AGENT_RESULT],
-  ["agentresult", WORKER_COLLECTION_METHODS.AGENT_RESULT],
-  ["taskstop", WORKER_COLLECTION_METHODS.TASK_STOP],
-  ["reaped", WORKER_COLLECTION_METHODS.TASK_REAPED],
-  ["taskreaped", WORKER_COLLECTION_METHODS.TASK_REAPED]
-]);
-const PEER_JOB_FOOTER_AGENT_TYPES = PEER_JOB_FOOTER_AGENTS;
+const COLLECTION_METHOD_VALUES = new Set(Object.values(WORKER_COLLECTION_METHODS));
 const AGENT_TYPES = new Map([
   ["fusion:fast-worker", "fusion:fast-worker"],
   ["fast-worker", "fusion:fast-worker"],
@@ -193,15 +184,116 @@ function expiredBefore(file, cutoffMs) {
   }
 }
 
-export function pruneExpiredWorkerRecords(env = process.env, nowMs = Date.now()) {
+function retentionSweepIsRecent(stampFile, nowMs) {
+  try {
+    const sweptAt = Number(fs.readFileSync(stampFile, "utf8"));
+    return Number.isFinite(sweptAt) && nowMs >= sweptAt && nowMs - sweptAt < RETENTION_SWEEP_INTERVAL_MS;
+  } catch {
+    return false;
+  }
+}
+
+function rollupMonth(createdAt) {
+  const timestamp = typeof createdAt === "string" ? Date.parse(createdAt) : NaN;
+  return Number.isFinite(timestamp) ? new Date(timestamp).toISOString().slice(0, 7) : null;
+}
+
+function rollupWallClockMs(record) {
+  const started = Date.parse(record.startedAt ?? "");
+  const finished = Date.parse(record.finishedAt ?? "");
+  return Number.isFinite(started) && Number.isFinite(finished) && finished >= started ? finished - started : 0;
+}
+
+// rollup.jsonl schema v1: each line is an additive delta keyed by UTC createdAt
+// month (YYYY-MM), agentType, model, transportStatus, acceptance, failureKind.
+// count and the four *Sum fields total records selected for removal in that sweep.
+// Missing historical dimensions use null; unavailable measurements contribute 0.
+function workerRollup(record) {
+  return {
+    schemaVersion: 1,
+    month: rollupMonth(record.createdAt),
+    agentType: record.agentType ?? null,
+    model: record.resolvedModel ?? null,
+    transportStatus: record.transportStatus ?? null,
+    acceptance: record.acceptance ?? null,
+    failureKind: record.failureKind ?? null,
+    count: 1,
+    wallClockMsSum: rollupWallClockMs(record),
+    outputTokensSum: integer(record.usage?.outputTokens),
+    uncachedTokensSum: integer(record.usage?.uncachedTokens),
+    cacheReadInputTokensSum: integer(record.usage?.cacheReadInputTokens)
+  };
+}
+
+function appendWorkerRollups(root, records) {
+  if (!records.length) {
+    return;
+  }
+  const rows = new Map();
+  for (const record of records) {
+    const row = workerRollup(record);
+    const key = JSON.stringify([row.month, row.agentType, row.model, row.transportStatus, row.acceptance, row.failureKind]);
+    const current = rows.get(key);
+    if (current) {
+      current.count += 1;
+      current.wallClockMsSum += row.wallClockMsSum;
+      current.outputTokensSum += row.outputTokensSum;
+      current.uncachedTokensSum += row.uncachedTokensSum;
+      current.cacheReadInputTokensSum += row.cacheReadInputTokensSum;
+    } else {
+      rows.set(key, row);
+    }
+  }
+  ensurePrivateDirectory(root);
+  const file = path.join(root, "rollup.jsonl");
+  const descriptor = fs.openSync(file, fs.constants.O_CREAT | fs.constants.O_APPEND | fs.constants.O_WRONLY, 0o600);
+  try {
+    fs.fchmodSync(descriptor, 0o600);
+    fs.writeFileSync(descriptor, `${[...rows.values()].map((row) => JSON.stringify(row)).join("\n")}\n`);
+  } finally {
+    fs.closeSync(descriptor);
+  }
+}
+
+export function readWorkerRollups(env = process.env) {
+  let content;
+  try {
+    content = fs.readFileSync(path.join(resolveWorkerStateDir(env), "rollup.jsonl"), "utf8");
+  } catch (error) {
+    if (error?.code === "ENOENT") {
+      return [];
+    }
+    throw error;
+  }
+  return content.split("\n").filter(Boolean).map((line) => JSON.parse(line));
+}
+
+export function pruneExpiredWorkerRecords(env = process.env, nowMs = Date.now(), { force = false } = {}) {
   const retentionDays = resolveWorkerRetentionDays(env);
   const summary = { records: 0, sessions: 0 };
   if (retentionDays === 0) {
     return summary;
   }
-  const cutoffMs = nowMs - retentionDays * DAY_MS;
   const root = resolveWorkerStateDir(env);
+  const stampFile = path.join(root, RETENTION_STAMP);
+  if (!force && retentionSweepIsRecent(stampFile, nowMs)) {
+    return summary;
+  }
+  return withLock(stampFile, () => {
+    if (!force && retentionSweepIsRecent(stampFile, nowMs)) {
+      return summary;
+    }
+    const result = sweepExpiredWorkerRecords(env, nowMs, root);
+    writePrivateFile(stampFile, String(nowMs));
+    return result;
+  });
+}
+
+function sweepExpiredWorkerRecords(env, nowMs, root) {
+  const summary = { records: 0, sessions: 0 };
+  const cutoffMs = nowMs - resolveWorkerRetentionDays(env) * DAY_MS;
   const jobsDir = path.join(root, "jobs");
+  const expired = [];
   for (const entry of readDirectorySafely(jobsDir)) {
     if (!entry.endsWith(".json")) {
       continue;
@@ -211,9 +303,13 @@ export function pruneExpiredWorkerRecords(env = process.env, nowMs = Date.now())
       continue;
     }
     const record = readWorkerRecordFile(file);
-    if (record && !isTerminalWorkerStatus(record.transportStatus)) {
+    if (record && !WORKER_TERMINAL_STATUSES.has(record.transportStatus)) {
       continue;
     }
+    expired.push({ entry, file, record });
+  }
+  appendWorkerRollups(root, expired.map(({ record }) => record ?? {}));
+  for (const { entry, file } of expired) {
     const taskId = entry.slice(0, -".json".length);
     for (const suffix of RECORD_SIDECAR_SUFFIXES) {
       removeSafely(path.join(jobsDir, `${taskId}.${suffix}`));
@@ -243,16 +339,8 @@ export function isFusionWorkerAgent(value) {
   return canonicalWorkerAgentType(value) != null;
 }
 
-function workerLane(value) {
-  return canonicalWorkerAgentType(value);
-}
-
-export function isTerminalWorkerStatus(value) {
-  return TERMINAL_STATUSES.has(value);
-}
-
 export function reopenWorkerContinuation(record, at = new Date().toISOString(), notificationFloor = 0) {
-  if (!isTerminalWorkerStatus(record.transportStatus)) {
+  if (!WORKER_TERMINAL_STATUSES.has(record.transportStatus)) {
     return record;
   }
   const fusionWorker = isFusionWorkerAgent(record.agentType);
@@ -391,33 +479,66 @@ function writePrivateJson(file, value) {
 }
 
 function canonicalCollectionMethod(value) {
-  return typeof value === "string" ? COLLECTION_METHODS_BY_KEY.get(value.replace(/[^a-z0-9]/gi, "").toLowerCase()) ?? null : null;
+  return COLLECTION_METHOD_VALUES.has(value) ? value : null;
 }
 
-function normalizeWorkerRecord(value) {
-  let normalized = value;
-  if (typeof normalized.outputFile === "string" && path.basename(path.dirname(normalized.outputFile)) === "tasks" && normalized.outputFile.endsWith(".output")) {
-    normalized = { ...normalized, transcriptPath: normalized.outputFile, outputFile: null };
+function workerOutputPaths(record) {
+  return [record?.outputFile, record?.transcriptPath]
+    .filter((value) => typeof value === "string" && value)
+    .map((value) => path.resolve(value));
+}
+
+function compactWorkerRecord(record) {
+  const compacted = { ...record };
+  const excessTurns = Math.max(0, (record.turnIds?.length ?? 0) - TRANSCRIPT_HISTORY_ENTRIES);
+  const excessTools = Math.max(0, (record.toolUseIds?.length ?? 0) - TRANSCRIPT_HISTORY_ENTRIES);
+  const usageEntries = Object.entries(record.usageMessages ?? {});
+  const excessUsage = usageEntries.slice(0, -TRANSCRIPT_HISTORY_ENTRIES);
+  if (excessTurns || excessTools || excessUsage.length) {
+    const prefix = record.transcriptRoundPrefix ?? {};
+    const evictedUsage = transcriptUsageTotal(excessUsage);
+    compacted.transcriptRoundPrefix = {
+      turns: integer(prefix.turns) + excessTurns,
+      toolCalls: integer(prefix.toolCalls) + excessTools,
+      usage: Object.fromEntries(USAGE_KEYS.map((key) => [key, integer(prefix.usage?.[key]) + evictedUsage[key]]))
+    };
   }
-  if (PEER_JOB_FOOTER_AGENT_TYPES.has(normalized.agentType) && !Array.isArray(normalized.peerJobIds)) {
-    normalized = { ...normalized, peerJobIds: [] };
+  if (Array.isArray(record.turnIds)) compacted.turnIds = record.turnIds.slice(-TRANSCRIPT_HISTORY_ENTRIES);
+  if (Array.isArray(record.toolUseIds)) compacted.toolUseIds = record.toolUseIds.slice(-TRANSCRIPT_HISTORY_ENTRIES);
+  if (record.usageMessages && typeof record.usageMessages === "object") {
+    compacted.usageMessages = Object.fromEntries(Object.entries(record.usageMessages).slice(-TRANSCRIPT_HISTORY_ENTRIES));
   }
-  if (Object.hasOwn(normalized, "collectionMethod")) {
-    const collectionMethod = canonicalCollectionMethod(normalized.collectionMethod);
-    if (collectionMethod !== normalized.collectionMethod) {
-      normalized = { ...normalized, collectionMethod };
+  if (typeof record.transcriptCarry === "string" && Buffer.byteLength(record.transcriptCarry) > TRANSCRIPT_CARRY_BYTES) {
+    compacted.transcriptCarry = "";
+    compacted.transcriptSkippingLine = true;
+  }
+  return compacted;
+}
+
+function buildWorkerOutputIndex(sessionId, env) {
+  const index = {};
+  for (const record of readSessionWorkerRecords(env, sessionId)) {
+    for (const outputPath of workerOutputPaths(record)) {
+      (index[outputPath] ??= []).push(record.taskId);
     }
   }
-  if (typeof normalized.taskId === "string" && !Object.hasOwn(normalized, "peerFailureKind")) {
-    normalized = { ...normalized, peerFailureKind: null };
+  updateWorkerSessionState(sessionId, env, (current) => current?.outputFiles && typeof current.outputFiles === "object"
+    ? null : { ...(current ?? {}), outputFiles: index });
+}
+
+export function readWorkerOutputFileTaskIds(sessionId, outputPath, env = process.env) {
+  let index = readWorkerSessionState(sessionId, env)?.outputFiles;
+  if (!index || typeof index !== "object" || Array.isArray(index)) {
+    buildWorkerOutputIndex(sessionId, env);
+    index = readWorkerSessionState(sessionId, env)?.outputFiles;
   }
-  return normalized;
+  return Array.isArray(index?.[path.resolve(outputPath)]) ? index[path.resolve(outputPath)] : [];
 }
 
 function readWorkerRecordFile(file) {
   try {
     const value = JSON.parse(fs.readFileSync(file, "utf8"));
-    return value && typeof value === "object" && !Array.isArray(value) ? normalizeWorkerRecord(value) : null;
+    return value && typeof value === "object" && !Array.isArray(value) ? value : null;
   } catch {
     return null;
   }
@@ -452,8 +573,27 @@ export function updateWorkerRecord(taskId, env, updater) {
     if (!next || typeof next !== "object" || Array.isArray(next)) {
       return current;
     }
-    const updated = normalizeWorkerRecord({ ...next, updatedAt: new Date().toISOString() });
+    const updated = compactWorkerRecord({ ...next, updatedAt: new Date().toISOString() });
     writePrivateJson(file, updated);
+    if (updated.sessionId && (workerOutputPaths(current).join("\0") !== workerOutputPaths(updated).join("\0"))) {
+      const sessionId = updated.sessionId;
+      if (!readWorkerSessionState(sessionId, env)?.outputFiles) {
+        buildWorkerOutputIndex(sessionId, env);
+      } else {
+        updateWorkerSessionState(sessionId, env, (state) => {
+          const outputFiles = { ...state.outputFiles };
+          for (const outputPath of workerOutputPaths(current)) {
+            const taskIds = (outputFiles[outputPath] ?? []).filter((id) => id !== taskId);
+            if (taskIds.length) outputFiles[outputPath] = taskIds;
+            else delete outputFiles[outputPath];
+          }
+          for (const outputPath of workerOutputPaths(updated)) {
+            outputFiles[outputPath] = [...new Set([...(outputFiles[outputPath] ?? []), taskId])];
+          }
+          return { ...state, outputFiles };
+        });
+      }
+    }
     return updated;
   });
 }
@@ -496,6 +636,9 @@ export function createWorkerRecord(record, env = process.env) {
   if (sessionState && !Array.isArray(sessionState.taskIds)) {
     readSessionWorkerRecords(env, record.sessionId);
   }
+  if (sessionState && !sessionState.outputFiles) {
+    buildWorkerOutputIndex(record.sessionId, env);
+  }
   return withLock(file, () => {
     if (readWorkerRecordFile(file)) {
       throw new Error(`Fusion worker task ${record.taskId} already exists.`);
@@ -510,7 +653,7 @@ export function createWorkerRecord(record, env = process.env) {
       agentId: null,
       backgroundTaskId: null,
       agentType: canonicalWorkerAgentType(record.agentType) ?? record.agentType,
-      lane: workerLane(record.agentType) ?? record.agentType,
+      lane: canonicalWorkerAgentType(record.agentType) ?? record.agentType,
       description: record.description ?? null,
       workspaceRoot: path.resolve(record.workspaceRoot),
       expectedDelivery: record.expectedDelivery ?? "foreground",
@@ -518,7 +661,7 @@ export function createWorkerRecord(record, env = process.env) {
       transportStatus: "dispatching",
       acceptance: "unverified",
       acceptanceFailureKind: record.acceptanceFailureKind ?? null,
-      ...(PEER_JOB_FOOTER_AGENT_TYPES.has(record.agentType) ? { peerJobId: null, peerJobIds: [] } : {}),
+      ...(PEER_JOB_FOOTER_AGENTS.has(record.agentType) ? { peerJobId: null, peerJobIds: [] } : {}),
       peerFailureKind: null,
       failureKind: null,
       deliveryMode: null,
@@ -570,14 +713,15 @@ export function createWorkerRecord(record, env = process.env) {
     };
     updateWorkerSessionState(record.sessionId, env, (current) => ({
       ...(current ?? {}),
-      taskIds: [...new Set([...(Array.isArray(current?.taskIds) ? current.taskIds : []), record.taskId])]
+      taskIds: [...new Set([...(Array.isArray(current?.taskIds) ? current.taskIds : []), record.taskId])],
+      outputFiles: current?.outputFiles ?? {}
     }));
     writePrivateJson(file, value);
     return value;
   });
 }
 
-export function readWorkerRecords(env = process.env, { strict = false } = {}) {
+export function readWorkerRecords(env = process.env, { strict = false, modifiedSinceMs = null, modifiedBeforeMs = null } = {}) {
   const directory = path.join(resolveWorkerStateDir(env), "jobs");
   let entries;
   try {
@@ -591,7 +735,22 @@ export function readWorkerRecords(env = process.env, { strict = false } = {}) {
   return entries
     .filter((entry) => entry.isFile() && entry.name.endsWith(".json"))
     .flatMap((entry) => {
-      const record = readWorkerRecordFile(path.join(directory, entry.name));
+      const file = path.join(directory, entry.name);
+      if (modifiedSinceMs != null || modifiedBeforeMs != null) {
+        let mtimeMs;
+        try {
+          mtimeMs = fs.statSync(file).mtimeMs;
+        } catch (error) {
+          if (strict && error?.code !== "ENOENT") {
+            throw error;
+          }
+          return [];
+        }
+        if ((modifiedSinceMs != null && mtimeMs < modifiedSinceMs) || (modifiedBeforeMs != null && mtimeMs > modifiedBeforeMs)) {
+          return [];
+        }
+      }
+      const record = readWorkerRecordFile(file);
       if (!record && strict) {
         throw new Error(`Fusion worker record ${entry.name} is unreadable.`);
       }
@@ -764,11 +923,11 @@ export function refreshWorkerTranscript(record, transcriptPath) {
   }
   const sameTranscript = selectedPath === record.transcriptPath || sameTranscriptFile(selectedPath, record.transcriptPath);
   const roundBaseline = record.budgetBaseline;
-  const roundPrefix = roundBaseline ? {
+  const roundPrefix = {
     turns: integer(record.transcriptRoundPrefix?.turns),
     toolCalls: integer(record.transcriptRoundPrefix?.toolCalls),
     usage: Object.fromEntries(USAGE_KEYS.map((key) => [key, integer(record.transcriptRoundPrefix?.usage?.[key])]))
-  } : null;
+  };
   const snapshot = {
     ...record,
     transcriptPath: selectedPath,
@@ -806,32 +965,28 @@ export function refreshWorkerTranscript(record, transcriptPath) {
       break;
     }
   }
-  if (roundPrefix) {
-    roundPrefix.turns += Math.max(0, snapshot.turnIds.length - 512);
-    roundPrefix.toolCalls += Math.max(0, snapshot.toolUseIds.length - 2048);
-  }
-  snapshot.turnIds = snapshot.turnIds.slice(-512);
-  snapshot.toolUseIds = snapshot.toolUseIds.slice(-2048);
+  roundPrefix.turns += Math.max(0, snapshot.turnIds.length - TRANSCRIPT_HISTORY_ENTRIES);
+  roundPrefix.toolCalls += Math.max(0, snapshot.toolUseIds.length - TRANSCRIPT_HISTORY_ENTRIES);
+  snapshot.turnIds = snapshot.turnIds.slice(-TRANSCRIPT_HISTORY_ENTRIES);
+  snapshot.toolUseIds = snapshot.toolUseIds.slice(-TRANSCRIPT_HISTORY_ENTRIES);
   const allUsageEntries = Object.entries(snapshot.usageMessages);
-  const usageEntries = allUsageEntries.slice(-512);
-  if (roundPrefix) {
-    const evictedUsage = transcriptUsageTotal(allUsageEntries.slice(0, -512));
-    for (const key of USAGE_KEYS) {
-      roundPrefix.usage[key] += evictedUsage[key];
-    }
-    snapshot.transcriptRoundPrefix = roundPrefix;
+  const usageEntries = allUsageEntries.slice(-TRANSCRIPT_HISTORY_ENTRIES);
+  const evictedUsage = transcriptUsageTotal(allUsageEntries.slice(0, -TRANSCRIPT_HISTORY_ENTRIES));
+  for (const key of USAGE_KEYS) {
+    roundPrefix.usage[key] += evictedUsage[key];
   }
+  snapshot.transcriptRoundPrefix = roundPrefix;
   snapshot.usageMessages = Object.fromEntries(usageEntries);
-  snapshot.turns = Math.max(integer(record.turns), roundBaseline ? integer(roundBaseline.turns) + roundPrefix.turns + snapshot.turnIds.length : snapshot.turnIds.length);
+  snapshot.turns = Math.max(integer(record.turns), integer(roundBaseline?.turns) + roundPrefix.turns + snapshot.turnIds.length);
   if (roundBaseline || record.toolCallsSource !== "tool-response") {
-    snapshot.toolCalls = roundBaseline ? Math.max(integer(record.toolCalls), integer(roundBaseline.toolCalls) + roundPrefix.toolCalls + snapshot.toolUseIds.length) : snapshot.toolUseIds.length;
-    snapshot.toolCallsSource = (roundPrefix?.toolCalls ?? 0) + snapshot.toolUseIds.length > 0 ? "agent-transcript" : record.toolCallsSource;
+    snapshot.toolCalls = Math.max(integer(record.toolCalls), integer(roundBaseline?.toolCalls) + roundPrefix.toolCalls + snapshot.toolUseIds.length);
+    snapshot.toolCallsSource = roundPrefix.toolCalls + snapshot.toolUseIds.length > 0 ? "agent-transcript" : record.toolCallsSource;
   }
   const transcriptUsage = transcriptUsageTotal(usageEntries);
   if (roundBaseline || record.usageSource !== "tool-response") {
-    snapshot.usage = roundBaseline ? Object.fromEntries(USAGE_KEYS.map((key) => [key, Math.max(integer(record.usage?.[key]), integer(roundBaseline.usage?.[key]) + roundPrefix.usage[key] + transcriptUsage[key])])) : transcriptUsage;
-    snapshot.usageSource = usageEntries.length > 0 ? "agent-transcript" : record.usageSource;
-    snapshot.usageAvailability = partial || snapshot.transcriptBacklogBytes > 0 || snapshot.transcriptSkippingLine ? "partial" : usageEntries.length > 0 ? "available" : "unreported";
+    snapshot.usage = Object.fromEntries(USAGE_KEYS.map((key) => [key, Math.max(integer(record.usage?.[key]), integer(roundBaseline?.usage?.[key]) + roundPrefix.usage[key] + transcriptUsage[key])]));
+    snapshot.usageSource = usageEntries.length > 0 || roundPrefix.usage.totalTokens > 0 ? "agent-transcript" : record.usageSource;
+    snapshot.usageAvailability = partial || snapshot.transcriptBacklogBytes > 0 || snapshot.transcriptSkippingLine ? "partial" : usageEntries.length > 0 || roundPrefix.usage.totalTokens > 0 ? "available" : "unreported";
   }
   return snapshot;
 }
@@ -1043,7 +1198,7 @@ function workerAcceptanceResult(record, queued) {
 }
 
 export function applyQueuedVerdict(record, now) {
-  if (!record?.pendingVerdict || !isTerminalWorkerStatus(record.transportStatus)) {
+  if (!record?.pendingVerdict || !WORKER_TERMINAL_STATUSES.has(record.transportStatus)) {
     return record;
   }
   const { acceptance, source, reason, failureKind, acceptFailedTransport = false } = record.pendingVerdict;
@@ -1069,7 +1224,7 @@ export function applyQueuedVerdict(record, now) {
 }
 
 export function isPendingSettlement(record) {
-  return record.completionContract !== "collector" && isTerminalWorkerStatus(record.transportStatus) && Boolean(record.collectedAt) && record.awaitingVerdict === true;
+  return record.completionContract !== "collector" && WORKER_TERMINAL_STATUSES.has(record.transportStatus) && Boolean(record.collectedAt) && record.awaitingVerdict === true;
 }
 
 export function isSettledWorker(record) {
@@ -1082,7 +1237,7 @@ function updateWorkerAcceptance({ taskId, acceptance, env, source, safeReason, s
     if (!record) {
       throw new Error(`Fusion worker task ${taskId} was not found.`);
     }
-    if (!isTerminalWorkerStatus(record.transportStatus)) {
+    if (!WORKER_TERMINAL_STATUSES.has(record.transportStatus)) {
       if (!queueIfNonTerminal) {
         throw new Error(`Fusion worker task ${taskId} is not terminal.`);
       }

@@ -1,12 +1,12 @@
 #!/usr/bin/env node
 
 import { randomUUID } from "node:crypto";
-import { spawn, spawnSync } from "node:child_process";
+import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { cliVersion, collectPluginVersions, readJsonFile } from "../lib.mjs";
+import { assertEnvironmentPins, assertManifestPins, cliVersion, collectPluginVersions, killSpawnGroup, readJsonFile, runBounded } from "../lib.mjs";
 import { buildManifest } from "../manifest.mjs";
 import { newestEngineCompanion } from "../../plugins/fusion/scripts/lib/engine-acceptance.mjs";
 import { readEngineJobRecord, resolveEngineStateRoots } from "../../plugins/fusion/scripts/lib/engine-job-state.mjs";
@@ -15,9 +15,8 @@ const DEFAULT_TASK_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.ur
 const CURSOR_PLUGIN_FILE = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..", "plugins", "cursor", ".claude-plugin", "plugin.json");
 const ENGINES = new Set(["codex", "grok", "cursor"]);
 const MODES = new Set(["write", "consult"]);
-const KILL_GRACE_MS = 20000;
-const OPTIONS = new Set(["task", "engine", "mode", "repetition", "results", "model", "effort", "brief", "fixtures", "task-root", "timeout-ms"]);
-const USAGE = "Usage: node bench/lanes/run.mjs --task <task-id> --engine <codex|grok|cursor> --mode <write|consult> --repetition <n> --results <dir> [--model <id>] [--effort <level>] [--brief <file>] [--fixtures <dir inside the task>] [--task-root <dir>] [--timeout-ms <n>]";
+const OPTIONS = new Set(["task", "engine", "mode", "repetition", "results", "model", "effort", "brief", "fixtures", "task-root", "timeout-ms", "verify-timeout-ms"]);
+const USAGE = "Usage: node bench/lanes/run.mjs --task <task-id> --engine <codex|grok|cursor> --mode <write|consult> --repetition <n> --results <dir> [--model <id>] [--effort <level>] [--brief <file>] [--fixtures <dir inside the task>] [--task-root <dir>] [--timeout-ms <n>] [--verify-timeout-ms <n>] (env: BENCH_VERIFY_TIMEOUT_MS; default: 600000 ms)";
 
 function parseArgs(argv) {
   const raw = {};
@@ -43,8 +42,10 @@ function parseArgs(argv) {
   if (!/^[1-9]\d*$/.test(raw.repetition) || !Number.isSafeInteger(Number(raw.repetition))) {
     throw new Error("Repetition must be a positive integer");
   }
-  if (raw["timeout-ms"] !== undefined && (!/^[1-9]\d*$/.test(raw["timeout-ms"]) || !Number.isSafeInteger(Number(raw["timeout-ms"])))) {
-    throw new Error("Timeout must be a positive integer");
+  for (const [key, value] of [["timeout-ms", raw["timeout-ms"]], ["verify-timeout-ms", raw["verify-timeout-ms"] ?? process.env.BENCH_VERIFY_TIMEOUT_MS]]) {
+    if (value !== undefined && (!/^[1-9]\d*$/.test(value) || !Number.isSafeInteger(Number(value)) || Number(value) > 2147483647)) {
+      throw new Error(`${key} must be a positive integer`);
+    }
   }
   if (raw.mode === "consult" && !raw.brief) {
     throw new Error("--brief is required in consult mode");
@@ -65,7 +66,8 @@ function parseArgs(argv) {
     brief: raw.brief ? path.resolve(raw.brief) : null,
     fixtures: raw.fixtures ?? "fixtures",
     taskRoot: path.resolve(raw["task-root"] ?? DEFAULT_TASK_ROOT),
-    timeoutMs: Number(raw["timeout-ms"] ?? 900000)
+    timeoutMs: Number(raw["timeout-ms"] ?? 900000),
+    verifyTimeoutMs: Number(raw["verify-timeout-ms"] ?? process.env.BENCH_VERIFY_TIMEOUT_MS ?? 600000)
   };
 }
 
@@ -92,7 +94,8 @@ function taskFiles(options) {
 }
 
 function git(workspace, args) {
-  const result = spawnSync("git", args, { cwd: workspace, encoding: "utf8" });
+  const result = spawnSync("git", args, { cwd: workspace, encoding: "utf8", timeout: 30000, maxBuffer: 8 * 1024 * 1024, detached: true });
+  killSpawnGroup(result.pid);
   if (result.error || result.status !== 0) {
     throw new Error(`git ${args[0]} failed: ${result.error?.message ?? result.stderr?.trim() ?? result.status}`);
   }
@@ -116,48 +119,23 @@ function prepareWorkspace(fixturesDir) {
   }
 }
 
-function runCompanion(companion, args, workspace, timeoutMs) {
-  return new Promise((resolve) => {
-    const started = process.hrtime.bigint();
-    let child;
-    try {
-      child = spawn(process.execPath, [companion, ...args], { cwd: workspace, env: process.env, detached: true, stdio: ["ignore", "pipe", "pipe"] });
-    } catch (error) {
-      resolve({ stdout: "", exit: null, seconds: 0, failure: { type: "start", message: error.message } });
-      return;
-    }
-    let stdout = "";
-    let stderr = "";
-    let timedOut = false;
-    let startError = null;
-    child.stdout.on("data", (chunk) => { stdout += chunk; });
-    child.stderr.on("data", (chunk) => { stderr += chunk; });
-    child.on("error", (error) => { startError = error; });
-    const signalGroup = (signal) => {
-      try {
-        process.kill(-child.pid, signal);
-      } catch {
-        child.kill(signal);
-      }
-    };
-    let killTimer = null;
-    const timer = setTimeout(() => {
-      timedOut = true;
-      signalGroup("SIGTERM");
-      killTimer = setTimeout(() => signalGroup("SIGKILL"), KILL_GRACE_MS);
-    }, timeoutMs);
-    child.on("close", (code) => {
-      clearTimeout(timer);
-      clearTimeout(killTimer);
-      resolve({
-        stdout,
-        exit: code,
-        seconds: Number(process.hrtime.bigint() - started) / 1e9,
-        failure: timedOut ? { type: "timeout", message: `Companion timed out after ${timeoutMs} ms` } : startError ? { type: "start", message: startError.message } : null,
-        stderr
-      });
-    });
-  });
+async function runCompanion(companion, args, workspace, timeoutMs) {
+  try {
+    const result = await runBounded(process.execPath, [companion, ...args], { cwd: workspace, env: process.env, timeoutMs, label: "Companion" });
+    return { stdout: result.stdout, stderr: result.stderr, seconds: result.seconds, exit: result.timedOut ? null : result.signal ? null : result.exitCode, failure: result.timedOut ? { type: "timeout", message: `Companion timed out after ${timeoutMs} ms` } : null };
+  } catch (error) {
+    return { stdout: "", exit: null, seconds: 0, failure: { type: "start", message: error.message } };
+  }
+}
+
+async function waitForJob(engine, jobId) {
+  const deadline = Date.now() + 5000;
+  do {
+    const job = readEngineJobRecord(engine, jobId, process.env);
+    if (job) return job;
+    if (Date.now() >= deadline) return null;
+    await new Promise((resolve) => setTimeout(resolve, Math.min(50, deadline - Date.now())));
+  } while (true);
 }
 
 function jobIdFromStdout(stdout, engine) {
@@ -209,9 +187,6 @@ function failedJobIdFromState(engine, workspace) {
 
 function writeEnvOnce(resultsDir, taskManifestHash) {
   const envFile = path.join(resultsDir, "env.json");
-  if (fs.existsSync(envFile)) {
-    return;
-  }
   const env = {
     date: new Date().toISOString(),
     nodeVersion: process.version,
@@ -221,6 +196,15 @@ function writeEnvOnce(resultsDir, taskManifestHash) {
     taskManifestHash,
     manifestHash: taskManifestHash
   };
+  if (fs.existsSync(envFile)) {
+    const existing = JSON.parse(fs.readFileSync(envFile, "utf8"));
+    assertManifestPins(existing, [], resultsDir);
+    if (existing.manifestHash !== taskManifestHash) {
+      throw new Error(`${envFile}: conflicting manifest pins: existing=${JSON.stringify(existing.manifestHash)} vs current=${JSON.stringify(taskManifestHash)}`);
+    }
+    assertEnvironmentPins(existing, env, resultsDir);
+    return;
+  }
   try {
     fs.writeFileSync(envFile, `${JSON.stringify(env, null, 2)}\n`, { flag: "wx" });
   } catch (error) {
@@ -243,8 +227,8 @@ async function attempt(options) {
     const args = ["task", ...(options.mode === "write" ? ["--write"] : []), "--json", ...(options.model ? ["--model", options.model] : []), ...(options.effort ? ["--effort", options.effort] : []), "--cwd", workspace, "--", briefText];
     const outcome = companionPath ? await runCompanion(companionPath, args, workspace, options.timeoutMs) : { stdout: "", exit: null, seconds: 0, failure: { type: "start", message: `No ${options.engine} companion found` } };
     const jobId = outcome.failure ? null : jobIdFromStdout(outcome.stdout, options.engine) ?? (outcome.exit !== 0 ? failedJobIdFromState(options.engine, workspace) : null);
-    const job = jobId ? readEngineJobRecord(options.engine, jobId, process.env) : null;
-    const infrastructureFailure = outcome.failure ?? (!jobId ? { type: "job_id", message: "Companion printed no parseable job id" } : !job ? { type: "job_record", message: `Job record ${jobId} could not be read` } : null);
+    const job = jobId ? await waitForJob(options.engine, jobId) : null;
+    let infrastructureFailure = outcome.failure ?? (!jobId ? { type: "job_id", message: "Companion printed no parseable job id" } : !job ? { type: "job_record", message: `Job record ${jobId} could not be read` } : null);
     let verifyExit = null;
     let verdict = infrastructureFailure ? "infra_failure" : options.mode === "consult" ? "unscored" : "fail";
     let resultFile = null;
@@ -253,9 +237,19 @@ async function attempt(options) {
       git(workspace, ["add", "-A"]);
       diffFile = path.join(options.resultsDir, `${runId}.diff`);
       fs.writeFileSync(diffFile, git(workspace, ["diff", "--cached"]));
-      const verify = spawnSync("bash", [verifyFile, workspace], { cwd: options.resultsDir, encoding: "utf8" });
-      verifyExit = verify.status ?? 1;
-      verdict = verifyExit === 0 && outcome.exit === 0 && job.status === "done" && !job.failureKind ? "pass" : "fail";
+      try {
+        const verify = await runBounded("bash", [verifyFile, workspace], { cwd: options.resultsDir, env: process.env, timeoutMs: options.verifyTimeoutMs, label: "Verifier" });
+        verifyExit = verify.timedOut ? null : verify.exitCode;
+        if (verify.timedOut) {
+          verdict = "infra_failure";
+          infrastructureFailure = { type: "timeout", message: `Verifier timed out after ${options.verifyTimeoutMs} ms` };
+        } else {
+          verdict = verifyExit === 0 && outcome.exit === 0 && job.status === "done" && !job.failureKind ? "pass" : "fail";
+        }
+      } catch (error) {
+        verdict = "infra_failure";
+        infrastructureFailure = { type: "start", message: error.message };
+      }
     } else if (!infrastructureFailure) {
       resultFile = path.join(options.resultsDir, `${runId}.result.md`);
       fs.writeFileSync(resultFile, job.resultText ?? "", "utf8");

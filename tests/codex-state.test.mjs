@@ -13,6 +13,8 @@ import { gitIsolation } from "./lib/git-fixture.mjs";
 import {
   DEFAULT_JOB_HISTORY_MAX_BYTES,
   DEFAULT_JOB_HISTORY_MAX_RECORDS,
+  DEFAULT_JOB_RECORD_MAX_RECORDS,
+  DEFAULT_JOB_RECORD_RETENTION_DAYS,
   DEFAULT_LOCK_TIMEOUT_MS,
   TERMINAL_STATUSES,
   appendJobEvent,
@@ -56,7 +58,7 @@ const processInspectionTests = new Set([
   "terminal finalization preserves acceptance provenance",
   "terminal collection is an atomic idempotent lifecycle transition",
   "a cancellation request wins a racing successful completion",
-  "lock-scoped updates see the current record and session aliases stay aligned",
+  "lock-scoped updates see the current record and keep session fields aligned",
   "multiple locked record writes probe the owner identity once",
   "workspace launch reservations serialize",
   "thread reservations use a data-root-wide lock",
@@ -71,7 +73,13 @@ const processInspectionTests = new Set([
   "global lookup rejects an id that is ambiguous across workspaces",
   "job history collection removes oldest records while preserving running jobs, the current resume head, and its predecessor",
   "job history collection enforces its managed byte quota and reports protected quota excess",
-  "job history collection removes empty managed directories across many disposable workspaces"
+  "job history collection removes empty managed directories across many disposable workspaces",
+  "artifact pruning preserves verdicts and briefs until the light record cap expires them",
+  "light retention expires old records and zero days disables age expiry",
+  "pruning waits for the record lock and rechecks background collection",
+  "pruning rechecks a new resume head while holding the source record lock",
+  "the data-root stamp skips a recent sweep until the record cap is over ten percent high",
+  "orphan sweep removes aged managed artifacts and temp files while preserving unknown records"
 ]);
 
 function test(name, callback) {
@@ -234,7 +242,7 @@ function makeRecord(sandbox, fields = {}) {
     logFile: jobLogPath(sandbox.dataDir, sandbox.workDir, id),
     eventsFile: jobEventsPath(sandbox.dataDir, sandbox.workDir, id),
     mode: "consult",
-    sessionId: "session-one",
+    claudeSessionId: "session-one",
     pid: process.pid,
     request: { model: "gpt-test", effort: "high" },
     ...fields
@@ -289,7 +297,7 @@ test("job ids contain 128 bits and records expose the canonical Codex fields", (
   assert.strictEqual(record.companionVersion, null);
   assert.strictEqual(record.fileChangeCount, null);
   assert.strictEqual(record.collectedAt, null);
-  assert.strictEqual(record.sessionId, "session-one");
+  assert.strictEqual(Object.hasOwn(record, "sessionId"), false);
   assert.strictEqual(record.claudeSessionId, "session-one");
   assert.strictEqual(record.pid, process.pid);
   assert.deepStrictEqual(record.pidIdentity, pidIdentity);
@@ -509,12 +517,9 @@ test("a cancellation request wins a racing successful completion", (t) => {
   assert.strictEqual(final.cancelRequestedAt, null);
 });
 
-test("lock-scoped updates see the current record and session aliases stay aligned", (t) => {
+test("lock-scoped updates see the current record and keep session fields aligned", (t) => {
   const sandbox = makeSandbox(t);
   const { file } = makeRecord(sandbox);
-  const legacyUpdated = updateJobRecordFile(file, { sessionId: "session-legacy" });
-  assert.strictEqual(legacyUpdated.sessionId, "session-legacy");
-  assert.strictEqual(legacyUpdated.claudeSessionId, "session-legacy");
   const updated = updateJobRecordFileWithCurrent(file, (current) => ({
     ...current,
     phase: "executing",
@@ -525,7 +530,7 @@ test("lock-scoped updates see the current record and session aliases stay aligne
   assert.strictEqual(updated.phase, "executing");
   assert.strictEqual(updated.codexPid, 456);
   assert.strictEqual(updated.threadId, "thread-current");
-  assert.strictEqual(updated.sessionId, "session-two");
+  assert.strictEqual(Object.hasOwn(updated, "sessionId"), false);
   assert.strictEqual(updated.claudeSessionId, "session-two");
 });
 
@@ -945,10 +950,10 @@ test("structurally invalid records are preserved for forward compatibility and f
   assert.deepStrictEqual(listJobRecords(sandbox.dataDir, sandbox.workDir), []);
 });
 
-test("semantic failure kinds accept legacy policy and oversized records and reject unknown values", (t) => {
+test("semantic failure kinds accept current policy and oversized records and reject unknown values", (t) => {
   const sandbox = makeSandbox(t);
-  const legacy = createJobRecord({ cwd: sandbox.workDir, id: "legacy-policy", semanticFailureKind: "policy" });
-  assert.equal(legacy.semanticFailureKind, "policy");
+  const policy = createJobRecord({ cwd: sandbox.workDir, id: "policy", semanticFailureKind: "policy" });
+  assert.equal(policy.semanticFailureKind, "policy");
   const oversized = createJobRecord({ cwd: sandbox.workDir, id: "oversized", semanticFailureKind: "oversized" });
   assert.equal(oversized.semanticFailureKind, "oversized");
 
@@ -959,14 +964,23 @@ test("semantic failure kinds accept legacy policy and oversized records and reje
   assert.equal(readJobRecordFile(invalidFile), null);
 });
 
-test("legacy records normalize missing file change counts to null", (t) => {
+test("records missing current fields or carrying retired fields are unreadable", (t) => {
   const sandbox = makeSandbox(t);
   const file = jobFilePath(sandbox.dataDir, sandbox.workDir, "legacy-file-change-count");
   const record = createJobRecord({ cwd: sandbox.workDir, id: "legacy-file-change-count" });
   fs.mkdirSync(path.dirname(file), { recursive: true });
   delete record.fileChangeCount;
   fs.writeFileSync(file, `${JSON.stringify(record)}\n`, { mode: 0o600 });
-  assert.equal(readJobRecordFile(file).fileChangeCount, null);
+  assert.equal(readJobRecordFile(file), null);
+  const oldSession = { ...createJobRecord({ cwd: sandbox.workDir, id: "old-session" }), sessionId: "legacy" };
+  delete oldSession.claudeSessionId;
+  const oldSessionFile = jobFilePath(sandbox.dataDir, sandbox.workDir, oldSession.id);
+  fs.writeFileSync(oldSessionFile, `${JSON.stringify(oldSession)}\n`, { mode: 0o600 });
+  assert.equal(readJobRecordFile(oldSessionFile), null);
+  const oldTier = { ...createJobRecord({ cwd: sandbox.workDir, id: "old-tier" }), appliedServiceTier: "priority" };
+  const oldTierFile = jobFilePath(sandbox.dataDir, sandbox.workDir, oldTier.id);
+  fs.writeFileSync(oldTierFile, `${JSON.stringify(oldTier)}\n`, { mode: 0o600 });
+  assert.equal(readJobRecordFile(oldTierFile), null);
 });
 
 test("global lookup rejects an id that is ambiguous across workspaces", (t) => {
@@ -987,15 +1001,21 @@ test("global lookup rejects an id that is ambiguous across workspaces", (t) => {
 test("job history limits have bounded defaults and accept explicit quotas", () => {
   assert.deepStrictEqual(resolveJobHistoryLimits({}), {
     maxBytes: DEFAULT_JOB_HISTORY_MAX_BYTES,
-    maxRecords: DEFAULT_JOB_HISTORY_MAX_RECORDS
+    maxRecords: DEFAULT_JOB_HISTORY_MAX_RECORDS,
+    recordMaxRecords: DEFAULT_JOB_RECORD_MAX_RECORDS,
+    recordRetentionDays: DEFAULT_JOB_RECORD_RETENTION_DAYS
   });
-  assert.deepStrictEqual(resolveJobHistoryLimits({ CODEX_COMPANION_HISTORY_MAX_BYTES: "4096", CODEX_COMPANION_HISTORY_MAX_RECORDS: "7" }), {
+  assert.deepStrictEqual(resolveJobHistoryLimits({ CODEX_COMPANION_HISTORY_MAX_BYTES: "4096", CODEX_COMPANION_HISTORY_MAX_RECORDS: "7", CODEX_COMPANION_RECORD_MAX_RECORDS: "80", CODEX_COMPANION_RECORD_RETENTION_DAYS: "0" }), {
     maxBytes: 4096,
-    maxRecords: 7
+    maxRecords: 7,
+    recordMaxRecords: 80,
+    recordRetentionDays: 0
   });
   assert.deepStrictEqual(resolveJobHistoryLimits({ CODEX_COMPANION_HISTORY_MAX_BYTES: "invalid", CODEX_COMPANION_HISTORY_MAX_RECORDS: "-1" }), {
     maxBytes: DEFAULT_JOB_HISTORY_MAX_BYTES,
-    maxRecords: DEFAULT_JOB_HISTORY_MAX_RECORDS
+    maxRecords: DEFAULT_JOB_HISTORY_MAX_RECORDS,
+    recordMaxRecords: DEFAULT_JOB_RECORD_MAX_RECORDS,
+    recordRetentionDays: DEFAULT_JOB_RECORD_RETENTION_DAYS
   });
 });
 
@@ -1027,7 +1047,7 @@ test("job history collection removes oldest records while preserving running job
     id: "resume-source",
     pid: null,
     request: { effort: "high" },
-    sessionId: "current-session",
+    claudeSessionId: "current-session",
     status: "done",
     threadId: "current-thread"
   });
@@ -1037,18 +1057,18 @@ test("job history collection removes oldest records while preserving running job
     id: "resume-head",
     pid: null,
     request: { resumeSourceJobId: source.record.id, resumeThreadId: "current-thread" },
-    sessionId: "current-session",
+    claudeSessionId: "current-session",
     status: "done",
     threadId: "current-thread"
   });
-  const running = makeRecord(sandbox, { createdAt: "2023-01-01T00:00:00.000Z", id: "running-job", sessionId: "other-session", status: "running" });
+  const running = makeRecord(sandbox, { createdAt: "2023-01-01T00:00:00.000Z", id: "running-job", claudeSessionId: "other-session", status: "running" });
   const jobs = path.dirname(running.file);
   const unsafeRecord = path.join(jobs, "future-job.json");
   const unknownFile = path.join(jobs, "manual-state.bin");
   fs.writeFileSync(unsafeRecord, `${JSON.stringify({ engine: "codex", id: "future-job", schemaVersion: 2, status: "done" })}\n`, { mode: 0o600 });
   fs.writeFileSync(unknownFile, "keep\n", { mode: 0o600 });
 
-  const result = pruneJobState(sandbox.dataDir, { claudeSessionId: "current-session", maxBytes: 1024 * 1024, maxRecords: 3 });
+  const result = pruneJobState(sandbox.dataDir, { claudeSessionId: "current-session", maxBytes: 1024 * 1024, maxRecords: 3, recordMaxRecords: 3, recordRetentionDays: 0 });
 
   assert.strictEqual(result.ok, true);
   assert.strictEqual(result.quotaSatisfied, true);
@@ -1071,7 +1091,7 @@ test("job history collection enforces its managed byte quota and reports protect
   const oldRecords = [];
   for (let index = 0; index < 3; index += 1) {
     const createdAt = new Date(Date.UTC(2024, 0, index + 1)).toISOString();
-    const entry = makeRecord(sandbox, { createdAt, finishedAt: createdAt, id: `large-old-${index}`, pid: null, sessionId: "old-session", status: "done", threadId: `large-thread-${index}` });
+    const entry = makeRecord(sandbox, { createdAt, finishedAt: createdAt, id: `large-old-${index}`, pid: null, claudeSessionId: "old-session", status: "done", threadId: `large-thread-${index}` });
     fs.writeFileSync(entry.record.logFile, "x".repeat(32 * 1024), { mode: 0o600 });
     oldRecords.push(entry);
   }
@@ -1080,22 +1100,23 @@ test("job history collection enforces its managed byte quota and reports protect
     finishedAt: "2025-01-01T00:00:00.000Z",
     id: "large-current",
     pid: null,
-    sessionId: "current-session",
+    claudeSessionId: "current-session",
     status: "done",
     threadId: "large-current-thread"
   });
   fs.writeFileSync(retained.record.logFile, "y".repeat(32 * 1024), { mode: 0o600 });
 
-  const bounded = pruneJobState(sandbox.dataDir, { claudeSessionId: "current-session", maxBytes: 48 * 1024, maxRecords: 100 });
+  const bounded = pruneJobState(sandbox.dataDir, { claudeSessionId: "current-session", maxBytes: 48 * 1024, maxRecords: 100, recordRetentionDays: 0 });
   assert.strictEqual(bounded.ok, true);
   assert.strictEqual(bounded.quotaSatisfied, true);
   assert.ok(bounded.afterBytes <= 48 * 1024);
   assert.strictEqual(fs.existsSync(retained.file), true);
-  assert.ok(oldRecords.every((entry) => !fs.existsSync(entry.file)));
+  assert.ok(oldRecords.every((entry) => fs.existsSync(entry.file)));
+  assert.ok(oldRecords.filter((entry) => readJobRecordFile(entry.file).artifactsPruned).length >= 2);
 
-  const protectedRunning = makeRecord(sandbox, { id: "oversized-running", sessionId: "current-session", status: "running" });
+  const protectedRunning = makeRecord(sandbox, { id: "oversized-running", claudeSessionId: "current-session", status: "running" });
   fs.writeFileSync(protectedRunning.record.logFile, "z".repeat(64 * 1024), { mode: 0o600 });
-  const exceeded = pruneJobState(sandbox.dataDir, { claudeSessionId: "current-session", maxBytes: 1, maxRecords: 0 });
+  const exceeded = pruneJobState(sandbox.dataDir, { claudeSessionId: "current-session", maxBytes: 1, maxRecords: 0, recordRetentionDays: 0 });
   assert.strictEqual(exceeded.ok, true);
   assert.strictEqual(exceeded.quotaSatisfied, false);
   assert.strictEqual(fs.existsSync(protectedRunning.file), true);
@@ -1107,7 +1128,7 @@ test("job history collection removes empty managed directories across many dispo
     const workDir = path.join(sandbox.root, `disposable-workspace-${index}`);
     fs.mkdirSync(workDir);
     const createdAt = new Date(Date.UTC(2024, 0, index + 1)).toISOString();
-    makeRecord({ ...sandbox, workDir }, { createdAt, finishedAt: createdAt, id: `disposable-job-${index}`, pid: null, sessionId: "expired-session", status: "done", threadId: `disposable-thread-${index}` });
+    makeRecord({ ...sandbox, workDir }, { createdAt, finishedAt: createdAt, id: `disposable-job-${index}`, pid: null, claudeSessionId: "expired-session", status: "done", threadId: `disposable-thread-${index}` });
   }
   const emptyWorkDir = path.join(sandbox.root, "empty-disposable-workspace");
   fs.mkdirSync(emptyWorkDir);
@@ -1115,7 +1136,7 @@ test("job history collection removes empty managed directories across many dispo
   fs.mkdirSync(path.join(emptyStateDir, "briefs"), { recursive: true });
   fs.mkdirSync(path.join(emptyStateDir, "jobs"));
 
-  const result = pruneJobState(sandbox.dataDir, { claudeSessionId: "current-session", maxBytes: 0, maxRecords: 0 });
+  const result = pruneJobState(sandbox.dataDir, { claudeSessionId: "current-session", maxBytes: 0, maxRecords: 0, recordMaxRecords: 0 });
   assert.strictEqual(result.ok, true);
   assert.strictEqual(result.quotaSatisfied, true);
   assert.strictEqual(result.deletedRecords, 20);
@@ -1125,7 +1146,7 @@ test("job history collection removes empty managed directories across many dispo
   const marker = path.join(unmanagedWorkspace, "keep.txt");
   fs.mkdirSync(unmanagedWorkspace, { recursive: true });
   fs.writeFileSync(marker, "keep\n", { mode: 0o600 });
-  pruneJobState(sandbox.dataDir, { claudeSessionId: "current-session", maxBytes: 0, maxRecords: 0 });
+  pruneJobState(sandbox.dataDir, { claudeSessionId: "current-session", maxBytes: 0, maxRecords: 0, recordMaxRecords: 0 });
   assert.strictEqual(fs.readFileSync(marker, "utf8"), "keep\n");
 });
 
@@ -1137,4 +1158,181 @@ test("job history collection fails closed without interrupting the caller", (t) 
   assert.strictEqual(result.ok, false);
   assert.strictEqual(result.deletedRecords, 0);
   assert.match(result.errorMessage, /directory|ENOTDIR|not a directory/i);
+});
+
+test("artifact pruning preserves verdicts and briefs until the light record cap expires them", (t) => {
+  const sandbox = makeSandbox(t);
+  const records = Array.from({ length: 4 }, (_, index) => {
+    const at = new Date(Date.now() - (4 - index) * 60_000).toISOString();
+    const entry = makeRecord(sandbox, {
+      id: `tier-review-${index}`, jobClass: "review", status: "done", pid: null,
+      createdAt: at, finishedAt: at, semanticStatus: "accepted",
+      acceptanceSource: "stats", acceptanceRecordedAt: at
+    });
+    fs.writeFileSync(entry.record.eventsFile, "event\n".repeat(100));
+    fs.writeFileSync(entry.record.logFile, "stderr\n");
+    for (const suffix of [".stdout.log", ".stderr.log", ".partial.txt", ".partial-result.txt"]) {
+      fs.writeFileSync(path.join(path.dirname(entry.file), `${entry.record.id}${suffix}`), "diagnostic\n");
+    }
+    return entry;
+  });
+  const heavy = pruneJobState(sandbox.dataDir, { maxRecords: 1, maxBytes: 1024 * 1024, recordMaxRecords: 4, recordRetentionDays: 0 });
+  assert.equal(heavy.prunedArtifacts, 3);
+  assert.equal(heavy.deletedRecords, 0);
+  for (const entry of records.slice(0, 3)) {
+    const saved = readJobRecordFile(entry.file);
+    assert.equal(saved.artifactsPruned, true);
+    assert.equal(saved.semanticStatus, "accepted");
+    assert.equal(saved.acceptanceSource, "stats");
+    assert.equal(fs.existsSync(entry.record.briefFile), true);
+    assert.equal(fs.existsSync(entry.record.eventsFile), false);
+    assert.equal(fs.existsSync(entry.record.logFile), false);
+    for (const suffix of [".stdout.log", ".stderr.log", ".partial.txt", ".partial-result.txt"]) {
+      assert.equal(fs.existsSync(path.join(path.dirname(entry.file), `${entry.record.id}${suffix}`)), false);
+    }
+  }
+  const light = pruneJobState(sandbox.dataDir, { maxRecords: 1, maxBytes: 1024 * 1024, recordMaxRecords: 2, recordRetentionDays: 0 });
+  assert.equal(light.deletedRecords, 2);
+  assert.equal(fs.existsSync(records[0].file), false);
+  assert.equal(fs.existsSync(records[0].record.briefFile), false);
+  assert.equal(fs.existsSync(records[2].file), true);
+});
+
+test("light retention expires old records and zero days disables age expiry", (t) => {
+  const sandbox = makeSandbox(t);
+  const old = new Date(Date.now() - 100 * 86_400_000).toISOString();
+  const entry = makeRecord(sandbox, { id: "old-review", jobClass: "review", status: "done", pid: null, createdAt: old, finishedAt: old });
+  const limits = { maxRecords: 100, maxBytes: 1024 * 1024, recordMaxRecords: 100 };
+  assert.equal(pruneJobState(sandbox.dataDir, { ...limits, recordRetentionDays: 0 }).deletedRecords, 0);
+  assert.equal(fs.existsSync(entry.file), true);
+  assert.equal(pruneJobState(sandbox.dataDir, { ...limits, recordRetentionDays: 90 }).deletedRecords, 1);
+  assert.equal(fs.existsSync(entry.file), false);
+});
+
+test("pruning waits for the record lock and rechecks background collection", async (t) => {
+  const sandbox = makeSandbox(t);
+  const at = new Date(Date.now() - 100 * 86_400_000).toISOString();
+  const entry = makeRecord(sandbox, {
+    id: "locked-review", jobClass: "review", status: "done", pid: null,
+    background: true, collectedAt: at, createdAt: at, finishedAt: at
+  });
+  fs.writeFileSync(entry.record.logFile, "keep this log\n");
+  const ready = path.join(sandbox.root, "locked-ready");
+  const childSource = `
+import fs from "node:fs";
+import path from "node:path";
+const [stateUrl, file, ready] = process.argv.slice(1);
+const { updateJobRecordFileWithCurrent } = await import(stateUrl);
+updateJobRecordFileWithCurrent(file, () => {
+  fs.writeFileSync(ready, "ready");
+  const jobs = path.dirname(file);
+  const lockOwnerPrefix = path.basename(file) + ".lock.owner.";
+  const deadline = Date.now() + 3000;
+  while (fs.readdirSync(jobs).filter((name) => name.startsWith(lockOwnerPrefix)).length < 2) {
+    if (Date.now() >= deadline) throw new Error("GC did not wait for the record lock");
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10);
+  }
+  fs.writeFileSync(ready + ".contended", "yes");
+  return { collectedAt: null };
+}, { allowTerminal: true });
+`;
+  const holder = runLockChild(childSource, [stateModuleUrl, entry.file, ready]);
+  await waitForPath(ready);
+  const result = pruneJobState(sandbox.dataDir, { maxBytes: 0, maxRecords: 0, recordMaxRecords: 0 });
+  const outcome = await waitForCompletion(holder.completion, 3000);
+  assert.equal(outcome.exitCode, 0, outcome.stderr);
+  assert.equal(result.ok, true);
+  assert.equal(fs.existsSync(`${ready}.contended`), true);
+  assert.equal(fs.existsSync(entry.file), true);
+  assert.equal(fs.existsSync(entry.record.logFile), true);
+  assert.equal(readJobRecordFile(entry.file).artifactsPruned, false);
+});
+
+test("pruning rechecks a new resume head while holding the source record lock", async (t) => {
+  const sandbox = makeSandbox(t);
+  const old = new Date(Date.now() - 100 * 86_400_000).toISOString();
+  const source = makeRecord(sandbox, {
+    id: "late-resume-source", status: "done", pid: null, createdAt: old,
+    finishedAt: old, threadId: "late-resume-thread", claudeSessionId: "current-session"
+  });
+  fs.writeFileSync(source.record.logFile, "keep source log\n");
+  const previousHead = new Date(Date.now() - 60_000).toISOString();
+  makeRecord(sandbox, {
+    id: "previous-resume-head", status: "done", pid: null, createdAt: previousHead,
+    finishedAt: previousHead, threadId: "other-thread", claudeSessionId: "current-session"
+  });
+  const ready = path.join(sandbox.root, "resume-lock-ready");
+  const childSource = `
+import fs from "node:fs";
+import path from "node:path";
+const [stateUrl, file, ready, dataDir, cwd] = process.argv.slice(1);
+const { createJobRecord, jobFilePath, updateJobRecordFileWithCurrent, writeJobRecordFile } = await import(stateUrl);
+updateJobRecordFileWithCurrent(file, () => {
+  fs.writeFileSync(ready, "ready");
+  const jobs = path.dirname(file);
+  const lockOwnerPrefix = path.basename(file) + ".lock.owner.";
+  const deadline = Date.now() + 3000;
+  while (fs.readdirSync(jobs).filter((name) => name.startsWith(lockOwnerPrefix)).length < 2) {
+    if (Date.now() >= deadline) throw new Error("GC did not reach the source record lock");
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10);
+  }
+  const now = new Date().toISOString();
+  const head = createJobRecord({ id: "new-resume-head", cwd, status: "done", pid: null,
+    createdAt: now, finishedAt: now, threadId: "late-resume-thread", claudeSessionId: "current-session",
+    request: { resumeSourceJobId: "late-resume-source", resumeThreadId: "late-resume-thread" } });
+  writeJobRecordFile(jobFilePath(dataDir, cwd, head.id), head);
+  return null;
+}, { allowTerminal: true });
+`;
+  const holder = runLockChild(childSource, [stateModuleUrl, source.file, ready, sandbox.dataDir, sandbox.workDir]);
+  await waitForPath(ready);
+  const result = pruneJobState(sandbox.dataDir, {
+    claudeSessionId: "current-session", maxBytes: 0, maxRecords: 0,
+    recordMaxRecords: 0, resumeWorkspaceJobFiles: [source.file]
+  });
+  const outcome = await waitForCompletion(holder.completion, 5000);
+  assert.equal(outcome.exitCode, 0, outcome.stderr);
+  assert.equal(result.ok, true);
+  assert.equal(fs.existsSync(source.file), true);
+  assert.equal(fs.existsSync(source.record.logFile), true);
+  assert.equal(readJobRecordFile(source.file).artifactsPruned, false);
+});
+
+test("the data-root stamp skips a recent sweep until the record cap is over ten percent high", (t) => {
+  const sandbox = makeSandbox(t);
+  const limits = { maxRecords: 2, maxBytes: 1024 * 1024, recordMaxRecords: 100, recordRetentionDays: 0 };
+  const add = (index) => makeRecord(sandbox, { id: `gate-review-${index}`, jobClass: "review", status: "done", pid: null });
+  add(0);
+  assert.equal(pruneJobState(sandbox.dataDir, limits).skipped, undefined);
+  const second = add(1);
+  const skipped = pruneJobState(sandbox.dataDir, limits);
+  assert.equal(skipped.skipped, true);
+  assert.equal(readJobRecordFile(second.file).artifactsPruned, false);
+  add(2);
+  const swept = pruneJobState(sandbox.dataDir, limits);
+  assert.equal(swept.skipped, undefined);
+  assert.equal(swept.prunedArtifacts, 1);
+});
+
+test("orphan sweep removes aged managed artifacts and temp files while preserving unknown records", (t) => {
+  const sandbox = makeSandbox(t);
+  const jobs = path.dirname(jobFilePath(sandbox.dataDir, sandbox.workDir, "orphan"));
+  fs.mkdirSync(jobs, { recursive: true });
+  const oldLog = path.join(jobs, "orphan.events.jsonl");
+  const recentLog = path.join(jobs, "recent.log");
+  const oldTemp = path.join(jobs, "orphan.json.123.abc.tmp");
+  const futureLog = path.join(jobs, "future.log");
+  const corruptLog = path.join(jobs, "corrupt.log");
+  for (const file of [oldLog, recentLog, oldTemp, futureLog, corruptLog]) fs.writeFileSync(file, "data");
+  fs.writeFileSync(path.join(jobs, "future.json"), '{"schemaVersion":2}');
+  fs.writeFileSync(path.join(jobs, "corrupt.json.corrupt.123"), "bad");
+  const aged = new Date(Date.now() - 25 * 60 * 60 * 1000);
+  for (const file of [oldLog, oldTemp, futureLog, corruptLog]) fs.utimesSync(file, aged, aged);
+  const result = pruneJobState(sandbox.dataDir, { recordRetentionDays: 0 });
+  assert.equal(result.deletedOrphans, 2);
+  assert.equal(fs.existsSync(oldLog), false);
+  assert.equal(fs.existsSync(oldTemp), false);
+  assert.equal(fs.existsSync(recentLog), true);
+  assert.equal(fs.existsSync(futureLog), true);
+  assert.equal(fs.existsSync(corruptLog), true);
 });

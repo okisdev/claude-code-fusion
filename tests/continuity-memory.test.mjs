@@ -191,29 +191,6 @@ test("Fusion routed briefs reject memory and never receive automatic continuity"
   assert.equal(grokInvocations(sandbox).length, 2);
 });
 
-test("legacy review and stop gate jobs mislabeled as tasks are never resume-last candidates", (t) => {
-  const sandbox = makeSandbox(t);
-  const env = envFor(sandbox, { CLAUDE_CODE_SESSION_ID: "claude-current" });
-  seedFinishedJob(sandbox, {
-    jobClass: "task",
-    sessionId: "22222222-2222-7222-8222-222222222222",
-    request: { reviewTargetLabel: "working tree changes" }
-  });
-  seedFinishedJob(sandbox, {
-    jobClass: "task",
-    sessionId: "33333333-3333-7333-8333-333333333333",
-    request: { maxTurns: 15 }
-  });
-  const consult = runTask(sandbox, ["--resume-last", "continue consult"], env);
-  assert.notEqual(consult.status, 0);
-  assert.match(consult.stderr, /No finished consult grok task/);
-  const write = runTask(sandbox, ["--write", "--resume-last", "continue write"], env);
-  assert.notEqual(write.status, 0);
-  assert.match(write.stderr, /No finished write grok task/);
-  assert.equal(grokInvocations(sandbox).length, 0);
-  assert.equal(jobRecords(sandbox.dataDir).length, 2);
-});
-
 test("memory is disabled by default and explicit --memory enables it in the Grok child", (t) => {
   const sandbox = makeSandbox(t);
   const defaultEnvFile = `${sandbox.root}/default-env.json`;

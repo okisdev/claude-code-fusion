@@ -359,7 +359,7 @@ test("history limit validation fails closed with structured input errors", (t) =
   }
 });
 
-test("history ignores mismatched filenames and native Grok sessions while narrowing malformed fields", (t) => {
+test("history ignores mismatched filenames, native Grok sessions, and malformed records", (t) => {
   const sandbox = makeSandbox(t);
   const validId = "dddddddddddddddddddddddddddddddd";
   seedJob(sandbox, {
@@ -414,25 +414,11 @@ test("history ignores mismatched filenames and native Grok sessions while narrow
   });
   assert.equal(result.status, 0, result.stderr);
   const payload = JSON.parse(result.stdout);
-  assert.equal(payload.totalJobs, 2);
+  assert.equal(payload.totalJobs, 1);
   assert.equal(payload.jobs.some((job) => job.jobId === mismatchedFileId), false);
   assert.equal(payload.jobs.some((job) => job.sessionId === "12121212-1212-7212-8212-121212121212"), false);
-
-  const malformed = payload.jobs.find((job) => job.jobId === malformedId);
-  assert.ok(malformed);
-  assert.equal(malformed.cwd, null);
-  assert.equal(malformed.status, "unknown");
-  assert.equal(malformed.jobClass, "unknown");
-  assert.equal(malformed.mode, "unknown");
-  assert.equal(malformed.background, false);
-  assert.equal(malformed.cleanupRequired, false);
-  assert.equal(malformed.failureKind, null);
-  assert.equal(malformed.resolvedModel, null);
-  assert.equal(malformed.resolvedEffort, null);
-  assert.equal(malformed.createdAt, null);
-  assert.equal(malformed.finishedAt, null);
-  assert.equal(malformed.sessionId, null);
-  assert.equal(malformed.resumable, false);
+  assert.equal(payload.jobs.some((job) => job.jobId === malformedId), false, "A malformed record takes the unreadable path instead of being narrowed.");
+  assert.deepEqual(payload.jobs.map((job) => job.jobId), [validId]);
 });
 
 test("history surfaces turn_limit failureKind from a terminal job record", (t) => {

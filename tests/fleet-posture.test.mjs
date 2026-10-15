@@ -40,17 +40,9 @@ function sessionLanesReminderPath(sandbox, sessionId = "session-1") {
   return path.join(sandbox.dataDir, "fleet-posture", "session-lanes-reminders", `${sessionId}.marker`);
 }
 
-function narrowWaveReminderPath(sandbox, streak, sessionId = "session-1") {
-  return path.join(sandbox.dataDir, "fleet-posture", "narrow-wave-reminders", `${sessionId}-${streak}.marker`);
-}
-
 function writeState(sandbox, state, sessionId = "session-1") {
   fs.mkdirSync(sandbox.stateDir, { recursive: true });
   fs.writeFileSync(statePath(sandbox, sessionId), JSON.stringify(state), "utf8");
-}
-
-function judgmentContext(streak) {
-  return tagMessage("fleet-posture.narrow-wave-reminder", `${streak} consecutive width one dispatch waves in this session. If the remaining packages are independent, dispatch them together in one message; /fusion:ultra is available when the goal is genuinely wide.`);
 }
 
 function run(sandbox, input = hookInput(sandbox), extraEnv = {}) {
@@ -72,9 +64,7 @@ function assertContext(result, additionalContext) {
   assert.strictEqual(result.stderr, "");
   const slug = additionalContext.includes("fleet-default active")
     ? "fleet-posture.strict-fleet-reminder"
-    : additionalContext.includes("fusion lanes ready:")
-      ? "fleet-posture.session-lanes-reminder"
-      : "fleet-posture.narrow-wave-reminder";
+    : "fleet-posture.session-lanes-reminder";
   assert.ok(additionalContext.endsWith(messageTag(slug)));
   assert.deepStrictEqual(JSON.parse(result.stdout), {
     hookSpecificOutput: { hookEventName: "UserPromptSubmit", additionalContext }
@@ -101,32 +91,31 @@ test("judgment posture is silent below the narrow wave threshold", (t) => {
   }
 });
 
-test("judgment posture emits the observed narrow wave streak", (t) => {
+test("fleet posture leaves observed narrow waves to the inline guard", (t) => {
   const sandbox = makeSandbox(t);
   writeState(sandbox, { consecutiveNarrowWaves: 2 });
   const original = fs.readFileSync(statePath(sandbox), "utf8");
 
   assertContext(run(sandbox), SESSION_LANES_CONTEXT);
-  assertContext(run(sandbox), judgmentContext(2));
   assertSilent(run(sandbox));
-  assert.strictEqual(fs.statSync(narrowWaveReminderPath(sandbox, 2)).mode & 0o777, 0o600);
-  assert.strictEqual(fs.statSync(path.dirname(narrowWaveReminderPath(sandbox, 2))).mode & 0o777, 0o700);
+  assertSilent(run(sandbox));
+  assert.strictEqual(fs.existsSync(path.join(sandbox.dataDir, "fleet-posture", "narrow-wave-reminders")), false);
   assert.strictEqual(fs.readFileSync(statePath(sandbox), "utf8"), original);
 });
 
-test("narrow wave reminders fire once per streak value per session", (t) => {
+test("fleet posture stays silent for narrow streak changes across sessions", (t) => {
   const sandbox = makeSandbox(t);
   assertContext(run(sandbox), SESSION_LANES_CONTEXT);
   writeState(sandbox, { consecutiveNarrowWaves: 2 });
-  assertContext(run(sandbox), judgmentContext(2));
+  assertSilent(run(sandbox));
   assertSilent(run(sandbox));
   writeState(sandbox, { consecutiveNarrowWaves: 3 });
-  assertContext(run(sandbox), judgmentContext(3));
+  assertSilent(run(sandbox));
   writeState(sandbox, { consecutiveNarrowWaves: 2 });
   assertSilent(run(sandbox));
   assertContext(run(sandbox, hookInput(sandbox, "session-2")), SESSION_LANES_CONTEXT);
   writeState(sandbox, { consecutiveNarrowWaves: 2 }, "session-2");
-  assertContext(run(sandbox, hookInput(sandbox, "session-2")), judgmentContext(2));
+  assertSilent(run(sandbox, hookInput(sandbox, "session-2")));
 });
 
 test("session lanes reminder renders the routing table's codex defaults", (t) => {
@@ -143,16 +132,16 @@ test("session lanes reminder renders the routing table's codex defaults", (t) =>
   assertContext(run(sandbox, hookInput(sandbox), { FUSION_MODEL_ROUTING: routingFile }), tagMessage("fleet-posture.session-lanes-reminder", "fusion lanes ready: codex flagship-choice for spec grade and deep review, quick-choice and volume-choice for quick and volume packages, grok under its four roles on the routing table's lane defaults, claude workers for the Claude surface. Independent packages dispatch together in one message; three or more convene /fusion:ultra; a single coherent change stays inline."));
 });
 
-test("judgment posture honors a valid narrow wave threshold and falls back for malformed values", (t) => {
+test("fleet posture ignores narrow wave threshold settings", (t) => {
   const sandbox = makeSandbox(t);
   assertContext(run(sandbox), SESSION_LANES_CONTEXT);
   writeState(sandbox, { consecutiveNarrowWaves: 2 });
 
   assertSilent(run(sandbox, hookInput(sandbox), { FUSION_NARROW_WAVE_THRESHOLD: "3" }));
   writeState(sandbox, { consecutiveNarrowWaves: 3 });
-  assertContext(run(sandbox, hookInput(sandbox), { FUSION_NARROW_WAVE_THRESHOLD: "3" }), judgmentContext(3));
+  assertSilent(run(sandbox, hookInput(sandbox), { FUSION_NARROW_WAVE_THRESHOLD: "3" }));
   writeState(sandbox, { consecutiveNarrowWaves: 2 });
-  assertContext(run(sandbox, hookInput(sandbox), { FUSION_NARROW_WAVE_THRESHOLD: "invalid" }), judgmentContext(2));
+  assertSilent(run(sandbox, hookInput(sandbox), { FUSION_NARROW_WAVE_THRESHOLD: "invalid" }));
 });
 
 test("strict posture emits the legacy reminder without guard state", (t) => {

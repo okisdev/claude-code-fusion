@@ -16,7 +16,6 @@ export function parseServiceTier(value) {
 export function parseArgs(argv, config = {}) {
   const valueOptions = new Set(config.valueOptions ?? []);
   const booleanOptions = new Set(config.booleanOptions ?? []);
-  const aliasMap = config.aliasMap ?? {};
   const options = {};
   const positionals = [];
   let passthrough = false;
@@ -44,10 +43,10 @@ export function parseArgs(argv, config = {}) {
     const separator = long ? raw.indexOf("=") : -1;
     const rawKey = separator === -1 ? raw : raw.slice(0, separator);
     const inlineValue = separator === -1 ? undefined : unquoteOptionValue(raw.slice(separator + 1));
-    const key = aliasMap[rawKey] ?? rawKey;
+    const key = rawKey;
 
     if (booleanOptions.has(key)) {
-      if (!long && raw.length > 1 && !aliasMap[raw]) {
+      if (!long && raw.length > 1) {
         throw new Error(`Unknown option -${raw}.`);
       }
       if (inlineValue !== undefined && inlineValue !== "true" && inlineValue !== "false") {
@@ -58,7 +57,7 @@ export function parseArgs(argv, config = {}) {
     }
     if (valueOptions.has(key)) {
       const nextValue = inlineValue ?? unquoteOptionValue(argv[index + 1]);
-      if (nextValue === undefined || (inlineValue === undefined && knownOptionToken(nextValue, valueOptions, booleanOptions, aliasMap))) {
+      if (nextValue === undefined || (inlineValue === undefined && knownOptionToken(nextValue, valueOptions, booleanOptions))) {
         throw new Error(`Missing value for ${long ? "--" : "-"}${rawKey}.`);
       }
       options[key] = nextValue;
@@ -78,7 +77,6 @@ export function parseRawArgs(value, config = {}) {
   const tokens = rawArgumentTokens(input);
   const valueOptions = new Set(config.valueOptions ?? []);
   const booleanOptions = new Set(config.booleanOptions ?? []);
-  const aliasMap = config.aliasMap ?? {};
   const options = {};
   const positionalIndexes = [];
   let passthrough = false;
@@ -107,13 +105,13 @@ export function parseRawArgs(value, config = {}) {
     const separator = long ? raw.indexOf("=") : -1;
     const rawKey = separator === -1 ? raw : raw.slice(0, separator);
     const inlineValue = separator === -1 ? undefined : unquoteOptionValue(raw.slice(separator + 1));
-    const key = aliasMap[rawKey] ?? rawKey;
+    const key = rawKey;
 
     if (booleanOptions.has(key)) {
       if (tokenInfo.unterminatedQuote) {
         throw new Error(`Unterminated quote in --${rawKey}.`);
       }
-      if (!long && raw.length > 1 && !aliasMap[raw]) {
+      if (!long && raw.length > 1) {
         throw new Error(`Unknown option -${raw}.`);
       }
       if (inlineValue !== undefined && inlineValue !== "true" && inlineValue !== "false") {
@@ -129,7 +127,7 @@ export function parseRawArgs(value, config = {}) {
       }
       const nextToken = nextTokenInfo?.value;
       const nextValue = inlineValue ?? unquoteOptionValue(nextToken);
-      if (nextValue === undefined || (inlineValue === undefined && knownOptionToken(nextValue, valueOptions, booleanOptions, aliasMap))) {
+      if (nextValue === undefined || (inlineValue === undefined && knownOptionToken(nextValue, valueOptions, booleanOptions))) {
         throw new Error(`Missing value for ${long ? "--" : "-"}${rawKey}.`);
       }
       options[key] = nextValue;
@@ -189,7 +187,7 @@ function unquoteOptionValue(value) {
   return (first === "'" || first === '"') && value.at(-1) === first ? value.slice(1, -1) : value;
 }
 
-function knownOptionToken(token, valueOptions, booleanOptions, aliasMap) {
+function knownOptionToken(token, valueOptions, booleanOptions) {
   if (!token || token === "-" || !token.startsWith("-")) {
     return false;
   }
@@ -197,7 +195,7 @@ function knownOptionToken(token, valueOptions, booleanOptions, aliasMap) {
   const raw = long ? token.slice(2) : token.slice(1);
   const separator = raw.indexOf("=");
   const rawKey = separator === -1 ? raw : raw.slice(0, separator);
-  const key = aliasMap[rawKey] ?? rawKey;
+  const key = rawKey;
   return valueOptions.has(key) || booleanOptions.has(key);
 }
 

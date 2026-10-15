@@ -36,7 +36,12 @@ if (mode === "timeout") {
   };
   const jobFile = path.join(process.env[`${engine.toUpperCase()}_COMPANION_DATA`], "state", "workspace", "jobs", `${jobId}.json`);
   fs.mkdirSync(path.dirname(jobFile), { recursive: true });
-  fs.writeFileSync(jobFile, JSON.stringify(record));
+  if (mode === "delayed-record") {
+    const publisher = spawn(process.execPath, ["-e", "const fs = require('node:fs'); const path = require('node:path'); setTimeout(() => { fs.mkdirSync(path.dirname(process.argv[1]), { recursive: true }); fs.writeFileSync(process.argv[1], process.argv[2]); }, 300);", jobFile, JSON.stringify(record)], { detached: true, stdio: "ignore" });
+    publisher.unref();
+  } else {
+    fs.writeFileSync(jobFile, JSON.stringify(record));
+  }
   if (mode === "stderr-error") {
     process.stderr.write(`${JSON.stringify({ status: "error", failureKind: "quota", message: `job: ${jobId}` })}\n`);
   } else {

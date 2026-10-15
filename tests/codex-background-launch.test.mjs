@@ -44,11 +44,12 @@ function createBackgroundJob(sandbox, env, id) {
     id,
     background: true,
     briefFile,
+    claudeSessionId: env.CLAUDE_CODE_SESSION_ID,
     cwd: sandbox.workDir,
     eventsFile: jobEventsPath(dataDir, sandbox.workDir, id),
     logFile: jobLogPath(dataDir, sandbox.workDir, id),
     phase: "queued",
-    request: { transport: "task", write: false, web: false, network: false }
+    request: { transport: "task", write: false, web: false, network: false, serviceTier: "priority" }
   });
   const file = jobFilePath(dataDir, sandbox.workDir, id);
   writeJobRecordFile(file, record);

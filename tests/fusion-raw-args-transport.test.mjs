@@ -142,8 +142,9 @@ test("the stats CLI consumes staged arguments without invoking embedded shell sy
   fs.writeFileSync(transport.file, `--json $(touch ${marker})`);
 
   const result = spawnSync(process.execPath, [SCRIPT, "--raw-args-token", transport.token], { cwd: directory, env, encoding: "utf8" });
-  assert.strictEqual(result.status, 0, result.stderr);
-  assert.doesNotThrow(() => JSON.parse(result.stdout));
+  assert.strictEqual(result.status, 2, result.stderr);
+  assert.match(result.stderr, /^Usage: \$\(touch: unknown argument\n$/);
+  assert.strictEqual(result.stdout, "");
   assert.strictEqual(fs.existsSync(marker), false);
   assert.strictEqual(fs.existsSync(path.dirname(transport.file)), false);
 });
@@ -204,4 +205,35 @@ test("the stats CLI forwards --failure-kind-for from staged arguments", (t) => {
   const result = spawnSync(process.execPath, [SCRIPT, "--raw-args-token", transport.token], { cwd: directory, env, encoding: "utf8" });
   assert.strictEqual(result.status, 0, result.stderr);
   assert.deepStrictEqual(JSON.parse(fs.readFileSync(argsFile, "utf8")), ["record-acceptance", "--job-id", jobId, "--acceptance", "rejected", "--source", "main-loop", "--reason", "The output did not satisfy the requested scope.", "--failure-kind", "scope_rewrite"]);
+});
+
+test("Codex prune leaves group- or world-readable aged requests untouched", (t) => {
+  if (process.platform === "win32") return t.skip("POSIX file modes are required");
+  const temporaryRoot = sandbox(t);
+  const companion = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "plugins", "codex", "scripts", "codex-companion.mjs");
+  const env = { ...process.env, TMPDIR: temporaryRoot, TMP: temporaryRoot, TEMP: temporaryRoot, CLAUDE_CODE_SESSION_ID: "codex-prune-private-file-test" };
+  const create = () => {
+    const result = spawnSync(process.execPath, [companion, "transport-create"], { env, encoding: "utf8" });
+    assert.strictEqual(result.status, 0, result.stderr);
+    const transport = JSON.parse(result.stdout);
+    t.after(() => fs.rmSync(path.dirname(transport.file), { recursive: true, force: true }));
+    const ownerFile = path.join(path.dirname(transport.file), "owner.json");
+    const owner = JSON.parse(fs.readFileSync(ownerFile, "utf8"));
+    fs.writeFileSync(ownerFile, `${JSON.stringify({ ...owner, createdAt: Date.now() - 2 * 60 * 60 * 1000 })}\n`);
+    return transport;
+  };
+
+  const readable = [0o640, 0o604].map((mode) => {
+    const transport = create();
+    fs.chmodSync(transport.file, mode);
+    return transport;
+  });
+  const privateRequest = create();
+  create(); // Pruning runs before allocation.
+
+  for (const transport of readable) {
+    assert.strictEqual(fs.existsSync(path.dirname(transport.file)), true);
+    assert.strictEqual(fs.existsSync(transport.file), true);
+  }
+  assert.strictEqual(fs.existsSync(path.dirname(privateRequest.file)), false);
 });

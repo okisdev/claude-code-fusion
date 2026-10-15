@@ -18,6 +18,11 @@ const PRIVATE_DIR_MODE = 0o700;
 const PRIVATE_FILE_MODE = 0o600;
 const STATE_MAX_BYTES_ENV = "CODEX_COMPANION_HISTORY_MAX_BYTES";
 const STATE_MAX_RECORDS_ENV = "CODEX_COMPANION_HISTORY_MAX_RECORDS";
+const RECORD_MAX_RECORDS_ENV = "CODEX_COMPANION_RECORD_MAX_RECORDS";
+const RECORD_RETENTION_DAYS_ENV = "CODEX_COMPANION_RECORD_RETENTION_DAYS";
+const GC_INTERVAL_MS = 60 * 1000;
+const ORPHAN_AGE_MS = 24 * 60 * 60 * 1000;
+const TEMP_AGE_MS = 60 * 60 * 1000;
 const JOB_STATUSES = new Set(["running", "done", "error", "cancelled"]);
 const DELIVERY_MODES = new Set(["foreground", "manual", "managed"]);
 const SEMANTIC_STATUSES = new Set(["accepted", "rejected", "unverified"]);
@@ -31,6 +36,8 @@ const gitValueCache = new Map();
 
 export const DEFAULT_JOB_HISTORY_MAX_BYTES = 512 * 1024 * 1024;
 export const DEFAULT_JOB_HISTORY_MAX_RECORDS = 256;
+export const DEFAULT_JOB_RECORD_MAX_RECORDS = 5000;
+export const DEFAULT_JOB_RECORD_RETENTION_DAYS = 90;
 export const DEFAULT_LOCK_TIMEOUT_MS = 5000;
 export const TERMINAL_STATUSES = new Set(["done", "error", "cancelled"]);
 export const SESSION_ID_ENV = "CLAUDE_CODE_SESSION_ID";
@@ -496,47 +503,20 @@ function assertJobRecord(record) {
   if (record.companionVersion != null && (typeof record.companionVersion !== "string" || !record.companionVersion.trim())) {
     throw new TypeError("Job companion version is invalid.");
   }
+  const requiredFields = ["claudeSessionId", "delivery", "deliveryCollectedAt", "artifactsPruned",
+    "acceptanceSource", "acceptanceRecordedAt", "fileChangeCount", "semanticStatus",
+    "semanticFailureKind", "semanticFailureMessage", "serviceTier", "resolvedModel", "resolvedEffort",
+    "timeoutMs", "companionVersion"];
+  if (record.schemaVersion !== JOB_SCHEMA_VERSION || record.engine !== "codex"
+    || Object.hasOwn(record, "appliedServiceTier") || Object.hasOwn(record, "sessionId")
+    || requiredFields.some((field) => !Object.hasOwn(record, field))) {
+    throw new TypeError("Job record schema is invalid.");
+  }
 }
 
 function ownerSessionId(record) {
-  const value = record?.claudeSessionId ?? record?.sessionId ?? null;
+  const value = record?.claudeSessionId ?? null;
   return typeof value === "string" && value.trim() ? value.trim() : null;
-}
-
-function normalizeRecord(record) {
-  const { appliedServiceTier, ...normalizedRecord } = record;
-  const sessionId = ownerSessionId(record);
-  return {
-    ...normalizedRecord,
-    delivery: record.delivery ?? (record.background ? "manual" : "foreground"),
-    deliveryCollectedAt: record.deliveryCollectedAt ?? null,
-    schemaVersion: record.schemaVersion ?? JOB_SCHEMA_VERSION,
-    acceptanceSource: record.acceptanceSource ?? null,
-    acceptanceRecordedAt: record.acceptanceRecordedAt ?? null,
-    fileChangeCount: record.fileChangeCount ?? null,
-    semanticStatus: record.semanticStatus ?? "unverified",
-    semanticFailureKind: record.semanticFailureKind ?? null,
-    semanticFailureMessage: record.semanticFailureMessage ?? null,
-    serviceTier: record.serviceTier ?? record.request?.serviceTier ?? null,
-    resolvedModel: record.resolvedModel ?? null,
-    resolvedEffort: record.resolvedEffort ?? null,
-    timeoutMs: record.timeoutMs ?? null,
-    companionVersion: record.companionVersion ?? null,
-    sessionId,
-    claudeSessionId: sessionId
-  };
-}
-
-function patchedSessionId(existing, patch) {
-  const claudeChanged = Object.hasOwn(patch, "claudeSessionId") && patch.claudeSessionId !== existing.claudeSessionId;
-  const legacyChanged = Object.hasOwn(patch, "sessionId") && patch.sessionId !== existing.sessionId;
-  if (claudeChanged) {
-    return ownerSessionId({ claudeSessionId: patch.claudeSessionId });
-  }
-  if (legacyChanged) {
-    return ownerSessionId({ sessionId: patch.sessionId });
-  }
-  return ownerSessionId(existing);
 }
 
 function terminalPatch(existing, patch, timestamp) {
@@ -567,13 +547,12 @@ function mergeRecord(existing, patch) {
   const effectivePatch = TERMINAL_STATUSES.has(requestedStatus)
     ? terminalPatch(existing, { ...patch, status: requestedStatus }, timestamp)
     : { ...patch, updatedAt: patch.updatedAt ?? timestamp };
-  const sessionId = patchedSessionId(existing, patch);
-  const next = normalizeRecord({
+  const sessionId = ownerSessionId({ claudeSessionId: Object.hasOwn(patch, "claudeSessionId") ? patch.claudeSessionId : existing.claudeSessionId });
+  const next = {
     ...existing,
     ...effectivePatch,
-    sessionId,
     claudeSessionId: sessionId
-  });
+  };
   assertJobRecord(next);
   return next;
 }
@@ -732,7 +711,6 @@ export function createJobRecord(fields) {
     repositoryTopLevel: gitValue(cwd, ["rev-parse", "--show-toplevel"]),
     repositoryIdentity: identity,
     repositoryKey: fields.repositoryKey ?? createHash("sha256").update(identity).digest("hex").slice(0, 16),
-    sessionId,
     claudeSessionId: sessionId,
     pid: fields.pid ?? null,
     pidIdentity: fields.pidIdentity ?? null,
@@ -746,6 +724,7 @@ export function createJobRecord(fields) {
     briefFile: fields.briefFile ?? null,
     logFile: fields.logFile ?? null,
     eventsFile: fields.eventsFile ?? null,
+    artifactsPruned: Boolean(fields.artifactsPruned),
     createdAt,
     startedAt: fields.startedAt ?? null,
     updatedAt: fields.updatedAt ?? createdAt,
@@ -799,9 +778,7 @@ export function writeJobRecordFile(file, record) {
     if (existing && TERMINAL_STATUSES.has(existing.status)) {
       return;
     }
-    const next = normalizeRecord(record);
-    assertJobRecord(next);
-    atomicWriteFile(file, `${JSON.stringify(next, null, 2)}\n`);
+    atomicWriteFile(file, `${JSON.stringify(record, null, 2)}\n`);
   });
   return file;
 }
@@ -825,7 +802,7 @@ export function readJobRecordFile(file) {
   }
   try {
     assertJobRecord(parsed);
-    return normalizeRecord(parsed);
+    return parsed;
   } catch {
     return null;
   }
@@ -905,11 +882,11 @@ export function markJobCollectedFile(file, collectedAt = nowIso()) {
     if (!TERMINAL_STATUSES.has(existing.status) || existing.collectedAt) {
       return existing;
     }
-    const next = normalizeRecord({
+    const next = {
       ...existing,
       collectedAt,
       deliveryCollectedAt: existing.delivery === "foreground" ? existing.deliveryCollectedAt ?? null : existing.deliveryCollectedAt ?? collectedAt
-    });
+    };
     assertJobRecord(next);
     atomicWriteFile(file, `${JSON.stringify(next, null, 2)}\n`);
     return next;
@@ -1001,7 +978,9 @@ function retentionLimit(value, fallback) {
 export function resolveJobHistoryLimits(env = process.env) {
   return {
     maxBytes: retentionLimit(env[STATE_MAX_BYTES_ENV], DEFAULT_JOB_HISTORY_MAX_BYTES),
-    maxRecords: retentionLimit(env[STATE_MAX_RECORDS_ENV], DEFAULT_JOB_HISTORY_MAX_RECORDS)
+    maxRecords: retentionLimit(env[STATE_MAX_RECORDS_ENV], DEFAULT_JOB_HISTORY_MAX_RECORDS),
+    recordMaxRecords: retentionLimit(env[RECORD_MAX_RECORDS_ENV], DEFAULT_JOB_RECORD_MAX_RECORDS),
+    recordRetentionDays: retentionLimit(env[RECORD_RETENTION_DAYS_ENV], DEFAULT_JOB_RECORD_RETENTION_DAYS)
   };
 }
 
@@ -1011,7 +990,7 @@ function regularFileDescriptor(file) {
     if (!stat.isFile()) {
       return { kind: "unsafe" };
     }
-    return { dev: stat.dev, file, ino: stat.ino, kind: "regular", size: stat.size };
+    return { dev: stat.dev, file, ino: stat.ino, kind: "regular", mtimeMs: stat.mtimeMs, size: stat.size };
   } catch (error) {
     if (error?.code === "ENOENT") {
       return { file, kind: "missing", size: 0 };
@@ -1025,7 +1004,11 @@ function expectedManagedArtifacts(workspaceDir, id) {
   return [
     { field: "briefFile", file: path.join(workspaceDir, "briefs", `${id}.md`) },
     { field: "logFile", file: path.join(jobs, `${id}.log`) },
-    { field: "eventsFile", file: path.join(jobs, `${id}.events.jsonl`) }
+    { field: "eventsFile", file: path.join(jobs, `${id}.events.jsonl`) },
+    { file: path.join(jobs, `${id}.stdout.log`) },
+    { file: path.join(jobs, `${id}.stderr.log`) },
+    { file: path.join(jobs, `${id}.partial.txt`) },
+    { file: path.join(jobs, `${id}.partial-result.txt`) }
   ];
 }
 
@@ -1061,27 +1044,28 @@ function readManagedJobEntry(workspace, workspaceDir, file, id) {
   }
   const files = [];
   for (const artifact of expectedManagedArtifacts(workspaceDir, id)) {
-    const configured = record[artifact.field];
-    if (configured !== null && configured !== undefined && (typeof configured !== "string" || path.resolve(configured) !== artifact.file)) {
+    const configured = artifact.field ? record[artifact.field] : undefined;
+    if (artifact.field && configured !== null && configured !== undefined && (typeof configured !== "string" || path.resolve(configured) !== artifact.file)) {
       return null;
     }
     const descriptor = regularFileDescriptor(artifact.file);
-    if (descriptor.kind === "unsafe" || ((configured === null || configured === undefined) && descriptor.kind !== "missing")) {
+    if (descriptor.kind === "unsafe" || (artifact.field && (configured === null || configured === undefined) && descriptor.kind !== "missing")) {
       return null;
     }
     if (descriptor.kind === "regular") {
-      files.push(descriptor);
+      files.push({ ...descriptor, tier: artifact.field === "briefFile" ? "light" : "heavy" });
     }
   }
-  files.push(recordDescriptor);
+  files.push({ ...recordDescriptor, tier: "light" });
   return {
     bytes: files.reduce((total, descriptor) => total + descriptor.size, 0),
+    artifactBytes: files.filter((descriptor) => descriptor.tier === "heavy").reduce((total, descriptor) => total + descriptor.size, 0),
     createdAt: record.createdAt,
     file,
     files,
     id,
     key: `${workspace}\0${id}`,
-    record: normalizeRecord(record),
+    record,
     resumeSourceJobId,
     timestamp,
     workspace
@@ -1216,32 +1200,193 @@ function removeEmptyManagedWorkspace(workspaceDir) {
   removeEmptyManagedDirectory(workspaceDir);
 }
 
-function deleteManagedJobEntry(entry) {
-  const workspaceDir = path.dirname(path.dirname(entry.file));
-  const refreshed = readManagedJobEntry(entry.workspace, workspaceDir, entry.file, entry.id);
-  if (!refreshed || !TERMINAL_STATUSES.has(refreshed.record.status) || refreshed.record.updatedAt !== entry.record.updatedAt || refreshed.bytes !== entry.bytes) {
-    return null;
+function resumeProtectionChanged(entry, current, protection) {
+  const jobs = path.dirname(entry.file);
+  const workspaceDir = path.dirname(jobs);
+  let changed = false;
+  const seen = new Set();
+  for (const name of fs.readdirSync(jobs)) {
+    if (!name.endsWith(".json")) continue;
+    const id = name.slice(0, -".json".length);
+    if (!JOB_ID_PATTERN.test(id)) continue;
+    const file = path.join(jobs, name);
+    seen.add(file);
+    const descriptor = regularFileDescriptor(file);
+    const previous = protection.descriptors.get(file);
+    if (descriptor.kind === previous?.kind && descriptor.dev === previous?.dev &&
+        descriptor.ino === previous?.ino && descriptor.size === previous?.size &&
+        descriptor.mtimeMs === previous?.mtimeMs) continue;
+    changed = true;
+    protection.descriptors.set(file, descriptor);
+    const refreshed = file === entry.file ? current : readManagedJobEntry(entry.workspace, workspaceDir, file, id);
+    if (refreshed) protection.entries.set(file, refreshed);
+    else protection.entries.delete(file);
   }
-  const recordDescriptor = refreshed.files.find((descriptor) => descriptor.file === refreshed.file);
-  const artifacts = refreshed.files.filter((descriptor) => descriptor.file !== refreshed.file);
-  for (const descriptor of artifacts) {
-    if (!unlinkManagedDescriptor(descriptor)) {
-      return null;
+  for (const [file, known] of protection.entries) {
+    if (known.workspace === entry.workspace && !seen.has(file)) {
+      changed = true;
+      protection.entries.delete(file);
+      protection.descriptors.delete(file);
     }
   }
-  if (!recordDescriptor || !unlinkManagedDescriptor(recordDescriptor)) {
-    return null;
+  if (changed) {
+    protection.currentKeys = protectedManagedJobs(
+      [...protection.entries.values()], protection.claudeSessionId,
+      protection.protectedJobFiles, protection.resumeWorkspaceJobFiles
+    );
   }
-  removeEmptyManagedWorkspace(workspaceDir);
-  removeEmptyManagedDirectory(path.dirname(workspaceDir));
-  return refreshed.bytes;
+  return changed;
 }
 
-export function pruneJobState(dataDir, options = {}) {
-  const defaults = resolveJobHistoryLimits(options.env ?? process.env);
-  const maxBytes = retentionLimit(options.maxBytes, defaults.maxBytes);
-  const maxRecords = retentionLimit(options.maxRecords, defaults.maxRecords);
-  const failure = (error) => ({
+function deleteManagedJobEntry(entry, tier, protection) {
+  return withRecordLock(entry.file, () => {
+    const workspaceDir = path.dirname(path.dirname(entry.file));
+    const refreshed = readManagedJobEntry(entry.workspace, workspaceDir, entry.file, entry.id);
+    if (!refreshed || !TERMINAL_STATUSES.has(refreshed.record.status)
+        || (refreshed.record.background && !refreshed.record.collectedAt)) {
+      return null;
+    }
+    resumeProtectionChanged(entry, refreshed, protection);
+    if (protection.snapshotKeys.has(refreshed.key) || protection.currentKeys.has(refreshed.key)) {
+      return null;
+    }
+    if (tier === "heavy" && refreshed.record.artifactsPruned) {
+      return null;
+    }
+    const files = refreshed.files.filter((descriptor) => tier === "light" || descriptor.tier === "heavy");
+    // If a file was replaced after the scan, leave this job for the next sweep.
+    if (refreshed.record.updatedAt !== entry.record.updatedAt && tier === "light") {
+      return null;
+    }
+    for (const descriptor of files.filter((candidate) => candidate.file !== entry.file)) {
+      if (!unlinkManagedDescriptor(descriptor)) {
+        return null;
+      }
+    }
+    if (tier === "heavy") {
+      const next = { ...refreshed.record, artifactsPruned: true };
+      atomicWriteFile(entry.file, `${JSON.stringify(next, null, 2)}\n`);
+      return { bytes: refreshed.artifactBytes, record: next };
+    }
+    const recordDescriptor = files.find((descriptor) => descriptor.file === entry.file);
+    if (!recordDescriptor || !unlinkManagedDescriptor(recordDescriptor)) {
+      return null;
+    }
+    removeEmptyManagedWorkspace(workspaceDir);
+    removeEmptyManagedDirectory(path.dirname(workspaceDir));
+    return { bytes: refreshed.bytes, record: null };
+  });
+}
+
+function artifactJobId(name) {
+  for (const suffix of [".events.jsonl", ".stdout.log", ".stderr.log", ".partial.txt", ".partial-result.txt", ".log"]) {
+    if (name.endsWith(suffix)) {
+      const id = name.slice(0, -suffix.length);
+      return JOB_ID_PATTERN.test(id) ? id : null;
+    }
+  }
+  return null;
+}
+
+function temporaryJobId(name) {
+  const match = /^(.+?)(?:\.json|\.events\.jsonl|\.stdout\.log|\.stderr\.log|\.partial\.txt|\.partial-result\.txt|\.log)(?:\..+)?\.tmp$/.exec(name);
+  const id = match?.[1] ?? name.slice(0, -".tmp".length);
+  return JOB_ID_PATTERN.test(id) ? id : null;
+}
+
+function sweepOrphanJobs(workspaceDirs, now) {
+  let removed = 0;
+  for (const workspaceDir of workspaceDirs) {
+    const jobs = path.join(workspaceDir, "jobs");
+    let names;
+    try {
+      names = fs.readdirSync(jobs);
+    } catch {
+      continue;
+    }
+    const namesSet = new Set(names);
+    for (const name of names) {
+      const temporary = name.endsWith(".tmp");
+      const id = temporary ? temporaryJobId(name) : artifactJobId(name);
+      if (!id) {
+        continue;
+      }
+      const file = path.join(jobs, name);
+      const recordFile = path.join(jobs, `${id}.json`);
+      const descriptor = regularFileDescriptor(file);
+      if (descriptor.kind !== "regular" || now - descriptor.mtimeMs < (temporary ? TEMP_AGE_MS : ORPHAN_AGE_MS)) {
+        continue;
+      }
+      if (!temporary && (namesSet.has(`${id}.json`) || names.some((candidate) => candidate.startsWith(`${id}.json.corrupt.`)))) {
+        continue;
+      }
+      withRecordLock(recordFile, () => {
+        const current = regularFileDescriptor(file);
+        if (current.kind !== "regular") {
+          return;
+        }
+        const age = now - current.mtimeMs;
+        if (age < (temporary ? TEMP_AGE_MS : ORPHAN_AGE_MS)) {
+          return;
+        }
+        // Any record, including a future or corrupt one, owns its sibling files.
+        if (!temporary && (fs.existsSync(recordFile) || names.some((candidate) => candidate.startsWith(`${id}.json.corrupt.`)))) {
+          return;
+        }
+        if (unlinkManagedDescriptor(current)) {
+          removed += 1;
+        }
+      });
+    }
+  }
+  return removed;
+}
+
+function readGcStamp(file) {
+  try {
+    const value = JSON.parse(fs.readFileSync(file, "utf8"));
+    return value && typeof value === "object" ? value : null;
+  } catch {
+    return null;
+  }
+}
+
+function recentSweepCanSkip(dataDir, stamp, limits, now) {
+  if (!stamp || now - stamp.at >= GC_INTERVAL_MS || now < stamp.at ||
+      ["maxBytes", "maxRecords", "recordMaxRecords", "recordRetentionDays"].some((key) => stamp[key] !== limits[key])) {
+    return false;
+  }
+  // This pass reads directory names and file sizes, never job JSON.
+  const known = new Set(stamp.recordFiles ?? []);
+  let newRecords = 0;
+  let artifactBytes = 0;
+  const root = path.join(path.resolve(dataDir), "state");
+  let workspaces;
+  try { workspaces = fs.readdirSync(root, { withFileTypes: true }); } catch (error) {
+    if (error?.code === "ENOENT") return true;
+    throw error;
+  }
+  for (const workspace of workspaces) {
+    if (!workspace.isDirectory() || !WORKSPACE_SLUG_PATTERN.test(workspace.name)) continue;
+    const jobs = path.join(root, workspace.name, "jobs");
+    let names;
+    try { names = fs.readdirSync(jobs); } catch { continue; }
+    for (const name of names) {
+      const file = path.join(jobs, name);
+      if (name.endsWith(".json") && !known.has(file)) newRecords += 1;
+      if (!artifactJobId(name)) continue;
+      const descriptor = regularFileDescriptor(file);
+      if (descriptor.kind === "regular") artifactBytes += descriptor.size;
+    }
+  }
+  return stamp.afterRecords + newRecords <= limits.maxRecords * 1.1 &&
+    artifactBytes <= limits.maxBytes * 1.1 &&
+    stamp.afterLightRecords + newRecords <= limits.recordMaxRecords * 1.1;
+}
+
+function failure(limits, error) {
+  const { maxBytes, maxRecords, recordMaxRecords, recordRetentionDays } = limits;
+  return {
     afterBytes: null,
     afterRecords: null,
     deletedBytes: 0,
@@ -1249,18 +1394,48 @@ export function pruneJobState(dataDir, options = {}) {
     errorMessage: error instanceof Error ? error.message : String(error),
     maxBytes,
     maxRecords,
+    recordMaxRecords,
+    recordRetentionDays,
     ok: false,
     quotaSatisfied: false,
     unrecognizedRecords: null
-  });
+  };
+}
+
+export function pruneJobState(dataDir, options = {}) {
+  const defaults = resolveJobHistoryLimits(options.env ?? process.env);
+  const maxBytes = retentionLimit(options.maxBytes, defaults.maxBytes);
+  const maxRecords = retentionLimit(options.maxRecords, defaults.maxRecords);
+  const recordMaxRecords = retentionLimit(options.recordMaxRecords, defaults.recordMaxRecords);
+  const recordRetentionDays = retentionLimit(options.recordRetentionDays, defaults.recordRetentionDays);
+  const limits = { maxBytes, maxRecords, recordMaxRecords, recordRetentionDays };
   try {
     return withRecordLock(path.join(path.resolve(dataDir), "locks", "history-gc"), () => {
+      const stampFile = path.join(path.resolve(dataDir), "history-gc-stamp.json");
+      const now = Date.now();
+      const stamp = readGcStamp(stampFile);
+      if (recentSweepCanSkip(dataDir, stamp, limits, now)) {
+        const { recordFiles, ...previous } = stamp;
+        return { ...previous, deletedBytes: 0, deletedRecords: 0, deletedOrphans: 0, prunedArtifacts: 0, ok: true, skipped: true, errorMessage: null };
+      }
       const { entries, unrecognizedRecords, workspaceDirs } = scanManagedJobState(dataDir);
       const protectedKeys = protectedManagedJobs(entries, options.claudeSessionId, options.protectedJobFiles, options.resumeWorkspaceJobFiles);
-      let afterBytes = entries.reduce((total, entry) => total + entry.bytes, 0);
-      let afterRecords = entries.length;
+      const protection = {
+        entries: new Map(entries.map((entry) => [entry.file, entry])),
+        descriptors: new Map(entries.map((entry) => [entry.file, entry.files.find((descriptor) => descriptor.file === entry.file)])),
+        snapshotKeys: protectedKeys,
+        currentKeys: protectedKeys,
+        claudeSessionId: options.claudeSessionId,
+        protectedJobFiles: options.protectedJobFiles,
+        resumeWorkspaceJobFiles: options.resumeWorkspaceJobFiles
+      };
+      let afterBytes = entries.reduce((total, entry) => total + entry.artifactBytes, 0);
+      let afterRecords = entries.filter((entry) => !entry.record.artifactsPruned).length;
+      let afterLightRecords = entries.length;
       let deletedBytes = 0;
       let deletedRecords = 0;
+      let prunedArtifacts = 0;
+      const prunedKeys = new Set();
       const candidates = entries
         .filter((entry) => TERMINAL_STATUSES.has(entry.record.status) && !protectedKeys.has(entry.key))
         .sort((left, right) => left.timestamp - right.timestamp || left.file.localeCompare(right.file));
@@ -1268,34 +1443,60 @@ export function pruneJobState(dataDir, options = {}) {
         if (afterRecords <= maxRecords && afterBytes <= maxBytes) {
           break;
         }
-        const removedBytes = deleteManagedJobEntry(entry);
-        if (removedBytes === null) {
+        if (entry.record.artifactsPruned) continue;
+        const removed = deleteManagedJobEntry(entry, "heavy", protection);
+        if (!removed) {
           continue;
         }
         afterRecords -= 1;
-        afterBytes = Math.max(0, afterBytes - removedBytes);
-        deletedRecords += 1;
-        deletedBytes += removedBytes;
+        afterBytes = Math.max(0, afterBytes - removed.bytes);
+        deletedBytes += removed.bytes;
+        prunedArtifacts += 1;
+        prunedKeys.add(entry.key);
       }
+      const cutoff = now - recordRetentionDays * 24 * 60 * 60 * 1000;
+      for (const entry of candidates) {
+        if (afterLightRecords <= recordMaxRecords && (recordRetentionDays === 0 || entry.timestamp >= cutoff)) break;
+        if (afterLightRecords <= recordMaxRecords && entry.timestamp >= cutoff) continue;
+        const removed = deleteManagedJobEntry(entry, "light", protection);
+        if (!removed) continue;
+        afterLightRecords -= 1;
+        deletedRecords += 1;
+        deletedBytes += removed.bytes;
+        if (!entry.record.artifactsPruned && !prunedKeys.has(entry.key)) {
+          afterRecords -= 1;
+          afterBytes = Math.max(0, afterBytes - entry.artifactBytes);
+        }
+      }
+      const deletedOrphans = sweepOrphanJobs(workspaceDirs, now);
       for (const workspaceDir of workspaceDirs) {
         removeEmptyManagedWorkspace(workspaceDir);
       }
       removeEmptyManagedDirectory(path.join(path.resolve(dataDir), "state"));
-      return {
+      const result = {
+        at: now,
         afterBytes,
         afterRecords,
+        afterLightRecords,
         deletedBytes,
         deletedRecords,
+        deletedOrphans,
+        prunedArtifacts,
         errorMessage: null,
         maxBytes,
         maxRecords,
+        recordMaxRecords,
+        recordRetentionDays,
         ok: true,
-        quotaSatisfied: afterRecords <= maxRecords && afterBytes <= maxBytes,
-        unrecognizedRecords
+        quotaSatisfied: afterRecords <= maxRecords && afterBytes <= maxBytes && afterLightRecords <= recordMaxRecords,
+        unrecognizedRecords,
+        recordFiles: entries.map((entry) => entry.file)
       };
+      atomicWriteFile(stampFile, `${JSON.stringify(result)}\n`);
+      return { ...result, recordFiles: undefined };
     }, 0);
   } catch (error) {
-    return failure(error);
+    return failure(limits, error);
   }
 }
 

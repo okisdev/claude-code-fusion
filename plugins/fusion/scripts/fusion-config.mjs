@@ -240,6 +240,11 @@ function refreshLiveRules(env, stdout) {
   for (const message of messages) {
     stdout.write(`${message}\n`);
   }
+  if (result.status === "local-edits") {
+    stdout.write(
+      "fusion: installed rules routing table was not refreshed because the installed rules file has local edits; run /fusion:setup to reconcile.\n"
+    );
+  }
   return result;
 }
 
@@ -248,7 +253,7 @@ function showCommand(options, env, stdout) {
   const filePath = resolveModelRoutingPath(env);
   const posture = resolvePostureStatus(env);
   const result = readModelRoutingFile(filePath);
-  const table = result.ok ? renderModelTable(result.data) : result.missing ? DEFAULT_MODEL_TABLE_PLACEHOLDER : null;
+  const table = result.ok ? renderModelTable(result.data, { includeNotes: true }) : result.missing ? DEFAULT_MODEL_TABLE_PLACEHOLDER : null;
   if (options.json) {
     stdout.write(
       `${JSON.stringify(
@@ -329,6 +334,18 @@ function setDefaultCommand(positionals, options, env, stdout) {
   data.defaults ??= {};
   data.defaults[lane] ??= {};
   data.defaults[lane][role] = { model, effort };
+  const validation = validateModelRoutingData(data);
+  if (!validation.ok) {
+    throw new UsageError(`Cannot write model routing file: ${validation.reason}`);
+  }
+  const listing = readEngineModelListing(lane, env);
+  if (listing.available) {
+    if (!matchesListing(lane, model, listing.modelIds)) {
+      throw new UsageError(`Model ${model} is absent from the ${ENGINES[lane].displayName} model listing (${listing.source}).`);
+    }
+  } else {
+    stdout.write(`fusion-config: ${ENGINES[lane].displayName} model listing unavailable; model availability was not checked.\n`);
+  }
   writeModelRoutingData(filePath, data);
   refreshLiveRules(env, stdout);
   stdout.write(`Updated ${lane} ${role} default to ${model}@${effort}.\n`);

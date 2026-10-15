@@ -66,3 +66,28 @@ test("keeps final-segment exit-status evidence and rejects mutating commands", (
   assert.equal(verificationEvidence("npm test", { is_error: false, output: "1 failed" }), "exit-status");
   assert.equal(summaryEvidence("npm install | tail -20", "3 passed"), null);
 });
+
+for (const command of [
+  "npm test", "npm run build", "npm run lint", "npm run typecheck", "npm run check",
+  "pnpm test", "pnpm build", "pnpm lint", "pnpm typecheck", "pnpm check",
+  "yarn test", "yarn build", "yarn lint", "yarn typecheck", "yarn check",
+  "bun test", "bun run build", "bun run lint", "bun run typecheck", "bun run check",
+  "tsc --noEmit", "npx tsc --noEmit", "git diff --check",
+  "pytest", "python -m pytest", "uv run pytest",
+  "cargo test", "cargo check", "cargo clippy",
+  "go test ./...", "go vet ./...", "swift test", "swift build", "make test", "make check"
+]) {
+  test(`recognizes ${command} as verification`, () => {
+    assert.equal(verificationEvidence(command, { exitCode: 0 }), "exit-status");
+  });
+}
+
+test("numeric failure codes reject observable and summary verification evidence", () => {
+  for (const key of ["exitCode", "exit_code", "code", "returnCode"]) {
+    for (const value of [1, -1]) {
+      assert.equal(verificationEvidence("npm test", { [key]: value }), null, `${key}=${value}`);
+      assert.equal(summaryEvidence("npm test | tail -5", "ℹ fail 0", { [key]: value }), null, `${key}=${value}`);
+    }
+    assert.equal(verificationEvidence("npm test", { [key]: 0 }), "exit-status", `${key}=0`);
+  }
+});

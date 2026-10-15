@@ -9,7 +9,10 @@
     fs.appendFileSync(argsFile, JSON.stringify(process.argv.slice(2)) + "\n");
   }
   if (process.argv.includes("--version")) {
-    process.stdout.write(`${process.env.FAKE_GROK_VERSION_OUTPUT ?? "grok 1.0.41 (0123456789ab)"}\n`);
+    const version = process.env.FAKE_GROK_MODE === "unparseable-version"
+      ? "grok unknown"
+      : process.env.FAKE_GROK_VERSION_OUTPUT ?? "grok 1.0.41 (0123456789ab)";
+    process.stdout.write(`${version}\n`);
     process.exit(0);
   }
   if (!process.env.GROK_HOME) {
@@ -27,6 +30,9 @@
     process.exit(0);
   }
   if (process.argv.includes("--help")) {
+    if (Number(process.env.FAKE_GROK_HELP_DELAY_MS) > 0) {
+      await new Promise((resolve) => setTimeout(resolve, Number(process.env.FAKE_GROK_HELP_DELAY_MS)));
+    }
     const removedCapabilities = new Set(
       String(process.env.FAKE_GROK_REMOVED_CAPABILITIES ?? "")
         .split(",")
@@ -116,8 +122,21 @@
   }
 
   if (process.argv.includes("models")) {
+    if (Number(process.env.FAKE_GROK_MODELS_DELAY_MS) > 0) {
+      await new Promise((resolve) => setTimeout(resolve, Number(process.env.FAKE_GROK_MODELS_DELAY_MS)));
+    }
     if (process.env.FAKE_GROK_MODELS_CWD_FILE) {
       fs.writeFileSync(process.env.FAKE_GROK_MODELS_CWD_FILE, process.cwd(), "utf8");
+    }
+    if (process.env.FAKE_GROK_MODELS_VALIDATE_STORE === "1") {
+      const authFile = process.env.GROK_AUTH_PATH
+        ? path.resolve(process.cwd(), process.env.GROK_AUTH_PATH)
+        : path.join(grokHome, "auth.json");
+      if (fs.readFileSync(authFile, "utf8") !== "fixture") {
+        process.exit(1);
+      }
+      const now = new Date(Date.now() + 1000);
+      fs.utimesSync(authFile, now, now);
     }
     if (process.env.FAKE_GROK_MODELS_TOUCH) {
       const now = new Date(Date.now() + 1000);
@@ -182,7 +201,44 @@
       };
     }
     if (event) {
-      fs.appendFileSync(eventFile, `${JSON.stringify(event)}\n`, "utf8");
+      if (mode === "sandbox-event-growing") {
+        const noiseBytes = Number(process.env.FAKE_GROK_SANDBOX_NOISE_BYTES) || 256 * 1024;
+        fs.appendFileSync(eventFile, `${JSON.stringify({ event_type: "ProfileApplied", workspace: "/other-workspace", padding: "x".repeat(noiseBytes) })}\n`, "utf8");
+        const gate = process.env.FAKE_GROK_SANDBOX_EVENT_GATE_FILE;
+        if (gate) {
+          const gateDeadline = Date.now() + 10000;
+          while (!fs.existsSync(gate) && Date.now() < gateDeadline) {
+            await new Promise((resolve) => setTimeout(resolve, 10));
+          }
+          if (!fs.existsSync(gate)) {
+            process.stderr.write("Sandbox event test gate was not opened.\n");
+            process.exit(2);
+          }
+        } else {
+          await new Promise((resolve) => setTimeout(resolve, 250));
+        }
+      }
+      if (mode === "sandbox-event-partial") {
+        const line = `${JSON.stringify(event)}\n`;
+        const middle = Math.floor(line.length / 2);
+        fs.appendFileSync(eventFile, line.slice(0, middle), "utf8");
+        const gate = process.env.FAKE_GROK_SANDBOX_PARTIAL_GATE_FILE;
+        if (gate) {
+          const gateDeadline = Date.now() + 10000;
+          while (!fs.existsSync(gate) && Date.now() < gateDeadline) {
+            await new Promise((resolve) => setTimeout(resolve, 10));
+          }
+          if (!fs.existsSync(gate)) {
+            process.stderr.write("Sandbox partial-line test gate was not opened.\n");
+            process.exit(2);
+          }
+        } else {
+          await new Promise((resolve) => setTimeout(resolve, 100));
+        }
+        fs.appendFileSync(eventFile, line.slice(middle), "utf8");
+      } else {
+        fs.appendFileSync(eventFile, `${JSON.stringify(event)}\n`, "utf8");
+      }
     }
     if (sandboxFailures[mode]) {
       process.stderr.write(`${sandboxFailures[mode]}\n`);
@@ -353,7 +409,11 @@
     }
   };
 
-  if (mode === "ok") {
+  if (Number(process.env.FAKE_GROK_TURN_DELAY_MS) > 0) {
+    await new Promise((resolve) => setTimeout(resolve, Number(process.env.FAKE_GROK_TURN_DELAY_MS)));
+  }
+
+  if (mode === "ok" || mode === "sandbox-event-growing" || mode === "sandbox-event-partial") {
     emit({
       text: "FAKE-OK",
       stopReason: "end_turn",
@@ -363,7 +423,7 @@
     process.exit(0);
   }
 
-  if (mode === "auth-once" || mode === "auth-once-then-error") {
+  if (mode === "auth-once" || mode === "auth-once-then-error" || mode === "auth-once-then-hang") {
     if (nextAttempt() === 0) {
       process.stderr.write("login required, AuthorizationRequired\n");
       process.exit(1);
@@ -371,6 +431,11 @@
     if (mode === "auth-once-then-error") {
       process.stderr.write("upstream failed after retry\n");
       process.exit(1);
+    }
+    if (mode === "auth-once-then-hang") {
+      process.on("SIGTERM", () => process.exit(143));
+      setTimeout(() => process.exit(0), 120000);
+      return;
     }
     emit({
       text: "FAKE-OK",
@@ -909,6 +974,15 @@
 
   if (mode === "quota-error") {
     process.stderr.write("quota exceeded\n");
+    process.exit(1);
+  }
+
+  if (mode === "quota-json-error") {
+    emit({ type: "error", message: "Internal error: {" });
+    process.stderr.write(JSON.stringify({
+      error: { message: process.env.FAKE_GROK_QUOTA_MESSAGE ?? "HTTP 402 Payment Required: usage balance exhausted", code: 402 },
+      message: "less specific"
+    }) + "\n");
     process.exit(1);
   }
 

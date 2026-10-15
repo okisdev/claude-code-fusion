@@ -4,7 +4,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { test } from "node:test";
-import { advisoryLine, codexFailureKind } from "../plugins/fusion/scripts/breaker-check.mjs";
+import { advisoryLine, codexFailureKind, run as runBreakerCheck } from "../plugins/fusion/scripts/breaker-check.mjs";
 import { engineStateRoots } from "../plugins/fusion/scripts/lib/engines.mjs";
 import { messageTag } from "../plugins/fusion/scripts/lib/user-messages.mjs";
 
@@ -62,6 +62,64 @@ function run(sandbox, extraEnv = {}) {
     encoding: "utf8"
   });
 }
+
+test("worker breaker parses recent ledger records once and skips 2,000 old files", (t) => {
+  const sandbox = makeSandbox(t);
+  const env = envFor(sandbox);
+  const now = Date.now();
+  const jobsDir = path.join(sandbox.workerState, "jobs");
+  fs.mkdirSync(jobsDir, { recursive: true });
+  const recent = new Set();
+  for (const [id, minutesAgo] of [["fusion-recent-one", 4], ["fusion-recent-two", 2]]) {
+    const file = path.join(jobsDir, `${id}.json`);
+    writeRecord(file, {
+      agentType: "fusion:claude-worker", transportStatus: "failed", failureKind: "timeout",
+      finishedAt: new Date(now - minutesAgo * 60000).toISOString()
+    });
+    fs.utimesSync(file, (now - 60000) / 1000, (now - 60000) / 1000);
+    recent.add(file);
+  }
+  const originalWrite = process.stdout.write;
+  const capture = () => {
+    let output = "";
+    process.stdout.write = (chunk) => { output += chunk; return true; };
+    try {
+      runBreakerCheck(env, now);
+    } finally {
+      process.stdout.write = originalWrite;
+    }
+    return output;
+  };
+  const expected = capture();
+  assert.match(expected, /fusion:claude-worker breaker as open.*2 timeout across 2 terminal jobs/);
+  const old = new Set();
+  for (let index = 0; index < 2000; index += 1) {
+    const file = path.join(jobsDir, `fusion-old-${index}.json`);
+    writeRecord(file, {
+      agentType: "fusion:claude-worker", transportStatus: "failed", failureKind: "timeout",
+      finishedAt: new Date(now - 13 * 60 * 60000).toISOString()
+    });
+    fs.utimesSync(file, (now - 13 * 60 * 60000) / 1000, (now - 13 * 60 * 60000) / 1000);
+    old.add(file);
+  }
+  let oldReads = 0;
+  let recentReads = 0;
+  const originalRead = fs.readFileSync;
+  fs.readFileSync = (file, ...args) => {
+    if (old.has(file)) oldReads += 1;
+    if (recent.has(file)) recentReads += 1;
+    return originalRead(file, ...args);
+  };
+  let actual;
+  try {
+    actual = capture();
+  } finally {
+    fs.readFileSync = originalRead;
+  }
+  assert.strictEqual(actual, expected);
+  assert.strictEqual(oldReads, 0);
+  assert.strictEqual(recentReads, 2);
+});
 
 test("an in-window quota failure prints a grok breaker advisory", (t) => {
   const sandbox = makeSandbox(t);

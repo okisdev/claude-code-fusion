@@ -1,5 +1,5 @@
 import assert from "node:assert";
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -15,13 +15,20 @@ const script = path.join(repoRoot, "plugins", "fusion", "scripts", "worker-lifec
 
 function sandbox(t) {
   const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "fusion-worker-test-")));
-  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const children = new Set();
+  t.after(() => {
+    for (const child of children) {
+      if (!child.stdin.destroyed) child.stdin.end();
+      child.kill("SIGKILL");
+    }
+    fs.rmSync(root, { recursive: true, force: true });
+  });
   const cwd = path.join(root, "repo");
   const state = path.join(root, "workers");
   const transcript = path.join(root, "parent.jsonl");
   fs.mkdirSync(cwd, { recursive: true });
   fs.writeFileSync(transcript, "", "utf8");
-  return { root, cwd, state, transcript };
+  return { root, cwd, state, transcript, children };
 }
 
 function envFor(box, extra = {}) {
@@ -55,7 +62,32 @@ function routingFixture(box) {
 }
 
 function run(box, payload, extra = {}) {
-  return spawnSync(process.execPath, [script], { input: JSON.stringify(payload), encoding: "utf8", env: envFor(box, extra) });
+  return spawnSync(process.execPath, [script], { input: JSON.stringify(payload), encoding: "utf8", env: envFor(box, extra), timeout: 30_000, killSignal: "SIGKILL" });
+}
+
+async function runWithClosedStdin(box, payload, extra = {}) {
+  const child = spawn(process.execPath, [script], { env: envFor(box, extra), stdio: ["pipe", "pipe", "pipe"] });
+  box.children.add(child);
+  let stdout = "";
+  let stderr = "";
+  child.stdout.setEncoding("utf8").on("data", (chunk) => { stdout += chunk; });
+  child.stderr.setEncoding("utf8").on("data", (chunk) => { stderr += chunk; });
+  child.stdin.on("error", (error) => { if (error.code !== "EPIPE") stderr += error.message; });
+  const completion = new Promise((resolve, reject) => {
+    child.once("error", reject);
+    child.once("close", (code, signal) => resolve({ code, signal }));
+  });
+  const timer = setTimeout(() => child.kill("SIGKILL"), 30_000);
+  child.stdin.end(JSON.stringify(payload));
+  try {
+    const { code, signal } = await completion;
+    return { status: code, signal, stdout, stderr };
+  } finally {
+    clearTimeout(timer);
+    if (!child.stdin.destroyed) child.stdin.end();
+    if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+    box.children.delete(child);
+  }
 }
 
 function writeCodexAcceptanceCompanion(box) {
@@ -131,21 +163,6 @@ function stop(box) {
   });
 }
 
-test("legacy collection methods normalize when worker records load", (t) => {
-  const box = sandbox(t);
-  const worker = createWorkerRecord({
-    taskId: `fusion-${"a".repeat(24)}`,
-    sessionId: "session-1",
-    agentType: "fusion:claude-worker",
-    workspaceRoot: box.cwd
-  }, envFor(box));
-  const file = path.join(box.state, "jobs", `${worker.taskId}.json`);
-  const stored = JSON.parse(fs.readFileSync(file, "utf8"));
-  fs.writeFileSync(file, `${JSON.stringify({ ...stored, collectionMethod: "SubagentStop" }, null, 2)}\n`, "utf8");
-
-  assert.strictEqual(record(box).collectionMethod, WORKER_COLLECTION_METHODS.SUBAGENT_STOP);
-});
-
 test("collection method write sites use the canonical set", () => {
   const allowed = new Set(Object.values(WORKER_COLLECTION_METHODS));
   assert.strictEqual(allowed.size, Object.keys(WORKER_COLLECTION_METHODS).length);
@@ -166,20 +183,20 @@ test("collection method write sites use the canonical set", () => {
   assert.ok(calls.every((line) => line.includes("WORKER_COLLECTION_METHODS.") || line.includes(", collectionMethod, now")));
 });
 
-test("worker limits preserve the default budgets and expose only the timing seams to the environment", () => {
+test("worker limits use recalibrated defaults and expose only the timing seams to the environment", () => {
   assert.deepStrictEqual(workerLimits("fusion:claude-worker", {}), {
-    wallClockMs: 1_200_000,
+    wallClockMs: 2_400_000,
     stallMs: 600_000,
-    maxTurns: 60,
-    maxOutputTokens: 96_000,
-    maxUncachedTokens: 720_000
+    maxTurns: 100,
+    maxOutputTokens: 192_000,
+    maxUncachedTokens: 960_000
   });
   assert.deepStrictEqual(workerLimits("fusion:claude-worker", { FUSION_WORKER_WALL_CLOCK_MS: "120", FUSION_WORKER_STALL_MS: "60" }), {
     wallClockMs: 120,
     stallMs: 60,
-    maxTurns: 60,
-    maxOutputTokens: 96_000,
-    maxUncachedTokens: 720_000
+    maxTurns: 100,
+    maxOutputTokens: 192_000,
+    maxUncachedTokens: 960_000
   });
   assert.deepStrictEqual(workerLimits("fusion:claude-worker", {}), workerLimits("fusion:claude-worker", {}));
 });
@@ -412,9 +429,9 @@ test("an in-flight tool call suspends the stall budget but not the wall clock, a
 
 test("brief sizing hints scale dispatch limits", (t) => {
   const cases = [
-    ["SMALL", { wallClockMs: 600_000, stallMs: 300_000, maxTurns: 30, maxOutputTokens: 48_000, maxUncachedTokens: 360_000 }],
-    ["StAnDaRd", { wallClockMs: 1_200_000, stallMs: 600_000, maxTurns: 60, maxOutputTokens: 96_000, maxUncachedTokens: 720_000 }],
-    ["large", { wallClockMs: 2_400_000, stallMs: 1_200_000, maxTurns: 120, maxOutputTokens: 192_000, maxUncachedTokens: 1_440_000 }]
+    ["SMALL", { wallClockMs: 1_200_000, stallMs: 300_000, maxTurns: 50, maxOutputTokens: 96_000, maxUncachedTokens: 480_000 }],
+    ["StAnDaRd", { wallClockMs: 2_400_000, stallMs: 600_000, maxTurns: 100, maxOutputTokens: 192_000, maxUncachedTokens: 960_000 }],
+    ["large", { wallClockMs: 4_800_000, stallMs: 1_200_000, maxTurns: 200, maxOutputTokens: 384_000, maxUncachedTokens: 1_920_000 }]
   ];
 
   for (const [sizing, limits] of cases) {
@@ -442,36 +459,36 @@ test("the timing seams override a brief sizing hint while the token budgets foll
   assert.deepStrictEqual(record(box).limits, {
     wallClockMs: 120,
     stallMs: 60,
-    maxTurns: 120,
-    maxOutputTokens: 192_000,
-    maxUncachedTokens: 1_440_000
+    maxTurns: 200,
+    maxOutputTokens: 384_000,
+    maxUncachedTokens: 1_920_000
   });
 });
 
 test("trivial worker limits raise token budgets and scale with the sizing hint", () => {
   assert.deepStrictEqual(workerLimits("fusion:trivial-worker", {}), {
-    wallClockMs: 240_000,
+    wallClockMs: 300_000,
     stallMs: 120_000,
-    maxTurns: 16,
-    maxOutputTokens: 24_000,
-    maxUncachedTokens: 120_000
+    maxTurns: 24,
+    maxOutputTokens: 32_000,
+    maxUncachedTokens: 240_000
   });
   assert.deepStrictEqual(workerLimits("fusion:trivial-worker", {}, "small"), {
-    wallClockMs: 120_000,
+    wallClockMs: 150_000,
     stallMs: 60_000,
-    maxTurns: 8,
-    maxOutputTokens: 12_000,
-    maxUncachedTokens: 60_000
+    maxTurns: 12,
+    maxOutputTokens: 16_000,
+    maxUncachedTokens: 120_000
   });
 });
 
 test("deep reasoner limits raise the advisory budgets", () => {
   assert.deepStrictEqual(workerLimits("fusion:deep-reasoner", {}), {
-    wallClockMs: 1_200_000,
+    wallClockMs: 2_400_000,
     stallMs: 900_000,
     maxTurns: 40,
-    maxOutputTokens: 64_000,
-    maxUncachedTokens: 480_000
+    maxOutputTokens: 128_000,
+    maxUncachedTokens: 960_000
   });
 });
 
@@ -573,22 +590,18 @@ test("oversized briefs without sizing advise a large package and combine with ve
   assert.strictEqual(combinedLaunch.additionalContext.match(/Verification advisory/g).length, 1);
 });
 
-test("parent context advisory uses main loop tokens, re-arms after compaction, and covers peer dispatches", (t) => {
+test("parent context advisory fires once at 600k and once at 800k across peer dispatches", (t) => {
   const box = sandbox(t);
   const usage = (tokens) => fs.appendFileSync(box.transcript, `${JSON.stringify({ type: "assistant", message: { usage: { input_tokens: 1000, cache_read_input_tokens: tokens - 1500, cache_creation_input_tokens: 500 } } })}\n`);
   usage(600000);
   const atThreshold = run(box, dispatch(box));
-  assert.strictEqual(JSON.parse(atThreshold.stdout).hookSpecificOutput.additionalContext, undefined);
+  assert.match(JSON.parse(atThreshold.stdout).hookSpecificOutput.additionalContext, /main loop context is 600k tokens/);
   assert.strictEqual(readWorkerRecords(envFor(box))[0].parentContextTokensAtDispatch, 600000);
 
   usage(601000);
   fs.appendFileSync(box.transcript, `${JSON.stringify({ type: "assistant", isSidechain: true, message: { usage: { input_tokens: 1, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 } } })}\n`);
   const peer = run(box, { ...dispatch(box), tool_use_id: "peer-1", tool_input: { subagent_type: "codex:codex-rescue", prompt: "plain peer brief" } });
-  const advisory = JSON.parse(peer.stdout).hookSpecificOutput;
-  assert.strictEqual(advisory.permissionDecision, "allow");
-  assert.strictEqual(advisory.updatedInput, undefined);
-  assert.match(advisory.additionalContext, /\[fusion:/);
-  assert.match(advisory.additionalContext, /The main loop context is 601k tokens and every turn replays it\. Finish this wave, then prefer \/compact or a fresh session before the next goal\./);
+  assert.strictEqual(peer.stdout, "");
   assert.strictEqual(readWorkerSessionState("session-1", envFor(box)).parentContextAdvisorySent, true);
 
   const repeated = run(box, { ...dispatch(box), tool_use_id: "peer-2", tool_input: { subagent_type: "codex:codex-rescue", prompt: "lane: codex quick\ngoal: repair" } }, routingFixture(box));
@@ -598,19 +611,19 @@ test("parent context advisory uses main loop tokens, re-arms after compaction, a
   usage(299999);
   const compacted = run(box, { ...dispatch(box), tool_use_id: "tool-2" });
   assert.strictEqual(JSON.parse(compacted.stdout).hookSpecificOutput.additionalContext, undefined);
-  assert.strictEqual(readWorkerSessionState("session-1", envFor(box)).parentContextAdvisorySent, false);
+  assert.strictEqual(readWorkerSessionState("session-1", envFor(box)).parentContextAdvisorySent, true);
 
   usage(601000);
   const injected = run(box, { ...dispatch(box), tool_use_id: "peer-3", tool_input: { subagent_type: "codex:codex-rescue", prompt: "lane: codex quick\ngoal: repair" } }, routingFixture(box));
   const injectedContext = JSON.parse(injected.stdout).hookSpecificOutput.additionalContext;
   assert.match(injectedContext, /lane default/);
-  assert.match(injectedContext, /main loop context is 601k tokens/);
+  assert.doesNotMatch(injectedContext, /main loop context/);
 
   usage(299999);
   run(box, { ...dispatch(box), tool_use_id: "tool-3" });
   usage(601000);
   const rearmed = run(box, { ...dispatch(box), tool_use_id: "tool-4" });
-  assert.match(JSON.parse(rearmed.stdout).hookSpecificOutput.additionalContext, /main loop context is 601k tokens/);
+  assert.strictEqual(JSON.parse(rearmed.stdout).hookSpecificOutput.additionalContext, undefined);
   assert.strictEqual(readWorkerRecords(envFor(box)).find((record) => record.dispatchToolUseId === "tool-4").parentContextTokensAtDispatch, 601000);
 
   const disabled = sandbox(t);
@@ -2178,7 +2191,7 @@ test("no-task errors ignore unmatched task ids and terminal worker records", (t)
     transportStatus: "done",
     finishedAt: "2026-07-19T00:00:00.000Z",
     collectedAt: "2026-07-19T00:00:01.000Z",
-    collectionMethod: "TaskOutput"
+    collectionMethod: "task_output"
   }));
   run(box, {
     hook_event_name: "PostToolUseFailure",
@@ -2459,7 +2472,7 @@ test("a completed async worker is collected at SubagentStop and remains verdict 
   assert.strictEqual(allowed.stdout, "");
 });
 
-test("SubagentStop bounds an oversized final-text artifact to a 72KB payload with a truncation marker", (t) => {
+test("SubagentStop bounds an oversized final-text artifact to a 72KB payload with a truncation marker", async (t) => {
   const box = sandbox(t);
   run(box, dispatch(box));
   run(box, {
@@ -2471,7 +2484,7 @@ test("SubagentStop bounds an oversized final-text artifact to a 72KB payload wit
     agent_type: "fusion:claude-worker"
   });
   const finalMessage = `${"h".repeat(65_536)}${"m".repeat(200_000)}${"t".repeat(130_000)}\ndelivery: complete\nverification: passed`;
-  run(box, {
+  const stopped = await runWithClosedStdin(box, {
     hook_event_name: "SubagentStop",
     session_id: "session-1",
     cwd: box.cwd,
@@ -2481,6 +2494,7 @@ test("SubagentStop bounds an oversized final-text artifact to a 72KB payload wit
     stop_hook_active: false,
     last_assistant_message: finalMessage
   });
+  assert.strictEqual(stopped.status, 0, stopped.stderr || `hook exited on ${stopped.signal}`);
 
   const artifact = fs.readFileSync(record(box).outputFile);
   const source = Buffer.from(finalMessage, "utf8");
@@ -2773,7 +2787,7 @@ test("Stop re-emits after a terminal task leaves while terminal blocks remain ex
     background_tasks: running
   });
   assert.match(JSON.parse(first.stdout).hookSpecificOutput.additionalContext, /still in flight/);
-  let expectedSignature = readWorkerRecords(envFor(box)).map((worker) => `${worker.taskId}:in-flight`).sort().join(",");
+  let expectedSignature = readWorkerRecords(envFor(box)).map((worker) => worker.taskId).sort().join(",");
   assert.strictEqual(readWorkerSessionState("session-1", envFor(box)).stopAdvisorySignatures["in-flight"], expectedSignature);
 
   const repeat = run(box, {
@@ -2803,7 +2817,7 @@ test("Stop re-emits after a terminal task leaves while terminal blocks remain ex
     background_tasks: running
   });
   assert.match(JSON.parse(grown.stdout).hookSpecificOutput.additionalContext, /still in flight/);
-  expectedSignature = readWorkerRecords(envFor(box)).map((worker) => `${worker.taskId}:in-flight`).sort().join(",");
+  expectedSignature = readWorkerRecords(envFor(box)).map((worker) => worker.taskId).sort().join(",");
   assert.strictEqual(readWorkerSessionState("session-1", envFor(box)).stopAdvisorySignatures["in-flight"], expectedSignature);
 
   const withTerminal = [{ ...running[0], status: "completed" }, running[1]];
@@ -3030,103 +3044,6 @@ test("a Read collects terminal output and captures its peer job footer", (t) => 
   assert.strictEqual(collected.peerEngine, "codex");
 });
 
-test("a legacy harness outputFile is collected through an extracted final text artifact", (t) => {
-  const box = sandbox(t);
-  const harnessPath = path.join(box.root, "tasks", "terminal-failed.output");
-  const output = "worker final message before it failed";
-  fs.mkdirSync(path.dirname(harnessPath), { recursive: true });
-  fs.writeFileSync(harnessPath, `${JSON.stringify({ type: "assistant", message: { content: [{ type: "text", text: output }] } })}\n`, "utf8");
-  run(box, dispatch(box));
-  run(box, {
-    ...dispatch(box),
-    hook_event_name: "PostToolUse",
-    tool_response: { isAsync: true, status: "async_launched", agentId: "terminal-failed" }
-  });
-  assert.strictEqual(record(box).runtimeAsync, true);
-  updateWorkerRecord(record(box).taskId, envFor(box), (current) => ({
-    ...current,
-    transportStatus: "failed",
-    failureKind: "task_reaped",
-    outputFile: harnessPath
-  }));
-  assert.strictEqual(record(box).transcriptPath, harnessPath);
-  assert.strictEqual(record(box).outputFile, null);
-
-  const blocked = run(box, {
-    hook_event_name: "Stop",
-    session_id: "session-1",
-    cwd: box.cwd,
-    transcript_path: box.transcript,
-    background_tasks: []
-  });
-  const blockedOutput = JSON.parse(blocked.stdout);
-  const finalTextFile = path.join(box.state, "jobs", `${record(box).taskId}.final.txt`);
-  assert.strictEqual(blockedOutput.decision, "block");
-  assert.match(blockedOutput.reason, /Call Read with file_path=/);
-  assert.ok(blockedOutput.reason.includes(`file_path=${finalTextFile}`));
-  assert.ok(!blockedOutput.reason.includes(harnessPath));
-  assert.strictEqual(record(box).outputFile, finalTextFile);
-
-  run(box, {
-    hook_event_name: "PostToolUse",
-    session_id: "session-1",
-    cwd: box.cwd,
-    transcript_path: box.transcript,
-    tool_name: "Read",
-    tool_input: { file_path: finalTextFile },
-    tool_response: { type: "text", file: { filePath: finalTextFile, content: output } }
-  });
-
-  const collected = record(box);
-  assert.strictEqual(collected.collectionMethod, "output_file_read");
-  assert.ok(collected.collectedAt);
-  assert.strictEqual(collected.transportStatus, "done");
-  assert.strictEqual(collected.failureKind, "task_reaped");
-
-  const cleared = run(box, {
-    hook_event_name: "Stop",
-    session_id: "session-1",
-    cwd: box.cwd,
-    transcript_path: box.transcript,
-    background_tasks: []
-  });
-  const clearedOutput = JSON.parse(cleared.stdout);
-  assert.strictEqual(clearedOutput.decision, undefined);
-  assert.match(clearedOutput.hookSpecificOutput.additionalContext, /Acceptance remains unverified for 1 collected Fusion worker/);
-  assert.doesNotMatch(clearedOutput.hookSpecificOutput.additionalContext, /Call Read with file_path=|TaskOutput/);
-});
-
-test("a direct Read of a legacy harness path still collects its peer job", (t) => {
-  const box = sandbox(t);
-  const harnessPath = path.join(box.root, "tasks", "legacy-peer.output");
-  const peerJobId = "c".repeat(32);
-  const peerDispatch = dispatch(box, { subagent_type: "codex:codex-rescue", prompt: "bounded peer brief" });
-  run(box, peerDispatch);
-  run(box, {
-    ...peerDispatch,
-    hook_event_name: "PostToolUse",
-    tool_response: { isAsync: true, status: "async_launched", agentId: "legacy-peer" }
-  });
-  updateWorkerRecord(record(box).taskId, envFor(box), (current) => ({ ...current, transportStatus: "ready_uncollected", outputFile: harnessPath }));
-  assert.strictEqual(record(box).transcriptPath, harnessPath);
-  assert.strictEqual(record(box).outputFile, null);
-
-  run(box, {
-    hook_event_name: "PostToolUse",
-    session_id: "session-1",
-    cwd: box.cwd,
-    transcript_path: box.transcript,
-    tool_name: "Read",
-    tool_input: { file_path: harnessPath },
-    tool_response: { type: "text", file: { filePath: harnessPath, content: `job: ${peerJobId}` } }
-  });
-
-  const collected = record(box);
-  assert.strictEqual(collected.collectionMethod, "output_file_read");
-  assert.strictEqual(collected.peerJobId, peerJobId);
-  assert.deepStrictEqual(collected.peerJobIds, [peerJobId]);
-});
-
 test("a terminal cancelled runtimeAsync worker is demanded by Stop and collected by a Read", (t) => {
   const box = sandbox(t);
   const output = "worker final message before it was cancelled\n";
@@ -3253,10 +3170,11 @@ test("a Read of a terminal runtimeAsync record's transcript path collects with o
 
 test("a Read of an unrelated file does not collect a terminal runtimeAsync record", (t) => {
   const box = sandbox(t);
-  const outputFile = path.join(box.root, "tasks", "terminal-unrelated-target.output");
+  const outputFile = path.join(box.state, "jobs", "terminal-unrelated-target.final.txt");
   const unrelatedFile = path.join(box.root, "tasks", "terminal-unrelated-other.output");
   const output = "worker final message\n";
   fs.mkdirSync(path.dirname(outputFile), { recursive: true });
+  fs.mkdirSync(path.dirname(unrelatedFile), { recursive: true });
   fs.writeFileSync(outputFile, output, "utf8");
   fs.writeFileSync(unrelatedFile, "some other file", "utf8");
   run(box, dispatch(box));
@@ -3296,7 +3214,7 @@ test("a Read of an unrelated file does not collect a terminal runtimeAsync recor
   });
   const blockedOutput = JSON.parse(blocked.stdout);
   assert.strictEqual(blockedOutput.decision, "block");
-  assert.match(blockedOutput.reason, /TaskOutput with block=true/);
+  assert.match(blockedOutput.reason, /Call Read with file_path=/);
 });
 
 test("a ready_uncollected record still collects through a Read", (t) => {
@@ -4275,7 +4193,7 @@ test("an authorized background worker cannot bypass an unjudged Codex collection
   assert.match(JSON.parse(blocked.stdout).reason, /semantic judgment/);
 });
 
-test("collector judgment gates do not age an unrelated active worker toward cancellation", (t) => {
+test("collector judgment gates release repeated blocks without aging an unrelated active worker", (t) => {
   const box = sandbox(t);
   const peerJobId = "6".repeat(32);
   const collectorDispatch = dispatch(box, { subagent_type: "fusion:job-collector", prompt: collectorPrompt("codex", peerJobId) });
@@ -4322,7 +4240,13 @@ test("collector judgment gates do not age an unrelated active worker toward canc
       last_assistant_message: "finished",
       background_tasks: [{ id: "worker-independent", type: "subagent", status: "running", agent_type: "fusion:claude-worker" }]
     });
-    assert.strictEqual(JSON.parse(blocked.stdout).decision, "block");
+    if (attempt < 2) {
+      assert.strictEqual(JSON.parse(blocked.stdout).decision, "block");
+    } else if (attempt === 2) {
+      assert.match(JSON.parse(blocked.stdout).hookSpecificOutput.additionalContext, /Stop gate released/);
+    } else {
+      assert.strictEqual(blocked.stdout, "");
+    }
   }
   const worker = readWorkerRecords(envFor(box)).find((candidate) => candidate.taskId === workerTaskId);
   assert.strictEqual(worker.stopBlockCount, 0);
@@ -4491,7 +4415,7 @@ test("a token limit permits exactly one final deliverable Write", (t) => {
   const taskId = record(box).taskId;
   updateWorkerRecord(taskId, envFor(box), (current) => ({
     ...current,
-    usage: { inputTokens: 0, cacheCreationInputTokens: 0, cacheReadInputTokens: 0, outputTokens: 96_000, totalTokens: 96_000, uncachedTokens: 96_000 }
+    usage: { inputTokens: 0, cacheCreationInputTokens: 0, cacheReadInputTokens: 0, outputTokens: 192_000, totalTokens: 192_000, uncachedTokens: 192_000 }
   }));
   const write = {
     hook_event_name: "PreToolUse",
@@ -4510,7 +4434,7 @@ test("a token limit permits exactly one final deliverable Write", (t) => {
   const graceUsedAt = record(box).terminalWriteGraceUsedAt;
   assert.ok(graceUsedAt);
 
-  const expectedReason = tagMessage("worker-lifecycle.worker-stop-deny", `Fusion worker ${taskId} must stop: output token budget reached (96000). Return a concise partial result now; do not retry or call more tools. If the deliverable file is not yet written, one final Write is permitted.`);
+  const expectedReason = tagMessage("worker-lifecycle.worker-stop-deny", `Fusion worker ${taskId} must stop: output token budget reached (192000). Return a concise partial result now; do not retry or call more tools. If the deliverable file is not yet written, one final Write is permitted.`);
   const secondWrite = JSON.parse(run(box, write).stdout).hookSpecificOutput;
   assert.strictEqual(secondWrite.permissionDecision, "deny");
   assert.strictEqual(secondWrite.permissionDecisionReason, expectedReason);
@@ -5060,7 +4984,7 @@ test("a no-text completion at the turn cap remains a turn limit", (t) => {
     tool_response: { isAsync: true, status: "async_launched", agentId: "notification-turn-limit", outputFile: workerTranscript }
   });
   const launched = record(box);
-  updateWorkerRecord(launched.taskId, envFor(box), (current) => ({ ...current, turns: 60 }));
+  updateWorkerRecord(launched.taskId, envFor(box), (current) => ({ ...current, turns: 100 }));
   fs.appendFileSync(box.transcript, `${JSON.stringify({ type: "user", message: { content: `<task-notification>\n<task-id>${launched.agentId}</task-id>\n<status>completed</status>\n</task-notification>` } })}\n`, "utf8");
 
   run(box, {
@@ -5075,7 +4999,7 @@ test("a no-text completion at the turn cap remains a turn limit", (t) => {
   const incomplete = record(box);
   assert.strictEqual(incomplete.transportStatus, "incomplete");
   assert.strictEqual(incomplete.failureKind, "turn_limit");
-  assert.strictEqual(incomplete.turns, 60);
+  assert.strictEqual(incomplete.turns, 100);
 });
 
 test("PostToolUse emits turn wind-down context once at two turns below the cap", (t) => {
@@ -5091,7 +5015,7 @@ test("PostToolUse emits turn wind-down context once at two turns below the cap",
     agent_type: "fusion:claude-worker"
   });
   const workerTranscript = path.join(box.root, "agent-wind-down.jsonl");
-  fs.writeFileSync(workerTranscript, Array.from({ length: 58 }, (_, index) => JSON.stringify({ type: "assistant", requestId: `turn-${index}`, message: { content: [{ type: "text", text: `turn ${index}` }] } })).join("\n") + "\n", "utf8");
+  fs.writeFileSync(workerTranscript, Array.from({ length: 98 }, (_, index) => JSON.stringify({ type: "assistant", requestId: `turn-${index}`, message: { content: [{ type: "text", text: `turn ${index}` }] } })).join("\n") + "\n", "utf8");
   const payload = {
     hook_event_name: "PostToolUse",
     session_id: "session-1",
@@ -5105,7 +5029,7 @@ test("PostToolUse emits turn wind-down context once at two turns below the cap",
   const first = run(box, payload);
   const firstOutput = JSON.parse(first.stdout);
   assert.match(firstOutput.hookSpecificOutput.additionalContext, /stop making tool calls and write your final deliverable now/);
-  assert.strictEqual(record(box).turns, 58);
+  assert.strictEqual(record(box).turns, 98);
   const notifiedAt = record(box).windDownContextSentAt;
   assert.ok(notifiedAt);
 
@@ -5127,7 +5051,7 @@ test("PostToolUse emits token wind-down context once at 85 percent of the cap", 
     agent_type: "fusion:claude-worker"
   });
   const workerTranscript = path.join(box.root, "agent-token-wind-down.jsonl");
-  fs.writeFileSync(workerTranscript, `${JSON.stringify({ type: "assistant", requestId: "token-before", message: { usage: { output_tokens: 81_599 } } })}\n`, "utf8");
+  fs.writeFileSync(workerTranscript, `${JSON.stringify({ type: "assistant", requestId: "token-before", message: { usage: { output_tokens: 163_199 } } })}\n`, "utf8");
   const payload = {
     hook_event_name: "PostToolUse",
     session_id: "session-1",
@@ -5145,7 +5069,7 @@ test("PostToolUse emits token wind-down context once at 85 percent of the cap", 
   fs.appendFileSync(workerTranscript, `${JSON.stringify({ type: "assistant", requestId: "token-threshold", message: { usage: { output_tokens: 1 } } })}\n`, "utf8");
   const threshold = JSON.parse(run(box, payload).stdout).hookSpecificOutput;
   assert.strictEqual(threshold.additionalContext, tagMessage("worker-lifecycle.budget-wind-down", "Token budget wind-down: stop making tool calls and write your final deliverable now."));
-  assert.strictEqual(record(box).usage.outputTokens, 81_600);
+  assert.strictEqual(record(box).usage.outputTokens, 163_200);
   const notifiedAt = record(box).tokenWindDownSentAt;
   assert.ok(notifiedAt);
 
@@ -5165,7 +5089,7 @@ test("PostToolUse warns once when a deep reasoner reaches 85 percent of its unca
     agent_type: "fusion:deep-reasoner"
   });
   const taskId = record(box).taskId;
-  updateWorkerRecord(taskId, envFor(box), (current) => ({ ...current, usage: { ...current.usage, inputTokens: 407_989, outputTokens: 10, uncachedTokens: 407_999 } }));
+  updateWorkerRecord(taskId, envFor(box), (current) => ({ ...current, usage: { ...current.usage, inputTokens: 815_989, outputTokens: 10, uncachedTokens: 815_999 } }));
   const payload = {
     hook_event_name: "PostToolUse",
     session_id: "session-1",
@@ -5175,7 +5099,7 @@ test("PostToolUse warns once when a deep reasoner reaches 85 percent of its unca
     tool_name: "Read"
   };
   assert.strictEqual(run(box, payload).stdout, "");
-  updateWorkerRecord(taskId, envFor(box), (current) => ({ ...current, usage: { ...current.usage, inputTokens: 407_990, uncachedTokens: 408_000 } }));
+  updateWorkerRecord(taskId, envFor(box), (current) => ({ ...current, usage: { ...current.usage, inputTokens: 815_990, uncachedTokens: 816_000 } }));
   const threshold = JSON.parse(run(box, payload).stdout).hookSpecificOutput;
   assert.strictEqual(threshold.additionalContext, tagMessage("worker-lifecycle.budget-wind-down", "Uncached token budget wind-down: stop making tool calls and write your final deliverable now."));
   const notifiedAt = record(box).uncachedWindDownSentAt;
@@ -5194,7 +5118,7 @@ test("PostToolUse sends one budget warning per call in output, uncached, turn or
     agent_id: "combined-wind-down",
     agent_type: "fusion:claude-worker"
   });
-  updateWorkerRecord(record(box).taskId, envFor(box), (current) => ({ ...current, turns: 58, usage: { ...current.usage, inputTokens: 530_400, outputTokens: 81_600, uncachedTokens: 612_000 } }));
+  updateWorkerRecord(record(box).taskId, envFor(box), (current) => ({ ...current, turns: 98, usage: { ...current.usage, inputTokens: 652_800, outputTokens: 163_200, uncachedTokens: 816_000 } }));
   const payload = {
     hook_event_name: "PostToolUse",
     session_id: "session-1",
@@ -5251,7 +5175,7 @@ test("Stop keeps terminal collection demands blocking without adding settlement 
   assert.doesNotMatch(decision.reason, /\/fusion:stats --record/);
 });
 
-test("Stop advises once without blocking when a collected worker has an in-flight sibling", (t) => {
+test("Stop defers acceptance advice until collected workers have no in-flight sibling", (t) => {
   const box = sandbox(t);
   const first = createSettleOnlyRecord(box, `fusion-${"1".repeat(24)}`);
   const second = createSettleOnlyRecord(box, `fusion-${"2".repeat(24)}`);
@@ -5266,11 +5190,9 @@ test("Stop advises once without blocking when a collected worker has an in-fligh
   const emitted = stop(box);
   const advisory = JSON.parse(emitted.stdout).hookSpecificOutput.additionalContext;
   assert.strictEqual(JSON.parse(emitted.stdout).decision, undefined);
-  assert.match(advisory, new RegExp(first.taskId));
-  assert.match(advisory, new RegExp(second.taskId));
-  assert.strictEqual((advisory.match(/\/fusion:stats --record/g) ?? []).length, 1);
-  assert.match(advisory, new RegExp(`/fusion:stats --record ${first.taskId}=accepted\\|rejected\\|unverified --record ${second.taskId}=accepted\\|rejected\\|unverified`));
-  assert.strictEqual(readWorkerSessionState("session-1", envFor(box)).settleOnlyAdvisorySignature, [first.taskId, second.taskId].sort().join(","));
+  assert.match(advisory, new RegExp(active.taskId));
+  assert.doesNotMatch(advisory, /Acceptance remains unverified|\/fusion:stats --record/);
+  assert.strictEqual(readWorkerSessionState("session-1", envFor(box)).settleOnlyAdvisorySignature, undefined);
 
   const repeated = stop(box);
   assert.strictEqual(repeated.status, 0);
@@ -5700,10 +5622,13 @@ test("hooks configuration wires lifecycle events through an executable shell com
   for (const event of ["PreToolUse", "PostToolUse", "PostToolUseFailure", "SubagentStart", "SubagentStop", "Stop", "SessionEnd"]) {
     const handlers = hooks[event].flatMap((group) => group.hooks).filter((hook) => hook.command?.includes("worker-lifecycle.mjs"));
     assert.ok(handlers.length > 0, event);
-    assert.ok(handlers.every((handler) => handler.command === 'node "${CLAUDE_PLUGIN_ROOT}/scripts/worker-lifecycle.mjs"'));
+    assert.ok(handlers.every((handler) => handler.command === 'command -v node >/dev/null 2>&1 || exit 0; node "${CLAUDE_PLUGIN_ROOT}/scripts/worker-lifecycle.mjs"'));
   }
-  const dispatchHandlers = hooks.PostToolUse.flatMap((group) => group.hooks.map((hook) => ({ matcher: group.matcher, command: hook.command }))).filter((hook) => hook.command?.includes("inline-delegation-guard.mjs"));
-  assert.deepStrictEqual(dispatchHandlers, [{ matcher: "^(Agent|Task|Bash|SendMessage)$", command: 'node "${CLAUDE_PLUGIN_ROOT}/scripts/inline-delegation-guard.mjs"' }]);
+  const dispatchHandlers = hooks.PostToolUse.flatMap((group) => group.hooks.map((hook) => ({ matcher: group.matcher, command: hook.command }))).filter((hook) => hook.command?.includes("fusion-hook.mjs"));
+  assert.deepStrictEqual(dispatchHandlers, [
+    { matcher: "^(Agent|Task|Bash|SendMessage)$", command: 'command -v node >/dev/null 2>&1 || exit 0; node "${CLAUDE_PLUGIN_ROOT}/scripts/fusion-hook.mjs"' },
+    { matcher: "^(Edit|Write|NotebookEdit|MultiEdit)$", command: 'command -v node >/dev/null 2>&1 || exit 0; node "${CLAUDE_PLUGIN_ROOT}/scripts/fusion-hook.mjs"' }
+  ]);
 });
 
 test("cancellation demand predicate covers both disjuncts and terminal-ready exclusions", () => {
