@@ -74,6 +74,16 @@ test("quota failure records cooldown and later task fails before Grok launch", (
   assert.equal(JSON.parse(fs.readFileSync(cooldownFile(sandbox), "utf8")).jobId, failed.id);
 });
 
+test("bare quota diagnostic classifies as quota without opening cooldown", (t) => {
+  const sandbox = makeSandbox(t);
+  const result = runTask(sandbox, { FAKE_GROK_MODE: "quota-error" });
+  assert.notEqual(result.status, 0);
+  const failed = jobRecords(sandbox.dataDir)[0];
+  assert.equal(failed.failureKind, "quota");
+  assert.match(failed.errorTail, /quota exceeded/);
+  assert.equal(fs.existsSync(cooldownFile(sandbox)), false);
+});
+
 test("setup reports and clears cooldown", (t) => {
   const sandbox = makeSandbox(t);
   writeQuotaCooldown(sandbox.dataDir, {
@@ -112,12 +122,12 @@ test("recovered JSON error messages are capped at 500 characters", (t) => {
 
 test("disabled and expired cooldowns allow launches", (t) => {
   const disabled = makeSandbox(t);
-  runTask(disabled, { FAKE_GROK_MODE: "quota-error", GROK_QUOTA_COOLDOWN_MS: "0" });
+  runTask(disabled, { FAKE_GROK_MODE: "http-402-error", GROK_QUOTA_COOLDOWN_MS: "0" });
   assert.equal(fs.existsSync(cooldownFile(disabled)), false);
   assert.equal(runTask(disabled, { GROK_QUOTA_COOLDOWN_MS: "0" }).status, 0);
 
   const expired = makeSandbox(t);
-  runTask(expired, { FAKE_GROK_MODE: "quota-error" });
+  runTask(expired, { FAKE_GROK_MODE: "http-402-error" });
   const value = JSON.parse(fs.readFileSync(cooldownFile(expired), "utf8"));
   value.expiresAt = new Date(Date.now() - 1000).toISOString();
   fs.writeFileSync(cooldownFile(expired), JSON.stringify(value));
@@ -128,7 +138,7 @@ test("disabled and expired cooldowns allow launches", (t) => {
 test("review and stop gate quota failures set the shared cooldown", (t) => {
   const review = makeSandbox(t);
   initFixtureRepo(review.workDir);
-  const failedReview = runTask(review, { FAKE_GROK_MODE: "quota-error" }, ["review"]);
+  const failedReview = runTask(review, { FAKE_GROK_MODE: "http-402-error" }, ["review"]);
   assert.notEqual(failedReview.status, 0);
   assert.equal(jobRecords(review.dataDir)[0].failureKind, "quota");
   assert.equal(JSON.parse(fs.readFileSync(cooldownFile(review), "utf8")).jobId, jobRecords(review.dataDir)[0].id);
@@ -141,7 +151,7 @@ test("review and stop gate quota failures set the shared cooldown", (t) => {
   initFixtureRepo(stop.workDir);
   const gate = runCompanion(["stop-gate"], {
     cwd: stop.workDir,
-    env: envFor(stop, { FAKE_GROK_MODE: "quota-error", CLAUDE_PLUGIN_OPTION_STOP_GATE: "true" }),
+    env: envFor(stop, { FAKE_GROK_MODE: "http-402-error", CLAUDE_PLUGIN_OPTION_STOP_GATE: "true" }),
     input: JSON.stringify({ cwd: stop.workDir })
   });
   assert.equal(gate.status, 0, gate.stderr);

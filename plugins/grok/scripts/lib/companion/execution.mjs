@@ -114,6 +114,7 @@ const STDERR_FAILURE_KINDS = [
   ["network", /getaddrinfo|ENOTFOUND|EAI_AGAIN|ECONNREFUSED|ECONNRESET|ETIMEDOUT|socket hang up/i],
   ["auth", /auth|unauthori[sz]ed|forbidden|login required/i]
 ];
+const QUOTA_COOLDOWN_EVIDENCE = /insufficient (?:account )?(?:balance|credit|credits|funds)|balance (?:is )?exhausted|exhausted (?:account )?balance|payment required|usage limit|billing|credit limit|http(?:\/\d(?:\.\d)?)?\s+402|status(?: code)?\s*[:=]?\s*402/i;
 
 function classifyFailure({ spawnError = null, result = null, logTail = "" } = {}) {
   if (spawnError?.failureKind) {
@@ -168,7 +169,8 @@ function finishJobRecord(jobFile, patch) {
     : {};
   const finished = updateJobRecordFile(jobFile, { ...patch, ...terminalAttribution });
   if (finished.status === "error" && finished.failureKind === "quota" &&
-      !finished.errorMessage?.startsWith("Grok quota cooldown is active")) {
+      !finished.errorMessage?.startsWith("Grok quota cooldown is active") &&
+      QUOTA_COOLDOWN_EVIDENCE.test([finished.errorMessage, finished.errorTail].filter(Boolean).join("\n"))) {
     recordQuotaCooldown(finished, finished.errorMessage ?? finished.errorTail ?? "Grok quota exhausted.");
   } else if (finished.status === "done") {
     clearQuotaCooldown(resolveDataDir());

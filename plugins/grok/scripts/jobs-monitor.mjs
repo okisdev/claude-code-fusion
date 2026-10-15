@@ -77,12 +77,12 @@ function readJobsSnapshot(dir, cache, forceReparse, seenFiles) {
       }
       const cached = cache.get(file);
       let record;
-      if (!forceReparse && cached?.mtimeMs === stats.mtimeMs && cached.size === stats.size) {
+      if (!forceReparse && cached?.mtimeMs === stats.mtimeMs && cached.size === stats.size && cached.ino === stats.ino) {
         record = cached.summary;
       } else {
         const parsed = readJobRecordFile(file);
         record = validMonitorRecord(parsed) ? monitorSummary(parsed) : null;
-        cache.set(file, { mtimeMs: stats.mtimeMs, size: stats.size, summary: record });
+        cache.set(file, { mtimeMs: stats.mtimeMs, size: stats.size, ino: stats.ino, summary: record });
       }
       if (!validMonitorRecord(record)) {
         unreadableIds.add(path.basename(entry, ".json"));

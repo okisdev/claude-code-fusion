@@ -31,6 +31,18 @@ function calls(sandbox, flag) {
   return readInvocations(sandbox.argsFile).filter((argv) => argv.includes(flag));
 }
 
+test("missing binary during capability preflight is classified as missing_cli", (t) => {
+  const sandbox = makeSandbox(t);
+  const bin = path.join(sandbox.root, "missing-grok");
+  const env = envFor(sandbox, { GROK_BIN: bin });
+  delete env.GROK_COMPANION_CAPABILITIES;
+  assert.throws(() => runGrok(options(sandbox, env)), (error) => {
+    assert.equal(error.failureKind, "missing_cli");
+    assert.equal(error.message, `Unable to locate the Grok CLI binary: ${bin}`);
+    return true;
+  });
+});
+
 test("R1: capability preflight consumes the managed run deadline", (t) => {
   const sandbox = makeSandbox(t);
   const env = envFor(sandbox, { FAKE_GROK_HELP_DELAY_MS: "500" });

@@ -758,6 +758,31 @@ test("a record with changed mtime and unchanged size is reparsed", async (t) => 
   await waitUntil(() => readCount() === 2);
 });
 
+test("an atomic replacement with unchanged mtime and size reports the new status", async (t) => {
+  const sandbox = makeSandbox(t);
+  const { file, record } = seedTracedJob(sandbox);
+  const oldTime = new Date(Date.now() - 5000);
+  fs.utimesSync(file, oldTime, oldTime);
+  const { monitor, readCount } = tracedMonitor(sandbox, file);
+  await waitUntil(() => readCount() === 1 && readAnnouncedLedger(sandbox));
+
+  const before = fs.statSync(file);
+  const replacement = `${file}.replacement`;
+  const contents = `${JSON.stringify({ ...record, status: "done" }).padEnd(before.size - 1, " ")}\n`;
+  assert.strictEqual(Buffer.byteLength(contents), before.size);
+  fs.writeFileSync(replacement, contents);
+  fs.renameSync(replacement, file);
+  fs.utimesSync(file, before.atime, before.mtime);
+  const after = fs.statSync(file);
+  assert.strictEqual(after.size, before.size);
+  assert.strictEqual(after.mtimeMs, before.mtimeMs);
+  assert.notStrictEqual(after.ino, before.ino);
+
+  await waitForAnnouncement(sandbox, announcedKey(sandbox.workDir, record.id, "done"));
+  assert.strictEqual(readCount(), 2);
+  assert.match(monitor.lines()[0], new RegExp(`grok job ${record.id} done`));
+});
+
 test("a record with changed size and unchanged mtime is reparsed", async (t) => {
   const sandbox = makeSandbox(t);
   const { file, record } = seedTracedJob(sandbox);

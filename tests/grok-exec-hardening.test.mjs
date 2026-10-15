@@ -154,3 +154,18 @@ test("failed stale refresh persists a 30 minute cooldown while auth failures sti
   assert.equal(expired.authRefresh.reason, "stale");
   assert.equal(modelsCalls(sandbox).length, 3);
 });
+
+test("stale refresh that exhausts deadline records a failed attempt", (t) => {
+  const sandbox = makeSandbox(t);
+  const auth = path.join(sandbox.root, "grok-home", "auth.json");
+  staleAuth(auth);
+  const env = envFor(sandbox, { FAKE_GROK_MODELS_DELAY_MS: "500" });
+  assert.throws(() => runGrok(options(sandbox, env, { timeoutMs: 250 })),
+    (error) => error.failureKind === "timeout");
+  assert.equal(modelsCalls(sandbox).length, 1);
+  const attempt = JSON.parse(fs.readFileSync(path.join(sandbox.dataDir, "auth-refresh-attempt.json"), "utf8"));
+  assert.equal(attempt.file, auth);
+  assert.equal(attempt.reason, "stale");
+  assert.equal(attempt.refreshed, false);
+  assert.equal(attempt.outcome, "failed");
+});

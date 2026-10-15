@@ -111,7 +111,9 @@ function resolvedBinaryIdentity(bin, env, cwd) {
       }
     } catch {}
   }
-  throw capabilityError(`Unable to locate the Grok CLI binary: ${bin}`);
+  const error = capabilityError(`Unable to locate the Grok CLI binary: ${bin}`);
+  error.failureKind = "missing_cli";
+  throw error;
 }
 
 export function normalizeGrokSessionId(value) {
@@ -994,7 +996,6 @@ function refreshGrokAuth({ bin, env, cwd, capabilities, reason, deadline }) {
   } finally {
     removeManagedRunTempDir(refreshDir);
   }
-  requireDeadline(deadline);
   let refreshed = false;
   try {
     refreshed = beforeMtime !== null && fs.statSync(file).mtimeMs > beforeMtime;
@@ -2074,6 +2075,7 @@ export function runGrok(options) {
           authRefresh = refreshGrokAuth({ bin, env: childEnv, cwd: options.cwd, capabilities, reason: "stale", deadline });
           const outcome = authRefresh.refreshed ? "refreshed" : "failed";
           writePrivateDataFile(dataDir, AUTH_REFRESH_ATTEMPT_FILE, `${JSON.stringify({ file: auth.file, ...authRefresh, outcome })}\n`);
+          requireDeadline(deadline);
         }
       }
       sandboxLogSnapshot = captureSandboxEventLog(resolveChildGrokHome(childEnv, options.cwd));
