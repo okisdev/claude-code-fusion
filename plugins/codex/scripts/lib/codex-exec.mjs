@@ -1,9 +1,23 @@
-import { spawn, spawnSync } from "node:child_process";
-import { createHash } from "node:crypto";
+import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import * as zlib from "node:zlib";
+import {
+  getProcessIdentity,
+  isProcessAlive,
+  processGroupAlive,
+  processIdentitiesMatch as identitiesMatch,
+  processIdentityMatches,
+  processIsDirectlyAlive as directProcessAlive
+} from "./process-identity.mjs";
+
+import { applyRolloutRecovery } from "./codex-rollout.mjs";
+import { resourceError, outputPaths } from "./codex-events.mjs";
+import { usageOutcome, timeoutOutcome, buildRunOutcome } from "./codex-outcome.mjs";
+import { superviseCodex } from "./codex-run-supervisor.mjs";
+
+export { normalizeCumulativeUsage, subtractUsage } from "./codex-usage.mjs";
+export { getProcessIdentity, isProcessAlive, processIdentitiesMatch, processIdentityMatches } from "./process-identity.mjs";
 
 export const DEFAULT_TIMEOUT_MS = 570000;
 export const DEFAULT_TERMINATION_GRACE_MS = 2000;
@@ -11,6 +25,7 @@ export const DEFAULT_TERMINATION_POLL_MS = 25;
 export const BASH_TOOL_TIMEOUT_MS = 600000;
 export const TIMEOUT_PATH_MARGIN_MS = 15000;
 export const FORCED_CLOSE_MS = 2000;
+const POST_CLOSE_DRAIN_MS = 10000;
 const DEFAULT_TIMEOUT_ESCALATION_MS =
   DEFAULT_TERMINATION_GRACE_MS * 2 + DEFAULT_TERMINATION_POLL_MS * 3 + FORCED_CLOSE_MS;
 export const DEFAULT_TIMEOUT_PATH_MAX_MS = DEFAULT_TIMEOUT_MS + DEFAULT_TIMEOUT_ESCALATION_MS;
@@ -24,29 +39,10 @@ const DEFAULT_EVENTS_MAX_BYTES = 8 * 1024 * 1024;
 const DEFAULT_EVENT_LINE_MAX_BYTES = 1024 * 1024;
 const DEFAULT_PROMPT_MAX_BYTES = 4 * 1024 * 1024;
 const DEFAULT_RESULT_MAX_BYTES = 1024 * 1024;
-const DEFAULT_ROLLOUT_HEAD_MAX_BYTES = 8 * 1024 * 1024;
-const DEFAULT_ROLLOUT_TAIL_MAX_BYTES = 16 * 1024 * 1024;
-const MAX_COMPRESSED_ROLLOUT_BYTES = 64 * 1024 * 1024;
-const MAX_ROLLOUT_SCAN_ENTRIES = 50000;
-const MAX_DIAGNOSTICS = 64;
-const MAX_DIAGNOSTIC_MESSAGE_BYTES = 4096;
-const PATCH_VERIFICATION_FAILURE = "apply_patch verification failed";
-const UNKNOWN_PROCESS_ID = "unknownprocessid";
-const STDERR_PARTIAL_LINE_TAIL_LENGTH = Math.max(PATCH_VERIFICATION_FAILURE.length, UNKNOWN_PROCESS_ID.length) - 1;
 const EFFORT_PATTERN = /^[a-z][a-z0-9_-]{0,31}$/;
 const SERVICE_TIER_PATTERN = /^[a-z][a-z0-9_-]{0,31}$/;
-const THREAD_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 const WEB_SEARCH_MODES = new Set(["disabled", "cached", "live"]);
-const PRIVATE_DIR_MODE = 0o700;
 const PRIVATE_FILE_MODE = 0o600;
-const ZERO_USAGE = Object.freeze({
-  inputTokens: 0,
-  cachedInputTokens: 0,
-  outputTokens: 0,
-  reasoningOutputTokens: 0,
-  totalTokens: 0
-});
-
 function hasOwn(value, key) {
   return Object.prototype.hasOwnProperty.call(value, key);
 }
@@ -262,304 +258,6 @@ export function buildReviewArgs(options = {}) {
   return args;
 }
 
-function usageField(value, ...keys) {
-  for (const key of keys) {
-    if (hasOwn(value, key)) {
-      const field = value[key];
-      return Number.isSafeInteger(field) && field >= 0 ? field : null;
-    }
-  }
-  return null;
-}
-
-export function normalizeCumulativeUsage(value) {
-  const raw = value?.total_token_usage ?? value?.totalTokenUsage ?? value;
-  if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
-    return null;
-  }
-  const inputTokens = usageField(raw, "inputTokens", "input_tokens");
-  const cachedInputTokens = usageField(raw, "cachedInputTokens", "cached_input_tokens");
-  const outputTokens = usageField(raw, "outputTokens", "output_tokens");
-  const reasoningOutputTokens = usageField(raw, "reasoningOutputTokens", "reasoning_output_tokens");
-  if ([inputTokens, cachedInputTokens, outputTokens, reasoningOutputTokens].some((field) => field == null)) {
-    return null;
-  }
-  if (cachedInputTokens > inputTokens || reasoningOutputTokens > outputTokens) {
-    return null;
-  }
-  const reportedTotal = usageField(raw, "totalTokens", "total_tokens");
-  const calculatedTotal = inputTokens + outputTokens;
-  if (!Number.isSafeInteger(calculatedTotal)) {
-    return null;
-  }
-  if (reportedTotal != null && reportedTotal !== calculatedTotal) {
-    return null;
-  }
-  const totalTokens = reportedTotal ?? calculatedTotal;
-  return { inputTokens, cachedInputTokens, outputTokens, reasoningOutputTokens, totalTokens };
-}
-
-export function subtractUsage(endValue, startValue) {
-  const end = normalizeCumulativeUsage(endValue);
-  const start = normalizeCumulativeUsage(startValue);
-  if (!end || !start) {
-    return null;
-  }
-  const result = {};
-  for (const key of ["inputTokens", "cachedInputTokens", "outputTokens", "reasoningOutputTokens", "totalTokens"]) {
-    const value = end[key] - start[key];
-    if (!Number.isSafeInteger(value) || value < 0) {
-      return null;
-    }
-    result[key] = value;
-  }
-  return result;
-}
-
-function observedString(value) {
-  return typeof value === "string" && value.trim() ? value.trim() : null;
-}
-
-function codexHome(env) {
-  const configured = observedString(env?.CODEX_HOME);
-  return path.resolve(configured ?? path.join(os.homedir(), ".codex"));
-}
-
-function recentRolloutDirectories(env) {
-  const sessions = path.join(codexHome(env), "sessions");
-  const directories = new Set([sessions, path.join(codexHome(env), "archived_sessions")]);
-  for (let offset = -2; offset <= 1; offset += 1) {
-    const date = new Date(Date.now() + offset * 24 * 60 * 60 * 1000);
-    directories.add(path.join(sessions, String(date.getFullYear()).padStart(4, "0"), String(date.getMonth() + 1).padStart(2, "0"), String(date.getDate()).padStart(2, "0")));
-    directories.add(path.join(sessions, String(date.getUTCFullYear()).padStart(4, "0"), String(date.getUTCMonth() + 1).padStart(2, "0"), String(date.getUTCDate()).padStart(2, "0")));
-  }
-  return [...directories];
-}
-
-function escapedRegExp(value) {
-  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-}
-
-function preferredRolloutCandidate(latest, candidate) {
-  if (!latest) {
-    return candidate;
-  }
-  if (latest.compressed !== candidate.compressed) {
-    return candidate.compressed ? latest : candidate;
-  }
-  return candidate.mtimeMs > latest.mtimeMs ? candidate : latest;
-}
-
-function matchingRolloutInDirectory(directory, namePattern) {
-  let latest = null;
-  try {
-    for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
-      const compressed = entry.name.endsWith(".zst");
-      if (!entry.isFile() || !namePattern.test(entry.name) || (compressed && typeof zlib.zstdDecompressSync !== "function")) {
-        continue;
-      }
-      const file = path.join(directory, entry.name);
-      const stats = fs.statSync(file);
-      latest = preferredRolloutCandidate(latest, { compressed, file, mtimeMs: stats.mtimeMs });
-    }
-  } catch {}
-  return latest;
-}
-
-function findRolloutPath(threadId, env, allowHistoricalScan = false) {
-  if (!THREAD_ID_PATTERN.test(threadId)) {
-    return null;
-  }
-  const escapedThreadId = escapedRegExp(threadId);
-  const namePattern = new RegExp(`^rollout-(?:.*-)?${escapedThreadId}(?:_[0-9a-fA-F-]+)?\\.jsonl(?:\\.zst)?$`);
-  let latest = null;
-  for (const directory of recentRolloutDirectories(env)) {
-    const candidate = matchingRolloutInDirectory(directory, namePattern);
-    if (candidate) {
-      latest = preferredRolloutCandidate(latest, candidate);
-    }
-  }
-  if (latest || !allowHistoricalScan) {
-    return latest?.file ?? null;
-  }
-  let scanned = 0;
-  for (const root of [path.join(codexHome(env), "sessions"), path.join(codexHome(env), "archived_sessions")]) {
-    const stack = [root];
-    while (stack.length > 0 && scanned < MAX_ROLLOUT_SCAN_ENTRIES) {
-      const directory = stack.pop();
-      let entries;
-      try {
-        entries = fs.readdirSync(directory, { withFileTypes: true }).sort((left, right) => right.name.localeCompare(left.name));
-      } catch {
-        continue;
-      }
-      for (const entry of entries) {
-        scanned += 1;
-        if (scanned > MAX_ROLLOUT_SCAN_ENTRIES) {
-          break;
-        }
-        const candidate = path.join(directory, entry.name);
-        if (entry.isDirectory()) {
-          stack.push(candidate);
-          continue;
-        }
-        const compressed = entry.name.endsWith(".zst");
-        if (!entry.isFile() || !namePattern.test(entry.name) || (compressed && typeof zlib.zstdDecompressSync !== "function")) {
-          continue;
-        }
-        try {
-          const stats = fs.statSync(candidate);
-          latest = preferredRolloutCandidate(latest, { compressed, file: candidate, mtimeMs: stats.mtimeMs });
-        } catch {}
-      }
-    }
-  }
-  return latest?.file ?? null;
-}
-
-function readFileSlice(descriptor, start, length) {
-  const buffer = Buffer.alloc(length);
-  const bytesRead = fs.readSync(descriptor, buffer, 0, length, start);
-  return buffer.subarray(0, bytesRead);
-}
-
-function completeJsonlLines(buffer, { dropLeading = false, dropTrailing = false } = {}) {
-  let start = 0;
-  let end = buffer.length;
-  if (dropLeading) {
-    const newline = buffer.indexOf(10);
-    start = newline === -1 ? buffer.length : newline + 1;
-  }
-  if (dropTrailing) {
-    const newline = buffer.lastIndexOf(10);
-    end = newline === -1 ? 0 : newline;
-  }
-  return buffer.subarray(start, Math.max(start, end)).toString("utf8").split("\n").filter(Boolean);
-}
-
-function boundedObservedText(value, maxBytes) {
-  const buffer = Buffer.from(String(value ?? ""));
-  return (buffer.length <= maxBytes ? buffer : buffer.subarray(0, maxBytes)).toString("utf8");
-}
-
-function boundedRolloutLines(buffer, headMaxBytes, tailMaxBytes) {
-  if (buffer.length <= headMaxBytes + tailMaxBytes) {
-    return completeJsonlLines(buffer);
-  }
-  const head = buffer.subarray(0, headMaxBytes);
-  const tailStart = Math.max(headMaxBytes, buffer.length - tailMaxBytes);
-  const tail = buffer.subarray(tailStart);
-  return [
-    ...completeJsonlLines(head, { dropTrailing: true }),
-    ...completeJsonlLines(tail, { dropLeading: true })
-  ];
-}
-
-function rolloutLines(file, options = {}) {
-  const headMaxBytes = options.headMaxBytes ?? DEFAULT_ROLLOUT_HEAD_MAX_BYTES;
-  const tailMaxBytes = options.tailMaxBytes ?? DEFAULT_ROLLOUT_TAIL_MAX_BYTES;
-  if (file.endsWith(".zst")) {
-    if (typeof zlib.zstdDecompressSync !== "function") {
-      return null;
-    }
-    try {
-      if (fs.statSync(file).size > MAX_COMPRESSED_ROLLOUT_BYTES) {
-        return null;
-      }
-      const buffer = zlib.zstdDecompressSync(fs.readFileSync(file));
-      return { compressed: true, lines: boundedRolloutLines(buffer, headMaxBytes, tailMaxBytes) };
-    } catch {
-      return null;
-    }
-  }
-  let descriptor;
-  try {
-    descriptor = fs.openSync(file, "r");
-    const size = fs.fstatSync(descriptor).size;
-    if (size <= headMaxBytes + tailMaxBytes) {
-      return { compressed: false, lines: completeJsonlLines(readFileSlice(descriptor, 0, size)) };
-    }
-    const head = readFileSlice(descriptor, 0, headMaxBytes);
-    const tailStart = Math.max(headMaxBytes, size - tailMaxBytes);
-    const tail = readFileSlice(descriptor, tailStart, size - tailStart);
-    return {
-      compressed: false,
-      lines: [
-        ...completeJsonlLines(head, { dropTrailing: true }),
-        ...completeJsonlLines(tail, { dropLeading: true })
-      ]
-    };
-  } catch {
-    return null;
-  } finally {
-    if (descriptor !== undefined) {
-      fs.closeSync(descriptor);
-    }
-  }
-}
-
-function recoverRolloutObservation(threadId, options = {}) {
-  const result = {
-    collaborationTool: null,
-    cumulativeTokenUsage: null,
-    found: false,
-    matchedTurn: false,
-    partialResultText: null,
-    resolvedEffort: null,
-    resolvedModel: null,
-    source: null
-  };
-  const file = options.file ?? findRolloutPath(threadId, options.env ?? process.env, options.allowHistoricalScan === true);
-  if (!file) {
-    return result;
-  }
-  result.found = true;
-  const rollout = rolloutLines(file, options);
-  if (!rollout) {
-    return result;
-  }
-  result.source = rollout.compressed ? "local_rollout_zst" : "local_rollout";
-  for (const line of rollout.lines) {
-    let entry;
-    try {
-      entry = JSON.parse(line);
-    } catch {
-      continue;
-    }
-    const payload = entry?.payload;
-    const timestamp = Date.parse(entry?.timestamp ?? "");
-    const belongsToExecution = options.notBeforeMs == null || (Number.isFinite(timestamp) && timestamp >= options.notBeforeMs - 5000);
-    if (!belongsToExecution) {
-      continue;
-    }
-    if (entry?.type === "turn_context" && payload && typeof payload === "object") {
-      result.matchedTurn = true;
-      result.resolvedModel = observedString(payload.model) ?? result.resolvedModel;
-      result.resolvedEffort = observedString(payload.collaboration_mode?.settings?.reasoning_effort ?? payload.effort ?? payload.reasoning_effort ?? payload.model_reasoning_effort) ?? result.resolvedEffort;
-    }
-    if (entry?.type === "event_msg" && payload?.type === "token_count") {
-      result.matchedTurn = true;
-      result.cumulativeTokenUsage = normalizeCumulativeUsage(payload.info?.total_token_usage) ?? result.cumulativeTokenUsage;
-    }
-    if (entry?.type === "event_msg" && payload?.type === "agent_message" && typeof payload.message === "string") {
-      result.matchedTurn = true;
-      result.partialResultText = boundedObservedText(payload.message, options.resultMaxBytes ?? DEFAULT_RESULT_MAX_BYTES);
-    }
-    if (entry?.type === "response_item" && payload?.type === "message" && payload.role === "assistant" && Array.isArray(payload.content)) {
-      const text = payload.content.filter((item) => item?.type === "output_text" && typeof item.text === "string").map((item) => item.text).join("");
-      if (text) {
-        result.matchedTurn = true;
-        result.partialResultText = boundedObservedText(text, options.resultMaxBytes ?? DEFAULT_RESULT_MAX_BYTES);
-      }
-    }
-    if (entry?.type === "response_item" && ["custom_tool_call", "function_call"].includes(payload?.type) && ["spawn_agent", "spawn_agents_on_csv"].includes(payload?.name)) {
-      result.matchedTurn = true;
-      result.collaborationTool = payload.name;
-    }
-  }
-  return result;
-}
-
 function signalProcessTree(pid, signal, ownsProcessGroup) {
   if (!Number.isInteger(pid) || pid <= 1) {
     return false;
@@ -584,219 +282,6 @@ function signalProcessTree(pid, signal, ownsProcessGroup) {
   } catch {
     return false;
   }
-}
-
-function linuxProcessState(pid) {
-  try {
-    const stat = fs.readFileSync(`/proc/${pid}/stat`, "utf8");
-    const commandEnd = stat.lastIndexOf(")");
-    if (commandEnd === -1) {
-      return null;
-    }
-    const fields = stat.slice(commandEnd + 2).trim().split(/\s+/);
-    return { state: fields[0] ?? null, pgrp: fields[2] ?? null };
-  } catch {
-    return null;
-  }
-}
-
-function linuxProcessGroupHasLiveMember(pgid) {
-  let entries;
-  try {
-    entries = fs.readdirSync("/proc");
-  } catch {
-    return true;
-  }
-  for (const entry of entries) {
-    if (!/^\d+$/.test(entry)) {
-      continue;
-    }
-    const info = linuxProcessState(Number(entry));
-    if (info && Number(info.pgrp) === pgid && info.state !== "Z") {
-      return true;
-    }
-  }
-  return false;
-}
-
-function directProcessAlive(pid) {
-  if (!Number.isInteger(pid) || pid <= 1) {
-    return false;
-  }
-  try {
-    process.kill(pid, 0);
-  } catch (error) {
-    return error?.code === "EPERM";
-  }
-  return process.platform !== "linux" || linuxProcessState(pid)?.state !== "Z";
-}
-
-function processGroupAlive(pid) {
-  if (process.platform === "win32" || !Number.isInteger(pid) || pid <= 1) {
-    return false;
-  }
-  let groupSignalable;
-  try {
-    process.kill(-pid, 0);
-    groupSignalable = true;
-  } catch (error) {
-    if (error?.code === "EPERM") {
-      return true;
-    }
-    groupSignalable = false;
-  }
-  if (!groupSignalable || process.platform !== "linux") {
-    return groupSignalable;
-  }
-  return linuxProcessGroupHasLiveMember(pid);
-}
-
-function digest(value) {
-  return createHash("sha256").update(String(value)).digest("hex");
-}
-
-let cachedBootMarker = null;
-let cachedOwnProcessIdentity = null;
-
-function hostBootMarker(env) {
-  if (cachedBootMarker) {
-    return cachedBootMarker;
-  }
-  if (process.platform === "linux") {
-    try {
-      cachedBootMarker = fs.readFileSync("/proc/sys/kernel/random/boot_id", "utf8").trim() || null;
-    } catch {
-      return null;
-    }
-    return cachedBootMarker;
-  }
-  const boot = process.platform === "darwin"
-    ? spawnSync("sysctl", ["-n", "kern.boottime"], { encoding: "utf8", env, timeout: 2000, windowsHide: true })
-    : spawnSync("uptime", ["-s"], { encoding: "utf8", env, timeout: 2000, windowsHide: true });
-  const bootValue = String(boot.stdout ?? "").trim();
-  if (boot.status !== 0 || !bootValue) {
-    return null;
-  }
-  const darwinBoot = process.platform === "darwin" ? bootValue.match(/\bsec\s*=\s*(\d+)\s*,\s*usec\s*=\s*(\d+)\b/) : null;
-  cachedBootMarker = darwinBoot ? `${darwinBoot[1]}.${darwinBoot[2]}` : digest(bootValue);
-  return cachedBootMarker;
-}
-
-function linuxProcessIdentity(pid) {
-  let stat;
-  let command;
-  try {
-    stat = fs.readFileSync(`/proc/${pid}/stat`, "utf8");
-    command = fs.readFileSync(`/proc/${pid}/cmdline`);
-  } catch {
-    return null;
-  }
-  const bootId = hostBootMarker();
-  const commandEnd = stat.lastIndexOf(")");
-  if (commandEnd === -1 || !bootId) {
-    return null;
-  }
-  const fields = stat.slice(commandEnd + 2).trim().split(/\s+/);
-  const startMarker = fields[19];
-  if (!/^\d+$/.test(startMarker ?? "")) {
-    return null;
-  }
-  return {
-    version: 1,
-    platform: "linux",
-    bootMarker: bootId,
-    startMarker,
-    commandHash: digest(command)
-  };
-}
-
-function bsdProcessIdentity(pid) {
-  const env = { ...process.env, LANG: "C", LC_ALL: "C", TZ: "UTC" };
-  const started = spawnSync("ps", ["-p", String(pid), "-o", "lstart="], {
-    encoding: "utf8",
-    env,
-    timeout: 2000,
-    windowsHide: true
-  });
-  const command = spawnSync("ps", ["-ww", "-p", String(pid), "-o", "command="], {
-    encoding: "utf8",
-    env,
-    timeout: 2000,
-    windowsHide: true
-  });
-  const startMarker = String(started.stdout ?? "").trim().replace(/\s+/g, " ");
-  const commandValue = String(command.stdout ?? "").trim();
-  const bootMarker = hostBootMarker(env);
-  if (started.status !== 0 || command.status !== 0 || !bootMarker || !startMarker || !commandValue) {
-    return null;
-  }
-  return {
-    version: 1,
-    platform: process.platform,
-    bootMarker,
-    startMarker,
-    commandHash: digest(commandValue)
-  };
-}
-
-function validProcessIdentity(value) {
-  return Boolean(
-    value &&
-      typeof value === "object" &&
-      !Array.isArray(value) &&
-      value.version === 1 &&
-      typeof value.platform === "string" &&
-      typeof value.bootMarker === "string" &&
-      typeof value.startMarker === "string" &&
-      typeof value.commandHash === "string"
-  );
-}
-
-export function getProcessIdentity(pid) {
-  if (pid === process.pid && cachedOwnProcessIdentity) {
-    return cachedOwnProcessIdentity;
-  }
-  if (!directProcessAlive(pid)) {
-    return null;
-  }
-  let identity = null;
-  if (process.platform === "linux") {
-    identity = linuxProcessIdentity(pid);
-  } else if (process.platform === "darwin" || process.platform === "freebsd" || process.platform === "openbsd") {
-    identity = bsdProcessIdentity(pid);
-  }
-  if (pid === process.pid && identity) {
-    cachedOwnProcessIdentity = identity;
-  }
-  return identity;
-}
-
-export function processIdentityMatches(pid, expectedIdentity) {
-  if (!validProcessIdentity(expectedIdentity)) {
-    return false;
-  }
-  return identitiesMatch(getProcessIdentity(pid), expectedIdentity);
-}
-
-export function processIdentitiesMatch(currentIdentity, expectedIdentity) {
-  return identitiesMatch(currentIdentity, expectedIdentity);
-}
-
-function identitiesMatch(currentIdentity, expectedIdentity) {
-  return validProcessIdentity(currentIdentity) && validProcessIdentity(expectedIdentity) && currentIdentity.version === expectedIdentity.version && currentIdentity.platform === expectedIdentity.platform && currentIdentity.bootMarker === expectedIdentity.bootMarker && currentIdentity.startMarker === expectedIdentity.startMarker && currentIdentity.commandHash === expectedIdentity.commandHash;
-}
-
-export function isProcessAlive(pid, identity = null, ownsProcessGroup = true) {
-  if (!Number.isInteger(pid) || pid <= 1) {
-    return false;
-  }
-  if (identity != null) {
-    return processIdentityMatches(pid, identity);
-  }
-  if (process.platform === "win32" || !ownsProcessGroup) {
-    return directProcessAlive(pid);
-  }
-  return directProcessAlive(pid) || processGroupAlive(pid);
 }
 
 function processTargetAlive(pid, identity, ownsProcessGroup) {
@@ -987,349 +472,6 @@ export function terminateProcessTreeSync(pid, options = {}) {
   return !stillAlive();
 }
 
-function boundedBuffer(current, chunk, maxBytes) {
-  const combined = Buffer.concat([current, Buffer.from(chunk)]);
-  return combined.length <= maxBytes ? combined : combined.subarray(combined.length - maxBytes);
-}
-
-function stderrPatternOccurrences(text, pattern, previousTailLength) {
-  let count = 0;
-  let offset = 0;
-  for (;;) {
-    const index = text.indexOf(pattern, offset);
-    if (index === -1) {
-      return count;
-    }
-    if (index + pattern.length > previousTailLength) {
-      count += 1;
-    }
-    offset = index + pattern.length;
-  }
-}
-
-function observeStderrPatterns(state, chunk) {
-  const previousTail = state.stderrPartialLine;
-  const text = `${previousTail}${Buffer.from(chunk).toString("utf8")}`;
-  const lowerCaseText = text.toLowerCase();
-  const previousTailLength = previousTail.length;
-  const patchFailures = stderrPatternOccurrences(lowerCaseText, PATCH_VERIFICATION_FAILURE, previousTailLength);
-  const lostProcesses = stderrPatternOccurrences(lowerCaseText, UNKNOWN_PROCESS_ID, previousTailLength);
-  const lastNewline = text.lastIndexOf("\n");
-  const partialLine = lastNewline === -1 ? text : text.slice(lastNewline + 1);
-  state.stderrPartialLine = partialLine.slice(-STDERR_PARTIAL_LINE_TAIL_LENGTH);
-  return { lostProcesses, patchFailures };
-}
-
-function boundedMessage(message) {
-  const buffer = Buffer.from(String(message ?? ""));
-  return (buffer.length <= MAX_DIAGNOSTIC_MESSAGE_BYTES ? buffer : buffer.subarray(0, MAX_DIAGNOSTIC_MESSAGE_BYTES)).toString("utf8");
-}
-
-function resourceError(message) {
-  const error = new Error(message);
-  error.failureKind = "resource";
-  return error;
-}
-
-function safeDiagnosticMessage(message) {
-  const redacted = String(message ?? "")
-    .replace(/\bsk-[A-Za-z0-9_-]{16,}\b/g, "[redacted]")
-    .replace(/\b(?:ghp_|gho_|ghu_|ghs_|ghr_)[A-Za-z0-9]{20,}\b/g, "[redacted]")
-    .replace(/\bxai-[A-Za-z0-9_-]{16,}\b/g, "[redacted]")
-    .replace(/\bBearer\s+\S{20,}/gi, "Bearer [redacted]")
-    .replace(/((?:OPENAI_API_KEY|CODEX_API_KEY|API_KEY|ACCESS_TOKEN|REFRESH_TOKEN)\s*[=:]\s*)[^\s,;]+/gi, "$1[redacted]")
-    .replace(/(["']?(?:api_key|access_token|refresh_token|authorization)["']?\s*:\s*["'])[^"']+/gi, "$1[redacted]");
-  return boundedMessage(redacted);
-}
-
-function signalExitCode(signal) {
-  const number = signal ? os.constants.signals[signal] : null;
-  return Number.isInteger(number) ? 128 + number : 1;
-}
-
-function outputPaths(options) {
-  const paths = [options.eventsFile, options.logFile].filter((value) => typeof value === "string" && value);
-  for (const file of paths) {
-    fs.mkdirSync(path.dirname(file), { recursive: true, mode: PRIVATE_DIR_MODE });
-    fs.chmodSync(path.dirname(file), PRIVATE_DIR_MODE);
-  }
-  if (options.logFile) {
-    fs.writeFileSync(options.logFile, Buffer.alloc(0), { mode: PRIVATE_FILE_MODE });
-    fs.chmodSync(options.logFile, PRIVATE_FILE_MODE);
-  }
-}
-
-function checkpointState(state, event = null) {
-  return {
-    policyViolation: state.policyViolation,
-    event,
-    eventCount: state.eventCount,
-    threadId: state.threadId,
-    turnStarted: state.turnStarted,
-    terminalEvent: state.terminalEvent?.type ?? null,
-    finalResponse: state.finalResponse,
-    cumulativeTokenUsage: state.cumulativeTokenUsage,
-    protocolError: state.protocolError
-  };
-}
-
-function classifyDiagnostic(state, event) {
-  let diagnostic = null;
-  if (event.type === "error") {
-    diagnostic = { type: "error", message: event.message };
-  } else if (event.type === "item.completed" && event.item?.type === "error") {
-    diagnostic = { type: "item.error", message: event.item.message };
-  }
-  if (!diagnostic || typeof diagnostic.message !== "string") {
-    return;
-  }
-  recordDiagnostic(state, diagnostic);
-}
-
-function recordDiagnostic(state, diagnostic) {
-  state.diagnostics.push({ ...diagnostic, message: safeDiagnosticMessage(diagnostic.message) });
-  if (state.diagnostics.length > MAX_DIAGNOSTICS) {
-    state.diagnostics.splice(0, state.diagnostics.length - MAX_DIAGNOSTICS);
-  }
-}
-
-function recordProtocolError(state, message) {
-  if (!state.protocolError) {
-    state.protocolError = boundedMessage(message);
-  }
-}
-
-function recordResourceError(state, message) {
-  if (!state.resourceError) {
-    state.resourceError = boundedMessage(message);
-  }
-}
-
-function validateEvent(state, event) {
-  if (!event || typeof event !== "object" || Array.isArray(event) || typeof event.type !== "string" || !event.type) {
-    recordProtocolError(state, "Codex emitted a JSONL value without a valid event type.");
-    return;
-  }
-  state.eventCount += 1;
-  classifyDiagnostic(state, event);
-  switch (event.type) {
-    case "thread.started": {
-      if (state.threadStarted || state.turnStarted || state.terminalEvent) {
-        recordProtocolError(state, "Codex emitted thread.started outside the initial lifecycle position.");
-      }
-      if (typeof event.thread_id !== "string" || !event.thread_id.trim()) {
-        recordProtocolError(state, "Codex thread.started omitted thread_id.");
-        break;
-      }
-      state.threadStarted = true;
-      state.threadId = event.thread_id;
-      if (state.expectedResumeThreadId && event.thread_id !== state.expectedResumeThreadId) {
-        state.resumeThreadMismatch = true;
-        recordProtocolError(state, `Codex resumed thread ${event.thread_id} instead of the requested thread ${state.expectedResumeThreadId}.`);
-      }
-      break;
-    }
-    case "turn.started":
-      if (!state.threadStarted || state.turnStarted || state.terminalEvent) {
-        recordProtocolError(state, "Codex emitted turn.started outside the required lifecycle sequence.");
-      }
-      state.turnStarted = true;
-      break;
-    case "turn.completed": {
-      const duplicateTerminal = Boolean(state.terminalEvent);
-      if (!state.threadStarted || !state.turnStarted || duplicateTerminal) {
-        recordProtocolError(state, "Codex emitted turn.completed outside the required lifecycle sequence.");
-      }
-      const usage = normalizeCumulativeUsage(event.usage);
-      if (!usage) {
-        recordProtocolError(state, "Codex turn.completed contained invalid cumulative usage.");
-      }
-      if (!duplicateTerminal) {
-        state.cumulativeTokenUsage = usage?.totalTokens === 0 ? null : usage;
-        state.cumulativeUsageUnavailableReason = usage?.totalTokens === 0 ? "upstream_zero_usage" : null;
-        state.terminalEvent = event;
-      }
-      break;
-    }
-    case "turn.failed": {
-      const duplicateTerminal = Boolean(state.terminalEvent);
-      if (!state.threadStarted || !state.turnStarted || duplicateTerminal) {
-        recordProtocolError(state, "Codex emitted turn.failed outside the required lifecycle sequence.");
-      }
-      if (typeof event.error?.message !== "string" || !event.error.message.trim()) {
-        recordProtocolError(state, "Codex turn.failed omitted error.message.");
-      }
-      if (!duplicateTerminal) {
-        state.terminalEvent = event;
-        state.turnFailureMessage = typeof event.error?.message === "string" ? event.error.message : null;
-      }
-      break;
-    }
-    case "item.started":
-    case "item.updated":
-    case "item.completed":
-      if ((!state.turnStarted && !(state.threadStarted && event.type === "item.completed" && event.item?.type === "error")) || state.terminalEvent) {
-        recordProtocolError(state, `Codex emitted ${event.type} outside an active turn.`);
-      }
-      if (!event.item || typeof event.item !== "object" || Array.isArray(event.item) || typeof event.item.type !== "string") {
-        recordProtocolError(state, `Codex ${event.type} contained an invalid item.`);
-        break;
-      }
-      if (event.item.type === "collab_tool_call") {
-        const tool = observedString(event.item.tool) ?? "unknown collaboration tool";
-        state.policyViolation = `Delegated Codex execution attempted the disabled ${tool} tool.`;
-      }
-      if (event.type === "item.completed" && event.item.type === "file_change") {
-        state.fileChangeCount += 1;
-        state.patchFailureCount = 0;
-      }
-      if (event.type === "item.completed" && event.item.type === "agent_message" && typeof event.item.text === "string") {
-        if (Buffer.byteLength(event.item.text) > state.resultMaxBytes) {
-          recordResourceError(state, `Codex final response exceeded the ${state.resultMaxBytes} byte limit.`);
-        } else {
-          state.finalResponse = event.item.text;
-          state.resultSource = "agent_message";
-        }
-      }
-      break;
-    case "error":
-      if (typeof event.message !== "string") {
-        recordProtocolError(state, "Codex error event omitted message.");
-      }
-      break;
-    default:
-      state.unknownEventCount += 1;
-      break;
-  }
-}
-
-function usageOutcome(state, options) {
-  if (state.resumeThreadMismatch) {
-    return { tokenUsage: null, tokenUsageAvailability: "unavailable", tokenUsageUnavailableReason: "resume_thread_mismatch" };
-  }
-  if (!state.cumulativeTokenUsage) {
-    return { tokenUsage: null, tokenUsageAvailability: "unavailable", tokenUsageUnavailableReason: state.cumulativeUsageUnavailableReason ?? "missing_cumulative_usage" };
-  }
-  const baselineValue = options.cumulativeUsageBaseline ?? options.cumulativeTokenUsageBaseline ?? options.usageBaseline;
-  const args = options.args ?? [];
-  const resumed = options.resumeThreadId != null || args.includes("resume");
-  if (resumed) {
-    return { tokenUsage: null, tokenUsageAvailability: "unavailable", tokenUsageUnavailableReason: "resume_continuity_unverifiable" };
-  }
-  const freshThread = options.freshThread ?? !resumed;
-  const baseline = baselineValue == null ? (freshThread ? ZERO_USAGE : null) : normalizeCumulativeUsage(baselineValue);
-  if (!baseline) {
-    return {
-      tokenUsage: null,
-      tokenUsageAvailability: "unavailable",
-      tokenUsageUnavailableReason: baselineValue == null ? "resume_baseline_unavailable" : "invalid_cumulative_baseline"
-    };
-  }
-  const tokenUsage = subtractUsage(state.cumulativeTokenUsage, baseline);
-  if (!tokenUsage) {
-    return { tokenUsage: null, tokenUsageAvailability: "unavailable", tokenUsageUnavailableReason: "invalid_cumulative_delta" };
-  }
-  return { tokenUsage, tokenUsageAvailability: "available", tokenUsageUnavailableReason: null };
-}
-
-function classifiedFailureKind(message, fallback = "error") {
-  const text = String(message ?? "");
-  if (/quota|insufficient (?:account )?(?:balance|credit|credits|funds)|balance (?:is )?exhausted|payment required|usage limit|billing|http(?:\/\d(?:\.\d)?)?\s+402|status(?: code)?\s*[:=]?\s*402/i.test(text)) {
-    return "quota";
-  }
-  if (/rate[ _-]?limit|too many requests|http(?:\/\d(?:\.\d)?)?\s+429|status(?: code)?\s*[:=]?\s*429/i.test(text) || text.includes("Flex capacity unavailable.")) {
-    return "rate_limited";
-  }
-  if (/misalignment policy|cyber policy|violat(?:ed|es|ion of) (?:the |our |an? )?[a-z ]{0,40}policy|content policy/i.test(text) || [
-    "stream disconnected before completion: Incomplete response returned, reason: content_filter",
-    "This request has been flagged for possible cybersecurity risk.",
-    "This content was flagged for possible biological risk."
-  ].some((message) => text.includes(message))) {
-    return "refused";
-  }
-  if (/unauthori[sz]ed|unauthenticated|authentication|login required|invalid api key|api key/i.test(text)) {
-    return "auth";
-  }
-  if (/permission denied|operation not permitted|approval (?:required|denied)|sandbox (?:denied|violation)/i.test(text)) {
-    return "permission";
-  }
-  return fallback;
-}
-
-function withTrustedDirectoryRemedy(message, stderrTail) {
-  if (!/Not inside a trusted directory and --skip-git-repo-check was not specified\./i.test(stderrTail)) {
-    return message;
-  }
-  return `${message} Re-run the task with --skip-git-repo-check to allow execution outside a Git repository.`;
-}
-
-function failureOutcome(state, processOutcome, stderrTail) {
-  if (state.callbackError) {
-    return { status: "error", failureKind: "error", errorMessage: state.callbackError.message };
-  }
-  if (processOutcome.spawnError) {
-    return {
-      status: "error",
-      failureKind: processOutcome.spawnError.code === "ENOENT" ? "missing_cli" : processOutcome.spawnError.code === "EACCES" ? "permission" : "error",
-      errorMessage: processOutcome.spawnError.message
-    };
-  }
-  if (state.policyViolation) {
-    return { status: "error", failureKind: "policy", errorMessage: state.policyViolation };
-  }
-  if (state.patchThrash) {
-    return {
-      status: "error",
-      failureKind: "patch_thrash",
-      errorMessage: `Codex could not land a patch because its context lines did not match the file on disk after ${state.patchFailureCount} consecutive apply_patch verification failures.`
-    };
-  }
-  if (state.execLost) {
-    return {
-      status: "error",
-      failureKind: "exec_lost",
-      errorMessage: `The sandbox lost the spawned process after ${state.lostProcessCount} UnknownProcessId errors.`
-    };
-  }
-  if (state.cancelled) {
-    return { status: "cancelled", failureKind: "cancelled", errorMessage: "Codex execution was cancelled." };
-  }
-  if (state.stdinError) {
-    return { status: "error", failureKind: "process", errorMessage: `Codex closed stdin before accepting the complete prompt: ${state.stdinError.message}` };
-  }
-  if (state.resourceError) {
-    return { status: "error", failureKind: "resource", errorMessage: state.resourceError };
-  }
-  if (state.protocolError) {
-    return { status: "error", failureKind: "protocol", errorMessage: state.protocolError };
-  }
-  if (state.terminalEvent?.type === "turn.failed") {
-    const errorMessage = state.turnFailureMessage || "Codex turn failed.";
-    return { status: "error", failureKind: classifiedFailureKind(`${errorMessage}\n${stderrTail}`), errorMessage };
-  }
-  if (processOutcome.exitCode !== 0 || processOutcome.signal) {
-    const processMessage = processOutcome.signal
-      ? `Codex exited with signal ${processOutcome.signal}.`
-      : `Codex exited with code ${processOutcome.exitCode}.`;
-    const diagnosticMessage = state.turnFailureMessage || state.diagnostics.at(-1)?.message || null;
-    const failureKind = classifiedFailureKind(`${diagnosticMessage ?? ""}\n${stderrTail}`, "process");
-    return {
-      status: "error",
-      failureKind,
-      errorMessage: withTrustedDirectoryRemedy(failureKind === "process" || !diagnosticMessage ? processMessage : diagnosticMessage, stderrTail)
-    };
-  }
-  return { status: "done", failureKind: null, errorMessage: null };
-}
-
-function timeoutOutcome(state) {
-  return {
-    status: state.cleanupComplete ? "error" : "running",
-    failureKind: "timeout",
-    errorMessage: `Codex timed out after ${state.timeoutMs}ms.`
-  };
-}
-
 export async function runCodex(options = {}) {
   const executionStartedAtMs = Date.now();
   const env = options.env ?? process.env;
@@ -1344,6 +486,9 @@ export async function runCodex(options = {}) {
   const prompt = String(options.prompt ?? "");
   if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
     throw new TypeError("timeoutMs must be greater than zero.");
+  }
+  if (options.deadlineMs != null && !Number.isFinite(options.deadlineMs)) {
+    throw new TypeError("deadlineMs must be an absolute time in epoch milliseconds.");
   }
   if (!Number.isSafeInteger(stderrMaxBytes) || stderrMaxBytes <= 0) {
     throw new TypeError("stderrMaxBytes must be a positive integer.");
@@ -1362,6 +507,51 @@ export async function runCodex(options = {}) {
   }
   if (Buffer.byteLength(prompt) > promptMaxBytes) {
     throw resourceError(`Codex prompt exceeded the ${promptMaxBytes} byte limit.`);
+  }
+  const terminationGraceMs = options.terminationGraceMs ?? DEFAULT_TERMINATION_GRACE_MS;
+  const terminationPollMs = options.terminationPollMs ?? DEFAULT_TERMINATION_POLL_MS;
+  const fullTerminationReserveMs = terminationGraceMs * 2 + terminationPollMs * 3 + FORCED_CLOSE_MS + POST_CLOSE_DRAIN_MS;
+  const terminationReserveMs = Math.min(fullTerminationReserveMs, timeoutMs / 10);
+  const executionTimeoutMs = options.deadlineMs == null
+    ? timeoutMs
+    : Math.min(timeoutMs, options.deadlineMs - Date.now() - terminationReserveMs);
+  if (executionTimeoutMs <= 0) {
+    const failure = timeoutOutcome({ cleanupComplete: true, timeoutMs: 0 });
+    return {
+      ...failure,
+      success: false,
+      pid: null,
+      pidIdentity: null,
+      ownsProcessGroup: false,
+      exitCode: null,
+      processCode: null,
+      signal: null,
+      timedOut: true,
+      cancelled: false,
+      cleanupComplete: true,
+      policyViolation: null,
+      threadId: null,
+      terminalEvent: null,
+      finalResponse: "",
+      partialResultText: null,
+      resultSource: null,
+      cumulativeTokenUsage: null,
+      resolvedEffort: null,
+      resolvedModel: null,
+      rolloutRecoveryStatus: "not_attempted",
+      semanticStatus: "unverified",
+      usageIsIncomplete: true,
+      ...usageOutcome({ cumulativeTokenUsage: null, cumulativeUsageUnavailableReason: null, terminalEvent: null }, { ...options, args }),
+      eventCount: 0,
+      eventsTruncated: false,
+      fileChangeCount: 0,
+      unknownEventCount: 0,
+      diagnostics: [],
+      protocolError: null,
+      resourceError: null,
+      stderrTail: "",
+      spawnError: null
+    };
   }
   outputPaths(options);
   const eventsFd = options.eventsFile ? fs.openSync(options.eventsFile, "w", PRIVATE_FILE_MODE) : null;
@@ -1400,400 +590,15 @@ export async function runCodex(options = {}) {
     stdinError: null,
     stderrPartialLine: "",
     timedOut: false,
-    timeoutMs,
+    timeoutMs: executionTimeoutMs,
     turnFailureMessage: null,
     turnStarted: false,
     unknownEventCount: 0
   };
-  let stderr = Buffer.alloc(0);
-  let eventsBytes = 0;
-  let spawnError = null;
-  let terminationPromise = null;
-  let closeResolved = false;
-  let forcedCloseTimer = null;
-  let resolveForcedClose;
-  const forcedClosePromise = new Promise((resolve) => {
-    resolveForcedClose = resolve;
+  const { processOutcome, child, childIdentity, spawnError, stderr } = await superviseCodex({
+    options, env, bin, args, prompt, state, eventsFd, eventsMaxBytes, stderrMaxBytes,
+    eventLineMaxBytes, executionTimeoutMs, terminationReserveMs, terminateProcessTree, settleProcessIdentity
   });
-  const forwardedSignals = process.platform === "win32" ? ["SIGTERM", "SIGINT"] : ["SIGTERM", "SIGINT", "SIGHUP", "SIGQUIT"];
-  let child;
-  let childIdentity = null;
-  let requestTermination = () => Promise.resolve(false);
-  const forwardTermination = () => {
-    state.cancelled = true;
-    void requestTermination();
-  };
-  for (const signal of forwardedSignals) {
-    process.on(signal, forwardTermination);
-  }
-  try {
-    child = spawn(bin, args, {
-      cwd: options.cwd,
-      env,
-      stdio: ["pipe", "pipe", "pipe"],
-      detached: true,
-      windowsHide: true
-    });
-  } catch (error) {
-    for (const signal of forwardedSignals) {
-      process.removeListener(signal, forwardTermination);
-    }
-    if (eventsFd != null) {
-      fs.closeSync(eventsFd);
-    }
-    throw error;
-  }
-  requestTermination = () => {
-    if (!terminationPromise) {
-      terminationPromise = terminateProcessTree(child.pid, {
-        allowOrphanedGroup: true,
-        graceMs: options.terminationGraceMs,
-        pollMs: options.terminationPollMs,
-        identity: childIdentity ?? undefined,
-        ownsProcessGroup: process.platform !== "win32",
-        requireIdentity: Boolean(childIdentity)
-      }).then((terminated) => {
-        state.cleanupComplete = terminated;
-        if (!closeResolved) {
-          forcedCloseTimer = setTimeout(() => {
-            state.cleanupComplete = false;
-            child.stdin?.destroy();
-            child.stdout?.destroy();
-            child.stderr?.destroy();
-            child.unref();
-            resolveForcedClose({ code: null, exitCode: null, forced: true, signal: null });
-          }, FORCED_CLOSE_MS);
-        }
-        return terminated;
-      });
-    }
-    return terminationPromise;
-  };
-  try {
-    options.onSpawnAttempt?.(child.pid ?? null);
-  } catch (error) {
-    state.callbackError = error instanceof Error ? error : new Error(String(error));
-    void requestTermination();
-  }
-  childIdentity = Number.isInteger(child.pid) ? getProcessIdentity(child.pid) : null;
-  if (Number.isInteger(child.pid) && !childIdentity) {
-    state.callbackError = new Error("Codex process identity could not be verified.");
-    void requestTermination();
-  } else if (state.cancelled) {
-    void requestTermination();
-  }
-  const identitySettlePromise = childIdentity
-    ? settleProcessIdentity(child.pid).then(async (settled) => {
-        if (settled) {
-          childIdentity = settled;
-        }
-        try {
-          await options.onIdentitySettled?.(child.pid ?? null, childIdentity);
-        } catch (error) {
-          state.callbackError = error instanceof Error ? error : new Error(String(error));
-          void requestTermination();
-        }
-      })
-    : Promise.resolve();
-  child.once("error", (error) => {
-    spawnError = error;
-  });
-  const closePromise = new Promise((resolve) => {
-    child.once("close", (code, signal) => {
-      closeResolved = true;
-      clearTimeout(forcedCloseTimer);
-      resolve({
-        code,
-        exitCode: Number.isInteger(code) ? code : signalExitCode(signal),
-        signal
-      });
-    });
-  });
-  const stdinSettled = new Promise((resolve) => {
-    if (!child.stdin) {
-      if (prompt) {
-        state.stdinError = new Error("Codex process did not expose stdin.");
-        void requestTermination();
-      }
-      resolve();
-      return;
-    }
-    let settled = false;
-    const settle = () => {
-      if (!settled) {
-        settled = true;
-        resolve();
-      }
-    };
-    child.stdin.once("error", (error) => {
-      if (prompt) {
-        state.stdinError = error;
-        void requestTermination();
-      }
-      settle();
-    });
-    child.stdin.once("close", settle);
-    child.stdin.end(prompt);
-  });
-  const timer = setTimeout(() => {
-    state.timedOut = true;
-    void requestTermination();
-  }, timeoutMs);
-  timer.unref?.();
-  child.stderr?.on("data", (chunk) => {
-    if (!state.timedOut) {
-      const { lostProcesses, patchFailures } = observeStderrPatterns(state, chunk);
-      if (!state.patchThrash && patchFailures > 0) {
-        state.patchFailureCount = Math.min(3, state.patchFailureCount + patchFailures);
-        if (state.patchFailureCount === 3) {
-          state.patchThrash = true;
-          void requestTermination();
-        }
-      }
-      if (!state.execLost && lostProcesses > 0) {
-        state.lostProcessCount = Math.min(3, state.lostProcessCount + lostProcesses);
-        if (state.lostProcessCount === 3) {
-          state.execLost = true;
-          void requestTermination();
-        }
-      }
-    }
-    stderr = boundedBuffer(stderr, chunk, stderrMaxBytes);
-    if (options.logFile) {
-      try {
-        fs.writeFileSync(options.logFile, stderr);
-        fs.chmodSync(options.logFile, PRIVATE_FILE_MODE);
-      } catch (error) {
-        state.callbackError = error instanceof Error ? error : new Error(String(error));
-        void requestTermination();
-      }
-    }
-  });
-  const spawnCheckpointPromise = (async () => {
-    try {
-      if (childIdentity) {
-        await options.onSpawn?.(child.pid ?? null, childIdentity);
-      }
-    } catch (error) {
-      state.callbackError = error instanceof Error ? error : new Error(String(error));
-      void requestTermination();
-    }
-  })();
-  const abort = () => {
-    state.cancelled = true;
-    void requestTermination();
-  };
-  if (options.signal?.aborted) {
-    abort();
-  } else {
-    options.signal?.addEventListener("abort", abort, { once: true });
-  }
-  const processLine = async (lineBuffer) => {
-    const line = (lineBuffer.at(-1) === 13 ? lineBuffer.subarray(0, -1) : lineBuffer).toString("utf8");
-    if (eventsFd != null && !state.eventsTruncated) {
-      const rawLine = Buffer.concat([lineBuffer, Buffer.from("\n")]);
-      if (eventsBytes + rawLine.length <= eventsMaxBytes) {
-        try {
-          fs.writeSync(eventsFd, rawLine);
-          eventsBytes += rawLine.length;
-        } catch (error) {
-          state.callbackError = error instanceof Error ? error : new Error(String(error));
-          void requestTermination();
-        }
-      } else {
-        state.eventsTruncated = true;
-      }
-    }
-    let event;
-    try {
-      event = JSON.parse(line);
-    } catch {
-      recordProtocolError(state, `Codex emitted malformed JSONL at event ${state.eventCount + 1}.`);
-      void requestTermination();
-      try {
-        await options.onCheckpoint?.(checkpointState(state));
-      } catch (error) {
-        state.callbackError = error instanceof Error ? error : new Error(String(error));
-      }
-      return;
-    }
-    validateEvent(state, event);
-    if (state.protocolError || state.resourceError || state.policyViolation) {
-      void requestTermination();
-    }
-    try {
-      await options.onCheckpoint?.(checkpointState(state, event));
-    } catch (error) {
-      state.callbackError = error instanceof Error ? error : new Error(String(error));
-      void requestTermination();
-    }
-  };
-  const parsePromise = (async () => {
-    if (!child.stdout) {
-      recordProtocolError(state, "Codex process did not expose stdout.");
-      void requestTermination();
-      return;
-    }
-    await spawnCheckpointPromise;
-    let segments = [];
-    let segmentBytes = 0;
-    let skippingOversizedEvent = false;
-    try {
-      for await (const rawChunk of child.stdout) {
-        const chunk = Buffer.from(rawChunk);
-        let offset = 0;
-        while (offset < chunk.length) {
-          const newline = chunk.indexOf(10, offset);
-          const end = newline === -1 ? chunk.length : newline;
-          const segment = chunk.subarray(offset, end);
-          if (skippingOversizedEvent) {
-            if (newline === -1) {
-              break;
-            }
-            skippingOversizedEvent = false;
-            offset = newline + 1;
-            continue;
-          }
-          if (segmentBytes + segment.length > eventLineMaxBytes) {
-            state.oversizedEventsSkipped += 1;
-            if (state.oversizedEventsSkipped === 1) {
-              recordDiagnostic(state, { type: "warning", message: `Skipped a JSONL event larger than the ${eventLineMaxBytes} byte limit.` });
-            }
-            segments = [];
-            segmentBytes = 0;
-            if (newline === -1) {
-              skippingOversizedEvent = true;
-              break;
-            }
-            offset = newline + 1;
-            continue;
-          }
-          if (segment.length > 0) {
-            segments.push(segment);
-            segmentBytes += segment.length;
-          }
-          if (newline === -1) {
-            break;
-          }
-          await processLine(Buffer.concat(segments, segmentBytes));
-          segments = [];
-          segmentBytes = 0;
-          offset = newline + 1;
-        }
-      }
-    } catch (error) {
-      if (state.cleanupComplete || error?.code !== "ERR_STREAM_PREMATURE_CLOSE") {
-        state.callbackError = error instanceof Error ? error : new Error(String(error));
-      }
-    }
-    if (segmentBytes > 0) {
-      await processLine(Buffer.concat(segments, segmentBytes));
-    }
-  })();
-  const processOutcome = await Promise.race([closePromise, forcedClosePromise]);
-  if (!terminationPromise && childIdentity && process.platform !== "win32" && !directProcessAlive(child.pid) && processGroupAlive(child.pid)) {
-    void requestTermination();
-  }
-  try {
-    await stdinSettled;
-    await parsePromise;
-    await identitySettlePromise;
-    if (terminationPromise) {
-      await terminationPromise;
-    }
-  } finally {
-    clearTimeout(timer);
-    for (const signal of forwardedSignals) {
-      process.removeListener(signal, forwardTermination);
-    }
-    options.signal?.removeEventListener("abort", abort);
-  }
-  if (eventsFd != null) {
-    fs.closeSync(eventsFd);
-  }
-  if (!state.timedOut && !state.cancelled && !spawnError && !state.callbackError && processOutcome.exitCode === 0 && !processOutcome.signal) {
-    const protocolIncomplete = !state.threadStarted || !state.turnStarted || !state.terminalEvent;
-    if (protocolIncomplete && state.oversizedEventsSkipped > 0) {
-      recordResourceError(state, `Codex emitted a JSONL event larger than the ${eventLineMaxBytes} byte limit.`);
-    } else if (!state.threadStarted) {
-      recordProtocolError(state, "Codex exited without thread.started.");
-    } else if (!state.turnStarted) {
-      recordProtocolError(state, "Codex exited without turn.started.");
-    } else if (!state.terminalEvent) {
-      recordProtocolError(state, "Codex reached EOF without a terminal turn event.");
-    }
-  }
-  if (state.threadId) {
-    const recovered = recoverRolloutObservation(state.threadId, {
-      allowHistoricalScan: options.resumeThreadId != null,
-      env,
-      notBeforeMs: executionStartedAtMs,
-      resultMaxBytes
-    });
-    state.rolloutRecoveryStatus = recovered.matchedTurn ? "recovered" : recovered.found ? "stale" : "not_found";
-    state.resolvedModel = recovered.resolvedModel;
-    state.resolvedEffort = recovered.resolvedEffort;
-    if (!state.policyViolation && state.resolvedEffort?.trim().toLowerCase() === "persistent") {
-      state.policyViolation = "Delegated Codex execution ran in the persistent reasoning mode.";
-    }
-    if (recovered.cumulativeTokenUsage && (!state.cumulativeTokenUsage || state.timedOut || state.cancelled)) {
-      state.cumulativeTokenUsage = recovered.cumulativeTokenUsage;
-      state.cumulativeUsageUnavailableReason = null;
-    }
-    if (!state.finalResponse && (state.timedOut || state.cancelled) && recovered.partialResultText) {
-      state.finalResponse = recovered.partialResultText;
-      state.resultSource = "rollout_partial";
-    }
-    if (!state.policyViolation && recovered.collaborationTool) {
-      state.policyViolation = `Delegated Codex execution attempted the disabled ${recovered.collaborationTool} tool.`;
-    }
-  }
-  const usage = usageOutcome(state, { ...options, args });
-  if ((state.timedOut || state.cancelled) && usage.tokenUsage) {
-    usage.tokenUsageAvailability = "partial";
-    usage.tokenUsageUnavailableReason = null;
-  }
-  const stderrTail = stderr.toString("utf8");
-  const failure = state.timedOut && !state.patchThrash && !state.execLost
-    ? timeoutOutcome(state)
-    : failureOutcome(state, { ...processOutcome, spawnError }, stderrTail);
-  const rawErrorMessage = failure.errorMessage;
-  const errorMessage = rawErrorMessage == null ? null : safeDiagnosticMessage(rawErrorMessage);
-  return {
-    status: failure.status,
-    success: failure.status === "done",
-    failureKind: failure.failureKind,
-    errorMessage,
-    pid: child.pid ?? null,
-    pidIdentity: childIdentity,
-    ownsProcessGroup: process.platform !== "win32",
-    exitCode: processOutcome.exitCode,
-    processCode: processOutcome.code,
-    signal: processOutcome.signal,
-    timedOut: state.timedOut,
-    cancelled: state.cancelled,
-    cleanupComplete: state.cleanupComplete,
-    policyViolation: state.policyViolation,
-    threadId: state.threadId,
-    terminalEvent: state.terminalEvent?.type ?? null,
-    finalResponse: state.finalResponse,
-    partialResultText: state.timedOut || state.cancelled ? state.finalResponse || null : null,
-    resultSource: state.resultSource,
-    cumulativeTokenUsage: state.cumulativeTokenUsage,
-    resolvedEffort: state.resolvedEffort,
-    resolvedModel: state.resolvedModel,
-    rolloutRecoveryStatus: state.rolloutRecoveryStatus,
-    semanticStatus: state.policyViolation ? "rejected" : "unverified",
-    usageIsIncomplete: state.timedOut || state.cancelled || state.terminalEvent?.type !== "turn.completed",
-    ...usage,
-    eventCount: state.eventCount,
-    eventsTruncated: state.eventsTruncated,
-    fileChangeCount: state.fileChangeCount,
-    unknownEventCount: state.unknownEventCount,
-    diagnostics: state.diagnostics,
-    protocolError: state.protocolError,
-    resourceError: state.resourceError,
-    stderrTail: safeDiagnosticMessage(stderrTail),
-    spawnError
-  };
+  applyRolloutRecovery(state, { options, env, executionStartedAtMs, resultMaxBytes });
+  return buildRunOutcome({ state, options, args, stderr, processOutcome, spawnError, child, childIdentity });
 }

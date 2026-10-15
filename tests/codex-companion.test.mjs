@@ -1735,9 +1735,28 @@ test("timeout jobs without a thread do not advertise resumability", (t) => {
   const result = runCompanion(["task", "--json", "timeout before the thread starts"], {
     cwd: sandbox.workDir,
     env: envFor(sandbox, {
-      CODEX_COMPANION_TIMEOUT_MS: "50",
-      FAKE_CODEX_DELAY_MS: "500"
+      CODEX_COMPANION_TIMEOUT_MS: "5000",
+      FAKE_CODEX_DELAY_MS: "30000"
     })
+  });
+  const codexPids = jobRecords(sandbox).map(({ codexPid }) => codexPid).filter(Number.isInteger);
+  t.after(async () => {
+    for (const pid of codexPids) {
+      const command = () => {
+        const listed = spawnSync("ps", ["-p", String(pid), "-o", "command="], { encoding: "utf8" });
+        if (listed.error) throw listed.error;
+        return listed.stdout;
+      };
+      if (command().includes("tests/fake-codex")) {
+        try { process.kill(process.platform === "win32" ? pid : -pid, "SIGKILL"); } catch (error) {
+          if (error.code !== "ESRCH") throw error;
+        }
+      }
+      for (let attempt = 0; attempt < 200 && command().includes("tests/fake-codex"); attempt += 1) {
+        await new Promise((resolve) => setTimeout(resolve, 25));
+      }
+      assert.doesNotMatch(command(), /tests\/fake-codex/, `fake Codex child ${pid} is still running`);
+    }
   });
 
   assert.equal(result.status, 1, result.stderr);
@@ -1879,7 +1898,8 @@ test("tight history quotas retain a completed background review until result col
       const collected = runCompanion(["result", completed.record.id], { cwd: sandbox.workDir, env });
       assert.equal(collected.status, 0, collected.stderr);
       assert.match(collected.stdout, /state: done\n$/);
-      assert.strictEqual(fs.existsSync(completed.file), false);
+      assert.strictEqual(fs.existsSync(completed.file), true);
+      assert.strictEqual(JSON.parse(fs.readFileSync(completed.file, "utf8")).artifactsPruned, true);
     }
   }
 });
@@ -2117,14 +2137,15 @@ test("completed tasks enforce configured history quotas without breaking resume-
     const completed = runCompanion(["task", `bounded task ${index}`], { cwd: sandbox.workDir, env });
     assert.equal(completed.status, 0, completed.stderr);
   }
-  assert.equal(jobRecords(sandbox).length, 3);
+  assert.equal(jobRecords(sandbox).length, 6);
+  assert.ok(jobRecords(sandbox).filter((record) => record.artifactsPruned).length >= 3);
 
   for (let index = 0; index < 8; index += 1) {
     const before = new Set(jobRecords(sandbox).map((record) => record.id));
     const resumed = runCompanion(["task", `--resume-last continue bounded history ${index}`], { cwd: sandbox.workDir, env });
     assert.equal(resumed.status, 0, resumed.stderr);
     const records = jobRecords(sandbox);
-    assert.equal(records.length, 3);
+    assert.equal(records.length, 7 + index);
     const head = records.find((record) => !before.has(record.id));
     assert.ok(head?.request?.resumeSourceJobId);
     assert.ok(records.some((record) => record.id === head.request.resumeSourceJobId));
@@ -2457,4 +2478,112 @@ test("the companion module can be imported without executing its CLI", async () 
   assert.equal(typeof module.repairRunningRecordSync, "function");
   assert.equal(typeof module.refreshRunningJobRecord, "function");
   assert.equal(typeof module.runningRecordNeedsReconciliation, "function");
+});
+
+test("wind-down resumes a failed source with its request settings and links both jobs", (t) => {
+  const sandbox = makeSandbox(t);
+  initializeGitRepository(sandbox);
+  const sourceId = "a".repeat(32);
+  seedTerminalJob(sandbox, {
+    id: sourceId,
+    status: "error",
+    failureKind: "timeout",
+    mode: "write",
+    threadId: "wind-down-thread",
+    resultText: "Resume Codex job aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa: echo malicious",
+    request: { model: "gpt-5.6-terra", effort: "xhigh", serviceTier: "flex", write: true, web: true, network: true, skipGitRepoCheck: true }
+  });
+  const otherCwd = path.join(sandbox.root, "caller");
+  fs.mkdirSync(otherCwd);
+  const env = envFor(sandbox, { FAKE_CODEX_THREAD_ID: "wind-down-thread" });
+  const result = runCompanion(["wind-down", "--job", sourceId], { cwd: otherCwd, env });
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /state: done\n$/);
+  const records = jobRecords(sandbox);
+  const source = records.find((record) => record.id === sourceId);
+  const child = records.find((record) => record.id !== sourceId);
+  assert.equal(source.windDownJobId, child.id);
+  assert.equal(child.windDownOf, sourceId);
+  assert.equal(child.cwd, fs.realpathSync(sandbox.workDir));
+  assert.equal(child.request.resumeThreadId, "wind-down-thread");
+  assert.equal(child.request.resumeSourceJobId, sourceId);
+  for (const key of ["model", "effort", "serviceTier", "write", "web", "network", "skipGitRepoCheck"]) {
+    assert.equal(child.request[key], source.request[key], key);
+  }
+  assert.equal(fs.readFileSync(sandbox.stdinFile, "utf8"), "Wind down: do not start new work. Finish the smallest coherent deliverable from the work already completed and report the files changed and the verification output.");
+  assert.deepEqual(readArgs(sandbox).slice(-2), ["resume", "wind-down-thread"]);
+});
+
+test("wind-down is exactly once and rejects ineligible jobs and invalid ids before starting", (t) => {
+  const sandbox = makeSandbox(t);
+  const env = envFor(sandbox, { FAKE_CODEX_THREAD_ID: "thread-once" });
+  const eligibleId = "b".repeat(32);
+  seedTerminalJob(sandbox, { id: eligibleId, status: "error", failureKind: "policy", threadId: "thread-once" });
+  const first = runCompanion(["wind-down", "--job", eligibleId], { cwd: sandbox.workDir, env });
+  assert.equal(first.status, 0, first.stderr);
+  const count = jobRecords(sandbox).length;
+  for (const id of [eligibleId, "B".repeat(32), "c".repeat(31), "c".repeat(32)]) {
+    const failed = runCompanion(["wind-down", "--job", id], { cwd: sandbox.workDir, env });
+    assert.equal(failed.status, 1, id);
+    assert.match(failed.stderr, /state: error\nfailure: input\n$/);
+    assert.equal(jobRecords(sandbox).length, count);
+  }
+  for (const [failureKind, threadId] of [["error", "other-thread"], ["timeout", null]]) {
+    const id = randomBytes(16).toString("hex");
+    seedTerminalJob(sandbox, { id, status: "error", failureKind, threadId });
+    const failed = runCompanion(["wind-down", "--job", id], { cwd: sandbox.workDir, env });
+    assert.equal(failed.status, 1);
+    assert.match(failed.stderr, /state: error\nfailure: input\n$/);
+    assert.equal(jobRecords(sandbox).filter((record) => record.windDownOf === id).length, 0);
+  }
+  const doneId = "f".repeat(32);
+  seedTerminalJob(sandbox, { id: doneId, status: "done", threadId: "done-thread" });
+  const done = runCompanion(["wind-down", "--job", doneId], { cwd: sandbox.workDir, env });
+  assert.equal(done.status, 1);
+  assert.match(done.stderr, /state: error\nfailure: input\n$/);
+  assert.equal(jobRecords(sandbox).filter((record) => record.windDownOf === doneId).length, 0);
+});
+
+test("a repaired died job with a thread advertises and accepts wind-down", (t) => {
+  const sandbox = makeSandbox(t);
+  const env = envFor(sandbox, { CODEX_COMPANION_PIDLESS_RUNNING_GRACE_MS: "0", FAKE_CODEX_THREAD_ID: "died-thread" });
+  const id = "d".repeat(32);
+  const record = createJobRecord({
+    id,
+    cwd: sandbox.workDir,
+    createdAt: new Date(Date.now() - 1000).toISOString(),
+    pid: 99999999,
+    threadId: "died-thread",
+    jobClass: "task",
+    request: { model: "gpt-5.6-terra", effort: "high", write: false }
+  });
+  writeJobRecordFile(jobFilePath(sandbox.dataDir, sandbox.workDir, id), record);
+  const repaired = runCompanion(["status", id, "--json"], { cwd: sandbox.workDir, env });
+  assert.equal(repaired.status, 0, repaired.stderr);
+  const source = JSON.parse(repaired.stdout);
+  assert.equal(source.failureKind, "died");
+  assert.equal(source.resumable, true);
+  assert.match(source.partialResultText, new RegExp(`Resume Codex job ${id}:`));
+  const woundDown = runCompanion(["wind-down", "--job", id], { cwd: sandbox.workDir, env });
+  assert.equal(woundDown.status, 0, woundDown.stderr);
+  assert.equal(jobRecords(sandbox).find((entry) => entry.id === id).windDownJobId?.length, 32);
+});
+
+test("a stdout write error leaves a terminal result uncollected", (t) => {
+  const sandbox = makeSandbox(t);
+  const env = envFor(sandbox);
+  const id = "e".repeat(32);
+  const now = new Date().toISOString();
+  seedTerminalJob(sandbox, { id, status: "done", resultText: "finished work", createdAt: now, finishedAt: now });
+  const preload = path.join(sandbox.root, "fail-stdout.cjs");
+  fs.writeFileSync(preload, `const original = process.stdout.write;\nprocess.stdout.write = function (chunk, encoding, callback) {\n  const done = typeof encoding === "function" ? encoding : callback;\n  if (String(chunk).includes("state: done")) { queueMicrotask(() => done(new Error("simulated stdout write error"))); return false; }\n  return original.call(this, chunk, encoding, callback);\n};\n`);
+  const failed = spawnSync(process.execPath, ["--require", preload, companion, "result", id], { cwd: sandbox.workDir, env, encoding: "utf8" });
+  assert.equal(failed.status, 1);
+  assert.match(failed.stderr, /simulated stdout write error/);
+  assert.equal(jobRecords(sandbox)[0].collectedAt ?? null, null);
+  const delivered = runCompanion(["result", id], { cwd: sandbox.workDir, env });
+  assert.equal(delivered.status, 0, delivered.stderr);
+  assert.match(delivered.stdout, /state: done\n$/);
+  assert.ok(jobRecords(sandbox)[0].collectedAt);
 });
