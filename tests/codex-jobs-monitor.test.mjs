@@ -18,6 +18,19 @@ import { engineJobsObserverStatePath } from "../plugins/fusion/scripts/engine-jo
 const repoRoot = path.join(import.meta.dirname, "..");
 const monitorScript = path.join(repoRoot, "plugins", "fusion", "scripts", "codex-jobs-monitor.mjs");
 
+async function spawnProbeChild(t) {
+  const child = spawn(process.execPath, ["-e", "process.stdout.write('ready\\n'); process.stdin.resume()"], { stdio: ["pipe", "pipe", "ignore"] });
+  t.after(() => { if (child.exitCode == null && child.signalCode == null) child.kill("SIGKILL"); });
+  await once(child.stdout, "data");
+  return child;
+}
+
+async function releaseProbeChild(child) {
+  const exited = once(child, "exit");
+  child.stdin.end();
+  await exited;
+}
+
 function makeSandbox(t) {
   const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "codex-monitor-test-")));
   const stateRoot = path.join(root, "state");
@@ -533,11 +546,11 @@ test("a monitor includes jobs recorded in a worktree beneath the repo root", asy
 
 test("a running job whose pid has vanished is terminalized and announced exactly once", async (t) => {
   const sandbox = makeSandbox(t);
-  const shortLivedChild = spawn(process.execPath, ["-e", "setTimeout(() => {}, 0)"]);
+  const shortLivedChild = await spawnProbeChild(t);
   const pid = shortLivedChild.pid;
   const pidIdentity = getProcessIdentity(pid);
   assert.ok(pidIdentity, "Process identity probing is unavailable for the tracked child.");
-  await once(shortLivedChild, "exit");
+  await releaseProbeChild(shortLivedChild);
 
   const { file, record } = seedJob(sandbox, { createdAt: new Date(Date.now() - 1000).toISOString(), status: "running", pid, pidIdentity });
   const monitor = startMonitor(sandbox, envFor(sandbox, { CODEX_COMPANION_PIDLESS_RUNNING_GRACE_MS: "0" }));
@@ -700,11 +713,11 @@ test("a terminal worktree copy suppresses a dead alarm for its stale running mir
   const sandbox = makeSandbox(t);
   const worktreeRoot = path.join(sandbox.workDir, ".claude", "worktrees", "agent-test");
   fs.mkdirSync(worktreeRoot, { recursive: true });
-  const shortLivedChild = spawn(process.execPath, ["-e", "setTimeout(() => {}, 0)"]);
+  const shortLivedChild = await spawnProbeChild(t);
   const pid = shortLivedChild.pid;
   const pidIdentity = getProcessIdentity(pid);
   assert.ok(pidIdentity, "Process identity probing is unavailable for the tracked child.");
-  await once(shortLivedChild, "exit");
+  await releaseProbeChild(shortLivedChild);
   const id = "mirrored-job";
   seedJob(sandbox, { id, status: "running", pid, pidIdentity }, { workspace: "parent-ws", workspaceRoot: sandbox.workDir });
   seedJob(
@@ -954,11 +967,11 @@ test("announcement state files older than 30 days are pruned", async (t) => {
 
 test("malformed dedup state is quarantined and dead running jobs are terminalized silently", async (t) => {
   const sandbox = makeSandbox(t);
-  const shortLivedChild = spawn(process.execPath, ["-e", "setTimeout(() => {}, 0)"]);
+  const shortLivedChild = await spawnProbeChild(t);
   const pid = shortLivedChild.pid;
   const pidIdentity = getProcessIdentity(pid);
   assert.ok(pidIdentity, "Process identity probing is unavailable for the tracked child.");
-  await once(shortLivedChild, "exit");
+  await releaseProbeChild(shortLivedChild);
   const { file, record } = seedJob(sandbox, { createdAt: new Date(Date.now() - 1000).toISOString(), status: "running", pid, pidIdentity });
   const stateFile = announcedPath(sandbox);
   fs.writeFileSync(stateFile, "{ malformed", "utf8");
@@ -1127,6 +1140,24 @@ test("argv capture writes exactly one model-audit observation for a running job"
   assert.deepStrictEqual(readJsonLines(fakePsLog), [["-o", "args=", "-p", String(codexPid)]]);
 });
 
+test("a terminal backlog captures each model in one sidecar on its first tick", async (t) => {
+  const sandbox = makeSandbox(t);
+  for (let index = 0; index < 8; index += 1) {
+    seedJob(sandbox, {
+      id: `terminal-${index}`,
+      status: "done",
+      resolvedModel: `model-${index}`,
+      resolvedEffort: "high",
+      tokenUsage: { inputTokens: 1, cachedInputTokens: 0, outputTokens: 1, reasoningOutputTokens: 0, totalTokens: 2 }
+    });
+  }
+  const monitor = startMonitor(sandbox, envFor(sandbox));
+  t.after(() => monitor.child.kill("SIGKILL"));
+  const lines = await waitUntil(() => readModelAuditLines(sandbox).length === 8 ? readModelAuditLines(sandbox) : null);
+  assert.deepStrictEqual(lines.map((entry) => entry.model), Array.from({ length: 8 }, (_, index) => `model-${index}`));
+  assert.strictEqual(monitor.stderr(), "");
+});
+
 test("a second poll does not duplicate a model-audit observation", async (t) => {
   const sandbox = makeSandbox(t);
   seedJob(sandbox, { status: "running", pid: process.pid });
@@ -1180,11 +1211,11 @@ test("a job whose record already carries request.model is not probed", async (t)
 
 test("dead pid and unparseable argv are skipped without error for model audit", async (t) => {
   const sandbox = makeSandbox(t);
-  const shortLivedChild = spawn(process.execPath, ["-e", "setTimeout(() => {}, 0)"]);
+  const shortLivedChild = await spawnProbeChild(t);
   const deadPid = shortLivedChild.pid;
   const deadPidIdentity = getProcessIdentity(deadPid);
   assert.ok(deadPidIdentity, "Process identity probing is unavailable for the tracked child.");
-  await once(shortLivedChild, "exit");
+  await releaseProbeChild(shortLivedChild);
 
   seedJob(sandbox, { id: "dead-job", status: "running", pid: deadPid, pidIdentity: deadPidIdentity });
   seedJob(sandbox, { id: "bad-argv-job", status: "running", pid: process.pid });
@@ -1533,4 +1564,47 @@ test("installed cache layout without codex companion starts in announce-only mod
   await assertMonitorStaysAlive(monitor);
   assert.strictEqual(monitor.child.exitCode, null);
   assert.ok(monitor.lines().includes(REPAIR_UNAVAILABLE_LINE));
+});
+
+test("monitor scans parse only changed files and forget deleted file signatures", async (t) => {
+  const sandbox = makeSandbox(t);
+  const { file, record } = seedJob(sandbox, { id: "scan-job", request: { model: "gpt-5", effort: "high" } });
+  const preload = path.join(sandbox.root, "count-job-reads.mjs");
+  const log = path.join(sandbox.root, "reads.log");
+  fs.writeFileSync(preload, `import fs from "node:fs";
+const target = process.env.MONITOR_TEST_RECORD;
+const log = process.env.MONITOR_TEST_LOG;
+const read = fs.readFileSync;
+const readdir = fs.readdirSync;
+fs.readFileSync = function (file, ...args) {
+  if (file === target) fs.appendFileSync(log, "R\\n");
+  return read.call(this, file, ...args);
+};
+fs.readdirSync = function (dir, ...args) {
+  if (dir === process.env.MONITOR_TEST_JOBS_DIR) fs.appendFileSync(log, "S\\n");
+  return readdir.call(this, dir, ...args);
+};
+`);
+  const monitor = startMonitor(sandbox, envFor(sandbox, {
+    FUSION_CODEX_COMPANION: path.join(sandbox.root, "missing-companion.mjs"),
+    MONITOR_TEST_RECORD: file,
+    MONITOR_TEST_JOBS_DIR: path.dirname(file),
+    MONITOR_TEST_LOG: log,
+    NODE_OPTIONS: `${process.env.NODE_OPTIONS ?? ""} --import=${preload}`,
+    CODEX_JOBS_MONITOR_INTERVAL_MS: "100"
+  }));
+  const count = (mark) => fs.existsSync(log) ? fs.readFileSync(log, "utf8").split("\n").filter((line) => line === mark).length : 0;
+  await waitUntil(() => count("S") >= 3);
+  assert.equal(count("R"), 1, monitor.stderr());
+  const changed = { ...record, status: "done", resolvedModel: "gpt-5", resolvedEffort: "high", tokenUsage: { inputTokens: 1, outputTokens: 1 } };
+  writeJobRecordFile(file, changed);
+  await waitUntil(() => count("R") >= 2);
+  const changedStat = fs.statSync(file);
+  fs.rmSync(file);
+  const scansBeforeDeletion = count("S");
+  await waitUntil(() => count("S") >= scansBeforeDeletion + 2);
+  writeJobRecordFile(file, changed);
+  fs.utimesSync(file, changedStat.atime, changedStat.mtime);
+  await waitUntil(() => count("R") >= 3);
+  assert.equal(count("R"), 3, monitor.stderr());
 });

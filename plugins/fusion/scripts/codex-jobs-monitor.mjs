@@ -9,7 +9,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 
 import {
   FILE_ENGINE_DESCRIPTORS,
-  appendModelAuditObservation,
+  appendModelAuditObservations,
   appendTokenUsageObservation,
   fusionRepositoryKey,
   loadModelAuditObservations,
@@ -33,6 +33,7 @@ const CODEX_COMPANION_ENV = "FUSION_CODEX_COMPANION";
 const ERROR_MESSAGE_MAX_LENGTH = 80;
 const DEAD_STATUS_KEY = "dead";
 const RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
+const RECONCILE_INTERVAL_MS = 10 * 60 * 1000;
 const MODEL_AUDIT_FILENAME = "model-audit.jsonl";
 const TERMINAL_LEDGER_SCHEMA_VERSION = 3;
 const REPAIR_UNAVAILABLE_LINE =
@@ -142,13 +143,25 @@ function resolveWorkspaceRoot(cwd) {
   return cwd;
 }
 
-function readWorkspaceJobsSnapshot(root, workspaceRoot, repositoryCache = new Map()) {
+function monitorRecordSummary(record) {
+  const { id, status, workspaceRoot, repositoryKey, claudeSessionId, background,
+    pid, pidIdentity, pidOwnsProcessGroup, codexPid, createdAt, request } = record;
+  return { id, status, workspaceRoot, repositoryKey, claudeSessionId,
+    ...(Object.hasOwn(record, "background") ? { background } : {}),
+    // The repair predicate and running model audit need these fields on every tick.
+    pid, pidIdentity, pidOwnsProcessGroup, codexPid, createdAt,
+    request: request && typeof request === "object" ? { model: request.model, effort: request.effort } : request };
+}
+
+function readWorkspaceJobsSnapshot(root, workspaceRoot, repositoryCache = new Map(), cache = { files: new Map(), scannedAt: 0 }) {
   try {
     if (!fs.statSync(root).isDirectory()) {
       return { available: false, records: [] };
     }
     const records = [];
     const recordIds = new Set();
+    const seenFiles = new Set();
+    const reconcile = Date.now() - cache.scannedAt >= RECONCILE_INTERVAL_MS;
     const scopeRepositoryKey = fusionRepositoryKey(workspaceRoot, repositoryCache);
     for (const workspace of fs.readdirSync(root, { withFileTypes: true })) {
       if (!workspace.isDirectory()) {
@@ -168,10 +181,28 @@ function readWorkspaceJobsSnapshot(root, workspaceRoot, repositoryCache = new Ma
         const fileId = entry.slice(0, -".json".length);
         try {
           const recordFile = path.join(dir, entry);
-          const record = JSON.parse(fs.readFileSync(recordFile, "utf8"));
+          const stat = fs.statSync(recordFile);
+          seenFiles.add(recordFile);
+          const previous = cache.files.get(recordFile);
+          let cached = previous;
+          let sourceRecord = null;
+          if (reconcile || !previous || previous.mtimeMs !== stat.mtimeMs || previous.size !== stat.size) {
+            try {
+              sourceRecord = JSON.parse(fs.readFileSync(recordFile, "utf8"));
+              cached = { mtimeMs: stat.mtimeMs, size: stat.size, record: monitorRecordSummary(sourceRecord) };
+            } catch {
+              cached = { mtimeMs: stat.mtimeMs, size: stat.size, record: null };
+            }
+            cache.files.set(recordFile, cached);
+          }
+          const record = cached.record;
+          if (!record) {
+            if (fileId) recordIds.add(fileId);
+            continue;
+          }
           const storedRepositoryKey = typeof record?.repositoryKey === "string" && record.repositoryKey.trim() ? record.repositoryKey.trim() : null;
           if ((storedRepositoryKey && storedRepositoryKey === scopeRepositoryKey) || (!storedRepositoryKey && workspaceRootsShareRepository(record?.workspaceRoot, workspaceRoot, repositoryCache))) {
-            records.push({ file: recordFile, record });
+            records.push({ file: recordFile, record, sourceRecord });
             if (record?.id) {
               recordIds.add(record.id);
             }
@@ -183,6 +214,10 @@ function readWorkspaceJobsSnapshot(root, workspaceRoot, repositoryCache = new Ma
         }
       }
     }
+    for (const file of cache.files.keys()) {
+      if (!seenFiles.has(file)) cache.files.delete(file);
+    }
+    if (reconcile) cache.scannedAt = Date.now();
     return { available: true, records, recordIds };
   } catch {
     return { available: false, records: [], recordIds: new Set() };
@@ -557,7 +592,7 @@ export function inspectCodexRollout(record, env = process.env, rolloutIndex = nu
   return { availability: "available", reason: null, threadId, turnId, model, effort, tokenUsage };
 }
 
-function maybeCaptureModelAudit(record, seenJobIds, sidecarPath, env = process.env) {
+function maybeCaptureModelAudit(record, seenJobIds, env = process.env) {
   if (!record?.id || seenJobIds.has(record.id)) {
     return;
   }
@@ -582,13 +617,7 @@ function maybeCaptureModelAudit(record, seenJobIds, sidecarPath, env = process.e
     source: "argv",
     observedAt: new Date().toISOString()
   };
-  try {
-    if (appendModelAuditObservation(sidecarPath, observation)) {
-      seenJobIds.add(record.id);
-    }
-  } catch {
-    void 0;
-  }
+  return observation;
 }
 
 function terminalObservations(record, env = process.env, rolloutIndex = null) {
@@ -614,9 +643,8 @@ function terminalObservations(record, env = process.env, rolloutIndex = null) {
   const modelSource = resolvedModel ? "job-record" : rollout.model ? "rollout-turn-context" : requestedModel ? "job-request" : null;
   const effortSource = resolvedEffort ? "job-record" : rollout.effort ? "rollout-turn-context" : requestedEffort ? "job-request" : null;
   const source = modelSource === "rollout-turn-context" || effortSource === "rollout-turn-context" ? "rollout-turn-context" : resolvedModel || resolvedEffort ? "job-record" : "job-request";
-  if (workspaceRoot && (model || effort)) {
-    try {
-      appendModelAuditObservation(modelAuditSidecarPath(workspaceRoot, env), {
+  const auditObservation = workspaceRoot && (model || effort)
+    ? {
         schemaVersion: 1,
         jobId: record.id,
         engine: "codex",
@@ -628,11 +656,8 @@ function terminalObservations(record, env = process.env, rolloutIndex = null) {
         repositoryKey: record.repositoryKey ?? fusionRepositoryKey(workspaceRoot),
         source,
         observedAt: new Date().toISOString()
-      });
-    } catch {
-      void 0;
-    }
-  }
+      }
+    : null;
   const tokenUsage = inlineUsage ?? rollout.tokenUsage;
   const availability = tokenUsage ? "available" : "unavailable";
   if (workspaceRoot) {
@@ -655,14 +680,14 @@ function terminalObservations(record, env = process.env, rolloutIndex = null) {
       void 0;
     }
   }
-  const existingModel = workspaceRoot ? loadModelAuditObservations(modelAuditSidecarPath(workspaceRoot, env)).get(record.id) : null;
   return {
-    model: existingModel?.model ?? model ?? null,
-    modelSource: existingModel?.source ?? modelSource,
-    effort: existingModel?.effort ?? effort ?? null,
-    effortSource: existingModel?.source ?? effortSource,
+    model: model ?? null,
+    modelSource,
+    effort: effort ?? null,
+    effortSource,
     tokenUsage,
-    tokenUsageAvailability: availability
+    tokenUsageAvailability: availability,
+    auditObservation
   };
 }
 
@@ -841,6 +866,7 @@ async function main() {
   const terminalRecords = loaded.records;
   const rolloutIndex = { files: [], scannedAt: 0 };
   const repositoryCache = new Map();
+  const snapshotCache = { files: new Map(), scannedAt: 0 };
   const auditStates = new Map();
   let announceOnlyPending = !repair;
   let startupPending = true;
@@ -852,12 +878,31 @@ async function main() {
       return;
     }
     const records = snapshot.records;
+    for (const state of auditStates.values()) state.merged = null;
     if (announceOnlyPending && records.length > 0) {
       safeWriteLine(REPAIR_UNAVAILABLE_LINE);
       announceOnlyPending = false;
     }
     const liveIds = new Set(snapshot.recordIds);
     const terminalJobIds = new Set(records.filter(({ record }) => record?.id && TERMINAL_STATUSES.has(record.status)).map(({ record }) => record.id));
+    const auditBatches = new Map();
+    const pendingTerminals = new Map();
+    const auditStateFor = (workspace) => {
+      if (typeof workspace !== "string" || !workspace) return null;
+      if (!auditStates.has(workspace)) {
+        auditStates.set(workspace, {
+          sidecarPath: modelAuditSidecarPath(workspace),
+          seenJobIds: new Set(),
+          merged: null
+        });
+      }
+      return auditStates.get(workspace);
+    };
+    const queueAudit = (workspace, observation) => {
+      if (!observation || !auditStateFor(workspace)) return;
+      if (!auditBatches.has(workspace)) auditBatches.set(workspace, []);
+      auditBatches.get(workspace).push(observation);
+    };
     let dirty = false;
     for (const entry of records) {
       let record = entry.record;
@@ -891,30 +936,58 @@ async function main() {
           }
           continue;
         }
-        if (!terminalRecords.has(key)) {
-          const observations = terminalObservations(record, process.env, rolloutIndex);
-          terminalRecords.set(key, terminalLedgerRecord(record, observations, workspaceRoot));
+        if (!terminalRecords.has(key) && !pendingTerminals.has(key)) {
+          const fullRecord = reconciled ? record : entry.sourceRecord ?? JSON.parse(fs.readFileSync(entry.file, "utf8"));
+          const observations = terminalObservations(fullRecord, process.env, rolloutIndex);
+          const auditWorkspace = fullRecord.workspaceRoot;
+          auditStateFor(auditWorkspace);
+          queueAudit(auditWorkspace, observations.auditObservation);
+          pendingTerminals.set(key, { fullRecord, observations, auditWorkspace });
           dirty = true;
         }
         if (!announced.has(key)) {
           announced.add(key);
           dirty = true;
           if (shouldAnnounceTerminal(record) && !(startupPending && (loaded.malformed || (!loaded.exists && !reconciled)))) {
-            safeWriteLine(formatOutcomeLine(record));
+            const noticeRecord = reconciled ? record : entry.sourceRecord ?? JSON.parse(fs.readFileSync(entry.file, "utf8"));
+            safeWriteLine(formatOutcomeLine(noticeRecord));
           }
         }
         continue;
       }
       const recordWorkspaceRoot = record.workspaceRoot;
-      if (!auditStates.has(recordWorkspaceRoot)) {
-        const sidecarPath = modelAuditSidecarPath(recordWorkspaceRoot);
-        auditStates.set(recordWorkspaceRoot, {
-          sidecarPath,
-          seenJobIds: new Set(loadModelAuditObservations(sidecarPath).keys())
-        });
+      const auditState = auditStateFor(recordWorkspaceRoot);
+      if (!auditState) continue;
+      const observation = maybeCaptureModelAudit(record, auditState.seenJobIds);
+      if (observation) {
+        queueAudit(recordWorkspaceRoot, observation);
+        auditState.seenJobIds.add(record.id);
       }
-      const auditState = auditStates.get(recordWorkspaceRoot);
-      maybeCaptureModelAudit(record, auditState.seenJobIds, auditState.sidecarPath);
+    }
+    for (const [recordWorkspaceRoot, batch] of auditBatches) {
+      const state = auditStates.get(recordWorkspaceRoot);
+      try {
+        if (!appendModelAuditObservations(state.sidecarPath, batch, (merged) => {
+          state.merged = merged;
+          state.seenJobIds = new Set(merged.keys());
+        })) {
+          for (const observation of batch) state.seenJobIds.delete(observation.jobId);
+        }
+      } catch {
+        for (const observation of batch) state.seenJobIds.delete(observation.jobId);
+      }
+    }
+    for (const [key, { fullRecord, observations, auditWorkspace }] of pendingTerminals) {
+      const state = auditStates.get(auditWorkspace);
+      if (state && !state.merged) state.merged = loadModelAuditObservations(state.sidecarPath);
+      const existing = state?.merged?.get(fullRecord.id);
+      terminalRecords.set(key, terminalLedgerRecord(fullRecord, {
+        ...observations,
+        model: existing?.model ?? observations.model,
+        modelSource: existing?.source ?? observations.modelSource,
+        effort: existing?.effort ?? observations.effort,
+        effortSource: existing?.source ?? observations.effortSource
+      }, workspaceRoot));
     }
     if (pruneAnnounced(announced, liveIds)) {
       dirty = true;
@@ -932,7 +1005,7 @@ async function main() {
   installExitHandlers(() => clearInterval(timer));
 
   try {
-    const initialSnapshot = readWorkspaceJobsSnapshot(root, workspaceRoot, repositoryCache);
+    const initialSnapshot = readWorkspaceJobsSnapshot(root, workspaceRoot, repositoryCache, snapshotCache);
     processSnapshot(initialSnapshot);
     if (!initialSnapshot.available) {
       startupPending = false;
@@ -944,7 +1017,7 @@ async function main() {
 
   timer = setInterval(() => {
     try {
-      processSnapshot(readWorkspaceJobsSnapshot(root, workspaceRoot, repositoryCache));
+      processSnapshot(readWorkspaceJobsSnapshot(root, workspaceRoot, repositoryCache, snapshotCache));
     } catch {}
     try {
       observePeerJobs();
