@@ -142,20 +142,21 @@ export function removePrivateHome(homeDir) {
   fs.rmSync(homeDir, { recursive: true, force: true });
 }
 
+function pruneHomeDirectory(directory, retained) {
+  if (directory === retained) return;
+  for (const name of fs.readdirSync(directory)) {
+    const child = path.join(directory, name);
+    if (child === retained) continue;
+    if (retained.startsWith(`${child}${path.sep}`) && fs.lstatSync(child).isDirectory()) pruneHomeDirectory(child, retained);
+    else removePrivateHome(child);
+  }
+}
+
 export function prunePrivateHome(homeDir, cwd, sessionId) {
   const retained = sessionId && CURSOR_SESSION_ID_PATTERN.test(sessionId) ? cursorChatDir(homeDir, cwd, sessionId) : null;
   if (!retained || !fs.lstatSync(retained, { throwIfNoEntry: false })?.isDirectory()) {
     removePrivateHome(homeDir);
     return;
   }
-  function prune(directory) {
-    if (directory === retained) return;
-    for (const name of fs.readdirSync(directory)) {
-      const child = path.join(directory, name);
-      if (child === retained) continue;
-      if (retained.startsWith(`${child}${path.sep}`) && fs.lstatSync(child).isDirectory()) prune(child);
-      else removePrivateHome(child);
-    }
-  }
-  prune(homeDir);
+  pruneHomeDirectory(homeDir, retained);
 }

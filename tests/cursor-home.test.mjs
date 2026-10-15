@@ -52,13 +52,13 @@ test("private homes isolate configuration and choose each mode's sandbox", (t) =
   removePrivateHome(linuxHome);
 });
 
-test("private homes share one private npm cache and replace a legacy local cache", (t) => {
+test("private homes share one private npm cache and replace an invalid link", (t) => {
   const root = fixture(t);
   const data = path.join(root, "data");
   const homes = ["first", "second"].map((id) => path.join(data, "runs", id, "home"));
   const cache = path.join(data, "npm-cache");
-  fs.mkdirSync(path.join(homes[0], ".npm"), { recursive: true });
-  fs.writeFileSync(path.join(homes[0], ".npm", "old"), "old");
+  fs.mkdirSync(homes[0], { recursive: true });
+  fs.symlinkSync(path.join(root, "wrong-cache"), path.join(homes[0], ".npm"));
   for (const homeDir of homes) {
     buildPrivateHome({ homeDir, mode: "consult", cwd: root, realHome: root });
     const link = path.join(homeDir, ".npm");
@@ -66,7 +66,6 @@ test("private homes share one private npm cache and replace a legacy local cache
     assert.equal(fs.readlinkSync(link), cache);
     assert.equal(fs.statSync(cache).mode & 0o777, 0o700);
   }
-  assert.equal(fs.existsSync(path.join(cache, "old")), false);
   fs.writeFileSync(path.join(homes[0], ".npm", "shared"), "cache");
   assert.equal(fs.readFileSync(path.join(homes[1], ".npm", "shared"), "utf8"), "cache");
   removePrivateHome(homes[0]);

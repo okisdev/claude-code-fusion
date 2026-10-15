@@ -7,6 +7,7 @@ import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 import { getProcessIdentity, processIdentityMatches } from "../plugins/cursor/scripts/lib/process-identity.mjs";
+import { jobFilePath } from "../plugins/cursor/scripts/lib/state.mjs";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const companion = path.join(root, "plugins/cursor/scripts/cursor-companion.mjs");
@@ -91,6 +92,24 @@ test("consult records stream fields and renders a contiguous footer", (t) => {
   assert.equal(call.HOME, record.homeDir);
   assert.ok(call.argv.includes("ask"));
   assert.ok(call.argv.includes("--disable-auto-update"));
+});
+
+test("incomplete stored jobs follow the absent record path", (t) => {
+  const h = harness(t);
+  assertDone(task(h));
+  const [record] = h.jobs();
+  const missingFields = { ...record };
+  delete missingFields.cursorVersion;
+  delete missingFields.semanticStatus;
+  for (const incomplete of [missingFields, { ...record, resultPayload: { status: "done" } }]) {
+    fs.writeFileSync(jobFilePath(h.data, record.cwd, record.id), JSON.stringify(incomplete));
+    const status = h.run(["status", record.id, "--json"]);
+    assert.equal(status.status, 1, status.stdout + status.stderr);
+    assert.match(status.stderr, /No job record found/);
+    const history = h.run(["history", "--json"]);
+    assert.equal(history.status, 0, history.stdout + history.stderr);
+    assert.deepEqual(JSON.parse(history.stdout).jobs, []);
+  }
 });
 
 test("write uses write tools without ask mode", (t) => {

@@ -166,7 +166,7 @@ export function renderHistoryReport(history, now = Date.now()) {
     const status = job?.cleanupRequired ? `${job.status ?? "unknown"} (cleanup required)` : job?.status;
     const cells = [
       historyCell(formatAge(job?.createdAt, now)),
-      historyCell(job?.jobId ?? job?.id),
+      historyCell(job?.jobId),
       historyCell(job?.jobClass),
       historyCell(status),
       historyCell(job?.mode),
@@ -354,7 +354,7 @@ export function renderCancelReport(job) {
 }
 
 export function renderRecordAcceptance(record) {
-  return `Recorded verdict for Cursor job ${record.id}: ${record.semanticStatus ?? "unverified"}.\n`;
+  return `Recorded verdict for Cursor job ${record.id}: ${record.semanticStatus}.\n`;
 }
 
 export function renderSetupReport(report) {
@@ -369,9 +369,6 @@ export function renderSetupReport(report) {
     `- compatibility: ${report.compatibility ?? "unknown"}`,
     `- data dir: ${report.dataDir?.writable ? `writable (${report.dataDir.path})` : `not writable (${report.dataDir?.detail ?? "not checked"})`}`
   ];
-  if (report.stopGate !== undefined) {
-    lines.push(`- stop gate: ${report.stopGate ? "enabled" : "disabled"}`);
-  }
   for (const step of report.nextSteps ?? []) {
     lines.push(`- ${step}`);
   }

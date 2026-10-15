@@ -58,7 +58,7 @@ export function runHomeDir(dataDir, jobId) {
 }
 
 export function homeRetentionExpired(record, now = Date.now()) {
-  const finished = Date.parse(record.finishedAt ?? record.createdAt ?? "");
+  const finished = Date.parse(record.finishedAt ?? "");
   return TERMINAL_STATUSES.has(record.status) && Number.isFinite(finished) && now - finished >= HOME_RETENTION_MS;
 }
 
@@ -324,20 +324,10 @@ function deliveryStatusFor(record) {
 
 function withStructuredStatuses(record) {
   const transportStatus = record.status;
-  const semanticStatus = record.semanticStatus ?? "unverified";
+  const semanticStatus = record.semanticStatus;
   const deliveryStatus = deliveryStatusFor(record);
-  const resultPayload = record.resultPayload && typeof record.resultPayload === "object" && !Array.isArray(record.resultPayload)
-    ? {
-        ...record.resultPayload,
-        transportStatus,
-        semanticStatus,
-        delivery: record.delivery,
-        deliveryStatus
-      }
-    : record.resultPayload;
   return {
     ...record,
-    resultPayload,
     transportStatus,
     semanticStatus,
     deliveryStatus
@@ -414,16 +404,30 @@ export function markDeliveryCollectedFile(file, collectedAt = nowIso()) {
   });
 }
 
+function currentJobRecord(record) {
+  return record && typeof record === "object" && !Array.isArray(record) &&
+    record.schemaVersion === 1 && record.engine === "cursor" &&
+    typeof record.id === "string" && typeof record.cwd === "string" &&
+    typeof record.createdAt === "string" &&
+    ["running", "done", "error", "cancelled"].includes(record.status) &&
+    ["consult", "write", "review"].includes(record.mode) &&
+    typeof record.jobClass === "string" && typeof record.delivery === "string" &&
+    typeof record.semanticStatus === "string" && typeof record.transportStatus === "string" &&
+    typeof record.deliveryStatus === "string" && Array.isArray(record.warnings) &&
+    record.resultPayload === null &&
+    Object.hasOwn(record, "finishedAt") && Object.hasOwn(record, "homeDir") &&
+    Object.hasOwn(record, "cursorVersion") && Object.hasOwn(record, "cursorBuildPath") &&
+    Object.hasOwn(record, "pidIdentity") && Object.hasOwn(record, "cursorPidIdentity") &&
+    Object.hasOwn(record, "cleanupRequired");
+}
+
 export function readJobRecordFile(file) {
   if (!fs.existsSync(file)) {
     return null;
   }
   try {
     const record = JSON.parse(fs.readFileSync(file, "utf8"));
-    if (record && typeof record === "object" && !Array.isArray(record) && typeof record.id === "string") {
-      return { ...record, cursorVersion: typeof record.cursorVersion === "string" && record.cursorVersion.trim() ? record.cursorVersion.trim() : null };
-    }
-    return record;
+    return path.basename(path.dirname(file)) === "jobs" && !currentJobRecord(record) ? null : record;
   } catch {
     return null;
   }
@@ -442,17 +446,13 @@ function recordedResumeOwnerProcessIsAlive(pid, identity) {
     return false;
   }
   if (!validProcessIdentity(identity)) {
-    return processIsDirectlyAlive(pid) || processGroupIsDirectlyAlive(pid);
+    return processIsDirectlyAlive(pid) || processGroupAlive(pid);
   }
   const currentIdentity = getProcessIdentity(pid);
   if (currentIdentity) {
     return processIdentitiesMatch(currentIdentity, identity);
   }
-  return processIsDirectlyAlive(pid) || processGroupIsDirectlyAlive(pid);
-}
-
-function processGroupIsDirectlyAlive(pid) {
-  return processGroupAlive(pid);
+  return processIsDirectlyAlive(pid) || processGroupAlive(pid);
 }
 
 function resumeOwnerMayStillRun(record, now = Date.now()) {
@@ -466,7 +466,7 @@ function resumeOwnerMayStillRun(record, now = Date.now()) {
   if (processes.length > 0) {
     return false;
   }
-  const createdAt = Date.parse(record.createdAt ?? "");
+  const createdAt = Date.parse(record.createdAt);
   return Number.isFinite(createdAt) && now - createdAt < RESUME_OWNER_LAUNCH_GRACE_MS;
 }
 
@@ -571,7 +571,7 @@ export function launchRunningJobProcess(file, launch, options = {}) {
         : existing.cleanupRequired
           ? "process cleanup is still required"
           : `the job is already ${existing.status}`;
-      const error = new Error(`${processLabel} launch for job ${existing.id ?? "unknown"} was blocked because ${reason}.`);
+      const error = new Error(`${processLabel} launch for job ${existing.id} was blocked because ${reason}.`);
       error.failureKind = cancelled ? "cancelled" : existing.failureKind ?? "resource";
       error.launchPrevented = true;
       error.processRole = processRole;
@@ -584,9 +584,9 @@ export function launchRunningJobProcess(file, launch, options = {}) {
     }
 
     const launched = launch();
-    const pid = launched?.pid ?? launched?.child?.pid;
+    const pid = launched?.child?.pid;
     if (!Number.isInteger(pid) || pid <= 1) {
-      const error = resourceError(`${processLabel} launch for job ${existing.id ?? "unknown"} did not produce a valid PID.`);
+      const error = resourceError(`${processLabel} launch for job ${existing.id} did not produce a valid PID.`);
       error.processRole = processRole;
       throw error;
     }
@@ -695,8 +695,7 @@ export function listJobRecords(dataDir, cwd) {
     }
   }
   return records.sort((left, right) =>
-    String(right.createdAt ?? "").localeCompare(String(left.createdAt ?? "")) ||
-    String(right.id ?? "").localeCompare(String(left.id ?? ""))
+    right.createdAt.localeCompare(left.createdAt) || right.id.localeCompare(left.id)
   );
 }
 
@@ -738,8 +737,8 @@ export function listAllJobRecords(dataDir) {
   }
   return results.sort(
     (left, right) =>
-      String(right.record.createdAt ?? "").localeCompare(String(left.record.createdAt ?? "")) ||
-      String(right.record.id ?? "").localeCompare(String(left.record.id ?? "")) ||
+      right.record.createdAt.localeCompare(left.record.createdAt) ||
+      right.record.id.localeCompare(left.record.id) ||
       String(left.file).localeCompare(String(right.file))
   );
 }

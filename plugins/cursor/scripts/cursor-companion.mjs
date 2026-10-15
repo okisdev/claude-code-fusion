@@ -464,10 +464,6 @@ function processOwned(pid, identity) {
   return Number.isInteger(pid) && pid > 1 && identity && processIdentityMatches(pid, identity);
 }
 
-function cursorGroupAlive(pid) {
-  return processGroupAlive(pid);
-}
-
 function runningAlive(record) {
   if (record.status !== "running") return false;
   if (record.pid) return processOwned(record.pid, record.pidIdentity);
@@ -485,7 +481,7 @@ function terminateOwned(record) {
   let safe = true;
   for (const [pid, identity, group] of targets) {
     if (!Number.isInteger(pid) || pid <= 1 || pid === process.pid) continue;
-    if (group ? !cursorGroupAlive(pid) : !processIsDirectlyAlive(pid)) continue;
+    if (group ? !processGroupAlive(pid) : !processIsDirectlyAlive(pid)) continue;
     if (processIsDirectlyAlive(pid) && !processOwned(pid, identity)) continue;
     try { process.kill(group ? -pid : pid, "SIGTERM"); }
     catch (error) { if (error.code !== "ESRCH") safe = false; }
@@ -493,24 +489,27 @@ function terminateOwned(record) {
   return safe;
 }
 
+function cleanupProcessesAlive(record) {
+  return processGroupAlive(record.cursorPid) || (record.pid !== process.pid && processIsDirectlyAlive(record.pid));
+}
+
 async function waitForCleanup(record) {
   const deadline = Date.now() + 12000;
-  const alive = () => cursorGroupAlive(record.cursorPid) || (record.pid !== process.pid && processIsDirectlyAlive(record.pid));
   while (Date.now() < deadline) {
-    if (!alive()) {
+    if (!cleanupProcessesAlive(record)) {
       await reapPrivateHomeHelpers(record.homeDir);
       return true;
     }
     await new Promise((resolve) => setTimeout(resolve, 50));
   }
   for (const [pid, group] of [[record.cursorPid, true], [record.pid, record.background]]) {
-    if (pid !== process.pid && (group ? cursorGroupAlive(pid) : processIsDirectlyAlive(pid)) && (!processIsDirectlyAlive(pid) || processOwned(pid, pid === record.pid ? record.pidIdentity : record.cursorPidIdentity))) {
+    if (pid !== process.pid && (group ? processGroupAlive(pid) : processIsDirectlyAlive(pid)) && (!processIsDirectlyAlive(pid) || processOwned(pid, pid === record.pid ? record.pidIdentity : record.cursorPidIdentity))) {
       try { process.kill(group ? -pid : pid, "SIGKILL"); } catch (error) { if (error.code !== "ESRCH") return false; }
     }
   }
   const killDeadline = Date.now() + 500;
-  while (alive() && Date.now() < killDeadline) await new Promise((resolve) => setTimeout(resolve, 25));
-  if (alive()) return false;
+  while (cleanupProcessesAlive(record) && Date.now() < killDeadline) await new Promise((resolve) => setTimeout(resolve, 25));
+  if (cleanupProcessesAlive(record)) return false;
   await reapPrivateHomeHelpers(record.homeDir);
   return true;
 }
@@ -550,8 +549,8 @@ async function handleStatus(argv, transport) {
 
 function historyEntry(record) {
   const sessionId = typeof record.sessionId === "string" ? record.sessionId : null;
-  const mode = ["consult", "write", "review"].includes(record.mode) ? record.mode : "unknown";
-  const resumable = terminal(record) && !homeRetentionExpired(record) && record.jobClass === "task" && CURSOR_SESSION_ID_PATTERN.test(sessionId) && Boolean(record.homeDir) && mode !== "unknown";
+  const mode = record.mode;
+  const resumable = terminal(record) && !homeRetentionExpired(record) && record.jobClass === "task" && CURSOR_SESSION_ID_PATTERN.test(sessionId) && Boolean(record.homeDir);
   return {
     jobId: record.id, sessionId, cwd: record.cwd, status: record.status, jobClass: record.jobClass, mode,
     background: Boolean(record.background), delivery: record.delivery, deliveryStatus: record.deliveryStatus,

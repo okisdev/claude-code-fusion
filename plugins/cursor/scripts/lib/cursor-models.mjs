@@ -53,20 +53,21 @@ export function billingPoolForModel(id) {
   return id.startsWith("composer-") ? "first-party" : "api";
 }
 
+function throwModelInputError(requested, identifiers, effortToken) {
+  const base = requested.replace(new RegExp(`-${effortToken}(?:-fast)?$`), "").replace(/-fast$/, "");
+  const variants = [...identifiers].filter((id) => id === base || id.startsWith(`${base}-`));
+  const error = new Error(`Unknown Cursor model ${requested}. Available variants for ${base}: ${variants.join(", ") || "none"}`);
+  error.failureKind = "input";
+  throw error;
+}
+
 export function resolveCursorModel({ catalog, model, effort = "default" }) {
   const requested = String(model ?? "");
   const models = Array.isArray(catalog) ? catalog : catalog.models;
   const identifiers = new Set(models.map((item) => item.id));
   const effortToken = "(?:none|minimal|low|medium|high|xhigh|extra-high|max)";
-  const inputError = () => {
-    const base = requested.replace(new RegExp(`-${effortToken}(?:-fast)?$`), "").replace(/-fast$/, "");
-    const variants = [...identifiers].filter((id) => id === base || id.startsWith(`${base}-`));
-    const error = new Error(`Unknown Cursor model ${requested}. Available variants for ${base}: ${variants.join(", ") || "none"}`);
-    error.failureKind = "input";
-    throw error;
-  };
   if (requested === "auto" || requested === "default") {
-    inputError();
+    throwModelInputError(requested, identifiers, effortToken);
   }
   if (requested.includes("[")) {
     return { variant: requested, effortApplied: effort !== "default", billingPool: billingPoolForModel(requested) };
@@ -96,7 +97,7 @@ export function resolveCursorModel({ catalog, model, effort = "default" }) {
     }
   }
   if (!variant) {
-    inputError();
+    throwModelInputError(requested, identifiers, effortToken);
   }
   return { variant, effortApplied, billingPool: billingPoolForModel(variant) };
 }

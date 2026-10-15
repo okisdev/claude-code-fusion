@@ -9,6 +9,33 @@ const READ_TOOLS = ["read_tool_call", "grep_tool_call", "glob_tool_call", "ls_to
 const WRITE_TOOLS = [...READ_TOOLS, "edit_tool_call", "delete_tool_call", "shell_tool_call", "update_todos_tool_call", "read_todos_tool_call"];
 const STDERR_MAX_BYTES = 64 * 1024;
 
+function cursorBuildDate(value) {
+  return String(value).slice(0, 10);
+}
+
+function processSignalable(pid) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return error.code === "EPERM";
+  }
+}
+
+function cursorGroupSignalable(pid) {
+  if (!Number.isInteger(pid) || pid <= 1) return false;
+  try {
+    process.kill(-pid, 0);
+    return true;
+  } catch (error) {
+    return error.code === "EPERM";
+  }
+}
+
+function launchCursorProcess(bin, args, cwd, env) {
+  return spawn(bin, args, { cwd, env, detached: true, stdio: ["pipe", "pipe", "pipe"] });
+}
+
 export function resolveCursorBin(env = process.env) {
   return env.CURSOR_AGENT_BIN?.trim() || "cursor-agent";
 }
@@ -39,8 +66,7 @@ export function probeCursorVersion(bin, env = process.env) {
 }
 
 export function compareCursorVersion(left, right) {
-  const date = (value) => String(value).slice(0, 10);
-  return date(left).localeCompare(date(right));
+  return cursorBuildDate(left).localeCompare(cursorBuildDate(right));
 }
 
 export function allowedToolsForMode(mode) {
@@ -107,14 +133,6 @@ export async function reapPrivateHomeHelpers(homeDir, { platform = process.platf
     return [];
   }
   const helpers = listing.stdout.split("\n").map((line) => line.trim().match(/^(\d+)\s+(.*)$/)).filter((match) => match && /\bworker-server\b/.test(match[2])).map((match) => Number(match[1])).filter((pid) => pid > 1 && pid !== process.pid && helperHome(pid, platform) === homeDir);
-  const alive = (pid) => {
-    try {
-      process.kill(pid, 0);
-      return true;
-    } catch (error) {
-      return error.code === "EPERM";
-    }
-  };
   for (const pid of helpers) {
     try {
       process.kill(pid, "SIGTERM");
@@ -123,10 +141,10 @@ export async function reapPrivateHomeHelpers(homeDir, { platform = process.platf
     }
   }
   const deadline = Date.now() + graceMs;
-  while (helpers.some(alive) && Date.now() < deadline) {
+  while (helpers.some(processSignalable) && Date.now() < deadline) {
     await new Promise((done) => setTimeout(done, 50));
   }
-  for (const pid of helpers.filter(alive)) {
+  for (const pid of helpers.filter(processSignalable)) {
     try {
       process.kill(pid, "SIGKILL");
     } catch {
@@ -145,8 +163,7 @@ export function runCursor({ bin, args, cwd, env, brief, timeoutMs = 540000, exit
     };
     let child;
     try {
-      const launch = () => spawn(bin, args, { cwd, env, detached: true, stdio: ["pipe", "pipe", "pipe"] });
-      child = launchProcess ? launchProcess(launch) : launch();
+      child = launchProcess ? launchProcess(() => launchCursorProcess(bin, args, cwd, env)) : launchCursorProcess(bin, args, cwd, env);
     } catch (error) {
       outcome.spawnError = error;
       outcome.stderrTail = error.message;
@@ -184,17 +201,6 @@ export function runCursor({ bin, args, cwd, env, brief, timeoutMs = 540000, exit
         if (error.code !== "ESRCH") {
           outcome.stderrTail = appendTail(outcome.stderrTail, Buffer.from(`\n${error.message}`));
         }
-      }
-    };
-    const groupAlive = () => {
-      if (!Number.isInteger(pid) || pid <= 1) {
-        return false;
-      }
-      try {
-        process.kill(-pid, 0);
-        return true;
-      } catch (error) {
-        return error.code === "EPERM";
       }
     };
     const terminate = () => {
@@ -352,10 +358,10 @@ export function runCursor({ bin, args, cwd, env, brief, timeoutMs = 540000, exit
       }
       signalGroup("SIGTERM");
       const deadline = Date.now() + killGraceMs;
-      while (groupAlive() && Date.now() < deadline) {
+      while (cursorGroupSignalable(pid) && Date.now() < deadline) {
         await new Promise((done) => setTimeout(done, Math.min(50, deadline - Date.now())));
       }
-      if (groupAlive()) {
+      if (cursorGroupSignalable(pid)) {
         signalGroup("SIGKILL");
       }
       await reapPrivateHomeHelpers(env?.HOME);

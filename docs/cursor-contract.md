@@ -89,7 +89,7 @@ Quota and rate limit failures carry the job's `billingPool`, so Fusion's breaker
 
 ## Job record
 
-Records live at `<data>/state/<workspace>/jobs/<id>.json`, where `<data>` is `CURSOR_COMPANION_DATA` or `~/.claude/plugins/data/cursor-claude-code-fusion`, and follow the Grok companion's record shape with `engine: "cursor"`. Cursor specific fields are `cursorVersion`, `cursorBuildPath`, `sessionId` (the chat id), `requestId`, `requestedModel`, `resolvedModel` (the catalog variant passed to the CLI), `observedModel`, `requestedEffort`, `effortApplied`, `billingPool`, `mode` (`consult`, `write`, or `review`), `role`, `usage`, `homeDir`, and `warnings`. The footer session line is `cursor-session: <session-id>`.
+Records live at `<data>/state/<workspace>/jobs/<id>.json`, where `<data>` is `CURSOR_COMPANION_DATA` or `~/.claude/plugins/data/cursor-claude-code-fusion`, and follow the Grok companion's record shape with `engine: "cursor"`. Cursor specific fields are `cursorVersion`, `cursorBuildPath`, `sessionId` (the chat id), `requestId`, `requestedModel`, `resolvedModel` (the catalog variant passed to the CLI), `observedModel`, `requestedEffort`, `effortApplied`, `billingPool`, `mode` (`consult`, `write`, or `review`), `role`, `usage`, `homeDir`, and `warnings`. An incomplete or malformed stored job is treated as absent; the companion does not repair older record shapes on read. The footer session line is `cursor-session: <session-id>`.
 
 ## Sessions
 
