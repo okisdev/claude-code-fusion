@@ -9,16 +9,82 @@ function digest(value) {
   return createHash("sha256").update(String(value)).digest("hex");
 }
 
+function linuxProcessState(pid) {
+  try {
+    const stat = fs.readFileSync(`/proc/${pid}/stat`, "utf8");
+    const commandEnd = stat.lastIndexOf(")");
+    if (commandEnd === -1) {
+      return null;
+    }
+    const fields = stat.slice(commandEnd + 2).trim().split(/\s+/);
+    return { state: fields[0] ?? null, pgrp: fields[2] ?? null };
+  } catch {
+    return null;
+  }
+}
+
+function linuxProcessGroupHasLiveMember(pgid) {
+  let entries;
+  try {
+    entries = fs.readdirSync("/proc");
+  } catch {
+    return true;
+  }
+  for (const entry of entries) {
+    if (!/^\d+$/.test(entry)) {
+      continue;
+    }
+    const info = linuxProcessState(Number(entry));
+    if (info && Number(info.pgrp) === pgid && info.state !== "Z") {
+      return true;
+    }
+  }
+  return false;
+}
+
 function directProcessAlive(pid) {
   if (!Number.isInteger(pid) || pid <= 1) {
     return false;
   }
   try {
     process.kill(pid, 0);
-    return true;
   } catch (error) {
     return error?.code === "EPERM";
   }
+  return process.platform !== "linux" || linuxProcessState(pid)?.state !== "Z";
+}
+
+export function processGroupAlive(pid) {
+  if (process.platform === "win32" || !Number.isInteger(pid) || pid <= 1) {
+    return false;
+  }
+  let groupSignalable;
+  try {
+    process.kill(-pid, 0);
+    groupSignalable = true;
+  } catch (error) {
+    if (error?.code === "EPERM") {
+      return true;
+    }
+    groupSignalable = false;
+  }
+  if (!groupSignalable || process.platform !== "linux") {
+    return groupSignalable;
+  }
+  return linuxProcessGroupHasLiveMember(pid);
+}
+
+export function isProcessAlive(pid, identity = null, ownsProcessGroup = true) {
+  if (!Number.isInteger(pid) || pid <= 1) {
+    return false;
+  }
+  if (identity != null) {
+    return processIdentityMatches(pid, identity);
+  }
+  if (process.platform === "win32" || !ownsProcessGroup) {
+    return directProcessAlive(pid);
+  }
+  return directProcessAlive(pid) || processGroupAlive(pid);
 }
 
 function linuxProcessIdentity(pid) {
