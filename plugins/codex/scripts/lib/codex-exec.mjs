@@ -43,10 +43,6 @@ const EFFORT_PATTERN = /^[a-z][a-z0-9_-]{0,31}$/;
 const SERVICE_TIER_PATTERN = /^[a-z][a-z0-9_-]{0,31}$/;
 const WEB_SEARCH_MODES = new Set(["disabled", "cached", "live"]);
 const PRIVATE_FILE_MODE = 0o600;
-function hasOwn(value, key) {
-  return Object.prototype.hasOwnProperty.call(value, key);
-}
-
 function nonemptyString(value, name) {
   if (typeof value !== "string" || !value.trim()) {
     throw new TypeError(`${name} must be a non-empty string.`);
@@ -97,7 +93,7 @@ export function getCodexAvailability(options = {}) {
 }
 
 function sandboxForTask(options) {
-  const write = options.write === true || options.mode === "write";
+  const write = options.write === true;
   const expected = write ? "workspace-write" : "read-only";
   if (options.sandboxMode === "danger-full-access") {
     throw new TypeError("danger-full-access is not supported by the Codex adapter.");
@@ -115,7 +111,7 @@ function appendExplicitSettings(args, options, sandbox) {
   if (options.model != null) {
     args.push("--model", nonemptyString(options.model, "model"));
   }
-  const configuredServiceTier = hasOwn(options, "serviceTier") ? options.serviceTier : "priority";
+  const configuredServiceTier = Object.hasOwn(options, "serviceTier") ? options.serviceTier : "priority";
   const serviceTier = configuredServiceTier === "none" ? null : configuredServiceTier;
   if (serviceTier != null) {
     if (typeof serviceTier !== "string" || !SERVICE_TIER_PATTERN.test(serviceTier)) {
@@ -123,7 +119,7 @@ function appendExplicitSettings(args, options, sandbox) {
     }
     args.push("-c", `service_tier=${serviceTier}`);
   }
-  const effort = options.effort ?? options.modelReasoningEffort;
+  const effort = options.effort;
   if (effort != null) {
     if (typeof effort !== "string" || !EFFORT_PATTERN.test(effort)) {
       throw new TypeError(`Unsupported Codex reasoning effort: ${effort}`);
@@ -131,21 +127,18 @@ function appendExplicitSettings(args, options, sandbox) {
     args.push("--config", `model_reasoning_effort=${JSON.stringify(effort)}`);
   }
   let webSearchMode = "disabled";
-  if (hasOwn(options, "webSearchMode")) {
+  if (Object.hasOwn(options, "webSearchMode")) {
     webSearchMode = options.webSearchMode;
-  } else if (hasOwn(options, "webSearchEnabled")) {
-    webSearchMode = options.webSearchEnabled ? "live" : "disabled";
-  } else if (hasOwn(options, "web")) {
+  } else if (Object.hasOwn(options, "web")) {
     webSearchMode = options.web ? "live" : "disabled";
   }
   if (!WEB_SEARCH_MODES.has(webSearchMode)) {
     throw new TypeError(`Unsupported Codex web search mode: ${webSearchMode}`);
   }
   args.push("--config", `web_search=${JSON.stringify(webSearchMode)}`);
-  const hasNetworkSetting = hasOwn(options, "networkAccessEnabled") || hasOwn(options, "network");
-  const network = hasNetworkSetting ? (hasOwn(options, "networkAccessEnabled") ? options.networkAccessEnabled : options.network) : false;
+  const network = Object.hasOwn(options, "network") ? options.network : false;
   if (typeof network !== "boolean") {
-    throw new TypeError("networkAccessEnabled must be a boolean.");
+    throw new TypeError("network must be a boolean.");
   }
   if (network && sandbox !== "workspace-write") {
     throw new TypeError("Codex sandbox network access requires a write task.");
@@ -153,9 +146,9 @@ function appendExplicitSettings(args, options, sandbox) {
   if (sandbox === "workspace-write") {
     args.push("--config", `sandbox_workspace_write.network_access=${network}`);
   }
-  const cwd = options.workingDirectory ?? options.cwd;
+  const cwd = options.cwd;
   if (cwd != null) {
-    args.push("--cd", nonemptyString(cwd, "workingDirectory"));
+    args.push("--cd", nonemptyString(cwd, "cwd"));
   }
   if (options.skipGitRepoCheck === true) {
     args.push("--skip-git-repo-check");
@@ -217,7 +210,7 @@ function baseExecArgs(sandbox, options) {
 
 export function buildTaskArgs(options = {}) {
   const args = baseExecArgs(sandboxForTask(options), options);
-  const threadId = options.resumeThreadId ?? options.threadId;
+  const threadId = options.resumeThreadId;
   if (threadId != null) {
     args.push("resume", nonemptyString(threadId, "resumeThreadId"));
   }
@@ -233,7 +226,7 @@ export function buildTaskArgs(options = {}) {
 }
 
 export function buildReviewArgs(options = {}) {
-  if (options.write === true || options.mode === "write" || options.sandboxMode === "workspace-write" || options.sandboxMode === "danger-full-access") {
+  if (options.write === true || options.sandboxMode === "workspace-write" || options.sandboxMode === "danger-full-access") {
     throw new TypeError("Codex native review must use the read-only sandbox.");
   }
   if (options.outputSchemaFile != null) {
@@ -359,11 +352,10 @@ export async function terminateProcessTree(pid, options = {}) {
     signalProcessTree(pid, "SIGINT", ownsProcessGroup);
   }
   let deadline = Date.now() + interruptGraceMs;
-  const stillAlive = () => processTargetAlive(pid, identity, ownsProcessGroup);
-  while (Date.now() < deadline && stillAlive()) {
+  while (Date.now() < deadline && processTargetAlive(pid, identity, ownsProcessGroup)) {
     await wait(pollMs);
   }
-  if (stillAlive()) {
+  if (processTargetAlive(pid, identity, ownsProcessGroup)) {
     const current = getProcessIdentity(pid);
     if (!identity || (current && processIdentityMatches(pid, identity))) {
       signalProcessTree(pid, "SIGTERM", ownsProcessGroup);
@@ -375,11 +367,11 @@ export async function terminateProcessTree(pid, options = {}) {
       return false;
     }
     deadline = Date.now() + terminateGraceMs;
-    while (Date.now() < deadline && stillAlive()) {
+    while (Date.now() < deadline && processTargetAlive(pid, identity, ownsProcessGroup)) {
       await wait(pollMs);
     }
   }
-  if (stillAlive()) {
+  if (processTargetAlive(pid, identity, ownsProcessGroup)) {
     const current = getProcessIdentity(pid);
     if (!identity || (current && processIdentityMatches(pid, identity))) {
       signalProcessTree(pid, "SIGKILL", ownsProcessGroup);
@@ -391,11 +383,11 @@ export async function terminateProcessTree(pid, options = {}) {
       return false;
     }
     deadline = Date.now() + graceMs;
-    while (Date.now() < deadline && stillAlive()) {
+    while (Date.now() < deadline && processTargetAlive(pid, identity, ownsProcessGroup)) {
       await wait(pollMs);
     }
   }
-  return !stillAlive();
+  return !processTargetAlive(pid, identity, ownsProcessGroup);
 }
 
 export function terminateProcessTreeSync(pid, options = {}) {
@@ -433,11 +425,10 @@ export function terminateProcessTreeSync(pid, options = {}) {
     signalProcessTree(pid, "SIGINT", ownsProcessGroup);
   }
   let deadline = Date.now() + interruptGraceMs;
-  const stillAlive = () => processTargetAlive(pid, identity, ownsProcessGroup);
-  while (Date.now() < deadline && stillAlive()) {
+  while (Date.now() < deadline && processTargetAlive(pid, identity, ownsProcessGroup)) {
     waitSync(pollMs);
   }
-  if (stillAlive()) {
+  if (processTargetAlive(pid, identity, ownsProcessGroup)) {
     const current = getProcessIdentity(pid);
     if (!identity || (current && processIdentityMatches(pid, identity))) {
       signalProcessTree(pid, "SIGTERM", ownsProcessGroup);
@@ -449,11 +440,11 @@ export function terminateProcessTreeSync(pid, options = {}) {
       return false;
     }
     deadline = Date.now() + terminateGraceMs;
-    while (Date.now() < deadline && stillAlive()) {
+    while (Date.now() < deadline && processTargetAlive(pid, identity, ownsProcessGroup)) {
       waitSync(pollMs);
     }
   }
-  if (stillAlive()) {
+  if (processTargetAlive(pid, identity, ownsProcessGroup)) {
     const current = getProcessIdentity(pid);
     if (!identity || (current && processIdentityMatches(pid, identity))) {
       signalProcessTree(pid, "SIGKILL", ownsProcessGroup);
@@ -465,11 +456,11 @@ export function terminateProcessTreeSync(pid, options = {}) {
       return false;
     }
     deadline = Date.now() + graceMs;
-    while (Date.now() < deadline && stillAlive()) {
+    while (Date.now() < deadline && processTargetAlive(pid, identity, ownsProcessGroup)) {
       waitSync(pollMs);
     }
   }
-  return !stillAlive();
+  return !processTargetAlive(pid, identity, ownsProcessGroup);
 }
 
 export async function runCodex(options = {}) {

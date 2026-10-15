@@ -1134,21 +1134,15 @@ function inheritedRouting(record, options, defaultServiceTier) {
     effort = sourceEffort;
     inherited = true;
   }
-  const hasSourceServiceTier = Object.hasOwn(source, "serviceTier") || typeof record?.serviceTier === "string";
-  const sourceServiceTier = Object.hasOwn(source, "serviceTier")
-    ? source.serviceTier
-    : record?.serviceTier;
-  if (!explicitServiceTier && hasSourceServiceTier) {
-    serviceTier = sourceServiceTier === null ? null : serviceTierOption(sourceServiceTier);
+  if (!explicitServiceTier && Object.hasOwn(source, "serviceTier")) {
+    serviceTier = source.serviceTier === null ? null : serviceTierOption(source.serviceTier);
     inherited = true;
   }
   return { effort, inherited, model, serviceTier };
 }
 
-function createReservedJob({ background, brief, codexVersion, companionVersion, cwd, dataDir, diagnostics = [], jobClass, mode, request, timeoutMs }) {
-  brief = boundedPrompt(brief);
-  const ownerIdentity = background ? null : currentProcessIdentity();
-  const reserveWorkspace = (reservedRequest) => withWorkspaceLock(dataDir, cwd, () => {
+function reserveWorkspaceJob({ background, brief, codexVersion, companionVersion, cwd, dataDir, diagnostics, jobClass, mode, timeoutMs }, reservedRequest, ownerIdentity) {
+  return withWorkspaceLock(dataDir, cwd, () => {
     const windDownOf = reservedRequest.ingress?.startsWith("wind-down:") ? reservedRequest.ingress.slice("wind-down:".length) : null;
     const source = windDownOf ? findRequestedJob(dataDir, windDownOf, {}) : null;
     if (windDownOf && (!source || source.record.status !== "error" || !RESUMABLE_FAILURE_KINDS.has(source.record.failureKind)
@@ -1210,9 +1204,15 @@ function createReservedJob({ background, brief, codexVersion, companionVersion, 
     }
     return { record, file };
   });
+}
+
+function createReservedJob({ background, brief, codexVersion, companionVersion, cwd, dataDir, diagnostics = [], jobClass, mode, request, timeoutMs }) {
+  brief = boundedPrompt(brief);
+  const ownerIdentity = background ? null : currentProcessIdentity();
+  const reservation = { background, brief, codexVersion, companionVersion, cwd, dataDir, diagnostics, jobClass, mode, timeoutMs };
   const threadId = request.resumeThreadId;
   if (!threadId) {
-    return reserveWorkspace(request);
+    return reserveWorkspaceJob(reservation, request, ownerIdentity);
   }
   return withThreadLock(dataDir, threadId, () => {
     const entries = listAllJobRecords(dataDir);
@@ -1230,7 +1230,7 @@ function createReservedJob({ background, brief, codexVersion, companionVersion, 
         throw new CompanionError(`Codex thread ${threadId} is already running in job ${current.id}.`, "input");
       }
     }
-    return reserveWorkspace(request);
+    return reserveWorkspaceJob(reservation, request, ownerIdentity);
   });
 }
 
@@ -1240,7 +1240,7 @@ function executionArgs(record) {
     cwd: record.cwd,
     effort: request.effort,
     model: request.model,
-    serviceTier: Object.hasOwn(request, "serviceTier") ? request.serviceTier : "priority",
+    serviceTier: request.serviceTier,
     network: Boolean(request.network),
     skipGitRepoCheck: request.transport === "task" ? taskGitPreflight(record.cwd, request.write === true, Boolean(request.skipGitRepoCheck)) : Boolean(request.skipGitRepoCheck),
     web: Boolean(request.web)
@@ -1348,6 +1348,9 @@ async function executeRecord(found) {
   if (record.background && (!record.launchApprovedAt || record.launchAbortRequestedAt)) {
     return finishExecutionFailure(found.file, record, new CompanionError("The background worker did not receive launch approval.", "process"));
   }
+  if (!record.request || typeof record.request !== "object" || !Object.hasOwn(record.request, "serviceTier")) {
+    return finishExecutionFailure(found.file, record, new CompanionError("The Codex job request is unavailable.", "process"));
+  }
   let ownerIdentity;
   try {
     ownerIdentity = currentProcessIdentity();
@@ -1356,7 +1359,7 @@ async function executeRecord(found) {
   }
   const timeoutMs = resolveExecutionTimeout(record.background);
   const startedAt = record.startedAt ?? nowIso();
-  const serviceTier = Object.hasOwn(record.request ?? {}, "serviceTier") ? record.request.serviceTier : "priority";
+  const serviceTier = record.request.serviceTier;
   record = updateJobRecordFile(found.file, {
     deadlineAt: new Date(Date.now() + timeoutMs).toISOString(),
     heartbeatAt: nowIso(),
@@ -1489,10 +1492,9 @@ function renderRecord(record, asJson, runningReceipt = false) {
     : record.status === "running" ? runningReceipt ? renderBackgroundLaunch(record) : renderRunningResult(record)
       : renderTerminalResult(record);
   return new Promise((resolve, reject) => {
-    const onError = (error) => reject(error);
-    process.stdout.once("error", onError);
+    process.stdout.once("error", reject);
     process.stdout.write(rendered, (error) => {
-      setImmediate(() => process.stdout.off("error", onError));
+      setImmediate(() => process.stdout.off("error", reject));
       if (error) {
         reject(error);
       } else {
@@ -2057,11 +2059,11 @@ async function handleWindDown(rawArgv) {
   const argv = ["--resume", record.threadId, "--cwd", record.cwd];
   const model = request.model ?? record.resolvedModel;
   const effort = request.effort ?? record.resolvedEffort;
-  const serviceTier = Object.hasOwn(request, "serviceTier") ? request.serviceTier : record.serviceTier;
+  const serviceTier = request.serviceTier;
   if (model) argv.push("--model", model);
   if (effort) argv.push("--effort", effort);
   if (serviceTier !== undefined) argv.push("--service-tier", serviceTier ?? "none");
-  if (request.write === true || (request.write == null && record.mode === "write")) argv.push("--write");
+  if (request.write === true) argv.push("--write");
   if (request.web === true) argv.push("--web");
   if (request.network === true) argv.push("--network");
   if (request.skipGitRepoCheck === true) argv.push("--skip-git-repo-check");

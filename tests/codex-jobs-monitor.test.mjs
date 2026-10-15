@@ -10,6 +10,7 @@ import path from "node:path";
 import { once } from "node:events";
 import { test } from "node:test";
 import { getProcessIdentity } from "../plugins/codex/scripts/lib/codex-exec.mjs";
+import { createJobRecord } from "../plugins/codex/scripts/lib/state.mjs";
 import { gitIsolation } from "./lib/git-fixture.mjs";
 import { inspectCodexRollout } from "../plugins/fusion/scripts/codex-jobs-monitor.mjs";
 import { fusionRepositoryKey, modelAuditSidecarPath, tokenUsageSidecarPath } from "../plugins/fusion/scripts/fusion-stats.mjs";
@@ -97,17 +98,14 @@ function readJsonLines(file) {
 
 function seedJob(sandbox, fields = {}, { workspace = "ws", workspaceRoot } = {}) {
   const id = fields.id ?? `task-${Math.random().toString(36).slice(2, 8)}`;
+  const root = workspaceRoot ?? sandbox.workDir;
   const record = {
-    id,
-    status: "running",
-    workspaceRoot: workspaceRoot ?? sandbox.workDir,
-    jobClass: "task",
-    kind: "task",
-    createdAt: new Date().toISOString(),
-    updatedAt: new Date().toISOString(),
+    ...createJobRecord({ id, cwd: root, workspaceRoot: root, background: fields.background ?? true, ...fields }),
     ...fields,
     id,
   };
+  // Preserve the monitor fixtures' repository matching path when no key was supplied.
+  if (!Object.hasOwn(fields, "repositoryKey")) delete record.repositoryKey;
   const file = path.join(jobsDirFor(sandbox, workspace), `${id}.json`);
   writeJobRecordFile(file, record);
   return { file, record };
@@ -427,15 +425,13 @@ test("session monitors announce their own Claude jobs once and still surface orp
   const sandbox = makeSandbox(t);
   const { file: ownFile, record: ownRecord } = seedJob(sandbox, {
     status: "running",
-    sessionId: "codex-own",
     claudeSessionId: "session-own"
   });
   const { file: otherFile, record: otherRecord } = seedJob(sandbox, {
     status: "running",
-    sessionId: "codex-other",
     claudeSessionId: "session-other"
   });
-  const { file: orphanFile, record: orphanRecord } = seedJob(sandbox, { status: "running", sessionId: "codex-orphan" });
+  const { file: orphanFile, record: orphanRecord } = seedJob(sandbox, { status: "running" });
   const ownMonitor = startMonitor(sandbox, envFor(sandbox, { CLAUDE_CODE_SESSION_ID: "session-own" }));
   const otherMonitor = startMonitor(sandbox, envFor(sandbox, { CLAUDE_CODE_SESSION_ID: "session-other" }));
   t.after(() => ownMonitor.child.kill("SIGKILL"));
@@ -474,7 +470,7 @@ test("session monitors announce their own Claude jobs once and still surface orp
 
 test("with the session id env var unset, a job from a different session still emits", async (t) => {
   const sandbox = makeSandbox(t);
-  const { file, record } = seedJob(sandbox, { status: "running", sessionId: "session-other" });
+  const { file, record } = seedJob(sandbox, { status: "running", claudeSessionId: "session-other" });
   const monitor = startMonitor(sandbox, envFor(sandbox));
   t.after(() => monitor.child.kill("SIGKILL"));
   await waitUntil(() => readAnnouncedState(sandbox));
@@ -881,12 +877,12 @@ test("workspace-scoped dedup lets identical job ids announce independently and p
   const sharedId = "shared-job-id";
   const firstJob = seedJob(
     sandbox,
-    { id: sharedId, status: "running", sessionId: "shared-session" },
+    { id: sharedId, status: "running", claudeSessionId: "shared-session" },
     { workspace: "workspace-a", workspaceRoot: sandbox.workDir }
   );
   const secondJob = seedJob(
     sandbox,
-    { id: sharedId, status: "running", sessionId: "shared-session" },
+    { id: sharedId, status: "running", claudeSessionId: "shared-session" },
     { workspace: "workspace-b", workspaceRoot: otherWorkDir }
   );
   const env = envFor(sandbox, { CLAUDE_CODE_SESSION_ID: "shared-session" });
@@ -919,7 +915,7 @@ test("old announcement state follows the missing-state startup path", async (t) 
   const sandbox = makeSandbox(t);
   const { record } = seedJob(sandbox, {
     status: "done",
-    sessionId: "session-own",
+    claudeSessionId: "session-own",
     finishedAt: new Date().toISOString()
   });
   fs.writeFileSync(announcedPath(sandbox, "session-own"), "[]\n", "utf8");

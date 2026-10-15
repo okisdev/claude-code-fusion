@@ -288,7 +288,7 @@ test("task arguments enforce safe headless execution and put global flags before
     model: "gpt-test",
     effort: "high",
     webSearchMode: "live",
-    networkAccessEnabled: true
+    network: true
   });
   assert.deepEqual(args, [
     "exec",

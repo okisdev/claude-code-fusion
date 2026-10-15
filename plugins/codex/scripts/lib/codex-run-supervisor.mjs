@@ -71,19 +71,18 @@ function startSupervisor(ctx) {
 
 function attachChildLifecycle(ctx) {
   const { child, state, options, prompt, settleProcessIdentity, executionTimeoutMs, terminationReserveMs } = ctx;
-  const requestTermination = () => ctx.requestTermination();
   try {
     options.onSpawnAttempt?.(child.pid ?? null);
   } catch (error) {
     state.callbackError = error instanceof Error ? error : new Error(String(error));
-    void requestTermination();
+    void ctx.requestTermination();
   }
   ctx.childIdentity = Number.isInteger(child.pid) ? getProcessIdentity(child.pid) : null;
   if (Number.isInteger(child.pid) && !ctx.childIdentity) {
     state.callbackError = new Error("Codex process identity could not be verified.");
-    void requestTermination();
+    void ctx.requestTermination();
   } else if (state.cancelled) {
-    void requestTermination();
+    void ctx.requestTermination();
   }
   ctx.identitySettlePromise = ctx.childIdentity
     ? settleProcessIdentity(child.pid).then(async (settled) => {
@@ -92,7 +91,7 @@ function attachChildLifecycle(ctx) {
           await options.onIdentitySettled?.(child.pid ?? null, ctx.childIdentity);
         } catch (error) {
           state.callbackError = error instanceof Error ? error : new Error(String(error));
-          void requestTermination();
+          void ctx.requestTermination();
         }
       })
     : Promise.resolve();
@@ -111,7 +110,7 @@ function attachChildLifecycle(ctx) {
     if (!child.stdin) {
       if (prompt) {
         state.stdinError = new Error("Codex process did not expose stdin.");
-        void requestTermination();
+        void ctx.requestTermination();
       }
       resolve();
       return;
@@ -121,7 +120,7 @@ function attachChildLifecycle(ctx) {
     child.stdin.once("error", (error) => {
       if (prompt) {
         state.stdinError = error;
-        void requestTermination();
+        void ctx.requestTermination();
       }
       settle();
     });
@@ -143,22 +142,24 @@ function attachChildLifecycle(ctx) {
       return;
     }
     state.timedOut = true;
-    void requestTermination();
+    void ctx.requestTermination();
   }, timerMs);
   ctx.executionTimer.unref?.();
+}
+
+async function observeSpawnCheckpoint(ctx) {
+  try {
+    if (ctx.childIdentity) await ctx.options.onSpawn?.(ctx.child.pid ?? null, ctx.childIdentity);
+  } catch (error) {
+    ctx.state.callbackError = error instanceof Error ? error : new Error(String(error));
+    void ctx.requestTermination();
+  }
 }
 
 function attachStreams(ctx) {
   const { child, state, options, eventLineMaxBytes } = ctx;
   child.stderr?.on("data", ctx.output.observeStderr);
-  const spawnCheckpointPromise = (async () => {
-    try {
-      if (ctx.childIdentity) await options.onSpawn?.(child.pid ?? null, ctx.childIdentity);
-    } catch (error) {
-      state.callbackError = error instanceof Error ? error : new Error(String(error));
-      void ctx.requestTermination();
-    }
-  })();
+  const spawnCheckpointPromise = observeSpawnCheckpoint(ctx);
   ctx.abort = () => {
     state.cancelled = true;
     void ctx.requestTermination();
@@ -169,6 +170,13 @@ function attachStreams(ctx) {
     writeEventLine: ctx.output.writeEventLine, requestTermination: ctx.requestTermination });
 }
 
+async function drainSupervisor(ctx) {
+  await ctx.stdinSettled;
+  await ctx.parsePromise;
+  await ctx.identitySettlePromise;
+  if (ctx.terminationPromise) await ctx.terminationPromise;
+}
+
 async function finishSupervisor(ctx) {
   const { child, state, options, eventsFd, eventLineMaxBytes } = ctx;
   const processOutcome = await Promise.race([ctx.closePromise, ctx.forcedClosePromise]);
@@ -177,12 +185,7 @@ async function finishSupervisor(ctx) {
     void ctx.requestTermination();
   }
   try {
-    const drain = (async () => {
-      await ctx.stdinSettled;
-      await ctx.parsePromise;
-      await ctx.identitySettlePromise;
-      if (ctx.terminationPromise) await ctx.terminationPromise;
-    })();
+    const drain = drainSupervisor(ctx);
     let drainTimer;
     const drained = await Promise.race([
       drain.then(() => true),

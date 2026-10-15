@@ -6,13 +6,9 @@ export const ZERO_USAGE = Object.freeze({
   totalTokens: 0
 });
 
-function hasOwn(value, key) {
-  return Object.prototype.hasOwnProperty.call(value, key);
-}
-
 function usageField(value, ...keys) {
   for (const key of keys) {
-    if (hasOwn(value, key)) {
+    if (Object.hasOwn(value, key)) {
       const field = value[key];
       return Number.isSafeInteger(field) && field >= 0 ? field : null;
     }

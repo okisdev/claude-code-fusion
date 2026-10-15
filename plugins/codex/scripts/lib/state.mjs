@@ -503,48 +503,20 @@ function assertJobRecord(record) {
   if (record.companionVersion != null && (typeof record.companionVersion !== "string" || !record.companionVersion.trim())) {
     throw new TypeError("Job companion version is invalid.");
   }
+  const requiredFields = ["claudeSessionId", "delivery", "deliveryCollectedAt", "artifactsPruned",
+    "acceptanceSource", "acceptanceRecordedAt", "fileChangeCount", "semanticStatus",
+    "semanticFailureKind", "semanticFailureMessage", "serviceTier", "resolvedModel", "resolvedEffort",
+    "timeoutMs", "companionVersion"];
+  if (record.schemaVersion !== JOB_SCHEMA_VERSION || record.engine !== "codex"
+    || Object.hasOwn(record, "appliedServiceTier") || Object.hasOwn(record, "sessionId")
+    || requiredFields.some((field) => !Object.hasOwn(record, field))) {
+    throw new TypeError("Job record schema is invalid.");
+  }
 }
 
 function ownerSessionId(record) {
-  const value = record?.claudeSessionId ?? record?.sessionId ?? null;
+  const value = record?.claudeSessionId ?? null;
   return typeof value === "string" && value.trim() ? value.trim() : null;
-}
-
-function normalizeRecord(record) {
-  const { appliedServiceTier, ...normalizedRecord } = record;
-  const sessionId = ownerSessionId(record);
-  return {
-    ...normalizedRecord,
-    delivery: record.delivery ?? (record.background ? "manual" : "foreground"),
-    deliveryCollectedAt: record.deliveryCollectedAt ?? null,
-    artifactsPruned: record.artifactsPruned === true,
-    schemaVersion: record.schemaVersion ?? JOB_SCHEMA_VERSION,
-    acceptanceSource: record.acceptanceSource ?? null,
-    acceptanceRecordedAt: record.acceptanceRecordedAt ?? null,
-    fileChangeCount: record.fileChangeCount ?? null,
-    semanticStatus: record.semanticStatus ?? "unverified",
-    semanticFailureKind: record.semanticFailureKind ?? null,
-    semanticFailureMessage: record.semanticFailureMessage ?? null,
-    serviceTier: record.serviceTier ?? record.request?.serviceTier ?? null,
-    resolvedModel: record.resolvedModel ?? null,
-    resolvedEffort: record.resolvedEffort ?? null,
-    timeoutMs: record.timeoutMs ?? null,
-    companionVersion: record.companionVersion ?? null,
-    sessionId,
-    claudeSessionId: sessionId
-  };
-}
-
-function patchedSessionId(existing, patch) {
-  const claudeChanged = Object.hasOwn(patch, "claudeSessionId") && patch.claudeSessionId !== existing.claudeSessionId;
-  const legacyChanged = Object.hasOwn(patch, "sessionId") && patch.sessionId !== existing.sessionId;
-  if (claudeChanged) {
-    return ownerSessionId({ claudeSessionId: patch.claudeSessionId });
-  }
-  if (legacyChanged) {
-    return ownerSessionId({ sessionId: patch.sessionId });
-  }
-  return ownerSessionId(existing);
 }
 
 function terminalPatch(existing, patch, timestamp) {
@@ -575,13 +547,12 @@ function mergeRecord(existing, patch) {
   const effectivePatch = TERMINAL_STATUSES.has(requestedStatus)
     ? terminalPatch(existing, { ...patch, status: requestedStatus }, timestamp)
     : { ...patch, updatedAt: patch.updatedAt ?? timestamp };
-  const sessionId = patchedSessionId(existing, patch);
-  const next = normalizeRecord({
+  const sessionId = ownerSessionId({ claudeSessionId: Object.hasOwn(patch, "claudeSessionId") ? patch.claudeSessionId : existing.claudeSessionId });
+  const next = {
     ...existing,
     ...effectivePatch,
-    sessionId,
     claudeSessionId: sessionId
-  });
+  };
   assertJobRecord(next);
   return next;
 }
@@ -740,7 +711,6 @@ export function createJobRecord(fields) {
     repositoryTopLevel: gitValue(cwd, ["rev-parse", "--show-toplevel"]),
     repositoryIdentity: identity,
     repositoryKey: fields.repositoryKey ?? createHash("sha256").update(identity).digest("hex").slice(0, 16),
-    sessionId,
     claudeSessionId: sessionId,
     pid: fields.pid ?? null,
     pidIdentity: fields.pidIdentity ?? null,
@@ -808,9 +778,7 @@ export function writeJobRecordFile(file, record) {
     if (existing && TERMINAL_STATUSES.has(existing.status)) {
       return;
     }
-    const next = normalizeRecord(record);
-    assertJobRecord(next);
-    atomicWriteFile(file, `${JSON.stringify(next, null, 2)}\n`);
+    atomicWriteFile(file, `${JSON.stringify(record, null, 2)}\n`);
   });
   return file;
 }
@@ -834,7 +802,7 @@ export function readJobRecordFile(file) {
   }
   try {
     assertJobRecord(parsed);
-    return normalizeRecord(parsed);
+    return parsed;
   } catch {
     return null;
   }
@@ -914,11 +882,11 @@ export function markJobCollectedFile(file, collectedAt = nowIso()) {
     if (!TERMINAL_STATUSES.has(existing.status) || existing.collectedAt) {
       return existing;
     }
-    const next = normalizeRecord({
+    const next = {
       ...existing,
       collectedAt,
       deliveryCollectedAt: existing.delivery === "foreground" ? existing.deliveryCollectedAt ?? null : existing.deliveryCollectedAt ?? collectedAt
-    });
+    };
     assertJobRecord(next);
     atomicWriteFile(file, `${JSON.stringify(next, null, 2)}\n`);
     return next;
@@ -1097,7 +1065,7 @@ function readManagedJobEntry(workspace, workspaceDir, file, id) {
     files,
     id,
     key: `${workspace}\0${id}`,
-    record: normalizeRecord(record),
+    record,
     resumeSourceJobId,
     timestamp,
     workspace

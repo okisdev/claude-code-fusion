@@ -25,7 +25,7 @@ Every record has one transport status: `running`, `done`, `error`, or `cancelled
 
 Terminal transport outcomes are immutable. Racing completion, cancellation, liveness repair, and worker failure may enrich diagnostics only when they do not change an existing terminal outcome. A successful `result` read may set `collectedAt` once so retention can distinguish an uncollected detached deliverable from ordinary history.
 
-Each record contains the companion PID and ownership identity, Codex PID and ownership identity, Claude session ID, Codex thread ID when known, workspace root, repository identity, request settings, transport status, semantic status, delivery mode and collection state, resolved model and effort when observable, result or bounded partial result text, exact reported token usage when available, failure kind, bounded diagnostic text, and paths to its brief, log, and raw event ledger.
+Each record contains the companion PID and ownership identity, Codex PID and ownership identity, Claude session ID, Codex thread ID when known, workspace root, repository identity, request settings, transport status, semantic status, delivery mode and collection state, resolved model and effort when observable, result or bounded partial result text, exact reported token usage when available, failure kind, bounded diagnostic text, and paths to its brief, log, and raw event ledger. Records missing fields required by the current schema are unreadable to the companion; it does not fill those fields or migrate older records.
 
 ## Process supervision
 

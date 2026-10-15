@@ -58,7 +58,7 @@ const processInspectionTests = new Set([
   "terminal finalization preserves acceptance provenance",
   "terminal collection is an atomic idempotent lifecycle transition",
   "a cancellation request wins a racing successful completion",
-  "lock-scoped updates see the current record and session aliases stay aligned",
+  "lock-scoped updates see the current record and keep session fields aligned",
   "multiple locked record writes probe the owner identity once",
   "workspace launch reservations serialize",
   "thread reservations use a data-root-wide lock",
@@ -242,7 +242,7 @@ function makeRecord(sandbox, fields = {}) {
     logFile: jobLogPath(sandbox.dataDir, sandbox.workDir, id),
     eventsFile: jobEventsPath(sandbox.dataDir, sandbox.workDir, id),
     mode: "consult",
-    sessionId: "session-one",
+    claudeSessionId: "session-one",
     pid: process.pid,
     request: { model: "gpt-test", effort: "high" },
     ...fields
@@ -297,7 +297,7 @@ test("job ids contain 128 bits and records expose the canonical Codex fields", (
   assert.strictEqual(record.companionVersion, null);
   assert.strictEqual(record.fileChangeCount, null);
   assert.strictEqual(record.collectedAt, null);
-  assert.strictEqual(record.sessionId, "session-one");
+  assert.strictEqual(Object.hasOwn(record, "sessionId"), false);
   assert.strictEqual(record.claudeSessionId, "session-one");
   assert.strictEqual(record.pid, process.pid);
   assert.deepStrictEqual(record.pidIdentity, pidIdentity);
@@ -517,12 +517,9 @@ test("a cancellation request wins a racing successful completion", (t) => {
   assert.strictEqual(final.cancelRequestedAt, null);
 });
 
-test("lock-scoped updates see the current record and session aliases stay aligned", (t) => {
+test("lock-scoped updates see the current record and keep session fields aligned", (t) => {
   const sandbox = makeSandbox(t);
   const { file } = makeRecord(sandbox);
-  const legacyUpdated = updateJobRecordFile(file, { sessionId: "session-legacy" });
-  assert.strictEqual(legacyUpdated.sessionId, "session-legacy");
-  assert.strictEqual(legacyUpdated.claudeSessionId, "session-legacy");
   const updated = updateJobRecordFileWithCurrent(file, (current) => ({
     ...current,
     phase: "executing",
@@ -533,7 +530,7 @@ test("lock-scoped updates see the current record and session aliases stay aligne
   assert.strictEqual(updated.phase, "executing");
   assert.strictEqual(updated.codexPid, 456);
   assert.strictEqual(updated.threadId, "thread-current");
-  assert.strictEqual(updated.sessionId, "session-two");
+  assert.strictEqual(Object.hasOwn(updated, "sessionId"), false);
   assert.strictEqual(updated.claudeSessionId, "session-two");
 });
 
@@ -953,10 +950,10 @@ test("structurally invalid records are preserved for forward compatibility and f
   assert.deepStrictEqual(listJobRecords(sandbox.dataDir, sandbox.workDir), []);
 });
 
-test("semantic failure kinds accept legacy policy and oversized records and reject unknown values", (t) => {
+test("semantic failure kinds accept current policy and oversized records and reject unknown values", (t) => {
   const sandbox = makeSandbox(t);
-  const legacy = createJobRecord({ cwd: sandbox.workDir, id: "legacy-policy", semanticFailureKind: "policy" });
-  assert.equal(legacy.semanticFailureKind, "policy");
+  const policy = createJobRecord({ cwd: sandbox.workDir, id: "policy", semanticFailureKind: "policy" });
+  assert.equal(policy.semanticFailureKind, "policy");
   const oversized = createJobRecord({ cwd: sandbox.workDir, id: "oversized", semanticFailureKind: "oversized" });
   assert.equal(oversized.semanticFailureKind, "oversized");
 
@@ -967,14 +964,23 @@ test("semantic failure kinds accept legacy policy and oversized records and reje
   assert.equal(readJobRecordFile(invalidFile), null);
 });
 
-test("legacy records normalize missing file change counts to null", (t) => {
+test("records missing current fields or carrying retired fields are unreadable", (t) => {
   const sandbox = makeSandbox(t);
   const file = jobFilePath(sandbox.dataDir, sandbox.workDir, "legacy-file-change-count");
   const record = createJobRecord({ cwd: sandbox.workDir, id: "legacy-file-change-count" });
   fs.mkdirSync(path.dirname(file), { recursive: true });
   delete record.fileChangeCount;
   fs.writeFileSync(file, `${JSON.stringify(record)}\n`, { mode: 0o600 });
-  assert.equal(readJobRecordFile(file).fileChangeCount, null);
+  assert.equal(readJobRecordFile(file), null);
+  const oldSession = { ...createJobRecord({ cwd: sandbox.workDir, id: "old-session" }), sessionId: "legacy" };
+  delete oldSession.claudeSessionId;
+  const oldSessionFile = jobFilePath(sandbox.dataDir, sandbox.workDir, oldSession.id);
+  fs.writeFileSync(oldSessionFile, `${JSON.stringify(oldSession)}\n`, { mode: 0o600 });
+  assert.equal(readJobRecordFile(oldSessionFile), null);
+  const oldTier = { ...createJobRecord({ cwd: sandbox.workDir, id: "old-tier" }), appliedServiceTier: "priority" };
+  const oldTierFile = jobFilePath(sandbox.dataDir, sandbox.workDir, oldTier.id);
+  fs.writeFileSync(oldTierFile, `${JSON.stringify(oldTier)}\n`, { mode: 0o600 });
+  assert.equal(readJobRecordFile(oldTierFile), null);
 });
 
 test("global lookup rejects an id that is ambiguous across workspaces", (t) => {
@@ -1041,7 +1047,7 @@ test("job history collection removes oldest records while preserving running job
     id: "resume-source",
     pid: null,
     request: { effort: "high" },
-    sessionId: "current-session",
+    claudeSessionId: "current-session",
     status: "done",
     threadId: "current-thread"
   });
@@ -1051,11 +1057,11 @@ test("job history collection removes oldest records while preserving running job
     id: "resume-head",
     pid: null,
     request: { resumeSourceJobId: source.record.id, resumeThreadId: "current-thread" },
-    sessionId: "current-session",
+    claudeSessionId: "current-session",
     status: "done",
     threadId: "current-thread"
   });
-  const running = makeRecord(sandbox, { createdAt: "2023-01-01T00:00:00.000Z", id: "running-job", sessionId: "other-session", status: "running" });
+  const running = makeRecord(sandbox, { createdAt: "2023-01-01T00:00:00.000Z", id: "running-job", claudeSessionId: "other-session", status: "running" });
   const jobs = path.dirname(running.file);
   const unsafeRecord = path.join(jobs, "future-job.json");
   const unknownFile = path.join(jobs, "manual-state.bin");
@@ -1085,7 +1091,7 @@ test("job history collection enforces its managed byte quota and reports protect
   const oldRecords = [];
   for (let index = 0; index < 3; index += 1) {
     const createdAt = new Date(Date.UTC(2024, 0, index + 1)).toISOString();
-    const entry = makeRecord(sandbox, { createdAt, finishedAt: createdAt, id: `large-old-${index}`, pid: null, sessionId: "old-session", status: "done", threadId: `large-thread-${index}` });
+    const entry = makeRecord(sandbox, { createdAt, finishedAt: createdAt, id: `large-old-${index}`, pid: null, claudeSessionId: "old-session", status: "done", threadId: `large-thread-${index}` });
     fs.writeFileSync(entry.record.logFile, "x".repeat(32 * 1024), { mode: 0o600 });
     oldRecords.push(entry);
   }
@@ -1094,7 +1100,7 @@ test("job history collection enforces its managed byte quota and reports protect
     finishedAt: "2025-01-01T00:00:00.000Z",
     id: "large-current",
     pid: null,
-    sessionId: "current-session",
+    claudeSessionId: "current-session",
     status: "done",
     threadId: "large-current-thread"
   });
@@ -1108,7 +1114,7 @@ test("job history collection enforces its managed byte quota and reports protect
   assert.ok(oldRecords.every((entry) => fs.existsSync(entry.file)));
   assert.ok(oldRecords.filter((entry) => readJobRecordFile(entry.file).artifactsPruned).length >= 2);
 
-  const protectedRunning = makeRecord(sandbox, { id: "oversized-running", sessionId: "current-session", status: "running" });
+  const protectedRunning = makeRecord(sandbox, { id: "oversized-running", claudeSessionId: "current-session", status: "running" });
   fs.writeFileSync(protectedRunning.record.logFile, "z".repeat(64 * 1024), { mode: 0o600 });
   const exceeded = pruneJobState(sandbox.dataDir, { claudeSessionId: "current-session", maxBytes: 1, maxRecords: 0, recordRetentionDays: 0 });
   assert.strictEqual(exceeded.ok, true);
@@ -1122,7 +1128,7 @@ test("job history collection removes empty managed directories across many dispo
     const workDir = path.join(sandbox.root, `disposable-workspace-${index}`);
     fs.mkdirSync(workDir);
     const createdAt = new Date(Date.UTC(2024, 0, index + 1)).toISOString();
-    makeRecord({ ...sandbox, workDir }, { createdAt, finishedAt: createdAt, id: `disposable-job-${index}`, pid: null, sessionId: "expired-session", status: "done", threadId: `disposable-thread-${index}` });
+    makeRecord({ ...sandbox, workDir }, { createdAt, finishedAt: createdAt, id: `disposable-job-${index}`, pid: null, claudeSessionId: "expired-session", status: "done", threadId: `disposable-thread-${index}` });
   }
   const emptyWorkDir = path.join(sandbox.root, "empty-disposable-workspace");
   fs.mkdirSync(emptyWorkDir);
@@ -1247,13 +1253,13 @@ test("pruning rechecks a new resume head while holding the source record lock", 
   const old = new Date(Date.now() - 100 * 86_400_000).toISOString();
   const source = makeRecord(sandbox, {
     id: "late-resume-source", status: "done", pid: null, createdAt: old,
-    finishedAt: old, threadId: "late-resume-thread", sessionId: "current-session"
+    finishedAt: old, threadId: "late-resume-thread", claudeSessionId: "current-session"
   });
   fs.writeFileSync(source.record.logFile, "keep source log\n");
   const previousHead = new Date(Date.now() - 60_000).toISOString();
   makeRecord(sandbox, {
     id: "previous-resume-head", status: "done", pid: null, createdAt: previousHead,
-    finishedAt: previousHead, threadId: "other-thread", sessionId: "current-session"
+    finishedAt: previousHead, threadId: "other-thread", claudeSessionId: "current-session"
   });
   const ready = path.join(sandbox.root, "resume-lock-ready");
   const childSource = `
@@ -1272,7 +1278,7 @@ updateJobRecordFileWithCurrent(file, () => {
   }
   const now = new Date().toISOString();
   const head = createJobRecord({ id: "new-resume-head", cwd, status: "done", pid: null,
-    createdAt: now, finishedAt: now, threadId: "late-resume-thread", sessionId: "current-session",
+    createdAt: now, finishedAt: now, threadId: "late-resume-thread", claudeSessionId: "current-session",
     request: { resumeSourceJobId: "late-resume-source", resumeThreadId: "late-resume-thread" } });
   writeJobRecordFile(jobFilePath(dataDir, cwd, head.id), head);
   return null;
