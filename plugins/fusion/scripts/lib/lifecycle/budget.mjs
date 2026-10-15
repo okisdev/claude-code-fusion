@@ -1,4 +1,4 @@
-import { canonicalWorkerAgentType, isTerminalWorkerStatus } from "../worker-state.mjs";
+import { canonicalWorkerAgentType, WORKER_TERMINAL_STATUSES } from "../worker-state.mjs";
 import { updateLifecycleWorkerRecord } from "./records.mjs";
 import { WALL_CLOCK_MS_ENV, STALL_MS_ENV, EXECUTION_AGENTS } from "./constants.mjs";
 
@@ -65,7 +65,7 @@ function workerRoundUsage(record) {
 
 function markBudgetFailure(record, failure, env) {
   return updateLifecycleWorkerRecord(record.taskId, env, (current) => {
-    if (!current || isTerminalWorkerStatus(current.transportStatus)) {
+    if (!current || WORKER_TERMINAL_STATUSES.has(current.transportStatus)) {
       return null;
     }
     return {

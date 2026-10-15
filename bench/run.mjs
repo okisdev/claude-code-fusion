@@ -69,6 +69,14 @@ function required(options, key) {
   return value;
 }
 
+function timeout(raw, key, envKey, fallback) {
+  const value = raw[key] ?? process.env[envKey] ?? String(fallback);
+  if (!/^[1-9]\d*$/.test(value) || !Number.isSafeInteger(Number(value)) || Number(value) > 2147483647) {
+    throw new Error(`Invalid --${key}: ${value}`);
+  }
+  return Number(value);
+}
+
 function normalizeOptions(raw) {
   const taskId = required(raw, "task");
   const condition = required(raw, "condition");
@@ -79,13 +87,6 @@ function normalizeOptions(raw) {
   if (!Number.isInteger(repetition) || repetition < 1) {
     throw new Error(`Invalid repetition: ${raw.repetition}`);
   }
-  const timeout = (key, envKey, fallback) => {
-    const value = raw[key] ?? process.env[envKey] ?? String(fallback);
-    if (!/^[1-9]\d*$/.test(value) || !Number.isSafeInteger(Number(value)) || Number(value) > 2147483647) {
-      throw new Error(`Invalid --${key}: ${value}`);
-    }
-    return Number(value);
-  };
   return {
     taskId,
     condition,
@@ -94,8 +95,8 @@ function normalizeOptions(raw) {
     claudeConfigDir: path.resolve(required(raw, "claude-config")),
     taskRoot: path.resolve(raw["task-root"] ?? DEFAULT_TASK_ROOT),
     claudeBin: raw["claude-bin"] ?? process.env.CLAUDE_BIN ?? "claude",
-    claudeTimeoutMs: timeout("claude-timeout-ms", "BENCH_CLAUDE_TIMEOUT_MS", 2700000),
-    verifyTimeoutMs: timeout("verify-timeout-ms", "BENCH_VERIFY_TIMEOUT_MS", 600000)
+    claudeTimeoutMs: timeout(raw, "claude-timeout-ms", "BENCH_CLAUDE_TIMEOUT_MS", 2700000),
+    verifyTimeoutMs: timeout(raw, "verify-timeout-ms", "BENCH_VERIFY_TIMEOUT_MS", 600000)
   };
 }
 

@@ -23,7 +23,6 @@ import { observeEngineJobsSafely } from "./engine-jobs-observer.mjs";
 import { ENGINES, ENGINE_IDS, ENGINE_TERMINAL_STATUSES, engineResultCommand } from "./lib/engines.mjs";
 import { tagMessage } from "./lib/user-messages.mjs";
 
-const TERMINAL_STATUSES = ENGINE_TERMINAL_STATUSES;
 const DEFAULT_POLL_INTERVAL_MS = 15000;
 const INTERVAL_ENV = "CODEX_JOBS_MONITOR_INTERVAL_MS";
 const PS_COMMAND_ENV = "CODEX_JOBS_MONITOR_PS_COMMAND";
@@ -299,6 +298,25 @@ function readProcessArgv(pid, env = process.env) {
   }
 }
 
+function configEffort(value) {
+  const config = String(value ?? "").trim();
+  const prefix = "model_reasoning_effort=";
+  if (!config.startsWith(prefix)) {
+    return null;
+  }
+  const effortValue = config.slice(prefix.length).trim();
+  if (!effortValue) {
+    return null;
+  }
+  if (
+    effortValue.length >= 2 &&
+    ((effortValue.startsWith('"') && effortValue.endsWith('"')) || (effortValue.startsWith("'") && effortValue.endsWith("'")))
+  ) {
+    return effortValue.slice(1, -1) || null;
+  }
+  return effortValue;
+}
+
 function parseModelAndEffortFromArgv(argvLine) {
   if (!argvLine || !String(argvLine).trim()) {
     return null;
@@ -306,24 +324,6 @@ function parseModelAndEffortFromArgv(argvLine) {
   const tokens = String(argvLine).trim().split(/\s+/).filter(Boolean);
   let model = null;
   let effort = null;
-  const configEffort = (value) => {
-    const config = String(value ?? "").trim();
-    const prefix = "model_reasoning_effort=";
-    if (!config.startsWith(prefix)) {
-      return null;
-    }
-    const effortValue = config.slice(prefix.length).trim();
-    if (!effortValue) {
-      return null;
-    }
-    if (
-      effortValue.length >= 2 &&
-      ((effortValue.startsWith('"') && effortValue.endsWith('"')) || (effortValue.startsWith("'") && effortValue.endsWith("'")))
-    ) {
-      return effortValue.slice(1, -1) || null;
-    }
-    return effortValue;
-  };
   for (let index = 0; index < tokens.length; index += 1) {
     const token = tokens[index];
     if (token === "--model" || token === "-m") {
@@ -742,31 +742,28 @@ function loadAnnounced(file, workspaceRoot) {
   try {
     text = fs.readFileSync(file, "utf8");
   } catch (error) {
-    return { exists: error?.code !== "ENOENT", malformed: false, needsMigration: false, announced: new Set(), records: new Map() };
+    return { exists: error?.code !== "ENOENT", malformed: false, announced: new Set(), records: new Map() };
   }
   try {
     const raw = JSON.parse(text);
-    const keys = Array.isArray(raw) ? raw : Array.isArray(raw?.keys) ? raw.keys : null;
-    if (!keys) {
+    if (raw?.schemaVersion !== TERMINAL_LEDGER_SCHEMA_VERSION) {
+      return { exists: false, malformed: false, announced: new Set(), records: new Map() };
+    }
+    if (!Array.isArray(raw.keys) || !Array.isArray(raw.records)) {
       throw new TypeError("invalid announcement state");
     }
-    const announced = new Set(keys.filter((key) => typeof key === "string"));
+    const announced = new Set(raw.keys.filter((key) => typeof key === "string"));
     const records = new Map();
-    if (Array.isArray(raw?.records)) {
-      for (const record of raw.records) {
-        if (!record?.jobId || !TERMINAL_STATUSES.has(record?.transportStatus)) {
-          continue;
-        }
-        records.set(announcementKey(record.jobId, record.transportStatus), {
-          ...record,
-          repositoryKey: record.repositoryKey ?? fusionRepositoryKey(workspaceRoot)
-        });
+    for (const record of raw.records) {
+      if (!record?.jobId || !ENGINE_TERMINAL_STATUSES.has(record?.transportStatus)) {
+        continue;
       }
+      records.set(announcementKey(record.jobId, record.transportStatus), record);
     }
-    return { exists: true, malformed: false, needsMigration: Array.isArray(raw) || raw?.schemaVersion !== TERMINAL_LEDGER_SCHEMA_VERSION, announced, records };
+    return { exists: true, malformed: false, announced, records };
   } catch {
     quarantineMalformed(file);
-    return { exists: true, malformed: true, needsMigration: false, announced: new Set(), records: new Map() };
+    return { exists: true, malformed: true, announced: new Set(), records: new Map() };
   }
 }
 
@@ -838,20 +835,152 @@ function safeWriteLine(line) {
   }
 }
 
+function shutdown(stopPolling) {
+  stopPolling();
+  process.exit(0);
+}
+
 function installExitHandlers(stopPolling) {
-  const shutdown = () => {
-    stopPolling();
-    process.exit(0);
-  };
-  process.on("SIGTERM", shutdown);
-  process.on("SIGINT", shutdown);
-  process.on("SIGHUP", shutdown);
+  process.on("SIGTERM", () => shutdown(stopPolling));
+  process.on("SIGINT", () => shutdown(stopPolling));
+  process.on("SIGHUP", () => shutdown(stopPolling));
   process.stdout.on("error", (error) => {
     if (error?.code === "EPIPE") {
       stopPolling();
       process.exit(0);
     }
   });
+}
+
+function auditStateFor(workspace, auditStates) {
+  if (typeof workspace !== "string" || !workspace) return null;
+  if (!auditStates.has(workspace)) {
+    auditStates.set(workspace, {
+      sidecarPath: modelAuditSidecarPath(workspace),
+      seenJobIds: new Set(),
+      merged: null
+    });
+  }
+  return auditStates.get(workspace);
+}
+
+function queueAudit(workspace, observation, auditBatches, auditStates) {
+  if (!observation || !auditStateFor(workspace, auditStates)) return;
+  if (!auditBatches.has(workspace)) auditBatches.set(workspace, []);
+  auditBatches.get(workspace).push(observation);
+}
+
+function processSnapshot(snapshot, context) {
+  const { repair, ownSessionId, rolloutIndex, workspaceRoot, announced, terminalRecords, auditStates, stateFile, loaded } = context;
+  if (!snapshot.available) {
+    return;
+  }
+  const records = snapshot.records;
+  for (const state of auditStates.values()) state.merged = null;
+  if (context.announceOnlyPending && records.length > 0) {
+    safeWriteLine(REPAIR_UNAVAILABLE_LINE);
+    context.announceOnlyPending = false;
+  }
+  const liveIds = new Set(snapshot.recordIds);
+  const terminalJobIds = new Set(records.filter(({ record }) => record?.id && ENGINE_TERMINAL_STATUSES.has(record.status)).map(({ record }) => record.id));
+  const auditBatches = new Map();
+  const pendingTerminals = new Map();
+  let dirty = false;
+  for (const entry of records) {
+    let record = entry.record;
+    if (!record?.id) {
+      continue;
+    }
+    liveIds.add(record.id);
+    let reconciled = false;
+    if (repair && !ENGINE_TERMINAL_STATUSES.has(record.status) && repair.runningRecordNeedsReconciliation(record)) {
+      if (!belongsToMonitorSession(record, ownSessionId) || terminalJobIds.has(record.id)) {
+        continue;
+      }
+      try {
+        record = repair.repairRunningRecordSync({ record, file: entry.file });
+      } catch {
+        continue;
+      }
+      reconciled = ENGINE_TERMINAL_STATUSES.has(record.status);
+      if (reconciled) {
+        terminalJobIds.add(record.id);
+      }
+    }
+    if (ENGINE_TERMINAL_STATUSES.has(record.status)) {
+      const key = announcementKey(record.id, record.status);
+      if (!belongsToMonitorSession(record, ownSessionId)) {
+        if (announced.delete(key)) {
+          dirty = true;
+        }
+        if (terminalRecords.delete(key)) {
+          dirty = true;
+        }
+        continue;
+      }
+      if (!terminalRecords.has(key) && !pendingTerminals.has(key)) {
+        const fullRecord = reconciled ? record : entry.sourceRecord ?? JSON.parse(fs.readFileSync(entry.file, "utf8"));
+        const observations = terminalObservations(fullRecord, process.env, rolloutIndex);
+        const auditWorkspace = fullRecord.workspaceRoot;
+        auditStateFor(auditWorkspace, auditStates);
+        queueAudit(auditWorkspace, observations.auditObservation, auditBatches, auditStates);
+        pendingTerminals.set(key, { fullRecord, observations, auditWorkspace });
+        dirty = true;
+      }
+      if (!announced.has(key)) {
+        announced.add(key);
+        dirty = true;
+        if (shouldAnnounceTerminal(record) && !(context.startupPending && (loaded.malformed || (!loaded.exists && !reconciled)))) {
+          const noticeRecord = reconciled ? record : entry.sourceRecord ?? JSON.parse(fs.readFileSync(entry.file, "utf8"));
+          safeWriteLine(formatOutcomeLine(noticeRecord));
+        }
+      }
+      continue;
+    }
+    const recordWorkspaceRoot = record.workspaceRoot;
+    const auditState = auditStateFor(recordWorkspaceRoot, auditStates);
+    if (!auditState) continue;
+    const observation = maybeCaptureModelAudit(record, auditState.seenJobIds);
+    if (observation) {
+      queueAudit(recordWorkspaceRoot, observation, auditBatches, auditStates);
+      auditState.seenJobIds.add(record.id);
+    }
+  }
+  for (const [recordWorkspaceRoot, batch] of auditBatches) {
+    const state = auditStates.get(recordWorkspaceRoot);
+    try {
+      if (!appendModelAuditObservations(state.sidecarPath, batch, (merged) => {
+        state.merged = merged;
+        state.seenJobIds = new Set(merged.keys());
+      })) {
+        for (const observation of batch) state.seenJobIds.delete(observation.jobId);
+      }
+    } catch {
+      for (const observation of batch) state.seenJobIds.delete(observation.jobId);
+    }
+  }
+  for (const [key, { fullRecord, observations, auditWorkspace }] of pendingTerminals) {
+    const state = auditStates.get(auditWorkspace);
+    if (state && !state.merged) state.merged = loadModelAuditObservations(state.sidecarPath);
+    const existing = state?.merged?.get(fullRecord.id);
+    terminalRecords.set(key, terminalLedgerRecord(fullRecord, {
+      ...observations,
+      model: existing?.model ?? observations.model,
+      modelSource: existing?.source ?? observations.modelSource,
+      effort: existing?.effort ?? observations.effort,
+      effortSource: existing?.source ?? observations.effortSource
+    }, workspaceRoot));
+  }
+  if (pruneAnnounced(announced, liveIds)) {
+    dirty = true;
+  }
+  if (context.startupPending && !loaded.exists) {
+    dirty = true;
+  }
+  if (dirty) {
+    saveAnnounced(stateFile, announced, terminalRecords, workspaceRoot);
+  }
+  context.startupPending = false;
 }
 
 async function main() {
@@ -868,147 +997,18 @@ async function main() {
   const repositoryCache = new Map();
   const snapshotCache = { files: new Map(), scannedAt: 0 };
   const auditStates = new Map();
-  let announceOnlyPending = !repair;
-  let startupPending = true;
+  const context = { repair, ownSessionId, rolloutIndex, workspaceRoot, announced, terminalRecords, auditStates, stateFile, loaded, announceOnlyPending: !repair, startupPending: true };
 
   pruneOldStateFiles(root, stateFile);
-
-  const processSnapshot = (snapshot) => {
-    if (!snapshot.available) {
-      return;
-    }
-    const records = snapshot.records;
-    for (const state of auditStates.values()) state.merged = null;
-    if (announceOnlyPending && records.length > 0) {
-      safeWriteLine(REPAIR_UNAVAILABLE_LINE);
-      announceOnlyPending = false;
-    }
-    const liveIds = new Set(snapshot.recordIds);
-    const terminalJobIds = new Set(records.filter(({ record }) => record?.id && TERMINAL_STATUSES.has(record.status)).map(({ record }) => record.id));
-    const auditBatches = new Map();
-    const pendingTerminals = new Map();
-    const auditStateFor = (workspace) => {
-      if (typeof workspace !== "string" || !workspace) return null;
-      if (!auditStates.has(workspace)) {
-        auditStates.set(workspace, {
-          sidecarPath: modelAuditSidecarPath(workspace),
-          seenJobIds: new Set(),
-          merged: null
-        });
-      }
-      return auditStates.get(workspace);
-    };
-    const queueAudit = (workspace, observation) => {
-      if (!observation || !auditStateFor(workspace)) return;
-      if (!auditBatches.has(workspace)) auditBatches.set(workspace, []);
-      auditBatches.get(workspace).push(observation);
-    };
-    let dirty = false;
-    for (const entry of records) {
-      let record = entry.record;
-      if (!record?.id) {
-        continue;
-      }
-      liveIds.add(record.id);
-      let reconciled = false;
-      if (repair && !TERMINAL_STATUSES.has(record.status) && repair.runningRecordNeedsReconciliation(record)) {
-        if (!belongsToMonitorSession(record, ownSessionId) || terminalJobIds.has(record.id)) {
-          continue;
-        }
-        try {
-          record = repair.repairRunningRecordSync({ record, file: entry.file });
-        } catch {
-          continue;
-        }
-        reconciled = TERMINAL_STATUSES.has(record.status);
-        if (reconciled) {
-          terminalJobIds.add(record.id);
-        }
-      }
-      if (TERMINAL_STATUSES.has(record.status)) {
-        const key = announcementKey(record.id, record.status);
-        if (!belongsToMonitorSession(record, ownSessionId)) {
-          if (announced.delete(key)) {
-            dirty = true;
-          }
-          if (terminalRecords.delete(key)) {
-            dirty = true;
-          }
-          continue;
-        }
-        if (!terminalRecords.has(key) && !pendingTerminals.has(key)) {
-          const fullRecord = reconciled ? record : entry.sourceRecord ?? JSON.parse(fs.readFileSync(entry.file, "utf8"));
-          const observations = terminalObservations(fullRecord, process.env, rolloutIndex);
-          const auditWorkspace = fullRecord.workspaceRoot;
-          auditStateFor(auditWorkspace);
-          queueAudit(auditWorkspace, observations.auditObservation);
-          pendingTerminals.set(key, { fullRecord, observations, auditWorkspace });
-          dirty = true;
-        }
-        if (!announced.has(key)) {
-          announced.add(key);
-          dirty = true;
-          if (shouldAnnounceTerminal(record) && !(startupPending && (loaded.malformed || (!loaded.exists && !reconciled)))) {
-            const noticeRecord = reconciled ? record : entry.sourceRecord ?? JSON.parse(fs.readFileSync(entry.file, "utf8"));
-            safeWriteLine(formatOutcomeLine(noticeRecord));
-          }
-        }
-        continue;
-      }
-      const recordWorkspaceRoot = record.workspaceRoot;
-      const auditState = auditStateFor(recordWorkspaceRoot);
-      if (!auditState) continue;
-      const observation = maybeCaptureModelAudit(record, auditState.seenJobIds);
-      if (observation) {
-        queueAudit(recordWorkspaceRoot, observation);
-        auditState.seenJobIds.add(record.id);
-      }
-    }
-    for (const [recordWorkspaceRoot, batch] of auditBatches) {
-      const state = auditStates.get(recordWorkspaceRoot);
-      try {
-        if (!appendModelAuditObservations(state.sidecarPath, batch, (merged) => {
-          state.merged = merged;
-          state.seenJobIds = new Set(merged.keys());
-        })) {
-          for (const observation of batch) state.seenJobIds.delete(observation.jobId);
-        }
-      } catch {
-        for (const observation of batch) state.seenJobIds.delete(observation.jobId);
-      }
-    }
-    for (const [key, { fullRecord, observations, auditWorkspace }] of pendingTerminals) {
-      const state = auditStates.get(auditWorkspace);
-      if (state && !state.merged) state.merged = loadModelAuditObservations(state.sidecarPath);
-      const existing = state?.merged?.get(fullRecord.id);
-      terminalRecords.set(key, terminalLedgerRecord(fullRecord, {
-        ...observations,
-        model: existing?.model ?? observations.model,
-        modelSource: existing?.source ?? observations.modelSource,
-        effort: existing?.effort ?? observations.effort,
-        effortSource: existing?.source ?? observations.effortSource
-      }, workspaceRoot));
-    }
-    if (pruneAnnounced(announced, liveIds)) {
-      dirty = true;
-    }
-    if (startupPending && (!loaded.exists || loaded.needsMigration)) {
-      dirty = true;
-    }
-    if (dirty) {
-      saveAnnounced(stateFile, announced, terminalRecords, workspaceRoot);
-    }
-    startupPending = false;
-  };
 
   let timer = null;
   installExitHandlers(() => clearInterval(timer));
 
   try {
     const initialSnapshot = readWorkspaceJobsSnapshot(root, workspaceRoot, repositoryCache, snapshotCache);
-    processSnapshot(initialSnapshot);
+    processSnapshot(initialSnapshot, context);
     if (!initialSnapshot.available) {
-      startupPending = false;
+      context.startupPending = false;
     }
   } catch {}
   try {
@@ -1017,7 +1017,7 @@ async function main() {
 
   timer = setInterval(() => {
     try {
-      processSnapshot(readWorkspaceJobsSnapshot(root, workspaceRoot, repositoryCache, snapshotCache));
+      processSnapshot(readWorkspaceJobsSnapshot(root, workspaceRoot, repositoryCache, snapshotCache), context);
     } catch {}
     try {
       observePeerJobs();

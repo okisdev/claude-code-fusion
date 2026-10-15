@@ -12,12 +12,8 @@ function sha256File(file) {
   return createHash("sha256").update(fs.readFileSync(file)).digest("hex");
 }
 
-function canonicalTasksString(tasks) {
-  return JSON.stringify(tasks);
-}
-
 export function manifestHash(tasks) {
-  return createHash("sha256").update(canonicalTasksString(tasks)).digest("hex");
+  return createHash("sha256").update(JSON.stringify(tasks)).digest("hex");
 }
 
 function listTaskFiles(taskDir) {

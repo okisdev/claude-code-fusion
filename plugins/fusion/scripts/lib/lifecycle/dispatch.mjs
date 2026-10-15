@@ -1,3 +1,4 @@
+import { PEER_RESCUE_AGENT_NAMES } from "../engines.mjs";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -7,7 +8,7 @@ import { tagMessage } from "../user-messages.mjs";
 import { canonicalWorkerAgentType, createWorkerRecord, createWorkerTaskId, updateWorkerSessionState, workerRecordFile, writePrivateText } from "../worker-state.mjs";
 import { workerLimits } from "./budget.mjs";
 import { updateLifecycleWorkerRecord } from "./records.mjs";
-import { PARENT_CONTEXT_ADVISORY_TOKENS_ENV, VERIFICATION_MANIFEST_ENV, DEFAULT_BRIEF_MAX_BYTES, SIZING_ADVISORY_BYTES, DEFAULT_PARENT_CONTEXT_ADVISORY_TOKENS, PARENT_CONTEXT_TAIL_MAX_BYTES, BRIEF_AGENTS, PEER_WRAPPER_AGENTS } from "./constants.mjs";
+import { PARENT_CONTEXT_ADVISORY_TOKENS_ENV, VERIFICATION_MANIFEST_ENV, DEFAULT_BRIEF_MAX_BYTES, SIZING_ADVISORY_BYTES, DEFAULT_PARENT_CONTEXT_ADVISORY_TOKENS, PARENT_CONTEXT_TAIL_MAX_BYTES, BRIEF_AGENTS } from "./constants.mjs";
 
 function allowAgentWithTaskId(toolInput, taskId, additionalContext = null) {
   const prompt = promptText(toolInput);
@@ -383,28 +384,29 @@ function collectorRequestIdentity(prompt) {
   return engine && jobId ? { expectedPeerEngine: engine, expectedPeerJobId: jobId } : null;
 }
 
+function fallbackPackageType(agentType, prompt) {
+  if (!PEER_RESCUE_AGENT_NAMES.has(agentType)) {
+    return /^verification:\s*\S/im.test(prompt) ? "implementation" : "consult";
+  }
+  const packageTypeLines = prompt.split(/\r?\n/).filter((line) => /^package-type\s*:/i.test(line.trim()));
+  const explicitPackageType = packageTypeLines.length === 1
+    ? packageTypeLines[0].match(/^package-type\s*:\s*(implementation|consult|review|research|design)\s*$/i)?.[1]?.toLowerCase()
+    : null;
+  if (explicitPackageType) {
+    return explicitPackageType;
+  }
+  const separator = /(?:^|\s)--(?=\s|$)/.exec(prompt);
+  const peerPromptPrefix = separator ? prompt.slice(0, separator.index) : prompt;
+  if (/(?:^|\s)--(?:write|transport-default-write)(?=\s|$)/.test(peerPromptPrefix)) {
+    return "implementation";
+  }
+  return /^verification:\s*\S/im.test(prompt) ? "implementation" : "consult";
+}
+
 function createDispatch(input, agentType, userBackgroundAuthorized, env, validation = {}) {
   const taskId = createWorkerTaskId(input.session_id, input.tool_use_id);
   const prompt = promptText(input.tool_input);
   const collectorIdentity = canonicalWorkerAgentType(agentType) === "fusion:job-collector" ? collectorRequestIdentity(prompt) : null;
-  const fallbackPackageType = () => {
-    if (!PEER_WRAPPER_AGENTS.has(agentType)) {
-      return /^verification:\s*\S/im.test(prompt) ? "implementation" : "consult";
-    }
-    const packageTypeLines = prompt.split(/\r?\n/).filter((line) => /^package-type\s*:/i.test(line.trim()));
-    const explicitPackageType = packageTypeLines.length === 1
-      ? packageTypeLines[0].match(/^package-type\s*:\s*(implementation|consult|review|research|design)\s*$/i)?.[1]?.toLowerCase()
-      : null;
-    if (explicitPackageType) {
-      return explicitPackageType;
-    }
-    const separator = /(?:^|\s)--(?=\s|$)/.exec(prompt);
-    const peerPromptPrefix = separator ? prompt.slice(0, separator.index) : prompt;
-    if (/(?:^|\s)--(?:write|transport-default-write)(?=\s|$)/.test(peerPromptPrefix)) {
-      return "implementation";
-    }
-    return /^verification:\s*\S/im.test(prompt) ? "implementation" : "consult";
-  };
   let parentTranscriptBytesAtDispatch = null;
   try {
     parentTranscriptBytesAtDispatch = fs.statSync(input.transcript_path).size;
@@ -423,13 +425,13 @@ function createDispatch(input, agentType, userBackgroundAuthorized, env, validat
     parentTranscriptPath: typeof input.transcript_path === "string" ? input.transcript_path : null,
     parentTranscriptBytesAtDispatch,
     parentContextTokensAtDispatch: parentContextTokens(input.transcript_path),
-    packageType: validation.packageType ?? fallbackPackageType(),
+    packageType: validation.packageType ?? fallbackPackageType(agentType, prompt),
     briefBytes: validation.briefBytes ?? null,
     completionContract: completionContract(agentType, prompt),
     ...collectorIdentity,
     limits: workerLimits(agentType, env, validation.sizing)
   }, env);
-  if (!PEER_WRAPPER_AGENTS.has(agentType)) {
+  if (!PEER_RESCUE_AGENT_NAMES.has(agentType)) {
     return record;
   }
   try {

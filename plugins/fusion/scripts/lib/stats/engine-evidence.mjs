@@ -2,7 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { ENGINE_TERMINAL_STATUSES, engineDataDir } from "../../lib/engines.mjs";
 import { readModelRoutingFile, resolveModelRoutingPath } from "../../lib/model-table.mjs";
-import { CODEX_TERMINAL_STATUSES, DEFAULT_ACCEPTANCE_EPOCH, FUSION_ACCEPTANCE_EPOCH_ENV, GROK_TERMINAL_STATUSES, LANE_SIGNAL_MIN_JUDGED_JOBS, LANE_SIGNAL_TRAILING_JOBS, LANE_SIGNAL_WINDOW_MS, LAST_SEVEN_DAYS_MS, RESUMABLE_CODEX_FAILURE_KINDS, fusionRepositoryKey, fusionWorkspaceKey, loadModelAuditObservations, modelAuditSidecarPath, modelObservationRank, nonEmptyString, observationTimestamp, readCodexJobEvidence, readGrokJobEvidence, resolveCodexJobEffort, resolveCodexJobModel, resolveFusionDataDir, resolveGitWorkspaceRoot, workspaceKeyMatchesRepository, workspaceRootsShareRepository } from "./evidence.mjs";
+import { LANE_SIGNAL_MIN_JUDGED_JOBS, LANE_SIGNAL_TRAILING_JOBS, LANE_SIGNAL_WINDOW_MS, LAST_SEVEN_DAYS_MS, RESUMABLE_CODEX_FAILURE_KINDS, fusionRepositoryKey, fusionWorkspaceKey, loadModelAuditObservations, modelAuditSidecarPath, modelObservationRank, nonEmptyString, observationTimestamp, readCodexJobEvidence, readWorkspaceJobFiles, resolveCodexJobEffort, resolveCodexJobModel, resolveFusionDataDir, resolveGitWorkspaceRoot, workspaceKeyMatchesRepository, workspaceRootsShareRepository } from "./evidence.mjs";
 
 export const FILE_ENGINE_DESCRIPTORS = {
   grok: {
@@ -11,7 +11,7 @@ export const FILE_ENGINE_DESCRIPTORS = {
     defaultStateRoot: (env) => path.join(engineDataDir("grok", env), "state"),
     unavailableReason: "grok plugin job state not found; the grok plugin may not be installed",
     note: "read best effort from Grok job state; totals are lower bounds",
-    enumerateJobs: readGrokJobEvidence,
+    enumerateJobs: readWorkspaceJobFiles,
     requiresJobs: true,
     requiresScopedJobs: true,
     resolveScope: resolveGitWorkspaceRoot,
@@ -21,7 +21,7 @@ export const FILE_ENGINE_DESCRIPTORS = {
     includeByModel: true,
     includeTokenUsage: true,
     dedupeById: true,
-    isTerminal: (raw) => GROK_TERMINAL_STATUSES.has(raw.status),
+    isTerminal: (raw) => ENGINE_TERMINAL_STATUSES.has(raw.status),
     normalizeJob(raw) {
       const finished = raw.finishedAt ?? raw.completedAt ?? raw.updatedAt ?? null;
       let durationSeconds = null;
@@ -87,11 +87,11 @@ export const FILE_ENGINE_DESCRIPTORS = {
     usesTokenUsageObservations: true,
     tokenUsageScope: "terminal transport jobs only",
     dedupeById: true,
-    isTerminal: (raw) => CODEX_TERMINAL_STATUSES.has(raw.status),
+    isTerminal: (raw) => ENGINE_TERMINAL_STATUSES.has(raw.status),
     normalizeJob(raw) {
       const finished = raw.finishedAt ?? raw.completedAt ?? raw.updatedAt ?? null;
       let durationSeconds = null;
-      if (CODEX_TERMINAL_STATUSES.has(raw.status) && raw.startedAt && finished) {
+      if (ENGINE_TERMINAL_STATUSES.has(raw.status) && raw.startedAt && finished) {
         const span = (Date.parse(finished) - Date.parse(raw.startedAt)) / 1000;
         if (Number.isFinite(span) && span >= 0) {
           durationSeconds = span;
@@ -118,7 +118,7 @@ export const FILE_ENGINE_DESCRIPTORS = {
     defaultStateRoot: (env) => path.join(engineDataDir("cursor", env), "state"),
     unavailableReason: "cursor plugin job state not found; the cursor plugin may not be installed",
     note: "read best effort from Cursor job state; totals are lower bounds",
-    enumerateJobs: readGrokJobEvidence,
+    enumerateJobs: readWorkspaceJobFiles,
     requiresJobs: true,
     requiresScopedJobs: true,
     resolveScope: resolveGitWorkspaceRoot,
@@ -476,15 +476,6 @@ export function tokenUsageForJob(raw, observation) {
     return { availability: "available", usage: normalized };
   }
   return { availability: incomplete ? "partial" : "unavailable", usage: null };
-}
-
-export function resolveAcceptanceEpoch(env) {
-  const configured = nonEmptyString(env[FUSION_ACCEPTANCE_EPOCH_ENV]);
-  const configuredTimestamp = Date.parse(configured ?? "");
-  if (configured && Number.isFinite(configuredTimestamp)) {
-    return { value: configured, timestamp: configuredTimestamp };
-  }
-  return { value: DEFAULT_ACCEPTANCE_EPOCH, timestamp: Date.parse(DEFAULT_ACCEPTANCE_EPOCH) };
 }
 
 export function codexSku(model, effort) {

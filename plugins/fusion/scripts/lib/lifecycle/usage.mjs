@@ -1,6 +1,6 @@
 import path from "node:path";
 import { appendTokenUsageObservation, fusionRepositoryKey } from "../../fusion-stats.mjs";
-import { isTerminalWorkerStatus, resolveFusionDataDir } from "../worker-state.mjs";
+import { WORKER_TERMINAL_STATUSES, resolveFusionDataDir } from "../worker-state.mjs";
 
 function observedWorkerTokenUsage(usage) {
   return {
@@ -13,7 +13,7 @@ function observedWorkerTokenUsage(usage) {
 }
 
 function observeTerminalTokenUsage(record, env) {
-  if (!record || !isTerminalWorkerStatus(record.transportStatus) || record.usageAvailability !== "available" || typeof record.workspaceRoot !== "string" || !record.workspaceRoot) {
+  if (!record || !WORKER_TERMINAL_STATUSES.has(record.transportStatus) || record.usageAvailability !== "available" || typeof record.workspaceRoot !== "string" || !record.workspaceRoot) {
     return;
   }
   try {

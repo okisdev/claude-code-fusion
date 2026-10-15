@@ -13,7 +13,6 @@ const MESSAGE_REGISTRY = [
   { slug: "inline-guard.reaped-worker-redirect", description: "Denial of a TaskOutput or TaskStop probe of a reaped worker with the result path." },
   { slug: "inline-guard.narrow-wave-advisory", description: "Advisory after consecutive width one dispatch waves." },
   { slug: "inline-guard.state-unavailable-deny", description: "Strict posture fail closed denial when guard state is unreadable." },
-  { slug: "inline-guard.allow-retired-notice", description: "Notice that the allow escape hatch subcommand is retired." },
   { slug: "worker-lifecycle.foreground-wrapper-deny", description: "Denial of background delivery for a peer wrapper Agent." },
   { slug: "worker-lifecycle.lane-default-injection", description: "Notice naming routing table options filled for a peer wrapper request." },
   { slug: "worker-lifecycle.collector-request-deny", description: "Denial of a collector request missing its engine and job lines." },

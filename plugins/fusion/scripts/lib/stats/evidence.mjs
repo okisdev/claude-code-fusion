@@ -2,6 +2,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { ENGINE_TERMINAL_STATUSES, engineStateRoots } from "../../lib/engines.mjs";
+import { WORKER_COLLECTION_METHODS } from "../../lib/worker-state.mjs";
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 
@@ -15,8 +16,6 @@ export function isPathPositivelyAbsent(target) {
 }
 
 const FUSION_DATA_DIR_ENV = "FUSION_DATA_DIR";
-export const CODEX_TERMINAL_STATUSES = ENGINE_TERMINAL_STATUSES;
-export const GROK_TERMINAL_STATUSES = ENGINE_TERMINAL_STATUSES;
 export const CODEX_ACCEPTANCE_STATES = new Set(["accepted", "rejected", "unverified"]);
 export const TOKEN_USAGE_FILENAME = "token-usage.jsonl";
 const TERMINAL_LEDGER_PREFIX = "codex-jobs-monitor-announced";
@@ -29,10 +28,7 @@ export const ENGINE_JOB_ID_PATTERN = /^[0-9a-f]{32}$/;
 export const RECORD_VERDICTS = new Set(["accepted", "rejected", "unverified"]);
 export const RESUMABLE_CODEX_FAILURE_KINDS = new Set(["timeout", "policy", "patch_thrash"]);
 export const SEMANTIC_FAILURE_KINDS = new Set(["intent_override", "scope_rewrite", "wrong_approach", "style_mismatch", "oversized"]);
-export const PEER_INFRASTRUCTURE_FAILURE_KINDS = new Set(["sandbox", "auth", "setup", "network", "quota", "missing_cli", "rate_limited", "timeout", "permission", "died", "resource", "transport", "error", "turn_limit"]);
 export const RECORD_SOURCES = new Set(["collector", "main-loop"]);
-export const FUSION_ACCEPTANCE_EPOCH_ENV = "FUSION_ACCEPTANCE_EPOCH";
-export const DEFAULT_ACCEPTANCE_EPOCH = "2026-07-22T00:00:00Z";
 export const LAST_SEVEN_DAYS_MS = 7 * 24 * 60 * 60 * 1000;
 export const LANE_SIGNAL_TRAILING_JOBS = 30;
 export const LANE_SIGNAL_MIN_JUDGED_JOBS = 10;
@@ -112,18 +108,7 @@ export function nonEmptyString(value) {
 }
 
 export function normalizeCollectionMethod(value) {
-  const method = nonEmptyString(value);
-  if (!method) {
-    return null;
-  }
-  if (method.toLowerCase() === "agent") {
-    return "agent_result";
-  }
-  const normalized = method
-    .replace(/([a-z0-9])([A-Z])/g, "$1_$2")
-    .replace(/([A-Z])([A-Z][a-z])/g, "$1_$2")
-    .toLowerCase();
-  return normalized;
+  return Object.values(WORKER_COLLECTION_METHODS).includes(value) ? value : null;
 }
 
 export function resolveCodexJobModel(raw, observation) {
@@ -376,7 +361,7 @@ export function resolveStateRoot(descriptor, env) {
   return engineStateRoots(descriptor.id, env)[0];
 }
 
-function readWorkspaceJobFiles(stateRoot) {
+export function readWorkspaceJobFiles(stateRoot) {
   const jobs = [];
   let workspaces;
   try {
@@ -414,36 +399,35 @@ function terminalLedgerWorkspaceKey(file) {
   return match?.[1] ?? null;
 }
 
-function terminalLedgerRecord(raw, { workspaceRoot = null, workspaceKey = null, repositoryKey = null } = {}) {
-  const jobId = nonEmptyString(raw?.jobId ?? raw?.id);
-  const status = nonEmptyString(raw?.transportStatus ?? raw?.status);
-  if (!jobId || !status || !CODEX_TERMINAL_STATUSES.has(status)) {
+function terminalLedgerRecord(raw, { workspaceRoot = null, workspaceKey = null } = {}) {
+  const jobId = nonEmptyString(raw?.jobId);
+  const status = nonEmptyString(raw?.transportStatus);
+  if (!jobId || !status || !ENGINE_TERMINAL_STATUSES.has(status)) {
     return null;
   }
-  const model = nonEmptyString(raw?.model ?? raw?.request?.model);
-  const effort = nonEmptyString(raw?.effort ?? raw?.request?.effort);
-  const resumeThreadId = nonEmptyString(raw?.request?.resumeThreadId);
+  const model = nonEmptyString(raw?.model);
+  const effort = nonEmptyString(raw?.effort);
   return {
     id: jobId,
     status,
     workspaceRoot: nonEmptyString(raw?.workspaceRoot) ?? workspaceRoot,
     sessionId: nonEmptyString(raw?.sessionId),
     threadId: nonEmptyString(raw?.threadId),
-    jobClass: nonEmptyString(raw?.kind ?? raw?.jobClass) ?? "unknown",
+    jobClass: nonEmptyString(raw?.kind) ?? "unknown",
     createdAt: raw?.createdAt ?? null,
     startedAt: raw?.startedAt ?? null,
-    finishedAt: raw?.finishedAt ?? raw?.completedAt ?? raw?.observedAt ?? null,
-    completedAt: raw?.finishedAt ?? raw?.completedAt ?? raw?.observedAt ?? null,
+    finishedAt: raw?.finishedAt ?? null,
+    completedAt: raw?.finishedAt ?? null,
     timeoutMs: raw?.timeoutMs ?? null,
     failureKind: raw?.failureKind ?? null,
-    request: model || effort || resumeThreadId ? { model, effort, ...(resumeThreadId ? { resumeThreadId } : {}) } : null,
+    request: model || effort ? { model, effort } : null,
     _fusionObservedModel: raw?.modelSource === "rollout-turn-context" ? model : null,
     _fusionObservedEffort: raw?.effortSource === "rollout-turn-context" ? effort : null,
     tokenUsage: raw?.tokenUsage ?? null,
-    tokenUsageAvailability: raw?.tokenUsageAvailability ?? (raw?.tokenUsage ? "available" : "unavailable"),
+    tokenUsageAvailability: raw?.tokenUsageAvailability ?? null,
     _fusionEvidence: "terminal-ledger",
     _fusionScopeKey: workspaceKey,
-    _fusionRepositoryKey: nonEmptyString(raw?.repositoryKey) ?? repositoryKey
+    _fusionRepositoryKey: nonEmptyString(raw?.repositoryKey)
   };
 }
 
@@ -460,14 +444,14 @@ function readCodexTerminalLedgerFiles(stateRoot) {
     const workspaceKey = terminalLedgerWorkspaceKey(file);
     try {
       const raw = JSON.parse(fs.readFileSync(file, "utf8"));
+      if (raw?.schemaVersion !== 3 || !Array.isArray(raw.records)) {
+        continue;
+      }
       const scopeRoot = nonEmptyString(raw?.workspaceRoot);
-      const repositoryKey = nonEmptyString(raw?.repositoryKey);
-      if (Array.isArray(raw?.records)) {
-        for (const candidate of raw.records) {
-          const record = terminalLedgerRecord(candidate, { workspaceRoot: scopeRoot, workspaceKey, repositoryKey });
-          if (record) {
-            records.push(record);
-          }
+      for (const candidate of raw.records) {
+        const record = terminalLedgerRecord(candidate, { workspaceRoot: scopeRoot, workspaceKey });
+        if (record) {
+          records.push(record);
         }
       }
     } catch {
@@ -480,10 +464,6 @@ function readCodexTerminalLedgerFiles(stateRoot) {
 export function readCodexJobEvidence(stateRoot, options = {}) {
   const roots = Object.hasOwn(options, "env") ? engineStateRoots("codex", options.env) : [stateRoot];
   return roots.flatMap((root) => [...readWorkspaceJobFiles(root), ...readCodexTerminalLedgerFiles(root)]);
-}
-
-export function readGrokJobEvidence(stateRoot) {
-  return readWorkspaceJobFiles(stateRoot);
 }
 
 function jobTimestamp(raw) {

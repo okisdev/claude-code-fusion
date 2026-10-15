@@ -3,8 +3,8 @@ import path from "node:path";
 import { readAuditEvents as readGuardAuditEvents, resolveStateDir as resolveGuardStateDir, stateFile as guardStateFile } from "../../inline-delegation-guard.mjs";
 import { ENGINE_TERMINAL_STATUSES, engineStateRoots } from "../../lib/engines.mjs";
 import { canonicalWorkerAgentType, readWorkerRecords } from "../../lib/worker-state.mjs";
-import { WORKSPACE_ENGINE_DESCRIPTORS, acceptanceGap, acceptanceSummary, automaticPeerInfrastructureKind, claudeWorkerStats, countJudged, emptyAcceptanceGaps, resolvedEngineAcceptance, workerSnapshot } from "./aggregation.mjs";
-import { FILE_ENGINE_DESCRIPTORS, isSupersededCodexJob, resolveAcceptanceEpoch } from "./engine-evidence.mjs";
+import { WORKSPACE_ENGINE_DESCRIPTORS, acceptanceGap, acceptanceSummary, claudeWorkerStats, countJudged, emptyAcceptanceGaps, resolvedEngineAcceptance, workerSnapshot } from "./aggregation.mjs";
+import { FILE_ENGINE_DESCRIPTORS, isSupersededCodexJob } from "./engine-evidence.mjs";
 import { bump, nonEmptyString, selectPreferredJobs } from "./evidence.mjs";
 import { spawnSync } from "node:child_process";
 
@@ -278,7 +278,6 @@ function sessionScopedEngineStats(descriptor, sessionId, env, workers) {
   const judgedExcludingInfrastructure = acceptanceSummary();
   const verdicts = workers.byPeerJobId;
   const acceptanceGaps = emptyAcceptanceGaps();
-  const acceptanceEpoch = resolveAcceptanceEpoch(env);
   let totalJobs = 0;
   let pendingTransportJobs = 0;
   if (sessionId) {
@@ -292,10 +291,10 @@ function sessionScopedEngineStats(descriptor, sessionId, env, workers) {
       if (ENGINE_TERMINAL_STATUSES.has(status)) {
         const acceptance = resolvedEngineAcceptance(raw, descriptor.id, verdicts, descriptor.usesSupersededJobs && isSupersededCodexJob(raw, preferredJobs));
         const joined = verdicts.get(descriptor.id)?.get(raw?.id);
-        const infrastructureKind = joined?.infrastructureKind ?? automaticPeerInfrastructureKind(raw, joined);
+        const infrastructureKind = joined?.infrastructureKind ?? null;
         bump(byAcceptance, acceptance);
         if (acceptance === "untracked" || acceptance === "unverified") {
-          acceptanceGaps[acceptanceGap(raw, joined, acceptanceEpoch)] += 1;
+          acceptanceGaps[acceptanceGap(raw, joined)] += 1;
         }
         countJudged(judgedExcludingInfrastructure, acceptance, infrastructureKind);
         if (infrastructureKind) {

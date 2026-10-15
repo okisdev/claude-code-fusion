@@ -915,7 +915,7 @@ test("workspace-scoped dedup lets identical job ids announce independently and p
   assert.strictEqual(fs.readFileSync(firstStateFile, "utf8"), firstState);
 });
 
-test("restart catch-up announces an unrecorded terminal job owned by the active session", async (t) => {
+test("old announcement state follows the missing-state startup path", async (t) => {
   const sandbox = makeSandbox(t);
   const { record } = seedJob(sandbox, {
     status: "done",
@@ -926,17 +926,16 @@ test("restart catch-up announces an unrecorded terminal job owned by the active 
 
   const monitor = startMonitor(sandbox, envFor(sandbox, { CLAUDE_CODE_SESSION_ID: "session-own" }));
   t.after(() => monitor.child.kill("SIGKILL"));
-  const lines = await waitUntil(() => (monitor.lines().length > 0 ? monitor.lines() : null));
-  assert.deepStrictEqual(lines, [
-    `codex job ${record.id} done. collect with /codex:result ${record.id}; completion notices do not replace collection. ${MONITOR_TAG}`
-  ]);
+  await waitUntil(() => readAnnouncedState(sandbox, "session-own")?.schemaVersion === 3);
+  assert.deepStrictEqual(monitor.lines(), []);
+  assert.deepStrictEqual(readAnnouncedState(sandbox, "session-own").keys, [`${record.id}:done`]);
 });
 
 test("an unavailable jobs snapshot neither prunes nor persists announcement state", async (t) => {
   const sandbox = makeSandbox(t);
   const { record } = seedJob(sandbox, { status: "running" });
   const stateFile = announcedPath(sandbox);
-  fs.writeFileSync(stateFile, `${JSON.stringify([`${record.id}:done`])}\n`, "utf8");
+  fs.writeFileSync(stateFile, `${JSON.stringify({ schemaVersion: 3, keys: [`${record.id}:done`], records: [] })}\n`, "utf8");
   const monitor = startMonitor(sandbox, envFor(sandbox));
   t.after(() => monitor.child.kill("SIGKILL"));
   await waitUntil(() => readAnnouncedState(sandbox)?.schemaVersion === 3);

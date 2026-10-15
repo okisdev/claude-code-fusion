@@ -1,6 +1,6 @@
 import { engineResultCommand, isEngineId } from "../engines.mjs";
 import { tagMessage } from "../user-messages.mjs";
-import { canonicalWorkerAgentType, isPendingSettlement, isSettledWorker, isTerminalWorkerStatus, readWorkerRecord, readSessionWorkerRecords, updateWorkerSessionState } from "../worker-state.mjs";
+import { canonicalWorkerAgentType, isPendingSettlement, isSettledWorker, WORKER_TERMINAL_STATUSES, readWorkerRecord, readSessionWorkerRecords, updateWorkerSessionState } from "../worker-state.mjs";
 import { workerBudgetFailure } from "./budget.mjs";
 import { isAutoSettledWrapperApiDeath, regularFileExists, runtimeTaskIsTerminal, settleQueuedVerdict, settleReapedIfActive, settleWrapperApiDeath, statusEvidence, terminalCollectedRecord, terminalCollectionPending, terminalTransportObserved, wrapperApiDeathEvidence, writeFinalTextArtifact } from "./collection.mjs";
 import { finalAssistantTextFromTranscript, reconcileTaskNotifications } from "./notifications.mjs";
@@ -94,7 +94,7 @@ function unjudgedPeerCollections(sessionId, env) {
 }
 
 function unreportedCollectorFailures(sessionId, env) {
-  return readSessionWorkerRecords(env, sessionId, { strict: true }).filter((record) => isTerminalWorkerStatus(record.transportStatus) && record.completionContract === "collector" && record.failureKind && !record.failureReportedAt);
+  return readSessionWorkerRecords(env, sessionId, { strict: true }).filter((record) => WORKER_TERMINAL_STATUSES.has(record.transportStatus) && record.completionContract === "collector" && record.failureKind && !record.failureReportedAt);
 }
 
 function collectorResultCommand(record) {
@@ -325,7 +325,7 @@ function handleStop(input, env) {
     const failure = observedTerminal ? null : workerBudgetFailure(record);
     const now = new Date().toISOString();
     const updated = updateLifecycleWorkerRecord(record.taskId, env, (current) => {
-      if (!current || isTerminalWorkerStatus(current.transportStatus)) {
+      if (!current || WORKER_TERMINAL_STATUSES.has(current.transportStatus)) {
         return null;
       }
       const worker = current;
@@ -355,7 +355,7 @@ function handleStop(input, env) {
     const missingRuntimeIds = verifiedCancellations.filter((record) => !record.backgroundTaskId && !record.agentId);
     for (const record of missingRuntimeIds) {
       updateLifecycleWorkerRecord(record.taskId, env, (current) => {
-        if (!current || isTerminalWorkerStatus(current.transportStatus)) {
+        if (!current || WORKER_TERMINAL_STATUSES.has(current.transportStatus)) {
           return null;
         }
         return settleQueuedVerdict({ ...current, transportStatus: "failed", failureKind: current.failureKind ?? "owner_lost", finishedAt: now }, now, env);
@@ -401,7 +401,7 @@ function handleStop(input, env) {
     return;
   }
   if (settleOnly.length > 0) {
-    const hasInFlightSibling = currentRecords.some((record) => !isTerminalWorkerStatus(record.transportStatus));
+    const hasInFlightSibling = currentRecords.some((record) => !WORKER_TERMINAL_STATUSES.has(record.transportStatus));
     if ((!hasInFlightSibling && settleOnly.length > 1) || hasStaleSettlement(settleOnly, env)) {
       writeSettlementDemand(input, settleOnly, env);
       return;

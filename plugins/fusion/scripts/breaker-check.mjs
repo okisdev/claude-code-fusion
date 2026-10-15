@@ -132,7 +132,7 @@ function normalizedRecordedFailureKind(record, value) {
   return failureKind;
 }
 
-function engineFailure(engine, record, now, lookbackMs) {
+function engineFailure(record, now, lookbackMs, engine) {
   if (!FAILURE_STATUSES.has(record.status)) {
     return null;
   }
@@ -175,16 +175,18 @@ function newerFailure(left, right) {
   return right.timestamp > left.timestamp ? right : left;
 }
 
-function latestBreakerFailure(records, failureReader, now, lookbackMs, includesFailure = () => true) {
+// scope "engine" counts only failures that are not pool scoped, "pool" only pool scoped ones, null counts every failure.
+function latestBreakerFailure(records, failureReader, now, lookbackMs, { scope = null, engine = null } = {}) {
   const outcomes = [];
   for (const record of records) {
     const timestamp = recordTimestamp(record);
     if (timestamp == null || !isWithinLookback(timestamp, now, lookbackMs)) {
       continue;
     }
-    const failure = failureReader(record, now, lookbackMs);
+    const failure = failureReader(record, now, lookbackMs, engine);
     if (TERMINAL_STATUSES.has(record.status)) {
-      const ignored = FAILURE_STATUSES.has(record.status) && !includesFailure(failure?.failureKind ?? normalizedRecordedFailureKind(record, record.failureKind));
+      const kind = failure?.failureKind ?? normalizedRecordedFailureKind(record, record.failureKind);
+      const ignored = FAILURE_STATUSES.has(record.status) && scope !== null && (scope === "pool") !== POOL_SCOPED_KINDS.has(kind);
       outcomes.push({
         failureKind: ignored ? null : failure?.failureKind ?? null,
         ignored,
@@ -299,7 +301,6 @@ function run(env = process.env, now = Date.now()) {
   for (const engine of ENGINE_IDS) {
     const lines = [];
     const records = readDeduplicatedJobRecords(engineStateRoots(engine, env));
-    const failureReader = (record, at, window) => engineFailure(engine, record, at, window);
     const pools = new Map();
     for (const record of records) {
       const pool = typeof record.billingPool === "string" ? record.billingPool : null;
@@ -309,19 +310,19 @@ function run(env = process.env, now = Date.now()) {
       pools.get(pool).push(record);
     }
     if (!pools.size || (pools.size === 1 && pools.has(null))) {
-      const failure = latestBreakerFailure(records, failureReader, now, lookbackMs);
+      const failure = latestBreakerFailure(records, engineFailure, now, lookbackMs, { engine });
       if (failure) {
         lines.push(advisoryLine(engine, failure, now, lookbackMs));
       }
       engineLines.set(engine, lines);
       continue;
     }
-    const engineFailureResult = latestBreakerFailure(records, failureReader, now, lookbackMs, (kind) => !POOL_SCOPED_KINDS.has(kind));
+    const engineFailureResult = latestBreakerFailure(records, engineFailure, now, lookbackMs, { scope: "engine", engine });
     if (engineFailureResult) {
       lines.push(advisoryLine(engine, engineFailureResult, now, lookbackMs));
     }
     for (const [pool, poolRecords] of pools) {
-      const poolFailure = latestBreakerFailure(poolRecords, failureReader, now, lookbackMs, (kind) => POOL_SCOPED_KINDS.has(kind));
+      const poolFailure = latestBreakerFailure(poolRecords, engineFailure, now, lookbackMs, { scope: "pool", engine });
       if (poolFailure) {
         lines.push(advisoryLine(engine, poolFailure, now, lookbackMs, pool));
       }

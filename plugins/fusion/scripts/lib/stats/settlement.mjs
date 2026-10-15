@@ -1,7 +1,7 @@
 import { recordEngineAcceptance } from "../../lib/engine-acceptance.mjs";
 import { readEngineJobRecord } from "../../lib/engine-job-state.mjs";
 import { ENGINE_IDS, ENGINE_TERMINAL_STATUSES, engineDisplayName, engineDisplayNameList, engineStateRoots, isEngineId } from "../../lib/engines.mjs";
-import { isTerminalWorkerStatus, readWorkerRecord, readWorkerRecords, recordWorkerAcceptance, validateWorkerAcceptance } from "../../lib/worker-state.mjs";
+import { WORKER_TERMINAL_STATUSES, readWorkerRecord, readWorkerRecords, recordWorkerAcceptance, validateWorkerAcceptance } from "../../lib/worker-state.mjs";
 import { FILE_ENGINE_DESCRIPTORS } from "./engine-evidence.mjs";
 import { ENGINE_JOB_ID_PATTERN, FUSION_TASK_ID_PATTERN, RESUMABLE_CODEX_FAILURE_KINDS, nonEmptyString } from "./evidence.mjs";
 
@@ -35,7 +35,7 @@ function writeRecordConfirmation({ kind, engine = null, jobId = null, worker = n
 
 function settleWorkerRecord({ taskId, verdict, source, reason, failureKind, acceptFailedTransport = false, asJson, workspaceRoot, env, stdout, stderr }) {
   const current = readWorkerRecord(taskId, env);
-  const terminal = isTerminalWorkerStatus(current?.transportStatus);
+  const terminal = WORKER_TERMINAL_STATUSES.has(current?.transportStatus);
   const peerJobId = terminal && typeof current.peerJobId === "string" && ENGINE_JOB_ID_PATTERN.test(current.peerJobId) ? current.peerJobId : null;
   const previousJobIds = new Set((Array.isArray(current?.continuations) ? current.continuations : []).flatMap((round) => Array.isArray(round?.peerJobIds) ? round.peerJobIds : []));
   const peerJobIds = terminal ? [...new Set([
@@ -125,7 +125,7 @@ function settleEngineRecord({ jobId, verdict, source, reason, failureKind, accep
 function validateWorkerSettlement({ taskId, verdict, source, reason, failureKind, acceptFailedTransport, env }) {
   const current = readWorkerRecord(taskId, env);
   validateWorkerAcceptance({ record: current, taskId, acceptance: verdict, source, reason, failureKind, acceptFailedTransport });
-  const peerJobId = isTerminalWorkerStatus(current?.transportStatus) && typeof current.peerJobId === "string" && ENGINE_JOB_ID_PATTERN.test(current.peerJobId) ? current.peerJobId : null;
+  const peerJobId = WORKER_TERMINAL_STATUSES.has(current?.transportStatus) && typeof current.peerJobId === "string" && ENGINE_JOB_ID_PATTERN.test(current.peerJobId) ? current.peerJobId : null;
   if (peerJobId && !isEngineId(current.peerEngine)) {
     resolveEngineJob(peerJobId, env);
   }

@@ -1,12 +1,13 @@
+import { PEER_RESCUE_AGENT_NAMES } from "../engines.mjs";
 import path from "node:path";
 import { PEER_JOB_FOOTER_AGENTS } from "../engines.mjs";
 import { tagMessage } from "../user-messages.mjs";
-import { canonicalWorkerAgentType, isFusionWorkerAgent, isTerminalWorkerStatus, markWorkerCollected, WORKER_COLLECTION_METHODS } from "../worker-state.mjs";
+import { canonicalWorkerAgentType, isFusionWorkerAgent, WORKER_TERMINAL_STATUSES, markWorkerCollected, WORKER_COLLECTION_METHODS } from "../worker-state.mjs";
 import { workerBudgetFailure } from "./budget.mjs";
 import { capturedPeerIdentity, completedReport, finalTextArtifactPath, mergedPeerJobIds, peerIdentityBackfill, retryInstruction, settleQueuedVerdict, settleWrapperApiDeath, statusEvidence, structuredCollectorReport, terminalCollectedRecord, wrapperApiDeathEvidence, writeFinalTextArtifact } from "./collection.mjs";
 import { blockStop, hookOutput, writeOutput } from "./output.mjs";
 import { pendingDispatchForStart, recordForAgent, refreshRecord, updateLifecycleWorkerRecord } from "./records.mjs";
-import { EXECUTION_AGENTS, PEER_WRAPPER_AGENTS } from "./constants.mjs";
+import { EXECUTION_AGENTS } from "./constants.mjs";
 
 function handleSubagentStart(input, env) {
   if (!isFusionWorkerAgent(input.agent_type)) {
@@ -19,7 +20,7 @@ function handleSubagentStart(input, env) {
   const now = new Date().toISOString();
   let started = false;
   const record = updateLifecycleWorkerRecord(pending.taskId, env, (current) => {
-    if (!current || isTerminalWorkerStatus(current.transportStatus)) {
+    if (!current || WORKER_TERMINAL_STATUSES.has(current.transportStatus)) {
       return null;
     }
     started = true;
@@ -58,7 +59,7 @@ function handleSubagentStop(input, env) {
   }
   const refreshed = refreshRecord(record, input, env);
   const message = typeof input.last_assistant_message === "string" ? input.last_assistant_message : "";
-  const footerMissing = PEER_WRAPPER_AGENTS.has(refreshed.agentType) && !message.split(/\r?\n/).filter((line) => line.trim()).slice(-15).some((line) => /^\s*state:\s*\S+/i.test(line));
+  const footerMissing = PEER_RESCUE_AGENT_NAMES.has(refreshed.agentType) && !message.split(/\r?\n/).filter((line) => line.trim()).slice(-15).some((line) => /^\s*state:\s*\S+/i.test(line));
   if (footerMissing) {
     updateLifecycleWorkerRecord(refreshed.taskId, env, (current) => current ? { ...current, relayFooterMissing: true } : null);
   }
@@ -79,7 +80,7 @@ function handleSubagentStop(input, env) {
   }
   if (wrapperApiDeathEvidence(refreshed, [message, statusEvidence(input)].join("\n"))) {
     const now = new Date().toISOString();
-    updateLifecycleWorkerRecord(refreshed.taskId, env, (current) => current && !isTerminalWorkerStatus(current.transportStatus)
+    updateLifecycleWorkerRecord(refreshed.taskId, env, (current) => current && !WORKER_TERMINAL_STATUSES.has(current.transportStatus)
       ? settleWrapperApiDeath(current, [message, statusEvidence(input)].join("\n"), now, env)
       : null);
     return;

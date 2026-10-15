@@ -1717,37 +1717,6 @@ test("a Skill invocation is ignored and does not touch the counters", (t) => {
   assert.deepStrictEqual(state.dispatches, {});
 });
 
-test("the old allow escape hatch exits 0 with a notice and never touches state", (t) => {
-  const sandbox = makeSandbox(t);
-  for (let i = 0; i < 6; i += 1) {
-    run(sandbox, writePayload(sandbox));
-  }
-  const before = readState(sandbox, "session-1");
-
-  const allowResult = spawnSync(process.execPath, [script, "allow", "session-1"], {
-    env: envFor(sandbox),
-    encoding: "utf8"
-  });
-  assert.strictEqual(allowResult.status, 0);
-  assert.match(allowResult.stdout, /retired/);
-  assertMessageTagged(allowResult.stdout.trimEnd(), "inline-guard.allow-retired-notice");
-  assert.strictEqual(allowResult.stderr, "");
-
-  const after = readState(sandbox, "session-1");
-  assert.deepStrictEqual(after, before);
-});
-
-test("the old allow escape hatch exits 0 even without a session id argument", (t) => {
-  const sandbox = makeSandbox(t);
-  const result = spawnSync(process.execPath, [script, "allow"], {
-    env: envFor(sandbox),
-    encoding: "utf8"
-  });
-  assert.strictEqual(result.status, 0);
-  assert.match(result.stdout, /retired/);
-  assertMessageTagged(result.stdout.trimEnd(), "inline-guard.allow-retired-notice");
-});
-
 test("a subagent payload fails open and is never counted", (t) => {
   const sandbox = makeSandbox(t);
   for (let i = 0; i < 8; i += 1) {

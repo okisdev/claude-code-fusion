@@ -1,7 +1,7 @@
 import { resolvePosture } from "../posture.mjs";
 import { tagMessage } from "../user-messages.mjs";
 import { resolveMode, resolveStateDir } from "./config.mjs";
-import { ALLOW_RETIRED_NOTICE_MESSAGE_SLUG, BASH_TOOL, DELEGATION_TOOLS, STATE_UNAVAILABLE_DENY_MESSAGE_SLUG, TASK_CONTROL_TOOLS, WRITE_TOOLS } from "./constants.mjs";
+import { BASH_TOOL, DELEGATION_TOOLS, STATE_UNAVAILABLE_DENY_MESSAGE_SLUG, TASK_CONTROL_TOOLS, WRITE_TOOLS } from "./constants.mjs";
 import { handleDispatch, handleTaskControl } from "./dispatch-events.mjs";
 import { normalizeSessionId, pruneStaleState, stateFile } from "./state.mjs";
 import { handleBash } from "./verification-events.mjs";
@@ -24,15 +24,6 @@ function readHookInput() {
 
 function isSubagentPayload(input) {
   return typeof input.agent_id === "string" && input.agent_id.length > 0;
-}
-
-function runAllowCommand() {
-  process.stdout.write(
-    `${tagMessage(
-      ALLOW_RETIRED_NOTICE_MESSAGE_SLUG,
-      "fusion inline delegation guard: the allow escape hatch is retired; judgment posture never denies a main-loop write, and strict posture opens the next write window with a dispatch; /fusion:config set-posture judgment restores the advisory default"
-    )}\n`
-  );
 }
 
 let hookOutputSink = (text) => process.stdout.write(text);
@@ -105,4 +96,4 @@ function handleInlineDelegationHook(input, env = process.env) {
   }
 }
 
-export { readHookInput, isSubagentPayload, runAllowCommand, writeHookText, runHook, executeHook, handleInlineDelegationHook };
+export { readHookInput, isSubagentPayload, writeHookText, runHook, executeHook, handleInlineDelegationHook };

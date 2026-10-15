@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { PEER_JOB_FOOTER_AGENTS } from "../engines.mjs";
-import { isTerminalWorkerStatus, markWorkerCollected, readWorkerSessionState, refreshWorkerTranscript, updateWorkerSessionState, WORKER_COLLECTION_METHODS } from "../worker-state.mjs";
+import { WORKER_TERMINAL_STATUSES, markWorkerCollected, readWorkerSessionState, refreshWorkerTranscript, updateWorkerSessionState, WORKER_COLLECTION_METHODS } from "../worker-state.mjs";
 import { workerRoundUsage } from "./budget.mjs";
 import { absoluteOutputFile, capturedPeerIdentity, collectedHarnessAsyncDelivery, regularFileExists, settleQueuedVerdict, settleWrapperApiDeath, statusEvidence, writeFinalTextArtifact } from "./collection.mjs";
 import { sessionRecords, updateLifecycleWorkerRecord } from "./records.mjs";
@@ -320,7 +320,7 @@ function taskNotificationTransition(record, notification, now, env) {
 
 function reconcileTaskNotifications(input, env) {
   try {
-    const candidates = sessionRecords(input.session_id, env).filter((record) => !isTerminalWorkerStatus(record.transportStatus) && [record.backgroundTaskId, record.agentId].some((taskId) => typeof taskId === "string" && taskId));
+    const candidates = sessionRecords(input.session_id, env).filter((record) => !WORKER_TERMINAL_STATUSES.has(record.transportStatus) && [record.backgroundTaskId, record.agentId].some((taskId) => typeof taskId === "string" && taskId));
     if (candidates.length === 0) {
       return;
     }
@@ -340,7 +340,7 @@ function reconcileTaskNotifications(input, env) {
     for (const [taskId, notification] of scanned.notifications) {
       for (const record of candidates.filter((candidate) => [candidate.backgroundTaskId, candidate.agentId].includes(taskId))) {
         const stamped = updateLifecycleWorkerRecord(record.taskId, env, (current) => {
-          if (!current || current.sessionId !== input.session_id || isTerminalWorkerStatus(current.transportStatus) || ![current.backgroundTaskId, current.agentId].includes(taskId) || notification.byteOffset <= (current.continuationNotificationFloor ?? 0)) {
+          if (!current || current.sessionId !== input.session_id || WORKER_TERMINAL_STATUSES.has(current.transportStatus) || ![current.backgroundTaskId, current.agentId].includes(taskId) || notification.byteOffset <= (current.continuationNotificationFloor ?? 0)) {
             return null;
           }
           const currentTranscriptExists = regularFileExists(current.transcriptPath);
@@ -351,11 +351,11 @@ function reconcileTaskNotifications(input, env) {
             ...(notification.statusDetail ? { statusDetail: notification.statusDetail } : {})
           };
         });
-        if (!stamped || stamped.sessionId !== input.session_id || isTerminalWorkerStatus(stamped.transportStatus) || ![stamped.backgroundTaskId, stamped.agentId].includes(taskId) || notification.byteOffset <= (stamped.continuationNotificationFloor ?? 0)) {
+        if (!stamped || stamped.sessionId !== input.session_id || WORKER_TERMINAL_STATUSES.has(stamped.transportStatus) || ![stamped.backgroundTaskId, stamped.agentId].includes(taskId) || notification.byteOffset <= (stamped.continuationNotificationFloor ?? 0)) {
           continue;
         }
         updateLifecycleWorkerRecord(record.taskId, env, (current) => {
-          if (!current || current.sessionId !== input.session_id || isTerminalWorkerStatus(current.transportStatus) || ![current.backgroundTaskId, current.agentId].includes(taskId) || notification.byteOffset <= (current.continuationNotificationFloor ?? 0)) {
+          if (!current || current.sessionId !== input.session_id || WORKER_TERMINAL_STATUSES.has(current.transportStatus) || ![current.backgroundTaskId, current.agentId].includes(taskId) || notification.byteOffset <= (current.continuationNotificationFloor ?? 0)) {
             return null;
           }
           return taskNotificationTransition(current, notification, now, env);

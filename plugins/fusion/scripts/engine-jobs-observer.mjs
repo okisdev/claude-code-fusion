@@ -6,7 +6,6 @@ import path from "node:path";
 import { appendModelAuditObservation, appendTokenUsageObservation, fusionRepositoryKey, modelAuditSidecarPath, resolveFusionDataDir, tokenUsageSidecarPath } from "./fusion-stats.mjs";
 import { ENGINE_TERMINAL_STATUSES, engineStateRoots, isEngineId } from "./lib/engines.mjs";
 
-const TERMINAL_STATUSES = ENGINE_TERMINAL_STATUSES;
 const DEFAULT_UNAVAILABLE_TTL_MS = 6 * 60 * 60 * 1000;
 const STATE_SCHEMA_VERSION = 2;
 const RECONCILE_INTERVAL_MS = 10 * 60 * 1000;
@@ -56,10 +55,10 @@ export function engineJobsObserverStatePath(engine, env = process.env) {
 function loadObserverState(file) {
   try {
     const state = JSON.parse(fs.readFileSync(file, "utf8"));
-    if (!Array.isArray(state?.observedJobIds)) {
+    if (state?.schemaVersion !== STATE_SCHEMA_VERSION || !Array.isArray(state.observedJobIds)) {
       return { observedJobIds: new Set(), unavailableObservedAt: new Map(), notifiedJobIds: new Set(), missingSince: new Map() };
     }
-    const unavailableObservedAt = state.schemaVersion === STATE_SCHEMA_VERSION && state.unavailableObservedAt && typeof state.unavailableObservedAt === "object" && !Array.isArray(state.unavailableObservedAt)
+    const unavailableObservedAt = state.unavailableObservedAt && typeof state.unavailableObservedAt === "object" && !Array.isArray(state.unavailableObservedAt)
       ? new Map(Object.entries(state.unavailableObservedAt).filter(([jobId, observedAt]) => typeof jobId === "string" && jobId && Number.isFinite(Date.parse(observedAt))))
       : new Map();
     const notifiedJobIds = Array.isArray(state.notifiedJobIds) ? state.notifiedJobIds.filter((jobId) => typeof jobId === "string" && jobId) : [];
@@ -186,7 +185,7 @@ function terminalRecords(engine, env) {
   }
   if (reconcile) cache.scannedAt = Date.now();
   return { records: records
-    .filter(({ record }) => TERMINAL_STATUSES.has(record?.status) && typeof record?.id === "string" && record.id && typeof record?.cwd === "string" && record.cwd)
+    .filter(({ record }) => ENGINE_TERMINAL_STATUSES.has(record?.status) && typeof record?.id === "string" && record.id && typeof record?.cwd === "string" && record.cwd)
     .sort((left, right) => left.record.id.localeCompare(right.record.id)), liveIds, complete };
 }
 

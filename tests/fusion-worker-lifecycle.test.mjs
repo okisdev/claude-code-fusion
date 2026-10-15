@@ -163,21 +163,6 @@ function stop(box) {
   });
 }
 
-test("legacy collection methods normalize when worker records load", (t) => {
-  const box = sandbox(t);
-  const worker = createWorkerRecord({
-    taskId: `fusion-${"a".repeat(24)}`,
-    sessionId: "session-1",
-    agentType: "fusion:claude-worker",
-    workspaceRoot: box.cwd
-  }, envFor(box));
-  const file = path.join(box.state, "jobs", `${worker.taskId}.json`);
-  const stored = JSON.parse(fs.readFileSync(file, "utf8"));
-  fs.writeFileSync(file, `${JSON.stringify({ ...stored, collectionMethod: "SubagentStop" }, null, 2)}\n`, "utf8");
-
-  assert.strictEqual(record(box).collectionMethod, WORKER_COLLECTION_METHODS.SUBAGENT_STOP);
-});
-
 test("collection method write sites use the canonical set", () => {
   const allowed = new Set(Object.values(WORKER_COLLECTION_METHODS));
   assert.strictEqual(allowed.size, Object.keys(WORKER_COLLECTION_METHODS).length);
@@ -2206,7 +2191,7 @@ test("no-task errors ignore unmatched task ids and terminal worker records", (t)
     transportStatus: "done",
     finishedAt: "2026-07-19T00:00:00.000Z",
     collectedAt: "2026-07-19T00:00:01.000Z",
-    collectionMethod: "TaskOutput"
+    collectionMethod: "task_output"
   }));
   run(box, {
     hook_event_name: "PostToolUseFailure",
@@ -3059,103 +3044,6 @@ test("a Read collects terminal output and captures its peer job footer", (t) => 
   assert.strictEqual(collected.peerEngine, "codex");
 });
 
-test("a legacy harness outputFile is collected through an extracted final text artifact", (t) => {
-  const box = sandbox(t);
-  const harnessPath = path.join(box.root, "tasks", "terminal-failed.output");
-  const output = "worker final message before it failed";
-  fs.mkdirSync(path.dirname(harnessPath), { recursive: true });
-  fs.writeFileSync(harnessPath, `${JSON.stringify({ type: "assistant", message: { content: [{ type: "text", text: output }] } })}\n`, "utf8");
-  run(box, dispatch(box));
-  run(box, {
-    ...dispatch(box),
-    hook_event_name: "PostToolUse",
-    tool_response: { isAsync: true, status: "async_launched", agentId: "terminal-failed" }
-  });
-  assert.strictEqual(record(box).runtimeAsync, true);
-  updateWorkerRecord(record(box).taskId, envFor(box), (current) => ({
-    ...current,
-    transportStatus: "failed",
-    failureKind: "task_reaped",
-    outputFile: harnessPath
-  }));
-  assert.strictEqual(record(box).transcriptPath, harnessPath);
-  assert.strictEqual(record(box).outputFile, null);
-
-  const blocked = run(box, {
-    hook_event_name: "Stop",
-    session_id: "session-1",
-    cwd: box.cwd,
-    transcript_path: box.transcript,
-    background_tasks: []
-  });
-  const blockedOutput = JSON.parse(blocked.stdout);
-  const finalTextFile = path.join(box.state, "jobs", `${record(box).taskId}.final.txt`);
-  assert.strictEqual(blockedOutput.decision, "block");
-  assert.match(blockedOutput.reason, /Call Read with file_path=/);
-  assert.ok(blockedOutput.reason.includes(`file_path=${finalTextFile}`));
-  assert.ok(!blockedOutput.reason.includes(harnessPath));
-  assert.strictEqual(record(box).outputFile, finalTextFile);
-
-  run(box, {
-    hook_event_name: "PostToolUse",
-    session_id: "session-1",
-    cwd: box.cwd,
-    transcript_path: box.transcript,
-    tool_name: "Read",
-    tool_input: { file_path: finalTextFile },
-    tool_response: { type: "text", file: { filePath: finalTextFile, content: output } }
-  });
-
-  const collected = record(box);
-  assert.strictEqual(collected.collectionMethod, "output_file_read");
-  assert.ok(collected.collectedAt);
-  assert.strictEqual(collected.transportStatus, "done");
-  assert.strictEqual(collected.failureKind, "task_reaped");
-
-  const cleared = run(box, {
-    hook_event_name: "Stop",
-    session_id: "session-1",
-    cwd: box.cwd,
-    transcript_path: box.transcript,
-    background_tasks: []
-  });
-  const clearedOutput = JSON.parse(cleared.stdout);
-  assert.strictEqual(clearedOutput.decision, undefined);
-  assert.match(clearedOutput.hookSpecificOutput.additionalContext, /Acceptance remains unverified for 1 collected Fusion worker/);
-  assert.doesNotMatch(clearedOutput.hookSpecificOutput.additionalContext, /Call Read with file_path=|TaskOutput/);
-});
-
-test("a direct Read of a legacy harness path still collects its peer job", (t) => {
-  const box = sandbox(t);
-  const harnessPath = path.join(box.root, "tasks", "legacy-peer.output");
-  const peerJobId = "c".repeat(32);
-  const peerDispatch = dispatch(box, { subagent_type: "codex:codex-rescue", prompt: "bounded peer brief" });
-  run(box, peerDispatch);
-  run(box, {
-    ...peerDispatch,
-    hook_event_name: "PostToolUse",
-    tool_response: { isAsync: true, status: "async_launched", agentId: "legacy-peer" }
-  });
-  updateWorkerRecord(record(box).taskId, envFor(box), (current) => ({ ...current, transportStatus: "ready_uncollected", outputFile: harnessPath }));
-  assert.strictEqual(record(box).transcriptPath, harnessPath);
-  assert.strictEqual(record(box).outputFile, null);
-
-  run(box, {
-    hook_event_name: "PostToolUse",
-    session_id: "session-1",
-    cwd: box.cwd,
-    transcript_path: box.transcript,
-    tool_name: "Read",
-    tool_input: { file_path: harnessPath },
-    tool_response: { type: "text", file: { filePath: harnessPath, content: `job: ${peerJobId}` } }
-  });
-
-  const collected = record(box);
-  assert.strictEqual(collected.collectionMethod, "output_file_read");
-  assert.strictEqual(collected.peerJobId, peerJobId);
-  assert.deepStrictEqual(collected.peerJobIds, [peerJobId]);
-});
-
 test("a terminal cancelled runtimeAsync worker is demanded by Stop and collected by a Read", (t) => {
   const box = sandbox(t);
   const output = "worker final message before it was cancelled\n";
@@ -3282,10 +3170,11 @@ test("a Read of a terminal runtimeAsync record's transcript path collects with o
 
 test("a Read of an unrelated file does not collect a terminal runtimeAsync record", (t) => {
   const box = sandbox(t);
-  const outputFile = path.join(box.root, "tasks", "terminal-unrelated-target.output");
+  const outputFile = path.join(box.state, "jobs", "terminal-unrelated-target.final.txt");
   const unrelatedFile = path.join(box.root, "tasks", "terminal-unrelated-other.output");
   const output = "worker final message\n";
   fs.mkdirSync(path.dirname(outputFile), { recursive: true });
+  fs.mkdirSync(path.dirname(unrelatedFile), { recursive: true });
   fs.writeFileSync(outputFile, output, "utf8");
   fs.writeFileSync(unrelatedFile, "some other file", "utf8");
   run(box, dispatch(box));
@@ -3325,7 +3214,7 @@ test("a Read of an unrelated file does not collect a terminal runtimeAsync recor
   });
   const blockedOutput = JSON.parse(blocked.stdout);
   assert.strictEqual(blockedOutput.decision, "block");
-  assert.match(blockedOutput.reason, /TaskOutput with block=true/);
+  assert.match(blockedOutput.reason, /Call Read with file_path=/);
 });
 
 test("a ready_uncollected record still collects through a Read", (t) => {

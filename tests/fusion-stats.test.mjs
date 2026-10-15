@@ -2949,7 +2949,7 @@ test("Codex acceptedWithErrorTransport excludes resumable failures but keeps oth
   assert.ok(!stats.acceptanceAnomalies.acceptedWithErrorTransport.includes(salvagedPatchThrashId));
 });
 
-test("Codex groups pre-epoch acceptance anomalies and includes direct done jobs", (t) => {
+test("Codex acceptance anomalies include terminal jobs regardless of date", (t) => {
   const dir = sandbox(t);
   const stateRoot = path.join(dir, "state");
   const fusionData = path.join(dir, "fusion");
@@ -2965,27 +2965,12 @@ test("Codex groups pre-epoch acceptance anomalies and includes direct done jobs"
   const baseEnv = { FUSION_CODEX_STATE: stateRoot, FUSION_DATA_DIR: fusionData };
   const defaultStats = codexStats({ env: baseEnv, cwd: dir });
   assert.deepStrictEqual(defaultStats.acceptanceAnomalies, {
-    acceptedWithErrorTransport: [currentAccepted],
-    doneWithoutAcceptance: [currentUnverified],
-    historicalPreEpoch: 2,
-    historicalEpoch: "2026-07-22T00:00:00Z"
+    acceptedWithErrorTransport: [historicalAccepted, currentAccepted],
+    doneWithoutAcceptance: [historicalUnverified, currentUnverified]
   });
   const rendered = renderFusionStats({ scope: dir, codex: defaultStats });
-  assert.match(rendered, /Accepted ledger entries with error transport: 1 \(cccccccc\)/);
-  assert.match(rendered, /Done jobs without acceptance records: 1/);
-  assert.match(rendered, /historical pre-epoch \(before 2026-07-22T00:00:00Z\): 2/);
-  assert.doesNotMatch(rendered, /aaaaaaaa|bbbbbbbb/);
-
-  const fallbackStats = codexStats({ env: { ...baseEnv, FUSION_ACCEPTANCE_EPOCH: "not-an-epoch" }, cwd: dir });
-  assert.deepStrictEqual(fallbackStats.acceptanceAnomalies, defaultStats.acceptanceAnomalies);
-
-  const overriddenStats = codexStats({ env: { ...baseEnv, FUSION_ACCEPTANCE_EPOCH: "2026-07-23T00:00:00Z" }, cwd: dir });
-  assert.deepStrictEqual(overriddenStats.acceptanceAnomalies, {
-    acceptedWithErrorTransport: [],
-    doneWithoutAcceptance: [],
-    historicalPreEpoch: 4,
-    historicalEpoch: "2026-07-23T00:00:00Z"
-  });
+  assert.match(rendered, /Accepted ledger entries with error transport: 2/);
+  assert.match(rendered, /Done jobs without acceptance records: 2/);
 });
 
 test("generic worker acceptance rejects Codex collectors", (t) => {
@@ -3541,7 +3526,7 @@ test("R1 stats invocation reads each live worker record once for all providers",
   assert.strictEqual(report.codex.acceptanceGaps.unsettled, 1);
 });
 
-test("R2 acceptance gaps separate unsettled, direct, and pre-tracking terminal peers", (t) => {
+test("R2 acceptance gaps separate linked and direct terminal peers", (t) => {
   const dir = sandbox(t);
   const stateRoot = path.join(dir, "codex-state");
   const env = { FUSION_CODEX_STATE: stateRoot, FUSION_WORKER_STATE_DIR: path.join(dir, "workers"), FUSION_DATA_DIR: path.join(dir, "fusion") };
@@ -3551,28 +3536,24 @@ test("R2 acceptance gaps separate unsettled, direct, and pre-tracking terminal p
   }
   createTerminalWorker({ taskId: `fusion-${"a".repeat(24)}`, env, workspaceRoot: dir, peerEngine: "codex", peerJobId: ids[0] });
   const stats = codexStats({ env, cwd: dir });
-  assert.deepStrictEqual(stats.acceptanceGaps, { unsettled: 1, direct: 1, preTracking: 1 });
+  assert.deepStrictEqual(stats.acceptanceGaps, { unsettled: 1, direct: 2 });
   assert.deepStrictEqual(stats.byAcceptance, { unverified: 1, untracked: 2 });
   assert.deepStrictEqual(stats.acceptanceAnomalies.doneWithoutAcceptance, ids.slice(0, 3));
   const rendered = renderFusionStats({ scope: dir, codex: stats });
   assert.match(rendered, /unsettled \(linked Fusion worker\): 1/);
-  assert.match(rendered, /direct \(no worker link\): 1/);
-  assert.match(rendered, /pre-tracking: 1/);
+  assert.match(rendered, /direct \(no worker link\): 2/);
 });
 
-test("R3 unsourced Grok transport rejections count as infrastructure, sourced rejections stay judged", (t) => {
+test("R3 sourced Grok rejection stays in judged acceptance", (t) => {
   const dir = sandbox(t);
   const grokData = path.join(dir, "grok-data");
   const env = { GROK_COMPANION_DATA: grokData, FUSION_WORKER_STATE_DIR: path.join(dir, "workers") };
-  writeGrokJob(grokData, dir, "auto-network", { status: "error", semanticStatus: "rejected", failureKind: "network" });
-  writeGrokJob(grokData, dir, "auto-error", { status: "error", semanticStatus: "rejected", failureKind: "error" });
-  writeGrokJob(grokData, dir, "legacy-auto", { status: "error", semanticStatus: "unverified", acceptance: "rejected", failureKind: "transport" });
   writeGrokJob(grokData, dir, "judged", { status: "error", semanticStatus: "rejected", failureKind: "network", acceptanceSource: "main-loop" });
   writeGrokJob(grokData, dir, "accepted", { status: "done", semanticStatus: "accepted" });
   const stats = fileBasedEngineStats(FILE_ENGINE_DESCRIPTORS.grok, { env, cwd: dir });
-  assert.deepStrictEqual(stats.infrastructureDeaths, { total: 3, byKind: { network: 1, error: 1, transport: 1 } });
+  assert.deepStrictEqual(stats.infrastructureDeaths, { total: 0, byKind: {} });
   assert.deepStrictEqual(stats.judgedExcludingInfrastructure, { accepted: 1, judged: 2, rate: 0.5 });
-  assert.deepStrictEqual(stats.byAcceptance, { rejected: 4, accepted: 1 });
+  assert.deepStrictEqual(stats.byAcceptance, { rejected: 1, accepted: 1 });
 });
 
 test("R4 --all reports retired worker rollups separately from live workers", (t) => {
@@ -3597,12 +3578,12 @@ test("R4 --all reports retired worker rollups separately from live workers", (t)
   assert.strictEqual(buildFusionStats({ env, cwd: dir }).retiredWorkers, undefined);
 });
 
-test("Claude worker stats normalize legacy collection methods for grouping and display", (t) => {
+test("Claude worker stats group current collection methods for display", (t) => {
   const dir = sandbox(t);
   const env = { FUSION_WORKER_STATE_DIR: path.join(dir, "worker-state") };
   const workers = [
-    ["fusion-legacy-stop", "SubagentStop"],
-    ["fusion-legacy-agent", "Agent"]
+    ["fusion-method-stop", "subagent_stop"],
+    ["fusion-method-agent", "agent_result"]
   ];
   for (const [taskId, collectionMethod] of workers) {
     createWorkerRecord({ taskId, sessionId: "session-workers", dispatchToolUseId: taskId, agentType: "fusion:claude-worker", workspaceRoot: dir, limits: {} }, env);
@@ -3610,9 +3591,9 @@ test("Claude worker stats normalize legacy collection methods for grouping and d
   }
 
   const stats = claudeWorkerStats({ all: true, env, cwd: dir });
-  assert.strictEqual(normalizeCollectionMethod("SubagentStop"), "subagent_stop");
-  assert.strictEqual(normalizeCollectionMethod("Agent"), "agent_result");
-  assert.strictEqual(normalizeCollectionMethod("aGeNt"), "agent_result");
+  assert.strictEqual(normalizeCollectionMethod("subagent_stop"), "subagent_stop");
+  assert.strictEqual(normalizeCollectionMethod("agent_result"), "agent_result");
+  assert.strictEqual(normalizeCollectionMethod("Agent"), null);
   assert.deepStrictEqual(stats.byCollectionMethod, { subagent_stop: 1, agent_result: 1 });
   assert.deepStrictEqual(stats.identities.map((identity) => identity.collectionMethod).sort(), ["agent_result", "subagent_stop"]);
   assert.match(renderFusionStats({ scope: dir, claudeWorkers: stats }), /By collection method:\n- agent_result: 1\n- subagent_stop: 1/);
@@ -3715,9 +3696,9 @@ test("Claude worker stats report completed harness async deliveries separately f
   updateWorkerRecord("fusion-async-pending", env, (record) => ({ ...record, transportStatus: "pending_async", failureKind: "unexpected_async" }));
 
   const stats = claudeWorkerStats({ all: true, env, cwd: dir });
-  assert.strictEqual(stats.harnessAsyncDeliveries, 2);
-  assert.deepStrictEqual(stats.byFailureKind, { unexpected_async: 1 });
-  assert.match(renderFusionStats({ scope: dir, claudeWorkers: stats }), /Harness async deliveries: 2/);
+  assert.strictEqual(stats.harnessAsyncDeliveries, 1);
+  assert.deepStrictEqual(stats.byFailureKind, { unexpected_async: 2 });
+  assert.match(renderFusionStats({ scope: dir, claudeWorkers: stats }), /Harness async deliveries: 1/);
 });
 
 test("Claude worker stats fail closed on malformed complete usage and aggregate overflow", (t) => {

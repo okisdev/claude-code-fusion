@@ -128,8 +128,7 @@ function renderCounts(lines, title, map) {
 function renderAcceptanceAnomalies(lines, anomalies) {
   const acceptedWithErrorTransport = anomalies?.acceptedWithErrorTransport ?? [];
   const doneWithoutAcceptance = anomalies?.doneWithoutAcceptance ?? [];
-  const historicalPreEpoch = anomalies?.historicalPreEpoch ?? 0;
-  if (acceptedWithErrorTransport.length === 0 && doneWithoutAcceptance.length === 0 && historicalPreEpoch === 0) {
+  if (acceptedWithErrorTransport.length === 0 && doneWithoutAcceptance.length === 0) {
     return;
   }
   lines.push("", "Acceptance anomalies:");
@@ -138,9 +137,6 @@ function renderAcceptanceAnomalies(lines, anomalies) {
   }
   if (doneWithoutAcceptance.length > 0) {
     lines.push(`- Done jobs without acceptance records: ${doneWithoutAcceptance.length} (${renderAnomalyIds(doneWithoutAcceptance)})`);
-  }
-  if (historicalPreEpoch > 0) {
-    lines.push(`- historical pre-epoch (before ${anomalies.historicalEpoch}): ${historicalPreEpoch}`);
   }
 }
 
@@ -165,7 +161,6 @@ function renderAcceptanceGaps(lines, gaps) {
   lines.push("", "Jobs without a judged verdict:");
   lines.push(`- unsettled (linked Fusion worker): ${gaps.unsettled}`);
   lines.push(`- direct (no worker link): ${gaps.direct}`);
-  lines.push(`- pre-tracking: ${gaps.preTracking}`);
 }
 
 function formatShare(value) {

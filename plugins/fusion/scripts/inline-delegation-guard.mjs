@@ -2,14 +2,9 @@
 
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { executeHook, readHookInput, runAllowCommand } from "./lib/guard/handler.mjs";
+import { executeHook, readHookInput } from "./lib/guard/handler.mjs";
 
 function main() {
-  const [subcommand] = process.argv.slice(2);
-  if (subcommand === "allow") {
-    runAllowCommand();
-    return;
-  }
   executeHook(readHookInput());
 }
 

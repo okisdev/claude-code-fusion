@@ -1,8 +1,8 @@
 import fs from "node:fs";
 import { ENGINES, ENGINE_IDS, ENGINE_TERMINAL_STATUSES, engineStateRoots } from "../../lib/engines.mjs";
-import { canonicalWorkerAgentType, isTerminalWorkerStatus, readWorkerRecords, readWorkerRollups } from "../../lib/worker-state.mjs";
-import { FILE_ENGINE_DESCRIPTORS, checkedUsageAddition, codexSku, isSupersededCodexJob, loadAllObservationCandidates, normalizeClaudeWorkerUsage, observationForJob, resolveAcceptanceEpoch, scopedObservationForJob, summarizeCodexSkuTelemetry, tokenUsageForJob } from "./engine-evidence.mjs";
-import { CODEX_ACCEPTANCE_STATES, CODEX_TERMINAL_STATUSES, GROK_TERMINAL_STATUSES, PEER_INFRASTRUCTURE_FAILURE_KINDS, RESUMABLE_CODEX_FAILURE_KINDS, TOKEN_USAGE_FILENAME, bump, fusionWorkspaceKey, loadTokenUsageObservations, nonEmptyString, normalizeCollectionMethod, readCodexJobEvidence, readGrokJobEvidence, resolveCodexJobEffort, resolveCodexJobModel, resolveGitWorkspaceRoot, resolveStateRoot, selectPreferredJobs, workspaceRootsShareRepository } from "./evidence.mjs";
+import { canonicalWorkerAgentType, WORKER_TERMINAL_STATUSES, readWorkerRecords, readWorkerRollups } from "../../lib/worker-state.mjs";
+import { FILE_ENGINE_DESCRIPTORS, checkedUsageAddition, codexSku, isSupersededCodexJob, loadAllObservationCandidates, normalizeClaudeWorkerUsage, observationForJob, scopedObservationForJob, summarizeCodexSkuTelemetry, tokenUsageForJob } from "./engine-evidence.mjs";
+import { CODEX_ACCEPTANCE_STATES, RESUMABLE_CODEX_FAILURE_KINDS, TOKEN_USAGE_FILENAME, bump, fusionWorkspaceKey, loadTokenUsageObservations, nonEmptyString, normalizeCollectionMethod, readCodexJobEvidence, readWorkspaceJobFiles, resolveCodexJobEffort, resolveCodexJobModel, resolveGitWorkspaceRoot, resolveStateRoot, selectPreferredJobs, workspaceRootsShareRepository } from "./evidence.mjs";
 import { buildCoercionLedger, buildFleetUsageStats } from "./fleet.mjs";
 
 function semanticAcceptance(raw, superseded = false) {
@@ -31,25 +31,26 @@ function workerInfrastructureKind(record) {
   return peerKind ?? failureKind ?? (record.acceptance === "accepted" && record.transportStatus === "done" ? null : "unknown");
 }
 
+function addPeerVerdict(byEngine, engine, ids, verdict, record) {
+  const entries = byEngine.get(engine);
+  if (!entries) {
+    return;
+  }
+  for (const id of new Set(ids.filter((value) => typeof value === "string" && value.trim()))) {
+    entries.set(id, { acceptance: verdict, infrastructureKind: workerInfrastructureKind(record), taskId: record.taskId ?? null });
+  }
+}
+
 function peerVerdictMap(records) {
   const byEngine = new Map(ENGINE_IDS.map((engine) => [engine, new Map()]));
-  const add = (engine, ids, verdict, record) => {
-    const entries = byEngine.get(engine);
-    if (!entries) {
-      return;
-    }
-    for (const id of new Set(ids.filter((value) => typeof value === "string" && value.trim()))) {
-      entries.set(id, { acceptance: verdict, infrastructureKind: workerInfrastructureKind(record), taskId: record.taskId ?? null });
-    }
-  };
   for (const record of records) {
     const continuations = Array.isArray(record.continuations) ? record.continuations : [];
     const priorIds = new Set(continuations.flatMap((round) => [...(Array.isArray(round?.peerJobIds) ? round.peerJobIds : []), round?.peerJobId]));
     const currentIds = [...(Array.isArray(record.peerJobIds) ? record.peerJobIds : []), record.peerJobId].filter((id) => !priorIds.has(id));
-    add(record.peerEngine, currentIds, record.acceptance, record);
-    add(record.expectedPeerEngine, [record.expectedPeerJobId], record.acceptance, record);
+    addPeerVerdict(byEngine, record.peerEngine, currentIds, record.acceptance, record);
+    addPeerVerdict(byEngine, record.expectedPeerEngine, [record.expectedPeerJobId], record.acceptance, record);
     for (const continuation of continuations) {
-      add(record.peerEngine, [...(Array.isArray(continuation?.peerJobIds) ? continuation.peerJobIds : []), continuation?.peerJobId], continuation?.acceptance, continuation);
+      addPeerVerdict(byEngine, record.peerEngine, [...(Array.isArray(continuation?.peerJobIds) ? continuation.peerJobIds : []), continuation?.peerJobId], continuation?.acceptance, continuation);
     }
   }
   return byEngine;
@@ -64,39 +65,16 @@ export function workerSnapshot(env) {
   };
 }
 
-export function automaticPeerInfrastructureKind(raw, joined = null) {
-  // Older peer runtimes wrote rejected on failed transport without a verdict source or
-  // semantic failure kind. A sourced rejection (or a semantic failure kind) was judged.
-  if (raw?.semanticStatus === "accepted" || (raw?.semanticStatus !== "rejected" && raw?.acceptance !== "rejected")) {
-    return null;
-  }
-  if (raw?.acceptanceSource || raw?.acceptanceRecordedAt || raw?.semanticFailureKind || ["accepted", "rejected"].includes(joined?.acceptance) || !["error", "cancelled"].includes(raw?.status)) {
-    return null;
-  }
-  const kind = nonEmptyString(raw?.failureKind);
-  return PEER_INFRASTRUCTURE_FAILURE_KINDS.has(kind) ? kind : null;
-}
-
-export function acceptanceGap(raw, joined, epoch) {
-  const created = Date.parse(raw?.createdAt ?? "");
-  if (Number.isFinite(created) && created < epoch.timestamp) {
-    return "preTracking";
-  }
+export function acceptanceGap(raw, joined) {
   return joined ? "unsettled" : "direct";
 }
 
 export function emptyAcceptanceGaps() {
-  return { unsettled: 0, direct: 0, preTracking: 0 };
+  return { unsettled: 0, direct: 0 };
 }
 
 export function resolvedEngineAcceptance(raw, engine, verdicts, superseded = false) {
   const joined = verdicts.get(engine)?.get(raw?.id);
-  if (automaticPeerInfrastructureKind(raw, joined)) {
-    return "rejected";
-  }
-  if (raw?.semanticStatus === "rejected" && !raw?.acceptanceSource && !raw?.acceptanceRecordedAt && !raw?.semanticFailureKind && PEER_INFRASTRUCTURE_FAILURE_KINDS.has(raw?.failureKind) && ["error", "cancelled"].includes(raw?.status) && ["accepted", "rejected"].includes(joined?.acceptance)) {
-    return joined.acceptance;
-  }
   const own = [raw?.semanticStatus, raw?.acceptance].find((value) => value === "accepted" || value === "rejected");
   if (own === "accepted" || own === "rejected") {
     return own;
@@ -131,6 +109,10 @@ function acceptanceProvenance(raw) {
   };
 }
 
+function includeWorkspaceJob(job, all, descriptor, cwd, workspaceRoot, repositoryCache) {
+  return all || descriptor.matchesWorkspace(job, cwd, workspaceRoot, repositoryCache);
+}
+
 export function fileBasedEngineStats(descriptor, { all = false, env = process.env, cwd = process.cwd(), workers = null } = {}) {
   const root = resolveStateRoot(descriptor, env);
   const availableRoots = descriptor.multiRootState ? engineStateRoots(descriptor.id, env) : [root];
@@ -148,11 +130,10 @@ export function fileBasedEngineStats(descriptor, { all = false, env = process.en
   }
   const workspaceRoot = typeof descriptor.resolveScope === "function" ? descriptor.resolveScope(cwd) : cwd;
   const repositoryCache = new Map();
-  const include = (job) => all || descriptor.matchesWorkspace(job, cwd, workspaceRoot, repositoryCache);
   const candidates = all
     ? jobs
-    : jobs.map((job) => include(job) && !job?._fusionScopeKey ? { ...job, _fusionScopeKey: fusionWorkspaceKey(workspaceRoot) } : job);
-  const scoped = selectPreferredJobs(candidates, descriptor, include);
+    : jobs.map((job) => includeWorkspaceJob(job, all, descriptor, cwd, workspaceRoot, repositoryCache) && !job?._fusionScopeKey ? { ...job, _fusionScopeKey: fusionWorkspaceKey(workspaceRoot) } : job);
+  const scoped = selectPreferredJobs(candidates, descriptor, (job) => includeWorkspaceJob(job, all, descriptor, cwd, workspaceRoot, repositoryCache));
   if (descriptor.requiresScopedJobs && !all && scoped.length === 0) {
     return { available: false, reason: descriptor.unavailableReason };
   }
@@ -180,8 +161,6 @@ export function fileBasedEngineStats(descriptor, { all = false, env = process.en
   let pendingTransportJobs = 0;
   const acceptedWithErrorTransport = [];
   const doneWithoutAcceptance = [];
-  let historicalAcceptanceAnomalies = 0;
-  const acceptanceEpoch = resolveAcceptanceEpoch(env);
   const codexSkuTelemetryEntries = [];
   let durationSum = 0;
   let durationCount = 0;
@@ -191,7 +170,7 @@ export function fileBasedEngineStats(descriptor, { all = false, env = process.en
     const job = descriptor.normalizeJob(raw);
     const acceptance = resolvedEngineAcceptance(raw, descriptor.id, verdicts, descriptor.usesSupersededJobs && isSupersededCodexJob(raw, scoped));
     const joined = verdicts.get(descriptor.id)?.get(raw?.id);
-    const infrastructureKind = joined?.infrastructureKind ?? automaticPeerInfrastructureKind(raw, joined);
+    const infrastructureKind = joined?.infrastructureKind ?? null;
     let model = null;
     let effort = null;
     bump(byStatus, job.status);
@@ -238,7 +217,7 @@ export function fileBasedEngineStats(descriptor, { all = false, env = process.en
     if (descriptor.isTerminal(raw)) {
       bump(byAcceptance, acceptance);
       if (acceptance === "untracked" || acceptance === "unverified") {
-        acceptanceGaps[acceptanceGap(raw, joined, acceptanceEpoch)] += 1;
+        acceptanceGaps[acceptanceGap(raw, joined)] += 1;
       }
       countJudged(judgedExcludingInfrastructure, acceptance, infrastructureKind);
       if (infrastructureKind) {
@@ -250,20 +229,11 @@ export function fileBasedEngineStats(descriptor, { all = false, env = process.en
     }
     if (descriptor.usesAcceptanceEpoch) {
       const jobId = nonEmptyString(raw?.id);
-      const historical = Number.isFinite(Date.parse(raw?.finishedAt ?? "")) && Date.parse(raw.finishedAt) < acceptanceEpoch.timestamp;
       if (jobId && job.status === "error" && acceptance === "accepted" && !RESUMABLE_CODEX_FAILURE_KINDS.has(nonEmptyString(raw?.failureKind))) {
-        if (historical) {
-          historicalAcceptanceAnomalies += 1;
-        } else {
-          acceptedWithErrorTransport.push(jobId);
-        }
+        acceptedWithErrorTransport.push(jobId);
       }
       if (jobId && job.status === "done" && (acceptance === "unverified" || acceptance === "untracked")) {
-        if (historical) {
-          historicalAcceptanceAnomalies += 1;
-        } else {
-          doneWithoutAcceptance.push(jobId);
-        }
+        doneWithoutAcceptance.push(jobId);
       }
     }
     if (descriptor.includeTokenUsage && descriptor.isTerminal(raw)) {
@@ -319,8 +289,7 @@ export function fileBasedEngineStats(descriptor, { all = false, env = process.en
           pendingTransportJobs,
           acceptanceAnomalies: {
             acceptedWithErrorTransport,
-            doneWithoutAcceptance,
-            ...(historicalAcceptanceAnomalies > 0 ? { historicalPreEpoch: historicalAcceptanceAnomalies, historicalEpoch: acceptanceEpoch.value } : {})
+            doneWithoutAcceptance
           }
         }
       : { acceptanceScope: "terminal transport jobs only", pendingTransportJobs }),
@@ -410,14 +379,13 @@ export function claudeWorkerStats({ all = false, env = process.env, cwd = proces
     if (record.resolvedModel) {
       bump(byModel, record.resolvedModel);
     }
-    const legacyHarnessAsyncDelivery = record.failureKind === "unexpected_async" && status === "done";
-    if (record.deliveryMode === "harness_async" || legacyHarnessAsyncDelivery) {
+    if (record.deliveryMode === "harness_async") {
       harnessAsyncDeliveries += 1;
     }
-    if (record.failureKind && !legacyHarnessAsyncDelivery) {
+    if (record.failureKind) {
       bump(byFailureKind, record.failureKind);
     }
-    if (isTerminalWorkerStatus(status)) {
+    if (WORKER_TERMINAL_STATUSES.has(status)) {
       const acceptance = CODEX_ACCEPTANCE_STATES.has(record.acceptance) ? record.acceptance : "unverified";
       const infrastructureKind = workerInfrastructureKind(record);
       bump(byAcceptance, acceptance);
@@ -525,12 +493,12 @@ export const WORKSPACE_ENGINE_DESCRIPTORS = [
     displayName: ENGINES.grok.displayName,
     unavailableReason: FILE_ENGINE_DESCRIPTORS.grok.unavailableReason,
     resolveRoot: (env) => engineStateRoots("grok", env)[0],
-    enumerateJobs: readGrokJobEvidence,
+    enumerateJobs: readWorkspaceJobFiles,
     traceModel: (raw) => nonEmptyString(raw?.request?.model),
     traceEffort: (raw) => nonEmptyString(raw?.request?.effort),
     cwdOf: (raw) => (typeof raw.cwd === "string" ? raw.cwd : null),
     sessionOf: (raw) => (typeof raw.claudeSessionId === "string" ? raw.claudeSessionId : null),
-    isLive: (raw) => !GROK_TERMINAL_STATUSES.has(raw.status)
+    isLive: (raw) => !ENGINE_TERMINAL_STATUSES.has(raw.status)
   },
   {
     id: "codex",
@@ -546,16 +514,16 @@ export const WORKSPACE_ENGINE_DESCRIPTORS = [
     traceEffort: (raw, env, auditCache) => resolveCodexJobEffort(raw, observationForJob(raw, env, auditCache)),
     cwdOf: (raw) => (typeof raw.workspaceRoot === "string" ? raw.workspaceRoot : null),
     sessionOf: (raw) => nonEmptyString(raw?.sessionId) ?? nonEmptyString(raw?.claudeSessionId),
-    isLive: (raw) => !CODEX_TERMINAL_STATUSES.has(raw.status),
+    isLive: (raw) => !ENGINE_TERMINAL_STATUSES.has(raw.status),
     dedupeById: true,
-    isTerminal: (raw) => CODEX_TERMINAL_STATUSES.has(raw.status)
+    isTerminal: (raw) => ENGINE_TERMINAL_STATUSES.has(raw.status)
   },
   {
     id: "cursor",
     displayName: ENGINES.cursor.displayName,
     unavailableReason: FILE_ENGINE_DESCRIPTORS.cursor.unavailableReason,
     resolveRoot: (env) => engineStateRoots("cursor", env)[0],
-    enumerateJobs: readGrokJobEvidence,
+    enumerateJobs: readWorkspaceJobFiles,
     traceModel: (raw) => nonEmptyString(raw?.resolvedModel),
     traceEffort: (raw) => raw?.effortApplied === true ? nonEmptyString(raw?.requestedEffort) : null,
     cwdOf: (raw) => (typeof raw.cwd === "string" ? raw.cwd : null),
@@ -628,7 +596,7 @@ function unsettledTimestamp(entry) {
 
 function unsettledWorkerEntries(env) {
   return readWorkerRecords(env)
-    .filter((record) => isTerminalWorkerStatus(record.transportStatus) && semanticAcceptance(record) === "unverified")
+    .filter((record) => WORKER_TERMINAL_STATUSES.has(record.transportStatus) && semanticAcceptance(record) === "unverified")
     .map((record) => ({
       engine: "fusion",
       id: nonEmptyString(record.taskId) ?? "unknown",

@@ -1,6 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
-import { canonicalWorkerAgentType, isFusionWorkerAgent, isTerminalWorkerStatus, readSessionWorkerRecords, refreshWorkerTranscript, reopenWorkerContinuation, updateWorkerRecord } from "../worker-state.mjs";
+import { canonicalWorkerAgentType, isFusionWorkerAgent, WORKER_TERMINAL_STATUSES, readSessionWorkerRecords, refreshWorkerTranscript, reopenWorkerContinuation, updateWorkerRecord } from "../worker-state.mjs";
 import { observeTerminalTokenUsage } from "./usage.mjs";
 
 function updateLifecycleWorkerRecord(taskId, env, updater) {
@@ -11,7 +11,7 @@ function updateLifecycleWorkerRecord(taskId, env, updater) {
 
 function pendingDispatchForStart(input, env) {
   const canonical = canonicalWorkerAgentType(input.agent_type);
-  const pending = readSessionWorkerRecords(env, input.session_id, { strict: true }).filter((record) => canonicalWorkerAgentType(record.agentType) === canonical && !isTerminalWorkerStatus(record.transportStatus) && !record.agentId);
+  const pending = readSessionWorkerRecords(env, input.session_id, { strict: true }).filter((record) => canonicalWorkerAgentType(record.agentType) === canonical && !WORKER_TERMINAL_STATUSES.has(record.transportStatus) && !record.agentId);
   return pending.length === 1 ? pending[0] : null;
 }
 
@@ -28,11 +28,11 @@ function recordForAgent(input, env) {
     }
   }
   record ??= findSessionWorkerRecord((candidate) => candidate.agentId === input.agent_id, input.session_id, env);
-  if (!record || !isFusionWorkerAgent(input.agent_type) || !isTerminalWorkerStatus(record.transportStatus)) {
+  if (!record || !isFusionWorkerAgent(input.agent_type) || !WORKER_TERMINAL_STATUSES.has(record.transportStatus)) {
     return record;
   }
   return updateLifecycleWorkerRecord(record.taskId, env, (current) => {
-    if (!current || current.sessionId !== input.session_id || current.agentId !== input.agent_id || !isTerminalWorkerStatus(current.transportStatus) || !continuationRequestIsNewer(current)) {
+    if (!current || current.sessionId !== input.session_id || current.agentId !== input.agent_id || !WORKER_TERMINAL_STATUSES.has(current.transportStatus) || !continuationRequestIsNewer(current)) {
       return null;
     }
     return reopenWorkerContinuation(current, new Date(Math.max(Date.now(), Date.parse(current.continuationRequestedAt))).toISOString(), current.continuationRequestedTranscriptBytes);
@@ -81,7 +81,7 @@ function sendMessageResumed(response, recordedStatus) {
       }
     }
   }
-  return isTerminalWorkerStatus(recordedStatus) || recordedStatus === "ready_uncollected";
+  return WORKER_TERMINAL_STATUSES.has(recordedStatus) || recordedStatus === "ready_uncollected";
 }
 
 function findSessionWorkerRecord(predicate, sessionId, env) {
@@ -127,7 +127,7 @@ function refreshRecord(record, input, env) {
 }
 
 function activeSessionRecords(sessionId, env) {
-  return readSessionWorkerRecords(env, sessionId, { strict: true }).filter((record) => !isTerminalWorkerStatus(record.transportStatus));
+  return readSessionWorkerRecords(env, sessionId, { strict: true }).filter((record) => !WORKER_TERMINAL_STATUSES.has(record.transportStatus));
 }
 
 function sessionRecords(sessionId, env) {

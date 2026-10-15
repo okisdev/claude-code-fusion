@@ -5,6 +5,10 @@ import path from "node:path";
 import { assertManifestPins } from "../lib.mjs";
 import { readModelRoutingFile, resolveModelRoutingPath } from "../../plugins/fusion/scripts/lib/model-table.mjs";
 
+function cell(value) {
+  return String(value ?? "").replaceAll("|", "\\|").replaceAll("\n", " ");
+}
+
 function parseArgs(argv) {
   let results = null;
   let routing = null;
@@ -151,7 +155,6 @@ function proposalReport(rows, json) {
     }, null, 2);
   }
   const headers = ["lane", "model", "runs", "pass rate", "median wall clock seconds", "lane median pass rate", "suggestion"];
-  const cell = (value) => String(value ?? "").replaceAll("|", "\\|").replaceAll("\n", " ");
   const lines = [
     "Suggestions require human review; this command does not write any files.",
     `| ${headers.join(" | ")} |`,
@@ -175,7 +178,6 @@ function proposalReport(rows, json) {
 function markdown(rows) {
   const columns = ["taskId", "engine", "model", "effort", "runs", "pass", "fail", "infra", "unscored", "medianWallClockSeconds", "medianInputTokens", "medianOutputTokens", "failureKinds"];
   const headers = ["taskId", "engine", "model", "effort", "runs", "pass", "fail", "infra", "unscored", "median wall clock seconds", "median input tokens", "median output tokens", "failure kinds"];
-  const cell = (value) => String(value ?? "").replaceAll("|", "\\|").replaceAll("\n", " ");
   return [`| ${headers.join(" | ")} |`, `| ${headers.map(() => "---").join(" | ")} |`, ...rows.map((row) => `| ${columns.map((column) => cell(row[column])).join(" | ")} |`)].join("\n");
 }
 

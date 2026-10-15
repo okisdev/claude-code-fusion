@@ -54,6 +54,33 @@ export function killSpawnGroup(pid) {
   try { process.kill(-pid, "SIGKILL"); } catch {}
 }
 
+function captureOutput() {
+  const buffer = Buffer.allocUnsafe(CAPTURE_BYTES);
+  let bytes = 0;
+  let truncated = false;
+  return {
+    add(chunk) {
+      const remaining = CAPTURE_BYTES - bytes;
+      if (chunk.length > remaining) truncated = true;
+      if (remaining > 0) {
+        const copied = Math.min(chunk.length, remaining);
+        chunk.copy(buffer, bytes, 0, copied);
+        bytes += copied;
+      }
+    },
+    text() {
+      const marker = `\n[output truncated after ${CAPTURE_BYTES} bytes]\n`;
+      return truncated ? Buffer.concat([buffer.subarray(0, CAPTURE_BYTES - Buffer.byteLength(marker)), Buffer.from(marker)]).toString("utf8") : buffer.subarray(0, bytes).toString("utf8");
+    }
+  };
+}
+
+function signalGroup(child, signal) {
+  if (!child.pid) return;
+  try { process.kill(-child.pid, signal); }
+  catch { try { child.kill(signal); } catch {} }
+}
+
 export function runBounded(bin, args, { cwd, env, timeoutMs, label }) {
   return new Promise((resolve, reject) => {
     let child;
@@ -64,47 +91,22 @@ export function runBounded(bin, args, { cwd, env, timeoutMs, label }) {
       return;
     }
     const started = process.hrtime.bigint();
-    const capture = () => {
-      const buffer = Buffer.allocUnsafe(CAPTURE_BYTES);
-      let bytes = 0;
-      let truncated = false;
-      return {
-        add(chunk) {
-          const remaining = CAPTURE_BYTES - bytes;
-          if (chunk.length > remaining) truncated = true;
-          if (remaining > 0) {
-            const copied = Math.min(chunk.length, remaining);
-            chunk.copy(buffer, bytes, 0, copied);
-            bytes += copied;
-          }
-        },
-        text() {
-          const marker = `\n[output truncated after ${CAPTURE_BYTES} bytes]\n`;
-          return truncated ? Buffer.concat([buffer.subarray(0, CAPTURE_BYTES - Buffer.byteLength(marker)), Buffer.from(marker)]).toString("utf8") : buffer.subarray(0, bytes).toString("utf8");
-        }
-      };
-    };
-    const stdout = capture();
-    const stderr = capture();
+    const stdout = captureOutput();
+    const stderr = captureOutput();
     child.stdout.on("data", (chunk) => stdout.add(chunk));
     child.stderr.on("data", (chunk) => stderr.add(chunk));
-    const signalGroup = (signal) => {
-      if (!child.pid) return;
-      try { process.kill(-child.pid, signal); }
-      catch { try { child.kill(signal); } catch {} }
-    };
     let timedOut = false;
     let startError = null;
     child.on("error", (error) => { startError = error; });
     let killTimer;
     const timer = setTimeout(() => {
       timedOut = true;
-      signalGroup("SIGTERM");
-      killTimer = setTimeout(() => signalGroup("SIGKILL"), KILL_GRACE_MS);
+      signalGroup(child, "SIGTERM");
+      killTimer = setTimeout(() => signalGroup(child, "SIGKILL"), KILL_GRACE_MS);
     }, timeoutMs);
     child.on("close", (code, signal) => {
       clearTimeout(timer);
-      if (timedOut) signalGroup("SIGKILL");
+      if (timedOut) signalGroup(child, "SIGKILL");
       clearTimeout(killTimer);
       if (startError) {
         reject(new Error(startError.code === "ENOENT" ? `${label} binary not found: ${bin}` : `${label} failed to start: ${startError.message}`));
@@ -118,7 +120,7 @@ export function runBounded(bin, args, { cwd, env, timeoutMs, label }) {
 export function collectPluginVersions(env = process.env) {
   const versions = {};
   const marketplace = readJsonFile(path.join(REPO_ROOT, ".claude-plugin", "marketplace.json"));
-  const marketplaceVersion = marketplace?.version ?? marketplace?.metadata?.version;
+  const marketplaceVersion = marketplace?.version;
   versions["claude-code-fusion"] = typeof marketplaceVersion === "string" ? marketplaceVersion : null;
   for (const source of PLUGIN_VERSION_FILES) {
     const plugin = readJsonFile(source.file);

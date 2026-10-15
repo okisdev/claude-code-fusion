@@ -1,7 +1,8 @@
+import { PEER_RESCUE_AGENT_NAMES, PEER_MANAGED_AGENT_NAMES } from "../engines.mjs";
 import path from "node:path";
-import { ENGINE_ID_ALTERNATION, PEER_JOB_FOOTER_AGENTS, PEER_RESCUE_AGENT_NAMES, engineDisplayNameList } from "../engines.mjs";
+import { ENGINE_ID_ALTERNATION, PEER_JOB_FOOTER_AGENTS, engineDisplayNameList } from "../engines.mjs";
 import { tagMessage } from "../user-messages.mjs";
-import { canonicalWorkerAgentType, isFusionWorkerAgent, isTerminalWorkerStatus, markWorkerCollected, readWorkerRecord, readWorkerOutputFileTaskIds, readSessionWorkerRecords, refreshWorkerTranscript, reopenWorkerContinuation, WORKER_COLLECTION_METHODS } from "../worker-state.mjs";
+import { canonicalWorkerAgentType, isFusionWorkerAgent, WORKER_TERMINAL_STATUSES, markWorkerCollected, readWorkerRecord, readWorkerOutputFileTaskIds, readSessionWorkerRecords, refreshWorkerTranscript, reopenWorkerContinuation, WORKER_COLLECTION_METHODS } from "../worker-state.mjs";
 import { markBudgetFailure, workerBudgetFailure, workerRoundUsage } from "./budget.mjs";
 import { backfillCollectedTaskOutput, capturedPeerIdentity, collectedHarnessAsyncDelivery, noTaskFoundError, outputFileFromLaunchResponse, peerIdentityBackfill, settleQueuedVerdict, settleReapedIfActive, taskOutputResultText, terminalCollectedRecord, terminalCollectionPending } from "./collection.mjs";
 import { allowAgentWithTaskId, claimParentContextAdvisory, collectorRequestIdentity, createDispatch, injectedPeerDefaults, latestUserRequestedBackground, parentContextTokens, promptText, validateWorkerBrief } from "./dispatch.mjs";
@@ -9,15 +10,15 @@ import { reconcileTaskNotifications, taskNotificationTransition } from "./notifi
 import { denyTool, hookOutput, writeOutput } from "./output.mjs";
 import { activeSessionRecords, clearContinuationRequest, findSessionWorkerRecord, isAttributedTranscriptPath, parentTranscriptByteSize, recordForAgent, refreshRecord, sendMessageResumed, updateLifecycleWorkerRecord } from "./records.mjs";
 import { canonicalToolResponseUsage } from "./usage.mjs";
-import { READ_ONLY_TOOLS, PEER_WRAPPER_AGENTS, MANAGED_PEER_AGENTS } from "./constants.mjs";
+import { READ_ONLY_TOOLS } from "./constants.mjs";
 
 function handlePreToolUse(input, env) {
   if (!input.agent_id && ["TaskStop", "TaskOutput"].includes(input.tool_name) && typeof input.tool_input?.task_id === "string") {
     const taskId = input.tool_input.task_id;
     const now = new Date().toISOString();
-    for (const record of readSessionWorkerRecords(env, input.session_id, { strict: true }).filter((candidate) => !isTerminalWorkerStatus(candidate.transportStatus) && [candidate.backgroundTaskId, candidate.agentId].includes(taskId))) {
+    for (const record of readSessionWorkerRecords(env, input.session_id, { strict: true }).filter((candidate) => !WORKER_TERMINAL_STATUSES.has(candidate.transportStatus) && [candidate.backgroundTaskId, candidate.agentId].includes(taskId))) {
       updateLifecycleWorkerRecord(record.taskId, env, (current) => {
-        if (!current || current.sessionId !== input.session_id || isTerminalWorkerStatus(current.transportStatus) || ![current.backgroundTaskId, current.agentId].includes(taskId)) {
+        if (!current || current.sessionId !== input.session_id || WORKER_TERMINAL_STATUSES.has(current.transportStatus) || ![current.backgroundTaskId, current.agentId].includes(taskId)) {
           return null;
         }
         return {
@@ -30,7 +31,7 @@ function handlePreToolUse(input, env) {
   }
   if (input.tool_name === "Agent" || input.tool_name === "Task") {
     const agentType = input.tool_input?.subagent_type;
-    if (PEER_WRAPPER_AGENTS.has(agentType)) {
+    if (PEER_RESCUE_AGENT_NAMES.has(agentType)) {
       if (input.tool_input?.run_in_background === true) {
         writeOutput(denyTool(tagMessage("worker-lifecycle.foreground-wrapper-deny", `${engineDisplayNameList()} wrapper Agents use foreground delivery. Keep the Agent foreground; an explicitly requested companion \`--background\` receipt stays inside that foreground wrapper call.`)));
         return;
@@ -42,7 +43,7 @@ function handlePreToolUse(input, env) {
       }
       return;
     }
-    if (MANAGED_PEER_AGENTS.has(agentType)) {
+    if (PEER_MANAGED_AGENT_NAMES.has(agentType)) {
       return;
     }
     if (!isFusionWorkerAgent(agentType)) {
@@ -101,14 +102,14 @@ function handlePreToolUse(input, env) {
     return;
   }
   const refreshed = refreshRecord(record, input, env);
-  if (isTerminalWorkerStatus(refreshed.transportStatus)) {
+  if (WORKER_TERMINAL_STATUSES.has(refreshed.transportStatus)) {
     return;
   }
   const failure = workerBudgetFailure(refreshed);
   if (failure?.failureKind === "stall") {
     const now = new Date().toISOString();
     updateLifecycleWorkerRecord(refreshed.taskId, env, (current) => {
-      if (!current || isTerminalWorkerStatus(current.transportStatus)) {
+      if (!current || WORKER_TERMINAL_STATUSES.has(current.transportStatus)) {
         return null;
       }
       return { ...current, lastLivenessAt: now, lastActivityAt: now, inFlightSince: now };
@@ -121,7 +122,7 @@ function handlePreToolUse(input, env) {
       const now = new Date().toISOString();
       let terminalWriteGraceUsed = false;
       updateLifecycleWorkerRecord(refreshed.taskId, env, (current) => {
-        if (!current || isTerminalWorkerStatus(current.transportStatus) || current.terminalWriteGraceUsedAt) {
+        if (!current || WORKER_TERMINAL_STATUSES.has(current.transportStatus) || current.terminalWriteGraceUsedAt) {
           return null;
         }
         terminalWriteGraceUsed = true;
@@ -138,7 +139,7 @@ function handlePreToolUse(input, env) {
   }
   const now = new Date().toISOString();
   updateLifecycleWorkerRecord(refreshed.taskId, env, (current) => {
-    if (!current || isTerminalWorkerStatus(current.transportStatus)) {
+    if (!current || WORKER_TERMINAL_STATUSES.has(current.transportStatus)) {
       return null;
     }
     return { ...current, lastActivityAt: now, inFlightSince: now };
@@ -163,7 +164,7 @@ function handlePostToolUse(input, env, failed = false) {
         const collected = current.transportStatus === "ready_uncollected"
           ? taskNotificationTransition(current, { status: "completed" }, at, env)
           : current;
-        const next = isTerminalWorkerStatus(collected.transportStatus) && !alreadyReopened
+        const next = WORKER_TERMINAL_STATUSES.has(collected.transportStatus) && !alreadyReopened
           ? reopenWorkerContinuation(collected, at, current.continuationRequestedTranscriptBytes ?? parentTranscriptByteSize(current, input))
           : collected;
         return current.continuationRequestedAt ? clearContinuationRequest(next) : next === current ? null : next;
@@ -191,7 +192,7 @@ function handlePostToolUse(input, env, failed = false) {
         : null;
       if (pending) {
         const now = new Date().toISOString();
-        updateLifecycleWorkerRecord(pending.taskId, env, (current) => current && !isTerminalWorkerStatus(current.transportStatus)
+        updateLifecycleWorkerRecord(pending.taskId, env, (current) => current && !WORKER_TERMINAL_STATUSES.has(current.transportStatus)
           ? settleQueuedVerdict({
               ...current,
               transportStatus: "failed",
@@ -223,7 +224,7 @@ function handlePostToolUse(input, env, failed = false) {
       : readSessionWorkerRecords(env, input.session_id, { strict: true });
     if (["TaskOutput", "TaskStop"].includes(input.tool_name) && taskId && noTaskFoundError(input, failed)) {
       const now = new Date().toISOString();
-      for (const record of records.filter((candidate) => candidate.sessionId === input.session_id && !isTerminalWorkerStatus(candidate.transportStatus) && [candidate.backgroundTaskId, candidate.agentId].includes(taskId))) {
+      for (const record of records.filter((candidate) => candidate.sessionId === input.session_id && !WORKER_TERMINAL_STATUSES.has(candidate.transportStatus) && [candidate.backgroundTaskId, candidate.agentId].includes(taskId))) {
         settleReapedIfActive(record.taskId, now, env, (current) => current.sessionId === input.session_id && [current.backgroundTaskId, current.agentId].includes(taskId));
       }
       return;
@@ -281,7 +282,7 @@ function handlePostToolUse(input, env, failed = false) {
   }
   if ((input.tool_name === "Agent" || input.tool_name === "Task") && !input.agent_id) {
     const agentType = input.tool_input?.subagent_type;
-    if (PEER_WRAPPER_AGENTS.has(agentType)) {
+    if (PEER_RESCUE_AGENT_NAMES.has(agentType)) {
       if (failed) {
         return;
       }
@@ -327,7 +328,7 @@ function handlePostToolUse(input, env, failed = false) {
           return null;
         }
         const worker = current;
-        const transportStatus = failed ? "failed" : isAsync ? "pending_async" : completed && !isTerminalWorkerStatus(worker.transportStatus) ? "done" : worker.transportStatus === "dispatching" ? "running" : worker.transportStatus;
+        const transportStatus = failed ? "failed" : isAsync ? "pending_async" : completed && !WORKER_TERMINAL_STATUSES.has(worker.transportStatus) ? "done" : worker.transportStatus === "dispatching" ? "running" : worker.transportStatus;
         const updated = {
           ...(!failed && completed ? markWorkerCollected(worker, WORKER_COLLECTION_METHODS.AGENT_RESULT, now) : worker),
           ...(agentId ? { agentId, backgroundTaskId: isAsync ? agentId : worker.backgroundTaskId } : {}),
@@ -343,7 +344,7 @@ function handlePostToolUse(input, env, failed = false) {
           runtimeAsync: isAsync,
           ...(isAsync ? { startedAt: worker.startedAt ?? now } : {})
         };
-        return isTerminalWorkerStatus(transportStatus) ? settleQueuedVerdict(updated, now, env) : updated;
+        return WORKER_TERMINAL_STATUSES.has(transportStatus) ? settleQueuedVerdict(updated, now, env) : updated;
       });
     }
     return;
@@ -360,7 +361,7 @@ function handlePostToolUse(input, env, failed = false) {
   let emitTokenWindDown = false;
   let emitUncachedWindDown = false;
   updateLifecycleWorkerRecord(record.taskId, env, (current) => {
-    if (!current || isTerminalWorkerStatus(current.transportStatus)) {
+    if (!current || WORKER_TERMINAL_STATUSES.has(current.transportStatus)) {
       return null;
     }
     const selectedTranscript = isAttributedTranscriptPath(input.transcript_path, record) ? input.transcript_path : null;
@@ -370,9 +371,9 @@ function handlePostToolUse(input, env, failed = false) {
     const tokenWindDownThreshold = (refreshed.limits?.maxOutputTokens ?? Number.POSITIVE_INFINITY) * 0.85;
     const uncachedWindDownThreshold = (refreshed.limits?.maxUncachedTokens ?? Number.POSITIVE_INFINITY) * 0.85;
     const usage = workerRoundUsage(refreshed);
-    emitTokenWindDown = !isTerminalWorkerStatus(refreshed.transportStatus) && refreshed.tokenWindDownSentAt == null && usage.outputTokens >= tokenWindDownThreshold;
-    emitUncachedWindDown = !emitTokenWindDown && !isTerminalWorkerStatus(refreshed.transportStatus) && refreshed.uncachedWindDownSentAt == null && usage.uncachedTokens >= uncachedWindDownThreshold;
-    emitTurnWindDown = !emitTokenWindDown && !emitUncachedWindDown && !isTerminalWorkerStatus(refreshed.transportStatus) && refreshed.windDownContextSentAt == null && usage.turns >= turnWindDownThreshold;
+    emitTokenWindDown = !WORKER_TERMINAL_STATUSES.has(refreshed.transportStatus) && refreshed.tokenWindDownSentAt == null && usage.outputTokens >= tokenWindDownThreshold;
+    emitUncachedWindDown = !emitTokenWindDown && !WORKER_TERMINAL_STATUSES.has(refreshed.transportStatus) && refreshed.uncachedWindDownSentAt == null && usage.uncachedTokens >= uncachedWindDownThreshold;
+    emitTurnWindDown = !emitTokenWindDown && !emitUncachedWindDown && !WORKER_TERMINAL_STATUSES.has(refreshed.transportStatus) && refreshed.windDownContextSentAt == null && usage.turns >= turnWindDownThreshold;
     return {
       ...refreshed,
       lastActivityAt: now,

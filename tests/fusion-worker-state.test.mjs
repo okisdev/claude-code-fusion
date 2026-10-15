@@ -340,31 +340,23 @@ test("created worker records stamp the Fusion companion version", (t) => {
   assert.strictEqual(record.companionVersion, expectedVersion);
 });
 
-test("worker records create and normalize the nullable peer failure kind", (t) => {
+test("worker records create a nullable peer failure kind", (t) => {
   const directory = sandbox(t);
   const env = { FUSION_WORKER_STATE_DIR: path.join(directory, "worker-state") };
   const taskId = "fusion-peer-failure-kind";
   const created = createWorkerRecord({ taskId, sessionId: "session-peer-kind", agentType: "fusion:claude-worker", workspaceRoot: directory }, env);
   assert.strictEqual(created.peerFailureKind, null);
 
-  const file = path.join(env.FUSION_WORKER_STATE_DIR, "jobs", `${taskId}.json`);
-  const stored = JSON.parse(fs.readFileSync(file, "utf8"));
-  delete stored.peerFailureKind;
-  fs.writeFileSync(file, `${JSON.stringify(stored, null, 2)}\n`, "utf8");
   assert.strictEqual(readWorkerRecord(taskId, env).peerFailureKind, null);
 });
 
-test("peer wrapper records start with an empty job history and older records load one", (t) => {
+test("peer wrapper records start with an empty job history", (t) => {
   const directory = sandbox(t);
   const env = { FUSION_WORKER_STATE_DIR: path.join(directory, "worker-state") };
   for (const [index, agentType] of ["codex:codex-rescue", "grok:grok-rescue", "grok:grok-review-runner"].entries()) {
     const taskId = `fusion-peer-history-${index}`;
     const created = createWorkerRecord({ taskId, sessionId: "session-peer-history", agentType, workspaceRoot: directory }, env);
     assert.deepStrictEqual(created.peerJobIds, []);
-    const file = path.join(env.FUSION_WORKER_STATE_DIR, "jobs", `${taskId}.json`);
-    const stored = JSON.parse(fs.readFileSync(file, "utf8"));
-    delete stored.peerJobIds;
-    fs.writeFileSync(file, `${JSON.stringify(stored)}\n`, "utf8");
     assert.deepStrictEqual(readWorkerRecord(taskId, env).peerJobIds, []);
   }
 });

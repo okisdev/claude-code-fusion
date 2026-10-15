@@ -1,11 +1,12 @@
+import { PEER_RESCUE_AGENT_NAMES } from "../engines.mjs";
 import fs from "node:fs";
 import path from "node:path";
 import { recordEngineAcceptance } from "../engine-acceptance.mjs";
 import { PEER_JOB_FOOTER_AGENTS, PEER_MANAGED_AGENTS, engineForAgentType, isEngineId } from "../engines.mjs";
 import { readEngineJobFailureKind } from "../engine-job-state.mjs";
-import { applyQueuedVerdict, backfillWorkerTaskOutputTelemetry, canonicalWorkerAgentType, isSettledWorker, isTerminalWorkerStatus, markWorkerCollected, WORKER_COLLECTION_METHODS, workerRecordFile, writePrivateText } from "../worker-state.mjs";
+import { applyQueuedVerdict, backfillWorkerTaskOutputTelemetry, canonicalWorkerAgentType, isSettledWorker, WORKER_TERMINAL_STATUSES, markWorkerCollected, WORKER_COLLECTION_METHODS, workerRecordFile, writePrivateText } from "../worker-state.mjs";
 import { updateLifecycleWorkerRecord } from "./records.mjs";
-import { FINAL_TEXT_MAX_BYTES, FINAL_TEXT_HEAD_BYTES, FINAL_TEXT_TAIL_BYTES, COLLECTOR_END_MARKER, COLLECTOR_TERMINAL_MARKER, COLLECTOR_OUTCOME_MARKER, PEER_WRAPPER_AGENTS, TERMINAL_RUNTIME_TASK_STATUSES, ENGINE_JOB_ID_PATTERN, WRAPPER_API_DEATH_PATTERN, WRAPPER_API_DEATH_REASON } from "./constants.mjs";
+import { FINAL_TEXT_MAX_BYTES, FINAL_TEXT_HEAD_BYTES, FINAL_TEXT_TAIL_BYTES, COLLECTOR_END_MARKER, COLLECTOR_TERMINAL_MARKER, COLLECTOR_OUTCOME_MARKER, TERMINAL_RUNTIME_TASK_STATUSES, ENGINE_JOB_ID_PATTERN, WRAPPER_API_DEATH_PATTERN, WRAPPER_API_DEATH_REASON } from "./constants.mjs";
 
 function completedReport(record, message) {
   const normalized = message.trimEnd();
@@ -282,13 +283,9 @@ function mergedPeerJobIds(record, ids) {
   return [...new Set([...(Array.isArray(record.peerJobIds) ? record.peerJobIds : []), record.peerJobId, ...ids].filter((id) => typeof id === "string" && ENGINE_JOB_ID_PATTERN.test(id)))];
 }
 
-function peerEngineFromAgentType(agentType) {
-  return engineForAgentType(agentType);
-}
-
 function capturedPeerIdentity(agentType, text, peerEngine, record) {
   const { peerJobId, peerJobIds } = peerJobIdsFromCollectedResult(text);
-  const derivedPeerEngine = peerEngineFromAgentType(agentType);
+  const derivedPeerEngine = engineForAgentType(agentType);
   return peerJobIds.length > 0
     ? {
         ...(peerJobId ? { peerJobId } : {}),
@@ -349,7 +346,7 @@ function settleQueuedVerdict(record, now, env) {
 function wrapperApiDeathEvidence(record, evidence) {
   const texts = [evidence, record.notificationSummary, record.statusDetail, record.finalText].filter((value) => typeof value === "string");
   const finalText = texts.join("\n");
-  return PEER_WRAPPER_AGENTS.has(record.agentType)
+  return PEER_RESCUE_AGENT_NAMES.has(record.agentType)
     && !record.peerJobId
     && !/^job: [0-9a-f]{32}\r?$/m.test(finalText)
     && WRAPPER_API_DEATH_PATTERN.test(finalText);
@@ -402,7 +399,7 @@ function settleReapedWorker(current, now, env) {
 function settleReapedIfActive(taskId, now, env, extraGuard) {
   let settled = false;
   updateLifecycleWorkerRecord(taskId, env, (current) => {
-    if (!current || isTerminalWorkerStatus(current.transportStatus) || !extraGuard(current)) {
+    if (!current || WORKER_TERMINAL_STATUSES.has(current.transportStatus) || !extraGuard(current)) {
       return null;
     }
     settled = true;
@@ -416,18 +413,18 @@ function runtimeTaskIsTerminal(task) {
 }
 
 function terminalTransportObserved(record, task) {
-  return isTerminalWorkerStatus(record.transportStatus)
+  return WORKER_TERMINAL_STATUSES.has(record.transportStatus)
     || ["ready_uncollected", "ready_background"].includes(record.transportStatus)
     || runtimeTaskIsTerminal(task);
 }
 
 function terminalCollectionPending(record) {
   return ["ready_uncollected", "ready_background"].includes(record.transportStatus)
-    || (record.runtimeAsync === true && isTerminalWorkerStatus(record.transportStatus) && !record.collectedAt && !isAutoSettledWrapperApiDeath(record));
+    || (record.runtimeAsync === true && WORKER_TERMINAL_STATUSES.has(record.transportStatus) && !record.collectedAt && !isAutoSettledWrapperApiDeath(record));
 }
 
 function terminalCollectedRecord(record) {
-  return Boolean(record) && isTerminalWorkerStatus(record.transportStatus) && Boolean(record.collectedAt) && (isSettledWorker(record) || record.awaitingVerdict === true || record.acceptance === "unverified");
+  return Boolean(record) && WORKER_TERMINAL_STATUSES.has(record.transportStatus) && Boolean(record.collectedAt) && (isSettledWorker(record) || record.awaitingVerdict === true || record.acceptance === "unverified");
 }
 
 function peerIdentityBackfill(record, identity, env) {
@@ -445,4 +442,4 @@ function peerIdentityBackfill(record, identity, env) {
 }
 
 
-export { completedReport, structuredCollectorReport, retryInstruction, noTaskFoundError, taskOutputTranscriptPaths, collectedHarnessAsyncDelivery, resultTextParts, documentedTaskOutputText, taskOutputResultText, absoluteOutputFile, regularFileExists, durableSubagentTranscript, withDurableCancellationTranscript, withPeerFailureKind, outputFileFromLaunchResponse, finalTextArtifactPath, boundedFinalText, writeFinalTextArtifact, peerJobIdsFromCollectedResult, peerJobIdFromCollectedResult, mergedPeerJobIds, peerEngineFromAgentType, capturedPeerIdentity, backfillCollectedTaskOutput, settleQueuedVerdict, wrapperApiDeathEvidence, settleWrapperApiDeath, isAutoSettledWrapperApiDeath, statusEvidence, settleReapedWorker, settleReapedIfActive, runtimeTaskIsTerminal, terminalTransportObserved, terminalCollectionPending, terminalCollectedRecord, peerIdentityBackfill };
+export { completedReport, structuredCollectorReport, retryInstruction, noTaskFoundError, taskOutputTranscriptPaths, collectedHarnessAsyncDelivery, resultTextParts, documentedTaskOutputText, taskOutputResultText, absoluteOutputFile, regularFileExists, durableSubagentTranscript, withDurableCancellationTranscript, withPeerFailureKind, outputFileFromLaunchResponse, finalTextArtifactPath, boundedFinalText, writeFinalTextArtifact, peerJobIdsFromCollectedResult, peerJobIdFromCollectedResult, mergedPeerJobIds, capturedPeerIdentity, backfillCollectedTaskOutput, settleQueuedVerdict, wrapperApiDeathEvidence, settleWrapperApiDeath, isAutoSettledWrapperApiDeath, statusEvidence, settleReapedWorker, settleReapedIfActive, runtimeTaskIsTerminal, terminalTransportObserved, terminalCollectionPending, terminalCollectedRecord, peerIdentityBackfill };
