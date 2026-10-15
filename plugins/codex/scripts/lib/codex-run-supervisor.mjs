@@ -132,8 +132,16 @@ function attachChildLifecycle(ctx) {
     ? executionTimeoutMs
     : Math.max(0, Math.min(executionTimeoutMs, options.deadlineMs - Date.now() - terminationReserveMs));
   ctx.executionTimer = setTimeout(() => {
-    if (ctx.closeResolved || ((child.exitCode !== null || child.signalCode !== null) &&
-      (process.platform === "win32" || !processGroupAlive(child.pid)))) return;
+    if (ctx.closeResolved) return;
+    if ((child.exitCode !== null || child.signalCode !== null) &&
+      (process.platform === "win32" || !processGroupAlive(child.pid))) {
+      ctx.forcedCloseTimer = setTimeout(() => {
+        state.outputAbandoned = true;
+        child.stdout?.destroy();
+        child.stderr?.destroy();
+      }, FORCED_CLOSE_MS);
+      return;
+    }
     state.timedOut = true;
     void requestTermination();
   }, timerMs);

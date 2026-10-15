@@ -777,7 +777,8 @@ function staleUnverifiedGroup(record, env = process.env) {
   }
   for (const prefix of ["codex", "owner"]) {
     const target = recordedProcessState(record, prefix);
-    if (target.ownsProcessGroup && target.state === "unverified") {
+    if (target.ownsProcessGroup && target.state === "unverified" &&
+      !isProcessAlive(target.pid, null, false) && isProcessAlive(target.pid, null, true)) {
       return target.pid;
     }
   }
@@ -1799,6 +1800,7 @@ function adversarialReviewPrompt(target, focus) {
 }
 
 async function handleReview(rawArgv, adversarial = false, transport = {}) {
+  const foregroundDeadlineMs = Date.now() + resolveExecutionTimeout(false);
   const { options, positionals, positionalText } = commandArgs(rawArgv, {
     booleanOptions: ["background", "json"],
     valueOptions: ["base", "cwd", "effort", "focus", "model", "output-schema", "scope", "service-tier"]
@@ -1852,6 +1854,9 @@ async function handleReview(rawArgv, adversarial = false, transport = {}) {
     request,
     timeoutMs: resolveExecutionTimeout(Boolean(options.background))
   });
+  if (!options.background) {
+    found.foregroundDeadlineMs = foregroundDeadlineMs;
+  }
   await dispatchJob(found, Boolean(options.json));
 }
 

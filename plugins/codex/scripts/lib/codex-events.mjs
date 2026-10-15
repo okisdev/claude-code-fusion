@@ -313,7 +313,7 @@ export function parseCodexEventStream({ child, state, spawnCheckpointPromise, op
         }
       }
     } catch (error) {
-      if (state.cleanupComplete || error?.code !== "ERR_STREAM_PREMATURE_CLOSE") {
+      if ((state.cleanupComplete && !state.outputAbandoned) || error?.code !== "ERR_STREAM_PREMATURE_CLOSE") {
         state.callbackError = error instanceof Error ? error : new Error(String(error));
       }
     }

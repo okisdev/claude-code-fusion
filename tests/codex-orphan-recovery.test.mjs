@@ -19,6 +19,55 @@ test("the same orphan guidance appears in status and one result footer warning",
   assert.ok(renderJobDetail(record).includes(warning));
 });
 
+test("a live unverified group leader keeps the workspace slot after ten minutes", async (t) => {
+  if (process.platform === "win32" || !processInspectionAvailable()) {
+    t.skip("process groups or process inspection unavailable in this environment");
+    return;
+  }
+  const sandbox = makeSandbox(t);
+  const readyFile = path.join(sandbox.root, "leader-ready");
+  const leader = spawn(process.execPath, ["--input-type=module", "--eval", `
+    import fs from "node:fs";
+    fs.writeFileSync(process.argv[1], "ready");
+    setInterval(() => {}, 1000);
+  `, readyFile], { detached: true, stdio: "ignore" });
+  t.after(() => {
+    if (leader.pid) {
+      try { process.kill(-leader.pid, "SIGKILL"); } catch { /* already exited */ }
+    }
+  });
+  await waitFor(() => fs.existsSync(readyFile));
+  assert.doesNotThrow(() => process.kill(leader.pid, 0));
+
+  const now = Date.now();
+  const id = "b".repeat(32);
+  const record = createJobRecord({
+    id,
+    cwd: sandbox.workDir,
+    createdAt: new Date(now - 660_000).toISOString(),
+    pid: 99999999,
+    codexPid: leader.pid,
+    codexPidIdentity: null,
+    codexPidIdentitySettled: true,
+    codexPidOwnsProcessGroup: true
+  });
+  record.phase = "cleanup-required";
+  record.cleanupRequiredAt = new Date(now - 600_001).toISOString();
+  const file = jobFilePath(sandbox.dataDir, sandbox.workDir, id);
+  writeJobRecordFile(file, record);
+  const env = envFor(sandbox, { CODEX_COMPANION_PIDLESS_RUNNING_GRACE_MS: "0" });
+
+  const attempt = runCompanion(["task", "another job"], { cwd: sandbox.workDir, env });
+  assert.equal(attempt.status, 1, attempt.stderr);
+  assert.match(attempt.stderr, new RegExp(`Codex job ${id} is already running`));
+  assert.doesNotMatch(attempt.stdout + attempt.stderr, /warning: stale Codex job/);
+  const current = readJobRecordFile(file);
+  assert.equal(current.orphanCleanupWarning, undefined);
+  assert.equal(current.phase, "cleanup-required");
+  assert.equal(jobRecords(sandbox).length, 1);
+  assert.doesNotThrow(() => process.kill(leader.pid, 0));
+});
+
 test("an unverified process group blocks for ten minutes, then permits reservation with manual cleanup guidance and no signal", async (t) => {
   if (process.platform === "win32" || !processInspectionAvailable()) {
     t.skip("process groups or process inspection unavailable in this environment");

@@ -72,7 +72,7 @@ function writeRollout(file, model, compressed = false) {
 }
 
 async function runFixture(t, mode, options = {}) {
-  const files = fixture(t);
+  const files = options.files ?? fixture(t);
   const bin = options.script ? path.join(files.dir, "scripted-codex.mjs") : fakeCodex;
   if (options.script) {
     fs.writeFileSync(bin, options.script, { mode: 0o700 });
@@ -955,6 +955,43 @@ test("an absolute deadline shortens the execution timeout", async (t) => {
   await waitForProcessExit(outcome.pid);
 });
 
+test("a clean exit with inherited output closes after the deadline without timing out", async (t) => {
+  if (process.platform === "win32") {
+    t.skip("detached process groups are unavailable on Windows.");
+    return;
+  }
+  const files = fixture(t);
+  t.after(() => {
+    if (fs.existsSync(files.childPidFile)) {
+      try { process.kill(Number(fs.readFileSync(files.childPidFile, "utf8")), "SIGKILL"); } catch { /* already exited */ }
+    }
+  });
+  const startedAt = Date.now();
+  const { outcome } = await runFixture(t, "scripted", {
+    files,
+    script: scriptedCodex(`
+      const { spawn } = await import("node:child_process");
+      const fs = await import("node:fs");
+      const helper = spawn(process.execPath, ["--input-type=module", "--eval", "setTimeout(() => {}, 30000)"], {
+        detached: true,
+        stdio: ["ignore", "inherit", "inherit"]
+      });
+      fs.writeFileSync(process.env.FAKE_CODEX_CHILD_PID_FILE, String(helper.pid));
+      helper.unref();
+      emit({ type: "turn.completed", usage });
+    `),
+    deadlineMs: startedAt + 2500,
+    timeoutMs: 5000
+  });
+  assert.equal(outcome.status, "done");
+  assert.equal(outcome.exitCode, 0);
+  assert.equal(outcome.timedOut, false);
+  assert.equal(outcome.terminalEvent, "turn.completed");
+  const helperPid = Number(fs.readFileSync(files.childPidFile, "utf8"));
+  assert.equal(isProcessAlive(helperPid, null, false), true, "the detached helper should still hold the pipe");
+  assert.ok(Date.now() - startedAt < 7000, "inherited output should be closed shortly after the deadline");
+});
+
 test("an exhausted deadline returns a typed timeout without spawning", async (t) => {
   let spawnAttempts = 0;
   const { files, outcome } = await runFixture(t, "completed", {
@@ -1051,7 +1088,8 @@ test("foreground timeout reaps an uncooperative child and persists a terminal ti
   const interruptFile = path.join(sandbox.root, "interrupt.signal");
   const readyFile = path.join(sandbox.root, "ready.signal");
   const termFile = path.join(sandbox.root, "term.signal");
-  const timeoutMs = 1000;
+  // The deadline starts at ingress, so leave the fake Codex time to start under a loaded runner.
+  const timeoutMs = 3000;
   const startedAt = Date.now();
   const result = runCompanion(["task", "--json", "wait for the timeout"], {
     cwd: sandbox.workDir,
