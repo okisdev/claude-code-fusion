@@ -33,7 +33,7 @@ function writeRecordConfirmation({ kind, engine = null, jobId = null, worker = n
   stdout.write(`Recorded ${worker.acceptance} for Fusion worker task ${worker.taskId}.\n`);
 }
 
-function settleWorkerRecord({ taskId, verdict, source, reason, failureKind, acceptFailedTransport = false, asJson, workspaceRoot, env, stdout, stderr }) {
+function settleWorkerRecord({ taskId, verdict, source, reason, failureKind, acceptFailedTransport = false, asJson, env, stdout, stderr }) {
   const current = readWorkerRecord(taskId, env);
   const terminal = WORKER_TERMINAL_STATUSES.has(current?.transportStatus);
   const peerJobId = terminal && typeof current.peerJobId === "string" && ENGINE_JOB_ID_PATTERN.test(current.peerJobId) ? current.peerJobId : null;
@@ -75,7 +75,7 @@ function settleWorkerRecord({ taskId, verdict, source, reason, failureKind, acce
       continue;
     }
     try {
-      recordEngineAcceptance({ engine, jobId, acceptance: verdict, source, reason, failureKind, acceptFailedTransport: transport.acceptFailedTransport, workspaceRoot, asJson, env });
+      recordEngineAcceptance({ engine, jobId, acceptance: verdict, source, reason, failureKind, acceptFailedTransport: transport.acceptFailedTransport, asJson, env });
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       if (!finalPeer) {
@@ -106,10 +106,10 @@ function settleWorkerRecord({ taskId, verdict, source, reason, failureKind, acce
   return [worker, ...settledPeers];
 }
 
-function settleEngineRecord({ jobId, verdict, source, reason, failureKind, acceptFailedTransport = false, asJson, workspaceRoot, env, stdout }) {
+function settleEngineRecord({ jobId, verdict, source, reason, failureKind, acceptFailedTransport = false, asJson, env, stdout }) {
   const engine = resolveEngineJob(jobId, env);
   const confirmation = { engine, jobId, acceptance: verdict };
-  recordEngineAcceptance({ engine, jobId, acceptance: verdict, source, reason, failureKind, acceptFailedTransport, workspaceRoot, asJson, env });
+  recordEngineAcceptance({ engine, jobId, acceptance: verdict, source, reason, failureKind, acceptFailedTransport, asJson, env });
   writeRecordConfirmation({ kind: "engine", engine, jobId, worker: confirmation, asJson, stdout });
   const writes = [confirmation];
   for (const record of readWorkerRecords(env).filter((candidate) => candidate.peerJobId === jobId)) {
@@ -159,7 +159,7 @@ function validateRecordSettlements({ records, source, acceptFailedTransport, env
   }
 }
 
-export function settleRecords({ records, source, acceptFailedTransport = false, asJson, workspaceRoot, env, stdout, stderr }) {
+export function settleRecords({ records, source, acceptFailedTransport = false, asJson, env, stdout, stderr }) {
   validateRecordSettlements({ records, source, acceptFailedTransport, env });
   const writes = [];
   const errors = [];
@@ -167,9 +167,9 @@ export function settleRecords({ records, source, acceptFailedTransport = false, 
     const pairOverride = acceptFailedTransport || pairAcceptFailedTransport;
     try {
       if (FUSION_TASK_ID_PATTERN.test(id)) {
-        writes.push(...settleWorkerRecord({ taskId: id, verdict, source, reason, failureKind, acceptFailedTransport: pairOverride, asJson, workspaceRoot, env, stdout, stderr }));
+        writes.push(...settleWorkerRecord({ taskId: id, verdict, source, reason, failureKind, acceptFailedTransport: pairOverride, asJson, env, stdout, stderr }));
       } else {
-        writes.push(...settleEngineRecord({ jobId: id, verdict, source, reason, failureKind, acceptFailedTransport: pairOverride, asJson, workspaceRoot, env, stdout }));
+        writes.push(...settleEngineRecord({ jobId: id, verdict, source, reason, failureKind, acceptFailedTransport: pairOverride, asJson, env, stdout }));
       }
     } catch (error) {
       const failure = { id, error };

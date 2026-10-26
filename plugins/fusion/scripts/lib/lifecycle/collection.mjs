@@ -330,7 +330,6 @@ function settleQueuedVerdict(record, now, env) {
         reason: settled.acceptanceReason,
         failureKind: settled.acceptanceFailureKind ?? null,
         acceptFailedTransport: transport.acceptFailedTransport,
-        workspaceRoot: typeof settled.workspaceRoot === "string" ? settled.workspaceRoot : process.cwd(),
         env
       });
     } catch (error) {
