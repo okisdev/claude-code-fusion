@@ -5,7 +5,7 @@ import test from "node:test";
 
 import { writeQuotaCooldown } from "../plugins/grok/scripts/lib/state.mjs";
 import { initFixtureRepo } from "./lib/git-fixture.mjs";
-import { envFor, jobRecords, makeSandbox, readInvocations, runCompanion } from "./lib/companion-harness.mjs";
+import { envFor, fakeGrok, jobRecords, makeSandbox, readInvocations, runCompanion } from "./lib/companion-harness.mjs";
 
 const cooldownFile = (sandbox) => path.join(sandbox.dataDir, "quota-cooldown.json");
 const runTask = (sandbox, extra = {}, args = ["task", "check"]) =>
@@ -72,6 +72,33 @@ test("quota failure records cooldown and later task fails before Grok launch", (
   assert.match(second.stderr, /--clear-quota-cooldown/);
   assert.equal(readInvocations(sandbox.argsFile).length, before);
   assert.equal(JSON.parse(fs.readFileSync(cooldownFile(sandbox), "utf8")).jobId, failed.id);
+});
+
+test("multiline internal error reports the JSON message and uses HTTP status for quota cooldown", (t) => {
+  const marker = '  if (mode === "quota-json-error") {';
+  const source = fs.readFileSync(fakeGrok, "utf8");
+  assert.ok(source.includes(marker));
+  for (const message of [
+    "API error (status 402 Payment Required): Grok Build usage balance exhausted",
+    "Grok Build plan disabled"
+  ]) {
+    const sandbox = makeSandbox(t);
+    const bin = path.join(sandbox.root, "multiline-grok");
+    fs.writeFileSync(bin, source.replace(marker, `  if (mode === "multiline-quota-error") {
+    emit({ type: "error", message: "Internal error: {" });
+    process.stderr.write("Error: Internal error: " + JSON.stringify({ message: process.env.FAKE_GROK_QUOTA_MESSAGE, http_status: 402 }, null, 2) + "\\n");
+    process.exit(1);
+  }
+
+${marker}`), { mode: 0o700 });
+    const result = runTask(sandbox, { GROK_BIN: bin, FAKE_GROK_MODE: "multiline-quota-error", FAKE_GROK_QUOTA_MESSAGE: message });
+    assert.notEqual(result.status, 0);
+    const [failed] = jobRecords(sandbox.dataDir);
+    assert.equal(failed.failureKind, "quota");
+    assert.equal(failed.errorMessage, message);
+    assert.match(failed.errorTail, /HTTP 402/);
+    assert.equal(JSON.parse(fs.readFileSync(cooldownFile(sandbox), "utf8")).message, message);
+  }
 });
 
 test("bare quota diagnostic classifies as quota without opening cooldown", (t) => {
