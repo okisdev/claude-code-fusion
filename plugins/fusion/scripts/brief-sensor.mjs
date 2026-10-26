@@ -10,12 +10,6 @@ const BRIEF_MIN_CHARS = 200;
 const FLAG_THRESHOLD = 0.7;
 const CHECKS = [
   {
-    id: "mixedConcern",
-    instructions: "Does this brief ask the worker to both find the unknown cause of a problem and change code to fix it within the same package?",
-    finding: "It asks one package to find a cause and to fix it",
-    remedy: "Split it into a diagnosis dispatch and an implementation dispatch written from that result."
-  },
-  {
     id: "tasteAsProse",
     instructions: "Does this brief demand a style, tone, naming, or design quality without pointing to an exemplar file, a signature, a test, or another checkable constraint?",
     finding: "It carries style or design intent only as prose",

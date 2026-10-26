@@ -1,13 +1,5 @@
 [
   {
-    "label": "mixedConcern",
-    "brief": "lane: codex | verification: npm test\nThe login test has been flaky since last week and nobody knows why. Figure out what is causing it and fix it. Files are somewhere under src/auth. Done when npm test passes ten times in a row."
-  },
-  {
-    "label": "mixedConcern",
-    "brief": "lane: codex | verification: node --test tests/stats.test.mjs\nfusion-stats sometimes double counts grok jobs. Investigate the root cause, then implement the fix and add a regression test in tests/stats.test.mjs."
-  },
-  {
     "label": "tasteAsProse",
     "brief": "lane: codex | verification: npm run build\nRewrite the error messages in src/cli/errors.ts so they feel friendly, elegant, and on brand. Make the naming cleaner and more idiomatic. Done when npm run build passes."
   },

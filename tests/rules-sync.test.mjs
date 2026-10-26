@@ -303,7 +303,8 @@ test("Grok rules document source verified headless boundaries", () => {
     assert.ok(text.includes(subagentSentence), "Grok headless subagent wording must stay synchronized");
   }
 
-  assert.match(rules, /--sandbox strict/);
+  assert.match(rules, /strict sandbox, which is not a companion option to pass/);
+  assert.doesNotMatch(rules, /use `--sandbox strict`/);
   assert.match(rules, /no silent downgrade to workspace/);
   assert.match(rules, /troubleshooting rules/);
 

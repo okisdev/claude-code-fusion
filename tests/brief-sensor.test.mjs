@@ -10,7 +10,7 @@ import { messageTag } from "../plugins/fusion/scripts/lib/user-messages.mjs";
 
 const repoRoot = path.join(import.meta.dirname, "..");
 const script = path.join(repoRoot, "plugins", "fusion", "scripts", "brief-sensor.mjs");
-const checkIds = ["mixedConcern", "tasteAsProse", "noDoneCriteria", "unbounded"];
+const checkIds = ["tasteAsProse", "noDoneCriteria", "unbounded"];
 
 function closeServer(server) {
   return new Promise((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
@@ -96,11 +96,11 @@ test("briefAdvisory ignores absent, low, and non-finite answers", () => {
   assert.strictEqual(briefAdvisory(null), null);
   assert.strictEqual(briefAdvisory({}), null);
   assert.strictEqual(briefAdvisory(answerSet(0.69)), null);
-  assert.strictEqual(briefAdvisory({ mixedConcern: { noul: Number.NaN }, unbounded: { noul: Infinity } }), null);
+  assert.strictEqual(briefAdvisory({ tasteAsProse: { noul: Number.NaN }, unbounded: { noul: Infinity } }), null);
 });
 
 test("briefAdvisory flags its threshold and retains its message tag", () => {
-  const advisory = briefAdvisory({ mixedConcern: { noul: 0.7 } });
+  const advisory = briefAdvisory({ tasteAsProse: { noul: 0.7 } });
 
   assert.ok(advisory.startsWith("Jev flagged this peer brief."));
   assert.ok(advisory.includes("(p=0.70)"));
@@ -108,10 +108,9 @@ test("briefAdvisory flags its threshold and retains its message tag", () => {
 });
 
 test("briefAdvisory preserves check order and excludes clean findings", () => {
-  const advisory = briefAdvisory({ mixedConcern: { noul: 0.93 }, tasteAsProse: { noul: 0.05 }, noDoneCriteria: { noul: 0.05 }, unbounded: { noul: 0.91 } });
+  const advisory = briefAdvisory({ tasteAsProse: { noul: 0.93 }, noDoneCriteria: { noul: 0.05 }, unbounded: { noul: 0.91 } });
 
-  assert.ok(advisory.indexOf("It asks one package to find a cause and to fix it") < advisory.indexOf("It asks for a sweep without named paths"));
-  assert.ok(!advisory.includes("It carries style or design intent only as prose"));
+  assert.ok(advisory.indexOf("It carries style or design intent only as prose") < advisory.indexOf("It asks for a sweep without named paths"));
   assert.ok(!advisory.includes("It names no checkable completion condition"));
 });
 
