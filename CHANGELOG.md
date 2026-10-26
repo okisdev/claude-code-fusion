@@ -1,5 +1,9 @@
 # changelog
 
+## 0.0.66
+
+- the orchestration rules give the rendered browser pass of a UI package to the orchestrator after merge, and a peer brief says so: of 24 dispatched codex runs that loaded a browser verification skill, none produced a screenshot, and 14 stopped at `listen EPERM` when their sandbox refused the dev server port.
+
 ## 0.0.65
 
 - this release acts on a full audit of the codebase and of local run history: 2,812 codex, 952 grok, and 12 cursor jobs, 1,079 claude worker records, 33,649 inline guard events, and 12,526 claude code transcripts.
