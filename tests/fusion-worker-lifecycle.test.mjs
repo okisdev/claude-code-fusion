@@ -590,21 +590,27 @@ test("oversized briefs without sizing advise a large package and combine with ve
   assert.strictEqual(combinedLaunch.additionalContext.match(/Verification advisory/g).length, 1);
 });
 
-test("parent context advisory fires once at 600k and once at 800k across peer dispatches", (t) => {
+function completePeer(box, payload) {
+  run(box, { ...payload, hook_event_name: "PostToolUse", tool_response: { status: "completed", content: [{ type: "text", text: "done" }] } });
+}
+
+test("parent context advisory fires once at 250k and once at 800k across peer dispatches", (t) => {
   const box = sandbox(t);
   const usage = (tokens) => fs.appendFileSync(box.transcript, `${JSON.stringify({ type: "assistant", message: { usage: { input_tokens: 1000, cache_read_input_tokens: tokens - 1500, cache_creation_input_tokens: 500 } } })}\n`);
-  usage(600000);
+  usage(250000);
   const atThreshold = run(box, dispatch(box));
-  assert.match(JSON.parse(atThreshold.stdout).hookSpecificOutput.additionalContext, /main loop context is 600k tokens/);
-  assert.strictEqual(readWorkerRecords(envFor(box))[0].parentContextTokensAtDispatch, 600000);
+  assert.match(JSON.parse(atThreshold.stdout).hookSpecificOutput.additionalContext, /main loop context is 250k tokens/);
+  assert.strictEqual(readWorkerRecords(envFor(box))[0].parentContextTokensAtDispatch, 250000);
 
   usage(601000);
   fs.appendFileSync(box.transcript, `${JSON.stringify({ type: "assistant", isSidechain: true, message: { usage: { input_tokens: 1, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 } } })}\n`);
   const peer = run(box, { ...dispatch(box), tool_use_id: "peer-1", tool_input: { subagent_type: "codex:codex-rescue", prompt: "plain peer brief" } });
+  completePeer(box, { ...dispatch(box), tool_use_id: "peer-1", tool_input: { subagent_type: "codex:codex-rescue", prompt: "plain peer brief" } });
   assert.strictEqual(peer.stdout, "");
   assert.strictEqual(readWorkerSessionState("session-1", envFor(box)).parentContextAdvisorySent, true);
 
   const repeated = run(box, { ...dispatch(box), tool_use_id: "peer-2", tool_input: { subagent_type: "codex:codex-rescue", prompt: "lane: codex quick\ngoal: repair" } }, routingFixture(box));
+  completePeer(box, { ...dispatch(box), tool_use_id: "peer-2", tool_input: { subagent_type: "codex:codex-rescue", prompt: "lane: codex quick\ngoal: repair" } });
   assert.match(JSON.parse(repeated.stdout).hookSpecificOutput.additionalContext, /lane default/);
   assert.doesNotMatch(JSON.parse(repeated.stdout).hookSpecificOutput.additionalContext, /main loop context/);
 
@@ -615,6 +621,7 @@ test("parent context advisory fires once at 600k and once at 800k across peer di
 
   usage(601000);
   const injected = run(box, { ...dispatch(box), tool_use_id: "peer-3", tool_input: { subagent_type: "codex:codex-rescue", prompt: "lane: codex quick\ngoal: repair" } }, routingFixture(box));
+  completePeer(box, { ...dispatch(box), tool_use_id: "peer-3", tool_input: { subagent_type: "codex:codex-rescue", prompt: "lane: codex quick\ngoal: repair" } });
   const injectedContext = JSON.parse(injected.stdout).hookSpecificOutput.additionalContext;
   assert.match(injectedContext, /lane default/);
   assert.doesNotMatch(injectedContext, /main loop context/);
@@ -5677,4 +5684,19 @@ test("cancellation demand and re-verification agree for an uncollected failed re
 
   assert.strictEqual(needsCancellation(candidate), true);
   assert.deepStrictEqual(reverifyCancellationRecords([candidate], envFor(box)).map((record) => record.taskId), [candidate.taskId]);
+});
+
+test("peer wrapper launches are denied while the host runs its peer capacity", (t) => {
+  const box = sandbox(t);
+  const capacity = Math.max(2, Math.floor(os.totalmem() / (3 * 1024 ** 3)));
+  for (let index = 0; index < capacity; index += 1) {
+    createWorkerRecord({ taskId: `fusion-host-peer-${index}`, sessionId: `other-session-${index % 2}`, agentType: "codex:codex-rescue", workspaceRoot: box.workDir ?? box.root, limits: { stallMs: 600_000 } }, envFor(box));
+  }
+  const denied = JSON.parse(run(box, dispatch(box, { subagent_type: "grok:grok-rescue", prompt: "bounded peer brief" })).stdout).hookSpecificOutput;
+  assert.strictEqual(denied.permissionDecision, "deny");
+  assert.match(denied.permissionDecisionReason, /Host peer capacity reached/);
+  assert.ok(denied.permissionDecisionReason.endsWith(messageTag("worker-lifecycle.host-capacity-deny")));
+  updateWorkerRecord("fusion-host-peer-0", envFor(box), (record) => ({ ...record, transportStatus: "done" }));
+  const allowed = run(box, dispatch(box, { subagent_type: "grok:grok-rescue", prompt: "bounded peer brief" })).stdout;
+  assert.ok(!allowed || JSON.parse(allowed).hookSpecificOutput.permissionDecision !== "deny");
 });

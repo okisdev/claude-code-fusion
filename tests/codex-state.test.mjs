@@ -964,23 +964,26 @@ test("semantic failure kinds accept current policy and oversized records and rej
   assert.equal(readJobRecordFile(invalidFile), null);
 });
 
-test("records missing current fields or carrying retired fields are unreadable", (t) => {
+test("records missing current fields or carrying retired fields migrate on read", (t) => {
   const sandbox = makeSandbox(t);
   const file = jobFilePath(sandbox.dataDir, sandbox.workDir, "legacy-file-change-count");
   const record = createJobRecord({ cwd: sandbox.workDir, id: "legacy-file-change-count" });
   fs.mkdirSync(path.dirname(file), { recursive: true });
   delete record.fileChangeCount;
   fs.writeFileSync(file, `${JSON.stringify(record)}\n`, { mode: 0o600 });
-  assert.equal(readJobRecordFile(file), null);
+  assert.equal(readJobRecordFile(file).fileChangeCount, null);
+  assert.equal(Object.hasOwn(JSON.parse(fs.readFileSync(file, "utf8")), "fileChangeCount"), true);
   const oldSession = { ...createJobRecord({ cwd: sandbox.workDir, id: "old-session" }), sessionId: "legacy" };
   delete oldSession.claudeSessionId;
   const oldSessionFile = jobFilePath(sandbox.dataDir, sandbox.workDir, oldSession.id);
   fs.writeFileSync(oldSessionFile, `${JSON.stringify(oldSession)}\n`, { mode: 0o600 });
-  assert.equal(readJobRecordFile(oldSessionFile), null);
+  assert.equal(readJobRecordFile(oldSessionFile).claudeSessionId, "legacy");
+  assert.equal(Object.hasOwn(JSON.parse(fs.readFileSync(oldSessionFile, "utf8")), "sessionId"), false);
   const oldTier = { ...createJobRecord({ cwd: sandbox.workDir, id: "old-tier" }), appliedServiceTier: "priority" };
   const oldTierFile = jobFilePath(sandbox.dataDir, sandbox.workDir, oldTier.id);
   fs.writeFileSync(oldTierFile, `${JSON.stringify(oldTier)}\n`, { mode: 0o600 });
-  assert.equal(readJobRecordFile(oldTierFile), null);
+  assert.equal(Object.hasOwn(readJobRecordFile(oldTierFile), "appliedServiceTier"), false);
+  assert.equal(Object.hasOwn(JSON.parse(fs.readFileSync(oldTierFile, "utf8")), "appliedServiceTier"), false);
 });
 
 test("global lookup rejects an id that is ambiguous across workspaces", (t) => {

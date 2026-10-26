@@ -141,12 +141,17 @@ test("next write compacts legacy buffers and skips an oversized carry", (t) => {
   assert.equal(compacted.transcriptSkippingLine, true);
 });
 
-test("parent context advice fires at 600k and 800k once each", async (t) => {
+test("parent context advice fires at 250k and 800k once each", async (t) => {
   const box = sandbox(t);
-  const dispatch = (id) => hook(box, { hook_event_name: "PreToolUse", session_id: "session-1", tool_use_id: `tool-${id}`, transcript_path: box.transcript, cwd: box.root, tool_name: "Agent", tool_input: { subagent_type: "codex:codex-rescue", description: "peer", prompt: "bounded peer brief" } });
+  const dispatch = async (id) => {
+    const event = { session_id: "session-1", tool_use_id: `tool-${id}`, transcript_path: box.transcript, cwd: box.root, tool_name: "Agent", tool_input: { subagent_type: "codex:codex-rescue", description: "peer", prompt: "bounded peer brief" } };
+    const output = await hook(box, { ...event, hook_event_name: "PreToolUse" });
+    await hook(box, { ...event, hook_event_name: "PostToolUse", tool_response: { status: "completed", content: [{ type: "text", text: "done" }] } });
+    return output;
+  };
   const usage = (tokens) => fs.appendFileSync(box.transcript, `${JSON.stringify({ type: "assistant", message: { usage: { input_tokens: tokens } } })}\n`);
-  usage(600000);
-  assert.match((await dispatch(1)).hookSpecificOutput.additionalContext, /main loop context is 600k/);
+  usage(250000);
+  assert.match((await dispatch(1)).hookSpecificOutput.additionalContext, /main loop context is 250k/);
   usage(700000);
   assert.equal(await dispatch(2), null);
   usage(800000);
@@ -158,7 +163,12 @@ test("parent context advice fires at 600k and 800k once each", async (t) => {
 
   const configured = sandbox(t);
   configured.env.FUSION_PARENT_CONTEXT_ADVISORY_TOKENS = "500000";
-  const configuredDispatch = (id) => hook(configured, { hook_event_name: "PreToolUse", session_id: "session-1", tool_use_id: `configured-${id}`, transcript_path: configured.transcript, cwd: configured.root, tool_name: "Agent", tool_input: { subagent_type: "codex:codex-rescue", description: "peer", prompt: "bounded peer brief" } });
+  const configuredDispatch = async (id) => {
+    const event = { session_id: "session-1", tool_use_id: `configured-${id}`, transcript_path: configured.transcript, cwd: configured.root, tool_name: "Agent", tool_input: { subagent_type: "codex:codex-rescue", description: "peer", prompt: "bounded peer brief" } };
+    const output = await hook(configured, { ...event, hook_event_name: "PreToolUse" });
+    await hook(configured, { ...event, hook_event_name: "PostToolUse", tool_response: { status: "completed", content: [{ type: "text", text: "done" }] } });
+    return output;
+  };
   fs.appendFileSync(configured.transcript, `${JSON.stringify({ type: "assistant", message: { usage: { input_tokens: 500000 } } })}\n`);
   assert.match((await configuredDispatch(1)).hookSpecificOutput.additionalContext, /main loop context is 500k/);
   fs.appendFileSync(configured.transcript, `${JSON.stringify({ type: "assistant", message: { usage: { input_tokens: 800000 } } })}\n`);

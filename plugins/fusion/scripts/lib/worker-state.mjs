@@ -146,6 +146,41 @@ export function resolveFusionDataDir(env = process.env) {
   return path.join(os.homedir(), ".claude", "plugins", "data", "fusion-claude-code-fusion");
 }
 
+function peerCapacityReservationsFile(env) {
+  return path.join(resolveFusionDataDir(env), "peer-capacity-reservations.json");
+}
+
+export function readPeerCapacityReservations(env = process.env) {
+  let text;
+  try {
+    text = fs.readFileSync(peerCapacityReservationsFile(env), "utf8");
+  } catch (error) {
+    if (error?.code === "ENOENT") {
+      return [];
+    }
+    throw error;
+  }
+  try {
+    const reservations = JSON.parse(text);
+    return Array.isArray(reservations) ? reservations.filter((entry) => entry && typeof entry === "object") : [];
+  } catch {
+    return [];
+  }
+}
+
+export function withPeerCapacityReservations(env, callback) {
+  const file = peerCapacityReservationsFile(env);
+  return withLock(file, () => {
+    const reservations = readPeerCapacityReservations(env);
+    const before = JSON.stringify(reservations);
+    const result = callback(reservations);
+    if (JSON.stringify(reservations) !== before) {
+      writePrivateFile(file, `${JSON.stringify(reservations)}\n`);
+    }
+    return result;
+  });
+}
+
 export function resolveWorkerStateDir(env = process.env) {
   const override = env[WORKER_STATE_ENV];
   if (override && String(override).trim()) {
@@ -408,15 +443,15 @@ export function reopenWorkerContinuation(record, at = new Date().toISOString(), 
     uncachedWindDownSentAt: null,
     lastActivityAt: at,
     inFlightSince: at,
+    budgetBaseline: {
+      at,
+      turns: record.turns ?? 0,
+      outputTokens: record.usage?.outputTokens ?? 0,
+      uncachedTokens: record.usage?.uncachedTokens ?? 0,
+      toolCalls: record.toolCalls ?? 0,
+      usage: Object.fromEntries(USAGE_KEYS.map((key) => [key, integer(record.usage?.[key])]))
+    },
     ...(fusionWorker ? {
-      budgetBaseline: {
-        at,
-        turns: record.turns ?? 0,
-        outputTokens: record.usage?.outputTokens ?? 0,
-        uncachedTokens: record.usage?.uncachedTokens ?? 0,
-        toolCalls: record.toolCalls ?? 0,
-        usage: Object.fromEntries(USAGE_KEYS.map((key) => [key, integer(record.usage?.[key])]))
-      },
       transcriptRoundPrefix: { turns: 0, toolCalls: 0, usage: emptyWorkerUsage() },
       usageMessages: {},
       turnIds: [],

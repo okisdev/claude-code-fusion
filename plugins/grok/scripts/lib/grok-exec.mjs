@@ -546,6 +546,39 @@ function maxTurnsReachedError(stderr) {
   return null;
 }
 
+function internalErrorFromStderr(stderr) {
+  const text = String(stderr ?? "");
+  let error = null;
+  for (const match of text.matchAll(/Internal error:\s*\{/gi)) {
+    const start = match.index + match[0].length - 1;
+    let depth = 0;
+    let quoted = false;
+    let escaped = false;
+    for (let end = start; end < text.length; end += 1) {
+      const char = text[end];
+      if (quoted) {
+        if (escaped) escaped = false;
+        else if (char === "\\") escaped = true;
+        else if (char === '"') quoted = false;
+      } else if (char === '"') {
+        quoted = true;
+      } else if (char === "{") {
+        depth += 1;
+      } else if (char === "}" && --depth === 0) {
+        const body = tryParseObject(text.slice(start, end + 1));
+        if (typeof body?.message === "string" && body.message.trim()) {
+          error = {
+            message: body.message.trim().replace(/\s+/g, " ").slice(0, 500),
+            httpStatus: Number.isInteger(body.http_status) && body.http_status >= 100 && body.http_status <= 599 ? body.http_status : null
+          };
+        }
+        break;
+      }
+    }
+  }
+  return error;
+}
+
 const DENIED_TOOL_STDERR_PATTERNS = [
   /\b(?:tool|rule)\s+[`'"]?([A-Za-z_][\w./:-]*(?:\([^)\r\n]*\))?)[`'"]?\s+(?:(?:is|was)\s+)?(?:not allowed|denied|disallowed|blocked|rejected)/i,
   /\b(?:denied|disallowed|blocked|rejected)\s+(?:tool|rule)\s*[:=]?\s*[`'"]?([A-Za-z_][\w./:-]*(?:\([^)\r\n]*\))?)[`'"]?/i,
@@ -2280,6 +2313,13 @@ async function closeGrokChild(run, code, signal) {
     parsed?.type === "error" && typeof parsed.message === "string" && parsed.message.trim()
       ? parsed.message.trim()
       : null;
+  const stderrError = exitCode !== 0 ? internalErrorFromStderr(run.stderr) : null;
+  const terminalErrorMessage = structuredErrorMessage && !/^Internal error:\s*\{$/i.test(structuredErrorMessage)
+    ? structuredErrorMessage
+    : stderrError?.message ?? structuredErrorMessage;
+  if (stderrError?.httpStatus != null) {
+    appendJobLog(run.options.logFile, `HTTP ${stderrError.httpStatus}`);
+  }
   const recognizedEnvelope = envelopeShapeIsValid || structuredErrorMessage != null;
   const metrics = recognizedEnvelope ? headlessMetricsObservation(parsed) : { error: null };
   const resolved = resolvedOutputMetadata(parsed, run.options.cwd, run.childEnv);
@@ -2291,7 +2331,7 @@ async function closeGrokChild(run, code, signal) {
       ? AUTH_RETRY_FAILURE_MESSAGE
     : run.promptTransportError
       ? `Grok prompt transport failed before stdin was accepted: ${run.promptTransportError.message}`
-      : structuredErrorMessage ?? maxTurnsReachedError(run.stderr);
+      : terminalErrorMessage ?? maxTurnsReachedError(run.stderr);
   const parseError = metrics.error ?? (
     exitCode === 0 && !run.timedOut && !errorMessage && expectsJsonOutput(run.args) && !validEnvelope
       ? invalidSessionId

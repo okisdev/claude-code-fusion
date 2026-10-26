@@ -117,7 +117,7 @@ function writePayload(sandbox, { sessionId = "session-1", toolName = "Edit", fil
   return payload;
 }
 
-function dispatchPayload(sandbox, { sessionId = "session-1", toolName = "Agent", subagentType, description = "do the thing", agentId } = {}) {
+function dispatchPayload(sandbox, { sessionId = "session-1", toolName = "Agent", subagentType = "Explore", description = "do the thing", agentId } = {}) {
   const payload = {
     hook_event_name: "PostToolUse",
     session_id: sessionId,
@@ -455,7 +455,7 @@ test("a passing verification resets the write window and stops the advisory from
 });
 
 test("a verification whose exit status is masked by a later segment does not reset the window", (t) => {
-  for (const command of ["npm test 2>&1 | tail -20", "npm test || true", "npm test && git status --short"]) {
+  for (const command of ["npm test 2>&1 | tail -20", "npm test || true", "npm test; git status --short"]) {
     const sandbox = makeSandbox(t);
     for (let index = 0; index < 5; index += 1) {
       run(sandbox, writePayload(sandbox));
@@ -493,6 +493,21 @@ for (const { name, command, output } of [
     name: "npm test after a manifest generator",
     command: 'node plugins/fusion/scripts/generate-rules-manifest.mjs && npm test 2>&1 | rg "^✖|^ℹ (tests|pass|fail|skipped)"',
     output: testSummary()
+  },
+  {
+    name: "npm test piped to tail with vitest output",
+    command: "npm test 2>&1 | tail -20",
+    output: "Test Files  3 passed (3)\nTests  42 passed (42)"
+  },
+  {
+    name: "jest piped to tail",
+    command: "npx jest --ci 2>&1 | tail -20",
+    output: "Tests: 12 passed, 12 total"
+  },
+  {
+    name: "pytest piped to tail",
+    command: "pytest -q 2>&1 | tail -5",
+    output: "3 passed in 0.12s"
   }
 ]) {
   test(`an output summary resets an unobservable verification for ${name}`, (t) => {
@@ -533,6 +548,11 @@ for (const { name, command, toolResponse } of [
     name: "a failing npm summary after a manifest generator",
     command: 'node plugins/fusion/scripts/generate-rules-manifest.mjs && npm test 2>&1 | rg "^✖|^ℹ (tests|pass|fail|skipped)"',
     toolResponse: { is_error: false, output: testSummary({ fail: 1 }) }
+  },
+  {
+    name: "a failing vitest summary after a passing count",
+    command: "npm test 2>&1 | tail -20",
+    toolResponse: { is_error: false, output: "Tests  42 passed\nTest Files  1 failed" }
   }
 ]) {
   test(`an unobservable verification does not reset for ${name}`, (t) => {
@@ -549,7 +569,7 @@ for (const { name, command, toolResponse } of [
 }
 
 test("a verification that ends the command resets the window through every separator", (t) => {
-  for (const command of ["pnpm lint && npm test", "echo starting; npm run test:unit", "npm test > /tmp/out 2>&1"]) {
+  for (const command of ["pnpm lint && npm test", "echo starting; npm run test:unit", "npm test > /tmp/out 2>&1", "npm test && git status --short", "set -o pipefail; npm test | tail", "set -euo pipefail; npm test 2>&1 | tail -20", "tsc --noEmit"]) {
     const sandbox = makeSandbox(t);
     for (let index = 0; index < 5; index += 1) {
       run(sandbox, writePayload(sandbox));
@@ -578,6 +598,20 @@ test("failed and interrupted verifications do not reset the write window", (t) =
     assert.strictEqual(readState(sandbox, "session-1").writesSinceDispatch, 5);
     assert.strictEqual(readAuditRecords(sandbox).filter((record) => record.event === "verification").length, 0);
   }
+});
+
+test("a failing summary prevents observable verification credit", (t) => {
+  const sandbox = makeSandbox(t);
+  for (let index = 0; index < 5; index += 1) {
+    run(sandbox, writePayload(sandbox));
+  }
+  const result = run(sandbox, verificationPayload(sandbox, {
+    command: "npm test && echo done",
+    toolResponse: { is_error: false, output: "ℹ pass 11\nℹ fail 1" }
+  }));
+  assert.strictEqual(result.stdout, "");
+  assert.strictEqual(readState(sandbox, "session-1").writesSinceDispatch, 5);
+  assert.strictEqual(readAuditRecords(sandbox).filter((record) => record.event === "verification").length, 0);
 });
 
 test("zero exit codes reset the write window", (t) => {
@@ -1001,7 +1035,7 @@ test("agent dispatches are bucketed by lane from the subagent_type prefix", (t) 
   run(sandbox, dispatchPayload(sandbox, { subagentType: "fusion:claude-worker" }));
   run(sandbox, dispatchPayload(sandbox, { subagentType: "fusion:trivial-worker" }));
   run(sandbox, dispatchPayload(sandbox, { subagentType: "Explore" }));
-  run(sandbox, dispatchPayload(sandbox, {}));
+  run(sandbox, dispatchPayload(sandbox, { subagentType: null }));
 
   const state = readState(sandbox, "session-1");
   assert.deepStrictEqual(state.dispatches, {
@@ -1011,6 +1045,50 @@ test("agent dispatches are bucketed by lane from the subagent_type prefix", (t) 
     "fusion:trivial-worker": 1,
     builtin: 2
   });
+});
+
+test("generic Agent launches advise on PostToolUse without denying the dispatch", (t) => {
+  for (const subagentType of ["fork", "general-purpose", "claude", null]) {
+    const sandbox = makeSandbox(t);
+    const payload = dispatchPayload(sandbox, { subagentType });
+    const launch = runRaw(sandbox, { ...payload, hook_event_name: "PreToolUse" });
+    assert.strictEqual(launch.stdout, "");
+    const result = runRaw(sandbox, payload);
+    const output = JSON.parse(result.stdout).hookSpecificOutput;
+    assert.strictEqual(output.hookEventName, "PostToolUse");
+    assert.strictEqual(output.permissionDecision, undefined);
+    assertMessageTagged(output.additionalContext, "inline-guard.generic-agent-advisory");
+    assert.match(output.additionalContext, /outside Fusion collection and settlement/);
+    assert.match(output.additionalContext, /codex:codex-rescue/);
+    assert.match(output.additionalContext, /fusion:claude-worker/);
+    assert.match(output.additionalContext, /Explore for read only search/);
+    assert.strictEqual(readState(sandbox, "session-1").dispatches.builtin, 1);
+  }
+});
+
+test("tracked agents, Explore, Task, and subagent launches do not receive the generic Agent advisory", (t) => {
+  for (const options of [
+    { subagentType: "codex:codex-rescue" },
+    { subagentType: "fusion:claude-worker" },
+    { subagentType: "Explore" },
+    { toolName: "Task", subagentType: "fork" },
+    { subagentType: "fork", agentId: "nested-agent" }
+  ]) {
+    const sandbox = makeSandbox(t);
+    assert.strictEqual(run(sandbox, dispatchPayload(sandbox, options)).stdout, "");
+  }
+});
+
+test("generic and narrow-wave advisories share one PostToolUse response", (t) => {
+  const sandbox = makeSandbox(t);
+  const result = triggerNarrowWaveAdvisory(sandbox, { FUSION_FLEET_WAVE_GAP_MS: "10000" }, dispatchPayload(sandbox, { subagentType: "fork" }));
+  const output = JSON.parse(result.stdout).hookSpecificOutput;
+  assert.strictEqual(output.hookEventName, "PostToolUse");
+  assert.strictEqual(output.permissionDecision, undefined);
+  assert.match(output.additionalContext, /outside Fusion collection and settlement/);
+  assert.match(output.additionalContext, /2 consecutive width one dispatch waves/);
+  assert.ok(output.additionalContext.includes(messageTag("inline-guard.generic-agent-advisory")));
+  assert.ok(output.additionalContext.includes(messageTag("inline-guard.narrow-wave-advisory")));
 });
 
 test("a Task dispatch is bucketed the same way as an Agent dispatch", (t) => {

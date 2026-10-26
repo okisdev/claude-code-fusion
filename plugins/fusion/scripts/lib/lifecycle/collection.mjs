@@ -1,7 +1,7 @@
 import { PEER_RESCUE_AGENT_NAMES } from "../engines.mjs";
 import fs from "node:fs";
 import path from "node:path";
-import { recordEngineAcceptance } from "../engine-acceptance.mjs";
+import { engineAcceptanceTransport, recordEngineAcceptance } from "../engine-acceptance.mjs";
 import { PEER_JOB_FOOTER_AGENTS, PEER_MANAGED_AGENTS, engineForAgentType, isEngineId } from "../engines.mjs";
 import { readEngineJobFailureKind } from "../engine-job-state.mjs";
 import { applyQueuedVerdict, backfillWorkerTaskOutputTelemetry, canonicalWorkerAgentType, isSettledWorker, WORKER_TERMINAL_STATUSES, markWorkerCollected, WORKER_COLLECTION_METHODS, workerRecordFile, writePrivateText } from "../worker-state.mjs";
@@ -321,6 +321,7 @@ function settleQueuedVerdict(record, now, env) {
   const errors = [];
   for (const jobId of peerJobIds) {
     try {
+      const transport = engineAcceptanceTransport({ engine: peerEngine, jobId, acceptance: settled.acceptance, acceptFailedTransport: pendingVerdict.acceptFailedTransport === true, env });
       recordEngineAcceptance({
         engine: peerEngine,
         jobId,
@@ -328,8 +329,7 @@ function settleQueuedVerdict(record, now, env) {
         source: pendingVerdict.source,
         reason: settled.acceptanceReason,
         failureKind: settled.acceptanceFailureKind ?? null,
-        acceptFailedTransport: pendingVerdict.acceptFailedTransport === true,
-        workspaceRoot: typeof settled.workspaceRoot === "string" ? settled.workspaceRoot : process.cwd(),
+        acceptFailedTransport: transport.acceptFailedTransport,
         env
       });
     } catch (error) {

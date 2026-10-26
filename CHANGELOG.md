@@ -1,5 +1,19 @@
 # changelog
 
+## 0.0.67
+
+- this release acts on the call records of a second host on 0.0.65: 24 sessions, 326 peer jobs, and 342 worker records since its upgrade.
+- codex and grok job records written by older companions are migrated to the current schema on first read and rewritten under the record lock, instead of being rejected. 260 of 438 codex and 12 of 64 grok records on that host had become unreadable to `record-acceptance`, `/codex:result`, history, and retention.
+- engine settlement runs the companion from its own directory, so a verdict queued for a worktree package still lands after the worktree is removed (all 43 "upgrade the plugin" settlement errors were this), and a spawn failure is reported as itself. the queued verdict path and `/fusion:stats --record` share one salvage rule, so an accepted salvaged timeout no longer fails with "pass --accept-failed-transport" (29 cases). settlement prefers the engine companion of fusion's own version, then the highest version, instead of the newest file.
+- a SendMessage continuation of a peer wrapper measures its budget from the reopen; 33 of 40 continued codex wrappers had been stopped as over their wall clock right after continuing.
+- grok `independence` and `live-web` dispatches get their own `high` effort default; sharing burst's model gave them `low`. cursor and grok role fields are recognized after a `·`, comma, or semicolon separator, so a cursor diversity brief no longer starts without a model.
+- fusion denies a peer launch while all sessions on the host already run its peer capacity (one peer per 3 gib of memory, at least two). the host had panicked from memory exhaustion with up to 19 peer jobs in flight.
+- the inline guard credits verification through the shared evidence rules (vitest, jest, pytest, and node test summaries) and treats `&&` chains and pipefail pipelines as exit observable; it had credited 30 of 1,136 passing verification commands. an Agent launched as `fork`, `general-purpose`, or `claude` gets an advisory that its work runs outside fusion collection.
+- codex classifies upstream connectivity failures (workspace routing discovery timeouts, dropped streams, connection errors) as `network`, an infrastructure death, instead of `error`. grok records the message inside a multi line `Internal error: {` instead of its first line.
+- `/fusion:stats` reports the median and p90 parent context at dispatch, and the parent context advisory defaults to 250,000 tokens (hosts compacting at 400,000 never reached 600,000).
+- the jev brief sensor drops its mixed concern check: all 96 of its advisories were that check, and flagged dispatches were accepted as often as unflagged ones (89.2% against 90.5%).
+- the rules say grok's strict sandbox is not a flag to pass (5 of 23 grok dispatches had failed on `--sandbox`), chain a wave's settlement behind its verification in one call, wait on ci with one background command instead of sleep turns, carry host constraints such as no local builds into peer briefs, and keep files a cursor package reads inside its workspace.
+
 ## 0.0.66
 
 - the orchestration rules give the rendered browser pass of a UI package to the orchestrator after merge, and a peer brief says so: of 24 dispatched codex runs that loaded a browser verification skill, none produced a screenshot, and 14 stopped at `listen EPERM` when their sandbox refused the dev server port.

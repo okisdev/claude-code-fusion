@@ -60,7 +60,7 @@ export function main(argv = process.argv.slice(2), { env = process.env, cwd = pr
 
   if (argv.includes("--record")) {
     const request = parseRecordArguments(argv, { allowPerPairReasons: rawArgs });
-    const result = settleRecords({ ...request, workspaceRoot: cwd, env, stdout, stderr });
+    const result = settleRecords({ ...request, env, stdout, stderr });
     if (result.errors.length > 0) {
       throw new Error(`${result.errors.length} record settlement ${result.errors.length === 1 ? "failed" : "failures"}.`);
     }

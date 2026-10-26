@@ -1,11 +1,12 @@
 import { JUDGMENT_POSTURE } from "../posture.mjs";
 import { messageCode, tagMessage } from "../user-messages.mjs";
+import { verificationEvidence } from "../verification-command.mjs";
 import { recordAuditEvent } from "./audit.mjs";
 import { resolveBudget, resolveFleetWaveGapMs, resolveMode } from "./config.mjs";
 import { BASH_TOOL, MAIN_LANE, NO_OP_BASH_COMMANDS, NO_OP_HEARTBEAT_DENY_MESSAGE_SLUG, NO_OP_HEARTBEAT_REASON } from "./constants.mjs";
 import { inFlightWorkerTaskSignature, totalDispatches } from "./dispatch.mjs";
 import { normalizeState, readState, resetWriteWindow, withStateLock, writeState } from "./state.mjs";
-import { extractBashCommand, verificationCommand, verificationOutputPasses, verificationResponseFailed } from "./verification.mjs";
+import { extractBashCommand } from "./verification.mjs";
 import { denyOutput } from "./write.mjs";
 
 function handleBash(input, env, { sessionId, toolName, file, now, posture, writeHookText }) {
@@ -13,19 +14,10 @@ function handleBash(input, env, { sessionId, toolName, file, now, posture, write
     const command = extractBashCommand(input.tool_input);
     if (input.hook_event_name === "PostToolUse") {
       const toolResponse = input.tool_response;
-      const recognizedVerification = command === null ? null : verificationCommand(command, env);
-      if (
-        posture !== JUDGMENT_POSTURE ||
-        command === null ||
-        !recognizedVerification.recognized ||
-        !toolResponse ||
-        typeof toolResponse !== "object" ||
-        Array.isArray(toolResponse) ||
-        verificationResponseFailed(toolResponse)
-      ) {
+      if (posture !== JUDGMENT_POSTURE || command === null) {
         return;
       }
-      const evidence = recognizedVerification.observable ? "exit-status" : verificationOutputPasses(toolResponse) ? "output-summary" : null;
+      const evidence = verificationEvidence(command, toolResponse, env);
       if (!evidence) {
         return;
       }

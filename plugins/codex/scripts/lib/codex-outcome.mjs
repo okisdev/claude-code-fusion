@@ -48,6 +48,9 @@ function classifiedFailureKind(message, fallback = "error") {
   if (/unauthori[sz]ed|unauthenticated|authentication|login required|invalid api key|api key/i.test(text)) {
     return "auth";
   }
+  if (/workspace routing discovery timed out|stream disconnected before completion|error sending request for url|connection (?:refused|reset)|\b(?:ECONNRESET|ECONNREFUSED|ENOTFOUND|EAI_AGAIN)\b|getaddrinfo|network is unreachable|Reconnecting\.\.\./i.test(text)) {
+    return "network";
+  }
   if (/permission denied|operation not permitted|approval (?:required|denied)|sandbox (?:denied|violation)/i.test(text)) {
     return "permission";
   }

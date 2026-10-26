@@ -568,16 +568,34 @@ function retiredWorkerStats(env) {
   return stats;
 }
 
+function parentContextAtDispatch(records, all, workspaceRoot) {
+  const repositoryCache = new Map();
+  const values = records
+    .filter((record) => all || workspaceRootsShareRepository(record.workspaceRoot, workspaceRoot, repositoryCache))
+    .map((record) => record.parentContextTokensAtDispatch)
+    .filter((value) => Number.isSafeInteger(value) && value >= 0)
+    .sort((left, right) => left - right);
+  const middle = Math.floor(values.length / 2);
+  return {
+    dispatchCount: values.length,
+    medianTokens: values.length ? (values[middle] + values[Math.floor((values.length - 1) / 2)]) / 2 : null,
+    p90Tokens: values.length ? values[Math.ceil(values.length * 0.9) - 1] : null
+  };
+}
+
 export function buildFusionStats({ all = false, env = process.env, cwd = process.cwd() } = {}) {
   const workers = workerSnapshot(env);
+  const workspaceRoot = resolveGitWorkspaceRoot(cwd);
   const options = { all, env, cwd, workers };
   const engines = {};
   for (const provider of STATS_PROVIDER_REGISTRY) {
     engines[provider.id] = provider.collect(options);
   }
   const fleet = buildFleetUsageStats({ env });
+  const parentContext = parentContextAtDispatch(workers.records, all, workspaceRoot);
   return {
-    scope: all ? "all" : resolveGitWorkspaceRoot(cwd),
+    scope: all ? "all" : workspaceRoot,
+    ...(parentContext.dispatchCount > 0 ? { parentContextAtDispatch: parentContext } : {}),
     ...engines,
     ...(all ? { retiredWorkers: retiredWorkerStats(env) } : {}),
     fleet,

@@ -63,6 +63,21 @@ function run(sandbox, extraEnv = {}) {
   });
 }
 
+test("text classified Codex connectivity failures map to network after stronger evidence", () => {
+  for (const message of [
+    "Reconnecting... (workspace routing discovery timed out)",
+    "stream disconnected before completion: upstream closed the stream",
+    "error sending request: connection refused",
+    "connection reset", "ECONNRESET", "ECONNREFUSED", "ENOTFOUND", "EAI_AGAIN", "getaddrinfo failed", "network is unreachable"
+  ]) {
+    assert.strictEqual(codexFailureKind(message), "network", message);
+  }
+  assert.strictEqual(codexFailureKind("quota exhausted; Reconnecting..."), "quota");
+  assert.strictEqual(codexFailureKind("rate limit exceeded; connection reset"), "rate_limited");
+  assert.strictEqual(codexFailureKind("stream disconnected before completion: Incomplete response returned, reason: content_filter"), "refused");
+  assert.strictEqual(codexFailureKind("authentication failed; error sending request"), "auth");
+});
+
 test("worker breaker parses recent ledger records once and skips 2,000 old files", (t) => {
   const sandbox = makeSandbox(t);
   const env = envFor(sandbox);
@@ -196,6 +211,11 @@ test("breaker quota recovery matches the companion diagnostic vocabulary", () =>
   ]) {
     assert.strictEqual(codexFailureKind(diagnostic), "quota", diagnostic);
   }
+});
+
+test("unsupported Codex model errors are not network failures", () => {
+  assert.strictEqual(codexFailureKind("Error sending request: model gpt-5 is not supported"), null);
+  assert.strictEqual(codexFailureKind("error sending request for url (https://example.test): connection failed"), "network");
 });
 
 test("typed grok failures are not reclassified from quota summaries or logs", (t) => {

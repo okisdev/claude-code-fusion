@@ -301,7 +301,7 @@ test("reopened tool-response worker counts new transcript usage above its prior 
   assert.deepStrictEqual(refreshWorkerTranscript(refreshed, transcript), refreshed);
 });
 
-test("peer continuation resets round counters without adding a Fusion budget baseline", () => {
+test("peer continuation resets round counters and records its budget baseline", () => {
   const at = "2026-09-27T00:01:00.000Z";
   const prior = unverifiedRecord({ agentType: "codex:codex-rescue", transcriptPath: "/tmp/peer.jsonl", transcriptOffset: 512, transcriptCarry: "partial", transcriptSkippingLine: true, stopBlockCount: 6, cancelAttemptCount: 2, retryCount: 1, terminalWriteGraceUsedAt: at, cancelReason: "old round", cancelRequestedAt: at, windDownContextSentAt: at, tokenWindDownSentAt: at, uncachedWindDownSentAt: at });
   const reopened = reopenWorkerContinuation(prior, at, 2048);
@@ -309,7 +309,7 @@ test("peer continuation resets round counters without adding a Fusion budget bas
   assert.deepStrictEqual([reopened.transcriptPath, reopened.transcriptOffset, reopened.transcriptCarry, reopened.transcriptSkippingLine], [null, 0, "", false]);
   assert.deepStrictEqual([reopened.stopBlockCount, reopened.cancelAttemptCount, reopened.retryCount], [0, 0, 0]);
   assert.deepStrictEqual([reopened.terminalWriteGraceUsedAt, reopened.cancelReason, reopened.cancelRequestedAt, reopened.windDownContextSentAt, reopened.tokenWindDownSentAt, reopened.uncachedWindDownSentAt], [null, null, null, null, null, null]);
-  assert.strictEqual(reopened.budgetBaseline, undefined);
+  assert.deepStrictEqual(reopened.budgetBaseline, { at, turns: 0, outputTokens: 0, uncachedTokens: 0, toolCalls: 0, usage: { inputTokens: 0, cacheCreationInputTokens: 0, cacheReadInputTokens: 0, outputTokens: 0, totalTokens: 0, uncachedTokens: 0 } });
 });
 
 test("unsettled continuation keeps its job id available for the next verdict", () => {
