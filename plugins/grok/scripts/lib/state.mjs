@@ -307,13 +307,7 @@ const JOB_RECORD_FIELDS = ["jobClass", "delivery", "semanticStatus", "request", 
 function assertJobRecord(record) {
   if (!record || typeof record !== "object" || Array.isArray(record)
       || record.schemaVersion !== 1 || record.engine !== "grok"
-      || typeof record.id !== "string" || !record.id
-      || !TERMINAL_STATUSES.has(record.status) && record.status !== "running"
-      || typeof record.mode !== "string" || !record.mode
-      || typeof record.cwd !== "string" || !record.cwd
-      || typeof record.createdAt !== "string" || !Number.isFinite(Date.parse(record.createdAt))
-      || typeof record.background !== "boolean"
-      || record.request != null && (typeof record.request !== "object" || Array.isArray(record.request))
+      || typeof record.id !== "string"
       || JOB_RECORD_FIELDS.some((field) => !Object.hasOwn(record, field))) {
     throw new TypeError("Job record schema is invalid.");
   }

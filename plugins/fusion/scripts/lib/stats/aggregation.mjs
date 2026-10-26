@@ -592,9 +592,10 @@ export function buildFusionStats({ all = false, env = process.env, cwd = process
     engines[provider.id] = provider.collect(options);
   }
   const fleet = buildFleetUsageStats({ env });
+  const parentContext = parentContextAtDispatch(workers.records, all, workspaceRoot);
   return {
     scope: all ? "all" : workspaceRoot,
-    parentContextAtDispatch: parentContextAtDispatch(workers.records, all, workspaceRoot),
+    ...(parentContext.dispatchCount > 0 ? { parentContextAtDispatch: parentContext } : {}),
     ...engines,
     ...(all ? { retiredWorkers: retiredWorkerStats(env) } : {}),
     fleet,
