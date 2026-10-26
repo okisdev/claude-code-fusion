@@ -1,11 +1,12 @@
 import { PEER_RESCUE_AGENT_NAMES } from "../engines.mjs";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { ENGINE_ID_ALTERNATION, PEER_JOB_FOOTER_AGENTS, engineForAgentType, engineRoleFromBrief } from "../engines.mjs";
 import { readRoutingDefaults } from "../model-table.mjs";
 import { tagMessage } from "../user-messages.mjs";
-import { canonicalWorkerAgentType, createWorkerRecord, createWorkerTaskId, updateWorkerSessionState, workerRecordFile, writePrivateText } from "../worker-state.mjs";
+import { canonicalWorkerAgentType, createWorkerRecord, createWorkerTaskId, readWorkerRecords, updateWorkerSessionState, workerRecordFile, writePrivateText, WORKER_TERMINAL_STATUSES } from "../worker-state.mjs";
 import { workerLimits } from "./budget.mjs";
 import { updateLifecycleWorkerRecord } from "./records.mjs";
 import { PARENT_CONTEXT_ADVISORY_TOKENS_ENV, VERIFICATION_MANIFEST_ENV, DEFAULT_BRIEF_MAX_BYTES, SIZING_ADVISORY_BYTES, DEFAULT_PARENT_CONTEXT_ADVISORY_TOKENS, PARENT_CONTEXT_TAIL_MAX_BYTES, BRIEF_AGENTS } from "./constants.mjs";
@@ -96,6 +97,29 @@ function parentContextAdvisoryTokens(env) {
   }
   const parsed = typeof raw === "number" ? raw : Number(String(raw).trim());
   return Number.isSafeInteger(parsed) && parsed >= 0 ? parsed : DEFAULT_PARENT_CONTEXT_ADVISORY_TOKENS;
+}
+
+function hostPeerCapacity(totalMemoryBytes = os.totalmem()) {
+  return Math.max(2, Math.floor(totalMemoryBytes / (3 * 1024 ** 3)));
+}
+
+function hostPeerCapacityDenial(env, now = Date.now(), totalMemoryBytes = os.totalmem()) {
+  const capacity = hostPeerCapacity(totalMemoryBytes);
+  const inFlight = readWorkerRecords(env, { strict: true }).filter((record) => {
+    if (!PEER_RESCUE_AGENT_NAMES.has(record.agentType) || WORKER_TERMINAL_STATUSES.has(record.transportStatus)) {
+      return false;
+    }
+    const livenessAt = Date.parse(record.lastLivenessAt ?? record.startedAt ?? record.createdAt ?? "");
+    const stallMs = Number.isSafeInteger(record.limits?.stallMs) && record.limits.stallMs > 0
+      ? record.limits.stallMs
+      : workerLimits(record.agentType, env).stallMs;
+    return Number.isFinite(livenessAt) && now - livenessAt <= stallMs;
+  }).length;
+  if (inFlight < capacity) {
+    return null;
+  }
+  const totalGiB = Math.round(totalMemoryBytes / 1024 ** 3 * 10) / 10;
+  return tagMessage("worker-lifecycle.host-capacity-deny", `Host peer capacity reached: ${inFlight} peer wrapper jobs in flight (capacity ${capacity}; total memory ${totalGiB} GiB). Relaunch after a completion notification.`);
 }
 
 function parentContextTokens(transcriptPath) {
@@ -473,4 +497,4 @@ function briefArtifactPath(record, env) {
 }
 
 
-export { allowAgentWithTaskId, promptText, leadingCompanionOptions, optionValue, injectedPeerDefaults, parentContextAdvisoryTokens, parentContextTokens, verificationManifestPath, globToRegExp, readVerificationManifest, pathsNamedInBrief, missingVerificationSuites, briefAdvisories, validateWorkerBrief, externalUserText, latestUserRequestedBackground, safeDescription, completionContract, collectorRequestIdentity, createDispatch, claimParentContextAdvisory, briefArtifactPath };
+export { allowAgentWithTaskId, promptText, leadingCompanionOptions, optionValue, injectedPeerDefaults, parentContextAdvisoryTokens, parentContextTokens, hostPeerCapacity, hostPeerCapacityDenial, verificationManifestPath, globToRegExp, readVerificationManifest, pathsNamedInBrief, missingVerificationSuites, briefAdvisories, validateWorkerBrief, externalUserText, latestUserRequestedBackground, safeDescription, completionContract, collectorRequestIdentity, createDispatch, claimParentContextAdvisory, briefArtifactPath };

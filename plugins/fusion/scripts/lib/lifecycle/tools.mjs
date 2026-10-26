@@ -5,7 +5,7 @@ import { tagMessage } from "../user-messages.mjs";
 import { canonicalWorkerAgentType, isFusionWorkerAgent, WORKER_TERMINAL_STATUSES, markWorkerCollected, readWorkerRecord, readWorkerOutputFileTaskIds, readSessionWorkerRecords, refreshWorkerTranscript, reopenWorkerContinuation, WORKER_COLLECTION_METHODS } from "../worker-state.mjs";
 import { markBudgetFailure, workerBudgetFailure, workerRoundUsage } from "./budget.mjs";
 import { backfillCollectedTaskOutput, capturedPeerIdentity, collectedHarnessAsyncDelivery, noTaskFoundError, outputFileFromLaunchResponse, peerIdentityBackfill, settleQueuedVerdict, settleReapedIfActive, taskOutputResultText, terminalCollectedRecord, terminalCollectionPending } from "./collection.mjs";
-import { allowAgentWithTaskId, claimParentContextAdvisory, collectorRequestIdentity, createDispatch, injectedPeerDefaults, latestUserRequestedBackground, parentContextTokens, promptText, validateWorkerBrief } from "./dispatch.mjs";
+import { allowAgentWithTaskId, claimParentContextAdvisory, collectorRequestIdentity, createDispatch, hostPeerCapacityDenial, injectedPeerDefaults, latestUserRequestedBackground, parentContextTokens, promptText, validateWorkerBrief } from "./dispatch.mjs";
 import { reconcileTaskNotifications, taskNotificationTransition } from "./notifications.mjs";
 import { denyTool, hookOutput, writeOutput } from "./output.mjs";
 import { activeSessionRecords, clearContinuationRequest, findSessionWorkerRecord, isAttributedTranscriptPath, parentTranscriptByteSize, recordForAgent, refreshRecord, sendMessageResumed, updateLifecycleWorkerRecord } from "./records.mjs";
@@ -34,6 +34,11 @@ function handlePreToolUse(input, env) {
     if (PEER_RESCUE_AGENT_NAMES.has(agentType)) {
       if (input.tool_input?.run_in_background === true) {
         writeOutput(denyTool(tagMessage("worker-lifecycle.foreground-wrapper-deny", `${engineDisplayNameList()} wrapper Agents use foreground delivery. Keep the Agent foreground; an explicitly requested companion \`--background\` receipt stays inside that foreground wrapper call.`)));
+        return;
+      }
+      const capacityDenial = hostPeerCapacityDenial(env);
+      if (capacityDenial) {
+        writeOutput(denyTool(capacityDenial));
         return;
       }
       const injection = injectedPeerDefaults(input.tool_input?.prompt, agentType, env);
