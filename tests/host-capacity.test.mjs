@@ -4,11 +4,12 @@ import os from "node:os";
 import path from "node:path";
 import { test } from "node:test";
 
-import { hostPeerCapacity, hostPeerCapacityDenial, createDispatch } from "../plugins/fusion/scripts/lib/lifecycle/dispatch.mjs";
+import { hostPeerCapacity, hostPeerCapacityDenial, createDispatch, reserveHostPeerCapacity } from "../plugins/fusion/scripts/lib/lifecycle/dispatch.mjs";
+import { handlePreToolUse, handlePostToolUse } from "../plugins/fusion/scripts/lib/lifecycle/tools.mjs";
 import { buildFusionStats } from "../plugins/fusion/scripts/lib/stats/aggregation.mjs";
 import { renderFusionStats } from "../plugins/fusion/scripts/lib/stats/rendering.mjs";
 import { messageTag } from "../plugins/fusion/scripts/lib/user-messages.mjs";
-import { createWorkerRecord, readWorkerRecord, updateWorkerRecord } from "../plugins/fusion/scripts/lib/worker-state.mjs";
+import { createWorkerRecord, readPeerCapacityReservations, readWorkerRecord, updateWorkerRecord, withPeerCapacityReservations } from "../plugins/fusion/scripts/lib/worker-state.mjs";
 
 const GiB = 1024 ** 3;
 
@@ -45,6 +46,84 @@ test("host capacity counts live peer wrappers across sessions and ignores stale 
   assert.equal(hostPeerCapacityDenial(box.env, now, 16 * GiB), null);
   updateWorkerRecord("fusion-peer-1", box.env, (record) => ({ ...record, transportStatus: "done" }));
   assert.equal(hostPeerCapacityDenial(box.env, now, 16 * GiB), null);
+});
+
+function hookOutput(callback) {
+  const original = process.stdout.write;
+  let output = "";
+  process.stdout.write = (chunk) => { output += chunk; return true; };
+  try {
+    callback();
+    return output;
+  } finally {
+    process.stdout.write = original;
+  }
+}
+
+test("synchronous peer PreToolUse bursts reserve host slots and PostToolUse releases one", (t) => {
+  const box = sandbox(t);
+  const capacity = hostPeerCapacity(os.totalmem());
+  const input = (index) => ({ session_id: "session-a", tool_use_id: `peer-${index}`, tool_name: "Agent", tool_input: { subagent_type: "codex:codex-rescue", prompt: "brief" } });
+  for (let index = 0; index < capacity; index += 1) {
+    assert.equal(hookOutput(() => handlePreToolUse(input(index), box.env)), "");
+  }
+  assert.equal(readPeerCapacityReservations(box.env).length, capacity);
+  assert.match(hookOutput(() => handlePreToolUse(input(capacity), box.env)), new RegExp(messageTag("worker-lifecycle.host-capacity-deny")));
+  hookOutput(() => handlePostToolUse(input(0), box.env));
+  assert.equal(readPeerCapacityReservations(box.env).length, capacity - 1);
+  assert.equal(hookOutput(() => handlePreToolUse(input(capacity), box.env)), "");
+  hookOutput(() => handlePostToolUse(input(1), box.env, true));
+  assert.equal(hookOutput(() => handlePreToolUse(input(capacity + 1), box.env)), "");
+});
+
+test("stale peer reservations are pruned before capacity is checked", (t) => {
+  const box = sandbox(t);
+  const input = (index) => ({ session_id: "session-a", tool_use_id: `peer-${index}`, tool_name: "Agent", tool_input: { subagent_type: "codex:codex-rescue" } });
+  for (let index = 0; index < 5; index += 1) {
+    assert.equal(reserveHostPeerCapacity(input(index), "codex:codex-rescue", box.env, null, Date.now(), 16 * GiB), null);
+  }
+  assert.match(reserveHostPeerCapacity(input(5), "codex:codex-rescue", box.env, null, Date.now(), 16 * GiB), new RegExp(messageTag("worker-lifecycle.host-capacity-deny")));
+  withPeerCapacityReservations(box.env, (reservations) => { reservations[0].at -= 2_400_001; });
+  assert.equal(reserveHostPeerCapacity(input(5), "codex:codex-rescue", box.env, null, Date.now(), 16 * GiB), null);
+  assert.equal(readPeerCapacityReservations(box.env).length, 5);
+});
+
+test("a peer record and its launch reservation occupy one slot", (t) => {
+  const box = sandbox(t);
+  const input = (index) => ({ session_id: "session-a", tool_use_id: `peer-${index}`, tool_name: "Agent", tool_input: { subagent_type: "codex:codex-rescue" } });
+  assert.equal(reserveHostPeerCapacity(input(0), "codex:codex-rescue", box.env, null, Date.now(), 16 * GiB), null);
+  worker(box, "fusion-async-peer", "session-a", "codex:codex-rescue", { dispatchToolUseId: "peer-0" });
+  for (let index = 1; index < 5; index += 1) {
+    assert.equal(reserveHostPeerCapacity(input(index), "codex:codex-rescue", box.env, null, Date.now(), 16 * GiB), null);
+  }
+  assert.match(hostPeerCapacityDenial(box.env, Date.now(), 16 * GiB), /5 peer wrapper jobs in flight/);
+});
+
+test("reservations without tool ids do not mask unrelated peer records", (t) => {
+  const box = sandbox(t);
+  worker(box, "fusion-active-peer", "session-a");
+  const input = (agentType) => ({ session_id: "session-a", tool_name: "Agent", tool_input: { subagent_type: agentType } });
+  assert.equal(reserveHostPeerCapacity(input("codex:codex-rescue"), "codex:codex-rescue", box.env, null, Date.now(), 6 * GiB), null);
+  assert.match(reserveHostPeerCapacity(input("grok:grok-rescue"), "grok:grok-rescue", box.env, null, Date.now(), 6 * GiB), /Host peer capacity reached: 2/);
+});
+
+test("SendMessage cannot reopen a terminal peer when host capacity is full", (t) => {
+  const box = sandbox(t);
+  const capacity = hostPeerCapacity(os.totalmem());
+  const taskId = "fusion-terminal-peer";
+  worker(box, taskId, "session-a");
+  updateWorkerRecord(taskId, box.env, (record) => ({ ...record, agentId: "terminal-peer", transportStatus: "done" }));
+  const launch = (index) => ({ session_id: "session-b", tool_use_id: `peer-${index}`, tool_name: "Agent", tool_input: { subagent_type: "codex:codex-rescue", prompt: "brief" } });
+  for (let index = 0; index < capacity; index += 1) {
+    hookOutput(() => handlePreToolUse(launch(index), box.env));
+  }
+  const message = { session_id: "session-a", tool_use_id: "message-1", tool_name: "SendMessage", tool_input: { to: "terminal-peer", message: "continue" } };
+  assert.match(hookOutput(() => handlePreToolUse(message, box.env)), new RegExp(messageTag("worker-lifecycle.host-capacity-deny")));
+  assert.equal(readWorkerRecord(taskId, box.env).continuationRequestedAt, undefined);
+  hookOutput(() => handlePostToolUse(launch(0), box.env));
+  assert.equal(hookOutput(() => handlePreToolUse(message, box.env)), "");
+  hookOutput(() => handlePostToolUse(message, box.env, true));
+  assert.equal(readPeerCapacityReservations(box.env).length, capacity - 1);
 });
 
 test("dispatch stores parent context tokens and stats render median and p90 for measured dispatches", (t) => {

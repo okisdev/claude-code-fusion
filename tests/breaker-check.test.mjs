@@ -213,6 +213,11 @@ test("breaker quota recovery matches the companion diagnostic vocabulary", () =>
   }
 });
 
+test("unsupported Codex model errors are not network failures", () => {
+  assert.strictEqual(codexFailureKind("Error sending request: model gpt-5 is not supported"), null);
+  assert.strictEqual(codexFailureKind("error sending request for url (https://example.test): connection failed"), "network");
+});
+
 test("typed grok failures are not reclassified from quota summaries or logs", (t) => {
   const sandbox = makeSandbox(t);
   const stateRoot = path.join(sandbox.grokData, "state");

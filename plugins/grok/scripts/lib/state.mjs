@@ -24,6 +24,7 @@ const STATE_SWEEP_INTERVAL_MS = 60 * 60 * 1000;
 const PRIVATE_DIR_MODE = 0o700;
 const PRIVATE_FILE_MODE = 0o600;
 const TERMINAL_STATUSES = new Set(["done", "error", "cancelled"]);
+const JOB_STATUSES = new Set([...TERMINAL_STATUSES, "running", "queued"]);
 
 export const SESSION_ID_ENV = "CLAUDE_CODE_SESSION_ID";
 export const DEFAULT_LOCK_TIMEOUT_MS = 5000;
@@ -307,7 +308,7 @@ const JOB_RECORD_FIELDS = ["jobClass", "delivery", "semanticStatus", "request", 
 function assertJobRecord(record) {
   if (!record || typeof record !== "object" || Array.isArray(record)
       || record.schemaVersion !== 1 || record.engine !== "grok"
-      || typeof record.id !== "string"
+      || typeof record.id !== "string" || !JOB_STATUSES.has(record.status)
       || JOB_RECORD_FIELDS.some((field) => !Object.hasOwn(record, field))) {
     throw new TypeError("Job record schema is invalid.");
   }
@@ -316,7 +317,7 @@ function assertJobRecord(record) {
 export function migrateJobRecord(raw) {
   if (!raw || typeof raw !== "object" || Array.isArray(raw)
       || raw.engine != null && raw.engine !== "grok"
-      || raw.schemaVersion != null && raw.schemaVersion !== 1) return raw;
+      || raw.schemaVersion != null && raw.schemaVersion !== 1 || !JOB_STATUSES.has(raw.status)) return raw;
   if (raw.schemaVersion === 1 && raw.engine === "grok"
       && JOB_RECORD_FIELDS.every((field) => Object.hasOwn(raw, field))) return raw;
   if (typeof raw.id !== "string" || !raw.id || typeof raw.mode !== "string"

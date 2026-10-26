@@ -26,6 +26,8 @@ test("keeps node:test fail-zero summaries", () => {
   assert.equal(summaryEvidence("npm test | grep -E 'fail|pass'", "ℹ fail 0"), "output-summary");
   assert.equal(summaryEvidence("node --test | tail", "ℹ pass 12\nℹ fail 0"), "output-summary");
   assert.equal(summaryEvidence("node --test | tail", "ℹ pass 11\nℹ fail 1"), null);
+  assert.equal(summaryEvidence("node --test | tail", "diagnostic: fail 1\nfail 1\nℹ fail 0"), "output-summary");
+  assert.equal(summaryEvidence("node --test | tail", "# fail 1\nℹ fail 0"), null);
 });
 
 test("credits and rejects piped pytest summaries", () => {
@@ -77,6 +79,8 @@ test("preserves runner failures through && and through pipes with pipefail", () 
   for (const command of ["npm test | tail", "npm test; echo done", "npm test || true", "npm test && echo done; echo again", "set -o pipefail; npm test | tail; echo done", "set -o pipefail; npm test && set +o pipefail && tsc --noEmit | tail"]) {
     assert.equal(summaryEvidence(command, ""), null, command);
   }
+  assert.equal(summaryEvidence("true || set -o pipefail; npm test | tail -1", ""), null);
+  assert.equal(summaryEvidence("set -o pipefail | cat; npm test | tail -1", ""), null);
 });
 
 test("rejects a failing summary anywhere in observable output", () => {

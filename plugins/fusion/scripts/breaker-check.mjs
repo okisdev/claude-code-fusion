@@ -26,7 +26,7 @@ const CODEX_FAILURE_PATTERNS = [
   ["rate_limited", /rate[ _-]?limit|too many requests|\b429\b/i],
   ["refused", /misalignment policy|cyber policy|content policy|reason: content_filter|flagged for possible (?:cybersecurity|biological) risk/i],
   ["auth", /unauthori[sz]ed|unauthenticated|authentication|auth(?:entication)? failed|invalid api key|api key/i],
-  ["network", /workspace routing discovery timed out|stream disconnected before completion|error sending request|connection (?:refused|reset)|\b(?:ECONNRESET|ECONNREFUSED|ENOTFOUND|EAI_AGAIN)\b|getaddrinfo|network is unreachable|Reconnecting\.\.\./i],
+  ["network", /workspace routing discovery timed out|stream disconnected before completion|error sending request for url|connection (?:refused|reset)|\b(?:ECONNRESET|ECONNREFUSED|ENOTFOUND|EAI_AGAIN)\b|getaddrinfo|network is unreachable|Reconnecting\.\.\./i],
   ["missing_cli", /missing[ _-]?cli|command not found|cli not found|no such file/i],
   ["timeout", /timed?\s*out|timeout/i],
   ["stall", /\bstall(?:ed|ing)?\b|no[- ]progress/i],

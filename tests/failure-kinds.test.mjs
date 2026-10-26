@@ -103,6 +103,8 @@ for (const [message, failureKind] of [
   ["Reconnecting... (workspace routing discovery timed out)", "network"],
   ["stream disconnected before completion: upstream connection closed", "network"],
   ["error sending request: connection reset", "network"],
+  ["error sending request for url (https://example.test): request failed", "network"],
+  ["Error sending request: model gpt-5 is not supported", "error"],
   ["network is unreachable", "network"],
   ["This request has been flagged for possible cybersecurity risk.", "refused"],
   ["This content was flagged for possible biological risk.", "refused"],

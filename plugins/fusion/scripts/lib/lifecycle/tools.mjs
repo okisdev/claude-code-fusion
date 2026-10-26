@@ -5,7 +5,7 @@ import { tagMessage } from "../user-messages.mjs";
 import { canonicalWorkerAgentType, isFusionWorkerAgent, WORKER_TERMINAL_STATUSES, markWorkerCollected, readWorkerRecord, readWorkerOutputFileTaskIds, readSessionWorkerRecords, refreshWorkerTranscript, reopenWorkerContinuation, WORKER_COLLECTION_METHODS } from "../worker-state.mjs";
 import { markBudgetFailure, workerBudgetFailure, workerRoundUsage } from "./budget.mjs";
 import { backfillCollectedTaskOutput, capturedPeerIdentity, collectedHarnessAsyncDelivery, noTaskFoundError, outputFileFromLaunchResponse, peerIdentityBackfill, settleQueuedVerdict, settleReapedIfActive, taskOutputResultText, terminalCollectedRecord, terminalCollectionPending } from "./collection.mjs";
-import { allowAgentWithTaskId, claimParentContextAdvisory, collectorRequestIdentity, createDispatch, hostPeerCapacityDenial, injectedPeerDefaults, latestUserRequestedBackground, parentContextTokens, promptText, validateWorkerBrief } from "./dispatch.mjs";
+import { allowAgentWithTaskId, claimParentContextAdvisory, collectorRequestIdentity, createDispatch, injectedPeerDefaults, latestUserRequestedBackground, parentContextTokens, promptText, releaseHostPeerCapacity, reserveHostPeerCapacity, validateWorkerBrief } from "./dispatch.mjs";
 import { reconcileTaskNotifications, taskNotificationTransition } from "./notifications.mjs";
 import { denyTool, hookOutput, writeOutput } from "./output.mjs";
 import { activeSessionRecords, clearContinuationRequest, findSessionWorkerRecord, isAttributedTranscriptPath, parentTranscriptByteSize, recordForAgent, refreshRecord, sendMessageResumed, updateLifecycleWorkerRecord } from "./records.mjs";
@@ -36,7 +36,7 @@ function handlePreToolUse(input, env) {
         writeOutput(denyTool(tagMessage("worker-lifecycle.foreground-wrapper-deny", `${engineDisplayNameList()} wrapper Agents use foreground delivery. Keep the Agent foreground; an explicitly requested companion \`--background\` receipt stays inside that foreground wrapper call.`)));
         return;
       }
-      const capacityDenial = hostPeerCapacityDenial(env);
+      const capacityDenial = reserveHostPeerCapacity(input, agentType, env);
       if (capacityDenial) {
         writeOutput(denyTool(capacityDenial));
         return;
@@ -83,6 +83,13 @@ function handlePreToolUse(input, env) {
     const recipient = input.tool_input.to;
     const record = findSessionWorkerRecord((candidate) => (PEER_RESCUE_AGENT_NAMES.has(candidate.agentType) || isFusionWorkerAgent(candidate.agentType)) && [candidate.agentId, candidate.backgroundTaskId].includes(recipient), input.session_id, env);
     if (record) {
+      if (PEER_RESCUE_AGENT_NAMES.has(record.agentType) && WORKER_TERMINAL_STATUSES.has(record.transportStatus)) {
+        const capacityDenial = reserveHostPeerCapacity(input, record.agentType, env, record.taskId);
+        if (capacityDenial) {
+          writeOutput(denyTool(capacityDenial));
+          return;
+        }
+      }
       updateLifecycleWorkerRecord(record.taskId, env, (current) => {
         if (!current || current.sessionId !== input.session_id || ![current.agentId, current.backgroundTaskId].includes(recipient)) {
           return null;
@@ -175,10 +182,14 @@ function handlePostToolUse(input, env, failed = false) {
         return current.continuationRequestedAt ? clearContinuationRequest(next) : next === current ? null : next;
       });
     }
+    releaseHostPeerCapacity(input, env);
     if (!failed) {
       reconcileTaskNotifications(input, env);
     }
     return;
+  }
+  if (failed && ["Agent", "Task"].includes(input.tool_name) && PEER_RESCUE_AGENT_NAMES.has(input.tool_input?.subagent_type)) {
+    releaseHostPeerCapacity(input, env);
   }
   if (failed && ["Agent", "Task"].includes(input.tool_name)) {
     const failureText = [input.error, input.tool_response].flatMap((value) => {
@@ -291,25 +302,29 @@ function handlePostToolUse(input, env, failed = false) {
       if (failed) {
         return;
       }
-      const response = input.tool_response && typeof input.tool_response === "object" ? input.tool_response : {};
-      const nested = response.toolUseResult && typeof response.toolUseResult === "object" ? response.toolUseResult : {};
-      const isAsync = response.isAsync === true || nested.isAsync === true || response.status === "async_launched" || nested.status === "async_launched";
-      if (!isAsync) {
-        return;
+      try {
+        const response = input.tool_response && typeof input.tool_response === "object" ? input.tool_response : {};
+        const nested = response.toolUseResult && typeof response.toolUseResult === "object" ? response.toolUseResult : {};
+        const isAsync = response.isAsync === true || nested.isAsync === true || response.status === "async_launched" || nested.status === "async_launched";
+        if (!isAsync) {
+          return;
+        }
+        const agentId = typeof response.agentId === "string" ? response.agentId : typeof nested.agentId === "string" ? nested.agentId : null;
+        const outputFile = outputFileFromLaunchResponse(response, nested);
+        const now = new Date().toISOString();
+        const record = createDispatch(input, agentType, false, env);
+        updateLifecycleWorkerRecord(record.taskId, env, (current) => ({
+          ...current,
+          ...(agentId ? { agentId, backgroundTaskId: agentId } : {}),
+          ...(outputFile ? { transcriptPath: outputFile } : {}),
+          transportStatus: "pending_async",
+          runtimeAsync: true,
+          failureKind: "unexpected_async",
+          startedAt: current.startedAt ?? now
+        }));
+      } finally {
+        releaseHostPeerCapacity(input, env);
       }
-      const agentId = typeof response.agentId === "string" ? response.agentId : typeof nested.agentId === "string" ? nested.agentId : null;
-      const outputFile = outputFileFromLaunchResponse(response, nested);
-      const now = new Date().toISOString();
-      const record = createDispatch(input, agentType, false, env);
-      updateLifecycleWorkerRecord(record.taskId, env, (current) => ({
-        ...current,
-        ...(agentId ? { agentId, backgroundTaskId: agentId } : {}),
-        ...(outputFile ? { transcriptPath: outputFile } : {}),
-        transportStatus: "pending_async",
-        runtimeAsync: true,
-        failureKind: "unexpected_async",
-        startedAt: current.startedAt ?? now
-      }));
       return;
     }
     if (!isFusionWorkerAgent(agentType)) {

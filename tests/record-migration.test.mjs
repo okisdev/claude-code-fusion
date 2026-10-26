@@ -134,3 +134,16 @@ test("irreparable records remain unreadable and unchanged", () => {
     assert.equal(fs.readFileSync(file, "utf8"), before);
   }
 });
+
+test("Grok legacy records with an unknown status stay unreadable and unchanged", () => {
+  const legacy = { ...grok.createJobRecord({ id: "grok-mystery", mode: "consult", cwd: root, briefFile: null, background: false }), status: "mystery" };
+  delete legacy.schemaVersion;
+  delete legacy.engine;
+  const file = path.join(root, "grok-mystery", `${legacy.id}.json`);
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  const before = `${JSON.stringify(legacy)}\n`;
+  fs.writeFileSync(file, before);
+  assert.deepEqual(grok.migrateJobRecord(legacy), legacy);
+  assert.equal(grok.readJobRecordFile(file), null);
+  assert.equal(fs.readFileSync(file, "utf8"), before);
+});

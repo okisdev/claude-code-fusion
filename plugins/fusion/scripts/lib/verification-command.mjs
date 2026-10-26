@@ -120,7 +120,7 @@ const PASS_SUMMARY_PATTERNS = [
 
 const FAILURE_SUMMARY_PATTERNS = [
   /^\s*(?:✖\s|not ok\b)/im,
-  /^\s*(?:ℹ\s+)?fail\s+[1-9]\d*\b/im,
+  /^\s*(?:ℹ\s+|#\s+)fail\s+[1-9]\d*\b/im,
   /[1-9]\d*\s+fail(?:ed|ures?)\b/i,
   /^\s*FAIL\b/m,
   /[1-9]\d*\s+error(s)?\b/i
@@ -302,7 +302,7 @@ function verificationCommand(command, env = process.env) {
   const lastVerificationIndex = matchingSegments.lastIndexOf(true);
   let pipefail = false;
   const pipefailAtSegment = segments.map((segment, index) => {
-    if (/^set\s+-[a-z]*o\s+pipefail$/i.test(segment.command) && segments[index + 1]?.separator !== "|") {
+    if (/^set\s+-[a-z]*o\s+pipefail$/i.test(segment.command) && segments[index + 1]?.separator !== "|" && segments.slice(1, index + 1).every((previous) => [";", "\n", "\r", "&&"].includes(previous.separator))) {
       pipefail = true;
     } else if (/^set\s+\+(?:[a-z]*o)\s+pipefail$/i.test(segment.command)) {
       pipefail = false;

@@ -813,6 +813,7 @@ test("terminal Codex connectivity diagnostics classify as network", () => {
     "Reconnecting... (workspace routing discovery timed out)",
     "stream disconnected before completion: upstream closed the stream",
     "error sending request: connection refused",
+    "error sending request for url (https://example.test): request failed",
     "ECONNRESET", "ECONNREFUSED", "ENOTFOUND", "EAI_AGAIN", "getaddrinfo failed", "network is unreachable"
   ]) {
     const outcome = failureOutcome({ terminalEvent: { type: "turn.failed" }, turnFailureMessage: message }, { exitCode: 1 }, "");
@@ -822,6 +823,12 @@ test("terminal Codex connectivity diagnostics classify as network", () => {
   }
   const stderrOnly = failureOutcome({ diagnostics: [] }, { exitCode: 1 }, "Reconnecting... (workspace routing discovery timed out)");
   assert.equal(stderrOnly.failureKind, "network");
+});
+
+test("an unsupported Codex model is not classified as a network failure", () => {
+  const message = "Error sending request: model gpt-5 is not supported";
+  const outcome = failureOutcome({ terminalEvent: { type: "turn.failed" }, turnFailureMessage: message }, { exitCode: 1 }, "");
+  assert.equal(outcome.failureKind, "error");
 });
 
 test("Codex quota, rate limit, refusal, and auth evidence precedes network evidence", () => {
