@@ -141,12 +141,12 @@ test("next write compacts legacy buffers and skips an oversized carry", (t) => {
   assert.equal(compacted.transcriptSkippingLine, true);
 });
 
-test("parent context advice fires at 600k and 800k once each", async (t) => {
+test("parent context advice fires at 250k and 800k once each", async (t) => {
   const box = sandbox(t);
   const dispatch = (id) => hook(box, { hook_event_name: "PreToolUse", session_id: "session-1", tool_use_id: `tool-${id}`, transcript_path: box.transcript, cwd: box.root, tool_name: "Agent", tool_input: { subagent_type: "codex:codex-rescue", description: "peer", prompt: "bounded peer brief" } });
   const usage = (tokens) => fs.appendFileSync(box.transcript, `${JSON.stringify({ type: "assistant", message: { usage: { input_tokens: tokens } } })}\n`);
-  usage(600000);
-  assert.match((await dispatch(1)).hookSpecificOutput.additionalContext, /main loop context is 600k/);
+  usage(250000);
+  assert.match((await dispatch(1)).hookSpecificOutput.additionalContext, /main loop context is 250k/);
   usage(700000);
   assert.equal(await dispatch(2), null);
   usage(800000);

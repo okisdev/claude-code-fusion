@@ -321,6 +321,10 @@ function renderCoercionLedger(lines, ledger) {
 
 export function renderFusionStats(report, { identities = false, byDay = false } = {}) {
   const lines = ["# Fusion stats", "", `Scope: ${report.scope === "all" ? "all workspaces" : `workspace ${report.scope}`}`];
+  if (report.parentContextAtDispatch) {
+    const { dispatchCount, medianTokens, p90Tokens } = report.parentContextAtDispatch;
+    lines.push(`Parent context at dispatch: ${dispatchCount} measured; median ${medianTokens ?? "n/a"} tokens, p90 ${p90Tokens ?? "n/a"} tokens`);
+  }
   for (const provider of STATS_PROVIDER_REGISTRY) {
     if (report[provider.id]) {
       renderEngine(lines, provider.displayName, report[provider.id], { identities });
