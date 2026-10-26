@@ -1,9 +1,9 @@
-import { recordEngineAcceptance } from "../../lib/engine-acceptance.mjs";
+import { engineAcceptanceTransport, recordEngineAcceptance } from "../../lib/engine-acceptance.mjs";
 import { readEngineJobRecord } from "../../lib/engine-job-state.mjs";
 import { ENGINE_IDS, ENGINE_TERMINAL_STATUSES, engineDisplayName, engineDisplayNameList, engineStateRoots, isEngineId } from "../../lib/engines.mjs";
 import { WORKER_TERMINAL_STATUSES, readWorkerRecord, readWorkerRecords, recordWorkerAcceptance, validateWorkerAcceptance } from "../../lib/worker-state.mjs";
 import { FILE_ENGINE_DESCRIPTORS } from "./engine-evidence.mjs";
-import { ENGINE_JOB_ID_PATTERN, FUSION_TASK_ID_PATTERN, RESUMABLE_CODEX_FAILURE_KINDS, nonEmptyString } from "./evidence.mjs";
+import { ENGINE_JOB_ID_PATTERN, FUSION_TASK_ID_PATTERN, nonEmptyString } from "./evidence.mjs";
 
 function resolveEngineJob(jobId, env) {
   const found = ENGINE_IDS.filter((engine) => FILE_ENGINE_DESCRIPTORS[engine].enumerateJobs(engineStateRoots(engine, env)[0], { env }).some((job) => nonEmptyString(job?.id) === jobId));
@@ -69,15 +69,13 @@ function settleWorkerRecord({ taskId, verdict, source, reason, failureKind, acce
     if (!finalPeer && !retainedEngines.includes(engine)) {
       continue;
     }
-    const engineRecord = finalPeer ? null : readEngineJobRecord(engine, jobId, env);
-    const failedTransport = engineRecord?.status === "error" || engineRecord?.transportStatus === "error";
-    const salvage = failedTransport && RESUMABLE_CODEX_FAILURE_KINDS.has(engineRecord.failureKind);
-    if (!finalPeer && verdict === "accepted" && failedTransport && !salvage) {
+    const transport = engineAcceptanceTransport({ engine, jobId, acceptance: verdict, acceptFailedTransport, env });
+    if (!finalPeer && verdict === "accepted" && transport.failedTransport && !transport.salvage) {
       stderr.write(`Skipped engine settlement for ${engineDisplayName(engine)} job ${jobId}: error transport is not a salvage failure.\n`);
       continue;
     }
     try {
-      recordEngineAcceptance({ engine, jobId, acceptance: verdict, source, reason, failureKind, acceptFailedTransport: acceptFailedTransport || (!finalPeer && verdict === "accepted" && salvage), workspaceRoot, asJson, env });
+      recordEngineAcceptance({ engine, jobId, acceptance: verdict, source, reason, failureKind, acceptFailedTransport: transport.acceptFailedTransport, workspaceRoot, asJson, env });
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       if (!finalPeer) {
