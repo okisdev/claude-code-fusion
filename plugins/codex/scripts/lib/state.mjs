@@ -28,6 +28,10 @@ const DELIVERY_MODES = new Set(["foreground", "manual", "managed"]);
 const SEMANTIC_STATUSES = new Set(["accepted", "rejected", "unverified"]);
 const SEMANTIC_FAILURE_KINDS = new Set(["intent_override", "scope_rewrite", "wrong_approach", "style_mismatch", "oversized"]);
 const ACCEPTANCE_SOURCES = new Set(["collector", "main-loop", "stats"]);
+const JOB_REQUIRED_FIELDS = ["claudeSessionId", "delivery", "deliveryCollectedAt", "artifactsPruned",
+  "acceptanceSource", "acceptanceRecordedAt", "fileChangeCount", "semanticStatus",
+  "semanticFailureKind", "semanticFailureMessage", "serviceTier", "resolvedModel", "resolvedEffort",
+  "timeoutMs", "companionVersion"];
 const JOB_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 const WORKSPACE_SLUG_PATTERN = /^.+-[a-f0-9]{16}$/;
 const GIT_CACHE_TTL_MS = 3000;
@@ -503,15 +507,39 @@ function assertJobRecord(record) {
   if (record.companionVersion != null && (typeof record.companionVersion !== "string" || !record.companionVersion.trim())) {
     throw new TypeError("Job companion version is invalid.");
   }
-  const requiredFields = ["claudeSessionId", "delivery", "deliveryCollectedAt", "artifactsPruned",
-    "acceptanceSource", "acceptanceRecordedAt", "fileChangeCount", "semanticStatus",
-    "semanticFailureKind", "semanticFailureMessage", "serviceTier", "resolvedModel", "resolvedEffort",
-    "timeoutMs", "companionVersion"];
   if (record.schemaVersion !== JOB_SCHEMA_VERSION || record.engine !== "codex"
     || Object.hasOwn(record, "appliedServiceTier") || Object.hasOwn(record, "sessionId")
-    || requiredFields.some((field) => !Object.hasOwn(record, field))) {
+    || JOB_REQUIRED_FIELDS.some((field) => !Object.hasOwn(record, field))) {
     throw new TypeError("Job record schema is invalid.");
   }
+}
+
+export function migrateJobRecord(raw) {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw) || raw.engine !== "codex"
+      || (raw.schemaVersion != null && raw.schemaVersion !== JOB_SCHEMA_VERSION)) return raw;
+  if (raw.schemaVersion === JOB_SCHEMA_VERSION && !Object.hasOwn(raw, "sessionId")
+      && !Object.hasOwn(raw, "appliedServiceTier")
+      && JOB_REQUIRED_FIELDS.every((field) => Object.hasOwn(raw, field))) return raw;
+  const { appliedServiceTier, sessionId, ...record } = raw;
+  return {
+    ...record,
+    claudeSessionId: raw.claudeSessionId ?? sessionId ?? null,
+    delivery: raw.delivery ?? (raw.background ? "manual" : "foreground"),
+    deliveryCollectedAt: raw.deliveryCollectedAt ?? null,
+    acceptanceSource: raw.acceptanceSource ?? null,
+    acceptanceRecordedAt: raw.acceptanceRecordedAt ?? null,
+    fileChangeCount: raw.fileChangeCount ?? null,
+    semanticStatus: raw.semanticStatus ?? "unverified",
+    semanticFailureKind: raw.semanticFailureKind ?? null,
+    semanticFailureMessage: raw.semanticFailureMessage ?? null,
+    serviceTier: raw.serviceTier ?? raw.request?.serviceTier ?? null,
+    resolvedModel: raw.resolvedModel ?? null,
+    resolvedEffort: raw.resolvedEffort ?? null,
+    timeoutMs: raw.timeoutMs ?? null,
+    companionVersion: raw.companionVersion ?? null,
+    schemaVersion: raw.schemaVersion ?? JOB_SCHEMA_VERSION,
+    artifactsPruned: raw.artifactsPruned ?? false
+  };
 }
 
 function ownerSessionId(record) {
@@ -774,7 +802,7 @@ export function createJobRecord(fields) {
 export function writeJobRecordFile(file, record) {
   assertJobRecord(record);
   withRecordLock(file, () => {
-    const existing = readJobRecordFile(file);
+    const existing = readJobRecordFile(file, true);
     if (existing && TERMINAL_STATUSES.has(existing.status)) {
       return;
     }
@@ -783,7 +811,7 @@ export function writeJobRecordFile(file, record) {
   return file;
 }
 
-export function readJobRecordFile(file) {
+export function readJobRecordFile(file, locked = false) {
   let text;
   try {
     text = fs.readFileSync(file, "utf8");
@@ -800,12 +828,19 @@ export function readJobRecordFile(file) {
     quarantineCorruptRecord(file);
     return null;
   }
+  let migrated;
   try {
-    assertJobRecord(parsed);
-    return parsed;
+    migrated = migrateJobRecord(parsed);
+    assertJobRecord(migrated);
   } catch {
     return null;
   }
+  if (migrated === parsed) return parsed;
+  if (locked) {
+    atomicWriteFile(file, `${JSON.stringify(migrated, null, 2)}\n`);
+    return migrated;
+  }
+  return withRecordLock(file, () => readJobRecordFile(file, true));
 }
 
 export function updateJobRecordFile(file, patch) {
@@ -813,7 +848,7 @@ export function updateJobRecordFile(file, patch) {
     throw new TypeError("Job record patch must be an object.");
   }
   return withRecordLock(file, () => {
-    const existing = readJobRecordFile(file);
+    const existing = readJobRecordFile(file, true);
     if (!existing) {
       throw new Error(`No job record found at ${file}.`);
     }
@@ -832,7 +867,7 @@ export function updateJobRecordFileWithCurrent(file, updater, options = {}) {
   }
   const allowTerminal = options.allowTerminal === true;
   return withRecordLock(file, () => {
-    const existing = readJobRecordFile(file);
+    const existing = readJobRecordFile(file, true);
     if (!existing) {
       throw new Error(`No job record found at ${file}.`);
     }
@@ -857,7 +892,7 @@ export function finishJobRecordFile(file, patch) {
     throw new TypeError("A terminal job status is required.");
   }
   return withRecordLock(file, () => {
-    const existing = readJobRecordFile(file);
+    const existing = readJobRecordFile(file, true);
     if (!existing) {
       throw new Error(`No job record found at ${file}.`);
     }
@@ -875,7 +910,7 @@ export function markJobCollectedFile(file, collectedAt = nowIso()) {
     throw new TypeError("A valid collection timestamp is required.");
   }
   return withRecordLock(file, () => {
-    const existing = readJobRecordFile(file);
+    const existing = readJobRecordFile(file, true);
     if (!existing) {
       throw new Error(`No job record found at ${file}.`);
     }
@@ -1012,18 +1047,15 @@ function expectedManagedArtifacts(workspaceDir, id) {
   ];
 }
 
-function readManagedJobEntry(workspace, workspaceDir, file, id) {
-  const recordDescriptor = regularFileDescriptor(file);
+function readManagedJobEntry(workspace, workspaceDir, file, id, locked = false) {
+  let recordDescriptor = regularFileDescriptor(file);
   if (recordDescriptor.kind !== "regular" || recordDescriptor.size > JOB_RECORD_SCAN_MAX_BYTES) {
     return null;
   }
-  let record;
-  try {
-    record = JSON.parse(fs.readFileSync(file, "utf8"));
-    assertJobRecord(record);
-  } catch {
-    return null;
-  }
+  const record = readJobRecordFile(file, locked);
+  if (!record) return null;
+  recordDescriptor = regularFileDescriptor(file);
+  if (recordDescriptor.kind !== "regular" || recordDescriptor.size > JOB_RECORD_SCAN_MAX_BYTES) return null;
   if (record.schemaVersion !== JOB_SCHEMA_VERSION || record.engine !== "codex" || record.id !== id) {
     return null;
   }
@@ -1241,7 +1273,7 @@ function resumeProtectionChanged(entry, current, protection) {
 function deleteManagedJobEntry(entry, tier, protection) {
   return withRecordLock(entry.file, () => {
     const workspaceDir = path.dirname(path.dirname(entry.file));
-    const refreshed = readManagedJobEntry(entry.workspace, workspaceDir, entry.file, entry.id);
+    const refreshed = readManagedJobEntry(entry.workspace, workspaceDir, entry.file, entry.id, true);
     if (!refreshed || !TERMINAL_STATUSES.has(refreshed.record.status)
         || (refreshed.record.background && !refreshed.record.collectedAt)) {
       return null;

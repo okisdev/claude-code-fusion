@@ -301,6 +301,68 @@ function withStructuredStatuses(record) {
   };
 }
 
+const JOB_RECORD_FIELDS = ["jobClass", "delivery", "semanticStatus", "request", "pidIdentity",
+  "grokPidIdentity", "grokVersion", "deliveryStatus", "transportStatus", "resultPayload", "cleanupRequired"];
+
+function assertJobRecord(record) {
+  if (!record || typeof record !== "object" || Array.isArray(record)
+      || record.schemaVersion !== 1 || record.engine !== "grok"
+      || typeof record.id !== "string" || !record.id
+      || !TERMINAL_STATUSES.has(record.status) && record.status !== "running"
+      || typeof record.mode !== "string" || !record.mode
+      || typeof record.cwd !== "string" || !record.cwd
+      || typeof record.createdAt !== "string" || !Number.isFinite(Date.parse(record.createdAt))
+      || typeof record.background !== "boolean"
+      || record.request != null && (typeof record.request !== "object" || Array.isArray(record.request))
+      || JOB_RECORD_FIELDS.some((field) => !Object.hasOwn(record, field))) {
+    throw new TypeError("Job record schema is invalid.");
+  }
+}
+
+export function migrateJobRecord(raw) {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)
+      || raw.engine != null && raw.engine !== "grok"
+      || raw.schemaVersion != null && raw.schemaVersion !== 1) return raw;
+  if (raw.schemaVersion === 1 && raw.engine === "grok"
+      && JOB_RECORD_FIELDS.every((field) => Object.hasOwn(raw, field))) return raw;
+  if (typeof raw.id !== "string" || !raw.id || typeof raw.mode !== "string"
+      || typeof raw.cwd !== "string" || typeof raw.createdAt !== "string"
+      || typeof raw.background !== "boolean" || !Object.hasOwn(raw, "request")) return raw;
+  return withStructuredStatuses({
+    ...raw,
+    schemaVersion: 1,
+    engine: "grok",
+    companionVersion: raw.companionVersion ?? null,
+    grokVersion: typeof raw.grokVersion === "string" && raw.grokVersion.trim() ? raw.grokVersion.trim() : null,
+    jobClass: raw.jobClass ?? "unknown",
+    delivery: raw.delivery ?? (raw.background ? "manual" : "foreground"),
+    deliveryCollectedAt: raw.deliveryCollectedAt ?? null,
+    claudeSessionId: raw.claudeSessionId ?? null,
+    finishedAt: raw.finishedAt ?? null,
+    exitCode: raw.exitCode ?? null,
+    sessionId: raw.sessionId ?? null,
+    resultText: raw.resultText ?? null,
+    resolvedModel: raw.resolvedModel ?? null,
+    resolvedEffort: raw.resolvedEffort ?? null,
+    role: raw.role ?? null,
+    usage: raw.usage ?? null,
+    modelUsage: raw.modelUsage ?? null,
+    usageIsIncomplete: raw.usageIsIncomplete ?? null,
+    modelUsageIsIncomplete: raw.modelUsageIsIncomplete ?? null,
+    errorMessage: raw.errorMessage ?? null,
+    errorTail: raw.errorTail ?? null,
+    failureKind: raw.failureKind ?? null,
+    semanticStatus: raw.semanticStatus ?? "unverified",
+    semanticFailureKind: raw.semanticFailureKind ?? null,
+    semanticFailureMessage: raw.semanticFailureMessage ?? null,
+    pidIdentity: raw.pidIdentity ?? null,
+    grokPidIdentity: raw.grokPidIdentity ?? null,
+    cleanupRequired: raw.cleanupRequired ?? false,
+    resultPayload: raw.resultPayload ?? null,
+    cancelRequestedAt: raw.cancelRequestedAt ?? null
+  });
+}
+
 function preserveTerminalRecord(existing, next) {
   if (existing && TERMINAL_STATUSES.has(existing.status)) {
     return withStructuredStatuses(existing);
@@ -336,7 +398,7 @@ export function createJobRecordFile(file, record) {
 
 export function writeJobRecordFile(file, record) {
   withRecordLock(file, () => {
-    const existing = readJobRecordFile(file);
+    const existing = readJobRecordFile(file, true);
     const next = preserveTerminalRecord(existing, record);
     atomicWriteFile(file, `${JSON.stringify(next, null, 2)}\n`);
   });
@@ -345,7 +407,7 @@ export function writeJobRecordFile(file, record) {
 
 export function markManagedDeliveryCollectedFile(file, collectedAt = nowIso()) {
   return withRecordLock(file, () => {
-    const existing = readJobRecordFile(file);
+    const existing = readJobRecordFile(file, true);
     if (!existing || existing.delivery !== "managed" || !TERMINAL_STATUSES.has(existing.status) || existing.deliveryCollectedAt) {
       return existing;
     }
@@ -357,7 +419,7 @@ export function markManagedDeliveryCollectedFile(file, collectedAt = nowIso()) {
 
 export function markDeliveryCollectedFile(file, collectedAt = nowIso()) {
   return withRecordLock(file, () => {
-    const existing = readJobRecordFile(file);
+    const existing = readJobRecordFile(file, true);
     if (!existing || existing.delivery === "foreground" || !TERMINAL_STATUSES.has(existing.status) || existing.deliveryCollectedAt) {
       return existing;
     }
@@ -367,22 +429,21 @@ export function markDeliveryCollectedFile(file, collectedAt = nowIso()) {
   });
 }
 
-export function readJobRecordFile(file) {
+export function readJobRecordFile(file, locked = false) {
   if (!fs.existsSync(file)) {
     return null;
   }
   try {
     const record = JSON.parse(fs.readFileSync(file, "utf8"));
-    if (record && typeof record === "object" && !Array.isArray(record) && Object.hasOwn(record, "id") && (
-      record.schemaVersion !== 1 || record.engine !== "grok" || typeof record.id !== "string" ||
-      !Object.hasOwn(record, "jobClass") || !Object.hasOwn(record, "delivery") ||
-      !Object.hasOwn(record, "semanticStatus") || !Object.hasOwn(record, "request") ||
-      !Object.hasOwn(record, "pidIdentity") || !Object.hasOwn(record, "grokPidIdentity") ||
-      !Object.hasOwn(record, "grokVersion") || !Object.hasOwn(record, "deliveryStatus") ||
-      !Object.hasOwn(record, "transportStatus") || !Object.hasOwn(record, "resultPayload") ||
-      !Object.hasOwn(record, "cleanupRequired")
-    )) return null;
-    return record;
+    if (!record || typeof record !== "object" || Array.isArray(record) || !Object.hasOwn(record, "id")) return record;
+    const migrated = migrateJobRecord(record);
+    assertJobRecord(migrated);
+    if (migrated === record) return record;
+    if (locked) {
+      atomicWriteFile(file, `${JSON.stringify(migrated, null, 2)}\n`);
+      return migrated;
+    }
+    return withRecordLock(file, () => readJobRecordFile(file, true));
   } catch {
     return null;
   }
@@ -536,7 +597,7 @@ function sweepGrokState(dataDir, now = Date.now()) {
 
 export function updateJobRecordFile(file, patch) {
   return withRecordLock(file, () => {
-    const existing = readJobRecordFile(file);
+    const existing = readJobRecordFile(file, true);
     if (!existing) {
       throw new Error(`No job record found at ${file}.`);
     }
@@ -553,7 +614,7 @@ export function launchRunningJobProcess(file, launch, options = {}) {
   return withRecordLock(file, () => {
     const processRole = options.processRole === "worker" ? "worker" : "grok";
     const processLabel = processRole === "worker" ? "Background worker" : "Grok process";
-    const existing = readJobRecordFile(file);
+    const existing = readJobRecordFile(file, true);
     if (!existing) {
       throw new Error(`No job record found at ${file}.`);
     }
@@ -597,7 +658,7 @@ export function launchRunningJobProcess(file, launch, options = {}) {
 
 export function updateJobRecordFileWithCurrent(file, updater, options = {}) {
   return withRecordLock(file, () => {
-    const existing = readJobRecordFile(file);
+    const existing = readJobRecordFile(file, true);
     if (!existing) {
       throw new Error(`No job record found at ${file}.`);
     }
@@ -626,7 +687,7 @@ export function updateJobRecordFileWithCurrent(file, updater, options = {}) {
 
 export function finishSuccessfulJobRecordFile(file, successPatch) {
   return withRecordLock(file, () => {
-    const existing = readJobRecordFile(file);
+    const existing = readJobRecordFile(file, true);
     if (!existing) {
       throw new Error(`No job record found at ${file}.`);
     }
