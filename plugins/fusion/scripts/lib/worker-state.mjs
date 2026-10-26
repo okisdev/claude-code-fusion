@@ -408,15 +408,15 @@ export function reopenWorkerContinuation(record, at = new Date().toISOString(), 
     uncachedWindDownSentAt: null,
     lastActivityAt: at,
     inFlightSince: at,
+    budgetBaseline: {
+      at,
+      turns: record.turns ?? 0,
+      outputTokens: record.usage?.outputTokens ?? 0,
+      uncachedTokens: record.usage?.uncachedTokens ?? 0,
+      toolCalls: record.toolCalls ?? 0,
+      usage: Object.fromEntries(USAGE_KEYS.map((key) => [key, integer(record.usage?.[key])]))
+    },
     ...(fusionWorker ? {
-      budgetBaseline: {
-        at,
-        turns: record.turns ?? 0,
-        outputTokens: record.usage?.outputTokens ?? 0,
-        uncachedTokens: record.usage?.uncachedTokens ?? 0,
-        toolCalls: record.toolCalls ?? 0,
-        usage: Object.fromEntries(USAGE_KEYS.map((key) => [key, integer(record.usage?.[key])]))
-      },
       transcriptRoundPrefix: { turns: 0, toolCalls: 0, usage: emptyWorkerUsage() },
       usageMessages: {},
       turnIds: [],

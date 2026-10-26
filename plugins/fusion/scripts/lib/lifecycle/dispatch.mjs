@@ -55,7 +55,7 @@ function injectedPeerDefaults(prompt, agentType, env) {
   }
   const { options, brief, separated } = leadingCompanionOptions(prompt);
   const header = brief.split(/\r?\n/).find((line) => line.trim())?.trim() ?? "";
-  const roleField = new RegExp(`(?:^|\\|\\s*)(?:${ENGINE_ID_ALTERNATION})-role:`, "i");
+  const roleField = new RegExp(`(?:^|[|·,;]\\s*)(?:${ENGINE_ID_ALTERNATION})-role:`, "i");
   if (!/^lane:/i.test(header) && !roleField.test(header)) {
     return null;
   }
@@ -77,7 +77,7 @@ function injectedPeerDefaults(prompt, agentType, env) {
     filled.push("--model", choice.model);
   }
   if (effort === null) {
-    const matched = Object.values(defaults[engine]).find((entry) => entry.model === (model ?? choice.model));
+    const matched = model !== null && model !== choice.model ? Object.values(defaults[engine]).find((entry) => entry.model === model) : null;
     filled.push("--effort", matched?.effort ?? choice.effort);
   }
   if (filled.length === 0) {
