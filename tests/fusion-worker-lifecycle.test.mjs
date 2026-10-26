@@ -590,6 +590,10 @@ test("oversized briefs without sizing advise a large package and combine with ve
   assert.strictEqual(combinedLaunch.additionalContext.match(/Verification advisory/g).length, 1);
 });
 
+function completePeer(box, payload) {
+  run(box, { ...payload, hook_event_name: "PostToolUse", tool_response: { status: "completed", content: [{ type: "text", text: "done" }] } });
+}
+
 test("parent context advisory fires once at 250k and once at 800k across peer dispatches", (t) => {
   const box = sandbox(t);
   const usage = (tokens) => fs.appendFileSync(box.transcript, `${JSON.stringify({ type: "assistant", message: { usage: { input_tokens: 1000, cache_read_input_tokens: tokens - 1500, cache_creation_input_tokens: 500 } } })}\n`);
@@ -601,10 +605,12 @@ test("parent context advisory fires once at 250k and once at 800k across peer di
   usage(601000);
   fs.appendFileSync(box.transcript, `${JSON.stringify({ type: "assistant", isSidechain: true, message: { usage: { input_tokens: 1, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 } } })}\n`);
   const peer = run(box, { ...dispatch(box), tool_use_id: "peer-1", tool_input: { subagent_type: "codex:codex-rescue", prompt: "plain peer brief" } });
+  completePeer(box, { ...dispatch(box), tool_use_id: "peer-1", tool_input: { subagent_type: "codex:codex-rescue", prompt: "plain peer brief" } });
   assert.strictEqual(peer.stdout, "");
   assert.strictEqual(readWorkerSessionState("session-1", envFor(box)).parentContextAdvisorySent, true);
 
   const repeated = run(box, { ...dispatch(box), tool_use_id: "peer-2", tool_input: { subagent_type: "codex:codex-rescue", prompt: "lane: codex quick\ngoal: repair" } }, routingFixture(box));
+  completePeer(box, { ...dispatch(box), tool_use_id: "peer-2", tool_input: { subagent_type: "codex:codex-rescue", prompt: "lane: codex quick\ngoal: repair" } });
   assert.match(JSON.parse(repeated.stdout).hookSpecificOutput.additionalContext, /lane default/);
   assert.doesNotMatch(JSON.parse(repeated.stdout).hookSpecificOutput.additionalContext, /main loop context/);
 
@@ -615,6 +621,7 @@ test("parent context advisory fires once at 250k and once at 800k across peer di
 
   usage(601000);
   const injected = run(box, { ...dispatch(box), tool_use_id: "peer-3", tool_input: { subagent_type: "codex:codex-rescue", prompt: "lane: codex quick\ngoal: repair" } }, routingFixture(box));
+  completePeer(box, { ...dispatch(box), tool_use_id: "peer-3", tool_input: { subagent_type: "codex:codex-rescue", prompt: "lane: codex quick\ngoal: repair" } });
   const injectedContext = JSON.parse(injected.stdout).hookSpecificOutput.additionalContext;
   assert.match(injectedContext, /lane default/);
   assert.doesNotMatch(injectedContext, /main loop context/);
