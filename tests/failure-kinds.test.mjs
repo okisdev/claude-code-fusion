@@ -100,6 +100,10 @@ test("a Codex refusal turn failure yields failure kind refused", (t) => {
 for (const [message, failureKind] of [
   ["Flex capacity unavailable.", "rate_limited"],
   ["stream disconnected before completion: Incomplete response returned, reason: content_filter", "refused"],
+  ["Reconnecting... (workspace routing discovery timed out)", "network"],
+  ["stream disconnected before completion: upstream connection closed", "network"],
+  ["error sending request: connection reset", "network"],
+  ["network is unreachable", "network"],
   ["This request has been flagged for possible cybersecurity risk.", "refused"],
   ["This content was flagged for possible biological risk.", "refused"],
   ["The local disk has capacity for this request.", "error"]

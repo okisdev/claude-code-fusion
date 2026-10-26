@@ -29,6 +29,7 @@ import {
   terminateProcessTree,
   terminateProcessTreeSync
 } from "../plugins/codex/scripts/lib/codex-exec.mjs";
+import { failureOutcome } from "../plugins/codex/scripts/lib/codex-outcome.mjs";
 import {
   envFor as companionEnvFor,
   jobRecords as companionJobRecords,
@@ -805,6 +806,34 @@ test("turn.failed remains the structured failure when the process exits nonzero"
   assert.equal(outcome.terminalEvent, "turn.failed");
   assert.equal(outcome.errorMessage, "model execution failed");
   assert.equal(outcome.exitCode, 1);
+});
+
+test("terminal Codex connectivity diagnostics classify as network", () => {
+  for (const message of [
+    "Reconnecting... (workspace routing discovery timed out)",
+    "stream disconnected before completion: upstream closed the stream",
+    "error sending request: connection refused",
+    "ECONNRESET", "ECONNREFUSED", "ENOTFOUND", "EAI_AGAIN", "getaddrinfo failed", "network is unreachable"
+  ]) {
+    const outcome = failureOutcome({ terminalEvent: { type: "turn.failed" }, turnFailureMessage: message }, { exitCode: 1 }, "");
+    assert.equal(outcome.status, "error", message);
+    assert.equal(outcome.failureKind, "network", message);
+    assert.equal(outcome.errorMessage, message);
+  }
+  const stderrOnly = failureOutcome({ diagnostics: [] }, { exitCode: 1 }, "Reconnecting... (workspace routing discovery timed out)");
+  assert.equal(stderrOnly.failureKind, "network");
+});
+
+test("Codex quota, rate limit, refusal, and auth evidence precedes network evidence", () => {
+  for (const [message, expected] of [
+    ["quota exhausted; Reconnecting...", "quota"],
+    ["rate limit exceeded; connection reset", "rate_limited"],
+    ["stream disconnected before completion: Incomplete response returned, reason: content_filter", "refused"],
+    ["authentication failed; error sending request", "auth"]
+  ]) {
+    const outcome = failureOutcome({ terminalEvent: { type: "turn.failed" }, turnFailureMessage: message }, { exitCode: 1 }, "");
+    assert.equal(outcome.failureKind, expected, message);
+  }
 });
 
 test("top-level and item errors are diagnostics and do not override a completed turn", async (t) => {
