@@ -1,7 +1,5 @@
 import { TRANSCRIPT_TAIL_MAX_BYTES } from "./constants.mjs";
-import { appendToolResponseText } from "../verification-command.mjs";
 import fs from "node:fs";
-export { verificationCommand, verificationResponseFailed } from "../verification-command.mjs";
 
 function transcriptEntryContent(entry) {
   if (Array.isArray(entry?.message?.content)) {
@@ -113,11 +111,4 @@ function extractBashCommand(toolInput) {
   return typeof toolInput.command === "string" ? toolInput.command.trim() : null;
 }
 
-function verificationOutputPasses(toolResponse) {
-  const parts = [];
-  appendToolResponseText(toolResponse, parts);
-  const output = parts.join("\n");
-  return /^\s*(?:ℹ\s+)?fail\s+0\b/im.test(output) && !/^\s*(?:✖\s|not ok\b)/im.test(output);
-}
-
-export { transcriptEntryContent, isExternalUserMessage, readTranscriptTail, hasFleetDeclineAfterLastUserMessage, normalizeMessageId, messageIdForToolUse, extractBashCommand, verificationOutputPasses };
+export { transcriptEntryContent, isExternalUserMessage, readTranscriptTail, hasFleetDeclineAfterLastUserMessage, normalizeMessageId, messageIdForToolUse, extractBashCommand };

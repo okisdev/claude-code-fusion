@@ -20,6 +20,7 @@ function handleDispatch(input, env, { sessionId, toolName, file, now, posture, w
       return;
     }
     const subagentType = toolName === "SendMessage" ? record.agentType : extractSubagentType(input.tool_input);
+    const genericAgent = toolName === "Agent" && !input.agent_id && (subagentType == null || ["fork", "general-purpose", "claude"].includes(subagentType));
     const safeSubagentType = sanitizeIdentifier(subagentType);
     const lane = laneForSubagentType(subagentType);
     const description = extractDispatchDescription(input.tool_input);
@@ -122,6 +123,7 @@ function handleDispatch(input, env, { sessionId, toolName, file, now, posture, w
       { at: now, session: sessionId, event: "dispatch", lane: confirmation.lane, tool: toolName, ...(confirmation.messageId ? { messageId: confirmation.messageId } : {}), ...(confirmation.description ? { description: confirmation.description } : {}) },
       env
     );
+    let advisoryContext = genericAgent ? tagMessage("inline-guard.generic-agent-advisory", "This Agent runs a work package outside Fusion collection and settlement. Use codex:codex-rescue or fusion:claude-worker for tracked work, and Explore for read only search.") : null;
     if (confirmation.shouldAdvise) {
       const declineStated = hasFleetDeclineAfterLastUserMessage(input.transcript_path);
       const advisory = claimAdvisory(
@@ -150,11 +152,13 @@ function handleDispatch(input, env, { sessionId, toolName, file, now, posture, w
           env
         );
         if (!advisory.suppressed && !declineStated) {
-          writeHookText(
-            `${JSON.stringify(postToolAdvisoryOutput(tagMessage(NARROW_WAVE_ADVISORY_MESSAGE_SLUG, `${confirmation.streak} ${NARROW_WAVE_ADVISORY_SUFFIX}`)))}\n`
-          );
+          const narrowContext = tagMessage(NARROW_WAVE_ADVISORY_MESSAGE_SLUG, `${confirmation.streak} ${NARROW_WAVE_ADVISORY_SUFFIX}`);
+          advisoryContext = advisoryContext ? `${advisoryContext}\n${narrowContext}` : narrowContext;
         }
       }
+    }
+    if (advisoryContext) {
+      writeHookText(`${JSON.stringify(postToolAdvisoryOutput(advisoryContext))}\n`);
     }
     return;
   }

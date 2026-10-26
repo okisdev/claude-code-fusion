@@ -120,6 +120,7 @@ const PASS_SUMMARY_PATTERNS = [
 
 const FAILURE_SUMMARY_PATTERNS = [
   /^\s*(?:✖\s|not ok\b)/im,
+  /^\s*(?:ℹ\s+)?fail\s+[1-9]\d*\b/im,
   /[1-9]\d*\s+fail(?:ed|ures?)\b/i,
   /^\s*FAIL\b/m,
   /[1-9]\d*\s+error(s)?\b/i
@@ -244,6 +245,7 @@ function isVerificationSegment(segment, pattern) {
 function commandSegments(command) {
   const segments = [];
   let start = 0;
+  let separator = null;
   let quote = null;
   let escaped = false;
   for (let index = 0; index < command.length; index += 1) {
@@ -273,14 +275,15 @@ function commandSegments(command) {
     }
     const segment = command.slice(start, index).trim();
     if (segment) {
-      segments.push(segment);
+      segments.push({ command: segment, separator });
     }
+    separator = twoCharacterSeparator === "&&" || twoCharacterSeparator === "||" ? twoCharacterSeparator : character;
     index += separatorLength - 1;
     start = index + 1;
   }
   const segment = command.slice(start).trim();
   if (segment) {
-    segments.push(segment);
+    segments.push({ command: segment, separator });
   }
   return segments;
 }
@@ -295,10 +298,22 @@ function verificationCommand(command, env = process.env) {
   }
   const segments = commandSegments(trimmed);
   const pattern = customPattern(env);
-  const matchingSegments = segments.map((segment) => isVerificationSegment(segment, pattern));
+  const matchingSegments = segments.map((segment) => isVerificationSegment(segment.command, pattern));
+  const lastVerificationIndex = matchingSegments.lastIndexOf(true);
+  let pipefail = false;
+  const pipefailAtSegment = segments.map((segment, index) => {
+    if (/^set\s+-[a-z]*o\s+pipefail$/i.test(segment.command) && segments[index + 1]?.separator !== "|") {
+      pipefail = true;
+    } else if (/^set\s+\+(?:[a-z]*o)\s+pipefail$/i.test(segment.command)) {
+      pipefail = false;
+    }
+    return pipefail;
+  });
   return {
-    recognized: matchingSegments.some(Boolean),
-    observable: matchingSegments.at(-1) === true
+    recognized: lastVerificationIndex !== -1,
+    observable: lastVerificationIndex !== -1 && segments.slice(lastVerificationIndex + 1).every(
+      (segment, offset) => segment.separator === "&&" || (segment.separator === "|" && pipefailAtSegment[lastVerificationIndex + offset])
+    )
   };
 }
 
@@ -325,19 +340,27 @@ function appendToolResponseText(value, parts, depth = 0) {
   }
 }
 
-function verificationOutputPasses(toolResponse) {
+function verificationOutputSummary(toolResponse) {
   if (
     !toolResponse ||
     typeof toolResponse !== "object" ||
     Array.isArray(toolResponse) ||
     verificationResponseFailed(toolResponse)
   ) {
-    return false;
+    return { passes: false, fails: false };
   }
   const parts = [];
   appendToolResponseText(toolResponse, parts);
   const output = parts.join("\n");
-  return PASS_SUMMARY_PATTERNS.some((pattern) => pattern.test(output)) && !FAILURE_SUMMARY_PATTERNS.some((pattern) => pattern.test(output));
+  return {
+    passes: PASS_SUMMARY_PATTERNS.some((pattern) => pattern.test(output)),
+    fails: FAILURE_SUMMARY_PATTERNS.some((pattern) => pattern.test(output))
+  };
+}
+
+function verificationOutputPasses(toolResponse) {
+  const summary = verificationOutputSummary(toolResponse);
+  return summary.passes && !summary.fails;
 }
 
 function verificationResponseFailed(toolResponse) {
@@ -355,7 +378,11 @@ function verificationEvidence(command, toolResponse, env = process.env) {
   if (verificationResponseFailed(toolResponse)) {
     return null;
   }
-  return verification.observable ? "exit-status" : verificationOutputPasses(toolResponse) ? "output-summary" : null;
+  const summary = verificationOutputSummary(toolResponse);
+  if (summary.fails) {
+    return null;
+  }
+  return verification.observable ? "exit-status" : summary.passes ? "output-summary" : null;
 }
 
 export {

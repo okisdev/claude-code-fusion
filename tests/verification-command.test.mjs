@@ -13,12 +13,19 @@ test("credits a piped vitest summary", () => {
   );
 });
 
+test("credits a piped npm vitest summary", () => {
+  assert.equal(summaryEvidence("npm test 2>&1 | tail -20", "Test Files  3 passed (3)\nTests  42 passed (42)"), "output-summary");
+  assert.equal(summaryEvidence("npm test | tail", "Tests  42 passed (42)"), "output-summary");
+});
+
 test("rejects a piped vitest summary with failures", () => {
   assert.equal(summaryEvidence("npx vitest run 2>&1 | tail -20", "Test Files  1 failed | 2 passed"), null);
 });
 
 test("keeps node:test fail-zero summaries", () => {
   assert.equal(summaryEvidence("npm test | grep -E 'fail|pass'", "ℹ fail 0"), "output-summary");
+  assert.equal(summaryEvidence("node --test | tail", "ℹ pass 12\nℹ fail 0"), "output-summary");
+  assert.equal(summaryEvidence("node --test | tail", "ℹ pass 11\nℹ fail 1"), null);
 });
 
 test("credits and rejects piped pytest summaries", () => {
@@ -52,6 +59,32 @@ test("credits and rejects piped jest summaries", () => {
   assert.equal(summaryEvidence("npx jest --ci 2>&1 | tail", "Tests:       1 failed, 11 passed, 12 total"), null);
 });
 
+test("credits silent tsc only when its exit status is observable", () => {
+  assert.equal(summaryEvidence("tsc --noEmit", ""), "exit-status");
+  assert.equal(summaryEvidence("tsc --noEmit | tail", ""), null);
+});
+
+test("preserves runner failures through && and through pipes with pipefail", () => {
+  for (const command of [
+    "npm test && echo done",
+    "npm test && git status --short && echo done",
+    "set -o pipefail; npm test | tail",
+    "set -euo pipefail; npm test 2>&1 | tail -20",
+    "set -o pipefail; npm test | tail && echo done"
+  ]) {
+    assert.equal(summaryEvidence(command, ""), "exit-status", command);
+  }
+  for (const command of ["npm test | tail", "npm test; echo done", "npm test || true", "npm test && echo done; echo again", "set -o pipefail; npm test | tail; echo done", "set -o pipefail; npm test && set +o pipefail && tsc --noEmit | tail"]) {
+    assert.equal(summaryEvidence(command, ""), null, command);
+  }
+});
+
+test("rejects a failing summary anywhere in observable output", () => {
+  for (const output of ["ℹ pass 11\nℹ fail 1", "Tests  42 passed\nTest Files  1 failed", "Tests: 1 failed, 11 passed, 12 total", "1 failed, 2 passed in 0.2s"]) {
+    assert.equal(summaryEvidence("npm test && echo done", output), null, output);
+  }
+});
+
 test("does not credit summaries for unrecognized commands", () => {
   assert.equal(summaryEvidence("./run-my-checks.sh", "3 passed"), null);
 });
@@ -63,7 +96,7 @@ test("does not credit failed or interrupted tool responses", () => {
 });
 
 test("keeps final-segment exit-status evidence and rejects mutating commands", () => {
-  assert.equal(verificationEvidence("npm test", { is_error: false, output: "1 failed" }), "exit-status");
+  assert.equal(verificationEvidence("npm test", { is_error: false, output: "1 failed" }), null);
   assert.equal(summaryEvidence("npm install | tail -20", "3 passed"), null);
 });
 
