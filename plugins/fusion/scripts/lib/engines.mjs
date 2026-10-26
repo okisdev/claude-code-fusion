@@ -163,12 +163,12 @@ function engineRoleFromBrief(id, brief) {
   const { defaultRole, roles } = ENGINES[id];
   const lines = brief.split(/\r?\n/).filter((line) => line.trim()).slice(0, ROLE_HEADER_LINES);
   const header = lines[0]?.trim() ?? "";
-  const lane = knownRole(header.match(new RegExp(`^lane:\\s*${id}\\s+([a-z][a-z-]*)(?=$|[\\s;,|])`, "i"))?.[1], roles);
+  const lane = knownRole(header.match(new RegExp(`^lane:\\s*${id}\\s+([a-z][a-z-]*)(?=$|[\\s;,|·])`, "i"))?.[1], roles);
   if (lane) {
     return lane;
   }
   for (const line of lines) {
-    const field = line.match(new RegExp(`(?:^|[\\s;,|])${id}-role:\\s*([^\\s;,|]+)`, "i"));
+    const field = line.match(new RegExp(`(?:^|[\\s;,|·])${id}-role:\\s*([^\\s;,|·]+)`, "i"));
     if (field) {
       return knownRole(field[1], roles);
     }
