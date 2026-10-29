@@ -80,7 +80,7 @@ test("Cursor collector resolves the configured companion and carries the termina
 test("collector agent stages a closed request schema instead of executable text", () => {
   const agent = fs.readFileSync(path.join(repoRoot, "plugins", "fusion", "agents", "job-collector.md"), "utf8");
   assert.match(agent, /tools: Bash, Read, Write/);
-  assert.match(agent, /exactly one standalone `engine: codex\|grok\|cursor` line/);
+  assert.match(agent, /exactly one standalone `engine: codex\|grok\|cursor\|devin` line/);
   assert.match(agent, /exactly one standalone `job: <32 lowercase hexadecimal characters>` line/);
   assert.match(agent, /exactly one JSON object containing only `engine`, `jobId`, `json`, `intervalMs`, `capMs`, and `deadRerunStatus`/);
   assert.match(agent, /transport-discard --raw-args-token TOKEN/);
