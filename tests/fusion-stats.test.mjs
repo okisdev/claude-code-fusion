@@ -101,7 +101,7 @@ function writeCursorJob(dataDir, cwd, id, fields) {
 
 function runtimeEnv(env, extraEnv = {}) {
   const inherited = Object.fromEntries(
-    Object.entries(process.env).filter(([key]) => key !== "HOME" && key !== "CLAUDE_CODE_SESSION_ID" && !/^(?:FUSION|GROK|CODEX|CURSOR)_/.test(key))
+    Object.entries(process.env).filter(([key]) => key !== "HOME" && key !== "CLAUDE_CODE_SESSION_ID" && !/^(?:FUSION|GROK|CODEX|CURSOR|DEVIN)_/.test(key))
   );
   const root = path.join(path.resolve(env.cwd), ".fusion-stats-runtime");
   return {
@@ -118,6 +118,7 @@ function runtimeEnv(env, extraEnv = {}) {
     FUSION_CURSOR_COMPANION: "/nonexistent/cursor-companion.mjs",
     GROK_COMPANION_DATA: path.join(root, "grok-data"),
     CURSOR_COMPANION_DATA: path.join(root, "cursor-data"),
+    DEVIN_COMPANION_DATA: path.join(root, "devin-data"),
     GROK_HOME: path.join(root, "grok-home"),
     CODEX_COMPANION_DATA: path.join(root, "codex-data"),
     CODEX_HOME: path.join(root, "codex-home"),
@@ -788,7 +789,7 @@ test("Grok job records contribute resolved and unknown models without a companio
 });
 
 test("file-based engine stats use the descriptor registry", () => {
-  assert.deepStrictEqual(Object.keys(FILE_ENGINE_DESCRIPTORS), ["grok", "codex", "cursor"]);
+  assert.deepStrictEqual(Object.keys(FILE_ENGINE_DESCRIPTORS), ["grok", "codex", "cursor", "devin"]);
   assert.strictEqual(FILE_ENGINE_DESCRIPTORS.codex.stateEnvVar, "FUSION_CODEX_STATE");
   assert.strictEqual(FILE_ENGINE_DESCRIPTORS.codex.defaultStateRoot({}), path.join(os.homedir(), ".claude", "plugins", "data", "codex-claude-code-fusion", "state"));
   assert.strictEqual(FILE_ENGINE_DESCRIPTORS.codex.defaultStateRoot({ CODEX_COMPANION_DATA: "/adapter-data" }), "/adapter-data/state");
@@ -836,6 +837,41 @@ test("Cursor stats report models, billing pools, and exact token coverage", (t) 
   const unsettled = run({ cwd: dir, codexState: path.join(dir, "missing-codex") }, ["--unsettled", "--json"], { CURSOR_COMPANION_DATA: dataDir });
   assert.strictEqual(unsettled.status, 0, unsettled.stderr);
   assert.deepStrictEqual(JSON.parse(unsettled.stdout).unsettled.filter((entry) => entry.engine === "cursor").map((entry) => entry.id).sort(), ["cursor-done", "cursor-quota", "cursor-unreported"]);
+});
+
+test("Devin stats retain billing pools, usage, sessions, and unsettled jobs without a routing seat", (t) => {
+  const dir = sandbox(t);
+  const dataDir = path.join(dir, "devin-data");
+  const state = path.join(dataDir, "state", grokWorkspaceSlug(dir), "jobs");
+  fs.mkdirSync(state, { recursive: true });
+  fs.writeFileSync(path.join(state, "devin-done.json"), JSON.stringify({
+    id: "devin-done", engine: "devin", cwd: dir, status: "done", role: "diversity",
+    resolvedModel: "muse-wonder", requestedEffort: "xhigh", effortApplied: true,
+    claudeSessionId: "devin-session", createdAt: "2026-10-13T00:00:00.000Z", billingPool: "api",
+    usage: { inputTokens: 13, outputTokens: 3, cachedReadTokens: 2, totalTokens: 16 }
+  }));
+  const options = { DEVIN_COMPANION_DATA: dataDir };
+  const base = { cwd: dir, codexState: path.join(dir, "missing-codex") };
+  const result = run(base, ["--json"], options);
+  assert.strictEqual(result.status, 0, result.stderr);
+  const stats = JSON.parse(result.stdout).devin;
+  assert.strictEqual(stats.available, true);
+  assert.strictEqual(stats.totalJobs, 1);
+  assert.deepStrictEqual(stats.byModel, { "muse-wonder@xhigh (api)": 1 });
+  assert.strictEqual(stats.tokenUsage.totals.totalTokens, 16);
+  assert.strictEqual(stats.tokenUsage.totals.inputTokens, 11);
+  assert.strictEqual(stats.tokenUsage.totals.cacheReadTokens, 2);
+  assert.match(renderFusionStats(JSON.parse(result.stdout)), /## Devin[\s\S]*muse-wonder@xhigh \(api\): 1/);
+  const session = run(base, ["--session", "devin-session", "--json"], options);
+  assert.deepStrictEqual(JSON.parse(session.stdout).engines.devin.byStatus, { done: 1 });
+  const unsettled = run(base, ["--unsettled", "--json"], options);
+  assert.deepStrictEqual(JSON.parse(unsettled.stdout).unsettled.filter((entry) => entry.engine === "devin").map((entry) => entry.id), ["devin-done"]);
+});
+
+test("Devin usage without reported cache reads stays incomplete", () => {
+  const usage = FILE_ENGINE_DESCRIPTORS.devin.resolveTokenUsage;
+  assert.deepStrictEqual(usage({ usage: { inputTokens: 13, outputTokens: 3, totalTokens: 16 } }), { availability: "partial", usage: null });
+  assert.deepStrictEqual(usage({ usage: { inputTokens: 13, outputTokens: 3, cachedReadTokens: 14, totalTokens: 16 } }), { availability: "partial", usage: null });
 });
 
 test("Codex token normalization rejects inconsistent counters", () => {
@@ -1318,7 +1354,7 @@ test("pruneDeadWorkspaces never touches a workspace with any running job even wi
 
 test("WORKSPACE_ENGINE_DESCRIPTORS covers every peer engine", () => {
   const ids = WORKSPACE_ENGINE_DESCRIPTORS.map((descriptor) => descriptor.id);
-  assert.deepStrictEqual(ids.sort(), ["codex", "cursor", "grok"]);
+  assert.deepStrictEqual(ids.sort(), ["codex", "cursor", "devin", "grok"]);
 });
 
 test("prune-dead treats any unreadable job record as unsafe for the whole workspace", (t) => {
@@ -2112,6 +2148,28 @@ test("--record settles a Fusion task and its Codex peer with direct strict argv"
 
   assert.strictEqual(result.status, 0, result.stderr);
   assert.strictEqual(result.stdout, `Recorded accepted for Fusion worker task ${taskId}.\nRecorded accepted for Codex job ${jobId}.\n`);
+  assert.deepStrictEqual(JSON.parse(fs.readFileSync(argsFile, "utf8")), ["record-acceptance", "--job-id", jobId, "--acceptance", "accepted", "--source", "main-loop"]);
+  assert.strictEqual(readWorkerRecord(taskId, env).acceptance, "accepted");
+});
+
+test("--record settles a Codex collector task through the Codex ledger", (t) => {
+  const dir = sandbox(t);
+  const stateRoot = path.join(dir, "codex-state");
+  const stateDir = path.join(dir, "worker-state");
+  const taskId = `fusion-${"c".repeat(24)}`;
+  const jobId = "d".repeat(32);
+  const argsFile = path.join(dir, "codex-companion-args.json");
+  const env = { FUSION_WORKER_STATE_DIR: stateDir };
+  createWorkerRecord({ taskId, sessionId: "session-settlement", dispatchToolUseId: `tool-${taskId}`, agentType: "fusion:job-collector", workspaceRoot: dir, completionContract: "collector", limits: {} }, env);
+  updateWorkerRecord(taskId, env, (record) => ({ ...record, transportStatus: "done", peerEngine: "codex", peerJobId: jobId, peerTransportStatus: "done" }));
+
+  const result = runDirect(
+    { cwd: dir, codexState: stateRoot },
+    ["--record", `${taskId}=accepted`],
+    { ...env, FUSION_CODEX_COMPANION: writeCodexAcceptanceCompanion(dir), FUSION_TEST_CODEX_COMPANION_ARGS: argsFile }
+  );
+
+  assert.strictEqual(result.status, 0, result.stderr);
   assert.deepStrictEqual(JSON.parse(fs.readFileSync(argsFile, "utf8")), ["record-acceptance", "--job-id", jobId, "--acceptance", "accepted", "--source", "main-loop"]);
   assert.strictEqual(readWorkerRecord(taskId, env).acceptance, "accepted");
 });

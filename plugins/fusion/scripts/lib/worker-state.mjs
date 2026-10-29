@@ -1191,9 +1191,9 @@ function validatedAcceptanceFields(acceptance, source, reason, failureKind) {
   return { safeReason, safeFailureKind: failureKind ?? null };
 }
 
-function workerAcceptanceGate(record, taskId, acceptance, acceptFailedTransport) {
+function workerAcceptanceGate(record, taskId, acceptance, acceptFailedTransport, engineLedgerWritten = false) {
   const collector = canonicalWorkerAgentType(record.agentType) === "fusion:job-collector" || record.completionContract === "collector";
-  if (collector && isEngineId(record.peerEngine) && ENGINES[record.peerEngine].acceptanceLedger) {
+  if (collector && !engineLedgerWritten && isEngineId(record.peerEngine) && ENGINES[record.peerEngine].acceptanceLedger) {
     throw new Error(`Fusion collector task ${taskId} acceptance must be recorded through the ${ENGINES[record.peerEngine].displayName} acceptance ledger.`);
   }
   if (collector && (!isEngineId(record.peerEngine) || !/^[a-f0-9]{32}$/.test(record.peerJobId ?? "") || !record.peerTransportStatus)) {
@@ -1296,16 +1296,16 @@ function updateWorkerAcceptance({ taskId, acceptance, env, source, safeReason, s
   return { record: updated, queued };
 }
 
-export function validateWorkerAcceptance({ record, taskId, acceptance, source = "main-loop", reason = null, failureKind = null, acceptFailedTransport = false }) {
+export function validateWorkerAcceptance({ record, taskId, acceptance, source = "main-loop", reason = null, failureKind = null, acceptFailedTransport = false, engineLedgerWritten = false }) {
   const { safeReason, safeFailureKind } = validatedAcceptanceFields(acceptance, source, reason, failureKind);
   if (!record) {
     throw new Error(`Fusion worker task ${taskId} was not found.`);
   }
-  workerAcceptanceGate(record, taskId, acceptance, acceptFailedTransport);
+  workerAcceptanceGate(record, taskId, acceptance, acceptFailedTransport, engineLedgerWritten);
   return { safeReason, safeFailureKind };
 }
 
-export function recordWorkerAcceptance({ taskId, acceptance, env = process.env, source = "main-loop", reason = null, failureKind = null, acceptFailedTransport = false }) {
+export function recordWorkerAcceptance({ taskId, acceptance, env = process.env, source = "main-loop", reason = null, failureKind = null, acceptFailedTransport = false, engineLedgerWritten = false }) {
   const { safeReason, safeFailureKind } = validatedAcceptanceFields(acceptance, source, reason, failureKind);
   const result = updateWorkerAcceptance({
     taskId,
@@ -1317,7 +1317,7 @@ export function recordWorkerAcceptance({ taskId, acceptance, env = process.env, 
     acceptFailedTransport,
     queueIfNonTerminal: true,
     validateRecord(record) {
-      workerAcceptanceGate(record, taskId, acceptance, acceptFailedTransport);
+      workerAcceptanceGate(record, taskId, acceptance, acceptFailedTransport, engineLedgerWritten);
     }
   });
   return workerAcceptanceResult(result.record, result.queued);
