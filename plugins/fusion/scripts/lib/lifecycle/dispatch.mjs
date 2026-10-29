@@ -3,7 +3,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { ENGINE_ID_ALTERNATION, PEER_JOB_FOOTER_AGENTS, engineForAgentType, engineRoleFromBrief } from "../engines.mjs";
+import { ENGINE_ID_ALTERNATION, PEER_JOB_FOOTER_AGENTS, engineForAgentType, engineRoleFromBrief, routedEngineIds } from "../engines.mjs";
 import { readRoutingDefaults } from "../model-table.mjs";
 import { tagMessage } from "../user-messages.mjs";
 import { canonicalWorkerAgentType, createWorkerRecord, createWorkerTaskId, readPeerCapacityReservations, readWorkerRecords, updateWorkerSessionState, withPeerCapacityReservations, workerRecordFile, writePrivateText, WORKER_TERMINAL_STATUSES } from "../worker-state.mjs";
@@ -66,6 +66,9 @@ function injectedPeerDefaults(prompt, agentType, env) {
     return null;
   }
   const defaults = readRoutingDefaults(env, { warn: null });
+  if (!routedEngineIds(defaults.breadth).includes(engine)) {
+    return null;
+  }
   const choice = defaults[engine]?.[role];
   if (!choice) {
     return null;

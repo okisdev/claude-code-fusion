@@ -24,6 +24,7 @@ function makeSandbox(t) {
     dataDir: path.join(root, "fusion-data"),
     grokData: path.join(root, "grok-data"),
     cursorData: path.join(root, "cursor-data"),
+    devinData: path.join(root, "devin-data"),
     codexState: path.join(root, "codex-state")
   };
 }
@@ -40,7 +41,7 @@ function writeRecord(file, record) {
 function envFor(sandbox, extra = {}) {
   const inherited = Object.fromEntries(
     Object.entries(process.env).filter(
-      ([key]) => key !== "HOME" && key !== "CLAUDE_CODE_SESSION_ID" && !/^(?:FUSION|GROK|CODEX|CURSOR)_/.test(key)
+      ([key]) => key !== "HOME" && key !== "CLAUDE_CODE_SESSION_ID" && !/^(?:FUSION|GROK|CODEX|CURSOR|DEVIN)_/.test(key)
     )
   );
   return {
@@ -52,6 +53,7 @@ function envFor(sandbox, extra = {}) {
     FUSION_CODEX_STATE_DIR: sandbox.codexState,
     GROK_COMPANION_DATA: sandbox.grokData,
     CURSOR_COMPANION_DATA: sandbox.cursorData,
+    DEVIN_COMPANION_DATA: sandbox.devinData,
     ...extra
   };
 }
@@ -738,6 +740,23 @@ test("Cursor setup failure opens immediately and version drift is reported", (t)
   assert.match(result.stdout, /treat the cursor breaker as open.*last failure setup.*1 setup across 1 terminal jobs/);
   assert.match(result.stdout, /; cursor 2026\.10\.02-abcdef0 installed, contract verified on 2026\.10\.01-e373342/);
   assert.doesNotMatch(result.stdout, /cursor api pool breaker/);
+});
+
+test("Devin breaker uses its billing pool and verified version", (t) => {
+  const sandbox = makeSandbox(t);
+  const root = engineStateRoots("devin", envFor(sandbox))[0];
+  writeRecord(jobFile(root, "workspace", "quota"), {
+    id: "quota", engine: "devin", status: "error", failureKind: "quota", billingPool: "api",
+    devinVersion: "3000.11.229", finishedAt: new Date(Date.now() - 60_000).toISOString()
+  });
+  const result = run(sandbox);
+  assert.strictEqual(result.status, 0);
+  assert.match(result.stdout, /treat the devin api pool breaker as open.*last failure quota/);
+  assert.match(result.stdout, /devin 3000\.11\.229 installed, contract verified on 3000\.11\.228/);
+  writeRecord(jobFile(root, "workspace", "recovered"), {
+    id: "recovered", status: "done", billingPool: "api", finishedAt: new Date().toISOString()
+  });
+  assert.strictEqual(run(sandbox).stdout, "");
 });
 
 test("Codex version drift uses the registry verified version key", (t) => {

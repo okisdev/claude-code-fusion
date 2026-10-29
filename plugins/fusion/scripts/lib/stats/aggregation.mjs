@@ -1,5 +1,5 @@
 import fs from "node:fs";
-import { ENGINES, ENGINE_IDS, ENGINE_TERMINAL_STATUSES, engineStateRoots } from "../../lib/engines.mjs";
+import { BREADTH_ENGINE_IDS, ENGINES, ENGINE_IDS, ENGINE_TERMINAL_STATUSES, engineStateRoots } from "../../lib/engines.mjs";
 import { canonicalWorkerAgentType, WORKER_TERMINAL_STATUSES, readWorkerRecords, readWorkerRollups } from "../../lib/worker-state.mjs";
 import { FILE_ENGINE_DESCRIPTORS, checkedUsageAddition, codexSku, isSupersededCodexJob, loadAllObservationCandidates, normalizeClaudeWorkerUsage, observationForJob, scopedObservationForJob, summarizeCodexSkuTelemetry, tokenUsageForJob } from "./engine-evidence.mjs";
 import { CODEX_ACCEPTANCE_STATES, RESUMABLE_CODEX_FAILURE_KINDS, TOKEN_USAGE_FILENAME, bump, fusionWorkspaceKey, loadTokenUsageObservations, nonEmptyString, normalizeCollectionMethod, readCodexJobEvidence, readWorkspaceJobFiles, resolveCodexJobEffort, resolveCodexJobModel, resolveGitWorkspaceRoot, resolveStateRoot, selectPreferredJobs, workspaceRootsShareRepository } from "./evidence.mjs";
@@ -518,18 +518,18 @@ export const WORKSPACE_ENGINE_DESCRIPTORS = [
     dedupeById: true,
     isTerminal: (raw) => ENGINE_TERMINAL_STATUSES.has(raw.status)
   },
-  {
-    id: "cursor",
-    displayName: ENGINES.cursor.displayName,
-    unavailableReason: FILE_ENGINE_DESCRIPTORS.cursor.unavailableReason,
-    resolveRoot: (env) => engineStateRoots("cursor", env)[0],
+  ...BREADTH_ENGINE_IDS.map((id) => ({
+    id,
+    displayName: ENGINES[id].displayName,
+    unavailableReason: FILE_ENGINE_DESCRIPTORS[id].unavailableReason,
+    resolveRoot: (env) => engineStateRoots(id, env)[0],
     enumerateJobs: readWorkspaceJobFiles,
     traceModel: (raw) => nonEmptyString(raw?.resolvedModel),
     traceEffort: (raw) => raw?.effortApplied === true ? nonEmptyString(raw?.requestedEffort) : null,
     cwdOf: (raw) => (typeof raw.cwd === "string" ? raw.cwd : null),
     sessionOf: (raw) => (typeof raw.claudeSessionId === "string" ? raw.claudeSessionId : null),
     isLive: (raw) => !ENGINE_TERMINAL_STATUSES.has(raw.status)
-  }
+  }))
 ];
 
 export const STATS_PROVIDER_REGISTRY = [

@@ -1,6 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
-import { engineDataDir } from "../../lib/engines.mjs";
+import { BREADTH_ENGINE_IDS, ENGINES, engineDataDir } from "../../lib/engines.mjs";
 import { WORKSPACE_ENGINE_DESCRIPTORS, listWorkspaceEntries } from "./aggregation.mjs";
 import { DAY_MS, PRUNE_EVIDENCE, isPathPositivelyAbsent, resolveFusionDataDir } from "./evidence.mjs";
 
@@ -55,6 +55,10 @@ function stillSafeToPrune(candidate, descriptor) {
 }
 
 function scanDeadWorkspaces(descriptor, env) {
+  const engine = ENGINES[descriptor.id];
+  if (!env.HOME && !env[engine.dataEnv] && !engine.stateEnvs.some((name) => env[name])) {
+    return [];
+  }
   const root = descriptor.resolveRoot(env);
   if (!fs.existsSync(root)) {
     return [];
@@ -158,7 +162,7 @@ function scanObservationDirectories(env, ageMs, requireDeadWorkspace, now = Date
     .filter(Boolean);
 }
 
-function cursorRunCandidate(dir, recorded, now) {
+function breadthRunCandidate(dir, recorded, now) {
   const jobId = path.basename(dir);
   if (recorded.has(jobId)) return null;
   try {
@@ -167,14 +171,14 @@ function cursorRunCandidate(dir, recorded, now) {
   } catch { return null; }
 }
 
-function scanOrphanCursorRuns(env, now = Date.now()) {
-  if (!env.CURSOR_COMPANION_DATA && !env.HOME) return [];
-  const root = path.join(engineDataDir("cursor", env), "runs");
-  const recorded = existingEngineJobIds(env, WORKSPACE_ENGINE_DESCRIPTORS.filter((entry) => entry.id === "cursor"));
+function scanOrphanBreadthRuns(id, env, now = Date.now()) {
+  if (!env[ENGINES[id].dataEnv] && !env.HOME) return [];
+  const root = path.join(engineDataDir(id, env), "runs");
+  const recorded = existingEngineJobIds(env, WORKSPACE_ENGINE_DESCRIPTORS.filter((entry) => entry.id === id));
   let entries;
   try { entries = fs.readdirSync(root, { withFileTypes: true }); } catch { return []; }
   return entries.filter((entry) => entry.isDirectory())
-    .map((entry) => cursorRunCandidate(path.join(root, entry.name), recorded, now))
+    .map((entry) => breadthRunCandidate(path.join(root, entry.name), recorded, now))
     .filter(Boolean);
 }
 
@@ -219,7 +223,7 @@ export function findDeadWorkspaces(env = process.env) {
   }
   dead.acceptance = findUnusedAcceptanceObservations(env);
   dead.observations = scanObservationDirectories(env, 30 * DAY_MS, true);
-  dead.cursorRuns = scanOrphanCursorRuns(env);
+  for (const id of BREADTH_ENGINE_IDS) dead[`${id}Runs`] = scanOrphanBreadthRuns(id, env);
   return dead;
 }
 
@@ -230,7 +234,7 @@ export function pruneDeadWorkspaces({ env = process.env, yes = false, beforeRemo
   }
   const removed = {};
   for (const [engineId, candidates] of Object.entries(dead)) {
-    if (engineId === "acceptance" || engineId === "observations" || engineId === "cursorRuns") {
+    if (engineId === "acceptance" || engineId === "observations" || BREADTH_ENGINE_IDS.some((id) => engineId === `${id}Runs`)) {
       continue;
     }
     removed[engineId] = [];
@@ -247,13 +251,14 @@ export function pruneDeadWorkspaces({ env = process.env, yes = false, beforeRemo
     }
   }
   const currentJobs = existingEngineJobIds(env);
-  const currentCursorJobs = existingEngineJobIds(env, WORKSPACE_ENGINE_DESCRIPTORS.filter((entry) => entry.id === "cursor"));
-  for (const key of ["observations", "cursorRuns"]) {
+  for (const key of ["observations", ...BREADTH_ENGINE_IDS.map((id) => `${id}Runs`)]) {
+    const id = BREADTH_ENGINE_IDS.find((engine) => key === `${engine}Runs`);
+    const currentBreadthJobs = id ? existingEngineJobIds(env, WORKSPACE_ENGINE_DESCRIPTORS.filter((entry) => entry.id === id)) : null;
     removed[key] = [];
     for (const candidate of dead[key]) {
       const current = key === "observations"
         ? observationDirectoryCandidate(candidate.dir, 30 * DAY_MS, true, currentJobs, Date.now())
-        : cursorRunCandidate(candidate.dir, currentCursorJobs, Date.now());
+        : breadthRunCandidate(candidate.dir, currentBreadthJobs, Date.now());
       if (!current || current.mtimeMs !== candidate.mtimeMs) continue;
       fs.rmSync(candidate.dir, { recursive: true, force: true });
       removed[key].push(candidate);

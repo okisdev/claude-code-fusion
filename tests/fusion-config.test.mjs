@@ -30,13 +30,15 @@ function sandbox(t) {
     `${JSON.stringify({ format: 2, hashes: [hashRulesTemplate(CANONICAL)] }, null, 2)}\n`,
     "utf8"
   );
-  const companions = Object.fromEntries(["codex", "grok", "cursor"].map((engine) => {
+  const companions = Object.fromEntries(["codex", "grok", "cursor", "devin"].map((engine) => {
     const file = path.join(root, `${engine}-companion.mjs`);
     const models = engine === "codex"
       ? ["gpt-5.6-terra", "gpt-5.7-new", "gpt-6-sol", "o3"]
       : engine === "grok"
         ? ["grok-4.7-build-fast", "grok-new"]
-        : ["muse-spark-1.3-xhigh", "composer-2.5", "cursor-new"];
+        : engine === "cursor"
+          ? ["muse-spark-1.3-xhigh", "composer-2.5", "cursor-new"]
+          : ["muse-wonder-xhigh", "swe-2", "devin-new"];
     fs.writeFileSync(file, `if (process.argv.slice(2).join(" ") !== "models --json") process.exit(2);\nprocess.stdout.write(JSON.stringify(${JSON.stringify({ engine, models: models.map((id) => ({ id, displayName: id })), source: "test listing" })}));\n`);
     return [engine, file];
   }));
@@ -65,6 +67,7 @@ function run(sandbox, args, overrides = {}) {
       FUSION_CODEX_COMPANION: sandbox.companions.codex,
       FUSION_GROK_COMPANION: sandbox.companions.grok,
       FUSION_CURSOR_COMPANION: sandbox.companions.cursor,
+      FUSION_DEVIN_COMPANION: sandbox.companions.devin,
       ...overrides
     }
   });
@@ -136,6 +139,40 @@ test("Set-default writes a lane choice and refreshes the live rules", (t) => {
     0
   );
   assert.deepStrictEqual(JSON.parse(fs.readFileSync(box.modelRoutingFile, "utf8")).defaults, data.defaults);
+});
+
+test("Set-breadth creates routing data, changes the rendered seat, and preserves scores", (t) => {
+  const box = sandbox(t);
+  const invalid = run(box, ["set-breadth", "grok"]);
+  assert.strictEqual(invalid.status, 1);
+  assert.match(invalid.stderr, /Expected set-breadth <cursor\|devin>/);
+  assert.strictEqual(fs.existsSync(box.modelRoutingFile), false);
+  const selected = run(box, ["set-breadth", "devin"]);
+  assert.strictEqual(selected.status, 0, selected.stderr);
+  assert.match(selected.stdout, /Updated breadth engine to Devin \(devin\)/);
+  const data = JSON.parse(fs.readFileSync(box.modelRoutingFile, "utf8"));
+  assert.strictEqual(data.breadth, "devin");
+  assert.deepStrictEqual(data.models, []);
+  assert.match(fs.readFileSync(box.rulesFile, "utf8"), /Breadth engine: Devin \(devin\)/);
+  assert.strictEqual(run(box, ["rescore", "muse-wonder", "--intelligence", "5", "--taste", "5", "--cost", "3", "--lane", "devin", "--family", "anthropic"]).status, 0);
+  assert.strictEqual(run(box, ["rescore", "composer-2.5", "--intelligence", "4", "--taste", "4", "--cost", "4", "--lane", "cursor", "--family", "cognition"]).status, 0);
+  assert.strictEqual(run(box, ["set-default", "devin", "diversity", "muse-wonder", "xhigh"]).status, 0);
+  const live = fs.readFileSync(box.rulesFile, "utf8");
+  assert.match(live, /\| muse-wonder \| devin \| anthropic \|/);
+  assert.doesNotMatch(live, /\| composer-2\.5 \| cursor \|/);
+  assert.match(live, /devin diversity muse-wonder@xhigh/);
+  assert.doesNotMatch(live, /cursor diversity/);
+  const audit = JSON.parse(run(box, ["audit", "--json"]).stdout);
+  assert.strictEqual(audit.breadth, "devin");
+  assert.strictEqual(audit.engines.devin.listing.available, true);
+  assert.deepStrictEqual(audit.engines.devin.defaultsAbsent, []);
+  assert.strictEqual(Object.hasOwn(audit.defaults, "cursor"), false);
+  assert.deepStrictEqual(audit.engines.cursor.unscored, []);
+  assert.strictEqual(run(box, ["set-breadth", "cursor"]).status, 0);
+  const switched = fs.readFileSync(box.rulesFile, "utf8");
+  assert.match(switched, /\| composer-2\.5 \| cursor \| cognition \|/);
+  assert.doesNotMatch(switched, /\| muse-wonder \| devin \|/);
+  assert.deepStrictEqual(JSON.parse(fs.readFileSync(box.modelRoutingFile, "utf8")).models.map((row) => row.id), ["muse-wonder", "composer-2.5"]);
 });
 
 test("Set-default rejects invalid choices and leaves the routing file unchanged", (t) => {

@@ -15,6 +15,7 @@ const ENGINES = Object.freeze({
   codex: engine({
     id: "codex",
     displayName: "Codex",
+    seat: null,
     family: "openai",
     rescueAgent: "codex:codex-rescue",
     managedAgents: [],
@@ -35,6 +36,7 @@ const ENGINES = Object.freeze({
   grok: engine({
     id: "grok",
     displayName: "Grok",
+    seat: null,
     family: "xai",
     rescueAgent: "grok:grok-rescue",
     managedAgents: ["grok:grok-review-runner"],
@@ -55,6 +57,7 @@ const ENGINES = Object.freeze({
   cursor: engine({
     id: "cursor",
     displayName: "Cursor",
+    seat: "breadth",
     family: null,
     rescueAgent: "cursor:cursor-rescue",
     managedAgents: [],
@@ -71,10 +74,36 @@ const ENGINES = Object.freeze({
     defaultRole: null,
     efforts: ["default", "low", "medium", "high", "xhigh", "max"],
     unavailablePrefix: "cursor unavailable:"
+  }),
+  devin: engine({
+    id: "devin",
+    displayName: "Devin",
+    seat: "breadth",
+    family: null,
+    rescueAgent: "devin:devin-rescue",
+    managedAgents: [],
+    companionFile: "devin-companion.mjs",
+    companionEnv: "FUSION_DEVIN_COMPANION",
+    dataDirName: "devin-claude-code-fusion",
+    dataEnv: "DEVIN_COMPANION_DATA",
+    stateEnvs: [],
+    versionField: "devinVersion",
+    verifiedVersionKey: "devin",
+    acceptanceLedger: false,
+    ownMonitor: false,
+    roles: ["diversity", "burst"],
+    defaultRole: null,
+    efforts: ["default", "none", "minimal", "low", "medium", "high", "xhigh", "max"],
+    unavailablePrefix: "devin unavailable:"
   })
 });
 
 const ENGINE_IDS = Object.freeze(Object.keys(ENGINES));
+const BREADTH_ENGINE_IDS = Object.freeze(ENGINE_IDS.filter((id) => ENGINES[id].seat === "breadth"));
+const DEFAULT_BREADTH_ENGINE = "cursor";
+function routedEngineIds(breadth = DEFAULT_BREADTH_ENGINE) {
+  return ENGINE_IDS.filter((id) => ENGINES[id].seat !== "breadth" || id === breadth);
+}
 const ENGINE_ID_ALTERNATION = ENGINE_IDS.join("|");
 const ENGINE_TERMINAL_STATUSES = new Set(["done", "error", "cancelled"]);
 const PEER_RESCUE_AGENTS = new Set(ENGINE_IDS.map((id) => ENGINES[id].rescueAgent));
@@ -179,6 +208,8 @@ function engineRoleFromBrief(id, brief) {
 export {
   ENGINES,
   ENGINE_IDS,
+  BREADTH_ENGINE_IDS,
+  DEFAULT_BREADTH_ENGINE,
   ENGINE_ID_ALTERNATION,
   ENGINE_TERMINAL_STATUSES,
   PEER_JOB_FOOTER_AGENTS,
@@ -194,5 +225,6 @@ export {
   engineResultCommand,
   engineRoleFromBrief,
   engineStateRoots,
-  isEngineId
+  isEngineId,
+  routedEngineIds
 };
