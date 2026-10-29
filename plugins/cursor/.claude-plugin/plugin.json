@@ -2,7 +2,7 @@
   "$schema": "https://json.schemastore.org/claude-code-plugin-manifest.json",
   "name": "cursor",
   "displayName": "Cursor Companion",
-  "version": "0.0.67",
+  "version": "0.0.68",
   "description": "Local Cursor Agent CLI delegation: multi family consults, Composer implementation in owned worktrees, review, resumable history, background jobs, and setup health checks.",
   "author": {
     "name": "Harry Yep"

@@ -1,5 +1,13 @@
 # changelog
 
+## 0.0.68
+
+- devin joins as a second breadth engine: a `devin` companion plugin drives the Devin CLI over the agent client protocol for `diversity` consults on any family a Devin plan serves and `burst` implementation on Cognition's SWE models. cursor's october pricing change moved third party models off its included plans, which emptied cursor's `diversity` seat for accounts on them.
+- exactly one breadth engine holds the routing seat, chosen with `/fusion:config set-breadth <cursor|devin>` (default cursor) and named by the rendered routing table; the other keeps working for direct `/cursor:*` or `/devin:*` commands, collection, and stats, but receives no routed work.
+- the devin companion runs every job under a private home that links only the credentials file, writes a per job configuration that turns off every configuration import except `AGENTS.md`, denies reads of credential and agent configuration directories, refuses every permission request, pins model, thought level, and standard speed through session options, and runs writes inside the OS sandbox. `adaptive` and `fusion-*` routers are refused because no event pins the model they choose.
+- the orchestration and troubleshooting rules, panel, ultra, smoke, doctor, and config speak of the breadth engine instead of cursor.
+- `/fusion:stats --record` settles a codex collector task again: the settlement path writes the codex ledger and then settles the collector, where the collector guard had refused both the task id and the job id, so the stop hook kept asking for a command that could not succeed.
+
 ## 0.0.67
 
 - this release acts on the call records of a second host on 0.0.65: 24 sessions, 326 peer jobs, and 342 worker records since its upgrade.

@@ -1,0 +1,178 @@
+#!/usr/bin/env node
+import { spawn } from "node:child_process";
+import fs from "node:fs";
+import readline from "node:readline";
+
+const args = process.argv.slice(2);
+if (args.includes("--version")) {
+  process.stdout.write(`${process.env.FAKE_DEVIN_VERSION || "devin 3000.11.228 (8f3abc)"}\n`);
+  process.exit(0);
+}
+if (args.length !== 1 || args[0] !== "acp") {
+  process.stderr.write("Expected acp.\n");
+  process.exit(2);
+}
+
+const scenario = process.env.FAKE_DEVIN_SCENARIO || "success";
+const logFile = process.env.FAKE_DEVIN_LOG;
+const log = { argv: args, cwd: process.cwd(), messages: [], signals: [], stdinEnded: false };
+const record = () => { if (logFile) fs.writeFileSync(logFile, `${JSON.stringify(log)}\n`); };
+const emit = (event) => fs.writeSync(1, `${JSON.stringify({ jsonrpc: "2.0", ...event })}\n`);
+const reply = (id, result) => emit({ id, result });
+const fail = (id, message, code = -32000, data) => emit({ id, error: { code, message, ...(data === undefined ? {} : { data }) } });
+let sessionId = "artistic-breeze";
+let promptId;
+let configOptions = [
+  { id: "mode", type: "select", currentValue: "accept-edits", options: ["accept-edits", "ask", "plan", "bypass"].map((value) => ({ value })) },
+  { id: "model", type: "select", currentValue: "swe-2-high", options: [{ value: "swe-2-high", name: "SWE-2" }, { value: "kimi-k3-high", name: "Kimi K3" }] }
+];
+const update = (value) => emit({ method: "session/update", params: { sessionId, update: value } });
+const text = (value) => update({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: value } });
+const tool = (name, id = `${name}:0#ab`, sessionUpdate = "tool_call") => update({ sessionUpdate, toolCallId: id, title: "Ran tool", kind: "execute", rawInput: {}, _meta: { "cognition.ai/inferenceToolName": name } });
+
+function stopped(cause = "complete") {
+  emit({ method: "_cognition.ai/agent_stopped", params: { cause, stats: { toolCalls: 2, modelLabel: process.env.FAKE_DEVIN_MODEL_LABEL || "SWE-2 High", requestId: "8f3a-fake-request" }, sessionId } });
+}
+
+function result() {
+  const usage = { totalTokens: 11914, inputTokens: 11875, outputTokens: 39 };
+  if (scenario !== "no_cache_usage") usage.cachedReadTokens = 11552;
+  if (scenario === "extra_usage") usage.vendorTokens = 7;
+  const value = { stopReason: scenario === "refusal" ? "refusal" : "end_turn", usage };
+  if (scenario === "missing_stop_reason") delete value.stopReason;
+  if (scenario === "no_final_newline") fs.writeSync(1, JSON.stringify({ jsonrpc: "2.0", id: promptId, result: value }));
+  else reply(promptId, value);
+}
+
+function success() {
+  update({ sessionUpdate: "agent_thought_chunk", content: { type: "text", text: "hidden thought" } });
+  update({ sessionUpdate: "usage_update", used: 999999 });
+  update({ sessionUpdate: "plan", entries: [] });
+  emit({ method: "_cognition.ai/turn_stats", params: { ignored: true } });
+  tool("read");
+  update({ sessionUpdate: "tool_call_update", toolCallId: "read:0#ab", status: "completed" });
+  tool("grep");
+  text("fake ");
+  text("result");
+  stopped(scenario === "tool_rejected" ? "tool_rejected" : "complete");
+  result();
+}
+
+async function helper(detached, resistant) {
+  const child = spawn(process.execPath, ["-e", `process.on('SIGTERM', () => { if (!${resistant}) process.exit(0); }); process.send('ready'); setInterval(() => {}, 1000);`], { detached, stdio: ["ignore", detached ? 1 : "ignore", "ignore", "ipc"] });
+  if (process.env.FAKE_DEVIN_HELPER_PID_FILE) fs.writeFileSync(process.env.FAKE_DEVIN_HELPER_PID_FILE, String(child.pid));
+  await new Promise((resolve) => child.once("message", resolve));
+  child.disconnect();
+  child.unref();
+}
+
+async function prompt(id) {
+  promptId = id;
+  if (process.env.FAKE_DEVIN_PROMPT_FILE) fs.writeFileSync(process.env.FAKE_DEVIN_PROMPT_FILE, "ready");
+  const errors = {
+    quota: "Usage limit reached for this account",
+    allowance: "Plan allowance exhausted",
+    rate_limit: "Too many requests (429)",
+    network: "fetch failed: getaddrinfo ENOTFOUND devin.ai",
+    sandbox_unavailable: "Failed to start sandbox: bubblewrap unavailable",
+    rpc_error: "Internal server error"
+  };
+  if (errors[scenario]) return fail(id, errors[scenario]);
+  if (scenario === "auth_required") {
+    stopped("auth_required");
+    return fail(id, "Please log in to use Devin. Use `/login` to authenticate again.");
+  }
+  if (scenario === "garbage") return fs.writeSync(1, "not json\n");
+  if (scenario === "non_object") return fs.writeSync(1, "[]\n");
+  if (scenario === "unknown_id") return reply(99999, {});
+  if (scenario === "malformed_response") return emit({ id, result: {}, error: { code: -32000, message: "bad" } });
+  if (scenario === "malformed_error") return emit({ id, error: "bad" });
+  if (scenario === "oversized_line") return fs.writeSync(1, "x".repeat(2 * 1024 * 1024 + 1));
+  if (scenario === "no_result") return process.exit(0);
+  if (scenario === "no_result_nonzero") return process.exit(7);
+  if (scenario === "hang") return;
+  if (scenario === "permission" || scenario === "unknown_request") {
+    return emit({ id: scenario === "permission" ? 0 : "client-request", method: scenario === "permission" ? "session/request_permission" : "fs/read_text_file", params: { sessionId, toolCall: { toolCallId: "write:0#c4" }, options: [{ optionId: "allow_once", kind: "allow_once" }] } });
+  }
+  if (scenario === "forbidden_tool") return tool("web_search");
+  if (scenario === "forbidden_update") {
+    tool("read");
+    return tool("web_search", "read:0#ab", "tool_call_update");
+  }
+  if (scenario === "missing_tool") return update({ sessionUpdate: "tool_call", toolCallId: "unknown" });
+  if (scenario === "write_tool") tool("exec");
+  if (scenario === "escape_stdio" || scenario === "spawn_helper" || scenario === "resistant_group") await helper(scenario === "escape_stdio", scenario === "resistant_group");
+  if (scenario === "split_utf8") {
+    const line = Buffer.from(`${JSON.stringify({ jsonrpc: "2.0", method: "session/update", params: { sessionId, update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "é 中文" } } } })}\n`);
+    const split = line.indexOf(0xc3) + 1;
+    fs.writeSync(1, line.subarray(0, split));
+    fs.writeSync(2, Buffer.from([0xc3]));
+    setTimeout(() => {
+      fs.writeSync(1, line.subarray(split));
+      fs.writeSync(2, Buffer.from([0xa9, 0x0a]));
+      stopped();
+      result();
+    }, 20);
+    return;
+  }
+  if (scenario === "stderr_tail") fs.writeSync(2, `${"é".repeat(40000)}tail\n`);
+  if (scenario === "network_after_result") fs.writeSync(2, "fetch failed: ECONNRESET\n");
+  success();
+  if (scenario === "forbidden_after_result") tool("web_search");
+  if (scenario === "unexpected_signal") process.kill(process.pid, "SIGUSR2");
+  if (scenario === "no_final_newline") process.exit(0);
+}
+
+async function handleMessage(message) {
+  log.messages.push(message);
+  record();
+  const { id, method, params } = message;
+  if (!method) return success();
+  if (method === "session/cancel") return;
+  if (method === "initialize") {
+    if (scenario === "slow_init") return;
+    if (scenario === "forbidden_before_init") return tool("web_search");
+    if (scenario === "initialize_error") return fail(id, "Initialization failed");
+    return reply(id, { protocolVersion: scenario === "bad_protocol_version" ? 2 : 1, agentCapabilities: { loadSession: true }, authMethods: [{ id: "login", name: "Log in" }] });
+  }
+  if (method === "session/new" || method === "session/load") {
+    if (params.sessionId) sessionId = params.sessionId;
+    if (method === "session/load") text("old conversation before load result");
+    reply(id, { ...(scenario === "missing_session" || method === "session/load" ? {} : { sessionId }), modes: { currentModeId: "accept-edits", availableModes: [] }, configOptions });
+    if (method === "session/load") text("old conversation after load result");
+    return;
+  }
+  if (method === "session/set_config_option") {
+    const { configId, value } = params;
+    const option = configOptions.find((entry) => entry.id === configId);
+    if (!option || process.env.FAKE_DEVIN_REJECT_CONFIG === configId || (!option.options.some((entry) => entry.value === value) && !(configId === "mode" && value === "autonomous"))) {
+      return fail(id, "Invalid params", -32602, `Invalid value '${value}' for config option '${configId}'`);
+    }
+    if (process.env.FAKE_DEVIN_MISMATCH_CONFIG !== configId) option.currentValue = value;
+    if (configId === "model") {
+      configOptions = configOptions.filter((entry) => !["thought_level", "speed"].includes(entry.id));
+      configOptions.push({ id: "thought_level", type: "select", currentValue: "high", options: ["low", "high", "max"].map((entry) => ({ value: entry })) });
+      if (value === "swe-2-high") configOptions.push({ id: "speed", type: "select", currentValue: "fast", options: ["standard", "fast"].map((entry) => ({ value: entry })) });
+    }
+    reply(id, { configOptions });
+    return;
+  }
+  if (method === "session/prompt") return prompt(id);
+  fail(id, "Method not found", -32601);
+}
+
+record();
+process.on("SIGTERM", () => {
+  log.signals.push("SIGTERM");
+  record();
+  if (scenario !== "late_close" && scenario !== "terminal_late_close") setTimeout(() => process.exit(0), 30);
+});
+const input = readline.createInterface({ input: process.stdin });
+input.on("line", (line) => { handleMessage(JSON.parse(line)).catch((error) => { process.stderr.write(`${error.message}\n`); process.exit(1); }); });
+input.on("close", () => {
+  log.stdinEnded = true;
+  record();
+  if (scenario === "late_close" || scenario === "terminal_late_close") setInterval(() => {}, 1000);
+  else if (scenario === "delayed_exit") setTimeout(() => process.exit(0), 300);
+  else process.exit(0);
+});

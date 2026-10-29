@@ -137,5 +137,14 @@
       "tests/cursor-render.test.mjs",
       "tests/cursor-state.test.mjs"
     ]
+  },
+  {
+    "paths": [
+      "plugins/devin/**/*.mjs",
+      "tests/fake-devin"
+    ],
+    "suites": [
+      "tests/devin-*.test.mjs"
+    ]
   }
 ]

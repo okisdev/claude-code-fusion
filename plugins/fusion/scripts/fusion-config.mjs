@@ -26,7 +26,7 @@ import {
   resolvePosture
 } from "./lib/posture.mjs";
 import { newestEngineCompanion } from "./lib/engine-acceptance.mjs";
-import { ENGINES, ENGINE_IDS, isEngineId } from "./lib/engines.mjs";
+import { BREADTH_ENGINE_IDS, ENGINES, ENGINE_IDS, isEngineId, routedEngineIds } from "./lib/engines.mjs";
 import { syncRulesToLive } from "./lib/rules-template.mjs";
 
 class UsageError extends Error {}
@@ -41,6 +41,7 @@ function usage() {
     "  node scripts/fusion-config.mjs audit [--json]",
     "  node scripts/fusion-config.mjs rescore <id> --intelligence N --taste N --cost N [--lane L] [--family F] [--notes S]",
     "  node scripts/fusion-config.mjs set-default <lane> <role> <model> <effort>",
+    `  node scripts/fusion-config.mjs set-breadth <${BREADTH_ENGINE_IDS.join("|")}>`,
     "  node scripts/fusion-config.mjs remove <id>",
     "  node scripts/fusion-config.mjs set-cost-profile <text>",
     "  node scripts/fusion-config.mjs set-posture <judgment|strict>",
@@ -142,22 +143,23 @@ function readEngineModelListing(engine, env) {
 }
 
 function matchesListing(engine, id, listedIds) {
-  return listedIds.some((listed) => listed === id || (engine === "cursor" && listed.startsWith(`${id}-`)));
+  return listedIds.some((listed) => listed === id || (ENGINES[engine].seat === "breadth" && listed.startsWith(`${id}-`)));
 }
 
 function auditModelDrift(env) {
   const modelRoutingFile = resolveModelRoutingPath(env);
   const routing = readModelRoutingFile(modelRoutingFile);
   const defaults = readRoutingDefaults(env, { warn: null });
+  const routed = new Set(routedEngineIds(defaults.breadth));
   const engines = Object.fromEntries(ENGINE_IDS.map((engine) => {
     const listing = readEngineModelListing(engine, env);
     const scored = routing.ok ? [...new Set(routing.data.models.filter((row) => row.lane === engine).map((row) => row.id))] : [];
     const listedIds = listing.available ? listing.modelIds : [];
     return [engine, {
       listing,
-      configuredButAbsent: listing.available && routing.ok ? scored.filter((id) => !matchesListing(engine, id, listedIds)) : [],
-      defaultsAbsent: listing.available ? Object.entries(defaults[engine]).filter(([, choice]) => !matchesListing(engine, choice.model, listedIds)).map(([role, choice]) => ({ role, model: choice.model })) : [],
-      unscored: listing.available ? listedIds.filter((id) => !scored.some((base) => matchesListing(engine, base, [id]))) : []
+      configuredButAbsent: routed.has(engine) && listing.available && routing.ok ? scored.filter((id) => !matchesListing(engine, id, listedIds)) : [],
+      defaultsAbsent: routed.has(engine) && listing.available ? Object.entries(defaults[engine]).filter(([, choice]) => !matchesListing(engine, choice.model, listedIds)).map(([role, choice]) => ({ role, model: choice.model })) : [],
+      unscored: routed.has(engine) && listing.available ? listedIds.filter((id) => !scored.some((base) => matchesListing(engine, base, [id]))) : []
     }];
   }));
   return {
@@ -165,7 +167,8 @@ function auditModelDrift(env) {
     configured: !routing.missing,
     valid: Boolean(routing.ok),
     error: routing.ok || routing.missing ? null : routing.reason,
-    defaults,
+    breadth: defaults.breadth,
+    defaults: Object.fromEntries(routedEngineIds(defaults.breadth).map((engine) => [engine, defaults[engine]])),
     engines
   };
 }
@@ -351,6 +354,20 @@ function setDefaultCommand(positionals, options, env, stdout) {
   stdout.write(`Updated ${lane} ${role} default to ${model}@${effort}.\n`);
 }
 
+function setBreadthCommand(positionals, options, env, stdout) {
+  ensureOnlyOptions(options, new Set(), "set-breadth");
+  if (positionals.length !== 1 || !BREADTH_ENGINE_IDS.includes(positionals[0])) {
+    throw new UsageError(`Expected set-breadth <${BREADTH_ENGINE_IDS.join("|")}>.`);
+  }
+  const breadth = positionals[0];
+  const filePath = resolveModelRoutingPath(env);
+  const data = loadEditableData(filePath);
+  data.breadth = breadth;
+  writeModelRoutingData(filePath, data);
+  refreshLiveRules(env, stdout);
+  stdout.write(`Updated breadth engine to ${ENGINES[breadth].displayName} (${breadth}).\n`);
+}
+
 function rescoreCommand(positionals, options, env, stdout) {
   ensureOnlyOptions(options, new Set(["intelligence", "taste", "cost", "lane", "family", "notes"]), "rescore");
   if (positionals.length !== 1) {
@@ -485,6 +502,9 @@ export function main(argv = process.argv.slice(2), { env = process.env, stdout =
         return 0;
       case "set-default":
         setDefaultCommand(positionals, options, env, stdout);
+        return 0;
+      case "set-breadth":
+        setBreadthCommand(positionals, options, env, stdout);
         return 0;
       case "remove":
         removeCommand(positionals, options, env, stdout);

@@ -2,7 +2,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
-import { ENGINES, ENGINE_IDS, isEngineId } from "./engines.mjs";
+import { BREADTH_ENGINE_IDS, DEFAULT_BREADTH_ENGINE, ENGINES, ENGINE_IDS, isEngineId, routedEngineIds } from "./engines.mjs";
 
 export const MODEL_TABLE_START = "<!-- fusion:model-table:start -->";
 export const MODEL_TABLE_END = "<!-- fusion:model-table:end -->";
@@ -23,6 +23,10 @@ export const DEFAULT_ROUTING_DEFAULTS = {
   cursor: {
     diversity: { model: "muse-spark-1.3", effort: "xhigh" },
     burst: { model: "composer-2.5", effort: "default" }
+  },
+  devin: {
+    diversity: { model: "muse-wonder", effort: "xhigh" },
+    burst: { model: "swe-2", effort: "high" }
   }
 };
 const ROUTING_DEFAULT_EFFORTS = new Set(["low", "medium", "high", "xhigh", "max"]);
@@ -77,6 +81,9 @@ export function validateModelRoutingData(value) {
   if (typeof value.costProfile !== "string") {
     return invalid("Expected costProfile to be a string.");
   }
+  if (value.breadth !== undefined && !BREADTH_ENGINE_IDS.includes(value.breadth)) {
+    return invalid(`Expected breadth to be one of ${BREADTH_ENGINE_IDS.join(", ")}.`);
+  }
   if (!Array.isArray(value.models)) {
     return invalid("Expected models to be an array.");
   }
@@ -96,8 +103,8 @@ export function validateModelRoutingData(value) {
     if (model.family !== undefined && (typeof model.family !== "string" || !/^[a-z][a-z0-9-]*$/.test(model.family))) {
       return invalid(`Expected models[${index}].family to be a lowercase slug.`);
     }
-    if (model.lane === "cursor" && model.family === undefined) {
-      return invalid(`Expected models[${index}].family for the cursor lane.`);
+    if (isEngineId(model.lane) && ENGINES[model.lane].family === null && model.family === undefined) {
+      return invalid(`Expected models[${index}].family for the ${model.lane} lane.`);
     }
     if (!isValidScore(model.intelligence)) {
       return invalid(`Expected models[${index}].intelligence to be an integer from 1 to 5.`);
@@ -172,6 +179,7 @@ export function validateModelRoutingData(value) {
       schemaVersion: MODEL_ROUTING_SCHEMA_VERSION,
       updatedAt: value.updatedAt,
       costProfile: value.costProfile,
+      ...(value.breadth === undefined ? {} : { breadth: value.breadth }),
       models,
       ...(defaults === undefined ? {} : { defaults })
     }
@@ -193,7 +201,7 @@ export function readRoutingDefaults(env = process.env, { warn = console.error } 
   if (!result.ok && !result.missing && warn) {
     warn(modelRoutingWarning(filePath, result.reason));
   }
-  return mergeRoutingDefaults(result.ok ? result.data.defaults : undefined);
+  return { breadth: result.ok ? result.data.breadth ?? DEFAULT_BREADTH_ENGINE : DEFAULT_BREADTH_ENGINE, ...mergeRoutingDefaults(result.ok ? result.data.defaults : undefined) };
 }
 
 export function readModelRoutingFile(filePath) {
@@ -223,6 +231,8 @@ function tableCell(value) {
 
 export function renderModelTable(data, { includeNotes = false } = {}) {
   const lines = [];
+  const breadth = data.breadth ?? DEFAULT_BREADTH_ENGINE;
+  const otherBreadth = BREADTH_ENGINE_IDS.find((id) => id !== breadth);
   const costProfile = data.costProfile.trim();
   if (costProfile) {
     lines.push(`Cost profile: ${tableCell(costProfile)}`, "");
@@ -230,14 +240,18 @@ export function renderModelTable(data, { includeNotes = false } = {}) {
   lines.push(`| Engine | Lane | Family | Intelligence | Taste | Cost |${includeNotes ? " Notes |" : ""}`);
   lines.push(`|---|---|---|---:|---:|---:|${includeNotes ? "---|" : ""}`);
   for (const model of data.models) {
+    if (isEngineId(model.lane) && ENGINES[model.lane].seat === "breadth" && model.lane !== breadth) {
+      continue;
+    }
     const family = model.family ?? (isEngineId(model.lane) ? ENGINES[model.lane].family : model.lane.startsWith("claude-") ? "anthropic" : null);
     lines.push(
       `| ${tableCell(model.id)} | ${tableCell(model.lane)} | ${tableCell(family ?? "")} | ${model.intelligence} | ${model.taste} | ${model.cost} |${includeNotes ? ` ${tableCell(model.notes ?? "")} |` : ""}`
     );
   }
   const defaults = mergeRoutingDefaults(data.defaults);
-  const defaultSentence = ENGINE_IDS.map((lane) => ENGINES[lane].roles.map((role, index) => `${index === 0 ? `${lane} ` : ""}${role} ${tableCell(defaults[lane][role].model)}@${defaults[lane][role].effort}`).join(", ")).join("; ");
+  const defaultSentence = routedEngineIds(breadth).map((lane) => ENGINES[lane].roles.map((role, index) => `${index === 0 ? `${lane} ` : ""}${role} ${tableCell(defaults[lane][role].model)}@${defaults[lane][role].effort}`).join(", ")).join("; ");
   lines.push(
+    `Breadth engine: ${ENGINES[breadth].displayName} (${breadth}); its briefs go to ${ENGINES[breadth].rescueAgent} with \`${breadth}-role: diversity\` or \`${breadth}-role: burst\`, and ${ENGINES[otherBreadth].displayName} holds no routing seat.`,
     ...(includeNotes ? [] : ["Model notes (benchmarks, prices, latency) live in model-routing.json; `/fusion:config` shows them."]),
     "",
     `Lane defaults: ${defaultSentence}.`,

@@ -4,6 +4,8 @@ import path from "node:path";
 import { test } from "node:test";
 
 import {
+  BREADTH_ENGINE_IDS,
+  DEFAULT_BREADTH_ENGINE,
   ENGINES,
   ENGINE_IDS,
   ENGINE_ID_ALTERNATION,
@@ -21,7 +23,8 @@ import {
   engineResultCommand,
   engineRoleFromBrief,
   engineStateRoots,
-  isEngineId
+  isEngineId,
+  routedEngineIds
 } from "../plugins/fusion/scripts/lib/engines.mjs";
 
 const repoRoot = path.join(import.meta.dirname, "..");
@@ -31,10 +34,15 @@ function readJson(relativePath) {
 }
 
 test("engine constants and definitions are frozen", () => {
-  assert.deepStrictEqual(ENGINE_IDS, ["codex", "grok", "cursor"]);
-  assert.strictEqual(ENGINE_ID_ALTERNATION, "codex|grok|cursor");
+  assert.deepStrictEqual(ENGINE_IDS, ["codex", "grok", "cursor", "devin"]);
+  assert.deepStrictEqual(BREADTH_ENGINE_IDS, ["cursor", "devin"]);
+  assert.strictEqual(DEFAULT_BREADTH_ENGINE, "cursor");
+  assert.deepStrictEqual(routedEngineIds(), ["codex", "grok", "cursor"]);
+  assert.deepStrictEqual(routedEngineIds("devin"), ["codex", "grok", "devin"]);
+  assert.strictEqual(ENGINE_ID_ALTERNATION, "codex|grok|cursor|devin");
   assert.ok(Object.isFrozen(ENGINES));
   assert.ok(Object.isFrozen(ENGINE_IDS));
+  assert.ok(Object.isFrozen(BREADTH_ENGINE_IDS));
 
   for (const id of ENGINE_IDS) {
     assert.ok(Object.isFrozen(ENGINES[id]));
@@ -52,6 +60,7 @@ test("every engine definition has the registry shape", () => {
       assert.ok(engine[field].length > 0);
     }
     assert.strictEqual(engine.id, id);
+    assert.strictEqual(engine.seat, BREADTH_ENGINE_IDS.includes(id) ? "breadth" : null);
     assert.ok(Array.isArray(engine.managedAgents));
     assert.ok(engine.rescueAgent.startsWith(`${id}:`));
     for (const agent of engine.managedAgents) {
@@ -60,20 +69,51 @@ test("every engine definition has the registry shape", () => {
   }
 });
 
+test("Devin registry contract matches the breadth companion", () => {
+  const devin = ENGINES.devin;
+  assert.deepStrictEqual({
+    displayName: devin.displayName,
+    family: devin.family,
+    rescueAgent: devin.rescueAgent,
+    managedAgents: devin.managedAgents,
+    companionFile: devin.companionFile,
+    companionEnv: devin.companionEnv,
+    dataDirName: devin.dataDirName,
+    dataEnv: devin.dataEnv,
+    stateEnvs: devin.stateEnvs,
+    versionField: devin.versionField,
+    verifiedVersionKey: devin.verifiedVersionKey,
+    acceptanceLedger: devin.acceptanceLedger,
+    ownMonitor: devin.ownMonitor,
+    roles: devin.roles,
+    defaultRole: devin.defaultRole,
+    efforts: devin.efforts,
+    unavailablePrefix: devin.unavailablePrefix
+  }, {
+    displayName: "Devin", family: null, rescueAgent: "devin:devin-rescue", managedAgents: [],
+    companionFile: "devin-companion.mjs", companionEnv: "FUSION_DEVIN_COMPANION",
+    dataDirName: "devin-claude-code-fusion", dataEnv: "DEVIN_COMPANION_DATA", stateEnvs: [],
+    versionField: "devinVersion", verifiedVersionKey: "devin", acceptanceLedger: false, ownMonitor: false,
+    roles: ["diversity", "burst"], defaultRole: null,
+    efforts: ["default", "none", "minimal", "low", "medium", "high", "xhigh", "max"],
+    unavailablePrefix: "devin unavailable:"
+  });
+});
+
 test("engine terminal statuses are exact", () => {
   assert.deepStrictEqual(ENGINE_TERMINAL_STATUSES, new Set(["done", "error", "cancelled"]));
 });
 
 test("peer agent sets are exact", () => {
-  assert.deepStrictEqual(PEER_RESCUE_AGENTS, new Set(["codex:codex-rescue", "grok:grok-rescue", "cursor:cursor-rescue"]));
+  assert.deepStrictEqual(PEER_RESCUE_AGENTS, new Set(["codex:codex-rescue", "grok:grok-rescue", "cursor:cursor-rescue", "devin:devin-rescue"]));
   assert.deepStrictEqual(PEER_MANAGED_AGENTS, new Set(["grok:grok-review-runner"]));
-  assert.deepStrictEqual(PEER_JOB_FOOTER_AGENTS, new Set(["codex:codex-rescue", "grok:grok-rescue", "cursor:cursor-rescue", "grok:grok-review-runner"]));
-  assert.deepStrictEqual(PEER_RESCUE_AGENT_NAMES, new Set(["codex:codex-rescue", "codex-rescue", "grok:grok-rescue", "grok-rescue", "cursor:cursor-rescue", "cursor-rescue"]));
+  assert.deepStrictEqual(PEER_JOB_FOOTER_AGENTS, new Set(["codex:codex-rescue", "grok:grok-rescue", "cursor:cursor-rescue", "devin:devin-rescue", "grok:grok-review-runner"]));
+  assert.deepStrictEqual(PEER_RESCUE_AGENT_NAMES, new Set(["codex:codex-rescue", "codex-rescue", "grok:grok-rescue", "grok-rescue", "cursor:cursor-rescue", "cursor-rescue", "devin:devin-rescue", "devin-rescue"]));
   assert.deepStrictEqual(PEER_MANAGED_AGENT_NAMES, new Set(["grok:grok-review-runner", "grok-review-runner"]));
 });
 
 test("isEngineId accepts only registered engine ids", () => {
-  for (const value of ["codex", "grok", "cursor"]) {
+  for (const value of ["codex", "grok", "cursor", "devin"]) {
     assert.strictEqual(isEngineId(value), true);
   }
   for (const value of ["claude", "", null, undefined, 1, "toString", "constructor"]) {
@@ -85,6 +125,7 @@ test("engineDisplayName maps registered engines", () => {
   assert.strictEqual(engineDisplayName("codex"), "Codex");
   assert.strictEqual(engineDisplayName("grok"), "Grok");
   assert.strictEqual(engineDisplayName("cursor"), "Cursor");
+  assert.strictEqual(engineDisplayName("devin"), "Devin");
   for (const value of ["claude", "", null, undefined]) {
     assert.strictEqual(engineDisplayName(value), null);
   }
@@ -95,9 +136,11 @@ test("engineForAgentType maps qualified and bare peer agents", () => {
   assert.strictEqual(engineForAgentType("grok:grok-rescue"), "grok");
   assert.strictEqual(engineForAgentType("grok:grok-review-runner"), "grok");
   assert.strictEqual(engineForAgentType("cursor:cursor-rescue"), "cursor");
+  assert.strictEqual(engineForAgentType("devin:devin-rescue"), "devin");
   assert.strictEqual(engineForAgentType("codex-rescue"), "codex");
   assert.strictEqual(engineForAgentType("grok-review-runner"), "grok");
   assert.strictEqual(engineForAgentType("cursor-rescue"), "cursor");
+  assert.strictEqual(engineForAgentType("devin-rescue"), "devin");
   for (const value of ["fusion:claude-worker", "claude-worker", "rescue", undefined]) {
     assert.strictEqual(engineForAgentType(value), null);
   }
@@ -110,6 +153,8 @@ test("engine state roots and data dirs follow the registry overrides", () => {
   assert.deepStrictEqual(engineStateRoots("grok", { HOME: "/h", GROK_COMPANION_DATA: "/g" }), ["/g/state"]);
   assert.strictEqual(engineDataDir("cursor", { HOME: "/h" }), "/h/.claude/plugins/data/cursor-claude-code-fusion");
   assert.deepStrictEqual(engineStateRoots("cursor", { HOME: "/h", CURSOR_COMPANION_DATA: "/c" }), ["/c/state"]);
+  assert.strictEqual(engineDataDir("devin", { HOME: "/h" }), "/h/.claude/plugins/data/devin-claude-code-fusion");
+  assert.deepStrictEqual(engineStateRoots("devin", { HOME: "/h", DEVIN_COMPANION_DATA: "/d" }), ["/d/state"]);
   assert.deepStrictEqual(engineStateRoots("unknown", { HOME: "/h" }), []);
   assert.strictEqual(engineDataDir("unknown", { HOME: "/h" }), null);
 });
@@ -125,6 +170,9 @@ test("engineRoleFromBrief reads lane headers and role fields per engine", () => 
   assert.strictEqual(engineRoleFromBrief("cursor", "goal: x\ncursor-role: burst"), "burst");
   assert.strictEqual(engineRoleFromBrief("cursor", "cursor-role: unknown"), null);
   assert.strictEqual(engineRoleFromBrief("cursor", "lane: panel | grok-role: independence"), null);
+  assert.strictEqual(engineRoleFromBrief("devin", "lane: devin diversity | acceptance: cited"), "diversity");
+  assert.strictEqual(engineRoleFromBrief("devin", "goal: x\ndevin-role: burst"), "burst");
+  assert.strictEqual(engineRoleFromBrief("devin", "lane: panel | cursor-role: diversity"), null);
   assert.strictEqual(engineRoleFromBrief("unknown", "lane: x"), null);
 });
 
@@ -134,9 +182,9 @@ test("engineResultCommand formats only registered engine commands", () => {
 });
 
 test("engine display lists use the requested conjunction", () => {
-  assert.strictEqual(engineIdChoices(), "codex, grok, or cursor");
-  assert.strictEqual(engineDisplayNameList(), "Codex, Grok, and Cursor");
-  assert.strictEqual(engineDisplayNameList("disjunction"), "Codex, Grok, or Cursor");
+  assert.strictEqual(engineIdChoices(), "codex, grok, cursor, or devin");
+  assert.strictEqual(engineDisplayNameList(), "Codex, Grok, Cursor, and Devin");
+  assert.strictEqual(engineDisplayNameList("disjunction"), "Codex, Grok, Cursor, or Devin");
 });
 
 test("engine definitions match plugin files and marketplace entries", () => {

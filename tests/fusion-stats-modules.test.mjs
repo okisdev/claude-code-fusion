@@ -36,6 +36,6 @@ test("fixture ledger keeps JSON and Markdown report bytes", (t) => {
   };
   const report = buildFusionStats({ all: true, env, cwd: "/fixture/workspace" });
   const digest = (value) => createHash("sha256").update(value).digest("hex");
-  assert.equal(digest(JSON.stringify(report, null, 2) + "\n"), "c970601dfcf207055d45c04f7279ba941b08fc9f1a338501b240d3a2cdf5a974");
-  assert.equal(digest(renderFusionStats(report)), "adccfbea16938798815cf71b407ba49647cfd28241c570cd1f6ef0cb71769afc");
+  assert.equal(digest(JSON.stringify(report, null, 2) + "\n"), "69b477c7754daf850d9b44def4d38483666d4d347ec7e613879a0e2c895fe62f");
+  assert.equal(digest(renderFusionStats(report)), "93d5f653a852a7656161d0456c6770b242fc908048b78b6e63ba9c5a83bc2882");
 });

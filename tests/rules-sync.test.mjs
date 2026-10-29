@@ -256,12 +256,12 @@ test("background collection distinguishes explicit Fusion receipts from foregrou
   const task = fs.readFileSync(path.join(repoRoot, "plugins", "codex", "skills", "task", "SKILL.md"), "utf8");
   const rescue = fs.readFileSync(path.join(repoRoot, "plugins", "codex", "skills", "rescue", "SKILL.md"), "utf8");
   assert.match(rules, /this obligation applies to a manual receipt that crosses into the main session from a detached job launched by Fusion orchestration/);
-  assert.match(rules, /closed direct prompt containing exactly one standalone `engine: codex\|grok\|cursor` line and one standalone `job: <32 lowercase hexadecimal characters>` line/);
+  assert.match(rules, /closed direct prompt containing exactly one standalone `engine: codex\|grok\|cursor\|devin` line and one standalone `job: <32 lowercase hexadecimal characters>` line/);
   assert.match(fs.readFileSync(path.join(repoRoot, "plugins", "fusion", "rules", "troubleshooting.md"), "utf8"), /The lifecycle binds the collected marker to this dispatch identity\./);
   assert.match(fs.readFileSync(path.join(repoRoot, "plugins", "fusion", "rules", "troubleshooting.md"), "utf8"), /Grok companion calls also remain foreground inside their owning Agent; expected duration does not authorize managed detachment/);
   assert.match(fs.readFileSync(path.join(repoRoot, "plugins", "fusion", "rules", "troubleshooting.md"), "utf8"), /A width one Claude worker dispatch may instead pass `run_in_background: false` so the deliverable returns synchronously inside the tool result; the lifecycle records it as an ordinary foreground worker\./);
   assert.doesNotMatch(rules, /Managed Grok detachment is different/);
-  assert.match(fs.readFileSync(path.join(repoRoot, "plugins", "fusion", "rules", "troubleshooting.md"), "utf8"), /Direct Codex, Grok, and Cursor slash commands with explicit `--background` return manual receipts for the user to inspect and collect through their status and result commands/);
+  assert.match(fs.readFileSync(path.join(repoRoot, "plugins", "fusion", "rules", "troubleshooting.md"), "utf8"), /Direct Codex, Grok, Cursor, and Devin slash commands with explicit `--background` return manual receipts for the user to inspect and collect through their status and result commands/);
   assert.match(task, /Direct users inspect progress through `\/codex:status` and collect the deliverable through `\/codex:result`; when Fusion is installed, its monitor can notify them of completion/);
   assert.match(rescue, /Direct users inspect progress through `\/codex:status` and collect the deliverable through `\/codex:result`; when Fusion is installed, its monitor can notify them of completion/);
 });

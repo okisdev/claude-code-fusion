@@ -1,6 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
-import { ENGINE_TERMINAL_STATUSES, engineDataDir } from "../../lib/engines.mjs";
+import { BREADTH_ENGINE_IDS, ENGINES, ENGINE_TERMINAL_STATUSES, engineDataDir } from "../../lib/engines.mjs";
 import { readModelRoutingFile, resolveModelRoutingPath } from "../../lib/model-table.mjs";
 import { LANE_SIGNAL_MIN_JUDGED_JOBS, LANE_SIGNAL_TRAILING_JOBS, LANE_SIGNAL_WINDOW_MS, LAST_SEVEN_DAYS_MS, RESUMABLE_CODEX_FAILURE_KINDS, fusionRepositoryKey, fusionWorkspaceKey, loadModelAuditObservations, modelAuditSidecarPath, modelObservationRank, nonEmptyString, observationTimestamp, readCodexJobEvidence, readWorkspaceJobFiles, resolveCodexJobEffort, resolveCodexJobModel, resolveFusionDataDir, resolveGitWorkspaceRoot, workspaceKeyMatchesRepository, workspaceRootsShareRepository } from "./evidence.mjs";
 
@@ -112,12 +112,12 @@ export const FILE_ENGINE_DESCRIPTORS = {
       return resolveCodexJobEffort(raw, observation);
     }
   },
-  cursor: {
-    id: "cursor",
-    displayOrder: 2,
-    defaultStateRoot: (env) => path.join(engineDataDir("cursor", env), "state"),
-    unavailableReason: "cursor plugin job state not found; the cursor plugin may not be installed",
-    note: "read best effort from Cursor job state; totals are lower bounds",
+  ...Object.fromEntries(BREADTH_ENGINE_IDS.map((id, index) => [id, {
+    id,
+    displayOrder: index + 2,
+    defaultStateRoot: (env) => path.join(engineDataDir(id, env), "state"),
+    unavailableReason: `${id} plugin job state not found; the ${id} plugin may not be installed`,
+    note: `read best effort from ${ENGINES[id].displayName} job state; totals are lower bounds`,
     enumerateJobs: readWorkspaceJobFiles,
     requiresJobs: true,
     requiresScopedJobs: true,
@@ -161,13 +161,13 @@ export const FILE_ENGINE_DESCRIPTORS = {
       }
       return nonEmptyString(raw?.failureKind) ?? (raw.status === "cancelled" ? "cancelled" : "error");
     },
-    resolveTokenUsage: cursorTokenUsageForJob,
+    resolveTokenUsage: breadthTokenUsageForJob,
     emptyTokenTotals: { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, totalTokens: 0 },
     resolveBillingPool(raw) {
       return nonEmptyString(raw?.billingPool);
     },
     tokenUsageScope: "terminal jobs only"
-  }
+  }]))
 };
 
 function workspaceRootsForJob(raw) {
@@ -403,13 +403,26 @@ function grokTokenUsageForJob(raw) {
   return { availability: raw?.usage != null || raw?.modelUsage != null ? "partial" : "unavailable", usage: null };
 }
 
-function cursorTokenUsageForJob(raw) {
+function breadthTokenUsageForJob(raw) {
   const value = raw?.usage;
   if (value == null) {
     return { availability: "unavailable", usage: null };
   }
   if (typeof value !== "object" || Array.isArray(value)) {
     return { availability: "partial", usage: null };
+  }
+  if (Object.hasOwn(value, "totalTokens")) {
+    const input = integerTokenField(value.inputTokens);
+    const output = integerTokenField(value.outputTokens);
+    const cachedRead = integerTokenField(value.cachedReadTokens);
+    const total = integerTokenField(value.totalTokens);
+    if ([input, output, cachedRead, total].some((field) => field == null) || cachedRead > input || BigInt(input) + BigInt(output) !== BigInt(total)) {
+      return { availability: "partial", usage: null };
+    }
+    return {
+      availability: "available",
+      usage: { inputTokens: input - cachedRead, outputTokens: output, cacheReadTokens: cachedRead, cacheWriteTokens: 0, totalTokens: total }
+    };
   }
   const fields = ["inputTokens", "outputTokens", "cacheReadTokens", "cacheWriteTokens"].map((field) => integerTokenField(value[field]));
   if (fields.some((field) => field == null)) {

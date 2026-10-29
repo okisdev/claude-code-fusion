@@ -55,7 +55,7 @@ test("Rules table renders scores without Notes and points to config", (t) => {
   assert.match(table, /^\| codex \| codex \| openai \| 5 \| 4 \| 5 \|$/m);
   assert.doesNotMatch(table, /primary implementation lane|\| Notes \|/);
   assert.match(table, /^Lane defaults: codex quick gpt-6-sol@xhigh, volume gpt-6-luna@xhigh, flagship gpt-6-astra@xhigh; grok burst grok-4\.7-build-fast@low, independence grok-4\.7-build-fast@high, live-web grok-4\.7-build-fast@high, large-context grok-4\.6@medium; cursor diversity muse-spark-1\.3@xhigh, burst composer-2\.5@default\.$/m);
-  assert.match(table, /\| grok-fast \| grok \| xai \| 3 \| 3 \| 5 \|\nModel notes \(benchmarks, prices, latency\) live in model-routing\.json; `\/fusion:config` shows them\.\n\nLane defaults: [^\n]+\n\nScores feed/);
+  assert.match(table, /\| grok-fast \| grok \| xai \| 3 \| 3 \| 5 \|\nBreadth engine: Cursor \(cursor\); its briefs go to cursor:cursor-rescue with `cursor-role: diversity` or `cursor-role: burst`, and Devin holds no routing seat\.\nModel notes \(benchmarks, prices, latency\) live in model-routing\.json; `\/fusion:config` shows them\.\n\nLane defaults: [^\n]+\n\nScores feed/);
   assert.match(
     table,
     /^Scores feed the routing priorities above: intelligence proxies correctness and safety, taste is user facing quality, cost applies only as the final tie breaker\.$/m
@@ -80,25 +80,29 @@ test("Routing defaults merge file choices over the seed and preserve only suppor
     grok: { independence: { model: "grok-4.7", effort: "max" } }
   });
   assert.deepStrictEqual(readRoutingDefaults({ FUSION_MODEL_ROUTING: file }), {
+    breadth: "cursor",
     codex: { ...DEFAULT_ROUTING_DEFAULTS.codex, quick: { model: "gpt-6-sol", effort: "high" } },
     grok: { ...DEFAULT_ROUTING_DEFAULTS.grok, independence: { model: "grok-4.7", effort: "max" } },
-    cursor: DEFAULT_ROUTING_DEFAULTS.cursor
+    cursor: DEFAULT_ROUTING_DEFAULTS.cursor,
+    devin: DEFAULT_ROUTING_DEFAULTS.devin
   });
   assert.match(renderModelTableFromFile(file), /Lane defaults: codex quick gpt-6-sol@high, volume gpt-6-luna@xhigh, flagship gpt-6-astra@xhigh; grok burst grok-4\.7-build-fast@low, independence grok-4\.7@max/);
 });
 
-test("Cursor requires a valid family and declared families survive sanitization", () => {
-  const row = { id: "muse-spark-1.3", lane: "cursor", intelligence: 4, taste: 5, cost: 3 };
-  for (const family of [undefined, "OpenAI", "two words", "", "-x", 5]) {
-    const result = validateModelRoutingData({ ...ROUTING, models: [...ROUTING.models, { ...row, ...(family === undefined ? {} : { family }) }] });
-    assert.strictEqual(result.ok, false);
-    assert.match(result.reason, /models\[2\]\.family/);
+test("Engines without a fixed family require a valid family and preserve it", () => {
+  for (const lane of ["cursor", "devin"]) {
+    const row = { id: "muse-spark-1.3", lane, intelligence: 4, taste: 5, cost: 3 };
+    for (const family of [undefined, "OpenAI", "two words", "", "-x", 5]) {
+      const result = validateModelRoutingData({ ...ROUTING, models: [...ROUTING.models, { ...row, ...(family === undefined ? {} : { family }) }] });
+      assert.strictEqual(result.ok, false);
+      assert.match(result.reason, /models\[2\]\.family/);
+    }
+    const valid = validateModelRoutingData({ ...ROUTING, models: [...ROUTING.models, { ...row, family: "anthropic", ignored: true }] });
+    assert.strictEqual(valid.ok, true);
+    assert.strictEqual(valid.data.models[2].family, "anthropic");
+    assert.strictEqual(Object.hasOwn(valid.data.models[0], "family"), false);
+    assert.strictEqual(Object.hasOwn(valid.data.models[2], "ignored"), false);
   }
-  const valid = validateModelRoutingData({ ...ROUTING, models: [...ROUTING.models, { ...row, family: "anthropic", ignored: true }] });
-  assert.strictEqual(valid.ok, true);
-  assert.strictEqual(valid.data.models[2].family, "anthropic");
-  assert.strictEqual(Object.hasOwn(valid.data.models[0], "family"), false);
-  assert.strictEqual(Object.hasOwn(valid.data.models[2], "ignored"), false);
 });
 
 test("Rendering uses declared and effective model families", () => {
@@ -115,6 +119,35 @@ test("Rendering uses declared and effective model families", () => {
   const table = renderModelTableFromContents(JSON.stringify(validated.data));
   for (const [id, lane, family] of [["codex-model", "codex", "openai"], ["grok-model", "grok", "xai"], ["claude-model", "claude-fast", "anthropic"], ["cursor-model", "cursor", "anthropic"], ["other-model", "other", ""], ["override", "codex", "custom-family"]]) {
     assert.ok(table.includes(`| ${id} | ${lane} | ${family} | 3 | 3 | 3 |`));
+  }
+});
+
+test("Breadth selection validates, survives file reads, and renders one seat", (t) => {
+  const rows = [
+    { id: "muse-spark-1.3", lane: "cursor", family: "anthropic", intelligence: 4, taste: 5, cost: 3 },
+    { id: "muse-wonder", lane: "devin", family: "anthropic", intelligence: 5, taste: 5, cost: 3 }
+  ];
+  for (const breadth of [null, "", "codex", "DEVIN", 1]) {
+    const result = validateModelRoutingData({ ...ROUTING, breadth });
+    assert.strictEqual(result.ok, false);
+    assert.match(result.reason, /Expected breadth to be one of cursor, devin/);
+  }
+  for (const breadth of ["cursor", "devin"]) {
+    const data = validateModelRoutingData({ ...ROUTING, breadth, models: [...ROUTING.models, ...rows] });
+    assert.strictEqual(data.ok, true);
+    assert.strictEqual(data.data.breadth, breadth);
+    const file = path.join(sandbox(t), `${breadth}.json`);
+    writeRouting(file, data.data);
+    assert.strictEqual(readRoutingDefaults({ FUSION_MODEL_ROUTING: file }).breadth, breadth);
+    const table = renderModelTableFromFile(file);
+    const other = breadth === "cursor" ? "devin" : "cursor";
+    const shown = breadth === "cursor" ? "muse-spark-1.3" : "muse-wonder";
+    const hidden = breadth === "cursor" ? "muse-wonder" : "muse-spark-1.3";
+    assert.match(table, new RegExp(`\\| ${shown.replaceAll(".", "\\.")} \\| ${breadth} \\|`));
+    assert.doesNotMatch(table, new RegExp(`\\| ${hidden.replaceAll(".", "\\.")} \\| ${other} \\|`));
+    assert.match(table, new RegExp(`; ${breadth} diversity [^\\n]+\\.$`, "m"));
+    assert.doesNotMatch(table, new RegExp(`; ${other} diversity `));
+    assert.ok(table.includes(`Breadth engine: ${breadth === "cursor" ? "Cursor" : "Devin"} (${breadth}); its briefs go to ${breadth}:${breadth}-rescue with ` + `\`${breadth}-role: diversity\` or \`${breadth}-role: burst\`, and ${breadth === "cursor" ? "Devin" : "Cursor"} holds no routing seat.`));
   }
 });
 
@@ -142,10 +175,10 @@ test("Missing and invalid routing files return seed defaults, with one warning f
   const file = path.join(dir, "model-routing.json");
   const warnings = [];
   const env = { FUSION_MODEL_ROUTING: file };
-  assert.deepStrictEqual(readRoutingDefaults(env, { warn: (message) => warnings.push(message) }), DEFAULT_ROUTING_DEFAULTS);
+  assert.deepStrictEqual(readRoutingDefaults(env, { warn: (message) => warnings.push(message) }), { breadth: "cursor", ...DEFAULT_ROUTING_DEFAULTS });
   assert.deepStrictEqual(warnings, []);
   writeRouting(file, { ...ROUTING, defaults: { codex: { quick: { model: "missing", effort: "high" } } } });
-  assert.deepStrictEqual(readRoutingDefaults(env, { warn: (message) => warnings.push(message) }), DEFAULT_ROUTING_DEFAULTS);
+  assert.deepStrictEqual(readRoutingDefaults(env, { warn: (message) => warnings.push(message) }), { breadth: "cursor", ...DEFAULT_ROUTING_DEFAULTS });
   assert.strictEqual(warnings.length, 1);
   assert.match(warnings[0], new RegExp(`^fusion: model routing file invalid at ${file}:`));
 });

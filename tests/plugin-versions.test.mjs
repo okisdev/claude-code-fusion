@@ -12,7 +12,7 @@ function readJson(file) {
 test("marketplace and plugin manifest versions stay synchronized", () => {
   const marketplace = readJson(".claude-plugin/marketplace.json");
   const entries = new Map(marketplace.plugins.map((entry) => [entry.name, entry]));
-  assert.deepEqual([...entries.keys()].sort(), ["codex", "cursor", "fusion", "grok"]);
+  assert.deepEqual([...entries.keys()].sort(), ["codex", "cursor", "devin", "fusion", "grok"]);
   for (const name of entries.keys()) {
     const manifest = readJson(`plugins/${name}/.claude-plugin/plugin.json`);
     assert.equal(entries.get(name)?.version, marketplace.version);
