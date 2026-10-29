@@ -1,0 +1,53 @@
+---
+name: devin-cli-runtime
+description: Internal helper contract for calling the devin-companion runtime from Claude Code
+user-invocable: false
+---
+
+# Devin runtime
+
+Primary helper:
+
+- `node "${CLAUDE_PLUGIN_ROOT}/scripts/devin-companion.mjs" <subcommand> [flags]`
+
+Subcommand surface:
+
+- `task [--write] [--model <id>] [--effort <effort>] [--resume <session-id>|--resume-last|--fresh] [--background] [--cwd <dir>] [--json] [--] [prompt]`
+- `review [--scope <auto|working-tree|branch>] [--base <ref>] [--focus <text>] [--model <id>] [--effort <effort>] [--cwd <dir>] [--background] [--json]`
+- `status [job-id] [--all] [--cwd <dir>] [--json]`
+- `result <job-id> [--wait] [--cwd <dir>] [--json]`
+- `cancel <job-id> [--cwd <dir>] [--json]`
+- `history [--all] [--limit <n>] [--cwd <dir>] [--json]`
+- `models [--refresh] [--json]`
+- `setup [--json]`
+- `record-acceptance --job-id <id> --acceptance <accepted|rejected|unverified> [--reason <text>] [--failure-kind <kind>] [--source <collector|main-loop|stats>] [--accept-failed-transport] [--json]`
+- `transport-create` and `transport-discard --raw-args-token <token>`
+- `task-worker` and `review-worker` are internal background workers that the helper never invokes directly.
+
+Execution rules:
+
+- Slash commands stage their complete raw arguments through `transport-create`, one Read of the allocated empty file, Write to that same file, and a fixed `--raw-args-token` invocation. The token transport applies to task, review, status, history, result, cancel, and setup. Raw request bytes never enter Bash, shell arguments, environment variables, redirections, substitutions, encoded literals, or heredocs. A transport is private, bounded, validated, and consumed once. Never delete, rename, recreate, or change the permissions of the transport file; use `transport-discard` when Read or Write fails or when the allocated file is not empty.
+- Place every task option before the prompt, and put `--` before a prompt that begins with an option shaped token. The prompt text may also arrive on stdin.
+- The companion resolves the CLI as `devin` on `PATH`, with `DEVIN_BIN` overriding the path. Preflight runs `devin --version` and every job records `devinVersion` and `devinBuildPath`.
+- The tested interval is `[3000.11, 3000.12)` by major and minor version. An older or unparseable build fails preflight as `setup`; a newer build runs and `/devin:setup` reports it as newer than the tested interval. The generated configuration disables background auto update.
+- Every run executes `devin acp` with the workspace as its working directory. The companion sends JSON-RPC `initialize`, `session/new` or `session/load`, the supported `session/set_config_option` requests, then `session/prompt`. The brief appears only in that prompt message. The companion never passes `--cloud`, `--agent-type`, `--model`, or `--refusal-fallback`. Permission requests receive `cancelled`.
+- Consult is the default mode, `--write` selects write mode, and `review` is always read only. Consult and review set ACP mode `ask` and allow `read`, `grep`, `glob`, `find_file_by_name`, `notebook_read`, and `todo_write`. Write sets `autonomous` and additionally allows `edit`, `write`, `notebook_edit`, `exec`, `get_output`, `kill_shell`, and `write_to_process`. A `tool_call` outside the mode list terminates the process group and fails as `policy`.
+- Consult and review deny edit and exec in the generated configuration. Write sets `DEVIN_SANDBOX=true` and allows `Write(<cwd>/**)` plus the linked worktree Git directory. The OS sandbox confines shell writes to these scopes and fails closed when it cannot start. Sensitive real home paths and `Fetch(*)` are denied in every mode; other home reads may remain possible.
+- Every job uses shared private `HOME`, `XDG_DATA_HOME`, `XDG_STATE_HOME`, and `XDG_CACHE_HOME` under `<data>/home`, and private `XDG_CONFIG_HOME` at `<data>/runs/<job-id>/config`. The shared data directory holds the CLI session database and a symbolic link to the real user credentials file; the companion never reads or copies the credential. Generated `devin/config.json` disables auto update, attribution, subagents, notifications, and personal imports, and `devin/mcp_config.json` has empty `mcpServers`. The child environment never inherits `DEVIN_*` variables.
+- Project scoped `AGENTS.md`, `AGENTS.local.md`, `AGENT.md`, `.windsurfrules`, and project skills under `.devin/skills`, `.cognition/skills`, and `.agents/skills` still load. Project `.devin/config.json`, `.devin/config.local.json`, `.devin/mcp_config.json`, and `.devin/mcp_config.local.json` may add permissions, hooks, MCP servers, or imports; the companion warns when they exist. Organization settings still apply. Prompts, workspace content, and results pass through Devin's backend to the serving model vendor, so never delegate secrets or credentials to this lane.
+- Fusion routed dispatches always carry `--model` and `--effort` from the routing table. A direct user call without `--model` uses the account default. `models` reads `devin models list --format json`, caches the family catalog for one hour, and `--refresh` reads it again.
+- Models are family slugs such as `kimi-k3`, `glm-5.2`, `muse-wonder`, and `swe-2`, their aliases, or variant uids. The companion matches the requested family to a usable session model option and records that option as `resolvedModel`. A missing catalog family fails before job creation as `input`; a family unavailable to the account fails as `setup`. Effort is the selected model's `thought_level`: `default` leaves its default, a supported level is set explicitly, and an unsupported level fails as `input`. `speed` is set to `standard` when offered. `adaptive` and `fusion-*` pairings are refused as `input`.
+- The `_cognition.ai/agent_stopped` or `_cognition.ai/turn_stats` event reports the serving model as `observedModel`; a difference from the selected display name renders `model_mismatch` without changing the transport outcome. `billingPool` is `first-party` for `swe-*` models and `api` for every other family.
+- ACP stdout carries JSON-RPC responses, `session/update`, permission requests, and Cognition notifications. The companion appends message chunks only after the prompt is sent, verifies request ids and the session id, and requires a prompt result with `stopReason: "end_turn"` and an agent stopped cause of `complete` for success. It records `usage` exactly as reported, without filling absent cache tokens or reporting cost. Malformed lines or an exit before the prompt result fail as `protocol`.
+- The native CLI starts in its own process group. After the prompt result, the companion closes stdin and waits up to `DEVIN_COMPANION_EXIT_GRACE_MS` (default 15000) before terminating the group and recording `late_close`. The run timeout is `DEVIN_COMPANION_TIMEOUT_MS` (default 540000). `DEVIN_COMPANION_WAIT_TIMEOUT_MS`, `DEVIN_COMPANION_WAIT_POLL_MS`, and `DEVIN_COMPANION_PIDLESS_RUNNING_GRACE_MS` use the companion defaults.
+- Ordinary delegations use one foreground helper call with timeout `600000`. Only an explicit incoming user `--background` detaches a task or review into an internal worker and creates a manual receipt; the helper prints the job id plus `/devin:status` and `/devin:result` hints. Never add `--background` because a task appears large or slow, and never use Bash background mode. `result --wait` blocks while a job is running, and when its bounded wait budget elapses first it returns output ending in `state: running`.
+- A user asking to resume maps to `--resume <session-id>` or `--resume-last`; these and `--fresh` are alternatives. Only a terminal job in the same workspace and mode is resumable. The shared session database lets a later job use ACP `session/load` on its session id; a resumed session keeps its model unless a new model is named. `--fresh` ignores continuity. A terminal job's config directory is removed, and a periodic sweep removes orphan run directories older than one hour.
+- `history` exposes a safe metadata projection with resumable session ids. It defaults to the current workspace, `--all` includes every recorded workspace, and `--limit` caps the number of jobs shown.
+- `--cwd` selects the workspace for task, review, status, history, result, and cancel. Status, result, and cancel search all recorded workspaces by job id when `--cwd` is omitted. A bad working directory, or an implicit task or review working directory below its Git repository root, fails before a job record is created. Worktree isolation means creating a real Git worktree before launch and supplying that path as the actual `--cwd`.
+- Review collects the working tree diff or a branch range, interpolates it into `${CLAUDE_PLUGIN_ROOT}/prompts/review.md`, and runs a review mode job. The reply must contain one JSON object with `verdict` (`approve` or `request_changes`), `summary`, and `findings` (each with `severity`, `file`, `line`, `title`, and `body`). The companion extracts the first JSON object from the result text and validates it, and a missing or invalid object fails the review as `error` instead of falling back to prose.
+- Typed failure kinds are `missing_cli`, `setup`, `auth`, `quota`, `rate_limited`, `network`, `permission`, `policy`, `refused`, `protocol`, `timeout`, `process`, `cancelled`, `died`, `input`, `resource`, and `error`. Quota and rate limit failures carry `billingPool`; authentication, missing CLI, setup, protocol, permission, and policy failures are engine wide.
+- Outcomes end with the shared footer block: `devin-session: <session-id>` when a resumable session exists, then `job:`, `sandbox:`, `delivery:`, `semantic:`, any adapter `warning:` lines, `state:`, and `failure:` for error and cancelled outcomes.
+- Job records live at `<data>/state/<workspace>/jobs/<id>.json`, where `<data>` is `DEVIN_COMPANION_DATA` or `~/.claude/plugins/data/devin-claude-code-fusion`. They carry `engine: "devin"` plus `devinVersion`, `devinBuildPath`, `sessionId`, `requestId`, `requestedModel`, `resolvedModel`, `observedModel`, `requestedEffort`, `effortApplied`, `billingPool`, `mode`, `role`, `usage`, `stopCause`, `configDir`, and `warnings`.
+- `scripts/session-end-hook.mjs` runs at Claude Code SessionEnd, performs verified cleanup of this session's running jobs, and removes unused raw transports.
+- Return the helper output exactly as received, whether the Bash tool reports it from stdout or stderr.
+- If the Bash call fails or Devin cannot be invoked, surface the failure instead of hiding it; the devin-rescue agent returns exactly one `devin unavailable: <reason>` line for the orchestrator's circuit breaker.

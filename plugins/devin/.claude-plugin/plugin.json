@@ -1,0 +1,20 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-plugin-manifest.json",
+  "name": "devin",
+  "displayName": "Devin Companion",
+  "version": "0.0.68",
+  "description": "Local Devin CLI delegation: multi family consults, SWE implementation in owned worktrees, review, resumable history, background jobs, and setup health checks.",
+  "author": {
+    "name": "Harry Yep"
+  },
+  "homepage": "https://github.com/okisdev/claude-code-fusion",
+  "repository": "https://github.com/okisdev/claude-code-fusion",
+  "license": "MIT",
+  "keywords": [
+    "devin",
+    "multi-model",
+    "delegation",
+    "code-review",
+    "orchestration"
+  ]
+}

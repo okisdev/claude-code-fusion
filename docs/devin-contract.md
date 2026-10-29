@@ -30,7 +30,7 @@ Live probes confirmed that with this layout the credential loads through the lin
 Every run executes `devin acp` with the workspace as its working directory and speaks JSON-RPC 2.0 over newline delimited stdio. The companion is the ACP client and sends, in order:
 
 1. `initialize` with `protocolVersion: 1` and `clientCapabilities` `{ fs: { readTextFile: false, writeTextFile: false }, terminal: false }`. The agent must answer with `protocolVersion: 1`.
-2. `session/new` with `{ cwd, mcpServers: [] }`, or `session/load` with `{ sessionId, cwd, mcpServers: [] }` when resuming. The result carries `sessionId` (a slug such as `artistic-breeze`) and `configOptions`.
+2. `session/new` with `{ cwd, mcpServers: [] }`, or `session/load` with `{ sessionId, cwd, mcpServers: [] }` when resuming. Both results carry `modes` and `configOptions`; only `session/new` carries `sessionId` (a slug such as `artistic-breeze`), so a resumed run keeps the id it requested.
 3. `session/set_config_option` for `mode`, then `model`, then `thought_level`, then `speed` when present, as described below. Each result returns the updated `configOptions`; the companion verifies every `currentValue` it set and fails before prompting when one differs.
 4. `session/prompt` with `{ sessionId, prompt: [{ type: "text", text: <brief> }] }`. The brief travels only inside this message, never in process arguments or files the CLI can see.
 
