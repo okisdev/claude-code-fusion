@@ -9,7 +9,7 @@ import { configureRawTransport, createRawCommandTransport as allocateRawCommandT
 import { parseArgs, parseRawArgs, rawBooleanOptionRequested } from "./lib/args.mjs";
 import { resolveDevinBin, probeDevinVersion, compareDevinVersion, TESTED_DEVIN_INTERVAL, buildDevinChildEnv, runDevin, classifyDevinFailure } from "./lib/devin-exec.mjs";
 import { ensurePrivateHome, buildJobConfig, worktreeGitDirs, projectConfigFiles } from "./lib/devin-home.mjs";
-import { readModelCatalog, findCatalogFamily, createSelectionResolver, billingPoolForModel, isPinnableFamily } from "./lib/devin-models.mjs";
+import { readModelCatalog, findCatalogFamily, createSelectionResolver, createSpeedResolver, billingPoolForModel, isPinnableFamily } from "./lib/devin-models.mjs";
 import { getProcessIdentity, processGroupAlive, processIdentityMatches, processIsDirectlyAlive } from "./lib/process-identity.mjs";
 import { extractFirstJsonObject, validateReviewOutput, renderReviewResult, renderBackgroundLaunch, renderTaskResult, renderStatusTable, renderJobDetail, renderHistoryReport, renderCancelReport, renderRecordAcceptance, renderSetupReport } from "./lib/render.mjs";
 import { SESSION_ID_ENV, DEVIN_SESSION_ID_PATTERN, resolveDataDir, runConfigDir, sweepDevinRuns, generateJobId, nowIso, createJobRecord, createJobRecordFile, updateJobRecordFile, updateJobRecordFileWithCurrent, finishSuccessfulJobRecordFile, launchRunningJobProcess, listJobRecords, listAllJobRecords, findJobRecordById, jobFilePath, jobLogPath, briefPath, readJobRecordFile, writeBrief, appendJobLog, readLogTail, markDeliveryCollectedFile, claimResumeSessionLease } from "./lib/state.mjs";
@@ -196,15 +196,15 @@ async function runRecordedJob(record, file) {
     const source = sourceId ? readJobRecordFile(jobFilePath(dataDir, record.cwd, sourceId)) : null;
     if (sourceId && (!source || !DEVIN_SESSION_ID_PATTERN.test(source.sessionId) || source.sessionId !== record.request.resumeSessionId)) throw errorWithFailure("The resume source is unavailable.");
     const { homeDir } = ensurePrivateHome({ dataDir, realHome: realUserHome() });
-    buildJobConfig({ configDir: record.configDir, mode: record.mode, cwd: record.cwd, realHome: realUserHome(), gitDirs: record.mode === "write" ? worktreeGitDirs(record.cwd) : {} });
-    const resolver = record.request?.model ? createSelectionResolver({ family: record.request.family, effort: record.request.effort }) : null;
-    const selection = resolver ? (context) => {
+    buildJobConfig({ configDir: record.configDir, mode: record.mode, cwd: record.cwd, realHome: realUserHome(), homeDir, gitDirs: record.mode === "write" ? worktreeGitDirs(record.cwd) : {} });
+    const resolver = record.request?.model ? createSelectionResolver({ family: record.request.family, effort: record.request.effort }) : createSpeedResolver();
+    const selection = (context) => {
       const changes = resolver(context);
       if (context.stage === "model" && changes[0]) {
         selectedDisplayName = context.configOptions.find((item) => item.id === "model")?.options?.find((item) => item.value === changes[0].value)?.name ?? null;
       }
       return changes;
-    } : null;
+    };
     const signals = ["SIGTERM", "SIGINT", "SIGHUP"];
     const controller = new AbortController();
     const handlers = signals.map((signal) => [signal, () => {

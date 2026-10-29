@@ -400,9 +400,21 @@ function launchDevinProcess(bin, cwd, env) {
 function startDevinRun(run, resolve) {
   run.resolve = resolve;
   const { bin, cwd, env, timeoutMs, exitGraceMs, killGraceMs, launchProcess, signal, onSpawn } = run.options;
+  let spawned;
+  const launch = () => {
+    spawned = launchDevinProcess(bin, cwd, env);
+    spawned.on("error", () => {});
+    return spawned;
+  };
   try {
-    run.child = launchProcess ? launchProcess(() => launchDevinProcess(bin, cwd, env)) : launchDevinProcess(bin, cwd, env);
+    run.child = launchProcess ? launchProcess(launch) : launch();
   } catch (error) {
+    if (spawned?.pid) {
+      spawned.stdin.destroy();
+      try {
+        process.kill(-spawned.pid, "SIGKILL");
+      } catch {}
+    }
     run.outcome.spawnError = error;
     run.outcome.stderrTail = appendTail("", error.message);
     settleRun(run);
@@ -469,6 +481,7 @@ export function classifyDevinFailure(outcome) {
   if (outcome.selectionError) return outcome.selectionError.failureKind;
   if (outcome.policyViolation) return "policy";
   if (outcome.timedOut) return "timeout";
+  if (outcome.resultSeen && outcome.stopReason === "end_turn" && (outcome.stopCause == null || outcome.stopCause === "complete") && !outcome.rpcError && !outcome.setupError && !outcome.protocolError && (outcome.exitCode === 0 || outcome.lateClose)) return null;
   if (outcome.setupError || /sandbox.{0,80}(?:cannot|could not|unable|unavailable|failed|failure)|(?:cannot|could not|unable|failed|failure).{0,80}(?:sandbox|seatbelt|bubblewrap)|(?:seatbelt|bubblewrap).{0,80}(?:unavailable|failed|failure)/i.test(message)) return "setup";
   if (outcome.stopCause === "auth_required" || /log in|not logged in|unauthorized|\b(?:401|403)\b/i.test(message)) return "auth";
   if (/usage limit|quota|allowance|spend limit|insufficient credit|\b402\b/i.test(message)) return "quota";
@@ -478,6 +491,5 @@ export function classifyDevinFailure(outcome) {
   if (outcome.stopReason === "refusal") return "refused";
   if (outcome.protocolError) return "protocol";
   if (outcome.signal && !outcome.lateClose) return "process";
-  if (outcome.resultSeen && outcome.stopReason === "end_turn" && !outcome.rpcError && !outcome.spawnError && (outcome.exitCode === 0 || outcome.lateClose)) return null;
   return "error";
 }

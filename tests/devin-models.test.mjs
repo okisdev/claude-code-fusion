@@ -4,7 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 
-import { billingPoolForModel, createSelectionResolver, findCatalogFamily, parseModelsJson, readModelCatalog } from "../plugins/devin/scripts/lib/devin-models.mjs";
+import { billingPoolForModel, createSelectionResolver, createSpeedResolver, findCatalogFamily, parseModelsJson, readModelCatalog } from "../plugins/devin/scripts/lib/devin-models.mjs";
 
 const listing = {
   families: [
@@ -154,4 +154,12 @@ test("billing pool follows the selected family or variant", () => {
   assert.equal(billingPoolForModel("swe-2"), "first-party");
   assert.equal(billingPoolForModel("swe-2-high"), "first-party");
   assert.equal(billingPoolForModel("kimi-k3-high"), "api");
+});
+
+test("the speed resolver pins standard speed when no model is requested", () => {
+  const resolver = createSpeedResolver();
+  assert.deepEqual(resolver({ stage: "model", configOptions: [] }), []);
+  assert.deepEqual(resolver({ stage: "effort", configOptions: [{ id: "speed", currentValue: "fast", options: [{ value: "standard" }, { value: "fast" }] }] }), [{ configId: "speed", value: "standard" }]);
+  assert.deepEqual(resolver({ stage: "effort", configOptions: [{ id: "speed", currentValue: "standard", options: [] }] }), []);
+  assert.equal(resolver.effortApplied, false);
 });

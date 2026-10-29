@@ -29,7 +29,7 @@ export function ensurePrivateHome({ dataDir, env = process.env, realHome = os.ho
   return { homeDir };
 }
 
-export function buildJobConfig({ configDir, mode, cwd, realHome = os.homedir(), gitDirs = {} }) {
+export function buildJobConfig({ configDir, mode, cwd, realHome = os.homedir(), gitDirs = {}, env = process.env, homeDir = null }) {
   if (!["consult", "review", "write"].includes(mode)) throw new Error(`Invalid Devin mode: ${mode}`);
   const devinDir = path.join(configDir, "devin");
   fs.mkdirSync(configDir, { recursive: true, mode: 0o700 });
@@ -43,7 +43,9 @@ export function buildJobConfig({ configDir, mode, cwd, realHome = os.homedir(), 
   const deny = [
     "Fetch(*)",
     ...sensitiveDirs.map((directory) => `Read(${path.join(realHome, directory)}/**)`),
-    ...[".netrc", ".npmrc", ".git-credentials"].map((file) => `Read(${path.join(realHome, file)})`)
+    ...[".netrc", ".npmrc", ".git-credentials"].map((file) => `Read(${path.join(realHome, file)})`),
+    `Read(${path.dirname(realCredentialsPath({ env, realHome }))}/**)`,
+    ...(homeDir ? [`Read(${path.join(homeDir, ".local", "share", "devin", "credentials.toml")})`] : [])
   ];
   if (mode !== "write") deny.push("edit", "exec");
   const permissions = { ask: [], deny };

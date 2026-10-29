@@ -434,7 +434,9 @@ test("failure classification respects precedence and ignores network logs after 
     [{ signal: "SIGINT" }, "process"],
     [{ exitCode: 1, stderrTail: "ENOENT opening a workspace file" }, "error"],
     [{ exitCode: 0, stopReason: "cancelled", resultSeen: true }, "error"],
-    [{ exitCode: 1, stopReason: "end_turn", resultSeen: true }, "error"]
+    [{ exitCode: 1, stopReason: "end_turn", resultSeen: true }, "error"],
+    [{ exitCode: 0, stopReason: "end_turn", stopCause: "complete", resultSeen: true, stderrTail: "HTTP 429 too many requests, retrying" }, null],
+    [{ exitCode: 0, stopReason: "end_turn", stopCause: "tool_rejected", resultSeen: true }, "permission"]
   ];
   for (const [outcome, kind] of cases) assert.equal(classifyDevinFailure(outcome), kind, JSON.stringify(outcome));
   for (const [kind, messages] of [
@@ -451,4 +453,16 @@ test("failure classification respects precedence and ignores network logs after 
   }
   const { result } = await fakeRun(t, "network_after_result");
   assert.equal(classifyDevinFailure(result), null);
+});
+
+test("a launch wrapper that throws after spawning kills the child", async (t) => {
+  const root = fixture(t);
+  let pid;
+  const result = await runDevin({ bin, cwd: root, env: { ...process.env, FAKE_DEVIN_SCENARIO: "hang", FAKE_DEVIN_LOG: path.join(root, "run.log") }, brief: "brief", timeoutMs: 2000, exitGraceMs: 75, killGraceMs: 75, mode: "consult",
+    launchProcess: (launch) => {
+      pid = launch().pid;
+      throw Object.assign(new Error("ENOSPC: no space left on device"), { code: "ENOSPC" });
+    } });
+  assert.equal(result.spawnError.code, "ENOSPC");
+  await waitFor(() => processGone(pid));
 });

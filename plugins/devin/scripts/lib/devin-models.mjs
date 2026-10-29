@@ -111,6 +111,16 @@ export function createSelectionResolver({ family, effort = "default" }) {
   return resolver;
 }
 
+export function createSpeedResolver() {
+  const resolver = ({ stage, configOptions }) => {
+    if (stage !== "effort") return [];
+    const speed = configOptions.find((item) => item.id === "speed");
+    return speed && speed.currentValue !== "standard" ? [{ configId: "speed", value: "standard" }] : [];
+  };
+  resolver.effortApplied = false;
+  return resolver;
+}
+
 export function billingPoolForModel(slugOrUid) {
   return slugOrUid.toLowerCase().startsWith("swe-") ? "first-party" : "api";
 }

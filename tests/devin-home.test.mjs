@@ -51,10 +51,10 @@ test("job config contains the exact base policy and consult or review tool denie
   const root = fixture(t);
   const realHome = path.join(root, "real");
   const sensitive = [".ssh", ".gnupg", ".aws", ".azure", ".kube", ".docker", ".config", ".local/share", ".claude", ".codex", ".grok", ".cursor", ".devin", "Library/Keychains", "Library/Application Support"];
-  const baseDeny = ["Fetch(*)", ...sensitive.map((dir) => `Read(${path.join(realHome, dir)}/**)`), ...[".netrc", ".npmrc", ".git-credentials"].map((file) => `Read(${path.join(realHome, file)})`)];
+  const baseDeny = ["Fetch(*)", ...sensitive.map((dir) => `Read(${path.join(realHome, dir)}/**)`), ...[".netrc", ".npmrc", ".git-credentials"].map((file) => `Read(${path.join(realHome, file)})`), `Read(${path.join(realHome, ".local", "share", "devin")}/**)`];
   for (const mode of ["consult", "review", "write"]) {
     const configDir = path.join(root, mode, "config");
-    assert.deepEqual(buildJobConfig({ configDir, mode, cwd: root, realHome }), { configDir });
+    assert.deepEqual(buildJobConfig({ configDir, mode, cwd: root, realHome, env: {} }), { configDir });
     const configPath = path.join(configDir, "devin", "config.json");
     const mcpPath = path.join(configDir, "devin", "mcp_config.json");
     const config = JSON.parse(fs.readFileSync(configPath, "utf8"));
@@ -120,4 +120,16 @@ test("project config scan reports existing Devin configuration files as absolute
   assert.deepEqual(projectConfigFiles(root), ["config.json", "config.local.json", "mcp_config.json", "mcp_config.local.json"].map((name) => path.join(devinDir, name)));
   fs.rmSync(path.join(devinDir, "mcp_config.local.json"));
   assert.deepEqual(projectConfigFiles(root), ["config.json", "config.local.json", "mcp_config.json"].map((name) => path.join(devinDir, name)));
+});
+
+test("job config denies the resolved credential directory and its private home link", (t) => {
+  const root = fixture(t);
+  const realHome = path.join(root, "real");
+  const xdg = path.join(root, "account-data");
+  const homeDir = path.join(root, "private-home");
+  const configDir = path.join(root, "config");
+  buildJobConfig({ configDir, mode: "write", cwd: root, realHome, env: { XDG_DATA_HOME: xdg }, homeDir });
+  const { deny } = JSON.parse(fs.readFileSync(path.join(configDir, "devin", "config.json"), "utf8")).permissions;
+  assert.ok(deny.includes(`Read(${path.join(xdg, "devin")}/**)`));
+  assert.ok(deny.includes(`Read(${path.join(homeDir, ".local", "share", "devin", "credentials.toml")})`));
 });
