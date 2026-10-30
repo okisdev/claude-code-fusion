@@ -157,7 +157,7 @@ export function renderHistoryReport(history, now = Date.now()) {
     `Showing ${jobs.length} of ${totalJobs} jobs, newest first.`,
     ""
   ];
-  const headings = ["age", "job", "class", "status", "mode", "delivery", "requested model", "resolved model", "observed model", "effort applied", "billing pool", "devin version", "session", "resumable", "owned"];
+  const headings = ["age", "job", "class", "status", "mode", "delivery", "requested model", "resolved model", "observed model", "resolved effort", "effort applied", "billing pool", "devin version", "session", "resumable", "owned"];
   if (allWorkspaces) {
     headings.push("workspace");
   }
@@ -174,6 +174,7 @@ export function renderHistoryReport(history, now = Date.now()) {
       historyCell(job?.requestedModel),
       historyCell(job?.resolvedModel),
       historyCell(job?.observedModel),
+      historyCell(job?.resolvedEffort),
       booleanLabel(job?.effortApplied),
       historyCell(job?.billingPool),
       historyCell(job?.devinVersion),
@@ -286,6 +287,7 @@ export function renderJobDetail(job, options = {}) {
     `Background: ${job.background ? "yes" : "no"}`,
     `Requested model: ${job.requestedModel ?? "unknown"}`,
     `Resolved model: ${job.resolvedModel ?? "unknown"}`,
+    `Resolved effort: ${job.resolvedEffort ?? "unknown"}`,
     `Observed model: ${job.observedModel ?? "unknown"}`,
     `Requested effort: ${job.requestedEffort ?? "unknown"}`,
     `Effort applied: ${booleanLabel(job.effortApplied)}`,

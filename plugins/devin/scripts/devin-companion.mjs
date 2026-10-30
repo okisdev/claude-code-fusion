@@ -152,7 +152,7 @@ function taskPayload(record) {
     requestedModel: record.requestedModel,
     resolvedModel: record.resolvedModel, observedModel: record.observedModel, modelDrift: record.modelDrift,
     companionVersion: record.companionVersion,
-    requestedEffort: record.requestedEffort, resolvedEffort: record.requestedEffort,
+    requestedEffort: record.requestedEffort, resolvedEffort: record.resolvedEffort,
     effortApplied: record.effortApplied, billingPool: record.billingPool, usage: record.usage,
     usageIsIncomplete: record.usageIsIncomplete, stopCause: record.stopCause, warnings: record.warnings,
     failureKind: record.failureKind,
@@ -178,7 +178,7 @@ function finishFailure(file, outcome, kind, warnings, modelDrift, effortApplied)
   const message = outcome.policyViolation ? `Devin called forbidden tool ${outcome.policyViolation.tool}.` : outcome.selectionError?.message || outcome.setupError || outcome.rpcError?.message || outcome.protocolError || outcome.stderrTail?.trim() || outcome.spawnError?.message || `Devin exited with ${outcome.exitCode ?? outcome.signal ?? "an error"}.`;
   return finishSuccessfulJobRecordFile(file, {
     status: "error", finishedAt: nowIso(), exitCode: outcome.exitCode, sessionId: outcome.sessionId,
-    requestId: outcome.requestId, resultText: outcome.resultText, resolvedModel: outcome.appliedOptions?.model ?? null, observedModel: outcome.observedModel,
+    requestId: outcome.requestId, resultText: outcome.resultText, resolvedModel: outcome.appliedOptions?.model ?? null, resolvedEffort: outcome.resolvedEffort ?? null, observedModel: outcome.observedModel,
     usage: outcome.usage, usageIsIncomplete: outcome.usage == null, stopCause: outcome.stopCause, warnings, modelDrift, effortApplied,
     failureKind: kind, errorMessage: message.split(/\r?\n/)[0], errorTail: String(outcome.stderrTail || message).slice(-65536)
   });
@@ -238,7 +238,7 @@ async function runRecordedJob(record, file) {
   if (modelDrift) warnings.push("model_mismatch");
   if (signalExitCode !== null) {
     finishSuccessfulJobRecordFile(file, { status: "cancelled", finishedAt: nowIso(), exitCode: outcome.exitCode,
-      sessionId: outcome.sessionId, requestId: outcome.requestId, resolvedModel, observedModel: outcome.observedModel, modelDrift, warnings,
+      sessionId: outcome.sessionId, requestId: outcome.requestId, resolvedModel, resolvedEffort: outcome.resolvedEffort ?? null, observedModel: outcome.observedModel, modelDrift, warnings,
       usage: outcome.usage, stopCause: outcome.stopCause, effortApplied, failureKind: "cancelled", errorMessage: "The Devin job was cancelled." });
     process.exit(signalExitCode);
   }
@@ -246,7 +246,7 @@ async function runRecordedJob(record, file) {
   const kind = outcome.spawnError?.failureKind ?? classifyDevinFailure(outcome);
   if (kind) return finishFailure(file, outcome, kind, warnings, modelDrift, effortApplied);
   const common = { finishedAt: nowIso(), exitCode: outcome.exitCode, sessionId: outcome.sessionId, requestId: outcome.requestId,
-    resolvedModel, observedModel: outcome.observedModel, usage: outcome.usage, usageIsIncomplete: outcome.usage == null,
+    resolvedModel, resolvedEffort: outcome.resolvedEffort ?? null, observedModel: outcome.observedModel, usage: outcome.usage, usageIsIncomplete: outcome.usage == null,
     stopCause: outcome.stopCause, warnings, modelDrift, effortApplied };
   if (record.jobClass === "review") {
     const parsed = extractFirstJsonObject(outcome.resultText);
@@ -534,7 +534,7 @@ function historyEntry(record) {
     background: Boolean(record.background), delivery: record.delivery, deliveryStatus: record.deliveryStatus,
     semanticStatus: record.semanticStatus, cleanupRequired: record.cleanupRequired, failureKind: record.failureKind,
     requestedModel: record.requestedModel, resolvedModel: record.resolvedModel, observedModel: record.observedModel,
-    requestedEffort: record.requestedEffort, effortApplied: record.effortApplied, billingPool: record.billingPool,
+    requestedEffort: record.requestedEffort, resolvedEffort: record.resolvedEffort, effortApplied: record.effortApplied, billingPool: record.billingPool,
     devinVersion: record.devinVersion, createdAt: record.createdAt, finishedAt: record.finishedAt,
     resumable, resumeMode: resumable ? mode : null,
     ownedByCurrentSession: currentClaudeSessionId() == null ? null : record.claudeSessionId === currentClaudeSessionId()

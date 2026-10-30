@@ -70,12 +70,12 @@ test("versions compare dotted numeric parts with missing parts treated as zero",
 });
 
 test("tools follow the contract for consult, review, and write", () => {
-  const read = ["read", "grep", "glob", "find_file_by_name", "notebook_read", "todo_write"];
+  const read = ["read", "grep", "glob", "find_file_by_name", "notebook_read", "todo_write", "web_search"];
   const write = [...read, "edit", "write", "notebook_edit", "exec", "get_output", "kill_shell", "write_to_process"];
   assert.deepEqual(toolsForMode("consult"), read);
   assert.deepEqual(toolsForMode("review"), read);
   assert.deepEqual(toolsForMode("write"), write);
-  toolsForMode("consult").push("web_search");
+  toolsForMode("consult").push("webfetch");
   assert.deepEqual(toolsForMode("consult"), read);
   assert.throws(() => toolsForMode("unknown"), /Invalid Devin mode/);
 });
@@ -105,6 +105,7 @@ test("success records text, exact usage, metadata, and the ACP handshake", async
   assert.equal(result.stopCause, "complete");
   assert.deepEqual(result.usage, { totalTokens: 11914, inputTokens: 11875, outputTokens: 39, cachedReadTokens: 11552 });
   assert.deepEqual(result.appliedOptions, { mode: "ask" });
+  assert.equal(result.resolvedEffort, null);
   assert.equal(result.toolCalls, 2);
   assert.deepEqual(log.argv, ["acp"]);
   assert.equal(log.cwd, fs.realpathSync(root));
@@ -149,6 +150,7 @@ test("model and effort selection receive updated options and apply each pair in 
   assert.equal(classifyDevinFailure(result), null);
   assert.deepEqual(stages, ["model", "effort"]);
   assert.deepEqual(result.appliedOptions, { mode: "ask", model: "swe-2-high", thought_level: "max", speed: "standard" });
+  assert.equal(result.resolvedEffort, "max");
   assert.deepEqual(log.messages.filter((message) => message.method === "session/set_config_option").map(({ params }) => [params.configId, params.value]), [["mode", "ask"], ["model", "swe-2-high"], ["thought_level", "max"], ["speed", "standard"]]);
   assert.equal(log.messages.at(-1).method, "session/prompt");
 });
@@ -162,6 +164,7 @@ test("a model change refreshes effort choices and an empty effort selection pres
   } });
   assert.equal(classifyDevinFailure(result), null);
   assert.deepEqual(result.appliedOptions, { mode: "ask", model: "kimi-k3-high" });
+  assert.equal(result.resolvedEffort, "high");
 });
 
 test("selection errors preserve input or setup and abort before prompting", async (t) => {
@@ -223,11 +226,17 @@ test("forbidden tools terminate before initialization, during updates, and after
   for (const scenario of ["forbidden_before_init", "forbidden_tool", "forbidden_update", "forbidden_after_result"]) {
     let pid;
     const { result } = await fakeRun(t, scenario, { onSpawn: (child) => { pid = child.pid; } });
-    assert.deepEqual(result.policyViolation, { tool: "web_search" }, scenario);
+    assert.deepEqual(result.policyViolation, { tool: "webfetch" }, scenario);
     assert.equal(classifyDevinFailure(result), "policy", scenario);
     assert.equal(result.timedOut, false, scenario);
     assert.throws(() => process.kill(-pid, 0), (error) => error.code === "ESRCH");
   }
+});
+
+test("web_search tool calls remain allowed in consult mode", async (t) => {
+  const { result } = await fakeRun(t, "web_search");
+  assert.equal(result.policyViolation, null);
+  assert.equal(classifyDevinFailure(result), null);
 });
 
 test("exec is refused in consult and review but accepted with autonomous write mode", async (t) => {

@@ -95,7 +95,7 @@ test("Devin record has the contract fields and no Grok usage channels", (t) => {
   const configDir = runConfigDir(dataDir, "job-1");
   const record = createJobRecord({
     id: "job-1", cwd, mode: "write", briefFile: "brief.md", devinVersion: " 3000.11.228 ",
-    devinBuildPath: "/usr/local/bin/devin", requestedModel: "swe-2", resolvedModel: "swe-2",
+    devinBuildPath: "/usr/local/bin/devin", requestedModel: "swe-2", resolvedModel: "swe-2", resolvedEffort: "max",
     observedModel: "SWE 2", requestedEffort: "high", effortApplied: false, billingPool: "first-party",
     role: "burst", requestId: "request-1", configDir, stopCause: "complete", warnings: ["project hooks"]
   });
@@ -108,6 +108,10 @@ test("Devin record has the contract fields and no Grok usage channels", (t) => {
   assert.equal(record.stopCause, "complete");
   assert.equal(record.requestedModel, "swe-2");
   assert.equal(record.resolvedModel, "swe-2");
+  assert.equal(record.resolvedEffort, "max");
+  const file = jobFilePath(dataDir, cwd, record.id);
+  createJobRecordFile(file, record);
+  assert.equal(readJobRecordFile(file).resolvedEffort, "max");
   assert.equal(record.observedModel, "SWE 2");
   assert.equal(record.requestedEffort, "high");
   assert.equal(record.effortApplied, false);
@@ -197,10 +201,11 @@ test("terminal transport evidence remains immutable after racing writes", (t) =>
 test("successful finish respects an already requested cancellation", (t) => {
   const { file } = recordFile(t);
   updateJobRecordFile(file, { cancelRequestedAt: new Date().toISOString() });
-  const record = finishSuccessfulJobRecordFile(file, { status: "done", resultText: "partial", requestId: "r1", usage: { outputTokens: 2 } });
+  const record = finishSuccessfulJobRecordFile(file, { status: "done", resultText: "partial", requestId: "r1", resolvedEffort: "max", usage: { outputTokens: 2 } });
   assert.equal(record.status, "cancelled");
   assert.equal(record.failureKind, "cancelled");
   assert.equal(record.requestId, "r1");
+  assert.equal(record.resolvedEffort, "max");
   assert.deepEqual(record.usage, { outputTokens: 2 });
 });
 
