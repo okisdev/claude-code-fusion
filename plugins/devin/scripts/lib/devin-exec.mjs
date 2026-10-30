@@ -4,7 +4,7 @@ import path from "node:path";
 
 export const TESTED_DEVIN_INTERVAL = { floor: "3000.11", ceiling: "3000.12" };
 
-const READ_TOOLS = ["read", "grep", "glob", "find_file_by_name", "notebook_read", "todo_write"];
+const READ_TOOLS = ["read", "grep", "glob", "find_file_by_name", "notebook_read", "todo_write", "web_search"];
 const WRITE_TOOLS = [...READ_TOOLS, "edit", "write", "notebook_edit", "exec", "get_output", "kill_shell", "write_to_process"];
 const STDERR_MAX_BYTES = 64 * 1024;
 const STREAM_MAX_BYTES = 2 * 1024 * 1024;
@@ -222,6 +222,7 @@ async function initializeSession(run) {
   run.outcome.sessionId = sessionId;
   run.configOptions = session.configOptions;
   await configureSession(run);
+  run.outcome.resolvedEffort = run.configOptions?.find((option) => option?.id === "thought_level")?.currentValue ?? null;
   await requestDevin(run, "session/prompt", { sessionId: run.outcome.sessionId, prompt: [{ type: "text", text: brief ?? "" }] });
 }
 
@@ -461,7 +462,7 @@ export function runDevin({ bin, cwd, env, brief, mode, resumeSessionId, resolveS
     options: { bin, cwd, env, brief, mode, resumeSessionId, resolveSelection, timeoutMs, exitGraceMs, killGraceMs, launchProcess, signal, onSpawn },
     outcome: {
       exitCode: null, signal: null, sessionId: null, requestId: null, resultText: "", usage: null,
-      observedModel: null, stopReason: null, stopCause: null, appliedOptions: {}, rpcError: null,
+      observedModel: null, resolvedEffort: null, stopReason: null, stopCause: null, appliedOptions: {}, rpcError: null,
       protocolError: null, setupError: null, policyViolation: null, selectionError: null,
       timedOut: false, lateClose: false, cancelled: false, stderrTail: "", toolCalls: 0, resultSeen: false
     },

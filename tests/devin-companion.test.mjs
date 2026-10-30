@@ -126,6 +126,7 @@ test("consult records ACP fields and a contiguous Devin footer", (t) => {
   assert.equal(record.devinVersion, "3000.11.228");
   assert.equal(record.devinBuildPath, fs.realpathSync(h.bin));
   assert.equal(record.resolvedModel, "swe-2-high");
+  assert.equal(record.resolvedEffort, "high");
   assert.equal(record.observedModel, "SWE-2 High");
   assert.equal(record.stopCause, "complete");
   assert.deepEqual(record.usage, { totalTokens: 11914, inputTokens: 11875, outputTokens: 39, cachedReadTokens: 11552 });
@@ -157,6 +158,7 @@ test("write mode uses a private home, sandbox and scoped config", (t) => {
   assert.equal(record.mode, "write");
   assert.equal(record.role, "burst");
   assert.equal(record.effortApplied, true);
+  assert.equal(record.resolvedEffort, "max");
   assert.equal(env.HOME, path.join(h.data, "home"));
   assert.equal(env.XDG_CONFIG_HOME, record.configDir);
   assert.equal(env.DEVIN_SANDBOX, "true");
@@ -189,6 +191,15 @@ test("default model leaves selection unset and rejects nondefault effort", (t) =
   assert.equal(invalid.status, 1);
   assert.match(invalid.stderr, /failure: input/);
   assert.equal(h.jobs().length, 1);
+});
+
+test("default effort records Devin's current thought level", (t) => {
+  const h = harness(t);
+  assertDone(task(h, ["--effort", "default"]));
+  const [record] = h.jobs();
+  assert.equal(record.requestedEffort, "default");
+  assert.equal(record.resolvedEffort, "high");
+  assert.equal(record.effortApplied, false);
 });
 
 test("unknown and adaptive models fail before a job exists", (t) => {

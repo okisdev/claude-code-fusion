@@ -28,6 +28,7 @@ const job = {
   semanticStatus: "unverified",
   requestedModel: "swe-2",
   resolvedModel: "swe-2-high",
+  resolvedEffort: "max",
   observedModel: "SWE 2 High",
   requestedEffort: "high",
   effortApplied: false,
@@ -81,6 +82,7 @@ test("status and job detail show the Devin model and build evidence", () => {
   }
   assert.match(status, /effort applied/);
   assert.match(detail, /Effort applied: no/);
+  assert.match(detail, /Resolved effort: max/);
   assert.match(detail, /Devin session: devin-chat/);
   assert.match(detail, /Stop cause: complete/);
   assert.ok(detail.endsWith("warning: late_close\nstate: done\n"));
@@ -110,6 +112,8 @@ test("history has Devin columns, safe cells, and no memory column", () => {
   assert.match(output, /job&#124;1/);
   assert.match(output, /\/tmp\/&lt;work&gt;/);
   assert.match(output, /requested model \| resolved model \| observed model/);
+  assert.match(output, /observed model \| resolved effort \| effort applied/);
+  assert.match(output, /SWE 2 High \| max \| no/);
   assert.doesNotMatch(output, /\| memory \|/);
   assert.equal(formatAge(job.createdAt, Date.parse("2026-10-13T00:01:00.000Z")), "1m");
   assert.equal(renderHistoryReport({ scope: "all", jobs: [] }), "No Devin jobs recorded across workspaces.\n");

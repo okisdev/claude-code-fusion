@@ -16,7 +16,7 @@ if (args.length !== 1 || args[0] !== "acp") {
 const scenario = process.env.FAKE_DEVIN_SCENARIO || "success";
 const logFile = process.env.FAKE_DEVIN_LOG;
 const log = { argv: args, cwd: process.cwd(), messages: [], signals: [], stdinEnded: false };
-const record = () => { if (logFile) fs.writeFileSync(logFile, `${JSON.stringify(log)}\n`); };
+const record = () => { if (!logFile) return; fs.writeFileSync(`${logFile}.tmp`, `${JSON.stringify(log)}\n`); fs.renameSync(`${logFile}.tmp`, logFile); };
 const emit = (event) => fs.writeSync(1, `${JSON.stringify({ jsonrpc: "2.0", ...event })}\n`);
 const reply = (id, result) => emit({ id, result });
 const fail = (id, message, code = -32000, data) => emit({ id, error: { code, message, ...(data === undefined ? {} : { data }) } });
@@ -94,11 +94,12 @@ async function prompt(id) {
   if (scenario === "permission" || scenario === "unknown_request") {
     return emit({ id: scenario === "permission" ? 0 : "client-request", method: scenario === "permission" ? "session/request_permission" : "fs/read_text_file", params: { sessionId, toolCall: { toolCallId: "write:0#c4" }, options: [{ optionId: "allow_once", kind: "allow_once" }] } });
   }
-  if (scenario === "forbidden_tool") return tool("web_search");
+  if (scenario === "forbidden_tool") return tool("webfetch");
   if (scenario === "forbidden_update") {
     tool("read");
-    return tool("web_search", "read:0#ab", "tool_call_update");
+    return tool("webfetch", "read:0#ab", "tool_call_update");
   }
+  if (scenario === "web_search") tool("web_search");
   if (scenario === "missing_tool") return update({ sessionUpdate: "tool_call", toolCallId: "unknown" });
   if (scenario === "write_tool") tool("exec");
   if (scenario === "escape_stdio" || scenario === "spawn_helper" || scenario === "resistant_group") await helper(scenario === "escape_stdio", scenario === "resistant_group");
@@ -118,7 +119,7 @@ async function prompt(id) {
   if (scenario === "stderr_tail") fs.writeSync(2, `${"é".repeat(40000)}tail\n`);
   if (scenario === "network_after_result") fs.writeSync(2, "fetch failed: ECONNRESET\n");
   success();
-  if (scenario === "forbidden_after_result") tool("web_search");
+  if (scenario === "forbidden_after_result") tool("webfetch");
   if (scenario === "unexpected_signal") process.kill(process.pid, "SIGUSR2");
   if (scenario === "no_final_newline") process.exit(0);
 }
@@ -131,7 +132,7 @@ async function handleMessage(message) {
   if (method === "session/cancel") return;
   if (method === "initialize") {
     if (scenario === "slow_init") return;
-    if (scenario === "forbidden_before_init") return tool("web_search");
+    if (scenario === "forbidden_before_init") return tool("webfetch");
     if (scenario === "initialize_error") return fail(id, "Initialization failed");
     return reply(id, { protocolVersion: scenario === "bad_protocol_version" ? 2 : 1, agentCapabilities: { loadSession: true }, authMethods: [{ id: "login", name: "Log in" }] });
   }

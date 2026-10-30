@@ -1,5 +1,12 @@
 # changelog
 
+## 0.0.69
+
+- this release acts on the first day of devin call records on one host: 2 routed jobs, one accepted consult and one panel track lost after 6 minutes of work.
+- devin accepts its `web_search` tool in every mode. the panel track was terminated as `policy` the moment it searched for upstream facts the brief asked it to cite; a probe showed the search runs on devin's backend, and denying it in the job configuration only fails the call and ends the turn as `tool_rejected`, so forbidding it fails every consult that needs a fact outside the workspace. `webfetch`, a local fetch, stays denied and forbidden.
+- devin job records carry `resolvedEffort`, the `thought_level` in effect when the prompt is sent. devin keeps the `model` option at the family's base variant whatever effort applies, so an xhigh run recorded as `muse-wonder-1-0-high` with no effort and model audits read effort as null.
+- `/fusion:panel` gives every external track the same leading `--cwd` on the workspace root. the skill forbade a `--cwd` prefix, so both standard tracks of a panel opened from a repository subdirectory failed as `input` and had to be relaunched.
+
 ## 0.0.68
 
 - devin joins as a second breadth engine: a `devin` companion plugin drives the Devin CLI over the agent client protocol for `diversity` consults on any family a Devin plan serves and `burst` implementation on Cognition's SWE models. cursor's october pricing change moved third party models off its included plans, which emptied cursor's `diversity` seat for accounts on them.

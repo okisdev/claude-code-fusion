@@ -154,7 +154,8 @@ test("the panel stays blind, asymmetric, evidence weighted, and main judged", ()
   assert.match(panel, /A panel never runs with fewer than two tracks\./);
   assert.match(panel, /This is the only exception to the identical brief rule\./);
   assert.match(panel, /Keep the exact brief in the Agent calls and pass it directly as each Agent prompt\./);
-  assert.match(panel, /Panel consultations do not use isolated implementation worktrees or a Codex only `--cwd` prefix because either would violate the identical brief invariant\./);
+  assert.match(panel, /Every external track's prompt opens with the same leading companion option `--cwd "<absolute workspace root>" --` before the brief/);
+  assert.match(panel, /no option on one track only, because either would violate the identical brief invariant\./);
   assert.match(panel, /Never average the verdicts or count them as equal votes\./);
   assert.match(panel, /configured Codex frontier lane is the default deep lead on long horizon correctness and architecture/);
   assert.match(panel, /configured Grok lane is an independent cross check weighted on large context factual verification and terminal or operational pragmatics/);
