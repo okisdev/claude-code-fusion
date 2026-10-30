@@ -16,7 +16,7 @@ if (args.length !== 1 || args[0] !== "acp") {
 const scenario = process.env.FAKE_DEVIN_SCENARIO || "success";
 const logFile = process.env.FAKE_DEVIN_LOG;
 const log = { argv: args, cwd: process.cwd(), messages: [], signals: [], stdinEnded: false };
-const record = () => { if (logFile) fs.writeFileSync(logFile, `${JSON.stringify(log)}\n`); };
+const record = () => { if (!logFile) return; fs.writeFileSync(`${logFile}.tmp`, `${JSON.stringify(log)}\n`); fs.renameSync(`${logFile}.tmp`, logFile); };
 const emit = (event) => fs.writeSync(1, `${JSON.stringify({ jsonrpc: "2.0", ...event })}\n`);
 const reply = (id, result) => emit({ id, result });
 const fail = (id, message, code = -32000, data) => emit({ id, error: { code, message, ...(data === undefined ? {} : { data }) } });
