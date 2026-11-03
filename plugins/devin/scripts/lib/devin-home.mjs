@@ -1,8 +1,8 @@
 import { spawnSync } from "node:child_process";
 import fs from "node:fs";
+import { createRequire } from "node:module";
 import os from "node:os";
 import path from "node:path";
-import { DatabaseSync } from "node:sqlite";
 import { withRecordLock } from "./record-lock.mjs";
 import { listAllJobRecords } from "./state.mjs";
 import { processGroupAlive, processIdentityMatches, processIsDirectlyAlive, validProcessIdentity } from "./process-identity.mjs";
@@ -27,6 +27,7 @@ function tableColumns(db, schema, table) {
 }
 
 function mergeSessions(privateFile, realFile) {
+  const { DatabaseSync } = createRequire(import.meta.url)("node:sqlite");
   const source = new DatabaseSync(privateFile, { timeout: 5000 });
   try {
     const checkpoint = source.prepare("PRAGMA wal_checkpoint(TRUNCATE)").get();
