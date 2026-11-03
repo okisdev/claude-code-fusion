@@ -1,5 +1,11 @@
 # changelog
 
+## 0.0.70
+
+- devin jobs record their sessions in the user's own devin session database. the private home held its own `sessions.db`, so every routed devin job was invisible to usage readers and to `devin list`; on two hosts the real database had no session since the engine joined while the private one held 14 and 2. the private home now links `devin/cli/sessions.db` to the real one, as it links the credentials file, and keeps logs and session locks private.
+- the first companion call after the upgrade merges the private session database into the real one under a lock, copying only sessions the real database lacks and only the tables and columns both share, then replaces it with the link. a merge that fails or a devin job still running leaves the private store in place and retries on a later call.
+- the job configuration also denies agent reads of the session database link.
+
 ## 0.0.69
 
 - this release acts on the first day of devin call records on one host: 2 routed jobs, one accepted consult and one panel track lost after 6 minutes of work.
