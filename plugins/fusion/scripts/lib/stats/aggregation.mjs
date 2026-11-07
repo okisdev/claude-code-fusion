@@ -3,7 +3,7 @@ import { BREADTH_ENGINE_IDS, ENGINES, ENGINE_IDS, ENGINE_TERMINAL_STATUSES, engi
 import { canonicalWorkerAgentType, WORKER_TERMINAL_STATUSES, readWorkerRecords, readWorkerRollups } from "../../lib/worker-state.mjs";
 import { FILE_ENGINE_DESCRIPTORS, checkedUsageAddition, codexSku, isSupersededCodexJob, loadAllObservationCandidates, normalizeClaudeWorkerUsage, observationForJob, scopedObservationForJob, summarizeCodexSkuTelemetry, tokenUsageForJob } from "./engine-evidence.mjs";
 import { CODEX_ACCEPTANCE_STATES, RESUMABLE_CODEX_FAILURE_KINDS, TOKEN_USAGE_FILENAME, bump, fusionWorkspaceKey, loadTokenUsageObservations, nonEmptyString, normalizeCollectionMethod, readCodexJobEvidence, readWorkspaceJobFiles, resolveCodexJobEffort, resolveCodexJobModel, resolveGitWorkspaceRoot, resolveStateRoot, selectPreferredJobs, workspaceRootsShareRepository } from "./evidence.mjs";
-import { buildCoercionLedger, buildFleetUsageStats } from "./fleet.mjs";
+import { buildCoercionLedger, buildFleetUsageStats, readStatsAuditEvents } from "./fleet.mjs";
 
 function semanticAcceptance(raw, superseded = false) {
   const recorded = raw?.semanticStatus ?? raw?.acceptance;
@@ -583,6 +583,41 @@ function parentContextAtDispatch(records, all, workspaceRoot) {
   };
 }
 
+function verificationEvidence(records, audit, all, workspaceRoot) {
+  const summary = { accepted: 0, evidenced: 0, rate: 0 };
+  if (audit.startMs == null) {
+    return summary;
+  }
+  const verifications = new Map();
+  for (const event of audit.events) {
+    if (event.event === "verification") {
+      const times = verifications.get(event.session) ?? [];
+      times.push(event.atMs);
+      verifications.set(event.session, times);
+    }
+  }
+  const repositoryCache = new Map();
+  for (const record of records) {
+    if (record.packageType !== "implementation" || record.acceptance !== "accepted" || (!all && !workspaceRootsShareRepository(record.workspaceRoot, workspaceRoot, repositoryCache))) {
+      continue;
+    }
+    const acceptedAt = Date.parse(record.acceptanceRecordedAt ?? "");
+    if (!Number.isFinite(acceptedAt) || acceptedAt < audit.startMs) {
+      continue;
+    }
+    const finishedAt = Date.parse(record.finishedAt ?? "");
+    if (!Number.isFinite(finishedAt)) {
+      continue;
+    }
+    summary.accepted += 1;
+    if ((verifications.get(record.sessionId) ?? []).some((atMs) => atMs >= finishedAt && atMs <= acceptedAt + 5000)) {
+      summary.evidenced += 1;
+    }
+  }
+  summary.rate = summary.accepted > 0 ? summary.evidenced / summary.accepted : 0;
+  return summary;
+}
+
 export function buildFusionStats({ all = false, env = process.env, cwd = process.cwd() } = {}) {
   const workers = workerSnapshot(env);
   const workspaceRoot = resolveGitWorkspaceRoot(cwd);
@@ -592,6 +627,7 @@ export function buildFusionStats({ all = false, env = process.env, cwd = process
     engines[provider.id] = provider.collect(options);
   }
   const fleet = buildFleetUsageStats({ env });
+  const audit = readStatsAuditEvents(env);
   const parentContext = parentContextAtDispatch(workers.records, all, workspaceRoot);
   return {
     scope: all ? "all" : workspaceRoot,
@@ -599,7 +635,8 @@ export function buildFusionStats({ all = false, env = process.env, cwd = process
     ...engines,
     ...(all ? { retiredWorkers: retiredWorkerStats(env) } : {}),
     fleet,
-    coercionLedger: buildCoercionLedger({ env, fleet })
+    coercionLedger: buildCoercionLedger({ env, fleet, audit }),
+    verificationEvidence: verificationEvidence(workers.records, audit, all, workspaceRoot)
   };
 }
 

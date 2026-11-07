@@ -7,7 +7,6 @@ export const FLEET_SHAPED_MIN_WIDTH = 3;
 const COERCION_LEDGER_POSTURES = ["judgment", "strict"];
 const COERCION_LEDGER_POSTURE_EVENTS = new Set(["deny", "warn", "verification", "tail-allowed", "zero-dispatch-softened"]);
 const COERCION_LEDGER_WRITE_TOOLS = new Set(["Edit", "Write", "NotebookEdit", "MultiEdit"]);
-export const COERCION_LEDGER_SMALL_FLEET_SHAPED_WAVES = 10;
 const COERCION_LEDGER_SPRAWL_MULTIPLE = 2;
 const COERCION_LEDGER_DEFAULT_BUDGET = 5;
 
@@ -155,8 +154,7 @@ export function buildFleetUsageStats({ env = process.env } = {}) {
 
 function emptyCoercionLedger(fleetShapedWaves = 0) {
   return {
-    fleetDeclines: 0,
-    narrowWaveAdvisories: 0,
+    readStreakAdvisories: 0,
     fleetShapedWaves,
     verificationResets: 0,
     unverifiedAccumulations: 0,
@@ -195,19 +193,21 @@ function normalizeCoercionAuditEvent(value) {
     atMs,
     session,
     event: value.event,
+    writeCount: value.event === "verification" && Number.isInteger(value.writeCount) ? value.writeCount : null,
     postureEvent,
     posture: value.posture ?? null,
-    narrowWaveAdvisory: value.event === "warn" && value.reason === "narrow-wave-advisory",
-    declineStated: value.declineStated === true,
+    readStreakAdvisory: value.event === "warn" && value.reason === "read-streak-advisory",
     deniedWrite: value.event === "deny" && value.lane === "main" && COERCION_LEDGER_WRITE_TOOLS.has(value.tool),
     unverifiedWindowWrites,
     unverifiedWindowBudget: unverifiedWindowWrites !== null && Number.isInteger(value.budget) && value.budget > 0 ? value.budget : null
   };
 }
 
-function readCoercionAuditEvents(env) {
+export function readStatsAuditEvents(env) {
   const events = [];
   let order = 0;
+  let firstDay = null;
+  let lastDay = null;
   try {
     const segments = listGuardAuditSegments(resolveGuardAuditDir(env)).sort((left, right) => left.date.localeCompare(right.date) || left.index - right.index);
     for (const segment of segments) {
@@ -217,6 +217,8 @@ function readCoercionAuditEvents(env) {
       } catch {
         continue;
       }
+      firstDay = firstDay ?? segment.date;
+      lastDay = segment.date;
       for (const line of text.split("\n")) {
         if (!line.trim()) {
           continue;
@@ -233,9 +235,13 @@ function readCoercionAuditEvents(env) {
       }
     }
   } catch {
-    return [];
+    return { events: [], startMs: null, endMs: null };
   }
-  return events.sort((left, right) => left.atMs - right.atMs || left.order - right.order);
+  return {
+    events: events.sort((left, right) => left.atMs - right.atMs || left.order - right.order),
+    startMs: firstDay ? Date.parse(`${firstDay}T00:00:00.000Z`) : null,
+    endMs: lastDay ? Date.parse(`${lastDay}T00:00:00.000Z`) + 86400000 : null
+  };
 }
 
 function inlineWindowFor(windows, session) {
@@ -261,7 +267,7 @@ function summarizeInlineWindows(events) {
   const summary = { unverifiedAccumulations: 0, inlineSprawlWindows: 0, deepestUnverifiedWindow: 0 };
   for (const event of events) {
     const window = inlineWindowFor(windows, event.session);
-    if (event.event === "verification") {
+    if (event.event === "verification" && event.writeCount > 0) {
       closeInlineWindow(summary, window, false);
       continue;
     }
@@ -285,18 +291,15 @@ function summarizeInlineWindows(events) {
   return summary;
 }
 
-export function buildCoercionLedger({ env = process.env, fleet = null } = {}) {
+export function buildCoercionLedger({ env = process.env, fleet = null, audit = null } = {}) {
   const fleetShapedWaves = Number.isSafeInteger(fleet?.fleetShapedBursts) && fleet.fleetShapedBursts >= 0 ? fleet.fleetShapedBursts : buildFleetUsageStats({ env }).fleetShapedBursts;
   const ledger = emptyCoercionLedger(fleetShapedWaves);
-  const events = readCoercionAuditEvents(env);
+  const events = (audit ?? readStatsAuditEvents(env)).events;
   for (const event of events) {
-    if (event.narrowWaveAdvisory) {
-      ledger.narrowWaveAdvisories += 1;
-      if (event.declineStated) {
-        ledger.fleetDeclines += 1;
-      }
+    if (event.readStreakAdvisory) {
+      ledger.readStreakAdvisories += 1;
     }
-    if (event.event === "verification") {
+    if (event.event === "verification" && event.writeCount > 0) {
       ledger.verificationResets += 1;
     }
     if (event.postureEvent) {
@@ -312,7 +315,7 @@ export function hasCoercionLedgerData(ledger) {
     return false;
   }
   return (
-    ["fleetDeclines", "narrowWaveAdvisories", "fleetShapedWaves", "verificationResets", "unverifiedAccumulations", "inlineSprawlWindows", "deepestUnverifiedWindow"].some(
+    ["readStreakAdvisories", "fleetShapedWaves", "verificationResets", "unverifiedAccumulations", "inlineSprawlWindows", "deepestUnverifiedWindow"].some(
       (key) => (ledger[key] ?? 0) > 0
     ) || Object.values(ledger.postureMix ?? {}).some((count) => count > 0)
   );

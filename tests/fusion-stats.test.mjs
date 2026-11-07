@@ -4043,13 +4043,14 @@ test("coercion ledger renders every counter in text and JSON", (t) => {
     { schemaVersion: 1, at: "2026-07-17T10:00:00.000Z", session: "session-a", event: "dispatch", lane: "grok", tool: "Agent" },
     { schemaVersion: 1, at: "2026-07-17T10:00:00.100Z", session: "session-a", event: "dispatch", lane: "codex", tool: "Agent" },
     { schemaVersion: 1, at: "2026-07-17T10:00:00.200Z", session: "session-a", event: "dispatch", lane: "grok", tool: "Agent" },
-    { schemaVersion: 1, at: "2026-07-17T10:01:00.000Z", session: "session-a", event: "warn", lane: "main", tool: "Agent", reason: "narrow-wave-advisory", declineStated: true, posture: "judgment" },
-    { schemaVersion: 1, at: "2026-07-17T10:02:00.000Z", session: "session-a", event: "warn", lane: "main", tool: "Agent", reason: "narrow-wave-advisory", posture: "strict" },
+    { schemaVersion: 1, at: "2026-07-17T10:01:00.000Z", session: "session-a", event: "warn", lane: "main", tool: "Agent", reason: "read-streak-advisory", posture: "judgment" },
+    { schemaVersion: 1, at: "2026-07-17T10:02:00.000Z", session: "session-a", event: "warn", lane: "main", tool: "Agent", reason: "read-streak-advisory", posture: "strict" },
     { schemaVersion: 1, at: "2026-07-17T10:03:00.000Z", session: "session-a", event: "warn", lane: "main", tool: "Bash", reason: "other" },
     { schemaVersion: 1, at: "2026-07-17T10:04:00.000Z", session: "session-a", event: "deny", lane: "main", tool: "Edit", posture: "strict" },
-    { schemaVersion: 1, at: "2026-07-17T10:05:00.000Z", session: "session-a", event: "verification", lane: "main", tool: "Bash", posture: "judgment" },
+    { schemaVersion: 1, at: "2026-07-17T10:05:00.000Z", session: "session-a", event: "verification", lane: "main", tool: "Bash", posture: "judgment", writeCount: 3 },
     { schemaVersion: 1, at: "2026-07-17T10:06:00.000Z", session: "session-a", event: "deny", lane: "main", tool: "Write" },
-    { schemaVersion: 1, at: "2026-07-17T11:00:00.000Z", session: "session-b", event: "verification", lane: "main", tool: "Bash", posture: "strict" },
+    { schemaVersion: 1, at: "2026-07-17T11:00:00.000Z", session: "session-b", event: "verification", lane: "main", tool: "Bash", posture: "strict", writeCount: 1 },
+    { schemaVersion: 1, at: "2026-07-17T11:00:30.000Z", session: "session-b", event: "verification", lane: "main", tool: "Bash", posture: "strict", writeCount: 0 },
     { schemaVersion: 1, at: "2026-07-17T11:01:00.000Z", session: "session-b", event: "deny", lane: "main", tool: "NotebookEdit", posture: "judgment" },
     { schemaVersion: 1, at: "2026-07-17T11:02:00.000Z", session: "session-b", event: "dispatch", lane: "codex", tool: "Agent" }
   ]);
@@ -4063,8 +4064,7 @@ test("coercion ledger renders every counter in text and JSON", (t) => {
 
   const report = buildFusionStats({ env, cwd: dir });
   assert.deepStrictEqual(report.coercionLedger, {
-    fleetDeclines: 1,
-    narrowWaveAdvisories: 2,
+    readStreakAdvisories: 2,
     fleetShapedWaves: 1,
     verificationResets: 2,
     unverifiedAccumulations: 2,
@@ -4072,14 +4072,13 @@ test("coercion ledger renders every counter in text and JSON", (t) => {
     deepestUnverifiedWindow: 0,
     postureMix: {
       judgment: 3,
-      strict: 3,
+      strict: 4,
       unset: 2
     }
   });
   const expectedSection = `## Coercion ledger
 
-Fleet declines: 1
-Narrow-wave advisories: 2
+Read-streak advisories: 2
 Fleet-shaped waves: 1
 Verification resets: 2
 Unverified accumulations: 2
@@ -4088,9 +4087,11 @@ Deepest unverified window: 0
 
 Posture mix:
 - judgment: 3
-- strict: 3
+- strict: 4
 - unset: 2`;
   assert.ok(renderFusionStats(report).includes(expectedSection));
+  assert.deepStrictEqual(report.verificationEvidence, { accepted: 0, evidenced: 0, rate: 0 });
+  assert.doesNotMatch(renderFusionStats(report), /## Verification evidence/);
 
   const result = runDirect({ cwd: dir, codexState: path.join(dir, "missing-codex") }, ["--json"], { FUSION_INLINE_GUARD_AUDIT_DIR: auditDir });
   assert.strictEqual(result.status, 0, result.stderr);
@@ -4102,9 +4103,10 @@ test("coercion ledger counts only denied windows without a verification reset", 
   const auditDir = path.join(dir, "inline-guard-audit");
   writeGuardAuditEvents(auditDir, "2026-07-18", [
     { schemaVersion: 1, at: "2026-07-18T10:00:00.000Z", session: "session-window", event: "deny", lane: "main", tool: "Edit" },
-    { schemaVersion: 1, at: "2026-07-18T10:01:00.000Z", session: "session-window", event: "verification", lane: "main", tool: "Bash" },
+    { schemaVersion: 1, at: "2026-07-18T10:01:00.000Z", session: "session-window", event: "verification", lane: "main", tool: "Bash", writeCount: 1 },
     { schemaVersion: 1, at: "2026-07-18T10:02:00.000Z", session: "session-window", event: "deny", lane: "main", tool: "Write" },
     { schemaVersion: 1, at: "2026-07-18T10:03:00.000Z", session: "session-window", event: "deny", lane: "main", tool: "MultiEdit" },
+    { schemaVersion: 1, at: "2026-07-18T10:03:30.000Z", session: "session-window", event: "verification", lane: "main", tool: "Bash", writeCount: 0 },
     { schemaVersion: 1, at: "2026-07-18T10:04:00.000Z", session: "session-window", event: "dispatch", lane: "codex", tool: "Agent" },
     { schemaVersion: 1, at: "2026-07-18T10:05:00.000Z", session: "session-window", event: "deny", lane: "main", tool: "NotebookEdit" }
   ]);
@@ -4144,8 +4146,7 @@ test("coercion ledger tolerates legacy audit events without posture or verificat
   });
 
   assert.deepStrictEqual(report.coercionLedger, {
-    fleetDeclines: 0,
-    narrowWaveAdvisories: 0,
+    readStreakAdvisories: 0,
     fleetShapedWaves: 0,
     verificationResets: 0,
     unverifiedAccumulations: 0,
@@ -4168,8 +4169,8 @@ test("coercion ledger skips malformed lines and unknown event kinds", (t) => {
     "{malformed",
     JSON.stringify({ schemaVersion: 1, at: "2026-07-20T10:00:00.000Z", session: "session-unknown", event: "future-event", posture: "strict" }),
     JSON.stringify({ schemaVersion: 1, at: "not-a-date", session: "session-invalid", event: "deny", lane: "main", tool: "Edit" }),
-    JSON.stringify({ schemaVersion: 1, at: "2026-07-20T10:01:00.000Z", session: "session-invalid", event: "warn", reason: "narrow-wave-advisory", declineStated: true, posture: "loose" }),
-    JSON.stringify({ schemaVersion: 1, at: "2026-07-20T10:02:00.000Z", session: "session-valid", event: "warn", reason: "narrow-wave-advisory", declineStated: true, posture: "strict" })
+    JSON.stringify({ schemaVersion: 1, at: "2026-07-20T10:01:00.000Z", session: "session-invalid", event: "warn", reason: "read-streak-advisory", posture: "loose" }),
+    JSON.stringify({ schemaVersion: 1, at: "2026-07-20T10:02:00.000Z", session: "session-valid", event: "warn", reason: "read-streak-advisory", posture: "strict" })
   ].join("\n"), "utf8");
 
   const report = buildFusionStats({
@@ -4184,8 +4185,7 @@ test("coercion ledger skips malformed lines and unknown event kinds", (t) => {
   });
 
   assert.deepStrictEqual(report.coercionLedger, {
-    fleetDeclines: 1,
-    narrowWaveAdvisories: 1,
+    readStreakAdvisories: 1,
     fleetShapedWaves: 0,
     verificationResets: 0,
     unverifiedAccumulations: 0,
@@ -4266,50 +4266,68 @@ test("coercion ledger treats historical ceiling denials as ordinary denials", (t
   assert.doesNotMatch(renderFusionStats(report), /Unverified ceiling stops/);
 });
 
-test("coercion ledger ratio advisory appears only when declines dominate a small fleet count", (t) => {
+test("verification evidence includes later unevidenced acceptances and excludes records without finish times", (t) => {
   const dir = sandbox(t);
-  const dominantAuditDir = path.join(dir, "dominant-audit");
-  const balancedAuditDir = path.join(dir, "balanced-audit");
-  const dispatches = [
-    { schemaVersion: 1, at: "2026-07-21T10:00:00.000Z", session: "session-ratio", event: "dispatch", lane: "grok", tool: "Agent" },
-    { schemaVersion: 1, at: "2026-07-21T10:00:00.100Z", session: "session-ratio", event: "dispatch", lane: "codex", tool: "Agent" },
-    { schemaVersion: 1, at: "2026-07-21T10:00:00.200Z", session: "session-ratio", event: "dispatch", lane: "grok", tool: "Agent" }
+  const auditDir = path.join(dir, "inline-guard-audit");
+  const workerState = path.join(dir, "workers");
+  const env = {
+    FUSION_DATA_DIR: path.join(dir, "fusion-data"),
+    FUSION_INLINE_GUARD_AUDIT_DIR: auditDir,
+    FUSION_WORKER_STATE_DIR: workerState,
+    FUSION_CODEX_STATE: path.join(dir, "missing-codex"),
+    GROK_COMPANION_DATA: path.join(dir, "missing-grok")
+  };
+  writeGuardAuditEvents(auditDir, "2026-07-21", [
+    { schemaVersion: 1, at: "2026-07-21T10:00:15.000Z", session: "margin", event: "verification", lane: "main", tool: "Bash" },
+    { schemaVersion: 1, at: "2026-07-21T10:01:15.001Z", session: "late", event: "verification", lane: "main", tool: "Bash" },
+    { schemaVersion: 1, at: "2026-07-21T10:02:00.000Z", session: "early", event: "verification", lane: "main", tool: "Bash" },
+    { schemaVersion: 1, at: "2026-07-21T10:03:05.000Z", session: "other", event: "verification", lane: "main", tool: "Bash" },
+    { schemaVersion: 1, at: "2026-07-21T10:04:05.000Z", session: "before-verdict", event: "verification", lane: "main", tool: "Bash" }
+  ]);
+  const records = [
+    ["margin", "2026-07-21T10:00:00.000Z", "2026-07-21T10:00:10.000Z", "implementation"],
+    ["late", "2026-07-21T10:01:00.000Z", "2026-07-21T10:01:10.000Z", "implementation"],
+    ["early", "2026-07-21T10:02:01.000Z", "2026-07-21T10:02:10.000Z", "implementation"],
+    ["target", "2026-07-21T10:03:00.000Z", "2026-07-21T10:03:10.000Z", "implementation"],
+    ["before-verdict", "2026-07-21T10:04:00.000Z", "2026-07-21T10:04:10.000Z", "implementation"],
+    ["at-audit-end", "2026-07-21T23:59:59.000Z", "2026-07-22T00:00:00.000Z", "implementation"],
+    ["no-audit-day", "2026-07-24T10:00:00.000Z", "2026-07-24T10:00:10.000Z", "implementation"],
+    ["missing-finish", null, "2026-07-25T10:00:10.000Z", "implementation"],
+    ["outside-window", "2026-07-20T10:00:00.000Z", "2026-07-20T10:00:10.000Z", "implementation"],
+    ["consult", "2026-07-21T10:04:00.000Z", "2026-07-21T10:04:10.000Z", "consult"]
   ];
-  const declines = Array.from({ length: 5 }, (_, index) => ({ schemaVersion: 1, at: `2026-07-21T11:0${index}:00.000Z`, session: "session-ratio", event: "warn", lane: "main", tool: "Agent", reason: "narrow-wave-advisory", declineStated: true }));
-  writeGuardAuditEvents(dominantAuditDir, "2026-07-21", [...dispatches, ...declines]);
-  writeGuardAuditEvents(balancedAuditDir, "2026-07-21", [...dispatches, ...declines.slice(0, 4)]);
+  for (const [sessionId, finishedAt, acceptanceRecordedAt, packageType] of records) {
+    const taskId = `fusion-${sessionId}`;
+    createWorkerRecord({ taskId, sessionId, dispatchToolUseId: `tool-${sessionId}`, agentType: "fusion:claude-worker", packageType, workspaceRoot: dir, limits: {} }, env);
+    updateWorkerRecord(taskId, env, (record) => ({ ...record, transportStatus: "done", finishedAt, acceptance: "accepted", acceptanceRecordedAt }));
+  }
 
-  const reportFor = (auditDir) => buildFusionStats({
-    env: {
-      FUSION_DATA_DIR: path.join(dir, path.basename(auditDir), "fusion-data"),
-      FUSION_INLINE_GUARD_AUDIT_DIR: auditDir,
-      FUSION_CODEX_STATE: path.join(dir, "missing-codex"),
-      GROK_COMPANION_DATA: path.join(dir, "missing-grok"),
-      FUSION_WORKER_STATE_DIR: path.join(dir, "missing-workers")
-    },
-    cwd: dir
-  });
-  const dominant = renderFusionStats(reportFor(dominantAuditDir));
-  const balanced = renderFusionStats(reportFor(balancedAuditDir));
-  const largeFleet = renderFusionStats({
-    scope: dir,
-    coercionLedger: {
-      fleetDeclines: 55,
-      narrowWaveAdvisories: 55,
-      fleetShapedWaves: 11,
-      verificationResets: 0,
-      unverifiedAccumulations: 0,
-      inlineSprawlWindows: 0,
-      deepestUnverifiedWindow: 0,
-      postureMix: {
-        judgment: 0,
-        strict: 0,
-        unset: 55
-      }
-    }
-  });
+  const report = buildFusionStats({ env, cwd: dir });
+  assert.deepStrictEqual(report.verificationEvidence, { accepted: 7, evidenced: 2, rate: 2 / 7 });
+  const rendered = renderFusionStats(report);
+  assert.match(rendered, /## Coercion ledger[\s\S]*## Verification evidence\n\nAccepted implementation packages: 7\nWith a credited verification before the verdict: 2 \(28\.6%\)/);
+  const result = runDirect({ cwd: dir, codexState: env.FUSION_CODEX_STATE }, ["--json"], env);
+  assert.strictEqual(result.status, 0, result.stderr);
+  assert.deepStrictEqual(JSON.parse(result.stdout).verificationEvidence, report.verificationEvidence);
+});
 
-  assert.match(dominant, /Advisory: Fleet declines to fleet-shaped waves are 5:1; the fleet default is being overridden more often than honored\./);
-  assert.doesNotMatch(balanced, /the fleet default is being overridden more often than honored/);
-  assert.doesNotMatch(largeFleet, /the fleet default is being overridden more often than honored/);
+test("a dispatched package settled after verification with zero inline writes is evidenced", (t) => {
+  const dir = sandbox(t);
+  const auditDir = path.join(dir, "audit");
+  const env = {
+    FUSION_DATA_DIR: path.join(dir, "fusion-data"),
+    FUSION_INLINE_GUARD_AUDIT_DIR: auditDir,
+    FUSION_WORKER_STATE_DIR: path.join(dir, "workers"),
+    FUSION_CODEX_STATE: path.join(dir, "missing-codex"),
+    GROK_COMPANION_DATA: path.join(dir, "missing-grok")
+  };
+  writeGuardAuditEvents(auditDir, "2026-07-21", [
+    { schemaVersion: 1, at: "2026-07-21T10:00:00.000Z", session: "session-dispatched", event: "dispatch", lane: "codex", tool: "Agent" },
+    { schemaVersion: 1, at: "2026-07-21T10:00:03.000Z", session: "session-dispatched", event: "verification", lane: "main", tool: "Bash", writeCount: 0, evidence: "exit-status" }
+  ]);
+  createWorkerRecord({ taskId: "fusion-dispatched", sessionId: "session-dispatched", dispatchToolUseId: "tool-dispatched", agentType: "fusion:claude-worker", packageType: "implementation", workspaceRoot: dir, limits: {} }, env);
+  updateWorkerRecord("fusion-dispatched", env, (record) => ({ ...record, transportStatus: "done", finishedAt: "2026-07-21T10:00:02.000Z", acceptance: "accepted", acceptanceRecordedAt: "2026-07-21T10:00:05.000Z" }));
+  const report = buildFusionStats({ env, cwd: dir });
+  assert.deepStrictEqual(report.verificationEvidence, { accepted: 1, evidenced: 1, rate: 1 });
+  assert.strictEqual(report.coercionLedger.verificationResets, 0);
 });
