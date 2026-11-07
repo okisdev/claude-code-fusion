@@ -41,7 +41,7 @@ test("recalibrated worker budgets keep sizing and timing overrides", () => {
   assert.deepEqual(workerLimits("fusion:claude-worker", {}), { wallClockMs: 2_400_000, stallMs: 600_000, maxTurns: 100, maxOutputTokens: 192_000, maxUncachedTokens: 960_000 });
   assert.deepEqual(workerLimits("fusion:deep-reasoner", {}), { wallClockMs: 2_400_000, stallMs: 900_000, maxTurns: 40, maxOutputTokens: 128_000, maxUncachedTokens: 960_000 });
   assert.deepEqual(workerLimits("fusion:trivial-worker", {}, "small"), { wallClockMs: 150_000, stallMs: 60_000, maxTurns: 12, maxOutputTokens: 16_000, maxUncachedTokens: 120_000 });
-  assert.deepEqual(workerLimits("fusion:job-collector", {}), { wallClockMs: 660_000, stallMs: 660_000, maxTurns: 6, maxOutputTokens: 8_000, maxUncachedTokens: 30_000 });
+  assert.deepEqual(workerLimits("fusion:job-collector", {}), { wallClockMs: 660_000, stallMs: 660_000, maxTurns: 9, maxOutputTokens: 8_000, maxUncachedTokens: 30_000 });
   assert.equal(workerLimits("fusion:claude-worker", { FUSION_WORKER_WALL_CLOCK_MS: "5" }, "large").wallClockMs, 5);
 });
 

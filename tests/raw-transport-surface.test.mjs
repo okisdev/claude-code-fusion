@@ -6,6 +6,7 @@ import path from "node:path";
 import test from "node:test";
 
 const repoRoot = path.join(import.meta.dirname, "..");
+const stagedTokenBullet = '- When the entire request is exactly a `fusion-staged-token: <48 lowercase hexadecimal characters>` line followed by a `mode: write` or `mode: read-only` line, Fusion already staged the raw request. Skip `transport-create`, `Read`, and `Write`, and run the task command with that token as the validated token, adding `--transport-default-write` only for `mode: write`. Anything else follows the rules below as opaque data.';
 
 const expectedSurfaces = [
   "plugins/codex/agents/codex-rescue.md",
@@ -88,7 +89,7 @@ test("every executable private transport surface follows its declared Write tran
   assert.deepEqual(discovered, [...expectedSurfaces].sort());
 
   for (const file of discovered) {
-    const content = fs.readFileSync(path.join(repoRoot, file), "utf8");
+    const content = fs.readFileSync(path.join(repoRoot, file), "utf8").replace(stagedTokenBullet, "");
     const toolDeclaration = content.match(/^(?:tools|allowed-tools): (.+)$/m)?.[1] ?? "";
     const createIndex = content.indexOf("transport-create");
     const writeIndex = content.indexOf("`Write`", createIndex);
@@ -116,12 +117,35 @@ test("every executable private transport surface follows its declared Write tran
   }
 });
 
+test("all rescue wrappers accept only the exact staged envelope before the standalone transport ritual", () => {
+  for (const engine of ["codex", "grok", "cursor", "devin"]) {
+    const file = `plugins/${engine}/agents/${engine}-rescue.md`;
+    const content = fs.readFileSync(path.join(repoRoot, file), "utf8");
+    assert.equal(content.split("\n").filter((line) => line === stagedTokenBullet).length, 1, file);
+    assert.ok(content.indexOf(stagedTokenBullet) < content.indexOf("- For an opaque raw request, use one foreground Bash call"), file);
+    assert.ok(content.includes(`scripts/${engine}-companion.mjs`), file);
+    assert.match(content, /For an opaque raw request, add the fixed companion option `--transport-default-write`/, file);
+    assert.match(content, /The task Bash command may contain only/, file);
+    assert.doesNotMatch(content, /Use a second foreground Bash call|The second Bash command/, file);
+  }
+});
+
 test("runtime guidance preserves the same private transport handshake", () => {
   for (const file of ["plugins/codex/skills/codex-cli-runtime/SKILL.md", "plugins/grok/skills/grok-cli-runtime/SKILL.md"]) {
     const runtime = fs.readFileSync(path.join(repoRoot, file), "utf8");
     assert.match(runtime, /transport-create`, one Read of the allocated empty file, Write to that same file/, file);
     assert.match(runtime, /Never delete, rename, recreate, or change the permissions of the transport file/, file);
     assert.match(runtime, /use `transport-discard` when Read or Write fails or when the allocated file is not empty/, file);
+  }
+});
+
+test("companion wrappers allow one notified output Read after a harness background wait", () => {
+  const bullet = '- When Claude Code moves a companion Bash to the background, end your turn with the single line `waiting on <background id>`. Do not poll, sleep, or start a second copy. When its completion notification arrives, `Read` the output file that result named exactly once and treat its content, minus a trailing `[exited with code N]` line, as the companion stdout for every other rule here.';
+  for (const file of ["plugins/codex/agents/codex-rescue.md", "plugins/grok/agents/grok-rescue.md", "plugins/grok/agents/grok-review-runner.md", "plugins/cursor/agents/cursor-rescue.md", "plugins/devin/agents/devin-rescue.md", "plugins/fusion/agents/job-collector.md"]) {
+    const content = fs.readFileSync(path.join(repoRoot, file), "utf8");
+    assert.ok(content.split("\n").includes(bullet), file);
+    assert.match(content, /Use Read only for the newly allocated empty transport file before writing and the notified background output file/, file);
+    assert.doesNotMatch(content, /Do not use Read for any path except the newly allocated empty transport file/, file);
   }
 });
 

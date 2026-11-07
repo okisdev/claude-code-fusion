@@ -1,4 +1,4 @@
-import { PEER_RESCUE_AGENT_NAMES } from "../engines.mjs";
+import { PEER_MANAGED_AGENT_NAMES, PEER_RESCUE_AGENT_NAMES } from "../engines.mjs";
 import path from "node:path";
 import { PEER_JOB_FOOTER_AGENTS } from "../engines.mjs";
 import { tagMessage } from "../user-messages.mjs";
@@ -6,6 +6,7 @@ import { canonicalWorkerAgentType, isFusionWorkerAgent, WORKER_TERMINAL_STATUSES
 import { workerBudgetFailure } from "./budget.mjs";
 import { capturedPeerIdentity, completedReport, finalTextArtifactPath, mergedPeerJobIds, peerIdentityBackfill, retryInstruction, settleQueuedVerdict, settleWrapperApiDeath, statusEvidence, structuredCollectorReport, terminalCollectedRecord, wrapperApiDeathEvidence, writeFinalTextArtifact } from "./collection.mjs";
 import { blockStop, hookOutput, writeOutput } from "./output.mjs";
+import { pendingBackgroundCommandFromTranscript } from "./notifications.mjs";
 import { pendingDispatchForStart, recordForAgent, refreshRecord, updateLifecycleWorkerRecord } from "./records.mjs";
 import { EXECUTION_AGENTS } from "./constants.mjs";
 
@@ -57,8 +58,24 @@ function handleSubagentStop(input, env) {
   if (!record) {
     return;
   }
-  const refreshed = refreshRecord(record, input, env);
+  let refreshed = refreshRecord(record, input, env);
   const message = typeof input.last_assistant_message === "string" ? input.last_assistant_message : "";
+  if (!WORKER_TERMINAL_STATUSES.has(refreshed.transportStatus)) {
+    const backgroundCommand = (!PEER_MANAGED_AGENT_NAMES.has(refreshed.agentType) && completedReport(refreshed, message)) ? null : pendingBackgroundCommandFromTranscript(refreshed.transcriptPath, refreshed.awaitingBackgroundCommand, message.trim().match(/(?:^|\n)waiting on ([\w-]+)$/)?.[1]);
+    if (backgroundCommand) {
+      const now = new Date().toISOString();
+      refreshed = updateLifecycleWorkerRecord(refreshed.taskId, env, (current) => current && !WORKER_TERMINAL_STATUSES.has(current.transportStatus) ? {
+        ...current,
+        awaitingBackgroundCommand: backgroundCommand,
+        inFlightSince: undefined,
+        lastActivityAt: now,
+        lastLivenessAt: current.awaitingBackgroundCommand === backgroundCommand ? current.lastLivenessAt : now
+      } : null);
+      if (!refreshed || WORKER_TERMINAL_STATUSES.has(refreshed.transportStatus) || !workerBudgetFailure(refreshed)) {
+        return;
+      }
+    }
+  }
   const footerMissing = PEER_RESCUE_AGENT_NAMES.has(refreshed.agentType) && !message.split(/\r?\n/).filter((line) => line.trim()).slice(-15).some((line) => /^\s*state:\s*\S+/i.test(line));
   if (footerMissing) {
     updateLifecycleWorkerRecord(refreshed.taskId, env, (current) => current ? { ...current, relayFooterMissing: true } : null);
@@ -69,6 +86,9 @@ function handleSubagentStop(input, env) {
     return;
   }
   const failure = workerBudgetFailure(refreshed);
+  if (refreshed.awaitingBackgroundCommand) {
+    refreshed = updateLifecycleWorkerRecord(refreshed.taskId, env, (current) => current ? { ...current, awaitingBackgroundCommand: undefined } : null);
+  }
   let finalTextFile = isFusionWorkerAgent(refreshed.agentType) && message.length > 0 ? finalTextArtifactPath(refreshed, env) : null;
   if (finalTextFile) {
     try {
