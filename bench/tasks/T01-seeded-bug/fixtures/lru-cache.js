@@ -61,7 +61,8 @@ export class TtlLruCache {
       if (!evicted) {
         break;
       }
-      this.#dropKey(evicted.key);
+      this.nodes.delete(evicted.key);
+      this.entries.delete(evicted.key);
     }
 
     const node = new ListNode(key);

@@ -1,9 +1,9 @@
 {
-  "manifestHash": "e0d1c68370ef0a682e23da0850d081e91365a964c95bf6386e67085114168967",
+  "manifestHash": "c0950bd370c7f6a0a4fe44f943d503909bd29b30f3adf056818daf8757f125ef",
   "tasks": [
     {
       "id": "T01-seeded-bug",
-      "taskSha256": "7a04b409c08e54f5dafd9a0381cfdd176568d226eb14f1689731bcc3f5638778",
+      "taskSha256": "66f849d2a613356ebafc833597734f8e3a02ab664cb9845734e6a7792032ed95",
       "files": [
         {
           "path": "brief.md",
@@ -11,7 +11,7 @@
         },
         {
           "path": "cache.test.mjs",
-          "sha256": "47e2a4fc5023dc01611949b54ce01688d8cfcd55efa5568ec49782421ce4c65d"
+          "sha256": "25aa798410074b4ac778fe78608f32c0c1d21474e9a3665c1dd4edb3558f0772"
         },
         {
           "path": "fixtures/index.js",
@@ -23,7 +23,7 @@
         },
         {
           "path": "fixtures/lru-cache.js",
-          "sha256": "5125b30cdfcb2da2dbaf49bdcfa962eb30c7c7ca55480890db33ef0a0a332f70"
+          "sha256": "ee589438017d5da3206b3092f674e3b2a8fe0f1400633cc07320548a1b039640"
         },
         {
           "path": "fixtures/package.json",
@@ -39,7 +39,7 @@
         },
         {
           "path": "mutant/lru-cache.js",
-          "sha256": "5125b30cdfcb2da2dbaf49bdcfa962eb30c7c7ca55480890db33ef0a0a332f70"
+          "sha256": "ee589438017d5da3206b3092f674e3b2a8fe0f1400633cc07320548a1b039640"
         },
         {
           "path": "mutant/package.json",
@@ -59,7 +59,7 @@
         },
         {
           "path": "solution/lru-cache.js",
-          "sha256": "3337d78c7011d31fbf071039516811b303b1983b0e9c63ad2c0e3340c2e9f1c9"
+          "sha256": "d4c0e684a687fb5da11214b4ccd7d887bbbaf37879c5443999202fdce1eeda34"
         },
         {
           "path": "solution/package.json",
