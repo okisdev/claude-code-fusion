@@ -1,6 +1,6 @@
 import { POSTURE_VALUES } from "../posture.mjs";
 import { resolveAuditDir, resolveAuditMaxBytes, resolveAuditMaxFiles, resolveAuditRetentionDays } from "./config.mjs";
-import { AUDIT_FILE_PATTERN, AUDIT_SCHEMA_VERSION, BASH_TOOL, DAY_MS, DELEGATION_TOOLS, ENFORCEMENT_AUDIT_TOOLS, MAIN_LANE, MISSING_LAUNCH_RECOVERY_REASON, NARROW_WAVE_ADVISORY_REASON, OUT_OF_WORKSPACE_EXEMPTION, REAPED_WORKER_REDIRECT_AUDIT_DESCRIPTION, TAIL_ALLOW_AUDIT_EVENT, TASK_CONTROL_TOOLS, WRITE_TOOLS, ZERO_DISPATCH_SOFTENED_AUDIT_EVENT } from "./constants.mjs";
+import { AUDIT_FILE_PATTERN, AUDIT_SCHEMA_VERSION, BASH_TOOL, DAY_MS, DELEGATION_TOOLS, ENFORCEMENT_AUDIT_TOOLS, MAIN_LANE, MISSING_LAUNCH_RECOVERY_REASON, OUT_OF_WORKSPACE_EXEMPTION, READ_STREAK_ADVISORY_REASON, REAPED_WORKER_REDIRECT_AUDIT_DESCRIPTION, TAIL_ALLOW_AUDIT_EVENT, TASK_CONTROL_TOOLS, WRITE_TOOLS, ZERO_DISPATCH_SOFTENED_AUDIT_EVENT } from "./constants.mjs";
 import { normalizeLane, sanitizeAuditPath, sanitizeAuditText } from "./dispatch.mjs";
 import { normalizeSessionId, withStateLock } from "./state.mjs";
 import { normalizeMessageId } from "./verification.mjs";
@@ -287,9 +287,8 @@ function normalizeAuditEvent(event) {
       ? { schemaVersion: AUDIT_SCHEMA_VERSION, at: new Date(atMs).toISOString(), session, event: "dispatch", lane, tool: event.tool, ...digest, ...(messageId ? { messageId } : {}), ...(description ? { description } : {}) }
       : null;
   }
-  if (event.event === "warn" && DELEGATION_TOOLS.has(event.tool) && (event.reason === MISSING_LAUNCH_RECOVERY_REASON || event.reason === NARROW_WAVE_ADVISORY_REASON)) {
+  if (event.event === "warn" && DELEGATION_TOOLS.has(event.tool) && event.reason === MISSING_LAUNCH_RECOVERY_REASON) {
     const lane = normalizeLane(event.lane);
-    const pendingIncludedWidth = Number.isInteger(event.pendingIncludedWidth) && event.pendingIncludedWidth > 0 ? event.pendingIncludedWidth : null;
     return lane
       ? {
           schemaVersion: AUDIT_SCHEMA_VERSION,
@@ -301,11 +300,25 @@ function normalizeAuditEvent(event) {
           reason: event.reason,
           ...posture,
           ...digest,
-          ...(event.reason === NARROW_WAVE_ADVISORY_REASON && event.declineStated === true ? { declineStated: true } : {}),
-          ...(event.reason === NARROW_WAVE_ADVISORY_REASON && pendingIncludedWidth !== null ? { pendingIncludedWidth } : {}),
           ...(event.suppressed === true ? { suppressed: true } : {})
         }
       : null;
+  }
+  if (event.event === "warn" && event.reason === READ_STREAK_ADVISORY_REASON && event.lane === MAIN_LANE &&
+    (event.tool === BASH_TOOL || ["Read", "Grep", "Glob"].includes(event.tool)) &&
+    Number.isSafeInteger(event.streakTurns) && event.streakTurns >= 5) {
+    return {
+      schemaVersion: AUDIT_SCHEMA_VERSION,
+      at: new Date(atMs).toISOString(),
+      session,
+      event: "warn",
+      reason: READ_STREAK_ADVISORY_REASON,
+      streakTurns: event.streakTurns,
+      ...posture,
+      ...digest,
+      lane: MAIN_LANE,
+      tool: event.tool
+    };
   }
   if (
     (event.event === "deny" || event.event === "warn") &&

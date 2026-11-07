@@ -1,5 +1,5 @@
 import { STRICT_POSTURE, resolvePosture } from "../posture.mjs";
-import { AUDIT_DIR_ENV, AUDIT_MAX_BYTES_ENV, AUDIT_MAX_FILES_ENV, AUDIT_RETENTION_DAYS_ENV, BUDGET_ENV, DEFAULT_AUDIT_MAX_BYTES, DEFAULT_AUDIT_MAX_FILES, DEFAULT_AUDIT_RETENTION_DAYS, DEFAULT_BUDGET, DEFAULT_FLEET_WAVE_GAP_MS, DEFAULT_LOCK_TIMEOUT_MS, DEFAULT_TAIL_ALLOWANCE, DEFAULT_TAIL_MAX_BYTES, DEFAULT_ZERO_DISPATCH_MAX_BYTES, DEFAULT_ZERO_DISPATCH_WRITES, FLEET_WAVE_GAP_ENV, LOCK_TIMEOUT_ENV, STATE_ENV, TAIL_ALLOWANCE_ENV, TAIL_MAX_BYTES_ENV, ZERO_DISPATCH_MAX_BYTES_ENV, ZERO_DISPATCH_WRITES_ENV } from "./constants.mjs";
+import { AUDIT_DIR_ENV, AUDIT_MAX_BYTES_ENV, AUDIT_MAX_FILES_ENV, AUDIT_RETENTION_DAYS_ENV, BUDGET_ENV, DEFAULT_AUDIT_MAX_BYTES, DEFAULT_AUDIT_MAX_FILES, DEFAULT_AUDIT_RETENTION_DAYS, DEFAULT_BUDGET, DEFAULT_LOCK_TIMEOUT_MS, DEFAULT_TAIL_ALLOWANCE, DEFAULT_TAIL_MAX_BYTES, DEFAULT_ZERO_DISPATCH_MAX_BYTES, DEFAULT_ZERO_DISPATCH_WRITES, LOCK_TIMEOUT_ENV, STATE_ENV, TAIL_ALLOWANCE_ENV, TAIL_MAX_BYTES_ENV, ZERO_DISPATCH_MAX_BYTES_ENV, ZERO_DISPATCH_WRITES_ENV } from "./constants.mjs";
 import os from "node:os";
 import path from "node:path";
 
@@ -79,8 +79,4 @@ function resolveAuditMaxFiles(env = process.env) {
   return resolvePositiveInteger(env, AUDIT_MAX_FILES_ENV, DEFAULT_AUDIT_MAX_FILES);
 }
 
-function resolveFleetWaveGapMs(env = process.env) {
-  return resolvePositiveInteger(env, FLEET_WAVE_GAP_ENV, DEFAULT_FLEET_WAVE_GAP_MS);
-}
-
-export { resolveStateDir, resolveBudget, resolveNonnegativeInteger, resolveTailMaxBytes, resolveTailAllowance, resolveZeroDispatchMaxBytes, resolveZeroDispatchWrites, resolveLockTimeoutMs, resolveMode, resolveAuditDir, resolvePositiveInteger, resolveAuditRetentionDays, resolveAuditMaxBytes, resolveAuditMaxFiles, resolveFleetWaveGapMs };
+export { resolveStateDir, resolveBudget, resolveNonnegativeInteger, resolveTailMaxBytes, resolveTailAllowance, resolveZeroDispatchMaxBytes, resolveZeroDispatchWrites, resolveLockTimeoutMs, resolveMode, resolveAuditDir, resolvePositiveInteger, resolveAuditRetentionDays, resolveAuditMaxBytes, resolveAuditMaxFiles };

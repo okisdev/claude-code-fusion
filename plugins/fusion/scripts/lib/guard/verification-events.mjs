@@ -2,7 +2,7 @@ import { JUDGMENT_POSTURE } from "../posture.mjs";
 import { messageCode, tagMessage } from "../user-messages.mjs";
 import { verificationEvidence } from "../verification-command.mjs";
 import { recordAuditEvent } from "./audit.mjs";
-import { resolveBudget, resolveFleetWaveGapMs, resolveMode } from "./config.mjs";
+import { resolveBudget, resolveMode } from "./config.mjs";
 import { BASH_TOOL, MAIN_LANE, NO_OP_BASH_COMMANDS, NO_OP_HEARTBEAT_DENY_MESSAGE_SLUG, NO_OP_HEARTBEAT_REASON } from "./constants.mjs";
 import { inFlightWorkerTaskSignature, totalDispatches } from "./dispatch.mjs";
 import { normalizeState, readState, resetWriteWindow, withStateLock, writeState } from "./state.mjs";
@@ -14,7 +14,7 @@ function handleBash(input, env, { sessionId, toolName, file, now, posture, write
     const command = extractBashCommand(input.tool_input);
     if (input.hook_event_name === "PostToolUse") {
       const toolResponse = input.tool_response;
-      if (posture !== JUDGMENT_POSTURE || command === null) {
+      if (command === null) {
         return;
       }
       const evidence = verificationEvidence(command, toolResponse, env);
@@ -22,34 +22,31 @@ function handleBash(input, env, { sessionId, toolName, file, now, posture, write
         return;
       }
       const verification = withStateLock(file, () => {
-        const state = normalizeState(readState(file), now, resolveFleetWaveGapMs(env));
-        if (state.writesSinceDispatch === 0) {
-          return null;
-        }
+        const state = normalizeState(readState(file), now);
         const writeCount = state.writesSinceDispatch;
         const dispatchCount = totalDispatches(state.dispatches);
-        resetWriteWindow(state);
-        writeState(file, state);
+        if (posture === JUDGMENT_POSTURE && writeCount > 0) {
+          resetWriteWindow(state);
+          writeState(file, state);
+        }
         return { writeCount, dispatchCount };
       });
-      if (verification) {
-        recordAuditEvent(
-          {
-            at: now,
-            session: sessionId,
-            event: "verification",
-            lane: MAIN_LANE,
-            tool: BASH_TOOL,
-            writeCount: verification.writeCount,
-            dispatchCount: verification.dispatchCount,
-            budget: resolveBudget(env),
-            mode: resolveMode(env),
-            posture,
-            evidence
-          },
-          env
-        );
-      }
+      recordAuditEvent(
+        {
+          at: now,
+          session: sessionId,
+          event: "verification",
+          lane: MAIN_LANE,
+          tool: BASH_TOOL,
+          writeCount: verification.writeCount,
+          dispatchCount: verification.dispatchCount,
+          budget: resolveBudget(env),
+          mode: resolveMode(env),
+          posture,
+          evidence
+        },
+        env
+      );
       return;
     }
     if (input.hook_event_name && input.hook_event_name !== "PreToolUse") {
@@ -63,7 +60,7 @@ function handleBash(input, env, { sessionId, toolName, file, now, posture, write
     let writeCount = 0;
     let dispatchCount = 0;
     try {
-      const snapshot = withStateLock(file, () => normalizeState(readState(file), now, resolveFleetWaveGapMs(env)));
+      const snapshot = withStateLock(file, () => normalizeState(readState(file), now));
       writeCount = snapshot.writesSinceDispatch;
       dispatchCount = totalDispatches(snapshot.dispatches);
     } catch {
