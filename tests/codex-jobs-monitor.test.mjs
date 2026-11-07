@@ -12,9 +12,9 @@ import { test } from "node:test";
 import { getProcessIdentity } from "../plugins/codex/scripts/lib/codex-exec.mjs";
 import { createJobRecord } from "../plugins/codex/scripts/lib/state.mjs";
 import { gitIsolation } from "./lib/git-fixture.mjs";
-import { inspectCodexRollout } from "../plugins/fusion/scripts/codex-jobs-monitor.mjs";
+import { inspectCodexRollout, readWorkspaceJobsSnapshot } from "../plugins/fusion/scripts/codex-jobs-monitor.mjs";
 import { fusionRepositoryKey, modelAuditSidecarPath, tokenUsageSidecarPath } from "../plugins/fusion/scripts/fusion-stats.mjs";
-import { engineJobsObserverStatePath } from "../plugins/fusion/scripts/engine-jobs-observer.mjs";
+import { engineJobsObserverStatePath, observeEngineJobs, observerScanCache } from "../plugins/fusion/scripts/engine-jobs-observer.mjs";
 
 const repoRoot = path.join(import.meta.dirname, "..");
 const monitorScript = path.join(repoRoot, "plugins", "fusion", "scripts", "codex-jobs-monitor.mjs");
@@ -1561,6 +1561,114 @@ test("installed cache layout without codex companion starts in announce-only mod
   assert.ok(monitor.lines().includes(REPAIR_UNAVAILABLE_LINE));
 });
 
+test("workspace scan retains only summaries and skips parsing unchanged records", (t) => {
+  const sandbox = makeSandbox(t);
+  const marker = "result-payload-sentinel";
+  const { file } = seedJob(sandbox, { id: "cache-job", result: { text: marker } });
+  const cache = { files: new Map(), scannedAt: 0 };
+  const originalRead = fs.readFileSync;
+  let reads = 0;
+  fs.readFileSync = function (candidate, ...args) {
+    if (candidate === file) reads++;
+    return originalRead.call(this, candidate, ...args);
+  };
+  t.after(() => { fs.readFileSync = originalRead; });
+
+  const first = readWorkspaceJobsSnapshot(sandbox.stateRoot, sandbox.workDir, new Map(), cache);
+  assert.equal(first.records.length, 1);
+  assert.equal(reads, 1);
+  assert.equal(JSON.stringify(cache.files.get(file)).includes(marker), false);
+  assert.equal(JSON.stringify(first.records[0]).includes(marker), false);
+  readWorkspaceJobsSnapshot(sandbox.stateRoot, sandbox.workDir, new Map(), cache);
+  assert.equal(reads, 1);
+});
+
+test("engine observer cache retains only summaries and skips parsing unchanged records", (t) => {
+  const sandbox = makeSandbox(t);
+  const marker = "observer-result-payload-sentinel";
+  const id = "observer-cache-job";
+  writeGrokJob(sandbox, sandbox.workDir, id, { status: "done", result: { text: marker } });
+  const file = path.join(sandbox.grokData, "state", engineWorkspaceSlug(sandbox.workDir), "jobs", `${id}.json`);
+  const env = envFor(sandbox);
+  const originalRead = fs.readFileSync;
+  let reads = 0;
+  fs.readFileSync = function (candidate, ...args) {
+    if (candidate === file) reads++;
+    return originalRead.call(this, candidate, ...args);
+  };
+  t.after(() => { fs.readFileSync = originalRead; });
+
+  observeEngineJobs("grok", { env });
+  assert.equal(reads, 1);
+  assert.equal(JSON.stringify(observerScanCache("grok", env).cache.files.get(file)).includes(marker), false);
+  observeEngineJobs("grok", { env });
+  assert.equal(reads, 1);
+});
+
+test("engine observer saves A when its notification deletes B before the full record read", (t) => {
+  const sandbox = makeSandbox(t);
+  const env = envFor(sandbox);
+  writeGrokJob(sandbox, sandbox.workDir, "a", { status: "done", background: true });
+  writeGrokJob(sandbox, sandbox.workDir, "b", { status: "done", background: true });
+  const bFile = path.join(sandbox.grokData, "state", engineWorkspaceSlug(sandbox.workDir), "jobs", "b.json");
+  const notified = [];
+  const notify = (record) => {
+    notified.push(record.id);
+    if (record.id === "a") fs.rmSync(bFile);
+  };
+
+  observeEngineJobs("grok", { env, notify });
+  observeEngineJobs("grok", { env, notify });
+
+  assert.deepStrictEqual(notified, ["a"]);
+  const state = JSON.parse(fs.readFileSync(engineJobsObserverStatePath("grok", env), "utf8"));
+  assert.deepStrictEqual(state.notifiedJobIds, ["a"]);
+});
+
+test("Codex monitor keeps A announced when B vanishes after the snapshot", async (t) => {
+  const sandbox = makeSandbox(t);
+  const jobsDir = jobsDirFor(sandbox, "ws");
+  const aFile = path.join(jobsDir, "a.json");
+  const bFile = path.join(jobsDir, "b.json");
+  const scanFile = path.join(sandbox.root, "scan-count");
+  const preload = path.join(sandbox.root, "vanish-after-scan.mjs");
+  fs.writeFileSync(preload, `import fs from "node:fs";
+const read = fs.readFileSync;
+const readdir = fs.readdirSync;
+let aReads = 0;
+let scans = 0;
+fs.readFileSync = function (file, ...args) {
+  const value = read.call(this, file, ...args);
+  if (file === process.env.RACE_A_FILE && ++aReads === 2) fs.rmSync(process.env.RACE_B_FILE);
+  return value;
+};
+fs.readdirSync = function (dir, ...args) {
+  const entries = readdir.call(this, dir, ...args);
+  if (dir === process.env.RACE_JOBS_DIR) return entries.sort();
+  if (dir === process.env.FUSION_CODEX_STATE) fs.writeFileSync(process.env.RACE_SCAN_FILE, String(++scans));
+  return entries;
+};
+`);
+  const env = envFor(sandbox, {
+    CODEX_JOBS_MONITOR_INTERVAL_MS: "300",
+    NODE_OPTIONS: `${process.env.NODE_OPTIONS ?? ""} --import=${preload}`.trim(),
+    RACE_A_FILE: aFile,
+    RACE_B_FILE: bFile,
+    RACE_JOBS_DIR: jobsDir,
+    RACE_SCAN_FILE: scanFile
+  });
+  const monitor = startMonitor(sandbox, env);
+  await waitUntil(() => readAnnouncedState(sandbox) && fs.existsSync(scanFile));
+  const scansBefore = Number(fs.readFileSync(scanFile, "utf8"));
+  seedJob(sandbox, { id: "a", status: "done", background: true });
+  seedJob(sandbox, { id: "b", status: "done", background: true });
+  await waitUntil(() => Number(fs.readFileSync(scanFile, "utf8")) >= scansBefore + 3);
+  const announced = readAnnouncedState(sandbox);
+  assert.equal(fs.existsSync(bFile), false);
+  assert.deepStrictEqual(announced.records.map((record) => record.jobId), ["a"]);
+  assert.equal(monitor.lines().filter((line) => line.includes("codex job a done.")).length, 1);
+});
+
 test("monitor scans parse only changed files and forget deleted file signatures", async (t) => {
   const sandbox = makeSandbox(t);
   const { file, record } = seedJob(sandbox, { id: "scan-job", request: { model: "gpt-5", effort: "high" } });
@@ -1593,15 +1701,16 @@ fs.readdirSync = function (dir, ...args) {
   assert.equal(count("R"), 1, monitor.stderr());
   const changed = { ...record, status: "done", resolvedModel: "gpt-5", resolvedEffort: "high", tokenUsage: { inputTokens: 1, outputTokens: 1 } };
   writeJobRecordFile(file, changed);
-  await waitUntil(() => count("R") >= 2);
+  await waitUntil(() => count("R") >= 3);
+  assert.equal(count("R"), 3, monitor.stderr());
   const changedStat = fs.statSync(file);
   fs.rmSync(file);
   const scansBeforeDeletion = count("S");
   await waitUntil(() => count("S") >= scansBeforeDeletion + 2);
   writeJobRecordFile(file, changed);
   fs.utimesSync(file, changedStat.atime, changedStat.mtime);
-  await waitUntil(() => count("R") >= 3);
-  assert.equal(count("R"), 3, monitor.stderr());
+  await waitUntil(() => count("R") >= 4);
+  assert.equal(count("R"), 4, monitor.stderr());
 });
 
 test("monitor observes atomic record replacement with unchanged size and mtime", async (t) => {

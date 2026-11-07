@@ -152,7 +152,7 @@ function monitorRecordSummary(record) {
     request: request && typeof request === "object" ? { model: request.model, effort: request.effort } : request };
 }
 
-function readWorkspaceJobsSnapshot(root, workspaceRoot, repositoryCache = new Map(), cache = { files: new Map(), scannedAt: 0 }) {
+export function readWorkspaceJobsSnapshot(root, workspaceRoot, repositoryCache = new Map(), cache = { files: new Map(), scannedAt: 0 }) {
   try {
     if (!fs.statSync(root).isDirectory()) {
       return { available: false, records: [] };
@@ -184,11 +184,9 @@ function readWorkspaceJobsSnapshot(root, workspaceRoot, repositoryCache = new Ma
           seenFiles.add(recordFile);
           const previous = cache.files.get(recordFile);
           let cached = previous;
-          let sourceRecord = null;
           if (reconcile || !previous || previous.mtimeMs !== stat.mtimeMs || previous.size !== stat.size || previous.ino !== stat.ino) {
             try {
-              sourceRecord = JSON.parse(fs.readFileSync(recordFile, "utf8"));
-              cached = { mtimeMs: stat.mtimeMs, size: stat.size, ino: stat.ino, record: monitorRecordSummary(sourceRecord) };
+              cached = { mtimeMs: stat.mtimeMs, size: stat.size, ino: stat.ino, record: monitorRecordSummary(JSON.parse(fs.readFileSync(recordFile, "utf8"))) };
             } catch {
               cached = { mtimeMs: stat.mtimeMs, size: stat.size, ino: stat.ino, record: null };
             }
@@ -201,7 +199,7 @@ function readWorkspaceJobsSnapshot(root, workspaceRoot, repositoryCache = new Ma
           }
           const storedRepositoryKey = typeof record?.repositoryKey === "string" && record.repositoryKey.trim() ? record.repositoryKey.trim() : null;
           if ((storedRepositoryKey && storedRepositoryKey === scopeRepositoryKey) || (!storedRepositoryKey && workspaceRootsShareRepository(record?.workspaceRoot, workspaceRoot, repositoryCache))) {
-            records.push({ file: recordFile, record, sourceRecord });
+            records.push({ file: recordFile, record });
             if (record?.id) {
               recordIds.add(record.id);
             }
@@ -918,8 +916,15 @@ function processSnapshot(snapshot, context) {
         }
         continue;
       }
+      let fullRecord = record;
+      if (!reconciled && ((!terminalRecords.has(key) && !pendingTerminals.has(key)) || !announced.has(key))) {
+        try {
+          fullRecord = JSON.parse(fs.readFileSync(entry.file, "utf8"));
+        } catch {
+          continue;
+        }
+      }
       if (!terminalRecords.has(key) && !pendingTerminals.has(key)) {
-        const fullRecord = reconciled ? record : entry.sourceRecord ?? JSON.parse(fs.readFileSync(entry.file, "utf8"));
         const observations = terminalObservations(fullRecord, process.env, rolloutIndex);
         const auditWorkspace = fullRecord.workspaceRoot;
         auditStateFor(auditWorkspace, auditStates);
@@ -931,7 +936,7 @@ function processSnapshot(snapshot, context) {
         announced.add(key);
         dirty = true;
         if (shouldAnnounceTerminal(record) && !(context.startupPending && (loaded.malformed || (!loaded.exists && !reconciled)))) {
-          const noticeRecord = reconciled ? record : entry.sourceRecord ?? JSON.parse(fs.readFileSync(entry.file, "utf8"));
+          const noticeRecord = pendingTerminals.get(key)?.fullRecord ?? fullRecord;
           safeWriteLine(formatOutcomeLine(noticeRecord));
         }
       }
