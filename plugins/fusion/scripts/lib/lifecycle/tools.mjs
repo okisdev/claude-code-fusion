@@ -5,7 +5,7 @@ import { tagMessage } from "../user-messages.mjs";
 import { canonicalWorkerAgentType, isFusionWorkerAgent, WORKER_TERMINAL_STATUSES, markWorkerCollected, readWorkerRecord, readWorkerOutputFileTaskIds, readSessionWorkerRecords, refreshWorkerTranscript, reopenWorkerContinuation, WORKER_COLLECTION_METHODS } from "../worker-state.mjs";
 import { markBudgetFailure, workerBudgetFailure, workerRoundUsage } from "./budget.mjs";
 import { backfillCollectedTaskOutput, capturedPeerIdentity, collectedHarnessAsyncDelivery, noTaskFoundError, outputFileFromLaunchResponse, peerIdentityBackfill, settleQueuedVerdict, settleReapedIfActive, taskOutputResultText, terminalCollectedRecord, terminalCollectionPending } from "./collection.mjs";
-import { allowAgentWithTaskId, claimParentContextAdvisory, collectorRequestIdentity, createDispatch, injectedPeerDefaults, latestUserRequestedBackground, parentContextTokens, promptText, releaseHostPeerCapacity, reserveHostPeerCapacity, validateWorkerBrief } from "./dispatch.mjs";
+import { allowAgentWithTaskId, claimParentContextAdvisory, collectorRequestIdentity, createDispatch, engineInfraDenial, flagshipWriteDenial, injectedPeerDefaults, latestUserRequestedBackground, latestUserText, parentContextTokens, prestagePeerPrompt, promptText, releaseHostPeerCapacity, reserveHostPeerCapacity, validateWorkerBrief } from "./dispatch.mjs";
 import { reconcileTaskNotifications, taskNotificationTransition } from "./notifications.mjs";
 import { denyTool, hookOutput, writeOutput } from "./output.mjs";
 import { activeSessionRecords, clearContinuationRequest, findSessionWorkerRecord, isAttributedTranscriptPath, parentTranscriptByteSize, recordForAgent, refreshRecord, sendMessageResumed, updateLifecycleWorkerRecord } from "./records.mjs";
@@ -31,9 +31,19 @@ function handlePreToolUse(input, env) {
   }
   if (input.tool_name === "Agent" || input.tool_name === "Task") {
     const agentType = input.tool_input?.subagent_type;
+    if (agentType === "Explore" && !Object.hasOwn(input.tool_input, "model")) {
+      writeOutput({ hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision: "allow", updatedInput: { ...input.tool_input, model: "sonnet" } } });
+      return;
+    }
     if (PEER_RESCUE_AGENT_NAMES.has(agentType)) {
       if (input.tool_input?.run_in_background === true) {
         writeOutput(denyTool(tagMessage("worker-lifecycle.foreground-wrapper-deny", `${engineDisplayNameList()} wrapper Agents use foreground delivery. Keep the Agent foreground; an explicitly requested companion \`--background\` receipt stays inside that foreground wrapper call.`)));
+        return;
+      }
+      const userText = latestUserText(input.transcript_path);
+      const admissionDenial = flagshipWriteDenial(promptText(input.tool_input), agentType, userText) ?? engineInfraDenial(input.session_id, agentType, userText, env);
+      if (admissionDenial) {
+        writeOutput(denyTool(admissionDenial));
         return;
       }
       const capacityDenial = reserveHostPeerCapacity(input, agentType, env);
@@ -42,9 +52,11 @@ function handlePreToolUse(input, env) {
         return;
       }
       const injection = injectedPeerDefaults(input.tool_input?.prompt, agentType, env);
+      const finalInput = injection ? { ...input.tool_input, prompt: injection.prompt } : input.tool_input;
+      const stagedPrompt = prestagePeerPrompt({ ...input, tool_input: finalInput }, env);
       const advisory = claimParentContextAdvisory(input.session_id, parentContextTokens(input.transcript_path), env);
-      if (injection || advisory) {
-        writeOutput({ hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision: "allow", ...(injection ? { updatedInput: { ...input.tool_input, prompt: injection.prompt } } : {}), additionalContext: [injection?.context, advisory ? tagMessage("worker-lifecycle.dispatch-advisory", advisory) : null].filter(Boolean).join("\n\n") } });
+      if (stagedPrompt || injection || advisory) {
+        writeOutput({ hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision: "allow", ...(stagedPrompt || injection ? { updatedInput: { ...finalInput, ...(stagedPrompt ? { prompt: stagedPrompt } : {}) } } : {}), additionalContext: [injection?.context, advisory ? tagMessage("worker-lifecycle.dispatch-advisory", advisory) : null].filter(Boolean).join("\n\n") } });
       }
       return;
     }
@@ -284,6 +296,7 @@ function handlePostToolUse(input, env, failed = false) {
           const updated = settleQueuedVerdict({
             ...markWorkerCollected(worker, collectionMethod, now),
             transportStatus,
+            awaitingBackgroundCommand: undefined,
             failureKind: input.tool_name === "TaskStop" ? worker.failureKind ?? "cancelled" : harnessAsyncDelivery ? null : worker.failureKind,
             ...(harnessAsyncDelivery ? { deliveryMode: "harness_async" } : {}),
             ...peerIdentity,
