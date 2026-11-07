@@ -1,0 +1,89 @@
+diff --git a/concurrent.js b/concurrent.js
+new file mode 100644
+index 0000000..1f3a0d1
+--- /dev/null
++++ b/concurrent.js
+@@ -0,0 +1,51 @@
++export function map_concurrent(items, limit, worker) {
++  return new Promise((resolve, reject) => {
++    if (items.length === 0) {
++      resolve([]);
++      return;
++    }
++    const results = new Array(items.length);
++    let next = 0;
++    let active = 0;
++    let finished = 0;
++    let settled = false;
++
++    const launch = () => {
++      if (settled) {
++        return;
++      }
++      while (active < limit && next < items.length) {
++        const index = next;
++        next += 1;
++        active += 1;
++        Promise.resolve()
++          .then(() => worker(items[index], index))
++          .then(
++            (value) => {
++              if (settled) {
++                return;
++              }
++              results[index] = value;
++              active -= 1;
++              finished += 1;
++              if (finished === items.length) {
++                settled = true;
++                resolve(results);
++                return;
++              }
++              launch();
++            },
++            (error) => {
++              if (settled) {
++                return;
++              }
++              settled = true;
++              reject(error);
++            },
++          );
++      }
++    };
++
++    launch();
++  });
++}
+diff --git a/retry.js b/retry.js
+new file mode 100644
+index 0000000..b223a45
+--- /dev/null
++++ b/retry.js
+@@ -0,0 +1,26 @@
++import { app_error } from "./errors.js";
++import { delay_ms } from "./util.js";
++
++function failure_message(error) {
++  if (error && typeof error.message === "string") {
++    return error.message;
++  }
++  return String(error);
++}
++
++export function retry_with_backoff(operation, attempts, base_delay_ms) {
++  const run = (index) => {
++    return Promise.resolve()
++      .then(() => operation())
++      .catch((error) => {
++        if (index + 1 >= attempts) {
++          return Promise.reject(
++            app_error("RETRY_EXHAUSTED", failure_message(error)),
++          );
++        }
++        const wait = base_delay_ms * 2 ** index;
++        return delay_ms(wait).then(() => run(index + 1));
++      });
++  };
++  return run(0);
++}

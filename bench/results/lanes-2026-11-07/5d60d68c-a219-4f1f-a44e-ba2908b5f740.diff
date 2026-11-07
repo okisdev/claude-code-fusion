@@ -1,0 +1,177 @@
+diff --git a/alert.js b/alert.js
+index 723a224..687913f 100644
+--- a/alert.js
++++ b/alert.js
+@@ -1,9 +1,6 @@
+-import { formatWithCallback } from "./format.js";
++import { format } from "./format.js";
+ 
+-export function buildAlert(message) {
+-  return new Promise((resolve) => {
+-    formatWithCallback(message, (value) => {
+-      resolve(`Alert: ${value.toUpperCase()}`);
+-    });
+-  });
++export async function buildAlert(message) {
++  const value = await format(message);
++  return `Alert: ${value.toUpperCase()}`;
+ }
+diff --git a/digest.js b/digest.js
+index 92ddcce..3acddba 100644
+--- a/digest.js
++++ b/digest.js
+@@ -1,9 +1,6 @@
+-import { formatWithCallback } from "./format.js";
++import { format } from "./format.js";
+ 
+-export function buildDigest(period) {
+-  return new Promise((resolve) => {
+-    formatWithCallback(period, (value) => {
+-      resolve(`Digest: ${value.toLowerCase()}`);
+-    });
+-  });
++export async function buildDigest(period) {
++  const value = await format(period);
++  return `Digest: ${value.toLowerCase()}`;
+ }
+diff --git a/format.js b/format.js
+index f7d1562..bf0c774 100644
+--- a/format.js
++++ b/format.js
+@@ -2,10 +2,6 @@ function normalize(value) {
+   return String(value).trim().replace(/\s+/g, " ");
+ }
+ 
+-export function formatWithCallback(value, callback) {
+-  queueMicrotask(() => callback(normalize(value)));
+-}
+-
+ export function format(value) {
+   return Promise.resolve(normalize(value));
+ }
+diff --git a/greeting.js b/greeting.js
+index 041ed0d..d452951 100644
+--- a/greeting.js
++++ b/greeting.js
+@@ -1,9 +1,6 @@
+-import { formatWithCallback } from "./format.js";
++import { format } from "./format.js";
+ 
+-export function buildGreeting(name) {
+-  return new Promise((resolve) => {
+-    formatWithCallback(name, (value) => {
+-      resolve(`Hello, ${value}!`);
+-    });
+-  });
++export async function buildGreeting(name) {
++  const value = await format(name);
++  return `Hello, ${value}!`;
+ }
+diff --git a/invite.js b/invite.js
+index 44806dd..f94a4e0 100644
+--- a/invite.js
++++ b/invite.js
+@@ -1,9 +1,6 @@
+-import { formatWithCallback } from "./format.js";
++import { format } from "./format.js";
+ 
+-export function buildInvite(event) {
+-  return new Promise((resolve) => {
+-    formatWithCallback(event, (value) => {
+-      resolve(`Invite: ${value}`);
+-    });
+-  });
++export async function buildInvite(event) {
++  const value = await format(event);
++  return `Invite: ${value}`;
+ }
+diff --git a/profile.js b/profile.js
+index 51c8930..db10f12 100644
+--- a/profile.js
++++ b/profile.js
+@@ -1,9 +1,6 @@
+-import { formatWithCallback } from "./format.js";
++import { format } from "./format.js";
+ 
+-export function buildProfile(name) {
+-  return new Promise((resolve) => {
+-    formatWithCallback(name, (value) => {
+-      resolve(`Profile: ${value}`);
+-    });
+-  });
++export async function buildProfile(name) {
++  const value = await format(name);
++  return `Profile: ${value}`;
+ }
+diff --git a/receipt.js b/receipt.js
+index ef82355..334f274 100644
+--- a/receipt.js
++++ b/receipt.js
+@@ -1,9 +1,6 @@
+-import { formatWithCallback } from "./format.js";
++import { format } from "./format.js";
+ 
+-export function buildReceipt(order) {
+-  return new Promise((resolve) => {
+-    formatWithCallback(order, (value) => {
+-      resolve(`Receipt: ${value}`);
+-    });
+-  });
++export async function buildReceipt(order) {
++  const value = await format(order);
++  return `Receipt: ${value}`;
+ }
+diff --git a/reminder.js b/reminder.js
+index e3c2452..8602f12 100644
+--- a/reminder.js
++++ b/reminder.js
+@@ -1,9 +1,6 @@
+-import { formatWithCallback } from "./format.js";
++import { format } from "./format.js";
+ 
+-export function buildReminder(task) {
+-  return new Promise((resolve) => {
+-    formatWithCallback(task, (value) => {
+-      resolve(`Reminder: ${value}`);
+-    });
+-  });
++export async function buildReminder(task) {
++  const value = await format(task);
++  return `Reminder: ${value}`;
+ }
+diff --git a/status.js b/status.js
+index 17a2da5..881b3e7 100644
+--- a/status.js
++++ b/status.js
+@@ -1,9 +1,6 @@
+-import { formatWithCallback } from "./format.js";
++import { format } from "./format.js";
+ 
+-export function buildStatus(status) {
+-  return new Promise((resolve) => {
+-    formatWithCallback(status, (value) => {
+-      resolve(`Status: ${value.toUpperCase()}`);
+-    });
+-  });
++export async function buildStatus(status) {
++  const value = await format(status);
++  return `Status: ${value.toUpperCase()}`;
+ }
+diff --git a/summary.js b/summary.js
+index 791029c..bb7a027 100644
+--- a/summary.js
++++ b/summary.js
+@@ -1,9 +1,6 @@
+-import { formatWithCallback } from "./format.js";
++import { format } from "./format.js";
+ 
+-export function buildSummary(topic) {
+-  return new Promise((resolve) => {
+-    formatWithCallback(topic, (value) => {
+-      resolve(`Summary: ${value}`);
+-    });
+-  });
++export async function buildSummary(topic) {
++  const value = await format(topic);
++  return `Summary: ${value}`;
+ }
