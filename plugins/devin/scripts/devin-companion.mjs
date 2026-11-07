@@ -174,8 +174,8 @@ function servedBySelectedModel(observed, selected) {
   return label === name || label.startsWith(`${name} `);
 }
 
-function finishFailure(file, outcome, kind, warnings, modelDrift, effortApplied) {
-  const message = outcome.policyViolation ? `Devin called forbidden tool ${outcome.policyViolation.tool}.` : outcome.selectionError?.message || outcome.setupError || outcome.rpcError?.message || outcome.protocolError || outcome.stderrTail?.trim() || outcome.spawnError?.message || `Devin exited with ${outcome.exitCode ?? outcome.signal ?? "an error"}.`;
+function finishFailure(file, outcome, kind, warnings, modelDrift, effortApplied, timeoutMs) {
+  const message = kind === "timeout" ? `Devin timed out after ${timeoutMs}ms and was terminated.` : outcome.policyViolation ? `Devin called forbidden tool ${outcome.policyViolation.tool}.` : outcome.selectionError?.message || outcome.setupError || outcome.rpcError?.message || outcome.protocolError || outcome.stderrTail?.trim() || outcome.spawnError?.message || `Devin exited with ${outcome.exitCode ?? outcome.signal ?? "an error"}.`;
   return finishSuccessfulJobRecordFile(file, {
     status: "error", finishedAt: nowIso(), exitCode: outcome.exitCode, sessionId: outcome.sessionId,
     requestId: outcome.requestId, resultText: outcome.resultText, resolvedModel: outcome.appliedOptions?.model ?? null, resolvedEffort: outcome.resolvedEffort ?? null, observedModel: outcome.observedModel,
@@ -186,6 +186,7 @@ function finishFailure(file, outcome, kind, warnings, modelDrift, effortApplied)
 
 async function runRecordedJob(record, file) {
   const dataDir = resolveDataDir();
+  const timeoutMs = positiveDuration("DEVIN_COMPANION_TIMEOUT_MS", 540000);
   let outcome;
   let signalExitCode = null;
   let effortApplied = false;
@@ -216,7 +217,7 @@ async function runRecordedJob(record, file) {
     try {
       outcome = await runDevin({ bin: record.devinBuildPath, cwd: record.cwd, env: buildDevinChildEnv({ homeDir, configDir: record.configDir, mode: record.mode }),
         brief, mode: record.mode, resumeSessionId: source?.sessionId, resolveSelection: selection,
-        signal: controller.signal, timeoutMs: positiveDuration("DEVIN_COMPANION_TIMEOUT_MS", 540000),
+        signal: controller.signal, timeoutMs,
         exitGraceMs: positiveDuration("DEVIN_COMPANION_EXIT_GRACE_MS", 15000),
         onSpawn: (child) => updateJobRecordFileWithCurrent(file, (current) => current.status === "running" && current.devinPid === child.pid ? { ...current, devinPidIdentity: getProcessIdentity(child.pid) } : current),
         launchProcess: (launch) => launchRunningJobProcess(file, () => {
@@ -244,7 +245,7 @@ async function runRecordedJob(record, file) {
   }
   if (outcome.stderrTail) appendJobLog(jobLogPath(dataDir, record.cwd, record.id), outcome.stderrTail);
   const kind = outcome.spawnError?.failureKind ?? classifyDevinFailure(outcome);
-  if (kind) return finishFailure(file, outcome, kind, warnings, modelDrift, effortApplied);
+  if (kind) return finishFailure(file, outcome, kind, warnings, modelDrift, effortApplied, timeoutMs);
   const common = { finishedAt: nowIso(), exitCode: outcome.exitCode, sessionId: outcome.sessionId, requestId: outcome.requestId,
     resolvedModel, resolvedEffort: outcome.resolvedEffort ?? null, observedModel: outcome.observedModel, usage: outcome.usage, usageIsIncomplete: outcome.usage == null,
     stopCause: outcome.stopCause, warnings, modelDrift, effortApplied };

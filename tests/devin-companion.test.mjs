@@ -314,6 +314,18 @@ test("auth, quota, policy and permission failures carry typed footers", (t) => {
   }
 });
 
+test("a timed out Devin job records its timeout duration", (t) => {
+  const timeoutMs = 250;
+  const h = harness(t, "hang", { DEVIN_COMPANION_TIMEOUT_MS: String(timeoutMs), DEVIN_COMPANION_EXIT_GRACE_MS: "100" });
+  const result = task(h, ["--json"]);
+  assert.equal(result.status, 1, result.stdout + result.stderr);
+  const record = h.jobs()[0];
+  const message = `Devin timed out after ${timeoutMs}ms and was terminated.`;
+  assert.equal(record.failureKind, "timeout");
+  assert.equal(record.errorMessage, message);
+  assert.equal(JSON.parse(result.stdout).message, message);
+});
+
 test("models and setup expose the family catalog and account plan", (t) => {
   const h = harness(t);
   const models = h.run(["models", "--json"]);
