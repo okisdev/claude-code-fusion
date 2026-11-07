@@ -11,7 +11,7 @@ import { claimParentContextAdvisory } from "../plugins/fusion/scripts/lib/lifecy
 const repoRoot = path.join(import.meta.dirname, "..");
 const script = path.join(repoRoot, "plugins", "fusion", "scripts", "fleet-posture.mjs");
 const LEGACY_CONTEXT = tagMessage("fleet-posture.strict-fleet-reminder", "fleet-default active: a goal that decomposes into three or more independent work packages convenes /fusion:ultra once bootstrap dependencies are resolved; explain narrower execution visibly in the reply.");
-const SESSION_LANES_CONTEXT = tagMessage("fleet-posture.session-lanes-reminder", "fusion lanes ready: codex gpt-6-astra for spec grade and deep review, gpt-6-sol and gpt-6-luna for quick and volume packages, grok under its four roles on the routing table's lane defaults, claude workers for the Claude surface. Independent packages dispatch together in one message; three or more convene /fusion:ultra; a single coherent change stays inline.");
+const SESSION_LANES_CONTEXT = tagMessage("fleet-posture.session-lanes-reminder", "fusion lanes ready: codex gpt-6-astra for spec grade and deep review, gpt-6-sol and gpt-6-luna for quick and volume packages, grok under its four roles on the routing table's lane defaults, cursor under diversity for a model family no other lane carries and under burst for bounded worktree implementation, claude workers for the Claude surface. Independent packages dispatch together in one message; three or more convene /fusion:ultra; a single coherent change stays inline.");
 const advisoryText = (tokens) => `The main loop context is ${Math.round(tokens / 1000)}k tokens and every turn replays it. Finish this wave, then prefer /compact or a fresh session before the next goal.`;
 const advisoryContext = (tokens) => tagMessage("fleet-posture.context-advisory", advisoryText(tokens));
 
@@ -161,7 +161,17 @@ test("session lanes reminder renders the routing table's codex defaults", (t) =>
     models,
     defaults: { codex: { quick: { model: "quick-choice", effort: "high" }, volume: { model: "volume-choice", effort: "low" }, flagship: { model: "flagship-choice", effort: "max" } } }
   }), "utf8");
-  assertContext(run(sandbox, hookInput(sandbox), { FUSION_MODEL_ROUTING: routingFile }), tagMessage("fleet-posture.session-lanes-reminder", "fusion lanes ready: codex flagship-choice for spec grade and deep review, quick-choice and volume-choice for quick and volume packages, grok under its four roles on the routing table's lane defaults, claude workers for the Claude surface. Independent packages dispatch together in one message; three or more convene /fusion:ultra; a single coherent change stays inline."));
+  assertContext(run(sandbox, hookInput(sandbox), { FUSION_MODEL_ROUTING: routingFile }), tagMessage("fleet-posture.session-lanes-reminder", "fusion lanes ready: codex flagship-choice for spec grade and deep review, quick-choice and volume-choice for quick and volume packages, grok under its four roles on the routing table's lane defaults, cursor under diversity for a model family no other lane carries and under burst for bounded worktree implementation, claude workers for the Claude surface. Independent packages dispatch together in one message; three or more convene /fusion:ultra; a single coherent change stays inline."));
+});
+
+test("the session lanes reminder names the selected breadth engine", (t) => {
+  const sandbox = makeSandbox(t);
+  const routingFile = path.join(sandbox.root, "breadth-routing.json");
+  const models = [{ id: "quick-choice", lane: "codex", intelligence: 5, taste: 4, cost: 3, notes: "" }];
+  fs.writeFileSync(routingFile, JSON.stringify({ schemaVersion: 1, updatedAt: "2026-07-04T00:00:00.000Z", costProfile: "", breadth: "devin", models }), "utf8");
+  const context = JSON.parse(run(sandbox, hookInput(sandbox), { FUSION_MODEL_ROUTING: routingFile }).stdout).hookSpecificOutput.additionalContext;
+  assert.match(context, /devin under diversity for a model family no other lane carries and under burst for bounded worktree implementation/);
+  assert.doesNotMatch(context, /cursor under diversity/);
 });
 
 test("strict posture emits the legacy reminder without guard state", (t) => {

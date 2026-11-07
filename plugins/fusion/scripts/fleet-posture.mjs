@@ -14,8 +14,8 @@ const FLEET_MODE_FILE = "fleet-mode";
 const ADDITIONAL_CONTEXT = tagMessage("fleet-posture.strict-fleet-reminder", "fleet-default active: a goal that decomposes into three or more independent work packages convenes /fusion:ultra once bootstrap dependencies are resolved; explain narrower execution visibly in the reply.");
 
 function sessionLanesReminder(env = process.env) {
-  const { flagship, quick, volume } = readRoutingDefaults(env).codex;
-  return tagMessage("fleet-posture.session-lanes-reminder", `fusion lanes ready: codex ${flagship.model} for spec grade and deep review, ${quick.model} and ${volume.model} for quick and volume packages, grok under its four roles on the routing table's lane defaults, claude workers for the Claude surface. Independent packages dispatch together in one message; three or more convene /fusion:ultra; a single coherent change stays inline.`);
+  const { breadth, codex: { flagship, quick, volume } } = readRoutingDefaults(env);
+  return tagMessage("fleet-posture.session-lanes-reminder", `fusion lanes ready: codex ${flagship.model} for spec grade and deep review, ${quick.model} and ${volume.model} for quick and volume packages, grok under its four roles on the routing table's lane defaults, ${breadth} under diversity for a model family no other lane carries and under burst for bounded worktree implementation, claude workers for the Claude surface. Independent packages dispatch together in one message; three or more convene /fusion:ultra; a single coherent change stays inline.`);
 }
 
 function readHookInput() {
