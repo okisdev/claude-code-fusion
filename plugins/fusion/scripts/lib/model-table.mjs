@@ -16,7 +16,7 @@ export const DEFAULT_ROUTING_DEFAULTS = {
   },
   grok: {
     burst: { model: "grok-4.7-build-fast", effort: "low" },
-    independence: { model: "grok-4.7-build-fast", effort: "high" },
+    independence: { model: "grok-4.7-build-fast", effort: "medium" },
     "live-web": { model: "grok-4.7-build-fast", effort: "high" },
     "large-context": { model: "grok-4.6", effort: "medium" }
   },

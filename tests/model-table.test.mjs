@@ -54,7 +54,7 @@ test("Rules table renders scores without Notes and points to config", (t) => {
   assert.match(table, /^\|---\|---\|---\|---:\|---:\|---:\|$/m);
   assert.match(table, /^\| codex \| codex \| openai \| 5 \| 4 \| 5 \|$/m);
   assert.doesNotMatch(table, /primary implementation lane|\| Notes \|/);
-  assert.match(table, /^Lane defaults: codex quick gpt-6-sol@xhigh, volume gpt-6-luna@xhigh, flagship gpt-6-astra@xhigh; grok burst grok-4\.7-build-fast@low, independence grok-4\.7-build-fast@high, live-web grok-4\.7-build-fast@high, large-context grok-4\.6@medium; cursor diversity muse-spark-1\.3@xhigh, burst composer-2\.5@default\.$/m);
+  assert.match(table, /^Lane defaults: codex quick gpt-6-sol@xhigh, volume gpt-6-luna@xhigh, flagship gpt-6-astra@xhigh; grok burst grok-4\.7-build-fast@low, independence grok-4\.7-build-fast@medium, live-web grok-4\.7-build-fast@high, large-context grok-4\.6@medium; cursor diversity muse-spark-1\.3@xhigh, burst composer-2\.5@default\.$/m);
   assert.match(table, /\| grok-fast \| grok \| xai \| 3 \| 3 \| 5 \|\nBreadth engine: Cursor \(cursor\); its briefs go to cursor:cursor-rescue with `cursor-role: diversity` or `cursor-role: burst`, and Devin holds no routing seat\.\nModel notes \(benchmarks, prices, latency\) live in model-routing\.json; `\/fusion:config` shows them\.\n\nLane defaults: [^\n]+\n\nScores feed/);
   assert.match(
     table,
