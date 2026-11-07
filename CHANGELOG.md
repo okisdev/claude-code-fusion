@@ -1,5 +1,27 @@
 # changelog
 
+## 0.0.71
+
+- this release acts on this host's call records since 2026-08-12: 6,172 worker records, 3,290 peer jobs, and 1,076 main sessions.
+- a wrapper whose companion bash claude code moved to the background stays in flight. since 2.1.312 an async subagent's bash moves after 180 seconds whatever its `timeout`, and fusion read the wrapper's first stop as a failed delivery: from 10-28, 76% of wrappers moved, 49% ended as `delivery`, wrappers went from 5 to 8 calls, and the parent's terminal collection blocks rose from 20 to 80 a day. the first stop now records `awaitingBackgroundCommand` with no retry, a notification saying `waiting on its own background work` is not a result, and the rescue agents, the review runner, and the job collector wait for the notification and read the output once. a report relayed while a background child still runs settles at once. the job collector gets 9 turns, because a moved collection takes 7.
+- the dispatch hook stages a peer brief in the companion transport when its write mode is stated, so the wrapper skips `transport-create`, the empty `Read`, and the `Write` that retyped the brief. a natural language brief keeps the old path, because the wrapper still chooses its write default from the words.
+- `Explore` runs on sonnet when the call names no model. 93% of 311 sampled runs inherited opus, at a median of 45 turns; the rule letting a scoped search pass haiku stays.
+- fusion denies a `gpt-6-astra` write brief of 3000 bytes or more unless the latest user message names the model. 58% of 3 to 6 kb briefs and 48% of longer ones timed out against 25% under 3 kb, and the companion's warning had not moved the rate. the rules' `single-flight-fit reason` is replaced by this gate and by `gpt-6.1-sol` at xhigh for larger packages.
+- fusion denies a new launch of an engine for 30 minutes after a `sandbox`, `auth`, or `setup` failure, or a `quota` failure on codex or grok, unless the latest user message names the engine. 34 of 82 such failures were repeats in one session, because the breaker only ran at session start.
+- the inline guard advises on main loop read only streaks at five turns and each doubling, and the rules ask for batched reads. read only turns were 39.5% of main loop token cost since 10-07, and 85% of turns carried one tool call. read, grep, and glob now reach the guard.
+- the parent context advisory also fires at prompt time, because most main loop turns never dispatch. it stays once per threshold across both paths.
+- the narrow wave advisory and its prompt reminder are gone: after three width one waves, 25% widened with the advisory and 33% without it. the narrow wave watch in `/fusion:stats` stays, and the coercion ledger drops its advisory and fleet decline counters.
+- `/fusion:stats` reports how many accepted implementation packages have a credited verification before the verdict. the guard now records a verification whenever it sees one, in every posture; it had recorded one only after inline writes, so a dispatch, verify, settle wave left no evidence at all. the report blocks nothing.
+- codex job events carry `observedAt`, so a timeout can be split between model turns and commands, and a wind down whose local rollout proves no other turn ran between records its usage as the difference from its source job, where all 259 recorded none.
+- the job monitor keeps summaries instead of parsed records, taking one startup scan plus ten polls over 3,000 records from 165 to 94 mib of rss, per session.
+- grok `independence` defaults to effort medium: since 10-08, 9 of 23 runs at high finished, with 7 timeouts and 3 turn limits, against 6 of 7 at low. live web research at high stays, because it finished 86 of 97.
+- a timed out devin job says so instead of `Devin exited with 0.`
+- the grok tested interval moves to `[1.0.14, 1.0.78)` and the verified version to 1.0.77, after a managed consult, write, and review through the companion each ended `state: done` (#75). the same pass adds the grok burst arm to a new lane snapshot: `grok-4.7-build-fast` at low passed 9 of 9 runs on T05, T06, and T09 in about half of composer's wall clock, including T06, where composer passed none.
+- that pass confirmed that grok loads hooks from plugins enabled in `~/.grok/config.toml` and from `~/.grok/hooks/*.json` inside managed runs. the `GROK_CONFIG` overlay does not disable them, so `/grok:setup` now names them.
+- the T01 bench task has one defect again: its eviction loop also unlinked a node `removeTail` had detached, which orphaned the survivors in the fixtures, the solution, and the mutant (#74).
+- five process timing tests stop depending on host load (#83). each now waits on a readiness handshake instead of a fixed window, and the fake grok writes its env and pid files atomically.
+- the rules drop a repeated scoring sentence, and their clock text names the 570 second flight and the 180 second background move instead of the 10 minute bash cap.
+
 ## 0.0.70
 
 - devin jobs record their sessions in the user's own devin session database. the private home held its own `sessions.db`, so every routed devin job was invisible to usage readers and to `devin list`; on two hosts the real database had no session since the engine joined while the private one held 14 and 2. the private home now links `devin/cli/sessions.db` to the real one, as it links the credentials file, and keeps logs and session locks private.
