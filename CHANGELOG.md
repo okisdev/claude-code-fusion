@@ -1,5 +1,11 @@
 # changelog
 
+## 0.0.72
+
+- this release acts on devin's first nine days as the breadth engine on one host: 17 dispatches against 500 for codex and 85 for grok, none refused, so the low count is routing and not a block.
+- the session lanes reminder names the selected breadth engine and its two roles. it listed codex, grok, and claude workers and left breadth out.
+- the rules say a breadth `burst` brief holds one package and carries any issue or PR text inline. devin's only two burst jobs both failed on this: one held four issues and spent its 570 second flight reading without an edit, and one reached for `webfetch` to read an issue because its private home has no `gh` login, which ended the job after 4.6 minutes.
+
 ## 0.0.71
 
 - this release acts on this host's call records since 2026-08-12: 6,172 worker records, 3,290 peer jobs, and 1,076 main sessions.
