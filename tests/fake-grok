@@ -11,7 +11,7 @@
   if (process.argv.includes("--version")) {
     const version = process.env.FAKE_GROK_MODE === "unparseable-version"
       ? "grok unknown"
-      : process.env.FAKE_GROK_VERSION_OUTPUT ?? "grok 1.0.41 (0123456789ab)";
+      : process.env.FAKE_GROK_VERSION_OUTPUT ?? "grok 1.0.77 (0123456789ab)";
     process.stdout.write(`${version}\n`);
     process.exit(0);
   }
@@ -20,6 +20,14 @@
     process.exit(2);
   }
   const grokHome = path.resolve(process.cwd(), process.env.GROK_HOME);
+
+  if (process.argv[2] === "inspect") {
+    if (process.env.FAKE_GROK_INSPECT_FAIL === "1") {
+      process.exit(2);
+    }
+    process.stdout.write(process.env.FAKE_GROK_INSPECT_JSON ?? '{"plugins":[]}');
+    process.exit(0);
+  }
 
   if (process.argv[2] === "doctor") {
     if (process.env.FAKE_GROK_DOCTOR_UNAVAILABLE === "1") {
@@ -118,7 +126,8 @@
     const envFile = process.argv.includes("models") && process.env.FAKE_GROK_MODELS_ENV_FILE
       ? process.env.FAKE_GROK_MODELS_ENV_FILE
       : process.env.FAKE_GROK_ENV_FILE;
-    fs.writeFileSync(envFile, `${JSON.stringify(trackedEnv, null, 2)}\n`, "utf8");
+    fs.writeFileSync(`${envFile}.tmp`, `${JSON.stringify(trackedEnv, null, 2)}\n`, "utf8");
+    fs.renameSync(`${envFile}.tmp`, envFile);
   }
 
   if (process.argv.includes("models")) {
@@ -451,7 +460,8 @@
       stdio: "ignore"
     });
     if (process.env.FAKE_GROK_DESCENDANT_PID_FILE) {
-      fs.writeFileSync(process.env.FAKE_GROK_DESCENDANT_PID_FILE, JSON.stringify({ leader: process.pid, descendant: descendant.pid }), "utf8");
+      fs.writeFileSync(`${process.env.FAKE_GROK_DESCENDANT_PID_FILE}.tmp`, JSON.stringify({ leader: process.pid, descendant: descendant.pid }), "utf8");
+      fs.renameSync(`${process.env.FAKE_GROK_DESCENDANT_PID_FILE}.tmp`, process.env.FAKE_GROK_DESCENDANT_PID_FILE);
     }
     emit({
       text: "FAKE-RESIDUAL-PROCESS-GROUP",

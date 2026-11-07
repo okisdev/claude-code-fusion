@@ -84,10 +84,10 @@ test("removed capabilities are rejected by probes and fail managed-run setup", (
   ]);
 });
 
-test("fake Grok reports the 1.0.41 version format and supports an output override", () => {
+test("fake Grok reports the 1.0.77 version format and supports an output override", () => {
   const defaultVersion = spawnSync(process.execPath, [fakeGrok, "--version"], { encoding: "utf8", env: {} });
   assert.equal(defaultVersion.status, 0, defaultVersion.stderr);
-  assert.equal(defaultVersion.stdout, "grok 1.0.41 (0123456789ab)\n");
+  assert.equal(defaultVersion.stdout, "grok 1.0.77 (0123456789ab)\n");
 
   const overriddenVersion = spawnSync(process.execPath, [fakeGrok, "--version"], {
     encoding: "utf8",
@@ -338,7 +338,38 @@ test("setup reports the injected capability verdict without an extra help probe"
   assert.equal(report.doctorCommand.available, true);
   assert.equal(report.shellEnvironmentPolicy.available, false);
   assert.equal(report.shellEnvironmentPolicy.present, false);
-  assert.deepEqual(readInvocations(sandbox.argsFile), [["--version"], ["doctor", "--help"]]);
+  assert.deepEqual(readInvocations(sandbox.argsFile), [["--version"], ["doctor", "--help"], ["inspect", "--json"]]);
+});
+
+test("setup names enabled plugin hooks and hook files from Grok inspect", (t) => {
+  const sandbox = makeSandbox(t);
+  writeFreshAuth(sandbox);
+  const grokHome = path.join(sandbox.root, "grok-home");
+  const hookDir = path.join(grokHome, "hooks");
+  fs.mkdirSync(hookDir, { recursive: true });
+  fs.writeFileSync(path.join(grokHome, "config.toml"), '[plugins]\nenabled = [\n  "alpha",\n  "beta",\n]\ndisabled = ["beta"]\n');
+  fs.writeFileSync(path.join(hookDir, "local.json"), "{}");
+  fs.writeFileSync(path.join(hookDir, "ignore.txt"), "{}");
+  const inspect = JSON.stringify({ plugins: [
+    { name: "alpha", provides: { hooks: true } },
+    { name: "beta", provides: { hooks: true } },
+    { name: "gamma", provides: { hooks: true } },
+    { name: "plain", provides: { hooks: false } }
+  ] });
+  const env = envFor(sandbox, { FAKE_GROK_INSPECT_JSON: inspect });
+  const result = runCompanion(["setup", "--json"], { cwd: sandbox.workDir, env });
+  assert.equal(result.status, 0, result.stderr);
+  const report = JSON.parse(result.stdout);
+  const step = "Hooks from alpha, local.json run inside managed Grok runs, and Grok has no per run switch for them. Remove a plugin from [plugins].enabled in ~/.grok/config.toml to keep it out.";
+  assert.deepEqual(report.managedRunHooks, { plugins: ["alpha"], hookFiles: ["local.json"] });
+  assert.deepEqual(report.nextSteps, [step]);
+  const rendered = runCompanion(["setup"], { cwd: sandbox.workDir, env });
+  assert.equal(rendered.status, 0, rendered.stderr);
+  assert.ok(rendered.stdout.includes(step));
+  const failed = runCompanion(["setup", "--json"], { cwd: sandbox.workDir, env: { ...env, FAKE_GROK_INSPECT_FAIL: "1" } });
+  assert.equal(failed.status, 0, failed.stderr);
+  assert.equal(JSON.parse(failed.stdout).ready, true);
+  assert.deepEqual(JSON.parse(failed.stdout).managedRunHooks, { plugins: [], hookFiles: [] });
 });
 
 test("setup accepts newer Grok builds with a warning and rejects older or unparseable builds", (t) => {
@@ -346,21 +377,21 @@ test("setup accepts newer Grok builds with a warning and rejects older or unpars
   writeFreshAuth(newerSandbox);
   const newer = runCompanion(["setup", "--json"], {
     cwd: newerSandbox.workDir,
-    env: envFor(newerSandbox, { FAKE_GROK_VERSION_OUTPUT: "grok 1.0.42 (abcdef012345)" })
+    env: envFor(newerSandbox, { FAKE_GROK_VERSION_OUTPUT: "grok 1.0.78 (abcdef012345)" })
   });
   assert.equal(newer.status, 0, newer.stderr);
   const newerReport = JSON.parse(newer.stdout);
   assert.equal(newerReport.ready, true);
-  assert.equal(newerReport.compatibility, "newer than the tested interval (1.0.14 to before 1.0.42)");
-  assert.deepEqual(newerReport.nextSteps, ["Grok CLI version 1.0.42 is newer than the tested interval (1.0.14 to before 1.0.42); run a verification pass."]);
+  assert.equal(newerReport.compatibility, "newer than the tested interval (1.0.14 to before 1.0.78)");
+  assert.deepEqual(newerReport.nextSteps, ["Grok CLI version 1.0.78 is newer than the tested interval (1.0.14 to before 1.0.78); run a verification pass."]);
 
   const newerRendered = runCompanion(["setup"], {
     cwd: newerSandbox.workDir,
-    env: envFor(newerSandbox, { FAKE_GROK_VERSION_OUTPUT: "grok 1.0.42 (abcdef012345)" })
+    env: envFor(newerSandbox, { FAKE_GROK_VERSION_OUTPUT: "grok 1.0.78 (abcdef012345)" })
   });
   assert.equal(newerRendered.status, 0, newerRendered.stderr);
-  assert.match(newerRendered.stdout, /- compatibility: newer than the tested interval \(1\.0\.14 to before 1\.0\.42\)/);
-  assert.match(newerRendered.stdout, /^- Grok CLI version 1\.0\.42 is newer than the tested interval \(1\.0\.14 to before 1\.0\.42\); run a verification pass\.$/m);
+  assert.match(newerRendered.stdout, /- compatibility: newer than the tested interval \(1\.0\.14 to before 1\.0\.78\)/);
+  assert.match(newerRendered.stdout, /^- Grok CLI version 1\.0\.78 is newer than the tested interval \(1\.0\.14 to before 1\.0\.78\); run a verification pass\.$/m);
 
   const olderSandbox = makeSandbox(t);
   writeFreshAuth(olderSandbox);
@@ -371,8 +402,8 @@ test("setup accepts newer Grok builds with a warning and rejects older or unpars
   assert.equal(older.status, 0, older.stderr);
   const olderReport = JSON.parse(older.stdout);
   assert.equal(olderReport.ready, false);
-  assert.equal(olderReport.compatibility, "outside the tested interval (1.0.14 to before 1.0.42)");
-  assert.deepEqual(olderReport.nextSteps, ["Use a Grok CLI version in the tested interval (1.0.14 to before 1.0.42)."]);
+  assert.equal(olderReport.compatibility, "outside the tested interval (1.0.14 to before 1.0.78)");
+  assert.deepEqual(olderReport.nextSteps, ["Use a Grok CLI version in the tested interval (1.0.14 to before 1.0.78)."]);
 
   const unparseableSandbox = makeSandbox(t);
   writeFreshAuth(unparseableSandbox);
@@ -515,7 +546,7 @@ test("setup reports grok doctor as unavailable when the subcommand is missing", 
   const report = JSON.parse(result.stdout);
   assert.equal(report.doctorCommand.available, false);
   assert.equal(report.ready, true);
-  assert.deepEqual(readInvocations(sandbox.argsFile), [["--version"], ["doctor", "--help"]]);
+  assert.deepEqual(readInvocations(sandbox.argsFile), [["--version"], ["doctor", "--help"], ["inspect", "--json"]]);
 
   const rendered = runCompanion(["setup"], {
     cwd: sandbox.workDir,

@@ -70,7 +70,7 @@ function localGrok(sandbox) {
   fs.writeFileSync(file, `#!/usr/bin/env node
 import fs from "node:fs";
 import path from "node:path";
-if (process.argv.includes("--version")) { process.stdout.write("grok 1.0.41 (0123456789ab)\\n"); process.exit(0); }
+if (process.argv.includes("--version")) { process.stdout.write("grok 1.0.77 (0123456789ab)\\n"); process.exit(0); }
 const profile = process.argv[process.argv.indexOf("--sandbox") + 1];
 const home = process.env.GROK_HOME;
 fs.mkdirSync(path.join(home, "sessions"), { recursive: true });

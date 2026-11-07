@@ -77,6 +77,61 @@ function shellEnvironmentPolicyAdvisory(env = process.env, cwd = process.cwd()) 
   };
 }
 
+function configuredPlugins(env = process.env, cwd = process.cwd()) {
+  let config;
+  try {
+    config = fs.readFileSync(resolveGrokConfigPath(env, cwd), "utf8");
+  } catch {
+    return { enabled: [], disabled: [] };
+  }
+  const lists = { enabled: [], disabled: [] };
+  let inPlugins = false;
+  let pending = null;
+  let value = "";
+  for (const line of config.split(/\r?\n/)) {
+    const trimmed = line.trim();
+    if (!pending && /^\[/.test(trimmed)) inPlugins = /^\[plugins\]\s*(?:#.*)?$/.test(trimmed);
+    if (!inPlugins) continue;
+    if (!pending) {
+      const match = /^(enabled|disabled)\s*=\s*(\[.*)$/.exec(trimmed);
+      if (!match) continue;
+      pending = match[1];
+      value = match[2];
+    } else value += `\n${trimmed}`;
+    if (!value.includes("]")) continue;
+    try {
+      lists[pending] = [...value.matchAll(/"((?:\\.|[^"\\])*)"|'([^']*)'/g)].map((item) => item[2] ?? JSON.parse(`"${item[1]}"`));
+    } catch {
+      lists[pending] = [];
+    }
+    pending = null;
+    value = "";
+  }
+  return lists;
+}
+
+function managedRunHooks(bin, available, env = process.env, cwd = process.cwd()) {
+  const empty = { plugins: [], hookFiles: [] };
+  if (!available) return empty;
+  const inspect = spawnSync(bin, ["inspect", "--json"], { encoding: "utf8", timeout: DOCTOR_PROBE_TIMEOUT_MS });
+  if (inspect.error || inspect.status !== 0) return empty;
+  let plugins;
+  try {
+    plugins = JSON.parse(inspect.stdout).plugins;
+  } catch {
+    return empty;
+  }
+  if (!Array.isArray(plugins)) return empty;
+  const { enabled, disabled } = configuredPlugins(env, cwd);
+  const selected = plugins.filter((plugin) => plugin?.provides?.hooks === true && enabled.includes(plugin.name) && !disabled.includes(plugin.name)).map((plugin) => plugin.name);
+  const hookDir = path.join(path.dirname(resolveGrokConfigPath(env, cwd)), "hooks");
+  let hookFiles = [];
+  try {
+    hookFiles = fs.readdirSync(hookDir, { withFileTypes: true }).filter((entry) => (entry.isFile() || entry.isSymbolicLink()) && entry.name.endsWith(".json")).map((entry) => entry.name).sort();
+  } catch {}
+  return { plugins: selected, hookFiles };
+}
+
 function hostEnvironmentAdvisory(env = process.env) {
   try {
     const runtimeSocketSymlinks = runtimeSocketSymlinkEndpoints(runtimeSocketEndpoints({ env }));
@@ -168,6 +223,7 @@ function handleSetup(argv, transport = {}) {
 
   const doctorCommand = doctorCommandAdvisory(bin, available);
   const shellEnvironmentPolicy = shellEnvironmentPolicyAdvisory(process.env);
+  const hooks = managedRunHooks(bin, available, process.env);
   const hostEnvironment = hostEnvironmentAdvisory(process.env);
   const auth = grokAuthStatus(process.env);
 
@@ -218,6 +274,9 @@ function handleSetup(argv, transport = {}) {
   if (auth.stale) {
     nextSteps.push("Run `grok models` once outside the sandbox to refresh the stored Grok token.");
   }
+  if (hooks.plugins.length > 0 || hooks.hookFiles.length > 0) {
+    nextSteps.push(`Hooks from ${[...hooks.plugins, ...hooks.hookFiles].join(", ")} run inside managed Grok runs, and Grok has no per run switch for them. Remove a plugin from [plugins].enabled in ~/.grok/config.toml to keep it out.`);
+  }
 
   const ready = available && capabilities.ready && compatible && hostEnvironment.ready && writable && !quotaCooldown;
   const report = {
@@ -229,6 +288,7 @@ function handleSetup(argv, transport = {}) {
     capabilities,
     doctorCommand,
     shellEnvironmentPolicy,
+    managedRunHooks: hooks,
     hostEnvironment,
     auth,
     dataDir: { path: dataDir, writable, detail: writeDetail },

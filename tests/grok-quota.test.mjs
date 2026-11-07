@@ -212,7 +212,7 @@ test("setup rejects unparseable versions and warns on newer ready builds", (t) =
 
   const newer = makeSandbox(t);
   const setup = runCompanion(["setup", "--json"], {
-    cwd: newer.workDir, env: envFor(newer, { FAKE_GROK_VERSION_OUTPUT: "grok 1.0.42" })
+    cwd: newer.workDir, env: envFor(newer, { FAKE_GROK_VERSION_OUTPUT: "grok 1.0.78" })
   });
   assert.equal(setup.status, 0, setup.stderr);
   const report = JSON.parse(setup.stdout);
@@ -222,5 +222,5 @@ test("setup rejects unparseable versions and warns on newer ready builds", (t) =
 
 test("newer builds execute managed tasks", (t) => {
   const newer = makeSandbox(t);
-  assert.equal(runTask(newer, { FAKE_GROK_VERSION_OUTPUT: "grok 1.0.42" }).status, 0);
+  assert.equal(runTask(newer, { FAKE_GROK_VERSION_OUTPUT: "grok 1.0.78" }).status, 0);
 });

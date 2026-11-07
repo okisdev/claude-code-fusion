@@ -55,7 +55,7 @@ import os from "node:os";
 import path from "node:path";
 if (process.env.FAKE_GROK_ARGS_FILE) fs.appendFileSync(process.env.FAKE_GROK_ARGS_FILE, JSON.stringify(process.argv.slice(2)) + "\\n");
 if (process.argv.includes("--version")) {
-  process.stdout.write("grok 1.0.41 (0123456789ab)\\n");
+  process.stdout.write("grok 1.0.77 (0123456789ab)\\n");
   process.exit(0);
 }
 const sandboxIndex = process.argv.indexOf("--sandbox");
@@ -311,7 +311,7 @@ test("task passes an inline JSON schema and renders structured success", (t) => 
   assert.equal(payload.structuredOutputError, null);
   const [record] = jobRecords(sandbox.dataDir);
   assert.equal(record.request.jsonSchema, taskSchema);
-  assert.equal(record.grokVersion, "1.0.41");
+  assert.equal(record.grokVersion, "1.0.77");
   assert.deepEqual(record.structuredOutput, payload.structuredOutput);
 
   const human = runCompanion(["task", "--json-schema", taskSchema, "complete the task"], {

@@ -936,7 +936,7 @@ export function preflightRuntimeSocketEndpoints({ candidates = runtimeSocketEndp
     const endpoint = symlinks[0];
     throw securityError(
       "sandbox",
-      `Grok strict sandbox (runtime-socket deny policy, 1.0.4 through 1.0.41) refuses to start while ${endpoint} exists as a symlink. ${runtimeSocketRemedy(endpoint, runtimeSocketEngine(endpoint, readlink))}`
+      `Grok strict sandbox (runtime-socket deny policy, 1.0.4 through 1.0.77) refuses to start while ${endpoint} exists as a symlink. ${runtimeSocketRemedy(endpoint, runtimeSocketEngine(endpoint, readlink))}`
     );
   }
   return symlinks;
