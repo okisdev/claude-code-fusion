@@ -12,6 +12,10 @@ export function usageOutcome(state, options) {
   const args = options.args ?? [];
   const resumed = options.resumeThreadId != null || args.includes("resume");
   if (resumed) {
+    const tokenUsage = state.windDownContinuityVerified ? subtractUsage(state.cumulativeTokenUsage, options.windDownSourceUsage) : null;
+    if (tokenUsage) {
+      return { tokenUsage, tokenUsageAvailability: "available", tokenUsageUnavailableReason: null };
+    }
     return { tokenUsage: null, tokenUsageAvailability: "unavailable", tokenUsageUnavailableReason: "resume_continuity_unverifiable" };
   }
   const freshThread = options.freshThread ?? !resumed;

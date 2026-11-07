@@ -146,7 +146,9 @@ for (const chunk of ${JSON.stringify(stderrChunks)}) {
   assert.equal(outcome.eventCount, events.length);
   assert.ok(eventWrites >= 2 && eventWrites <= 3, `event writes: ${eventWrites}`);
   assert.ok(stderrWrites <= 2, `stderr writes: ${stderrWrites}`);
-  assert.equal(fs.readFileSync(files.eventsFile, "utf8"), `${events.join("\n")}\n`);
+  const recorded = fs.readFileSync(files.eventsFile, "utf8").trimEnd().split("\n").map((line) => JSON.parse(line));
+  assert.deepEqual(recorded.map(({ observedAt, ...event }) => event), events.map((line) => JSON.parse(line)));
+  assert.ok(recorded.every(({ observedAt }) => Number.isFinite(Date.parse(observedAt))));
   assert.equal(fs.readFileSync(files.logFile, "utf8"), stderrChunks.join(""));
 });
 

@@ -139,15 +139,13 @@ function boundedObservedText(value, maxBytes) {
 
 function boundedRolloutLines(buffer, headMaxBytes, tailMaxBytes) {
   if (buffer.length <= headMaxBytes + tailMaxBytes) {
-    return completeJsonlLines(buffer);
+    return { lines: completeJsonlLines(buffer), continuityStart: 0 };
   }
   const head = buffer.subarray(0, headMaxBytes);
   const tailStart = Math.max(headMaxBytes, buffer.length - tailMaxBytes);
   const tail = buffer.subarray(tailStart);
-  return [
-    ...completeJsonlLines(head, { dropTrailing: true }),
-    ...completeJsonlLines(tail, { dropLeading: true })
-  ];
+  const headLines = completeJsonlLines(head, { dropTrailing: true });
+  return { lines: [...headLines, ...completeJsonlLines(tail, { dropLeading: true })], continuityStart: headLines.length };
 }
 
 function rolloutLines(file, options = {}) {
@@ -162,7 +160,7 @@ function rolloutLines(file, options = {}) {
         return null;
       }
       const buffer = zlib.zstdDecompressSync(fs.readFileSync(file));
-      return { compressed: true, lines: boundedRolloutLines(buffer, headMaxBytes, tailMaxBytes) };
+      return { compressed: true, ...boundedRolloutLines(buffer, headMaxBytes, tailMaxBytes) };
     } catch {
       return null;
     }
@@ -172,18 +170,13 @@ function rolloutLines(file, options = {}) {
     descriptor = fs.openSync(file, "r");
     const size = fs.fstatSync(descriptor).size;
     if (size <= headMaxBytes + tailMaxBytes) {
-      return { compressed: false, lines: completeJsonlLines(readFileSlice(descriptor, 0, size)) };
+      return { compressed: false, lines: completeJsonlLines(readFileSlice(descriptor, 0, size)), continuityStart: 0 };
     }
     const head = readFileSlice(descriptor, 0, headMaxBytes);
     const tailStart = Math.max(headMaxBytes, size - tailMaxBytes);
     const tail = readFileSlice(descriptor, tailStart, size - tailStart);
-    return {
-      compressed: false,
-      lines: [
-        ...completeJsonlLines(head, { dropTrailing: true }),
-        ...completeJsonlLines(tail, { dropLeading: true })
-      ]
-    };
+    const headLines = completeJsonlLines(head, { dropTrailing: true });
+    return { compressed: false, lines: [...headLines, ...completeJsonlLines(tail, { dropLeading: true })], continuityStart: headLines.length };
   } catch {
     return null;
   } finally {
@@ -202,7 +195,8 @@ export function recoverRolloutObservation(threadId, options = {}) {
     partialResultText: null,
     resolvedEffort: null,
     resolvedModel: null,
-    source: null
+    source: null,
+    windDownContinuityVerified: false
   };
   const file = options.file ?? findRolloutPath(threadId, options.env ?? process.env, options.allowHistoricalScan === true);
   if (!file) {
@@ -214,15 +208,37 @@ export function recoverRolloutObservation(threadId, options = {}) {
     return result;
   }
   result.source = rollout.compressed ? "local_rollout_zst" : "local_rollout";
-  for (const line of rollout.lines) {
+  const sourceUsage = normalizeCumulativeUsage(options.windDownSourceUsage);
+  let lastUsage = null;
+  let startedSinceCount = false;
+  let candidateStarts = 0;
+  for (const [index, line] of rollout.lines.entries()) {
+    if (index === rollout.continuityStart) {
+      lastUsage = null;
+      startedSinceCount = false;
+    }
     let entry;
     try {
       entry = JSON.parse(line);
     } catch {
+      lastUsage = null;
+      startedSinceCount = true;
       continue;
     }
     const payload = entry?.payload;
     const timestamp = Date.parse(entry?.timestamp ?? "");
+    if (index >= rollout.continuityStart && sourceUsage) {
+      if (entry?.type === "event_msg" && payload?.type === "task_started") {
+        if (Number.isFinite(options.notBeforeMs) && Number.isFinite(timestamp) && timestamp >= options.notBeforeMs) {
+          candidateStarts += 1;
+          result.windDownContinuityVerified = candidateStarts === 1 && Boolean(lastUsage && !startedSinceCount && Object.keys(sourceUsage).every((key) => lastUsage[key] === sourceUsage[key]));
+        }
+        startedSinceCount = true;
+      } else if (entry?.type === "event_msg" && payload?.type === "token_count") {
+        lastUsage = normalizeCumulativeUsage(payload.info?.total_token_usage);
+        startedSinceCount = false;
+      }
+    }
     const belongsToExecution = options.notBeforeMs == null || (Number.isFinite(timestamp) && timestamp >= options.notBeforeMs - 5000);
     if (!belongsToExecution) {
       continue;
@@ -261,8 +277,10 @@ export function applyRolloutRecovery(state, { options, env, executionStartedAtMs
       allowHistoricalScan: options.resumeThreadId != null,
       env,
       notBeforeMs: executionStartedAtMs,
-      resultMaxBytes
+      resultMaxBytes,
+      windDownSourceUsage: options.windDownSourceUsage
     });
+    state.windDownContinuityVerified = recovered.windDownContinuityVerified;
     state.rolloutRecoveryStatus = recovered.matchedTurn ? "recovered" : recovered.found ? "stale" : "not_found";
     state.resolvedModel = recovered.resolvedModel;
     state.resolvedEffort = recovered.resolvedEffort;

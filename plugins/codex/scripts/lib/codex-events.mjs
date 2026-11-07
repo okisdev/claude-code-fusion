@@ -75,6 +75,20 @@ export function signalExitCode(signal) {
   return Number.isInteger(number) ? 128 + number : 1;
 }
 
+export function observedEventLine(value, observedAt = new Date().toISOString()) {
+  let event = value;
+  if (typeof event === "string") {
+    try {
+      event = JSON.parse(event);
+    } catch {
+      event = { raw: event };
+    }
+  }
+  return JSON.stringify(event && typeof event === "object" && !Array.isArray(event)
+    ? { ...event, observedAt }
+    : { raw: event, observedAt });
+}
+
 export function outputPaths(options) {
   const paths = [options.eventsFile, options.logFile].filter((value) => typeof value === "string" && value);
   for (const file of paths) {
@@ -231,14 +245,14 @@ export function validateEvent(state, event) {
   }
 }
 
-async function processLine(ctx, lineBuffer) {
+async function processLine(ctx, lineBuffer, observedAt) {
   const { state, writeEventLine, requestTermination, options } = ctx;
   const line = (lineBuffer.at(-1) === 13 ? lineBuffer.subarray(0, -1) : lineBuffer).toString("utf8");
-  writeEventLine(lineBuffer);
   let event;
   try {
     event = JSON.parse(line);
   } catch {
+    writeEventLine(Buffer.from(observedEventLine({ raw: line }, observedAt)));
     recordProtocolError(state, `Codex emitted malformed JSONL at event ${state.eventCount + 1}.`);
     void requestTermination();
     try {
@@ -248,6 +262,7 @@ async function processLine(ctx, lineBuffer) {
     }
     return;
   }
+  writeEventLine(Buffer.from(observedEventLine(event, observedAt)));
   validateEvent(state, event);
   if (state.protocolError || state.resourceError || state.policyViolation) {
     void requestTermination();
@@ -273,6 +288,7 @@ export async function parseCodexEventStream(ctx) {
   let skippingOversizedEvent = false;
   try {
     for await (const rawChunk of child.stdout) {
+      const observedAt = new Date().toISOString();
       const chunk = Buffer.from(rawChunk);
       let offset = 0;
       while (offset < chunk.length) {
@@ -308,7 +324,7 @@ export async function parseCodexEventStream(ctx) {
         if (newline === -1) {
           break;
         }
-        await processLine(ctx, Buffer.concat(segments, segmentBytes));
+        await processLine(ctx, Buffer.concat(segments, segmentBytes), observedAt);
         segments = [];
         segmentBytes = 0;
         offset = newline + 1;
@@ -320,7 +336,7 @@ export async function parseCodexEventStream(ctx) {
     }
   }
   if (segmentBytes > 0) {
-    await processLine(ctx, Buffer.concat(segments, segmentBytes));
+    await processLine(ctx, Buffer.concat(segments, segmentBytes), new Date().toISOString());
   }
 }
 

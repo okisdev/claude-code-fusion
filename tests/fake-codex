@@ -4,6 +4,7 @@ import fs from "node:fs";
 import { spawn } from "node:child_process";
 
 const args = process.argv.slice(2);
+const mode = process.env.FAKE_CODEX_MODE || "completed";
 const STDIN_DRAIN_TIMEOUT_MS = 3000;
 const GROUP_CHILD_READY_TIMEOUT_MS = 3000;
 const GROUP_CHILD_READY_POLL_MS = 25;
@@ -84,7 +85,9 @@ if (Number.isFinite(delayMs) && delayMs > 0) {
 }
 
 let prompt = "";
-if (process.env.FAKE_CODEX_CLOSE_STDIN === "true") {
+if (mode === "interrupt-cleanup") {
+  process.stdin.resume();
+} else if (process.env.FAKE_CODEX_CLOSE_STDIN === "true") {
   process.stdin.destroy();
   await new Promise((resolve) => setTimeout(resolve, 2000));
 } else {
@@ -98,7 +101,6 @@ if (process.env.FAKE_CODEX_STDIN_FILE) {
   fs.writeFileSync(process.env.FAKE_CODEX_STDIN_FILE, prompt);
 }
 
-const mode = process.env.FAKE_CODEX_MODE || "completed";
 const threadId = process.env.FAKE_CODEX_THREAD_ID || "thread-123";
 const usage = process.env.FAKE_CODEX_USAGE
   ? JSON.parse(process.env.FAKE_CODEX_USAGE)
