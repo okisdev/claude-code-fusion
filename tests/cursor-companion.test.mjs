@@ -437,10 +437,10 @@ test("SIGTERM forwards cancellation from a foreground companion", async (t) => {
   const h = harness(t, { FAKE_CURSOR_SCENARIO: "hang" });
   const child = spawn(process.execPath, [companion, "task", "--model", "composer-2.5", "--", "wait"], { cwd: h.cwd, env: h.env, stdio: ["ignore", "pipe", "pipe"] });
   t.after(() => { if (child.exitCode === null) child.kill("SIGKILL"); });
-  const deadline = Date.now() + 10000;
-  while (!h.jobs()[0]?.cursorPid && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 25));
+  const deadline = Date.now() + 30000;
+  while ((!h.jobs()[0]?.cursorPidIdentity || !h.invocations().length) && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 25));
   const record = h.jobs()[0];
-  assert.ok(record?.cursorPid);
+  assert.ok(record?.cursorPidIdentity && h.invocations().length, "Cursor did not reach init before SIGTERM");
   child.kill("SIGTERM");
   const code = await new Promise((resolve) => child.once("close", resolve));
   assert.equal(code, 143);
