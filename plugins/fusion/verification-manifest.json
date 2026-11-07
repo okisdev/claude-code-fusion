@@ -146,5 +146,33 @@
     "suites": [
       "tests/devin-*.test.mjs"
     ]
+  },
+  {
+    "paths": [
+      "plugins/fusion/scripts/lib/lifecycle/**/*.mjs"
+    ],
+    "suites": [
+      "tests/fusion-worker-lifecycle.test.mjs",
+      "tests/dispatch-gates.test.mjs",
+      "tests/wrapper-prestage.test.mjs"
+    ]
+  },
+  {
+    "paths": [
+      "plugins/fusion/scripts/lib/guard/**/*.mjs"
+    ],
+    "suites": [
+      "tests/inline-delegation-guard.test.mjs"
+    ]
+  },
+  {
+    "paths": [
+      "plugins/fusion/scripts/lib/stats/**/*.mjs"
+    ],
+    "suites": [
+      "tests/fusion-stats.test.mjs",
+      "tests/fusion-stats-modules.test.mjs",
+      "tests/stats.test.mjs"
+    ]
   }
 ]

@@ -150,7 +150,7 @@ function transcriptEntryContent(entry) {
   return Array.isArray(entry?.content) ? entry.content : [];
 }
 
-function boundedTranscriptTailText(transcriptPath) {
+function boundedTranscriptTail(transcriptPath) {
   if (typeof transcriptPath !== "string" || !path.isAbsolute(transcriptPath)) {
     return null;
   }
@@ -170,22 +170,7 @@ function boundedTranscriptTailText(transcriptPath) {
       const firstNewline = text.indexOf("\n");
       text = firstNewline === -1 ? "" : text.slice(firstNewline + 1);
     }
-    const parts = [];
-    for (const line of text.split("\n")) {
-      if (!line.trim() || Buffer.byteLength(line) > TASK_NOTIFICATION_MAX_LINE_BYTES) {
-        continue;
-      }
-      try {
-        for (const block of transcriptEntryContent(JSON.parse(line))) {
-          if (block?.type === "text" && typeof block.text === "string") {
-            parts.push(block.text);
-          }
-        }
-      } catch {
-        void 0;
-      }
-    }
-    return parts.length > 0 ? parts.join("\n") : text;
+    return text;
   } catch {
     return null;
   } finally {
@@ -197,70 +182,103 @@ function boundedTranscriptTailText(transcriptPath) {
       }
     }
   }
+}
+
+function boundedTranscriptTailText(transcriptPath) {
+  const text = boundedTranscriptTail(transcriptPath);
+  if (text == null) {
+    return null;
+  }
+  const parts = [];
+  for (const line of text.split("\n")) {
+    if (!line.trim() || Buffer.byteLength(line) > TASK_NOTIFICATION_MAX_LINE_BYTES) {
+      continue;
+    }
+    try {
+      for (const block of transcriptEntryContent(JSON.parse(line))) {
+        if (block?.type === "text" && typeof block.text === "string") {
+          parts.push(block.text);
+        }
+      }
+    } catch {
+      void 0;
+    }
+  }
+  return parts.length > 0 ? parts.join("\n") : text;
+}
+
+function pendingBackgroundCommandFromTranscript(transcriptPath, awaitingBackgroundCommand = null, unreadableFallback = null) {
+  const text = boundedTranscriptTail(transcriptPath);
+  if (text == null) {
+    return awaitingBackgroundCommand ?? unreadableFallback;
+  }
+  const lines = text.split("\n");
+  const notified = new Set();
+  for (let index = lines.length - 1; index >= 0; index -= 1) {
+    const line = lines[index];
+    if (!line.trim() || Buffer.byteLength(line) > TASK_NOTIFICATION_MAX_LINE_BYTES) {
+      continue;
+    }
+    try {
+      const entry = JSON.parse(line);
+      if (entry?.type !== "user") {
+        continue;
+      }
+      const result = entry.toolUseResult;
+      const taskId = result?.backgroundTaskId;
+      const moved = result?.timedOutAfterMs != null || result?.backgroundedToDeliverMessage === true || result?.backgroundedByTurnAbort === true || result?.backgroundedByUser === true;
+      if (moved && typeof taskId === "string" && taskId) {
+        return notified.has(taskId) ? null : taskId;
+      }
+      for (const notification of taskNotificationsFromTranscriptLine(line)) {
+        notified.add(notification.taskId);
+      }
+    } catch {
+      void 0;
+    }
+  }
+  return awaitingBackgroundCommand && !notified.has(awaitingBackgroundCommand) ? awaitingBackgroundCommand : null;
 }
 
 function finalAssistantTextFromTranscript(transcriptPath) {
-  if (typeof transcriptPath !== "string" || !path.isAbsolute(transcriptPath)) {
+  const text = boundedTranscriptTail(transcriptPath);
+  if (text == null) {
     return null;
   }
-  let descriptor;
-  try {
-    descriptor = fs.openSync(transcriptPath, "r");
-    const stat = fs.fstatSync(descriptor);
-    if (!stat.isFile() || stat.size === 0) {
-      return null;
+  const lines = text.split("\n");
+  for (let index = lines.length - 1; index >= 0; index -= 1) {
+    const line = lines[index].replace(/\r$/, "");
+    if (!line.trim() || Buffer.byteLength(line) > TASK_NOTIFICATION_MAX_LINE_BYTES) {
+      continue;
     }
-    const bytesToRead = Math.min(TASK_NOTIFICATION_FINAL_SCAN_MAX_BYTES, stat.size);
-    const start = stat.size - bytesToRead;
-    const buffer = Buffer.allocUnsafe(bytesToRead);
-    const bytesRead = fs.readSync(descriptor, buffer, 0, buffer.length, start);
-    let text = buffer.subarray(0, bytesRead).toString("utf8");
-    if (start > 0) {
-      const firstNewline = text.indexOf("\n");
-      text = firstNewline === -1 ? "" : text.slice(firstNewline + 1);
+    let entry;
+    try {
+      entry = JSON.parse(line);
+    } catch {
+      continue;
     }
-    const lines = text.split("\n");
-    for (let index = lines.length - 1; index >= 0; index -= 1) {
-      const line = lines[index].replace(/\r$/, "");
-      if (!line.trim() || Buffer.byteLength(line) > TASK_NOTIFICATION_MAX_LINE_BYTES) {
-        continue;
-      }
-      let entry;
-      try {
-        entry = JSON.parse(line);
-      } catch {
-        continue;
-      }
-      const content = transcriptEntryContent(entry);
-      if (entry?.type === "assistant") {
-        if (content.some((block) => block?.type === "tool_use")) {
-          return null;
-        }
-        const blocks = content.filter((block) => block?.type === "text" && typeof block.text === "string" && block.text.length > 0).map((block) => block.text);
-        if (blocks.length > 0) {
-          return blocks.join("\n");
-        }
-      } else if (entry?.type === "user" && (entry.toolUseResult != null || content.some((block) => block?.type === "tool_result"))) {
+    const content = transcriptEntryContent(entry);
+    if (entry?.type === "assistant") {
+      if (content.some((block) => block?.type === "tool_use")) {
         return null;
       }
-    }
-    return null;
-  } catch {
-    return null;
-  } finally {
-    if (descriptor != null) {
-      try {
-        fs.closeSync(descriptor);
-      } catch {
-        void 0;
+      const blocks = content.filter((block) => block?.type === "text" && typeof block.text === "string" && block.text.length > 0).map((block) => block.text);
+      if (blocks.length > 0) {
+        return blocks.join("\n");
       }
+    } else if (entry?.type === "user" && (entry.toolUseResult != null || content.some((block) => block?.type === "tool_result"))) {
+      return null;
     }
   }
+  return null;
 }
 
 function taskNotificationTransition(record, notification, now, env) {
+  if (notification.notificationSummary?.includes("waiting on its own background work") && record.transportStatus !== "ready_uncollected") {
+    return record;
+  }
   const { status } = notification;
-  const refreshed = refreshWorkerTranscript(record, record.transcriptPath);
+  const refreshed = { ...refreshWorkerTranscript(record, record.transcriptPath), awaitingBackgroundCommand: undefined };
   if (SUCCESSFUL_TASK_NOTIFICATION_STATUSES.has(status)) {
     const finalText = finalAssistantTextFromTranscript(refreshed.transcriptPath);
     const peerIdentity = PEER_JOB_FOOTER_AGENTS.has(refreshed.agentType)
@@ -338,7 +356,8 @@ function reconcileTaskNotifications(input, env) {
     }
     const now = new Date().toISOString();
     for (const [taskId, notification] of scanned.notifications) {
-      for (const record of candidates.filter((candidate) => [candidate.backgroundTaskId, candidate.agentId].includes(taskId))) {
+      const interim = notification.notificationSummary?.includes("waiting on its own background work");
+      for (const record of candidates.filter((candidate) => [candidate.backgroundTaskId, candidate.agentId].includes(taskId) && (!interim || candidate.transportStatus === "ready_uncollected"))) {
         const stamped = updateLifecycleWorkerRecord(record.taskId, env, (current) => {
           if (!current || current.sessionId !== input.session_id || WORKER_TERMINAL_STATUSES.has(current.transportStatus) || ![current.backgroundTaskId, current.agentId].includes(taskId) || notification.byteOffset <= (current.continuationNotificationFloor ?? 0)) {
             return null;
@@ -373,4 +392,4 @@ function reconcileTaskNotifications(input, env) {
 }
 
 
-export { taskNotificationTextParts, notificationField, taskNotificationsFromTranscriptLine, taskNotificationScanOffset, initialTaskNotificationScanOffset, parentTranscriptPathForTaskNotifications, scanTaskNotifications, transcriptEntryContent, boundedTranscriptTailText, finalAssistantTextFromTranscript, taskNotificationTransition, reconcileTaskNotifications };
+export { taskNotificationTextParts, notificationField, taskNotificationsFromTranscriptLine, taskNotificationScanOffset, initialTaskNotificationScanOffset, parentTranscriptPathForTaskNotifications, scanTaskNotifications, transcriptEntryContent, boundedTranscriptTailText, pendingBackgroundCommandFromTranscript, finalAssistantTextFromTranscript, taskNotificationTransition, reconcileTaskNotifications };

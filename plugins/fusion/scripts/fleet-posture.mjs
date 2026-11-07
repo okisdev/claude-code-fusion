@@ -7,10 +7,11 @@ import { isStrictPosture, resolveFusionDataDir } from "./lib/posture.mjs";
 import { readRoutingDefaults } from "./lib/model-table.mjs";
 import { normalizeSessionId } from "./inline-delegation-guard.mjs";
 import { tagMessage } from "./lib/user-messages.mjs";
+import { parentContextTokens, claimParentContextAdvisory } from "./lib/lifecycle/dispatch.mjs";
 
 const FLEET_MODE_ENV = "FUSION_FLEET_MODE";
 const FLEET_MODE_FILE = "fleet-mode";
-const ADDITIONAL_CONTEXT = tagMessage("fleet-posture.strict-fleet-reminder", "fleet-default active: a goal that decomposes into three or more independent work packages convenes /fusion:ultra once bootstrap dependencies are resolved; narrower execution states `fleet-decline: <reason>` visibly in the reply.");
+const ADDITIONAL_CONTEXT = tagMessage("fleet-posture.strict-fleet-reminder", "fleet-default active: a goal that decomposes into three or more independent work packages convenes /fusion:ultra once bootstrap dependencies are resolved; explain narrower execution visibly in the reply.");
 
 function sessionLanesReminder(env = process.env) {
   const { flagship, quick, volume } = readRoutingDefaults(env).codex;
@@ -69,20 +70,32 @@ function claimReminder(input, markerDirectory, env = process.env) {
 }
 
 function main() {
-  if (!fleetEnabled()) {
-    return;
-  }
   const input = readHookInput();
   if (!input) {
     return;
   }
-  if (isStrictPosture()) {
-    process.stdout.write(`${JSON.stringify({ hookSpecificOutput: { hookEventName: "UserPromptSubmit", additionalContext: ADDITIONAL_CONTEXT } })}\n`);
-    return;
+  const contexts = [];
+  try {
+    const advisory = claimParentContextAdvisory(input.session_id, parentContextTokens(input.transcript_path), process.env);
+    if (advisory) {
+      contexts.push(tagMessage("fleet-posture.context-advisory", advisory));
+    }
+  } catch {
+    void 0;
   }
-  if (claimReminder(input, "session-lanes-reminders")) {
-    process.stdout.write(`${JSON.stringify({ hookSpecificOutput: { hookEventName: "UserPromptSubmit", additionalContext: sessionLanesReminder() } })}\n`);
-    return;
+  if (fleetEnabled()) {
+    if (isStrictPosture()) {
+      contexts.unshift(ADDITIONAL_CONTEXT);
+    } else {
+      try {
+        if (claimReminder(input, "session-lanes-reminders")) contexts.unshift(sessionLanesReminder());
+      } catch {
+        void 0;
+      }
+    }
+  }
+  if (contexts.length) {
+    process.stdout.write(`${JSON.stringify({ hookSpecificOutput: { hookEventName: "UserPromptSubmit", additionalContext: contexts.join("\n\n") } })}\n`);
   }
 }
 

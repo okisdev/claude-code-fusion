@@ -1,0 +1,55 @@
+diff --git a/csv-parser/index.js b/csv-parser/index.js
+index 92cb4c1..e25ce4a 100644
+--- a/csv-parser/index.js
++++ b/csv-parser/index.js
+@@ -1,3 +1,25 @@
+ export function parseCsvLine(line) {
+-  return line.split(",").map((field) => field.trim());
++  const fields = [];
++  let current = "";
++  let inQuotes = false;
++
++  for (let i = 0; i < line.length; i++) {
++    const char = line[i];
++    if (char === '"') {
++      if (inQuotes && line[i + 1] === '"') {
++        current += '"';
++        i++;
++      } else {
++        inQuotes = !inQuotes;
++      }
++    } else if (char === "," && !inQuotes) {
++      fields.push(current.trim());
++      current = "";
++    } else {
++      current += char;
++    }
++  }
++
++  fields.push(current.trim());
++  return fields;
+ }
+diff --git a/duration-formatter/index.js b/duration-formatter/index.js
+index 5a94f9a..2ae7b7c 100644
+--- a/duration-formatter/index.js
++++ b/duration-formatter/index.js
+@@ -1,6 +1,6 @@
+ export function formatDuration(totalSeconds) {
+   const seconds = Math.max(0, Math.trunc(totalSeconds));
+-  const minutes = Math.round(seconds / 60);
+-  const remainingSeconds = seconds - minutes * 60;
++  const minutes = Math.floor(seconds / 60);
++  const remainingSeconds = seconds % 60;
+   return minutes > 0 ? `${minutes}m ${remainingSeconds}s` : `${remainingSeconds}s`;
+ }
+diff --git a/path-matcher/index.js b/path-matcher/index.js
+index 577fa17..5d08dca 100644
+--- a/path-matcher/index.js
++++ b/path-matcher/index.js
+@@ -1,5 +1,5 @@
+ export function matchesPath(pattern, candidate) {
+   const escaped = pattern.replace(/[|\\{}()[\]^$+?.]/g, "\\$&");
+-  const source = escaped.replaceAll("*", ".*");
++  const source = escaped.replaceAll("*", "[^/]*");
+   return new RegExp(`^${source}$`).test(candidate);
+ }

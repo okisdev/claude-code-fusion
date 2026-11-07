@@ -155,7 +155,7 @@ test("an in-window quota failure prints a grok breaker advisory", (t) => {
 });
 
 test("grok breaker version advice reports only a contract drift", (t) => {
-  assert.strictEqual(verifiedGrokVersion, "1.0.41");
+  assert.strictEqual(verifiedGrokVersion, "1.0.77");
   const changed = makeSandbox(t);
   writeRecord(jobFile(path.join(changed.grokData, "state"), "workspace", "changed"), {
     status: "error",

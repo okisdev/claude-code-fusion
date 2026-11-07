@@ -3,6 +3,7 @@ import { spawn, spawnSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { Readable } from "node:stream";
 import test from "node:test";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import * as zlib from "node:zlib";
@@ -29,7 +30,10 @@ import {
   terminateProcessTree,
   terminateProcessTreeSync
 } from "../plugins/codex/scripts/lib/codex-exec.mjs";
-import { failureOutcome } from "../plugins/codex/scripts/lib/codex-outcome.mjs";
+import { failureOutcome, usageOutcome } from "../plugins/codex/scripts/lib/codex-outcome.mjs";
+import { applyRolloutRecovery } from "../plugins/codex/scripts/lib/codex-rollout.mjs";
+import { observedEventLine, parseCodexEventStream } from "../plugins/codex/scripts/lib/codex-events.mjs";
+import { appendJobEvent, createJobRecord, jobFilePath, writeJobRecordFile } from "../plugins/codex/scripts/lib/state.mjs";
 import {
   envFor as companionEnvFor,
   jobRecords as companionJobRecords,
@@ -87,7 +91,7 @@ async function runFixture(t, mode, options = {}) {
     FAKE_CODEX_MODE: mode,
     FAKE_CODEX_STDIN_FILE: files.stdinFile,
     FAKE_CODEX_TERM_FILE: files.termFile,
-    ...(options.waitForReady ? { FAKE_CODEX_READY_FILE: files.readyFile } : {}),
+    ...(options.waitForReady || options.readyBeforeTimeout ? { FAKE_CODEX_READY_FILE: files.readyFile } : {}),
     ...options.env
   };
   const resumeThreadId = options.resumeThreadId;
@@ -116,9 +120,21 @@ async function runFixture(t, mode, options = {}) {
     promptMaxBytes: options.promptMaxBytes,
     resultMaxBytes: options.resultMaxBytes,
     cumulativeUsageBaseline: options.cumulativeUsageBaseline,
+    windDownSourceUsage: options.windDownSourceUsage,
     freshThread: options.freshThread,
     signal: options.signal,
-    onSpawnAttempt: options.onSpawnAttempt,
+    onSpawnAttempt: (pid) => {
+      if (options.readyBeforeTimeout) {
+        const deadline = Date.now() + LOAD_TOLERANT_WAIT_TIMEOUT_MS;
+        const pause = new Int32Array(new SharedArrayBuffer(4));
+        while (!fs.existsSync(files.readyFile)) {
+          if (Date.now() >= deadline) throw new Error("Timed out waiting for Codex readiness before starting its timeout.");
+          Atomics.wait(pause, 0, 0, LOAD_TOLERANT_POLL_INTERVAL_MS);
+        }
+        assert.equal(fs.readFileSync(files.readyFile, "utf8"), "ready");
+      }
+      options.onSpawnAttempt?.(pid);
+    },
     onSpawn: async (...args) => {
       if (options.waitForReady) {
         await waitForFile(files.readyFile);
@@ -257,7 +273,7 @@ test("a persisted leader identity cannot authorize signaling a leaderless proces
     return;
   }
   const files = fixture(t);
-  const leader = spawn(process.execPath, ["-e", `const { spawn } = require("node:child_process"); const fs = require("node:fs"); const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" }); fs.writeFileSync(${JSON.stringify(files.childPidFile)}, String(child.pid)); setInterval(() => {}, 1000);`], {
+  const leader = spawn(process.execPath, ["-e", `const { spawn } = require("node:child_process"); spawn(process.execPath, ["-e", ${JSON.stringify(`require("node:fs").writeFileSync(${JSON.stringify(files.childPidFile)}, String(process.pid)); setInterval(() => {}, 1000);`)}], { stdio: "ignore" }); setInterval(() => {}, 1000);`], {
     detached: true,
     stdio: "ignore"
   });
@@ -870,6 +886,64 @@ test("unknown valid events remain in the raw ledger and are forward compatible",
   assert.match(raw, /"type":"future_item"/);
 });
 
+test("persisted event lines receive timestamps without changing event payloads", async (t) => {
+  const before = Date.now();
+  const { files, outcome } = await runFixture(t, "completed");
+  const after = Date.now();
+  assert.equal(outcome.status, "done");
+  const events = fs.readFileSync(files.eventsFile, "utf8").trim().split("\n").map((line) => JSON.parse(line));
+  assert.equal(events.length, outcome.eventCount);
+  assert.deepEqual(events.map(({ type }) => type), ["thread.started", "turn.started", "item.completed", "turn.completed"]);
+  for (const event of events) {
+    assert.match(event.observedAt, /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z$/);
+    assert.ok(Date.parse(event.observedAt) >= before && Date.parse(event.observedAt) <= after);
+  }
+});
+
+test("event serialization timestamps malformed lines and replaces upstream timestamps", () => {
+  const observedAt = "2026-11-07T00:00:00.000Z";
+  assert.deepEqual(JSON.parse(observedEventLine('{"type":"future.event","observedAt":"upstream"}', observedAt)),
+    { type: "future.event", observedAt });
+  assert.deepEqual(JSON.parse(observedEventLine("{malformed", observedAt)), { raw: "{malformed", observedAt });
+});
+
+test("lines in one received chunk keep their receive time across a slow checkpoint", async () => {
+  let releaseCheckpoint;
+  let enterCheckpoint;
+  const checkpointEntered = new Promise((resolve) => { enterCheckpoint = resolve; });
+  const checkpointRelease = new Promise((resolve) => { releaseCheckpoint = resolve; });
+  const persisted = [];
+  const pending = parseCodexEventStream({
+    child: { stdout: Readable.from([Buffer.from('{"type":"thread.started","thread_id":"thread-1"}\n{"type":"turn.started"}\n')]) },
+    state: { eventCount: 0, diagnostics: [], threadStarted: false, turnStarted: false, terminalEvent: null },
+    spawnCheckpointPromise: Promise.resolve(),
+    eventLineMaxBytes: 1024,
+    writeEventLine: (line) => persisted.push(JSON.parse(line)),
+    requestTermination: () => {},
+    options: { onCheckpoint: async ({ event }) => {
+      if (event?.type === "thread.started") {
+        enterCheckpoint();
+        await checkpointRelease;
+      }
+    } }
+  });
+  await checkpointEntered;
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  releaseCheckpoint();
+  await pending;
+  assert.deepEqual(persisted.map(({ type }) => type), ["thread.started", "turn.started"]);
+  assert.equal(persisted[0].observedAt, persisted[1].observedAt);
+});
+
+test("job event appends stamp object and JSON string inputs", (t) => {
+  const files = fixture(t);
+  appendJobEvent(files.eventsFile, { type: "thread.started", thread_id: "thread-1" });
+  appendJobEvent(files.eventsFile, '{"type":"turn.started"}');
+  const events = fs.readFileSync(files.eventsFile, "utf8").trim().split("\n").map((line) => JSON.parse(line));
+  assert.deepEqual(events.map(({ type }) => type), ["thread.started", "turn.started"]);
+  for (const event of events) assert.ok(Number.isFinite(Date.parse(event.observedAt)));
+});
+
 test("raw event ledgers retain a valid bounded prefix without affecting protocol parsing", async (t) => {
   const { files, outcome } = await runFixture(t, "completed", { eventsMaxBytes: 100 });
   assert.equal(outcome.status, "done");
@@ -1187,8 +1261,8 @@ test("timeout stops after INT when Codex gracefully reaps its group child", asyn
   }
   const { files, outcome } = await runFixture(t, "interrupt-cleanup", {
     timeoutMs: SHORT_TIMEOUT_MS,
-    terminationGraceMs: SHORT_TERMINATION_GRACE_MS,
-    waitForReady: true
+    terminationGraceMs: TIMEOUT_TEST_TERMINATION_GRACE_MS,
+    readyBeforeTimeout: true
   });
   const childPid = Number(fs.readFileSync(files.childPidFile, "utf8"));
   t.after(() => {
@@ -1228,17 +1302,44 @@ test("timeout escalates from INT through TERM to KILL when Codex ignores INT and
 
 test("incomplete timeout cleanup remains nonterminal with process evidence", async (t) => {
   const startedAt = Date.now();
-  const { outcome } = await runFixture(t, "inherited-pipe", {
-    timeoutMs: 2000,
-    terminationGraceMs: 50,
-    waitForReady: true
-  });
-  assert.equal(outcome.status, "running");
-  assert.equal(outcome.failureKind, "timeout");
-  assert.equal(outcome.cleanupComplete, false);
-  assert.ok(Number.isInteger(outcome.pid));
-  assert.ok(outcome.pidIdentity);
-  assert.ok(Date.now() - startedAt < LOAD_TOLERANT_WAIT_TIMEOUT_MS);
+  const files = fixture(t);
+  try {
+    const { outcome } = await runFixture(t, "inherited-pipe", {
+      files,
+      script: scriptedCodex(`
+const { spawn } = await import("node:child_process");
+const fs = await import("node:fs");
+const holder = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], {
+  detached: true,
+  stdio: ["ignore", process.stdout, process.stderr]
+});
+fs.writeFileSync(process.env.FAKE_CODEX_CHILD_PID_FILE, String(holder.pid));
+holder.unref();
+fs.writeFileSync(process.env.FAKE_CODEX_READY_FILE, "ready");
+setInterval(() => {}, 1000);
+`),
+      timeoutMs: 2000,
+      terminationGraceMs: 50,
+      waitForReady: true
+    });
+    assert.equal(outcome.status, "running");
+    assert.equal(outcome.failureKind, "timeout");
+    assert.equal(outcome.cleanupComplete, false);
+    assert.ok(Number.isInteger(outcome.pid));
+    assert.ok(outcome.pidIdentity);
+    assert.ok(Date.now() - startedAt < LOAD_TOLERANT_WAIT_TIMEOUT_MS);
+  } finally {
+    if (fs.existsSync(files.childPidFile)) {
+      const pid = Number(fs.readFileSync(files.childPidFile, "utf8"));
+      if (Number.isInteger(pid) && pid > 1) {
+        try {
+          process.kill(pid, "SIGKILL");
+        } catch (error) {
+          if (error.code !== "ESRCH") throw error;
+        }
+      }
+    }
+  }
 });
 
 test("stderr is kept separate from JSONL and bounded to the configured tail", async (t) => {
@@ -1277,6 +1378,133 @@ test("resumed cumulative usage is unavailable without provable thread continuity
   assert.equal(outcome.tokenUsage, null);
   assert.equal(outcome.tokenUsageAvailability, "unavailable");
   assert.equal(outcome.tokenUsageUnavailableReason, "resume_continuity_unverifiable");
+});
+
+const windDownSourceUsage = { inputTokens: 70, cachedInputTokens: 20, outputTokens: 10, reasoningOutputTokens: 4, totalTokens: 80 };
+const windDownFinalUsage = { input_tokens: 120, cached_input_tokens: 40, output_tokens: 30, reasoning_output_tokens: 10 };
+
+function windDownUsageFromRollout(t, priorPayloads, { unreadable = false } = {}) {
+  const files = fixture(t);
+  const codexHome = path.join(files.dir, "codex-home");
+  const rolloutFile = path.join(codexHome, "sessions", "rollout-test-thread-123.jsonl");
+  const executionStartedAtMs = Date.now();
+  if (priorPayloads) {
+    fs.mkdirSync(path.dirname(rolloutFile), { recursive: true });
+    const before = new Date(executionStartedAtMs - 10000).toISOString();
+    const current = new Date(executionStartedAtMs + 1).toISOString();
+    const entries = [
+      ...priorPayloads.map((payload) => ({ timestamp: before, type: "event_msg", payload })),
+      { timestamp: current, type: "event_msg", payload: { type: "task_started" } },
+      { timestamp: current, type: "event_msg", payload: { type: "token_count", info: { total_token_usage: windDownFinalUsage } } }
+    ];
+    fs.writeFileSync(rolloutFile, entries.map((entry) => JSON.stringify(entry)).join("\n") + "\n");
+  }
+  const state = { threadId: "thread-123", cumulativeTokenUsage: { inputTokens: 120, cachedInputTokens: 40, outputTokens: 30, reasoningOutputTokens: 10, totalTokens: 150 } };
+  const options = { resumeThreadId: "thread-123", windDownSourceUsage };
+  const originalOpen = fs.openSync;
+  if (unreadable) {
+    fs.openSync = function (file, ...args) {
+      if (file === rolloutFile) throw Object.assign(new Error("rollout unreadable"), { code: "EACCES" });
+      return originalOpen.call(this, file, ...args);
+    };
+  }
+  try {
+    applyRolloutRecovery(state, { options, env: { CODEX_HOME: codexHome }, executionStartedAtMs, resultMaxBytes: 1024 });
+    return usageOutcome(state, options);
+  } finally {
+    fs.openSync = originalOpen;
+  }
+}
+
+test("wind-down usage is available when the adjacent rollout count matches its source", (t) => {
+  const outcome = windDownUsageFromRollout(t, [
+    { type: "task_started" },
+    { type: "token_count", info: { total_token_usage: windDownSourceUsage } }
+  ]);
+  assert.deepEqual(outcome.tokenUsage, { inputTokens: 50, cachedInputTokens: 20, outputTokens: 20, reasoningOutputTokens: 6, totalTokens: 70 });
+  assert.equal(outcome.tokenUsageAvailability, "available");
+  assert.equal(outcome.tokenUsageUnavailableReason, null);
+});
+
+test("wind-down usage is unavailable when another turn starts between source and wind-down", (t) => {
+  const outcome = windDownUsageFromRollout(t, [
+    { type: "token_count", info: { total_token_usage: windDownSourceUsage } },
+    { type: "task_started" }
+  ]);
+  assert.equal(outcome.tokenUsage, null);
+  assert.equal(outcome.tokenUsageUnavailableReason, "resume_continuity_unverifiable");
+});
+
+test("wind-down usage is unavailable when the preceding rollout count differs", (t) => {
+  const outcome = windDownUsageFromRollout(t, [
+    { type: "token_count", info: { total_token_usage: { input_tokens: 100, cached_input_tokens: 30, output_tokens: 20, reasoning_output_tokens: 6 } } }
+  ]);
+  assert.equal(outcome.tokenUsage, null);
+  assert.equal(outcome.tokenUsageUnavailableReason, "resume_continuity_unverifiable");
+});
+
+test("wind-down usage is unavailable when its rollout cannot be read", (t) => {
+  const outcome = windDownUsageFromRollout(t, [
+    { type: "token_count", info: { total_token_usage: windDownSourceUsage } }
+  ], { unreadable: true });
+  assert.equal(outcome.tokenUsage, null);
+  assert.equal(outcome.tokenUsageUnavailableReason, "resume_continuity_unverifiable");
+});
+
+test("wind-down usage is unavailable without a rollout", (t) => {
+  const outcome = windDownUsageFromRollout(t, null);
+  assert.equal(outcome.tokenUsage, null);
+  assert.equal(outcome.tokenUsageUnavailableReason, "resume_continuity_unverifiable");
+});
+
+test("wind-down records unavailable usage without a rollout", (t) => {
+  const sandbox = makeCompanionSandbox(t);
+  const git = spawnSync("git", ["init", "-q"], { cwd: sandbox.workDir, encoding: "utf8" });
+  assert.equal(git.status, 0, git.stderr);
+  const sourceId = "a".repeat(32);
+  const sourceUsage = { inputTokens: 70, cachedInputTokens: 20, outputTokens: 10, reasoningOutputTokens: 4, totalTokens: 80 };
+  const source = createJobRecord({
+    id: sourceId,
+    cwd: sandbox.workDir,
+    status: "error",
+    failureKind: "timeout",
+    mode: "write",
+    threadId: "thread-123",
+    finishedAt: "2026-01-01T00:00:00.000Z",
+    cumulativeTokenUsage: sourceUsage,
+    request: { model: "gpt-5.6-terra", effort: "xhigh", serviceTier: "flex", write: true, web: true, network: true, skipGitRepoCheck: true }
+  });
+  writeJobRecordFile(jobFilePath(sandbox.dataDir, sandbox.workDir, sourceId), source);
+  const result = runCompanion(["wind-down", "--job", sourceId], {
+    cwd: sandbox.workDir,
+    env: companionEnvFor(sandbox)
+  });
+  assert.equal(result.status, 0, result.stderr);
+  const child = companionJobRecords(sandbox).find((record) => record.windDownOf === sourceId);
+  assert.ok(child);
+  assert.equal(child.status, "done");
+  assert.equal(child.tokenUsage, null);
+  assert.equal(child.tokenUsageAvailability, "unavailable");
+  assert.equal(child.tokenUsageUnavailableReason, "resume_continuity_unverifiable");
+});
+
+test("wind-down usage stays unavailable without valid nondecreasing source counters", () => {
+  const state = { cumulativeTokenUsage: { inputTokens: 120, cachedInputTokens: 40, outputTokens: 30, reasoningOutputTokens: 10, totalTokens: 150 }, windDownContinuityVerified: true };
+  const options = { resumeThreadId: "thread-123" };
+  for (const source of [
+    null,
+    { inputTokens: 130, cachedInputTokens: 40, outputTokens: 30, reasoningOutputTokens: 10, totalTokens: 160 },
+    { inputTokens: 70, cachedInputTokens: 45, outputTokens: 10, reasoningOutputTokens: 4, totalTokens: 80 },
+    { inputTokens: 70, cachedInputTokens: 20, outputTokens: 35, reasoningOutputTokens: 4, totalTokens: 105 },
+    { inputTokens: 70, cachedInputTokens: 20, outputTokens: 15, reasoningOutputTokens: 11, totalTokens: 85 },
+    { inputTokens: 70 }
+  ]) {
+    assert.deepEqual(usageOutcome(state, { ...options, windDownSourceUsage: source }), {
+      tokenUsage: null,
+      tokenUsageAvailability: "unavailable",
+      tokenUsageUnavailableReason: "resume_continuity_unverifiable"
+    });
+  }
 });
 
 test("resume fails closed when Codex starts a different thread", async (t) => {

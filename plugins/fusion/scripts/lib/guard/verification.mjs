@@ -8,21 +8,6 @@ function transcriptEntryContent(entry) {
   return Array.isArray(entry?.content) ? entry.content : [];
 }
 
-function isExternalUserMessage(entry) {
-  if (entry?.type !== "user" || entry.toolUseResult != null || entry.sourceToolAssistantUUID || entry.isMeta === true || entry?.message?.isMeta === true) {
-    return false;
-  }
-  const content = entry?.message?.content ?? entry?.content;
-  if (typeof content === "string") {
-    return true;
-  }
-  return (
-    Array.isArray(content) &&
-    content.length > 0 &&
-    content.every((block) => block?.type === "text" && typeof block.text === "string")
-  );
-}
-
 function readTranscriptTail(transcriptPath) {
   if (typeof transcriptPath !== "string" || !transcriptPath) {
     return [];
@@ -68,26 +53,6 @@ function readTranscriptTail(transcriptPath) {
   }
 }
 
-function hasFleetDeclineAfterLastUserMessage(transcriptPath) {
-  const entries = readTranscriptTail(transcriptPath);
-  const lastUserIndex = entries.findLastIndex(isExternalUserMessage);
-  if (lastUserIndex === -1) {
-    return false;
-  }
-  const assistantText = [];
-  for (const entry of entries.slice(lastUserIndex + 1)) {
-    if (entry?.type !== "assistant") {
-      continue;
-    }
-    for (const block of transcriptEntryContent(entry)) {
-      if (block?.type === "text" && typeof block.text === "string") {
-        assistantText.push(block.text);
-      }
-    }
-  }
-  return /^\s*fleet-decline:/mi.test(assistantText.join("\n"));
-}
-
 function normalizeMessageId(value) {
   return typeof value === "string" && value.length > 0 && value.length <= 128 && /^[A-Za-z0-9_-]+$/.test(value) ? value : null;
 }
@@ -111,4 +76,4 @@ function extractBashCommand(toolInput) {
   return typeof toolInput.command === "string" ? toolInput.command.trim() : null;
 }
 
-export { transcriptEntryContent, isExternalUserMessage, readTranscriptTail, hasFleetDeclineAfterLastUserMessage, normalizeMessageId, messageIdForToolUse, extractBashCommand };
+export { transcriptEntryContent, readTranscriptTail, normalizeMessageId, messageIdForToolUse, extractBashCommand };

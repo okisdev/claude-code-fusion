@@ -16,7 +16,7 @@ test("verified peer CLI versions are complete and well formed", () => {
     verifiedVersions = readVerifiedVersions();
   });
   assert.deepEqual(Object.keys(verifiedVersions).sort(), ["codex-cli", "cursor", "devin", "grok", "verifiedAt"]);
-  assert.deepEqual(verifiedVersions, { "codex-cli": "0.162.1", grok: "1.0.41", cursor: "2026.10.01-e373342", devin: "3000.11.228", verifiedAt: "2026-10-13" });
+  assert.deepEqual(verifiedVersions, { "codex-cli": "0.162.1", grok: "1.0.77", cursor: "2026.10.01-e373342", devin: "3000.11.228", verifiedAt: "2026-11-07" });
   assert.match(verifiedVersions["codex-cli"], /^\d+\.\d+\.\d+$/);
   assert.match(verifiedVersions.grok, /^\d+\.\d+\.\d+$/);
   assert.match(verifiedVersions.cursor, /^\d{4}\.\d{2}\.\d{2}-[a-f0-9]+$/);

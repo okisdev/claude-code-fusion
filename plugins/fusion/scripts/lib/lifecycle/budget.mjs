@@ -12,7 +12,7 @@ function workerLimits(agentType, env = process.env, sizing) {
   const defaults = canonical === "fusion:trivial-worker"
     ? { wallClockMs: 300_000, stallMs: 120_000, maxTurns: 24, maxOutputTokens: 32_000, maxUncachedTokens: 240_000 }
     : canonical === "fusion:job-collector"
-      ? { wallClockMs: 660_000, stallMs: 660_000, maxTurns: 6, maxOutputTokens: 8_000, maxUncachedTokens: 30_000 }
+      ? { wallClockMs: 660_000, stallMs: 660_000, maxTurns: 9, maxOutputTokens: 8_000, maxUncachedTokens: 30_000 }
       : canonical === "fusion:deep-reasoner"
         ? { wallClockMs: 2_400_000, stallMs: 900_000, maxTurns: 40, maxOutputTokens: 128_000, maxUncachedTokens: 960_000 }
         : { wallClockMs: 2_400_000, stallMs: 600_000, maxTurns: 100, maxOutputTokens: 192_000, maxUncachedTokens: 960_000 };
@@ -36,7 +36,7 @@ function workerBudgetFailure(record, now = Date.now()) {
   if (Number.isFinite(startedAt) && now - startedAt >= limits.wallClockMs) {
     return { failureKind: "timeout", limitKind: "wall", reason: `wall clock budget reached (${limits.wallClockMs}ms)` };
   }
-  if (EXECUTION_AGENTS.has(canonicalWorkerAgentType(record.agentType)) && !record.inFlightSince) {
+  if ((EXECUTION_AGENTS.has(canonicalWorkerAgentType(record.agentType)) || record.awaitingBackgroundCommand) && !record.inFlightSince) {
     const livenessAt = Date.parse(record.lastLivenessAt ?? record.startedAt ?? record.createdAt ?? "");
     if (Number.isFinite(livenessAt) && now - livenessAt >= limits.stallMs) {
       return { failureKind: "stall", limitKind: "stall", reason: `no-activity budget reached (${limits.stallMs}ms)` };

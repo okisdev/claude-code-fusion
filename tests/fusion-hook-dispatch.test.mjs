@@ -89,7 +89,7 @@ function compare(box, input, extra = {}) {
 
 test("each shared matcher uses one dispatcher process and lifecycle-only tools keep their command", () => {
   const shared = {
-    PreToolUse: ["Edit", "Write", "NotebookEdit", "MultiEdit", "Bash", "Agent", "Task", "SendMessage", "TaskOutput", "TaskStop"],
+    PreToolUse: ["Read", "Grep", "Glob", "Edit", "Write", "NotebookEdit", "MultiEdit", "Bash", "Agent", "Task", "SendMessage", "TaskOutput", "TaskStop"],
     PostToolUse: ["Agent", "Task", "Bash", "SendMessage", "Edit", "Write", "NotebookEdit", "MultiEdit"],
     PostToolUseFailure: ["Edit", "Write", "NotebookEdit", "MultiEdit"]
   };
@@ -102,9 +102,14 @@ test("each shared matcher uses one dispatcher process and lifecycle-only tools k
       assert.ok(commands.every((command) => !command.includes("node ") || command.startsWith("command -v node >/dev/null 2>&1 || exit 0; ")));
       if (event === "PreToolUse" && tool === "Agent") assert.ok(commands.some((command) => command.includes("brief-sensor.mjs")));
     }
-    const other = hooks[event].filter((group) => group.matcher === "*" || new RegExp(group.matcher).test("Read")).flatMap((group) => group.hooks.map((hook) => hook.command));
-    assert.equal(other.length, 1, `${event} Read`);
+    const other = hooks[event].filter((group) => group.matcher === "*" || new RegExp(group.matcher).test("Skill")).flatMap((group) => group.hooks.map((hook) => hook.command));
+    assert.equal(other.length, 1, `${event} Skill`);
     assert.match(other[0], /scripts\/worker-lifecycle\.mjs/);
+    if (event !== "PreToolUse") {
+      const read = hooks[event].filter((group) => group.matcher === "*" || new RegExp(group.matcher).test("Read")).flatMap((group) => group.hooks.map((hook) => hook.command));
+      assert.equal(read.length, 1, `${event} Read`);
+      assert.match(read[0], /scripts\/worker-lifecycle\.mjs/);
+    }
   }
 });
 
@@ -112,6 +117,7 @@ test("dispatcher matches sequential standalone outputs for every shared matcher"
   const box = sandbox(t);
   const edit = { file_path: path.join(box.cwd, "file.txt"), old_string: "old", new_string: "new" };
   const cases = [
+    ["PreToolUse", "Read", { file_path: path.join(box.cwd, "file.txt") }],
     ["PreToolUse", "Edit", edit],
     ["PreToolUse", "Agent", { subagent_type: "codex:codex-rescue", prompt: "lane: codex quick\nGoal: test" }],
     ["PreToolUse", "SendMessage", { to: "unknown", message: "hello" }],

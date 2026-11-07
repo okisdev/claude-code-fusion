@@ -2,6 +2,20 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { TtlLruCache } from "./index.js";
 
+test("successive inserts keep the two newest keys", () => {
+  const cache = new TtlLruCache({ maxSize: 2 });
+  for (const key of ["a", "b", "c", "d"]) {
+    cache.set(key, key);
+  }
+  assert.equal(cache.size, 2);
+  assert.equal(cache.has("a"), false);
+  assert.equal(cache.has("b"), false);
+  assert.equal(cache.has("c"), true);
+  assert.equal(cache.has("d"), true);
+  assert.equal(cache.get("c"), "c");
+  assert.equal(cache.get("d"), "d");
+});
+
 test("get promotes entry so a later insert evicts the untouched key", () => {
   const cache = new TtlLruCache({ maxSize: 2 });
   cache.set("a", 1);

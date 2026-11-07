@@ -1,6 +1,6 @@
 import { resolveLockTimeoutMs } from "./config.mjs";
-import { DEFAULT_FLEET_WAVE_GAP_MS, LOCK_RETRY_MS, LOCK_STALE_MS, SESSION_ID_PATTERN, STALE_MS } from "./constants.mjs";
-import { deriveFleetWaveState, normalizeDispatchLog, normalizeDispatches, pruneExpiredLaunchedDispatches, totalDispatches } from "./dispatch.mjs";
+import { LOCK_RETRY_MS, LOCK_STALE_MS, SESSION_ID_PATTERN, STALE_MS } from "./constants.mjs";
+import { normalizeDispatchLog, normalizeDispatches, pruneExpiredLaunchedDispatches, totalDispatches } from "./dispatch.mjs";
 import { createHash } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
@@ -105,6 +105,9 @@ function withStateLock(file, callback) {
 }
 
 function withAvailableStateLock(file, callback) {
+  const dir = path.dirname(file);
+  fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+  fs.chmodSync(dir, 0o700);
   const lockFile = `${file}.lock`;
   let descriptor;
   try {
@@ -114,7 +117,7 @@ function withAvailableStateLock(file, callback) {
     throw error;
   }
   try {
-    callback();
+    return callback();
   } finally {
     fs.closeSync(descriptor);
     fs.rmSync(lockFile, { force: true });
@@ -155,10 +158,8 @@ function defaultState(now) {
     confirmedPathSignatures: [],
     dispatchEpoch: 0,
     lastDispatchAt: null,
-    fleetWaveWidth: 0,
-    consecutiveNarrowWaves: 0,
-    lastAdvisedNarrowWaveStreak: 0,
-    advisedNarrowWaveSignatures: [],
+    readStreakTurns: 0,
+    lastReadAt: null,
     pendingWrites: [],
     dispatches: {},
     dispatchLog: [],
@@ -189,14 +190,14 @@ function normalizeAdvisorySignatures(value) {
   }
   const signatures = {};
   for (const [kind, signature] of Object.entries(value)) {
-    if (/^[a-z][a-z0-9-]{0,79}$/.test(kind) && typeof signature === "string" && signature.length > 0 && signature.length <= 1024) {
+    if (kind !== "narrow-wave" && /^[a-z][a-z0-9-]{0,79}$/.test(kind) && typeof signature === "string" && signature.length > 0 && signature.length <= 1024) {
       signatures[kind] = signature;
     }
   }
   return signatures;
 }
 
-function normalizeState(existing, now, waveGapMs = DEFAULT_FLEET_WAVE_GAP_MS) {
+function normalizeState(existing, now) {
   if (!existing || typeof existing !== "object") {
     return defaultState(now);
   }
@@ -214,14 +215,7 @@ function normalizeState(existing, now, waveGapMs = DEFAULT_FLEET_WAVE_GAP_MS) {
   const dispatchLog = pruneExpiredLaunchedDispatches(normalizeDispatchLog(existing.dispatchLog), now);
   const createdAtMs = Date.parse(existing.createdAt);
   const lastDispatchAtMs = Date.parse(existing.lastDispatchAt);
-  const derivedFleetWaveState = deriveFleetWaveState(dispatchLog, waveGapMs);
-  const fleetWaveWidth = Number.isInteger(existing.fleetWaveWidth) && existing.fleetWaveWidth >= 0 ? existing.fleetWaveWidth : derivedFleetWaveState.fleetWaveWidth;
-  const consecutiveNarrowWaves =
-    Number.isInteger(existing.consecutiveNarrowWaves) && existing.consecutiveNarrowWaves >= 0 ? existing.consecutiveNarrowWaves : derivedFleetWaveState.consecutiveNarrowWaves;
-  const lastAdvisedNarrowWaveStreak =
-    Number.isInteger(existing.lastAdvisedNarrowWaveStreak) && existing.lastAdvisedNarrowWaveStreak >= 0 ? existing.lastAdvisedNarrowWaveStreak : 0;
-  const advisedNarrowWaveSignatures = Array.isArray(existing.advisedNarrowWaveSignatures)
-    ? existing.advisedNarrowWaveSignatures.filter((value) => typeof value === "string" && /^[a-f0-9]{64}$/.test(value)) : [];
+  const lastReadAtMs = Date.parse(existing.lastReadAt);
   const pendingWrites = Array.isArray(existing.pendingWrites) ? existing.pendingWrites.filter((entry) =>
     entry && typeof entry.id === "string" && Number.isInteger(entry.epoch) && Number.isSafeInteger(entry.bytes) &&
     typeof entry.signature === "string" && typeof entry.tail === "boolean") : [];
@@ -234,10 +228,8 @@ function normalizeState(existing, now, waveGapMs = DEFAULT_FLEET_WAVE_GAP_MS) {
     confirmedPathSignatures,
     dispatchEpoch: Number.isInteger(existing.dispatchEpoch) && existing.dispatchEpoch >= 0 ? existing.dispatchEpoch : dispatchCount,
     lastDispatchAt: Number.isFinite(lastDispatchAtMs) ? new Date(lastDispatchAtMs).toISOString() : null,
-    fleetWaveWidth,
-    consecutiveNarrowWaves,
-    lastAdvisedNarrowWaveStreak,
-    advisedNarrowWaveSignatures,
+    readStreakTurns: Number.isSafeInteger(existing.readStreakTurns) && existing.readStreakTurns >= 0 ? existing.readStreakTurns : 0,
+    lastReadAt: Number.isFinite(lastReadAtMs) ? new Date(lastReadAtMs).toISOString() : null,
     pendingWrites,
     dispatches,
     dispatchLog,
@@ -252,10 +244,10 @@ function stableAdvisorySignature(values) {
   return createHash("sha256").update(JSON.stringify(values)).digest("hex");
 }
 
-function claimAdvisory(file, kind, signature, now, waveGapMs, isCurrent = () => true) {
+function claimAdvisory(file, kind, signature, now, isCurrent = () => true) {
   try {
     return withStateLock(file, () => {
-      const state = normalizeState(readState(file), now, waveGapMs);
+      const state = normalizeState(readState(file), now);
       if (!isCurrent(state)) {
         return { skipped: true, suppressed: false };
       }

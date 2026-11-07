@@ -1,6 +1,6 @@
 import { BREADTH_ENGINE_IDS, ENGINES } from "../engines.mjs";
 import { STATS_PROVIDER_REGISTRY, WORKSPACE_ENGINE_DESCRIPTORS, acceptanceSummary } from "./aggregation.mjs";
-import { COERCION_LEDGER_SMALL_FLEET_SHAPED_WAVES, FLEET_SHAPED_MIN_WIDTH, hasCoercionLedgerData } from "./fleet.mjs";
+import { FLEET_SHAPED_MIN_WIDTH, hasCoercionLedgerData } from "./fleet.mjs";
 import { formatTraceModel } from "./reports.mjs";
 
 export function renderAuditReport(report) {
@@ -305,19 +305,13 @@ function renderCoercionLedger(lines, ledger) {
     return;
   }
   lines.push("", "## Coercion ledger", "");
-  lines.push(`Fleet declines: ${ledger.fleetDeclines ?? 0}`);
-  lines.push(`Narrow-wave advisories: ${ledger.narrowWaveAdvisories ?? 0}`);
+  lines.push(`Read-streak advisories: ${ledger.readStreakAdvisories ?? 0}`);
   lines.push(`Fleet-shaped waves: ${ledger.fleetShapedWaves ?? 0}`);
   lines.push(`Verification resets: ${ledger.verificationResets ?? 0}`);
   lines.push(`Unverified accumulations: ${ledger.unverifiedAccumulations ?? 0}`);
   lines.push(`Inline sprawl windows: ${ledger.inlineSprawlWindows ?? 0}`);
   lines.push(`Deepest unverified window: ${ledger.deepestUnverifiedWindow ?? 0}`);
   renderCounts(lines, "Posture mix", ledger.postureMix ?? {});
-  const fleetDeclines = ledger.fleetDeclines ?? 0;
-  const fleetShapedWaves = ledger.fleetShapedWaves ?? 0;
-  if (fleetDeclines >= 5 && fleetShapedWaves <= COERCION_LEDGER_SMALL_FLEET_SHAPED_WAVES && fleetDeclines >= 5 * Math.max(1, fleetShapedWaves)) {
-    lines.push("", `Advisory: Fleet declines to fleet-shaped waves are ${fleetDeclines}:${fleetShapedWaves}; the fleet default is being overridden more often than honored.`);
-  }
 }
 
 export function renderFusionStats(report, { identities = false, byDay = false } = {}) {
@@ -344,6 +338,9 @@ export function renderFusionStats(report, { identities = false, byDay = false } 
   }
   renderFleetUsageStats(lines, report.fleet, { byDay });
   renderCoercionLedger(lines, report.coercionLedger);
+  if (report.verificationEvidence?.accepted > 0) {
+    lines.push("", "## Verification evidence", "", `Accepted implementation packages: ${report.verificationEvidence.accepted}`, `With a credited verification before the verdict: ${report.verificationEvidence.evidenced} (${formatShare(report.verificationEvidence.rate)})`);
+  }
   lines.push("", "Peer token totals include only jobs with exact reported usage. Unavailable jobs are never estimated.");
   return `${lines.join("\n")}\n`;
 }

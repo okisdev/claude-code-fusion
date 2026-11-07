@@ -40,7 +40,7 @@ test("Grok injects the selected role's effort when roles share a model", (t) => 
   t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
   const env = { FUSION_MODEL_ROUTING: path.join(directory, "missing.json") };
 
-  for (const [role, effort] of [["independence", "high"], ["live-web", "high"], ["burst", "low"]]) {
+  for (const [role, effort] of [["independence", "medium"], ["live-web", "high"], ["burst", "low"]]) {
     const prompt = `grok-role: ${role}\ngoal: review`;
     assert.strictEqual(injectedPeerDefaults(prompt, "grok:grok-rescue", env)?.prompt, `--model grok-4.7-build-fast --effort ${effort} -- ${prompt}`);
     assert.strictEqual(injectedPeerDefaults(`--model grok-4.7-build-fast -- ${prompt}`, "grok:grok-rescue", env)?.prompt, `--effort ${effort} --model grok-4.7-build-fast -- ${prompt}`);

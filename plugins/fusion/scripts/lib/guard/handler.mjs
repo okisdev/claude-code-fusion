@@ -3,10 +3,11 @@ import { tagMessage } from "../user-messages.mjs";
 import { resolveMode, resolveStateDir } from "./config.mjs";
 import { BASH_TOOL, DELEGATION_TOOLS, STATE_UNAVAILABLE_DENY_MESSAGE_SLUG, TASK_CONTROL_TOOLS, WRITE_TOOLS } from "./constants.mjs";
 import { handleDispatch, handleTaskControl } from "./dispatch-events.mjs";
+import { handleReadStreak } from "./read-streak.mjs";
 import { normalizeSessionId, pruneStaleState, stateFile } from "./state.mjs";
 import { handleBash } from "./verification-events.mjs";
 import { handleWrite } from "./write-events.mjs";
-import { denyOutput, extractWritePath, isWorkspaceWritePath } from "./write.mjs";
+import { advisoryOutput, denyOutput, extractWritePath, isWorkspaceWritePath } from "./write.mjs";
 import fs from "node:fs";
 
 function readHookInput() {
@@ -51,6 +52,10 @@ function runHook(env = process.env, input = readHookInput()) {
   const file = stateFile(stateDir, sessionId);
   const now = new Date().toISOString();
   const posture = resolvePosture(env);
+  const readContext = handleReadStreak(input, env, { sessionId, toolName, file, now, posture });
+  if (readContext && toolName !== BASH_TOOL) {
+    writeHookText(`${JSON.stringify(advisoryOutput(readContext))}\n`);
+  }
 
   if (DELEGATION_TOOLS.has(toolName)) {
     handleDispatch(input, env, { sessionId, toolName, file, now, posture, writeHookText });
@@ -61,9 +66,18 @@ function runHook(env = process.env, input = readHookInput()) {
     return;
   }
   if (toolName === BASH_TOOL) {
-    handleBash(input, env, { sessionId, toolName, file, now, posture, writeHookText });
+    let bashOutput = "";
+    handleBash(input, env, { sessionId, toolName, file, now, posture, writeHookText: (text) => { bashOutput += text; } });
+    if (readContext) {
+      const output = bashOutput ? JSON.parse(bashOutput) : advisoryOutput(readContext);
+      if (bashOutput) output.hookSpecificOutput.additionalContext = [output.hookSpecificOutput.additionalContext, readContext].filter(Boolean).join("\n");
+      writeHookText(`${JSON.stringify(output)}\n`);
+    } else if (bashOutput) {
+      writeHookText(bashOutput);
+    }
     return;
   }
+  if (["Read", "Grep", "Glob"].includes(toolName)) return;
   handleWrite(input, env, { sessionId, toolName, file, now, posture, cwd, writeHookText });
 }
 

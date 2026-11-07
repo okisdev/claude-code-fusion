@@ -1,0 +1,83 @@
+diff --git a/concurrent.js b/concurrent.js
+new file mode 100644
+index 0000000..c6549d3
+--- /dev/null
++++ b/concurrent.js
+@@ -0,0 +1,44 @@
++export function map_concurrent(items, limit, worker) {
++  if (items.length === 0) {
++    return Promise.resolve([]);
++  }
++  const results = new Array(items.length);
++  let next = 0;
++  let active = 0;
++  let settled = false;
++  return new Promise((resolve, reject) => {
++    const pump = () => {
++      if (settled) {
++        return;
++      }
++      if (next >= items.length && active === 0) {
++        settled = true;
++        resolve(results);
++        return;
++      }
++      while (!settled && active < limit && next < items.length) {
++        const index = next;
++        next += 1;
++        active += 1;
++        Promise.resolve()
++          .then(() => worker(items[index], index))
++          .then((value) => {
++            if (settled) {
++              return;
++            }
++            results[index] = value;
++            active -= 1;
++            pump();
++          })
++          .catch((error) => {
++            if (settled) {
++              return;
++            }
++            settled = true;
++            reject(error);
++          });
++      }
++    };
++    pump();
++  });
++}
+diff --git a/retry.js b/retry.js
+new file mode 100644
+index 0000000..1c4ea30
+--- /dev/null
++++ b/retry.js
+@@ -0,0 +1,27 @@
++import { app_error } from "./errors.js";
++import { delay_ms } from "./util.js";
++
++function failure_message(error) {
++  if (error && typeof error.message === "string") {
++    return error.message;
++  }
++  return String(error);
++}
++
++export function retry_with_backoff(operation, attempts, base_delay_ms) {
++  const attempt = (index) => {
++    return Promise.resolve()
++      .then(() => operation())
++      .catch((error) => {
++        if (index + 1 >= attempts) {
++          return Promise.reject(app_error("RETRY_EXHAUSTED", failure_message(error)));
++        }
++        const wait = base_delay_ms * (2 ** index);
++        return delay_ms(wait).then(() => attempt(index + 1));
++      });
++  };
++  if (attempts < 1) {
++    return Promise.reject(app_error("RETRY_EXHAUSTED", ""));
++  }
++  return attempt(0);
++}

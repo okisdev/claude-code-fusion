@@ -5,6 +5,7 @@ import path from "node:path";
 import { spawnSync } from "node:child_process";
 
 import { getProcessIdentity, isProcessAlive, processIdentityMatches } from "./codex-exec.mjs";
+import { observedEventLine } from "./codex-events.mjs";
 
 const DATA_DIR_ENV = "CODEX_COMPANION_DATA";
 const JOB_SCHEMA_VERSION = 1;
@@ -1563,11 +1564,11 @@ export function appendJobEvent(eventsFile, event) {
   if (!eventsFile) {
     return;
   }
-  const line = typeof event === "string" ? event.trimEnd() : JSON.stringify(event);
-  if (!line) {
+  const value = typeof event === "string" ? event.trimEnd() : event;
+  if (!value) {
     return;
   }
-  appendBoundedFile(eventsFile, `${line}\n`, JOB_EVENTS_MAX_BYTES);
+  appendBoundedFile(eventsFile, `${observedEventLine(value)}\n`, JOB_EVENTS_MAX_BYTES);
 }
 
 export function readLogTail(logFile, maxLines = 20) {

@@ -29,7 +29,7 @@ export function makeSandbox(t) {
   fs.mkdirSync(homeDir, { recursive: true });
   fs.mkdirSync(tmpDir, { recursive: true });
   fs.mkdirSync(workDir, { recursive: true });
-  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }));
   return {
     argsFile: path.join(root, "args.json"),
     codexHome,

@@ -6,21 +6,24 @@ import path from "node:path";
 import { test } from "node:test";
 
 import { messageTag, tagMessage } from "../plugins/fusion/scripts/lib/user-messages.mjs";
+import { claimParentContextAdvisory } from "../plugins/fusion/scripts/lib/lifecycle/dispatch.mjs";
 
 const repoRoot = path.join(import.meta.dirname, "..");
 const script = path.join(repoRoot, "plugins", "fusion", "scripts", "fleet-posture.mjs");
-const LEGACY_CONTEXT = tagMessage("fleet-posture.strict-fleet-reminder", "fleet-default active: a goal that decomposes into three or more independent work packages convenes /fusion:ultra once bootstrap dependencies are resolved; narrower execution states `fleet-decline: <reason>` visibly in the reply.");
+const LEGACY_CONTEXT = tagMessage("fleet-posture.strict-fleet-reminder", "fleet-default active: a goal that decomposes into three or more independent work packages convenes /fusion:ultra once bootstrap dependencies are resolved; explain narrower execution visibly in the reply.");
 const SESSION_LANES_CONTEXT = tagMessage("fleet-posture.session-lanes-reminder", "fusion lanes ready: codex gpt-6-astra for spec grade and deep review, gpt-6-sol and gpt-6-luna for quick and volume packages, grok under its four roles on the routing table's lane defaults, claude workers for the Claude surface. Independent packages dispatch together in one message; three or more convene /fusion:ultra; a single coherent change stays inline.");
+const advisoryText = (tokens) => `The main loop context is ${Math.round(tokens / 1000)}k tokens and every turn replays it. Finish this wave, then prefer /compact or a fresh session before the next goal.`;
+const advisoryContext = (tokens) => tagMessage("fleet-posture.context-advisory", advisoryText(tokens));
 
 function makeSandbox(t) {
   const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "fleet-posture-test-")));
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
-  return { root, dataDir: path.join(root, "fusion-data"), stateDir: path.join(root, "inline-guard") };
+  return { root, dataDir: path.join(root, "fusion-data"), stateDir: path.join(root, "inline-guard"), workerStateDir: path.join(root, "workers"), transcript: path.join(root, "transcript.jsonl") };
 }
 
 function envFor(sandbox, extra = {}) {
-  const env = { ...process.env, FUSION_DATA_DIR: sandbox.dataDir, FUSION_INLINE_GUARD_STATE: sandbox.stateDir, FUSION_MODEL_ROUTING: path.join(sandbox.root, "missing-model-routing.json"), ...extra };
-  for (const name of ["FUSION_FLEET_MODE", "FUSION_POSTURE", "FUSION_NARROW_WAVE_THRESHOLD"]) {
+  const env = { ...process.env, FUSION_DATA_DIR: sandbox.dataDir, FUSION_INLINE_GUARD_STATE: sandbox.stateDir, FUSION_WORKER_STATE_DIR: sandbox.workerStateDir, FUSION_MODEL_ROUTING: path.join(sandbox.root, "missing-model-routing.json"), ...extra };
+  for (const name of ["FUSION_FLEET_MODE", "FUSION_POSTURE", "FUSION_PARENT_CONTEXT_ADVISORY_TOKENS"]) {
     if (!Object.hasOwn(extra, name)) {
       delete env[name];
     }
@@ -29,7 +32,11 @@ function envFor(sandbox, extra = {}) {
 }
 
 function hookInput(sandbox, sessionId = "session-1") {
-  return JSON.stringify({ ...(sessionId === undefined ? {} : { session_id: sessionId }), prompt: "do work", cwd: sandbox.root });
+  return JSON.stringify({ ...(sessionId === undefined ? {} : { session_id: sessionId }), prompt: "do work", cwd: sandbox.root, transcript_path: sandbox.transcript });
+}
+
+function writeTranscript(sandbox, tokens) {
+  fs.appendFileSync(sandbox.transcript, `${JSON.stringify({ type: "assistant", message: { usage: { input_tokens: tokens, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 } } })}\n`);
 }
 
 function statePath(sandbox, sessionId = "session-1") {
@@ -62,10 +69,6 @@ function assertSilent(result) {
 function assertContext(result, additionalContext) {
   assert.strictEqual(result.status, 0);
   assert.strictEqual(result.stderr, "");
-  const slug = additionalContext.includes("fleet-default active")
-    ? "fleet-posture.strict-fleet-reminder"
-    : "fleet-posture.session-lanes-reminder";
-  assert.ok(additionalContext.endsWith(messageTag(slug)));
   assert.deepStrictEqual(JSON.parse(result.stdout), {
     hookSpecificOutput: { hookEventName: "UserPromptSubmit", additionalContext }
   });
@@ -81,41 +84,70 @@ test("judgment posture emits the session lanes reminder once without guard state
   assert.strictEqual(fs.statSync(path.dirname(sessionLanesReminderPath(sandbox))).mode & 0o777, 0o700);
 });
 
-test("judgment posture is silent below the narrow wave threshold", (t) => {
+test("parent context below threshold adds no advisory", (t) => {
   const sandbox = makeSandbox(t);
+  writeTranscript(sandbox, 249999);
   assertContext(run(sandbox), SESSION_LANES_CONTEXT);
-
-  for (const streak of [0, 1]) {
-    writeState(sandbox, { consecutiveNarrowWaves: streak });
-    assertSilent(run(sandbox));
-  }
+  assertSilent(run(sandbox));
+  assert.strictEqual(fs.existsSync(path.join(sandbox.workerStateDir, "sessions", "session-1.json")), false);
 });
 
-test("fleet posture leaves observed narrow waves to the inline guard", (t) => {
+test("parent context advisory sends once at each threshold across prompts", (t) => {
+  const sandbox = makeSandbox(t);
+  assertContext(run(sandbox), SESSION_LANES_CONTEXT);
+  writeTranscript(sandbox, 250000);
+  assertContext(run(sandbox), advisoryContext(250000));
+  assertSilent(run(sandbox));
+  writeTranscript(sandbox, 800000);
+  assertContext(run(sandbox), advisoryContext(800000));
+  assertSilent(run(sandbox));
+});
+
+test("first prompt combines the session reminder and parent context advisory", (t) => {
+  const sandbox = makeSandbox(t);
+  writeTranscript(sandbox, 250000);
+  assertContext(run(sandbox), `${SESSION_LANES_CONTEXT}\n\n${advisoryContext(250000)}`);
+  assertSilent(run(sandbox));
+});
+
+test("a dispatch claim suppresses the prompt advisory", (t) => {
+  const sandbox = makeSandbox(t);
+  assertContext(run(sandbox), SESSION_LANES_CONTEXT);
+  writeTranscript(sandbox, 250000);
+  assert.strictEqual(claimParentContextAdvisory("session-1", 250000, envFor(sandbox)), advisoryText(250000));
+  assertSilent(run(sandbox));
+});
+
+test("an unreadable transcript leaves other prompt output intact", (t) => {
+  const sandbox = makeSandbox(t);
+  assert.strictEqual(fs.existsSync(sandbox.transcript), false);
+  assertContext(run(sandbox), SESSION_LANES_CONTEXT);
+  assertSilent(run(sandbox));
+});
+
+test("an advisory claim failure leaves other prompt output intact", (t) => {
+  const sandbox = makeSandbox(t);
+  writeTranscript(sandbox, 250000);
+  fs.writeFileSync(sandbox.workerStateDir, "blocked");
+  assertContext(run(sandbox), SESSION_LANES_CONTEXT);
+});
+
+test("a fleet reminder claim failure leaves the context advisory intact", (t) => {
+  const sandbox = makeSandbox(t);
+  writeTranscript(sandbox, 250000);
+  fs.writeFileSync(sandbox.dataDir, "blocked");
+  assertContext(run(sandbox), advisoryContext(250000));
+});
+
+test("the narrow wave reminder and marker are gone", (t) => {
   const sandbox = makeSandbox(t);
   writeState(sandbox, { consecutiveNarrowWaves: 2 });
   const original = fs.readFileSync(statePath(sandbox), "utf8");
-
   assertContext(run(sandbox), SESSION_LANES_CONTEXT);
   assertSilent(run(sandbox));
-  assertSilent(run(sandbox));
+  assert.throws(() => messageTag("fleet-posture.narrow-wave-reminder"), RangeError);
   assert.strictEqual(fs.existsSync(path.join(sandbox.dataDir, "fleet-posture", "narrow-wave-reminders")), false);
   assert.strictEqual(fs.readFileSync(statePath(sandbox), "utf8"), original);
-});
-
-test("fleet posture stays silent for narrow streak changes across sessions", (t) => {
-  const sandbox = makeSandbox(t);
-  assertContext(run(sandbox), SESSION_LANES_CONTEXT);
-  writeState(sandbox, { consecutiveNarrowWaves: 2 });
-  assertSilent(run(sandbox));
-  assertSilent(run(sandbox));
-  writeState(sandbox, { consecutiveNarrowWaves: 3 });
-  assertSilent(run(sandbox));
-  writeState(sandbox, { consecutiveNarrowWaves: 2 });
-  assertSilent(run(sandbox));
-  assertContext(run(sandbox, hookInput(sandbox, "session-2")), SESSION_LANES_CONTEXT);
-  writeState(sandbox, { consecutiveNarrowWaves: 2 }, "session-2");
-  assertSilent(run(sandbox, hookInput(sandbox, "session-2")));
 });
 
 test("session lanes reminder renders the routing table's codex defaults", (t) => {
@@ -132,18 +164,6 @@ test("session lanes reminder renders the routing table's codex defaults", (t) =>
   assertContext(run(sandbox, hookInput(sandbox), { FUSION_MODEL_ROUTING: routingFile }), tagMessage("fleet-posture.session-lanes-reminder", "fusion lanes ready: codex flagship-choice for spec grade and deep review, quick-choice and volume-choice for quick and volume packages, grok under its four roles on the routing table's lane defaults, claude workers for the Claude surface. Independent packages dispatch together in one message; three or more convene /fusion:ultra; a single coherent change stays inline."));
 });
 
-test("fleet posture ignores narrow wave threshold settings", (t) => {
-  const sandbox = makeSandbox(t);
-  assertContext(run(sandbox), SESSION_LANES_CONTEXT);
-  writeState(sandbox, { consecutiveNarrowWaves: 2 });
-
-  assertSilent(run(sandbox, hookInput(sandbox), { FUSION_NARROW_WAVE_THRESHOLD: "3" }));
-  writeState(sandbox, { consecutiveNarrowWaves: 3 });
-  assertSilent(run(sandbox, hookInput(sandbox), { FUSION_NARROW_WAVE_THRESHOLD: "3" }));
-  writeState(sandbox, { consecutiveNarrowWaves: 2 });
-  assertSilent(run(sandbox, hookInput(sandbox), { FUSION_NARROW_WAVE_THRESHOLD: "invalid" }));
-});
-
 test("strict posture emits the legacy reminder without guard state", (t) => {
   const sandbox = makeSandbox(t);
 
@@ -152,22 +172,32 @@ test("strict posture emits the legacy reminder without guard state", (t) => {
   assert.strictEqual(fs.existsSync(sessionLanesReminderPath(sandbox)), false);
 });
 
-test("FUSION_FLEET_MODE=off suppresses both postures", (t) => {
+test("strict posture also emits the parent context advisory", (t) => {
   const sandbox = makeSandbox(t);
-  writeState(sandbox, { consecutiveNarrowWaves: 2 });
-
-  assertSilent(run(sandbox, hookInput(sandbox), { FUSION_FLEET_MODE: "off" }));
-  assertSilent(run(sandbox, hookInput(sandbox), { FUSION_FLEET_MODE: "off", FUSION_POSTURE: "strict" }));
-  assert.strictEqual(fs.existsSync(sessionLanesReminderPath(sandbox)), false);
+  writeTranscript(sandbox, 250000);
+  assertContext(run(sandbox, hookInput(sandbox), { FUSION_POSTURE: "strict" }), `${LEGACY_CONTEXT}\n\n${advisoryContext(250000)}`);
+  assertContext(run(sandbox, hookInput(sandbox), { FUSION_POSTURE: "strict" }), LEGACY_CONTEXT);
 });
 
-test("the fleet mode state file suppresses both postures", (t) => {
+test("FUSION_FLEET_MODE=off suppresses only fleet reminders", (t) => {
   const sandbox = makeSandbox(t);
-  writeState(sandbox, { consecutiveNarrowWaves: 2 });
+  writeTranscript(sandbox, 250000);
+
+  assertContext(run(sandbox, hookInput(sandbox), { FUSION_FLEET_MODE: "off" }), advisoryContext(250000));
+  assertSilent(run(sandbox, hookInput(sandbox), { FUSION_FLEET_MODE: "off", FUSION_POSTURE: "strict" }));
+  assert.strictEqual(fs.existsSync(sessionLanesReminderPath(sandbox)), false);
+  const strictSandbox = makeSandbox(t);
+  writeTranscript(strictSandbox, 250000);
+  assertContext(run(strictSandbox, hookInput(strictSandbox), { FUSION_FLEET_MODE: "off", FUSION_POSTURE: "strict" }), advisoryContext(250000));
+});
+
+test("the fleet mode state file suppresses reminders but keeps the context advisory", (t) => {
+  const sandbox = makeSandbox(t);
+  writeTranscript(sandbox, 250000);
   fs.mkdirSync(sandbox.dataDir, { recursive: true });
   fs.writeFileSync(path.join(sandbox.dataDir, "fleet-mode"), "off\n", "utf8");
 
-  assertSilent(run(sandbox));
+  assertContext(run(sandbox), advisoryContext(250000));
   assertSilent(run(sandbox, hookInput(sandbox), { FUSION_POSTURE: "strict" }));
   assert.strictEqual(fs.existsSync(sessionLanesReminderPath(sandbox)), false);
 });
@@ -188,8 +218,6 @@ test("invalid guard state is silent after the session lanes reminder", (t) => {
   assertContext(run(sandbox), SESSION_LANES_CONTEXT);
   assertSilent(run(sandbox));
   assertSilent(run(sandbox, hookInput(sandbox, undefined)));
-  writeState(sandbox, { consecutiveNarrowWaves: "2" });
-  assertSilent(run(sandbox));
 });
 
 test("malformed hook input is silent", (t) => {

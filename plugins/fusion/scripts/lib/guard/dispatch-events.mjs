@@ -2,11 +2,10 @@ import { PEER_RESCUE_AGENT_NAMES } from "../engines.mjs";
 import { messageCode, tagMessage } from "../user-messages.mjs";
 import { isFusionWorkerAgent } from "../worker-state.mjs";
 import { recordAuditEvent } from "./audit.mjs";
-import { resolveFleetWaveGapMs } from "./config.mjs";
-import { DELEGATION_TOOLS, DISPATCH_LOG_LIMIT, MAIN_LANE, MISSING_LAUNCH_RECOVERY_REASON, NARROW_WAVE_ADVISORY_MESSAGE_SLUG, NARROW_WAVE_ADVISORY_REASON, NARROW_WAVE_ADVISORY_SUFFIX, REAPED_WORKER_REDIRECT_AUDIT_DESCRIPTION, REAPED_WORKER_REDIRECT_MESSAGE_SLUG, REAPED_WORKER_TERMINAL_STATUSES, TASK_CONTROL_TOOLS } from "./constants.mjs";
-import { deriveInclusiveFleetWaveWidth, extractDispatchDescription, extractSubagentType, extractTaskControlId, extractToolUseId, findLaunchedDispatch, findWorkerRecordForTaskControlId, laneForSubagentType, latestConfirmedDispatchAt, reapedWorkerRedirectReason, sameFleetWave, sanitizeIdentifier } from "./dispatch.mjs";
-import { claimAdvisory, normalizeState, readState, resetWriteWindow, stableAdvisorySignature, withStateLock, writeState } from "./state.mjs";
-import { hasFleetDeclineAfterLastUserMessage, messageIdForToolUse } from "./verification.mjs";
+import { DELEGATION_TOOLS, DISPATCH_LOG_LIMIT, MAIN_LANE, MISSING_LAUNCH_RECOVERY_REASON, REAPED_WORKER_REDIRECT_AUDIT_DESCRIPTION, REAPED_WORKER_REDIRECT_MESSAGE_SLUG, REAPED_WORKER_TERMINAL_STATUSES, TASK_CONTROL_TOOLS } from "./constants.mjs";
+import { extractDispatchDescription, extractSubagentType, extractTaskControlId, extractToolUseId, findLaunchedDispatch, findWorkerRecordForTaskControlId, laneForSubagentType, latestConfirmedDispatchAt, reapedWorkerRedirectReason, sanitizeIdentifier } from "./dispatch.mjs";
+import { normalizeState, readState, resetWriteWindow, withStateLock, writeState } from "./state.mjs";
+import { messageIdForToolUse } from "./verification.mjs";
 import { denyOutput, postToolAdvisoryOutput } from "./write.mjs";
 
 function handleDispatch(input, env, { sessionId, toolName, file, now, posture, writeHookText }) {
@@ -26,11 +25,10 @@ function handleDispatch(input, env, { sessionId, toolName, file, now, posture, w
     const description = extractDispatchDescription(input.tool_input);
     const toolUseId = extractToolUseId(input);
     const messageId = input.hook_event_name === "PreToolUse" ? null : messageIdForToolUse(input.transcript_path, input.tool_use_id);
-    const waveGapMs = resolveFleetWaveGapMs(env);
 
     if (input.hook_event_name === "PreToolUse") {
       withStateLock(file, () => {
-        const state = normalizeState(readState(file), now, waveGapMs);
+        const state = normalizeState(readState(file), now);
         state.dispatchLog.push({
           at: now,
           lane,
@@ -48,7 +46,7 @@ function handleDispatch(input, env, { sessionId, toolName, file, now, posture, w
     }
 
     const confirmation = withStateLock(file, () => {
-      const state = normalizeState(readState(file), now, waveGapMs);
+      const state = normalizeState(readState(file), now);
       let launched = findLaunchedDispatch(state.dispatchLog, toolUseId, lane);
       const recoveredMissingLaunch = launched === null;
       if (recoveredMissingLaunch) {
@@ -74,39 +72,12 @@ function handleDispatch(input, env, { sessionId, toolName, file, now, posture, w
           launched.description = description;
         }
       }
-      const pendingIncludedWidth = deriveInclusiveFleetWaveWidth(state.dispatchLog, waveGapMs, launched) || state.fleetWaveWidth;
-      const previousDispatch = state.dispatchLog.findLast((entry) => entry !== launched && entry.phase === "confirmed");
-      const sameWave = previousDispatch && sameFleetWave(previousDispatch, launched, waveGapMs);
-      const previousFleetWaveWidth = state.fleetWaveWidth;
-      state.fleetWaveWidth = pendingIncludedWidth;
-      if (pendingIncludedWidth > 2) {
-        state.consecutiveNarrowWaves = 0;
-      } else if (pendingIncludedWidth === 1 && !sameWave) {
-        state.consecutiveNarrowWaves = previousFleetWaveWidth > 0 && previousFleetWaveWidth <= 2 ? state.consecutiveNarrowWaves + 1 : 0;
-      }
-      if (state.consecutiveNarrowWaves === 0) {
-        state.lastAdvisedNarrowWaveStreak = 0;
-      }
-      const narrowSignature = stableAdvisorySignature([state.consecutiveNarrowWaves, state.fleetWaveWidth]);
-      const shouldAdvise =
-        state.consecutiveNarrowWaves > 0 &&
-        state.consecutiveNarrowWaves % 2 === 0 &&
-        !state.advisedNarrowWaveSignatures.includes(narrowSignature);
-      if (shouldAdvise) {
-        state.lastAdvisedNarrowWaveStreak = state.consecutiveNarrowWaves;
-        state.advisedNarrowWaveSignatures.push(narrowSignature);
-      }
       state.dispatches[launched.lane] = (state.dispatches[launched.lane] ?? 0) + 1;
       state.dispatchEpoch += 1;
       state.lastDispatchAt = latestConfirmedDispatchAt(state.dispatchLog);
       resetWriteWindow(state);
       writeState(file, state);
       return {
-        shouldAdvise,
-        streak: state.consecutiveNarrowWaves,
-        fleetWaveWidth: state.fleetWaveWidth,
-        pendingIncludedWidth,
-        dispatchEpoch: state.dispatchEpoch,
         lane: launched.lane,
         messageId: launched.messageId,
         description: launched.description ?? description,
@@ -123,42 +94,8 @@ function handleDispatch(input, env, { sessionId, toolName, file, now, posture, w
       { at: now, session: sessionId, event: "dispatch", lane: confirmation.lane, tool: toolName, ...(confirmation.messageId ? { messageId: confirmation.messageId } : {}), ...(confirmation.description ? { description: confirmation.description } : {}) },
       env
     );
-    let advisoryContext = genericAgent ? tagMessage("inline-guard.generic-agent-advisory", "This Agent runs a work package outside Fusion collection and settlement. Use codex:codex-rescue or fusion:claude-worker for tracked work, and Explore for read only search.") : null;
-    if (confirmation.shouldAdvise) {
-      const declineStated = hasFleetDeclineAfterLastUserMessage(input.transcript_path);
-      const advisory = claimAdvisory(
-        file,
-        "narrow-wave",
-        stableAdvisorySignature([confirmation.streak, confirmation.fleetWaveWidth]),
-        now,
-        waveGapMs,
-        (state) => state.dispatchEpoch === confirmation.dispatchEpoch && state.consecutiveNarrowWaves === confirmation.streak
-      );
-      if (!advisory.skipped) {
-        recordAuditEvent(
-          {
-            at: now,
-            session: sessionId,
-            event: "warn",
-            lane: confirmation.lane,
-            tool: toolName,
-            reason: NARROW_WAVE_ADVISORY_REASON,
-            posture,
-            messageCode: messageCode(NARROW_WAVE_ADVISORY_MESSAGE_SLUG),
-            pendingIncludedWidth: confirmation.pendingIncludedWidth,
-            ...(declineStated ? { declineStated: true } : {}),
-            ...(advisory.suppressed ? { suppressed: true } : {})
-          },
-          env
-        );
-        if (!advisory.suppressed && !declineStated) {
-          const narrowContext = tagMessage(NARROW_WAVE_ADVISORY_MESSAGE_SLUG, `${confirmation.streak} ${NARROW_WAVE_ADVISORY_SUFFIX}`);
-          advisoryContext = advisoryContext ? `${advisoryContext}\n${narrowContext}` : narrowContext;
-        }
-      }
-    }
-    if (advisoryContext) {
-      writeHookText(`${JSON.stringify(postToolAdvisoryOutput(advisoryContext))}\n`);
+    if (genericAgent) {
+      writeHookText(`${JSON.stringify(postToolAdvisoryOutput(tagMessage("inline-guard.generic-agent-advisory", "This Agent runs a work package outside Fusion collection and settlement. Use codex:codex-rescue or fusion:claude-worker for tracked work, and Explore for read only search.")))}\n`);
     }
     return;
   }

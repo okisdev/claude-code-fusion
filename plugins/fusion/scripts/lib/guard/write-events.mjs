@@ -1,7 +1,7 @@
 import { STRICT_POSTURE } from "../posture.mjs";
 import { messageCode, tagMessage } from "../user-messages.mjs";
 import { recordAuditEvent } from "./audit.mjs";
-import { resolveBudget, resolveFleetWaveGapMs, resolveMode, resolveTailAllowance, resolveTailMaxBytes, resolveZeroDispatchMaxBytes, resolveZeroDispatchWrites } from "./config.mjs";
+import { resolveBudget, resolveMode, resolveTailAllowance, resolveTailMaxBytes, resolveZeroDispatchMaxBytes, resolveZeroDispatchWrites } from "./config.mjs";
 import { MAIN_LANE, OUT_OF_WORKSPACE_EXEMPTION, TAIL_ALLOWANCE_ADVISORY_MESSAGE_SLUG, TAIL_ALLOW_AUDIT_EVENT, UNVERIFIED_ADVISORY_MESSAGE_SLUG, WRITE_BUDGET_ADVISORY_MESSAGE_SLUG, WRITE_BUDGET_DENY_MESSAGE_SLUG, WRITE_TOOLS, ZERO_DISPATCH_ADVISORY_MESSAGE_SLUG, ZERO_DISPATCH_SOFTENED_AUDIT_EVENT } from "./constants.mjs";
 import { extractToolUseId, totalDispatches } from "./dispatch.mjs";
 import { claimAdvisory, normalizeState, readState, stableAdvisorySignature, withStateLock, writeState } from "./state.mjs";
@@ -16,7 +16,7 @@ function handleWrite(input, env, { sessionId, toolName, file, now, posture, cwd,
   if (input.hook_event_name === "PostToolUseFailure" || input.hook_event_name === "PostToolUse") {
     if (!toolUseId) return;
     withStateLock(file, () => {
-      const state = normalizeState(readState(file), now, resolveFleetWaveGapMs(env));
+      const state = normalizeState(readState(file), now);
       const index = state.pendingWrites.findIndex((entry) => entry.id === toolUseId && entry.tool === toolName);
       if (index < 0) return;
       const [entry] = state.pendingWrites.splice(index, 1);
@@ -63,7 +63,7 @@ function handleWrite(input, env, { sessionId, toolName, file, now, posture, cwd,
   const zeroDispatchMaxBytes = resolveZeroDispatchMaxBytes(env);
   const zeroDispatchWrites = resolveZeroDispatchWrites(env);
   const decision = withStateLock(file, () => {
-    const state = normalizeState(readState(file), now, resolveFleetWaveGapMs(env));
+    const state = normalizeState(readState(file), now);
     if (toolUseId && state.pendingWrites.some((entry) => entry.id === toolUseId && entry.tool === toolName)) return { duplicate: true };
     const dispatchCount = totalDispatches(state.dispatches);
     let relief = null;
@@ -160,8 +160,7 @@ function handleWrite(input, env, { sessionId, toolName, file, now, posture, cwd,
           ? [decision.dispatchEpoch, decision.remainingTailSlots]
           : [decision.remainingZeroDispatchWrites, decision.remainingZeroDispatchBytes]
       ),
-      now,
-      resolveFleetWaveGapMs(env)
+      now
     );
     const auditEvent = {
       at: now,
@@ -207,7 +206,6 @@ function handleWrite(input, env, { sessionId, toolName, file, now, posture, cwd,
       "write-budget",
       stableAdvisorySignature([decision.candidate.multiple, budget, decision.candidate.dispatchEpoch]),
       now,
-      resolveFleetWaveGapMs(env),
       (state) => state.dispatchEpoch === decision.candidate.dispatchEpoch && state.advisedMultiples.includes(decision.candidate.multiple)
     );
     if (!advisory.skipped) {

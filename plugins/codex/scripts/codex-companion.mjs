@@ -1383,6 +1383,9 @@ async function executeRecord(found) {
   try {
     const prompt = record.request?.transport === "native-review" ? "" : readPromptFile(record.briefFile);
     const args = executionArgs(record);
+    const windDownSourceUsage = record.windDownOf
+      ? readJobRecordFile(jobFilePath(resolveDataDir(), record.cwd, record.windDownOf))?.cumulativeTokenUsage
+      : null;
     const outcome = await runCodex({
       args,
       cwd: record.cwd,
@@ -1432,7 +1435,8 @@ async function executeRecord(found) {
       resumeThreadId: record.request?.resumeThreadId ?? undefined,
       signal: cancellation.signal,
       deadlineMs: found.foregroundDeadlineMs,
-      timeoutMs
+      timeoutMs,
+      windDownSourceUsage
     });
     if (!outcome.cleanupComplete) {
       const message = outcome.errorMessage || "Codex process cleanup did not complete. The verified process identifiers were retained for retry.";

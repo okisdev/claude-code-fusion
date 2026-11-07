@@ -159,7 +159,7 @@ test("Rendered model scores do not look like local edits", (t) => {
   const sandbox = makeSandbox(t);
   writeModelRouting(sandbox.modelRoutingFile);
   const rendered = renderRulesContent(CANONICAL, { routingPath: sandbox.modelRoutingFile });
-  assert.match(rendered, /^Lane defaults: codex quick gpt-6-sol@xhigh, volume gpt-6-luna@xhigh, flagship gpt-6-astra@xhigh; grok burst grok-4\.7-build-fast@low, independence grok-4\.7-build-fast@high, live-web grok-4\.7-build-fast@high, large-context grok-4\.6@medium; cursor diversity muse-spark-1\.3@xhigh, burst composer-2\.5@default\.$/m);
+  assert.match(rendered, /^Lane defaults: codex quick gpt-6-sol@xhigh, volume gpt-6-luna@xhigh, flagship gpt-6-astra@xhigh; grok burst grok-4\.7-build-fast@low, independence grok-4\.7-build-fast@medium, live-web grok-4\.7-build-fast@high, large-context grok-4\.6@medium; cursor diversity muse-spark-1\.3@xhigh, burst composer-2\.5@default\.$/m);
   assert.strictEqual(hashRulesTemplate(rendered), hashRulesTemplate(CANONICAL));
   fs.mkdirSync(path.dirname(sandbox.rulesFile), { recursive: true });
   fs.writeFileSync(sandbox.rulesFile, rendered, "utf8");
@@ -280,6 +280,7 @@ test("Grok rules document source verified headless boundaries", () => {
   const readme = fs.readFileSync(path.join(repoRoot, "README.md"), "utf8");
   const security = fs.readFileSync(path.join(repoRoot, "SECURITY.md"), "utf8");
   const bridgeSentence = "The child sets all eighteen `GROK_CLAUDE_*_ENABLED`, `GROK_CURSOR_*_ENABLED`, and `GROK_CODEX_*_ENABLED` bridge variables to false; upstream currently consumes the six Claude and six Cursor cells plus the Codex sessions cell and reserves the other five Codex cells, and the child also pins `GROK_MANAGED_MCPS_ENABLED=false` because that variable has highest precedence over `[managed_mcps]` in `~/.grok/config.toml` and remote settings.";
+  const hookClaim = "Grok loads hooks from plugins enabled in ~/.grok/config.toml and from ~/.grok/hooks/*.json inside managed runs, verified at 1.0.77. The GROK_CONFIG overlay does not disable them (the plugin stays loaded in GROK_HOOKS_LOG), and allow_managed_hooks_only is read only from policy layers that also bind interactive use, so /grok:setup names them and the repair is the user's [plugins] list.";
   const subagentSentence = "Upstream parses `--no-subagents`, but the single-turn and agent resolvers do not forward it, while the interactive TUI does apply it; the hard Agent tool deny and `GROK_SUBAGENTS=0` are the effective headless controls.";
   const rustLogSentence = "Every run forces `RUST_LOG=xai_grok_agent::builder=debug,xai_grok_sandbox=warn,xai_grok_shell::session::acp_session::turn=warn`.";
   const bubblewrapSentence = "On Linux, a strict profile with deny paths re-executes under bubblewrap and refuses to start when `bwrap` is missing or unusable; macOS has no equivalent hard enforcement and relies on Seatbelt application plus best-effort tool denies.";
@@ -297,6 +298,9 @@ test("Grok rules document source verified headless boundaries", () => {
 
   for (const text of [troubleshooting, runtime, contract, readme, security, doctor]) {
     assert.ok(text.includes(bridgeSentence), "Grok bridge isolation wording must stay synchronized");
+  }
+  for (const text of [troubleshooting, contract, readme, security, doctor]) {
+    assert.ok(text.includes(hookClaim), "Grok hook behavior must stay synchronized");
   }
 
   for (const text of [troubleshooting, runtime, contract, readme, security]) {
@@ -383,8 +387,7 @@ test("Grok rules document source verified headless boundaries", () => {
   assert.match(fs.readFileSync(path.join(repoRoot, "plugins", "fusion", "rules", "troubleshooting.md"), "utf8"), /not the only writable temporary surface/);
   assert.match(fs.readFileSync(path.join(repoRoot, "plugins", "fusion", "rules", "troubleshooting.md"), "utf8"), /sandbox still permits consult `read_file` to reach `~\/\.grok\/auth\.json`/i);
   assert.match(fs.readFileSync(path.join(repoRoot, "plugins", "fusion", "rules", "troubleshooting.md"), "utf8"), /native MCP servers, plugins, or hooks/);
-  assert.match(fs.readFileSync(path.join(repoRoot, "plugins", "fusion", "rules", "troubleshooting.md"), "utf8"), /bridge variables gate only loose compatibility imports, not native Grok configuration and not the Claude Code plugins that `~\/\.claude\/settings\.json` enables/);
-  assert.match(fs.readFileSync(path.join(repoRoot, "plugins", "fusion", "rules", "troubleshooting.md"), "utf8"), /`\[claude_compat\] imported = true` or lists them in `\[plugins\] disabled`/);
+  assert.match(troubleshooting, /bridge variables gate only loose compatibility imports, not native Grok configuration/);
   for (const sentence of [
     freshSessionSentence,
     volumeTierSentence,

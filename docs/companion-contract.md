@@ -75,3 +75,5 @@ An explicit `--cwd` on a status by id, result, or cancel command restricts the l
 ## Stop gate
 
 The stop gate verdict is the first nonempty line in the engine reply. `ALLOW` allows the stop, and `BLOCK: <reason>` blocks with that reason. Infrastructure failures fail open.
+
+When Fusion is installed, its dispatch hook may run `transport-create`, write the raw request itself, and replace the Agent prompt with a `fusion-staged-token: <token>` line and a `mode: write` or `mode: read-only` line. A rescue agent that receives exactly those two lines runs the task command with that token and skips its own transport steps, so a companion needs no Fusion specific code for this path.

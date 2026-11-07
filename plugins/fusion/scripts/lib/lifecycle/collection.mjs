@@ -359,6 +359,7 @@ function settleWrapperApiDeath(record, evidence, now, env) {
   return settleQueuedVerdict({
     ...record,
     transportStatus: "failed",
+    awaitingBackgroundCommand: undefined,
     failureKind: "delivery",
     infraFailure: true,
     pendingVerdict: {
@@ -390,6 +391,7 @@ function settleReapedWorker(current, now, env) {
   return settleQueuedVerdict({
     ...markWorkerCollected(current, WORKER_COLLECTION_METHODS.TASK_REAPED, now),
     transportStatus: "failed",
+    awaitingBackgroundCommand: undefined,
     failureKind: "task_reaped",
     finishedAt: now,
     lastActivityAt: now
@@ -415,7 +417,7 @@ function runtimeTaskIsTerminal(task) {
 function terminalTransportObserved(record, task) {
   return WORKER_TERMINAL_STATUSES.has(record.transportStatus)
     || ["ready_uncollected", "ready_background"].includes(record.transportStatus)
-    || runtimeTaskIsTerminal(task);
+    || (!record.awaitingBackgroundCommand && runtimeTaskIsTerminal(task));
 }
 
 function terminalCollectionPending(record) {

@@ -114,7 +114,7 @@ function observerRecordSummary(record) {
     finishedAt, completedAt, updatedAt, createdAt };
 }
 
-function observerScanCache(engine, env) {
+export function observerScanCache(engine, env) {
   const roots = engineStateRoots(engine, env);
   const key = JSON.stringify(roots);
   const previous = scanCaches.get(engine);
@@ -158,18 +158,16 @@ function terminalRecords(engine, env) {
           const stat = fs.statSync(file);
           const previous = cache.files.get(file);
           let cached = previous;
-          let sourceRecord = null;
           if (reconcile || !previous || previous.mtimeMs !== stat.mtimeMs || previous.size !== stat.size || previous.ino !== stat.ino) {
             let record = null;
             try {
-              sourceRecord = JSON.parse(fs.readFileSync(file, "utf8"));
-              record = observerRecordSummary(sourceRecord);
+              record = observerRecordSummary(JSON.parse(fs.readFileSync(file, "utf8")));
             } catch {}
             cached = { mtimeMs: stat.mtimeMs, size: stat.size, ino: stat.ino, record };
             cache.files.set(file, cached);
           }
           if (cached.record) {
-            records.push({ record: cached.record, file, sourceRecord });
+            records.push({ record: cached.record, file });
             if (cached.record.id) liveIds.add(cached.record.id);
           }
         } catch {
@@ -222,7 +220,13 @@ export function observeEngineJobs(engine, { env = process.env, now = () => new D
     const ownSessionId = typeof env.CLAUDE_CODE_SESSION_ID === "string" && env.CLAUDE_CODE_SESSION_ID.trim() ? env.CLAUDE_CODE_SESSION_ID.trim() : null;
     const recordSessionId = typeof record.claudeSessionId === "string" && record.claudeSessionId.trim() ? record.claudeSessionId.trim() : null;
     if (notify && !notifiedJobIds.has(record.id) && (!ownSessionId || !recordSessionId || ownSessionId === recordSessionId) && (!Object.hasOwn(record, "background") || record.background === true)) {
-      notify(entry.sourceRecord ?? JSON.parse(fs.readFileSync(entry.file, "utf8")));
+      let fullRecord;
+      try {
+        fullRecord = JSON.parse(fs.readFileSync(entry.file, "utf8"));
+      } catch {
+        continue;
+      }
+      notify(fullRecord);
       notifiedJobIds.add(record.id);
       changed = true;
     }

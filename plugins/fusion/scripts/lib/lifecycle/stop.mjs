@@ -320,7 +320,7 @@ function handleStop(input, env) {
   }
   const pending = [];
   for (const record of activeSessionRecords(input.session_id, env)) {
-    const task = runtimeTaskForRecord(record, tasks);
+    const task = record.awaitingBackgroundCommand ? null : runtimeTaskForRecord(record, tasks);
     const observedTerminal = terminalTransportObserved(record, task);
     const failure = observedTerminal ? null : workerBudgetFailure(record);
     const now = new Date().toISOString();

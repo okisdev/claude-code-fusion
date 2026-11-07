@@ -17,6 +17,7 @@ import {
   resolveZeroDispatchWrites
 } from "../plugins/fusion/scripts/inline-delegation-guard.mjs";
 import { messageCode, messageTag, tagMessage } from "../plugins/fusion/scripts/lib/user-messages.mjs";
+import { isReadOnlyBash } from "../plugins/fusion/scripts/lib/guard/read-streak.mjs";
 
 const repoRoot = path.join(import.meta.dirname, "..");
 const script = path.join(repoRoot, "plugins", "fusion", "scripts", "inline-delegation-guard.mjs");
@@ -181,24 +182,15 @@ function readState(sandbox, sessionId) {
   return JSON.parse(fs.readFileSync(stateFileFor(sandbox, sessionId), "utf8"));
 }
 
-function completeActiveWave(sandbox, gapMs) {
-  const file = stateFileFor(sandbox, "session-1");
-  const state = readState(sandbox, "session-1");
-  for (const entry of state.dispatchLog) {
-    entry.at = new Date(Date.parse(entry.at) - gapMs - 1000).toISOString();
-  }
-  state.lastDispatchAt = new Date(Date.parse(state.lastDispatchAt) - gapMs - 1000).toISOString();
-  fs.writeFileSync(file, JSON.stringify(state), "utf8");
-}
-
-function triggerNarrowWaveAdvisory(sandbox, extraEnv = {}, payload = dispatchPayload(sandbox)) {
-  const gapMs = Number(extraEnv.FUSION_FLEET_WAVE_GAP_MS);
-  assert.ok(Number.isFinite(gapMs) && gapMs > 0);
-  assert.strictEqual(run(sandbox, dispatchPayload(sandbox), extraEnv).stdout, "");
-  completeActiveWave(sandbox, gapMs);
-  assert.strictEqual(run(sandbox, dispatchPayload(sandbox), extraEnv).stdout, "");
-  completeActiveWave(sandbox, gapMs);
-  return run(sandbox, payload, extraEnv);
+function readPayload(sandbox, toolName = "Read", agentId) {
+  return {
+    hook_event_name: "PreToolUse",
+    session_id: "session-1",
+    cwd: sandbox.workDir,
+    tool_name: toolName,
+    tool_input: { file_path: path.join(sandbox.workDir, "file.txt") },
+    ...(agentId ? { agent_id: agentId } : {})
+  };
 }
 
 function auditFiles(sandbox) {
@@ -625,13 +617,35 @@ test("zero exit codes reset the write window", (t) => {
   }
 });
 
-test("a passing verification without writes is a state and audit no-op", (t) => {
+test("a passing verification without writes records evidence without creating state", (t) => {
   const sandbox = makeSandbox(t);
   const verification = run(sandbox, verificationPayload(sandbox));
   assert.strictEqual(verification.status, 0);
   assert.strictEqual(verification.stdout, "");
   assert.strictEqual(fs.existsSync(stateFileFor(sandbox, "session-1")), false);
-  assert.deepStrictEqual(readAuditRecords(sandbox), []);
+  const [event] = readAuditRecords(sandbox);
+  assert.strictEqual(event.event, "verification");
+  assert.strictEqual(event.writeCount, 0);
+  assert.strictEqual(event.evidence, "exit-status");
+});
+
+test("dispatch, verify, and settle records evidence with zero inline writes in both postures", (t) => {
+  for (const posture of ["judgment", "strict"]) {
+    const sandbox = makeSandbox(t);
+    const extraEnv = { FUSION_POSTURE: posture };
+    run(sandbox, dispatchPayload(sandbox, { subagentType: "codex:codex-rescue" }), extraEnv);
+    const before = readState(sandbox, "session-1");
+    assert.strictEqual(before.writesSinceDispatch, 0);
+    const result = run(sandbox, verificationPayload(sandbox, { command: "npm test && node fusion-stats.mjs --record fusion-example=accepted" }), extraEnv);
+    assert.strictEqual(result.status, 0);
+    assert.strictEqual(result.stdout, "");
+    assert.deepStrictEqual(readState(sandbox, "session-1"), before);
+    const [event] = readAuditRecords(sandbox).filter((record) => record.event === "verification");
+    assert.strictEqual(event.writeCount, 0);
+    assert.strictEqual(event.dispatchCount, 1);
+    assert.strictEqual(event.posture, posture);
+    assert.strictEqual(event.evidence, "exit-status");
+  }
 });
 
 test("an unrecognized Bash command does not reset the write window", (t) => {
@@ -657,9 +671,6 @@ test("a verification reset leaves dispatch and fleet telemetry unchanged", (t) =
     dispatches: before.dispatches,
     dispatchEpoch: before.dispatchEpoch,
     lastDispatchAt: before.lastDispatchAt,
-    fleetWaveWidth: before.fleetWaveWidth,
-    consecutiveNarrowWaves: before.consecutiveNarrowWaves,
-    lastAdvisedNarrowWaveStreak: before.lastAdvisedNarrowWaveStreak,
     dispatchLog: before.dispatchLog
   };
 
@@ -671,16 +682,13 @@ test("a verification reset leaves dispatch and fleet telemetry unchanged", (t) =
       dispatches: after.dispatches,
       dispatchEpoch: after.dispatchEpoch,
       lastDispatchAt: after.lastDispatchAt,
-      fleetWaveWidth: after.fleetWaveWidth,
-      consecutiveNarrowWaves: after.consecutiveNarrowWaves,
-      lastAdvisedNarrowWaveStreak: after.lastAdvisedNarrowWaveStreak,
       dispatchLog: after.dispatchLog
     },
     telemetryBefore
   );
 });
 
-test("strict posture ignores a passing verification and preserves the strict deny reason", (t) => {
+test("strict posture records a passing verification and preserves the strict deny reason", (t) => {
   const sandbox = makeSandbox(t);
   const extraEnv = { FUSION_POSTURE: "strict", FUSION_INLINE_TAIL_ALLOWANCE: "0", FUSION_INLINE_ZERO_DISPATCH_WRITES: "0" };
   for (let index = 0; index < 5; index += 1) {
@@ -697,7 +705,9 @@ test("strict posture ignores a passing verification and preserves the strict den
       "5 inline writes happened this session with zero dispatches. Lanes: quick scoped work goes to the codex quick default gpt-6-sol at effort xhigh; trivial or high volume work goes to the codex volume default gpt-6-luna at effort xhigh; work needing the Claude Code tool surface goes to fusion:claude-worker. The inline write budget is exhausted. Dispatch an Agent or Task before another main-loop write."
     )
   );
-  assert.strictEqual(readAuditRecords(sandbox).filter((record) => record.event === "verification").length, 0);
+  const [event] = readAuditRecords(sandbox).filter((record) => record.event === "verification");
+  assert.strictEqual(event.writeCount, 5);
+  assert.strictEqual(event.posture, "strict");
 });
 
 test("a new path Write past the budget is silent in judgment posture and denied in strict posture", (t) => {
@@ -821,7 +831,6 @@ test("audit normalization accepts verification posture and every legacy event ca
     },
     { at, session: "session-1", event: "dispatch", lane: "codex", tool: "Agent", description: "legacy dispatch" },
     { at, session: "session-1", event: "warn", lane: "codex", tool: "Agent", reason: "missing-launch-recovered" },
-    { at, session: "session-1", event: "warn", lane: "codex", tool: "Task", reason: "narrow-wave-advisory", pendingIncludedWidth: 1 },
     { at, session: "session-1", event: "deny", lane: "main", tool: "TaskOutput", description: "reaped-worker-redirect", mode: "enforce" },
     { at, session: "session-1", event: "warn", lane: "main", tool: "TaskStop", description: "reaped-worker-redirect", mode: "advisory", suppressed: true },
     { at, session: "session-1", event: "deny", lane: "main", tool: "Edit", path: "file.txt", writeCount: 5, dispatchCount: 1, budget: 5, mode: "enforce" },
@@ -1079,18 +1088,6 @@ test("tracked agents, Explore, Task, and subagent launches do not receive the ge
   }
 });
 
-test("generic and narrow-wave advisories share one PostToolUse response", (t) => {
-  const sandbox = makeSandbox(t);
-  const result = triggerNarrowWaveAdvisory(sandbox, { FUSION_FLEET_WAVE_GAP_MS: "10000" }, dispatchPayload(sandbox, { subagentType: "fork" }));
-  const output = JSON.parse(result.stdout).hookSpecificOutput;
-  assert.strictEqual(output.hookEventName, "PostToolUse");
-  assert.strictEqual(output.permissionDecision, undefined);
-  assert.match(output.additionalContext, /outside Fusion collection and settlement/);
-  assert.match(output.additionalContext, /2 consecutive width one dispatch waves/);
-  assert.ok(output.additionalContext.includes(messageTag("inline-guard.generic-agent-advisory")));
-  assert.ok(output.additionalContext.includes(messageTag("inline-guard.narrow-wave-advisory")));
-});
-
 test("a Task dispatch is bucketed the same way as an Agent dispatch", (t) => {
   const sandbox = makeSandbox(t);
   const result = run(sandbox, dispatchPayload(sandbox, { toolName: "Task", subagentType: "codex:codex-rescue" }));
@@ -1100,133 +1097,7 @@ test("a Task dispatch is bucketed the same way as an Agent dispatch", (t) => {
   assert.deepStrictEqual(state.dispatches, { codex: 1 });
 });
 
-test("two narrow dispatch waves attach the fleet advisory to the following dispatch", (t) => {
-  const sandbox = makeSandbox(t);
-  const gapMs = 10000;
-  const extraEnv = { FUSION_FLEET_WAVE_GAP_MS: String(gapMs) };
-
-  assert.strictEqual(run(sandbox, dispatchPayload(sandbox), extraEnv).stdout, "");
-  assert.strictEqual(run(sandbox, dispatchPayload(sandbox), extraEnv).stdout, "");
-  completeActiveWave(sandbox, gapMs);
-  assert.strictEqual(run(sandbox, dispatchPayload(sandbox), extraEnv).stdout, "");
-  assert.strictEqual(run(sandbox, dispatchPayload(sandbox), extraEnv).stdout, "");
-  completeActiveWave(sandbox, gapMs);
-
-  const revealed = run(sandbox, dispatchPayload(sandbox), extraEnv);
-  const output = JSON.parse(revealed.stdout);
-  assert.strictEqual(output.hookSpecificOutput.hookEventName, "PostToolUse");
-  assert.strictEqual(output.hookSpecificOutput.permissionDecision, undefined);
-  assert.strictEqual(
-    output.hookSpecificOutput.additionalContext,
-    tagMessage(
-      "inline-guard.narrow-wave-advisory",
-      "2 consecutive width one dispatch waves. If the remaining packages are independent, dispatch them together; /fusion:ultra is available when the goal is genuinely wide."
-    )
-  );
-  assert.strictEqual(readState(sandbox, "session-1").consecutiveNarrowWaves, 2);
-});
-
-test("a fleet decline after the last user message suppresses the narrow-wave context and remains audited", (t) => {
-  const sandbox = makeSandbox(t);
-  const transcript = path.join(sandbox.root, "transcript.jsonl");
-  fs.writeFileSync(
-    transcript,
-    `${[
-      { type: "user", message: { content: "continue with the package" } },
-      { type: "assistant", message: { content: [{ type: "text", text: "fleet-decline: codex single flight" }] } }
-    ]
-      .map((entry) => JSON.stringify(entry))
-      .join("\n")}\n`,
-    "utf8"
-  );
-
-  const result = triggerNarrowWaveAdvisory(sandbox, { FUSION_FLEET_WAVE_GAP_MS: "10000" });
-  assert.strictEqual(result.stdout, "");
-  assert.strictEqual(readState(sandbox, "session-1").lastAdvisedNarrowWaveStreak, 2);
-  const warnings = readAuditRecords(sandbox).filter((record) => record.event === "warn" && record.reason === "narrow-wave-advisory");
-  assert.strictEqual(warnings.length, 1);
-  assert.strictEqual(warnings[0].declineStated, true);
-  assert.strictEqual(warnings[0].messageCode, messageCode("inline-guard.narrow-wave-advisory"));
-});
-
-test("a fleet decline before the last user message does not suppress the narrow-wave context", (t) => {
-  const sandbox = makeSandbox(t);
-  const transcript = path.join(sandbox.root, "transcript.jsonl");
-  fs.writeFileSync(
-    transcript,
-    `${[
-      { type: "user", message: { content: "continue with the package" } },
-      { type: "assistant", message: { content: [{ type: "text", text: "fleet-decline: codex single flight" }] } },
-      { type: "user", message: { content: "continue with the next package" } }
-    ]
-      .map((entry) => JSON.stringify(entry))
-      .join("\n")}\n`,
-    "utf8"
-  );
-
-  const result = triggerNarrowWaveAdvisory(sandbox, { FUSION_FLEET_WAVE_GAP_MS: "10000" });
-  assert.strictEqual(
-    JSON.parse(result.stdout).hookSpecificOutput.additionalContext,
-    tagMessage(
-      "inline-guard.narrow-wave-advisory",
-      "2 consecutive width one dispatch waves. If the remaining packages are independent, dispatch them together; /fusion:ultra is available when the goal is genuinely wide."
-    )
-  );
-});
-
-test("a missing transcript does not suppress the narrow-wave context", (t) => {
-  const sandbox = makeSandbox(t);
-  const payload = dispatchPayload(sandbox);
-  payload.transcript_path = path.join(sandbox.root, "missing-transcript.jsonl");
-
-  const result = triggerNarrowWaveAdvisory(sandbox, { FUSION_FLEET_WAVE_GAP_MS: "10000" }, payload);
-  assert.strictEqual(
-    JSON.parse(result.stdout).hookSpecificOutput.additionalContext,
-    tagMessage(
-      "inline-guard.narrow-wave-advisory",
-      "2 consecutive width one dispatch waves. If the remaining packages are independent, dispatch them together; /fusion:ultra is available when the goal is genuinely wide."
-    )
-  );
-});
-
-test("a wide dispatch wave resets the narrow-wave advisory run", (t) => {
-  const sandbox = makeSandbox(t);
-  const gapMs = 10000;
-  const extraEnv = { FUSION_FLEET_WAVE_GAP_MS: String(gapMs) };
-
-  run(sandbox, dispatchPayload(sandbox), extraEnv);
-  run(sandbox, dispatchPayload(sandbox), extraEnv);
-  completeActiveWave(sandbox, gapMs);
-  assert.strictEqual(run(sandbox, dispatchPayload(sandbox), extraEnv).stdout, "");
-  run(sandbox, dispatchPayload(sandbox), extraEnv);
-  run(sandbox, dispatchPayload(sandbox), extraEnv);
-  completeActiveWave(sandbox, gapMs);
-  assert.strictEqual(run(sandbox, dispatchPayload(sandbox), extraEnv).stdout, "");
-  run(sandbox, dispatchPayload(sandbox), extraEnv);
-  completeActiveWave(sandbox, gapMs);
-
-  const afterReset = run(sandbox, dispatchPayload(sandbox), extraEnv);
-  assert.strictEqual(afterReset.stdout, "");
-  assert.strictEqual(readState(sandbox, "session-1").consecutiveNarrowWaves, 1);
-});
-
-test("the guard emits each narrow wave streak signature at most once per session", (t) => {
-  const sandbox = makeSandbox(t);
-  const gapMs = 10000;
-  const env = { FUSION_FLEET_WAVE_GAP_MS: String(gapMs) };
-  assertMessageTagged(JSON.parse(triggerNarrowWaveAdvisory(sandbox, env).stdout).hookSpecificOutput.additionalContext, "inline-guard.narrow-wave-advisory");
-  completeActiveWave(sandbox, gapMs);
-  for (let index = 0; index < 3; index += 1) run(sandbox, dispatchPayload(sandbox), env);
-  assert.strictEqual(readState(sandbox, "session-1").consecutiveNarrowWaves, 0);
-  completeActiveWave(sandbox, gapMs);
-  for (let index = 0; index < 3; index += 1) {
-    assert.strictEqual(run(sandbox, dispatchPayload(sandbox), env).stdout, "");
-    completeActiveWave(sandbox, gapMs);
-  }
-  assert.strictEqual(readState(sandbox, "session-1").consecutiveNarrowWaves, 2);
-});
-
-test("launch timestamps preserve a four-wide fleet wave when confirmations span ten minutes", (t) => {
+test("launch timestamps remain in the dispatch ledger when confirmations span ten minutes", (t) => {
   const sandbox = makeSandbox(t);
   const baseMs = Date.parse("2026-07-21T00:00:00.000Z");
   const payloads = Array.from({ length: 4 }, (_, index) =>
@@ -1246,152 +1117,12 @@ test("launch timestamps preserve a four-wide fleet wave when confirmations span 
   }
 
   const state = readState(sandbox, "session-1");
-  assert.strictEqual(state.fleetWaveWidth, 4);
-  assert.strictEqual(state.consecutiveNarrowWaves, 0);
   assert.strictEqual(state.dispatchLog.length, 4);
   assert.ok(state.dispatchLog.every((entry) => entry.phase === "confirmed"));
   assert.deepStrictEqual(
     state.dispatchLog.map((entry) => entry.at),
     Array.from({ length: 4 }, (_, index) => new Date(baseMs + index * 1000).toISOString())
   );
-});
-
-test("same-message multi-Agent batches include pending launches before deciding the narrow streak", (t) => {
-  const sandbox = makeSandbox(t);
-  const gapMs = 10000;
-  const extraEnv = { FUSION_FLEET_WAVE_GAP_MS: String(gapMs) };
-  const baseMs = Date.parse("2026-07-21T05:00:00.000Z");
-  const at = (offsetMs) => ({ ...extraEnv, FUSION_TEST_NOW: new Date(baseMs + offsetMs).toISOString() });
-
-  for (let index = 0; index < 2; index += 1) {
-    const payload = dispatchPayload(sandbox, { description: `prior solo ${index + 1}` });
-    const now = at(index * 12000);
-    assert.strictEqual(runRaw(sandbox, { ...payload, hook_event_name: "PreToolUse" }, now).stdout, "");
-    assert.strictEqual(runRaw(sandbox, payload, now).stdout, "");
-  }
-  assert.strictEqual(readState(sandbox, "session-1").consecutiveNarrowWaves, 1);
-
-  const payloads = Array.from({ length: 3 }, (_, index) => dispatchPayload(sandbox, { description: `batched package ${index + 1}` }));
-  for (const [index, payload] of payloads.entries()) {
-    assert.strictEqual(runRaw(sandbox, { ...payload, hook_event_name: "PreToolUse" }, at(24000 + index * 1000)).stdout, "");
-  }
-
-  const outputs = payloads.map((payload, index) => runRaw(sandbox, payload, at(27000 + index * 1000)).stdout);
-  assert.deepStrictEqual(outputs, ["", "", ""]);
-  const state = readState(sandbox, "session-1");
-  assert.strictEqual(state.fleetWaveWidth, 3);
-  assert.strictEqual(state.consecutiveNarrowWaves, 0);
-  assert.strictEqual(readAuditRecords(sandbox).filter((record) => record.reason === "narrow-wave-advisory").length, 0);
-});
-
-test("abandoned launches do not widen fleet waves or reset the narrow streak and expire after the launch TTL", (t) => {
-  const sandbox = makeSandbox(t);
-  const gapMs = 120000;
-  const baseMs = Date.parse("2026-07-21T04:00:00.000Z");
-  const extraEnv = { FUSION_FLEET_WAVE_GAP_MS: String(gapMs) };
-
-  for (let index = 0; index < 3; index += 1) {
-    const now = new Date(baseMs + index * 180000).toISOString();
-    const payload = dispatchPayload(sandbox, { description: `confirmed solo ${index + 1}` });
-    assert.strictEqual(runRaw(sandbox, { ...payload, hook_event_name: "PreToolUse" }, { ...extraEnv, FUSION_TEST_NOW: now }).stdout, "");
-    const confirmation = runRaw(sandbox, payload, { ...extraEnv, FUSION_TEST_NOW: now });
-    assert.strictEqual(confirmation.status, 0);
-    if (index < 2) {
-      assert.strictEqual(confirmation.stdout, "");
-    } else {
-      const additionalContext = JSON.parse(confirmation.stdout).hookSpecificOutput.additionalContext;
-      assert.match(additionalContext, /^2 consecutive width one dispatch waves/);
-      assertMessageTagged(additionalContext, "inline-guard.narrow-wave-advisory");
-    }
-  }
-  assert.strictEqual(readState(sandbox, "session-1").consecutiveNarrowWaves, 2);
-
-  for (let index = 0; index < 4; index += 1) {
-    const payload = dispatchPayload(sandbox, { description: `abandoned launch ${index + 1}` });
-    const now = new Date(baseMs + 540000 + index * 1000).toISOString();
-    assert.strictEqual(runRaw(sandbox, { ...payload, hook_event_name: "PreToolUse" }, { ...extraEnv, FUSION_TEST_NOW: now }).stdout, "");
-  }
-
-  const soloNow = new Date(baseMs + 720000).toISOString();
-  const solo = dispatchPayload(sandbox, { description: "confirmed solo after abandoned launches" });
-  assert.strictEqual(runRaw(sandbox, { ...solo, hook_event_name: "PreToolUse" }, { ...extraEnv, FUSION_TEST_NOW: soloNow }).stdout, "");
-  assert.strictEqual(runRaw(sandbox, solo, { ...extraEnv, FUSION_TEST_NOW: soloNow }).stdout, "");
-
-  const state = readState(sandbox, "session-1");
-  assert.strictEqual(state.fleetWaveWidth, 1);
-  assert.strictEqual(state.consecutiveNarrowWaves, 3);
-  assert.strictEqual(state.dispatchLog.filter((entry) => entry.phase === "launched").length, 4);
-
-  const afterTtl = new Date(baseMs + 30 * 60000).toISOString();
-  assert.strictEqual(run(sandbox, writePayload(sandbox), { ...extraEnv, FUSION_TEST_NOW: afterTtl }).stdout, "");
-  assert.strictEqual(readState(sandbox, "session-1").dispatchLog.filter((entry) => entry.phase === "launched").length, 0);
-});
-
-test("solo launch waves re-nudge at consecutive narrow streaks two and four", (t) => {
-  const sandbox = makeSandbox(t);
-  const baseMs = Date.parse("2026-07-21T02:00:00.000Z");
-  const outputs = [];
-
-  for (let index = 0; index < 5; index += 1) {
-    const now = new Date(baseMs + index * 121000).toISOString();
-    const payload = dispatchPayload(sandbox, { description: `solo package ${index + 1}` });
-    assert.strictEqual(runRaw(sandbox, { ...payload, hook_event_name: "PreToolUse" }, { FUSION_TEST_NOW: now }).stdout, "");
-    outputs.push(runRaw(sandbox, payload, { FUSION_TEST_NOW: now }).stdout);
-  }
-
-  assert.strictEqual(outputs[0], "");
-  assert.strictEqual(outputs[1], "");
-  assert.strictEqual(
-    JSON.parse(outputs[2]).hookSpecificOutput.additionalContext,
-    tagMessage(
-      "inline-guard.narrow-wave-advisory",
-      "2 consecutive width one dispatch waves. If the remaining packages are independent, dispatch them together; /fusion:ultra is available when the goal is genuinely wide."
-    )
-  );
-  assert.strictEqual(outputs[3], "");
-  assert.strictEqual(
-    JSON.parse(outputs[4]).hookSpecificOutput.additionalContext,
-    tagMessage(
-      "inline-guard.narrow-wave-advisory",
-      "4 consecutive width one dispatch waves. If the remaining packages are independent, dispatch them together; /fusion:ultra is available when the goal is genuinely wide."
-    )
-  );
-  const state = readState(sandbox, "session-1");
-  assert.strictEqual(state.consecutiveNarrowWaves, 4);
-  assert.strictEqual(state.lastAdvisedNarrowWaveStreak, 4);
-  assert.deepStrictEqual(
-    readAuditRecords(sandbox).filter((record) => record.reason === "narrow-wave-advisory").map((record) => record.pendingIncludedWidth),
-    [1, 1]
-  );
-});
-
-test("pending launches that expire do not permanently widen a later wave", (t) => {
-  const sandbox = makeSandbox(t);
-  const gapMs = 10000;
-  const extraEnv = { FUSION_FLEET_WAVE_GAP_MS: String(gapMs) };
-  const baseMs = Date.parse("2026-07-21T06:00:00.000Z");
-  const pendingPayloads = Array.from({ length: 2 }, (_, index) => dispatchPayload(sandbox, { description: `pending package ${index + 1}` }));
-
-  for (const [index, payload] of pendingPayloads.entries()) {
-    assert.strictEqual(
-      runRaw(sandbox, { ...payload, hook_event_name: "PreToolUse" }, { ...extraEnv, FUSION_TEST_NOW: new Date(baseMs + index * 1000).toISOString() }).stdout,
-      ""
-    );
-  }
-  assert.strictEqual(
-    runRaw(sandbox, pendingPayloads[0], { ...extraEnv, FUSION_TEST_NOW: new Date(baseMs + 2000).toISOString() }).stdout,
-    ""
-  );
-  assert.strictEqual(readState(sandbox, "session-1").fleetWaveWidth, 2);
-
-  const later = new Date(baseMs + 16 * 60 * 1000).toISOString();
-  const solo = dispatchPayload(sandbox, { description: "confirmed after pending expiry" });
-  assert.strictEqual(runRaw(sandbox, { ...solo, hook_event_name: "PreToolUse" }, { ...extraEnv, FUSION_TEST_NOW: later }).stdout, "");
-  assert.strictEqual(runRaw(sandbox, solo, { ...extraEnv, FUSION_TEST_NOW: later }).stdout, "");
-
-  const state = readState(sandbox, "session-1");
-  assert.strictEqual(state.fleetWaveWidth, 1);
-  assert.strictEqual(state.dispatchLog.filter((entry) => entry.phase === "launched").length, 0);
 });
 
 test("an Agent PreToolUse attempt does not reset the write window before dispatch succeeds", (t) => {
@@ -1436,7 +1167,7 @@ test("Agent and Task dispatches append ledger entries with their computed lane",
   });
 });
 
-test("assistant message IDs group dispatches fifteen seconds apart and split distinct messages within the gap", (t) => {
+test("assistant message IDs remain on dispatch records across time gaps", (t) => {
   const sandbox = makeSandbox(t);
   const first = dispatchPayload(sandbox, { subagentType: "codex:codex-rescue" });
   const second = dispatchPayload(sandbox, { subagentType: "grok:grok-rescue" });
@@ -1446,19 +1177,15 @@ test("assistant message IDs group dispatches fifteen seconds apart and split dis
     { messageId: "wave_two", payloads: [third] }
   ]);
   const baseMs = Date.parse("2026-07-21T00:00:00.000Z");
-  const at = (offset) => ({ FUSION_FLEET_WAVE_GAP_MS: "10000", FUSION_TEST_NOW: new Date(baseMs + offset).toISOString() });
+  const at = (offset) => ({ FUSION_TEST_NOW: new Date(baseMs + offset).toISOString() });
 
   assert.strictEqual(run(sandbox, first, at(0)).stdout, "");
   assert.strictEqual(run(sandbox, second, at(15000)).stdout, "");
   let state = readState(sandbox, "session-1");
-  assert.strictEqual(state.fleetWaveWidth, 2);
-  assert.strictEqual(state.consecutiveNarrowWaves, 0);
   assert.deepStrictEqual(state.dispatchLog.map((entry) => entry.messageId), ["wave_one", "wave_one"]);
 
   assert.strictEqual(run(sandbox, third, at(16000)).stdout, "");
   state = readState(sandbox, "session-1");
-  assert.strictEqual(state.fleetWaveWidth, 1);
-  assert.strictEqual(state.consecutiveNarrowWaves, 1);
   assert.deepStrictEqual(readAuditRecords(sandbox).filter((event) => event.event === "dispatch").map((event) => event.messageId), ["wave_one", "wave_one", "wave_two"]);
 });
 
@@ -1471,41 +1198,6 @@ test("missing transcripts and invalid assistant IDs leave messageId absent", (t)
   assert.strictEqual(run(sandbox, invalid).stdout, "");
   assert.ok(readState(sandbox, "session-1").dispatchLog.every((entry) => !Object.hasOwn(entry, "messageId")));
   assert.ok(readAuditRecords(sandbox).filter((event) => event.event === "dispatch").every((event) => !Object.hasOwn(event, "messageId")));
-});
-
-test("different message IDs form narrow waves even without a time gap", (t) => {
-  const sandbox = makeSandbox(t);
-  const payloads = Array.from({ length: 3 }, () => dispatchPayload(sandbox));
-  writeDispatchTranscript(sandbox, payloads.map((payload, index) => ({ messageId: `message_${index}`, payloads: [payload] })));
-  const baseMs = Date.parse("2026-07-21T00:00:00.000Z");
-  const outputs = payloads.map((payload, index) => run(sandbox, payload, {
-    FUSION_FLEET_WAVE_GAP_MS: "10000",
-    FUSION_TEST_NOW: new Date(baseMs + index * 1000).toISOString()
-  }).stdout);
-  assert.deepStrictEqual(outputs.slice(0, 2), ["", ""]);
-  assert.match(JSON.parse(outputs[2]).hookSpecificOutput.additionalContext, /^2 consecutive width one dispatch waves/);
-  assert.strictEqual(readState(sandbox, "session-1").consecutiveNarrowWaves, 2);
-});
-
-test("an idless dispatch bridges different message IDs within the wave gap", (t) => {
-  const sandbox = makeSandbox(t);
-  const first = dispatchPayload(sandbox);
-  const middle = dispatchPayload(sandbox);
-  const last = dispatchPayload(sandbox);
-  writeDispatchTranscript(sandbox, [
-    { messageId: "A", payloads: [first] },
-    { messageId: "B", payloads: [last] }
-  ]);
-  const baseMs = Date.parse("2026-07-21T00:00:00.000Z");
-  const at = (offset) => ({ FUSION_FLEET_WAVE_GAP_MS: "10000", FUSION_TEST_NOW: new Date(baseMs + offset).toISOString() });
-
-  assert.strictEqual(run(sandbox, first, at(0)).stdout, "");
-  assert.strictEqual(run(sandbox, middle, at(1000)).stdout, "");
-  assert.strictEqual(run(sandbox, last, at(2000)).stdout, "");
-  const state = readState(sandbox, "session-1");
-  assert.deepStrictEqual(state.dispatchLog.map((entry) => entry.messageId ?? null), ["A", null, "B"]);
-  assert.strictEqual(state.fleetWaveWidth, 3);
-  assert.strictEqual(state.consecutiveNarrowWaves, 0);
 });
 
 test("SendMessage continuations of same-session rescue wrappers count as dispatches", (t) => {
@@ -1533,7 +1225,6 @@ test("SendMessage continuations of same-session rescue wrappers count as dispatc
   assert.strictEqual(runRaw(sandbox, agentContinuation, env).stdout, "");
   const state = readState(sandbox, "session-1");
   assert.deepStrictEqual(state.dispatches, { codex: 2 });
-  assert.strictEqual(state.fleetWaveWidth, 2);
   assert.strictEqual(state.dispatchLog[0].lane, "codex");
   assert.strictEqual(state.dispatchLog[0].messageId, "continuation_1");
   assert.deepStrictEqual(readAuditRecords(sandbox).filter((event) => event.event === "dispatch").map((event) => ({ tool: event.tool, lane: event.lane, messageId: event.messageId })), [
@@ -1557,7 +1248,6 @@ test("same-session Fusion worker SendMessage continuation counts as a dispatch",
   assert.strictEqual(state.dispatchLog.length, 1);
   assert.strictEqual(state.dispatchLog[0].subagentType, "fusion:claude-worker");
   assert.strictEqual(state.dispatchLog[0].messageId, "fusion_continuation");
-  assert.strictEqual(state.fleetWaveWidth, 1);
   assert.deepStrictEqual(readAuditRecords(sandbox).filter((event) => event.event === "dispatch").map((event) => ({ tool: event.tool, lane: event.lane, messageId: event.messageId })), [
     { tool: "SendMessage", lane: "fusion:claude-worker", messageId: "fusion_continuation" }
   ]);
@@ -2339,12 +2029,168 @@ test("the terminal TaskOutput redirect denies in strict posture too", (t) => {
   assert.strictEqual(denials[0].posture, "strict");
 });
 
-test("hooks configuration wires PreToolUse write tools, Bash, dispatch tools, TaskOutput, and TaskStop through the inline guard", () => {
+test("read only Bash classification accepts only listed commands in every segment", () => {
+  const cases = [
+    ["cd src && rg pattern . | head -20; wc -l file", true],
+    ["sed -n '1,10p' file", true],
+    ["cat file", true],
+    ["grep pattern file", true],
+    ["rg 'foo|bar' file", true],
+    ["head file", true],
+    ["tail file", true],
+    ["ls -la", true],
+    ["wc -l file", true],
+    ["find . -name '*.mjs'", true],
+    ["awk '{ print $1; }' file", true],
+    ["nl -ba file", true],
+    ["jq '.items[]' file", true],
+    ["tree src", true],
+    ...["diff", "show", "log", "status", "grep", "blame"].map((subcommand) => [`git ${subcommand} --help`, true]),
+    ...["pr view", "pr diff", "issue view", "run view"].map((subcommand) => [`gh ${subcommand} 1`, true]),
+    ["sed -i 's/x/y/' file", false],
+    ["sed -ni '1p' file", false],
+    ["sed --in-place 's/x/y/' file", false],
+    ["sed --in-place=.bak 's/x/y/' file", false],
+    ["sed 'w out' file", false],
+    ["sed -n '1w out' file", false],
+    ["sed 's/x/y/w out' file", false],
+    ["find . -delete", false],
+    ["find . -exec rm {} \\;", false],
+    ["find . -fprint out", false],
+    ["find . -fprintf out '%p'", false],
+    ["find . -fls out", false],
+    ["awk '{ print $1 > \"out\" }' file", false],
+    ["awk '{ print $1 | \"cat\" }' file", false],
+    ["awk '{ system(\"touch out\") }' file", false],
+    ["awk 'BEGIN { system (\"touch out\") }' file", false],
+    ["cat file 2>/dev/null", true],
+    ["rg pattern . 2>&1 | head", true],
+    ["git checkout main", false],
+    ["gh pr edit 1", false],
+    ["cat file > out", false],
+    ["rg pattern . | rm file", false],
+    ["cat file && node script.mjs", false],
+    ["cat file || true", false],
+    ["cat $(touch file)", false],
+    ["", false]
+  ];
+  for (const [command, expected] of cases) assert.strictEqual(isReadOnlyBash(command), expected, command);
+});
+
+test("read calls within 1500 ms share a turn and unknown tools leave the streak alone", (t) => {
+  const sandbox = makeSandbox(t);
+  const base = Date.parse("2026-07-21T00:00:00.000Z");
+  const at = (offset) => ({ FUSION_TEST_NOW: new Date(base + offset).toISOString() });
+  for (const offset of [0, 1500, 3000]) assert.strictEqual(run(sandbox, readPayload(sandbox), at(offset)).stdout, "");
+  assert.strictEqual(readState(sandbox, "session-1").readStreakTurns, 1);
+  assert.strictEqual(run(sandbox, readPayload(sandbox, "Skill"), at(4501)).stdout, "");
+  assert.strictEqual(readState(sandbox, "session-1").readStreakTurns, 1);
+  for (const [offset, tool] of [[4501, "Grep"], [6102, "Glob"], [7703, "Read"]]) {
+    assert.strictEqual(run(sandbox, readPayload(sandbox, tool), at(offset)).stdout, "");
+  }
+  assert.strictEqual(readState(sandbox, "session-1").readStreakTurns, 4);
+  const result = run(sandbox, bashPayload(sandbox, { command: "git status --short" }), at(9304));
+  assert.strictEqual(JSON.parse(result.stdout).hookSpecificOutput.additionalContext,
+    tagMessage("inline-guard.read-streak-advisory", "5 read only turns in a row, and every turn replays the whole context. Batch independent reads into one message, and send open ended reconnaissance to Explore."));
+  assert.strictEqual(readState(sandbox, "session-1").readStreakTurns, 5);
+  assert.strictEqual(readAuditRecords(sandbox).filter((event) => event.reason === "read-streak-advisory").length, 1);
+});
+
+test("read streak advises at five turns and each doubling in both postures", (t) => {
+  for (const posture of ["judgment", "strict"]) {
+    const sandbox = makeSandbox(t);
+    const base = Date.parse("2026-07-21T00:00:00.000Z");
+    const warnings = [];
+    for (let turn = 1; turn <= 20; turn += 1) {
+      const tool = ["Read", "Grep", "Glob"][turn % 3];
+      const result = run(sandbox, readPayload(sandbox, tool), { FUSION_POSTURE: posture, FUSION_TEST_NOW: new Date(base + turn * 1600).toISOString() });
+      if ([5, 10, 20].includes(turn)) {
+        assert.strictEqual(JSON.parse(result.stdout).hookSpecificOutput.additionalContext,
+          tagMessage("inline-guard.read-streak-advisory", `${turn} read only turns in a row, and every turn replays the whole context. Batch independent reads into one message, and send open ended reconnaissance to Explore.`));
+        warnings.push(turn);
+      } else assert.strictEqual(result.stdout, "", `${posture}: ${turn}`);
+    }
+    assert.deepStrictEqual(warnings, [5, 10, 20]);
+    assert.strictEqual(readState(sandbox, "session-1").readStreakTurns, 20);
+    assert.deepStrictEqual(readAuditRecords(sandbox).filter((event) => event.reason === "read-streak-advisory").map((event) => ({
+      event: event.event, reason: event.reason, streakTurns: event.streakTurns, posture: event.posture,
+      messageCode: event.messageCode, lane: event.lane, tool: event.tool
+    })), [5, 10, 20].map((turn) => ({
+      event: "warn", reason: "read-streak-advisory", streakTurns: turn, posture,
+      messageCode: messageCode("inline-guard.read-streak-advisory"), lane: "main", tool: ["Read", "Grep", "Glob"][turn % 3]
+    })));
+  }
+});
+
+test("Bash writes, edit tools, and dispatches reset the read streak", (t) => {
+  for (const tool of ["Bash", "Edit", "Write", "NotebookEdit", "MultiEdit", "Agent", "Task", "SendMessage"]) {
+    const sandbox = makeSandbox(t);
+    const base = Date.parse("2026-07-21T00:00:00.000Z");
+    for (let turn = 0; turn < 4; turn += 1) run(sandbox, readPayload(sandbox), { FUSION_TEST_NOW: new Date(base + turn * 1600).toISOString() });
+    const payload = tool === "Bash" ? bashPayload(sandbox, { command: "node -v" }) :
+      ["Agent", "Task", "SendMessage"].includes(tool) ? { ...dispatchPayload(sandbox, { toolName: tool }), hook_event_name: "PreToolUse" } : writePayload(sandbox, { toolName: tool });
+    run(sandbox, payload, { FUSION_TEST_NOW: new Date(base + 6400).toISOString() });
+    assert.strictEqual(readState(sandbox, "session-1").readStreakTurns, 0, tool);
+    assert.strictEqual(readState(sandbox, "session-1").lastReadAt, null, tool);
+    assert.strictEqual(run(sandbox, readPayload(sandbox), { FUSION_TEST_NOW: new Date(base + 8000).toISOString() }).stdout, "", tool);
+    assert.strictEqual(readState(sandbox, "session-1").readStreakTurns, 1, tool);
+  }
+});
+
+test("read streak read and reset skip a held state lock promptly without output", (t) => {
+  const sandbox = makeSandbox(t);
+  for (let turn = 0; turn < 4; turn += 1) {
+    run(sandbox, readPayload(sandbox), { FUSION_TEST_NOW: new Date(Date.parse("2026-07-21T00:00:00.000Z") + turn * 1600).toISOString() });
+  }
+  const file = stateFileFor(sandbox, "session-1");
+  fs.writeFileSync(`${file}.lock`, String(process.pid));
+  for (const payload of [readPayload(sandbox, "Read"), readPayload(sandbox, "Grep"), readPayload(sandbox, "Glob"), bashPayload(sandbox, { command: "node -v" })]) {
+    const start = performance.now();
+    const result = run(sandbox, payload);
+    assert.ok(performance.now() - start < 2000, payload.tool_name);
+    assert.strictEqual(result.status, 0);
+    assert.strictEqual(result.stdout, "");
+    assert.strictEqual(result.stderr, "");
+  }
+  assert.strictEqual(readState(sandbox, "session-1").readStreakTurns, 4);
+  assert.deepStrictEqual(readAuditRecords(sandbox), []);
+});
+
+test("subagent reads do not change the main loop streak", (t) => {
+  const sandbox = makeSandbox(t);
+  const base = Date.parse("2026-07-21T00:00:00.000Z");
+  const at = (offset) => ({ FUSION_TEST_NOW: new Date(base + offset).toISOString() });
+  assert.strictEqual(run(sandbox, readPayload(sandbox, "Read", "worker-1"), at(0)).stdout, "");
+  assert.strictEqual(run(sandbox, { ...readPayload(sandbox), agent_id: "" }, at(0)).stdout, "");
+  assert.strictEqual(fs.existsSync(stateFileFor(sandbox, "session-1")), false);
+  run(sandbox, readPayload(sandbox), at(1600));
+  assert.strictEqual(run(sandbox, bashPayload(sandbox, { command: "cat file", agentId: "worker-1" }), at(3200)).stdout, "");
+  assert.strictEqual(readState(sandbox, "session-1").readStreakTurns, 1);
+  assert.deepStrictEqual(readAuditRecords(sandbox), []);
+});
+
+test("legacy narrow wave state is discarded when the guard updates a session", (t) => {
+  const sandbox = makeSandbox(t);
+  const at = "2026-07-21T00:00:00.000Z";
+  run(sandbox, readPayload(sandbox), { FUSION_TEST_NOW: at });
+  const file = stateFileFor(sandbox, "session-1");
+  fs.writeFileSync(file, JSON.stringify({ ...readState(sandbox, "session-1"), fleetWaveWidth: 1,
+    consecutiveNarrowWaves: 2, lastAdvisedNarrowWaveStreak: 2, advisedNarrowWaveSignatures: ["a".repeat(64)],
+    advisorySignatures: { "narrow-wave": "old", "write-budget": "kept" } }));
+  run(sandbox, readPayload(sandbox), { FUSION_TEST_NOW: "2026-07-21T00:00:01.600Z" });
+  const state = readState(sandbox, "session-1");
+  for (const key of ["fleetWaveWidth", "consecutiveNarrowWaves", "lastAdvisedNarrowWaveStreak", "advisedNarrowWaveSignatures"]) {
+    assert.strictEqual(Object.hasOwn(state, key), false, key);
+  }
+  assert.deepStrictEqual(state.advisorySignatures, { "write-budget": "kept" });
+});
+
+test("hooks configuration wires PreToolUse read, write, Bash, dispatch, TaskOutput, and TaskStop tools through the inline guard", () => {
   const hooks = JSON.parse(fs.readFileSync(path.join(repoRoot, "plugins", "fusion", "hooks", "hooks.json"), "utf8")).hooks;
   const preToolHandlers = hooks.PreToolUse.flatMap((group) => group.hooks.map((hook) => ({ matcher: group.matcher, command: hook.command }))).filter((hook) => hook.command?.includes("fusion-hook.mjs"));
   assert.deepStrictEqual(preToolHandlers, [
     {
-      matcher: "^(Edit|Write|NotebookEdit|MultiEdit|Bash)$",
+      matcher: "^(Read|Grep|Glob|Edit|Write|NotebookEdit|MultiEdit|Bash)$",
       command: 'command -v node >/dev/null 2>&1 || exit 0; node "${CLAUDE_PLUGIN_ROOT}/scripts/fusion-hook.mjs"'
     },
     {
