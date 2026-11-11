@@ -150,6 +150,35 @@ test("the narrow wave reminder and marker are gone", (t) => {
   assert.strictEqual(fs.readFileSync(statePath(sandbox), "utf8"), original);
 });
 
+test("a new session claim cleans old markers and legacy reminders once", (t) => {
+  const sandbox = makeSandbox(t);
+  const markerDirectory = path.dirname(sessionLanesReminderPath(sandbox));
+  const oldMarker = path.join(markerDirectory, "old-session.marker");
+  const recentMarker = path.join(markerDirectory, "recent-session.marker");
+  const legacyDirectory = path.join(sandbox.dataDir, "fleet-posture", "narrow-wave-reminders");
+  fs.mkdirSync(markerDirectory, { recursive: true });
+  fs.writeFileSync(oldMarker, "\n", "utf8");
+  fs.utimesSync(oldMarker, new Date(Date.now() - 49 * 60 * 60 * 1000), new Date(Date.now() - 49 * 60 * 60 * 1000));
+  fs.writeFileSync(recentMarker, "\n", "utf8");
+  fs.mkdirSync(legacyDirectory, { recursive: true });
+  fs.writeFileSync(path.join(legacyDirectory, "session-1.marker"), "\n", "utf8");
+
+  assertContext(run(sandbox), SESSION_LANES_CONTEXT);
+  assert.strictEqual(fs.existsSync(oldMarker), false);
+  assert.strictEqual(fs.existsSync(recentMarker), true);
+  assert.strictEqual(fs.existsSync(legacyDirectory), false);
+
+  const secondOldMarker = path.join(markerDirectory, "second-old-session.marker");
+  fs.writeFileSync(secondOldMarker, "\n", "utf8");
+  fs.utimesSync(secondOldMarker, new Date(Date.now() - 49 * 60 * 60 * 1000), new Date(Date.now() - 49 * 60 * 60 * 1000));
+  fs.mkdirSync(legacyDirectory, { recursive: true });
+  fs.writeFileSync(path.join(legacyDirectory, "session-1.marker"), "\n", "utf8");
+
+  assertSilent(run(sandbox));
+  assert.strictEqual(fs.existsSync(secondOldMarker), true);
+  assert.strictEqual(fs.existsSync(legacyDirectory), true);
+});
+
 test("session lanes reminder renders the routing table's codex defaults", (t) => {
   const sandbox = makeSandbox(t);
   const routingFile = path.join(sandbox.root, "model-routing.json");

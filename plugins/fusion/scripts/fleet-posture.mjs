@@ -42,21 +42,57 @@ function fleetEnabled(env = process.env) {
   }
 }
 
+function cleanupReminderMarkers(directory, dataDirectory) {
+  try {
+    const cutoff = Date.now() - 48 * 60 * 60 * 1000;
+    for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
+      if (!entry.isFile() || !entry.name.endsWith(".marker")) {
+        continue;
+      }
+      const file = path.join(directory, entry.name);
+      try {
+        if (fs.statSync(file).mtimeMs < cutoff) {
+          fs.unlinkSync(file);
+        }
+      } catch {
+        void 0;
+      }
+    }
+  } catch {
+    void 0;
+  }
+  try {
+    fs.rmSync(path.join(dataDirectory, "fleet-posture", "narrow-wave-reminders"), { recursive: true, force: true });
+  } catch {
+    void 0;
+  }
+}
+
 function claimReminder(input, markerDirectory, env = process.env) {
   const sessionId = normalizeSessionId(input?.session_id);
   if (!sessionId) {
     return false;
   }
-  const file = path.join(resolveFusionDataDir(env), "fleet-posture", markerDirectory, `${sessionId}.marker`);
+  const dataDirectory = resolveFusionDataDir(env);
+  const file = path.join(dataDirectory, "fleet-posture", markerDirectory, `${sessionId}.marker`);
   const directory = path.dirname(file);
-  fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
-  fs.chmodSync(directory, 0o700);
   let descriptor;
   try {
-    descriptor = fs.openSync(file, fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_WRONLY, 0o600);
+    try {
+      descriptor = fs.openSync(file, fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_WRONLY, 0o600);
+    } catch (error) {
+      if (error?.code === "EEXIST") {
+        return false;
+      }
+      if (error?.code !== "ENOENT") {
+        throw error;
+      }
+      fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
+      descriptor = fs.openSync(file, fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_WRONLY, 0o600);
+    }
+    fs.chmodSync(directory, 0o700);
     fs.writeFileSync(descriptor, "\n", "utf8");
     fs.fchmodSync(descriptor, 0o600);
-    return true;
   } catch (error) {
     if (error?.code === "EEXIST") {
       return false;
@@ -67,6 +103,8 @@ function claimReminder(input, markerDirectory, env = process.env) {
       fs.closeSync(descriptor);
     }
   }
+  cleanupReminderMarkers(directory, dataDirectory);
+  return true;
 }
 
 function main() {
