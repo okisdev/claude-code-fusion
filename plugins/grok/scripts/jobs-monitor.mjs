@@ -277,8 +277,9 @@ function readSnapshot({ dataDir, dir, ownSessionId, cache, state }) {
 
 function processSnapshot(snapshot, { ownSessionId, managedGraceMs, cwd, loaded, announced, state, stateFile }) {
   if (!snapshot.available) {
-    return;
+    return false;
   }
+  const hasActiveJob = snapshot.records.some((record) => record?.id && !TERMINAL_STATUSES.has(record.status) && (!ownSessionId || record.claudeSessionId === ownSessionId));
   const liveKeys = new Set();
   const duplicateWorkspacesById = new Map();
   for (const record of snapshot.records) {
@@ -347,6 +348,7 @@ function processSnapshot(snapshot, { ownSessionId, managedGraceMs, cwd, loaded, 
   if (snapshot.complete) {
     state.startupPending = false;
   }
+  return hasActiveJob;
 }
 
 function main() {
@@ -366,21 +368,26 @@ function main() {
   pruneOldStateFiles(stateDir, stateFile);
 
   let timer = null;
-  installExitHandlers(() => clearInterval(timer));
+  installExitHandlers(() => clearTimeout(timer));
 
+  let hasActiveJob = false;
   try {
     const initialSnapshot = readSnapshot(context);
-    processSnapshot(initialSnapshot, context);
+    hasActiveJob = processSnapshot(initialSnapshot, context);
     if (!initialSnapshot.available && initialSnapshot.complete) {
       state.startupPending = false;
     }
   } catch {}
 
-  timer = setInterval(() => {
+  const intervalMs = resolvePollIntervalMs();
+  const scan = () => {
+    let active = false;
     try {
-      processSnapshot(readSnapshot(context), context);
+      active = processSnapshot(readSnapshot(context), context);
     } catch {}
-  }, resolvePollIntervalMs());
+    timer = setTimeout(scan, active ? intervalMs : intervalMs * 4);
+  };
+  timer = setTimeout(scan, hasActiveJob ? intervalMs : intervalMs * 4);
 }
 
 main();

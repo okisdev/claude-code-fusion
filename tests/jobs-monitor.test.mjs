@@ -115,12 +115,69 @@ function readAnnouncedLedger(sandbox, sessionId = null) {
   }
 }
 
+function monitorTimerProbe(sandbox) {
+  const preload = path.join(sandbox.root, "monitor-timer-probe.mjs");
+  const log = path.join(sandbox.root, "monitor-timer-delays.log");
+  fs.writeFileSync(preload, `import fs from "node:fs";
+const original = globalThis.setTimeout;
+globalThis.setTimeout = (callback, delay, ...args) => {
+  if (delay === 1000 || delay === 4000) {
+    fs.appendFileSync(process.env.MONITOR_TIMER_LOG, String(delay) + "\\n");
+    return original(callback, 30, ...args);
+  }
+  return original(callback, delay, ...args);
+};
+`);
+  return {
+    env: { NODE_OPTIONS: `${process.env.NODE_OPTIONS ?? ""} --import=${preload}`.trim(), MONITOR_TIMER_LOG: log, GROK_JOBS_MONITOR_INTERVAL_MS: "1000" },
+    delays: () => fs.existsSync(log) ? fs.readFileSync(log, "utf8").trim().split("\n").map(Number) : []
+  };
+}
+
+function seedMonitorRecord(sandbox, fields = {}) {
+  const id = `monitor-${Math.random().toString(36).slice(2)}`;
+  const record = { ...createJobRecord({ id, pid: null, mode: "consult", cwd: sandbox.workDir, briefFile: path.join(sandbox.root, "brief"), background: true }), ...fields, id, cwd: sandbox.workDir };
+  const file = jobFilePath(sandbox.dataDir, record.cwd, record.id);
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.writeFileSync(file, `${JSON.stringify(record)}\n`);
+  return { file, record };
+}
+
 async function waitForAnnouncement(sandbox, key, sessionId = null) {
   return waitUntil(() => {
     const ledger = readAnnouncedLedger(sandbox, sessionId);
     return ledger?.keys.includes(key) ? ledger : null;
   });
 }
+
+test("Grok monitor schedules slow scans while idle or foreign-owned and fast scans for its active jobs", async (t) => {
+  const sandbox = makeSandbox(t);
+  const probe = monitorTimerProbe(sandbox);
+  const monitor = startMonitor(sandbox, envFor(sandbox, { ...probe.env, CLAUDE_CODE_SESSION_ID: "session-own" }));
+  await waitUntil(() => probe.delays().length >= 1);
+  assert.strictEqual(probe.delays()[0], 4000);
+  seedMonitorRecord(sandbox, { status: "running", claudeSessionId: "session-other" });
+  await waitUntil(() => probe.delays().length >= 2);
+  assert.strictEqual(probe.delays()[1], 4000);
+  const own = seedMonitorRecord(sandbox, { status: "running", claudeSessionId: "session-own" });
+  await waitUntil(() => probe.delays().includes(1000));
+  fs.writeFileSync(own.file, `${JSON.stringify({ ...own.record, status: "done" })}\n`);
+  await waitUntil(() => probe.delays().slice(probe.delays().indexOf(1000) + 1).includes(4000));
+  assert.strictEqual(monitor.child.exitCode, null, monitor.stderr());
+});
+
+test("Grok monitor keeps a terminal job deduplicated across active and idle scans", async (t) => {
+  const sandbox = makeSandbox(t);
+  const { file, record } = seedMonitorRecord(sandbox, { status: "running" });
+  const probe = monitorTimerProbe(sandbox);
+  const monitor = startMonitor(sandbox, envFor(sandbox, probe.env));
+  await waitUntil(() => probe.delays().includes(1000));
+  fs.writeFileSync(file, `${JSON.stringify({ ...record, status: "done" })}\n`);
+  await waitForAnnouncement(sandbox, announcedKey(sandbox.workDir, record.id, "done"));
+  await waitUntil(() => probe.delays().filter((delay) => delay === 4000).length >= 3);
+  assert.strictEqual(monitor.lines().length, 1);
+  assert.deepStrictEqual(readAnnouncedLedger(sandbox).keys, [announcedKey(sandbox.workDir, record.id, "done")]);
+});
 
 test("a pre-existing terminal job emits nothing on startup", async (t) => {
   if (process.platform === "win32") {

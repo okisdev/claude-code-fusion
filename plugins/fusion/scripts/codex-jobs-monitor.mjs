@@ -14,6 +14,7 @@ import {
   fusionRepositoryKey,
   loadModelAuditObservations,
   normalizeCodexTokenUsage,
+  pruneOldObservationSidecars,
   resolveFusionDataDir,
   fusionWorkspaceKey,
   tokenUsageSidecarPath,
@@ -30,7 +31,6 @@ const SESSIONS_DIR_ENV = "CODEX_JOBS_MONITOR_SESSIONS_DIR";
 const SESSION_ID_ENV = "CLAUDE_CODE_SESSION_ID";
 const CODEX_COMPANION_ENV = "FUSION_CODEX_COMPANION";
 const ERROR_MESSAGE_MAX_LENGTH = 80;
-const DEAD_STATUS_KEY = "dead";
 const RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
 const RECONCILE_INTERVAL_MS = 10 * 60 * 1000;
 const MODEL_AUDIT_FILENAME = "model-audit.jsonl";
@@ -787,14 +787,21 @@ function saveAnnounced(file, announced, records, workspaceRoot) {
   fs.chmodSync(file, 0o600);
 }
 
-function pruneAnnounced(announced, liveIds) {
+function pruneAnnounced(announced, terminalRecords, liveIds) {
   let dirty = false;
   for (const key of [...announced]) {
     const separator = key.lastIndexOf(":");
     const id = separator > 0 ? key.slice(0, separator) : null;
-    const status = separator > 0 ? key.slice(separator + 1) : null;
-    if ((!id || !liveIds.has(id)) && status === DEAD_STATUS_KEY) {
+    if (!id || !liveIds.has(id)) {
       announced.delete(key);
+      dirty = true;
+    }
+  }
+  for (const key of terminalRecords.keys()) {
+    const separator = key.lastIndexOf(":");
+    const id = separator > 0 ? key.slice(0, separator) : null;
+    if (!id || !liveIds.has(id)) {
+      terminalRecords.delete(key);
       dirty = true;
     }
   }
@@ -871,9 +878,10 @@ function queueAudit(workspace, observation, auditBatches, auditStates) {
 function processSnapshot(snapshot, context) {
   const { repair, ownSessionId, rolloutIndex, workspaceRoot, announced, terminalRecords, auditStates, stateFile, loaded } = context;
   if (!snapshot.available) {
-    return;
+    return false;
   }
   const records = snapshot.records;
+  const hasActiveJob = records.some(({ record }) => record?.id && !ENGINE_TERMINAL_STATUSES.has(record.status) && belongsToMonitorSession(record, ownSessionId));
   for (const state of auditStates.values()) state.merged = null;
   if (context.announceOnlyPending && records.length > 0) {
     safeWriteLine(REPAIR_UNAVAILABLE_LINE);
@@ -976,7 +984,7 @@ function processSnapshot(snapshot, context) {
       effortSource: existing?.source ?? observations.effortSource
     }, workspaceRoot));
   }
-  if (pruneAnnounced(announced, liveIds)) {
+  if (pruneAnnounced(announced, terminalRecords, liveIds)) {
     dirty = true;
   }
   if (context.startupPending && !loaded.exists) {
@@ -986,6 +994,7 @@ function processSnapshot(snapshot, context) {
     saveAnnounced(stateFile, announced, terminalRecords, workspaceRoot);
   }
   context.startupPending = false;
+  return hasActiveJob;
 }
 
 async function main() {
@@ -1005,13 +1014,17 @@ async function main() {
   const context = { repair, ownSessionId, rolloutIndex, workspaceRoot, announced, terminalRecords, auditStates, stateFile, loaded, announceOnlyPending: !repair, startupPending: true };
 
   pruneOldStateFiles(root, stateFile);
+  try {
+    pruneOldObservationSidecars();
+  } catch {}
 
   let timer = null;
-  installExitHandlers(() => clearInterval(timer));
+  installExitHandlers(() => clearTimeout(timer));
 
+  let hasActiveJob = false;
   try {
     const initialSnapshot = readWorkspaceJobsSnapshot(root, workspaceRoot, repositoryCache, snapshotCache);
-    processSnapshot(initialSnapshot, context);
+    hasActiveJob = processSnapshot(initialSnapshot, context);
     if (!initialSnapshot.available) {
       context.startupPending = false;
     }
@@ -1020,14 +1033,18 @@ async function main() {
     observePeerJobs();
   } catch {}
 
-  timer = setInterval(() => {
+  const intervalMs = resolvePollIntervalMs();
+  const scan = () => {
+    let active = false;
     try {
-      processSnapshot(readWorkspaceJobsSnapshot(root, workspaceRoot, repositoryCache, snapshotCache), context);
+      active = processSnapshot(readWorkspaceJobsSnapshot(root, workspaceRoot, repositoryCache, snapshotCache), context);
     } catch {}
     try {
       observePeerJobs();
     } catch {}
-  }, resolvePollIntervalMs());
+    timer = setTimeout(scan, active ? intervalMs : intervalMs * 4);
+  };
+  timer = setTimeout(scan, hasActiveJob ? intervalMs : intervalMs * 4);
 }
 
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
