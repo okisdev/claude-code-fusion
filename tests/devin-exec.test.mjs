@@ -216,6 +216,19 @@ test("permission requests with id zero receive a cancelled outcome", async (t) =
   assert.equal(result.cancelled, false);
 });
 
+test("request_scope is refused without ending the run in every mode", async (t) => {
+  for (const mode of ["consult", "write", "review"]) {
+    const { result, log } = await fakeRun(t, "request_scope", { mode });
+    assert.equal(classifyDevinFailure(result), null, mode);
+    assert.equal(result.policyViolation, null, mode);
+    assert.equal(result.stopReason, "end_turn", mode);
+    assert.equal(result.stopCause, "complete", mode);
+    assert.equal(result.toolCalls, 3, mode);
+    assert.deepEqual(log.messages.at(-1), { jsonrpc: "2.0", id: "scope-permission", result: { outcome: { outcome: "cancelled" } } }, mode);
+    assert.equal(log.messages.some((message) => message.method === "session/cancel"), false, mode);
+  }
+});
+
 test("other agent requests receive method-not-found errors", async (t) => {
   const { result, log } = await fakeRun(t, "unknown_request");
   assert.equal(classifyDevinFailure(result), null);

@@ -235,7 +235,7 @@ function processToolUpdate(run, update) {
   }
   if (!run.tools.has(id)) run.outcome.toolCalls += 1;
   run.tools.set(id, tool);
-  if (!run.allowedTools.includes(tool)) {
+  if (tool !== "request_scope" && !run.allowedTools.includes(tool)) {
     run.outcome.policyViolation ??= { tool };
     finishRun(run);
     terminateRun(run);
