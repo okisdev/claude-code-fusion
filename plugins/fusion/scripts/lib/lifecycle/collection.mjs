@@ -421,8 +421,8 @@ function terminalTransportObserved(record, task) {
 }
 
 function terminalCollectionPending(record) {
-  return ["ready_uncollected", "ready_background"].includes(record.transportStatus)
-    || (record.runtimeAsync === true && WORKER_TERMINAL_STATUSES.has(record.transportStatus) && !record.collectedAt && !isAutoSettledWrapperApiDeath(record));
+  return !isSettledWorker(record) && (["ready_uncollected", "ready_background"].includes(record.transportStatus)
+    || (record.runtimeAsync === true && WORKER_TERMINAL_STATUSES.has(record.transportStatus) && !record.collectedAt && !isAutoSettledWrapperApiDeath(record)));
 }
 
 function terminalCollectedRecord(record) {

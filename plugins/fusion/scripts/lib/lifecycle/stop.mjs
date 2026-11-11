@@ -424,7 +424,7 @@ function handleStop(input, env) {
     }
     const signature = taskSetSignature(verifiedInFlight);
     if (!input.stop_hook_active && claimStopAdvisory(input.session_id, "in-flight", signature, env)) {
-      writeOutput(hookOutput("Stop", tagMessage("worker-lifecycle.in-flight-context", `Fusion task${verifiedInFlight.length === 1 ? "" : "s"} ${verifiedInFlight.map((record) => record.taskId).join(", ")} ${verifiedInFlight.length === 1 ? "is" : "are"} still in flight. Collection is armed and will be required after terminal notification.`)));
+      writeOutput({ systemMessage: tagMessage("worker-lifecycle.in-flight-context", `Fusion task${verifiedInFlight.length === 1 ? "" : "s"} ${verifiedInFlight.map((record) => record.taskId).join(", ")} ${verifiedInFlight.length === 1 ? "is" : "are"} still in flight. Collection is armed and will be required after terminal notification.`) });
     }
     clearStopGate(input.session_id, env);
     return;

@@ -139,7 +139,7 @@ function handleSubagentStop(input, env) {
     }
     const runtimeAsync = worker.runtimeAsync === true;
     const successfulCompletion = complete && !failure && trustedCollectorReport?.kind !== "outcome" && !collectorProtocolFailure;
-    const subagentStopCollected = successfulCompletion && finalTextFile != null && !collectorContract;
+    const subagentStopCollected = (successfulCompletion || handedBack) && finalTextFile != null && !collectorContract;
     return settleQueuedVerdict({
       ...(runtimeAsync && !subagentStopCollected ? worker : markWorkerCollected(worker, WORKER_COLLECTION_METHODS.SUBAGENT_STOP, now)),
       transportStatus: complete && (trustedCollectorReport?.kind === "outcome" || collectorProtocolFailure) ? "incomplete" : complete ? runtimeAsync && !subagentStopCollected ? "ready_uncollected" : "done" : failure ? "failed" : "incomplete",
