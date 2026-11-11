@@ -15,7 +15,7 @@ Size gate first (cheap, in the main loop):
 
 - If the task is small, a single question, or a one file change, do NOT convene a fleet. Return it to the normal routing policy: questions stay in the main session, and requested changes normally use the Codex primary lane. Say you skipped the fleet because the task did not warrant it.
 - Width is a judgment call, not a floor. A goal that stays narrow because its packages interlock, depend on each other, or are one coherent change needs no decline statement. The real defect is dispatching independent packages one per turn instead of together.
-- Otherwise decompose the task into independent facets. Research decomposes by angle or source (different subsystems, different questions, different documents). Implementation decomposes by work package. Facet count follows the goal's natural package count with a floor of three: 6 to 8 facets when the seams allow it; up to about 12 only when the user asked for maximum coverage and the facets are truly independent. A three package goal is fleet shaped even though it sits below six.
+- Otherwise decompose the task into independent facets. Research decomposes by angle or source (different subsystems, different questions, different documents). Implementation decomposes by work package. Facet count follows the goal's natural package count, and a fleet starts at three: 6 to 8 facets when the seams allow it; up to about 12 only when the user asked for maximum coverage and the facets are truly independent. A three package goal is fleet shaped even though it sits below six.
 
 Compose one self contained brief per facet:
 
