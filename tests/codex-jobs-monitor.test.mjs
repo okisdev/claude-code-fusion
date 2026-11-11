@@ -122,7 +122,7 @@ function envFor(sandbox, extra = {}) {
     GROK_COMPANION_DATA: sandbox.grokData,
     CURSOR_COMPANION_DATA: sandbox.cursorData,
     CODEX_JOBS_MONITOR_SESSIONS_DIR: sandbox.sessionsDir,
-    CODEX_JOBS_MONITOR_INTERVAL_MS: "200",
+    CODEX_JOBS_MONITOR_INTERVAL_MS: "50",
     ...extra,
   };
 }

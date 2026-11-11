@@ -3375,20 +3375,20 @@ test("a successfully terminal async worker without a final-text artifact demands
   assert.doesNotMatch(decision.reason, /TaskOutput/);
 });
 
-function handbackWorker(box, agentId, completionContract) {
+function handbackWorker(box, agentId, completionContract, agentType = "fusion:claude-worker", runtimeAsync = true) {
   const workerTranscript = path.join(box.root, `agent-${agentId}.jsonl`);
   const worker = createWorkerRecord({
     taskId: `fusion-${"e".repeat(24)}`,
     sessionId: "session-1",
-    agentType: "fusion:claude-worker",
+    agentType,
     workspaceRoot: box.cwd,
     parentTranscriptPath: box.transcript,
     parentTranscriptBytesAtDispatch: 0,
     completionContract,
-    limits: workerLimits("fusion:claude-worker", {})
+    limits: workerLimits(agentType, {})
   }, envFor(box));
   const startedAt = new Date().toISOString();
-  updateWorkerRecord(worker.taskId, envFor(box), (current) => ({ ...current, agentId, backgroundTaskId: agentId, runtimeAsync: true, transportStatus: "running", startedAt, lastLivenessAt: startedAt, transcriptPath: workerTranscript }));
+  updateWorkerRecord(worker.taskId, envFor(box), (current) => ({ ...current, agentId, backgroundTaskId: agentId, runtimeAsync, transportStatus: "running", startedAt, lastLivenessAt: startedAt, transcriptPath: workerTranscript }));
   return workerTranscript;
 }
 
@@ -3401,8 +3401,8 @@ function writeHandback(workerTranscript, message, result = {}) {
   ].map((entry) => `${JSON.stringify(entry)}\n`).join(""));
 }
 
-function handbackStop(box, agentId, workerTranscript) {
-  return run(box, { hook_event_name: "SubagentStop", session_id: "session-1", cwd: box.cwd, transcript_path: box.transcript, agent_transcript_path: workerTranscript, agent_id: agentId, agent_type: "fusion:claude-worker", stop_hook_active: false, last_assistant_message: "" });
+function handbackStop(box, agentId, workerTranscript, agentType = "fusion:claude-worker") {
+  return run(box, { hook_event_name: "SubagentStop", session_id: "session-1", cwd: box.cwd, transcript_path: box.transcript, agent_transcript_path: workerTranscript, agent_id: agentId, agent_type: agentType, stop_hook_active: false, last_assistant_message: "" });
 }
 
 test("a report delivered through SubagentHandback settles the worker at SubagentStop", (t) => {
@@ -3442,6 +3442,35 @@ test("a SubagentHandback report without markers is collected at SubagentStop and
   assert.match(decision.hookSpecificOutput.additionalContext, new RegExp(incomplete.taskId));
   assert.doesNotMatch(decision.hookSpecificOutput.additionalContext, /Call Read|TaskOutput|terminal-collection-block/);
   assert.strictEqual(stop(box).stdout, "");
+});
+
+test("a placeholder handed back by a Fusion worker is still collected at SubagentStop", (t) => {
+  const box = sandbox(t);
+  const workerTranscript = handbackWorker(box, "handback-fusion-placeholder", "coverage");
+  const report = "waiting on bg-fusion-1";
+  writeHandback(workerTranscript, report);
+  handbackStop(box, "handback-fusion-placeholder", workerTranscript);
+  const settled = record(box);
+  assert.ok(settled.collectedAt);
+  assert.strictEqual(settled.collectionMethod, "subagent_stop");
+  assert.strictEqual(fs.readFileSync(settled.outputFile, "utf8"), report);
+});
+
+test("a placeholder handed back by a peer rescue wrapper is not collected and the Stop gate still asks for collection", (t) => {
+  for (const runtimeAsync of [true, false]) {
+    for (const report of ["waiting on bg-peer-1", "await-output: pending"]) {
+      const box = sandbox(t);
+      const workerTranscript = handbackWorker(box, "handback-peer-placeholder", "transport", "grok:grok-rescue", runtimeAsync);
+      writeHandback(workerTranscript, report);
+      handbackStop(box, "handback-peer-placeholder", workerTranscript, "grok:grok-rescue");
+      const pending = record(box);
+      assert.strictEqual(pending.collectedAt ?? null, null, report);
+      assert.notStrictEqual(pending.transportStatus, "done", report);
+      if (runtimeAsync) {
+        assert.strictEqual(JSON.parse(stop(box).stdout).decision, "block", report);
+      }
+    }
+  }
 });
 
 test("a completed notification collects a SubagentHandback report that SubagentStop never settled", (t) => {

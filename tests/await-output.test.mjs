@@ -44,20 +44,20 @@ test("exit line completes immediately and removes only that line", async (t) => 
   assert.equal(fs.readFileSync(file, "utf8"), "first\nsecond\n[exited with code -2]\n");
 });
 
-test("footer completes after two seconds without a change", async (t) => {
+test("footer completes after ten seconds without a change", async (t) => {
   for (const state of ["done", "error", "cancelled"]) {
     const file = fixture(t, `body\nstate: ${state}\n`);
-    const result = await run(["--file", file, "--slice-ms", "2000"]);
+    const result = await run(["--file", file, "--slice-ms", "10000"]);
     assert.equal(result.code, 0);
     assert.deepEqual(result.output, Buffer.from(`body\nstate: ${state}\n`));
-    assert.deepEqual(result.sleeps, [500, 500, 500, 500]);
+    assert.deepEqual(result.sleeps, Array(20).fill(500));
   }
 });
 
 test("an already quiet footer completes immediately", async (t) => {
   const file = fixture(t, "body\nstate: done\n");
   const time = Date.now();
-  fs.utimesSync(file, new Date(time - 3000), new Date(time - 3000));
+  fs.utimesSync(file, new Date(time - 11000), new Date(time - 11000));
   const result = await run(["--file", file], { initialTime: time });
   assert.deepEqual(result.output, Buffer.from("body\nstate: done\n"));
   assert.deepEqual(result.sleeps, []);
@@ -65,14 +65,14 @@ test("an already quiet footer completes immediately", async (t) => {
 
 test("a file change restarts the footer quiet period", async (t) => {
   const file = fixture(t, "body\nstate: done\n");
-  const result = await run(["--file", file, "--slice-ms", "3000"], {
+  const result = await run(["--file", file, "--slice-ms", "12000"], {
     onSleep: (time) => {
       if (time === 1000) fs.writeFileSync(file, "revised\nstate: done\n");
     }
   });
   assert.equal(result.code, 0);
   assert.deepEqual(result.output, Buffer.from("revised\nstate: done\n"));
-  assert.equal(result.sleeps.length, 6);
+  assert.equal(result.sleeps.length, 22);
 });
 
 test("slice expiry prints only pending", async (t) => {

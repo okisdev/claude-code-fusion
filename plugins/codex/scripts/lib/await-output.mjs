@@ -80,7 +80,7 @@ export async function awaitOutput(argv, { now = Date.now, sleep = (ms) => new Pr
       stdout.write(Buffer.concat([bytes.subarray(0, last.start), bytes.subarray(last.end)]));
       return 0;
     }
-    if (last && /^state: (done|error|cancelled)$/.test(last.line) && time - unchangedSince >= 2000) {
+    if (last && /^state: (done|error|cancelled)$/.test(last.line) && time - unchangedSince >= 10000) {
       stdout.write(bytes);
       return 0;
     }

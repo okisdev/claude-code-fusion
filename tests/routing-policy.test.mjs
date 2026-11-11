@@ -113,7 +113,7 @@ test("Grok automatic routing exposes four protected roles while the companion re
   assert.match(grokRescue, /Requested changes still follow the Codex first admission ladder unless a protected Grok role applies\./);
   assert.match(grokRescue, /text output contains terminal `state` and `failure` footer lines \(plus `job` when a record was created\), or JSON output contains top level `status` and `failureKind` fields/);
   assert.match(grokRescue, /only when Node or the companion cannot be invoked and no valid typed text or JSON outcome exists/);
-  assert.match(grokRescue, /Never use Bash background mode\./);
+  assert.match(grokRescue, /Background mode belongs to that Bash call alone and is not the companion's `--background`/);
   assert.match(grokRescue, /An explicit incoming user `--background` stays inside the raw request\./);
   assert.match(grokReviewRunner, /return an output containing `phase: cleanup-required` instead of chaining/);
   assert.match(grokReviewRunner, /top level `status` is `running`, and `cleanupRequired` is not true/);

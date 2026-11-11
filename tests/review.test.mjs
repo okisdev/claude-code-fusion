@@ -189,7 +189,7 @@ test("review --background drives the job to done and result returns the review o
     const current = jobRecords(sandbox.dataDir)[0];
     return current && current.status === "done" ? current : null;
   });
-  assert.ok(launch.stdout.endsWith(`job: ${record.id}\ndelivery: manual\nstate: running\n`));
+  assert.ok(launch.stdout.endsWith(`job: ${record.id}\nsandbox: ${sandbox.workDir}\ndelivery: manual\nstate: running\n`));
   assert.ok(launch.stdout.endsWith("state: running\n"));
   assert.strictEqual(record.background, true);
   assert.strictEqual(record.mode, "consult");
