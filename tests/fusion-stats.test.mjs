@@ -4090,8 +4090,10 @@ Posture mix:
 - strict: 4
 - unset: 2`;
   assert.ok(renderFusionStats(report).includes(expectedSection));
-  assert.deepStrictEqual(report.verificationEvidence, { accepted: 0, evidenced: 0, rate: 0 });
+  assert.deepStrictEqual(report.verificationEvidence, { accepted: 0, evidenced: 0, rate: 0, recent: { days: 7, accepted: 0, evidenced: 0, rate: 0 } });
   assert.doesNotMatch(renderFusionStats(report), /## Verification evidence/);
+  assert.deepStrictEqual(report.wrapperDelivery, []);
+  assert.doesNotMatch(renderFusionStats(report), /## Wrapper delivery by plugin version/);
 
   const result = runDirect({ cwd: dir, codexState: path.join(dir, "missing-codex") }, ["--json"], { FUSION_INLINE_GUARD_AUDIT_DIR: auditDir });
   assert.strictEqual(result.status, 0, result.stderr);
@@ -4303,9 +4305,10 @@ test("verification evidence includes later unevidenced acceptances and excludes 
   }
 
   const report = buildFusionStats({ env, cwd: dir });
-  assert.deepStrictEqual(report.verificationEvidence, { accepted: 7, evidenced: 2, rate: 2 / 7 });
+  assert.deepStrictEqual(report.verificationEvidence, { accepted: 7, evidenced: 2, rate: 2 / 7, recent: { days: 7, accepted: 0, evidenced: 0, rate: 0 } });
   const rendered = renderFusionStats(report);
   assert.match(rendered, /## Coercion ledger[\s\S]*## Verification evidence\n\nAccepted implementation packages: 7\nWith a credited verification before the verdict: 2 \(28\.6%\)/);
+  assert.doesNotMatch(rendered, /Last 7 days:/);
   const result = runDirect({ cwd: dir, codexState: env.FUSION_CODEX_STATE }, ["--json"], env);
   assert.strictEqual(result.status, 0, result.stderr);
   assert.deepStrictEqual(JSON.parse(result.stdout).verificationEvidence, report.verificationEvidence);
@@ -4328,6 +4331,77 @@ test("a dispatched package settled after verification with zero inline writes is
   createWorkerRecord({ taskId: "fusion-dispatched", sessionId: "session-dispatched", dispatchToolUseId: "tool-dispatched", agentType: "fusion:claude-worker", packageType: "implementation", workspaceRoot: dir, limits: {} }, env);
   updateWorkerRecord("fusion-dispatched", env, (record) => ({ ...record, transportStatus: "done", finishedAt: "2026-07-21T10:00:02.000Z", acceptance: "accepted", acceptanceRecordedAt: "2026-07-21T10:00:05.000Z" }));
   const report = buildFusionStats({ env, cwd: dir });
-  assert.deepStrictEqual(report.verificationEvidence, { accepted: 1, evidenced: 1, rate: 1 });
+  assert.deepStrictEqual(report.verificationEvidence, { accepted: 1, evidenced: 1, rate: 1, recent: { days: 7, accepted: 0, evidenced: 0, rate: 0 } });
   assert.strictEqual(report.coercionLedger.verificationResets, 0);
+});
+
+test("verification evidence reports the last seven days by verdict time", (t) => {
+  const dir = sandbox(t);
+  const auditDir = path.join(dir, "audit");
+  const env = {
+    FUSION_DATA_DIR: path.join(dir, "fusion-data"),
+    FUSION_INLINE_GUARD_AUDIT_DIR: auditDir,
+    FUSION_WORKER_STATE_DIR: path.join(dir, "workers"),
+    FUSION_CODEX_STATE: path.join(dir, "missing-codex"),
+    GROK_COMPANION_DATA: path.join(dir, "missing-grok")
+  };
+  const now = Date.now();
+  const recentAt = now - 86400000;
+  const oldAt = now - 8 * 86400000;
+  for (const [session, at] of [["recent-evidenced", recentAt], ["old-evidenced", oldAt]]) {
+    writeGuardAuditEvents(auditDir, new Date(at).toISOString().slice(0, 10), [
+      { schemaVersion: 1, at: new Date(at + 1000).toISOString(), session, event: "verification", lane: "main", tool: "Bash" }
+    ]);
+  }
+  for (const [session, at] of [["recent-evidenced", recentAt], ["recent-plain", recentAt], ["old-evidenced", oldAt]]) {
+    const taskId = `fusion-${session}`;
+    createWorkerRecord({ taskId, sessionId: session, dispatchToolUseId: `tool-${session}`, agentType: "fusion:claude-worker", packageType: "implementation", workspaceRoot: dir, limits: {} }, env);
+    updateWorkerRecord(taskId, env, (record) => ({ ...record, transportStatus: "done", finishedAt: new Date(at).toISOString(), acceptance: "accepted", acceptanceRecordedAt: new Date(at + 2000).toISOString() }));
+  }
+  const report = buildFusionStats({ env, cwd: dir });
+  assert.deepStrictEqual(report.verificationEvidence, { accepted: 3, evidenced: 2, rate: 2 / 3, recent: { days: 7, accepted: 2, evidenced: 1, rate: 0.5 } });
+  assert.match(renderFusionStats(report), /With a credited verification before the verdict: 2 \(66\.7%\)\nLast 7 days: 2 accepted, 1 with a credited verification \(50\.0%\)/);
+  const result = runDirect({ cwd: dir, codexState: env.FUSION_CODEX_STATE }, ["--json"], env);
+  assert.strictEqual(result.status, 0, result.stderr);
+  assert.deepStrictEqual(JSON.parse(result.stdout).verificationEvidence, report.verificationEvidence);
+});
+
+test("wrapper delivery groups recent rescue records by version and honors scope", (t) => {
+  const dir = sandbox(t);
+  const other = sandbox(t);
+  const env = {
+    FUSION_DATA_DIR: path.join(dir, "fusion-data"),
+    FUSION_WORKER_STATE_DIR: path.join(dir, "workers"),
+    FUSION_CODEX_STATE: path.join(dir, "missing-codex"),
+    GROK_COMPANION_DATA: path.join(dir, "missing-grok")
+  };
+  const recent = new Date(Date.now() - 86400000).toISOString();
+  const old = new Date(Date.now() - 8 * 86400000).toISOString();
+  const records = [
+    ["new-failed", dir, "codex:codex-rescue", "1.10.0", recent, "delivery", 1],
+    ["new-retried", dir, "grok:grok-rescue", "1.10.0", recent, null, 2],
+    ["older-version", dir, "codex:codex-rescue", "1.9.0", recent, "delivery", 0],
+    ["other-repo", other, "codex:codex-rescue", "1.10.0", recent, "delivery", 0],
+    ["old-record", dir, "codex:codex-rescue", "1.10.0", old, "delivery", 1],
+    ["not-rescue", dir, "fusion:claude-worker", "1.10.0", recent, "delivery", 1]
+  ];
+  for (const [name, workspaceRoot, agentType, version, createdAt, failureKind, retryCount] of records) {
+    const taskId = `fusion-${name}`;
+    createWorkerRecord({ taskId, sessionId: `session-${name}`, dispatchToolUseId: `tool-${name}`, agentType, workspaceRoot, limits: {} }, env);
+    updateWorkerRecord(taskId, env, (record) => ({ ...record, companionVersion: version, createdAt, failureKind, retryCount }));
+  }
+  const report = buildFusionStats({ env, cwd: dir });
+  assert.deepStrictEqual(report.wrapperDelivery, [
+    { version: "1.10.0", jobs: 2, deliveryFailures: 1, retried: 2 },
+    { version: "1.9.0", jobs: 1, deliveryFailures: 1, retried: 0 }
+  ]);
+  assert.match(renderFusionStats(report), /## Wrapper delivery by plugin version, last 7 days\n\n1\.10\.0: 2 jobs, 1 delivery failures \(50\.0%\), 2 retried \(100\.0%\)\n1\.9\.0: 1 jobs, 1 delivery failures \(100\.0%\), 0 retried \(0\.0%\)/);
+  const all = buildFusionStats({ all: true, env, cwd: dir });
+  assert.deepStrictEqual(all.wrapperDelivery, [
+    { version: "1.10.0", jobs: 3, deliveryFailures: 2, retried: 2 },
+    { version: "1.9.0", jobs: 1, deliveryFailures: 1, retried: 0 }
+  ]);
+  const result = runDirect({ cwd: dir, codexState: env.FUSION_CODEX_STATE }, ["--json"], env);
+  assert.strictEqual(result.status, 0, result.stderr);
+  assert.deepStrictEqual(JSON.parse(result.stdout).wrapperDelivery, report.wrapperDelivery);
 });

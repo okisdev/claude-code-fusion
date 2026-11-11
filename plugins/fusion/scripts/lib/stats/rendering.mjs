@@ -340,6 +340,16 @@ export function renderFusionStats(report, { identities = false, byDay = false } 
   renderCoercionLedger(lines, report.coercionLedger);
   if (report.verificationEvidence?.accepted > 0) {
     lines.push("", "## Verification evidence", "", `Accepted implementation packages: ${report.verificationEvidence.accepted}`, `With a credited verification before the verdict: ${report.verificationEvidence.evidenced} (${formatShare(report.verificationEvidence.rate)})`);
+    const recent = report.verificationEvidence.recent;
+    if (recent?.accepted > 0) {
+      lines.push(`Last 7 days: ${recent.accepted} accepted, ${recent.evidenced} with a credited verification (${formatShare(recent.rate)})`);
+    }
+  }
+  if (report.wrapperDelivery?.length > 0) {
+    lines.push("", "## Wrapper delivery by plugin version, last 7 days", "");
+    for (const row of report.wrapperDelivery) {
+      lines.push(`${row.version}: ${row.jobs} jobs, ${row.deliveryFailures} delivery failures (${formatShare(row.deliveryFailures / row.jobs)}), ${row.retried} retried (${formatShare(row.retried / row.jobs)})`);
+    }
   }
   lines.push("", "Peer token totals include only jobs with exact reported usage. Unavailable jobs are never estimated.");
   return `${lines.join("\n")}\n`;

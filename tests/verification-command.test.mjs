@@ -104,6 +104,63 @@ test("keeps final-segment exit-status evidence and rejects mutating commands", (
   assert.equal(summaryEvidence("npm install | tail -20", "3 passed"), null);
 });
 
+test("unwraps timeout flags and env assignments within the wrapper depth limit", () => {
+  for (const command of [
+    "timeout 60 npm test",
+    "timeout --preserve-status -k 5s 60s npm test",
+    "timeout --kill-after=5s --signal TERM 1m npm test",
+    "env npm test",
+    "env CI=1 MODE=test npm test",
+    "env CI=1 timeout -k 5 60 npm test",
+    "time nice timeout 60 env CI=1 npm test"
+  ]) {
+    assert.equal(summaryEvidence(command, ""), "exit-status", command);
+  }
+  for (const command of [
+    "timeout 60 npm install",
+    "timeout npm test",
+    "timeout -k 5 npm test",
+    "env CI=1 npm install",
+    "env CI=1 deploy npm test"
+  ]) {
+    assert.equal(summaryEvidence(command, "Tests  3 passed"), null, command);
+  }
+  assert.equal(summaryEvidence("env CI=1 timeout 60 npm test | tail", ""), null);
+  assert.equal(summaryEvidence("env CI=1 timeout 60 npm test | tail", "Tests  3 passed"), "output-summary");
+});
+
+test("recognizes verification tasks in turbo and nx runners", () => {
+  for (const command of [
+    "turbo run test",
+    "turbo lint:fix",
+    "turbo run type-check",
+    "nx test app",
+    "nx run app:test",
+    "nx run-many -t lint",
+    "nx run-many --target typecheck",
+    "nx affected -t check",
+    "nx affected --target=test:e2e",
+    "env CI=1 timeout 60 turbo run test",
+    "timeout 60 env CI=1 nx run app:test"
+  ]) {
+    assert.equal(summaryEvidence(command, ""), "exit-status", command);
+  }
+  for (const command of [
+    "turbo run deploy",
+    "turbo deploy",
+    "nx deploy",
+    "nx run app:deploy",
+    "nx run-many -t deploy",
+    "nx run-many --projects test",
+    "nx affected --target deploy",
+    "nx affected --projects test"
+  ]) {
+    assert.equal(summaryEvidence(command, "Tests  3 passed"), null, command);
+  }
+  assert.equal(summaryEvidence("turbo run test | tail", ""), null);
+  assert.equal(summaryEvidence("turbo run test | tail", "Tests  3 passed"), "output-summary");
+});
+
 for (const command of [
   "npm test", "npm run build", "npm run lint", "npm run typecheck", "npm run check",
   "pnpm test", "pnpm build", "pnpm lint", "pnpm typecheck", "pnpm check",

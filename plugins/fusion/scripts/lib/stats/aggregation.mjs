@@ -1,5 +1,5 @@
 import fs from "node:fs";
-import { BREADTH_ENGINE_IDS, ENGINES, ENGINE_IDS, ENGINE_TERMINAL_STATUSES, engineStateRoots } from "../../lib/engines.mjs";
+import { BREADTH_ENGINE_IDS, ENGINES, ENGINE_IDS, ENGINE_TERMINAL_STATUSES, PEER_RESCUE_AGENT_NAMES, engineStateRoots } from "../../lib/engines.mjs";
 import { canonicalWorkerAgentType, WORKER_TERMINAL_STATUSES, readWorkerRecords, readWorkerRollups } from "../../lib/worker-state.mjs";
 import { FILE_ENGINE_DESCRIPTORS, checkedUsageAddition, codexSku, isSupersededCodexJob, loadAllObservationCandidates, normalizeClaudeWorkerUsage, observationForJob, scopedObservationForJob, summarizeCodexSkuTelemetry, tokenUsageForJob } from "./engine-evidence.mjs";
 import { CODEX_ACCEPTANCE_STATES, RESUMABLE_CODEX_FAILURE_KINDS, TOKEN_USAGE_FILENAME, bump, fusionWorkspaceKey, loadTokenUsageObservations, nonEmptyString, normalizeCollectionMethod, readCodexJobEvidence, readWorkspaceJobFiles, resolveCodexJobEffort, resolveCodexJobModel, resolveGitWorkspaceRoot, resolveStateRoot, selectPreferredJobs, workspaceRootsShareRepository } from "./evidence.mjs";
@@ -584,10 +584,13 @@ function parentContextAtDispatch(records, all, workspaceRoot) {
 }
 
 function verificationEvidence(records, audit, all, workspaceRoot) {
-  const summary = { accepted: 0, evidenced: 0, rate: 0 };
+  const recent = { days: 7, accepted: 0, evidenced: 0, rate: 0 };
+  const summary = { accepted: 0, evidenced: 0, rate: 0, recent };
   if (audit.startMs == null) {
     return summary;
   }
+  const nowMs = Date.now();
+  const recentStartMs = nowMs - recent.days * 86400000;
   const verifications = new Map();
   for (const event of audit.events) {
     if (event.event === "verification") {
@@ -610,12 +613,38 @@ function verificationEvidence(records, audit, all, workspaceRoot) {
       continue;
     }
     summary.accepted += 1;
-    if ((verifications.get(record.sessionId) ?? []).some((atMs) => atMs >= finishedAt && atMs <= acceptedAt + 5000)) {
+    const evidenced = (verifications.get(record.sessionId) ?? []).some((atMs) => atMs >= finishedAt && atMs <= acceptedAt + 5000);
+    if (evidenced) {
       summary.evidenced += 1;
+    }
+    if (acceptedAt >= recentStartMs && acceptedAt <= nowMs) {
+      recent.accepted += 1;
+      recent.evidenced += Number(evidenced);
     }
   }
   summary.rate = summary.accepted > 0 ? summary.evidenced / summary.accepted : 0;
+  recent.rate = recent.accepted > 0 ? recent.evidenced / recent.accepted : 0;
   return summary;
+}
+
+function wrapperDelivery(records, all, workspaceRoot) {
+  const nowMs = Date.now();
+  const recentStartMs = nowMs - 7 * 86400000;
+  const repositoryCache = new Map();
+  const byVersion = new Map();
+  for (const record of records) {
+    const createdAt = Date.parse(record.createdAt ?? "");
+    if (!PEER_RESCUE_AGENT_NAMES.has(record.agentType) || !Number.isFinite(createdAt) || createdAt < recentStartMs || createdAt > nowMs || (!all && !workspaceRootsShareRepository(record.workspaceRoot, workspaceRoot, repositoryCache))) {
+      continue;
+    }
+    const version = nonEmptyString(record.companionVersion) ?? "unknown";
+    const row = byVersion.get(version) ?? { version, jobs: 0, deliveryFailures: 0, retried: 0 };
+    row.jobs += 1;
+    row.deliveryFailures += Number(record.failureKind === "delivery");
+    row.retried += Number(record.retryCount > 0);
+    byVersion.set(version, row);
+  }
+  return [...byVersion.values()].sort((left, right) => right.version.localeCompare(left.version, undefined, { numeric: true }));
 }
 
 export function buildFusionStats({ all = false, env = process.env, cwd = process.cwd() } = {}) {
@@ -636,7 +665,8 @@ export function buildFusionStats({ all = false, env = process.env, cwd = process
     ...(all ? { retiredWorkers: retiredWorkerStats(env) } : {}),
     fleet,
     coercionLedger: buildCoercionLedger({ env, fleet, audit }),
-    verificationEvidence: verificationEvidence(workers.records, audit, all, workspaceRoot)
+    verificationEvidence: verificationEvidence(workers.records, audit, all, workspaceRoot),
+    wrapperDelivery: wrapperDelivery(workers.records, all, workspaceRoot)
   };
 }
 
