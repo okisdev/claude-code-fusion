@@ -12,7 +12,7 @@ export const DEFAULT_ROUTING_DEFAULTS = {
   codex: {
     quick: { model: "gpt-6-sol", effort: "xhigh" },
     volume: { model: "gpt-6-luna", effort: "xhigh" },
-    flagship: { model: "gpt-6-astra", effort: "xhigh" }
+    flagship: { model: "gpt-6.1-sol", effort: "xhigh" }
   },
   grok: {
     burst: { model: "grok-4.7-build-fast", effort: "low" },

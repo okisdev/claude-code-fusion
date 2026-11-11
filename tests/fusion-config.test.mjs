@@ -368,7 +368,7 @@ test("Audit reports listing drift, unscored models, and Cursor variants per engi
   assert.deepStrictEqual(report.defaults.grok.burst, { model: "grok-4.7-build-fast", effort: "low" });
   assert.deepStrictEqual(report.engines.codex.defaultsAbsent, [
     { role: "volume", model: "gpt-6-luna" },
-    { role: "flagship", model: "gpt-6-astra" }
+    { role: "flagship", model: "gpt-6.1-sol" }
   ]);
   assert.deepStrictEqual(report.engines.codex.unscored, ["gpt-5.7-new", "gpt-6-sol", "o3"]);
   assert.deepStrictEqual(report.engines.grok.configuredButAbsent, ["grok-4-missing"]);
@@ -379,7 +379,7 @@ test("Audit reports listing drift, unscored models, and Cursor variants per engi
   assert.strictEqual(fs.readFileSync(box.modelRoutingFile, "utf8"), routingBeforeAudit);
   const text = run(box, ["audit"]);
   assert.match(text.stdout, /codex defaults: quick gpt-5\.6-terra@high/);
-  assert.match(text.stdout, /Codex defaults absent: volume gpt-6-luna, flagship gpt-6-astra/);
+  assert.match(text.stdout, /Codex defaults absent: volume gpt-6-luna, flagship gpt-6\.1-sol/);
   assert.match(text.stdout, /Unconfigured gpt-\* newcomers: gpt-5\.7-new/);
   assert.match(text.stdout, /Cursor unscored models \(no routing seat\): cursor-new/);
 });
