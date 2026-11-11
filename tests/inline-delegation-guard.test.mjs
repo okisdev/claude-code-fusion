@@ -1880,6 +1880,24 @@ test("in-flight worker tasks allow a real Bash command untouched", (t) => {
   assert.deepStrictEqual(readAuditRecords(sandbox), []);
 });
 
+test("ordinary Bash PreToolUse does not read worker records", (t) => {
+  const sandbox = makeSandbox(t);
+  seedInFlightWorker(sandbox);
+  const marker = path.join(sandbox.root, "worker-reads.txt");
+  const jobsDir = path.join(sandbox.root, "workers", "jobs") + path.sep;
+  const preloadFile = path.join(sandbox.root, "trace-worker-reads.mjs");
+  fs.writeFileSync(preloadFile, `import fs from "node:fs";\nconst read = fs.readFileSync;\nfs.readFileSync = function (file, ...args) { if (String(file).startsWith(${JSON.stringify(jobsDir)})) fs.appendFileSync(${JSON.stringify(marker)}, String(file) + "\\n"); return read.call(this, file, ...args); };\n`);
+  const env = { ...workerStateEnv(sandbox), NODE_OPTIONS: `${process.env.NODE_OPTIONS ?? ""} --import=${pathToFileURL(preloadFile).href}`.trim() };
+  const ordinary = run(sandbox, bashPayload(sandbox, { command: "ls -la" }), env);
+  assert.strictEqual(ordinary.status, 0, ordinary.stderr);
+  assert.strictEqual(ordinary.stdout, "");
+  assert.strictEqual(fs.existsSync(marker), false);
+  const noOp = run(sandbox, bashPayload(sandbox, { command: "true" }), env);
+  assert.strictEqual(noOp.status, 0, noOp.stderr);
+  assert.strictEqual(JSON.parse(noOp.stdout).hookSpecificOutput.permissionDecision, "deny");
+  assert.match(fs.readFileSync(marker, "utf8"), /fusion-abcdef0123456789abcdef01\.json/);
+});
+
 test("no in-flight worker tasks allow no-op Bash true untouched", (t) => {
   const sandbox = makeSandbox(t);
   const result = run(sandbox, bashPayload(sandbox, { command: "true" }), workerStateEnv(sandbox));

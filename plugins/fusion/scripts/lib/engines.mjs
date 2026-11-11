@@ -7,6 +7,7 @@ function engine(descriptor) {
     managedAgents: Object.freeze([...descriptor.managedAgents]),
     stateEnvs: Object.freeze([...descriptor.stateEnvs]),
     roles: Object.freeze([...descriptor.roles]),
+    consultOnlyRoles: Object.freeze([...descriptor.consultOnlyRoles]),
     efforts: Object.freeze([...descriptor.efforts])
   });
 }
@@ -30,6 +31,7 @@ const ENGINES = Object.freeze({
     ownMonitor: false,
     roles: ["quick", "volume", "flagship"],
     defaultRole: "quick",
+    consultOnlyRoles: [],
     efforts: ["low", "medium", "high", "xhigh", "max"],
     unavailablePrefix: "codex unavailable:"
   }),
@@ -51,6 +53,7 @@ const ENGINES = Object.freeze({
     ownMonitor: true,
     roles: ["burst", "independence", "live-web", "large-context"],
     defaultRole: null,
+    consultOnlyRoles: ["live-web", "large-context"],
     efforts: ["low", "medium", "high", "xhigh", "max"],
     unavailablePrefix: "grok unavailable:"
   }),
@@ -72,6 +75,7 @@ const ENGINES = Object.freeze({
     ownMonitor: false,
     roles: ["diversity", "burst"],
     defaultRole: null,
+    consultOnlyRoles: ["diversity"],
     efforts: ["default", "low", "medium", "high", "xhigh", "max"],
     unavailablePrefix: "cursor unavailable:"
   }),
@@ -93,6 +97,7 @@ const ENGINES = Object.freeze({
     ownMonitor: false,
     roles: ["diversity", "burst"],
     defaultRole: null,
+    consultOnlyRoles: ["diversity"],
     efforts: ["default", "none", "minimal", "low", "medium", "high", "xhigh", "max"],
     unavailablePrefix: "devin unavailable:"
   })

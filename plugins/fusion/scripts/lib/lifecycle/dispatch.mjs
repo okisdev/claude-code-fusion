@@ -134,8 +134,10 @@ function prestagePeerPrompt(input, env) {
   }
   const prompt = promptText(input.tool_input);
   const { options, brief, separated } = leadingCompanionOptions(prompt);
+  const engine = engineForAgentType(input.tool_input?.subagent_type);
+  const role = engineRoleFromBrief(engine, separated ? brief : prompt);
   const mode = options.includes("--write") ? "write"
-    : separated && /\bread[ -]only\b|\bconsult\b/i.test(brief.split(/\r?\n/, 1)[0]) ? "read-only" : null;
+    : (separated && /\bread[ -]only\b|\bconsult\b/i.test(brief.split(/\r?\n/, 1)[0])) || ENGINES[engine]?.consultOnlyRoles.includes(role) ? "read-only" : null;
   if (!mode) {
     return null;
   }
@@ -144,7 +146,7 @@ function prestagePeerPrompt(input, env) {
   let output = "";
   const companionEnv = { ...env, CLAUDE_CODE_SESSION_ID: input.session_id };
   try {
-    companion = newestEngineCompanion(engineForAgentType(input.tool_input?.subagent_type), env);
+    companion = newestEngineCompanion(engine, env);
     if (!companion) {
       return null;
     }
@@ -199,7 +201,7 @@ function livePeerReservations(reservations, env, now) {
 function hostPeerCapacityDenial(env, now = Date.now(), totalMemoryBytes = os.totalmem(), reservations = readPeerCapacityReservations(env)) {
   const capacity = hostPeerCapacity(totalMemoryBytes);
   const liveReservations = livePeerReservations(reservations, env, now);
-  const inFlight = liveReservations.length + readWorkerRecords(env, { strict: true }).filter((record) => {
+  const inFlight = liveReservations.length + readWorkerRecords(env, { strict: true, modifiedSinceMs: now - workerLimits(ENGINES.codex.rescueAgent, env).wallClockMs }).filter((record) => {
     if (!PEER_RESCUE_AGENT_NAMES.has(record.agentType) || WORKER_TERMINAL_STATUSES.has(record.transportStatus)) {
       return false;
     }

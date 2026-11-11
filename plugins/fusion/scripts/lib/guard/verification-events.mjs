@@ -52,8 +52,11 @@ function handleBash(input, env, { sessionId, toolName, file, now, posture, write
     if (input.hook_event_name && input.hook_event_name !== "PreToolUse") {
       return;
     }
+    if (command === null || !NO_OP_BASH_COMMANDS.has(command)) {
+      return;
+    }
     const inFlightSignature = sessionId ? inFlightWorkerTaskSignature(sessionId, env) : null;
-    if (command === null || !NO_OP_BASH_COMMANDS.has(command) || !inFlightSignature) {
+    if (!inFlightSignature) {
       return;
     }
     const budget = resolveBudget(env);

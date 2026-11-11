@@ -163,6 +163,35 @@ test("only a deterministic leading mode stages an Agent request", (t) => {
   assert.equal(consume(box, "codex", staged.token).status, 0);
 });
 
+test("consult only routed roles prestage read only while write takes precedence", (t) => {
+  const box = sandbox(t);
+  const cases = [
+    ["grok", "lane: grok live-web", true],
+    ["grok", "lane: panel | grok-role: large-context", true],
+    ["cursor", "lane: cursor diversity", true],
+    ["devin", "lane: devin diversity", true],
+    ["codex", "lane: codex quick", false],
+    ["grok", "lane: grok burst", false],
+    ["cursor", "lane: cursor burst", false],
+    ["devin", "lane: devin burst", false]
+  ];
+  for (const [index, [engine, header, consultOnly]] of cases.entries()) {
+    for (const write of [false, true]) {
+      const prompt = `--model sample --effort high ${write ? "--write " : ""}-- ${header}\ngoal: inspect the package`;
+      const input = event(box, engine, prompt, { tool_use_id: `role-${index}-${write}` });
+      const output = runHook(box, input);
+      if (!consultOnly && !write) {
+        assert.equal(output?.hookSpecificOutput?.updatedInput, undefined, prompt);
+      } else {
+        const staged = stagedTransport(t, box, engine, output, write ? "write" : "read-only");
+        assert.equal(fs.readFileSync(staged.file, "utf8"), prompt);
+        assert.equal(consume(box, engine, staged.token).status, 0);
+      }
+      runHook(box, { ...input, hook_event_name: "PostToolUse", tool_response: { status: "completed" } });
+    }
+  }
+});
+
 test("leading write options stage without a brief separator", (t) => {
   const box = sandbox(t);
   for (const [index, prompt] of ["--write", "--write modify the parser", '--model "model with spaces" --write modify the parser'].entries()) {
