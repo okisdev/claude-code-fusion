@@ -2,6 +2,7 @@
 
 import path from "node:path";
 import { configureRawTransport, createRawCommandTransport as allocateRawCommandTransport, consumeRawCommandTransport, cleanupRawCommandTransportsForSession, resolveCommandTransport } from "./lib/raw-transport.mjs";
+import { awaitOutput } from "./lib/await-output.mjs";
 import { rawBooleanOptionRequested } from "./lib/args.mjs";
 import { SESSION_ID_ENV } from "./lib/state.mjs";
 import { commandContext, output, errorWithFailure } from "./lib/companion/base.mjs";
@@ -24,6 +25,7 @@ function printUsage() {
       "  node scripts/grok-companion.mjs status [job-id] [--cwd <dir>] [--json]",
       "  node scripts/grok-companion.mjs history [--all] [--limit <n>] [--cwd <dir>] [--json]",
       "  node scripts/grok-companion.mjs result <job-id> [--cwd <dir>] [--wait] [--wait-timeout-ms <ms>] [--json]",
+      "  node scripts/grok-companion.mjs await-output --file <path> [--slice-ms <n>]",
       "  node scripts/grok-companion.mjs cancel <job-id> [--cwd <dir>] [--json]",
       "  node scripts/grok-companion.mjs record-acceptance --job-id <32 lowercase hex> --acceptance <accepted|rejected|unverified> [--reason <text>] [--failure-kind <intent_override|scope_rewrite|wrong_approach|style_mismatch|oversized>] [--accept-failed-transport]",
       "  node scripts/grok-companion.mjs stats [--all] [--cwd <dir>] [--json]",
@@ -53,6 +55,10 @@ async function main() {
   const [subcommand, ...receivedArgv] = process.argv.slice(2);
   if (!subcommand || subcommand === "help" || subcommand === "--help") {
     printUsage();
+    return;
+  }
+  if (subcommand === "await-output") {
+    process.exitCode = await awaitOutput(receivedArgv);
     return;
   }
   if (subcommand === "transport-create") {

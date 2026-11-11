@@ -8,6 +8,7 @@ import { isatty } from "node:tty";
 import { fileURLToPath } from "node:url";
 
 import { configureRawTransport, createRawCommandTransport as allocateRawCommandTransport, consumeRawCommandTransport, pruneRawCommandTransports, resolveCommandTransport } from "./lib/raw-transport.mjs";
+import { awaitOutput } from "./lib/await-output.mjs";
 import { parseArgs, parseRawArgs, parseServiceTier, splitRawArgumentString } from "./lib/args.mjs";
 import {
   buildReviewArgs,
@@ -126,6 +127,7 @@ function printUsage() {
       "  node scripts/codex-companion.mjs adversarial-review [--base <ref>] [--scope <auto|working-tree|branch>] [--focus <text>] [--background] [--model <id>] [--effort <level>] [--cwd <dir>] [--json]",
       "  node scripts/codex-companion.mjs status [job-id] [--all] [--cwd <dir>] [--json]",
       "  node scripts/codex-companion.mjs result <job-id> [--wait] [--wait-timeout-ms <ms>] [--cwd <dir>] [--json]",
+      "  node scripts/codex-companion.mjs await-output --file <path> [--slice-ms <n>]",
       "  node scripts/codex-companion.mjs wind-down --job <32 lowercase hex>",
       "  node scripts/codex-companion.mjs cancel <job-id> [--cwd <dir>] [--json]",
       "  node scripts/codex-companion.mjs record-acceptance --job-id <32 lowercase hex> --acceptance <accepted|rejected|unverified> [--reason <text>] [--failure-kind <intent_override|scope_rewrite|wrong_approach|style_mismatch>] [--source <collector|main-loop|stats>] [--accept-failed-transport]",
@@ -2300,6 +2302,10 @@ async function main() {
   const [subcommand, ...receivedArgv] = process.argv.slice(2);
   if (!subcommand || subcommand === "help" || subcommand === "--help") {
     printUsage();
+    return;
+  }
+  if (subcommand === "await-output") {
+    process.exitCode = await awaitOutput(receivedArgv);
     return;
   }
   if (subcommand === "transport-create") {
