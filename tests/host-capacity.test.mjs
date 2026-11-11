@@ -5,11 +5,12 @@ import path from "node:path";
 import { test } from "node:test";
 
 import { hostPeerCapacity, hostPeerCapacityDenial, createDispatch, reserveHostPeerCapacity } from "../plugins/fusion/scripts/lib/lifecycle/dispatch.mjs";
+import { workerLimits } from "../plugins/fusion/scripts/lib/lifecycle/budget.mjs";
 import { handlePreToolUse, handlePostToolUse } from "../plugins/fusion/scripts/lib/lifecycle/tools.mjs";
 import { buildFusionStats } from "../plugins/fusion/scripts/lib/stats/aggregation.mjs";
 import { renderFusionStats } from "../plugins/fusion/scripts/lib/stats/rendering.mjs";
 import { messageTag } from "../plugins/fusion/scripts/lib/user-messages.mjs";
-import { createWorkerRecord, readPeerCapacityReservations, readWorkerRecord, updateWorkerRecord, withPeerCapacityReservations } from "../plugins/fusion/scripts/lib/worker-state.mjs";
+import { createWorkerRecord, readPeerCapacityReservations, readWorkerRecord, updateWorkerRecord, withPeerCapacityReservations, workerRecordFile } from "../plugins/fusion/scripts/lib/worker-state.mjs";
 
 const GiB = 1024 ** 3;
 
@@ -46,6 +47,38 @@ test("host capacity counts live peer wrappers across sessions and ignores stale 
   assert.equal(hostPeerCapacityDenial(box.env, now, 16 * GiB), null);
   updateWorkerRecord("fusion-peer-1", box.env, (record) => ({ ...record, transportStatus: "done" }));
   assert.equal(hostPeerCapacityDenial(box.env, now, 16 * GiB), null);
+});
+
+test("host capacity skips old wrapper records before opening them", (t) => {
+  const box = sandbox(t);
+  const now = Date.now();
+  const oldTaskId = "fusion-old-peer";
+  worker(box, oldTaskId, "session-a", "codex:codex-rescue", {
+    lastLivenessAt: new Date(now).toISOString(),
+    limits: { stallMs: 10_000_000 }
+  });
+  const oldFile = workerRecordFile(oldTaskId, box.env);
+  const oldTime = new Date(now - workerLimits("codex:codex-rescue", box.env).wallClockMs - 1000);
+  fs.utimesSync(oldFile, oldTime, oldTime);
+  worker(box, "fusion-fresh-peer", "session-a");
+  const originalRead = fs.readFileSync;
+  let oldReads = 0;
+  fs.readFileSync = function (file, ...args) {
+    if (file === oldFile) {
+      oldReads += 1;
+      throw new Error("old worker record was opened");
+    }
+    return originalRead.call(this, file, ...args);
+  };
+  try {
+    assert.equal(hostPeerCapacityDenial(box.env, now, 6 * GiB), null);
+    assert.equal(oldReads, 0);
+    worker(box, "fusion-second-fresh-peer", "session-b");
+    assert.match(hostPeerCapacityDenial(box.env, Date.now(), 6 * GiB), /2 peer wrapper jobs in flight/);
+    assert.equal(oldReads, 0);
+  } finally {
+    fs.readFileSync = originalRead;
+  }
 });
 
 function hookOutput(callback) {

@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
-import { renderCancelReport, renderJobDetail, renderTerminalResult } from "../plugins/codex/scripts/lib/render.mjs";
+import { renderBackgroundLaunch, renderCancelReport, renderJobDetail, renderRunningResult, renderTerminalResult } from "../plugins/codex/scripts/lib/render.mjs";
 
 function record(overrides = {}) {
   return {
@@ -14,6 +14,16 @@ function record(overrides = {}) {
     ...overrides
   };
 }
+
+test("a background launch receipt includes its sandbox after the job id", () => {
+  const rendered = renderBackgroundLaunch(record({ status: "running", background: true, delivery: "manual" }));
+  assert.match(rendered, /job: a{32}\nsandbox: \/workspace\/sandbox-root\ndelivery: manual\nstate: running\n$/);
+});
+
+test("a running result includes its sandbox after the job id", () => {
+  const rendered = renderRunningResult(record({ status: "running" }));
+  assert.match(rendered, /job: a{32}\nsandbox: \/workspace\/sandbox-root\nstate: running\n$/);
+});
 
 test("an unverified done result is labeled as transport completion rather than acceptance", () => {
   const rendered = renderTerminalResult(record());

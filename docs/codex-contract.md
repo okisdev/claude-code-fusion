@@ -103,7 +103,7 @@ failure: <kind>
 
 Successful transport output includes `state: done`. Error and cancelled output includes the corresponding `failure` line. Final response prose cannot mark its own result accepted or rejected, so successful Codex transport remains `semantic: unverified` until the orchestrator verifies it. The adapter uses `semantic: rejected` only for structured policy evidence such as a forbidden collaboration tool call. Later verification judgments are recorded independently by Fusion and do not rewrite the companion footer. JSON output exposes the complete persisted record without converting absent fields into zero values.
 
-`result --wait` may wait for an explicitly detached job. If its bounded wait period expires, it returns `state: running` without claiming completion. Foreground task and review calls do not use collector polling.
+`result --wait` may wait for an explicitly detached job. If its bounded wait period expires, it returns `state: running` without claiming completion. Foreground task and review calls do not use collector polling; a rescue wrapper waits for its background shell through `await-output --file <path>` and returns the companion output as one report.
 
 ## Failure kinds
 
@@ -121,14 +121,14 @@ Protocol fixtures cover every supported event type, unknown extensions, malforme
 
 - `CODEX_BIN` overrides the Codex executable for tests and controlled installations.
 - `CODEX_COMPANION_DATA` overrides the data root. The value must be an absolute path, since the companion fails closed on a relative value and Fusion treats a non-absolute state-root override as unset rather than throwing.
-- `CODEX_COMPANION_TIMEOUT_MS` overrides the foreground execution timeout.
+- `CODEX_COMPANION_TIMEOUT_MS` overrides the 570000 ms execution timeout for a task run from a foreground Bash call; `task --transport-background-shell` uses a 900000 ms budget, overridden by `CODEX_COMPANION_BACKGROUND_SHELL_TIMEOUT_MS`.
 - `CODEX_COMPANION_BACKGROUND_TIMEOUT_MS` overrides the detached worker timeout.
 - `CODEX_COMPANION_BACKGROUND_DELIVERY=managed` marks a detached job as owned by an internal collector. Unset explicit background jobs use manual delivery.
 - `CODEX_COMPANION_LAUNCH_APPROVAL_TIMEOUT_MS` overrides how long an unapproved background worker waits before failing without starting Codex.
 - `CODEX_COMPANION_PIDLESS_RUNNING_GRACE_MS` overrides the launch grace period.
 - `CODEX_COMPANION_WAIT_POLL_MS` and `CODEX_COMPANION_WAIT_TIMEOUT_MS` control bounded result waiting.
 - `CODEX_COMPANION_HISTORY_MAX_RECORDS` and `CODEX_COMPANION_HISTORY_MAX_BYTES` control managed terminal history retention.
-- `CODEX_JOBS_MONITOR_SESSIONS_DIR` overrides the Codex rollout tree used by Fusion's monitor for best effort model, effort, and token observations. When it is unset, the monitor uses `$CODEX_HOME/sessions` if `CODEX_HOME` is nonempty, then `~/.codex/sessions`.
+- `CODEX_JOBS_MONITOR_SESSIONS_DIR` overrides the Codex rollout tree used by Fusion's monitor for best effort model, effort, and token observations. When it is unset, the monitor uses `$CODEX_HOME/sessions` if `CODEX_HOME` is nonempty, then `~/.codex/sessions`; it scans every 15 seconds while this session has a running job and every 60 seconds otherwise, drops ledger entries for missing jobs, and prunes old observation sidecars at startup.
 - `FUSION_CODEX_STATE` selects one Codex state root for Fusion. The compatibility alias `FUSION_CODEX_STATE_DIR` also selects one root.
 
 ## Fusion integration

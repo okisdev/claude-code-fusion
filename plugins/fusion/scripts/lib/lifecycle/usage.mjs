@@ -1,5 +1,5 @@
 import path from "node:path";
-import { appendTokenUsageObservation, fusionRepositoryKey } from "../../fusion-stats.mjs";
+import { appendTokenUsageObservation, fusionRepositoryKey } from "../stats/evidence.mjs";
 import { WORKER_TERMINAL_STATUSES, resolveFusionDataDir } from "../worker-state.mjs";
 
 function observedWorkerTokenUsage(usage) {

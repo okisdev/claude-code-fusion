@@ -2069,6 +2069,7 @@ test("resume-last inherits model, effort, and service tier from its thread", (t)
   assert.ok(args.some((value, index) => value === "-c" && args[index + 1] === "service_tier=flex"));
   const resumed = jobRecords(sandbox).find((record) => record.id !== source.id);
   assert.deepEqual(resumed.request, {
+    backgroundShellBudget: false,
     effort: "xhigh",
     fresh: false,
     inheritedFromThread: true,

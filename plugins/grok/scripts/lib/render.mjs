@@ -270,12 +270,16 @@ export function renderTaskResult({ text, structuredOutput, structuredOutputError
   return `${lines.join("\n")}\n`;
 }
 
-export function renderBackgroundLaunch(jobId, delivery) {
+export function renderBackgroundLaunch(jobId, delivery, cwd) {
+  if (typeof cwd !== "string" || !cwd) {
+    throw new Error("A background launch receipt requires a workspace path.");
+  }
   return [
     `Started background job ${jobId}.`,
     `Check progress with /grok:status ${jobId}.`,
     `Fetch the result with /grok:result ${jobId}.`,
     `job: ${jobId}`,
+    `sandbox: ${cwd}`,
     `delivery: ${delivery}`,
     "state: running",
     ""
@@ -492,6 +496,8 @@ export function renderCancelReport(job) {
     "",
     `job: ${job.id}`,
     `sandbox: ${job.cwd}`,
+    ...(job.delivery != null ? [`delivery: ${job.delivery}`] : []),
+    ...(job.semanticStatus != null ? [`semantic: ${job.semanticStatus}`] : []),
     "state: cancelled"
   ];
   if (job.failureKind === "cancelled") {

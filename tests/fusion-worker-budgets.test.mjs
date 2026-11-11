@@ -102,7 +102,8 @@ test("third identical Stop block releases once and a lifecycle change resets the
   assert.equal(readWorkerSessionState("budget-session", box.env).stopGate.count, 2);
   const released = stop(box);
   assert.equal(released.decision, undefined, JSON.stringify({ released, gate: readWorkerSessionState("budget-session", box.env).stopGate }));
-  assert.match(released.hookSpecificOutput.additionalContext, new RegExp(first.taskId));
+  assert.match(released.systemMessage, new RegExp(first.taskId));
+  assert.equal(released.hookSpecificOutput, undefined);
   assert.equal(readWorkerSessionState("budget-session", box.env).events.at(-1).type, "stop-gate-released");
   assert.equal(stop(box), null);
   updateWorkerRecord(first.taskId, box.env, (current) => ({ ...current, progressEvents: (current.progressEvents ?? 0) + 1 }));
@@ -110,7 +111,7 @@ test("third identical Stop block releases once and a lifecycle change resets the
   updateWorkerRecord(first.taskId, box.env, (current) => ({ ...current, description: "new lifecycle detail" }));
   assert.equal(stop(box).decision, "block");
   assert.equal(stop(box).decision, "block");
-  assert.match(stop(box).hookSpecificOutput.additionalContext, /Stop gate released/);
+  assert.match(stop(box).systemMessage, /Stop gate released/);
   assert.equal(readWorkerSessionState("budget-session", box.env).events.length, 2);
 });
 
@@ -119,11 +120,11 @@ test("Stop suppresses acceptance advice in flight and repeats in-flight advice o
   worker(box, "3", { transportStatus: "done", collectedAt: new Date().toISOString(), awaitingVerdict: true });
   const active = worker(box, "4", { agentId: "active-4", backgroundTaskId: "active-4", transportStatus: "pending_async" });
   const first = stop(box, { background_tasks: [{ id: "active-4", status: "running", type: "subagent" }] });
-  assert.match(first.hookSpecificOutput.additionalContext, /still in flight/);
-  assert.doesNotMatch(first.hookSpecificOutput.additionalContext, /Acceptance remains unverified/);
+  assert.match(first.systemMessage, /still in flight/);
+  assert.doesNotMatch(first.systemMessage, /Acceptance remains unverified/);
   assert.equal(stop(box, { background_tasks: [{ id: "active-4", status: "running", type: "subagent" }] }), null);
   const next = worker(box, "5", { agentId: "active-5", backgroundTaskId: "active-5", transportStatus: "pending_async" });
   const changed = stop(box, { background_tasks: [{ id: "active-4", status: "running", type: "subagent" }, { id: "active-5", status: "running", type: "subagent" }] });
-  assert.match(changed.hookSpecificOutput.additionalContext, new RegExp(active.taskId));
-  assert.match(changed.hookSpecificOutput.additionalContext, new RegExp(next.taskId));
+  assert.match(changed.systemMessage, new RegExp(active.taskId));
+  assert.match(changed.systemMessage, new RegExp(next.taskId));
 });

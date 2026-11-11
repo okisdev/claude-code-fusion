@@ -1,4 +1,11 @@
 {
+  "await-output.mjs": [
+    "plugins/grok/scripts/lib/await-output.mjs",
+    "plugins/cursor/scripts/lib/await-output.mjs",
+    "plugins/codex/scripts/lib/await-output.mjs",
+    "plugins/devin/scripts/lib/await-output.mjs",
+    "plugins/fusion/scripts/lib/await-output.mjs"
+  ],
   "process-identity.mjs": [
     "plugins/grok/scripts/lib/process-identity.mjs",
     "plugins/cursor/scripts/lib/process-identity.mjs",
@@ -20,5 +27,9 @@
     "plugins/grok/scripts/lib/args.mjs",
     "plugins/cursor/scripts/lib/args.mjs",
     "plugins/devin/scripts/lib/args.mjs"
+  ],
+  "job-state.mjs": [
+    "plugins/cursor/scripts/lib/job-state.mjs",
+    "plugins/devin/scripts/lib/job-state.mjs"
   ]
 }

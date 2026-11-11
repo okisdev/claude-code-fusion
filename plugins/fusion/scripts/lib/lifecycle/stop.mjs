@@ -35,7 +35,7 @@ function writeStopGateBlock(input, env, code, message, pendingRecords) {
     };
   });
   if (newlyReleased) {
-    writeOutput(hookOutput("Stop", tagMessage(code, `Fusion Stop gate released after repeated blocks. Still pending: ${ids || "unknown Fusion tasks"}.`)));
+    writeOutput({ systemMessage: tagMessage(code, `Fusion Stop gate released after repeated blocks. Still pending: ${ids || "unknown Fusion tasks"}.`) });
   } else if (!released) {
     writeOutput(blockStop(tagMessage(code, message)));
   }
@@ -162,7 +162,6 @@ function writeAcceptanceAdvisory(records, env) {
 }
 
 function terminalCollectionInstruction(record, env) {
-  const collectId = record.backgroundTaskId ?? record.agentId;
   const identity = [record.agentType, record.description].filter((value) => typeof value === "string" && value.trim()).join(", ");
   const worker = `${record.taskId}${identity ? ` (${identity})` : ""}`;
   let finalTextFile = regularFileExists(record.outputFile) ? record.outputFile : null;
@@ -177,9 +176,12 @@ function terminalCollectionInstruction(record, env) {
       }
     }
   }
-  return finalTextFile
-    ? `Call Read with file_path=${finalTextFile} to collect the terminal output for Fusion task ${worker} before finishing.`
-    : collectId ? `Call TaskOutput with block=true for terminal owned task ${collectId} and collect Fusion task ${worker} before finishing.` : `Collect terminal owned task ${worker} before finishing.`;
+  if (finalTextFile) {
+    return `Call Read with file_path=${finalTextFile} to collect the terminal output for Fusion task ${worker} before finishing.`;
+  }
+  return regularFileExists(record.transcriptPath)
+    ? `Fusion task ${worker} ended without a final report. Call Read with file_path=${record.transcriptPath} to collect what it left before finishing.`
+    : `Collect terminal owned task ${worker} before finishing.`;
 }
 
 function settleOnlyRecords(records) {
@@ -422,7 +424,7 @@ function handleStop(input, env) {
     }
     const signature = taskSetSignature(verifiedInFlight);
     if (!input.stop_hook_active && claimStopAdvisory(input.session_id, "in-flight", signature, env)) {
-      writeOutput(hookOutput("Stop", tagMessage("worker-lifecycle.in-flight-context", `Fusion task${verifiedInFlight.length === 1 ? "" : "s"} ${verifiedInFlight.map((record) => record.taskId).join(", ")} ${verifiedInFlight.length === 1 ? "is" : "are"} still in flight. Collection is armed and will be required after terminal notification.`)));
+      writeOutput({ systemMessage: tagMessage("worker-lifecycle.in-flight-context", `Fusion task${verifiedInFlight.length === 1 ? "" : "s"} ${verifiedInFlight.map((record) => record.taskId).join(", ")} ${verifiedInFlight.length === 1 ? "is" : "are"} still in flight. Collection is armed and will be required after terminal notification.`) });
     }
     clearStopGate(input.session_id, env);
     return;

@@ -6,6 +6,7 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
+import { awaitOutput } from "./lib/await-output.mjs";
 import { ENGINES, engineIdChoices, isEngineId } from "./lib/engines.mjs";
 import { consumeRawArgsTransport, createRawArgsTransport } from "./lib/raw-args-transport.mjs";
 
@@ -24,7 +25,7 @@ const FOOTER_FIELD = /^\s*(?:[a-z][a-z0-9_-]*-session|job|delivery|semantic|stat
 const REQUEST_FIELDS = new Set(["engine", "jobId", "json", "intervalMs", "capMs", "deadRerunStatus"]);
 
 function usage() {
-  return "Usage: node job-collect.mjs transport-create | transport-discard --raw-args-token <token> | --raw-args-token <token>";
+  return "Usage: node job-collect.mjs await-output --file <path> [--slice-ms <n>] | transport-create | transport-discard --raw-args-token <token> | --raw-args-token <token>";
 }
 
 function regularFile(file) {
@@ -388,6 +389,9 @@ export async function collect(options, { env = process.env } = {}) {
 }
 
 export async function runCli(argv, { env = process.env } = {}) {
+  if (argv[0] === "await-output") {
+    return awaitOutput(argv.slice(1));
+  }
   if (argv[0] === "transport-create") {
     if (argv.length !== 1) {
       throw new UsageError("transport-create accepts no arguments.");

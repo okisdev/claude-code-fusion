@@ -7,6 +7,7 @@ function engine(descriptor) {
     managedAgents: Object.freeze([...descriptor.managedAgents]),
     stateEnvs: Object.freeze([...descriptor.stateEnvs]),
     roles: Object.freeze([...descriptor.roles]),
+    consultOnlyRoles: Object.freeze([...descriptor.consultOnlyRoles]),
     efforts: Object.freeze([...descriptor.efforts])
   });
 }
@@ -21,6 +22,7 @@ const ENGINES = Object.freeze({
     managedAgents: [],
     companionFile: "codex-companion.mjs",
     companionEnv: "FUSION_CODEX_COMPANION",
+    hostCheck: false,
     dataDirName: "codex-claude-code-fusion",
     dataEnv: "CODEX_COMPANION_DATA",
     stateEnvs: ["FUSION_CODEX_STATE", "FUSION_CODEX_STATE_DIR"],
@@ -30,6 +32,7 @@ const ENGINES = Object.freeze({
     ownMonitor: false,
     roles: ["quick", "volume", "flagship"],
     defaultRole: "quick",
+    consultOnlyRoles: [],
     efforts: ["low", "medium", "high", "xhigh", "max"],
     unavailablePrefix: "codex unavailable:"
   }),
@@ -42,6 +45,7 @@ const ENGINES = Object.freeze({
     managedAgents: ["grok:grok-review-runner"],
     companionFile: "grok-companion.mjs",
     companionEnv: "FUSION_GROK_COMPANION",
+    hostCheck: true,
     dataDirName: "grok-claude-code-fusion",
     dataEnv: "GROK_COMPANION_DATA",
     stateEnvs: [],
@@ -51,6 +55,7 @@ const ENGINES = Object.freeze({
     ownMonitor: true,
     roles: ["burst", "independence", "live-web", "large-context"],
     defaultRole: null,
+    consultOnlyRoles: ["live-web", "large-context"],
     efforts: ["low", "medium", "high", "xhigh", "max"],
     unavailablePrefix: "grok unavailable:"
   }),
@@ -63,6 +68,7 @@ const ENGINES = Object.freeze({
     managedAgents: [],
     companionFile: "cursor-companion.mjs",
     companionEnv: "FUSION_CURSOR_COMPANION",
+    hostCheck: false,
     dataDirName: "cursor-claude-code-fusion",
     dataEnv: "CURSOR_COMPANION_DATA",
     stateEnvs: [],
@@ -72,6 +78,7 @@ const ENGINES = Object.freeze({
     ownMonitor: false,
     roles: ["diversity", "burst"],
     defaultRole: null,
+    consultOnlyRoles: ["diversity"],
     efforts: ["default", "low", "medium", "high", "xhigh", "max"],
     unavailablePrefix: "cursor unavailable:"
   }),
@@ -84,6 +91,7 @@ const ENGINES = Object.freeze({
     managedAgents: [],
     companionFile: "devin-companion.mjs",
     companionEnv: "FUSION_DEVIN_COMPANION",
+    hostCheck: false,
     dataDirName: "devin-claude-code-fusion",
     dataEnv: "DEVIN_COMPANION_DATA",
     stateEnvs: [],
@@ -93,6 +101,7 @@ const ENGINES = Object.freeze({
     ownMonitor: false,
     roles: ["diversity", "burst"],
     defaultRole: null,
+    consultOnlyRoles: ["diversity"],
     efforts: ["default", "none", "minimal", "low", "medium", "high", "xhigh", "max"],
     unavailablePrefix: "devin unavailable:"
   })

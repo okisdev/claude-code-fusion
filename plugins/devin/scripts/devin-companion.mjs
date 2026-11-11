@@ -6,6 +6,7 @@ import { isatty } from "node:tty";
 import { fileURLToPath } from "node:url";
 
 import { configureRawTransport, createRawCommandTransport as allocateRawCommandTransport, consumeRawCommandTransport, cleanupRawCommandTransportsForSession, resolveCommandTransport } from "./lib/raw-transport.mjs";
+import { awaitOutput } from "./lib/await-output.mjs";
 import { parseArgs, parseRawArgs, rawBooleanOptionRequested } from "./lib/args.mjs";
 import { resolveDevinBin, probeDevinVersion, compareDevinVersion, TESTED_DEVIN_INTERVAL, buildDevinChildEnv, runDevin, classifyDevinFailure } from "./lib/devin-exec.mjs";
 import { ensurePrivateHome, buildJobConfig, worktreeGitDirs, projectConfigFiles } from "./lib/devin-home.mjs";
@@ -681,12 +682,13 @@ function handleRecordAcceptance(argv) {
 }
 
 function printUsage() {
-  output("Usage: devin-companion.mjs <task|review|status|result|cancel|history|models|setup|record-acceptance|transport-create|transport-discard> [options]\n");
+  output("Usage: devin-companion.mjs <task|review|status|result|await-output|cancel|history|models|setup|record-acceptance|transport-create|transport-discard> [options]\n");
 }
 
 async function main() {
   const [command, ...received] = process.argv.slice(2);
   if (!command || command === "help" || command === "--help") { printUsage(); return; }
+  if (command === "await-output") { process.exitCode = await awaitOutput(received); return; }
   if (command === "transport-create") {
     if (received.length) throw errorWithFailure("transport-create accepts no arguments.");
     createRawCommandTransport();

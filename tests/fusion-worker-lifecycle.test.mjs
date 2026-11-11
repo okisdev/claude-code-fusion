@@ -683,6 +683,7 @@ test("SubagentStart requires verdict envelopes for execution and coverage worker
   });
   const executionInstruction = JSON.parse(executionStart.stdout).hookSpecificOutput.additionalContext;
   assert.match(executionInstruction, /End a successful execution report with separate lines `delivery: complete` and `verification: passed`/);
+  assert.match(executionInstruction, /through a SubagentHandback call, they are the last lines of that call's message\./);
   assert.match(executionInstruction, /compact verdict envelope/);
   assert.match(executionInstruction, /changed file paths without diffs/);
   assert.match(executionInstruction, /pass and fail counts/);
@@ -905,10 +906,10 @@ test("Cursor dispatches fill role defaults and preserve explicit model choices",
   const routing = routingFixture(box);
   for (const [agentType, prompt, expected, staged] of [
     ["cursor:cursor-rescue", "lane: cursor diversity | goal: consult", "--model muse-spark-1.3 --effort xhigh -- lane: cursor diversity | goal: consult", true],
-    ["cursor-rescue", "cursor-role: diversity\ngoal: consult", "--model muse-spark-1.3 --effort xhigh -- cursor-role: diversity\ngoal: consult"],
+    ["cursor-rescue", "cursor-role: diversity\ngoal: consult", "--model muse-spark-1.3 --effort xhigh -- cursor-role: diversity\ngoal: consult", true],
     ["cursor:cursor-rescue", "lane: cursor burst\ngoal: implement", "--model composer-2.5 --effort default -- lane: cursor burst\ngoal: implement"],
-    ["cursor:cursor-rescue", "--model composer-2.5-fast -- lane: cursor diversity", "--effort xhigh --model composer-2.5-fast -- lane: cursor diversity"],
-    ["cursor:cursor-rescue", "--model composer-2.5 -- lane: cursor diversity", "--effort default --model composer-2.5 -- lane: cursor diversity"]
+    ["cursor:cursor-rescue", "--model composer-2.5-fast -- lane: cursor diversity", "--effort xhigh --model composer-2.5-fast -- lane: cursor diversity", true],
+    ["cursor:cursor-rescue", "--model composer-2.5 -- lane: cursor diversity", "--effort default --model composer-2.5 -- lane: cursor diversity", true]
   ]) {
     const result = run(box, dispatch(box, { subagent_type: agentType, prompt }), routing);
     assert.strictEqual(result.status, 0, result.stderr);
@@ -1482,7 +1483,8 @@ test("an unexpected async peer wrapper allows Stop while in flight and remains o
   });
   const inFlightOutput = JSON.parse(inFlight.stdout);
   assert.strictEqual(inFlightOutput.decision, undefined);
-  assert.match(inFlightOutput.hookSpecificOutput.additionalContext, /still in flight/);
+  assert.match(inFlightOutput.systemMessage, /still in flight/);
+  assert.strictEqual(inFlightOutput.hookSpecificOutput, undefined);
   assert.strictEqual(record(box).awaitingCollection, true);
   assert.ok(record(box).awaitingCollectionArmedAt);
 
@@ -1862,7 +1864,7 @@ for (const agentType of ["codex:codex-rescue", "grok:grok-rescue", "grok:grok-re
       const between = stop(box);
       assert.strictEqual(between.status, 0, between.stderr);
       assert.strictEqual(JSON.parse(between.stdout).decision, undefined);
-      assert.match(JSON.parse(between.stdout).hookSpecificOutput.additionalContext, /still in flight/);
+      assert.match(JSON.parse(between.stdout).systemMessage, /still in flight/);
 
       fs.appendFileSync(box.transcript, `${JSON.stringify({ type: "user", message: { content: `<task-notification>\n<task-id>${agentId}</task-id>\n<status>completed</status>\n<summary>Agent "X" is waiting on its own background work</summary>\n</task-notification>` } })}\n`);
       const parentStop = {
@@ -3110,6 +3112,30 @@ test("Stop advises on collected unverified workers without blocking and stays qu
   assert.strictEqual(quiet.stdout, "");
 });
 
+test("Stop reports an in-flight worker as a system message without hook context", (t) => {
+  const box = sandbox(t);
+  run(box, dispatch(box));
+  run(box, {
+    ...dispatch(box),
+    hook_event_name: "PostToolUse",
+    tool_response: { isAsync: true, status: "async_launched", agentId: "visible-running" }
+  });
+  const taskId = record(box).taskId;
+  const stopped = run(box, {
+    hook_event_name: "Stop",
+    session_id: "session-1",
+    cwd: box.cwd,
+    transcript_path: box.transcript,
+    stop_hook_active: false,
+    background_tasks: [{ id: "visible-running", type: "subagent", status: "running", agent_type: "fusion:claude-worker" }]
+  });
+  assert.strictEqual(stopped.status, 0, stopped.stderr);
+  assert.deepStrictEqual(JSON.parse(stopped.stdout), {
+    systemMessage: tagMessage("worker-lifecycle.in-flight-context", `Fusion task ${taskId} is still in flight. Collection is armed and will be required after terminal notification.`)
+  });
+  assert.strictEqual(record(box).awaitingCollection, true);
+});
+
 test("Stop in-flight advisory emits only when the in-flight set changes", (t) => {
   const box = sandbox(t);
   run(box, dispatch(box));
@@ -3131,8 +3157,9 @@ test("Stop in-flight advisory emits only when the in-flight set changes", (t) =>
   });
   const firstOutput = JSON.parse(firstStop.stdout);
   assert.strictEqual(firstOutput.decision, undefined);
-  assert.match(firstOutput.hookSpecificOutput.additionalContext, /still in flight/);
-  assert.match(firstOutput.hookSpecificOutput.additionalContext, /Collection is armed/);
+  assert.match(firstOutput.systemMessage, /still in flight/);
+  assert.match(firstOutput.systemMessage, /Collection is armed/);
+  assert.strictEqual(firstOutput.hookSpecificOutput, undefined);
   assert.strictEqual(record(box).awaitingCollection, true);
   const armedAt = record(box).awaitingCollectionArmedAt;
   assert.ok(armedAt);
@@ -3178,7 +3205,7 @@ test("Stop in-flight advisory emits only when the in-flight set changes", (t) =>
     last_assistant_message: "done",
     background_tasks: expandedBackgroundTasks
   });
-  assert.match(JSON.parse(changed.stdout).hookSpecificOutput.additionalContext, /Collection is armed/);
+  assert.match(JSON.parse(changed.stdout).systemMessage, /Collection is armed/);
 
   const emptied = run(box, {
     hook_event_name: "Stop",
@@ -3218,7 +3245,7 @@ test("Stop in-flight advisory emits only when the in-flight set changes", (t) =>
     last_assistant_message: "done",
     background_tasks: [{ id: "a3", type: "subagent", status: "running", agent_type: "fusion:claude-worker" }]
   });
-  assert.match(JSON.parse(newWave.stdout).hookSpecificOutput.additionalContext, /Collection is armed/);
+  assert.match(JSON.parse(newWave.stdout).systemMessage, /Collection is armed/);
 });
 
 test("Stop re-emits after a terminal task leaves while terminal blocks remain exempt", (t) => {
@@ -3239,7 +3266,7 @@ test("Stop re-emits after a terminal task leaves while terminal blocks remain ex
     stop_hook_active: false,
     background_tasks: running
   });
-  assert.match(JSON.parse(first.stdout).hookSpecificOutput.additionalContext, /still in flight/);
+  assert.match(JSON.parse(first.stdout).systemMessage, /still in flight/);
   let expectedSignature = readWorkerRecords(envFor(box)).map((worker) => worker.taskId).sort().join(",");
   assert.strictEqual(readWorkerSessionState("session-1", envFor(box)).stopAdvisorySignatures["in-flight"], expectedSignature);
 
@@ -3269,7 +3296,7 @@ test("Stop re-emits after a terminal task leaves while terminal blocks remain ex
     stop_hook_active: false,
     background_tasks: running
   });
-  assert.match(JSON.parse(grown.stdout).hookSpecificOutput.additionalContext, /still in flight/);
+  assert.match(JSON.parse(grown.stdout).systemMessage, /still in flight/);
   expectedSignature = readWorkerRecords(envFor(box)).map((worker) => worker.taskId).sort().join(",");
   assert.strictEqual(readWorkerSessionState("session-1", envFor(box)).stopAdvisorySignatures["in-flight"], expectedSignature);
 
@@ -3314,10 +3341,10 @@ test("Stop re-emits after a terminal task leaves while terminal blocks remain ex
     stop_hook_active: false,
     background_tasks: [running[1]]
   });
-  assert.match(JSON.parse(afterTerminal.stdout).hookSpecificOutput.additionalContext, /still in flight/);
+  assert.match(JSON.parse(afterTerminal.stdout).systemMessage, /still in flight/);
 });
 
-test("a successfully terminal async worker without a final-text artifact demands TaskOutput", (t) => {
+test("a successfully terminal async worker without a final-text artifact demands a Read of its transcript", (t) => {
   const box = sandbox(t);
   run(box, dispatch(box));
   const transcriptPath = path.join(box.root, "tasks", "agent-a1.output");
@@ -3344,8 +3371,130 @@ test("a successfully terminal async worker without a final-text artifact demands
   assert.strictEqual(decision.decision, "block");
   assert.strictEqual(record(box).transportStatus, "ready_uncollected");
   assert.strictEqual(record(box).collectedAt, null);
-  assert.match(decision.reason, /TaskOutput with block=true.*a1/);
-  assert.doesNotMatch(decision.reason, /Call Read with file_path=/);
+  assert.match(decision.reason, /ended without a final report\. Call Read with file_path=\S*agent-a1\.output /);
+  assert.doesNotMatch(decision.reason, /TaskOutput/);
+});
+
+function handbackWorker(box, agentId, completionContract, agentType = "fusion:claude-worker", runtimeAsync = true) {
+  const workerTranscript = path.join(box.root, `agent-${agentId}.jsonl`);
+  const worker = createWorkerRecord({
+    taskId: `fusion-${"e".repeat(24)}`,
+    sessionId: "session-1",
+    agentType,
+    workspaceRoot: box.cwd,
+    parentTranscriptPath: box.transcript,
+    parentTranscriptBytesAtDispatch: 0,
+    completionContract,
+    limits: workerLimits(agentType, {})
+  }, envFor(box));
+  const startedAt = new Date().toISOString();
+  updateWorkerRecord(worker.taskId, envFor(box), (current) => ({ ...current, agentId, backgroundTaskId: agentId, runtimeAsync, transportStatus: "running", startedAt, lastLivenessAt: startedAt, transcriptPath: workerTranscript }));
+  return workerTranscript;
+}
+
+function writeHandback(workerTranscript, message, result = {}) {
+  fs.writeFileSync(workerTranscript, [
+    { type: "assistant", message: { content: [{ type: "thinking", thinking: "report" }] } },
+    { type: "assistant", message: { content: [{ type: "tool_use", id: "handback-1", name: "SubagentHandback", input: { message } }] } },
+    { type: "user", message: { content: [{ type: "tool_result", tool_use_id: "handback-1", content: [{ type: "text", text: "{\"success\":true}" }], ...result }] } },
+    { type: "attachment", attachment: { type: "hook_success", hookEvent: "PostToolUse" } }
+  ].map((entry) => `${JSON.stringify(entry)}\n`).join(""));
+}
+
+function handbackStop(box, agentId, workerTranscript, agentType = "fusion:claude-worker") {
+  return run(box, { hook_event_name: "SubagentStop", session_id: "session-1", cwd: box.cwd, transcript_path: box.transcript, agent_transcript_path: workerTranscript, agent_id: agentId, agent_type: agentType, stop_hook_active: false, last_assistant_message: "" });
+}
+
+test("a report delivered through SubagentHandback settles the worker at SubagentStop", (t) => {
+  const box = sandbox(t);
+  const workerTranscript = handbackWorker(box, "handback-done", "coverage");
+  const report = "(1) Final recommendation: merge as-is\ndelivery: complete\ncoverage: complete";
+  writeHandback(workerTranscript, report);
+  const stopped = handbackStop(box, "handback-done", workerTranscript);
+  assert.strictEqual(stopped.status, 0, stopped.stderr);
+  assert.strictEqual(stopped.stdout, "");
+  const settled = record(box);
+  assert.strictEqual(settled.transportStatus, "done");
+  assert.strictEqual(settled.failureKind, null);
+  assert.strictEqual(settled.collectionMethod, "subagent_stop");
+  assert.strictEqual(fs.readFileSync(settled.outputFile, "utf8"), report);
+  assert.doesNotMatch(stop(box).stdout, /"decision":"block"/);
+});
+
+test("a SubagentHandback report without markers is collected at SubagentStop and asks only for a verdict", (t) => {
+  const box = sandbox(t);
+  const workerTranscript = handbackWorker(box, "handback-bare", "coverage");
+  const report = "(1) Final recommendation: merge as-is";
+  writeHandback(workerTranscript, report);
+  const stopped = handbackStop(box, "handback-bare", workerTranscript);
+  assert.strictEqual(stopped.stdout, "");
+  const incomplete = record(box);
+  assert.strictEqual(incomplete.transportStatus, "incomplete");
+  assert.strictEqual(incomplete.failureKind, "delivery");
+  assert.strictEqual(incomplete.retryCount ?? 0, 0);
+  assert.ok(incomplete.collectedAt);
+  assert.strictEqual(incomplete.collectionMethod, "subagent_stop");
+  assert.strictEqual(incomplete.awaitingVerdict, true);
+  assert.strictEqual(fs.readFileSync(incomplete.outputFile, "utf8"), report);
+  const decision = JSON.parse(stop(box).stdout);
+  assert.strictEqual(decision.decision, undefined);
+  assert.match(decision.hookSpecificOutput.additionalContext, /Acceptance remains unverified/);
+  assert.match(decision.hookSpecificOutput.additionalContext, new RegExp(incomplete.taskId));
+  assert.doesNotMatch(decision.hookSpecificOutput.additionalContext, /Call Read|TaskOutput|terminal-collection-block/);
+  assert.strictEqual(stop(box).stdout, "");
+});
+
+test("a placeholder handed back by a Fusion worker is still collected at SubagentStop", (t) => {
+  const box = sandbox(t);
+  const workerTranscript = handbackWorker(box, "handback-fusion-placeholder", "coverage");
+  const report = "waiting on bg-fusion-1";
+  writeHandback(workerTranscript, report);
+  handbackStop(box, "handback-fusion-placeholder", workerTranscript);
+  const settled = record(box);
+  assert.ok(settled.collectedAt);
+  assert.strictEqual(settled.collectionMethod, "subagent_stop");
+  assert.strictEqual(fs.readFileSync(settled.outputFile, "utf8"), report);
+});
+
+test("a placeholder handed back by a peer rescue wrapper is not collected and the Stop gate still asks for collection", (t) => {
+  for (const runtimeAsync of [true, false]) {
+    for (const report of ["waiting on bg-peer-1", "await-output: pending"]) {
+      const box = sandbox(t);
+      const workerTranscript = handbackWorker(box, "handback-peer-placeholder", "transport", "grok:grok-rescue", runtimeAsync);
+      writeHandback(workerTranscript, report);
+      handbackStop(box, "handback-peer-placeholder", workerTranscript, "grok:grok-rescue");
+      const pending = record(box);
+      assert.strictEqual(pending.collectedAt ?? null, null, report);
+      assert.notStrictEqual(pending.transportStatus, "done", report);
+      if (runtimeAsync) {
+        assert.strictEqual(JSON.parse(stop(box).stdout).decision, "block", report);
+      }
+    }
+  }
+});
+
+test("a completed notification collects a SubagentHandback report that SubagentStop never settled", (t) => {
+  const box = sandbox(t);
+  const workerTranscript = handbackWorker(box, "handback-notified", "coverage");
+  const report = "(1) Final recommendation: merge as-is";
+  writeHandback(workerTranscript, report);
+  fs.appendFileSync(box.transcript, `${JSON.stringify({ type: "user", message: { content: `<task-notification>\n<task-id>handback-notified</task-id>\n<status>completed</status>\n<summary>Agent "verify" finished</summary>\n<result>This agent's report was delivered to you as a message from "handback-notified" (its SubagentHandback call).</result>\n</task-notification>` } })}\n`);
+  const parent = stop(box);
+  assert.doesNotMatch(parent.stdout, /"decision":"block"/);
+  const collected = record(box);
+  assert.strictEqual(collected.transportStatus, "done");
+  assert.strictEqual(collected.collectionMethod, "task_notification");
+  assert.strictEqual(fs.readFileSync(collected.outputFile, "utf8"), report);
+});
+
+test("a refused SubagentHandback call is not a delivered report", (t) => {
+  const box = sandbox(t);
+  const workerTranscript = handbackWorker(box, "handback-refused", "coverage");
+  writeHandback(workerTranscript, "report\ndelivery: complete\ncoverage: complete", { is_error: true });
+  const stopped = handbackStop(box, "handback-refused", workerTranscript);
+  assert.strictEqual(JSON.parse(stopped.stdout).decision, "block");
+  assert.strictEqual(record(box).transportStatus, "running");
+  assert.strictEqual(record(box).retryCount, 1);
 });
 
 test("collection captures peer job footers and leaves absent or malformed footers null", (t) => {
@@ -4696,7 +4845,10 @@ test("collector judgment gates release repeated blocks without aging an unrelate
     if (attempt < 2) {
       assert.strictEqual(JSON.parse(blocked.stdout).decision, "block");
     } else if (attempt === 2) {
-      assert.match(JSON.parse(blocked.stdout).hookSpecificOutput.additionalContext, /Stop gate released/);
+      const released = JSON.parse(blocked.stdout);
+      assert.match(released.systemMessage, /Stop gate released/);
+      assert.strictEqual(released.decision, undefined);
+      assert.strictEqual(released.hookSpecificOutput, undefined);
     } else {
       assert.strictEqual(blocked.stdout, "");
     }
@@ -4948,7 +5100,7 @@ test("advisory in-flight stop rounds do not consume the cancellation budget for 
     if (count === 0) {
       const output = JSON.parse(stop.stdout);
       assert.strictEqual(output.decision, undefined);
-      assert.match(output.hookSpecificOutput.additionalContext, /still in flight/);
+      assert.match(output.systemMessage, /still in flight/);
     } else {
       assert.strictEqual(stop.stdout, "");
     }
@@ -5045,7 +5197,7 @@ test("an explicitly authorized running worker is not cancelled by repeated Stop 
     });
     if (count === 0) {
       assert.strictEqual(JSON.parse(stop.stdout).decision, undefined);
-      assert.match(JSON.parse(stop.stdout).hookSpecificOutput.additionalContext, /still in flight/);
+      assert.match(JSON.parse(stop.stdout).systemMessage, /still in flight/);
     } else {
       assert.strictEqual(stop.stdout, "");
     }
@@ -5628,6 +5780,38 @@ test("Stop keeps terminal collection demands blocking without adding settlement 
   assert.doesNotMatch(decision.reason, /\/fusion:stats --record/);
 });
 
+test("a recorded verdict clears terminal collection even when collectedAt is empty", (t) => {
+  const box = sandbox(t);
+  const worker = createWorkerRecord({
+    taskId: `fusion-${"8".repeat(24)}`,
+    sessionId: "session-1",
+    agentType: "fusion:claude-worker",
+    workspaceRoot: box.cwd
+  }, envFor(box));
+  updateWorkerRecord(worker.taskId, envFor(box), (current) => ({
+    ...current,
+    runtimeAsync: true,
+    transportStatus: "done",
+    awaitingCollection: true,
+    collectedAt: null
+  }));
+  const pending = JSON.parse(stop(box).stdout);
+  assert.strictEqual(pending.decision, "block");
+  assert.match(pending.reason, /Collect terminal owned task/);
+
+  updateWorkerRecord(worker.taskId, envFor(box), (current) => ({
+    ...current,
+    acceptance: "accepted",
+    acceptanceRecordedAt: new Date().toISOString(),
+    awaitingVerdict: false
+  }));
+  const settled = stop(box);
+  assert.strictEqual(settled.status, 0, settled.stderr);
+  assert.strictEqual(settled.stdout, "");
+  assert.strictEqual(record(box).collectedAt, null);
+  assert.strictEqual(readWorkerSessionState("session-1", envFor(box)).stopGate, undefined);
+});
+
 test("Stop defers acceptance advice until collected workers have no in-flight sibling", (t) => {
   const box = sandbox(t);
   const first = createSettleOnlyRecord(box, `fusion-${"1".repeat(24)}`);
@@ -5641,7 +5825,7 @@ test("Stop defers acceptance advice until collected workers have no in-flight si
   updateWorkerRecord(active.taskId, envFor(box), (current) => ({ ...current, agentId: "wave-active", backgroundTaskId: "wave-active", transportStatus: "pending_async" }));
 
   const emitted = stop(box);
-  const advisory = JSON.parse(emitted.stdout).hookSpecificOutput.additionalContext;
+  const advisory = JSON.parse(emitted.stdout).systemMessage;
   assert.strictEqual(JSON.parse(emitted.stdout).decision, undefined);
   assert.match(advisory, new RegExp(active.taskId));
   assert.doesNotMatch(advisory, /Acceptance remains unverified|\/fusion:stats --record/);

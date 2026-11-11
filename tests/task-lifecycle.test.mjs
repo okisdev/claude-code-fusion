@@ -229,7 +229,7 @@ test("result --wait on a background task returns the terminal output", async (t)
   });
   assert.strictEqual(launch.status, 0, launch.stderr);
   const record = await waitFor(() => jobRecords(sandbox.dataDir)[0]);
-  assert.ok(launch.stdout.endsWith(`job: ${record.id}\ndelivery: manual\nstate: running\n`));
+  assert.ok(launch.stdout.endsWith(`job: ${record.id}\nsandbox: ${sandbox.workDir}\ndelivery: manual\nstate: running\n`));
   assert.ok(launch.stdout.endsWith("state: running\n"));
   const result = runCompanion(["result", record.id, "--wait"], { cwd: sandbox.workDir, env });
   assert.strictEqual(result.status, 0, result.stderr);
@@ -253,7 +253,7 @@ test("collecting a managed background result records owner delivery", async (t) 
   const record = await waitFor(() => jobRecords(sandbox.dataDir)[0]);
   assert.strictEqual(record.delivery, "managed");
   assert.strictEqual(record.deliveryCollectedAt, null);
-  assert.ok(launch.stdout.endsWith(`job: ${record.id}\ndelivery: managed\nstate: running\n`));
+  assert.ok(launch.stdout.endsWith(`job: ${record.id}\nsandbox: ${sandbox.workDir}\ndelivery: managed\nstate: running\n`));
   assert.ok(launch.stdout.endsWith("state: running\n"));
 
   const result = runCompanion(["result", record.id, "--wait"], { cwd: sandbox.workDir, env });
@@ -542,7 +542,7 @@ test("cancel kills a hanging worker and its grok process and marks the record ca
   assert.deepStrictEqual(fs.readdirSync(tempDir).filter((entry) => entry.startsWith("grok-companion-stdout-")), []);
   assert.match(
     cancelOutput.stdout,
-    new RegExp(`Check /grok:status for the updated list\\.\\n\\njob: ${running.id}\\nsandbox: ${running.cwd}\\nstate: cancelled\\nfailure: cancelled\\n$`),
+    new RegExp(`Check /grok:status for the updated list\\.\\n\\njob: ${running.id}\\nsandbox: ${running.cwd}\\ndelivery: manual\\nsemantic: unverified\\nstate: cancelled\\nfailure: cancelled\\n$`),
   );
 });
 

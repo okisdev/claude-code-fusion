@@ -14,7 +14,6 @@
     "paths": [
       "plugins/fusion/scripts/fusion-stats.mjs",
       "plugins/fusion/scripts/lib/engine-acceptance.mjs",
-      "plugins/fusion/scripts/lib/codex-state-roots.mjs",
       "plugins/fusion/scripts/lib/raw-args-transport.mjs"
     ],
     "suites": [

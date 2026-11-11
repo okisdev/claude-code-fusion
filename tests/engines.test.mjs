@@ -49,7 +49,31 @@ test("engine constants and definitions are frozen", () => {
     assert.ok(Object.isFrozen(ENGINES[id].managedAgents));
     assert.ok(Object.isFrozen(ENGINES[id].stateEnvs));
     assert.ok(Object.isFrozen(ENGINES[id].roles));
+    assert.ok(Object.isFrozen(ENGINES[id].consultOnlyRoles));
     assert.ok(Object.isFrozen(ENGINES[id].efforts));
+  }
+});
+
+test("consult only roles are defined by the engine registry", () => {
+  assert.deepStrictEqual(Object.fromEntries(ENGINE_IDS.map((id) => [id, ENGINES[id].consultOnlyRoles])), {
+    codex: [],
+    grok: ["live-web", "large-context"],
+    cursor: ["diversity"],
+    devin: ["diversity"]
+  });
+  for (const id of ENGINE_IDS) {
+    assert.ok(ENGINES[id].consultOnlyRoles.every((role) => ENGINES[id].roles.includes(role)));
+    assert.strictEqual(Object.keys(ENGINES[id])[Object.keys(ENGINES[id]).indexOf("defaultRole") + 1], "consultOnlyRoles");
+  }
+});
+
+test("lifecycle and guard modules do not import the stats CLI", () => {
+  for (const section of ["lifecycle", "guard"]) {
+    const directory = path.join(repoRoot, "plugins", "fusion", "scripts", "lib", section);
+    for (const relativePath of fs.readdirSync(directory, { recursive: true }).filter((name) => name.endsWith(".mjs"))) {
+      const file = path.join(directory, relativePath);
+      assert.doesNotMatch(fs.readFileSync(file, "utf8"), /(?:from\s+|import\s*\()\s*["'][^"']*fusion-stats\.mjs["']/, file);
+    }
   }
 });
 
@@ -60,6 +84,7 @@ test("every engine definition has the registry shape", () => {
       assert.ok(engine[field].length > 0);
     }
     assert.strictEqual(engine.id, id);
+    assert.strictEqual(engine.hostCheck, id === "grok");
     assert.strictEqual(engine.seat, BREADTH_ENGINE_IDS.includes(id) ? "breadth" : null);
     assert.ok(Array.isArray(engine.managedAgents));
     assert.ok(engine.rescueAgent.startsWith(`${id}:`));
@@ -78,6 +103,7 @@ test("Devin registry contract matches the breadth companion", () => {
     managedAgents: devin.managedAgents,
     companionFile: devin.companionFile,
     companionEnv: devin.companionEnv,
+    hostCheck: devin.hostCheck,
     dataDirName: devin.dataDirName,
     dataEnv: devin.dataEnv,
     stateEnvs: devin.stateEnvs,
@@ -87,14 +113,16 @@ test("Devin registry contract matches the breadth companion", () => {
     ownMonitor: devin.ownMonitor,
     roles: devin.roles,
     defaultRole: devin.defaultRole,
+    consultOnlyRoles: devin.consultOnlyRoles,
     efforts: devin.efforts,
     unavailablePrefix: devin.unavailablePrefix
   }, {
     displayName: "Devin", family: null, rescueAgent: "devin:devin-rescue", managedAgents: [],
     companionFile: "devin-companion.mjs", companionEnv: "FUSION_DEVIN_COMPANION",
+    hostCheck: false,
     dataDirName: "devin-claude-code-fusion", dataEnv: "DEVIN_COMPANION_DATA", stateEnvs: [],
     versionField: "devinVersion", verifiedVersionKey: "devin", acceptanceLedger: false, ownMonitor: false,
-    roles: ["diversity", "burst"], defaultRole: null,
+    roles: ["diversity", "burst"], defaultRole: null, consultOnlyRoles: ["diversity"],
     efforts: ["default", "none", "minimal", "low", "medium", "high", "xhigh", "max"],
     unavailablePrefix: "devin unavailable:"
   });

@@ -2,6 +2,7 @@
 
 import path from "node:path";
 import { configureRawTransport, createRawCommandTransport as allocateRawCommandTransport, consumeRawCommandTransport, cleanupRawCommandTransportsForSession, resolveCommandTransport } from "./lib/raw-transport.mjs";
+import { awaitOutput } from "./lib/await-output.mjs";
 import { rawBooleanOptionRequested } from "./lib/args.mjs";
 import { SESSION_ID_ENV } from "./lib/state.mjs";
 import { commandContext, output, errorWithFailure } from "./lib/companion/base.mjs";
@@ -14,6 +15,7 @@ import { handleModels } from "./lib/companion/models.mjs";
 import { handleRecordAcceptance } from "./lib/companion/acceptance.mjs";
 import { handleStopGate } from "./lib/companion/stop_gate.mjs";
 import { SELF_PATH } from "./lib/companion/paths.mjs";
+import { preflightRuntimeSocketEndpoints, preflightUndeniedRuntimeSocketEndpoints, runtimeSocketEndpoints } from "./lib/grok-exec.mjs";
 
 function printUsage() {
   console.log(
@@ -24,7 +26,9 @@ function printUsage() {
       "  node scripts/grok-companion.mjs status [job-id] [--cwd <dir>] [--json]",
       "  node scripts/grok-companion.mjs history [--all] [--limit <n>] [--cwd <dir>] [--json]",
       "  node scripts/grok-companion.mjs result <job-id> [--cwd <dir>] [--wait] [--wait-timeout-ms <ms>] [--json]",
+      "  node scripts/grok-companion.mjs await-output --file <path> [--slice-ms <n>]",
       "  node scripts/grok-companion.mjs cancel <job-id> [--cwd <dir>] [--json]",
+      "  node scripts/grok-companion.mjs host-check [--json]",
       "  node scripts/grok-companion.mjs record-acceptance --job-id <32 lowercase hex> --acceptance <accepted|rejected|unverified> [--reason <text>] [--failure-kind <intent_override|scope_rewrite|wrong_approach|style_mismatch|oversized>] [--accept-failed-transport]",
       "  node scripts/grok-companion.mjs stats [--all] [--cwd <dir>] [--json]",
       "  node scripts/grok-companion.mjs models [--json]",
@@ -53,6 +57,31 @@ async function main() {
   const [subcommand, ...receivedArgv] = process.argv.slice(2);
   if (!subcommand || subcommand === "help" || subcommand === "--help") {
     printUsage();
+    return;
+  }
+  if (subcommand === "await-output") {
+    process.exitCode = await awaitOutput(receivedArgv);
+    return;
+  }
+  if (subcommand === "host-check") {
+    if (receivedArgv.length > 1 || (receivedArgv.length === 1 && receivedArgv[0] !== "--json")) {
+      throw errorWithFailure("host-check accepts only --json.", "input");
+    }
+    const blockers = [];
+    for (const [check, modes] of [
+      [() => preflightRuntimeSocketEndpoints({ candidates: runtimeSocketEndpoints() }), ["consult", "write", "review"]],
+      [() => preflightUndeniedRuntimeSocketEndpoints(), ["write"]]
+    ]) {
+      try {
+        check();
+      } catch (error) {
+        if (error?.failureKind !== "sandbox") throw error;
+        blockers.push({ kind: "sandbox", modes, message: String(error.message).split(/(?<=[.!?])\s+/u)[0] });
+      }
+    }
+    process.stdout.write(receivedArgv[0] === "--json"
+      ? `${JSON.stringify({ blockers })}\n`
+      : blockers.length ? `${blockers.map(({ kind, message }) => `${kind}: ${message}`).join("\n")}\n` : "host-check: clear\n");
     return;
   }
   if (subcommand === "transport-create") {

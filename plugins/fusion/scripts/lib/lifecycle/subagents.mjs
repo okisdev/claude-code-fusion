@@ -6,7 +6,7 @@ import { canonicalWorkerAgentType, isFusionWorkerAgent, WORKER_TERMINAL_STATUSES
 import { workerBudgetFailure } from "./budget.mjs";
 import { capturedPeerIdentity, completedReport, finalTextArtifactPath, mergedPeerJobIds, peerIdentityBackfill, retryInstruction, settleQueuedVerdict, settleWrapperApiDeath, statusEvidence, structuredCollectorReport, terminalCollectedRecord, wrapperApiDeathEvidence, writeFinalTextArtifact } from "./collection.mjs";
 import { blockStop, hookOutput, writeOutput } from "./output.mjs";
-import { pendingBackgroundCommandFromTranscript } from "./notifications.mjs";
+import { finalReportFromTranscript, pendingBackgroundCommandFromTranscript } from "./notifications.mjs";
 import { pendingDispatchForStart, recordForAgent, refreshRecord, updateLifecycleWorkerRecord } from "./records.mjs";
 import { EXECUTION_AGENTS } from "./constants.mjs";
 
@@ -38,12 +38,13 @@ function handleSubagentStart(input, env) {
     return;
   }
   const limits = record.limits;
+  const handback = "These lines end the report itself: when the harness delivers your report through a SubagentHandback call, they are the last lines of that call's message.";
   const verdictEnvelope = "Keep the final message to a compact verdict envelope that states changed file paths without diffs, the verification command with pass and fail counts, any environment findings, and the path of a file holding the full report when one is written. Write long unified diffs, full test logs, and long quoted file contents to that file instead of inlining them.";
   const delivery = record.completionContract === "collector"
     ? "Return the collector command output exactly, including its terminal `collector:` marker."
     : record.completionContract === "coverage"
-      ? `End the completed analysis with separate lines \`delivery: complete\` and \`coverage: complete\`. ${verdictEnvelope}`
-      : `End a successful execution report with separate lines \`delivery: complete\` and \`verification: passed\`. ${verdictEnvelope}`;
+      ? `End the completed analysis with separate lines \`delivery: complete\` and \`coverage: complete\`. ${handback} ${verdictEnvelope}`
+      : `End a successful execution report with separate lines \`delivery: complete\` and \`verification: passed\`. ${handback} ${verdictEnvelope}`;
   const artifactFirst = EXECUTION_AGENTS.has(canonicalWorkerAgentType(record.agentType))
     ? " Write your deliverable artifact to a file early, before deep work, and keep updating it; your final message names its path, and a budget death must still leave a readable artifact."
     : "";
@@ -59,7 +60,9 @@ function handleSubagentStop(input, env) {
     return;
   }
   let refreshed = refreshRecord(record, input, env);
-  const message = typeof input.last_assistant_message === "string" ? input.last_assistant_message : "";
+  const report = finalReportFromTranscript(refreshed.transcriptPath);
+  const handedBack = report?.handback === true;
+  const message = handedBack ? report.text : typeof input.last_assistant_message === "string" ? input.last_assistant_message : "";
   if (!WORKER_TERMINAL_STATUSES.has(refreshed.transportStatus)) {
     const backgroundCommand = (!PEER_MANAGED_AGENT_NAMES.has(refreshed.agentType) && completedReport(refreshed, message)) ? null : pendingBackgroundCommandFromTranscript(refreshed.transcriptPath, refreshed.awaitingBackgroundCommand, message.trim().match(/(?:^|\n)waiting on ([\w-]+)$/)?.[1]);
     if (backgroundCommand) {
@@ -111,7 +114,7 @@ function handleSubagentStop(input, env) {
   const collectorIdentityMismatch = collectorContract && collectorReport && (collectorReport.peerEngine !== refreshed.expectedPeerEngine || collectorReport.peerJobId !== refreshed.expectedPeerJobId);
   const trustedCollectorReport = collectorIdentityMismatch ? null : collectorReport;
   const collectorProtocolFailure = (collectorContract && complete && !collectorReport) || collectorIdentityMismatch;
-  if (collectorProtocolFailure && !failure && (refreshed.retryCount ?? 0) < 1 && !input.stop_hook_active) {
+  if (collectorProtocolFailure && !failure && !handedBack && (refreshed.retryCount ?? 0) < 1 && !input.stop_hook_active) {
     updateLifecycleWorkerRecord(refreshed.taskId, env, (current) => ({ ...current, retryCount: (current.retryCount ?? 0) + 1 }));
     const expected = refreshed.expectedPeerEngine && refreshed.expectedPeerJobId
       ? ` Repeat collection for exactly engine=${refreshed.expectedPeerEngine} job=${refreshed.expectedPeerJobId}.`
@@ -119,7 +122,7 @@ function handleSubagentStop(input, env) {
     writeOutput(blockStop(tagMessage("worker-lifecycle.collector-marker-block", `The collector returned an invalid or mismatched terminal marker.${expected} Return the exact collector command output with its terminal marker. This is the only retry.`)));
     return;
   }
-  if (!complete && !failure && (refreshed.retryCount ?? 0) < 1 && !input.stop_hook_active) {
+  if (!complete && !failure && !handedBack && (refreshed.retryCount ?? 0) < 1 && !input.stop_hook_active) {
     updateLifecycleWorkerRecord(refreshed.taskId, env, (current) => ({ ...current, retryCount: (current.retryCount ?? 0) + 1 }));
     writeOutput(blockStop(tagMessage("worker-lifecycle.deliverable-retry-block", retryInstruction(refreshed))));
     return;
@@ -136,9 +139,10 @@ function handleSubagentStop(input, env) {
     }
     const runtimeAsync = worker.runtimeAsync === true;
     const successfulCompletion = complete && !failure && trustedCollectorReport?.kind !== "outcome" && !collectorProtocolFailure;
-    const subagentStopCollected = successfulCompletion && finalTextFile != null && !collectorContract;
+    const subagentStopCollected = (successfulCompletion || handedBack) && finalTextFile != null && !collectorContract;
+    const peerHandbackPending = handedBack && !complete && !isFusionWorkerAgent(worker.agentType);
     return settleQueuedVerdict({
-      ...(runtimeAsync && !subagentStopCollected ? worker : markWorkerCollected(worker, WORKER_COLLECTION_METHODS.SUBAGENT_STOP, now)),
+      ...((runtimeAsync && !subagentStopCollected) || peerHandbackPending ? worker : markWorkerCollected(worker, WORKER_COLLECTION_METHODS.SUBAGENT_STOP, now)),
       transportStatus: complete && (trustedCollectorReport?.kind === "outcome" || collectorProtocolFailure) ? "incomplete" : complete ? runtimeAsync && !subagentStopCollected ? "ready_uncollected" : "done" : failure ? "failed" : "incomplete",
       failureKind: failure?.failureKind ?? (trustedCollectorReport?.kind === "outcome" ? `collection_${trustedCollectorReport.collectionOutcome}` : collectorProtocolFailure ? "collection_protocol" : complete ? null : "delivery"),
       ...(failure ? { limitKind: failure.limitKind, cancelReason: failure.reason } : {}),

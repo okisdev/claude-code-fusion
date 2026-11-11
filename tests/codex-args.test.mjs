@@ -103,6 +103,21 @@ test("task style parsing never promotes option shaped prompt suffixes", () => {
   });
 });
 
+test("background shell transport option stays outside raw task arguments", () => {
+  const config = {
+    booleanOptions: ["background", "write"],
+    optionsBeforePositionals: true
+  };
+  for (const background of [false, true]) {
+    const raw = `${background ? "--background " : ""}inspect --transport-background-shell`;
+    const parsed = parseRawArgs(raw, config);
+    assert.equal(parsed.options.background, background || undefined);
+    assert.equal(parsed.positionalText, "inspect --transport-background-shell");
+  }
+  assert.throws(() => parseRawArgs("--transport-background-shell inspect", config), /Unknown option/);
+  assert.throws(() => parseArgs(["--transport-background-shell", "inspect"], config), /Unknown option/);
+});
+
 test("task style parsing accepts an output schema before the opaque prompt", () => {
   const parsed = parseRawArgs("--output-schema='schemas/verdict.json' inspect the change", {
     optionsBeforePositionals: true,

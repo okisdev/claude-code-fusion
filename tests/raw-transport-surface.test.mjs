@@ -139,14 +139,53 @@ test("runtime guidance preserves the same private transport handshake", () => {
   }
 });
 
-test("companion wrappers allow one notified output Read after a harness background wait", () => {
-  const bullet = '- When Claude Code moves a companion Bash to the background, end your turn with the single line `waiting on <background id>`. Do not poll, sleep, or start a second copy. When its completion notification arrives, `Read` the output file that result named exactly once and treat its content, minus a trailing `[exited with code N]` line, as the companion stdout for every other rule here.';
-  for (const file of ["plugins/codex/agents/codex-rescue.md", "plugins/grok/agents/grok-rescue.md", "plugins/grok/agents/grok-review-runner.md", "plugins/cursor/agents/cursor-rescue.md", "plugins/devin/agents/devin-rescue.md", "plugins/fusion/agents/job-collector.md"]) {
+test("every forwarder launches in a background shell, awaits the output file, and delivers one report", () => {
+  const forwarders = [
+    ["plugins/codex/agents/codex-rescue.md", "codex-companion.mjs"],
+    ["plugins/grok/agents/grok-rescue.md", "grok-companion.mjs"],
+    ["plugins/grok/agents/grok-review-runner.md", "grok-companion.mjs"],
+    ["plugins/cursor/agents/cursor-rescue.md", "cursor-companion.mjs"],
+    ["plugins/devin/agents/devin-rescue.md", "devin-companion.mjs"],
+    ["plugins/fusion/agents/job-collector.md", "job-collect.mjs"]
+  ];
+  for (const [file, script] of forwarders) {
     const content = fs.readFileSync(path.join(repoRoot, file), "utf8");
-    assert.ok(content.split("\n").includes(bullet), file);
-    assert.match(content, /Use Read only for the newly allocated empty transport file before writing and the notified background output file/, file);
-    assert.doesNotMatch(content, /Do not use Read for any path except the newly allocated empty transport file/, file);
+    assert.ok(content.includes("a Bash call with `run_in_background: true`") || content.includes("Bash call with `run_in_background: true`"), file);
+    assert.ok(content.includes("The call returns at once with a background id and the path of the output file."), file);
+    assert.ok(content.includes(`a foreground Bash call with \`timeout: 120000\` that runs \`node "\${CLAUDE_PLUGIN_ROOT}/scripts/${script}" await-output --file "PATH"\``), file);
+    assert.ok(content.includes("When it prints exactly `await-output: pending`, run the same await call again."), file);
+    assert.match(content, /The harness delivers one report per agent\. Never end your turn, write a waiting line, or hand a report back while the await operation still prints `await-output: pending`\. A completion notification for the background shell is a cue to run the await operation once more, never output to relay\./, file);
+    assert.match(content, /Use Read only for the newly allocated empty transport file before writing\./, file);
+    assert.doesNotMatch(content, /waiting on <background id>/, file);
+    assert.doesNotMatch(content, /notified background output file/, file);
+    assert.doesNotMatch(content, /Never use Bash background mode/, file);
+    assert.doesNotMatch(content, /foreground Bash call with `?timeout:? ?`?600000/, file);
+    assert.doesNotMatch(content, /timeout `600000`/, file);
   }
+});
+
+test("only the Codex rescue launch carries the fixed background shell option", () => {
+  const codex = fs.readFileSync(path.join(repoRoot, "plugins/codex/agents/codex-rescue.md"), "utf8");
+  assert.ok(codex.includes('task --transport-background-shell --raw-args-token TOKEN'));
+  for (const file of ["plugins/grok/agents/grok-rescue.md", "plugins/grok/agents/grok-review-runner.md", "plugins/cursor/agents/cursor-rescue.md", "plugins/devin/agents/devin-rescue.md", "plugins/fusion/agents/job-collector.md"]) {
+    const content = fs.readFileSync(path.join(repoRoot, file), "utf8");
+    assert.doesNotMatch(content, /--transport-background-shell/, file);
+  }
+});
+
+test("runtime skills describe the forwarder launch and keep direct slash commands foreground", () => {
+  for (const engine of ["codex", "grok", "cursor", "devin"]) {
+    const file = `plugins/${engine}/skills/${engine}-cli-runtime/SKILL.md`;
+    const runtime = fs.readFileSync(path.join(repoRoot, file), "utf8");
+    assert.match(runtime, /a Bash call with `run_in_background: true`, which returns at once with a background id and the path of the output file/, file);
+    assert.ok(runtime.includes(`await-output --file "PATH"\` in a foreground Bash call with \`timeout: 120000\``), file);
+    assert.match(runtime, /repeats that call while it prints exactly `await-output: pending`/, file);
+    assert.match(runtime, /so a forwarder never ends its turn or writes a waiting line while the await operation prints pending/, file);
+    assert.match(runtime, /A companion run directly by the main session through a slash command, with no forwarder agent, is a foreground `Bash` call with `timeout: 600000`/, file);
+    assert.doesNotMatch(runtime, /waiting on <background id>/, file);
+  }
+  const codex = fs.readFileSync(path.join(repoRoot, "plugins/codex/skills/codex-cli-runtime/SKILL.md"), "utf8");
+  assert.match(codex, /adds the fixed option `--transport-background-shell` to its task launch/);
 });
 
 test("Codex preallocated transport stays private when Write replaces staged content", (t) => {

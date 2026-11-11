@@ -54,7 +54,7 @@ test("Rules table renders scores without Notes and points to config", (t) => {
   assert.match(table, /^\|---\|---\|---\|---:\|---:\|---:\|$/m);
   assert.match(table, /^\| codex \| codex \| openai \| 5 \| 4 \| 5 \|$/m);
   assert.doesNotMatch(table, /primary implementation lane|\| Notes \|/);
-  assert.match(table, /^Lane defaults: codex quick gpt-6-sol@xhigh, volume gpt-6-luna@xhigh, flagship gpt-6-astra@xhigh; grok burst grok-4\.7-build-fast@low, independence grok-4\.7-build-fast@medium, live-web grok-4\.7-build-fast@high, large-context grok-4\.6@medium; cursor diversity muse-spark-1\.3@xhigh, burst composer-2\.5@default\.$/m);
+  assert.match(table, /^Lane defaults: codex quick gpt-6-sol@xhigh, volume gpt-6-luna@xhigh, flagship gpt-6\.1-sol@xhigh; grok burst grok-4\.7-build-fast@low, independence grok-4\.7-build-fast@medium, live-web grok-4\.7-build-fast@high, large-context grok-4\.6@medium; cursor diversity muse-spark-1\.3@xhigh, burst composer-2\.5@default\.$/m);
   assert.match(table, /\| grok-fast \| grok \| xai \| 3 \| 3 \| 5 \|\nBreadth engine: Cursor \(cursor\); its briefs go to cursor:cursor-rescue with `cursor-role: diversity` or `cursor-role: burst`, and Devin holds no routing seat\.\nModel notes \(benchmarks, prices, latency\) live in model-routing\.json; `\/fusion:config` shows them\.\n\nLane defaults: [^\n]+\n\nScores feed/);
   assert.match(
     table,
@@ -86,7 +86,20 @@ test("Routing defaults merge file choices over the seed and preserve only suppor
     cursor: DEFAULT_ROUTING_DEFAULTS.cursor,
     devin: DEFAULT_ROUTING_DEFAULTS.devin
   });
-  assert.match(renderModelTableFromFile(file), /Lane defaults: codex quick gpt-6-sol@high, volume gpt-6-luna@xhigh, flagship gpt-6-astra@xhigh; grok burst grok-4\.7-build-fast@low, independence grok-4\.7@max/);
+  assert.match(renderModelTableFromFile(file), /Lane defaults: codex quick gpt-6-sol@high, volume gpt-6-luna@xhigh, flagship gpt-6\.1-sol@xhigh; grok burst grok-4\.7-build-fast@low, independence grok-4\.7@max/);
+});
+
+test("Routing file flagship choice overrides the shipped default", (t) => {
+  const dir = sandbox(t);
+  const file = path.join(dir, "model-routing.json");
+  writeRouting(file, {
+    ...ROUTING,
+    models: [...ROUTING.models, { id: "gpt-6-astra", lane: "codex", intelligence: 5, taste: 4, cost: 2 }],
+    defaults: { codex: { flagship: { model: "gpt-6-astra", effort: "xhigh" } } }
+  });
+  assert.deepStrictEqual(DEFAULT_ROUTING_DEFAULTS.codex.flagship, { model: "gpt-6.1-sol", effort: "xhigh" });
+  assert.deepStrictEqual(readRoutingDefaults({ FUSION_MODEL_ROUTING: file }).codex.flagship, { model: "gpt-6-astra", effort: "xhigh" });
+  assert.match(renderModelTableFromFile(file), /flagship gpt-6-astra@xhigh/);
 });
 
 test("Engines without a fixed family require a valid family and preserve it", () => {

@@ -1,5 +1,25 @@
 # changelog
 
+## 0.0.73
+
+- this release acts on a usage review of two hosts: thirty days of ledgers on one, and the first two days of a new 64 GB host whose claude code delivers subagent reports through `SubagentHandback`.
+- forwarder agents launch their companion in a background shell and wait on it with a new `await-output` operation in slices of at most 100 seconds, then return one report. a handback is delivered once, so on the new host 13 of 17 wrappers handed back their `waiting on <id>` line and the real output never reached the orchestrator. the wait also removes one orchestrator wake up per dispatch that ran past 180 seconds.
+- a report delivered through `SubagentHandback` is read from the transcript and counts as collected at SubagentStop. 9 of 10 claude workers on that host were recorded as `missing_final_text`.
+- the stop gate stops asking for collection once a verdict is recorded. one session took 87 stop blocks, 75 of them for tasks already settled, and replayed 32.85M tokens of context for them.
+- the in flight notice at stop is a `systemMessage`. as hook context it forced another turn each time: 269 in a week on one host, 265 of them a one line heartbeat at 376k tokens of context.
+- a codex task launched by a rescue wrapper flies for 900 seconds (`--transport-background-shell`); a foreground bash call keeps 570. over seventeen days 15.6% of codex jobs timed out, and timed out flights with their wind downs took 35% of codex wall clock, while the event ledgers show those jobs working, not hung.
+- the codex flagship lane default is gpt-6.1-sol at xhigh. gpt-6-astra at xhigh timed out on 40% of flights at 68.8 credits per job against 21% and 23.1 for gpt-6.1-sol, and beside four or more concurrent codex jobs more than half of its flights timed out, so the rules say it runs one package at a time.
+- a devin run survives the agent's `request_scope` call: the permission request is refused like any other and the turn ends normally. ending the run at the announcement failed both write runs on devin 3000.12.43 in linked worktrees. a burst brief now tells the engine to leave its changes uncommitted.
+- consult only roles (grok live-web and large-context, breadth diversity) stage read only without a header, and the smoke probes carry read only in theirs.
+- verification recognition covers `timeout`, `env`, `turbo`, and `nx`, and the rules ask for `set -o pipefail` in front of a filtered verification. `/fusion:stats` adds a last 7 days line to verification evidence, because the all time 16.7% was history and the current build credits 81%.
+- `/fusion:stats` reports wrapper delivery by plugin version and the breaker check raises a wrapper delivery advisory. four releases shipped a 26% to 55% delivery failure share that the ledger showed the whole time.
+- the breaker check reads only job files inside its lookback window and asks a companion for host blockers through `host-check`, grok first: a new host lost its first grok write to an orbstack docker socket symlink.
+- hooks stop loading the stats graph, an ordinary bash call reads no worker records, and the peer capacity check opens only records that can be live.
+- job monitors scan every 60 seconds while the session has nothing running and every 15 seconds otherwise. the codex monitor ledger drops jobs that no longer exist, and observation sidecars are pruned at monitor start.
+- grok, cursor, and devin prune terminal job records after 90 days as codex does, and session reminder markers are swept after 48 hours.
+- cursor and devin share one job state module, the codex lock scavenges orphan owner directories, and the grok and codex footers carry the lines the contract names.
+- rules: an inline change that passes the gate is not a work package, a delegated review checks taste without authoring it, the panel's third seat follows the skill's triggers, and a lane's single flight slot is the one exception to dispatching independent packages together. the runtime guard paragraph is shorter and says the same thing.
+
 ## 0.0.72
 
 - this release acts on devin's first nine days as the breadth engine on one host: 17 dispatches against 500 for codex and 85 for grok, none refused, so the low count is routing and not a block.

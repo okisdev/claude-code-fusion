@@ -7,7 +7,7 @@ import test from "node:test";
 import { fileURLToPath } from "node:url";
 
 import { buildPrivateHome, cursorChatDir } from "../plugins/cursor/scripts/lib/cursor-home.mjs";
-import { createJobRecord, createJobRecordFile, finishSuccessfulJobRecordFile, jobFilePath, listJobRecords, runHomeDir, sweepCursorHomes, updateJobRecordFile, updateJobRecordFileWithCurrent } from "../plugins/cursor/scripts/lib/state.mjs";
+import { briefPath, createJobRecord, createJobRecordFile, finishSuccessfulJobRecordFile, jobFilePath, jobLogPath, listJobRecords, resumeSessionLeasePath, runHomeDir, sweepCursorHomes, updateJobRecordFile, updateJobRecordFileWithCurrent } from "../plugins/cursor/scripts/lib/state.mjs";
 
 const repo = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const companion = path.join(repo, "plugins/cursor/scripts/cursor-companion.mjs");
@@ -53,6 +53,74 @@ function recordFixture(h, id, status = "running") {
   createJobRecordFile(file, record);
   return { file, homeDir };
 }
+
+test("home sweep prunes expired terminal records and preserves protected jobs", (t) => {
+  const h = fixture(t);
+  const now = Date.now();
+  const old = new Date(now - 91 * 86400000).toISOString();
+  const artifacts = (id, fields = {}) => {
+    const file = jobFilePath(h.data, h.cwd, id);
+    const brief = briefPath(h.data, h.cwd, id);
+    const log = jobLogPath(h.data, h.cwd, id);
+    createJobRecordFile(file, { ...createJobRecord({ id, cwd: h.cwd, mode: "consult", briefFile: brief, ...fields }), finishedAt: old, ...fields });
+    fs.mkdirSync(path.dirname(brief), { recursive: true });
+    fs.writeFileSync(brief, "brief");
+    fs.writeFileSync(log, "log");
+    return [file, brief, log];
+  };
+  const removed = [
+    artifacts("expired-done", { status: "done" }),
+    artifacts("expired-error", { status: "error" }),
+    artifacts("expired-cancelled", { status: "cancelled" }),
+    artifacts("collected", { status: "done", background: true, deliveryCollectedAt: old }),
+    artifacts("expired-mtime", { status: "done", finishedAt: null })
+  ];
+  const oldRecord = JSON.parse(fs.readFileSync(removed[4][0], "utf8"));
+  delete oldRecord.finishedAt;
+  fs.writeFileSync(removed[4][0], JSON.stringify(oldRecord));
+  fs.utimesSync(removed[4][0], new Date(old), new Date(old));
+  const kept = [
+    artifacts("running", { status: "running" }),
+    artifacts("cleanup", { status: "error", cleanupRequired: true }),
+    artifacts("manual", { status: "done", background: true }),
+    artifacts("background-foreground", { status: "done", background: true, delivery: "foreground" }),
+    artifacts("managed", { status: "done", delivery: "managed" }),
+    artifacts("leased", { status: "done" }),
+    artifacts("recent", { status: "done", finishedAt: new Date(now - 89 * 86400000).toISOString() })
+  ];
+  const lease = resumeSessionLeasePath(h.data, h.cwd, sessionId);
+  fs.mkdirSync(path.dirname(lease), { recursive: true });
+  fs.writeFileSync(lease, JSON.stringify({ version: 1, sessionId, ownerJobId: "leased", claimedAt: new Date(now).toISOString() }));
+  assert.equal(Object.hasOwn(JSON.parse(fs.readFileSync(removed[4][0], "utf8")), "finishedAt"), false);
+  assert.ok(now - fs.statSync(removed[4][0]).mtimeMs >= 90 * 86400000);
+  assert.equal(sweepCursorHomes(h.data, now), true);
+  for (const paths of removed) for (const file of paths) assert.equal(fs.existsSync(file), false, file);
+  for (const paths of kept) for (const file of paths) assert.equal(fs.existsSync(file), true, file);
+});
+
+test("zero retention override disables Cursor record pruning", (t) => {
+  const h = fixture(t);
+  const id = "retained-by-override";
+  const file = jobFilePath(h.data, h.cwd, id);
+  createJobRecordFile(file, { ...createJobRecord({ id, cwd: h.cwd, mode: "consult", status: "done" }), finishedAt: new Date(Date.now() - 100 * 86400000).toISOString() });
+  const previous = process.env.CURSOR_COMPANION_RECORD_RETENTION_DAYS;
+  process.env.CURSOR_COMPANION_RECORD_RETENTION_DAYS = "0";
+  t.after(() => { if (previous === undefined) delete process.env.CURSOR_COMPANION_RECORD_RETENTION_DAYS; else process.env.CURSOR_COMPANION_RECORD_RETENTION_DAYS = previous; });
+  sweepCursorHomes(h.data);
+  assert.equal(fs.existsSync(file), true);
+});
+
+test("positive Cursor retention override prunes at the configured age", (t) => {
+  const h = fixture(t);
+  const id = "two-days-old";
+  const file = jobFilePath(h.data, h.cwd, id);
+  createJobRecordFile(file, { ...createJobRecord({ id, cwd: h.cwd, mode: "consult", status: "done" }), finishedAt: new Date(Date.now() - 2 * 86400000).toISOString() });
+  const previous = process.env.CURSOR_COMPANION_RECORD_RETENTION_DAYS;
+  process.env.CURSOR_COMPANION_RECORD_RETENTION_DAYS = "1";
+  t.after(() => { if (previous === undefined) delete process.env.CURSOR_COMPANION_RECORD_RETENTION_DAYS; else process.env.CURSOR_COMPANION_RECORD_RETENTION_DAYS = previous; });
+  sweepCursorHomes(h.data);
+  assert.equal(fs.existsSync(file), false);
+});
 
 test("done, error, and cancelled jobs retain only their own chat", (t) => {
   const h = fixture(t);

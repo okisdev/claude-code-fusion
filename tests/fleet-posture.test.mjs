@@ -11,7 +11,7 @@ import { claimParentContextAdvisory } from "../plugins/fusion/scripts/lib/lifecy
 const repoRoot = path.join(import.meta.dirname, "..");
 const script = path.join(repoRoot, "plugins", "fusion", "scripts", "fleet-posture.mjs");
 const LEGACY_CONTEXT = tagMessage("fleet-posture.strict-fleet-reminder", "fleet-default active: a goal that decomposes into three or more independent work packages convenes /fusion:ultra once bootstrap dependencies are resolved; explain narrower execution visibly in the reply.");
-const SESSION_LANES_CONTEXT = tagMessage("fleet-posture.session-lanes-reminder", "fusion lanes ready: codex gpt-6-astra for spec grade and deep review, gpt-6-sol and gpt-6-luna for quick and volume packages, grok under its four roles on the routing table's lane defaults, cursor under diversity for a model family no other lane carries and under burst for bounded worktree implementation, claude workers for the Claude surface. Independent packages dispatch together in one message; three or more convene /fusion:ultra; a single coherent change stays inline.");
+const SESSION_LANES_CONTEXT = tagMessage("fleet-posture.session-lanes-reminder", "fusion lanes ready: codex gpt-6.1-sol for spec grade and deep review, gpt-6-sol and gpt-6-luna for quick and volume packages, grok under its four roles on the routing table's lane defaults, cursor under diversity for a model family no other lane carries and under burst for bounded worktree implementation, claude workers for the Claude surface. Independent packages dispatch together in one message; three or more convene /fusion:ultra; a single coherent change stays inline.");
 const advisoryText = (tokens) => `The main loop context is ${Math.round(tokens / 1000)}k tokens and every turn replays it. Finish this wave, then prefer /compact or a fresh session before the next goal.`;
 const advisoryContext = (tokens) => tagMessage("fleet-posture.context-advisory", advisoryText(tokens));
 
@@ -148,6 +148,35 @@ test("the narrow wave reminder and marker are gone", (t) => {
   assert.throws(() => messageTag("fleet-posture.narrow-wave-reminder"), RangeError);
   assert.strictEqual(fs.existsSync(path.join(sandbox.dataDir, "fleet-posture", "narrow-wave-reminders")), false);
   assert.strictEqual(fs.readFileSync(statePath(sandbox), "utf8"), original);
+});
+
+test("a new session claim cleans old markers and legacy reminders once", (t) => {
+  const sandbox = makeSandbox(t);
+  const markerDirectory = path.dirname(sessionLanesReminderPath(sandbox));
+  const oldMarker = path.join(markerDirectory, "old-session.marker");
+  const recentMarker = path.join(markerDirectory, "recent-session.marker");
+  const legacyDirectory = path.join(sandbox.dataDir, "fleet-posture", "narrow-wave-reminders");
+  fs.mkdirSync(markerDirectory, { recursive: true });
+  fs.writeFileSync(oldMarker, "\n", "utf8");
+  fs.utimesSync(oldMarker, new Date(Date.now() - 49 * 60 * 60 * 1000), new Date(Date.now() - 49 * 60 * 60 * 1000));
+  fs.writeFileSync(recentMarker, "\n", "utf8");
+  fs.mkdirSync(legacyDirectory, { recursive: true });
+  fs.writeFileSync(path.join(legacyDirectory, "session-1.marker"), "\n", "utf8");
+
+  assertContext(run(sandbox), SESSION_LANES_CONTEXT);
+  assert.strictEqual(fs.existsSync(oldMarker), false);
+  assert.strictEqual(fs.existsSync(recentMarker), true);
+  assert.strictEqual(fs.existsSync(legacyDirectory), false);
+
+  const secondOldMarker = path.join(markerDirectory, "second-old-session.marker");
+  fs.writeFileSync(secondOldMarker, "\n", "utf8");
+  fs.utimesSync(secondOldMarker, new Date(Date.now() - 49 * 60 * 60 * 1000), new Date(Date.now() - 49 * 60 * 60 * 1000));
+  fs.mkdirSync(legacyDirectory, { recursive: true });
+  fs.writeFileSync(path.join(legacyDirectory, "session-1.marker"), "\n", "utf8");
+
+  assertSilent(run(sandbox));
+  assert.strictEqual(fs.existsSync(secondOldMarker), true);
+  assert.strictEqual(fs.existsSync(legacyDirectory), true);
 });
 
 test("session lanes reminder renders the routing table's codex defaults", (t) => {

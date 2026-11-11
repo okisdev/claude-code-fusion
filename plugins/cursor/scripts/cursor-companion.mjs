@@ -6,6 +6,7 @@ import { isatty } from "node:tty";
 import { fileURLToPath } from "node:url";
 
 import { configureRawTransport, createRawCommandTransport as allocateRawCommandTransport, consumeRawCommandTransport, cleanupRawCommandTransportsForSession, resolveCommandTransport } from "./lib/raw-transport.mjs";
+import { awaitOutput } from "./lib/await-output.mjs";
 import { parseArgs, parseRawArgs, rawBooleanOptionRequested } from "./lib/args.mjs";
 import { resolveCursorBin, probeCursorVersion, compareCursorVersion, TESTED_CURSOR_INTERVAL, buildCursorArgs, buildCursorChildEnv, runCursor, classifyCursorFailure, reapPrivateHomeHelpers } from "./lib/cursor-exec.mjs";
 import { buildPrivateHome, copyChatForResume, cursorChatDir, projectHookFiles, CURSOR_SESSION_ID_PATTERN } from "./lib/cursor-home.mjs";
@@ -697,12 +698,13 @@ function handleRecordAcceptance(argv) {
 }
 
 function printUsage() {
-  output("Usage: cursor-companion.mjs <task|review|status|result|cancel|history|models|setup|record-acceptance|transport-create|transport-discard> [options]\n");
+  output("Usage: cursor-companion.mjs <task|review|status|result|await-output|cancel|history|models|setup|record-acceptance|transport-create|transport-discard> [options]\n");
 }
 
 async function main() {
   const [command, ...received] = process.argv.slice(2);
   if (!command || command === "help" || command === "--help") { printUsage(); return; }
+  if (command === "await-output") { process.exitCode = await awaitOutput(received); return; }
   if (command === "transport-create") {
     if (received.length) throw errorWithFailure("transport-create accepts no arguments.");
     createRawCommandTransport();

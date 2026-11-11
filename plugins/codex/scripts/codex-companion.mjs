@@ -8,6 +8,7 @@ import { isatty } from "node:tty";
 import { fileURLToPath } from "node:url";
 
 import { configureRawTransport, createRawCommandTransport as allocateRawCommandTransport, consumeRawCommandTransport, pruneRawCommandTransports, resolveCommandTransport } from "./lib/raw-transport.mjs";
+import { awaitOutput } from "./lib/await-output.mjs";
 import { parseArgs, parseRawArgs, parseServiceTier, splitRawArgumentString } from "./lib/args.mjs";
 import {
   buildReviewArgs,
@@ -66,6 +67,7 @@ const ADVERSARIAL_REVIEW_PROMPT_FILE = path.join(ROOT_DIR, "prompts", "adversari
 const ADVERSARIAL_REVIEW_SCHEMA_FILE = path.join(ROOT_DIR, "schemas", "adversarial-review-verdict.schema.json");
 const COMPANION_MANIFEST_FILE = path.join(ROOT_DIR, ".claude-plugin", "plugin.json");
 const FOREGROUND_TIMEOUT_ENV = "CODEX_COMPANION_TIMEOUT_MS";
+const BACKGROUND_SHELL_TIMEOUT_ENV = "CODEX_COMPANION_BACKGROUND_SHELL_TIMEOUT_MS";
 const BACKGROUND_TIMEOUT_ENV = "CODEX_COMPANION_BACKGROUND_TIMEOUT_MS";
 const BACKGROUND_DELIVERY_ENV = "CODEX_COMPANION_BACKGROUND_DELIVERY";
 const BACKGROUND_LAUNCH_APPROVAL_TIMEOUT_ENV = "CODEX_COMPANION_LAUNCH_APPROVAL_TIMEOUT_MS";
@@ -73,6 +75,7 @@ const PIDLESS_GRACE_ENV = "CODEX_COMPANION_PIDLESS_RUNNING_GRACE_MS";
 const WAIT_POLL_ENV = "CODEX_COMPANION_WAIT_POLL_MS";
 const WAIT_TIMEOUT_ENV = "CODEX_COMPANION_WAIT_TIMEOUT_MS";
 const DEFAULT_FOREGROUND_TIMEOUT_MS = 570000;
+const DEFAULT_BACKGROUND_SHELL_TIMEOUT_MS = 900000;
 const DEFAULT_BACKGROUND_TIMEOUT_MS = 1800000;
 const DEFAULT_PIDLESS_GRACE_MS = 15000;
 const UNVERIFIED_GROUP_RESERVATION_GRACE_MS = 10 * 60 * 1000;
@@ -104,7 +107,6 @@ const FLAGSHIP_WARNING_MAX_FILES = 500;
 const FLAGSHIP_WARNING_MAX_EXAMINED_FILES = 5000;
 const FLAGSHIP_WARNING_MAX_FILE_BYTES = 16 * 1024 * 1024;
 const FLAGSHIP_WARNING_WINDOW_MS = 7 * 24 * 60 * 60 * 1000;
-const FLAGSHIP_FOREGROUND_WRITE_FALLBACK_WARNING = "warning: foreground gpt-6-astra write tasks run against a 570s flight budget and the flagship's time to first token at max runs into minutes. Keep effort at xhigh, split the package, or route quick shapes to the Codex quick default and volume shapes to the volume default in the Fusion routing table.";
 const SWIFTPM_SANDBOX_NOTE = "Environment note from the Codex companion: SwiftPM cannot nest its own sandbox-exec inside this sandbox, so run SwiftPM with --disable-sandbox, for example swift build --disable-sandbox and swift test --disable-sandbox.";
 let activeCommandArgv = null;
 let cachedCompanionVersion = null;
@@ -126,6 +128,7 @@ function printUsage() {
       "  node scripts/codex-companion.mjs adversarial-review [--base <ref>] [--scope <auto|working-tree|branch>] [--focus <text>] [--background] [--model <id>] [--effort <level>] [--cwd <dir>] [--json]",
       "  node scripts/codex-companion.mjs status [job-id] [--all] [--cwd <dir>] [--json]",
       "  node scripts/codex-companion.mjs result <job-id> [--wait] [--wait-timeout-ms <ms>] [--cwd <dir>] [--json]",
+      "  node scripts/codex-companion.mjs await-output --file <path> [--slice-ms <n>]",
       "  node scripts/codex-companion.mjs wind-down --job <32 lowercase hex>",
       "  node scripts/codex-companion.mjs cancel <job-id> [--cwd <dir>] [--json]",
       "  node scripts/codex-companion.mjs record-acceptance --job-id <32 lowercase hex> --acceptance <accepted|rejected|unverified> [--reason <text>] [--failure-kind <intent_override|scope_rewrite|wrong_approach|style_mismatch>] [--source <collector|main-loop|stats>] [--accept-failed-transport]",
@@ -397,8 +400,10 @@ function nonnegativeEnvMs(name, fallback, env = process.env) {
   return Number.isSafeInteger(number) && number >= 0 ? number : fallback;
 }
 
-function resolveExecutionTimeout(background, env = process.env) {
-  return positiveEnvMs(background ? BACKGROUND_TIMEOUT_ENV : FOREGROUND_TIMEOUT_ENV, background ? DEFAULT_BACKGROUND_TIMEOUT_MS : DEFAULT_FOREGROUND_TIMEOUT_MS, env);
+function resolveExecutionTimeout(background, backgroundShellBudget = false, env = process.env) {
+  const name = background ? BACKGROUND_TIMEOUT_ENV : backgroundShellBudget ? BACKGROUND_SHELL_TIMEOUT_ENV : FOREGROUND_TIMEOUT_ENV;
+  const fallback = background ? DEFAULT_BACKGROUND_TIMEOUT_MS : backgroundShellBudget ? DEFAULT_BACKGROUND_SHELL_TIMEOUT_MS : DEFAULT_FOREGROUND_TIMEOUT_MS;
+  return positiveEnvMs(name, fallback, env);
 }
 
 function companionVersion() {
@@ -924,13 +929,14 @@ function scanFlagshipForegroundWriteStat(dataDir) {
   }
 }
 
-function flagshipForegroundWriteWarning(dataDir) {
+function flagshipForegroundWriteWarning(dataDir, timeoutMs) {
   const stat = scanFlagshipForegroundWriteStat(dataDir);
+  const flightBudget = `${timeoutMs / 1000}s`;
   if (!stat || stat.total < FLAGSHIP_WARNING_MIN_SAMPLE) {
-    return FLAGSHIP_FOREGROUND_WRITE_FALLBACK_WARNING;
+    return `warning: foreground gpt-6-astra write tasks run against a ${flightBudget} flight budget and the flagship's time to first token at max runs into minutes. Keep effort at xhigh, split the package, or route quick shapes to the Codex quick default and volume shapes to the volume default in the Fusion routing table.`;
   }
   const percentage = Math.round((100 * stat.timeouts) / stat.total);
-  return `warning: ${percentage}% of foreground gpt-6-astra write tasks timed out in the last 7 days (${stat.timeouts} of ${stat.total}). Sized to the 570s flight budget? Keep effort at xhigh, split the package, or route quick shapes to the Codex quick default and volume shapes to the volume default in the Fusion routing table.`;
+  return `warning: ${percentage}% of foreground gpt-6-astra write tasks timed out in the last 7 days (${stat.timeouts} of ${stat.total}). Sized to the ${flightBudget} flight budget? Keep effort at xhigh, split the package, or route quick shapes to the Codex quick default and volume shapes to the volume default in the Fusion routing table.`;
 }
 
 function shellArgument(value) {
@@ -1357,11 +1363,11 @@ async function executeRecord(found) {
   } catch (error) {
     return finishExecutionFailure(found.file, record, error);
   }
-  const timeoutMs = resolveExecutionTimeout(record.background);
+  const timeoutMs = resolveExecutionTimeout(record.background, record.request.backgroundShellBudget);
   const startedAt = record.startedAt ?? nowIso();
   const serviceTier = record.request.serviceTier;
   record = updateJobRecordFile(found.file, {
-    deadlineAt: new Date(Date.now() + timeoutMs).toISOString(),
+    deadlineAt: new Date(record.request.backgroundShellBudget ? found.foregroundDeadlineMs : Date.now() + timeoutMs).toISOString(),
     heartbeatAt: nowIso(),
     phase: record.background ? "codex-spawning" : "executing",
     serviceTier,
@@ -1449,11 +1455,12 @@ async function executeRecord(found) {
     const resolvedModel = outcome.resolvedModel ?? record.resolvedModel;
     const modelDrift = taskModelDrift(record, prompt, resolvedModel);
     const diagnostics = [...record.diagnostics, ...outcome.diagnostics.map((diagnostic) => ({ ...diagnostic, message: redactDiagnostic(diagnostic.message) }))];
+    const executionErrorMessage = record.request.backgroundShellBudget && outcome.failureKind === "timeout" ? `Codex timed out after ${timeoutMs}ms.` : outcome.errorMessage;
     return finishJob(found.file, {
       cumulativeTokenUsage: outcome.cumulativeTokenUsage,
       diagnostics,
-      errorMessage: outcome.errorMessage ? redactDiagnostic(outcome.errorMessage) : null,
-      errorTail: outcome.status === "done" ? null : errorTail || outcome.errorMessage,
+      errorMessage: executionErrorMessage ? redactDiagnostic(executionErrorMessage) : null,
+      errorTail: outcome.status === "done" ? null : errorTail || executionErrorMessage,
       eventsTruncated: outcome.eventsTruncated,
       exitCode: outcome.exitCode,
       fileChangeCount: outcome.fileChangeCount,
@@ -1681,7 +1688,7 @@ async function dispatchJob(found, asJson) {
 }
 
 async function handleTask(rawArgv, transport = {}) {
-  const foregroundDeadlineMs = Date.now() + resolveExecutionTimeout(false);
+  const taskStartedAtMs = Date.now();
   let releaseTransport = transport.release;
   try {
     const { options, positionals, positionalText } = commandArgs(rawArgv, {
@@ -1699,6 +1706,9 @@ async function handleTask(rawArgv, transport = {}) {
     rejectPersistentEffort(routing.effort);
     const write = options.write ?? Boolean(transport.defaultWrite);
     const background = Boolean(options.background);
+    const backgroundShellBudget = Boolean(transport.backgroundShell && !background);
+    const timeoutMs = resolveExecutionTimeout(background, backgroundShellBudget);
+    const foregroundDeadlineMs = taskStartedAtMs + timeoutMs;
     const outputSchemaFile = options["output-schema"] ? resolveOutputSchemaFile(cwd, options["output-schema"]) : null;
     let prompt = readTaskPrompt(cwd, options, positionals, positionalText);
     if (!prompt.trim() && resume.threadId) {
@@ -1718,6 +1728,7 @@ async function handleTask(rawArgv, transport = {}) {
     }
     const probe = preflightCodex(cwd);
     const request = {
+      backgroundShellBudget,
       effort: routing.effort,
       fresh: Boolean(options.fresh),
       ingress: transport.ingress ?? "argv",
@@ -1735,7 +1746,7 @@ async function handleTask(rawArgv, transport = {}) {
       ...(routing.inherited ? { inheritedFromThread: true } : {})
     };
     validateExecutionRequest(cwd, request);
-    const warning = isFlagshipForegroundWriteRequest({ background, model: request.model, write: request.write }) ? flagshipForegroundWriteWarning(dataDir) : null;
+    const warning = isFlagshipForegroundWriteRequest({ background, model: request.model, write: request.write }) ? flagshipForegroundWriteWarning(dataDir, timeoutMs) : null;
     const diagnostics = warning ? [{ type: "warning", message: warning }] : [];
     if (warning) {
       process.stderr.write(`${warning}\n`);
@@ -1751,7 +1762,7 @@ async function handleTask(rawArgv, transport = {}) {
       jobClass: "task",
       mode: write ? "write" : "consult",
       request,
-      timeoutMs: resolveExecutionTimeout(background)
+      timeoutMs
     });
     if (!background) {
       found.foregroundDeadlineMs = foregroundDeadlineMs;
@@ -2302,6 +2313,10 @@ async function main() {
     printUsage();
     return;
   }
+  if (subcommand === "await-output") {
+    process.exitCode = await awaitOutput(receivedArgv);
+    return;
+  }
   if (subcommand === "transport-create") {
     if (receivedArgv.length > 0) {
       throw new CompanionError("transport-create accepts no arguments.", "input");
@@ -2321,7 +2336,13 @@ async function main() {
     await handleRecordAcceptance(receivedArgv);
     return;
   }
-  const transport = resolveCommandTransport(receivedArgv, { retainStaged: subcommand === "task" });
+  const backgroundShell = subcommand === "task" && (receivedArgv[0] === "--transport-background-shell" ||
+    (receivedArgv[0] === "--transport-default-write" && receivedArgv[1] === "--transport-background-shell"));
+  const transportArgv = backgroundShell ? receivedArgv.filter((value, index) => index !== (receivedArgv[0] === "--transport-background-shell" ? 0 : 1)) : receivedArgv;
+  if (backgroundShell && transportArgv[transportArgv[0] === "--transport-default-write" ? 1 : 0] !== "--raw-args-token") {
+    throw new CompanionError("The background shell transport option requires a raw argument token.", "input");
+  }
+  const transport = { ...resolveCommandTransport(transportArgv, { retainStaged: subcommand === "task" }), backgroundShell };
   if (transport.defaultWrite && subcommand !== "task") {
     throw new CompanionError("The raw command transport write default is valid only for task.", "input");
   }

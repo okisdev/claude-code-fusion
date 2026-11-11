@@ -35,7 +35,9 @@ test("fixture ledger keeps JSON and Markdown report bytes", (t) => {
     CODEX_COMPANION_DATA: path.join(dir, "codex")
   };
   const report = buildFusionStats({ all: true, env, cwd: "/fixture/workspace" });
+  assert.deepStrictEqual(report.verificationEvidence.recent, { days: 7, accepted: 0, evidenced: 0, rate: 0 });
+  assert.deepStrictEqual(report.wrapperDelivery, []);
   const digest = (value) => createHash("sha256").update(value).digest("hex");
-  assert.equal(digest(JSON.stringify(report, null, 2) + "\n"), "8bc5c7969597453a9892dc187994f13d5f7c4d1621b569f67a044caf0c2abf50");
+  assert.equal(digest(JSON.stringify(report, null, 2) + "\n"), "a1ae340e815cb25f807f3d8981f8acf633c1d7f8ee561fadaf7c097ad1331759");
   assert.equal(digest(renderFusionStats(report)), "93d5f653a852a7656161d0456c6770b242fc908048b78b6e63ba9c5a83bc2882");
 });

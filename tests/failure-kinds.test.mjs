@@ -516,7 +516,7 @@ test("cancelled background job retains requested model and effort attribution", 
   });
   const cancelOutput = runCompanion(["cancel", running.id], { cwd: sandbox.workDir, env });
   assert.strictEqual(cancelOutput.status, 0, cancelOutput.stderr);
-  assert.match(cancelOutput.stdout, new RegExp(`job: ${running.id}\\nsandbox: ${sandbox.workDir}\\nstate: cancelled\\nfailure: cancelled\\n$`));
+  assert.match(cancelOutput.stdout, new RegExp(`job: ${running.id}\\nsandbox: ${sandbox.workDir}\\ndelivery: manual\\nsemantic: unverified\\nstate: cancelled\\nfailure: cancelled\\n$`));
   assert.match(cancelOutput.stdout, /^state: cancelled$/m);
   assert.match(cancelOutput.stdout, /^failure: cancelled$/m);
   const cancelled = await waitFor(() => {

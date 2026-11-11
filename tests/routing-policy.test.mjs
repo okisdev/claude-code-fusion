@@ -38,7 +38,7 @@ test("the main Claude session remains the sole control plane", () => {
     rules,
     /The main session owns ambiguity resolution, decomposition, integration, semantic acceptance, final judgment, and user communication\./
   );
-  assert.match(rules, /It may perform bounded inline work under the inline work gate and read only verification, but it never executes a work package\./);
+  assert.match(rules, /It may perform bounded inline work under the inline work gate and read only verification; a change that passes that gate is not a work package, and the main session never executes one\./);
   assert.match(rules, /Explore owns open ended read only repository reconnaissance\./);
   assert.match(
     rules,
@@ -113,7 +113,7 @@ test("Grok automatic routing exposes four protected roles while the companion re
   assert.match(grokRescue, /Requested changes still follow the Codex first admission ladder unless a protected Grok role applies\./);
   assert.match(grokRescue, /text output contains terminal `state` and `failure` footer lines \(plus `job` when a record was created\), or JSON output contains top level `status` and `failureKind` fields/);
   assert.match(grokRescue, /only when Node or the companion cannot be invoked and no valid typed text or JSON outcome exists/);
-  assert.match(grokRescue, /Never use Bash background mode\./);
+  assert.match(grokRescue, /Background mode belongs to that Bash call alone and is not the companion's `--background`/);
   assert.match(grokRescue, /An explicit incoming user `--background` stays inside the raw request\./);
   assert.match(grokReviewRunner, /return an output containing `phase: cleanup-required` instead of chaining/);
   assert.match(grokReviewRunner, /top level `status` is `running`, and `cleanupRequired` is not true/);

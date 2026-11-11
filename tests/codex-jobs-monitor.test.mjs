@@ -122,7 +122,7 @@ function envFor(sandbox, extra = {}) {
     GROK_COMPANION_DATA: sandbox.grokData,
     CURSOR_COMPANION_DATA: sandbox.cursorData,
     CODEX_JOBS_MONITOR_SESSIONS_DIR: sandbox.sessionsDir,
-    CODEX_JOBS_MONITOR_INTERVAL_MS: "200",
+    CODEX_JOBS_MONITOR_INTERVAL_MS: "50",
     ...extra,
   };
 }
@@ -184,12 +184,78 @@ function readAnnouncedState(sandbox, sessionId = null, workspaceRoot = sandbox.w
   }
 }
 
+function monitorTimerProbe(sandbox) {
+  const preload = path.join(sandbox.root, "monitor-timer-probe.mjs");
+  const log = path.join(sandbox.root, "monitor-timer-delays.log");
+  fs.writeFileSync(preload, `import fs from "node:fs";
+const original = globalThis.setTimeout;
+globalThis.setTimeout = (callback, delay, ...args) => {
+  if (delay === 1000 || delay === 4000) {
+    fs.appendFileSync(process.env.MONITOR_TIMER_LOG, String(delay) + "\\n");
+    return original(callback, 30, ...args);
+  }
+  return original(callback, delay, ...args);
+};
+`);
+  return {
+    env: { NODE_OPTIONS: `${process.env.NODE_OPTIONS ?? ""} --import=${preload}`.trim(), MONITOR_TIMER_LOG: log, CODEX_JOBS_MONITOR_INTERVAL_MS: "1000" },
+    delays: () => fs.existsSync(log) ? fs.readFileSync(log, "utf8").trim().split("\n").map(Number) : []
+  };
+}
+
 async function waitForAnnouncedRecord(sandbox, jobId, sessionId = null, workspaceRoot = sandbox.workDir) {
   return waitUntil(() => {
     const state = readAnnouncedState(sandbox, sessionId, workspaceRoot);
     return state?.records.some((record) => record.jobId === jobId) ? state : null;
   });
 }
+
+test("Codex monitor schedules slow scans while idle or foreign-owned and fast scans for its active jobs", async (t) => {
+  const sandbox = makeSandbox(t);
+  const probe = monitorTimerProbe(sandbox);
+  const staleSidecar = path.join(sandbox.fusionData, "observations", "stale");
+  const staleTime = new Date(Date.now() - 100 * 24 * 60 * 60 * 1000);
+  fs.mkdirSync(staleSidecar, { recursive: true });
+  const staleFile = path.join(staleSidecar, "model-audit.jsonl");
+  fs.writeFileSync(staleFile, `${JSON.stringify({ jobId: "missing", workspaceRoot: sandbox.workDir })}\n`);
+  fs.utimesSync(staleFile, staleTime, staleTime);
+  fs.utimesSync(staleSidecar, staleTime, staleTime);
+  const env = envFor(sandbox, { ...probe.env, CLAUDE_CODE_SESSION_ID: "session-own", FUSION_CODEX_COMPANION: path.join(sandbox.root, "missing-companion.mjs") });
+  const monitor = startMonitor(sandbox, env);
+  await waitUntil(() => probe.delays().length >= 1);
+  assert.strictEqual(probe.delays()[0], 4000);
+  const foreign = seedJob(sandbox, { status: "running", claudeSessionId: "session-other" });
+  await waitUntil(() => probe.delays().length >= 2);
+  assert.strictEqual(probe.delays()[1], 4000);
+  const own = seedJob(sandbox, { status: "running", claudeSessionId: "session-own" });
+  await waitUntil(() => probe.delays().includes(1000));
+  writeJobRecordFile(own.file, { ...own.record, status: "done" });
+  await waitUntil(() => probe.delays().slice(probe.delays().indexOf(1000) + 1).includes(4000));
+  assert.strictEqual(fs.existsSync(staleSidecar), false);
+  assert.ok(fs.existsSync(path.join(sandbox.fusionData, ".observation-prune-stamp")));
+  assert.strictEqual(monitor.child.exitCode, null, monitor.stderr());
+  fs.rmSync(foreign.file);
+});
+
+test("Codex monitor prunes removed terminal jobs while keeping and deduplicating jobs on disk", async (t) => {
+  const sandbox = makeSandbox(t);
+  const removed = seedJob(sandbox, { id: "removed-job", status: "running" });
+  const retained = seedJob(sandbox, { id: "retained-job", status: "running" });
+  const monitor = startMonitor(sandbox, envFor(sandbox, { CODEX_JOBS_MONITOR_INTERVAL_MS: "40", FUSION_CODEX_COMPANION: path.join(sandbox.root, "missing-companion.mjs") }));
+  await waitUntil(() => readAnnouncedState(sandbox));
+  writeJobRecordFile(removed.file, { ...removed.record, status: "done" });
+  writeJobRecordFile(retained.file, { ...retained.record, status: "done" });
+  await waitUntil(() => readAnnouncedState(sandbox)?.records.length === 2 && monitor.lines().filter((line) => line.includes("codex job ")).length === 2);
+  await new Promise((resolve) => setTimeout(resolve, 220));
+  assert.strictEqual(monitor.lines().filter((line) => line.includes("codex job ")).length, 2);
+  fs.rmSync(removed.file);
+  const state = await waitUntil(() => {
+    const current = readAnnouncedState(sandbox);
+    return current?.records.length === 1 && current.records[0].jobId === retained.record.id ? current : null;
+  });
+  assert.deepStrictEqual(state.keys, [`${retained.record.id}:done`]);
+  assert.strictEqual(monitor.lines().filter((line) => line.includes("codex job ")).length, 2);
+});
 
 test("a pre-existing terminal job emits nothing on startup", async (t) => {
   const sandbox = makeSandbox(t);
@@ -1684,7 +1750,7 @@ fs.readFileSync = function (file, ...args) {
   return read.call(this, file, ...args);
 };
 fs.readdirSync = function (dir, ...args) {
-  if (dir === process.env.MONITOR_TEST_JOBS_DIR) fs.appendFileSync(log, "S\\n");
+  if (dir === process.env.MONITOR_TEST_JOBS_DIR && new Error().stack.includes("readWorkspaceJobsSnapshot")) fs.appendFileSync(log, "S\\n");
   return readdir.call(this, dir, ...args);
 };
 `);
@@ -1707,10 +1773,12 @@ fs.readdirSync = function (dir, ...args) {
   fs.rmSync(file);
   const scansBeforeDeletion = count("S");
   await waitUntil(() => count("S") >= scansBeforeDeletion + 2);
-  writeJobRecordFile(file, changed);
-  fs.utimesSync(file, changedStat.atime, changedStat.mtime);
-  await waitUntil(() => count("R") >= 4);
-  assert.equal(count("R"), 4, monitor.stderr());
+  const restored = `${file}.replacement`;
+  writeJobRecordFile(restored, changed);
+  fs.utimesSync(restored, changedStat.atime, changedStat.mtime);
+  fs.renameSync(restored, file);
+  await waitUntil(() => count("R") >= 5);
+  assert.equal(count("R"), 5, monitor.stderr());
 });
 
 test("monitor observes atomic record replacement with unchanged size and mtime", async (t) => {

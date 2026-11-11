@@ -2,7 +2,7 @@ const PATTERN_ENV = "FUSION_VERIFICATION_PATTERN";
 const PATTERN_MAX_LENGTH = 512;
 const COMMAND_MAX_LENGTH = 16384;
 
-const WRAPPER_HEADS = new Set(["time", "nice", "command", "npx", "bunx", "uvx", "dotenv", "cross-env"]);
+const WRAPPER_HEADS = new Set(["time", "nice", "command", "npx", "bunx", "uvx", "dotenv", "cross-env", "env"]);
 const WRAPPER_SUBCOMMANDS = new Map([
   ["npm", new Set(["exec"])],
   ["pnpm", new Set(["exec", "dlx"])],
@@ -141,10 +141,35 @@ function tokenize(segment) {
     .filter((token) => token.length > 0 && !isEnvAssignment(token));
 }
 
+function stripTimeout(tokens) {
+  let index = 1;
+  while (index < tokens.length) {
+    const flag = tokens[index].toLowerCase();
+    if (["--preserve-status", "--foreground", "--verbose", "-v"].includes(flag)) {
+      index += 1;
+    } else if (["-k", "--kill-after", "-s", "--signal"].includes(flag)) {
+      index += 2;
+    } else if (/^(?:-k|-s).+/.test(flag) || /^--(?:kill-after|signal)=.+/.test(flag)) {
+      index += 1;
+    } else {
+      break;
+    }
+  }
+  return /^(?:\d+(?:\.\d*)?|\.\d+)[smhd]?$/.test(tokens[index] ?? "") ? tokens.slice(index + 1) : tokens;
+}
+
 function stripWrappers(tokens) {
   let current = tokens;
   for (let depth = 0; depth < 4 && current.length > 0; depth += 1) {
     const head = commandHead(current[0]);
+    if (head === "timeout") {
+      const next = stripTimeout(current);
+      if (next === current) {
+        return current;
+      }
+      current = next;
+      continue;
+    }
     if (WRAPPER_HEADS.has(head)) {
       current = current.slice(1);
       continue;
@@ -163,6 +188,11 @@ function stripWrappers(tokens) {
     current = current.slice(index + 1);
   }
   return current;
+}
+
+function isVerificationScript(token) {
+  const name = token?.toLowerCase();
+  return Boolean(name && (VERIFICATION_SCRIPTS.has(name) || VERIFICATION_SCRIPT_PREFIX.test(name)));
 }
 
 function positionalTokens(tokens) {
@@ -188,13 +218,28 @@ function matchesPackageManager(head, tokens) {
   }
   return positionals.some(
     (token) =>
-      VERIFICATION_SCRIPTS.has(token) ||
-      VERIFICATION_SCRIPT_PREFIX.test(token) ||
+      isVerificationScript(token) ||
       UNCONDITIONAL_RUNNERS.has(commandHead(token))
   );
 }
 
 function matchesRunner(head, tokens) {
+  if (head === "turbo") {
+    return isVerificationScript(tokens[tokens[1]?.toLowerCase() === "run" ? 2 : 1]);
+  }
+  if (head === "nx") {
+    const subcommand = tokens[1]?.toLowerCase();
+    if (subcommand === "run") {
+      const target = tokens[2]?.split(":")[1];
+      return isVerificationScript(target);
+    }
+    if (subcommand === "run-many" || subcommand === "affected") {
+      const targetIndex = tokens.findIndex((token, index) => index > 1 && (token === "-t" || token === "--target"));
+      const assigned = tokens.slice(2).find((token) => token.startsWith("--target=") || token.startsWith("-t="));
+      return isVerificationScript(targetIndex === -1 ? assigned?.split("=")[1] : tokens[targetIndex + 1]);
+    }
+    return isVerificationScript(subcommand);
+  }
   if (head === "git" && tokens[1]?.toLowerCase() === "diff" && tokens.slice(2).includes("--check")) {
     return true;
   }
