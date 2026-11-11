@@ -148,7 +148,7 @@ async function handleTask(argv, transport = {}) {
       resolvedEffort: null,
       failureKind: null
     };
-    output(options.json ? payload : renderBackgroundLaunch(jobId, record.delivery), options.json);
+    output(options.json ? payload : renderBackgroundLaunch(jobId, record.delivery, record.cwd), options.json);
     return;
   }
 

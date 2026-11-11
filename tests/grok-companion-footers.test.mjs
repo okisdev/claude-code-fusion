@@ -3,7 +3,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { test } from "node:test";
 
-import { renderJobDetail, renderTaskResult } from "../plugins/grok/scripts/lib/render.mjs";
+import { renderBackgroundLaunch, renderCancelReport, renderJobDetail, renderTaskResult } from "../plugins/grok/scripts/lib/render.mjs";
 import { failureOutcomeMessage } from "../plugins/grok/scripts/lib/companion/base.mjs";
 import { createJobRecord, createJobRecordFile, finishSuccessfulJobRecordFile, jobFilePath } from "../plugins/grok/scripts/lib/state.mjs";
 import { envFor, makeSandbox, runCompanion } from "./lib/companion-harness.mjs";
@@ -15,7 +15,7 @@ function footerLines(value) {
 
 function identityBin(sandbox) {
   const bin = path.join(sandbox.root, "bin");
-  fs.mkdirSync(bin);
+  fs.mkdirSync(bin, { recursive: true });
   fs.writeFileSync(path.join(bin, "ps"), '#!/bin/sh\nprintf "process-%s\\n" "$*"\n');
   fs.writeFileSync(path.join(bin, "sysctl"), '#!/bin/sh\nprintf "{ sec = 1, usec = 0 }\\n"\n');
   fs.chmodSync(path.join(bin, "ps"), 0o755);
@@ -42,6 +42,28 @@ test("task and job detail footers retain contract order and pair job with sandbo
   assert.deepEqual(footerLines(failed), ["job: job-3", "sandbox: /work", "delivery: foreground", "semantic: rejected", "state: error", "failure: quota"]);
   const managed = { ...createJobRecord({ id: "job-4", mode: "consult", cwd: "/work", background: true, delivery: "managed" }), semanticStatus: "rejected" };
   assert.deepEqual(footerLines(failureOutcomeMessage({ message: "failed", record: managed, failureKind: "quota" })), ["job: job-4", "sandbox: /work", "delivery: managed", "semantic: rejected", "state: error", "failure: quota"]);
+});
+
+test("background launch receipt pairs its job and sandbox lines", () => {
+  const receipt = renderBackgroundLaunch("job-5", "manual", "/work");
+  assert.deepEqual(footerLines(receipt), ["job: job-5", "sandbox: /work", "delivery: manual", "state: running"]);
+  assert.throws(() => renderBackgroundLaunch("job-5", "manual"), /requires a workspace path/);
+});
+
+test("result without wait ends with a running footer", (t) => {
+  const sandbox = makeSandbox(t);
+  const id = "a".repeat(32);
+  const record = createJobRecord({ id, cwd: sandbox.workDir, mode: "consult", background: true });
+  const bin = identityBin(sandbox);
+  withIdentityPath(sandbox, () => createJobRecordFile(jobFilePath(sandbox.dataDir, sandbox.workDir, id), record));
+  const result = runCompanion(["result", id, "--cwd", sandbox.workDir], { cwd: sandbox.workDir, env: envFor(sandbox, { PATH: `${bin}${path.delimiter}${process.env.PATH}` }) });
+  assert.equal(result.status, 0, result.stderr);
+  assert.ok(result.stdout.endsWith(`job: ${id}\nsandbox: ${sandbox.workDir}\ndelivery: manual\nsemantic: unverified\nstate: running\n`));
+});
+
+test("cancel report retains delivery and semantic fields when present", () => {
+  const record = { id: "job-6", cwd: "/work", delivery: "managed", semanticStatus: "rejected", failureKind: "cancelled" };
+  assert.deepEqual(footerLines(renderCancelReport(record)), ["job: job-6", "sandbox: /work", "delivery: managed", "semantic: rejected", "state: cancelled", "failure: cancelled"]);
 });
 
 test("cancelled success keeps observed turns, cost, usage, and model usage", (t) => {

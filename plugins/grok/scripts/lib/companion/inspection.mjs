@@ -180,7 +180,7 @@ function renderResultRecord(record, dataDir) {
     if (record.cleanupRequired) {
       return renderRunningWaitResult(record);
     }
-    return `Job ${record.id} is still running. Check /grok:status ${record.id} for progress.\n`;
+    return `Job ${record.id} is still running. Check /grok:status ${record.id} for progress.\n\njob: ${record.id}\nsandbox: ${record.cwd}\ndelivery: ${record.delivery}\nsemantic: ${record.semanticStatus}\nstate: running\n`;
   }
 
   if (record.status === "error") {
@@ -359,4 +359,4 @@ async function handleCancel(argv, transport = {}) {
   output(options.json ? next : renderCancelReport(next), options.json);
 }
 
-export { handleStatus, historyString, historyTimestamp, historyEnum, historyJob, handleHistory, renderFailedResult, renderRunningWaitResult, renderNotRunningReport, renderResultRecord, jsonResultPayload, waitForResultRecord, handleResult, handleCancel };
+export { handleStatus, handleHistory, handleResult, handleCancel };

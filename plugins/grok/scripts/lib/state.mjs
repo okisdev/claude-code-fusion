@@ -444,10 +444,6 @@ export function readJobRecordFile(file, locked = false) {
   }
 }
 
-function writeJobRecord(dataDir, cwd, record) {
-  return writeJobRecordFile(jobFilePath(dataDir, cwd, record.id), record);
-}
-
 function readJobRecord(dataDir, cwd, jobId) {
   return readJobRecordFile(jobFilePath(dataDir, cwd, jobId));
 }

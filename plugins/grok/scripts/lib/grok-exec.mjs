@@ -942,6 +942,19 @@ export function preflightRuntimeSocketEndpoints({ candidates = runtimeSocketEndp
   return symlinks;
 }
 
+export function preflightUndeniedRuntimeSocketEndpoints(env = process.env) {
+  let sockets;
+  try {
+    sockets = existingUnixSockets(undeniedRuntimeSocketCandidates(env));
+  } catch (error) {
+    throw securityError("sandbox", `Unable to inspect undenied Grok runtime sockets: ${error.message}`);
+  }
+  if (sockets.length > 0) {
+    throw securityError("sandbox", `Grok's strict runtime-socket deny list does not cover ${sockets[0]}, so a write shell could drive that container engine and write outside the workspace. ${undeniedRuntimeSocketRemedy()}`);
+  }
+  return sockets;
+}
+
 function createManagedRunTempDir() {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), "grok-companion-run-"));
   try {
@@ -2502,15 +2515,7 @@ export function runGrok(options) {
       lstat: options.runtimeSocketLstat ?? fs.lstatSync
     });
     if (requestedMode === "write") {
-      let sockets;
-      try {
-        sockets = existingUnixSockets(undeniedRuntimeSocketCandidates(env));
-      } catch (error) {
-        throw securityError("sandbox", `Unable to inspect undenied Grok runtime sockets: ${error.message}`);
-      }
-      if (sockets.length > 0) {
-        throw securityError("sandbox", `Grok's strict runtime-socket deny list does not cover ${sockets[0]}, so a write shell could drive that container engine and write outside the workspace. ${undeniedRuntimeSocketRemedy()}`);
-      }
+      preflightUndeniedRuntimeSocketEndpoints(env);
     }
     requireDeadline(deadline);
   }
