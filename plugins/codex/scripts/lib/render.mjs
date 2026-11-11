@@ -59,6 +59,7 @@ export function renderBackgroundLaunch(record) {
     `Use /codex:result ${record.id} to collect the terminal result.`,
     "",
     `job: ${record.id}`,
+    `sandbox: ${record.cwd}`,
     `delivery: ${record.delivery ?? "manual"}`,
     ...(record.orphanCleanupWarning ? [`warning: ${record.orphanCleanupWarning}`] : []),
     "state: running",
@@ -93,6 +94,7 @@ export function renderRunningResult(record) {
     `Use /codex:status ${record.id} for progress.`,
     "",
     `job: ${record.id}`,
+    `sandbox: ${record.cwd}`,
     ...(record.orphanCleanupWarning ? [`warning: ${record.orphanCleanupWarning}`] : []),
     "state: running",
     ""

@@ -15,6 +15,7 @@ const JOB_RECORD_SCAN_MAX_BYTES = 16 * 1024 * 1024;
 const LOG_TAIL_MAX_BYTES = 64 * 1024;
 const LOCK_TIMEOUT_ENV = "CODEX_COMPANION_LOCK_TIMEOUT_MS";
 const LOCK_RETRY_MS = 20;
+const LOCK_STALE_MS = 10000;
 const PRIVATE_DIR_MODE = 0o700;
 const PRIVATE_FILE_MODE = 0o600;
 const STATE_MAX_BYTES_ENV = "CODEX_COMPANION_HISTORY_MAX_BYTES";
@@ -241,6 +242,59 @@ function lockTargetsToken(lockDir, token) {
   }
 }
 
+function linkedOwnerDir(lockDir) {
+  try {
+    if (!fs.lstatSync(lockDir).isSymbolicLink()) {
+      return null;
+    }
+    const ownerDir = path.resolve(path.dirname(lockDir), fs.readlinkSync(lockDir));
+    return path.dirname(ownerDir) === path.dirname(lockDir) && path.basename(ownerDir).startsWith(`${path.basename(lockDir)}.owner.`) ? ownerDir : null;
+  } catch {
+    return null;
+  }
+}
+
+function scavengeOrphanOwnerDirs(lockDir) {
+  const dir = path.dirname(lockDir);
+  const prefix = `${path.basename(lockDir)}.owner.`;
+  let entries;
+  try {
+    entries = fs.readdirSync(dir);
+  } catch {
+    return;
+  }
+  for (const entry of entries) {
+    if (!entry.startsWith(prefix)) {
+      continue;
+    }
+    const ownerDir = path.join(dir, entry);
+    if (linkedOwnerDir(lockDir) === ownerDir) {
+      continue;
+    }
+    let stats;
+    try {
+      stats = fs.lstatSync(ownerDir);
+    } catch {
+      continue;
+    }
+    if (!stats.isDirectory() || Date.now() - stats.mtimeMs < LOCK_STALE_MS) {
+      continue;
+    }
+    const record = readLockRecord(ownerDir);
+    if (record && !lockOwnerWasReplaced(record)) {
+      continue;
+    }
+    if (linkedOwnerDir(lockDir) === ownerDir) {
+      continue;
+    }
+    const claimedDir = `${ownerDir}.scavenged.${randomBytes(8).toString("hex")}`;
+    try {
+      fs.renameSync(ownerDir, claimedDir);
+      fs.rmSync(claimedDir, { recursive: true, force: true });
+    } catch {}
+  }
+}
+
 function publishPreparedLock(lockDir, ownerDir) {
   try {
     fs.symlinkSync(path.basename(ownerDir), lockDir, "dir");
@@ -417,6 +471,7 @@ function describeLockHolder(lockDir, observed) {
 function withRecordLock(file, callback, timeoutMs = resolveLockTimeoutMs()) {
   ensurePrivateDir(path.dirname(file));
   const lockDir = `${file}.lock`;
+  scavengeOrphanOwnerDirs(lockDir);
   const deadline = Date.now() + timeoutMs;
   const token = randomBytes(16).toString("hex");
   const record = {

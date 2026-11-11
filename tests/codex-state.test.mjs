@@ -711,6 +711,42 @@ test("a lock owned by a dead process is reclaimed without an age heuristic", asy
   assert.strictEqual(fs.existsSync(lockDir), false);
 });
 
+test("stale orphan lock owner directories are scavenged while live owners remain", (t) => {
+  const sandbox = makeSandbox(t);
+  const threadId = "orphan-owner-thread";
+  const lockDir = threadLockDir(sandbox.dataDir, threadId);
+  const source = `
+import fs from "node:fs";
+import path from "node:path";
+const [stateUrl, identityUrl, dataDir, threadId, lockDir] = process.argv.slice(1);
+const { withThreadLock } = await import(stateUrl);
+const { getProcessIdentity } = await import(identityUrl);
+const identity = getProcessIdentity(process.pid);
+if (!identity) throw new Error("owner identity unavailable");
+fs.mkdirSync(path.dirname(lockDir), { recursive: true });
+function ownerDir(token, replaced, ageMs) {
+  const dir = lockDir + ".owner." + token;
+  const ownerIdentity = replaced ? { ...identity, commandHash: "0".repeat(64) } : identity;
+  fs.mkdirSync(dir);
+  fs.writeFileSync(path.join(dir, "owner.json"), JSON.stringify({ version: 1, token, ownerPid: process.pid, ownerIdentity }) + "\\n");
+  const at = new Date(Date.now() - ageMs);
+  fs.utimesSync(dir, at, at);
+  return dir;
+}
+const stale = ownerDir("a".repeat(32), true, 60000);
+const live = ownerDir("b".repeat(32), false, 60000);
+const young = ownerDir("c".repeat(32), true, 1000);
+const value = withThreadLock(dataDir, threadId, () => "acquired");
+process.stdout.write(JSON.stringify({ value, stale: fs.existsSync(stale), live: fs.existsSync(live), young: fs.existsSync(young) }));
+`;
+  const result = spawnSync(process.execPath, ["--input-type=module", "--eval", source, stateModuleUrl, new URL("../plugins/codex/scripts/lib/codex-exec.mjs", import.meta.url).href, sandbox.dataDir, threadId, lockDir], {
+    encoding: "utf8",
+    env: identityChildEnv()
+  });
+  assert.strictEqual(result.status, 0, result.stderr);
+  assert.deepStrictEqual(JSON.parse(result.stdout), { value: "acquired", stale: false, live: true, young: true });
+});
+
 test("concurrent reapers serialize after a lock owner is killed", async (t) => {
   const sandbox = makeSandbox(t);
   const threadId = "concurrent-reapers-thread";
