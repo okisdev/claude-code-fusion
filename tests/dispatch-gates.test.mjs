@@ -91,7 +91,7 @@ function assertStaged(box, output, prompt, engine = "codex") {
   assert.equal(fs.existsSync(file), false);
 }
 
-const flagshipMessage = "gpt-6-astra write briefs of 3000 bytes or more time out on most 570 second flights. Split the package, or pass --model gpt-6.1-sol --effort xhigh.";
+const flagshipMessage = "gpt-6-astra write briefs of 3000 bytes or more time out on most flights. Split the package, or drop --model to use the codex flagship lane default.";
 
 function infraMessage(engine, kind, elapsed = 5, remaining = 25) {
   return `${ENGINES[engine].displayName} failed with failure: ${kind} ${elapsed} minutes ago in this session. Route this package to another eligible lane. It reopens after ${remaining} minutes or after you name the engine in a message.`;

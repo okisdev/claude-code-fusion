@@ -60,7 +60,7 @@ function flagshipWriteDenial(prompt, agentType, userText) {
   if (!separated || !options.includes("--write") || optionValue(options, "--model") !== "gpt-6-astra" || Buffer.byteLength(brief, "utf8") < 3000 || userText?.includes("gpt-6-astra")) {
     return null;
   }
-  return tagMessage("worker-lifecycle.flagship-write-deny", "gpt-6-astra write briefs of 3000 bytes or more time out on most 570 second flights. Split the package, or pass --model gpt-6.1-sol --effort xhigh.");
+  return tagMessage("worker-lifecycle.flagship-write-deny", "gpt-6-astra write briefs of 3000 bytes or more time out on most flights. Split the package, or drop --model to use the codex flagship lane default.");
 }
 
 function engineInfraDenial(sessionId, agentType, userText, env, now = Date.now()) {
