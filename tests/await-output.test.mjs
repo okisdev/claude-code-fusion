@@ -135,3 +135,24 @@ test("each companion entry script routes await-output to the shared handler", (t
     assert.deepEqual(result.stderr, Buffer.alloc(0), engine);
   }
 });
+
+test("Fusion job collector routes await-output to the shared handler", (t) => {
+  const script = path.join(repoRoot, "plugins", "fusion", "scripts", "job-collect.mjs");
+  const content = Buffer.from([0, 255, 13, 10, 65, 13, 10]);
+  const file = fixture(t, Buffer.concat([content, Buffer.from("[exited with code 0]\r\n")]));
+  const completed = spawnSync(process.execPath, [script, "await-output", "--file", file], { cwd: repoRoot });
+  assert.equal(completed.status, 0, completed.stderr.toString());
+  assert.deepEqual(completed.stdout, content);
+  assert.deepEqual(completed.stderr, Buffer.alloc(0));
+
+  fs.writeFileSync(file, "still running\n");
+  const pending = spawnSync(process.execPath, [script, "await-output", "--file", file, "--slice-ms", "1"], { cwd: repoRoot });
+  assert.equal(pending.status, 0, pending.stderr.toString());
+  assert.equal(pending.stdout.toString(), "await-output: pending\n");
+  assert.deepEqual(pending.stderr, Buffer.alloc(0));
+
+  const invalid = spawnSync(process.execPath, [script, "await-output", "--file", "relative.output"], { cwd: repoRoot });
+  assert.equal(invalid.status, 2);
+  assert.deepEqual(invalid.stdout, Buffer.alloc(0));
+  assert.equal(invalid.stderr.toString(), "await-output: --file must be an absolute path\n");
+});
