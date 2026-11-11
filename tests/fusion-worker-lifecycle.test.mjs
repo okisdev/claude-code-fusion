@@ -906,10 +906,10 @@ test("Cursor dispatches fill role defaults and preserve explicit model choices",
   const routing = routingFixture(box);
   for (const [agentType, prompt, expected, staged] of [
     ["cursor:cursor-rescue", "lane: cursor diversity | goal: consult", "--model muse-spark-1.3 --effort xhigh -- lane: cursor diversity | goal: consult", true],
-    ["cursor-rescue", "cursor-role: diversity\ngoal: consult", "--model muse-spark-1.3 --effort xhigh -- cursor-role: diversity\ngoal: consult"],
+    ["cursor-rescue", "cursor-role: diversity\ngoal: consult", "--model muse-spark-1.3 --effort xhigh -- cursor-role: diversity\ngoal: consult", true],
     ["cursor:cursor-rescue", "lane: cursor burst\ngoal: implement", "--model composer-2.5 --effort default -- lane: cursor burst\ngoal: implement"],
-    ["cursor:cursor-rescue", "--model composer-2.5-fast -- lane: cursor diversity", "--effort xhigh --model composer-2.5-fast -- lane: cursor diversity"],
-    ["cursor:cursor-rescue", "--model composer-2.5 -- lane: cursor diversity", "--effort default --model composer-2.5 -- lane: cursor diversity"]
+    ["cursor:cursor-rescue", "--model composer-2.5-fast -- lane: cursor diversity", "--effort xhigh --model composer-2.5-fast -- lane: cursor diversity", true],
+    ["cursor:cursor-rescue", "--model composer-2.5 -- lane: cursor diversity", "--effort default --model composer-2.5 -- lane: cursor diversity", true]
   ]) {
     const result = run(box, dispatch(box, { subagent_type: agentType, prompt }), routing);
     assert.strictEqual(result.status, 0, result.stderr);
