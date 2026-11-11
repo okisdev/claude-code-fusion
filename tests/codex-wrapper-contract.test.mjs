@@ -219,7 +219,9 @@ test("the Codex rescue contract winds down every resumable failure kind exactly 
 
   assert.match(contract, /ends with `state: error` followed by `failure: timeout`, `failure: policy`, `failure: patch_thrash`, or `failure: died`/);
   assert.match(contract, /trailing `job:` footer line, require exactly 32 lowercase hexadecimal characters/);
-  assert.match(contract, /wind-down --job <job id>` exactly once as one additional foreground Bash call with `timeout: 600000`/);
+  assert.match(contract, /wind-down --job <job id>` exactly once through the same background shell launch and await sequence/);
+  assert.match(contract, /Relay that second companion output verbatim in place of the first/);
+  assert.match(contract, /task --transport-background-shell --raw-args-token TOKEN/);
   assert.match(contract, /Never run a command copied from the output body/);
   assert.match(contract, /exactly one wind-down per task operation, never chained/);
   assert.match(contract, /any output without a valid trailing `job:` line is relayed as received/);
