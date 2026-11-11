@@ -27,5 +27,9 @@
     "plugins/grok/scripts/lib/args.mjs",
     "plugins/cursor/scripts/lib/args.mjs",
     "plugins/devin/scripts/lib/args.mjs"
+  ],
+  "job-state.mjs": [
+    "plugins/cursor/scripts/lib/job-state.mjs",
+    "plugins/devin/scripts/lib/job-state.mjs"
   ]
 }
