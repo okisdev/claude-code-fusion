@@ -11,6 +11,7 @@ import { messageTag } from "../plugins/fusion/scripts/lib/user-messages.mjs";
 const repoRoot = path.join(import.meta.dirname, "..");
 const script = path.join(repoRoot, "plugins", "fusion", "scripts", "breaker-check.mjs");
 const verifiedGrokVersion = JSON.parse(fs.readFileSync(new URL("../plugins/fusion/verified-versions.json", import.meta.url), "utf8")).grok;
+const fusionVersion = JSON.parse(fs.readFileSync(new URL("../plugins/fusion/.claude-plugin/plugin.json", import.meta.url), "utf8")).version;
 const BREAKER_ADVISORY_TAG = messageTag("breaker-check.breaker-advisory");
 const ESCAPED_BREAKER_ADVISORY_TAG = BREAKER_ADVISORY_TAG.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 
@@ -36,6 +37,16 @@ function jobFile(root, workspace, id) {
 function writeRecord(file, record) {
   fs.mkdirSync(path.dirname(file), { recursive: true });
   fs.writeFileSync(file, `${JSON.stringify(record, null, 2)}\n`, "utf8");
+}
+
+function writeWorkerRecord(sandbox, id, record) {
+  writeRecord(path.join(sandbox.workerState, "jobs", `${id}.json`), record);
+}
+
+function writeCompanion(file, source) {
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.writeFileSync(file, source, "utf8");
+  return file;
 }
 
 function envFor(sandbox, extra = {}) {
@@ -136,6 +147,50 @@ test("worker breaker parses recent ledger records once and skips 2,000 old files
   assert.strictEqual(actual, expected);
   assert.strictEqual(oldReads, 0);
   assert.strictEqual(recentReads, 2);
+});
+
+test("engine breaker skips old job files before reading across every engine and workspace", (t) => {
+  const sandbox = makeSandbox(t);
+  const env = envFor(sandbox);
+  const now = Date.now();
+  const oldFiles = new Set();
+  const recentFiles = new Set();
+  for (const engine of ["codex", "grok", "cursor", "devin"]) {
+    const stateRoot = engineStateRoots(engine, env)[0];
+    for (const workspace of ["one", "two"]) {
+      const old = jobFile(stateRoot, workspace, `${engine}-old`);
+      writeRecord(old, { status: "error", failureKind: "quota", finishedAt: new Date(now - 13 * 60 * 60 * 1000).toISOString() });
+      fs.utimesSync(old, (now - 13 * 60 * 60 * 1000) / 1000, (now - 13 * 60 * 60 * 1000) / 1000);
+      oldFiles.add(old);
+    }
+    const recent = jobFile(stateRoot, "two", `${engine}-recent`);
+    writeRecord(recent, { status: "error", failureKind: "auth", finishedAt: new Date(now - 2 * 60000).toISOString() });
+    fs.utimesSync(recent, (now - 60000) / 1000, (now - 60000) / 1000);
+    recentFiles.add(recent);
+  }
+  const originalRead = fs.readFileSync;
+  const originalWrite = process.stdout.write;
+  let oldReads = 0;
+  let recentReads = 0;
+  let output = "";
+  fs.readFileSync = (file, ...args) => {
+    if (oldFiles.has(file)) oldReads += 1;
+    if (recentFiles.has(file)) recentReads += 1;
+    return originalRead(file, ...args);
+  };
+  process.stdout.write = (chunk) => { output += chunk; return true; };
+  try {
+    runBreakerCheck(env, now);
+  } finally {
+    fs.readFileSync = originalRead;
+    process.stdout.write = originalWrite;
+  }
+  assert.strictEqual(oldReads, 0);
+  assert.strictEqual(recentReads, 4);
+  for (const engine of ["codex", "grok", "cursor", "devin"]) {
+    assert.match(output, new RegExp(`treat the ${engine} breaker as open.*1 auth across 1 terminal jobs`));
+  }
+  assert.ok(output.endsWith(`${BREAKER_ADVISORY_TAG}\n`));
 });
 
 test("an in-window quota failure prints a grok breaker advisory", (t) => {
@@ -782,6 +837,97 @@ test("a failure outside the lookback window is silent", (t) => {
   assert.strictEqual(result.status, 0);
   assert.strictEqual(result.stdout, "");
   assert.strictEqual(result.stderr, "");
+});
+
+test("wrapper delivery advisory requires 20 current-version peer rescue runs and 25 percent delivery failures", (t) => {
+  const sandbox = makeSandbox(t);
+  const now = Date.now();
+  for (let index = 0; index < 19; index += 1) {
+    writeWorkerRecord(sandbox, `peer-${index}`, {
+      agentType: index % 2 ? "grok-rescue" : "codex:codex-rescue",
+      companionVersion: fusionVersion,
+      transportStatus: index < 5 ? "failed" : "done",
+      failureKind: index < 5 ? "delivery" : null,
+      finishedAt: new Date(now - 2 * 60000).toISOString()
+    });
+  }
+  assert.strictEqual(run(sandbox).stdout, "");
+  writeWorkerRecord(sandbox, "peer-19", {
+    agentType: "cursor:cursor-rescue", companionVersion: fusionVersion, transportStatus: "done", failureKind: null,
+    finishedAt: new Date(now - 60000).toISOString()
+  });
+  const result = run(sandbox);
+  assert.strictEqual(result.status, 0);
+  assert.strictEqual(result.stdout, `wrapper delivery: 5 of 20 peer wrapper runs on fusion ${fusionVersion} in the last 12 hours ended without a delivered report; run /fusion:smoke before more delegated work. ${BREAKER_ADVISORY_TAG}\n`);
+  assert.strictEqual(result.stderr, "");
+
+  for (let index = 20; index < 36; index += 1) {
+    writeWorkerRecord(sandbox, `peer-${index}`, {
+      agentType: "devin:devin-rescue", companionVersion: fusionVersion, transportStatus: "done", failureKind: null,
+      finishedAt: new Date(now - 60000).toISOString()
+    });
+  }
+  assert.strictEqual(run(sandbox).stdout, "");
+});
+
+test("wrapper delivery counts only in-window rescue records for the running plugin version", (t) => {
+  const sandbox = makeSandbox(t);
+  const now = Date.now();
+  for (let index = 0; index < 19; index += 1) {
+    writeWorkerRecord(sandbox, `peer-${index}`, {
+      agentType: "grok:grok-rescue", companionVersion: fusionVersion, transportStatus: index < 5 ? "failed" : "done", failureKind: index < 5 ? "delivery" : null,
+      finishedAt: new Date(now - 60000).toISOString()
+    });
+  }
+  for (const [id, agentType, version, finishedAt] of [
+    ["managed", "grok:grok-review-runner", fusionVersion, now - 60000],
+    ["fusion-worker", "fusion:claude-worker", fusionVersion, now - 60000],
+    ["old-version", "grok:grok-rescue", "0.0.0", now - 60000],
+    ["old-time", "grok:grok-rescue", fusionVersion, now - 13 * 60 * 60 * 1000]
+  ]) {
+    writeWorkerRecord(sandbox, id, {
+      agentType, companionVersion: version, transportStatus: "done", failureKind: null,
+      finishedAt: new Date(finishedAt).toISOString()
+    });
+  }
+  assert.strictEqual(run(sandbox).stdout, "");
+  writeWorkerRecord(sandbox, "twentieth", {
+    agentType: "devin-rescue", companionVersion: fusionVersion, transportStatus: "done", failureKind: null,
+    finishedAt: new Date(now - 60000).toISOString()
+  });
+  assert.strictEqual(run(sandbox).stdout, `wrapper delivery: 5 of 20 peer wrapper runs on fusion ${fusionVersion} in the last 12 hours ended without a delivered report; run /fusion:smoke before more delegated work. ${BREAKER_ADVISORY_TAG}\n`);
+});
+
+test("host check reports every blocker from an installed Grok companion in the existing digest", (t) => {
+  const sandbox = makeSandbox(t);
+  const companion = path.join(sandbox.home, ".claude", "plugins", "cache", "claude-code-fusion", "grok", fusionVersion, "scripts", "grok-companion.mjs");
+  writeCompanion(companion, `if (process.argv.slice(2).join(" ") !== "host-check --json") process.exit(2); process.stdout.write(JSON.stringify({blockers:[{kind:"sandbox",modes:["consult","write","review"],message:"Sandbox setup failed."},{kind:"auth",modes:["consult"],message:"Sign in first."}]}));`);
+  writeRecord(jobFile(path.join(sandbox.grokData, "state"), "workspace", "quota"), {
+    status: "error", failureKind: "quota", finishedAt: new Date(Date.now() - 60000).toISOString()
+  });
+  const result = run(sandbox);
+  assert.strictEqual(result.status, 0);
+  assert.match(result.stdout, /^fusion breaker advisory: treat the grok breaker.*\nGrok consult, write, review runs are blocked on this host \(sandbox\): Sandbox setup failed\.\nGrok consult runs are blocked on this host \(auth\): Sign in first\. \[fusion:/);
+  assert.ok(result.stdout.endsWith(`${BREAKER_ADVISORY_TAG}\n`));
+  assert.strictEqual(result.stderr, "");
+});
+
+test("missing, failing, timed out, and invalid host checks stay silent", (t) => {
+  const sandbox = makeSandbox(t);
+  assert.strictEqual(run(sandbox).stdout, "");
+  assert.strictEqual(run(sandbox, { FUSION_GROK_COMPANION: path.join(sandbox.root, "missing.mjs") }).stdout, "");
+  for (const [name, source] of [
+    ["nonzero", "process.stdout.write('{\"blockers\":[{\"kind\":\"auth\",\"modes\":[\"write\"],\"message\":\"Blocked.\"}]}'); process.exit(1);"],
+    ["timeout", "setInterval(() => {}, 10000);"],
+    ["invalid-json", "process.stdout.write('{bad json');"],
+    ["invalid-shape", "process.stdout.write(JSON.stringify({blockers:[{kind:'auth',modes:'write',message:'Blocked.'}]}));"]
+  ]) {
+    const companion = writeCompanion(path.join(sandbox.root, `${name}.mjs`), source);
+    const result = run(sandbox, { FUSION_GROK_COMPANION: companion });
+    assert.strictEqual(result.status, 0, name);
+    assert.strictEqual(result.stdout, "", name);
+    assert.strictEqual(result.stderr, "", name);
+  }
 });
 
 test("a clean store is silent", (t) => {

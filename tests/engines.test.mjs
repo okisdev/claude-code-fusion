@@ -84,6 +84,7 @@ test("every engine definition has the registry shape", () => {
       assert.ok(engine[field].length > 0);
     }
     assert.strictEqual(engine.id, id);
+    assert.strictEqual(engine.hostCheck, id === "grok");
     assert.strictEqual(engine.seat, BREADTH_ENGINE_IDS.includes(id) ? "breadth" : null);
     assert.ok(Array.isArray(engine.managedAgents));
     assert.ok(engine.rescueAgent.startsWith(`${id}:`));
@@ -102,6 +103,7 @@ test("Devin registry contract matches the breadth companion", () => {
     managedAgents: devin.managedAgents,
     companionFile: devin.companionFile,
     companionEnv: devin.companionEnv,
+    hostCheck: devin.hostCheck,
     dataDirName: devin.dataDirName,
     dataEnv: devin.dataEnv,
     stateEnvs: devin.stateEnvs,
@@ -117,6 +119,7 @@ test("Devin registry contract matches the breadth companion", () => {
   }, {
     displayName: "Devin", family: null, rescueAgent: "devin:devin-rescue", managedAgents: [],
     companionFile: "devin-companion.mjs", companionEnv: "FUSION_DEVIN_COMPANION",
+    hostCheck: false,
     dataDirName: "devin-claude-code-fusion", dataEnv: "DEVIN_COMPANION_DATA", stateEnvs: [],
     versionField: "devinVersion", verifiedVersionKey: "devin", acceptanceLedger: false, ownMonitor: false,
     roles: ["diversity", "burst"], defaultRole: null, consultOnlyRoles: ["diversity"],

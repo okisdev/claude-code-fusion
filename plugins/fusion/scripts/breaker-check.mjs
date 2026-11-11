@@ -1,10 +1,13 @@
 #!/usr/bin/env node
 
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { spawnSync } from "node:child_process";
 
-import { ENGINES, ENGINE_IDS, engineStateRoots } from "./lib/engines.mjs";
+import { ENGINES, ENGINE_IDS, PEER_RESCUE_AGENT_NAMES, engineStateRoots } from "./lib/engines.mjs";
+import { newestEngineCompanion } from "./lib/engine-acceptance.mjs";
 import { canonicalWorkerAgentType, readWorkerRecords } from "./lib/worker-state.mjs";
 import { tagMessage } from "./lib/user-messages.mjs";
 
@@ -36,6 +39,7 @@ const CODEX_FAILURE_PATTERNS = [
 ];
 const TRANSPORT_PERMISSION_PATTERN = /(?:sandbox|seatbelt|landlock).*(?:init|initializ|profile|policy)|(?:operation not permitted|\bEACCES\b|\bEPERM\b|permission denied).*(?:brief|prompt|transport|state|plugin|sandbox)|(?:brief|prompt|transport|state|plugin|sandbox).*(?:operation not permitted|\bEACCES\b|\bEPERM\b|permission denied)/i;
 const VERIFIED_VERSIONS_FILE = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "verified-versions.json");
+const FUSION_MANIFEST_FILE = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", ".claude-plugin", "plugin.json");
 
 function resolveLookbackMs(env = process.env) {
   const parsed = Number.parseFloat(String(env[LOOKBACK_ENV] ?? ""));
@@ -43,7 +47,7 @@ function resolveLookbackMs(env = process.env) {
   return hours * 60 * 60 * 1000;
 }
 
-function readJobRecords(stateRoot) {
+function readJobRecords(stateRoot, modifiedSinceMs) {
   const records = [];
   let workspaces;
   try {
@@ -67,7 +71,11 @@ function readJobRecords(stateRoot) {
         continue;
       }
       try {
-        const record = JSON.parse(fs.readFileSync(path.join(jobsDir, entry.name), "utf8"));
+        const file = path.join(jobsDir, entry.name);
+        if (fs.statSync(file).mtimeMs < modifiedSinceMs) {
+          continue;
+        }
+        const record = JSON.parse(fs.readFileSync(file, "utf8"));
         if (record && typeof record === "object" && !Array.isArray(record)) {
           records.push(record);
         }
@@ -79,11 +87,11 @@ function readJobRecords(stateRoot) {
   return records;
 }
 
-function readDeduplicatedJobRecords(stateRoots) {
+function readDeduplicatedJobRecords(stateRoots, modifiedSinceMs) {
   const recordsWithoutIds = [];
   const byId = new Map();
   for (const root of stateRoots) {
-    for (const record of readJobRecords(root)) {
+    for (const record of readJobRecords(root, modifiedSinceMs)) {
       const id = typeof record.id === "string" && record.id.trim() ? record.id.trim() : null;
       if (!id) {
         recordsWithoutIds.push(record);
@@ -297,12 +305,76 @@ function workerBreakerRecords(records, lane) {
     .map((record) => ({ ...record, status: record.transportStatus === "done" ? "done" : ["failed", "incomplete", "owner_ended"].includes(record.transportStatus) ? "failed" : record.transportStatus }));
 }
 
+function wrapperDeliveryAdvisory(records, now, lookbackMs) {
+  if (records.length < 20) {
+    return null;
+  }
+  let version;
+  try {
+    version = JSON.parse(fs.readFileSync(FUSION_MANIFEST_FILE, "utf8")).version;
+  } catch {
+    return null;
+  }
+  if (typeof version !== "string" || !version.trim()) {
+    return null;
+  }
+  const wrappers = records.filter((record) => {
+    const timestamp = recordTimestamp(record);
+    return PEER_RESCUE_AGENT_NAMES.has(record.agentType) && record.companionVersion === version && timestamp != null && isWithinLookback(timestamp, now, lookbackMs);
+  });
+  const deliveries = wrappers.filter((record) => record.failureKind === "delivery").length;
+  return wrappers.length >= 20 && deliveries * 4 >= wrappers.length
+    ? `wrapper delivery: ${deliveries} of ${wrappers.length} peer wrapper runs on fusion ${version} in the last ${formatLookbackHours(lookbackMs)} hours ended without a delivered report; run /fusion:smoke before more delegated work.`
+    : null;
+}
+
+function hostCheckAdvisories(engine, env) {
+  const descriptor = ENGINES[engine];
+  if (!descriptor.hostCheck) {
+    return [];
+  }
+  try {
+    const override = typeof env[descriptor.companionEnv] === "string" ? env[descriptor.companionEnv].trim() : "";
+    if (override && (!path.isAbsolute(override) || !fs.statSync(override).isFile())) {
+      return [];
+    }
+    const companion = newestEngineCompanion(engine, env);
+    if (!companion) {
+      return [];
+    }
+    const configuredHome = typeof env.HOME === "string" ? env.HOME.trim() : "";
+    const home = path.isAbsolute(configuredHome) ? configuredHome : os.homedir();
+    const cacheRoot = path.join(home, ".claude", "plugins", "cache", "claude-code-fusion", engine);
+    if (!override && !companion.startsWith(`${cacheRoot}${path.sep}`)) {
+      return [];
+    }
+    const result = spawnSync(process.execPath, [companion, "host-check", "--json"], { encoding: "utf8", env, timeout: 2000 });
+    if (result.error || result.status !== 0) {
+      return [];
+    }
+    const value = JSON.parse(result.stdout);
+    const valid = Array.isArray(value?.blockers) && value.blockers.every((blocker) =>
+      blocker &&
+      typeof blocker.kind === "string" && blocker.kind.trim() && !/[\r\n]/.test(blocker.kind) &&
+      Array.isArray(blocker.modes) && blocker.modes.length > 0 &&
+      blocker.modes.every((mode) => ["consult", "write", "review"].includes(mode)) &&
+      typeof blocker.message === "string" && blocker.message.trim() && !/[\r\n]/.test(blocker.message)
+    );
+    if (!valid) {
+      return [];
+    }
+    return value.blockers.map(({ kind, modes, message }) => `${descriptor.displayName} ${modes.join(", ")} runs are blocked on this host (${kind}): ${message}`);
+  } catch {
+    return [];
+  }
+}
+
 function run(env = process.env, now = Date.now()) {
   const lookbackMs = resolveLookbackMs(env);
   const engineLines = new Map();
   for (const engine of ENGINE_IDS) {
     const lines = [];
-    const records = readDeduplicatedJobRecords(engineStateRoots(engine, env));
+    const records = readDeduplicatedJobRecords(engineStateRoots(engine, env), now - lookbackMs);
     const pools = new Map();
     for (const record of records) {
       const pool = typeof record.billingPool === "string" ? record.billingPool : null;
@@ -338,6 +410,13 @@ function run(env = process.env, now = Date.now()) {
     if (worker) {
       lines.push(advisoryLine(lane, worker, now, lookbackMs));
     }
+  }
+  const deliveryAdvisory = wrapperDeliveryAdvisory(workerRecords, now, lookbackMs);
+  if (deliveryAdvisory) {
+    lines.push(deliveryAdvisory);
+  }
+  for (const engine of ENGINE_IDS) {
+    lines.push(...hostCheckAdvisories(engine, env));
   }
   if (lines.length > 0) {
     process.stdout.write(`${tagMessage("breaker-check.breaker-advisory", lines.join("\n"))}\n`);
