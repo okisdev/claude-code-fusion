@@ -53,6 +53,19 @@ function jobCount(dataDir, slug) {
   return fs.readdirSync(jobsDir).filter((name) => name.endsWith(".json")).length;
 }
 
+function allowSandboxIdentityProbe(t, root) {
+  if (!["darwin", "freebsd", "openbsd"].includes(process.platform)) return;
+  const bin = path.join(root, "identity-bin");
+  fs.mkdirSync(bin);
+  fs.writeFileSync(path.join(bin, "ps"), '#!/bin/sh\nprintf "process\\n"\n');
+  fs.writeFileSync(path.join(bin, "sysctl"), '#!/bin/sh\nprintf "{ sec = 1, usec = 0 }\\n"\n');
+  fs.writeFileSync(path.join(bin, "uptime"), '#!/bin/sh\nprintf "2020-01-01 00:00:00\\n"\n');
+  for (const command of ["ps", "sysctl", "uptime"]) fs.chmodSync(path.join(bin, command), 0o755);
+  const previous = process.env.PATH;
+  process.env.PATH = `${bin}${path.delimiter}${previous}`;
+  t.after(() => { process.env.PATH = previous; });
+}
+
 async function waitForFile(file, timeoutMs = 10000) {
   const deadline = Date.now() + timeoutMs;
   while (!fs.existsSync(file)) {
@@ -142,6 +155,81 @@ test("job ids are 128-bit lowercase hexadecimal values", async () => {
   const ids = Array.from({ length: 64 }, () => stateModule.generateJobId());
   assert.ok(ids.every((id) => /^[0-9a-f]{32}$/.test(id)));
   assert.strictEqual(new Set(ids).size, ids.length);
+});
+
+test("hourly state sweep prunes expired Grok records and preserves protected jobs", async (t) => {
+  const sandbox = makeSandbox(t);
+  allowSandboxIdentityProbe(t, sandbox.root);
+  const state = await import(stateModulePath);
+  const now = Date.now();
+  const old = new Date(now - 91 * 86400000).toISOString();
+  const artifacts = (id, fields = {}) => {
+    const file = state.jobFilePath(sandbox.dataDir, sandbox.workDir, id);
+    const brief = state.briefPath(sandbox.dataDir, sandbox.workDir, id);
+    const log = state.jobLogPath(sandbox.dataDir, sandbox.workDir, id);
+    state.createJobRecordFile(file, { ...state.createJobRecord({ id, cwd: sandbox.workDir, mode: "consult", briefFile: brief, ...fields }), finishedAt: old, ...fields });
+    fs.mkdirSync(path.dirname(brief), { recursive: true });
+    fs.writeFileSync(brief, "brief");
+    fs.writeFileSync(log, "log");
+    return [file, brief, log];
+  };
+  const removed = [
+    artifacts("expired-done", { status: "done" }),
+    artifacts("expired-error", { status: "error" }),
+    artifacts("expired-cancelled", { status: "cancelled" }),
+    artifacts("collected", { status: "done", background: true, deliveryCollectedAt: old }),
+    artifacts("expired-mtime", { status: "done", finishedAt: null })
+  ];
+  const oldRecord = JSON.parse(fs.readFileSync(removed[4][0], "utf8"));
+  delete oldRecord.finishedAt;
+  fs.writeFileSync(removed[4][0], JSON.stringify(oldRecord));
+  fs.utimesSync(removed[4][0], new Date(old), new Date(old));
+  const kept = [
+    artifacts("running", { status: "running" }),
+    artifacts("cleanup", { status: "error", cleanupRequired: true }),
+    artifacts("manual", { status: "done", background: true }),
+    artifacts("background-foreground", { status: "done", background: true, delivery: "foreground" }),
+    artifacts("managed", { status: "done", delivery: "managed" }),
+    artifacts("leased", { status: "done" }),
+    artifacts("recent", { status: "done", finishedAt: new Date(now - 89 * 86400000).toISOString() })
+  ];
+  const sessionId = "leased-session";
+  const lease = state.resumeSessionLeasePath(sandbox.dataDir, sandbox.workDir, sessionId);
+  fs.mkdirSync(path.dirname(lease), { recursive: true });
+  fs.writeFileSync(lease, JSON.stringify({ version: 1, sessionId, ownerJobId: "leased", claimedAt: new Date(now).toISOString() }));
+  assert.strictEqual(Object.hasOwn(JSON.parse(fs.readFileSync(removed[4][0], "utf8")), "finishedAt"), false);
+  assert.ok(now - fs.statSync(removed[4][0]).mtimeMs >= 90 * 86400000);
+  state.ensurePrivateDataDir(sandbox.dataDir);
+  for (const paths of removed) for (const file of paths) assert.strictEqual(fs.existsSync(file), false, file);
+  for (const paths of kept) for (const file of paths) assert.strictEqual(fs.existsSync(file), true, file);
+});
+
+test("zero retention override disables Grok record pruning", async (t) => {
+  const sandbox = makeSandbox(t);
+  allowSandboxIdentityProbe(t, sandbox.root);
+  const state = await import(stateModulePath);
+  const id = "retained-by-override";
+  const file = state.jobFilePath(sandbox.dataDir, sandbox.workDir, id);
+  state.createJobRecordFile(file, { ...state.createJobRecord({ id, cwd: sandbox.workDir, mode: "consult", status: "done" }), finishedAt: new Date(Date.now() - 100 * 86400000).toISOString() });
+  const previous = process.env.GROK_COMPANION_RECORD_RETENTION_DAYS;
+  process.env.GROK_COMPANION_RECORD_RETENTION_DAYS = "0";
+  t.after(() => { if (previous === undefined) delete process.env.GROK_COMPANION_RECORD_RETENTION_DAYS; else process.env.GROK_COMPANION_RECORD_RETENTION_DAYS = previous; });
+  state.ensurePrivateDataDir(sandbox.dataDir);
+  assert.strictEqual(fs.existsSync(file), true);
+});
+
+test("positive Grok retention override prunes at the configured age", async (t) => {
+  const sandbox = makeSandbox(t);
+  allowSandboxIdentityProbe(t, sandbox.root);
+  const state = await import(stateModulePath);
+  const id = "two-days-old";
+  const file = state.jobFilePath(sandbox.dataDir, sandbox.workDir, id);
+  state.createJobRecordFile(file, { ...state.createJobRecord({ id, cwd: sandbox.workDir, mode: "consult", status: "done" }), finishedAt: new Date(Date.now() - 2 * 86400000).toISOString() });
+  const previous = process.env.GROK_COMPANION_RECORD_RETENTION_DAYS;
+  process.env.GROK_COMPANION_RECORD_RETENTION_DAYS = "1";
+  t.after(() => { if (previous === undefined) delete process.env.GROK_COMPANION_RECORD_RETENTION_DAYS; else process.env.GROK_COMPANION_RECORD_RETENTION_DAYS = previous; });
+  state.ensurePrivateDataDir(sandbox.dataDir);
+  assert.strictEqual(fs.existsSync(file), false);
 });
 
 test("creating a job record never overwrites an existing record", async (t) => {

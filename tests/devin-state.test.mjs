@@ -8,11 +8,13 @@ import test from "node:test";
 import { getProcessIdentity } from "../plugins/devin/scripts/lib/process-identity.mjs";
 import {
   claimResumeSessionLease,
+  briefPath,
   createJobRecord,
   createJobRecordFile,
   DEFAULT_LOCK_TIMEOUT_MS,
   finishSuccessfulJobRecordFile,
   jobFilePath,
+  jobLogPath,
   readJobRecordFile,
   resumeSessionLeasePath,
   resolveDataDir,
@@ -177,6 +179,75 @@ test("run sweep removes old unrecorded runs at most once per ten minutes", (t) =
   assert.equal(fs.existsSync(next), true);
   assert.equal(sweepDevinRuns(dataDir, now + 10 * 60 * 1000), true);
   assert.equal(fs.existsSync(next), false);
+});
+
+test("run sweep prunes expired terminal records and preserves protected jobs", (t) => {
+  const { dataDir, cwd } = sandbox(t);
+  const now = Date.now();
+  const old = new Date(now - 91 * 86400000).toISOString();
+  const artifacts = (id, fields = {}) => {
+    const file = jobFilePath(dataDir, cwd, id);
+    const brief = briefPath(dataDir, cwd, id);
+    const log = jobLogPath(dataDir, cwd, id);
+    createJobRecordFile(file, { ...createJobRecord({ id, cwd, mode: "consult", briefFile: brief, ...fields }), finishedAt: old, ...fields });
+    fs.mkdirSync(path.dirname(brief), { recursive: true });
+    fs.writeFileSync(brief, "brief");
+    fs.writeFileSync(log, "log");
+    return [file, brief, log];
+  };
+  const removed = [
+    artifacts("expired-done", { status: "done" }),
+    artifacts("expired-error", { status: "error" }),
+    artifacts("expired-cancelled", { status: "cancelled" }),
+    artifacts("collected", { status: "done", background: true, deliveryCollectedAt: old }),
+    artifacts("expired-mtime", { status: "done", finishedAt: null })
+  ];
+  const oldRecord = JSON.parse(fs.readFileSync(removed[4][0], "utf8"));
+  delete oldRecord.finishedAt;
+  fs.writeFileSync(removed[4][0], JSON.stringify(oldRecord));
+  fs.utimesSync(removed[4][0], new Date(old), new Date(old));
+  const kept = [
+    artifacts("running", { status: "running" }),
+    artifacts("cleanup", { status: "error", cleanupRequired: true }),
+    artifacts("manual", { status: "done", background: true }),
+    artifacts("background-foreground", { status: "done", background: true, delivery: "foreground" }),
+    artifacts("managed", { status: "done", delivery: "managed" }),
+    artifacts("leased", { status: "done" }),
+    artifacts("recent", { status: "done", finishedAt: new Date(now - 89 * 86400000).toISOString() })
+  ];
+  const sessionId = "leased-session";
+  const lease = resumeSessionLeasePath(dataDir, cwd, sessionId);
+  fs.mkdirSync(path.dirname(lease), { recursive: true });
+  fs.writeFileSync(lease, JSON.stringify({ version: 1, sessionId, ownerJobId: "leased", claimedAt: new Date(now).toISOString() }));
+  assert.equal(Object.hasOwn(JSON.parse(fs.readFileSync(removed[4][0], "utf8")), "finishedAt"), false);
+  assert.ok(now - fs.statSync(removed[4][0]).mtimeMs >= 90 * 86400000);
+  assert.equal(sweepDevinRuns(dataDir, now), true);
+  for (const paths of removed) for (const file of paths) assert.equal(fs.existsSync(file), false, file);
+  for (const paths of kept) for (const file of paths) assert.equal(fs.existsSync(file), true, file);
+});
+
+test("zero retention override disables Devin record pruning", (t) => {
+  const { dataDir, cwd } = sandbox(t);
+  const id = "retained-by-override";
+  const file = jobFilePath(dataDir, cwd, id);
+  createJobRecordFile(file, { ...createJobRecord({ id, cwd, mode: "consult", status: "done" }), finishedAt: new Date(Date.now() - 100 * 86400000).toISOString() });
+  const previous = process.env.DEVIN_COMPANION_RECORD_RETENTION_DAYS;
+  process.env.DEVIN_COMPANION_RECORD_RETENTION_DAYS = "0";
+  t.after(() => { if (previous === undefined) delete process.env.DEVIN_COMPANION_RECORD_RETENTION_DAYS; else process.env.DEVIN_COMPANION_RECORD_RETENTION_DAYS = previous; });
+  sweepDevinRuns(dataDir);
+  assert.equal(fs.existsSync(file), true);
+});
+
+test("positive Devin retention override prunes at the configured age", (t) => {
+  const { dataDir, cwd } = sandbox(t);
+  const id = "two-days-old";
+  const file = jobFilePath(dataDir, cwd, id);
+  createJobRecordFile(file, { ...createJobRecord({ id, cwd, mode: "consult", status: "done" }), finishedAt: new Date(Date.now() - 2 * 86400000).toISOString() });
+  const previous = process.env.DEVIN_COMPANION_RECORD_RETENTION_DAYS;
+  process.env.DEVIN_COMPANION_RECORD_RETENTION_DAYS = "1";
+  t.after(() => { if (previous === undefined) delete process.env.DEVIN_COMPANION_RECORD_RETENTION_DAYS; else process.env.DEVIN_COMPANION_RECORD_RETENTION_DAYS = previous; });
+  sweepDevinRuns(dataDir);
+  assert.equal(fs.existsSync(file), false);
 });
 
 test("terminal transport evidence remains immutable after racing writes", (t) => {

@@ -12,6 +12,19 @@ const HOME_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
 const NPM_CACHE_MAX_BYTES = 256 * 1024 * 1024;
 const NPM_CACHE_CLEAR_INTERVAL_MS = 24 * 60 * 60 * 1000;
 
+const jobState = createJobState({
+  engine: "cursor",
+  engineName: "Cursor",
+  pidField: "cursorPid",
+  dataDirEnv: "CURSOR_COMPANION_DATA",
+  lockTimeoutEnv: "CURSOR_COMPANION_LOCK_TIMEOUT_MS",
+  dataDirName: "cursor-claude-code-fusion",
+  sweepMarker: ".cursor-home-sweep.json",
+  recordFields: (fields) => ({ homeDir: fields.homeDir ?? null }),
+  requiredRecordFields: ["homeDir"],
+  maintainTerminalRecord: maintainTerminalHome
+});
+
 export const {
   SESSION_ID_ENV,
   DEFAULT_LOCK_TIMEOUT_MS,
@@ -48,18 +61,7 @@ export const {
   writePrivateDataFile,
   appendJobLog,
   readLogTail
-} = createJobState({
-  engine: "cursor",
-  engineName: "Cursor",
-  pidField: "cursorPid",
-  dataDirEnv: "CURSOR_COMPANION_DATA",
-  lockTimeoutEnv: "CURSOR_COMPANION_LOCK_TIMEOUT_MS",
-  dataDirName: "cursor-claude-code-fusion",
-  sweepMarker: ".cursor-home-sweep.json",
-  recordFields: (fields) => ({ homeDir: fields.homeDir ?? null }),
-  requiredRecordFields: ["homeDir"],
-  maintainTerminalRecord: maintainTerminalHome
-});
+} = jobState;
 
 export function runHomeDir(dataDir, jobId) {
   return path.join(dataDir, "runs", jobId, "home");
@@ -110,6 +112,7 @@ export function sweepCursorHomes(dataDir, now = Date.now()) {
     maintainNpmCache(dataDir, records, now);
     const last = readJobRecordFile(marker)?.sweptAt;
     if (Number.isFinite(last) && now - last < SWEEP_INTERVAL_MS) return false;
+    try { jobState.pruneJobRecords(dataDir, now); } catch {}
     const recorded = new Set(records.map((record) => record.id));
     for (const record of records) {
       if (!TERMINAL_STATUSES.has(record.status) || record.homeDir !== runHomeDir(dataDir, record.id)) continue;

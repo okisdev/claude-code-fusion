@@ -9,6 +9,27 @@ const SWEEP_INTERVAL_MS = 10 * 60 * 1000;
 
 export const DEVIN_SESSION_ID_PATTERN = /^[a-z0-9]+(?:-[a-z0-9]+){1,5}$/;
 
+const jobState = createJobState({
+  engine: "devin",
+  engineName: "Devin",
+  pidField: "devinPid",
+  dataDirEnv: "DEVIN_COMPANION_DATA",
+  lockTimeoutEnv: "DEVIN_COMPANION_LOCK_TIMEOUT_MS",
+  dataDirName: "devin-claude-code-fusion",
+  sweepMarker: ".devin-run-sweep.json",
+  recordFields: (fields) => ({
+    resolvedEffort: fields.resolvedEffort ?? null,
+    stopCause: fields.stopCause ?? null,
+    configDir: fields.configDir ?? null
+  }),
+  requiredRecordFields: ["configDir", "stopCause"],
+  cancelledRecordFields: (existing, success, terminalAttribution) => ({
+    resolvedEffort: terminalAttribution.resolvedEffort ?? success.resolvedEffort ?? existing.resolvedEffort ?? null,
+    stopCause: success.stopCause ?? existing.stopCause ?? null
+  }),
+  maintainTerminalRecord: maintainTerminalConfig
+});
+
 export const {
   SESSION_ID_ENV,
   DEFAULT_LOCK_TIMEOUT_MS,
@@ -45,26 +66,7 @@ export const {
   writePrivateDataFile,
   appendJobLog,
   readLogTail
-} = createJobState({
-  engine: "devin",
-  engineName: "Devin",
-  pidField: "devinPid",
-  dataDirEnv: "DEVIN_COMPANION_DATA",
-  lockTimeoutEnv: "DEVIN_COMPANION_LOCK_TIMEOUT_MS",
-  dataDirName: "devin-claude-code-fusion",
-  sweepMarker: ".devin-run-sweep.json",
-  recordFields: (fields) => ({
-    resolvedEffort: fields.resolvedEffort ?? null,
-    stopCause: fields.stopCause ?? null,
-    configDir: fields.configDir ?? null
-  }),
-  requiredRecordFields: ["configDir", "stopCause"],
-  cancelledRecordFields: (existing, success, terminalAttribution) => ({
-    resolvedEffort: terminalAttribution.resolvedEffort ?? success.resolvedEffort ?? existing.resolvedEffort ?? null,
-    stopCause: success.stopCause ?? existing.stopCause ?? null
-  }),
-  maintainTerminalRecord: maintainTerminalConfig
-});
+} = jobState;
 
 export function runConfigDir(dataDir, jobId) {
   return path.join(dataDir, "runs", jobId, "config");
@@ -95,6 +97,7 @@ export function sweepDevinRuns(dataDir, now = Date.now()) {
     const records = listAllJobRecords(dataDir).map(({ record }) => record);
     const last = readJobRecordFile(marker)?.sweptAt;
     if (Number.isFinite(last) && now - last < SWEEP_INTERVAL_MS) return false;
+    try { jobState.pruneJobRecords(dataDir, now); } catch {}
     const recorded = new Set(records.map((record) => record.id));
     for (const record of records) {
       if (!TERMINAL_STATUSES.has(record.status) || record.configDir !== runConfigDir(dataDir, record.id)) continue;

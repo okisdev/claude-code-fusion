@@ -545,6 +545,66 @@ function regularFileOlderThan(file, ageMs, now) {
   return Boolean(stats?.isFile() && now - stats.mtimeMs >= ageMs);
 }
 
+function pruneWorkspaceJobRecords(workspaceDir, now) {
+  const rawDays = process.env.GROK_COMPANION_RECORD_RETENTION_DAYS;
+  const days = typeof rawDays === "string" && /^(0|[1-9]\d*)$/.test(rawDays.trim()) && Number.isSafeInteger(Number(rawDays.trim()))
+    ? Number(rawDays.trim()) : 90;
+  if (days === 0) return;
+  const retentionMs = days * 24 * 60 * 60 * 1000;
+  const jobs = path.join(workspaceDir, "jobs");
+  if (!fs.lstatSync(jobs, { throwIfNoEntry: false })?.isDirectory()) return;
+  const leaseOwners = new Set();
+  const leases = path.join(workspaceDir, "session-leases");
+  if (fs.lstatSync(leases, { throwIfNoEntry: false })?.isDirectory()) {
+    for (const entry of fs.readdirSync(leases, { withFileTypes: true })) {
+      if (!entry.isFile() || !/^[a-f0-9]{64}\.json$/.test(entry.name)) continue;
+      try {
+        const lease = JSON.parse(fs.readFileSync(path.join(leases, entry.name), "utf8"));
+        if (lease.version === 1 && typeof lease.sessionId === "string" &&
+            createHash("sha256").update(lease.sessionId).digest("hex") + ".json" === entry.name &&
+            typeof lease.ownerJobId === "string" && typeof lease.claimedAt === "string") {
+          leaseOwners.add(lease.ownerJobId);
+        }
+      } catch {}
+    }
+  }
+  const expired = (record, stats, id) => {
+    if (!stats?.isFile() || stats.isSymbolicLink() || record?.engine !== "grok" || record.id !== id ||
+        !TERMINAL_STATUSES.has(record.status) || record.cleanupRequired ||
+        ((record.background || record.delivery !== "foreground") && !record.deliveryCollectedAt) ||
+        leaseOwners.has(id)) return false;
+    const finished = record.finishedAt == null ? stats.mtimeMs : Date.parse(record.finishedAt);
+    return Number.isFinite(finished) && now - finished >= retentionMs;
+  };
+  for (const entry of fs.readdirSync(jobs, { withFileTypes: true })) {
+    if (!entry.isFile() || !/^[A-Za-z0-9_-]+\.json$/.test(entry.name)) continue;
+    const file = path.join(jobs, entry.name);
+    const id = entry.name.slice(0, -5);
+    try {
+      const stats = fs.lstatSync(file, { throwIfNoEntry: false });
+      if (!stats?.isFile() || stats.isSymbolicLink() ||
+          !expired(migrateJobRecord(JSON.parse(fs.readFileSync(file, "utf8"))), stats, id)) continue;
+      withRecordLock(file, () => {
+        const stats = fs.lstatSync(file, { throwIfNoEntry: false });
+        const record = migrateJobRecord(JSON.parse(fs.readFileSync(file, "utf8")));
+        if (!expired(record, stats, id)) return;
+        const brief = record.briefFile;
+        const briefDir = path.join(workspaceDir, "briefs");
+        const briefDirStats = fs.lstatSync(briefDir, { throwIfNoEntry: false });
+        if (briefDirStats?.isDirectory() && !briefDirStats.isSymbolicLink() &&
+            typeof brief === "string" && path.dirname(brief) === briefDir) {
+          const briefStats = fs.lstatSync(brief, { throwIfNoEntry: false });
+          if (briefStats?.isFile() && !briefStats.isSymbolicLink()) fs.unlinkSync(brief);
+        }
+        const log = path.join(jobs, `${id}.log`);
+        const logStats = fs.lstatSync(log, { throwIfNoEntry: false });
+        if (logStats?.isFile() && !logStats.isSymbolicLink()) fs.unlinkSync(log);
+        fs.unlinkSync(file);
+      });
+    } catch {}
+  }
+}
+
 function sweepGrokState(dataDir, now = Date.now()) {
   const stamp = path.join(dataDir, ".grok-state-sweep.json");
   return withRecordLock(stamp, () => {
@@ -579,6 +639,7 @@ function sweepGrokState(dataDir, now = Date.now()) {
           const file = path.join(workspaceDir, entry.name);
           if (regularFileOlderThan(file, MONITOR_RETENTION_MS, now)) fs.unlinkSync(file);
         }
+        try { pruneWorkspaceJobRecords(workspaceDir, now); } catch {}
       }
     }
     atomicWriteFile(stamp, `${JSON.stringify({ sweptAt: now })}\n`);
