@@ -683,6 +683,7 @@ test("SubagentStart requires verdict envelopes for execution and coverage worker
   });
   const executionInstruction = JSON.parse(executionStart.stdout).hookSpecificOutput.additionalContext;
   assert.match(executionInstruction, /End a successful execution report with separate lines `delivery: complete` and `verification: passed`/);
+  assert.match(executionInstruction, /through a SubagentHandback call, they are the last lines of that call's message\./);
   assert.match(executionInstruction, /compact verdict envelope/);
   assert.match(executionInstruction, /changed file paths without diffs/);
   assert.match(executionInstruction, /pass and fail counts/);
@@ -3317,7 +3318,7 @@ test("Stop re-emits after a terminal task leaves while terminal blocks remain ex
   assert.match(JSON.parse(afterTerminal.stdout).hookSpecificOutput.additionalContext, /still in flight/);
 });
 
-test("a successfully terminal async worker without a final-text artifact demands TaskOutput", (t) => {
+test("a successfully terminal async worker without a final-text artifact demands a Read of its transcript", (t) => {
   const box = sandbox(t);
   run(box, dispatch(box));
   const transcriptPath = path.join(box.root, "tasks", "agent-a1.output");
@@ -3344,8 +3345,100 @@ test("a successfully terminal async worker without a final-text artifact demands
   assert.strictEqual(decision.decision, "block");
   assert.strictEqual(record(box).transportStatus, "ready_uncollected");
   assert.strictEqual(record(box).collectedAt, null);
-  assert.match(decision.reason, /TaskOutput with block=true.*a1/);
-  assert.doesNotMatch(decision.reason, /Call Read with file_path=/);
+  assert.match(decision.reason, /ended without a final report\. Call Read with file_path=\S*agent-a1\.output /);
+  assert.doesNotMatch(decision.reason, /TaskOutput/);
+});
+
+function handbackWorker(box, agentId, completionContract) {
+  const workerTranscript = path.join(box.root, `agent-${agentId}.jsonl`);
+  const worker = createWorkerRecord({
+    taskId: `fusion-${"e".repeat(24)}`,
+    sessionId: "session-1",
+    agentType: "fusion:claude-worker",
+    workspaceRoot: box.cwd,
+    parentTranscriptPath: box.transcript,
+    parentTranscriptBytesAtDispatch: 0,
+    completionContract,
+    limits: workerLimits("fusion:claude-worker", {})
+  }, envFor(box));
+  const startedAt = new Date().toISOString();
+  updateWorkerRecord(worker.taskId, envFor(box), (current) => ({ ...current, agentId, backgroundTaskId: agentId, runtimeAsync: true, transportStatus: "running", startedAt, lastLivenessAt: startedAt, transcriptPath: workerTranscript }));
+  return workerTranscript;
+}
+
+function writeHandback(workerTranscript, message, result = {}) {
+  fs.writeFileSync(workerTranscript, [
+    { type: "assistant", message: { content: [{ type: "thinking", thinking: "report" }] } },
+    { type: "assistant", message: { content: [{ type: "tool_use", id: "handback-1", name: "SubagentHandback", input: { message } }] } },
+    { type: "user", message: { content: [{ type: "tool_result", tool_use_id: "handback-1", content: [{ type: "text", text: "{\"success\":true}" }], ...result }] } },
+    { type: "attachment", attachment: { type: "hook_success", hookEvent: "PostToolUse" } }
+  ].map((entry) => `${JSON.stringify(entry)}\n`).join(""));
+}
+
+function handbackStop(box, agentId, workerTranscript) {
+  return run(box, { hook_event_name: "SubagentStop", session_id: "session-1", cwd: box.cwd, transcript_path: box.transcript, agent_transcript_path: workerTranscript, agent_id: agentId, agent_type: "fusion:claude-worker", stop_hook_active: false, last_assistant_message: "" });
+}
+
+test("a report delivered through SubagentHandback settles the worker at SubagentStop", (t) => {
+  const box = sandbox(t);
+  const workerTranscript = handbackWorker(box, "handback-done", "coverage");
+  const report = "(1) Final recommendation: merge as-is\ndelivery: complete\ncoverage: complete";
+  writeHandback(workerTranscript, report);
+  const stopped = handbackStop(box, "handback-done", workerTranscript);
+  assert.strictEqual(stopped.status, 0, stopped.stderr);
+  assert.strictEqual(stopped.stdout, "");
+  const settled = record(box);
+  assert.strictEqual(settled.transportStatus, "done");
+  assert.strictEqual(settled.failureKind, null);
+  assert.strictEqual(settled.collectionMethod, "subagent_stop");
+  assert.strictEqual(fs.readFileSync(settled.outputFile, "utf8"), report);
+  assert.doesNotMatch(stop(box).stdout, /"decision":"block"/);
+});
+
+test("a SubagentHandback report without its markers settles incomplete with no retry and collects through a Read", (t) => {
+  const box = sandbox(t);
+  const workerTranscript = handbackWorker(box, "handback-bare", "coverage");
+  const report = "(1) Final recommendation: merge as-is";
+  writeHandback(workerTranscript, report);
+  const stopped = handbackStop(box, "handback-bare", workerTranscript);
+  assert.strictEqual(stopped.stdout, "");
+  const incomplete = record(box);
+  assert.strictEqual(incomplete.transportStatus, "incomplete");
+  assert.strictEqual(incomplete.failureKind, "delivery");
+  assert.strictEqual(incomplete.retryCount ?? 0, 0);
+  assert.strictEqual(incomplete.collectedAt, null);
+  assert.strictEqual(fs.readFileSync(incomplete.outputFile, "utf8"), report);
+  const decision = JSON.parse(stop(box).stdout);
+  assert.strictEqual(decision.decision, "block");
+  assert.ok(decision.reason.includes(`Call Read with file_path=${incomplete.outputFile} `));
+  assert.doesNotMatch(decision.reason, /TaskOutput/);
+  run(box, { hook_event_name: "PostToolUse", session_id: "session-1", cwd: box.cwd, transcript_path: box.transcript, tool_name: "Read", tool_input: { file_path: incomplete.outputFile }, tool_response: { type: "text", text: report } });
+  assert.strictEqual(record(box).collectionMethod, "output_file_read");
+  assert.doesNotMatch(stop(box).stdout, /"decision":"block"/);
+});
+
+test("a completed notification collects a SubagentHandback report that SubagentStop never settled", (t) => {
+  const box = sandbox(t);
+  const workerTranscript = handbackWorker(box, "handback-notified", "coverage");
+  const report = "(1) Final recommendation: merge as-is";
+  writeHandback(workerTranscript, report);
+  fs.appendFileSync(box.transcript, `${JSON.stringify({ type: "user", message: { content: `<task-notification>\n<task-id>handback-notified</task-id>\n<status>completed</status>\n<summary>Agent "verify" finished</summary>\n<result>This agent's report was delivered to you as a message from "handback-notified" (its SubagentHandback call).</result>\n</task-notification>` } })}\n`);
+  const parent = stop(box);
+  assert.doesNotMatch(parent.stdout, /"decision":"block"/);
+  const collected = record(box);
+  assert.strictEqual(collected.transportStatus, "done");
+  assert.strictEqual(collected.collectionMethod, "task_notification");
+  assert.strictEqual(fs.readFileSync(collected.outputFile, "utf8"), report);
+});
+
+test("a refused SubagentHandback call is not a delivered report", (t) => {
+  const box = sandbox(t);
+  const workerTranscript = handbackWorker(box, "handback-refused", "coverage");
+  writeHandback(workerTranscript, "report\ndelivery: complete\ncoverage: complete", { is_error: true });
+  const stopped = handbackStop(box, "handback-refused", workerTranscript);
+  assert.strictEqual(JSON.parse(stopped.stdout).decision, "block");
+  assert.strictEqual(record(box).transportStatus, "running");
+  assert.strictEqual(record(box).retryCount, 1);
 });
 
 test("collection captures peer job footers and leaves absent or malformed footers null", (t) => {
@@ -4696,7 +4789,10 @@ test("collector judgment gates release repeated blocks without aging an unrelate
     if (attempt < 2) {
       assert.strictEqual(JSON.parse(blocked.stdout).decision, "block");
     } else if (attempt === 2) {
-      assert.match(JSON.parse(blocked.stdout).hookSpecificOutput.additionalContext, /Stop gate released/);
+      const released = JSON.parse(blocked.stdout);
+      assert.match(released.systemMessage, /Stop gate released/);
+      assert.strictEqual(released.decision, undefined);
+      assert.strictEqual(released.hookSpecificOutput, undefined);
     } else {
       assert.strictEqual(blocked.stdout, "");
     }

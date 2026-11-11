@@ -102,7 +102,8 @@ test("third identical Stop block releases once and a lifecycle change resets the
   assert.equal(readWorkerSessionState("budget-session", box.env).stopGate.count, 2);
   const released = stop(box);
   assert.equal(released.decision, undefined, JSON.stringify({ released, gate: readWorkerSessionState("budget-session", box.env).stopGate }));
-  assert.match(released.hookSpecificOutput.additionalContext, new RegExp(first.taskId));
+  assert.match(released.systemMessage, new RegExp(first.taskId));
+  assert.equal(released.hookSpecificOutput, undefined);
   assert.equal(readWorkerSessionState("budget-session", box.env).events.at(-1).type, "stop-gate-released");
   assert.equal(stop(box), null);
   updateWorkerRecord(first.taskId, box.env, (current) => ({ ...current, progressEvents: (current.progressEvents ?? 0) + 1 }));
@@ -110,7 +111,7 @@ test("third identical Stop block releases once and a lifecycle change resets the
   updateWorkerRecord(first.taskId, box.env, (current) => ({ ...current, description: "new lifecycle detail" }));
   assert.equal(stop(box).decision, "block");
   assert.equal(stop(box).decision, "block");
-  assert.match(stop(box).hookSpecificOutput.additionalContext, /Stop gate released/);
+  assert.match(stop(box).systemMessage, /Stop gate released/);
   assert.equal(readWorkerSessionState("budget-session", box.env).events.length, 2);
 });
 
