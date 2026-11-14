@@ -601,7 +601,8 @@ test("parent context advisory fires once at 250k and once at 800k across peer di
   const usage = (tokens) => fs.appendFileSync(box.transcript, `${JSON.stringify({ type: "assistant", message: { usage: { input_tokens: 1000, cache_read_input_tokens: tokens - 1500, cache_creation_input_tokens: 500 } } })}\n`);
   usage(250000);
   const atThreshold = run(box, dispatch(box));
-  assert.match(JSON.parse(atThreshold.stdout).hookSpecificOutput.additionalContext, /main loop context is 250k tokens/);
+  assert.match(JSON.parse(atThreshold.stdout).systemMessage, /main loop context is 250k tokens/);
+  assert.strictEqual(JSON.parse(atThreshold.stdout).hookSpecificOutput.additionalContext, undefined);
   assert.strictEqual(readWorkerRecords(envFor(box))[0].parentContextTokensAtDispatch, 250000);
 
   usage(601000);
@@ -614,11 +615,11 @@ test("parent context advisory fires once at 250k and once at 800k across peer di
   const repeated = run(box, { ...dispatch(box), tool_use_id: "peer-2", tool_input: { subagent_type: "codex:codex-rescue", prompt: "lane: codex quick\ngoal: repair" } }, routingFixture(box));
   completePeer(box, { ...dispatch(box), tool_use_id: "peer-2", tool_input: { subagent_type: "codex:codex-rescue", prompt: "lane: codex quick\ngoal: repair" } });
   assert.match(JSON.parse(repeated.stdout).hookSpecificOutput.additionalContext, /lane default/);
-  assert.doesNotMatch(JSON.parse(repeated.stdout).hookSpecificOutput.additionalContext, /main loop context/);
+  assert.strictEqual(JSON.parse(repeated.stdout).systemMessage, undefined);
 
   usage(299999);
   const compacted = run(box, { ...dispatch(box), tool_use_id: "tool-2" });
-  assert.strictEqual(JSON.parse(compacted.stdout).hookSpecificOutput.additionalContext, undefined);
+  assert.strictEqual(JSON.parse(compacted.stdout).systemMessage, undefined);
   assert.strictEqual(readWorkerSessionState("session-1", envFor(box)).parentContextAdvisorySent, true);
 
   usage(601000);
@@ -626,19 +627,19 @@ test("parent context advisory fires once at 250k and once at 800k across peer di
   completePeer(box, { ...dispatch(box), tool_use_id: "peer-3", tool_input: { subagent_type: "codex:codex-rescue", prompt: "lane: codex quick\ngoal: repair" } });
   const injectedContext = JSON.parse(injected.stdout).hookSpecificOutput.additionalContext;
   assert.match(injectedContext, /lane default/);
-  assert.doesNotMatch(injectedContext, /main loop context/);
+  assert.strictEqual(JSON.parse(injected.stdout).systemMessage, undefined);
 
   usage(299999);
   run(box, { ...dispatch(box), tool_use_id: "tool-3" });
   usage(601000);
   const rearmed = run(box, { ...dispatch(box), tool_use_id: "tool-4" });
-  assert.strictEqual(JSON.parse(rearmed.stdout).hookSpecificOutput.additionalContext, undefined);
+  assert.strictEqual(JSON.parse(rearmed.stdout).systemMessage, undefined);
   assert.strictEqual(readWorkerRecords(envFor(box)).find((record) => record.dispatchToolUseId === "tool-4").parentContextTokensAtDispatch, 601000);
 
   const disabled = sandbox(t);
   fs.writeFileSync(disabled.transcript, `${JSON.stringify({ type: "assistant", message: { usage: { input_tokens: 1000, cache_read_input_tokens: 600000, cache_creation_input_tokens: 0 } } })}\n`);
   const zero = run(disabled, dispatch(disabled), { FUSION_PARENT_CONTEXT_ADVISORY_TOKENS: "0" });
-  assert.strictEqual(JSON.parse(zero.stdout).hookSpecificOutput.additionalContext, undefined);
+  assert.strictEqual(JSON.parse(zero.stdout).systemMessage, undefined);
 });
 
 test("the dispatch guard requires a minimal isolated brief and explicit user background authorization", (t) => {

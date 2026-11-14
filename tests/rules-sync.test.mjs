@@ -284,7 +284,7 @@ test("Grok rules document source verified headless boundaries", () => {
   const subagentSentence = "Upstream parses `--no-subagents`, but the single-turn and agent resolvers do not forward it, while the interactive TUI does apply it; the hard Agent tool deny and `GROK_SUBAGENTS=0` are the effective headless controls.";
   const rustLogSentence = "Every run forces `RUST_LOG=xai_grok_agent::builder=debug,xai_grok_sandbox=warn,xai_grok_shell::session::acp_session::turn=warn`.";
   const bubblewrapSentence = "On Linux, a strict profile with deny paths re-executes under bubblewrap and refuses to start when `bwrap` is missing or unusable; macOS has no equivalent hard enforcement and relies on Seatbelt application plus best-effort tool denies.";
-  const freshSessionSentence = "A new goal after a heavy implementation goal prefers a fresh session because orchestrator cache reread cost is context size times turns; `FUSION_PARENT_CONTEXT_ADVISORY_TOKENS` names the parent context advisory threshold in context tokens.";
+  const freshSessionSentence = "Orchestrator cache reread cost is context size times turns, so Fusion shows the user one notice at the first prompt or dispatch past `FUSION_PARENT_CONTEXT_ADVISORY_TOKENS` context tokens. Compacting or opening a fresh session is the user's decision, and the main session never recommends either unasked.";
   const volumeTierSentence = "Research digests, review triage, doc summaries, and mechanical checks default to the codex volume lane default.";
   const volumePeerOffloadSentence = "Independent bounded packages overflow to Grok under `burst` when the Codex slot is busy.";
   const volumeRoutingDefectSentence = "Leaving the volume tiers idle while this work runs on premium lanes is a routing defect.";

@@ -12,8 +12,7 @@ const repoRoot = path.join(import.meta.dirname, "..");
 const script = path.join(repoRoot, "plugins", "fusion", "scripts", "fleet-posture.mjs");
 const LEGACY_CONTEXT = tagMessage("fleet-posture.strict-fleet-reminder", "fleet-default active: a goal that decomposes into three or more independent work packages convenes /fusion:ultra once bootstrap dependencies are resolved; explain narrower execution visibly in the reply.");
 const SESSION_LANES_CONTEXT = tagMessage("fleet-posture.session-lanes-reminder", "fusion lanes ready: codex gpt-6.1-sol for spec grade and deep review, gpt-6-sol and gpt-6-luna for quick and volume packages, grok under its four roles on the routing table's lane defaults, cursor under diversity for a model family no other lane carries and under burst for bounded worktree implementation, claude workers for the Claude surface. Independent packages dispatch together in one message; three or more convene /fusion:ultra; a single coherent change stays inline.");
-const advisoryText = (tokens) => `The main loop context is ${Math.round(tokens / 1000)}k tokens and every turn replays it. Finish this wave, then prefer /compact or a fresh session before the next goal.`;
-const advisoryContext = (tokens) => tagMessage("fleet-posture.context-advisory", advisoryText(tokens));
+const advisoryNotice = (tokens) => tagMessage("fleet-posture.context-advisory", `The main loop context is ${Math.round(tokens / 1000)}k tokens and every turn replays it. /compact or a fresh session before the next goal cuts that cost.`);
 
 function makeSandbox(t) {
   const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "fleet-posture-test-")));
@@ -66,11 +65,12 @@ function assertSilent(result) {
   assert.strictEqual(result.stderr, "");
 }
 
-function assertContext(result, additionalContext) {
+function assertContext(result, additionalContext, systemMessage) {
   assert.strictEqual(result.status, 0);
   assert.strictEqual(result.stderr, "");
   assert.deepStrictEqual(JSON.parse(result.stdout), {
-    hookSpecificOutput: { hookEventName: "UserPromptSubmit", additionalContext }
+    ...(additionalContext ? { hookSpecificOutput: { hookEventName: "UserPromptSubmit", additionalContext } } : {}),
+    ...(systemMessage ? { systemMessage } : {})
   });
 }
 
@@ -96,17 +96,25 @@ test("parent context advisory sends once at each threshold across prompts", (t) 
   const sandbox = makeSandbox(t);
   assertContext(run(sandbox), SESSION_LANES_CONTEXT);
   writeTranscript(sandbox, 250000);
-  assertContext(run(sandbox), advisoryContext(250000));
+  assertContext(run(sandbox), null, advisoryNotice(250000));
   assertSilent(run(sandbox));
   writeTranscript(sandbox, 800000);
-  assertContext(run(sandbox), advisoryContext(800000));
+  assertContext(run(sandbox), null, advisoryNotice(800000));
+  assertSilent(run(sandbox));
+});
+
+test("a first reading past both thresholds shows one notice", (t) => {
+  const sandbox = makeSandbox(t);
+  assertContext(run(sandbox), SESSION_LANES_CONTEXT);
+  writeTranscript(sandbox, 800000);
+  assertContext(run(sandbox), null, advisoryNotice(800000));
   assertSilent(run(sandbox));
 });
 
 test("first prompt combines the session reminder and parent context advisory", (t) => {
   const sandbox = makeSandbox(t);
   writeTranscript(sandbox, 250000);
-  assertContext(run(sandbox), `${SESSION_LANES_CONTEXT}\n\n${advisoryContext(250000)}`);
+  assertContext(run(sandbox), SESSION_LANES_CONTEXT, advisoryNotice(250000));
   assertSilent(run(sandbox));
 });
 
@@ -114,7 +122,7 @@ test("a dispatch claim suppresses the prompt advisory", (t) => {
   const sandbox = makeSandbox(t);
   assertContext(run(sandbox), SESSION_LANES_CONTEXT);
   writeTranscript(sandbox, 250000);
-  assert.strictEqual(claimParentContextAdvisory("session-1", 250000, envFor(sandbox)), advisoryText(250000));
+  assert.strictEqual(claimParentContextAdvisory("session-1", 250000, envFor(sandbox)), advisoryNotice(250000));
   assertSilent(run(sandbox));
 });
 
@@ -136,7 +144,7 @@ test("a fleet reminder claim failure leaves the context advisory intact", (t) =>
   const sandbox = makeSandbox(t);
   writeTranscript(sandbox, 250000);
   fs.writeFileSync(sandbox.dataDir, "blocked");
-  assertContext(run(sandbox), advisoryContext(250000));
+  assertContext(run(sandbox), null, advisoryNotice(250000));
 });
 
 test("the narrow wave reminder and marker are gone", (t) => {
@@ -214,7 +222,7 @@ test("strict posture emits the legacy reminder without guard state", (t) => {
 test("strict posture also emits the parent context advisory", (t) => {
   const sandbox = makeSandbox(t);
   writeTranscript(sandbox, 250000);
-  assertContext(run(sandbox, hookInput(sandbox), { FUSION_POSTURE: "strict" }), `${LEGACY_CONTEXT}\n\n${advisoryContext(250000)}`);
+  assertContext(run(sandbox, hookInput(sandbox), { FUSION_POSTURE: "strict" }), LEGACY_CONTEXT, advisoryNotice(250000));
   assertContext(run(sandbox, hookInput(sandbox), { FUSION_POSTURE: "strict" }), LEGACY_CONTEXT);
 });
 
@@ -222,12 +230,12 @@ test("FUSION_FLEET_MODE=off suppresses only fleet reminders", (t) => {
   const sandbox = makeSandbox(t);
   writeTranscript(sandbox, 250000);
 
-  assertContext(run(sandbox, hookInput(sandbox), { FUSION_FLEET_MODE: "off" }), advisoryContext(250000));
+  assertContext(run(sandbox, hookInput(sandbox), { FUSION_FLEET_MODE: "off" }), null, advisoryNotice(250000));
   assertSilent(run(sandbox, hookInput(sandbox), { FUSION_FLEET_MODE: "off", FUSION_POSTURE: "strict" }));
   assert.strictEqual(fs.existsSync(sessionLanesReminderPath(sandbox)), false);
   const strictSandbox = makeSandbox(t);
   writeTranscript(strictSandbox, 250000);
-  assertContext(run(strictSandbox, hookInput(strictSandbox), { FUSION_FLEET_MODE: "off", FUSION_POSTURE: "strict" }), advisoryContext(250000));
+  assertContext(run(strictSandbox, hookInput(strictSandbox), { FUSION_FLEET_MODE: "off", FUSION_POSTURE: "strict" }), null, advisoryNotice(250000));
 });
 
 test("the fleet mode state file suppresses reminders but keeps the context advisory", (t) => {
@@ -236,7 +244,7 @@ test("the fleet mode state file suppresses reminders but keeps the context advis
   fs.mkdirSync(sandbox.dataDir, { recursive: true });
   fs.writeFileSync(path.join(sandbox.dataDir, "fleet-mode"), "off\n", "utf8");
 
-  assertContext(run(sandbox), advisoryContext(250000));
+  assertContext(run(sandbox), null, advisoryNotice(250000));
   assertSilent(run(sandbox, hookInput(sandbox), { FUSION_POSTURE: "strict" }));
   assert.strictEqual(fs.existsSync(sessionLanesReminderPath(sandbox)), false);
 });

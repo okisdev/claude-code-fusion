@@ -626,7 +626,7 @@ function claimParentContextAdvisory(sessionId, tokens, env) {
   } catch {
     return null;
   }
-  return claimed.length ? claimed.map(() => `The main loop context is ${Math.round(tokens / 1000)}k tokens and every turn replays it. Finish this wave, then prefer /compact or a fresh session before the next goal.`).join("\n") : null;
+  return claimed.length ? tagMessage("fleet-posture.context-advisory", `The main loop context is ${Math.round(tokens / 1000)}k tokens and every turn replays it. /compact or a fresh session before the next goal cuts that cost.`) : null;
 }
 
 function briefArtifactPath(record, env) {

@@ -113,11 +113,9 @@ function main() {
     return;
   }
   const contexts = [];
+  let advisory = null;
   try {
-    const advisory = claimParentContextAdvisory(input.session_id, parentContextTokens(input.transcript_path), process.env);
-    if (advisory) {
-      contexts.push(tagMessage("fleet-posture.context-advisory", advisory));
-    }
+    advisory = claimParentContextAdvisory(input.session_id, parentContextTokens(input.transcript_path), process.env);
   } catch {
     void 0;
   }
@@ -132,8 +130,8 @@ function main() {
       }
     }
   }
-  if (contexts.length) {
-    process.stdout.write(`${JSON.stringify({ hookSpecificOutput: { hookEventName: "UserPromptSubmit", additionalContext: contexts.join("\n\n") } })}\n`);
+  if (contexts.length || advisory) {
+    process.stdout.write(`${JSON.stringify({ ...(contexts.length ? { hookSpecificOutput: { hookEventName: "UserPromptSubmit", additionalContext: contexts.join("\n\n") } } : {}), ...(advisory ? { systemMessage: advisory } : {}) })}\n`);
   }
 }
 

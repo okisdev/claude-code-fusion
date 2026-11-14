@@ -56,7 +56,7 @@ function handlePreToolUse(input, env) {
       const stagedPrompt = prestagePeerPrompt({ ...input, tool_input: finalInput }, env);
       const advisory = claimParentContextAdvisory(input.session_id, parentContextTokens(input.transcript_path), env);
       if (stagedPrompt || injection || advisory) {
-        writeOutput({ hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision: "allow", ...(stagedPrompt || injection ? { updatedInput: { ...finalInput, ...(stagedPrompt ? { prompt: stagedPrompt } : {}) } } : {}), additionalContext: [injection?.context, advisory ? tagMessage("worker-lifecycle.dispatch-advisory", advisory) : null].filter(Boolean).join("\n\n") } });
+        writeOutput({ ...(stagedPrompt || injection ? { hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision: "allow", updatedInput: { ...finalInput, ...(stagedPrompt ? { prompt: stagedPrompt } : {}) }, ...(injection?.context ? { additionalContext: injection.context } : {}) } } : {}), ...(advisory ? { systemMessage: advisory } : {}) });
       }
       return;
     }
@@ -82,13 +82,9 @@ function handlePreToolUse(input, env) {
       return;
     }
     const record = createDispatch(input, agentType, userBackgroundAuthorized, env, validation);
-    const advisories = [...(validation.advisories ?? [])];
     const parentAdvisory = claimParentContextAdvisory(record.sessionId, record.parentContextTokensAtDispatch, env);
-    if (parentAdvisory) {
-      advisories.push(parentAdvisory);
-    }
-    const additionalContext = advisories.join("\n\n");
-    writeOutput(allowAgentWithTaskId(input.tool_input, record.taskId, additionalContext ? tagMessage("worker-lifecycle.dispatch-advisory", additionalContext) : null));
+    const additionalContext = (validation.advisories ?? []).join("\n\n");
+    writeOutput({ ...allowAgentWithTaskId(input.tool_input, record.taskId, additionalContext ? tagMessage("worker-lifecycle.dispatch-advisory", additionalContext) : null), ...(parentAdvisory ? { systemMessage: parentAdvisory } : {}) });
     return;
   }
   if (input.tool_name === "SendMessage" && typeof input.tool_input?.to === "string") {

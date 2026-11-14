@@ -323,7 +323,7 @@ test("staged bytes and late brief artifacts retain injected defaults and parent 
   const expected = `--model gpt-6.1-sol --effort xhigh ${prompt}`;
   assert.equal(fs.readFileSync(staged.file, "utf8"), expected);
   assert.match(output.hookSpecificOutput.additionalContext, /lane default/);
-  assert.match(output.hookSpecificOutput.additionalContext, /main loop context is 300k tokens/);
+  assert.match(output.systemMessage, /main loop context is 300k tokens/);
   assert.equal(engineRoleFromBrief("codex", expected.slice(expected.indexOf("lane:"))), "quick");
   assert.equal(consume(box, "codex", staged.token).stdout, expected);
   runHook(box, { ...input, hook_event_name: "PostToolUse", tool_input: staged.input, tool_response: { isAsync: true, agentId: "peer-1" } });
