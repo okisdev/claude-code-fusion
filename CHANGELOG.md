@@ -1,5 +1,12 @@
 # changelog
 
+## 0.0.74
+
+- the parent context notice is a `systemMessage` shown to the user at the prompt or dispatch that crosses the threshold, and it no longer enters the model context. only the user can run /compact or open a session, so as hook context it made the model relay the advice inside its answer; 219 of 1188 recorded sessions on one host received it.
+- the rules no longer tell the main session that a new goal prefers a fresh session. that sentence sat in context on every turn, outside the once per threshold claim, so the model could raise it at any goal boundary. the rule now says compacting or opening a fresh session is the user's decision and the main session never recommends either unasked.
+- a first reading past both the threshold and 800,000 tokens shows one notice instead of the same line twice.
+- the grok job monitor test waits for the observer state file before reading it. it read the file as soon as the sidecars appeared and failed 3 of 5 full suite runs.
+
 ## 0.0.73
 
 - this release acts on a usage review of two hosts: thirty days of ledgers on one, and the first two days of a new 64 GB host whose claude code delivers subagent reports through `SubagentHandback`.
