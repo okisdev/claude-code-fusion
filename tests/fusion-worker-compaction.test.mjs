@@ -151,11 +151,11 @@ test("parent context advice fires at 250k and 800k once each", async (t) => {
   };
   const usage = (tokens) => fs.appendFileSync(box.transcript, `${JSON.stringify({ type: "assistant", message: { usage: { input_tokens: tokens } } })}\n`);
   usage(250000);
-  assert.match((await dispatch(1)).hookSpecificOutput.additionalContext, /main loop context is 250k/);
+  assert.deepEqual(Object.keys(await dispatch(1)), ["systemMessage"]);
   usage(700000);
   assert.equal(await dispatch(2), null);
   usage(800000);
-  assert.match((await dispatch(3)).hookSpecificOutput.additionalContext, /main loop context is 800k/);
+  assert.match((await dispatch(3)).systemMessage, /main loop context is 800k/);
   assert.equal(await dispatch(4), null);
   const session = readWorkerSessionState("session-1", box.env);
   assert.equal(session.parentContextAdvisorySent, true);
@@ -170,9 +170,9 @@ test("parent context advice fires at 250k and 800k once each", async (t) => {
     return output;
   };
   fs.appendFileSync(configured.transcript, `${JSON.stringify({ type: "assistant", message: { usage: { input_tokens: 500000 } } })}\n`);
-  assert.match((await configuredDispatch(1)).hookSpecificOutput.additionalContext, /main loop context is 500k/);
+  assert.match((await configuredDispatch(1)).systemMessage, /main loop context is 500k/);
   fs.appendFileSync(configured.transcript, `${JSON.stringify({ type: "assistant", message: { usage: { input_tokens: 800000 } } })}\n`);
-  assert.match((await configuredDispatch(2)).hookSpecificOutput.additionalContext, /main loop context is 800k/);
+  assert.match((await configuredDispatch(2)).systemMessage, /main loop context is 800k/);
 });
 
 test("peer wrapper relays without a recent state footer are flagged without added output", async (t) => {

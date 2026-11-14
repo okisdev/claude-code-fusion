@@ -311,6 +311,7 @@ test("the merged monitor observes a terminal Grok job in its recorded workspace"
     repositoryKey,
     source: "grok-job-record"
   });
+  await waitUntil(() => fs.existsSync(engineJobsObserverStatePath("grok", env)));
   assert.deepStrictEqual(JSON.parse(fs.readFileSync(engineJobsObserverStatePath("grok", env), "utf8")).observedJobIds, ["grok-terminal"]);
 });
 
