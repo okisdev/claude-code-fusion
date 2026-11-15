@@ -6,6 +6,7 @@ import path from "node:path";
 import { test } from "node:test";
 
 import { hashRulesTemplate } from "../plugins/fusion/scripts/lib/rules-template.mjs";
+import { resolveModelRoutingPath } from "../plugins/fusion/scripts/lib/model-table.mjs";
 
 const repoRoot = path.join(import.meta.dirname, "..");
 const script = path.join(repoRoot, "plugins", "fusion", "scripts", "fusion-config.mjs");
@@ -48,8 +49,7 @@ function sandbox(t) {
     fusionData: path.join(root, "fusion-data"),
     modelRoutingFile: path.join(root, "model-routing.json"),
     companions,
-    rulesFile: path.join(root, "live", "orchestration.md"),
-    postureFile: path.join(root, "fusion-data", "posture")
+    rulesFile: path.join(root, "live", "orchestration.md")
   };
 }
 
@@ -72,6 +72,20 @@ function run(sandbox, args, overrides = {}) {
     }
   });
 }
+
+test("model routing follows FUSION_DATA_DIR and preserves explicit and legacy paths", (t) => {
+  const box = sandbox(t);
+  const redirected = path.join(box.fusionData, "model-routing.json");
+  assert.strictEqual(resolveModelRoutingPath({ FUSION_DATA_DIR: ` ${box.fusionData} ` }), redirected);
+  assert.strictEqual(resolveModelRoutingPath({ FUSION_DATA_DIR: box.fusionData, FUSION_MODEL_ROUTING: box.modelRoutingFile }), box.modelRoutingFile);
+  const legacy = path.join(os.homedir(), ".claude", "plugins", "data", "fusion-claude-code-fusion", "model-routing.json");
+  assert.strictEqual(resolveModelRoutingPath({}), legacy);
+  assert.strictEqual(resolveModelRoutingPath({ FUSION_DATA_DIR: " " }), legacy);
+  const result = run(box, ["set-cost-profile", "shared storage"], { FUSION_MODEL_ROUTING: "" });
+  assert.strictEqual(result.status, 0, result.stderr);
+  assert.strictEqual(JSON.parse(fs.readFileSync(redirected, "utf8")).costProfile, "shared storage");
+  assert.strictEqual(fs.statSync(redirected).mode & 0o777, 0o600);
+});
 
 test("Rejects a bad score with a usage error", (t) => {
   const box = sandbox(t);
@@ -226,116 +240,6 @@ test("Show reports an invalid model routing file explicitly", (t) => {
   assert.strictEqual(typeof data.error, "string");
   assert.ok(data.error.length > 0);
   assert.strictEqual(data.table, null);
-});
-
-test("Set posture strict persists it and show reports its file source", (t) => {
-  const box = sandbox(t);
-  const set = run(box, ["set-posture", "strict"]);
-  assert.strictEqual(set.status, 0, set.stderr);
-  assert.strictEqual(set.stdout, `Updated posture to strict at ${box.postureFile}.\n`);
-  assert.strictEqual(fs.readFileSync(box.postureFile, "utf8"), "strict\n");
-
-  const text = run(box, ["show"]);
-  assert.strictEqual(text.status, 0, text.stderr);
-  assert.match(text.stdout, /^Posture: strict \(file\)$/m);
-
-  const json = run(box, ["show", "--json"]);
-  assert.strictEqual(json.status, 0, json.stderr);
-  assert.deepStrictEqual(JSON.parse(json.stdout).posture, { value: "strict", source: "file" });
-});
-
-test("Set posture judgment replaces strict and round trips", (t) => {
-  const box = sandbox(t);
-  assert.strictEqual(run(box, ["set-posture", "strict"]).status, 0);
-  const set = run(box, ["set-posture", "judgment"]);
-  assert.strictEqual(set.status, 0, set.stderr);
-  assert.strictEqual(set.stdout, `Updated posture to judgment at ${box.postureFile}.\n`);
-  assert.strictEqual(fs.readFileSync(box.postureFile, "utf8"), "judgment\n");
-  const shown = JSON.parse(run(box, ["show", "--json"]).stdout);
-  assert.deepStrictEqual(shown.posture, { value: "judgment", source: "file" });
-});
-
-test("Set posture rejects an invalid value without changing the existing file", (t) => {
-  const box = sandbox(t);
-  fs.mkdirSync(box.fusionData, { recursive: true, mode: 0o700 });
-  fs.writeFileSync(box.postureFile, "strict\n", { encoding: "utf8", mode: 0o600 });
-  const result = run(box, ["set-posture", "yolo"]);
-  assert.strictEqual(result.status, 1);
-  assert.match(result.stderr, /^fusion-config: Expected set-posture <judgment\|strict>\./);
-  assert.strictEqual(fs.readFileSync(box.postureFile, "utf8"), "strict\n");
-});
-
-test("Show gives a valid environment posture priority over the file", (t) => {
-  const box = sandbox(t);
-  const envOnly = run(box, ["show", "--json"], { FUSION_POSTURE: "strict" });
-  assert.strictEqual(envOnly.status, 0, envOnly.stderr);
-  assert.deepStrictEqual(JSON.parse(envOnly.stdout).posture, { value: "strict", source: "env" });
-
-  assert.strictEqual(run(box, ["set-posture", "judgment"]).status, 0);
-  const withFile = run(box, ["show", "--json"], { FUSION_POSTURE: "strict" });
-  assert.strictEqual(withFile.status, 0, withFile.stderr);
-  assert.deepStrictEqual(JSON.parse(withFile.stdout).posture, { value: "strict", source: "env" });
-});
-
-test("Show reports the default judgment posture without a file or environment", (t) => {
-  const box = sandbox(t);
-  const result = run(box, ["show"]);
-  assert.strictEqual(result.status, 0, result.stderr);
-  assert.match(result.stdout, /^Posture: judgment \(default\)$/m);
-  const json = run(box, ["show", "--json"]);
-  assert.deepStrictEqual(JSON.parse(json.stdout).posture, { value: "judgment", source: "default" });
-});
-
-test("Show falls through an invalid environment posture", (t) => {
-  const box = sandbox(t);
-  const defaultResult = run(box, ["show", "--json"], { FUSION_POSTURE: "yolo" });
-  assert.strictEqual(defaultResult.status, 0, defaultResult.stderr);
-  assert.deepStrictEqual(JSON.parse(defaultResult.stdout).posture, { value: "judgment", source: "default" });
-
-  assert.strictEqual(run(box, ["set-posture", "strict"]).status, 0);
-  const fileResult = run(box, ["show", "--json"], { FUSION_POSTURE: "yolo" });
-  assert.strictEqual(fileResult.status, 0, fileResult.stderr);
-  assert.deepStrictEqual(JSON.parse(fileResult.stdout).posture, { value: "strict", source: "file" });
-});
-
-test("Set posture writes private file permissions", (t) => {
-  const box = sandbox(t);
-  const result = run(box, ["set-posture", "strict"]);
-  assert.strictEqual(result.status, 0, result.stderr);
-  if (process.platform !== "win32") {
-    assert.strictEqual(fs.statSync(box.fusionData).mode & 0o777, 0o700);
-    assert.strictEqual(fs.statSync(box.postureFile).mode & 0o777, 0o600);
-  }
-});
-
-test("Set posture leaves model routing and live rules unchanged", (t) => {
-  const box = sandbox(t);
-  assert.strictEqual(
-    run(box, ["rescore", "codex", "--intelligence", "5", "--taste", "4", "--cost", "5", "--lane", "codex"]).status,
-    0
-  );
-  const modelRouting = fs.readFileSync(box.modelRoutingFile, "utf8");
-  const liveRules = fs.readFileSync(box.rulesFile, "utf8");
-  const fixedTime = new Date("2000-01-01T00:00:00.000Z");
-  fs.utimesSync(box.modelRoutingFile, fixedTime, fixedTime);
-  fs.utimesSync(box.rulesFile, fixedTime, fixedTime);
-
-  const result = run(box, ["set-posture", "strict"]);
-  assert.strictEqual(result.status, 0, result.stderr);
-  assert.strictEqual(fs.readFileSync(box.modelRoutingFile, "utf8"), modelRouting);
-  assert.strictEqual(fs.readFileSync(box.rulesFile, "utf8"), liveRules);
-  assert.strictEqual(fs.statSync(box.modelRoutingFile).mtimeMs, fixedTime.getTime());
-  assert.strictEqual(fs.statSync(box.rulesFile).mtimeMs, fixedTime.getTime());
-});
-
-test("Reset defaults leaves the posture file intact", (t) => {
-  const box = sandbox(t);
-  assert.strictEqual(run(box, ["set-posture", "strict"]).status, 0);
-  const result = run(box, ["reset-defaults", "--yes"]);
-  assert.strictEqual(result.status, 0, result.stderr);
-  assert.strictEqual(fs.readFileSync(box.postureFile, "utf8"), "strict\n");
-  const shown = JSON.parse(run(box, ["show", "--json"]).stdout);
-  assert.deepStrictEqual(shown.posture, { value: "strict", source: "file" });
 });
 
 test("Audit reports listing drift, unscored models, and Cursor variants per engine", (t) => {

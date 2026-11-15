@@ -311,10 +311,8 @@ function renderCoercionLedger(lines, ledger) {
   lines.push(`Read-streak advisories: ${ledger.readStreakAdvisories ?? 0}`);
   lines.push(`Fleet-shaped waves: ${ledger.fleetShapedWaves ?? 0}`);
   lines.push(`Verification resets: ${ledger.verificationResets ?? 0}`);
-  lines.push(`Unverified accumulations: ${ledger.unverifiedAccumulations ?? 0}`);
   lines.push(`Inline sprawl windows: ${ledger.inlineSprawlWindows ?? 0}`);
   lines.push(`Deepest unverified window: ${ledger.deepestUnverifiedWindow ?? 0}`);
-  renderCounts(lines, "Posture mix", ledger.postureMix ?? {});
 }
 
 function renderMainLoopReplay(lines, replay) {

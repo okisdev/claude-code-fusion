@@ -2,7 +2,7 @@ import assert from "node:assert";
 import fs from "node:fs";
 import path from "node:path";
 import { test } from "node:test";
-import { envFor as companionEnvFor, flagValues, grokCompanionCapabilities, jobRecords, makeSandbox, readInvocations, runCompanion, stateModulePath, waitFor } from "./lib/companion-harness.mjs";
+import { envFor as companionEnvFor, flagValues, grokCompanionCapabilities, jobRecords, makeSandbox, readInvocations, runCompanion, stateModulePath, waitFor, workerExitSignal } from "./lib/companion-harness.mjs";
 import { initFixtureRepo } from "./lib/git-fixture.mjs";
 
 const { createJobRecord, generateJobId, jobFilePath, writeBrief, writeJobRecordFile } = await import(stateModulePath);
@@ -272,6 +272,7 @@ test("review records a structured validation error without resuming or trusting 
 
 test("background review records a structured validation failure after one model call", async (t) => {
   const sandbox = makeSandbox(t);
+  const worker = workerExitSignal(sandbox, "review-worker");
   initFixtureRepo(sandbox.workDir);
   const grokBin = writeEnvelopeGrok(sandbox, "background-invalid-review", {
     text: "I could not produce the requested object.",
@@ -281,9 +282,10 @@ test("background review records a structured validation failure after one model 
     sessionId: "45454545-4545-7545-8545-454545454545",
     requestId: "req-background-invalid"
   });
-  const env = envFor(sandbox, { GROK_BIN: grokBin });
+  const env = envFor(sandbox, { GROK_BIN: grokBin, ...worker.env });
   const launch = runCompanion(["review", "--background"], { cwd: sandbox.workDir, env });
   assert.strictEqual(launch.status, 0, launch.stderr);
+  sandbox.registerCleanup(worker.waitForExit);
   const record = await waitFor(() => {
     const current = jobRecords(sandbox.dataDir)[0];
     return current?.status === "error" ? current : null;

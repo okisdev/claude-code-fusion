@@ -6,9 +6,8 @@ import { DELEGATION_TOOLS, DISPATCH_LOG_LIMIT, MAIN_LANE, MISSING_LAUNCH_RECOVER
 import { extractDispatchDescription, extractSubagentType, extractTaskControlId, extractToolUseId, findLaunchedDispatch, findWorkerRecordForTaskControlId, laneForSubagentType, latestConfirmedDispatchAt, reapedWorkerRedirectReason, sanitizeIdentifier } from "./dispatch.mjs";
 import { normalizeState, readState, resetWriteWindow, withStateLock, writeState } from "./state.mjs";
 import { messageIdForToolUse } from "./verification.mjs";
-import { denyOutput, postToolAdvisoryOutput } from "./write.mjs";
 
-function handleDispatch(input, env, { sessionId, toolName, file, now, posture, writeHookText }) {
+function handleDispatch(input, env, { sessionId, toolName, file, now }) {
   if (DELEGATION_TOOLS.has(toolName)) {
     if (input.hook_event_name && input.hook_event_name !== "PreToolUse" && input.hook_event_name !== "PostToolUse") {
       return;
@@ -47,6 +46,7 @@ function handleDispatch(input, env, { sessionId, toolName, file, now, posture, w
 
     const confirmation = withStateLock(file, () => {
       const state = normalizeState(readState(file), now);
+      if (toolUseId && state.confirmedDispatchIds.includes(toolUseId)) return null;
       let launched = findLaunchedDispatch(state.dispatchLog, toolUseId, lane);
       const recoveredMissingLaunch = launched === null;
       if (recoveredMissingLaunch) {
@@ -73,6 +73,7 @@ function handleDispatch(input, env, { sessionId, toolName, file, now, posture, w
         }
       }
       state.dispatches[launched.lane] = (state.dispatches[launched.lane] ?? 0) + 1;
+      if (toolUseId) state.confirmedDispatchIds.push(toolUseId);
       state.dispatchEpoch += 1;
       state.lastDispatchAt = latestConfirmedDispatchAt(state.dispatchLog);
       resetWriteWindow(state);
@@ -84,9 +85,10 @@ function handleDispatch(input, env, { sessionId, toolName, file, now, posture, w
         recoveredMissingLaunch
       };
     });
+    if (!confirmation) return;
     if (confirmation.recoveredMissingLaunch) {
       recordAuditEvent(
-        { at: now, session: sessionId, event: "warn", lane: confirmation.lane, tool: toolName, reason: MISSING_LAUNCH_RECOVERY_REASON, posture },
+        { at: now, session: sessionId, event: "warn", lane: confirmation.lane, tool: toolName, reason: MISSING_LAUNCH_RECOVERY_REASON },
         env
       );
     }
@@ -95,13 +97,13 @@ function handleDispatch(input, env, { sessionId, toolName, file, now, posture, w
       env
     );
     if (genericAgent) {
-      writeHookText(`${JSON.stringify(postToolAdvisoryOutput(tagMessage("inline-guard.generic-agent-advisory", "This Agent runs a work package outside Fusion collection and settlement. Use codex:codex-rescue or fusion:claude-worker for tracked work, and Explore for read only search.")))}\n`);
+      return { additionalContext: tagMessage("inline-guard.generic-agent-advisory", "This Agent runs a work package outside Fusion collection and settlement. Use codex:codex-rescue or fusion:claude-worker for tracked work, and Explore for read only search.") };
     }
     return;
   }
 }
 
-function handleTaskControl(input, env, { sessionId, toolName, file, now, posture, writeHookText }) {
+function handleTaskControl(input, env, { sessionId, toolName, file, now }) {
   if (TASK_CONTROL_TOOLS.has(toolName)) {
     if (input.hook_event_name && input.hook_event_name !== "PreToolUse") {
       return;
@@ -120,13 +122,11 @@ function handleTaskControl(input, env, { sessionId, toolName, file, now, posture
         tool: toolName,
         description: REAPED_WORKER_REDIRECT_AUDIT_DESCRIPTION,
         mode: "enforce",
-        posture,
         messageCode: messageCode(REAPED_WORKER_REDIRECT_MESSAGE_SLUG)
       },
       env
     );
-    writeHookText(`${JSON.stringify(denyOutput(reapedWorkerRedirectReason(record, taskId)))}\n`);
-    return;
+    return { decision: "deny", reason: reapedWorkerRedirectReason(record, taskId) };
   }
 }
 

@@ -1,13 +1,9 @@
 import fs from "node:fs";
 import path from "node:path";
 
-import { engineDataDir, engineStateRoots } from "./engines.mjs";
+import { engineStateRoots } from "./engines.mjs";
 
 const ENGINE_JOB_ID_PATTERN = /^[0-9a-f]{32}$/;
-
-export function resolveGrokDataDir(env = process.env) {
-  return engineDataDir("grok", env);
-}
 
 export function resolveEngineStateRoots(engine, env = process.env) {
   return engineStateRoots(engine, env);

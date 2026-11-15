@@ -3,6 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { ENGINE_TERMINAL_STATUSES, engineStateRoots } from "../../lib/engines.mjs";
 import { WORKER_COLLECTION_METHODS } from "../../lib/worker-state.mjs";
+import { withFileLock, writeFileAtomic } from "../storage.mjs";
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 
@@ -19,8 +20,6 @@ const FUSION_DATA_DIR_ENV = "FUSION_DATA_DIR";
 export const CODEX_ACCEPTANCE_STATES = new Set(["accepted", "rejected", "unverified"]);
 export const TOKEN_USAGE_FILENAME = "token-usage.jsonl";
 const TERMINAL_LEDGER_PREFIX = "codex-jobs-monitor-announced";
-const OBSERVATION_LOCK_STALE_MS = 30000;
-const OBSERVATION_LOCK_ATTEMPTS = 8;
 export const PRUNE_EVIDENCE = Symbol("pruneEvidence");
 export const DAY_MS = 24 * 60 * 60 * 1000;
 export const FUSION_TASK_ID_PATTERN = /^fusion-[0-9a-f]{24}$/;
@@ -168,68 +167,24 @@ export function loadTokenUsageObservations(sidecarPath) {
   return loadLatestJsonlByJobId(sidecarPath, "observedAt");
 }
 
-function waitForObservationLock() {
-  const signal = new Int32Array(new SharedArrayBuffer(4));
-  Atomics.wait(signal, 0, 0, 10);
-}
-
-function ensurePrivateDirectory(directory) {
-  fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
-  try {
-    fs.chmodSync(directory, 0o700);
-  } catch {
-    void 0;
-  }
-}
-
-function acquireObservationLock(lockPath) {
-  for (let attempt = 0; attempt < OBSERVATION_LOCK_ATTEMPTS; attempt += 1) {
-    try {
-      const descriptor = fs.openSync(lockPath, fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_WRONLY, 0o600);
-      fs.fchmodSync(descriptor, 0o600);
-      return descriptor;
-    } catch (error) {
-      if (error?.code !== "EEXIST") {
-        throw error;
-      }
-      try {
-        if (Date.now() - fs.statSync(lockPath).mtimeMs > OBSERVATION_LOCK_STALE_MS) {
-          fs.rmSync(lockPath, { force: true });
-          continue;
-        }
-      } catch (statError) {
-        if (statError?.code === "ENOENT") {
-          continue;
-        }
-      }
-      if (attempt + 1 < OBSERVATION_LOCK_ATTEMPTS) {
-        waitForObservationLock();
-      }
-    }
-  }
-  return null;
-}
-
 function appendJsonlObservation(sidecarPath, observation, shouldAppend = () => true) {
-  ensurePrivateDirectory(path.dirname(sidecarPath));
-  const lockPath = `${sidecarPath}.lock`;
-  const lock = acquireObservationLock(lockPath);
-  if (lock == null) {
-    return false;
-  }
+  let acquired = false;
   try {
-    if (fs.existsSync(sidecarPath)) {
+    return withFileLock(sidecarPath, () => {
+      acquired = true;
+      if (fs.existsSync(sidecarPath)) {
+        fs.chmodSync(sidecarPath, 0o600);
+      }
+      if (!shouldAppend()) {
+        return true;
+      }
+      fs.appendFileSync(sidecarPath, `${JSON.stringify(observation)}\n`, { encoding: "utf8", mode: 0o600 });
       fs.chmodSync(sidecarPath, 0o600);
-    }
-    if (!shouldAppend()) {
       return true;
-    }
-    fs.appendFileSync(sidecarPath, `${JSON.stringify(observation)}\n`, { encoding: "utf8", mode: 0o600 });
-    fs.chmodSync(sidecarPath, 0o600);
-    return true;
-  } finally {
-    fs.closeSync(lock);
-    fs.rmSync(lockPath, { force: true });
+    }, { timeoutMs: 70 });
+  } catch (error) {
+    if (!acquired && error?.code === "ETIMEDOUT") return false;
+    throw error;
   }
 }
 
@@ -242,48 +197,31 @@ export function appendTokenUsageObservation(sidecarPath, observation) {
 
 export function appendModelAuditObservations(sidecarPath, batch, onMerged = () => {}) {
   if (batch.length === 0) return true;
-  ensurePrivateDirectory(path.dirname(sidecarPath));
-  const lockPath = `${sidecarPath}.lock`;
-  let lock;
+  let acquired = false;
   try {
-    lock = fs.openSync(lockPath, fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_WRONLY, 0o600);
-    fs.fchmodSync(lock, 0o600);
-  } catch (error) {
-    if (error?.code === "EEXIST") {
-      return false;
-    }
-    throw error;
-  }
-  try {
-    if (fs.existsSync(sidecarPath)) {
-      fs.chmodSync(sidecarPath, 0o600);
-    }
-    const observations = loadModelAuditObservations(sidecarPath);
-    let changed = false;
-    for (const observation of batch) {
-      const current = observations.get(observation.jobId);
-      if (!current || modelObservationRank(observation) > modelObservationRank(current)) {
-        observations.set(observation.jobId, observation);
-        changed = true;
+    return withFileLock(sidecarPath, () => {
+      acquired = true;
+      if (fs.existsSync(sidecarPath)) {
+        fs.chmodSync(sidecarPath, 0o600);
       }
-    }
-    if (!changed) {
+      const observations = loadModelAuditObservations(sidecarPath);
+      let changed = false;
+      for (const observation of batch) {
+        const current = observations.get(observation.jobId);
+        if (!current || modelObservationRank(observation) > modelObservationRank(current)) {
+          observations.set(observation.jobId, observation);
+          changed = true;
+        }
+      }
+      if (changed) {
+        writeFileAtomic(sidecarPath, `${[...observations.values()].map((entry) => JSON.stringify(entry)).join("\n")}\n`);
+      }
       onMerged(observations);
       return true;
-    }
-    const replacementPath = `${sidecarPath}.${process.pid}.${Date.now()}.tmp`;
-    try {
-      fs.writeFileSync(replacementPath, `${[...observations.values()].map((entry) => JSON.stringify(entry)).join("\n")}\n`, { encoding: "utf8", mode: 0o600 });
-      fs.chmodSync(replacementPath, 0o600);
-      fs.renameSync(replacementPath, sidecarPath);
-    } finally {
-      fs.rmSync(replacementPath, { force: true });
-    }
-    onMerged(observations);
-    return true;
-  } finally {
-    fs.closeSync(lock);
-    fs.rmSync(lockPath, { force: true });
+    }, { timeoutMs: 0 });
+  } catch (error) {
+    if (!acquired && error?.code === "ETIMEDOUT") return false;
+    throw error;
   }
 }
 

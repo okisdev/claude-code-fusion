@@ -81,6 +81,14 @@ export function sessionIdFromArgs(argv, env) {
 }
 
 export const RECORD_REASON_EXAMPLE = 'example: --record <id>=rejected --reason-for <id> "why it failed"';
+const DIRECT_TEXT_PATTERN = /^[A-Za-z0-9 .,:;()\/_+=-]{1,300}$/;
+class DirectTextError extends TypeError {}
+
+function requireDirectText(value, flag) {
+  if (!DIRECT_TEXT_PATTERN.test(value)) {
+    throw new DirectTextError(`${flag} direct text must use the allowed charset [A-Za-z0-9 .,:;()\\/_+=-] and be 1 to 300 characters. Use the raw-args transport for other text.`);
+  }
+}
 
 export class UsageError extends Error {}
 
@@ -191,7 +199,7 @@ export function parseRecordArguments(argv, { allowPerPairReasons = false } = {})
     if (token === "--reason-for") {
       const id = argv[index + 1];
       const pairReason = argv[index + 2];
-      if (!allowPerPairReasons) {
+      if (!allowPerPairReasons && !DIRECT_TEXT_PATTERN.test(pairReason)) {
         throw recordReasonGrammarError("--reason-for is available only through the raw-args transport.");
       }
       if ((!FUSION_TASK_ID_PATTERN.test(id) && !ENGINE_JOB_ID_PATTERN.test(id)) || typeof pairReason !== "string" || !pairReason) {
@@ -207,9 +215,6 @@ export function parseRecordArguments(argv, { allowPerPairReasons = false } = {})
     if (token === "--failure-kind-for") {
       const id = argv[index + 1];
       const pairFailureKind = argv[index + 2];
-      if (!allowPerPairReasons) {
-        throw new TypeError("--failure-kind-for is available only through the raw-args transport.");
-      }
       if (!SEMANTIC_FAILURE_KINDS.has(pairFailureKind)) {
         throw new TypeError("The --failure-kind value must be one of intent_override, scope_rewrite, wrong_approach, style_mismatch, oversized.");
       }
@@ -337,6 +342,22 @@ export function isStrictDirectRecordArguments(argv) {
         index += 1;
         continue;
       }
+      if (token === "--reason" || token === "--failure-kind") {
+        const value = argv[index + 1];
+        requireDirectText(value, token);
+        if (token === "--failure-kind" && !SEMANTIC_FAILURE_KINDS.has(value)) return false;
+        index += 1;
+        continue;
+      }
+      if (token === "--reason-for" || token === "--failure-kind-for") {
+        const id = argv[index + 1];
+        if (!FUSION_TASK_ID_PATTERN.test(id) && !ENGINE_JOB_ID_PATTERN.test(id)) return false;
+        const value = argv[index + 2];
+        requireDirectText(value, token);
+        if (token === "--failure-kind-for" && !SEMANTIC_FAILURE_KINDS.has(value)) return false;
+        index += 2;
+        continue;
+      }
       if (token === "--json" || token === "--accept-failed-transport") {
         if (flags.has(token)) {
           return false;
@@ -347,7 +368,8 @@ export function isStrictDirectRecordArguments(argv) {
       return false;
     }
     return records > 0;
-  } catch {
+  } catch (error) {
+    if (error instanceof DirectTextError) throw error;
     return false;
   }
 }
@@ -364,6 +386,7 @@ export function isStrictDirectReportOrMaintenanceArguments(argv) {
 }
 
 export function hasRejectedRecordPair(argv) {
+  if (argv.includes("--reason") || argv.includes("--reason-for")) return false;
   for (let index = 0; index < argv.length; index += 1) {
     if (argv[index] !== "--record") {
       continue;

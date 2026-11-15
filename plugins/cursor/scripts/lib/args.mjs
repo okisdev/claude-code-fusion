@@ -214,6 +214,10 @@ function unquoteOptionValue(value) {
   return (first === "'" || first === '"') && value.at(-1) === first ? value.slice(1, -1) : value;
 }
 
+export function splitRawArgumentString(value) {
+  return rawArgumentTokens(String(value ?? "")).map((token) => token.value);
+}
+
 function rawArgumentTokens(input) {
   const tokens = [];
   let quote = null;
@@ -262,12 +266,9 @@ function isKnownOptionToken(token, valueOptions, booleanOptions, aliasMap) {
   if (!token || token === "-" || !token.startsWith("-")) {
     return false;
   }
-  if (token.startsWith("--")) {
-    const separator = token.indexOf("=");
-    const rawKey = token.slice(2, separator === -1 ? undefined : separator);
-    const key = aliasMap[rawKey] ?? rawKey;
-    return valueOptions.has(key) || booleanOptions.has(key);
-  }
-  const key = aliasMap[token.slice(1)] ?? token.slice(1);
+  const raw = token.slice(token.startsWith("--") ? 2 : 1);
+  const separator = raw.indexOf("=");
+  const rawKey = separator === -1 ? raw : raw.slice(0, separator);
+  const key = aliasMap[rawKey] ?? rawKey;
   return valueOptions.has(key) || booleanOptions.has(key);
 }

@@ -3,7 +3,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { isStrictPosture, resolveFusionDataDir } from "./lib/posture.mjs";
+import { resolveFusionDataDir } from "./lib/worker-state.mjs";
 import { readRoutingDefaults } from "./lib/model-table.mjs";
 import { normalizeSessionId } from "./inline-delegation-guard.mjs";
 import { tagMessage } from "./lib/user-messages.mjs";
@@ -11,7 +11,16 @@ import { parentContextTokens, claimParentContextAdvisory } from "./lib/lifecycle
 
 const FLEET_MODE_ENV = "FUSION_FLEET_MODE";
 const FLEET_MODE_FILE = "fleet-mode";
-const ADDITIONAL_CONTEXT = tagMessage("fleet-posture.strict-fleet-reminder", "fleet-default active: a goal that decomposes into three or more independent work packages convenes /fusion:ultra once bootstrap dependencies are resolved; explain narrower execution visibly in the reply.");
+const DEEP_REASONER_HINT = tagMessage("fleet-posture.deep-reasoner-hint", "This reads as a design or root-cause question. Consult fusion:deep-reasoner with a scoped brief before deciding.");
+const DESIGN_QUESTION_PATTERN = /思考|分析|重构|架构|根本|为什么|怎么设计|root cause|architecture|redesign|refactor|why does|why is|how should we/i;
+
+function isDesignQuestion(input) {
+  const prompt = input?.prompt;
+  if (typeof prompt !== "string" || prompt.length > 4000 || input.isMeta === true || input.origin?.kind === "task-notification") return false;
+  const trimmed = prompt.trimStart();
+  if (trimmed.startsWith("/") || /<task-notification\b/i.test(trimmed) || /^\{[\s\S]*"(?:hook_event_name|hookEventName|hookSpecificOutput|tool_name|tool_input|session_id)"\s*:/.test(trimmed)) return false;
+  return DESIGN_QUESTION_PATTERN.test(prompt);
+}
 
 function sessionLanesReminder(env = process.env) {
   const { breadth, codex: { flagship, quick, volume } } = readRoutingDefaults(env);
@@ -120,16 +129,13 @@ function main() {
     void 0;
   }
   if (fleetEnabled()) {
-    if (isStrictPosture()) {
-      contexts.unshift(ADDITIONAL_CONTEXT);
-    } else {
-      try {
-        if (claimReminder(input, "session-lanes-reminders")) contexts.unshift(sessionLanesReminder());
-      } catch {
-        void 0;
-      }
+    try {
+      if (claimReminder(input, "session-lanes-reminders")) contexts.unshift(sessionLanesReminder());
+    } catch {
+      void 0;
     }
   }
+  if (isDesignQuestion(input)) contexts.push(DEEP_REASONER_HINT);
   if (contexts.length || advisory) {
     process.stdout.write(`${JSON.stringify({ ...(contexts.length ? { hookSpecificOutput: { hookEventName: "UserPromptSubmit", additionalContext: contexts.join("\n\n") } } : {}), ...(advisory ? { systemMessage: advisory } : {}) })}\n`);
   }

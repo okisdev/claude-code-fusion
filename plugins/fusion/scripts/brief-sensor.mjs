@@ -67,15 +67,28 @@ function briefAdvisory(answers) {
   return tagMessage("brief-sensor.readiness-advisory", `Jev flagged this peer brief. ${findings} This is a classifier estimate, not a gate, and the dispatch proceeds.`);
 }
 
+async function handleBriefSensor(input, env = process.env) {
+  const brief = peerBrief(input);
+  if (!brief) return {};
+  let deadline;
+  try {
+    return await Promise.race([
+      askJev(brief, QUESTIONS, { env }).then((answers) => {
+        const additionalContext = briefAdvisory(answers);
+        return additionalContext ? { additionalContext } : {};
+      }),
+      new Promise((resolve) => { deadline = setTimeout(() => resolve({}), 1_500); })
+    ]);
+  } catch {
+    return {};
+  } finally {
+    clearTimeout(deadline);
+  }
+}
+
 async function main() {
-  const brief = peerBrief(await readHookInput());
-  if (!brief) {
-    return;
-  }
-  const additionalContext = briefAdvisory(await askJev(brief, QUESTIONS));
-  if (additionalContext) {
-    process.stdout.write(`${JSON.stringify({ hookSpecificOutput: { hookEventName: "PreToolUse", additionalContext } })}\n`);
-  }
+  const { additionalContext } = await handleBriefSensor(await readHookInput());
+  if (additionalContext) process.stdout.write(`${JSON.stringify({ hookSpecificOutput: { hookEventName: "PreToolUse", additionalContext } })}\n`);
 }
 
 function isMain() {
@@ -88,4 +101,4 @@ if (isMain()) {
   main().catch(() => void 0).finally(() => clearTimeout(deadline));
 }
 
-export { FLAG_THRESHOLD, QUESTIONS, briefAdvisory, peerBrief };
+export { FLAG_THRESHOLD, QUESTIONS, briefAdvisory, handleBriefSensor, peerBrief };

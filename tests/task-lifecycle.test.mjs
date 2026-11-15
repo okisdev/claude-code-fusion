@@ -15,6 +15,7 @@ import {
   runCompanion,
   stateModulePath,
   waitFor,
+  workerExitSignal,
 } from "./lib/companion-harness.mjs";
 import { getProcessIdentity } from "../plugins/grok/scripts/lib/process-identity.mjs";
 
@@ -768,11 +769,13 @@ test("foreground spawn failure records an error instead of leaving the job runni
 
 test("background worker failures record a one line error summary", async (t) => {
   const sandbox = makeSandbox(t);
+  const worker = workerExitSignal(sandbox, "task-worker");
   const launch = runCompanion(["task", "--background", "unlaunchable"], {
     cwd: sandbox.workDir,
-    env: envFor(sandbox, { GROK_BIN: path.join(sandbox.root, "missing-grok") }),
+    env: envFor(sandbox, { GROK_BIN: path.join(sandbox.root, "missing-grok"), ...worker.env }),
   });
   assert.strictEqual(launch.status, 0, launch.stderr);
+  sandbox.registerCleanup(worker.waitForExit);
   const record = await waitFor(() => {
     const current = jobRecords(sandbox.dataDir)[0];
     return current?.status === "error" ? current : null;

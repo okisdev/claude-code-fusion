@@ -1,5 +1,24 @@
 # changelog
 
+## 0.0.76
+
+- this release acts on a usage review of one host: fourteen days of transcripts, 306 main sessions and about 3,760 USD of API-equivalent main loop cost. requests above 200,000 tokens of context took 70% of it, turns started by task notifications 30%, fusion bookkeeping about 6.6%, and the rules file about 3%.
+- a failed or empty Read or TaskOutput no longer collects a worker or applies a queued accepted verdict. the old path marked transport `done` on a permission-denied Read, and a test asserted that.
+- settling a linked collector by its engine job id records the same outcome as settling it by its fusion task id, instead of failing prevalidation.
+- worker retention records each retired record's id with its rollup, so a crash or unlink failure after the append no longer counts the record twice on retry.
+- claude-worker and trivial-worker frontmatter turn caps match the largest runtime budget (200 and 48), so `sizing: large` is reachable, and the consistency test derives them from the budget module.
+- the stop gate prints a directly runnable `node <fusion-stats.mjs> --record` command with every pending id, instead of `/fusion:stats`, which cost a Skill load before the Bash call. `--reason`, `--reason-for`, `--failure-kind`, and `--failure-kind-for` pass as direct arguments when the text uses letters, digits, spaces, and `.,:;()/_+=-`; settlement took 867 turns in two weeks and 39 of them were four-call raw-args transports.
+- the always loaded rules shrink from 48 KB to 13.7 KB. hook enforced mechanics, engine detail, clocks, and panel and fleet ceremony live in troubleshooting.md and the skills. the rules no longer claim `run_in_background: false` makes a dispatch synchronous: the harness launches it asynchronously either way, verified with and without work in flight.
+- the `strict` posture is gone: no strict session was recorded since 2026-08-02. `/fusion:config set-posture`, `FUSION_POSTURE`, the write budget deny, tail allowance, and zero-dispatch relief are removed; an old strict setting is ignored.
+- the unverified write advisory is gone. it was 96% of all guard warnings, and dispatch or verification followed it 21.5% of the time against a 23.2% base rate. six audit fields that nothing read are no longer written.
+- a lifecycle denial skips the inline guard, so a denied launch leaves no guard state, and dispatch accounting is idempotent per `tool_use_id`. handlers return results and the hook renders once.
+- engine acceptance is delivered after the worker record lock is released, with a 10 second timeout, and a pending or failed delivery is retried by the monitor and the next settlement, up to five attempts.
+- one storage module owns locking and atomic writes for worker state, guard state, audit, observer state, evidence sidecars, and config. concurrent observer passes no longer lose updates. `FUSION_DATA_DIR` also relocates guard, audit, and routing paths; without it nothing moves.
+- stale guard session pruning runs at most every ten minutes instead of on every tool call: one Read took 103 locks with 100 other sessions on disk and now takes one. turn and read streak accounting share one transaction.
+- SessionStart runs one process instead of two, the brief sensor runs inside the Agent pre-dispatch hook only after admission, and a tool call fusion ignores loads 5 modules instead of 39.
+- grok job state is built on the shared job-state factory (928 to 246 lines), which gives it the resume lease preflight and the sweep lock cursor and devin already had. cursor and devin share one companion command loop and footer renderer (about 610 lines fewer each), and a timed out cursor job now says it timed out. codex uses the shared record lock and argument parser, and every engine's lock timeout names the holder.
+- `fusion:deep-reasoner` runs at high effort instead of xhigh. a prompt that reads as a design or root-cause question gets a one line hint to consult it with a scoped brief, which brings the strongest weights to one question without moving the main session onto them.
+
 ## 0.0.75
 
 - this release acts on a usage review of one host: seven days of transcripts, 115 main sessions. the main loop took 78% of weighted token cost and its cache reads alone 57%; the peer wrappers took about 4%. in the 41 sessions that dispatched, the main loop ran 17.5 turns and replayed 7.4M tokens of context per dispatched package, a quarter of it reading code and an eighth editing it.

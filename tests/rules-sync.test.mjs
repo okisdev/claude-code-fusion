@@ -105,6 +105,60 @@ test("Live file matching the rendered canonical content prints nothing and is le
   assert.strictEqual(fs.statSync(sandbox.rulesFile).mtimeMs, before);
 });
 
+test("session startup preserves sequential rules and breaker output", (t) => {
+  for (const rules of ["missing", "unchanged", "old", "local-edits", "error"]) {
+    for (const breaker of [false, true]) {
+      const sandbox = makeSandbox(t);
+      const companion = path.join(sandbox.root, "host-check.mjs");
+      fs.writeFileSync(companion, 'process.stdout.write(JSON.stringify({ blockers: [] }));');
+      const env = {
+        ...process.env,
+        CLAUDE_PLUGIN_ROOT: sandbox.pluginRoot,
+        FUSION_RULES_FILE: sandbox.rulesFile,
+        FUSION_MODEL_ROUTING: sandbox.modelRoutingFile,
+        FUSION_WORKER_STATE_DIR: path.join(sandbox.root, "workers"),
+        FUSION_DATA_DIR: path.join(sandbox.root, "data"),
+        FUSION_CODEX_STATE: path.join(sandbox.root, "codex"),
+        GROK_COMPANION_DATA: path.join(sandbox.root, "grok"),
+        CURSOR_COMPANION_DATA: path.join(sandbox.root, "cursor"),
+        DEVIN_COMPANION_DATA: path.join(sandbox.root, "devin"),
+        FUSION_GROK_COMPANION: companion,
+        FUSION_BREAKER_LOOKBACK_HOURS: "12"
+      };
+      if (breaker) {
+        const jobs = path.join(env.FUSION_CODEX_STATE, "workspace", "jobs");
+        fs.mkdirSync(jobs, { recursive: true });
+        fs.writeFileSync(path.join(jobs, "failure.json"), JSON.stringify({ status: "error", failureKind: "auth", finishedAt: new Date(Date.now() - 330_000).toISOString() }));
+      }
+      const resetRules = () => {
+        fs.rmSync(path.dirname(sandbox.rulesFile), { recursive: true, force: true });
+        fs.mkdirSync(path.dirname(sandbox.rulesFile), { recursive: true });
+        if (rules === "unchanged") fs.writeFileSync(sandbox.rulesFile, CANONICAL);
+        if (rules === "old") fs.writeFileSync(sandbox.rulesFile, OLD_VERSION);
+        if (rules === "local-edits") fs.writeFileSync(sandbox.rulesFile, UNKNOWN_VERSION);
+        if (rules === "error") fs.mkdirSync(sandbox.rulesFile);
+      };
+      const execute = (name) => {
+        const result = spawnSync(process.execPath, [path.join(repoRoot, "plugins", "fusion", "scripts", `${name}.mjs`)], { env, encoding: "utf8", timeout: 30_000 });
+        assert.strictEqual(result.error, undefined);
+        assert.strictEqual(result.status, 0, result.stderr);
+        return result;
+      };
+      resetRules();
+      const sync = execute("rules-sync");
+      const check = execute("breaker-check");
+      resetRules();
+      const combined = execute("session-start");
+      assert.strictEqual(combined.stdout, sync.stdout + check.stdout, `${rules}, breaker=${breaker}`);
+      assert.strictEqual(combined.stderr, sync.stderr + check.stderr, `${rules}, breaker=${breaker}`);
+      assert.strictEqual(check.stdout.includes("breaker as open"), breaker);
+      if (rules === "unchanged") assert.strictEqual(sync.stdout, "");
+      else if (rules !== "error") assert.notStrictEqual(sync.stdout, "");
+      if (rules === "error") assert.ok(sync.stderr.includes("rules sync failed"));
+    }
+  }
+});
+
 test("Live file matching a manifest hash gets overwritten and prints the updated line", (t) => {
   const sandbox = makeSandbox(t);
   fs.mkdirSync(path.dirname(sandbox.rulesFile), { recursive: true });
@@ -255,11 +309,14 @@ test("background collection distinguishes explicit Fusion receipts from foregrou
   const rules = fs.readFileSync(path.join(repoRoot, "plugins", "fusion", "rules", "orchestration.md"), "utf8");
   const task = fs.readFileSync(path.join(repoRoot, "plugins", "codex", "skills", "task", "SKILL.md"), "utf8");
   const rescue = fs.readFileSync(path.join(repoRoot, "plugins", "codex", "skills", "rescue", "SKILL.md"), "utf8");
-  assert.match(rules, /this obligation applies to a manual receipt that crosses into the main session from a detached job launched by Fusion orchestration/);
-  assert.match(rules, /closed direct prompt containing exactly one standalone `engine: codex\|grok\|cursor\|devin` line and one standalone `job: <32 lowercase hexadecimal characters>` line/);
+  const troubleshootingText = fs.readFileSync(path.join(repoRoot, "plugins", "fusion", "rules", "troubleshooting.md"), "utf8");
+  assert.match(troubleshootingText, /this obligation applies to a manual receipt that crosses into the main session from a detached job launched by Fusion orchestration/);
+  assert.match(troubleshootingText, /closed direct prompt containing exactly one standalone `engine: codex\|grok\|cursor\|devin` line and one standalone `job: <32 lowercase hexadecimal characters>` line/);
+  assert.doesNotMatch(troubleshootingText, /`engine: codex\|grok` line/);
+  assert.match(rules, /A detached receipt Fusion created is collected with `fusion:job-collector`\./);
   assert.match(fs.readFileSync(path.join(repoRoot, "plugins", "fusion", "rules", "troubleshooting.md"), "utf8"), /The lifecycle binds the collected marker to this dispatch identity\./);
   assert.match(fs.readFileSync(path.join(repoRoot, "plugins", "fusion", "rules", "troubleshooting.md"), "utf8"), /Grok, Cursor, and Devin rescue wrappers also launch their companion calls in background shells and wait through `await-output` slices; expected duration does not authorize managed detachment\./);
-  assert.match(fs.readFileSync(path.join(repoRoot, "plugins", "fusion", "rules", "troubleshooting.md"), "utf8"), /A width one Claude worker dispatch may instead pass `run_in_background: false` so the deliverable returns synchronously inside the tool result; the lifecycle records it as an ordinary foreground worker\./);
+  assert.match(fs.readFileSync(path.join(repoRoot, "plugins", "fusion", "rules", "troubleshooting.md"), "utf8"), /Passing `run_in_background: false` does not make a dispatch synchronous/);
   assert.doesNotMatch(rules, /Managed Grok detachment is different/);
   assert.match(fs.readFileSync(path.join(repoRoot, "plugins", "fusion", "rules", "troubleshooting.md"), "utf8"), /Direct Codex, Grok, Cursor, and Devin slash commands with explicit `--background` return manual receipts for the user to inspect and collect through their status and result commands/);
   assert.match(task, /Direct users inspect progress through `\/codex:status` and collect the deliverable through `\/codex:result`; when Fusion is installed, its monitor can notify them of completion/);
@@ -290,10 +347,10 @@ test("Grok rules document source verified headless boundaries", () => {
   const volumeRoutingDefectSentence = "Leaving the volume tiers idle while this work runs on premium lanes is a routing defect.";
   const balanceCheckSentence = "Balance check: on a delegating project, peer lanes carry a meaningful share of implementation output. A session where Claude worker lanes absorb spec grade or quick scoped packages while Codex sits idle is a routing defect.";
   const narrowWaveSentence = "Repeated width one dispatch turns on a goal with multiple independent packages are the signature of that defect, and the narrow wave watch in `/fusion:stats` surfaces it.";
-  const settlementSentence = "Settlement is batched per wave: collect and verify every result in a wave, then record all verdicts in one `/fusion:stats --record` call with multiple `<id>=<accepted|rejected|unverified>` pairs, where each id is the fusion task id or the engine job id.";
+  const settlementSentence = "Settlement is batched per wave: collect and verify every result in a wave, then record all verdicts in one `node <fusion plugin>/scripts/fusion-stats.mjs --record` call (the Stop hook prints the exact path and pending ids) with multiple `<id>=<accepted|rejected|unverified>` pairs, where each id is the fusion task id or the engine job id.";
   const perPackageSettlementSentence = "Per package settlement turns are reserved for waves of one.";
   const settlementInvariantSentence = "One settlement validates every pair before writing and is idempotent to rerun after a partial transport failure; it writes the worker ledger and linked engine record for every recorded verdict.";
-  const settlementTransportSentence = "Strict record forms may pass as direct arguments, and anything carrying free text still uses the raw-args transport.";
+  const settlementTransportSentence = "Record forms pass as direct arguments, including `--reason`, `--reason-for`, `--failure-kind`, and `--failure-kind-for` when every text value uses only letters, digits, spaces, and `.,:;()/_+=-`; other text uses the raw-args transport.";
   const releaseCadenceSentence = "After each release, `/fusion:stats --prune-dead` runs as part of the release cadence.";
 
   for (const text of [troubleshooting, runtime, contract, readme, security, doctor]) {

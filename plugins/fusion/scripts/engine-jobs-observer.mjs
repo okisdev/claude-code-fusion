@@ -4,6 +4,7 @@ import fs from "node:fs";
 import path from "node:path";
 
 import { appendModelAuditObservation, appendTokenUsageObservation, fusionRepositoryKey, modelAuditSidecarPath, resolveFusionDataDir, tokenUsageSidecarPath } from "./fusion-stats.mjs";
+import { readJsonFile, withFileLock, writeFileAtomic } from "./lib/storage.mjs";
 import { ENGINE_TERMINAL_STATUSES, engineStateRoots, isEngineId } from "./lib/engines.mjs";
 
 const DEFAULT_UNAVAILABLE_TTL_MS = 6 * 60 * 60 * 1000;
@@ -54,7 +55,7 @@ export function engineJobsObserverStatePath(engine, env = process.env) {
 
 function loadObserverState(file) {
   try {
-    const state = JSON.parse(fs.readFileSync(file, "utf8"));
+    const state = readJsonFile(file, null);
     if (state?.schemaVersion !== STATE_SCHEMA_VERSION || !Array.isArray(state.observedJobIds)) {
       return { observedJobIds: new Set(), unavailableObservedAt: new Map(), notifiedJobIds: new Set(), missingSince: new Map() };
     }
@@ -72,13 +73,6 @@ function loadObserverState(file) {
 }
 
 function saveObserverState(file, engine, observedJobIds, unavailableObservedAt, notifiedJobIds, missingSince) {
-  fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
-  try {
-    fs.chmodSync(path.dirname(file), 0o700);
-  } catch {
-    void 0;
-  }
-  const temporary = `${file}.${process.pid}.${Date.now()}.tmp`;
   const state = {
     schemaVersion: STATE_SCHEMA_VERSION,
     engine,
@@ -88,10 +82,7 @@ function saveObserverState(file, engine, observedJobIds, unavailableObservedAt, 
     ...(missingSince.size > 0 ? { missingSince: Object.fromEntries([...missingSince].sort(([left], [right]) => left.localeCompare(right))) } : {}),
     updatedAt: new Date().toISOString()
   };
-  fs.writeFileSync(temporary, `${JSON.stringify(state)}\n`, { encoding: "utf8", mode: 0o600 });
-  fs.chmodSync(temporary, 0o600);
-  fs.renameSync(temporary, file);
-  fs.chmodSync(file, 0o600);
+  writeFileAtomic(file, `${JSON.stringify(state)}\n`);
 }
 
 function hasUsageObject(record) {
@@ -189,107 +180,109 @@ function terminalRecords(engine, env) {
 
 export function observeEngineJobs(engine, { env = process.env, now = () => new Date().toISOString(), notify } = {}) {
   const stateFile = engineJobsObserverStatePath(engine, env);
-  const { observedJobIds, unavailableObservedAt, notifiedJobIds, missingSince } = loadObserverState(stateFile);
-  const unavailableTtlMs = resolveUnavailableTtlMs(engine, env);
-  let changed = false;
-  let observations = 0;
-  const { records, liveIds, complete } = terminalRecords(engine, env);
-  if (complete) {
-    const observedAt = now();
-    const nowMs = Date.parse(observedAt);
-    for (const id of new Set([...observedJobIds, ...notifiedJobIds, ...unavailableObservedAt.keys(), ...missingSince.keys()])) {
-      if (liveIds.has(id)) {
-        if (missingSince.delete(id)) changed = true;
+  return withFileLock(stateFile, () => {
+    const { observedJobIds, unavailableObservedAt, notifiedJobIds, missingSince } = loadObserverState(stateFile);
+    const unavailableTtlMs = resolveUnavailableTtlMs(engine, env);
+    let changed = false;
+    let observations = 0;
+    const { records, liveIds, complete } = terminalRecords(engine, env);
+    if (complete) {
+      const observedAt = now();
+      const nowMs = Date.parse(observedAt);
+      for (const id of new Set([...observedJobIds, ...notifiedJobIds, ...unavailableObservedAt.keys(), ...missingSince.keys()])) {
+        if (liveIds.has(id)) {
+          if (missingSince.delete(id)) changed = true;
+          continue;
+        }
+        const missingAt = missingSince.get(id);
+        if (!missingAt) {
+          missingSince.set(id, observedAt);
+          changed = true;
+        } else if (Number.isFinite(nowMs) && nowMs - Date.parse(missingAt) > RETENTION_MS) {
+          changed = true;
+          observedJobIds.delete(id);
+          notifiedJobIds.delete(id);
+          unavailableObservedAt.delete(id);
+          missingSince.delete(id);
+        }
+      }
+    }
+    for (const entry of records) {
+      const record = entry.record;
+      const ownSessionId = typeof env.CLAUDE_CODE_SESSION_ID === "string" && env.CLAUDE_CODE_SESSION_ID.trim() ? env.CLAUDE_CODE_SESSION_ID.trim() : null;
+      const recordSessionId = typeof record.claudeSessionId === "string" && record.claudeSessionId.trim() ? record.claudeSessionId.trim() : null;
+      if (notify && !notifiedJobIds.has(record.id) && (!ownSessionId || !recordSessionId || ownSessionId === recordSessionId) && (!Object.hasOwn(record, "background") || record.background === true)) {
+        let fullRecord;
+        try {
+          fullRecord = JSON.parse(fs.readFileSync(entry.file, "utf8"));
+        } catch {
+          continue;
+        }
+        notify(fullRecord);
+        notifiedJobIds.add(record.id);
+        changed = true;
+      }
+      if (observedJobIds.has(record.id)) {
         continue;
       }
-      const missingAt = missingSince.get(id);
-      if (!missingAt) {
-        missingSince.set(id, observedAt);
-        changed = true;
-      } else if (Number.isFinite(nowMs) && nowMs - Date.parse(missingAt) > RETENTION_MS) {
-        changed = true;
-        observedJobIds.delete(id);
-        notifiedJobIds.delete(id);
-        unavailableObservedAt.delete(id);
-        missingSince.delete(id);
-      }
-    }
-  }
-  for (const entry of records) {
-    const record = entry.record;
-    const ownSessionId = typeof env.CLAUDE_CODE_SESSION_ID === "string" && env.CLAUDE_CODE_SESSION_ID.trim() ? env.CLAUDE_CODE_SESSION_ID.trim() : null;
-    const recordSessionId = typeof record.claudeSessionId === "string" && record.claudeSessionId.trim() ? record.claudeSessionId.trim() : null;
-    if (notify && !notifiedJobIds.has(record.id) && (!ownSessionId || !recordSessionId || ownSessionId === recordSessionId) && (!Object.hasOwn(record, "background") || record.background === true)) {
-      let fullRecord;
-      try {
-        fullRecord = JSON.parse(fs.readFileSync(entry.file, "utf8"));
-      } catch {
-        continue;
-      }
-      notify(fullRecord);
-      notifiedJobIds.add(record.id);
-      changed = true;
-    }
-    if (observedJobIds.has(record.id)) {
-      continue;
-    }
-    const workspaceRoot = path.resolve(record.cwd);
-    const repositoryKey = fusionRepositoryKey(workspaceRoot);
-    const available = hasUsageObject(record);
-    const observedAt = now();
-    const appended = appendTokenUsageObservation(tokenUsageSidecarPath(workspaceRoot, env), {
-      schemaVersion: 1,
-      jobId: record.id,
-      engine,
-      workspaceRoot,
-      repositoryKey,
-      availability: available ? "available" : "unavailable",
-      tokenUsage: available ? record.usage : null,
-      source: `${engine}-job-record`,
-      observedAt
-    });
-    if (!appended) {
-      continue;
-    }
-    const resolvedModel = typeof record.resolvedModel === "string" && record.resolvedModel.trim() ? record.resolvedModel.trim() : null;
-    if (resolvedModel) {
-      const resolvedEffort = typeof record.resolvedEffort === "string" && record.resolvedEffort.trim() ? record.resolvedEffort.trim() : null;
-      appendModelAuditObservation(modelAuditSidecarPath(workspaceRoot, env), {
+      const workspaceRoot = path.resolve(record.cwd);
+      const repositoryKey = fusionRepositoryKey(workspaceRoot);
+      const available = hasUsageObject(record);
+      const observedAt = now();
+      const appended = appendTokenUsageObservation(tokenUsageSidecarPath(workspaceRoot, env), {
         schemaVersion: 1,
         jobId: record.id,
         engine,
-        model: resolvedModel,
-        effort: resolvedEffort,
         workspaceRoot,
         repositoryKey,
+        availability: available ? "available" : "unavailable",
+        tokenUsage: available ? record.usage : null,
         source: `${engine}-job-record`,
         observedAt
       });
-    }
-    observations += 1;
-    if (available) {
-      const becameObserved = !observedJobIds.has(record.id);
-      observedJobIds.add(record.id);
-      if (unavailableObservedAt.delete(record.id) || becameObserved) {
+      if (!appended) {
+        continue;
+      }
+      const resolvedModel = typeof record.resolvedModel === "string" && record.resolvedModel.trim() ? record.resolvedModel.trim() : null;
+      if (resolvedModel) {
+        const resolvedEffort = typeof record.resolvedEffort === "string" && record.resolvedEffort.trim() ? record.resolvedEffort.trim() : null;
+        appendModelAuditObservation(modelAuditSidecarPath(workspaceRoot, env), {
+          schemaVersion: 1,
+          jobId: record.id,
+          engine,
+          model: resolvedModel,
+          effort: resolvedEffort,
+          workspaceRoot,
+          repositoryKey,
+          source: `${engine}-job-record`,
+          observedAt
+        });
+      }
+      observations += 1;
+      if (available) {
+        const becameObserved = !observedJobIds.has(record.id);
+        observedJobIds.add(record.id);
+        if (unavailableObservedAt.delete(record.id) || becameObserved) {
+          changed = true;
+        }
+        continue;
+      }
+      const firstObservedAt = unavailableObservedAt.get(record.id) ?? observedAt;
+      if (!unavailableObservedAt.has(record.id)) {
+        unavailableObservedAt.set(record.id, firstObservedAt);
         changed = true;
       }
-      continue;
+      if (recordAgeMs(record, firstObservedAt, Date.parse(observedAt)) > unavailableTtlMs) {
+        observedJobIds.add(record.id);
+        unavailableObservedAt.delete(record.id);
+        changed = true;
+      }
     }
-    const firstObservedAt = unavailableObservedAt.get(record.id) ?? observedAt;
-    if (!unavailableObservedAt.has(record.id)) {
-      unavailableObservedAt.set(record.id, firstObservedAt);
-      changed = true;
+    if (changed) {
+      saveObserverState(stateFile, engine, observedJobIds, unavailableObservedAt, notifiedJobIds, missingSince);
     }
-    if (recordAgeMs(record, firstObservedAt, Date.parse(observedAt)) > unavailableTtlMs) {
-      observedJobIds.add(record.id);
-      unavailableObservedAt.delete(record.id);
-      changed = true;
-    }
-  }
-  if (changed) {
-    saveObserverState(stateFile, engine, observedJobIds, unavailableObservedAt, notifiedJobIds, missingSince);
-  }
-  return observations;
+    return observations;
+  });
 }
 
 export function observeEngineJobsSafely(engine, options) {

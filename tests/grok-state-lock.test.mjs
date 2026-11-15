@@ -534,6 +534,8 @@ test("a held job record lock times out a second acquirer within the configured c
   assert.equal(result.code, 0, result.stderr);
   const outcome = JSON.parse(result.stdout);
   assert.match(outcome.message, /Timed out waiting for the job record lock at/);
+  assert.ok(outcome.message.includes(`Held by pid ${holder.child.pid} (alive)`), outcome.message);
+  assert.ok(outcome.message.includes(process.platform === "linux" ? path.basename(process.execPath) : `process-${holder.child.pid}`), outcome.message);
   assert.ok(outcome.elapsedMs >= timeoutMs, `Expected the waiter to wait for at least ${timeoutMs}ms, took ${outcome.elapsedMs}ms.`);
   assert.ok(outcome.elapsedMs <= timeoutMs + 5000, `Expected the waiter to finish near ${timeoutMs}ms, took ${outcome.elapsedMs}ms.`);
 
@@ -545,6 +547,45 @@ test("a held job record lock times out a second acquirer within the configured c
 test("GROK_COMPANION_LOCK_TIMEOUT_MS overrides the default lock timeout", () => {
   assert.equal(resolveLockTimeoutMs({ GROK_COMPANION_LOCK_TIMEOUT_MS: "1" }), 1);
   assert.equal(resolveLockTimeoutMs({ GROK_COMPANION_LOCK_TIMEOUT_MS: "7500" }), 7500);
+});
+
+test("lock candidate publication retries a vanished staging directory and propagates other errors", (t) => {
+  const sandbox = makeSandbox(t);
+  const source = `
+import fs from "node:fs";
+const [stateUrl, jobFile, failureCode] = process.argv.slice(1);
+const state = await import(stateUrl);
+const originalRenameSync = fs.renameSync;
+let injected = false;
+fs.renameSync = function renameWithoutStaging(from, to) {
+  if (!injected && String(from).includes(".lock.owner.") && String(from).includes(".prepare.") && !String(to).endsWith("/owner.json")) {
+    injected = true;
+    if (failureCode === "ENOENT") {
+      fs.rmSync(from, { recursive: true, force: true });
+    } else {
+      throw Object.assign(new Error("injected publication failure"), { code: failureCode });
+    }
+  }
+  return originalRenameSync.call(this, from, to);
+};
+let record;
+let errorCode;
+try {
+  record = state.updateJobRecordFile(jobFile, { revision: 1 });
+} catch (error) {
+  errorCode = error.code;
+}
+process.stdout.write(JSON.stringify({ injected, revision: record?.revision, errorCode, lockExists: fs.existsSync(jobFile + ".lock") }));
+`;
+  for (const code of ["ENOENT", "EIO"]) {
+    const jobFile = makeRecord(sandbox, `publication-${code.toLowerCase()}`);
+    const result = runChildSync(source, [stateModulePath, jobFile, code]);
+    assert.equal(result.status, 0, result.stderr);
+    assert.deepEqual(JSON.parse(result.stdout), code === "ENOENT"
+      ? { injected: true, revision: 1, lockExists: false }
+      : { injected: true, errorCode: "EIO", lockExists: false });
+    assert.deepEqual(fs.readdirSync(path.dirname(jobFile)).filter((entry) => entry.startsWith(`${path.basename(jobFile)}.lock.owner.`)), []);
+  }
 });
 
 test("an invalid GROK_COMPANION_LOCK_TIMEOUT_MS falls back to the default", () => {

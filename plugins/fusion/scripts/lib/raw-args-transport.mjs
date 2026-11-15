@@ -254,16 +254,3 @@ export function splitRawArgs(value) {
   }
   return tokens;
 }
-
-export function resolveRawArgsTransport(argv, options = {}) {
-  if (argv[0] !== "--raw-args-token") {
-    if (argv.includes("--raw-args-token")) {
-      throw new RawArgsTransportError("The Fusion input transport cannot be combined with normal arguments.");
-    }
-    return { argv, ingress: "argv" };
-  }
-  if (argv.length !== 2) {
-    throw new RawArgsTransportError("The Fusion input transport requires exactly one token.");
-  }
-  return { argv: splitRawArgs(consumeRawArgsTransport(argv[1], options)), ingress: "staged_file" };
-}

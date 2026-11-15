@@ -242,7 +242,7 @@ test("Codex jobs monitor tags its announce-only notification", async (t) => {
   assert.ok(result.stdout.trimEnd().endsWith(messageTag("codex-monitor.job-notification")));
 });
 
-function writeCodexAcceptanceCompanion(directory) {
+function writeCodexAcceptanceCompanion(directory, jobFile = null) {
   const companion = path.join(directory, "codex-companion.mjs");
   fs.writeFileSync(
     companion,
@@ -259,6 +259,12 @@ function writeCodexAcceptanceCompanion(directory) {
       "  if (process.env.FUSION_TEST_CODEX_COMPANION_ARGS) {",
       "    fs.writeFileSync(process.env.FUSION_TEST_CODEX_COMPANION_ARGS, JSON.stringify(argv));",
       "  }",
+      ...(jobFile ? [
+        `  const file = ${JSON.stringify(jobFile)};`,
+        '  const record = JSON.parse(fs.readFileSync(file, "utf8"));',
+        '  const value = (flag) => argv.includes(flag) ? argv[argv.indexOf(flag) + 1] : null;',
+        '  fs.writeFileSync(file, JSON.stringify({ ...record, semanticStatus: value("--acceptance"), acceptanceSource: value("--source"), acceptanceRecordedAt: new Date().toISOString(), semanticFailureMessage: value("--reason"), semanticFailureKind: value("--failure-kind") }));'
+      ] : []),
       '  process.stdout.write("Recorded Codex acceptance.\\n");',
       "}"
     ].join("\n")
@@ -1319,18 +1325,18 @@ test("model audit batch loads and rewrites a sidecar once while preserving rank"
   const dir = sandbox(t);
   const file = path.join(dir, "observations", "model-audit.jsonl");
   const read = fs.readFileSync;
-  const write = fs.writeFileSync;
+  const rename = fs.renameSync;
   let reads = 0;
   let writes = 0;
   fs.readFileSync = function (...args) { if (args[0] === file) reads += 1; return read.apply(this, args); };
-  fs.writeFileSync = function (...args) { if (String(args[0]).startsWith(`${file}.`)) writes += 1; return write.apply(this, args); };
+  fs.renameSync = function (...args) { if (args[1] === file) writes += 1; return rename.apply(this, args); };
   try {
     assert.strictEqual(appendModelAuditObservations(file, [
       { jobId: "one", source: "argv", model: "a" },
       { jobId: "one", source: "rollout-turn-context", model: "b" },
       { jobId: "two", source: "argv", model: "c" }
     ]), true);
-  } finally { fs.readFileSync = read; fs.writeFileSync = write; }
+  } finally { fs.readFileSync = read; fs.renameSync = rename; }
   assert.strictEqual(reads, 1);
   assert.strictEqual(writes, 1);
   assert.deepStrictEqual(fs.readFileSync(file, "utf8").trim().split("\n").map((line) => JSON.parse(line).model), ["b", "c"]);
@@ -2174,6 +2180,55 @@ test("--record settles a Codex collector task through the Codex ledger", (t) => 
   assert.strictEqual(readWorkerRecord(taskId, env).acceptance, "accepted");
 });
 
+for (const agentType of ["fusion:job-collector", "codex:codex-rescue"]) {
+  for (const verdict of ["accepted", "rejected", "unverified"]) {
+    test(`--record ${verdict} has identical linked ${agentType} ledger outcomes by task id and engine job id`, (t) => {
+      const dir = sandbox(t);
+      const taskId = `fusion-${"e".repeat(24)}`;
+      const jobId = "f".repeat(32);
+      const outcomes = [];
+      for (const id of [taskId, jobId]) {
+        const root = path.join(dir, id);
+        fs.mkdirSync(root);
+        const codexData = path.join(root, "codex-data");
+        const stateRoot = path.join(codexData, "state");
+        const env = {
+          FUSION_WORKER_STATE_DIR: path.join(root, "worker-state"),
+          CODEX_COMPANION_DATA: codexData
+        };
+        const jobFile = writeCodexJob(stateRoot, root, jobId, { status: "done", jobClass: "task" });
+        env.FUSION_CODEX_COMPANION = writeCodexAcceptanceCompanion(root, jobFile);
+        createWorkerRecord({ taskId, sessionId: "session-settlement", agentType, workspaceRoot: root, completionContract: agentType === "fusion:job-collector" ? "collector" : "execution" }, env);
+        updateWorkerRecord(taskId, env, (record) => ({ ...record, transportStatus: "done", peerEngine: "codex", peerJobId: jobId, peerTransportStatus: "done", awaitingVerdict: true }));
+        const reason = verdict === "rejected" ? "The result failed verification." : null;
+        const failureKind = verdict === "rejected" ? "wrong_approach" : null;
+        const result = run(
+          { cwd: root, codexState: stateRoot },
+          ["--record", `${id}=${verdict}`, ...(reason ? ["--reason", reason, "--failure-kind", failureKind] : []), "--json"],
+          env
+        );
+
+        assert.strictEqual(result.status, 0, result.stderr);
+        const worker = readWorkerRecord(taskId, env);
+        const job = JSON.parse(fs.readFileSync(jobFile, "utf8"));
+        assert.strictEqual(worker.acceptance, verdict);
+        assert.strictEqual(worker.acceptanceSource, "main-loop");
+        assert.strictEqual(worker.acceptanceReason, reason);
+        assert.strictEqual(worker.acceptanceFailureKind, failureKind);
+        assert.strictEqual(worker.awaitingVerdict, false);
+        assert.ok(Number.isFinite(Date.parse(worker.acceptanceRecordedAt)));
+        assert.strictEqual(job.semanticStatus, verdict);
+        assert.strictEqual(job.acceptanceSource, "main-loop");
+        assert.strictEqual(job.semanticFailureMessage, reason);
+        assert.strictEqual(job.semanticFailureKind, failureKind);
+        assert.ok(Number.isFinite(Date.parse(job.acceptanceRecordedAt)));
+        outcomes.push({ worker: { acceptance: worker.acceptance, reason: worker.acceptanceReason, failureKind: worker.acceptanceFailureKind }, job: { acceptance: job.semanticStatus, reason: job.semanticFailureMessage, failureKind: job.semanticFailureKind } });
+      }
+      assert.deepStrictEqual(outcomes[0], outcomes[1]);
+    });
+  }
+}
+
 test("--record settles multiple direct pairs after one flag", (t) => {
   const dir = sandbox(t);
   const stateDir = path.join(dir, "worker-state");
@@ -2194,7 +2249,7 @@ test("--record settles multiple direct pairs after one flag", (t) => {
   assert.strictEqual(readWorkerRecord(secondTaskId, env).acceptance, "unverified");
 });
 
-test("--record leaves a terminal worker unsettled when its engine companion fails", (t) => {
+test("--record preserves a terminal worker verdict for retry when its engine companion fails", (t) => {
   const dir = sandbox(t);
   const stateDir = path.join(dir, "worker-state");
   const taskId = `fusion-${"1".repeat(24)}`;
@@ -2218,9 +2273,11 @@ test("--record leaves a terminal worker unsettled when its engine companion fail
   assert.notStrictEqual(result.status, 0);
   assert.match(result.stderr, new RegExp(`Failed to settle ${taskId}: Engine settlement failed for Codex job ${jobId}`));
   const worker = readWorkerRecord(taskId, env);
-  assert.strictEqual(worker.acceptance, "unverified");
-  assert.strictEqual(worker.acceptanceRecordedAt, undefined);
-  assert.strictEqual(worker.awaitingVerdict, true);
+  assert.strictEqual(worker.acceptance, "accepted");
+  assert.ok(worker.acceptanceRecordedAt);
+  assert.strictEqual(worker.awaitingVerdict, false);
+  assert.strictEqual(worker.engineAcceptanceDelivery.status, "failed");
+  assert.strictEqual(worker.engineAcceptanceDelivery.attempts, 1);
 });
 
 test("--record resolves a bare Codex job with a raw transport reason and settles matching worker rows", (t) => {
@@ -2273,7 +2330,7 @@ test("--record refuses a rejected strict direct argument", (t) => {
   assert.strictEqual(readWorkerRecord(taskId, env).acceptance, "unverified");
 });
 
-test("--record with --failure-kind requires the raw-args transport", (t) => {
+test("--record accepts a safe direct reason and failure kind", (t) => {
   const dir = sandbox(t);
   const stateDir = path.join(dir, "worker-state");
   const taskId = `fusion-${"e".repeat(24)}`;
@@ -2286,9 +2343,45 @@ test("--record with --failure-kind requires the raw-args transport", (t) => {
     env
   );
 
-  assert.notStrictEqual(result.status, 0);
-  assert.match(result.stderr, /Fusion stats requests must be supplied through --raw-args-token\./);
-  assert.strictEqual(readWorkerRecord(taskId, env).acceptance, "unverified");
+  assert.strictEqual(result.status, 0, result.stderr);
+  assert.strictEqual(readWorkerRecord(taskId, env).acceptance, "rejected");
+  assert.strictEqual(readWorkerRecord(taskId, env).acceptanceReason, "The output did not meet the requested scope.");
+  assert.strictEqual(readWorkerRecord(taskId, env).acceptanceFailureKind, "scope_rewrite");
+});
+
+test("--record requires raw-args for direct reasons outside the allowed charset", (t) => {
+  const dir = sandbox(t);
+  const env = { FUSION_WORKER_STATE_DIR: path.join(dir, "worker-state") };
+  for (const [index, reason] of ["The result's scope changed.", "The `check` failed.", "x".repeat(301)].entries()) {
+    const taskId = `fusion-${String(index + 1).repeat(24)}`;
+    createTerminalWorker({ taskId, env, workspaceRoot: dir });
+    const direct = runDirect({ cwd: dir, codexState: path.join(dir, "missing") }, ["--record", `${taskId}=rejected`, "--reason", reason], env);
+    assert.strictEqual(direct.status, 1);
+    assert.match(direct.stderr, /allowed charset.*raw-args transport/);
+    assert.strictEqual(readWorkerRecord(taskId, env).acceptance, "unverified");
+
+    const staged = run({ cwd: dir, codexState: path.join(dir, "missing") }, ["--record", `${taskId}=rejected`, "--reason", reason], env);
+    assert.strictEqual(staged.status, 0, staged.stderr);
+    const recordedReason = readWorkerRecord(taskId, env).acceptanceReason;
+    assert.ok(recordedReason);
+    assert.ok(reason.startsWith(recordedReason));
+  }
+});
+
+test("--record accepts safe per-pair reasons and failure kinds after one flag", (t) => {
+  const dir = sandbox(t);
+  const env = { FUSION_WORKER_STATE_DIR: path.join(dir, "worker-state") };
+  const acceptedId = `fusion-${"a".repeat(24)}`;
+  const rejectedId = `fusion-${"b".repeat(24)}`;
+  for (const taskId of [acceptedId, rejectedId]) createTerminalWorker({ taskId, env, workspaceRoot: dir });
+
+  const result = runDirect({ cwd: dir, codexState: path.join(dir, "missing") }, ["--reason-for", rejectedId, "Check failed: output/incomplete.", "--failure-kind-for", rejectedId, "wrong_approach", "--record", `${acceptedId}=accepted`, `${rejectedId}=rejected`], env);
+
+  assert.strictEqual(result.status, 0, result.stderr);
+  assert.strictEqual(readWorkerRecord(acceptedId, env).acceptance, "accepted");
+  assert.strictEqual(readWorkerRecord(rejectedId, env).acceptance, "rejected");
+  assert.strictEqual(readWorkerRecord(rejectedId, env).acceptanceReason, "Check failed: output/incomplete.");
+  assert.strictEqual(readWorkerRecord(rejectedId, env).acceptanceFailureKind, "wrong_approach");
 });
 
 test("--record rejects semantic failure kinds on non-rejected verdicts", (t) => {
@@ -2834,7 +2927,9 @@ test("--record continues a batch after a partial engine transport failure and ca
 
   assert.notStrictEqual(result.status, 0);
   assert.match(result.stderr, new RegExp(`Failed to settle ${failedTaskId}`));
-  assert.strictEqual(readWorkerRecord(failedTaskId, env).acceptance, "unverified");
+  assert.strictEqual(readWorkerRecord(failedTaskId, env).acceptance, "accepted");
+  assert.strictEqual(readWorkerRecord(failedTaskId, env).engineAcceptanceDelivery.status, "failed");
+  assert.strictEqual(readWorkerRecord(failedTaskId, env).engineAcceptanceDelivery.attempts, 1);
   assert.strictEqual(readWorkerRecord(settledTaskId, env).acceptance, "accepted");
 
   const retry = runDirect(
@@ -2844,7 +2939,8 @@ test("--record continues a batch after a partial engine transport failure and ca
   );
 
   assert.notStrictEqual(retry.status, 0);
-  assert.strictEqual(readWorkerRecord(failedTaskId, env).acceptance, "unverified");
+  assert.strictEqual(readWorkerRecord(failedTaskId, env).acceptance, "accepted");
+  assert.strictEqual(readWorkerRecord(failedTaskId, env).engineAcceptanceDelivery.attempts, 2);
   assert.strictEqual(readWorkerRecord(settledTaskId, env).acceptance, "accepted");
 });
 
@@ -2866,6 +2962,47 @@ test("--record accepts a per-pair failed transport override", (t) => {
   assert.strictEqual(readWorkerRecord(taskId, env).acceptance, "accepted");
 });
 
+for (const recordEngineId of [false, true]) {
+  test(`--record ${recordEngineId ? "engine" : "worker"} delivery failure retries on the next unrelated CLI settlement`, (t) => {
+    const dir = sandbox(t);
+    const stateRoot = path.join(dir, "codex-state");
+    const env = { FUSION_WORKER_STATE_DIR: path.join(dir, "workers") };
+    const taskId = `fusion-${"b".repeat(24)}`;
+    const nextTaskId = `fusion-${"c".repeat(24)}`;
+    const jobId = "d".repeat(32);
+    const calls = path.join(dir, "calls.jsonl");
+    const companion = path.join(dir, "codex-companion.mjs");
+    const lock = `${workerRecordFile(taskId, env)}.lock`;
+    fs.writeFileSync(companion, [
+      'import assert from "node:assert/strict";',
+      'import fs from "node:fs";',
+      `assert.equal(fs.existsSync(${JSON.stringify(lock)}), false);`,
+      'fs.appendFileSync(process.env.TEST_CALLS, "called\\n");',
+      'if (fs.readFileSync(process.env.TEST_CALLS, "utf8").trim().split("\\n").length === 1) { process.stderr.write("temporary failure"); process.exitCode = 1; }'
+    ].join("\n"));
+    writeCodexJob(stateRoot, dir, jobId, { status: "done", jobClass: "task" });
+    createTerminalWorker({ taskId, env, workspaceRoot: dir, peerEngine: "codex", peerJobId: jobId });
+    createTerminalWorker({ taskId: nextTaskId, env, workspaceRoot: dir });
+    const runtime = { cwd: dir, codexState: stateRoot };
+    const childEnv = { ...env, FUSION_CODEX_COMPANION: companion, TEST_CALLS: calls };
+
+    const failed = runDirect(runtime, ["--record", `${recordEngineId ? jobId : taskId}=accepted`], childEnv);
+    assert.strictEqual(failed.status, 1);
+    assert.strictEqual(failed.stdout, "");
+    assert.match(failed.stderr, /temporary failure/);
+    assert.strictEqual(readWorkerRecord(taskId, env).acceptance, "accepted");
+    assert.strictEqual(readWorkerRecord(taskId, env).engineAcceptanceDelivery.status, "failed");
+
+    const retry = runDirect(runtime, ["--record", `${nextTaskId}=accepted`, "--json"], childEnv);
+    assert.strictEqual(retry.status, 0, retry.stderr);
+    assert.strictEqual(retry.stderr, "");
+    assert.deepStrictEqual(JSON.parse(retry.stdout), { kind: "worker", taskId: nextTaskId, acceptance: "accepted" });
+    assert.strictEqual(readWorkerRecord(taskId, env).engineAcceptanceDelivery.status, "delivered");
+    assert.strictEqual(readWorkerRecord(taskId, env).engineAcceptanceDelivery.attempts, 2);
+    assert.strictEqual(fs.readFileSync(calls, "utf8").trim().split("\n").length, 2);
+  });
+}
+
 test("--record broadcasts --reason to rejected pairs without a per-pair reason", (t) => {
   const dir = sandbox(t);
   const stateDir = path.join(dir, "worker-state");
@@ -2879,11 +3016,7 @@ test("--record broadcasts --reason to rejected pairs without a per-pair reason",
   const args = ["--record", `${firstTaskId}=accepted`, "--record", `${secondTaskId}=rejected`, "--record", `${thirdTaskId}=rejected`, "--reason", "shared failure", "--reason-for", thirdTaskId, "specific failure"];
 
   const direct = runDirect({ cwd: dir, codexState: path.join(dir, "missing") }, args, env);
-  assert.notStrictEqual(direct.status, 0);
-  assert.match(direct.stderr, /must be supplied through --raw-args-token/);
-
-  const staged = run({ cwd: dir, codexState: path.join(dir, "missing") }, args, env);
-  assert.strictEqual(staged.status, 0, staged.stderr);
+  assert.strictEqual(direct.status, 0, direct.stderr);
   assert.strictEqual(readWorkerRecord(firstTaskId, env).acceptanceReason, null);
   assert.strictEqual(readWorkerRecord(secondTaskId, env).acceptanceReason, "shared failure");
   assert.strictEqual(readWorkerRecord(thirdTaskId, env).acceptanceReason, "specific failure");
@@ -4154,26 +4287,14 @@ test("main loop replay shares one audit directory read and one read of each segm
   }
 });
 
-test("coercion ledger includes Bash write warnings in unverified window depth and sprawl", (t) => {
+test("coercion ledger includes Bash write audits in unverified window depth and sprawl", (t) => {
   const dir = sandbox(t);
   const env = runtimeEnv({ cwd: dir, codexState: path.join(dir, "codex") });
   writeGuardAuditEvents(env.FUSION_INLINE_GUARD_AUDIT_DIR, "2026-08-01", [
-    { schemaVersion: 1, at: "2026-08-01T10:00:00.000Z", session: "bash-warn", event: "warn", lane: "main", tool: "Bash", writeCount: 12, dispatchCount: 0, budget: 5, mode: "advisory", messageCode: messageCode("inline-guard.unverified-advisory") }
+    { schemaVersion: 1, at: "2026-08-01T10:00:00.000Z", session: "bash-write", event: "write", lane: "main", tool: "Bash", writeCount: 12, budget: 2_000_000, replayTokens: 4_000_000 }
   ]);
   const ledger = buildFusionStats({ env, cwd: dir }).coercionLedger;
   assert.strictEqual(ledger.deepestUnverifiedWindow, 12);
-  assert.strictEqual(ledger.inlineSprawlWindows, 1);
-  assert.strictEqual(ledger.unverifiedAccumulations, 0);
-});
-
-test("coercion ledger includes Bash budget denials in unverified accumulations", (t) => {
-  const dir = sandbox(t);
-  const env = runtimeEnv({ cwd: dir, codexState: path.join(dir, "codex") });
-  writeGuardAuditEvents(env.FUSION_INLINE_GUARD_AUDIT_DIR, "2026-08-01", [
-    { schemaVersion: 1, at: "2026-08-01T10:00:00.000Z", session: "bash-deny", event: "deny", lane: "main", tool: "Bash", writeCount: 6, dispatchCount: 1, budget: 2_000_000, replayTokens: 4_000_000, mode: "enforce", messageCode: messageCode("inline-guard.write-budget-deny") }
-  ]);
-  const ledger = buildFusionStats({ env, cwd: dir }).coercionLedger;
-  assert.strictEqual(ledger.unverifiedAccumulations, 1);
   assert.strictEqual(ledger.inlineSprawlWindows, 1);
 });
 
@@ -4185,9 +4306,7 @@ test("coercion ledger excludes Bash heartbeat denials from write windows", (t) =
   ]);
   const ledger = buildFusionStats({ env, cwd: dir }).coercionLedger;
   assert.strictEqual(ledger.deepestUnverifiedWindow, 0);
-  assert.strictEqual(ledger.unverifiedAccumulations, 0);
   assert.strictEqual(ledger.inlineSprawlWindows, 0);
-  assert.strictEqual(ledger.postureMix.unset, 1);
 });
 
 test("main loop replay stays absent from reports without replay events", (t) => {
@@ -4462,29 +4581,20 @@ test("coercion ledger renders every counter in text and JSON", (t) => {
     readStreakAdvisories: 2,
     fleetShapedWaves: 1,
     verificationResets: 2,
-    unverifiedAccumulations: 2,
     inlineSprawlWindows: 0,
     deepestUnverifiedWindow: 0,
-    postureMix: {
-      judgment: 3,
-      strict: 4,
-      unset: 2
-    }
   });
   const expectedSection = `## Coercion ledger
 
 Read-streak advisories: 2
 Fleet-shaped waves: 1
 Verification resets: 2
-Unverified accumulations: 2
 Inline sprawl windows: 0
-Deepest unverified window: 0
-
-Posture mix:
-- judgment: 3
-- strict: 4
-- unset: 2`;
+Deepest unverified window: 0`;
   assert.ok(renderFusionStats(report).includes(expectedSection));
+  assert.doesNotMatch(renderFusionStats(report), /Posture mix|Unverified accumulations/);
+  assert.strictEqual(Object.hasOwn(report.coercionLedger, "postureMix"), false);
+  assert.strictEqual(Object.hasOwn(report.coercionLedger, "unverifiedAccumulations"), false);
   assert.deepStrictEqual(report.verificationEvidence, { accepted: 0, evidenced: 0, rate: 0, recent: { days: 7, accepted: 0, evidenced: 0, rate: 0 } });
   assert.doesNotMatch(renderFusionStats(report), /## Verification evidence/);
   assert.deepStrictEqual(report.wrapperDelivery, []);
@@ -4495,35 +4605,7 @@ Posture mix:
   assert.deepStrictEqual(JSON.parse(result.stdout).coercionLedger, report.coercionLedger);
 });
 
-test("coercion ledger counts only denied windows without a verification reset", (t) => {
-  const dir = sandbox(t);
-  const auditDir = path.join(dir, "inline-guard-audit");
-  writeGuardAuditEvents(auditDir, "2026-07-18", [
-    { schemaVersion: 1, at: "2026-07-18T10:00:00.000Z", session: "session-window", event: "deny", lane: "main", tool: "Edit" },
-    { schemaVersion: 1, at: "2026-07-18T10:01:00.000Z", session: "session-window", event: "verification", lane: "main", tool: "Bash", writeCount: 1 },
-    { schemaVersion: 1, at: "2026-07-18T10:02:00.000Z", session: "session-window", event: "deny", lane: "main", tool: "Write" },
-    { schemaVersion: 1, at: "2026-07-18T10:03:00.000Z", session: "session-window", event: "deny", lane: "main", tool: "MultiEdit" },
-    { schemaVersion: 1, at: "2026-07-18T10:03:30.000Z", session: "session-window", event: "verification", lane: "main", tool: "Bash", writeCount: 0 },
-    { schemaVersion: 1, at: "2026-07-18T10:04:00.000Z", session: "session-window", event: "dispatch", lane: "codex", tool: "Agent" },
-    { schemaVersion: 1, at: "2026-07-18T10:05:00.000Z", session: "session-window", event: "deny", lane: "main", tool: "NotebookEdit" }
-  ]);
-
-  const report = buildFusionStats({
-    env: {
-      FUSION_DATA_DIR: path.join(dir, "fusion-data"),
-      FUSION_INLINE_GUARD_AUDIT_DIR: auditDir,
-      FUSION_CODEX_STATE: path.join(dir, "missing-codex"),
-      GROK_COMPANION_DATA: path.join(dir, "missing-grok"),
-      FUSION_WORKER_STATE_DIR: path.join(dir, "missing-workers")
-    },
-    cwd: dir
-  });
-
-  assert.strictEqual(report.coercionLedger.verificationResets, 1);
-  assert.strictEqual(report.coercionLedger.unverifiedAccumulations, 2);
-});
-
-test("coercion ledger tolerates legacy audit events without posture or verification", (t) => {
+test("coercion ledger tolerates legacy audit events without window counts or verification", (t) => {
   const dir = sandbox(t);
   const auditDir = path.join(dir, "inline-guard-audit");
   writeGuardAuditEvents(auditDir, "2026-07-19", [
@@ -4546,14 +4628,8 @@ test("coercion ledger tolerates legacy audit events without posture or verificat
     readStreakAdvisories: 0,
     fleetShapedWaves: 0,
     verificationResets: 0,
-    unverifiedAccumulations: 0,
     inlineSprawlWindows: 0,
     deepestUnverifiedWindow: 0,
-    postureMix: {
-      judgment: 0,
-      strict: 0,
-      unset: 0
-    }
   });
   assert.doesNotMatch(renderFusionStats(report), /## Coercion ledger/);
 });
@@ -4566,7 +4642,7 @@ test("coercion ledger skips malformed lines and unknown event kinds", (t) => {
     "{malformed",
     JSON.stringify({ schemaVersion: 1, at: "2026-07-20T10:00:00.000Z", session: "session-unknown", event: "future-event", posture: "strict" }),
     JSON.stringify({ schemaVersion: 1, at: "not-a-date", session: "session-invalid", event: "deny", lane: "main", tool: "Edit" }),
-    JSON.stringify({ schemaVersion: 1, at: "2026-07-20T10:01:00.000Z", session: "session-invalid", event: "warn", reason: "read-streak-advisory", posture: "loose" }),
+    JSON.stringify({ schemaVersion: 1, at: "2026-07-20T10:01:00.000Z", session: "session-invalid", event: "warn", reason: "unknown" }),
     JSON.stringify({ schemaVersion: 1, at: "2026-07-20T10:02:00.000Z", session: "session-valid", event: "warn", reason: "read-streak-advisory", posture: "strict" })
   ].join("\n"), "utf8");
 
@@ -4585,26 +4661,20 @@ test("coercion ledger skips malformed lines and unknown event kinds", (t) => {
     readStreakAdvisories: 1,
     fleetShapedWaves: 0,
     verificationResets: 0,
-    unverifiedAccumulations: 0,
     inlineSprawlWindows: 0,
     deepestUnverifiedWindow: 0,
-    postureMix: {
-      judgment: 0,
-      strict: 1,
-      unset: 0
-    }
   });
 });
 
-test("coercion ledger counts inline sprawl windows from advisory depth without any denial", (t) => {
+test("coercion ledger counts inline sprawl windows from write audits without warnings", (t) => {
   const dir = sandbox(t);
   const auditDir = path.join(dir, "inline-guard-audit");
   writeGuardAuditEvents(auditDir, "2026-07-30", [
-    { schemaVersion: 1, at: "2026-07-30T10:00:00.000Z", session: "session-sprawl", event: "warn", lane: "main", tool: "Edit", writeCount: 5, dispatchCount: 0, budget: 5, mode: "advisory", posture: "judgment" },
-    { schemaVersion: 1, at: "2026-07-30T10:01:00.000Z", session: "session-sprawl", event: "warn", lane: "main", tool: "Write", writeCount: 15, dispatchCount: 0, budget: 5, mode: "advisory", posture: "judgment" },
-    { schemaVersion: 1, at: "2026-07-30T10:02:00.000Z", session: "session-sprawl", event: "verification", lane: "main", tool: "Bash", writeCount: 15, dispatchCount: 0, budget: 5, mode: "advisory", posture: "judgment" },
-    { schemaVersion: 1, at: "2026-07-30T10:03:00.000Z", session: "session-sprawl", event: "warn", lane: "main", tool: "Edit", writeCount: 5, dispatchCount: 0, budget: 5, mode: "advisory", posture: "judgment" },
-    { schemaVersion: 1, at: "2026-07-30T11:00:00.000Z", session: "session-tidy", event: "warn", lane: "main", tool: "Edit", writeCount: 5, dispatchCount: 1, budget: 5, mode: "advisory", posture: "judgment" },
+    { schemaVersion: 1, at: "2026-07-30T10:00:00.000Z", session: "session-sprawl", event: "write", lane: "main", tool: "Edit", writeCount: 5, replayTokens: 2_000_000, dispatchCount: 0, budget: 2_000_000, mode: "advisory", posture: "judgment" },
+    { schemaVersion: 1, at: "2026-07-30T10:01:00.000Z", session: "session-sprawl", event: "write", lane: "main", tool: "Write", writeCount: 15, replayTokens: 6_000_000, dispatchCount: 0, budget: 2_000_000, mode: "advisory", posture: "judgment" },
+    { schemaVersion: 1, at: "2026-07-30T10:02:00.000Z", session: "session-sprawl", event: "verification", lane: "main", tool: "Bash", writeCount: 15, replayTokens: 6_000_000, dispatchCount: 0, budget: 2_000_000, mode: "advisory", posture: "judgment" },
+    { schemaVersion: 1, at: "2026-07-30T10:03:00.000Z", session: "session-sprawl", event: "write", lane: "main", tool: "Edit", writeCount: 5, replayTokens: 2_000_000, dispatchCount: 0, budget: 2_000_000, mode: "advisory", posture: "judgment" },
+    { schemaVersion: 1, at: "2026-07-30T11:00:00.000Z", session: "session-tidy", event: "write", lane: "main", tool: "Edit", writeCount: 5, replayTokens: 2_000_000, dispatchCount: 1, budget: 2_000_000, mode: "advisory", posture: "judgment" },
     { schemaVersion: 1, at: "2026-07-30T11:01:00.000Z", session: "session-tidy", event: "dispatch", lane: "codex", tool: "Agent" }
   ]);
 
@@ -4621,46 +4691,7 @@ test("coercion ledger counts inline sprawl windows from advisory depth without a
 
   assert.strictEqual(report.coercionLedger.inlineSprawlWindows, 1);
   assert.strictEqual(report.coercionLedger.deepestUnverifiedWindow, 15);
-  assert.strictEqual(report.coercionLedger.unverifiedAccumulations, 0);
   assert.match(renderFusionStats(report), /Inline sprawl windows: 1\nDeepest unverified window: 15/);
-});
-
-test("coercion ledger treats historical ceiling denials as ordinary denials", (t) => {
-  const dir = sandbox(t);
-  const auditDir = path.join(dir, "inline-guard-audit");
-  writeGuardAuditEvents(auditDir, "2026-07-31", [
-    { schemaVersion: 1, at: "2026-07-31T10:00:00.000Z", session: "session-ceiling", event: "warn", lane: "main", tool: "Edit", writeCount: 35, dispatchCount: 0, budget: 5, mode: "advisory", posture: "judgment" },
-    {
-      schemaVersion: 1,
-      at: "2026-07-31T10:01:00.000Z",
-      session: "session-ceiling",
-      event: "deny",
-      lane: "main",
-      tool: "Edit",
-      writeCount: 40,
-      dispatchCount: 0,
-      budget: 5,
-      mode: "advisory",
-      posture: "judgment",
-      reason: "unverified-ceiling",
-      ceiling: 40
-    },
-    { schemaVersion: 1, at: "2026-07-31T10:02:00.000Z", session: "session-strict", event: "deny", lane: "main", tool: "Edit", writeCount: 5, dispatchCount: 0, budget: 5, mode: "enforce", posture: "strict" }
-  ]);
-
-  const report = buildFusionStats({
-    env: {
-      FUSION_DATA_DIR: path.join(dir, "fusion-data"),
-      FUSION_INLINE_GUARD_AUDIT_DIR: auditDir,
-      FUSION_CODEX_STATE: path.join(dir, "missing-codex"),
-      GROK_COMPANION_DATA: path.join(dir, "missing-grok"),
-      FUSION_WORKER_STATE_DIR: path.join(dir, "missing-workers")
-    },
-    cwd: dir
-  });
-
-  assert.strictEqual(report.coercionLedger.unverifiedAccumulations, 2);
-  assert.doesNotMatch(renderFusionStats(report), /Unverified ceiling stops/);
 });
 
 test("verification evidence includes later unevidenced acceptances and excludes records without finish times", (t) => {
@@ -4702,7 +4733,7 @@ test("verification evidence includes later unevidenced acceptances and excludes 
   const report = buildFusionStats({ env, cwd: dir });
   assert.deepStrictEqual(report.verificationEvidence, { accepted: 7, evidenced: 2, rate: 2 / 7, recent: { days: 7, accepted: 0, evidenced: 0, rate: 0 } });
   const rendered = renderFusionStats(report);
-  assert.match(rendered, /## Coercion ledger[\s\S]*## Verification evidence\n\nAccepted implementation packages: 7\nWith a credited verification before the verdict: 2 \(28\.6%\)/);
+  assert.match(rendered, /## Verification evidence\n\nAccepted implementation packages: 7\nWith a credited verification before the verdict: 2 \(28\.6%\)/);
   assert.doesNotMatch(rendered, /Last 7 days:/);
   const result = runDirect({ cwd: dir, codexState: env.FUSION_CODEX_STATE }, ["--json"], env);
   assert.strictEqual(result.status, 0, result.stderr);

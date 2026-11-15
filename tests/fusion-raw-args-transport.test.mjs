@@ -6,7 +6,7 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { consumeRawArgsTransport, createRawArgsTransport, resolveRawArgsTransport, splitRawArgs } from "../plugins/fusion/scripts/lib/raw-args-transport.mjs";
+import { consumeRawArgsTransport, createRawArgsTransport, splitRawArgs } from "../plugins/fusion/scripts/lib/raw-args-transport.mjs";
 import { messageCode } from "../plugins/fusion/scripts/lib/user-messages.mjs";
 
 const SCRIPT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "plugins", "fusion", "scripts", "fusion-stats.mjs");
@@ -65,8 +65,7 @@ test("private argument transports are session bound and consumed once", (t) => {
   assert.strictEqual(written.ino, identity.ino);
   assert.strictEqual(written.mode & 0o777, 0o600);
 
-  const resolved = resolveRawArgsTransport(["--raw-args-token", transport.token], { sessionId: "session-a", temporaryRoot });
-  assert.deepStrictEqual(resolved, { argv: ["--audit", "--days", "3", "--json"], ingress: "staged_file" });
+  assert.deepStrictEqual(splitRawArgs(consumeRawArgsTransport(transport.token, { sessionId: "session-a", temporaryRoot })), ["--audit", "--days", "3", "--json"]);
   assert.strictEqual(fs.existsSync(directory), false);
   assert.throws(() => consumeRawArgsTransport(transport.token, { sessionId: "session-a", temporaryRoot }), /Could not read Fusion input transport/);
 });
@@ -84,8 +83,7 @@ test("private argument transport accepts an empty payload as empty argv and remo
 
   const emptyTransport = createRawArgsTransport({ sessionId: "session-a", temporaryRoot });
   const emptyDirectory = path.dirname(emptyTransport.file);
-  const resolved = resolveRawArgsTransport(["--raw-args-token", emptyTransport.token], { sessionId: "session-a", temporaryRoot });
-  assert.deepStrictEqual(resolved, { argv: [], ingress: "staged_file" });
+  assert.deepStrictEqual(splitRawArgs(consumeRawArgsTransport(emptyTransport.token, { sessionId: "session-a", temporaryRoot })), []);
   assert.strictEqual(fs.existsSync(emptyDirectory), false);
 });
 
@@ -122,7 +120,10 @@ test("an invalid transport symlink is rejected without touching its target", (t)
 });
 
 test("transport options cannot be mixed with ordinary arguments", () => {
-  assert.throws(() => resolveRawArgsTransport(["--json", "--raw-args-token", "a".repeat(48)]), /cannot be combined/);
+  const result = spawnSync(process.execPath, [SCRIPT, "--raw-args-token", "a".repeat(48), "--json"], { encoding: "utf8" });
+  assert.strictEqual(result.status, 1);
+  assert.strictEqual(result.stdout, "");
+  assert.match(result.stderr, /The Fusion input transport requires exactly one token/);
   assert.throws(() => splitRawArgs('--reason "unterminated'), /unterminated/);
 });
 

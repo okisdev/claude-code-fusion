@@ -15,6 +15,8 @@ import { gitIsolation } from "./lib/git-fixture.mjs";
 import { inspectCodexRollout, readWorkspaceJobsSnapshot } from "../plugins/fusion/scripts/codex-jobs-monitor.mjs";
 import { fusionRepositoryKey, modelAuditSidecarPath, tokenUsageSidecarPath } from "../plugins/fusion/scripts/fusion-stats.mjs";
 import { engineJobsObserverStatePath, observeEngineJobs, observerScanCache } from "../plugins/fusion/scripts/engine-jobs-observer.mjs";
+import { prepareEngineAcceptanceDelivery } from "../plugins/fusion/scripts/lib/engine-acceptance.mjs";
+import { createWorkerRecord, readWorkerRecord, updateWorkerRecord, workerRecordFile } from "../plugins/fusion/scripts/lib/worker-state.mjs";
 
 const repoRoot = path.join(import.meta.dirname, "..");
 const monitorScript = path.join(repoRoot, "plugins", "fusion", "scripts", "codex-jobs-monitor.mjs");
@@ -154,6 +156,39 @@ function startMonitor(sandbox, env, { cwd = sandbox.workDir, script = monitorScr
     stderr: () => stderr,
   };
 }
+
+test("monitor retries pending and failed engine acceptance delivery outside the worker lock", async (t) => {
+  const sandbox = makeSandbox(t);
+  const taskId = `fusion-${"a".repeat(24)}`;
+  const jobId = "b".repeat(32);
+  const calls = path.join(sandbox.root, "acceptance-calls.jsonl");
+  const ready = path.join(sandbox.root, "delivery-ready");
+  const companion = path.join(sandbox.root, "acceptance-companion.mjs");
+  const env = envFor(sandbox, { FUSION_WORKER_STATE_DIR: path.join(sandbox.root, "workers"), FUSION_CODEX_COMPANION: companion });
+  const file = workerRecordFile(taskId, env);
+  fs.writeFileSync(companion, [
+    'import assert from "node:assert/strict";',
+    'import fs from "node:fs";',
+    'if (process.argv[2] === "record-acceptance") {',
+    `assert.equal(fs.existsSync(${JSON.stringify(`${file}.lock`)}), false);`,
+    `fs.appendFileSync(${JSON.stringify(calls)}, "attempt\\n");`,
+    `if (!fs.existsSync(${JSON.stringify(ready)})) { process.stderr.write("temporary failure"); process.exitCode = 1; }`,
+    '}'
+  ].join("\n"));
+  createWorkerRecord({ taskId, sessionId: "monitor-delivery", agentType: "codex:codex-rescue", workspaceRoot: sandbox.workDir }, env);
+  updateWorkerRecord(taskId, env, (record) => prepareEngineAcceptanceDelivery({ ...record, transportStatus: "done", acceptance: "accepted", acceptanceSource: "main-loop", acceptanceRecordedAt: new Date().toISOString() }, { jobs: [{ engine: "codex", jobId }] }));
+
+  const monitor = startMonitor(sandbox, env);
+  await waitUntil(() => readWorkerRecord(taskId, env).engineAcceptanceDelivery.status === "failed");
+  assert.equal(readWorkerRecord(taskId, env).acceptance, "accepted");
+  fs.writeFileSync(ready, "");
+  await waitUntil(() => readWorkerRecord(taskId, env).engineAcceptanceDelivery.status === "delivered");
+  const attempts = readWorkerRecord(taskId, env).engineAcceptanceDelivery.attempts;
+  assert.ok(attempts >= 2 && attempts <= 5);
+  await new Promise((resolve) => setTimeout(resolve, 450));
+  assert.equal(fs.readFileSync(calls, "utf8").trim().split("\n").length, attempts);
+  assert.equal(monitor.stderr(), "");
+});
 
 function createSiblingWorktree(sandbox) {
   const sibling = path.join(sandbox.root, "sibling-worktree");

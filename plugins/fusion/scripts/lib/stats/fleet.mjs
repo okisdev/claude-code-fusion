@@ -5,8 +5,7 @@ import { messageCode } from "../user-messages.mjs";
 
 const DEFAULT_FLEET_WAVE_GAP_MS = 120000;
 export const FLEET_SHAPED_MIN_WIDTH = 3;
-const COERCION_LEDGER_POSTURES = ["judgment", "strict"];
-const COERCION_LEDGER_POSTURE_EVENTS = new Set(["deny", "warn", "verification", "tail-allowed", "zero-dispatch-softened"]);
+const COERCION_LEDGER_EVENTS = new Set(["dispatch", "write", "deny", "warn", "verification"]);
 const COERCION_LEDGER_WRITE_TOOLS = new Set(["Edit", "Write", "NotebookEdit", "MultiEdit", "Bash"]);
 const COERCION_LEDGER_SPRAWL_MULTIPLE = 2;
 const COERCION_LEDGER_DEFAULT_BUDGET = 5;
@@ -158,14 +157,8 @@ function emptyCoercionLedger(fleetShapedWaves = 0) {
     readStreakAdvisories: 0,
     fleetShapedWaves,
     verificationResets: 0,
-    unverifiedAccumulations: 0,
     inlineSprawlWindows: 0,
-    deepestUnverifiedWindow: 0,
-    postureMix: {
-      judgment: 0,
-      strict: 0,
-      unset: 0
-    }
+    deepestUnverifiedWindow: 0
   };
 }
 
@@ -181,30 +174,23 @@ function normalizeCoercionAuditEvent(value, guardEvent) {
   if (!Number.isFinite(atMs) || !session) {
     return null;
   }
-  const postureEvent = COERCION_LEDGER_POSTURE_EVENTS.has(value.event);
-  if (value.event !== "dispatch" && !postureEvent) {
-    return null;
-  }
-  if (value.posture !== undefined && !COERCION_LEDGER_POSTURES.includes(value.posture)) {
+  if (!COERCION_LEDGER_EVENTS.has(value.event)) {
     return null;
   }
   if (value.event === "verification" && value.lane !== "main") {
     return null;
   }
-  const mainWriteWarn = value.event === "warn" && value.lane === "main" && COERCION_LEDGER_WRITE_TOOLS.has(value.tool);
+  const mainWriteObservation = ["write", "warn"].includes(value.event) && value.lane === "main" && COERCION_LEDGER_WRITE_TOOLS.has(value.tool);
   const heartbeatDeny = value.event === "deny" && value.tool === "Bash" && value.messageCode === messageCode("inline-guard.no-op-heartbeat-deny");
-  const unverifiedWindowWrites = mainWriteWarn && Number.isInteger(value.writeCount) && value.writeCount >= 0 ? value.writeCount : null;
+  const unverifiedWindowWrites = mainWriteObservation && Number.isInteger(value.writeCount) && value.writeCount >= 0 ? value.writeCount : null;
   const budget = Number.isInteger(value.budget) && value.budget > 0 ? value.budget : null;
-  const replayTokens = !heartbeatDeny && value.lane === "main" && ["warn", "deny", "verification"].includes(value.event) && Number.isSafeInteger(value.replayTokens) && value.replayTokens >= 0 ? value.replayTokens : null;
+  const replayTokens = !heartbeatDeny && value.lane === "main" && ["write", "warn", "deny", "verification"].includes(value.event) && Number.isSafeInteger(value.replayTokens) && value.replayTokens >= 0 ? value.replayTokens : null;
   return {
     atMs,
     session,
     event: value.event,
     writeCount: value.event === "verification" && Number.isInteger(value.writeCount) ? value.writeCount : null,
-    postureEvent,
-    posture: value.posture ?? null,
     readStreakAdvisory: value.event === "warn" && value.reason === "read-streak-advisory",
-    deniedWrite: !heartbeatDeny && value.event === "deny" && value.lane === "main" && COERCION_LEDGER_WRITE_TOOLS.has(value.tool),
     unverifiedWindowWrites,
     inlineSprawl: replayTokens !== null
       ? budget !== null && replayTokens >= COERCION_LEDGER_SPRAWL_MULTIPLE * budget
@@ -270,45 +256,38 @@ export function readStatsAuditEvents(env, { sessionId = null, sinceMs = null, un
 
 function inlineWindowFor(windows, session) {
   if (!windows.has(session)) {
-    windows.set(session, { denied: false, sprawl: false });
+    windows.set(session, { sprawl: false });
   }
   return windows.get(session);
 }
 
-function closeInlineWindow(summary, window, countAccumulation) {
-  if (countAccumulation && window.denied) {
-    summary.unverifiedAccumulations += 1;
-  }
+function closeInlineWindow(summary, window) {
   if (window.sprawl) {
     summary.inlineSprawlWindows += 1;
   }
-  window.denied = false;
   window.sprawl = false;
 }
 
 function summarizeInlineWindows(events) {
   const windows = new Map();
-  const summary = { unverifiedAccumulations: 0, inlineSprawlWindows: 0, deepestUnverifiedWindow: 0 };
+  const summary = { inlineSprawlWindows: 0, deepestUnverifiedWindow: 0 };
   for (const event of events) {
     const window = inlineWindowFor(windows, event.session);
     window.sprawl ||= event.inlineSprawl === true;
-    if (event.event === "verification" && event.writeCount > 0) {
-      closeInlineWindow(summary, window, false);
+    if (event.event === "verification") {
+      closeInlineWindow(summary, window);
       continue;
     }
     if (event.event === "dispatch") {
-      closeInlineWindow(summary, window, true);
+      closeInlineWindow(summary, window);
       continue;
-    }
-    if (event.deniedWrite) {
-      window.denied = true;
     }
     if (event.unverifiedWindowWrites != null) {
       summary.deepestUnverifiedWindow = Math.max(summary.deepestUnverifiedWindow, event.unverifiedWindowWrites);
     }
   }
   for (const window of windows.values()) {
-    closeInlineWindow(summary, window, true);
+    closeInlineWindow(summary, window);
   }
   return summary;
 }
@@ -324,9 +303,6 @@ export function buildCoercionLedger({ env = process.env, fleet = null, audit = n
     if (event.event === "verification" && event.writeCount > 0) {
       ledger.verificationResets += 1;
     }
-    if (event.postureEvent) {
-      ledger.postureMix[event.posture ?? "unset"] += 1;
-    }
   }
   Object.assign(ledger, summarizeInlineWindows(events));
   return ledger;
@@ -337,8 +313,8 @@ export function hasCoercionLedgerData(ledger) {
     return false;
   }
   return (
-    ["readStreakAdvisories", "fleetShapedWaves", "verificationResets", "unverifiedAccumulations", "inlineSprawlWindows", "deepestUnverifiedWindow"].some(
+    ["readStreakAdvisories", "fleetShapedWaves", "verificationResets", "inlineSprawlWindows", "deepestUnverifiedWindow"].some(
       (key) => (ledger[key] ?? 0) > 0
-    ) || Object.values(ledger.postureMix ?? {}).some((count) => count > 0)
+    )
   );
 }

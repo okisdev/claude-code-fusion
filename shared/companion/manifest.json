@@ -15,6 +15,7 @@
   "record-lock.mjs": [
     "plugins/grok/scripts/lib/record-lock.mjs",
     "plugins/cursor/scripts/lib/record-lock.mjs",
+    "plugins/codex/scripts/lib/record-lock.mjs",
     "plugins/devin/scripts/lib/record-lock.mjs"
   ],
   "raw-transport.mjs": [
@@ -26,10 +27,20 @@
   "args.mjs": [
     "plugins/grok/scripts/lib/args.mjs",
     "plugins/cursor/scripts/lib/args.mjs",
+    "plugins/codex/scripts/lib/shared-args.mjs",
     "plugins/devin/scripts/lib/args.mjs"
   ],
   "job-state.mjs": [
+    "plugins/grok/scripts/lib/job-state.mjs",
     "plugins/cursor/scripts/lib/job-state.mjs",
     "plugins/devin/scripts/lib/job-state.mjs"
+  ],
+  "companion-commands.mjs": [
+    "plugins/cursor/scripts/lib/companion-commands.mjs",
+    "plugins/devin/scripts/lib/companion-commands.mjs"
+  ],
+  "render-footers.mjs": [
+    "plugins/cursor/scripts/lib/render-footers.mjs",
+    "plugins/devin/scripts/lib/render-footers.mjs"
   ]
 }

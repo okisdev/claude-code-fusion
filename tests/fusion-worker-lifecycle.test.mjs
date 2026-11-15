@@ -10,10 +10,13 @@ import { messageTag, tagMessage } from "../plugins/fusion/scripts/lib/user-messa
 import { pendingBackgroundCommandFromTranscript } from "../plugins/fusion/scripts/lib/lifecycle/notifications.mjs";
 import { settleReapedWorker, settleWrapperApiDeath } from "../plugins/fusion/scripts/lib/lifecycle/collection.mjs";
 import { createWorkerRecord, readWorkerSessionState, readWorkerRecords, recordWorkerAcceptance, refreshWorkerTranscript, reopenWorkerContinuation, updateWorkerRecord, WORKER_COLLECTION_METHODS } from "../plugins/fusion/scripts/lib/worker-state.mjs";
-import { needsCancellation, reverifyCancellationRecords, reverifyInFlightRecords, runtimeTaskMissing, settleOnlyRecords, validateWorkerBrief, workerBudgetFailure, workerLimits } from "../plugins/fusion/scripts/worker-lifecycle.mjs";
+import { needsCancellation, reverifyCancellationRecords, reverifyInFlightRecords, runtimeTaskMissing, settleOnlyRecords } from "../plugins/fusion/scripts/lib/lifecycle/stop.mjs";
+import { validateWorkerBrief } from "../plugins/fusion/scripts/lib/lifecycle/dispatch.mjs";
+import { workerBudgetFailure, workerLimits } from "../plugins/fusion/scripts/lib/lifecycle/budget.mjs";
 
 const repoRoot = path.join(import.meta.dirname, "..");
 const script = path.join(repoRoot, "plugins", "fusion", "scripts", "worker-lifecycle.mjs");
+const statsScript = path.join(repoRoot, "plugins", "fusion", "scripts", "fusion-stats.mjs");
 
 function sandbox(t) {
   const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "fusion-worker-test-")));
@@ -172,9 +175,11 @@ test("collection method write sites use the canonical set", () => {
     assert.match(method, /^[a-z]+(?:_[a-z]+)*$/);
   }
 
+  const lifecycleDir = path.join(repoRoot, "plugins", "fusion", "scripts", "lib", "lifecycle");
   const sources = [
     fs.readFileSync(script, "utf8"),
-    fs.readFileSync(path.join(repoRoot, "plugins", "fusion", "scripts", "lib", "worker-state.mjs"), "utf8")
+    fs.readFileSync(path.join(repoRoot, "plugins", "fusion", "scripts", "lib", "worker-state.mjs"), "utf8"),
+    ...fs.readdirSync(lifecycleDir).filter((file) => file.endsWith(".mjs")).map((file) => fs.readFileSync(path.join(lifecycleDir, file), "utf8"))
   ];
   const assignments = sources.flatMap((source) => [...source.matchAll(/collectionMethod:\s*([^,\n}]+)/g)].map((match) => match[1].trim()));
   assert.ok(assignments.length > 0);
@@ -3097,7 +3102,9 @@ test("Stop advises on collected unverified workers without blocking and stays qu
   const output = JSON.parse(advisory.stdout);
   assert.strictEqual(output.decision, undefined);
   assert.match(output.hookSpecificOutput.additionalContext, /Acceptance remains unverified for 1 collected Fusion worker/);
-  assert.match(output.hookSpecificOutput.additionalContext, new RegExp(`/fusion:stats --record ${completed.taskId}=accepted\\|rejected\\|unverified`));
+  assert.ok(output.hookSpecificOutput.additionalContext.includes(`node "${statsScript}" --record ${completed.taskId}=accepted|rejected|unverified`));
+  assert.ok(fs.existsSync(statsScript));
+  assert.ok(path.isAbsolute(statsScript));
   assert.match(output.hookSpecificOutput.additionalContext, /pairs are <id>=<verdict> with id either a fusion task id \(fusion- plus 24 lowercase hex\) or an engine job id \(32 lowercase hex\), verdict one of accepted\|rejected\|unverified/);
 
   recordWorkerAcceptance({ taskId: completed.taskId, acceptance: "accepted", env: envFor(box), source: "main-loop" });
@@ -3707,7 +3714,7 @@ test("a terminal cancelled runtimeAsync worker is demanded by Stop and collected
   assert.doesNotMatch(clearedOutput.hookSpecificOutput.additionalContext, /Call Read with file_path=|TaskOutput/);
 });
 
-test("a failed Read of a terminal runtimeAsync record's output file collects with a limit", (t) => {
+test("a failed Read of a terminal runtimeAsync record's output file does not collect with a limit", (t) => {
   const box = sandbox(t);
   const outputFile = path.join(box.root, "tasks", "terminal-partial.output");
   const output = "worker final message\n";
@@ -3736,11 +3743,49 @@ test("a failed Read of a terminal runtimeAsync record's output file collects wit
     tool_response: { is_error: true, content: "Read output exceeded the size limit" }
   });
 
-  const collected = record(box);
-  assert.ok(collected.collectedAt);
-  assert.strictEqual(collected.collectionMethod, "output_file_read");
-  assert.strictEqual(collected.transportStatus, "done");
+  const untouched = record(box);
+  assert.strictEqual(untouched.collectedAt, null);
+  assert.strictEqual(untouched.collectionMethod, null);
+  assert.strictEqual(untouched.transportStatus, "failed");
 });
+
+for (const toolName of ["Read", "TaskOutput"]) {
+  for (const scenario of ["failed", "is_error", "isError", "empty", "whitespace", "empty output", "unrelated", "other session"]) {
+    test(`${toolName} ${scenario} result preserves collection and a queued accepted verdict`, (t) => {
+      const box = sandbox(t);
+      run(box, dispatch(box));
+      const taskId = record(box).taskId;
+      const outputFile = path.join(box.state, "jobs", `${taskId}.final.txt`);
+      fs.writeFileSync(outputFile, "worker final message\n", "utf8");
+      recordWorkerAcceptance({ taskId, acceptance: "accepted", env: envFor(box), source: "main-loop" });
+      const before = updateWorkerRecord(taskId, envFor(box), (current) => ({
+        ...current,
+        transportStatus: "ready_uncollected",
+        agentId: "collection-worker",
+        backgroundTaskId: "collection-worker",
+        outputFile
+      }));
+      const text = scenario === "empty" ? "" : scenario === "whitespace" ? " \n\t " : scenario === "empty output" ? "<status>completed</status><output> </output>" : "worker final message";
+      const response = { type: "text", text, ...(["is_error", "isError"].includes(scenario) ? { [scenario]: true } : {}) };
+      const result = run(box, {
+        hook_event_name: scenario === "failed" ? "PostToolUseFailure" : "PostToolUse",
+        session_id: scenario === "other session" ? "session-other" : "session-1",
+        cwd: box.cwd,
+        transcript_path: box.transcript,
+        tool_name: toolName,
+        tool_input: toolName === "Read"
+          ? { file_path: scenario === "unrelated" ? path.join(box.root, "unrelated.txt") : outputFile }
+          : { task_id: scenario === "unrelated" ? "unrelated-worker" : "collection-worker", block: true },
+        tool_response: response
+      });
+
+      assert.strictEqual(result.status, 0, result.stderr);
+      assert.deepStrictEqual(record(box), before);
+      assert.strictEqual(record(box).acceptance, "unverified");
+      assert.strictEqual(record(box).pendingVerdict.acceptance, "accepted");
+    });
+  }
+}
 
 test("a Read of a terminal runtimeAsync record's transcript path collects with offset and limit", (t) => {
   const box = sandbox(t);
@@ -4655,7 +4700,7 @@ test("a structured Grok collection remains gated until the main loop records a s
   });
   assert.strictEqual(JSON.parse(blocked.stdout).decision, "block");
   assert.match(JSON.parse(blocked.stdout).reason, new RegExp(collector.taskId));
-  assert.match(JSON.parse(blocked.stdout).reason, new RegExp(`/fusion:stats --record ${collector.taskId}=accepted\\|rejected\\|unverified`));
+  assert.ok(JSON.parse(blocked.stdout).reason.includes(`node "${statsScript}" --record ${collector.taskId}=accepted|rejected|unverified`));
 
   recordWorkerAcceptance({ taskId: collector.taskId, acceptance: "accepted", env: envFor(box), source: "main-loop" });
   const allowed = run(box, {
@@ -5845,8 +5890,8 @@ test("Stop blocks one batched settlement demand after the wave drains", (t) => {
   const blocked = stop(box);
   const output = JSON.parse(blocked.stdout);
   assert.strictEqual(output.decision, "block");
-  assert.strictEqual((output.reason.match(/\/fusion:stats --record/g) ?? []).length, 1);
-  assert.match(output.reason, new RegExp(`/fusion:stats --record ${first.taskId}=accepted\\|rejected\\|unverified --record ${second.taskId}=accepted\\|rejected\\|unverified`));
+  assert.strictEqual((output.reason.match(/ --record /g) ?? []).length, 1);
+  assert.ok(output.reason.includes(`node "${statsScript}" --record ${first.taskId}=accepted|rejected|unverified ${second.taskId}=accepted|rejected|unverified`));
 });
 
 test("a stale collected settlement blocks despite an in-flight sibling", (t) => {

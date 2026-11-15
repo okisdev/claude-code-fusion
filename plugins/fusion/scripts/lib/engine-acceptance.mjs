@@ -1,4 +1,5 @@
 import { spawnSync } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -7,6 +8,11 @@ import { fileURLToPath } from "node:url";
 import { ENGINES, isEngineId } from "./engines.mjs";
 import { readEngineJobRecord } from "./engine-job-state.mjs";
 import { RESUMABLE_CODEX_FAILURE_KINDS } from "./stats/evidence.mjs";
+import { withFileLock } from "./storage.mjs";
+import { readWorkerRecord, readWorkerRecords, updateWorkerRecord, workerRecordFile } from "./worker-state.mjs";
+
+const ACCEPTANCE_TIMEOUT_MS = 10_000;
+const DELIVERY_ATTEMPT_LIMIT = 5;
 
 export class EnginePluginUpgradeRequiredError extends Error {
   constructor(message) {
@@ -135,7 +141,10 @@ export function recordEngineAcceptance({ engine, jobId, acceptance, source, reas
   let updated = false;
   if (bin) {
     const argv = [bin, "record-acceptance", "--job-id", jobId, "--acceptance", acceptance, ...(source ? ["--source", source] : []), ...(reason ? ["--reason", reason] : []), ...(failureKind ? ["--failure-kind", failureKind] : []), ...(acceptFailedTransport ? ["--accept-failed-transport"] : []), ...(asJson ? ["--json"] : [])];
-    const result = spawnSync(process.execPath, argv, { cwd: path.dirname(bin), encoding: "utf8", env });
+    const result = spawnSync(process.execPath, argv, { cwd: path.dirname(bin), encoding: "utf8", env, timeout: ACCEPTANCE_TIMEOUT_MS, killSignal: "SIGKILL" });
+    if (result.error?.code === "ETIMEDOUT") {
+      return { updated: false, error: new Error(`${displayName} acceptance record update timed out after 10 seconds.`) };
+    }
     if (result.error) {
       throw result.error;
     }
@@ -149,4 +158,99 @@ export function recordEngineAcceptance({ engine, jobId, acceptance, source, reas
     throw new EnginePluginUpgradeRequiredError(`The ${displayName} job was found, but its companion is unavailable or does not support record-acceptance. Upgrade the ${displayName} plugin and retry.`);
   }
   return { updated };
+}
+
+function deliveryState(entries) {
+  const failures = entries.filter((entry) => entry.status === "failed");
+  return {
+    status: entries.every((entry) => entry.status === "delivered") ? "delivered" : failures.length ? "failed" : "pending",
+    attempts: entries.reduce((total, entry) => total + entry.attempts, 0),
+    lastError: failures.map((entry) => `${entry.jobId}: ${entry.lastError}`).join("; ") || null,
+    updatedAt: new Date().toISOString(),
+    entries
+  };
+}
+
+export function prepareEngineAcceptanceDelivery(record, { jobs, acceptFailedTransport = false }) {
+  const entries = [...(record.engineAcceptanceDelivery?.entries ?? [])];
+  for (const { engine, jobId } of jobs) {
+    const payload = { engine, jobId, acceptance: record.acceptance, source: record.acceptanceSource, reason: record.acceptanceReason ?? null, failureKind: record.acceptanceFailureKind ?? null, acceptFailedTransport };
+    const index = entries.findIndex((entry) => entry.engine === engine && entry.jobId === jobId);
+    if (index >= 0 && Object.entries(payload).every(([key, value]) => entries[index][key] === value)) {
+      continue;
+    }
+    const entry = { ...payload, id: randomUUID(), status: "pending", attempts: 0, failures: 0, lastError: null, updatedAt: new Date().toISOString() };
+    if (index >= 0) entries[index] = entry;
+    else entries.push(entry);
+  }
+  return { ...record, engineAcceptanceDelivery: deliveryState(entries) };
+}
+
+function deliveryFailures(entry) {
+  return entry.failures ?? Math.max(0, entry.attempts - Number(Boolean(entry.attemptId)));
+}
+
+function retryableDelivery(entry) {
+  return entry.status !== "delivered" && deliveryFailures(entry) < DELIVERY_ATTEMPT_LIMIT
+    && (!entry.attemptId || Date.now() - Date.parse(entry.updatedAt) > ACCEPTANCE_TIMEOUT_MS + 1_000);
+}
+
+export function deliverWorkerEngineAcceptance({ taskId, env = process.env, asJson = false }) {
+  const snapshot = readWorkerRecord(taskId, env);
+  for (const candidate of snapshot?.engineAcceptanceDelivery?.entries ?? []) {
+    if (!retryableDelivery(candidate)) continue;
+    const lock = path.join(path.dirname(workerRecordFile(taskId, env)), `.acceptance-${candidate.engine}-${candidate.jobId}`);
+    let acquired = false;
+    try {
+      withFileLock(lock, () => {
+        acquired = true;
+        for (;;) {
+          let claimed = null;
+          updateWorkerRecord(taskId, env, (record) => {
+            const entries = record?.engineAcceptanceDelivery?.entries;
+            const current = entries?.find((entry) => entry.engine === candidate.engine && entry.jobId === candidate.jobId);
+            if (!current || !retryableDelivery(current)) return null;
+            claimed = { ...current, status: "pending", attempts: current.attempts + 1, failures: deliveryFailures(current), attemptId: randomUUID(), updatedAt: new Date().toISOString() };
+            return { ...record, engineAcceptanceDelivery: deliveryState(entries.map((entry) => entry.id === claimed.id ? claimed : entry)) };
+          });
+          if (!claimed) break;
+          let lastError = null;
+          try {
+            const transport = engineAcceptanceTransport({ ...claimed, env });
+            const result = recordEngineAcceptance({ ...claimed, acceptFailedTransport: transport.acceptFailedTransport, asJson, env });
+            if (!result.updated) throw result.error ?? new Error("Engine acceptance record update failed.");
+          } catch (error) {
+            lastError = error instanceof Error ? error.message : String(error);
+          }
+          let replaced = false;
+          updateWorkerRecord(taskId, env, (record) => {
+            const entries = record?.engineAcceptanceDelivery?.entries;
+            replaced = entries?.some((entry) => entry.engine === claimed.engine && entry.jobId === claimed.jobId && entry.id !== claimed.id);
+            if (!entries?.some((entry) => entry.id === claimed.id && entry.attemptId === claimed.attemptId)) return null;
+            const updatedEntries = entries.map((entry) => entry.id === claimed.id && entry.attemptId === claimed.attemptId
+              ? { ...entry, status: lastError ? "failed" : "delivered", failures: claimed.failures + Number(lastError !== null), lastError, attemptId: null, updatedAt: new Date().toISOString() }
+              : entry);
+            const state = deliveryState(updatedEntries);
+            const { engineSettlementError: _engineSettlementError, ...updated } = record;
+            return { ...updated, engineAcceptanceDelivery: state, ...(state.lastError ? { engineSettlementError: state.lastError } : {}) };
+          });
+          if (!replaced) break;
+        }
+      }, { timeoutMs: 0, staleMs: ACCEPTANCE_TIMEOUT_MS + 1_000 });
+    } catch (error) {
+      if (acquired || error?.code !== "ETIMEDOUT") throw error;
+    }
+  }
+  return readWorkerRecord(taskId, env);
+}
+
+export function retryWorkerEngineAcceptances({ env = process.env, skipTaskIds = new Set() } = {}) {
+  for (const record of readWorkerRecords(env)) {
+    if (skipTaskIds.has(record.taskId) || !record.engineAcceptanceDelivery?.entries?.some(retryableDelivery)) continue;
+    try {
+      deliverWorkerEngineAcceptance({ taskId: record.taskId, env });
+    } catch {
+      continue;
+    }
+  }
 }
