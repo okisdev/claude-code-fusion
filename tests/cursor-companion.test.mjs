@@ -146,6 +146,29 @@ test("late result close keeps a done outcome with a warning", (t) => {
   assert.deepEqual(h.jobs()[0].warnings, ["late_close"]);
 });
 
+test("a timed out Cursor job reports its timeout duration in every result surface", (t) => {
+  const timeoutMs = 250;
+  const h = harness(t, { FAKE_CURSOR_SCENARIO: "hang", CURSOR_COMPANION_TIMEOUT_MS: String(timeoutMs), CURSOR_COMPANION_EXIT_GRACE_MS: "100" });
+  const result = task(h, ["--json"]);
+  assert.equal(result.status, 1, result.stdout + result.stderr);
+  const [record] = h.jobs();
+  const message = `Cursor timed out after ${timeoutMs}ms and was terminated.`;
+  assert.equal(record.status, "error");
+  assert.equal(record.failureKind, "timeout");
+  assert.equal(record.errorMessage, message);
+  assert.equal(JSON.parse(result.stdout).message, message);
+  const status = h.run(["status", record.id, "--json"]);
+  assert.equal(status.status, 0, status.stdout + status.stderr);
+  assert.equal(JSON.parse(status.stdout).errorMessage, message);
+  const collected = h.run(["result", record.id, "--json"]);
+  assert.equal(collected.status, 0, collected.stdout + collected.stderr);
+  assert.equal(JSON.parse(collected.stdout).message, message);
+  const text = h.run(["result", record.id]);
+  assert.equal(text.status, 0, text.stdout + text.stderr);
+  assert.ok(text.stdout.includes(message));
+  assert.match(text.stdout, /state: error\nfailure: timeout\n$/);
+});
+
 test("unknown model and auto fail before job creation", (t) => {
   const h = harness(t);
   for (const model of ["unknown", "auto"]) {

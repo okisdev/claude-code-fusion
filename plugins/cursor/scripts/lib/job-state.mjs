@@ -33,6 +33,9 @@ export function createJobState({
   recordFields,
   requiredRecordFields,
   cancelledRecordFields = () => ({}),
+  migrate,
+  validateRecord,
+  normalizeRecord = (record) => record,
   maintainTerminalRecord
 }) {
   const versionField = `${engine}Version`;
@@ -267,12 +270,12 @@ export function createJobState({
     const transportStatus = record.status;
     const semanticStatus = record.semanticStatus;
     const deliveryStatus = deliveryStatusFor(record);
-    return {
+    return normalizeRecord({
       ...record,
       transportStatus,
       semanticStatus,
       deliveryStatus
-    };
+    });
   }
 
   function preserveTerminalRecord(existing, next) {
@@ -312,18 +315,17 @@ export function createJobState({
   }
 
   function writeJobRecordFile(file, record) {
-    withRecordLock(file, () => {
-      const existing = readJobRecordFile(file);
+    withRecordUpdate(file, (existing) => {
       const next = preserveTerminalRecord(existing, record);
       atomicWriteFile(file, `${JSON.stringify(next, null, 2)}\n`);
-      maintainTerminalRecord(file, next);
+      return next;
     });
     return file;
   }
 
   function markManagedDeliveryCollectedFile(file, collectedAt = nowIso()) {
     return withRecordLock(file, () => {
-      const existing = readJobRecordFile(file);
+      const existing = readJobRecordFile(file, true);
       if (!existing || existing.delivery !== "managed" || !TERMINAL_STATUSES.has(existing.status) || existing.deliveryCollectedAt) {
         return existing;
       }
@@ -335,7 +337,7 @@ export function createJobState({
 
   function markDeliveryCollectedFile(file, collectedAt = nowIso()) {
     return withRecordLock(file, () => {
-      const existing = readJobRecordFile(file);
+      const existing = readJobRecordFile(file, true);
       if (!existing || existing.delivery === "foreground" || !TERMINAL_STATUSES.has(existing.status) || existing.deliveryCollectedAt) {
         return existing;
       }
@@ -362,13 +364,24 @@ export function createJobState({
       Object.hasOwn(record, "cleanupRequired");
   }
 
-  function readJobRecordFile(file) {
+  function readJobRecordFile(file, locked = false) {
     if (!fs.existsSync(file)) {
       return null;
     }
     try {
       const record = JSON.parse(fs.readFileSync(file, "utf8"));
-      return path.basename(path.dirname(file)) === "jobs" && !currentJobRecord(record) ? null : record;
+      if (migrate) {
+        if (!record || typeof record !== "object" || Array.isArray(record) || !Object.hasOwn(record, "id")) return record;
+        const migrated = migrate(record);
+        if (!(validateRecord ?? currentJobRecord)(migrated)) return null;
+        if (migrated === record) return record;
+        if (locked) {
+          atomicWriteFile(file, `${JSON.stringify(migrated, null, 2)}\n`);
+          return migrated;
+        }
+        return withRecordLock(file, () => readJobRecordFile(file, true));
+      }
+      return path.basename(path.dirname(file)) === "jobs" && !(validateRecord ?? currentJobRecord)(record) ? null : record;
     } catch {
       return null;
     }
@@ -420,11 +433,13 @@ export function createJobState({
         const id = entry.name.slice(0, -5);
         try {
           const stats = fs.lstatSync(file, { throwIfNoEntry: false });
-          if (!stats?.isFile() || stats.isSymbolicLink() ||
-              !expired(JSON.parse(fs.readFileSync(file, "utf8")), stats, id)) continue;
+          if (!stats?.isFile() || stats.isSymbolicLink()) continue;
+          const raw = JSON.parse(fs.readFileSync(file, "utf8"));
+          if (!expired(migrate ? migrate(raw) : raw, stats, id)) continue;
           withRecordLock(file, () => {
             const stats = fs.lstatSync(file, { throwIfNoEntry: false });
-            const record = JSON.parse(fs.readFileSync(file, "utf8"));
+            const raw = JSON.parse(fs.readFileSync(file, "utf8"));
+            const record = migrate ? migrate(raw) : raw;
             if (!expired(record, stats, id)) return;
             const brief = record.briefFile;
             const briefDir = path.join(workspaceDir, "briefs");
@@ -474,12 +489,14 @@ export function createJobState({
   }
 
   function repairDeadResumeOwner(file, sessionId) {
-    return updateJobRecordFileWithCurrent(file, (current) => {
+    return withRecordLock(file, () => {
+      const current = readJobRecordFile(file, true);
+      if (!current) throw new Error(`No job record found at ${file}.`);
       if (current.status !== "running" || resumeOwnerMayStillRun(current)) {
         return current;
       }
       const message = `The process that owned ${engineName} session ${sessionId} exited without recording a terminal outcome.`;
-      return {
+      const next = preserveTerminalRecord(current, {
         ...current,
         status: "error",
         finishedAt: nowIso(),
@@ -487,65 +504,85 @@ export function createJobState({
         errorTail: message,
         failureKind: "died",
         cancelRequestedAt: null
-      };
-    });
-  }
-
-  function claimResumeSessionLease(dataDir, cwd, sessionId, ownerJobId, { preflight = false } = {}) {
-    const file = resumeSessionLeasePath(dataDir, cwd, sessionId);
-    return withRecordLock(file, () => {
-      const exists = fs.existsSync(file);
-      const existing = readJobRecordFile(file);
-      if (
-        exists &&
-        (!existing ||
-          existing.version !== 1 ||
-          existing.sessionId !== sessionId ||
-          typeof existing.ownerJobId !== "string" ||
-          typeof existing.claimedAt !== "string")
-      ) {
-        throw resourceError(`The resume session lease for ${sessionId} is invalid.`);
-      }
-      if (existing?.ownerJobId === ownerJobId) {
-        return existing;
-      }
-      if (existing) {
-        const owner = readJobRecord(dataDir, cwd, existing.ownerJobId);
-        if (!owner && Number.isInteger(existing.ownerPid) && recordedResumeOwnerProcessIsAlive(existing.ownerPid, existing.ownerPidIdentity)) {
-          throw resourceError(`${engineName} session ${sessionId} is already being resumed by running job ${existing.ownerJobId} in this workspace. Inspect it with /${engine}:status ${existing.ownerJobId}, then collect or cancel it before retrying.`);
-        }
-        if (owner && (owner.id !== existing.ownerJobId || (owner.status !== "running" && !TERMINAL_STATUSES.has(owner.status)))) {
-          throw resourceError(`The resume session lease for ${sessionId} has an invalid owner record.`);
-        }
-        if (!owner && !Number.isInteger(existing.ownerPid)) {
-          throw resourceError(`The resume session lease for ${sessionId} has an invalid owner record.`);
-        }
-        if (owner?.status === "running") {
-          const repaired = repairDeadResumeOwner(jobFilePath(dataDir, cwd, existing.ownerJobId), sessionId);
-          if (repaired.status === "running") {
-            throw resourceError(`${engineName} session ${sessionId} is already being resumed by running job ${existing.ownerJobId} in this workspace. Inspect it with /${engine}:status ${existing.ownerJobId}, then collect or cancel it before retrying.`);
-          }
-        }
-      }
-      const nextOwner = readJobRecord(dataDir, cwd, ownerJobId);
-      if ((!preflight || nextOwner) && (!nextOwner || nextOwner.id !== ownerJobId || nextOwner.status !== "running")) {
-        throw resourceError(`${engineName} session ${sessionId} cannot be leased to invalid job ${ownerJobId}.`);
-      }
-      const next = {
-        version: 1,
-        sessionId,
-        ownerJobId,
-        ...(preflight ? { ownerPid: process.pid, ownerPidIdentity: getProcessIdentity(process.pid) } : {}),
-        claimedAt: nowIso()
-      };
+      });
       atomicWriteFile(file, `${JSON.stringify(next, null, 2)}\n`);
       return next;
     });
   }
 
+  function claimResumeSessionLease(dataDir, cwd, sessionId, ownerJobId, { preflight = false } = {}) {
+    const file = resumeSessionLeasePath(dataDir, cwd, sessionId);
+    let repairedOwner;
+    try {
+      return withRecordLock(file, () => {
+        const exists = fs.existsSync(file);
+        const existing = readJobRecordFile(file);
+        if (
+          exists &&
+          (!existing ||
+            existing.version !== 1 ||
+            existing.sessionId !== sessionId ||
+            typeof existing.ownerJobId !== "string" ||
+            typeof existing.claimedAt !== "string")
+        ) {
+          throw resourceError(`The resume session lease for ${sessionId} is invalid.`);
+        }
+        if (existing?.ownerJobId === ownerJobId) {
+          return existing;
+        }
+        if (existing) {
+          const owner = readJobRecord(dataDir, cwd, existing.ownerJobId);
+          if (!owner && Number.isInteger(existing.ownerPid) && recordedResumeOwnerProcessIsAlive(existing.ownerPid, existing.ownerPidIdentity)) {
+            throw resourceError(`${engineName} session ${sessionId} is already being resumed by running job ${existing.ownerJobId} in this workspace. Inspect it with /${engine}:status ${existing.ownerJobId}, then collect or cancel it before retrying.`);
+          }
+          if (owner && (owner.id !== existing.ownerJobId || (owner.status !== "running" && !TERMINAL_STATUSES.has(owner.status)))) {
+            throw resourceError(`The resume session lease for ${sessionId} has an invalid owner record.`);
+          }
+          if (!owner && !Number.isInteger(existing.ownerPid)) {
+            throw resourceError(`The resume session lease for ${sessionId} has an invalid owner record.`);
+          }
+          if (owner?.status === "running") {
+            const repaired = repairDeadResumeOwner(jobFilePath(dataDir, cwd, existing.ownerJobId), sessionId);
+            if (repaired.status === "running") {
+              throw resourceError(`${engineName} session ${sessionId} is already being resumed by running job ${existing.ownerJobId} in this workspace. Inspect it with /${engine}:status ${existing.ownerJobId}, then collect or cancel it before retrying.`);
+            }
+            repairedOwner = repaired;
+          }
+        }
+        const nextOwner = readJobRecord(dataDir, cwd, ownerJobId);
+        if ((!preflight || nextOwner) && (!nextOwner || nextOwner.id !== ownerJobId || nextOwner.status !== "running")) {
+          throw resourceError(`${engineName} session ${sessionId} cannot be leased to invalid job ${ownerJobId}.`);
+        }
+        const next = {
+          version: 1,
+          sessionId,
+          ownerJobId,
+          ...(preflight ? { ownerPid: process.pid, ownerPidIdentity: getProcessIdentity(process.pid) } : {}),
+          claimedAt: nowIso()
+        };
+        atomicWriteFile(file, `${JSON.stringify(next, null, 2)}\n`);
+        return next;
+      });
+    } finally {
+      if (repairedOwner) maintainTerminalRecord(jobFilePath(dataDir, cwd, repairedOwner.id), repairedOwner);
+    }
+  }
+
+  function withRecordUpdate(file, update) {
+    let becameTerminal = false;
+    const record = withRecordLock(file, () => {
+      const existing = readJobRecordFile(file, true);
+      const wasActive = existing && !TERMINAL_STATUSES.has(existing.status);
+      const next = update(existing);
+      becameTerminal = wasActive && TERMINAL_STATUSES.has(next?.status);
+      return next;
+    });
+    if (becameTerminal) maintainTerminalRecord(file, record);
+    return record;
+  }
+
   function updateJobRecordFile(file, patch) {
-    return withRecordLock(file, () => {
-      const existing = readJobRecordFile(file);
+    return withRecordUpdate(file, (existing) => {
       if (!existing) {
         throw new Error(`No job record found at ${file}.`);
       }
@@ -554,7 +591,6 @@ export function createJobState({
       }
       const next = preserveTerminalRecord(existing, { ...existing, ...patch });
       atomicWriteFile(file, `${JSON.stringify(next, null, 2)}\n`);
-      if (!TERMINAL_STATUSES.has(existing.status)) maintainTerminalRecord(file, next);
       return next;
     });
   }
@@ -563,7 +599,7 @@ export function createJobState({
     return withRecordLock(file, () => {
       const processRole = options.processRole === "worker" ? "worker" : engine;
       const processLabel = processRole === "worker" ? "Background worker" : `${engineName} process`;
-      const existing = readJobRecordFile(file);
+      const existing = readJobRecordFile(file, true);
       if (!existing) {
         throw new Error(`No job record found at ${file}.`);
       }
@@ -587,7 +623,7 @@ export function createJobState({
       }
 
       const launched = launch();
-      const pid = launched?.child?.pid;
+      const pid = launched?.pid ?? launched?.child?.pid;
       if (!Number.isInteger(pid) || pid <= 1) {
         const error = resourceError(`${processLabel} launch for job ${existing.id} did not produce a valid PID.`);
         error.processRole = processRole;
@@ -606,8 +642,7 @@ export function createJobState({
   }
 
   function updateJobRecordFileWithCurrent(file, updater, options = {}) {
-    return withRecordLock(file, () => {
-      const existing = readJobRecordFile(file);
+    return withRecordUpdate(file, (existing) => {
       if (!existing) {
         throw new Error(`No job record found at ${file}.`);
       }
@@ -630,14 +665,12 @@ export function createJobState({
         return existing;
       }
       atomicWriteFile(file, `${JSON.stringify(next, null, 2)}\n`);
-      if (!TERMINAL_STATUSES.has(existing.status)) maintainTerminalRecord(file, next);
       return next;
     });
   }
 
   function finishSuccessfulJobRecordFile(file, successPatch) {
-    return withRecordLock(file, () => {
-      const existing = readJobRecordFile(file);
+    return withRecordUpdate(file, (existing) => {
       if (!existing) {
         throw new Error(`No job record found at ${file}.`);
       }
@@ -672,7 +705,6 @@ export function createJobState({
         : { ...success, cancelRequestedAt: null };
       const next = preserveTerminalRecord(existing, { ...existing, ...patch });
       atomicWriteFile(file, `${JSON.stringify(next, null, 2)}\n`);
-      maintainTerminalRecord(file, next);
       return next;
     });
   }
@@ -699,7 +731,8 @@ export function createJobState({
       }
     }
     return records.sort((left, right) =>
-      right.createdAt.localeCompare(left.createdAt) || right.id.localeCompare(left.id)
+      String(right.createdAt ?? "").localeCompare(String(left.createdAt ?? "")) ||
+      String(right.id ?? "").localeCompare(String(left.id ?? ""))
     );
   }
 
@@ -741,8 +774,8 @@ export function createJobState({
     }
     return results.sort(
       (left, right) =>
-        right.record.createdAt.localeCompare(left.record.createdAt) ||
-        right.record.id.localeCompare(left.record.id) ||
+        String(right.record.createdAt ?? "").localeCompare(String(left.record.createdAt ?? "")) ||
+        String(right.record.id ?? "").localeCompare(String(left.record.id ?? "")) ||
         String(left.file).localeCompare(String(right.file))
     );
   }
@@ -856,6 +889,7 @@ export function createJobState({
     listJobRecords,
     listAllJobRecords,
     pruneJobRecords,
+    resumeOwnerMayStillRun,
     findJobRecordById,
     writeBrief,
     writePrivateDataFile,

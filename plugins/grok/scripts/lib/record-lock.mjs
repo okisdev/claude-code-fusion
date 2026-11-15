@@ -1,4 +1,5 @@
 import { randomBytes } from "node:crypto";
+import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import {
@@ -19,8 +20,8 @@ function sleepMs(ms) {
 
 let recordLockDeps;
 
-export function configureRecordLock({ atomicWriteFile, ensurePrivateDir, ensurePrivateStatePath, resolveLockTimeoutMs }) {
-  recordLockDeps = { atomicWriteFile, ensurePrivateDir, ensurePrivateStatePath, resolveLockTimeoutMs };
+export function configureRecordLock({ atomicWriteFile, ensurePrivateDir, ensurePrivateStatePath, resolveLockTimeoutMs, reaperClaimPath = reaperClaimSlot, onReleaseError }) {
+  recordLockDeps = { atomicWriteFile, ensurePrivateDir, ensurePrivateStatePath, resolveLockTimeoutMs, reaperClaimPath, onReleaseError };
 }
 
 function lockOwnerDir(lockDir, token) {
@@ -89,12 +90,12 @@ function publishPreparedLock(lockDir, ownerDir) {
   }
 }
 
-function createLinkedOwner(linkPath, record, deps) {
+function createLinkedOwner(linkPath, record, deps, retryMissingDirectory = true) {
   const ownerDir = lockOwnerDir(linkPath, record.token);
   const preparedDir = `${ownerDir}.prepare.${process.pid}.${randomBytes(8).toString("hex")}`;
   deps.ensurePrivateDir(preparedDir);
   try {
-    deps.atomicWriteFile(path.join(preparedDir, "owner.json"), `${JSON.stringify(record)}\n`);
+    deps.atomicWriteFile(path.join(preparedDir, "owner.json"), `${JSON.stringify(record)}\n`, retryMissingDirectory);
     fs.renameSync(preparedDir, ownerDir);
     return { ownerDir, published: publishPreparedLock(linkPath, ownerDir) };
   } catch (error) {
@@ -128,8 +129,8 @@ function linkedPathExists(linkPath) {
   }
 }
 
-function reaperClaimSlot(lockDir, token) {
-  return `${lockDir}.reap.${token}`;
+function reaperClaimSlot(lockDir, token, predecessorToken) {
+  return `${lockDir}.reap.${token}${predecessorToken ? `.successor-${predecessorToken}` : ""}`;
 }
 
 function claimTeardownError(error) {
@@ -144,7 +145,7 @@ function acquireReaperClaim(lockDir, ownerToken, deps) {
     ownerPid: process.pid,
     ownerIdentity: lockOwnerIdentity()
   };
-  const primarySlot = reaperClaimSlot(lockDir, ownerToken);
+  const primarySlot = deps.reaperClaimPath(lockDir, ownerToken);
   let slot = primarySlot;
   const observedTokens = new Set();
   for (;;) {
@@ -155,10 +156,10 @@ function acquireReaperClaim(lockDir, ownerToken, deps) {
         if (linkedPathExists(slot)) {
           return null;
         }
-        const candidate = createLinkedOwner(slot, claim, deps);
+        const candidate = createLinkedOwner(slot, claim, deps, false);
         if (candidate.published) {
           if (!lockTargetsToken(lockDir, ownerToken)) {
-            releaseLock(slot, claim.token);
+            releaseLock(slot, claim.token, deps);
             return null;
           }
           return { slot, token: claim.token };
@@ -179,13 +180,13 @@ function acquireReaperClaim(lockDir, ownerToken, deps) {
       return null;
     }
     observedTokens.add(existing.token);
-    slot = `${primarySlot}.successor-${existing.token}`;
+    slot = deps.reaperClaimPath(lockDir, ownerToken, existing.token);
   }
 }
 
-function cleanupReaperClaims(lockDir, ownerToken) {
+function cleanupReaperClaims(lockDir, ownerToken, deps) {
   const dir = path.dirname(lockDir);
-  const prefix = path.basename(reaperClaimSlot(lockDir, ownerToken));
+  const prefix = path.basename(deps.reaperClaimPath(lockDir, ownerToken));
   let entries;
   try {
     entries = fs.readdirSync(dir);
@@ -193,7 +194,7 @@ function cleanupReaperClaims(lockDir, ownerToken) {
     return;
   }
   for (const entry of entries) {
-    if (entry !== prefix && !entry.startsWith(`${prefix}.`)) {
+    if (entry !== prefix && !entry.startsWith(`${prefix}.`) && !entry.startsWith(`${prefix}-successor-`)) {
       continue;
     }
     try {
@@ -230,11 +231,11 @@ function reclaimReplacedLock(lockDir, observed, deps) {
   } finally {
     if (reaped) {
       try {
-        releaseLock(claim.slot, claim.token);
+        releaseLock(claim.slot, claim.token, deps);
       } catch {}
-      cleanupReaperClaims(lockDir, observed.token);
+      cleanupReaperClaims(lockDir, observed.token, deps);
     } else {
-      releaseLock(claim.slot, claim.token);
+      releaseLock(claim.slot, claim.token, deps);
     }
   }
 }
@@ -298,7 +299,7 @@ function scavengeOrphanOwnerDirs(lockDir) {
   }
 }
 
-function releaseLock(lockDir, token) {
+function releaseLock(lockDir, token, deps) {
   const ownerDir = lockOwnerDir(lockDir, token);
   try {
     fs.writeFileSync(path.join(ownerDir, ".released"), `${token}\n`, { flag: "wx", mode: PRIVATE_FILE_MODE });
@@ -319,8 +320,37 @@ function releaseLock(lockDir, token) {
   }
   try {
     fs.rmSync(ownerDir, { recursive: true, force: true });
-  } catch {}
+  } catch (error) {
+    deps.onReleaseError?.(error);
+  }
   return true;
+}
+
+function lockHolderCommand(pid) {
+  try {
+    if (process.platform === "linux") {
+      return fs.readFileSync(`/proc/${pid}/cmdline`, "utf8").split("\0").filter(Boolean).join(" ");
+    }
+    const result = spawnSync("ps", ["-ww", "-p", String(pid), "-o", "command="], { encoding: "utf8", timeout: 2000, windowsHide: true });
+    return result.status === 0 ? String(result.stdout ?? "").trim() : "";
+  } catch {
+    return "";
+  }
+}
+
+function describeLockHolder(lockDir, observed) {
+  if (!observed) {
+    return " No owner record was readable.";
+  }
+  let heldSeconds = null;
+  try {
+    heldSeconds = Math.round((Date.now() - fs.statSync(lockOwnerDir(lockDir, observed.token)).mtimeMs) / 100) / 10;
+  } catch {}
+  const alive = processIsDirectlyAlive(observed.ownerPid);
+  const current = alive ? getProcessIdentity(observed.ownerPid) : null;
+  const state = !alive ? "not running" : !current ? "alive, identity unreadable" : processIdentityMatches(observed.ownerPid, observed.ownerIdentity) ? "alive" : "alive with a different identity";
+  const command = alive ? lockHolderCommand(observed.ownerPid).slice(0, 200) : "";
+  return ` Held by pid ${observed.ownerPid} (${state})${heldSeconds == null ? "" : ` for ${heldSeconds}s`}${command ? `: ${command}` : ""}.`;
 }
 
 export function withRecordLock(file, fn) {
@@ -336,8 +366,19 @@ export function withRecordLock(file, fn) {
     ownerPid: process.pid,
     ownerIdentity: lockOwnerIdentity()
   };
-  let candidateDir = publishLockCandidate(lockDir, record, deps);
+  let candidateDir = null;
   try {
+    for (;;) {
+      try {
+        candidateDir = publishLockCandidate(lockDir, record, deps);
+        break;
+      } catch (error) {
+        if (error?.code !== "ENOENT" || Date.now() >= deadline) {
+          throw error;
+        }
+        deps.ensurePrivateStatePath(path.dirname(file));
+      }
+    }
     while (candidateDir) {
       const observed = readLockRecord(lockDir);
       if (reclaimReplacedLock(lockDir, observed, deps)) {
@@ -347,7 +388,7 @@ export function withRecordLock(file, fn) {
         }
       }
       if (Date.now() >= deadline) {
-        throw new Error(`Timed out waiting for the job record lock at ${file}.`);
+        throw new Error(`Timed out waiting for the job record lock at ${file}.${describeLockHolder(lockDir, readLockRecord(lockDir))}`);
       }
       sleepMs(LOCK_RETRY_MS);
       if (publishPreparedLock(lockDir, candidateDir)) {
@@ -362,7 +403,7 @@ export function withRecordLock(file, fn) {
       throw error;
     } finally {
       try {
-        releaseLock(lockDir, token);
+        releaseLock(lockDir, token, deps);
       } catch (error) {
         if (!callbackError) {
           throw error;

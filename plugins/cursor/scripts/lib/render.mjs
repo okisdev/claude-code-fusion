@@ -1,3 +1,5 @@
+import { renderFooterLines } from "./render-footers.mjs";
+
 const VALID_VERDICTS = new Set(["approve", "request_changes"]);
 const VALID_SEVERITIES = new Set(["critical", "high", "medium", "low"]);
 const SEVERITY_ORDER = ["critical", "high", "medium", "low"];
@@ -189,37 +191,6 @@ export function renderHistoryReport(history, now = Date.now()) {
   return `${lines.join("\n")}\n`;
 }
 
-function footerLines(record) {
-  const lines = [];
-  if (record.sessionId) {
-    lines.push(`cursor-session: ${record.sessionId}`);
-  }
-  if (record.id) {
-    if (typeof record.cwd !== "string" || !record.cwd) {
-      throw new TypeError("A job footer requires a workspace path.");
-    }
-    lines.push(`job: ${record.id}`);
-    if (record.resumedFromJobId) {
-      lines.push(`resumed-from: ${record.resumedFromJobId}`);
-    }
-    lines.push(`sandbox: ${record.cwd}`);
-  }
-  if (record.delivery) {
-    lines.push(`delivery: ${record.delivery}`);
-  }
-  if (record.semanticStatus) {
-    lines.push(`semantic: ${record.semanticStatus}`);
-  }
-  for (const warning of record.warnings ?? []) {
-    lines.push(`warning: ${String(warning).replace(/[\r\n]+/g, " ")}`);
-  }
-  lines.push(`state: ${record.status ?? "done"}`);
-  if (record.status === "cancelled" || record.status === "error") {
-    lines.push(`failure: ${record.failureKind ?? (record.status === "cancelled" ? "cancelled" : "error")}`);
-  }
-  return lines;
-}
-
 export function renderTaskResult({ text, sessionId, jobId, cwd, record, resumedFromJobId, delivery, semanticStatus, warnings, status, failureKind }) {
   const job = {
     id: jobId,
@@ -233,7 +204,7 @@ export function renderTaskResult({ text, sessionId, jobId, cwd, record, resumedF
     failureKind,
     ...record
   };
-  const lines = [String(text ?? "").trimEnd() || "Cursor returned no output.", "", ...footerLines(job)];
+  const lines = [String(text ?? "").trimEnd() || "Cursor returned no output.", "", ...renderFooterLines(job, "cursor")];
   return `${lines.join("\n")}\n`;
 }
 
@@ -243,7 +214,7 @@ export function renderBackgroundLaunch(jobId, delivery, cwd) {
     `Check progress with /cursor:status ${jobId}.`,
     `Fetch the result with /cursor:result ${jobId}.`,
     "",
-    ...footerLines({ id: jobId, cwd, delivery, status: "running" }),
+    ...renderFooterLines({ id: jobId, cwd, delivery, status: "running" }, "cursor"),
     ""
   ].join("\n");
 }
@@ -315,7 +286,7 @@ export function renderJobDetail(job, options = {}) {
   if (job.status === "error" && logTail) {
     lines.push("", "Log tail:", "", "```text", logTail, "```");
   }
-  lines.push("", ...footerLines(job));
+  lines.push("", ...renderFooterLines(job, "cursor"));
   return `${lines.join("\n").trimEnd()}\n`;
 }
 
@@ -348,7 +319,7 @@ export function renderCancelReport(job) {
     `Cancelled job ${job.id}.`,
     "Check /cursor:status for the updated list.",
     "",
-    ...footerLines({ ...job, status: "cancelled", failureKind: "cancelled" }),
+    ...renderFooterLines({ ...job, status: "cancelled", failureKind: "cancelled" }, "cursor"),
     ""
   ].join("\n");
 }
