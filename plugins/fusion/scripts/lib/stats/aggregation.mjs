@@ -4,6 +4,7 @@ import { canonicalWorkerAgentType, WORKER_TERMINAL_STATUSES, readWorkerRecords, 
 import { FILE_ENGINE_DESCRIPTORS, checkedUsageAddition, codexSku, isSupersededCodexJob, loadAllObservationCandidates, normalizeClaudeWorkerUsage, observationForJob, scopedObservationForJob, summarizeCodexSkuTelemetry, tokenUsageForJob } from "./engine-evidence.mjs";
 import { CODEX_ACCEPTANCE_STATES, RESUMABLE_CODEX_FAILURE_KINDS, TOKEN_USAGE_FILENAME, bump, fusionWorkspaceKey, loadTokenUsageObservations, nonEmptyString, normalizeCollectionMethod, readCodexJobEvidence, readWorkspaceJobFiles, resolveCodexJobEffort, resolveCodexJobModel, resolveGitWorkspaceRoot, resolveStateRoot, selectPreferredJobs, workspaceRootsShareRepository } from "./evidence.mjs";
 import { buildCoercionLedger, buildFleetUsageStats, readStatsAuditEvents } from "./fleet.mjs";
+import { REPLAY_KINDS, outranksReplayKind } from "../guard/replay.mjs";
 
 function semanticAcceptance(raw, superseded = false) {
   const recorded = raw?.semanticStatus ?? raw?.acceptance;
@@ -583,7 +584,7 @@ function parentContextAtDispatch(records, all, workspaceRoot) {
   };
 }
 
-function verificationEvidence(records, audit, all, workspaceRoot) {
+export function verificationEvidence(records, audit, all, workspaceRoot) {
   const recent = { days: 7, accepted: 0, evidenced: 0, rate: 0 };
   const summary = { accepted: 0, evidenced: 0, rate: 0, recent };
   if (audit.startMs == null) {
@@ -601,11 +602,11 @@ function verificationEvidence(records, audit, all, workspaceRoot) {
   }
   const repositoryCache = new Map();
   for (const record of records) {
-    if (record.packageType !== "implementation" || record.acceptance !== "accepted" || (!all && !workspaceRootsShareRepository(record.workspaceRoot, workspaceRoot, repositoryCache))) {
+    if (record.packageType !== "implementation" || record.acceptance !== "accepted" || (audit.sessionId && record.sessionId !== audit.sessionId) || (!all && !workspaceRootsShareRepository(record.workspaceRoot, workspaceRoot, repositoryCache))) {
       continue;
     }
     const acceptedAt = Date.parse(record.acceptanceRecordedAt ?? "");
-    if (!Number.isFinite(acceptedAt) || acceptedAt < audit.startMs) {
+    if (!Number.isFinite(acceptedAt) || acceptedAt < audit.startMs || acceptedAt > (audit.untilMs ?? Infinity)) {
       continue;
     }
     const finishedAt = Date.parse(record.finishedAt ?? "");
@@ -625,6 +626,49 @@ function verificationEvidence(records, audit, all, workspaceRoot) {
   summary.rate = summary.accepted > 0 ? summary.evidenced / summary.accepted : 0;
   recent.rate = recent.accepted > 0 ? recent.evidenced / recent.accepted : 0;
   return summary;
+}
+
+export function summarizeMainLoopReplay(records, audit, all, workspaceRoot) {
+  const repositoryCache = new Map();
+  const scopedRecords = records.filter((record) => (!audit.sessionId || record.sessionId === audit.sessionId) && (all || workspaceRootsShareRepository(record.workspaceRoot, workspaceRoot, repositoryCache)));
+  const sessions = new Set(scopedRecords.map((record) => record.sessionId));
+  const turns = new Map();
+  let earliestReplayMs = Infinity;
+  for (const event of audit.events) {
+    if (event.event !== "replay" || !sessions.has(event.session)) {
+      continue;
+    }
+    earliestReplayMs = Math.min(earliestReplayMs, event.atMs);
+    const key = `${event.session}\u0000${event.turn}`;
+    const turn = turns.get(key) ?? { kind: event.kind, tokens: 0, unmeasured: false };
+    if (outranksReplayKind(event.kind, turn.kind)) {
+      turn.kind = event.kind;
+    }
+    turn.tokens = Math.max(turn.tokens, event.tokens);
+    turn.unmeasured ||= event.measured === false;
+    turns.set(key, turn);
+  }
+  if (turns.size === 0) {
+    return null;
+  }
+  const acceptedPackages = verificationEvidence(scopedRecords, { ...audit, startMs: earliestReplayMs }, true, null).accepted;
+  const byKind = Object.fromEntries(REPLAY_KINDS.map((kind) => [kind, { tokens: 0, turns: 0 }]));
+  let totalTokens = 0;
+  let unmeasuredTurns = 0;
+  for (const turn of turns.values()) {
+    totalTokens += turn.tokens;
+    unmeasuredTurns += Number(turn.unmeasured);
+    byKind[turn.kind].tokens += turn.tokens;
+    byKind[turn.kind].turns += 1;
+  }
+  return {
+    totalTokens,
+    totalTurns: turns.size,
+    acceptedPackages,
+    tokensPerAcceptedPackage: acceptedPackages > 0 ? totalTokens / acceptedPackages : null,
+    byKind,
+    unmeasuredTurns
+  };
 }
 
 function wrapperDelivery(records, all, workspaceRoot) {
@@ -655,9 +699,11 @@ export function buildFusionStats({ all = false, env = process.env, cwd = process
   for (const provider of STATS_PROVIDER_REGISTRY) {
     engines[provider.id] = provider.collect(options);
   }
-  const fleet = buildFleetUsageStats({ env });
   const audit = readStatsAuditEvents(env);
+  const fleet = buildFleetUsageStats({ env, audit });
   const parentContext = parentContextAtDispatch(workers.records, all, workspaceRoot);
+  const verification = verificationEvidence(workers.records, audit, all, workspaceRoot);
+  const mainLoopReplay = summarizeMainLoopReplay(workers.records, audit, all, workspaceRoot);
   return {
     scope: all ? "all" : workspaceRoot,
     ...(parentContext.dispatchCount > 0 ? { parentContextAtDispatch: parentContext } : {}),
@@ -665,7 +711,8 @@ export function buildFusionStats({ all = false, env = process.env, cwd = process
     ...(all ? { retiredWorkers: retiredWorkerStats(env) } : {}),
     fleet,
     coercionLedger: buildCoercionLedger({ env, fleet, audit }),
-    verificationEvidence: verificationEvidence(workers.records, audit, all, workspaceRoot),
+    verificationEvidence: verification,
+    ...(mainLoopReplay ? { mainLoopReplay } : {}),
     wrapperDelivery: wrapperDelivery(workers.records, all, workspaceRoot)
   };
 }

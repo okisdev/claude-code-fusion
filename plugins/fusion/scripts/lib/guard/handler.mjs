@@ -1,10 +1,13 @@
 import { resolvePosture } from "../posture.mjs";
 import { tagMessage } from "../user-messages.mjs";
+import { bashWriteEffect } from "./bash-effect.mjs";
 import { resolveMode, resolveStateDir } from "./config.mjs";
-import { BASH_TOOL, DELEGATION_TOOLS, STATE_UNAVAILABLE_DENY_MESSAGE_SLUG, TASK_CONTROL_TOOLS, WRITE_TOOLS } from "./constants.mjs";
+import { BASH_TOOL, DELEGATION_TOOLS, READ_TOOLS, STATE_UNAVAILABLE_DENY_MESSAGE_SLUG, TASK_CONTROL_TOOLS, WRITE_TOOLS } from "./constants.mjs";
 import { handleDispatch, handleTaskControl } from "./dispatch-events.mjs";
 import { handleReadStreak } from "./read-streak.mjs";
 import { normalizeSessionId, pruneStaleState, stateFile } from "./state.mjs";
+import { recordTurn } from "./turn.mjs";
+import { extractBashCommand } from "./verification.mjs";
 import { handleBash } from "./verification-events.mjs";
 import { handleWrite } from "./write-events.mjs";
 import { advisoryOutput, denyOutput, extractWritePath, isWorkspaceWritePath } from "./write.mjs";
@@ -52,7 +55,8 @@ function runHook(env = process.env, input = readHookInput()) {
   const file = stateFile(stateDir, sessionId);
   const now = new Date().toISOString();
   const posture = resolvePosture(env);
-  const readContext = handleReadStreak(input, env, { sessionId, toolName, file, now, posture });
+  const turn = recordTurn(input, env, { sessionId, toolName, file, now, cwd });
+  const readContext = handleReadStreak(input, env, { sessionId, toolName, file, now, posture, turn });
   if (readContext && toolName !== BASH_TOOL) {
     writeHookText(`${JSON.stringify(advisoryOutput(readContext))}\n`);
   }
@@ -67,6 +71,10 @@ function runHook(env = process.env, input = readHookInput()) {
   }
   if (toolName === BASH_TOOL) {
     let bashOutput = "";
+    const writeEffect = bashWriteEffect(extractBashCommand(input.tool_input), cwd);
+    if (writeEffect || input.hook_event_name === "PostToolUse" || input.hook_event_name === "PostToolUseFailure") {
+      handleWrite(input, env, { sessionId, toolName, file, now, posture, cwd, writeEffect, writeHookText: (text) => { bashOutput += text; } });
+    }
     handleBash(input, env, { sessionId, toolName, file, now, posture, writeHookText: (text) => { bashOutput += text; } });
     if (readContext) {
       const output = bashOutput ? JSON.parse(bashOutput) : advisoryOutput(readContext);
@@ -77,7 +85,7 @@ function runHook(env = process.env, input = readHookInput()) {
     }
     return;
   }
-  if (["Read", "Grep", "Glob"].includes(toolName)) return;
+  if (READ_TOOLS.has(toolName)) return;
   handleWrite(input, env, { sessionId, toolName, file, now, posture, cwd, writeHookText });
 }
 
@@ -85,8 +93,9 @@ function executeHook(input, env = process.env) {
   try {
     runHook(env, input ?? null);
   } catch {
-    const targetPath = extractWritePath(input?.tool_input);
-    if (resolveMode(env) === "enforce" && input && !isSubagentPayload(input) && WRITE_TOOLS.has(input.tool_name) && isWorkspaceWritePath(targetPath, input.cwd)) {
+    const writeEffect = input?.tool_name === BASH_TOOL ? bashWriteEffect(extractBashCommand(input.tool_input), input.cwd) : null;
+    const targetPath = writeEffect?.path ?? extractWritePath(input?.tool_input);
+    if (resolveMode(env) === "enforce" && input && !isSubagentPayload(input) && (WRITE_TOOLS.has(input.tool_name) || writeEffect) && isWorkspaceWritePath(targetPath, input.cwd)) {
       writeHookText(
         `${JSON.stringify(
           denyOutput(

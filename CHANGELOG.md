@@ -1,5 +1,15 @@
 # changelog
 
+## 0.0.75
+
+- this release acts on a usage review of one host: seven days of transcripts, 115 main sessions. the main loop took 78% of weighted token cost and its cache reads alone 57%; the peer wrappers took about 4%. in the 41 sessions that dispatched, the main loop ran 17.5 turns and replayed 7.4M tokens of context per dispatched package, a quarter of it reading code and an eighth editing it.
+- the inline guard prices each main loop turn at the context tokens it replays, read from the assistant message that holds the tool call, and one replay budget of 2,000,000 tokens (`FUSION_INLINE_REPLAY_BUDGET_TOKENS`) replaces the five write budget and the five turn read streak. a turn at 800,000 tokens of context costs ten times one at 80,000, and both counted as one: half of the main loop cache reads came from turns above 500,000 tokens. a session at 80,000 tokens now reads for about 25 turns before the advisory and one at 800,000 for 3. a turn with no context reading prices at 400,000 tokens, where the budget equals the old count of five. `FUSION_INLINE_WRITE_BUDGET` is gone.
+- a Bash command counts by its effect. an in place edit, a redirect or `tee` into a workspace file, and an inline interpreter script that writes a workspace path are writes; the guard saw none of them, and 834 of 1066 main loop edit turns went through Bash against 232 through Edit and Write. the read classifier accepts `echo`, `cut`, `sort`, `uniq`, `diff`, newlines, `||`, more `git` and `gh` read subcommands, and a `git -C` prefix: one `echo` separator between two reads used to reset the streak.
+- every priced turn is logged as a `replay` audit event with its kind (read, write, verify, settle, dispatch, other), and `/fusion:stats` reports the main loop replay per accepted package with its split by kind.
+- the coercion ledger counts a sprawl in replayed tokens for events that carry them and keeps the write count rule for older events.
+- the codex deadline test waits for the detached worker's history gc before its sandbox is removed. the worker writes `history-gc-stamp.json` and a lock into the data directory after the job record turns done, and on the linux runner the cleanup lost that race with `ENOTEMPTY` on three runs.
+- rules: locus also follows the price of the seat, so reading and editing leave the main loop first as its context grows; the read only stretch that belongs to Explore is the one that would replay the budget; the runtime guard paragraph names the replay budget.
+
 ## 0.0.74
 
 - the parent context notice is a `systemMessage` shown to the user at the prompt or dispatch that crosses the threshold, and it no longer enters the model context. only the user can run /compact or open a session, so as hook context it made the model relay the advice inside its answer; 219 of 1188 recorded sessions on one host received it.

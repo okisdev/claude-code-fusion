@@ -1,39 +1,50 @@
 import { STRICT_POSTURE } from "../posture.mjs";
 import { messageCode, tagMessage } from "../user-messages.mjs";
+import { verificationResponseFailed } from "../verification-command.mjs";
 import { recordAuditEvent } from "./audit.mjs";
-import { resolveBudget, resolveMode, resolveTailAllowance, resolveTailMaxBytes, resolveZeroDispatchMaxBytes, resolveZeroDispatchWrites } from "./config.mjs";
-import { MAIN_LANE, OUT_OF_WORKSPACE_EXEMPTION, TAIL_ALLOWANCE_ADVISORY_MESSAGE_SLUG, TAIL_ALLOW_AUDIT_EVENT, UNVERIFIED_ADVISORY_MESSAGE_SLUG, WRITE_BUDGET_ADVISORY_MESSAGE_SLUG, WRITE_BUDGET_DENY_MESSAGE_SLUG, WRITE_TOOLS, ZERO_DISPATCH_ADVISORY_MESSAGE_SLUG, ZERO_DISPATCH_SOFTENED_AUDIT_EVENT } from "./constants.mjs";
+import { resolveMode, resolveTailAllowance, resolveTailMaxBytes, resolveZeroDispatchMaxBytes, resolveZeroDispatchWrites } from "./config.mjs";
+import { BASH_TOOL, MAIN_LANE, OUT_OF_WORKSPACE_EXEMPTION, TAIL_ALLOWANCE_ADVISORY_MESSAGE_SLUG, TAIL_ALLOW_AUDIT_EVENT, UNVERIFIED_ADVISORY_MESSAGE_SLUG, WRITE_BUDGET_ADVISORY_MESSAGE_SLUG, WRITE_BUDGET_DENY_MESSAGE_SLUG, WRITE_TOOLS, ZERO_DISPATCH_ADVISORY_MESSAGE_SLUG, ZERO_DISPATCH_SOFTENED_AUDIT_EVENT } from "./constants.mjs";
 import { extractToolUseId, totalDispatches } from "./dispatch.mjs";
+import { crossedBudgetMultiple, resolveReplayBudgetTokens } from "./replay.mjs";
 import { claimAdvisory, normalizeState, readState, stableAdvisorySignature, withStateLock, writeState } from "./state.mjs";
 import { advisoryOutput, budgetMultiple, buildAdvisoryLine, buildTailAllowanceAdvisory, buildUnverifiedAdvisory, buildZeroDispatchAdvisory, denyOutput, editReplacementBytes, extractAuditWritePath, extractWritePath, inlineWriteBytes, isWorkspaceWritePath, writePathSignature } from "./write.mjs";
 
-function handleWrite(input, env, { sessionId, toolName, file, now, posture, cwd, writeHookText }) {
-  if (!WRITE_TOOLS.has(toolName)) {
+function handleWrite(input, env, { sessionId, toolName, file, now, posture, cwd, writeEffect, writeHookText }) {
+  if (!WRITE_TOOLS.has(toolName) && toolName !== BASH_TOOL) {
     return;
   }
 
   const toolUseId = extractToolUseId(input);
   if (input.hook_event_name === "PostToolUseFailure" || input.hook_event_name === "PostToolUse") {
     if (!toolUseId) return;
+    const failed = input.hook_event_name === "PostToolUseFailure" || (toolName === BASH_TOOL && verificationResponseFailed(input.tool_response ?? {}));
     withStateLock(file, () => {
       const state = normalizeState(readState(file), now);
       const index = state.pendingWrites.findIndex((entry) => entry.id === toolUseId && entry.tool === toolName);
       if (index < 0) return;
       const [entry] = state.pendingWrites.splice(index, 1);
-      if (input.hook_event_name === "PostToolUse" && entry.epoch === state.dispatchEpoch && !state.confirmedPathSignatures.includes(entry.signature)) {
+      if (!failed && entry.epoch === state.dispatchEpoch && !state.confirmedPathSignatures.includes(entry.signature)) {
         state.confirmedPathSignatures.push(entry.signature);
       }
-      if (input.hook_event_name === "PostToolUseFailure") {
+      if (failed && toolName !== BASH_TOOL) {
         state.writeCount = Math.max(0, state.writeCount - 1);
         state.inlineWriteBytes = Math.max(0, state.inlineWriteBytes - entry.bytes);
         if (entry.epoch === state.dispatchEpoch) {
+          if (entry.turn && entry.turn === state.writeTurnKey) {
+            state.writeTurnWrites = Math.max(0, state.writeTurnWrites - 1);
+            if (state.writeTurnWrites === 0) {
+              state.writeReplayTokens = Math.max(0, state.writeReplayTokens - state.writeTurnTokens);
+              state.writeTurnKey = null;
+              state.writeTurnTokens = 0;
+            }
+          }
           state.writesSinceDispatch = Math.max(0, state.writesSinceDispatch - 1);
           if (entry.tail) state.tailWritesSinceDispatch = Math.max(0, state.tailWritesSinceDispatch - 1);
           if (!state.confirmedPathSignatures.includes(entry.signature) && !state.pendingWrites.some((other) => other.epoch === entry.epoch && other.signature === entry.signature)) {
             state.writtenPathSignatures = state.writtenPathSignatures.filter((value) => value !== entry.signature);
           }
-          const budget = resolveBudget(env);
-          state.advisedMultiples = state.advisedMultiples.filter((multiple) => multiple * budget <= state.writesSinceDispatch);
+          const budget = resolveReplayBudgetTokens(env);
+          state.advisedMultiples = state.advisedMultiples.filter((multiple) => multiple * budget <= state.writeReplayTokens);
           delete state.advisorySignatures["write-budget"];
         }
       }
@@ -42,8 +53,9 @@ function handleWrite(input, env, { sessionId, toolName, file, now, posture, cwd,
     return;
   }
   if (input.hook_event_name && input.hook_event_name !== "PreToolUse") return;
+  if (toolName === BASH_TOOL && !writeEffect) return;
 
-  const targetPath = extractWritePath(input.tool_input);
+  const targetPath = writeEffect?.path ?? extractWritePath(input.tool_input);
   if (!isWorkspaceWritePath(targetPath, cwd)) {
     recordAuditEvent(
       { at: now, session: sessionId, event: "write", lane: MAIN_LANE, tool: toolName, exempt: OUT_OF_WORKSPACE_EXEMPTION },
@@ -53,9 +65,9 @@ function handleWrite(input, env, { sessionId, toolName, file, now, posture, cwd,
   }
 
   const auditPath = extractAuditWritePath(targetPath, cwd);
-  const budget = resolveBudget(env);
+  const budget = resolveReplayBudgetTokens(env);
   const mode = resolveMode(env);
-  const writeBytes = inlineWriteBytes(input.tool_input);
+  const writeBytes = toolName === BASH_TOOL ? writeEffect.bytes ?? 0 : inlineWriteBytes(input.tool_input);
   const replacementBytes = toolName === "Edit" ? editReplacementBytes(input.tool_input) : null;
   const pathSignature = writePathSignature(targetPath, cwd);
   const tailMaxBytes = resolveTailMaxBytes(env);
@@ -67,7 +79,7 @@ function handleWrite(input, env, { sessionId, toolName, file, now, posture, cwd,
     if (toolUseId && state.pendingWrites.some((entry) => entry.id === toolUseId && entry.tool === toolName)) return { duplicate: true };
     const dispatchCount = totalDispatches(state.dispatches);
     let relief = null;
-    if (mode === "enforce" && state.writesSinceDispatch >= budget) {
+    if (mode === "enforce" && state.writeReplayTokens >= budget && state.turn?.key !== state.writeTurnKey) {
       const tailAllowed =
         toolName === "Edit" &&
         replacementBytes !== null &&
@@ -77,17 +89,26 @@ function handleWrite(input, env, { sessionId, toolName, file, now, posture, cwd,
         state.writtenPathSignatures.includes(pathSignature);
       const zeroDispatchAllowed =
         !tailAllowed &&
+        (toolName !== BASH_TOOL || writeEffect.bytes !== null) &&
         dispatchCount === 0 &&
         state.writeCount < zeroDispatchWrites &&
         state.inlineWriteBytes + writeBytes < zeroDispatchMaxBytes;
       if (!tailAllowed && !zeroDispatchAllowed) {
-        return { denied: true, writeCount: state.writesSinceDispatch, dispatchCount };
+        return { denied: true, writeCount: state.writesSinceDispatch, replayTokens: state.writeReplayTokens, dispatchCount };
       }
       relief = tailAllowed ? TAIL_ALLOW_AUDIT_EVENT : ZERO_DISPATCH_SOFTENED_AUDIT_EVENT;
     }
     state.writeCount += 1;
     state.writesSinceDispatch += 1;
     state.inlineWriteBytes += writeBytes;
+    const before = state.writeReplayTokens;
+    if (state.turn && state.turn.key !== state.writeTurnKey) {
+      state.writeReplayTokens = Math.min(Number.MAX_SAFE_INTEGER, before + state.turn.tokens);
+      state.writeTurnKey = state.turn.key;
+      state.writeTurnTokens = state.writeReplayTokens - before;
+      state.writeTurnWrites = 0;
+    }
+    state.writeTurnWrites += 1;
     const newPath = !state.writtenPathSignatures.includes(pathSignature);
     if (newPath) {
       state.writtenPathSignatures.push(pathSignature);
@@ -95,12 +116,11 @@ function handleWrite(input, env, { sessionId, toolName, file, now, posture, cwd,
     if (relief === TAIL_ALLOW_AUDIT_EVENT) {
       state.tailWritesSinceDispatch += 1;
     }
-    if (toolUseId) state.pendingWrites.push({ id: toolUseId, tool: toolName, epoch: state.dispatchEpoch, bytes: writeBytes, signature: pathSignature, tail: relief === TAIL_ALLOW_AUDIT_EVENT });
-    const multiple = budgetMultiple(state.writesSinceDispatch, budget);
+    if (toolUseId) state.pendingWrites.push({ id: toolUseId, tool: toolName, epoch: state.dispatchEpoch, bytes: writeBytes, turn: state.writeTurnKey, signature: pathSignature, tail: relief === TAIL_ALLOW_AUDIT_EVENT });
+    const multiple = posture === STRICT_POSTURE ? budgetMultiple(state.writeReplayTokens, budget) : crossedBudgetMultiple(before, state.writeReplayTokens, budget);
     let candidate = null;
     if (
       multiple >= 1 &&
-      (posture === STRICT_POSTURE || (state.writesSinceDispatch === multiple * budget && Number.isInteger(Math.log2(multiple)))) &&
       !state.advisedMultiples.includes(multiple)
     ) {
       state.advisedMultiples.push(multiple);
@@ -112,6 +132,7 @@ function handleWrite(input, env, { sessionId, toolName, file, now, posture, cwd,
     return {
       denied: false,
       writeCount: state.writesSinceDispatch,
+      replayTokens: state.writeReplayTokens,
       dispatchCount,
       candidate,
       relief,
@@ -134,6 +155,7 @@ function handleWrite(input, env, { sessionId, toolName, file, now, posture, cwd,
         tool: toolName,
         ...(auditPath ? { path: auditPath } : {}),
         writeCount: decision.writeCount,
+        replayTokens: decision.replayTokens,
         dispatchCount: decision.dispatchCount,
         budget,
         mode,
@@ -144,7 +166,7 @@ function handleWrite(input, env, { sessionId, toolName, file, now, posture, cwd,
     );
     const reason = tagMessage(
       WRITE_BUDGET_DENY_MESSAGE_SLUG,
-      `${buildAdvisoryLine(decision.writeCount, decision.dispatchCount, env)} The inline write budget is exhausted. Dispatch an Agent or Task before another main-loop write.`
+      `${buildAdvisoryLine(decision.writeCount, decision.dispatchCount, decision.replayTokens, env)} The inline replay budget is exhausted. Dispatch an Agent or Task before another main-loop write.`
     );
     writeHookText(`${JSON.stringify(denyOutput(reason))}\n`);
     return;
@@ -170,6 +192,7 @@ function handleWrite(input, env, { sessionId, toolName, file, now, posture, cwd,
       tool: toolName,
       ...(auditPath ? { path: auditPath } : {}),
       writeCount: decision.writeCount,
+      replayTokens: decision.replayTokens,
       dispatchCount: decision.dispatchCount,
       budget,
       mode,
@@ -219,6 +242,7 @@ function handleWrite(input, env, { sessionId, toolName, file, now, posture, cwd,
           tool: toolName,
           ...(auditPath ? { path: auditPath } : {}),
           writeCount: decision.writeCount,
+          replayTokens: decision.replayTokens,
           dispatchCount: decision.dispatchCount,
           budget,
           mode,
@@ -231,7 +255,7 @@ function handleWrite(input, env, { sessionId, toolName, file, now, posture, cwd,
       if (!advisory.suppressed) {
         const line = tagMessage(
           advisorySlug,
-          posture === STRICT_POSTURE ? buildAdvisoryLine(decision.writeCount, decision.dispatchCount, env) : buildUnverifiedAdvisory(decision.writeCount, decision.dispatchCount, env)
+          posture === STRICT_POSTURE ? buildAdvisoryLine(decision.writeCount, decision.dispatchCount, decision.replayTokens, env) : buildUnverifiedAdvisory(decision.writeCount, decision.dispatchCount, decision.replayTokens, env)
         );
         writeHookText(`${JSON.stringify(advisoryOutput(line))}\n`);
       }

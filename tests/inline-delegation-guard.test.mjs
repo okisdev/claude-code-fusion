@@ -8,6 +8,7 @@ import { test } from "node:test";
 import { pathToFileURL } from "node:url";
 import {
   DEFAULT_LOCK_TIMEOUT_MS,
+  handleInlineDelegationHook,
   normalizeAuditEvent,
   readAuditEvents,
   resolveLockTimeoutMs,
@@ -17,7 +18,7 @@ import {
   resolveZeroDispatchWrites
 } from "../plugins/fusion/scripts/inline-delegation-guard.mjs";
 import { messageCode, messageTag, tagMessage } from "../plugins/fusion/scripts/lib/user-messages.mjs";
-import { isReadOnlyBash } from "../plugins/fusion/scripts/lib/guard/read-streak.mjs";
+import { normalizeState } from "../plugins/fusion/scripts/lib/guard/state.mjs";
 
 const repoRoot = path.join(import.meta.dirname, "..");
 const script = path.join(repoRoot, "plugins", "fusion", "scripts", "inline-delegation-guard.mjs");
@@ -56,6 +57,10 @@ function envFor(sandbox, extra = {}) {
 }
 
 function runRaw(sandbox, payload, extraEnv = {}) {
+  if (!extraEnv.FUSION_TEST_NOW && payload?.hook_event_name === "PreToolUse" && ["Edit", "Write", "NotebookEdit", "MultiEdit"].includes(payload.tool_name) && (!path.isAbsolute(payload.tool_input?.file_path ?? "") || payload.tool_input.file_path.startsWith(`${sandbox.workDir}/`))) {
+    sandbox.writeTurnAt = Math.max(Date.now(), (sandbox.writeTurnAt ?? 0) + 2000);
+    extraEnv = { ...extraEnv, FUSION_TEST_NOW: new Date(sandbox.writeTurnAt).toISOString() };
+  }
   return spawnSync(process.execPath, [script], {
     input: payload === undefined ? "" : JSON.stringify(payload),
     env: envFor(sandbox, extraEnv),
@@ -216,6 +221,12 @@ function readAuditRecords(sandbox) {
   return records;
 }
 
+function assertSingleReplay(sandbox, tool, kind) {
+  const { turn } = readState(sandbox, "session-1");
+  const records = readAuditRecords(sandbox);
+  assert.deepStrictEqual(records, [{ schemaVersion: 1, at: records[0]?.at, session: "session-1", event: "replay", lane: "main", tool, turn: turn.key, kind, tokens: 400_000, measured: false }]);
+}
+
 function assertMessageTagged(text, slug) {
   const tag = messageTag(slug);
   assert.ok(text.endsWith(tag), `${text} should end with ${tag}`);
@@ -240,6 +251,368 @@ test("writes below the budget are allowed silently and accumulate", (t) => {
   }
   const state = readState(sandbox, "session-1");
   assert.strictEqual(state.writeCount, 4);
+  assert.strictEqual(state.writeReplayTokens, 1_600_000);
+});
+
+test("five Edit calls in one turn price one context without an advisory", (t) => {
+  for (const posture of ["judgment", "strict"]) {
+    const sandbox = makeSandbox(t);
+    for (let index = 0; index < 5; index += 1) {
+      const payload = { ...writePayload(sandbox), tool_use_id: `edit-${index}` };
+      assert.strictEqual(run(sandbox, payload, { FUSION_POSTURE: posture, FUSION_TEST_NOW: "2026-07-21T00:00:00.000Z" }).stdout, "");
+    }
+    const state = readState(sandbox, "session-1");
+    assert.strictEqual(state.writeCount, 5);
+    assert.strictEqual(state.writesSinceDispatch, 5);
+    assert.strictEqual(state.writeReplayTokens, 400_000);
+    assert.strictEqual(state.writeTurnKey, state.turn.key);
+    assert.deepStrictEqual(state.pendingWrites.map((entry) => entry.turn), Array(5).fill(state.turn.key));
+    assert.strictEqual(state.writeTurnTokens, 400_000);
+    assert.strictEqual(state.writeTurnWrites, 5);
+    assert.deepStrictEqual(state.advisedMultiples, []);
+    assert.strictEqual(readAuditRecords(sandbox).filter((event) => event.event === "warn").length, 0);
+  }
+});
+
+for (const [contextTokens, thresholdTurn, formattedTokens] of [[800_000, 3, "2.4M"], [80_000, 25, "2.0M"], [2_000_000, 1, "2.0M"]]) {
+  for (const posture of ["judgment", "strict"]) {
+    test(`${posture} prices ${contextTokens} tokens of context per write turn and reaches the budget at turn ${thresholdTurn}`, (t) => {
+      const sandbox = makeSandbox(t);
+      const env = { FUSION_POSTURE: posture, FUSION_INLINE_TAIL_ALLOWANCE: "0", FUSION_INLINE_ZERO_DISPATCH_WRITES: "0" };
+      const base = Date.parse("2026-07-21T00:00:00.000Z");
+      for (let turn = 1; turn <= thresholdTurn; turn += 1) {
+        const payload = { ...writePayload(sandbox), tool_use_id: `write-${turn}` };
+        fs.appendFileSync(payload.transcript_path, `${JSON.stringify({ type: "assistant", message: { id: `msg_${turn}`, usage: { input_tokens: 1000, cache_read_input_tokens: contextTokens - 2000, cache_creation_input_tokens: 1000 }, content: [{ type: "tool_use", id: payload.tool_use_id }] } })}\n`);
+        const result = run(sandbox, payload, { ...env, FUSION_TEST_NOW: new Date(base + turn * 1600).toISOString() });
+        assert.strictEqual(result.status, 0);
+        assert.strictEqual(result.stderr, "");
+        if (turn < thresholdTurn) assert.strictEqual(result.stdout, "", `turn ${turn}`);
+        else {
+          const line = advisoryContext(result, posture === "strict" ? "inline-guard.write-budget-advisory" : "inline-guard.unverified-advisory");
+          const prefix = posture === "strict"
+            ? `${turn} inline ${turn === 1 ? "write" : "writes"} replayed ${formattedTokens} tokens of context this session with zero dispatches. `
+            : `${turn} main loop ${turn === 1 ? "write is" : "writes are"} unverified in this window, and ${turn === 1 ? "its turn" : "their turns"} replayed ${formattedTokens} tokens of context. `;
+          assert.ok(line.startsWith(prefix), line);
+        }
+      }
+      const state = readState(sandbox, "session-1");
+      assert.strictEqual(state.writeCount, thresholdTurn);
+      assert.strictEqual(state.writeReplayTokens, contextTokens * thresholdTurn);
+      assert.strictEqual(state.writeTurnKey, `msg_${thresholdTurn}`);
+      assert.deepStrictEqual(state.pendingWrites.map((entry) => entry.turn), Array.from({ length: thresholdTurn }, (_, index) => `msg_${index + 1}`));
+      assert.strictEqual(state.writeTurnTokens, contextTokens);
+      assert.strictEqual(state.writeTurnWrites, 1);
+      const [warning] = readAuditRecords(sandbox).filter((event) => event.event === "warn");
+      assert.strictEqual(warning.budget, 2_000_000);
+      assert.strictEqual(warning.replayTokens, state.writeReplayTokens);
+      const next = run(sandbox, { ...writePayload(sandbox, { toolName: "Write" }), tool_use_id: "next-write" }, { ...env, FUSION_TEST_NOW: new Date(base + (thresholdTurn + 1) * 1600).toISOString() });
+      if (posture === "strict") {
+        assert.strictEqual(JSON.parse(next.stdout).hookSpecificOutput.permissionDecision, "deny");
+        assert.strictEqual(readState(sandbox, "session-1").writeReplayTokens, state.writeReplayTokens);
+        assert.strictEqual(readAuditRecords(sandbox).at(-1).replayTokens, state.writeReplayTokens);
+      } else {
+        const nextMultiple = Math.floor((state.writeReplayTokens + contextTokens) / 2_000_000);
+        if (nextMultiple === 2) advisoryContext(next, "inline-guard.unverified-advisory");
+        else assert.strictEqual(next.stdout, "");
+      }
+    });
+  }
+}
+
+for (const [name, command, bytes] of [
+  ["sed in place", "sed -i 's/old/new/' src/x", 0],
+  ["cat heredoc", "cat > src/x <<'EOF'\nnew\nEOF", 3],
+  ["python heredoc", "python3 - <<'PY'\nfrom pathlib import Path\nPath('src/x').write_text('new')\nPY", 56]
+]) {
+  test(`a ${name} Bash write counts, audits its path, and is denied past the strict replay budget`, (t) => {
+    const sandbox = makeSandbox(t);
+    const payload = { ...bashPayload(sandbox, { command }), tool_use_id: "bash-write" };
+    const env = { FUSION_POSTURE: "strict", FUSION_INLINE_ZERO_DISPATCH_WRITES: "0" };
+    const base = Date.parse("2026-07-21T00:00:00.000Z");
+    assert.strictEqual(run(sandbox, payload, { ...env, FUSION_TEST_NOW: new Date(base).toISOString() }).stdout, "");
+    let state = readState(sandbox, "session-1");
+    assert.strictEqual(state.writeCount, 1);
+    assert.strictEqual(state.writesSinceDispatch, 1);
+    assert.strictEqual(state.writeReplayTokens, 400_000);
+    assert.strictEqual(state.inlineWriteBytes, bytes);
+    assert.strictEqual(state.pendingWrites[0].turn, state.turn.key);
+    assert.strictEqual(state.writeTurnTokens, 400_000);
+    const [write] = readAuditRecords(sandbox).filter((event) => event.event === "write");
+    assert.strictEqual(write.tool, "Bash");
+    assert.strictEqual(write.path, "src/x");
+    for (let index = 1; index <= 4; index += 1) run(sandbox, writePayload(sandbox, { filePath: path.join(sandbox.workDir, "src/x") }), { ...env, FUSION_TEST_NOW: new Date(base + index * 1600).toISOString() });
+    const denied = run(sandbox, { ...payload, tool_use_id: "denied-bash-write" }, { ...env, FUSION_TEST_NOW: new Date(base + 8000).toISOString() });
+    assert.strictEqual(JSON.parse(denied.stdout).hookSpecificOutput.permissionDecision, "deny");
+    state = readState(sandbox, "session-1");
+    assert.strictEqual(state.writeCount, 5);
+    assert.strictEqual(state.writeReplayTokens, 2_000_000);
+    assert.strictEqual(state.tailWritesSinceDispatch, 0);
+    const denial = readAuditRecords(sandbox).at(-1);
+    assert.strictEqual(denial.tool, "Bash");
+    assert.strictEqual(denial.path, "src/x");
+    assert.strictEqual(denial.budget, 2_000_000);
+    assert.strictEqual(denial.replayTokens, 2_000_000);
+  });
+}
+
+test("a Bash redirect outside the workspace does not consume the write window", (t) => {
+  const sandbox = makeSandbox(t);
+  const result = run(sandbox, bashPayload(sandbox, { command: "cat > /tmp/fusion-output <<'EOF'\nnew\nEOF" }));
+  assert.strictEqual(result.stdout, "");
+  const state = readState(sandbox, "session-1");
+  assert.strictEqual(state.writeCount, 0);
+  assert.strictEqual(state.writeReplayTokens, 0);
+  assert.strictEqual(state.writeTurnKey, null);
+  assertSingleReplay(sandbox, "Bash", "other");
+});
+
+test("failed Bash write callbacks preserve their count, bytes, tokens, path, and advisory", (t) => {
+  for (const response of [null, { is_error: true }, { isError: true }, { interrupted: true }, { exitCode: 1 }, { exit_code: 2 }, { code: -1 }, { returnCode: 3 }]) {
+    const sandbox = makeSandbox(t);
+    const payload = { ...bashPayload(sandbox, { command: "cat > src/x <<'EOF'\nnew\nEOF" }), tool_use_id: "failed-bash" };
+    const env = { FUSION_INLINE_REPLAY_BUDGET_TOKENS: "400000" };
+    advisoryContext(run(sandbox, payload, env), "inline-guard.unverified-advisory");
+    assert.strictEqual(readState(sandbox, "session-1").writeReplayTokens, 400_000);
+    const result = run(sandbox, { ...payload, hook_event_name: response ? "PostToolUse" : "PostToolUseFailure", tool_response: response }, env);
+    assert.strictEqual(result.stdout, "");
+    const state = readState(sandbox, "session-1");
+    assert.strictEqual(state.writeCount, 1);
+    assert.strictEqual(state.writesSinceDispatch, 1);
+    assert.strictEqual(state.writeReplayTokens, 400_000);
+    assert.strictEqual(state.inlineWriteBytes, 3);
+    assert.strictEqual(state.writeTurnTokens, 400_000);
+    assert.strictEqual(state.writeTurnWrites, 1);
+    assert.deepStrictEqual(state.pendingWrites, []);
+    assert.strictEqual(state.writtenPathSignatures.length, 1);
+    assert.deepStrictEqual(state.advisedMultiples, [1]);
+    assert.ok(state.advisorySignatures["write-budget"]);
+  }
+});
+
+test("Bash and Edit writes in the same turn keep their charge when both report failure", (t) => {
+  const sandbox = makeSandbox(t);
+  const env = { FUSION_TEST_NOW: "2026-07-21T00:00:00.000Z" };
+  const edit = { ...writePayload(sandbox), tool_use_id: "edit-first" };
+  const bash = { ...bashPayload(sandbox, { command: "printf changed > src/a.ts; false" }), tool_use_id: "bash-second" };
+  assert.strictEqual(run(sandbox, edit, env).stdout, "");
+  assert.strictEqual(run(sandbox, bash, env).stdout, "");
+  const admitted = readState(sandbox, "session-1");
+  assert.deepStrictEqual(admitted.pendingWrites.map((entry) => entry.turn), [admitted.turn.key, admitted.turn.key]);
+  run(sandbox, { ...bash, hook_event_name: "PostToolUseFailure" }, env);
+  assert.strictEqual(readState(sandbox, "session-1").writeCount, 2);
+  assert.strictEqual(readState(sandbox, "session-1").writeReplayTokens, 400_000);
+  run(sandbox, { ...edit, hook_event_name: "PostToolUseFailure" }, env);
+  assert.strictEqual(readState(sandbox, "session-1").writeReplayTokens, 400_000);
+  assert.strictEqual(readState(sandbox, "session-1").writeTurnWrites, 1);
+});
+
+test("a successful Bash write consumes the window once and confirms its path", (t) => {
+  const sandbox = makeSandbox(t);
+  const payload = { ...bashPayload(sandbox, { command: "printf new > src/x" }), tool_use_id: "bash-success" };
+  run(sandbox, payload);
+  assert.strictEqual(run(sandbox, payload).stdout, "");
+  assert.strictEqual(readState(sandbox, "session-1").writeCount, 1);
+  run(sandbox, { ...payload, hook_event_name: "PostToolUse", tool_response: { exitCode: 0 } });
+  const confirmed = readState(sandbox, "session-1");
+  assert.strictEqual(confirmed.writeReplayTokens, 400_000);
+  assert.deepStrictEqual(confirmed.pendingWrites, []);
+  assert.deepStrictEqual(confirmed.confirmedPathSignatures, confirmed.writtenPathSignatures);
+  run(sandbox, { ...payload, hook_event_name: "PostToolUseFailure" });
+  assert.strictEqual(readState(sandbox, "session-1").writeCount, 1);
+  assert.strictEqual(readState(sandbox, "session-1").writeReplayTokens, 400_000);
+});
+
+test("confirming B then failing A in one write turn keeps the turn charged", (t) => {
+  const sandbox = makeSandbox(t);
+  const env = { FUSION_TEST_NOW: "2026-07-21T00:00:00.000Z" };
+  const a = { ...writePayload(sandbox), tool_use_id: "write-a" };
+  const b = { ...writePayload(sandbox), tool_use_id: "write-b" };
+  run(sandbox, a, env);
+  run(sandbox, b, env);
+  run(sandbox, { ...b, hook_event_name: "PostToolUse" }, env);
+  run(sandbox, { ...a, hook_event_name: "PostToolUseFailure" }, env);
+  const state = readState(sandbox, "session-1");
+  assert.strictEqual(state.writeReplayTokens, 400_000);
+  assert.strictEqual(state.writeTurnTokens, 400_000);
+  assert.strictEqual(state.writeTurnWrites, 1);
+  assert.strictEqual(state.writeCount, 1);
+  assert.deepStrictEqual(state.pendingWrites, []);
+});
+
+test("failing A then retrying B in the same turn charges the turn again", (t) => {
+  const sandbox = makeSandbox(t);
+  const env = { FUSION_TEST_NOW: "2026-07-21T00:00:00.000Z" };
+  const a = { ...writePayload(sandbox), tool_use_id: "write-a" };
+  const b = { ...writePayload(sandbox), tool_use_id: "write-b" };
+  run(sandbox, a, env);
+  run(sandbox, { ...a, hook_event_name: "PostToolUseFailure" }, env);
+  const failed = readState(sandbox, "session-1");
+  assert.strictEqual(failed.writeReplayTokens, 0);
+  assert.strictEqual(failed.writeTurnKey, null);
+  assert.strictEqual(failed.writeTurnTokens, 0);
+  assert.strictEqual(failed.writeTurnWrites, 0);
+  run(sandbox, b, env);
+  const state = readState(sandbox, "session-1");
+  assert.strictEqual(state.writeReplayTokens, 400_000);
+  assert.strictEqual(state.writeTurnKey, state.turn.key);
+  assert.strictEqual(state.writeTurnTokens, 400_000);
+  assert.strictEqual(state.writeTurnWrites, 1);
+  assert.strictEqual(state.pendingWrites[0].turn, state.turn.key);
+  assert.strictEqual(Object.hasOwn(state.pendingWrites[0], "tokens"), false);
+});
+
+test("failing every write in the current turn refunds its charge once", (t) => {
+  for (const order of [["a", "b"], ["b", "a"]]) {
+    const sandbox = makeSandbox(t);
+    const env = { FUSION_TEST_NOW: "2026-07-21T00:00:00.000Z" };
+    const writes = Object.fromEntries(order.map((id) => [id, { ...writePayload(sandbox), tool_use_id: id }]));
+    run(sandbox, writes.a, env);
+    run(sandbox, writes.b, env);
+    run(sandbox, { ...writes[order[0]], hook_event_name: "PostToolUseFailure" }, env);
+    assert.strictEqual(readState(sandbox, "session-1").writeReplayTokens, 400_000);
+    run(sandbox, { ...writes[order[1]], hook_event_name: "PostToolUseFailure" }, env);
+    const state = readState(sandbox, "session-1");
+    assert.strictEqual(state.writeReplayTokens, 0);
+    assert.strictEqual(state.writeTurnKey, null);
+    assert.strictEqual(state.writeTurnTokens, 0);
+    assert.strictEqual(state.writeTurnWrites, 0);
+  }
+});
+
+test("failure of an older write turn does not refund replay tokens", (t) => {
+  const sandbox = makeSandbox(t);
+  const a = { ...writePayload(sandbox), tool_use_id: "write-a" };
+  const b = { ...writePayload(sandbox), tool_use_id: "write-b" };
+  writeDispatchTranscript(sandbox, [{ messageId: "msg_a", payloads: [a] }, { messageId: "msg_b", payloads: [b] }]);
+  run(sandbox, a);
+  run(sandbox, b);
+  run(sandbox, { ...a, hook_event_name: "PostToolUseFailure" });
+  const state = readState(sandbox, "session-1");
+  assert.strictEqual(state.writeReplayTokens, 800_000);
+  assert.strictEqual(state.writeTurnKey, "msg_b");
+  assert.strictEqual(state.writeTurnTokens, 400_000);
+  assert.strictEqual(state.writeTurnWrites, 1);
+});
+
+test("strict posture admits further writes in a turn that reached the budget", (t) => {
+  const sandbox = makeSandbox(t);
+  const env = { FUSION_POSTURE: "strict", FUSION_INLINE_REPLAY_BUDGET_TOKENS: "400000", FUSION_INLINE_TAIL_ALLOWANCE: "0", FUSION_INLINE_ZERO_DISPATCH_WRITES: "0" };
+  const writes = ["a", "b", "c"].map((id) => ({ ...writePayload(sandbox), tool_use_id: id }));
+  writeDispatchTranscript(sandbox, [{ messageId: "msg_ab", payloads: writes.slice(0, 2) }, { messageId: "msg_c", payloads: writes.slice(2) }]);
+  advisoryContext(run(sandbox, writes[0], env), "inline-guard.write-budget-advisory");
+  assert.strictEqual(run(sandbox, writes[1], env).stdout, "");
+  const state = readState(sandbox, "session-1");
+  assert.strictEqual(state.writeCount, 2);
+  assert.strictEqual(state.writeReplayTokens, 400_000);
+  assert.strictEqual(state.writeTurnWrites, 2);
+  const denied = run(sandbox, writes[2], env);
+  assert.strictEqual(JSON.parse(denied.stdout).hookSpecificOutput.permissionDecision, "deny");
+});
+
+test("Bash writes with unknown bytes count zero bytes and cannot use zero dispatch relief", (t) => {
+  const sandbox = makeSandbox(t);
+  const env = { FUSION_POSTURE: "strict", FUSION_INLINE_REPLAY_BUDGET_TOKENS: "400000" };
+  const first = { ...bashPayload(sandbox, { command: "printf changed > src/a.ts; false" }), tool_use_id: "bash-a" };
+  const second = { ...bashPayload(sandbox, { command: "sed -i s/a/b/ src/a.ts" }), tool_use_id: "bash-b" };
+  writeDispatchTranscript(sandbox, [{ messageId: "msg_a", payloads: [first] }, { messageId: "msg_b", payloads: [second] }]);
+  advisoryContext(run(sandbox, first, env), "inline-guard.write-budget-advisory");
+  assert.strictEqual(readState(sandbox, "session-1").inlineWriteBytes, 0);
+  const denied = run(sandbox, second, env);
+  assert.strictEqual(JSON.parse(denied.stdout).hookSpecificOutput.permissionDecision, "deny");
+  assert.strictEqual(readState(sandbox, "session-1").writeCount, 1);
+  assert.strictEqual(readAuditRecords(sandbox).filter((event) => event.event === "zero-dispatch-softened").length, 0);
+});
+
+test("passing verification clears turn accounting and permits the same budget advisory again", (t) => {
+  const sandbox = makeSandbox(t);
+  const env = { FUSION_INLINE_REPLAY_BUDGET_TOKENS: "400000" };
+  const first = { ...writePayload(sandbox), tool_use_id: "a" };
+  advisoryContext(run(sandbox, first, env), "inline-guard.unverified-advisory");
+  run(sandbox, verificationPayload(sandbox), env);
+  const reset = readState(sandbox, "session-1");
+  assert.strictEqual(reset.writeTurnKey, null);
+  assert.strictEqual(reset.writeTurnTokens, 0);
+  assert.strictEqual(reset.writeTurnWrites, 0);
+  assert.strictEqual(reset.advisorySignatures["write-budget"], undefined);
+  advisoryContext(run(sandbox, { ...writePayload(sandbox), tool_use_id: "b" }, env), "inline-guard.unverified-advisory");
+  assert.strictEqual(readAuditRecords(sandbox).filter((event) => event.event === "warn" && !event.suppressed).length, 2);
+});
+
+test("a late failure before verification cannot refund a new window in the same turn", (t) => {
+  const sandbox = makeSandbox(t);
+  const a = { ...writePayload(sandbox), tool_use_id: "a" };
+  const b = { ...writePayload(sandbox), tool_use_id: "b" };
+  writeDispatchTranscript(sandbox, [{ messageId: "msg_ab", payloads: [a, b] }]);
+  run(sandbox, a);
+  run(sandbox, verificationPayload(sandbox));
+  run(sandbox, b);
+  run(sandbox, { ...a, hook_event_name: "PostToolUseFailure" });
+  const state = readState(sandbox, "session-1");
+  assert.strictEqual(state.writeReplayTokens, 400_000);
+  assert.strictEqual(state.writeTurnTokens, 400_000);
+  assert.strictEqual(state.writeTurnWrites, 1);
+  assert.strictEqual(state.writeTurnKey, "msg_ab");
+});
+
+test("a write waits for a held state lock and charges its current turn", async (t) => {
+  const sandbox = makeSandbox(t);
+  const a = { ...writePayload(sandbox), tool_use_id: "a" };
+  const b = { ...writePayload(sandbox), tool_use_id: "b" };
+  writeDispatchTranscript(sandbox, [{ messageId: "msg_a", payloads: [a] }, { messageId: "msg_b", payloads: [b] }]);
+  run(sandbox, a);
+  const lock = `${stateFileFor(sandbox, "session-1")}.lock`;
+  const marker = path.join(sandbox.root, "contended");
+  const preload = path.join(sandbox.root, "contention.mjs");
+  fs.writeFileSync(preload, `import fs from 'node:fs'; const open = fs.openSync; let attempts = 0; fs.openSync = function (...args) { try { return open.apply(this, args); } catch (error) { if (args[0] === ${JSON.stringify(lock)} && error.code === 'EEXIST' && ++attempts === 2) fs.writeFileSync(${JSON.stringify(marker)}, ''); throw error; } };`);
+  fs.writeFileSync(lock, String(process.pid));
+  const pending = runAsyncRaw(sandbox, b, { NODE_OPTIONS: `${process.env.NODE_OPTIONS ?? ""} --import=${pathToFileURL(preload).href}`.trim() });
+  try {
+    const deadline = performance.now() + 3000;
+    while (!fs.existsSync(marker) && performance.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 10));
+    assert.ok(fs.existsSync(marker));
+  } finally {
+    fs.rmSync(lock, { force: true });
+  }
+  const result = await pending;
+  assert.strictEqual(result.status, 0, result.stderr);
+  assert.strictEqual(result.stdout, "");
+  const state = readState(sandbox, "session-1");
+  assert.strictEqual(state.turn.key, "msg_b");
+  assert.strictEqual(state.writeTurnKey, "msg_b");
+  assert.strictEqual(state.writeReplayTokens, 800_000);
+});
+
+test("late Bash failures do not subtract replay tokens from a window opened by verification or dispatch", (t) => {
+  for (const reset of [verificationPayload, dispatchPayload]) {
+    const sandbox = makeSandbox(t);
+    const payload = { ...bashPayload(sandbox, { command: "printf new > src/x" }), tool_use_id: "old-bash" };
+    run(sandbox, payload);
+    assert.strictEqual(readState(sandbox, "session-1").writeReplayTokens, 400_000);
+    run(sandbox, reset(sandbox));
+    assert.strictEqual(readState(sandbox, "session-1").writeReplayTokens, 0);
+    assert.strictEqual(readState(sandbox, "session-1").writeTurnKey, null);
+    run(sandbox, writePayload(sandbox));
+    assert.strictEqual(readState(sandbox, "session-1").writeReplayTokens, 400_000);
+    run(sandbox, { ...payload, hook_event_name: "PostToolUseFailure" });
+    assert.strictEqual(readState(sandbox, "session-1").writeReplayTokens, 400_000);
+  }
+});
+
+test("a Bash write can use zero dispatch relief and audits the resulting replay total", (t) => {
+  const sandbox = makeSandbox(t);
+  const env = { FUSION_POSTURE: "strict" };
+  for (let index = 0; index < 5; index += 1) run(sandbox, writePayload(sandbox), env);
+  const result = run(sandbox, bashPayload(sandbox, { command: "cat > src/x <<'EOF'\nnew\nEOF" }), env);
+  advisoryContext(result, "inline-guard.zero-dispatch-advisory");
+  const state = readState(sandbox, "session-1");
+  assert.strictEqual(state.writeCount, 6);
+  assert.strictEqual(state.inlineWriteBytes, 3);
+  const relief = readAuditRecords(sandbox).at(-1);
+  assert.strictEqual(relief.event, "zero-dispatch-softened");
+  assert.strictEqual(relief.tool, "Bash");
+  assert.strictEqual(relief.path, "src/x");
+  assert.strictEqual(relief.budget, 2_000_000);
+  assert.strictEqual(relief.replayTokens, state.writeReplayTokens);
 });
 
 test("judgment posture allows a main loop write at count 200", (t) => {
@@ -277,7 +650,7 @@ test("strict posture denies writes after the dispatch window budget and audits e
     const denied = run(sandbox, writePayload(sandbox), strictEnv);
     const output = JSON.parse(denied.stdout);
     assert.strictEqual(output.hookSpecificOutput.permissionDecision, "deny");
-    assert.match(output.hookSpecificOutput.permissionDecisionReason, /inline write budget is exhausted/i);
+    assert.match(output.hookSpecificOutput.permissionDecisionReason, /inline replay budget is exhausted/i);
     assertMessageTagged(output.hookSpecificOutput.permissionDecisionReason, "inline-guard.write-budget-deny");
   }
   assert.strictEqual(readState(sandbox, "session-1").writesSinceDispatch, 5);
@@ -296,7 +669,8 @@ test("strict posture denies writes after the dispatch window budget and audits e
     path: "file.txt",
     writeCount: 5,
     dispatchCount: 1,
-    budget: 5,
+    budget: 2_000_000,
+    replayTokens: 2_000_000,
     mode: "enforce",
     posture: "strict",
     messageCode: messageCode("inline-guard.write-budget-deny")
@@ -380,7 +754,7 @@ test("strict posture softens an exhausted budget for a zero dispatch session wit
     context,
     tagMessage(
       "inline-guard.zero-dispatch-advisory",
-      "The inline write budget is exhausted; this window remains within its inline relief bounds, with 4 writes and 16378 bytes left before enforcement resumes."
+      "The inline replay budget is exhausted; this window remains within its inline relief bounds, with 4 writes and 16378 bytes left before enforcement resumes."
     )
   );
   const audit = readAuditRecords(sandbox).filter((record) => record.event === "zero-dispatch-softened");
@@ -420,6 +794,8 @@ test("a passing verification resets the write window and stops the advisory from
   assert.strictEqual(verified.stderr, "");
   const reset = readState(sandbox, "session-1");
   assert.strictEqual(reset.writesSinceDispatch, 0);
+  assert.strictEqual(reset.writeReplayTokens, 0);
+  assert.strictEqual(reset.writeTurnKey, null);
   assert.deepStrictEqual(reset.advisedMultiples, []);
   assert.deepStrictEqual(reset.writtenPathSignatures, []);
 
@@ -437,7 +813,8 @@ test("a passing verification resets the write window and stops the advisory from
       tool: "Bash",
       writeCount: 5,
       dispatchCount: 0,
-      budget: 5,
+      budget: 2_000_000,
+      replayTokens: 2_000_000,
       mode: "advisory",
       posture: "judgment",
       evidence: "exit-status"
@@ -702,7 +1079,7 @@ test("strict posture records a passing verification and preserves the strict den
     JSON.parse(sixth.stdout).hookSpecificOutput.permissionDecisionReason,
     tagMessage(
       "inline-guard.write-budget-deny",
-      "5 inline writes happened this session with zero dispatches. Lanes: quick scoped work goes to the codex quick default gpt-6-sol at effort xhigh; trivial or high volume work goes to the codex volume default gpt-6-luna at effort xhigh; work needing the Claude Code tool surface goes to fusion:claude-worker. The inline write budget is exhausted. Dispatch an Agent or Task before another main-loop write."
+      "5 inline writes replayed 2.0M tokens of context this session with zero dispatches. Lanes: quick scoped work goes to the codex quick default gpt-6-sol at effort xhigh; trivial or high volume work goes to the codex volume default gpt-6-luna at effort xhigh; work needing the Claude Code tool surface goes to fusion:claude-worker. The inline replay budget is exhausted. Dispatch an Agent or Task before another main-loop write."
     )
   );
   const [event] = readAuditRecords(sandbox).filter((record) => record.event === "verification");
@@ -748,6 +1125,10 @@ test("the write window resets on dispatch and on a passing verification", (t) =>
   run(sandbox, dispatchPayload(sandbox, { subagentType: "codex:codex-rescue" }));
   const dispatched = readState(sandbox, "session-1");
   assert.strictEqual(dispatched.writesSinceDispatch, 0);
+  assert.strictEqual(dispatched.writeReplayTokens, 0);
+  assert.strictEqual(dispatched.writeTurnKey, null);
+  assert.strictEqual(dispatched.writeTurnTokens, 0);
+  assert.strictEqual(dispatched.writeTurnWrites, 0);
   assert.deepStrictEqual(dispatched.writtenPathSignatures, []);
 
   for (let index = 0; index < 3; index += 1) {
@@ -773,7 +1154,7 @@ test("judgment posture uses the exact unverified advisory and the guard omits th
     context,
     tagMessage(
       "inline-guard.unverified-advisory",
-      "5 main loop writes are unverified in this window. Run this change's verification command once it is coherent, or hand the remaining work to a lane. Lanes: quick scoped work goes to the codex quick default gpt-6-sol at effort xhigh; trivial or high volume work goes to the codex volume default gpt-6-luna at effort xhigh; work needing the Claude Code tool surface goes to fusion:claude-worker. This session has not dispatched yet; if the remaining work splits into independent packages, dispatch them together in one message, and three or more convene /fusion:ultra."
+      "5 main loop writes are unverified in this window, and their turns replayed 2.0M tokens of context. Run this change's verification command once it is coherent, or hand the remaining work to a lane. Lanes: quick scoped work goes to the codex quick default gpt-6-sol at effort xhigh; trivial or high volume work goes to the codex volume default gpt-6-luna at effort xhigh; work needing the Claude Code tool surface goes to fusion:claude-worker. This session has not dispatched yet; if the remaining work splits into independent packages, dispatch them together in one message, and three or more convene /fusion:ultra."
     )
   );
   assert.doesNotMatch(fs.readFileSync(script, "utf8"), /fast-worker/);
@@ -824,7 +1205,8 @@ test("audit normalization accepts verification posture and every legacy event ca
       path: "file.txt",
       writeCount: 6,
       dispatchCount: 0,
-      budget: 5,
+      budget: 2_000_000,
+      replayTokens: 2_000_000,
       mode: "enforce",
       remainingZeroDispatchWrites: 4,
       remainingZeroDispatchBytes: 100
@@ -965,7 +1347,7 @@ test("the fifth write under the default budget attaches one advisory and audits 
   assert.strictEqual(fifth.status, 0);
   const output = JSON.parse(fifth.stdout);
   assert.strictEqual(output.hookSpecificOutput.hookEventName, "PreToolUse");
-  assert.match(advisoryContext(fifth, "inline-guard.unverified-advisory"), /^5 main loop writes are unverified in this window\./);
+  assert.match(advisoryContext(fifth, "inline-guard.unverified-advisory"), /^5 main loop writes are unverified in this window, and their turns replayed 2\.0M tokens of context\./);
   const records = readAuditRecords(sandbox);
   assert.strictEqual(records.filter((record) => record.event === "write").length, 5);
   const warnings = records.filter((record) => record.event === "warn");
@@ -980,7 +1362,8 @@ test("the fifth write under the default budget attaches one advisory and audits 
     path: "file.txt",
     writeCount: 5,
     dispatchCount: 0,
-    budget: 5,
+    budget: 2_000_000,
+    replayTokens: 2_000_000,
     mode: "advisory",
     posture: "judgment",
     messageCode: messageCode("inline-guard.unverified-advisory")
@@ -992,7 +1375,7 @@ test("judgment advisories fire at 1x, 2x, 4x, 8x, and 16x the budget", (t) => {
   for (let i = 1; i <= 80; i += 1) {
     const result = run(sandbox, writePayload(sandbox));
     if ([5, 10, 20, 40, 80].includes(i)) {
-      assert.match(advisoryContext(result, "inline-guard.unverified-advisory"), new RegExp(`^${i} main loop writes are unverified in this window\\.`));
+      assert.match(advisoryContext(result, "inline-guard.unverified-advisory"), new RegExp(`^${i} main loop writes are unverified in this window, and their turns replayed ${(i * 0.4).toFixed(1).replace(".", "\\.")}M tokens of context\\.`));
     } else {
       assert.strictEqual(result.stdout, "", `write ${i} should stay silent`);
     }
@@ -1014,7 +1397,7 @@ test("advisories count writes since the most recent dispatch and restart after e
   }
   const fifth = run(sandbox, writePayload(sandbox));
   const fifthReason = advisoryContext(fifth, "inline-guard.unverified-advisory");
-  assert.match(fifthReason, /^5 main loop writes are unverified in this window\./);
+  assert.match(fifthReason, /^5 main loop writes are unverified in this window, and their turns replayed 2\.0M tokens of context\./);
   assert.doesNotMatch(fifthReason, /This session has not dispatched yet;/);
   assertMessageTagged(fifthReason, "inline-guard.unverified-advisory");
 
@@ -1025,7 +1408,7 @@ test("advisories count writes since the most recent dispatch and restart after e
   }
   const nextFifth = run(sandbox, writePayload(sandbox));
   const nextFifthReason = advisoryContext(nextFifth, "inline-guard.unverified-advisory");
-  assert.match(nextFifthReason, /^5 main loop writes are unverified in this window\./);
+  assert.match(nextFifthReason, /^5 main loop writes are unverified in this window, and their turns replayed 2\.0M tokens of context\./);
   assert.doesNotMatch(nextFifthReason, /This session has not dispatched yet;/);
   assertMessageTagged(nextFifthReason, "inline-guard.unverified-advisory");
 
@@ -1217,7 +1600,9 @@ test("SendMessage continuations of same-session rescue wrappers count as dispatc
     assert.strictEqual(runRaw(sandbox, { ...ignored, hook_event_name: "PreToolUse" }, env).stdout, "");
     assert.strictEqual(runRaw(sandbox, ignored, env).stdout, "");
   }
-  assert.strictEqual(fs.existsSync(stateFileFor(sandbox, "session-1")), false);
+  assert.strictEqual(readState(sandbox, "session-1").writeCount, 0);
+  assert.deepStrictEqual(readState(sandbox, "session-1").dispatches, {});
+  assertSingleReplay(sandbox, "SendMessage", "dispatch");
 
   assert.strictEqual(runRaw(sandbox, { ...continuation, hook_event_name: "PreToolUse" }, env).stdout, "");
   assert.strictEqual(runRaw(sandbox, continuation, env).stdout, "");
@@ -1260,7 +1645,9 @@ test("writes and dispatches append minimal long-term audit records", (t) => {
   run(sandbox, dispatchPayload(sandbox, { toolName: "Task", subagentType: "codex:codex-rescue", description: "implement the repair" }));
   run(sandbox, writePayload(sandbox, { filePath: target }));
 
-  const { events: records, malformedCount } = readAuditEvents({ auditDir: sandbox.auditDir });
+  const { events, malformedCount } = readAuditEvents({ auditDir: sandbox.auditDir });
+  const records = events.filter((event) => event.event !== "replay");
+  assert.strictEqual(events.filter((event) => event.event === "replay").length, 1);
   assert.strictEqual(records.length, 3);
   assert.strictEqual(malformedCount, 0);
   assert.deepStrictEqual(records[0], {
@@ -1383,7 +1770,8 @@ test("malformed or oversized subagent types fall back to builtin without enterin
   const auditText = readAuditLines(sandbox).join("\n");
   assert.deepStrictEqual(readState(sandbox, "session-1").dispatches, { builtin: 4 });
   assert.ok(readState(sandbox, "session-1").dispatchLog.every((entry) => !Object.hasOwn(entry, "subagentType")));
-  assert.deepStrictEqual(readAuditRecords(sandbox).map((record) => record.lane), ["builtin", "builtin", "builtin", "builtin"]);
+  assert.deepStrictEqual(readAuditRecords(sandbox).map((record) => record.lane), ["main", "builtin", "builtin", "builtin", "builtin"]);
+  assert.strictEqual(readAuditRecords(sandbox)[0].event, "replay");
   assert.doesNotMatch(`${stateText}\n${auditText}`, /secret-value/);
   assert.doesNotMatch(`${stateText}\n${auditText}`, new RegExp("s".repeat(100)));
 });
@@ -1529,8 +1917,11 @@ test("out-of-workspace writes are audited as exempt without entering either post
       assert.strictEqual(result.stdout, "");
     }
   }
-  assert.strictEqual(fs.existsSync(stateFileFor(sandbox, "session-1")), false);
-  const records = readAuditRecords(sandbox);
+  assert.strictEqual(readState(sandbox, "session-1").writeCount, 0);
+  assert.strictEqual(readState(sandbox, "session-1").writesSinceDispatch, 0);
+  assert.strictEqual(readState(sandbox, "session-1").turn.kind, "other");
+  const records = readAuditRecords(sandbox).filter((event) => event.event !== "replay");
+  assert.strictEqual(readAuditRecords(sandbox).filter((event) => event.event === "replay").length, 1);
   assert.strictEqual(records.length, 4);
   assert.ok(records.every((record) => record.event === "write" && record.exempt === "out-of-workspace" && !Object.hasOwn(record, "path")));
 
@@ -1573,27 +1964,27 @@ test("inline relief environment values accept overrides, preserve zero, and reje
   assert.strictEqual(resolveZeroDispatchWrites({ FUSION_INLINE_ZERO_DISPATCH_WRITES: "not-a-number" }), 10);
 });
 
-test("FUSION_INLINE_WRITE_BUDGET overrides the default threshold", (t) => {
+test("FUSION_INLINE_REPLAY_BUDGET_TOKENS overrides the default threshold", (t) => {
   const sandbox = makeSandbox(t);
-  const extraEnv = { FUSION_INLINE_WRITE_BUDGET: "2" };
+  const extraEnv = { FUSION_INLINE_REPLAY_BUDGET_TOKENS: "800000" };
   const first = run(sandbox, writePayload(sandbox), extraEnv);
   const second = run(sandbox, writePayload(sandbox), extraEnv);
   assert.strictEqual(first.stdout, "");
   const secondReason = advisoryContext(second, "inline-guard.unverified-advisory");
-  assert.match(secondReason, /^2 main loop writes are unverified in this window\./);
+  assert.match(secondReason, /^2 main loop writes are unverified in this window, and their turns replayed 800k tokens of context\./);
   assertMessageTagged(secondReason, "inline-guard.unverified-advisory");
 });
 
-test("a nonsense FUSION_INLINE_WRITE_BUDGET value falls back to the default of 5", (t) => {
+test("a nonsense FUSION_INLINE_REPLAY_BUDGET_TOKENS value falls back to the default of 2,000,000 tokens", (t) => {
   const sandbox = makeSandbox(t);
-  const extraEnv = { FUSION_INLINE_WRITE_BUDGET: "not-a-number" };
+  const extraEnv = { FUSION_INLINE_REPLAY_BUDGET_TOKENS: "not-a-number" };
   for (let i = 0; i < 4; i += 1) {
     const result = run(sandbox, writePayload(sandbox), extraEnv);
     assert.strictEqual(result.stdout, "");
   }
   const fifth = run(sandbox, writePayload(sandbox), extraEnv);
   const reason = advisoryContext(fifth, "inline-guard.unverified-advisory");
-  assert.match(reason, /^5 main loop writes are unverified in this window\./);
+  assert.match(reason, /^5 main loop writes are unverified in this window, and their turns replayed 2\.0M tokens of context\./);
   assertMessageTagged(reason, "inline-guard.unverified-advisory");
 });
 
@@ -1658,8 +2049,8 @@ test("failure callbacks release Edit, Write, NotebookEdit, and MultiEdit counts"
   const sandbox = makeSandbox(t);
   for (const toolName of ["Edit", "Write", "NotebookEdit", "MultiEdit"]) {
     const payload = { ...writePayload(sandbox, { toolName, filePath: path.join(sandbox.workDir, `${toolName}.txt`) }), tool_use_id: `id-${toolName}` };
-    run(sandbox, payload, { FUSION_INLINE_WRITE_BUDGET: "20" });
-    run(sandbox, { ...payload, hook_event_name: "PostToolUseFailure" }, { FUSION_INLINE_WRITE_BUDGET: "20" });
+    run(sandbox, payload, { FUSION_INLINE_REPLAY_BUDGET_TOKENS: "8000000" });
+    run(sandbox, { ...payload, hook_event_name: "PostToolUseFailure" }, { FUSION_INLINE_REPLAY_BUDGET_TOKENS: "8000000" });
     assert.strictEqual(readState(sandbox, "session-1").writesSinceDispatch, 0, toolName);
   }
   assert.strictEqual(readState(sandbox, "session-1").writeCount, 0);
@@ -1686,24 +2077,25 @@ test("audit appends after a malformed trailing line and readers skip only the da
 
   run(sandbox, writePayload(sandbox));
   const lines = fs.readFileSync(file, "utf8").split("\n").filter(Boolean);
-  assert.strictEqual(lines.length, 2);
+  assert.strictEqual(lines.length, 3);
   assert.strictEqual(lines[0], "{ malformed");
   const audit = readAuditEvents({ auditDir: sandbox.auditDir });
-  assert.strictEqual(audit.events.length, 1);
-  assert.strictEqual(audit.events[0].event, "write");
+  assert.strictEqual(audit.events.length, 2);
+  assert.deepStrictEqual(audit.events.map((event) => event.event), ["replay", "write"]);
   assert.strictEqual(audit.malformedCount, 1);
 });
 
 test("audit rotates by size without losing valid enforcement records", (t) => {
   const sandbox = makeSandbox(t);
-  const extraEnv = { FUSION_POSTURE: "strict", FUSION_INLINE_GUARD_AUDIT_MAX_BYTES: "1", FUSION_INLINE_GUARD_AUDIT_MAX_FILES: "10", FUSION_INLINE_ZERO_DISPATCH_WRITES: "0" };
+  const extraEnv = { FUSION_POSTURE: "strict", FUSION_INLINE_GUARD_AUDIT_MAX_BYTES: "1", FUSION_INLINE_GUARD_AUDIT_MAX_FILES: "20", FUSION_INLINE_ZERO_DISPATCH_WRITES: "0" };
   for (let index = 0; index < 6; index += 1) {
     run(sandbox, writePayload(sandbox), extraEnv);
   }
 
   const audit = readAuditEvents({ auditDir: sandbox.auditDir });
-  assert.strictEqual(auditFiles(sandbox).length, 7);
-  assert.strictEqual(audit.events.length, 7);
+  assert.strictEqual(auditFiles(sandbox).length, 13);
+  assert.strictEqual(audit.events.length, 13);
+  assert.strictEqual(audit.events.filter((event) => event.event === "replay").length, 6);
   assert.strictEqual(audit.events.filter((event) => event.event === "write").length, 5);
   assert.strictEqual(audit.events.filter((event) => event.event === "warn").length, 1);
   assert.strictEqual(audit.events.filter((event) => event.event === "deny").length, 1);
@@ -1730,7 +2122,7 @@ test("audit removes segments older than its retention window", (t) => {
 
   run(sandbox, writePayload(sandbox), { FUSION_INLINE_GUARD_AUDIT_RETENTION_DAYS: "1" });
   assert.strictEqual(fs.existsSync(staleFile), false);
-  assert.strictEqual(readAuditEvents({ auditDir: sandbox.auditDir }).events.length, 1);
+  assert.deepStrictEqual(readAuditEvents({ auditDir: sandbox.auditDir }).events.map((event) => event.event), ["replay", "write"]);
 });
 
 test("audit pointer avoids a segment scan and retention waits for its hourly stamp", (t) => {
@@ -1750,12 +2142,15 @@ test("audit pointer avoids a segment scan and retention waits for its hourly sta
   assert.strictEqual(fs.statSync(stamp).mtimeMs, stampTime);
   run(sandbox, writePayload(sandbox), { FUSION_TEST_NOW: later, FUSION_INLINE_GUARD_AUDIT_RETENTION_DAYS: "1" });
   assert.strictEqual(fs.existsSync(staleFile), false);
-  assert.strictEqual(readAuditEvents({ auditDir: sandbox.auditDir }).events.length, 3);
+  const records = readAuditEvents({ auditDir: sandbox.auditDir }).events;
+  assert.strictEqual(records.length, 6);
+  assert.strictEqual(records.filter((event) => event.event === "replay").length, 3);
+  assert.strictEqual(records.filter((event) => event.event === "write").length, 3);
 });
 
 test("concurrent hook invocations serialize dispatch and write increments", async (t) => {
   const sandbox = makeSandbox(t);
-  const extraEnv = { FUSION_INLINE_WRITE_BUDGET: "1000" };
+  const extraEnv = { FUSION_INLINE_REPLAY_BUDGET_TOKENS: "400000000" };
   const calls = [];
   for (let index = 0; index < 16; index += 1) {
     calls.push(runAsync(sandbox, writePayload(sandbox), extraEnv));
@@ -1771,7 +2166,8 @@ test("concurrent hook invocations serialize dispatch and write increments", asyn
   assert.deepStrictEqual(state.dispatches, { grok: 16 });
   assert.strictEqual(fs.existsSync(`${stateFileFor(sandbox, "session-1")}.lock`), false);
   const audit = readAuditEvents({ auditDir: sandbox.auditDir });
-  assert.strictEqual(audit.events.length, 32);
+  assert.strictEqual(audit.events.filter((event) => event.event !== "replay").length, 32);
+  assert.ok(audit.events.some((event) => event.event === "replay"));
   assert.strictEqual(audit.malformedCount, 0);
   assert.strictEqual(audit.events.filter((record) => record.event === "write").length, 16);
   assert.strictEqual(audit.events.filter((record) => record.event === "dispatch").length, 16);
@@ -1877,7 +2273,7 @@ test("in-flight worker tasks allow a real Bash command untouched", (t) => {
   const result = run(sandbox, bashPayload(sandbox, { command: "ls -la" }), workerStateEnv(sandbox));
   assert.strictEqual(result.status, 0);
   assert.strictEqual(result.stdout, "");
-  assert.deepStrictEqual(readAuditRecords(sandbox), []);
+  assertSingleReplay(sandbox, "Bash", "read");
 });
 
 test("ordinary Bash PreToolUse does not read worker records", (t) => {
@@ -1903,7 +2299,7 @@ test("no in-flight worker tasks allow no-op Bash true untouched", (t) => {
   const result = run(sandbox, bashPayload(sandbox, { command: "true" }), workerStateEnv(sandbox));
   assert.strictEqual(result.status, 0);
   assert.strictEqual(result.stdout, "");
-  assert.deepStrictEqual(readAuditRecords(sandbox), []);
+  assertSingleReplay(sandbox, "Bash", "read");
 });
 
 test("the no-op heartbeat denial holds in judgment posture and in strict posture", (t) => {
@@ -1952,7 +2348,8 @@ test("no-op Bash deny audits an enforcement event for Bash on the main lane", (t
     tool: "Bash",
     writeCount: 0,
     dispatchCount: 0,
-    budget: 5,
+    budget: 2_000_000,
+    replayTokens: 0,
     mode: "enforce",
     posture: "judgment",
     messageCode: messageCode("inline-guard.no-op-heartbeat-deny")
@@ -1974,7 +2371,7 @@ test("TaskOutput against a terminal Fusion worker redirects to its output file",
   assert.match(output.hookSpecificOutput.permissionDecisionReason, new RegExp(outputFile));
   assert.match(output.hookSpecificOutput.permissionDecisionReason, new RegExp(`/fusion:stats --record ${taskId}=<verdict>`));
   assertMessageTagged(output.hookSpecificOutput.permissionDecisionReason, "inline-guard.reaped-worker-redirect");
-  const redirects = readAuditRecords(sandbox).filter((record) => record.tool === "TaskOutput");
+  const redirects = readAuditRecords(sandbox).filter((record) => record.tool === "TaskOutput" && record.event !== "replay");
   assert.deepStrictEqual(redirects, [
     {
       schemaVersion: 1,
@@ -1999,7 +2396,7 @@ test("TaskOutput against a running Fusion worker is allowed", (t) => {
   const result = run(sandbox, taskControlPayload(sandbox, { taskId: backgroundTaskId }), workerStateEnv(sandbox));
   assert.strictEqual(result.status, 0);
   assert.strictEqual(result.stdout, "");
-  assert.deepStrictEqual(readAuditRecords(sandbox), []);
+  assertSingleReplay(sandbox, "TaskOutput", "other");
 });
 
 test("TaskOutput with an unknown task id is allowed", (t) => {
@@ -2007,7 +2404,7 @@ test("TaskOutput with an unknown task id is allowed", (t) => {
   const result = run(sandbox, taskControlPayload(sandbox, { taskId: "not-a-fusion-worker" }), workerStateEnv(sandbox));
   assert.strictEqual(result.status, 0);
   assert.strictEqual(result.stdout, "");
-  assert.deepStrictEqual(readAuditRecords(sandbox), []);
+  assertSingleReplay(sandbox, "TaskOutput", "other");
 });
 
 test("TaskStop against a terminal Fusion worker redirects to its transcript", (t) => {
@@ -2039,7 +2436,7 @@ test("the terminal TaskOutput redirect denies in strict posture too", (t) => {
   assert.strictEqual(output.hookSpecificOutput.permissionDecision, "deny");
   assert.match(output.hookSpecificOutput.permissionDecisionReason, /settle via \/fusion:stats --record/);
   assertMessageTagged(output.hookSpecificOutput.permissionDecisionReason, "inline-guard.reaped-worker-redirect");
-  const denials = readAuditRecords(sandbox).filter((record) => record.tool === "TaskOutput");
+  const denials = readAuditRecords(sandbox).filter((record) => record.tool === "TaskOutput" && record.event !== "replay");
   assert.strictEqual(denials.length, 1);
   assert.strictEqual(denials[0].event, "deny");
   assert.strictEqual(denials[0].description, "reaped-worker-redirect");
@@ -2047,53 +2444,6 @@ test("the terminal TaskOutput redirect denies in strict posture too", (t) => {
   assert.strictEqual(denials[0].posture, "strict");
 });
 
-test("read only Bash classification accepts only listed commands in every segment", () => {
-  const cases = [
-    ["cd src && rg pattern . | head -20; wc -l file", true],
-    ["sed -n '1,10p' file", true],
-    ["cat file", true],
-    ["grep pattern file", true],
-    ["rg 'foo|bar' file", true],
-    ["head file", true],
-    ["tail file", true],
-    ["ls -la", true],
-    ["wc -l file", true],
-    ["find . -name '*.mjs'", true],
-    ["awk '{ print $1; }' file", true],
-    ["nl -ba file", true],
-    ["jq '.items[]' file", true],
-    ["tree src", true],
-    ...["diff", "show", "log", "status", "grep", "blame"].map((subcommand) => [`git ${subcommand} --help`, true]),
-    ...["pr view", "pr diff", "issue view", "run view"].map((subcommand) => [`gh ${subcommand} 1`, true]),
-    ["sed -i 's/x/y/' file", false],
-    ["sed -ni '1p' file", false],
-    ["sed --in-place 's/x/y/' file", false],
-    ["sed --in-place=.bak 's/x/y/' file", false],
-    ["sed 'w out' file", false],
-    ["sed -n '1w out' file", false],
-    ["sed 's/x/y/w out' file", false],
-    ["find . -delete", false],
-    ["find . -exec rm {} \\;", false],
-    ["find . -fprint out", false],
-    ["find . -fprintf out '%p'", false],
-    ["find . -fls out", false],
-    ["awk '{ print $1 > \"out\" }' file", false],
-    ["awk '{ print $1 | \"cat\" }' file", false],
-    ["awk '{ system(\"touch out\") }' file", false],
-    ["awk 'BEGIN { system (\"touch out\") }' file", false],
-    ["cat file 2>/dev/null", true],
-    ["rg pattern . 2>&1 | head", true],
-    ["git checkout main", false],
-    ["gh pr edit 1", false],
-    ["cat file > out", false],
-    ["rg pattern . | rm file", false],
-    ["cat file && node script.mjs", false],
-    ["cat file || true", false],
-    ["cat $(touch file)", false],
-    ["", false]
-  ];
-  for (const [command, expected] of cases) assert.strictEqual(isReadOnlyBash(command), expected, command);
-});
 
 test("read calls within 1500 ms share a turn and unknown tools leave the streak alone", (t) => {
   const sandbox = makeSandbox(t);
@@ -2103,14 +2453,17 @@ test("read calls within 1500 ms share a turn and unknown tools leave the streak 
   assert.strictEqual(readState(sandbox, "session-1").readStreakTurns, 1);
   assert.strictEqual(run(sandbox, readPayload(sandbox, "Skill"), at(4501)).stdout, "");
   assert.strictEqual(readState(sandbox, "session-1").readStreakTurns, 1);
-  for (const [offset, tool] of [[4501, "Grep"], [6102, "Glob"], [7703, "Read"]]) {
+  assert.strictEqual(run(sandbox, readPayload(sandbox, "Grep"), at(4501)).stdout, "");
+  assert.strictEqual(readState(sandbox, "session-1").readStreakTurns, 1);
+  for (const [offset, tool] of [[6102, "Grep"], [7703, "Glob"], [9304, "Read"]]) {
     assert.strictEqual(run(sandbox, readPayload(sandbox, tool), at(offset)).stdout, "");
   }
   assert.strictEqual(readState(sandbox, "session-1").readStreakTurns, 4);
-  const result = run(sandbox, bashPayload(sandbox, { command: "git status --short" }), at(9304));
+  const result = run(sandbox, bashPayload(sandbox, { command: "git status --short" }), at(10905));
   assert.strictEqual(JSON.parse(result.stdout).hookSpecificOutput.additionalContext,
-    tagMessage("inline-guard.read-streak-advisory", "5 read only turns in a row, and every turn replays the whole context. Batch independent reads into one message, and send open ended reconnaissance to Explore."));
+    tagMessage("inline-guard.read-streak-advisory", "5 read only turns in a row replayed 2.0M tokens of context. Batch independent reads into one message, and send open ended reconnaissance to Explore."));
   assert.strictEqual(readState(sandbox, "session-1").readStreakTurns, 5);
+  assert.strictEqual(readState(sandbox, "session-1").readStreakReplayTokens, 2_000_000);
   assert.strictEqual(readAuditRecords(sandbox).filter((event) => event.reason === "read-streak-advisory").length, 1);
 });
 
@@ -2124,17 +2477,18 @@ test("read streak advises at five turns and each doubling in both postures", (t)
       const result = run(sandbox, readPayload(sandbox, tool), { FUSION_POSTURE: posture, FUSION_TEST_NOW: new Date(base + turn * 1600).toISOString() });
       if ([5, 10, 20].includes(turn)) {
         assert.strictEqual(JSON.parse(result.stdout).hookSpecificOutput.additionalContext,
-          tagMessage("inline-guard.read-streak-advisory", `${turn} read only turns in a row, and every turn replays the whole context. Batch independent reads into one message, and send open ended reconnaissance to Explore.`));
+          tagMessage("inline-guard.read-streak-advisory", `${turn} read only turns in a row replayed ${(turn * 0.4).toFixed(1)}M tokens of context. Batch independent reads into one message, and send open ended reconnaissance to Explore.`));
         warnings.push(turn);
       } else assert.strictEqual(result.stdout, "", `${posture}: ${turn}`);
     }
     assert.deepStrictEqual(warnings, [5, 10, 20]);
     assert.strictEqual(readState(sandbox, "session-1").readStreakTurns, 20);
+    assert.strictEqual(readState(sandbox, "session-1").readStreakReplayTokens, 8_000_000);
     assert.deepStrictEqual(readAuditRecords(sandbox).filter((event) => event.reason === "read-streak-advisory").map((event) => ({
-      event: event.event, reason: event.reason, streakTurns: event.streakTurns, posture: event.posture,
+      event: event.event, reason: event.reason, streakTurns: event.streakTurns, replayTokens: event.replayTokens, budget: event.budget, posture: event.posture,
       messageCode: event.messageCode, lane: event.lane, tool: event.tool
     })), [5, 10, 20].map((turn) => ({
-      event: "warn", reason: "read-streak-advisory", streakTurns: turn, posture,
+      event: "warn", reason: "read-streak-advisory", streakTurns: turn, replayTokens: turn * 400_000, budget: 2_000_000, posture,
       messageCode: messageCode("inline-guard.read-streak-advisory"), lane: "main", tool: ["Read", "Grep", "Glob"][turn % 3]
     })));
   }
@@ -2149,20 +2503,23 @@ test("Bash writes, edit tools, and dispatches reset the read streak", (t) => {
       ["Agent", "Task", "SendMessage"].includes(tool) ? { ...dispatchPayload(sandbox, { toolName: tool }), hook_event_name: "PreToolUse" } : writePayload(sandbox, { toolName: tool });
     run(sandbox, payload, { FUSION_TEST_NOW: new Date(base + 6400).toISOString() });
     assert.strictEqual(readState(sandbox, "session-1").readStreakTurns, 0, tool);
-    assert.strictEqual(readState(sandbox, "session-1").lastReadAt, null, tool);
+    assert.strictEqual(readState(sandbox, "session-1").readStreakReplayTokens, 0, tool);
+    assert.strictEqual(Object.hasOwn(readState(sandbox, "session-1"), "lastReadAt"), false, tool);
     assert.strictEqual(run(sandbox, readPayload(sandbox), { FUSION_TEST_NOW: new Date(base + 8000).toISOString() }).stdout, "", tool);
     assert.strictEqual(readState(sandbox, "session-1").readStreakTurns, 1, tool);
+    assert.strictEqual(readState(sandbox, "session-1").readStreakReplayTokens, 400_000, tool);
   }
 });
 
-test("read streak read and reset skip a held state lock promptly without output", (t) => {
+test("read streak reads skip a held state lock promptly without output", (t) => {
   const sandbox = makeSandbox(t);
   for (let turn = 0; turn < 4; turn += 1) {
     run(sandbox, readPayload(sandbox), { FUSION_TEST_NOW: new Date(Date.parse("2026-07-21T00:00:00.000Z") + turn * 1600).toISOString() });
   }
   const file = stateFileFor(sandbox, "session-1");
+  const before = readAuditRecords(sandbox);
   fs.writeFileSync(`${file}.lock`, String(process.pid));
-  for (const payload of [readPayload(sandbox, "Read"), readPayload(sandbox, "Grep"), readPayload(sandbox, "Glob"), bashPayload(sandbox, { command: "node -v" })]) {
+  for (const payload of [readPayload(sandbox, "Read"), readPayload(sandbox, "Grep"), readPayload(sandbox, "Glob"), bashPayload(sandbox, { command: "cat file" })]) {
     const start = performance.now();
     const result = run(sandbox, payload);
     assert.ok(performance.now() - start < 2000, payload.tool_name);
@@ -2171,7 +2528,8 @@ test("read streak read and reset skip a held state lock promptly without output"
     assert.strictEqual(result.stderr, "");
   }
   assert.strictEqual(readState(sandbox, "session-1").readStreakTurns, 4);
-  assert.deepStrictEqual(readAuditRecords(sandbox), []);
+  assert.strictEqual(readState(sandbox, "session-1").readStreakReplayTokens, 1_600_000);
+  assert.deepStrictEqual(readAuditRecords(sandbox), before);
 });
 
 test("subagent reads do not change the main loop streak", (t) => {
@@ -2184,6 +2542,170 @@ test("subagent reads do not change the main loop streak", (t) => {
   run(sandbox, readPayload(sandbox), at(1600));
   assert.strictEqual(run(sandbox, bashPayload(sandbox, { command: "cat file", agentId: "worker-1" }), at(3200)).stdout, "");
   assert.strictEqual(readState(sandbox, "session-1").readStreakTurns, 1);
+  assert.strictEqual(readState(sandbox, "session-1").readStreakReplayTokens, 400_000);
+  const records = readAuditRecords(sandbox);
+  assert.deepStrictEqual(records, [{ schemaVersion: 1, at: new Date(base + 1600).toISOString(), session: "session-1", event: "replay", lane: "main", tool: "Read", turn: `t:${base + 1600}`, kind: "read", tokens: 400_000, measured: false }]);
+});
+
+for (const [contextTokens, advisoryTurn, formattedTokens] of [[800_000, 3, "2.4M"], [80_000, 25, "2.0M"], [2_000_000, 1, "2.0M"]]) {
+  test(`${contextTokens} tokens of context advises on read turn ${advisoryTurn}`, (t) => {
+    const sandbox = makeSandbox(t);
+    const transcript = path.join(sandbox.root, "transcript.jsonl");
+    const base = Date.parse("2026-07-21T00:00:00.000Z");
+    for (let turn = 1; turn <= advisoryTurn; turn += 1) {
+      const payload = { ...readPayload(sandbox), transcript_path: transcript, tool_use_id: `tool-${turn}` };
+      fs.appendFileSync(transcript, `${JSON.stringify({ type: "assistant", message: { id: `msg_${turn}`, usage: { input_tokens: 1000, cache_read_input_tokens: contextTokens - 2000, cache_creation_input_tokens: 1000 }, content: [{ type: "tool_use", id: payload.tool_use_id }] } })}\n`);
+      const result = run(sandbox, payload, { FUSION_TEST_NOW: new Date(base + turn * 1600).toISOString() });
+      assert.strictEqual(result.status, 0);
+      assert.strictEqual(result.stderr, "");
+      if (turn < advisoryTurn) assert.strictEqual(result.stdout, "", `turn ${turn}`);
+      else assert.strictEqual(advisoryContext(result, "inline-guard.read-streak-advisory"), tagMessage("inline-guard.read-streak-advisory", `${turn} read only ${turn === 1 ? "turn" : "turns"} in a row replayed ${formattedTokens} tokens of context. Batch independent reads into one message, and send open ended reconnaissance to Explore.`));
+    }
+    const state = readState(sandbox, "session-1");
+    assert.strictEqual(state.readStreakTurns, advisoryTurn);
+    assert.strictEqual(state.readStreakReplayTokens, contextTokens * advisoryTurn);
+    assert.deepStrictEqual(state.turn, { id: `msg_${advisoryTurn}`, key: `msg_${advisoryTurn}`, at: new Date(base + advisoryTurn * 1600).toISOString(), kind: "read", tokens: contextTokens, measured: true });
+    const records = readAuditRecords(sandbox);
+    assert.strictEqual(records.filter((event) => event.event === "replay").length, advisoryTurn);
+    const warnings = records.filter((event) => event.reason === "read-streak-advisory");
+    assert.strictEqual(warnings.length, 1);
+    assert.strictEqual(warnings[0].replayTokens, contextTokens * advisoryTurn);
+    assert.strictEqual(warnings[0].budget, 2_000_000);
+  });
+}
+
+test("compound Bash reads count toward the replay budget", (t) => {
+  const sandbox = makeSandbox(t);
+  const result = run(sandbox, bashPayload(sandbox, { command: "sed -n 1,5p a; echo ---; grep x b" }));
+  assert.strictEqual(result.status, 0);
+  assert.strictEqual(result.stdout, "");
+  assert.strictEqual(result.stderr, "");
+  const state = readState(sandbox, "session-1");
+  assert.strictEqual(state.readStreakTurns, 1);
+  assert.strictEqual(state.readStreakReplayTokens, 400_000);
+  assert.strictEqual(state.turn.kind, "read");
+  assert.deepStrictEqual(readAuditRecords(sandbox), [{ schemaVersion: 1, at: state.turn.at, session: "session-1", event: "replay", lane: "main", tool: "Bash", turn: state.turn.key, kind: "read", tokens: 400_000, measured: false }]);
+});
+
+test("parallel tool calls sharing an assistant message price one turn and one replay event", async (t) => {
+  const sandbox = makeSandbox(t);
+  const at = "2026-07-21T00:00:00.000Z";
+  const payloads = ["Read", "Grep", "Glob"].map((tool, index) => ({ ...readPayload(sandbox, tool), transcript_path: path.join(sandbox.root, "transcript.jsonl"), tool_use_id: `parallel-${index}` }));
+  writeDispatchTranscript(sandbox, [{ messageId: "msg_parallel", payloads }]);
+  const results = await Promise.all(payloads.map((payload) => runAsync(sandbox, payload, { FUSION_TEST_NOW: at })));
+  for (const result of results) assert.deepStrictEqual(result, { status: 0, stdout: "", stderr: "" });
+  assert.strictEqual(readState(sandbox, "session-1").readStreakTurns, 1);
+  assert.strictEqual(readState(sandbox, "session-1").readStreakReplayTokens, 400_000);
+  const records = readAuditRecords(sandbox);
+  assert.strictEqual(records.length, 1);
+  assert.deepStrictEqual(records[0], { schemaVersion: 1, at, session: "session-1", event: "replay", lane: "main", tool: records[0].tool, turn: "msg_parallel", kind: "read", tokens: 400_000, measured: false });
+  assert.ok(["Read", "Grep", "Glob"].includes(records[0].tool));
+  assert.strictEqual(run(sandbox, payloads[0], { FUSION_TEST_NOW: "2026-07-21T00:10:00.000Z" }).stdout, "");
+  assert.strictEqual(readState(sandbox, "session-1").readStreakTurns, 1);
+  assert.strictEqual(readState(sandbox, "session-1").turn.at, "2026-07-21T00:10:00.000Z");
+  assert.deepStrictEqual(readAuditRecords(sandbox), records);
+});
+
+test("a later tool that outranks its turn emits another replay event with the same key", (t) => {
+  const sandbox = makeSandbox(t);
+  const at = "2026-07-21T00:00:00.000Z";
+  const read = { ...readPayload(sandbox), transcript_path: path.join(sandbox.root, "transcript.jsonl"), tool_use_id: "first-read" };
+  const write = { ...writePayload(sandbox), tool_use_id: "later-write" };
+  writeDispatchTranscript(sandbox, [{ messageId: "msg_raise", payloads: [read, write] }]);
+  assert.strictEqual(run(sandbox, read, { FUSION_TEST_NOW: at }).stdout, "");
+  assert.strictEqual(run(sandbox, write, { FUSION_TEST_NOW: "2026-07-21T00:00:02.000Z" }).stdout, "");
+  const state = readState(sandbox, "session-1");
+  assert.strictEqual(state.turn.kind, "write");
+  assert.strictEqual(state.readStreakTurns, 0);
+  assert.strictEqual(state.readStreakReplayTokens, 0);
+  const records = readAuditRecords(sandbox).filter((event) => event.event === "replay");
+  assert.deepStrictEqual(records, [
+    { schemaVersion: 1, at, session: "session-1", event: "replay", lane: "main", tool: "Read", turn: "msg_raise", kind: "read", tokens: 400_000, measured: false },
+    { schemaVersion: 1, at: "2026-07-21T00:00:02.000Z", session: "session-1", event: "replay", lane: "main", tool: "Edit", turn: "msg_raise", kind: "write", tokens: 400_000, measured: false }
+  ]);
+  assert.strictEqual(run(sandbox, read, { FUSION_TEST_NOW: "2026-07-21T00:00:04.000Z" }).stdout, "");
+  assert.strictEqual(readState(sandbox, "session-1").turn.kind, "write");
+  assert.deepStrictEqual(readAuditRecords(sandbox).filter((event) => event.event === "replay"), records);
+});
+
+test("state validates replay turns and token totals without migrating old fields", () => {
+  const at = "2026-07-21T00:00:00.000Z";
+  const turn = { id: "msg_valid", key: "msg_valid", at, kind: "read", tokens: 80_000, measured: true };
+  assert.strictEqual(normalizeState(null, at).turn, null);
+  assert.strictEqual(normalizeState(null, at).readStreakReplayTokens, 0);
+  assert.strictEqual(normalizeState(null, at).writeReplayTokens, 0);
+  assert.strictEqual(normalizeState(null, at).writeTurnKey, null);
+  assert.strictEqual(normalizeState(null, at).writeTurnTokens, 0);
+  assert.strictEqual(normalizeState(null, at).writeTurnWrites, 0);
+  assert.deepStrictEqual(normalizeState({ turn, readStreakReplayTokens: 80_000 }, at).turn, turn);
+  assert.deepStrictEqual(normalizeState({ turn: { ...turn, id: null, key: `t:${Date.parse(at)}` } }, at).turn, { ...turn, id: null, key: `t:${Date.parse(at)}` });
+  for (const change of [{ id: "bad id" }, { id: undefined }, { key: "" }, { key: "bad key" }, { at: "bad" }, { kind: "unknown" }, { tokens: 0 }, { tokens: -1 }, { tokens: 1.5 }, { tokens: Number.MAX_SAFE_INTEGER + 1 }, { measured: "true" }]) {
+    assert.strictEqual(normalizeState({ turn: { ...turn, ...change } }, at).turn, null, JSON.stringify(change));
+  }
+  for (const tokens of [-1, 1.5, "80000", Number.MAX_SAFE_INTEGER + 1, null]) {
+    assert.strictEqual(normalizeState({ readStreakReplayTokens: tokens }, at).readStreakReplayTokens, 0);
+    assert.strictEqual(normalizeState({ writeReplayTokens: tokens }, at).writeReplayTokens, 0);
+    assert.strictEqual(normalizeState({ writeTurnTokens: tokens }, at).writeTurnTokens, 0);
+    assert.strictEqual(normalizeState({ writeTurnWrites: tokens }, at).writeTurnWrites, 0);
+  }
+  for (const tokens of [0, 80_000, Number.MAX_SAFE_INTEGER]) {
+    assert.strictEqual(normalizeState({ writeReplayTokens: tokens }, at).writeReplayTokens, tokens);
+    assert.strictEqual(normalizeState({ writeTurnTokens: tokens }, at).writeTurnTokens, tokens);
+    assert.strictEqual(normalizeState({ writeTurnWrites: tokens }, at).writeTurnWrites, tokens);
+  }
+  for (const key of [turn.key, `t:${Date.parse(at)}`]) {
+    assert.strictEqual(normalizeState({ writeTurnKey: key }, at).writeTurnKey, key);
+  }
+  for (const key of ["", "bad key", 42, null]) {
+    assert.strictEqual(normalizeState({ writeTurnKey: key }, at).writeTurnKey, null);
+  }
+  const legacy = normalizeState({ lastReadAt: at, readStreakTurns: 4 }, at);
+  assert.strictEqual(legacy.turn, null);
+  assert.strictEqual(legacy.readStreakReplayTokens, 0);
+  assert.strictEqual(Object.hasOwn(legacy, "lastReadAt"), false);
+});
+
+test("every main lane tool is classified for replay before its existing handler", (t) => {
+  const cases = [
+    ...["Agent", "Task", "SendMessage"].map((tool) => [tool, { subagent_type: "Explore" }, "dispatch"]),
+    ...["Edit", "Write", "NotebookEdit", "MultiEdit"].map((tool) => [tool, { file_path: "src/file.mjs" }, "write"]),
+    ...["Read", "Grep", "Glob"].map((tool) => [tool, {}, "read"]),
+    ["Write", { file_path: "/tmp/outside-replay-workspace.txt" }, "other"],
+    ["Bash", { command: "npm test > results.log" }, "write"],
+    ["Bash", { command: "npm test" }, "verify"],
+    ["Bash", { command: "npm test && node fusion-stats.mjs --record job=accepted" }, "verify"],
+    ["Bash", { command: "node fusion-stats.mjs --record job=accepted" }, "settle"],
+    ["Bash", { command: "node fusion-stats.mjs --json" }, "other"],
+    ["Bash", { command: "git status --short" }, "read"],
+    ["Bash", { command: "node -v" }, "other"],
+    ["TaskOutput", { task_id: "unknown" }, "other"],
+    ["TaskStop", { task_id: "unknown" }, "other"],
+    ["Skill", {}, "other"]
+  ];
+  for (const [tool, toolInput, kind] of cases) {
+    const sandbox = makeSandbox(t);
+    const payload = { ...readPayload(sandbox, tool), tool_input: toolInput };
+    const result = handleInlineDelegationHook(payload, envFor(sandbox));
+    assert.deepStrictEqual(result, { stdout: "", stderr: "", exitCode: 0 }, `${tool} ${JSON.stringify(toolInput)}`);
+    const state = readState(sandbox, "session-1");
+    assert.strictEqual(state.turn.kind, kind);
+    assert.strictEqual(state.turn.tokens, 400_000);
+    assert.strictEqual(state.turn.measured, false);
+    assert.strictEqual(state.readStreakReplayTokens, kind === "read" ? 400_000 : 0);
+    const replay = readAuditRecords(sandbox).filter((event) => event.event === "replay");
+    assert.deepStrictEqual(replay, [{ schemaVersion: 1, at: state.turn.at, session: "session-1", event: "replay", lane: "main", tool, turn: state.turn.key, kind, tokens: 400_000, measured: false }]);
+  }
+});
+
+test("callbacks and subagent payloads do not price replay turns", (t) => {
+  const sandbox = makeSandbox(t);
+  for (const hook_event_name of ["PostToolUse", "PostToolUseFailure"]) {
+    assert.deepStrictEqual(handleInlineDelegationHook({ ...readPayload(sandbox), hook_event_name }, envFor(sandbox)), { stdout: "", stderr: "", exitCode: 0 });
+  }
+  for (const agent_id of ["worker-1", ""]) {
+    assert.deepStrictEqual(handleInlineDelegationHook({ ...readPayload(sandbox), agent_id }, envFor(sandbox)), { stdout: "", stderr: "", exitCode: 0 });
+  }
+  assert.strictEqual(fs.existsSync(stateFileFor(sandbox, "session-1")), false);
   assert.deepStrictEqual(readAuditRecords(sandbox), []);
 });
 
@@ -2236,7 +2758,7 @@ test("hooks configuration wires PreToolUse read, write, Bash, dispatch, TaskOutp
     }
   ]);
   const failedHandlers = hooks.PostToolUseFailure.flatMap((group) => group.hooks.map((hook) => ({ matcher: group.matcher, command: hook.command }))).filter((hook) => hook.command?.includes("fusion-hook.mjs"));
-  assert.deepStrictEqual(failedHandlers, [{ matcher: "^(Edit|Write|NotebookEdit|MultiEdit)$", command: 'command -v node >/dev/null 2>&1 || exit 0; node "${CLAUDE_PLUGIN_ROOT}/scripts/fusion-hook.mjs"' }]);
+  assert.deepStrictEqual(failedHandlers, [{ matcher: "^(Edit|Write|NotebookEdit|MultiEdit|Bash)$", command: 'command -v node >/dev/null 2>&1 || exit 0; node "${CLAUDE_PLUGIN_ROOT}/scripts/fusion-hook.mjs"' }]);
 });
 
 test("all plugin node hooks fail open without node and compact text is exact", () => {

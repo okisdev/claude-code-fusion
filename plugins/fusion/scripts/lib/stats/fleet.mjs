@@ -1,12 +1,13 @@
 import fs from "node:fs";
-import { listAuditSegments as listGuardAuditSegments, readAuditEvents as readGuardAuditEvents, resolveAuditDir as resolveGuardAuditDir } from "../../inline-delegation-guard.mjs";
+import { listAuditSegments as listGuardAuditSegments, normalizeAuditEvent as normalizeGuardAuditEvent, readAuditEvents as readGuardAuditEvents, resolveAuditDir as resolveGuardAuditDir } from "../../inline-delegation-guard.mjs";
 import { bump, nonEmptyString } from "./evidence.mjs";
+import { messageCode } from "../user-messages.mjs";
 
 const DEFAULT_FLEET_WAVE_GAP_MS = 120000;
 export const FLEET_SHAPED_MIN_WIDTH = 3;
 const COERCION_LEDGER_POSTURES = ["judgment", "strict"];
 const COERCION_LEDGER_POSTURE_EVENTS = new Set(["deny", "warn", "verification", "tail-allowed", "zero-dispatch-softened"]);
-const COERCION_LEDGER_WRITE_TOOLS = new Set(["Edit", "Write", "NotebookEdit", "MultiEdit"]);
+const COERCION_LEDGER_WRITE_TOOLS = new Set(["Edit", "Write", "NotebookEdit", "MultiEdit", "Bash"]);
 const COERCION_LEDGER_SPRAWL_MULTIPLE = 2;
 const COERCION_LEDGER_DEFAULT_BUDGET = 5;
 
@@ -135,10 +136,10 @@ function narrowWaveWatch(dispatchEvents, gapMs) {
  * Derive ultra / fleet visibility from inline-guard audit dispatch events.
  * Pure read-side: clusters same-session dispatches within a short window into bursts.
  */
-export function buildFleetUsageStats({ env = process.env } = {}) {
+export function buildFleetUsageStats({ env = process.env, audit = null } = {}) {
   let events;
   try {
-    ({ events } = readGuardAuditEvents({ env }));
+    events = audit ? audit.guardEvents : readGuardAuditEvents({ env }).events;
   } catch {
     return emptyFleetUsageStats();
   }
@@ -168,7 +169,10 @@ function emptyCoercionLedger(fleetShapedWaves = 0) {
   };
 }
 
-function normalizeCoercionAuditEvent(value) {
+function normalizeCoercionAuditEvent(value, guardEvent) {
+  if (value?.event === "replay") {
+    return guardEvent ? { ...guardEvent, atMs: Date.parse(guardEvent.at) } : null;
+  }
   if (!value || typeof value !== "object" || value.schemaVersion !== 1 || typeof value.at !== "string" || typeof value.session !== "string" || typeof value.event !== "string") {
     return null;
   }
@@ -188,7 +192,10 @@ function normalizeCoercionAuditEvent(value) {
     return null;
   }
   const mainWriteWarn = value.event === "warn" && value.lane === "main" && COERCION_LEDGER_WRITE_TOOLS.has(value.tool);
+  const heartbeatDeny = value.event === "deny" && value.tool === "Bash" && value.messageCode === messageCode("inline-guard.no-op-heartbeat-deny");
   const unverifiedWindowWrites = mainWriteWarn && Number.isInteger(value.writeCount) && value.writeCount >= 0 ? value.writeCount : null;
+  const budget = Number.isInteger(value.budget) && value.budget > 0 ? value.budget : null;
+  const replayTokens = !heartbeatDeny && value.lane === "main" && ["warn", "deny", "verification"].includes(value.event) && Number.isSafeInteger(value.replayTokens) && value.replayTokens >= 0 ? value.replayTokens : null;
   return {
     atMs,
     session,
@@ -197,14 +204,18 @@ function normalizeCoercionAuditEvent(value) {
     postureEvent,
     posture: value.posture ?? null,
     readStreakAdvisory: value.event === "warn" && value.reason === "read-streak-advisory",
-    deniedWrite: value.event === "deny" && value.lane === "main" && COERCION_LEDGER_WRITE_TOOLS.has(value.tool),
+    deniedWrite: !heartbeatDeny && value.event === "deny" && value.lane === "main" && COERCION_LEDGER_WRITE_TOOLS.has(value.tool),
     unverifiedWindowWrites,
-    unverifiedWindowBudget: unverifiedWindowWrites !== null && Number.isInteger(value.budget) && value.budget > 0 ? value.budget : null
+    inlineSprawl: replayTokens !== null
+      ? budget !== null && replayTokens >= COERCION_LEDGER_SPRAWL_MULTIPLE * budget
+      : unverifiedWindowWrites !== null && unverifiedWindowWrites >= COERCION_LEDGER_SPRAWL_MULTIPLE * (budget ?? COERCION_LEDGER_DEFAULT_BUDGET)
   };
 }
 
-export function readStatsAuditEvents(env) {
+export function readStatsAuditEvents(env, { sessionId = null, sinceMs = null, untilMs = null } = {}) {
   const events = [];
+  const guardEvents = [];
+  let malformedCount = 0;
   let order = 0;
   let firstDay = null;
   let lastDay = null;
@@ -215,6 +226,7 @@ export function readStatsAuditEvents(env) {
       try {
         text = fs.readFileSync(segment.file, "utf8");
       } catch {
+        malformedCount += 1;
         continue;
       }
       firstDay = firstDay ?? segment.date;
@@ -224,22 +236,34 @@ export function readStatsAuditEvents(env) {
           continue;
         }
         try {
-          const event = normalizeCoercionAuditEvent(JSON.parse(line));
-          if (event) {
+          const value = JSON.parse(line);
+          const guardEvent = normalizeGuardAuditEvent(value);
+          if (!guardEvent) {
+            malformedCount += 1;
+          } else {
+            const atMs = Date.parse(guardEvent.at);
+            if ((sessionId == null || guardEvent.session === sessionId) && (sinceMs == null || atMs >= sinceMs) && (untilMs == null || atMs <= untilMs)) {
+              guardEvents.push(guardEvent);
+            }
+          }
+          const event = normalizeCoercionAuditEvent(value, guardEvent);
+          if (event && (sessionId == null || event.session === sessionId) && (sinceMs == null || event.atMs >= sinceMs) && (untilMs == null || event.atMs <= untilMs)) {
             events.push({ ...event, order });
             order += 1;
           }
         } catch {
-          void 0;
+          malformedCount += 1;
         }
       }
     }
   } catch {
-    return { events: [], startMs: null, endMs: null };
+    return { events: [], guardEvents: [], malformedCount, startMs: null, endMs: null };
   }
   return {
     events: events.sort((left, right) => left.atMs - right.atMs || left.order - right.order),
-    startMs: firstDay ? Date.parse(`${firstDay}T00:00:00.000Z`) : null,
+    guardEvents: guardEvents.sort((left, right) => Date.parse(left.at) - Date.parse(right.at)),
+    malformedCount,
+    startMs: sinceMs ?? (firstDay ? Date.parse(`${firstDay}T00:00:00.000Z`) : null),
     endMs: lastDay ? Date.parse(`${lastDay}T00:00:00.000Z`) + 86400000 : null
   };
 }
@@ -267,6 +291,7 @@ function summarizeInlineWindows(events) {
   const summary = { unverifiedAccumulations: 0, inlineSprawlWindows: 0, deepestUnverifiedWindow: 0 };
   for (const event of events) {
     const window = inlineWindowFor(windows, event.session);
+    window.sprawl ||= event.inlineSprawl === true;
     if (event.event === "verification" && event.writeCount > 0) {
       closeInlineWindow(summary, window, false);
       continue;
@@ -278,11 +303,8 @@ function summarizeInlineWindows(events) {
     if (event.deniedWrite) {
       window.denied = true;
     }
-    if (event.unverifiedWindowWrites !== null) {
+    if (event.unverifiedWindowWrites != null) {
       summary.deepestUnverifiedWindow = Math.max(summary.deepestUnverifiedWindow, event.unverifiedWindowWrites);
-      window.sprawl =
-        window.sprawl ||
-        event.unverifiedWindowWrites >= COERCION_LEDGER_SPRAWL_MULTIPLE * (event.unverifiedWindowBudget ?? COERCION_LEDGER_DEFAULT_BUDGET);
     }
   }
   for (const window of windows.values()) {

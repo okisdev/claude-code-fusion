@@ -1,7 +1,8 @@
 import { POSTURE_VALUES } from "../posture.mjs";
 import { resolveAuditDir, resolveAuditMaxBytes, resolveAuditMaxFiles, resolveAuditRetentionDays } from "./config.mjs";
-import { AUDIT_FILE_PATTERN, AUDIT_SCHEMA_VERSION, BASH_TOOL, DAY_MS, DELEGATION_TOOLS, ENFORCEMENT_AUDIT_TOOLS, MAIN_LANE, MISSING_LAUNCH_RECOVERY_REASON, OUT_OF_WORKSPACE_EXEMPTION, READ_STREAK_ADVISORY_REASON, REAPED_WORKER_REDIRECT_AUDIT_DESCRIPTION, TAIL_ALLOW_AUDIT_EVENT, TASK_CONTROL_TOOLS, WRITE_TOOLS, ZERO_DISPATCH_SOFTENED_AUDIT_EVENT } from "./constants.mjs";
+import { AUDIT_FILE_PATTERN, AUDIT_SCHEMA_VERSION, BASH_TOOL, DAY_MS, DELEGATION_TOOLS, ENFORCEMENT_AUDIT_TOOLS, MAIN_LANE, MISSING_LAUNCH_RECOVERY_REASON, OUT_OF_WORKSPACE_EXEMPTION, READ_STREAK_ADVISORY_REASON, REAPED_WORKER_REDIRECT_AUDIT_DESCRIPTION, TAIL_ALLOW_AUDIT_EVENT, TASK_CONTROL_TOOLS, ZERO_DISPATCH_SOFTENED_AUDIT_EVENT } from "./constants.mjs";
 import { normalizeLane, sanitizeAuditPath, sanitizeAuditText } from "./dispatch.mjs";
+import { REPLAY_KINDS } from "./replay.mjs";
 import { normalizeSessionId, withStateLock } from "./state.mjs";
 import { normalizeMessageId } from "./verification.mjs";
 import fs from "node:fs";
@@ -176,8 +177,9 @@ function normalizeAuditEvent(event) {
     return null;
   }
   const posture = posturePresent ? { posture: event.posture } : {};
+  const replay = Number.isSafeInteger(event.replayTokens) && event.replayTokens >= 0 ? { replayTokens: event.replayTokens } : {};
   const digest = Number.isInteger(event.messageCode) && event.messageCode >= 1000 && event.messageCode <= 9999 ? { messageCode: event.messageCode } : {};
-  if (event.event === "write" && WRITE_TOOLS.has(event.tool) && event.lane === MAIN_LANE) {
+  if (event.event === "write" && ENFORCEMENT_AUDIT_TOOLS.has(event.tool) && event.lane === MAIN_LANE) {
     const safePath = sanitizeAuditPath(event.path);
     return {
       schemaVersion: AUDIT_SCHEMA_VERSION,
@@ -213,6 +215,7 @@ function normalizeAuditEvent(event) {
       writeCount: event.writeCount,
       dispatchCount: event.dispatchCount,
       budget: event.budget,
+      ...replay,
       mode: event.mode,
       ...posture,
       ...digest,
@@ -221,7 +224,7 @@ function normalizeAuditEvent(event) {
   }
   if (
     (event.event === TAIL_ALLOW_AUDIT_EVENT || event.event === ZERO_DISPATCH_SOFTENED_AUDIT_EVENT) &&
-    WRITE_TOOLS.has(event.tool) &&
+    ENFORCEMENT_AUDIT_TOOLS.has(event.tool) &&
     event.lane === MAIN_LANE &&
     Number.isInteger(event.writeCount) &&
     event.writeCount >= 0 &&
@@ -244,6 +247,7 @@ function normalizeAuditEvent(event) {
         writeCount: event.writeCount,
         dispatchCount: event.dispatchCount,
         budget: event.budget,
+        ...replay,
         mode: "enforce",
         ...posture,
         ...digest,
@@ -269,6 +273,7 @@ function normalizeAuditEvent(event) {
         writeCount: event.writeCount,
         dispatchCount: event.dispatchCount,
         budget: event.budget,
+        ...replay,
         mode: "enforce",
         ...posture,
         ...digest,
@@ -304,9 +309,25 @@ function normalizeAuditEvent(event) {
         }
       : null;
   }
+  if (event.event === "replay" && event.lane === MAIN_LANE && typeof event.tool === "string" && /^[A-Za-z][A-Za-z0-9_-]{0,63}$/.test(event.tool) &&
+    typeof event.turn === "string" && /^[A-Za-z0-9_:-]{1,160}$/.test(event.turn) && REPLAY_KINDS.includes(event.kind) &&
+    Number.isSafeInteger(event.tokens) && event.tokens > 0 && typeof event.measured === "boolean") {
+    return {
+      schemaVersion: AUDIT_SCHEMA_VERSION,
+      at: new Date(atMs).toISOString(),
+      session,
+      event: "replay",
+      lane: MAIN_LANE,
+      tool: event.tool,
+      turn: event.turn,
+      kind: event.kind,
+      tokens: event.tokens,
+      measured: event.measured
+    };
+  }
   if (event.event === "warn" && event.reason === READ_STREAK_ADVISORY_REASON && event.lane === MAIN_LANE &&
     (event.tool === BASH_TOOL || ["Read", "Grep", "Glob"].includes(event.tool)) &&
-    Number.isSafeInteger(event.streakTurns) && event.streakTurns >= 5) {
+    Number.isSafeInteger(event.streakTurns) && event.streakTurns >= 1) {
     return {
       schemaVersion: AUDIT_SCHEMA_VERSION,
       at: new Date(atMs).toISOString(),
@@ -314,6 +335,8 @@ function normalizeAuditEvent(event) {
       event: "warn",
       reason: READ_STREAK_ADVISORY_REASON,
       streakTurns: event.streakTurns,
+      ...replay,
+      ...(replay.replayTokens !== undefined && Number.isSafeInteger(event.budget) && event.budget > 0 ? { budget: event.budget } : {}),
       ...posture,
       ...digest,
       lane: MAIN_LANE,
@@ -353,7 +376,7 @@ function normalizeAuditEvent(event) {
     event.budget > 0 &&
     (event.mode === "enforce" || event.mode === "advisory")
   ) {
-    const safePath = WRITE_TOOLS.has(event.tool) ? sanitizeAuditPath(event.path) : null;
+    const safePath = sanitizeAuditPath(event.path);
     return {
       schemaVersion: AUDIT_SCHEMA_VERSION,
       at: new Date(atMs).toISOString(),
@@ -365,6 +388,7 @@ function normalizeAuditEvent(event) {
       writeCount: event.writeCount,
       dispatchCount: event.dispatchCount,
       budget: event.budget,
+      ...replay,
       mode: event.mode,
       ...posture,
       ...digest,
