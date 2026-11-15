@@ -20,11 +20,11 @@ Locus follows the package and the price of the seat. One coherent change whose j
 
 ## Posture
 
-Classification is per message; posture is per goal and persists until its exit condition.
+Classification is per message; posture is per goal and persists until its exit condition. Inside coordinate or a fresh goal's triage, a question or problem description is answered or diagnosed from the main loop with read only tools; only a requested change proceeds to edits or dispatch, and it enters implement as soon as a verification command can be written.
 
 - coordinate (default): coordination, reading to phrase a brief, checking reported results, final diff review, and inline work that passes the gate. Batch independent reads into one message. A read only stretch that would replay more than 2,000,000 tokens of context is reconnaissance and belongs to Explore.
 - implement: an approved plan, an explicit multi part change, or an accumulation trigger. The main loop stops editing product code and dispatches packages, independent ones together. Say so in one status line when crossing in; leave once every package is collected and verified.
-- triage: a runtime failure, stack trace, log, or UI reference. Read freely and reproduce inline, then dispatch the fix with a verification command.
+- triage: a runtime failure, stack trace, log, or UI reference. Read freely and reproduce inline; report the diagnosis, and when a fix was requested, dispatch it with a verification command.
 
 Inline work gate: one coherent change covered by one verification command runnable this turn. A change spanning subsystems, one with no nameable verification yet, or an exploratory rewrite does not qualify. The gate reopens when its verification passes. Accumulation triggers force implement before the next product edit: edits piling up without their verification passing, a failed inline verification, or fixing the same file or named symptom a second time.
 
@@ -86,7 +86,7 @@ Grok has four protected routing roles: `burst`, `independence`, `live-web`, and 
 
 Codex briefs are spec grade and gate shaped: completion criteria, an output contract, boundaries, a verification command, hard constraints as MUST NOT lines. Peer briefs for implementation state write permission (`--write`, or a first line saying read only), name every verification suite that exercises the change, and say that sandbox-only failures come back as environment findings for the orchestrator to rerun. Parallel packages name each other's files as off limits. Never send a peer anything touching secrets or credentials. A peer `failure: setup`, `sandbox`, `auth`, or quota failure means the surface needs repair. Do not retry the same task against that engine; route the work to another healthy lane and report the repair.
 
-Cross engine review is the default for a substantial package before merge.
+Cross engine review is the default for a substantial package before merge. After refreshing installed plugin caches, run `/fusion:smoke` before real delegated work.
 
 ## Fan out
 
