@@ -1,5 +1,6 @@
 import { readRoutingDefaults } from "../model-table.mjs";
 import { sanitizeAuditPath } from "./dispatch.mjs";
+import { formatTokens } from "./replay.mjs";
 import { createHash } from "node:crypto";
 import path from "node:path";
 
@@ -64,8 +65,8 @@ function extractAuditWritePath(filePath, cwd) {
   return sanitizeAuditPath(relative);
 }
 
-function budgetMultiple(writeCount, budget) {
-  return Math.floor(writeCount / budget);
+function budgetMultiple(replayTokens, budget) {
+  return Math.floor(replayTokens / budget);
 }
 
 function advisoryOutput(additionalContext) {
@@ -80,8 +81,8 @@ function postToolAdvisoryOutput(additionalContext) {
   return { hookSpecificOutput: { hookEventName: "PostToolUse", additionalContext } };
 }
 
-function buildUnverifiedLine(writeCount) {
-  return `${writeCount} main loop ${writeCount === 1 ? "write is" : "writes are"} unverified in this window.`;
+function buildUnverifiedLine(writeCount, replayTokens) {
+  return `${writeCount} main loop ${writeCount === 1 ? "write is" : "writes are"} unverified in this window, and ${writeCount === 1 ? "its turn" : "their turns"} replayed ${formatTokens(replayTokens)} tokens of context.`;
 }
 
 function buildLaneHint(env = process.env) {
@@ -89,25 +90,25 @@ function buildLaneHint(env = process.env) {
   return `Lanes: quick scoped work goes to the codex quick default ${quick.model} at effort ${quick.effort}; trivial or high volume work goes to the codex volume default ${volume.model} at effort ${volume.effort}; work needing the Claude Code tool surface goes to fusion:claude-worker.`;
 }
 
-function buildAdvisoryLine(writeCount, dispatchCount, env = process.env) {
+function buildAdvisoryLine(writeCount, dispatchCount, replayTokens, env = process.env) {
   const countSummary =
     dispatchCount === 0
-      ? `${writeCount} inline writes happened this session with zero dispatches. `
-      : `${writeCount} inline writes happened since the most recent dispatch; this session has ${dispatchCount} dispatch${dispatchCount === 1 ? "" : "es"}. `;
+      ? `${writeCount} inline ${writeCount === 1 ? "write" : "writes"} replayed ${formatTokens(replayTokens)} tokens of context this session with zero dispatches. `
+      : `${writeCount} inline ${writeCount === 1 ? "write" : "writes"} replayed ${formatTokens(replayTokens)} tokens of context since the most recent dispatch; this session has ${dispatchCount} dispatch${dispatchCount === 1 ? "" : "es"}. `;
   return countSummary + buildLaneHint(env);
 }
 
-function buildUnverifiedAdvisory(writeCount, dispatchCount, env = process.env) {
+function buildUnverifiedAdvisory(writeCount, dispatchCount, replayTokens, env = process.env) {
   const zeroDispatchClause = dispatchCount === 0 ? " This session has not dispatched yet; if the remaining work splits into independent packages, dispatch them together in one message, and three or more convene /fusion:ultra." : "";
-  return `${buildUnverifiedLine(writeCount)} Run this change's verification command once it is coherent, or hand the remaining work to a lane. ${buildLaneHint(env)}${zeroDispatchClause}`;
+  return `${buildUnverifiedLine(writeCount, replayTokens)} Run this change's verification command once it is coherent, or hand the remaining work to a lane. ${buildLaneHint(env)}${zeroDispatchClause}`;
 }
 
 function buildTailAllowanceAdvisory(remainingTailSlots) {
-  return `The inline write budget is exhausted. Tail allowance permits this small Edit to an already touched file; ${remainingTailSlots} tail ${remainingTailSlots === 1 ? "slot" : "slots"} remain in this dispatch window.`;
+  return `The inline replay budget is exhausted. Tail allowance permits this small Edit to an already touched file; ${remainingTailSlots} tail ${remainingTailSlots === 1 ? "slot" : "slots"} remain in this dispatch window.`;
 }
 
 function buildZeroDispatchAdvisory(remainingWrites, remainingBytes) {
-  return `The inline write budget is exhausted; this window remains within its inline relief bounds, with ${remainingWrites} ${remainingWrites === 1 ? "write" : "writes"} and ${remainingBytes} ${remainingBytes === 1 ? "byte" : "bytes"} left before enforcement resumes.`;
+  return `The inline replay budget is exhausted; this window remains within its inline relief bounds, with ${remainingWrites} ${remainingWrites === 1 ? "write" : "writes"} and ${remainingBytes} ${remainingBytes === 1 ? "byte" : "bytes"} left before enforcement resumes.`;
 }
 
 export { extractWritePath, inlineWriteBytes, editReplacementBytes, writePathSignature, isInsideCwd, isWorkspaceWritePath, extractAuditWritePath, budgetMultiple, advisoryOutput, denyOutput, postToolAdvisoryOutput, buildUnverifiedLine, buildLaneHint, buildAdvisoryLine, buildUnverifiedAdvisory, buildTailAllowanceAdvisory, buildZeroDispatchAdvisory };

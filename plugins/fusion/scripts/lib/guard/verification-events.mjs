@@ -2,9 +2,10 @@ import { JUDGMENT_POSTURE } from "../posture.mjs";
 import { messageCode, tagMessage } from "../user-messages.mjs";
 import { verificationEvidence } from "../verification-command.mjs";
 import { recordAuditEvent } from "./audit.mjs";
-import { resolveBudget, resolveMode } from "./config.mjs";
+import { resolveMode } from "./config.mjs";
 import { BASH_TOOL, MAIN_LANE, NO_OP_BASH_COMMANDS, NO_OP_HEARTBEAT_DENY_MESSAGE_SLUG, NO_OP_HEARTBEAT_REASON } from "./constants.mjs";
 import { inFlightWorkerTaskSignature, totalDispatches } from "./dispatch.mjs";
+import { resolveReplayBudgetTokens } from "./replay.mjs";
 import { normalizeState, readState, resetWriteWindow, withStateLock, writeState } from "./state.mjs";
 import { extractBashCommand } from "./verification.mjs";
 import { denyOutput } from "./write.mjs";
@@ -24,12 +25,13 @@ function handleBash(input, env, { sessionId, toolName, file, now, posture, write
       const verification = withStateLock(file, () => {
         const state = normalizeState(readState(file), now);
         const writeCount = state.writesSinceDispatch;
+        const replayTokens = state.writeReplayTokens;
         const dispatchCount = totalDispatches(state.dispatches);
         if (posture === JUDGMENT_POSTURE && writeCount > 0) {
           resetWriteWindow(state);
           writeState(file, state);
         }
-        return { writeCount, dispatchCount };
+        return { writeCount, replayTokens, dispatchCount };
       });
       recordAuditEvent(
         {
@@ -39,8 +41,9 @@ function handleBash(input, env, { sessionId, toolName, file, now, posture, write
           lane: MAIN_LANE,
           tool: BASH_TOOL,
           writeCount: verification.writeCount,
+          replayTokens: verification.replayTokens,
           dispatchCount: verification.dispatchCount,
-          budget: resolveBudget(env),
+          budget: resolveReplayBudgetTokens(env),
           mode: resolveMode(env),
           posture,
           evidence
@@ -59,12 +62,14 @@ function handleBash(input, env, { sessionId, toolName, file, now, posture, write
     if (!inFlightSignature) {
       return;
     }
-    const budget = resolveBudget(env);
+    const budget = resolveReplayBudgetTokens(env);
     let writeCount = 0;
+    let replayTokens = 0;
     let dispatchCount = 0;
     try {
       const snapshot = withStateLock(file, () => normalizeState(readState(file), now));
       writeCount = snapshot.writesSinceDispatch;
+      replayTokens = snapshot.writeReplayTokens;
       dispatchCount = totalDispatches(snapshot.dispatches);
     } catch {
       void 0;
@@ -77,6 +82,7 @@ function handleBash(input, env, { sessionId, toolName, file, now, posture, write
         lane: MAIN_LANE,
         tool: BASH_TOOL,
         writeCount,
+        replayTokens,
         dispatchCount,
         budget,
         mode: "enforce",

@@ -134,7 +134,7 @@
     ],
     "PostToolUseFailure": [
       {
-        "matcher": "^(?!(?:Edit|Write|NotebookEdit|MultiEdit)$).*$",
+        "matcher": "^(?!(?:Edit|Write|NotebookEdit|MultiEdit|Bash)$).*$",
         "hooks": [
           {
             "type": "command",
@@ -144,7 +144,7 @@
         ]
       },
       {
-        "matcher": "^(Edit|Write|NotebookEdit|MultiEdit)$",
+        "matcher": "^(Edit|Write|NotebookEdit|MultiEdit|Bash)$",
         "hooks": [
           {
             "type": "command",

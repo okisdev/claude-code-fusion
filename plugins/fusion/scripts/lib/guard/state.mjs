@@ -1,6 +1,8 @@
 import { resolveLockTimeoutMs } from "./config.mjs";
 import { LOCK_RETRY_MS, LOCK_STALE_MS, SESSION_ID_PATTERN, STALE_MS } from "./constants.mjs";
 import { normalizeDispatchLog, normalizeDispatches, pruneExpiredLaunchedDispatches, totalDispatches } from "./dispatch.mjs";
+import { REPLAY_KINDS } from "./replay.mjs";
+import { normalizeMessageId } from "./verification.mjs";
 import { createHash } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
@@ -152,6 +154,8 @@ function defaultState(now) {
   return {
     writeCount: 0,
     writesSinceDispatch: 0,
+    writeReplayTokens: 0,
+    writeTurnKey: null,
     inlineWriteBytes: 0,
     tailWritesSinceDispatch: 0,
     writtenPathSignatures: [],
@@ -159,7 +163,8 @@ function defaultState(now) {
     dispatchEpoch: 0,
     lastDispatchAt: null,
     readStreakTurns: 0,
-    lastReadAt: null,
+    readStreakReplayTokens: 0,
+    turn: null,
     pendingWrites: [],
     dispatches: {},
     dispatchLog: [],
@@ -197,6 +202,15 @@ function normalizeAdvisorySignatures(value) {
   return signatures;
 }
 
+function normalizeTurn(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value) ||
+    (value.id !== null && normalizeMessageId(value.id) === null) ||
+    typeof value.key !== "string" || !/^[A-Za-z0-9_:-]{1,160}$/.test(value.key) ||
+    typeof value.at !== "string" || !Number.isFinite(Date.parse(value.at)) || !REPLAY_KINDS.includes(value.kind) ||
+    !Number.isSafeInteger(value.tokens) || value.tokens <= 0 || typeof value.measured !== "boolean") return null;
+  return { id: value.id, key: value.key, at: new Date(value.at).toISOString(), kind: value.kind, tokens: value.tokens, measured: value.measured };
+}
+
 function normalizeState(existing, now) {
   if (!existing || typeof existing !== "object") {
     return defaultState(now);
@@ -215,13 +229,14 @@ function normalizeState(existing, now) {
   const dispatchLog = pruneExpiredLaunchedDispatches(normalizeDispatchLog(existing.dispatchLog), now);
   const createdAtMs = Date.parse(existing.createdAt);
   const lastDispatchAtMs = Date.parse(existing.lastDispatchAt);
-  const lastReadAtMs = Date.parse(existing.lastReadAt);
   const pendingWrites = Array.isArray(existing.pendingWrites) ? existing.pendingWrites.filter((entry) =>
     entry && typeof entry.id === "string" && Number.isInteger(entry.epoch) && Number.isSafeInteger(entry.bytes) &&
-    typeof entry.signature === "string" && typeof entry.tail === "boolean") : [];
+    typeof entry.signature === "string" && typeof entry.tail === "boolean").map((entry) => ({ ...entry, tokens: Number.isSafeInteger(entry.tokens) && entry.tokens >= 0 ? entry.tokens : 0 })) : [];
   return {
     writeCount,
     writesSinceDispatch,
+    writeReplayTokens: Number.isSafeInteger(existing.writeReplayTokens) && existing.writeReplayTokens >= 0 ? existing.writeReplayTokens : 0,
+    writeTurnKey: typeof existing.writeTurnKey === "string" && /^[A-Za-z0-9_:-]{1,160}$/.test(existing.writeTurnKey) ? existing.writeTurnKey : null,
     inlineWriteBytes,
     tailWritesSinceDispatch,
     writtenPathSignatures,
@@ -229,7 +244,8 @@ function normalizeState(existing, now) {
     dispatchEpoch: Number.isInteger(existing.dispatchEpoch) && existing.dispatchEpoch >= 0 ? existing.dispatchEpoch : dispatchCount,
     lastDispatchAt: Number.isFinite(lastDispatchAtMs) ? new Date(lastDispatchAtMs).toISOString() : null,
     readStreakTurns: Number.isSafeInteger(existing.readStreakTurns) && existing.readStreakTurns >= 0 ? existing.readStreakTurns : 0,
-    lastReadAt: Number.isFinite(lastReadAtMs) ? new Date(lastReadAtMs).toISOString() : null,
+    readStreakReplayTokens: Number.isSafeInteger(existing.readStreakReplayTokens) && existing.readStreakReplayTokens >= 0 ? existing.readStreakReplayTokens : 0,
+    turn: normalizeTurn(existing.turn),
     pendingWrites,
     dispatches,
     dispatchLog,
@@ -263,6 +279,9 @@ function claimAdvisory(file, kind, signature, now, isCurrent = () => true) {
 
 function resetWriteWindow(state) {
   state.writesSinceDispatch = 0;
+  state.writeReplayTokens = 0;
+  state.writeTurnKey = null;
+  for (const entry of state.pendingWrites) entry.tokens = 0;
   state.tailWritesSinceDispatch = 0;
   state.writtenPathSignatures = [];
   state.confirmedPathSignatures = [];

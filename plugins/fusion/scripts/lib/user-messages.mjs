@@ -4,14 +4,14 @@ const CODE_MIN = 1000;
 const CODE_SPAN = 9000;
 
 const MESSAGE_REGISTRY = [
-  { slug: "inline-guard.write-budget-advisory", description: "Strict posture advisory naming inline write count and available lanes." },
-  { slug: "inline-guard.unverified-advisory", description: "Judgment posture advisory counting unverified writes in the current window." },
-  { slug: "inline-guard.write-budget-deny", description: "Strict posture denial of a main loop write past the budget." },
+  { slug: "inline-guard.write-budget-advisory", description: "Strict posture advisory naming the context tokens inline writes replayed and the available lanes." },
+  { slug: "inline-guard.unverified-advisory", description: "Judgment posture advisory pricing the unverified writes in the current window." },
+  { slug: "inline-guard.write-budget-deny", description: "Strict posture denial of a main loop write past the replay budget." },
   { slug: "inline-guard.tail-allowance-advisory", description: "Strict posture relief permitting a small Edit to an already touched file." },
   { slug: "inline-guard.zero-dispatch-advisory", description: "Strict posture relief for a window that has not dispatched yet." },
   { slug: "inline-guard.no-op-heartbeat-deny", description: "Denial of a no-op Bash command while Fusion tasks are in flight." },
   { slug: "inline-guard.reaped-worker-redirect", description: "Denial of a TaskOutput or TaskStop probe of a reaped worker with the result path." },
-  { slug: "inline-guard.read-streak-advisory", description: "Advisory after consecutive main loop read only turns." },
+  { slug: "inline-guard.read-streak-advisory", description: "Advisory when consecutive main loop read only turns replay a full budget of context tokens." },
   { slug: "inline-guard.generic-agent-advisory", description: "Advisory that a generic or forked Agent ran a work package outside Fusion tracking." },
   { slug: "inline-guard.state-unavailable-deny", description: "Strict posture fail closed denial when guard state is unreadable." },
   { slug: "worker-lifecycle.foreground-wrapper-deny", description: "Denial of background delivery for a peer wrapper Agent." },

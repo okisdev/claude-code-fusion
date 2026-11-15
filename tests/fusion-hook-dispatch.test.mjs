@@ -6,7 +6,7 @@ import path from "node:path";
 import { test } from "node:test";
 
 import { mergeHookResults } from "../plugins/fusion/scripts/fusion-hook.mjs";
-import { handleInlineDelegationHook } from "../plugins/fusion/scripts/inline-delegation-guard.mjs";
+import { handleInlineDelegationHook, readAuditEvents } from "../plugins/fusion/scripts/inline-delegation-guard.mjs";
 import { tagMessage } from "../plugins/fusion/scripts/lib/user-messages.mjs";
 import { handleLifecycleHook } from "../plugins/fusion/scripts/worker-lifecycle.mjs";
 
@@ -91,7 +91,7 @@ test("each shared matcher uses one dispatcher process and lifecycle-only tools k
   const shared = {
     PreToolUse: ["Read", "Grep", "Glob", "Edit", "Write", "NotebookEdit", "MultiEdit", "Bash", "Agent", "Task", "SendMessage", "TaskOutput", "TaskStop"],
     PostToolUse: ["Agent", "Task", "Bash", "SendMessage", "Edit", "Write", "NotebookEdit", "MultiEdit"],
-    PostToolUseFailure: ["Edit", "Write", "NotebookEdit", "MultiEdit"]
+    PostToolUseFailure: ["Edit", "Write", "NotebookEdit", "MultiEdit", "Bash"]
   };
   for (const [event, tools] of Object.entries(shared)) {
     for (const tool of tools) {
@@ -124,7 +124,8 @@ test("dispatcher matches sequential standalone outputs for every shared matcher"
     ["PreToolUse", "TaskStop", { task_id: "unknown" }],
     ["PostToolUse", "Agent", { subagent_type: "generic", prompt: "hello" }],
     ["PostToolUse", "Edit", edit],
-    ["PostToolUseFailure", "Edit", edit]
+    ["PostToolUseFailure", "Edit", edit],
+    ["PostToolUseFailure", "Bash", { command: "cat > src/x <<'EOF'\nx\nEOF" }]
   ];
   for (const [event, tool, toolInput] of cases) {
     const input = payload(box, event, tool, toolInput);
@@ -150,7 +151,7 @@ test("in-process handlers return output without writing to process streams", (t)
     process.stdout.write = (chunk) => { streamed.push(String(chunk)); return true; };
     process.stderr.write = (chunk) => { streamed.push(String(chunk)); return true; };
     lifecycle = handleLifecycleHook(lifecycleInput, environment(box, "handler"));
-    guard = handleInlineDelegationHook(guardInput, environment(box, "handler", { FUSION_POSTURE: "strict", FUSION_INLINE_WRITE_BUDGET: "1" }));
+    guard = handleInlineDelegationHook(guardInput, environment(box, "handler", { FUSION_POSTURE: "strict", FUSION_INLINE_REPLAY_BUDGET_TOKENS: "400000" }));
   } finally {
     process.stdout.write = stdoutWrite;
     process.stderr.write = stderrWrite;
@@ -164,7 +165,7 @@ test("in-process handlers return output without writing to process streams", (t)
 
 test("a guard denial wins over lifecycle output and retains its tagged reason", (t) => {
   const box = sandbox(t);
-  const extra = { FUSION_POSTURE: "strict", FUSION_INLINE_WRITE_BUDGET: "1", FUSION_INLINE_ZERO_DISPATCH_WRITES: "0", FUSION_INLINE_TAIL_ALLOWANCE: "0" };
+  const extra = { FUSION_POSTURE: "strict", FUSION_INLINE_REPLAY_BUDGET_TOKENS: "400000", FUSION_INLINE_ZERO_DISPATCH_WRITES: "0", FUSION_INLINE_TAIL_ALLOWANCE: "0" };
   const edit = { file_path: path.join(box.cwd, "file.txt"), old_string: "old", new_string: "new" };
   const first = payload(box, "PreToolUse", "Edit", edit);
   first.tool_use_id = "first";
@@ -174,6 +175,48 @@ test("a guard denial wins over lifecycle output and retains its tagged reason", 
   assert.equal(output(dispatched).hookSpecificOutput.permissionDecision, "deny");
   assert.equal(output(dispatched).hookSpecificOutput.permissionDecisionReason, output(guard).hookSpecificOutput.permissionDecisionReason);
   assert.match(output(dispatched).hookSpecificOutput.permissionDecisionReason, /\[fusion:\d+\]/);
+});
+
+test("the dispatcher rolls back Bash writes on both failure callback forms", (t) => {
+  for (const event of ["PostToolUseFailure", "PostToolUse"]) {
+    const box = sandbox(t);
+    const input = payload(box, "PreToolUse", "Bash", { command: "cat > src/x <<'EOF'\nnew\nEOF" });
+    compare(box, input);
+    const env = environment(box, "fused");
+    const file = path.join(env.FUSION_INLINE_GUARD_STATE, "fusion-dispatch.json");
+    const before = JSON.parse(fs.readFileSync(file, "utf8"));
+    assert.equal(before.writeCount, 1);
+    assert.equal(before.writeReplayTokens, 400_000);
+    compare(box, { ...input, hook_event_name: event, tool_response: { exitCode: 1 } });
+    const after = JSON.parse(fs.readFileSync(file, "utf8"));
+    assert.equal(after.writeCount, 0);
+    assert.equal(after.writeReplayTokens, 0);
+    assert.deepEqual(after.pendingWrites, []);
+  }
+});
+
+test("dispatcher preserves replay token advisories for read tools and compound Bash reads", (t) => {
+  for (const tool of ["Read", "Bash"]) {
+    const box = sandbox(t);
+    for (const variant of ["reference", "fused"]) {
+      const dir = environment(box, variant).FUSION_INLINE_GUARD_STATE;
+      fs.mkdirSync(dir, { recursive: true });
+      fs.writeFileSync(path.join(dir, "fusion-dispatch.json"), JSON.stringify({ readStreakTurns: 4, readStreakReplayTokens: 1_600_000 }));
+    }
+    const input = payload(box, "PreToolUse", tool, tool === "Bash" ? { command: "sed -n 1,5p a; echo ---; grep x b" } : { file_path: path.join(box.cwd, "file.txt") });
+    const { dispatched } = compare(box, input);
+    assert.equal(output(dispatched).hookSpecificOutput.additionalContext, tagMessage("inline-guard.read-streak-advisory", "5 read only turns in a row replayed 2.0M tokens of context. Batch independent reads into one message, and send open ended reconnaissance to Explore."));
+    const env = environment(box, "fused");
+    const state = JSON.parse(fs.readFileSync(path.join(env.FUSION_INLINE_GUARD_STATE, "fusion-dispatch.json"), "utf8"));
+    assert.equal(state.readStreakTurns, 5);
+    assert.equal(state.readStreakReplayTokens, 2_000_000);
+    const { events } = readAuditEvents({ auditDir: env.FUSION_INLINE_GUARD_AUDIT_DIR });
+    assert.deepEqual(events.map((event) => event.event), ["replay", "warn"]);
+    assert.equal(events[0].tool, tool);
+    assert.equal(events[0].tokens, 400_000);
+    assert.equal(events[1].replayTokens, 2_000_000);
+    assert.equal(events[1].budget, 2_000_000);
+  }
 });
 
 test("merger joins tagged context and system messages, keeps allow input, and uses severe exit code", () => {
