@@ -7,6 +7,7 @@
 - a Bash command counts by its effect. an in place edit, a redirect or `tee` into a workspace file, and an inline interpreter script that writes a workspace path are writes; the guard saw none of them, and 834 of 1066 main loop edit turns went through Bash against 232 through Edit and Write. the read classifier accepts `echo`, `cut`, `sort`, `uniq`, `diff`, newlines, `||`, more `git` and `gh` read subcommands, and a `git -C` prefix: one `echo` separator between two reads used to reset the streak.
 - every priced turn is logged as a `replay` audit event with its kind (read, write, verify, settle, dispatch, other), and `/fusion:stats` reports the main loop replay per accepted package with its split by kind.
 - the coercion ledger counts a sprawl in replayed tokens for events that carry them and keeps the write count rule for older events.
+- the codex deadline test waits for the detached worker's history gc before its sandbox is removed. the worker writes `history-gc-stamp.json` and a lock into the data directory after the job record turns done, and on the linux runner the cleanup lost that race with `ENOTEMPTY` on three runs.
 - rules: locus also follows the price of the seat, so reading and editing leave the main loop first as its context grows; the read only stretch that belongs to Explore is the one that would replay the budget; the runtime guard paragraph names the replay budget.
 
 ## 0.0.74

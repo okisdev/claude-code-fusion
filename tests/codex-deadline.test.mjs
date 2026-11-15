@@ -5,6 +5,10 @@ import test from "node:test";
 
 import { envFor, jobRecords, makeSandbox, runCompanion, waitFor } from "./lib/codex-companion-harness.mjs";
 
+function historyGcFinished(sandbox) {
+  return fs.existsSync(path.join(sandbox.dataDir, "history-gc-stamp.json")) && !fs.existsSync(path.join(sandbox.dataDir, "locks", "history-gc.lock"));
+}
+
 function stageRawTask(sandbox, raw, env = envFor(sandbox)) {
   const created = runCompanion(["transport-create"], { cwd: sandbox.workDir, env });
   assert.equal(created.status, 0, created.stderr);
@@ -60,6 +64,7 @@ test("background shell flag leaves background jobs on their own timeout", async 
     assert.equal(record.timeoutMs, entry.timeoutMs);
     assert.ok(Date.parse(record.deadlineAt) >= Date.parse(record.startedAt) + entry.timeoutMs);
     assert.ok(Date.parse(record.deadlineAt) <= Date.now() + entry.timeoutMs);
+    await waitFor(() => historyGcFinished(sandbox));
   }
 });
 
