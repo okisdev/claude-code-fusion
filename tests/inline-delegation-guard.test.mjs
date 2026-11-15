@@ -1701,7 +1701,7 @@ test("main-session Read lock counts stay constant after pruning as unrelated ses
 
 test("stale pruning persists a ten minute throttle per data directory including callbacks", (t) => {
   const sandbox = makeSandbox(t);
-  const now = Date.now();
+  const now = Date.parse("2026-07-21T00:00:00.000Z");
   const payload = { ...readPayload(sandbox), hook_event_name: "PostToolUse" };
   const env = { FUSION_DATA_DIR: sandbox.dataDir, FUSION_INLINE_GUARD_STATE: "" };
   const directory = path.join(sandbox.dataDir, "inline-guard");
@@ -1713,11 +1713,16 @@ test("stale pruning persists a ten minute throttle per data directory including 
     return file;
   };
   const expired = seed("expired", 49 * 60 * 60 * 1000);
+  const justExpired = seed("just-expired", 48 * 60 * 60 * 1000 + 1);
   const boundary = seed("boundary", 48 * 60 * 60 * 1000);
+  const justFresh = seed("just-fresh", 48 * 60 * 60 * 1000 - 1);
   const fresh = seed("fresh", 47 * 60 * 60 * 1000);
+  assert.strictEqual(fs.statSync(boundary).mtimeMs, now - 48 * 60 * 60 * 1000);
   assert.strictEqual(run(sandbox, payload, { ...env, FUSION_TEST_NOW: new Date(now).toISOString() }).status, 0);
   assert.strictEqual(fs.existsSync(expired), false);
+  assert.strictEqual(fs.existsSync(justExpired), false);
   assert.strictEqual(fs.existsSync(boundary), true);
+  assert.strictEqual(fs.existsSync(justFresh), true);
   assert.strictEqual(fs.existsSync(fresh), true);
   const marker = path.join(directory, ".prune");
   assert.strictEqual(JSON.parse(fs.readFileSync(marker, "utf8")), now);
@@ -1732,6 +1737,7 @@ test("stale pruning persists a ten minute throttle per data directory including 
   assert.strictEqual(run(sandbox, payload, { ...env, FUSION_TEST_NOW: new Date(now + 600_000).toISOString() }).status, 0);
   assert.strictEqual(fs.existsSync(later), false);
   assert.strictEqual(fs.existsSync(boundary), false);
+  assert.strictEqual(fs.existsSync(justFresh), false);
   assert.strictEqual(fs.existsSync(fresh), true);
   assert.strictEqual(JSON.parse(fs.readFileSync(marker, "utf8")), now + 600_000);
   const other = makeSandbox(t);

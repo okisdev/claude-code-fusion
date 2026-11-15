@@ -8,7 +8,8 @@ import { fileURLToPath } from "node:url";
 import { ENGINES, isEngineId } from "./engines.mjs";
 import { readEngineJobRecord } from "./engine-job-state.mjs";
 import { RESUMABLE_CODEX_FAILURE_KINDS } from "./stats/evidence.mjs";
-import { readWorkerRecord, readWorkerRecords, updateWorkerRecord } from "./worker-state.mjs";
+import { withFileLock } from "./storage.mjs";
+import { readWorkerRecord, readWorkerRecords, updateWorkerRecord, workerRecordFile } from "./worker-state.mjs";
 
 const ACCEPTANCE_TIMEOUT_MS = 10_000;
 const DELIVERY_ATTEMPT_LIMIT = 5;
@@ -178,15 +179,19 @@ export function prepareEngineAcceptanceDelivery(record, { jobs, acceptFailedTran
     if (index >= 0 && Object.entries(payload).every(([key, value]) => entries[index][key] === value)) {
       continue;
     }
-    const entry = { ...payload, id: randomUUID(), status: "pending", attempts: 0, lastError: null, updatedAt: new Date().toISOString() };
+    const entry = { ...payload, id: randomUUID(), status: "pending", attempts: 0, failures: 0, lastError: null, updatedAt: new Date().toISOString() };
     if (index >= 0) entries[index] = entry;
     else entries.push(entry);
   }
   return { ...record, engineAcceptanceDelivery: deliveryState(entries) };
 }
 
+function deliveryFailures(entry) {
+  return entry.failures ?? Math.max(0, entry.attempts - Number(Boolean(entry.attemptId)));
+}
+
 function retryableDelivery(entry) {
-  return entry.status !== "delivered" && entry.attempts < DELIVERY_ATTEMPT_LIMIT
+  return entry.status !== "delivered" && deliveryFailures(entry) < DELIVERY_ATTEMPT_LIMIT
     && (!entry.attemptId || Date.now() - Date.parse(entry.updatedAt) > ACCEPTANCE_TIMEOUT_MS + 1_000);
 }
 
@@ -194,33 +199,47 @@ export function deliverWorkerEngineAcceptance({ taskId, env = process.env, asJso
   const snapshot = readWorkerRecord(taskId, env);
   for (const candidate of snapshot?.engineAcceptanceDelivery?.entries ?? []) {
     if (!retryableDelivery(candidate)) continue;
-    let claimed = null;
-    updateWorkerRecord(taskId, env, (record) => {
-      const entries = record?.engineAcceptanceDelivery?.entries;
-      const current = entries?.find((entry) => entry.id === candidate.id);
-      if (!current || !retryableDelivery(current)) return null;
-      claimed = { ...current, status: "pending", attempts: current.attempts + 1, attemptId: randomUUID(), updatedAt: new Date().toISOString() };
-      return { ...record, engineAcceptanceDelivery: deliveryState(entries.map((entry) => entry.id === claimed.id ? claimed : entry)) };
-    });
-    if (!claimed) continue;
-    let lastError = null;
+    const lock = path.join(path.dirname(workerRecordFile(taskId, env)), `.acceptance-${candidate.engine}-${candidate.jobId}`);
+    let acquired = false;
     try {
-      const transport = engineAcceptanceTransport({ ...claimed, env });
-      const result = recordEngineAcceptance({ ...claimed, acceptFailedTransport: transport.acceptFailedTransport, asJson, env });
-      if (!result.updated) throw result.error ?? new Error("Engine acceptance record update failed.");
+      withFileLock(lock, () => {
+        acquired = true;
+        for (;;) {
+          let claimed = null;
+          updateWorkerRecord(taskId, env, (record) => {
+            const entries = record?.engineAcceptanceDelivery?.entries;
+            const current = entries?.find((entry) => entry.engine === candidate.engine && entry.jobId === candidate.jobId);
+            if (!current || !retryableDelivery(current)) return null;
+            claimed = { ...current, status: "pending", attempts: current.attempts + 1, failures: deliveryFailures(current), attemptId: randomUUID(), updatedAt: new Date().toISOString() };
+            return { ...record, engineAcceptanceDelivery: deliveryState(entries.map((entry) => entry.id === claimed.id ? claimed : entry)) };
+          });
+          if (!claimed) break;
+          let lastError = null;
+          try {
+            const transport = engineAcceptanceTransport({ ...claimed, env });
+            const result = recordEngineAcceptance({ ...claimed, acceptFailedTransport: transport.acceptFailedTransport, asJson, env });
+            if (!result.updated) throw result.error ?? new Error("Engine acceptance record update failed.");
+          } catch (error) {
+            lastError = error instanceof Error ? error.message : String(error);
+          }
+          let replaced = false;
+          updateWorkerRecord(taskId, env, (record) => {
+            const entries = record?.engineAcceptanceDelivery?.entries;
+            replaced = entries?.some((entry) => entry.engine === claimed.engine && entry.jobId === claimed.jobId && entry.id !== claimed.id);
+            if (!entries?.some((entry) => entry.id === claimed.id && entry.attemptId === claimed.attemptId)) return null;
+            const updatedEntries = entries.map((entry) => entry.id === claimed.id && entry.attemptId === claimed.attemptId
+              ? { ...entry, status: lastError ? "failed" : "delivered", failures: claimed.failures + Number(lastError !== null), lastError, attemptId: null, updatedAt: new Date().toISOString() }
+              : entry);
+            const state = deliveryState(updatedEntries);
+            const { engineSettlementError: _engineSettlementError, ...updated } = record;
+            return { ...updated, engineAcceptanceDelivery: state, ...(state.lastError ? { engineSettlementError: state.lastError } : {}) };
+          });
+          if (!replaced) break;
+        }
+      }, { timeoutMs: 0, staleMs: ACCEPTANCE_TIMEOUT_MS + 1_000 });
     } catch (error) {
-      lastError = error instanceof Error ? error.message : String(error);
+      if (acquired || error?.code !== "ETIMEDOUT") throw error;
     }
-    updateWorkerRecord(taskId, env, (record) => {
-      const entries = record?.engineAcceptanceDelivery?.entries;
-      if (!entries?.some((entry) => entry.id === claimed.id && entry.attemptId === claimed.attemptId)) return null;
-      const updatedEntries = entries.map((entry) => entry.id === claimed.id && entry.attemptId === claimed.attemptId
-        ? { ...entry, status: lastError ? "failed" : "delivered", lastError, attemptId: null, updatedAt: new Date().toISOString() }
-        : entry);
-      const state = deliveryState(updatedEntries);
-      const { engineSettlementError: _engineSettlementError, ...updated } = record;
-      return { ...updated, engineAcceptanceDelivery: state, ...(state.lastError ? { engineSettlementError: state.lastError } : {}) };
-    });
   }
   return readWorkerRecord(taskId, env);
 }

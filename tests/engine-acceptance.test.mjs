@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -169,6 +170,7 @@ test("failed deliveries stop after five attempts and repeating the same verdict 
   const failed = readWorkerRecord(box.taskId, box.env);
   assert.equal(failed.engineAcceptanceDelivery.status, "failed");
   assert.equal(failed.engineAcceptanceDelivery.attempts, 5);
+  assert.equal(failed.engineAcceptanceDelivery.entries[0].failures, 5);
   assert.equal(fs.readFileSync(box.calls, "utf8").trim().split("\n").length, 5);
 });
 
@@ -214,6 +216,76 @@ test("a concurrent retry cannot claim a delivery while its companion is running"
   assert.equal(readWorkerRecord(box.taskId, box.env).engineAcceptanceDelivery.attempts, 1);
   assert.equal(fs.readFileSync(box.calls, "utf8").trim().split("\n").length, 1);
 });
+
+test("a verdict replaced during delivery reaches the engine after the older verdict", (t) => {
+  const acceptanceModule = new URL("../plugins/fusion/scripts/lib/engine-acceptance.mjs", import.meta.url).href;
+  const workerModule = new URL("../plugins/fusion/scripts/lib/worker-state.mjs", import.meta.url).href;
+  const box = deliveryWorker(t, `
+const { deliverWorkerEngineAcceptance, prepareEngineAcceptanceDelivery } = await import(${JSON.stringify(acceptanceModule)});
+const { updateWorkerRecord } = await import(${JSON.stringify(workerModule)});
+const args = process.argv.slice(2);
+const acceptance = args[args.indexOf("--acceptance") + 1];
+if (acceptance === "accepted") {
+  updateWorkerRecord(worker.taskId, process.env, (current) => prepareEngineAcceptanceDelivery({ ...current, acceptance: "rejected", acceptanceReason: "verification failed", description: "updated during delivery" }, { jobs: [{ engine: "codex", jobId: args[args.indexOf("--job-id") + 1] }] }));
+  deliverWorkerEngineAcceptance({ taskId: worker.taskId, env: process.env });
+}
+fs.writeFileSync(process.env.TEST_ENGINE_VERDICT, acceptance);
+`);
+  box.env.TEST_ENGINE_VERDICT = path.join(box.root, "engine-verdict");
+  updateWorkerRecord(box.taskId, box.env, (record) => prepareEngineAcceptanceDelivery({ ...record, transportStatus: "done", acceptance: "accepted", acceptanceSource: "main-loop", acceptanceRecordedAt: new Date().toISOString() }, { jobs: [{ engine: "codex", jobId: box.jobId }] }));
+
+  deliverWorkerEngineAcceptance({ taskId: box.taskId, env: box.env });
+
+  const worker = readWorkerRecord(box.taskId, box.env);
+  assert.equal(worker.acceptance, "rejected");
+  assert.equal(worker.description, "updated during delivery");
+  assert.equal(worker.engineAcceptanceDelivery.status, "delivered");
+  assert.equal(worker.engineAcceptanceDelivery.entries[0].acceptance, "rejected");
+  assert.equal(fs.readFileSync(box.env.TEST_ENGINE_VERDICT, "utf8"), "rejected");
+  assert.deepEqual(fs.readFileSync(box.calls, "utf8").trim().split("\n").map((line) => JSON.parse(line).acceptance), ["accepted", "rejected"]);
+});
+
+for (const recovery of ["monitor", "same verdict"]) {
+  test(`a crash after claiming attempt five recovers through ${recovery}`, (t) => {
+    const acceptanceModule = new URL("../plugins/fusion/scripts/lib/engine-acceptance.mjs", import.meta.url).href;
+    const box = deliveryWorker(t, `
+const attempts = fs.readFileSync(process.env.TEST_CALLS, "utf8").trim().split("\\n").length;
+if (attempts <= 4) { process.stderr.write("temporary failure"); process.exitCode = 1; }
+if (attempts === 5) process.kill(process.ppid, "SIGKILL");
+`);
+    const jobs = [{ engine: "codex", jobId: box.jobId }];
+    updateWorkerRecord(box.taskId, box.env, (record) => prepareEngineAcceptanceDelivery({ ...record, transportStatus: "done", acceptance: "accepted", acceptanceSource: "main-loop", acceptanceRecordedAt: new Date().toISOString() }, { jobs }));
+    for (let attempt = 0; attempt < 4; attempt += 1) deliverWorkerEngineAcceptance({ taskId: box.taskId, env: box.env });
+    const crashed = spawnSync(process.execPath, ["--input-type=module", "-e", `import { deliverWorkerEngineAcceptance } from ${JSON.stringify(acceptanceModule)}; deliverWorkerEngineAcceptance({ taskId: ${JSON.stringify(box.taskId)}, env: process.env });`], { env: box.env, encoding: "utf8", timeout: 5_000 });
+    assert.equal(crashed.signal, "SIGKILL", crashed.stderr);
+    const claimed = readWorkerRecord(box.taskId, box.env).engineAcceptanceDelivery.entries[0];
+    assert.equal(claimed.attempts, 5);
+    assert.ok(claimed.attemptId);
+    retryWorkerEngineAcceptances({ env: box.env });
+    assert.equal(fs.readFileSync(box.calls, "utf8").trim().split("\n").length, 5);
+    updateWorkerRecord(box.taskId, box.env, (record) => ({ ...record, engineAcceptanceDelivery: { ...record.engineAcceptanceDelivery, entries: record.engineAcceptanceDelivery.entries.map((entry) => {
+      const { failures, ...legacy } = entry;
+      return { ...(recovery === "same verdict" ? legacy : entry), updatedAt: new Date(Date.now() - 12_000).toISOString() };
+    }) } }));
+    const lockDirectory = path.dirname(workerRecordFile(box.taskId, box.env));
+    for (const file of fs.readdirSync(lockDirectory).filter((file) => file.endsWith(".lock"))) {
+      const staleAt = new Date(Date.now() - 12_000);
+      fs.utimesSync(path.join(lockDirectory, file), staleAt, staleAt);
+    }
+    if (recovery === "same verdict") {
+      updateWorkerRecord(box.taskId, box.env, (record) => prepareEngineAcceptanceDelivery(record, { jobs }));
+      deliverWorkerEngineAcceptance({ taskId: box.taskId, env: box.env });
+    } else {
+      retryWorkerEngineAcceptances({ env: box.env });
+    }
+
+    const delivered = readWorkerRecord(box.taskId, box.env);
+    assert.equal(delivered.engineAcceptanceDelivery.status, "delivered");
+    assert.equal(delivered.engineAcceptanceDelivery.entries[0].failures, 4);
+    assert.equal(delivered.engineSettlementError, undefined);
+    assert.equal(fs.readFileSync(box.calls, "utf8").trim().split("\n").length, 6);
+  });
+}
 
 for (const engine of ["codex", "grok", "cursor", "devin"]) {
   test(`${engine} companion repeated acceptance preserves the job and verdict`, async (t) => {
