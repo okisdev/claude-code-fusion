@@ -50,6 +50,8 @@ test("the main Claude session remains the sole control plane", () => {
 
 test("Claude workers stay inside their advisory and capability roles", () => {
   assert.match(deepReasoner, /Read only advisory lane/);
+  assert.match(frontmatterValue(deepReasoner, "description"), /at high effort\./);
+  assert.equal(frontmatterValue(deepReasoner, "effort"), "high");
   assert.match(deepReasoner, /It recommends and challenges; the main session decides, implements through another lane, and owns acceptance\./);
   assert.match(deepReasoner, /Never edit files, execute an implementation brief, dispatch another agent, or claim final acceptance\./);
   assert.match(deepReasoner, /If the brief needs broader reconnaissance, return that gap to the main session\./);
