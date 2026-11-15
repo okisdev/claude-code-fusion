@@ -2,6 +2,7 @@ import { BREADTH_ENGINE_IDS, ENGINES } from "../engines.mjs";
 import { STATS_PROVIDER_REGISTRY, WORKSPACE_ENGINE_DESCRIPTORS, acceptanceSummary } from "./aggregation.mjs";
 import { FLEET_SHAPED_MIN_WIDTH, hasCoercionLedgerData } from "./fleet.mjs";
 import { formatTraceModel } from "./reports.mjs";
+import { formatTokens, NOMINAL_CONTEXT_TOKENS } from "../guard/replay.mjs";
 
 export function renderAuditReport(report) {
   const lines = ["# Fusion inline audit", "", `Scope: ${report.scope}`, "", `Total events: ${report.totalEvents}`, `Sessions: ${report.sessionCount}`];
@@ -19,6 +20,7 @@ export function renderAuditReport(report) {
   }
   renderCounts(lines, "Dispatches by lane", report.dispatchesByLane);
   renderCounts(lines, "Verification evidence", report.verificationByEvidence);
+  renderMainLoopReplay(lines, report.mainLoopReplay);
   if (report.malformedCount > 0) {
     lines.push("", `Malformed audit entries skipped: ${report.malformedCount}`);
   }
@@ -59,6 +61,7 @@ export function renderSessionReport(report) {
       lines.push(`Malformed audit entries skipped: ${report.guard.malformedCount}`);
     }
   }
+  renderMainLoopReplay(lines, report.mainLoopReplay);
   if (report.workers) {
     lines.push("", "## Claude workers (session scope)", "", `Total jobs: ${report.workers.totalJobs}`);
     renderCounts(lines, "By transport status", report.workers.byTransportStatus);
@@ -314,6 +317,26 @@ function renderCoercionLedger(lines, ledger) {
   renderCounts(lines, "Posture mix", ledger.postureMix ?? {});
 }
 
+function renderMainLoopReplay(lines, replay) {
+  if (!replay || replay.totalTurns === 0) {
+    return;
+  }
+  const total = `${formatTokens(replay.totalTokens)} tokens over ${replay.totalTurns} tool turn${replay.totalTurns === 1 ? "" : "s"}`;
+  lines.push(replay.acceptedPackages > 0
+    ? `- main loop replay: ${formatTokens(replay.tokensPerAcceptedPackage)} tokens per accepted package (${total}, ${replay.acceptedPackages} accepted package${replay.acceptedPackages === 1 ? "" : "s"})`
+    : `- main loop replay: ${total}, no accepted packages`);
+  const kinds = ["read", "write", "verify", "settle", "dispatch", "other"]
+    .filter((kind) => replay.byKind[kind].turns > 0)
+    .map((kind) => {
+      const { tokens, turns } = replay.byKind[kind];
+      return `${kind} ${Math.round(tokens / replay.totalTokens * 100)}% (${turns} turn${turns === 1 ? "" : "s"})`;
+    });
+  lines.push(`- replay by kind: ${kinds.join(", ")}`);
+  if (replay.unmeasuredTurns > 0) {
+    lines.push(`- ${replay.unmeasuredTurns} replay turn${replay.unmeasuredTurns === 1 ? "" : "s"} had no context reading and ${replay.unmeasuredTurns === 1 ? "is" : "are"} priced at ${formatTokens(NOMINAL_CONTEXT_TOKENS)} tokens`);
+  }
+}
+
 export function renderFusionStats(report, { identities = false, byDay = false } = {}) {
   const lines = ["# Fusion stats", "", `Scope: ${report.scope === "all" ? "all workspaces" : `workspace ${report.scope}`}`];
   if (report.parentContextAtDispatch) {
@@ -345,6 +368,7 @@ export function renderFusionStats(report, { identities = false, byDay = false } 
       lines.push(`Last 7 days: ${recent.accepted} accepted, ${recent.evidenced} with a credited verification (${formatShare(recent.rate)})`);
     }
   }
+  renderMainLoopReplay(lines, report.mainLoopReplay);
   if (report.wrapperDelivery?.length > 0) {
     lines.push("", "## Wrapper delivery by plugin version, last 7 days", "");
     for (const row of report.wrapperDelivery) {

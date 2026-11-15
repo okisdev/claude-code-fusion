@@ -3,9 +3,10 @@ import path from "node:path";
 import { readAuditEvents as readGuardAuditEvents, resolveStateDir as resolveGuardStateDir, stateFile as guardStateFile } from "../../inline-delegation-guard.mjs";
 import { ENGINE_TERMINAL_STATUSES, engineStateRoots } from "../../lib/engines.mjs";
 import { canonicalWorkerAgentType, readWorkerRecords } from "../../lib/worker-state.mjs";
-import { WORKSPACE_ENGINE_DESCRIPTORS, acceptanceGap, acceptanceSummary, claudeWorkerStats, countJudged, emptyAcceptanceGaps, resolvedEngineAcceptance, workerSnapshot } from "./aggregation.mjs";
+import { WORKSPACE_ENGINE_DESCRIPTORS, acceptanceGap, acceptanceSummary, claudeWorkerStats, countJudged, emptyAcceptanceGaps, resolvedEngineAcceptance, summarizeMainLoopReplay, verificationEvidence, workerSnapshot } from "./aggregation.mjs";
 import { FILE_ENGINE_DESCRIPTORS, isSupersededCodexJob } from "./engine-evidence.mjs";
 import { bump, nonEmptyString, selectPreferredJobs } from "./evidence.mjs";
+import { readStatsAuditEvents } from "./fleet.mjs";
 import { spawnSync } from "node:child_process";
 
 function readGuardSessionState(env, sessionId) {
@@ -82,6 +83,9 @@ export function buildAuditReport({ env = process.env, sessionId = null, days = 7
   const windowDays = all ? null : positiveAuditDays(days);
   const sinceMs = all ? null : now - windowDays * 24 * 60 * 60 * 1000;
   const { events, malformedCount } = readGuardAuditEvents({ env, sessionId, sinceMs, untilMs: now });
+  const replayAudit = readStatsAuditEvents(env, { sessionId, sinceMs, untilMs: now });
+  const acceptedPackages = replayAudit.events.some((event) => event.event === "replay") ? verificationEvidence(readWorkerRecords(env), { ...replayAudit, sessionId, untilMs: now }, true, null).accepted : 0;
+  const mainLoopReplay = summarizeMainLoopReplay(replayAudit.events, acceptedPackages);
   const windowLabel = all ? "all retained audit events" : `last ${windowDays} ${windowDays === 1 ? "day" : "days"}`;
   const byEvent = {};
   const eventsByDay = {};
@@ -112,6 +116,7 @@ export function buildAuditReport({ env = process.env, sessionId = null, days = 7
     eventsByDay,
     dispatchesByLane,
     verificationByEvidence,
+    ...(mainLoopReplay ? { mainLoopReplay } : {}),
     earliestAt: events[0]?.at ?? null,
     latestAt: events.at(-1)?.at ?? null,
     malformedCount
@@ -333,5 +338,8 @@ export function buildSessionReport({ env = process.env, sessionId = env.CLAUDE_C
   for (const descriptor of WORKSPACE_ENGINE_DESCRIPTORS) {
     engines[descriptor.id] = sessionScopedEngineStats(descriptor, sessionId, env, workers);
   }
-  return { available: true, sessionId, guard: readGuardSessionState(env, sessionId), workers: claudeWorkerStats({ all: true, env, sessionId, workers }), engines };
+  const audit = readStatsAuditEvents(env, { sessionId });
+  const acceptedPackages = verificationEvidence(workers.records, { ...audit, sessionId }, true, null).accepted;
+  const mainLoopReplay = summarizeMainLoopReplay(audit.events, acceptedPackages);
+  return { available: true, sessionId, guard: readGuardSessionState(env, sessionId), workers: claudeWorkerStats({ all: true, env, sessionId, workers }), engines, ...(mainLoopReplay ? { mainLoopReplay } : {}) };
 }
