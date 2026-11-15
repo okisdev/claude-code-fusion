@@ -38,7 +38,7 @@ function turnReplayTokens(turn) {
 
 function isNewTurn(previous, turn, now) {
   if (!previous) return true;
-  if (previous.id && turn?.id && previous.id === turn.id) return false;
+  if (previous.id && turn?.id) return previous.id !== turn.id;
   const elapsed = Date.parse(now) - Date.parse(previous.at);
   return !(elapsed >= 0 && elapsed <= SAME_TURN_MS);
 }

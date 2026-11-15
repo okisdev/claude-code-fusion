@@ -309,7 +309,7 @@ function normalizeAuditEvent(event) {
         }
       : null;
   }
-  if (event.event === "replay" && event.lane === MAIN_LANE && typeof event.tool === "string" && /^[A-Za-z][A-Za-z0-9_]{0,63}$/.test(event.tool) &&
+  if (event.event === "replay" && event.lane === MAIN_LANE && typeof event.tool === "string" && /^[A-Za-z][A-Za-z0-9_-]{0,63}$/.test(event.tool) &&
     typeof event.turn === "string" && /^[A-Za-z0-9_:-]{1,160}$/.test(event.turn) && REPLAY_KINDS.includes(event.kind) &&
     Number.isSafeInteger(event.tokens) && event.tokens > 0 && typeof event.measured === "boolean") {
     return {

@@ -105,7 +105,7 @@ test("a Bash command that authors a workspace file is a write", () => {
     assert.strictEqual(bashWriteEffect(command, cwd)?.path, path.join(cwd, expected), command);
   }
   assert.strictEqual(bashWriteEffect("cat > src/new.ts <<'EOF'\nexport const a = 1;\nEOF", cwd).bytes, Buffer.byteLength("export const a = 1;"));
-  assert.strictEqual(bashWriteEffect("sed -i 's/x/y/' src/a.ts", cwd).bytes, 0);
+  assert.strictEqual(bashWriteEffect("sed -i 's/x/y/' src/a.ts", cwd).bytes, null);
 });
 
 test("a Bash command that leaves workspace files alone is not a write", () => {
@@ -135,4 +135,100 @@ test("a Bash command that leaves workspace files alone is not a write", () => {
   for (const command of commands) assert.strictEqual(bashWriteEffect(command, cwd), null, command);
   assert.strictEqual(bashWriteEffect("echo text > notes.md", "relative/cwd"), null);
   assert.strictEqual(bashWriteEffect(null, cwd), null);
+});
+
+for (const [command, target] of [
+  ["git status\nsed -i s/a/b/ src/a.ts", "src/a.ts"],
+  ["LC_ALL=C sed -i s/a/b/ src/a.ts", "src/a.ts"],
+  ["LC_ALL=C LANG=C sed -i s/a/b/ src/a.ts", "src/a.ts"],
+  ["echo x >& src/a.ts", "src/a.ts"],
+  ["echo x &> src/a.ts", "src/a.ts"],
+  ["sed -i s/a/b/ src/a.ts /tmp/a.ts", "src/a.ts"],
+  ["sed -i -e s/a/b/ src/a.ts /tmp/a.ts", "src/a.ts"],
+  ["sed -i -es/a/b/ src/a.ts /tmp/a.ts", "src/a.ts"],
+  ["sed -i -f /tmp/script.sed src/a.ts /tmp/a.ts", "src/a.ts"],
+  ["sed -i --expression=s/a/b/ src/a.ts /tmp/a.ts", "src/a.ts"],
+  ["sed -i --file=/tmp/script.sed src/a.ts /tmp/a.ts", "src/a.ts"],
+  ["sed -i.foo 's/x/y/' /tmp/scratch.txt", null],
+  ["sed -i.foo 's/x/y/' src/a.ts /tmp/scratch.txt", "src/a.ts"],
+  ["perl -pi -e 's/a/b/' src/a.ts /tmp/a.ts", "src/a.ts"],
+  ["perl -pi -e's/a/b/' src/a.ts /tmp/a.ts", "src/a.ts"],
+  ["perl -pi -e 's/a/b/' /tmp/a.ts src/a.ts /tmp/b.ts", "src/a.ts"],
+  ["printf %s '|' sed -i s/a/b/ src/a.ts", null],
+  ["printf %s ';' sed -i s/a/b/ src/a.ts", null],
+  ["printf %s '&' sed -i s/a/b/ src/a.ts", null],
+  ["printf %s \"\n\" sed -i s/a/b/ src/a.ts", null],
+  ["cat <<'EOF'\nsed -i s/a/b/ src/a.ts\nEOF", null],
+  ["sed -i 's/x/y/' /tmp/scratch.txt", null],
+  ["sed -i src/script.sed /tmp/scratch.txt", null],
+  ["sed -i -e 's/x/y/' /tmp/scratch.txt", null],
+  ["sed -i -f src/script.sed /tmp/scratch.txt", null],
+  ["perl -pi -e 'src/script.pl' /tmp/scratch.txt", null],
+  ["perl -pi -e'src/script.pl' /tmp/scratch.txt", null],
+  ["echo x >& 2", null],
+  ["printf %s \">\" notes.txt", null],
+  ["printf %s \\> notes.txt", null],
+  ["printf %s \\| sed -i s/a/b/ src/a.ts", null],
+  ["printf %s \\; sed -i s/a/b/ src/a.ts", null],
+  ["printf %s \\& sed -i s/a/b/ src/a.ts", null],
+  [`node -e 'require("fs").writeFileSync("/tmp/report.txt",require("fs").readFileSync("README.md"))'`, null],
+  [`python3 -c 'from pathlib import Path; Path(".gitignore").write_text("x")'`, ".gitignore"],
+  [`python3 -c 'open("Makefile", "w")'`, "Makefile"],
+  [`python3 -c 'open(".gitignore", "a").write("x")'`, ".gitignore"],
+  [`python3 -c 'open("Makefile", "xb").write(b"x")'`, "Makefile"],
+  [`python3 -c 'from pathlib import Path; Path("Makefile").write_bytes(b"x")'`, "Makefile"],
+  [`python3 -c 'open("/tmp/report.txt", "w").write(open("README.md").read())'`, null],
+  [`python3 -c 'from pathlib import Path; Path("/tmp/report.txt").write_text(Path("README.md").read_text())'`, null],
+  ...["writeFileSync", "writeFile", "appendFileSync", "appendFile"].flatMap((method) => [
+    [`node -e 'require("fs").${method}("Makefile", "x")'`, "Makefile"],
+    [`node -e 'require("fs").${method}("/tmp/report.txt",require("fs").readFileSync("README.md"))'`, null]
+  ]),
+  [`ruby -e 'File.write("Makefile", "x")'`, "Makefile"],
+  [`ruby -e 'File.write("/tmp/report.txt", File.read("README.md"))'`, null],
+  [`node -e 'fs.writeFileSync("/tmp/out", "x"); fs.appendFile("Makefile", "x"); fs.writeFile("src/a.ts", "x")'`, "Makefile"],
+  [`python3 -c 'p="src/a.ts"; open(p,"w").write("x")'`, "src/a.ts"]
+]) {
+  test(`Bash write target: ${JSON.stringify(command)}`, () => {
+    const effect = bashWriteEffect(command, cwd);
+    assert.deepStrictEqual(effect, target === null ? null : { path: path.join(cwd, target), bytes: null });
+  });
+}
+
+for (const [command, expected] of [
+  ["sort -o out src/a.ts", false],
+  ["sort -oout src/a.ts", false],
+  ["sort --output out src/a.ts", false],
+  ["sort --output=out src/a.ts", false],
+  ["uniq input output", false],
+  ["uniq -c input output", false],
+  ["uniq -c 'input file'", true],
+  ["uniq -f 1 input", true],
+  ["tree -o out src", false],
+  ["tree -oout src", false],
+  ["file -C", false],
+  ["file --compile", false],
+  ...["diff", "show", "log", "status", "grep", "blame", "rev-parse", "ls-files", "ls-tree", "cat-file", "merge-base", "describe", "shortlog"].map((name) => [`git ${name} --output=out`, false]),
+  ["git remote", true],
+  ["git remote -v", true],
+  ["git remote get-url --all origin", true],
+  ["git remote -v add origin url", false],
+  ...["-XPOST", "-ftitle=x", "-Ftitle=x", "--method=POST", "--field=title=x", "--raw-field=title=x", "--input=body.json"].map((flag) => [`gh api repos/o/r/issues ${flag}`, false]),
+  ["find . -fprint0 out", false],
+  ["sed -nf script src/a.ts", false],
+  ...["sed", "awk"].flatMap((name) => ["-f script", "-fscript", "--file script", "--file=script"].map((flag) => [`${name} ${flag} src/a.ts`, false])),
+  ["git branch --list main", true],
+  ["git branch -l 'feat/*'", true],
+  ["git tag --list v1", true],
+  ["git tag -l", true],
+  ["git branch -a main", false],
+  ["git tag -v v1", false]
+]) {
+  test(`read only Bash: ${JSON.stringify(command)}`, () => {
+    assert.strictEqual(isReadOnlyBash(command), expected);
+  });
+}
+
+test("Bash write bytes distinguish unknown size from an empty heredoc", () => {
+  assert.strictEqual(bashWriteEffect("echo x > src/a.ts", cwd).bytes, null);
+  assert.strictEqual(bashWriteEffect("cat > src/a.ts <<'EOF'\nEOF", cwd).bytes, 0);
 });

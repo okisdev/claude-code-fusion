@@ -169,15 +169,17 @@ test("a guard denial wins over lifecycle output and retains its tagged reason", 
   const edit = { file_path: path.join(box.cwd, "file.txt"), old_string: "old", new_string: "new" };
   const first = payload(box, "PreToolUse", "Edit", edit);
   first.tool_use_id = "first";
+  const second = payload(box, "PreToolUse", "Edit", edit);
+  fs.writeFileSync(box.transcript, [first, second].map((input, index) => JSON.stringify({ type: "assistant", message: { id: `msg_${index}`, content: [{ type: "tool_use", id: input.tool_use_id }] } })).join("\n"));
   run("inline-delegation-guard", first, environment(box, "reference", extra));
   run("inline-delegation-guard", first, environment(box, "fused", extra));
-  const { guard, dispatched } = compare(box, payload(box, "PreToolUse", "Edit", edit), extra);
+  const { guard, dispatched } = compare(box, second, extra);
   assert.equal(output(dispatched).hookSpecificOutput.permissionDecision, "deny");
   assert.equal(output(dispatched).hookSpecificOutput.permissionDecisionReason, output(guard).hookSpecificOutput.permissionDecisionReason);
   assert.match(output(dispatched).hookSpecificOutput.permissionDecisionReason, /\[fusion:\d+\]/);
 });
 
-test("the dispatcher rolls back Bash writes on both failure callback forms", (t) => {
+test("the dispatcher retains Bash write charges on both failure callback forms", (t) => {
   for (const event of ["PostToolUseFailure", "PostToolUse"]) {
     const box = sandbox(t);
     const input = payload(box, "PreToolUse", "Bash", { command: "cat > src/x <<'EOF'\nnew\nEOF" });
@@ -189,8 +191,10 @@ test("the dispatcher rolls back Bash writes on both failure callback forms", (t)
     assert.equal(before.writeReplayTokens, 400_000);
     compare(box, { ...input, hook_event_name: event, tool_response: { exitCode: 1 } });
     const after = JSON.parse(fs.readFileSync(file, "utf8"));
-    assert.equal(after.writeCount, 0);
-    assert.equal(after.writeReplayTokens, 0);
+    assert.equal(after.writeCount, 1);
+    assert.equal(after.writesSinceDispatch, 1);
+    assert.equal(after.inlineWriteBytes, 3);
+    assert.equal(after.writeReplayTokens, 400_000);
     assert.deepEqual(after.pendingWrites, []);
   }
 });

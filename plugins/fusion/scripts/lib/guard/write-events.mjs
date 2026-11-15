@@ -26,11 +26,18 @@ function handleWrite(input, env, { sessionId, toolName, file, now, posture, cwd,
       if (!failed && entry.epoch === state.dispatchEpoch && !state.confirmedPathSignatures.includes(entry.signature)) {
         state.confirmedPathSignatures.push(entry.signature);
       }
-      if (failed) {
+      if (failed && toolName !== BASH_TOOL) {
         state.writeCount = Math.max(0, state.writeCount - 1);
         state.inlineWriteBytes = Math.max(0, state.inlineWriteBytes - entry.bytes);
         if (entry.epoch === state.dispatchEpoch) {
-          state.writeReplayTokens = Math.max(0, state.writeReplayTokens - entry.tokens);
+          if (entry.turn && entry.turn === state.writeTurnKey) {
+            state.writeTurnWrites = Math.max(0, state.writeTurnWrites - 1);
+            if (state.writeTurnWrites === 0) {
+              state.writeReplayTokens = Math.max(0, state.writeReplayTokens - state.writeTurnTokens);
+              state.writeTurnKey = null;
+              state.writeTurnTokens = 0;
+            }
+          }
           state.writesSinceDispatch = Math.max(0, state.writesSinceDispatch - 1);
           if (entry.tail) state.tailWritesSinceDispatch = Math.max(0, state.tailWritesSinceDispatch - 1);
           if (!state.confirmedPathSignatures.includes(entry.signature) && !state.pendingWrites.some((other) => other.epoch === entry.epoch && other.signature === entry.signature)) {
@@ -60,7 +67,7 @@ function handleWrite(input, env, { sessionId, toolName, file, now, posture, cwd,
   const auditPath = extractAuditWritePath(targetPath, cwd);
   const budget = resolveReplayBudgetTokens(env);
   const mode = resolveMode(env);
-  const writeBytes = writeEffect?.bytes ?? inlineWriteBytes(input.tool_input);
+  const writeBytes = toolName === BASH_TOOL ? writeEffect.bytes ?? 0 : inlineWriteBytes(input.tool_input);
   const replacementBytes = toolName === "Edit" ? editReplacementBytes(input.tool_input) : null;
   const pathSignature = writePathSignature(targetPath, cwd);
   const tailMaxBytes = resolveTailMaxBytes(env);
@@ -72,7 +79,7 @@ function handleWrite(input, env, { sessionId, toolName, file, now, posture, cwd,
     if (toolUseId && state.pendingWrites.some((entry) => entry.id === toolUseId && entry.tool === toolName)) return { duplicate: true };
     const dispatchCount = totalDispatches(state.dispatches);
     let relief = null;
-    if (mode === "enforce" && state.writeReplayTokens >= budget) {
+    if (mode === "enforce" && state.writeReplayTokens >= budget && state.turn?.key !== state.writeTurnKey) {
       const tailAllowed =
         toolName === "Edit" &&
         replacementBytes !== null &&
@@ -82,6 +89,7 @@ function handleWrite(input, env, { sessionId, toolName, file, now, posture, cwd,
         state.writtenPathSignatures.includes(pathSignature);
       const zeroDispatchAllowed =
         !tailAllowed &&
+        (toolName !== BASH_TOOL || writeEffect.bytes !== null) &&
         dispatchCount === 0 &&
         state.writeCount < zeroDispatchWrites &&
         state.inlineWriteBytes + writeBytes < zeroDispatchMaxBytes;
@@ -97,8 +105,10 @@ function handleWrite(input, env, { sessionId, toolName, file, now, posture, cwd,
     if (state.turn && state.turn.key !== state.writeTurnKey) {
       state.writeReplayTokens = Math.min(Number.MAX_SAFE_INTEGER, before + state.turn.tokens);
       state.writeTurnKey = state.turn.key;
+      state.writeTurnTokens = state.writeReplayTokens - before;
+      state.writeTurnWrites = 0;
     }
-    const tokens = state.writeReplayTokens - before;
+    state.writeTurnWrites += 1;
     const newPath = !state.writtenPathSignatures.includes(pathSignature);
     if (newPath) {
       state.writtenPathSignatures.push(pathSignature);
@@ -106,7 +116,7 @@ function handleWrite(input, env, { sessionId, toolName, file, now, posture, cwd,
     if (relief === TAIL_ALLOW_AUDIT_EVENT) {
       state.tailWritesSinceDispatch += 1;
     }
-    if (toolUseId) state.pendingWrites.push({ id: toolUseId, tool: toolName, epoch: state.dispatchEpoch, bytes: writeBytes, tokens, signature: pathSignature, tail: relief === TAIL_ALLOW_AUDIT_EVENT });
+    if (toolUseId) state.pendingWrites.push({ id: toolUseId, tool: toolName, epoch: state.dispatchEpoch, bytes: writeBytes, turn: state.writeTurnKey, signature: pathSignature, tail: relief === TAIL_ALLOW_AUDIT_EVENT });
     const multiple = posture === STRICT_POSTURE ? budgetMultiple(state.writeReplayTokens, budget) : crossedBudgetMultiple(before, state.writeReplayTokens, budget);
     let candidate = null;
     if (

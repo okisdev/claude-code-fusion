@@ -156,6 +156,8 @@ function defaultState(now) {
     writesSinceDispatch: 0,
     writeReplayTokens: 0,
     writeTurnKey: null,
+    writeTurnTokens: 0,
+    writeTurnWrites: 0,
     inlineWriteBytes: 0,
     tailWritesSinceDispatch: 0,
     writtenPathSignatures: [],
@@ -231,12 +233,18 @@ function normalizeState(existing, now) {
   const lastDispatchAtMs = Date.parse(existing.lastDispatchAt);
   const pendingWrites = Array.isArray(existing.pendingWrites) ? existing.pendingWrites.filter((entry) =>
     entry && typeof entry.id === "string" && Number.isInteger(entry.epoch) && Number.isSafeInteger(entry.bytes) &&
-    typeof entry.signature === "string" && typeof entry.tail === "boolean").map((entry) => ({ ...entry, tokens: Number.isSafeInteger(entry.tokens) && entry.tokens >= 0 ? entry.tokens : 0 })) : [];
+    typeof entry.signature === "string" && typeof entry.tail === "boolean").map((entry) => ({
+      id: entry.id, tool: entry.tool, epoch: entry.epoch, bytes: entry.bytes,
+      turn: typeof entry.turn === "string" && /^[A-Za-z0-9_:-]{1,160}$/.test(entry.turn) ? entry.turn : null,
+      signature: entry.signature, tail: entry.tail
+    })) : [];
   return {
     writeCount,
     writesSinceDispatch,
     writeReplayTokens: Number.isSafeInteger(existing.writeReplayTokens) && existing.writeReplayTokens >= 0 ? existing.writeReplayTokens : 0,
     writeTurnKey: typeof existing.writeTurnKey === "string" && /^[A-Za-z0-9_:-]{1,160}$/.test(existing.writeTurnKey) ? existing.writeTurnKey : null,
+    writeTurnTokens: Number.isSafeInteger(existing.writeTurnTokens) && existing.writeTurnTokens >= 0 ? existing.writeTurnTokens : 0,
+    writeTurnWrites: Number.isSafeInteger(existing.writeTurnWrites) && existing.writeTurnWrites >= 0 ? existing.writeTurnWrites : 0,
     inlineWriteBytes,
     tailWritesSinceDispatch,
     writtenPathSignatures,
@@ -281,11 +289,14 @@ function resetWriteWindow(state) {
   state.writesSinceDispatch = 0;
   state.writeReplayTokens = 0;
   state.writeTurnKey = null;
-  for (const entry of state.pendingWrites) entry.tokens = 0;
+  state.writeTurnTokens = 0;
+  state.writeTurnWrites = 0;
+  for (const entry of state.pendingWrites) entry.turn = null;
   state.tailWritesSinceDispatch = 0;
   state.writtenPathSignatures = [];
   state.confirmedPathSignatures = [];
   state.advisedMultiples = [];
+  delete state.advisorySignatures["write-budget"];
 }
 
 export { normalizeSessionId, stateFile, readState, writeState, waitForLock, acquireStateLock, withStateLock, withAvailableStateLock, pruneStaleState, defaultState, normalizeAdvisedMultiples, normalizeWrittenPathSignatures, normalizeAdvisorySignatures, normalizeState, stableAdvisorySignature, claimAdvisory, resetWriteWindow };

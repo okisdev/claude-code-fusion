@@ -65,14 +65,16 @@ test("an unreadable transcript prices a turn at the nominal context", (t) => {
   assert.strictEqual(turnReplayTokens({ id: "msg_1", contextTokens: 80_000 }), 80_000);
 });
 
-test("tool calls share a turn when either the message id or a 1500 ms gap says so", () => {
+test("known message ids decide the turn and missing ids use a 1500 ms gap", () => {
   const at = "2026-07-21T00:00:00.000Z";
   const later = (ms) => new Date(Date.parse(at) + ms).toISOString();
   assert.strictEqual(isNewTurn(null, { id: "msg_1" }, at), true);
   assert.strictEqual(isNewTurn({ id: "msg_1", at }, { id: "msg_1" }, later(600_000)), false);
-  assert.strictEqual(isNewTurn({ id: "msg_1", at }, { id: "msg_2" }, later(1500)), false);
+  assert.strictEqual(isNewTurn({ id: "msg_1", at }, { id: "msg_2" }, later(0)), true);
+  assert.strictEqual(isNewTurn({ id: "msg_1", at }, { id: "msg_2" }, later(1500)), true);
   assert.strictEqual(isNewTurn({ id: "msg_1", at }, { id: "msg_2" }, later(1501)), true);
   assert.strictEqual(isNewTurn({ id: null, at }, { id: "msg_2" }, later(1500)), false);
+  assert.strictEqual(isNewTurn({ id: "msg_1", at }, { id: null }, later(1500)), false);
   assert.strictEqual(isNewTurn({ id: null, at }, { id: null }, later(1501)), true);
   assert.strictEqual(isNewTurn({ id: "msg_1", at }, { id: null }, later(-1)), true);
   assert.strictEqual(isNewTurn({ id: "msg_1", at: null }, { id: "msg_2" }, at), true);
@@ -124,4 +126,9 @@ test("the audit log keeps one replay event per priced tool call", () => {
   for (const change of [{ kind: "think" }, { tokens: 0 }, { tokens: 1.5 }, { turn: "" }, { turn: "a b" }, { measured: "yes" }, { lane: "builtin" }, { tool: "" }]) {
     assert.strictEqual(normalizeAuditEvent({ ...event, ...change }), null, JSON.stringify(change));
   }
+});
+
+test("replay audit events accept hyphens in tool names", () => {
+  const event = { at: "2026-07-21T00:00:00.000Z", session: "session-1", event: "replay", lane: "main", tool: "mcp__claude-in-chrome__read_page", turn: "msg_1", kind: "other", tokens: 400_000, measured: false };
+  assert.deepStrictEqual(normalizeAuditEvent(event), { schemaVersion: 1, ...event });
 });

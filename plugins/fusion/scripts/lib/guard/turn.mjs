@@ -3,7 +3,7 @@ import { recordAuditEvent } from "./audit.mjs";
 import { bashWriteEffect, isReadOnlyBash } from "./bash-effect.mjs";
 import { BASH_TOOL, DELEGATION_TOOLS, MAIN_LANE, READ_TOOLS, WRITE_TOOLS } from "./constants.mjs";
 import { isNewTurn, outranksReplayKind, readTurn, turnReplayTokens } from "./replay.mjs";
-import { normalizeState, readState, withAvailableStateLock, writeState } from "./state.mjs";
+import { normalizeState, readState, withAvailableStateLock, withStateLock, writeState } from "./state.mjs";
 import { extractBashCommand } from "./verification.mjs";
 import { extractWritePath, isWorkspaceWritePath } from "./write.mjs";
 
@@ -18,7 +18,8 @@ function recordTurn(input, env, { sessionId, toolName, file, now, cwd }) {
     toolName === BASH_TOOL && /(?:^|[\s/'"])fusion-stats\.mjs(?=[\s'"]|$)/.test(command) && /(?:^|\s)--record(?=[=\s]|$)/.test(command) ? "settle" :
     READ_TOOLS.has(toolName) || (toolName === BASH_TOOL && isReadOnlyBash(command)) ? "read" : "other";
   const turn = readTurn(input.transcript_path, input.tool_use_id);
-  return withAvailableStateLock(file, () => {
+  const lock = kind === "read" ? withAvailableStateLock : withStateLock;
+  return lock(file, () => {
     const state = normalizeState(readState(file), now);
     const newTurn = isNewTurn(state.turn, turn, now);
     const raisedKind = !newTurn && outranksReplayKind(kind, state.turn.kind);

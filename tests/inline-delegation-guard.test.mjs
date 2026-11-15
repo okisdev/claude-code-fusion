@@ -266,7 +266,9 @@ test("five Edit calls in one turn price one context without an advisory", (t) =>
     assert.strictEqual(state.writesSinceDispatch, 5);
     assert.strictEqual(state.writeReplayTokens, 400_000);
     assert.strictEqual(state.writeTurnKey, state.turn.key);
-    assert.deepStrictEqual(state.pendingWrites.map((entry) => entry.tokens), [400_000, 0, 0, 0, 0]);
+    assert.deepStrictEqual(state.pendingWrites.map((entry) => entry.turn), Array(5).fill(state.turn.key));
+    assert.strictEqual(state.writeTurnTokens, 400_000);
+    assert.strictEqual(state.writeTurnWrites, 5);
     assert.deepStrictEqual(state.advisedMultiples, []);
     assert.strictEqual(readAuditRecords(sandbox).filter((event) => event.event === "warn").length, 0);
   }
@@ -297,7 +299,9 @@ for (const [contextTokens, thresholdTurn, formattedTokens] of [[800_000, 3, "2.4
       assert.strictEqual(state.writeCount, thresholdTurn);
       assert.strictEqual(state.writeReplayTokens, contextTokens * thresholdTurn);
       assert.strictEqual(state.writeTurnKey, `msg_${thresholdTurn}`);
-      assert.deepStrictEqual(state.pendingWrites.map((entry) => entry.tokens), Array(thresholdTurn).fill(contextTokens));
+      assert.deepStrictEqual(state.pendingWrites.map((entry) => entry.turn), Array.from({ length: thresholdTurn }, (_, index) => `msg_${index + 1}`));
+      assert.strictEqual(state.writeTurnTokens, contextTokens);
+      assert.strictEqual(state.writeTurnWrites, 1);
       const [warning] = readAuditRecords(sandbox).filter((event) => event.event === "warn");
       assert.strictEqual(warning.budget, 2_000_000);
       assert.strictEqual(warning.replayTokens, state.writeReplayTokens);
@@ -331,7 +335,8 @@ for (const [name, command, bytes] of [
     assert.strictEqual(state.writesSinceDispatch, 1);
     assert.strictEqual(state.writeReplayTokens, 400_000);
     assert.strictEqual(state.inlineWriteBytes, bytes);
-    assert.strictEqual(state.pendingWrites[0].tokens, 400_000);
+    assert.strictEqual(state.pendingWrites[0].turn, state.turn.key);
+    assert.strictEqual(state.writeTurnTokens, 400_000);
     const [write] = readAuditRecords(sandbox).filter((event) => event.event === "write");
     assert.strictEqual(write.tool, "Bash");
     assert.strictEqual(write.path, "src/x");
@@ -361,7 +366,7 @@ test("a Bash redirect outside the workspace does not consume the write window", 
   assertSingleReplay(sandbox, "Bash", "other");
 });
 
-test("failed Bash write callbacks roll back their count, bytes, tokens, path, and advisory", (t) => {
+test("failed Bash write callbacks preserve their count, bytes, tokens, path, and advisory", (t) => {
   for (const response of [null, { is_error: true }, { isError: true }, { interrupted: true }, { exitCode: 1 }, { exit_code: 2 }, { code: -1 }, { returnCode: 3 }]) {
     const sandbox = makeSandbox(t);
     const payload = { ...bashPayload(sandbox, { command: "cat > src/x <<'EOF'\nnew\nEOF" }), tool_use_id: "failed-bash" };
@@ -371,30 +376,34 @@ test("failed Bash write callbacks roll back their count, bytes, tokens, path, an
     const result = run(sandbox, { ...payload, hook_event_name: response ? "PostToolUse" : "PostToolUseFailure", tool_response: response }, env);
     assert.strictEqual(result.stdout, "");
     const state = readState(sandbox, "session-1");
-    assert.strictEqual(state.writeCount, 0);
-    assert.strictEqual(state.writesSinceDispatch, 0);
-    assert.strictEqual(state.writeReplayTokens, 0);
-    assert.strictEqual(state.inlineWriteBytes, 0);
+    assert.strictEqual(state.writeCount, 1);
+    assert.strictEqual(state.writesSinceDispatch, 1);
+    assert.strictEqual(state.writeReplayTokens, 400_000);
+    assert.strictEqual(state.inlineWriteBytes, 3);
+    assert.strictEqual(state.writeTurnTokens, 400_000);
+    assert.strictEqual(state.writeTurnWrites, 1);
     assert.deepStrictEqual(state.pendingWrites, []);
-    assert.deepStrictEqual(state.writtenPathSignatures, []);
-    assert.deepStrictEqual(state.advisedMultiples, []);
-    assert.strictEqual(state.advisorySignatures["write-budget"], undefined);
+    assert.strictEqual(state.writtenPathSignatures.length, 1);
+    assert.deepStrictEqual(state.advisedMultiples, [1]);
+    assert.ok(state.advisorySignatures["write-budget"]);
   }
 });
 
-test("Bash and Edit writes in the same turn share their replay charge and roll back only their own tokens", (t) => {
+test("Bash and Edit writes in the same turn keep their charge when both report failure", (t) => {
   const sandbox = makeSandbox(t);
   const env = { FUSION_TEST_NOW: "2026-07-21T00:00:00.000Z" };
   const edit = { ...writePayload(sandbox), tool_use_id: "edit-first" };
-  const bash = { ...bashPayload(sandbox, { command: "printf new > src/x" }), tool_use_id: "bash-second" };
+  const bash = { ...bashPayload(sandbox, { command: "printf changed > src/a.ts; false" }), tool_use_id: "bash-second" };
   assert.strictEqual(run(sandbox, edit, env).stdout, "");
   assert.strictEqual(run(sandbox, bash, env).stdout, "");
-  assert.deepStrictEqual(readState(sandbox, "session-1").pendingWrites.map((entry) => entry.tokens), [400_000, 0]);
+  const admitted = readState(sandbox, "session-1");
+  assert.deepStrictEqual(admitted.pendingWrites.map((entry) => entry.turn), [admitted.turn.key, admitted.turn.key]);
   run(sandbox, { ...bash, hook_event_name: "PostToolUseFailure" }, env);
-  assert.strictEqual(readState(sandbox, "session-1").writeCount, 1);
+  assert.strictEqual(readState(sandbox, "session-1").writeCount, 2);
   assert.strictEqual(readState(sandbox, "session-1").writeReplayTokens, 400_000);
   run(sandbox, { ...edit, hook_event_name: "PostToolUseFailure" }, env);
-  assert.strictEqual(readState(sandbox, "session-1").writeReplayTokens, 0);
+  assert.strictEqual(readState(sandbox, "session-1").writeReplayTokens, 400_000);
+  assert.strictEqual(readState(sandbox, "session-1").writeTurnWrites, 1);
 });
 
 test("a successful Bash write consumes the window once and confirms its path", (t) => {
@@ -411,6 +420,166 @@ test("a successful Bash write consumes the window once and confirms its path", (
   run(sandbox, { ...payload, hook_event_name: "PostToolUseFailure" });
   assert.strictEqual(readState(sandbox, "session-1").writeCount, 1);
   assert.strictEqual(readState(sandbox, "session-1").writeReplayTokens, 400_000);
+});
+
+test("confirming B then failing A in one write turn keeps the turn charged", (t) => {
+  const sandbox = makeSandbox(t);
+  const env = { FUSION_TEST_NOW: "2026-07-21T00:00:00.000Z" };
+  const a = { ...writePayload(sandbox), tool_use_id: "write-a" };
+  const b = { ...writePayload(sandbox), tool_use_id: "write-b" };
+  run(sandbox, a, env);
+  run(sandbox, b, env);
+  run(sandbox, { ...b, hook_event_name: "PostToolUse" }, env);
+  run(sandbox, { ...a, hook_event_name: "PostToolUseFailure" }, env);
+  const state = readState(sandbox, "session-1");
+  assert.strictEqual(state.writeReplayTokens, 400_000);
+  assert.strictEqual(state.writeTurnTokens, 400_000);
+  assert.strictEqual(state.writeTurnWrites, 1);
+  assert.strictEqual(state.writeCount, 1);
+  assert.deepStrictEqual(state.pendingWrites, []);
+});
+
+test("failing A then retrying B in the same turn charges the turn again", (t) => {
+  const sandbox = makeSandbox(t);
+  const env = { FUSION_TEST_NOW: "2026-07-21T00:00:00.000Z" };
+  const a = { ...writePayload(sandbox), tool_use_id: "write-a" };
+  const b = { ...writePayload(sandbox), tool_use_id: "write-b" };
+  run(sandbox, a, env);
+  run(sandbox, { ...a, hook_event_name: "PostToolUseFailure" }, env);
+  const failed = readState(sandbox, "session-1");
+  assert.strictEqual(failed.writeReplayTokens, 0);
+  assert.strictEqual(failed.writeTurnKey, null);
+  assert.strictEqual(failed.writeTurnTokens, 0);
+  assert.strictEqual(failed.writeTurnWrites, 0);
+  run(sandbox, b, env);
+  const state = readState(sandbox, "session-1");
+  assert.strictEqual(state.writeReplayTokens, 400_000);
+  assert.strictEqual(state.writeTurnKey, state.turn.key);
+  assert.strictEqual(state.writeTurnTokens, 400_000);
+  assert.strictEqual(state.writeTurnWrites, 1);
+  assert.strictEqual(state.pendingWrites[0].turn, state.turn.key);
+  assert.strictEqual(Object.hasOwn(state.pendingWrites[0], "tokens"), false);
+});
+
+test("failing every write in the current turn refunds its charge once", (t) => {
+  for (const order of [["a", "b"], ["b", "a"]]) {
+    const sandbox = makeSandbox(t);
+    const env = { FUSION_TEST_NOW: "2026-07-21T00:00:00.000Z" };
+    const writes = Object.fromEntries(order.map((id) => [id, { ...writePayload(sandbox), tool_use_id: id }]));
+    run(sandbox, writes.a, env);
+    run(sandbox, writes.b, env);
+    run(sandbox, { ...writes[order[0]], hook_event_name: "PostToolUseFailure" }, env);
+    assert.strictEqual(readState(sandbox, "session-1").writeReplayTokens, 400_000);
+    run(sandbox, { ...writes[order[1]], hook_event_name: "PostToolUseFailure" }, env);
+    const state = readState(sandbox, "session-1");
+    assert.strictEqual(state.writeReplayTokens, 0);
+    assert.strictEqual(state.writeTurnKey, null);
+    assert.strictEqual(state.writeTurnTokens, 0);
+    assert.strictEqual(state.writeTurnWrites, 0);
+  }
+});
+
+test("failure of an older write turn does not refund replay tokens", (t) => {
+  const sandbox = makeSandbox(t);
+  const a = { ...writePayload(sandbox), tool_use_id: "write-a" };
+  const b = { ...writePayload(sandbox), tool_use_id: "write-b" };
+  writeDispatchTranscript(sandbox, [{ messageId: "msg_a", payloads: [a] }, { messageId: "msg_b", payloads: [b] }]);
+  run(sandbox, a);
+  run(sandbox, b);
+  run(sandbox, { ...a, hook_event_name: "PostToolUseFailure" });
+  const state = readState(sandbox, "session-1");
+  assert.strictEqual(state.writeReplayTokens, 800_000);
+  assert.strictEqual(state.writeTurnKey, "msg_b");
+  assert.strictEqual(state.writeTurnTokens, 400_000);
+  assert.strictEqual(state.writeTurnWrites, 1);
+});
+
+test("strict posture admits further writes in a turn that reached the budget", (t) => {
+  const sandbox = makeSandbox(t);
+  const env = { FUSION_POSTURE: "strict", FUSION_INLINE_REPLAY_BUDGET_TOKENS: "400000", FUSION_INLINE_TAIL_ALLOWANCE: "0", FUSION_INLINE_ZERO_DISPATCH_WRITES: "0" };
+  const writes = ["a", "b", "c"].map((id) => ({ ...writePayload(sandbox), tool_use_id: id }));
+  writeDispatchTranscript(sandbox, [{ messageId: "msg_ab", payloads: writes.slice(0, 2) }, { messageId: "msg_c", payloads: writes.slice(2) }]);
+  advisoryContext(run(sandbox, writes[0], env), "inline-guard.write-budget-advisory");
+  assert.strictEqual(run(sandbox, writes[1], env).stdout, "");
+  const state = readState(sandbox, "session-1");
+  assert.strictEqual(state.writeCount, 2);
+  assert.strictEqual(state.writeReplayTokens, 400_000);
+  assert.strictEqual(state.writeTurnWrites, 2);
+  const denied = run(sandbox, writes[2], env);
+  assert.strictEqual(JSON.parse(denied.stdout).hookSpecificOutput.permissionDecision, "deny");
+});
+
+test("Bash writes with unknown bytes count zero bytes and cannot use zero dispatch relief", (t) => {
+  const sandbox = makeSandbox(t);
+  const env = { FUSION_POSTURE: "strict", FUSION_INLINE_REPLAY_BUDGET_TOKENS: "400000" };
+  const first = { ...bashPayload(sandbox, { command: "printf changed > src/a.ts; false" }), tool_use_id: "bash-a" };
+  const second = { ...bashPayload(sandbox, { command: "sed -i s/a/b/ src/a.ts" }), tool_use_id: "bash-b" };
+  writeDispatchTranscript(sandbox, [{ messageId: "msg_a", payloads: [first] }, { messageId: "msg_b", payloads: [second] }]);
+  advisoryContext(run(sandbox, first, env), "inline-guard.write-budget-advisory");
+  assert.strictEqual(readState(sandbox, "session-1").inlineWriteBytes, 0);
+  const denied = run(sandbox, second, env);
+  assert.strictEqual(JSON.parse(denied.stdout).hookSpecificOutput.permissionDecision, "deny");
+  assert.strictEqual(readState(sandbox, "session-1").writeCount, 1);
+  assert.strictEqual(readAuditRecords(sandbox).filter((event) => event.event === "zero-dispatch-softened").length, 0);
+});
+
+test("passing verification clears turn accounting and permits the same budget advisory again", (t) => {
+  const sandbox = makeSandbox(t);
+  const env = { FUSION_INLINE_REPLAY_BUDGET_TOKENS: "400000" };
+  const first = { ...writePayload(sandbox), tool_use_id: "a" };
+  advisoryContext(run(sandbox, first, env), "inline-guard.unverified-advisory");
+  run(sandbox, verificationPayload(sandbox), env);
+  const reset = readState(sandbox, "session-1");
+  assert.strictEqual(reset.writeTurnKey, null);
+  assert.strictEqual(reset.writeTurnTokens, 0);
+  assert.strictEqual(reset.writeTurnWrites, 0);
+  assert.strictEqual(reset.advisorySignatures["write-budget"], undefined);
+  advisoryContext(run(sandbox, { ...writePayload(sandbox), tool_use_id: "b" }, env), "inline-guard.unverified-advisory");
+  assert.strictEqual(readAuditRecords(sandbox).filter((event) => event.event === "warn" && !event.suppressed).length, 2);
+});
+
+test("a late failure before verification cannot refund a new window in the same turn", (t) => {
+  const sandbox = makeSandbox(t);
+  const a = { ...writePayload(sandbox), tool_use_id: "a" };
+  const b = { ...writePayload(sandbox), tool_use_id: "b" };
+  writeDispatchTranscript(sandbox, [{ messageId: "msg_ab", payloads: [a, b] }]);
+  run(sandbox, a);
+  run(sandbox, verificationPayload(sandbox));
+  run(sandbox, b);
+  run(sandbox, { ...a, hook_event_name: "PostToolUseFailure" });
+  const state = readState(sandbox, "session-1");
+  assert.strictEqual(state.writeReplayTokens, 400_000);
+  assert.strictEqual(state.writeTurnTokens, 400_000);
+  assert.strictEqual(state.writeTurnWrites, 1);
+  assert.strictEqual(state.writeTurnKey, "msg_ab");
+});
+
+test("a write waits for a held state lock and charges its current turn", async (t) => {
+  const sandbox = makeSandbox(t);
+  const a = { ...writePayload(sandbox), tool_use_id: "a" };
+  const b = { ...writePayload(sandbox), tool_use_id: "b" };
+  writeDispatchTranscript(sandbox, [{ messageId: "msg_a", payloads: [a] }, { messageId: "msg_b", payloads: [b] }]);
+  run(sandbox, a);
+  const lock = `${stateFileFor(sandbox, "session-1")}.lock`;
+  const marker = path.join(sandbox.root, "contended");
+  const preload = path.join(sandbox.root, "contention.mjs");
+  fs.writeFileSync(preload, `import fs from 'node:fs'; const open = fs.openSync; let attempts = 0; fs.openSync = function (...args) { try { return open.apply(this, args); } catch (error) { if (args[0] === ${JSON.stringify(lock)} && error.code === 'EEXIST' && ++attempts === 2) fs.writeFileSync(${JSON.stringify(marker)}, ''); throw error; } };`);
+  fs.writeFileSync(lock, String(process.pid));
+  const pending = runAsyncRaw(sandbox, b, { NODE_OPTIONS: `${process.env.NODE_OPTIONS ?? ""} --import=${pathToFileURL(preload).href}`.trim() });
+  try {
+    const deadline = performance.now() + 3000;
+    while (!fs.existsSync(marker) && performance.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 10));
+    assert.ok(fs.existsSync(marker));
+  } finally {
+    fs.rmSync(lock, { force: true });
+  }
+  const result = await pending;
+  assert.strictEqual(result.status, 0, result.stderr);
+  assert.strictEqual(result.stdout, "");
+  const state = readState(sandbox, "session-1");
+  assert.strictEqual(state.turn.key, "msg_b");
+  assert.strictEqual(state.writeTurnKey, "msg_b");
+  assert.strictEqual(state.writeReplayTokens, 800_000);
 });
 
 test("late Bash failures do not subtract replay tokens from a window opened by verification or dispatch", (t) => {
@@ -958,6 +1127,8 @@ test("the write window resets on dispatch and on a passing verification", (t) =>
   assert.strictEqual(dispatched.writesSinceDispatch, 0);
   assert.strictEqual(dispatched.writeReplayTokens, 0);
   assert.strictEqual(dispatched.writeTurnKey, null);
+  assert.strictEqual(dispatched.writeTurnTokens, 0);
+  assert.strictEqual(dispatched.writeTurnWrites, 0);
   assert.deepStrictEqual(dispatched.writtenPathSignatures, []);
 
   for (let index = 0; index < 3; index += 1) {
@@ -2340,7 +2511,7 @@ test("Bash writes, edit tools, and dispatches reset the read streak", (t) => {
   }
 });
 
-test("read streak read and reset skip a held state lock promptly without output", (t) => {
+test("read streak reads skip a held state lock promptly without output", (t) => {
   const sandbox = makeSandbox(t);
   for (let turn = 0; turn < 4; turn += 1) {
     run(sandbox, readPayload(sandbox), { FUSION_TEST_NOW: new Date(Date.parse("2026-07-21T00:00:00.000Z") + turn * 1600).toISOString() });
@@ -2348,7 +2519,7 @@ test("read streak read and reset skip a held state lock promptly without output"
   const file = stateFileFor(sandbox, "session-1");
   const before = readAuditRecords(sandbox);
   fs.writeFileSync(`${file}.lock`, String(process.pid));
-  for (const payload of [readPayload(sandbox, "Read"), readPayload(sandbox, "Grep"), readPayload(sandbox, "Glob"), bashPayload(sandbox, { command: "node -v" })]) {
+  for (const payload of [readPayload(sandbox, "Read"), readPayload(sandbox, "Grep"), readPayload(sandbox, "Glob"), bashPayload(sandbox, { command: "cat file" })]) {
     const start = performance.now();
     const result = run(sandbox, payload);
     assert.ok(performance.now() - start < 2000, payload.tool_name);
@@ -2464,6 +2635,8 @@ test("state validates replay turns and token totals without migrating old fields
   assert.strictEqual(normalizeState(null, at).readStreakReplayTokens, 0);
   assert.strictEqual(normalizeState(null, at).writeReplayTokens, 0);
   assert.strictEqual(normalizeState(null, at).writeTurnKey, null);
+  assert.strictEqual(normalizeState(null, at).writeTurnTokens, 0);
+  assert.strictEqual(normalizeState(null, at).writeTurnWrites, 0);
   assert.deepStrictEqual(normalizeState({ turn, readStreakReplayTokens: 80_000 }, at).turn, turn);
   assert.deepStrictEqual(normalizeState({ turn: { ...turn, id: null, key: `t:${Date.parse(at)}` } }, at).turn, { ...turn, id: null, key: `t:${Date.parse(at)}` });
   for (const change of [{ id: "bad id" }, { id: undefined }, { key: "" }, { key: "bad key" }, { at: "bad" }, { kind: "unknown" }, { tokens: 0 }, { tokens: -1 }, { tokens: 1.5 }, { tokens: Number.MAX_SAFE_INTEGER + 1 }, { measured: "true" }]) {
@@ -2472,9 +2645,13 @@ test("state validates replay turns and token totals without migrating old fields
   for (const tokens of [-1, 1.5, "80000", Number.MAX_SAFE_INTEGER + 1, null]) {
     assert.strictEqual(normalizeState({ readStreakReplayTokens: tokens }, at).readStreakReplayTokens, 0);
     assert.strictEqual(normalizeState({ writeReplayTokens: tokens }, at).writeReplayTokens, 0);
+    assert.strictEqual(normalizeState({ writeTurnTokens: tokens }, at).writeTurnTokens, 0);
+    assert.strictEqual(normalizeState({ writeTurnWrites: tokens }, at).writeTurnWrites, 0);
   }
   for (const tokens of [0, 80_000, Number.MAX_SAFE_INTEGER]) {
     assert.strictEqual(normalizeState({ writeReplayTokens: tokens }, at).writeReplayTokens, tokens);
+    assert.strictEqual(normalizeState({ writeTurnTokens: tokens }, at).writeTurnTokens, tokens);
+    assert.strictEqual(normalizeState({ writeTurnWrites: tokens }, at).writeTurnWrites, tokens);
   }
   for (const key of [turn.key, `t:${Date.parse(at)}`]) {
     assert.strictEqual(normalizeState({ writeTurnKey: key }, at).writeTurnKey, key);
