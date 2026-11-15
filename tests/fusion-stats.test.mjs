@@ -3873,7 +3873,7 @@ test("main loop replay reports the exact per-package headline and token shares a
   assert.strictEqual(report.mainLoopReplay.acceptedPackages, report.verificationEvidence.accepted);
   assert.strictEqual(report.mainLoopReplay.tokensPerAcceptedPackage, 312_500_000 / 42);
   const rendered = renderFusionStats(report);
-  assert.ok(rendered.includes("With a credited verification before the verdict: 0 (0.0%)\n- main loop replay: 7.4M tokens per accepted package (312.5M tokens over 842 tool turns, 42 accepted packages)\n- replay by kind: read 25% (210 turns), write 12% (101 turns), verify 10% (84 turns), settle 4% (34 turns), dispatch 4% (33 turns), other 45% (380 turns)"));
+  assert.ok(rendered.includes("With a credited verification before the verdict: 0 (0.0%)\n- main loop replay in dispatching sessions: 7.4M tokens per accepted package (312.5M tokens over 842 tool turns, 42 accepted packages)\n- replay by kind: read 25% (210 turns), write 12% (101 turns), verify 10% (84 turns), settle 4% (34 turns), dispatch 4% (33 turns), other 45% (380 turns)"));
   assert.doesNotMatch(rendered, /replay turns had no context reading/);
   const json = runDirect({ cwd: dir, codexState: env.FUSION_CODEX_STATE }, ["--json"], env);
   assert.strictEqual(json.status, 0, json.stderr);
@@ -3887,11 +3887,12 @@ test("main loop replay reports the exact per-package headline and token shares a
 test("main loop replay reports total tokens when no packages were accepted", (t) => {
   const dir = sandbox(t);
   const env = runtimeEnv({ cwd: dir, codexState: path.join(dir, "codex") });
+  createWorkerRecord({ taskId: "fusion-unaccepted-replay", sessionId: "replay-session", dispatchToolUseId: "unaccepted", agentType: "fusion:claude-worker", packageType: "implementation", workspaceRoot: dir, limits: {} }, env);
   writeGuardAuditEvents(env.FUSION_INLINE_GUARD_AUDIT_DIR, "2026-08-01", Array.from({ length: 842 }, (_, index) => replayAuditEvent({ turn: `turn-${index}`, tokens: index === 0 ? 312_500_000 - 841 * 371_000 : 371_000 })));
   const report = buildFusionStats({ env, cwd: dir });
   assert.strictEqual(report.mainLoopReplay.acceptedPackages, 0);
   assert.strictEqual(report.mainLoopReplay.tokensPerAcceptedPackage, null);
-  assert.ok(renderFusionStats(report).includes("- main loop replay: 312.5M tokens over 842 tool turns, no accepted packages\n"));
+  assert.ok(renderFusionStats(report).includes("- main loop replay in dispatching sessions: 312.5M tokens over 842 tool turns, no accepted packages\n"));
 });
 
 test("main loop replay follows the recent verification evidence line", (t) => {
@@ -3902,12 +3903,15 @@ test("main loop replay follows the recent verification evidence line", (t) => {
   createWorkerRecord({ taskId: "fusion-recent-replay", sessionId: "replay-session", dispatchToolUseId: "recent", agentType: "fusion:claude-worker", packageType: "implementation", workspaceRoot: dir, limits: {} }, env);
   updateWorkerRecord("fusion-recent-replay", env, (record) => ({ ...record, transportStatus: "done", finishedAt: at, acceptance: "accepted", acceptanceRecordedAt: at }));
   const rendered = renderFusionStats(buildFusionStats({ env, cwd: dir }));
-  assert.ok(rendered.includes("Last 7 days: 1 accepted, 0 with a credited verification (0.0%)\n- main loop replay: 400k tokens per accepted package (400k tokens over 1 tool turn, 1 accepted package)\n"));
+  assert.ok(rendered.includes("Last 7 days: 1 accepted, 0 with a credited verification (0.0%)\n- main loop replay in dispatching sessions: 400k tokens per accepted package (400k tokens over 1 tool turn, 1 accepted package)\n"));
 });
 
 test("main loop replay deduplicates raised kinds and maximum token readings independently per session and turn", (t) => {
   const dir = sandbox(t);
   const env = runtimeEnv({ cwd: dir, codexState: path.join(dir, "codex") });
+  for (const sessionId of ["replay-session", "other-session"]) {
+    createWorkerRecord({ taskId: `fusion-dedup-${sessionId}`, sessionId, dispatchToolUseId: sessionId, agentType: "fusion:claude-worker", packageType: "implementation", workspaceRoot: dir, limits: {} }, env);
+  }
   const events = [
     replayAuditEvent({ kind: "read", tokens: 300_000 }),
     replayAuditEvent({ kind: "other", tokens: 350_000 }),
@@ -3938,6 +3942,7 @@ test("main loop replay deduplicates raised kinds and maximum token readings inde
 test("main loop replay renders token percentages in fixed kind order and omits kinds with zero turns", (t) => {
   const dir = sandbox(t);
   const env = runtimeEnv({ cwd: dir, codexState: path.join(dir, "codex") });
+  createWorkerRecord({ taskId: "fusion-kind-replay", sessionId: "replay-session", dispatchToolUseId: "kind", agentType: "fusion:claude-worker", packageType: "implementation", workspaceRoot: dir, limits: {} }, env);
   writeGuardAuditEvents(env.FUSION_INLINE_GUARD_AUDIT_DIR, "2026-08-01", [
     replayAuditEvent({ turn: "other", kind: "other", tokens: 501_000 }),
     replayAuditEvent({ turn: "dispatch", kind: "dispatch", tokens: 49_000 }),
@@ -3963,7 +3968,7 @@ test("main loop replay counts nominal context turns once and uses singular label
   const report = buildFusionStats({ env, cwd: dir });
   assert.strictEqual(report.mainLoopReplay.unmeasuredTurns, 1);
   const rendered = renderFusionStats(report);
-  assert.ok(rendered.includes("- main loop replay: 400k tokens per accepted package (400k tokens over 1 tool turn, 1 accepted package)\n- replay by kind: write 100% (1 turn)\n- 1 replay turn had no context reading and is priced at 400k tokens\n"));
+  assert.ok(rendered.includes("- main loop replay in dispatching sessions: 400k tokens per accepted package (400k tokens over 1 tool turn, 1 accepted package)\n- replay by kind: write 100% (1 turn)\n- 1 replay turn had no context reading and is priced at 400k tokens\n"));
   const session = buildSessionReport({ env, sessionId: "replay-session" });
   assert.deepStrictEqual(session.mainLoopReplay, report.mainLoopReplay);
   assert.ok(renderSessionReport(session).includes("- 1 replay turn had no context reading and is priced at 400k tokens\n"));
@@ -4006,7 +4011,7 @@ test("main loop replay filters the audit window and session before deduplicating
   assert.strictEqual(report.mainLoopReplay.tokensPerAcceptedPackage, 150_000);
   assert.strictEqual(report.mainLoopReplay.unmeasuredTurns, 0);
   assert.deepStrictEqual(report.mainLoopReplay.byKind.dispatch, { tokens: 0, turns: 0 });
-  assert.ok(renderAuditReport(report).includes("- main loop replay: 150k tokens per accepted package (300k tokens over 2 tool turns, 2 accepted packages)"));
+  assert.ok(renderAuditReport(report).includes("- main loop replay in dispatching sessions: 150k tokens per accepted package (300k tokens over 2 tool turns, 2 accepted packages)"));
   const everySession = buildAuditReport({ env, days: 1, now });
   assert.strictEqual(everySession.mainLoopReplay.totalTokens, 900_000);
   assert.strictEqual(everySession.mainLoopReplay.acceptedPackages, 3);
@@ -4037,6 +4042,152 @@ test("main loop replay uses accepted packages in the retained window and existin
   }
   assert.strictEqual(buildFusionStats({ env, cwd: dir }).mainLoopReplay.acceptedPackages, 1);
   assert.strictEqual(buildFusionStats({ env, cwd: dir, all: true }).mainLoopReplay.acceptedPackages, 2);
+});
+
+test("main loop replay scopes tokens to sessions with worker records in each repository", (t) => {
+  const dir = sandbox(t);
+  const other = sandbox(t);
+  const env = runtimeEnv({ cwd: dir, codexState: path.join(dir, "codex") });
+  writeGuardAuditEvents(env.FUSION_INLINE_GUARD_AUDIT_DIR, "2026-08-01", [
+    replayAuditEvent(),
+    replayAuditEvent({ session: "other-session", tokens: 4_000_000 })
+  ]);
+  createWorkerRecord({ taskId: "fusion-scoped-replay", sessionId: "replay-session", dispatchToolUseId: "scoped", agentType: "fusion:claude-worker", packageType: "implementation", workspaceRoot: dir, limits: {} }, env);
+  updateWorkerRecord("fusion-scoped-replay", env, (record) => ({ ...record, transportStatus: "done", finishedAt: "2026-08-01T10:00:00.000Z", acceptance: "accepted", acceptanceRecordedAt: "2026-08-01T10:01:00.000Z" }));
+  createWorkerRecord({ taskId: "fusion-other-replay", sessionId: "other-session", dispatchToolUseId: "other", agentType: "fusion:claude-worker", packageType: "consult", workspaceRoot: other, limits: {} }, env);
+
+  const scoped = buildFusionStats({ env, cwd: dir }).mainLoopReplay;
+  assert.strictEqual(scoped.totalTokens, 400_000);
+  assert.strictEqual(scoped.totalTurns, 1);
+  assert.strictEqual(scoped.acceptedPackages, 1);
+  assert.strictEqual(scoped.tokensPerAcceptedPackage, 400_000);
+  const otherScope = buildFusionStats({ env, cwd: other }).mainLoopReplay;
+  assert.strictEqual(otherScope.totalTokens, 4_000_000);
+  assert.strictEqual(otherScope.acceptedPackages, 0);
+  const all = buildFusionStats({ env, cwd: dir, all: true }).mainLoopReplay;
+  assert.strictEqual(all.totalTokens, 4_400_000);
+  assert.strictEqual(all.totalTurns, 2);
+  assert.strictEqual(all.tokensPerAcceptedPackage, 4_400_000);
+  assert.deepStrictEqual(buildSessionReport({ env, sessionId: "replay-session" }).mainLoopReplay, scoped);
+  assert.deepStrictEqual(buildSessionReport({ env, sessionId: "other-session" }).mainLoopReplay, otherScope);
+  assert.deepStrictEqual(buildAuditReport({ env, all: true }).mainLoopReplay, all);
+});
+
+test("main loop replay omits sessions without an in scope worker record", (t) => {
+  const dir = sandbox(t);
+  const env = runtimeEnv({ cwd: dir, codexState: path.join(dir, "codex") });
+  writeGuardAuditEvents(env.FUSION_INLINE_GUARD_AUDIT_DIR, "2026-08-01", [replayAuditEvent()]);
+  createWorkerRecord({ taskId: "fusion-without-replay", sessionId: "quiet-session", dispatchToolUseId: "quiet", agentType: "fusion:claude-worker", packageType: "implementation", workspaceRoot: dir, limits: {} }, env);
+  for (const [report, render] of [
+    [buildFusionStats({ env, cwd: dir }), renderFusionStats],
+    [buildFusionStats({ env, cwd: dir, all: true }), renderFusionStats],
+    [buildSessionReport({ env, sessionId: "replay-session" }), renderSessionReport],
+    [buildAuditReport({ env, all: true }), renderAuditReport]
+  ]) {
+    assert.strictEqual(Object.hasOwn(report, "mainLoopReplay"), false);
+    assert.doesNotMatch(render(report), /main loop replay|replay by kind|no context reading/);
+  }
+  createWorkerRecord({ taskId: "fusion-outside-replay", sessionId: "replay-session", dispatchToolUseId: "outside", agentType: "fusion:claude-worker", packageType: "implementation", workspaceRoot: sandbox(t), limits: {} }, env);
+  assert.strictEqual(Object.hasOwn(buildFusionStats({ env, cwd: dir }), "mainLoopReplay"), false);
+  assert.strictEqual(buildFusionStats({ env, cwd: dir, all: true }).mainLoopReplay.totalTokens, 400_000);
+});
+
+test("main loop replay counts acceptances at or after the earliest counted replay event", (t) => {
+  const dir = sandbox(t);
+  const env = runtimeEnv({ cwd: dir, codexState: path.join(dir, "codex") });
+  writeGuardAuditEvents(env.FUSION_INLINE_GUARD_AUDIT_DIR, "2026-08-01", [
+    { schemaVersion: 1, at: "2026-08-01T00:00:00.000Z", session: "replay-session", event: "dispatch", lane: "codex", tool: "Agent" },
+    replayAuditEvent({ at: "2026-08-01T09:00:00.000Z", session: "undispatched-session", tokens: 9_000_000 }),
+    replayAuditEvent({ at: "2026-08-01T11:00:00.000Z", turn: "later", tokens: 200_000 }),
+    replayAuditEvent()
+  ]);
+  for (const [id, acceptanceRecordedAt] of [
+    ["before", "2026-08-01T09:59:59.999Z"],
+    ["boundary", "2026-08-01T10:00:00.000Z"],
+    ["after", "2026-08-01T10:00:00.001Z"]
+  ]) {
+    const taskId = `fusion-coverage-${id}`;
+    createWorkerRecord({ taskId, sessionId: "replay-session", dispatchToolUseId: id, agentType: "fusion:claude-worker", packageType: "implementation", workspaceRoot: dir, limits: {} }, env);
+    updateWorkerRecord(taskId, env, (record) => ({ ...record, transportStatus: "done", finishedAt: "2026-08-01T09:00:00.000Z", acceptance: "accepted", acceptanceRecordedAt }));
+  }
+  const workspace = buildFusionStats({ env, cwd: dir });
+  assert.strictEqual(workspace.verificationEvidence.accepted, 3);
+  for (const report of [
+    workspace,
+    buildFusionStats({ env, cwd: dir, all: true }),
+    buildSessionReport({ env, sessionId: "replay-session" }),
+    buildAuditReport({ env, all: true }),
+    buildAuditReport({ env, sessionId: "replay-session", days: 1, now: Date.parse("2026-08-01T12:00:00.000Z") })
+  ]) {
+    assert.strictEqual(report.mainLoopReplay.acceptedPackages, 2);
+    assert.strictEqual(report.mainLoopReplay.totalTokens, 600_000);
+    assert.strictEqual(report.mainLoopReplay.tokensPerAcceptedPackage, 300_000);
+  }
+});
+
+test("main loop replay shares one audit directory read and one read of each segment per report", (t) => {
+  const dir = sandbox(t);
+  const env = runtimeEnv({ cwd: dir, codexState: path.join(dir, "codex") });
+  const auditDir = env.FUSION_INLINE_GUARD_AUDIT_DIR;
+  writeGuardAuditEvents(auditDir, "2026-08-01", [replayAuditEvent()]);
+  writeGuardAuditEvents(auditDir, "2026-08-02", [replayAuditEvent({ at: "2026-08-02T10:00:00.000Z", turn: "second" })]);
+  createWorkerRecord({ taskId: "fusion-read-once", sessionId: "replay-session", dispatchToolUseId: "once", agentType: "fusion:claude-worker", packageType: "implementation", workspaceRoot: dir, limits: {} }, env);
+  const originalReaddir = fs.readdirSync;
+  const originalReadFile = fs.readFileSync;
+  const directoryReads = t.mock.method(fs, "readdirSync", function (root, ...args) { return originalReaddir.call(this, root, ...args); });
+  const segmentReads = t.mock.method(fs, "readFileSync", function (file, ...args) { return originalReadFile.call(this, file, ...args); });
+  for (const build of [
+    () => buildFusionStats({ env, cwd: dir }),
+    () => buildFusionStats({ env, cwd: dir, all: true }),
+    () => buildSessionReport({ env, sessionId: "replay-session" }),
+    () => buildAuditReport({ env, all: true }),
+    () => buildAuditReport({ env, sessionId: "replay-session", days: 2, now: Date.parse("2026-08-02T12:00:00.000Z") })
+  ]) {
+    directoryReads.mock.resetCalls();
+    segmentReads.mock.resetCalls();
+    assert.strictEqual(build().mainLoopReplay.totalTurns, 2);
+    assert.strictEqual(directoryReads.mock.calls.filter(({ arguments: [root] }) => root === auditDir).length, 1);
+    for (const day of ["2026-08-01", "2026-08-02"]) {
+      const segment = path.join(auditDir, `events-${day}.jsonl`);
+      assert.strictEqual(segmentReads.mock.calls.filter(({ arguments: [file] }) => file === segment).length, 1);
+    }
+  }
+});
+
+test("coercion ledger includes Bash write warnings in unverified window depth and sprawl", (t) => {
+  const dir = sandbox(t);
+  const env = runtimeEnv({ cwd: dir, codexState: path.join(dir, "codex") });
+  writeGuardAuditEvents(env.FUSION_INLINE_GUARD_AUDIT_DIR, "2026-08-01", [
+    { schemaVersion: 1, at: "2026-08-01T10:00:00.000Z", session: "bash-warn", event: "warn", lane: "main", tool: "Bash", writeCount: 12, dispatchCount: 0, budget: 5, mode: "advisory", messageCode: messageCode("inline-guard.unverified-advisory") }
+  ]);
+  const ledger = buildFusionStats({ env, cwd: dir }).coercionLedger;
+  assert.strictEqual(ledger.deepestUnverifiedWindow, 12);
+  assert.strictEqual(ledger.inlineSprawlWindows, 1);
+  assert.strictEqual(ledger.unverifiedAccumulations, 0);
+});
+
+test("coercion ledger includes Bash budget denials in unverified accumulations", (t) => {
+  const dir = sandbox(t);
+  const env = runtimeEnv({ cwd: dir, codexState: path.join(dir, "codex") });
+  writeGuardAuditEvents(env.FUSION_INLINE_GUARD_AUDIT_DIR, "2026-08-01", [
+    { schemaVersion: 1, at: "2026-08-01T10:00:00.000Z", session: "bash-deny", event: "deny", lane: "main", tool: "Bash", writeCount: 6, dispatchCount: 1, budget: 2_000_000, replayTokens: 4_000_000, mode: "enforce", messageCode: messageCode("inline-guard.write-budget-deny") }
+  ]);
+  const ledger = buildFusionStats({ env, cwd: dir }).coercionLedger;
+  assert.strictEqual(ledger.unverifiedAccumulations, 1);
+  assert.strictEqual(ledger.inlineSprawlWindows, 1);
+});
+
+test("coercion ledger excludes Bash heartbeat denials from write windows", (t) => {
+  const dir = sandbox(t);
+  const env = runtimeEnv({ cwd: dir, codexState: path.join(dir, "codex") });
+  writeGuardAuditEvents(env.FUSION_INLINE_GUARD_AUDIT_DIR, "2026-08-01", [
+    { schemaVersion: 1, at: "2026-08-01T10:00:00.000Z", session: "heartbeat", event: "deny", lane: "main", tool: "Bash", writeCount: 99, dispatchCount: 1, budget: 2_000_000, replayTokens: 4_000_000, mode: "enforce", messageCode: messageCode("inline-guard.no-op-heartbeat-deny") }
+  ]);
+  const ledger = buildFusionStats({ env, cwd: dir }).coercionLedger;
+  assert.strictEqual(ledger.deepestUnverifiedWindow, 0);
+  assert.strictEqual(ledger.unverifiedAccumulations, 0);
+  assert.strictEqual(ledger.inlineSprawlWindows, 0);
+  assert.strictEqual(ledger.postureMix.unset, 1);
 });
 
 test("main loop replay stays absent from reports without replay events", (t) => {

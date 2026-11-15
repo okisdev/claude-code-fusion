@@ -323,8 +323,8 @@ function renderMainLoopReplay(lines, replay) {
   }
   const total = `${formatTokens(replay.totalTokens)} tokens over ${replay.totalTurns} tool turn${replay.totalTurns === 1 ? "" : "s"}`;
   lines.push(replay.acceptedPackages > 0
-    ? `- main loop replay: ${formatTokens(replay.tokensPerAcceptedPackage)} tokens per accepted package (${total}, ${replay.acceptedPackages} accepted package${replay.acceptedPackages === 1 ? "" : "s"})`
-    : `- main loop replay: ${total}, no accepted packages`);
+    ? `- main loop replay in dispatching sessions: ${formatTokens(replay.tokensPerAcceptedPackage)} tokens per accepted package (${total}, ${replay.acceptedPackages} accepted package${replay.acceptedPackages === 1 ? "" : "s"})`
+    : `- main loop replay in dispatching sessions: ${total}, no accepted packages`);
   const kinds = ["read", "write", "verify", "settle", "dispatch", "other"]
     .filter((kind) => replay.byKind[kind].turns > 0)
     .map((kind) => {

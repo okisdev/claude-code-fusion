@@ -628,12 +628,17 @@ export function verificationEvidence(records, audit, all, workspaceRoot) {
   return summary;
 }
 
-export function summarizeMainLoopReplay(events, acceptedPackages) {
+export function summarizeMainLoopReplay(records, audit, all, workspaceRoot) {
+  const repositoryCache = new Map();
+  const scopedRecords = records.filter((record) => (!audit.sessionId || record.sessionId === audit.sessionId) && (all || workspaceRootsShareRepository(record.workspaceRoot, workspaceRoot, repositoryCache)));
+  const sessions = new Set(scopedRecords.map((record) => record.sessionId));
   const turns = new Map();
-  for (const event of events) {
-    if (event.event !== "replay") {
+  let earliestReplayMs = Infinity;
+  for (const event of audit.events) {
+    if (event.event !== "replay" || !sessions.has(event.session)) {
       continue;
     }
+    earliestReplayMs = Math.min(earliestReplayMs, event.atMs);
     const key = `${event.session}\u0000${event.turn}`;
     const turn = turns.get(key) ?? { kind: event.kind, tokens: 0, unmeasured: false };
     if (outranksReplayKind(event.kind, turn.kind)) {
@@ -646,6 +651,7 @@ export function summarizeMainLoopReplay(events, acceptedPackages) {
   if (turns.size === 0) {
     return null;
   }
+  const acceptedPackages = verificationEvidence(scopedRecords, { ...audit, startMs: earliestReplayMs }, true, null).accepted;
   const byKind = Object.fromEntries(REPLAY_KINDS.map((kind) => [kind, { tokens: 0, turns: 0 }]));
   let totalTokens = 0;
   let unmeasuredTurns = 0;
@@ -693,11 +699,11 @@ export function buildFusionStats({ all = false, env = process.env, cwd = process
   for (const provider of STATS_PROVIDER_REGISTRY) {
     engines[provider.id] = provider.collect(options);
   }
-  const fleet = buildFleetUsageStats({ env });
   const audit = readStatsAuditEvents(env);
+  const fleet = buildFleetUsageStats({ env, audit });
   const parentContext = parentContextAtDispatch(workers.records, all, workspaceRoot);
   const verification = verificationEvidence(workers.records, audit, all, workspaceRoot);
-  const mainLoopReplay = summarizeMainLoopReplay(audit.events, verification.accepted);
+  const mainLoopReplay = summarizeMainLoopReplay(workers.records, audit, all, workspaceRoot);
   return {
     scope: all ? "all" : workspaceRoot,
     ...(parentContext.dispatchCount > 0 ? { parentContextAtDispatch: parentContext } : {}),
