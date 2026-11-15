@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { readJsonFile, withFileLock, writeFileAtomic } from "../plugins/fusion/scripts/lib/storage.mjs";
 import {
   WORKER_COLLECTION_METHODS,
   applyQueuedVerdict,
@@ -27,6 +28,136 @@ function sandbox(t) {
   t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
   return directory;
 }
+
+test("storage honors FUSION_LOCK_TIMEOUT_MS and explicit timeout options", (t) => {
+  const directory = sandbox(t);
+  const file = path.join(directory, "state.json");
+  fs.writeFileSync(`${file}.lock`, String(process.pid));
+  const previous = process.env.FUSION_LOCK_TIMEOUT_MS;
+  t.after(() => {
+    if (previous === undefined) delete process.env.FUSION_LOCK_TIMEOUT_MS;
+    else process.env.FUSION_LOCK_TIMEOUT_MS = previous;
+  });
+  let elapsed = 0;
+  const started = Date.now();
+  t.mock.method(Date, "now", () => started + elapsed);
+  t.mock.method(Atomics, "wait", (_array, _index, _value, timeout) => { elapsed += timeout; });
+  for (const value of ["1", "7500"]) {
+    process.env.FUSION_LOCK_TIMEOUT_MS = value;
+    elapsed = 0;
+    assert.throws(() => withFileLock(file, () => assert.fail("held lock acquired")), { code: "ETIMEDOUT" });
+    assert.strictEqual(elapsed, Number(value));
+  }
+  elapsed = 0;
+  assert.throws(() => withFileLock(file, () => assert.fail("held lock acquired"), { timeoutMs: 25 }), { code: "ETIMEDOUT" });
+  assert.strictEqual(elapsed, 25);
+});
+
+test("storage uses a 5 second timeout when FUSION_LOCK_TIMEOUT_MS is absent or invalid", (t) => {
+  const directory = sandbox(t);
+  const file = path.join(directory, "state.json");
+  fs.writeFileSync(`${file}.lock`, String(process.pid));
+  const previous = process.env.FUSION_LOCK_TIMEOUT_MS;
+  t.after(() => {
+    if (previous === undefined) delete process.env.FUSION_LOCK_TIMEOUT_MS;
+    else process.env.FUSION_LOCK_TIMEOUT_MS = previous;
+  });
+  let elapsed = 0;
+  const started = Date.now();
+  t.mock.method(Date, "now", () => started + elapsed);
+  t.mock.method(Atomics, "wait", (_array, _index, _value, timeout) => { elapsed += timeout; });
+  for (const value of [undefined, "", "invalid", "0", "-5", "1.5"]) {
+    if (value === undefined) delete process.env.FUSION_LOCK_TIMEOUT_MS;
+    else process.env.FUSION_LOCK_TIMEOUT_MS = value;
+    elapsed = 0;
+    assert.throws(() => withFileLock(file, () => assert.fail("held lock acquired")), { code: "ETIMEDOUT" });
+    assert.strictEqual(elapsed, 5000);
+  }
+});
+
+test("storage reclaims an aged dead owner and leaves live or fresh owners locked", (t) => {
+  const directory = sandbox(t);
+  const file = path.join(directory, "state.json");
+  const lock = `${file}.lock`;
+  const old = new Date(Date.now() - 31_000);
+  let deadPid = 2_147_483_647;
+  for (;;) {
+    try { process.kill(deadPid, 0); } catch (error) {
+      if (error.code === "ESRCH") break;
+      throw error;
+    }
+    deadPid -= 1;
+  }
+  fs.writeFileSync(lock, String(deadPid));
+  assert.throws(() => withFileLock(file, () => assert.fail("fresh lock acquired"), { timeoutMs: 0 }), { code: "ETIMEDOUT" });
+  fs.utimesSync(lock, old, old);
+  assert.strictEqual(withFileLock(file, () => {
+    assert.strictEqual(fs.readFileSync(lock, "utf8"), String(process.pid));
+    assert.strictEqual(fs.statSync(lock).mode & 0o777, 0o600);
+    return "reclaimed";
+  }, { timeoutMs: 0 }), "reclaimed");
+  assert.strictEqual(fs.existsSync(lock), false);
+  fs.writeFileSync(lock, String(process.pid));
+  fs.utimesSync(lock, old, old);
+  assert.throws(() => withFileLock(file, () => assert.fail("live lock acquired"), { timeoutMs: 0 }), { code: "ETIMEDOUT" });
+  assert.strictEqual(fs.readFileSync(lock, "utf8"), String(process.pid));
+  fs.writeFileSync(lock, String(deadPid));
+  fs.utimesSync(lock, old, old);
+  assert.throws(() => withFileLock(file, () => assert.fail("custom stale threshold ignored"), { timeoutMs: 0, staleMs: 60_000 }), { code: "ETIMEDOUT" });
+});
+
+test("storage treats EPERM as a live lock owner", (t) => {
+  const file = path.join(sandbox(t), "state.json");
+  const lock = `${file}.lock`;
+  fs.writeFileSync(lock, String(process.pid));
+  const old = new Date(Date.now() - 31_000);
+  fs.utimesSync(lock, old, old);
+  t.mock.method(process, "kill", () => { throw Object.assign(new Error("not permitted"), { code: "EPERM" }); });
+  assert.throws(() => withFileLock(file, () => assert.fail("owner reclaimed"), { timeoutMs: 0 }), { code: "ETIMEDOUT" });
+  assert.strictEqual(fs.existsSync(lock), true);
+});
+
+test("storage releases locks on exceptions without deleting a replacement lock", (t) => {
+  const file = path.join(sandbox(t), "state.json");
+  const lock = `${file}.lock`;
+  assert.throws(() => withFileLock(file, () => { throw new Error("callback failed"); }), /callback failed/);
+  assert.strictEqual(fs.existsSync(lock), false);
+  withFileLock(file, () => {
+    fs.renameSync(lock, `${lock}.old`);
+    fs.writeFileSync(lock, "replacement");
+  });
+  assert.strictEqual(fs.readFileSync(lock, "utf8"), "replacement");
+});
+
+test("atomic writes preserve the prior file on failure and remove temporary files", (t) => {
+  const directory = sandbox(t);
+  const file = path.join(directory, "state.json");
+  writeFileAtomic(file, '{"value":1}\n');
+  assert.deepStrictEqual(readJsonFile(file, null), { value: 1 });
+  assert.strictEqual(fs.statSync(directory).mode & 0o777, 0o700);
+  assert.strictEqual(fs.statSync(file).mode & 0o777, 0o600);
+  writeFileAtomic(file, '{"value":2}\n', 0o640);
+  assert.strictEqual(fs.statSync(file).mode & 0o777, 0o640);
+  t.mock.method(fs, "renameSync", () => { throw new Error("rename failed"); });
+  assert.throws(() => writeFileAtomic(file, '{"value":3}\n'), /rename failed/);
+  assert.deepStrictEqual(readJsonFile(file, null), { value: 2 });
+  assert.deepStrictEqual(fs.readdirSync(directory), ["state.json"]);
+});
+
+test("JSON reads use the fallback only for missing files and preserve failures", (t) => {
+  const directory = sandbox(t);
+  const file = path.join(directory, "state.json");
+  const fallback = {};
+  assert.strictEqual(readJsonFile(file, fallback), fallback);
+  fs.writeFileSync(file, "{");
+  assert.throws(() => readJsonFile(file, fallback), SyntaxError);
+  fs.writeFileSync(file, "null");
+  assert.strictEqual(readJsonFile(file, fallback), null);
+  fs.rmSync(file);
+  fs.symlinkSync(path.join(directory, "missing.json"), file);
+  assert.throws(() => readJsonFile(file, fallback), { code: "ENOENT" });
+  assert.throws(() => readJsonFile(directory, fallback));
+});
 
 function unverifiedRecord(overrides = {}) {
   return {

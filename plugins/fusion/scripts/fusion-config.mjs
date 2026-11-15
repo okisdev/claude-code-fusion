@@ -17,16 +17,9 @@ import {
   validateLane,
   validateModelRoutingData
 } from "./lib/model-table.mjs";
-import {
-  normalizePosture,
-  POSTURE_ENV,
-  POSTURE_VALUES,
-  posturePath,
-  readPostureFile,
-  resolvePosture
-} from "./lib/posture.mjs";
 import { newestEngineCompanion } from "./lib/engine-acceptance.mjs";
 import { BREADTH_ENGINE_IDS, ENGINES, ENGINE_IDS, isEngineId, routedEngineIds } from "./lib/engines.mjs";
+import { withFileLock, writeFileAtomic } from "./lib/storage.mjs";
 import { syncRulesToLive } from "./lib/rules-template.mjs";
 
 class UsageError extends Error {}
@@ -44,7 +37,6 @@ function usage() {
     `  node scripts/fusion-config.mjs set-breadth <${BREADTH_ENGINE_IDS.join("|")}>`,
     "  node scripts/fusion-config.mjs remove <id>",
     "  node scripts/fusion-config.mjs set-cost-profile <text>",
-    "  node scripts/fusion-config.mjs set-posture <judgment|strict>",
     "  node scripts/fusion-config.mjs reset-defaults --yes"
   ].join("\n");
 }
@@ -193,42 +185,14 @@ function loadEditableData(filePath) {
   return result.data;
 }
 
-function ensurePrivateDirectory(directory) {
-  fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
-  try {
-    fs.chmodSync(directory, 0o700);
-  } catch {
-    void 0;
-  }
-}
-
 function writeModelRoutingData(filePath, data) {
   data.updatedAt = new Date().toISOString();
   const validation = validateModelRoutingData(data);
   if (!validation.ok) {
     throw new UsageError(`Cannot write model routing file: ${validation.reason}`);
   }
-  ensurePrivateDirectory(path.dirname(filePath));
-  fs.writeFileSync(filePath, `${JSON.stringify(validation.data, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
-  fs.chmodSync(filePath, 0o600);
+  writeFileAtomic(filePath, `${JSON.stringify(validation.data, null, 2)}\n`);
   return validation.data;
-}
-
-function writePosture(filePath, posture) {
-  ensurePrivateDirectory(path.dirname(filePath));
-  fs.writeFileSync(filePath, `${posture}\n`, { encoding: "utf8", mode: 0o600 });
-  fs.chmodSync(filePath, 0o600);
-}
-
-function resolvePostureStatus(env) {
-  const value = resolvePosture(env);
-  if (normalizePosture(env[POSTURE_ENV])) {
-    return { value, source: "env" };
-  }
-  if (readPostureFile(env)) {
-    return { value, source: "file" };
-  }
-  return { value, source: "default" };
 }
 
 function refreshLiveRules(env, stdout) {
@@ -254,14 +218,12 @@ function refreshLiveRules(env, stdout) {
 function showCommand(options, env, stdout) {
   ensureOnlyOptions(options, new Set(["json"]), "show");
   const filePath = resolveModelRoutingPath(env);
-  const posture = resolvePostureStatus(env);
   const result = readModelRoutingFile(filePath);
   const table = result.ok ? renderModelTable(result.data, { includeNotes: true }) : result.missing ? DEFAULT_MODEL_TABLE_PLACEHOLDER : null;
   if (options.json) {
     stdout.write(
       `${JSON.stringify(
         {
-          posture,
           filePath,
           configured: !result.missing,
           valid: Boolean(result.ok),
@@ -275,7 +237,7 @@ function showCommand(options, env, stdout) {
     );
     return;
   }
-  const lines = [`Posture: ${posture.value} (${posture.source})`, `Model routing file: ${filePath}`];
+  const lines = [`Model routing file: ${filePath}`];
   if (result.missing) {
     lines.push("Not configured: use `rescore <id> --intelligence N --taste N --cost N` with values from 1 to 5 to add your first score.");
   } else if (!result.ok) {
@@ -452,20 +414,6 @@ function setCostProfileCommand(positionals, options, env, stdout) {
   stdout.write("Updated cost profile.\n");
 }
 
-function setPostureCommand(positionals, options, env, stdout) {
-  ensureOnlyOptions(options, new Set(), "set-posture");
-  if (positionals.length !== 1) {
-    throw new UsageError(`Expected set-posture <${POSTURE_VALUES.join("|")}>.`);
-  }
-  const posture = normalizePosture(positionals[0]);
-  if (!posture) {
-    throw new UsageError(`Expected set-posture <${POSTURE_VALUES.join("|")}>.`);
-  }
-  const filePath = posturePath(env);
-  writePosture(filePath, posture);
-  stdout.write(`Updated posture to ${posture} at ${filePath}.\n`);
-}
-
 function resetDefaultsCommand(positionals, options, env, stdout) {
   if (positionals.length !== 0) {
     throw new UsageError("reset-defaults does not accept extra arguments.");
@@ -484,43 +432,44 @@ export function main(argv = process.argv.slice(2), { env = process.env, stdout =
   try {
     const { options, positionals } = parseCli(argv);
     const command = positionals.shift() ?? "show";
-    switch (command) {
-      case "show":
-        if (positionals.length !== 0) {
-          throw new UsageError("show does not accept positional arguments.");
-        }
-        showCommand(options, env, stdout);
-        return 0;
-      case "audit":
-        if (positionals.length !== 0) {
-          throw new UsageError("audit does not accept positional arguments.");
-        }
-        auditCommand(options, env, stdout);
-        return 0;
-      case "rescore":
-        rescoreCommand(positionals, options, env, stdout);
-        return 0;
-      case "set-default":
-        setDefaultCommand(positionals, options, env, stdout);
-        return 0;
-      case "set-breadth":
-        setBreadthCommand(positionals, options, env, stdout);
-        return 0;
-      case "remove":
-        removeCommand(positionals, options, env, stdout);
-        return 0;
-      case "set-cost-profile":
-        setCostProfileCommand(positionals, options, env, stdout);
-        return 0;
-      case "set-posture":
-        setPostureCommand(positionals, options, env, stdout);
-        return 0;
-      case "reset-defaults":
-        resetDefaultsCommand(positionals, options, env, stdout);
-        return 0;
-      default:
-        throw new UsageError(`Unknown command ${command}.\n${usage()}`);
-    }
+    const runCommand = () => {
+      switch (command) {
+        case "show":
+          if (positionals.length !== 0) {
+            throw new UsageError("show does not accept positional arguments.");
+          }
+          showCommand(options, env, stdout);
+          return 0;
+        case "audit":
+          if (positionals.length !== 0) {
+            throw new UsageError("audit does not accept positional arguments.");
+          }
+          auditCommand(options, env, stdout);
+          return 0;
+        case "rescore":
+          rescoreCommand(positionals, options, env, stdout);
+          return 0;
+        case "set-default":
+          setDefaultCommand(positionals, options, env, stdout);
+          return 0;
+        case "set-breadth":
+          setBreadthCommand(positionals, options, env, stdout);
+          return 0;
+        case "remove":
+          removeCommand(positionals, options, env, stdout);
+          return 0;
+        case "set-cost-profile":
+          setCostProfileCommand(positionals, options, env, stdout);
+          return 0;
+        case "reset-defaults":
+          resetDefaultsCommand(positionals, options, env, stdout);
+          return 0;
+        default:
+          throw new UsageError(`Unknown command ${command}.\n${usage()}`);
+      }
+    };
+    return ["rescore", "set-default", "set-breadth", "remove", "set-cost-profile", "reset-defaults"].includes(command)
+      ? withFileLock(resolveModelRoutingPath(env), runCommand) : runCommand();
   } catch (error) {
     if (error instanceof UsageError) {
       stderr.write(`fusion-config: ${error.message}\n`);

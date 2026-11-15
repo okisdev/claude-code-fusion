@@ -265,10 +265,11 @@ function handlePostToolUse(input, env, failed = false) {
       }
       return taskId && [record.backgroundTaskId, record.agentId, record.taskId].includes(taskId);
     });
-    if (!failed || input.tool_name === "Read") {
+    if (!failed && input.tool_response?.is_error !== true && input.tool_response?.isError !== true) {
       const now = new Date().toISOString();
-      const collectedResultText = !failed && ["Read", "TaskOutput"].includes(input.tool_name) ? taskOutputResultText(input) : null;
-      if (["Read", "TaskOutput"].includes(input.tool_name) && matches.length > 0) {
+      const collectedResultText = ["Read", "TaskOutput"].includes(input.tool_name) ? taskOutputResultText(input) : null;
+      if (input.tool_name !== "TaskStop" && !collectedResultText?.trim()) {
+        return;
       }
       for (const record of matches) {
         updateLifecycleWorkerRecord(record.taskId, env, (current) => {

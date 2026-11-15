@@ -6,7 +6,7 @@ import path from "node:path";
 import { test } from "node:test";
 
 import { createWorkerRecord, readWorkerRecord, readWorkerSessionState, updateWorkerRecord } from "../plugins/fusion/scripts/lib/worker-state.mjs";
-import { workerBudgetFailure, workerLimits } from "../plugins/fusion/scripts/worker-lifecycle.mjs";
+import { workerBudgetFailure, workerLimits } from "../plugins/fusion/scripts/lib/lifecycle/budget.mjs";
 
 const script = path.join(import.meta.dirname, "..", "plugins", "fusion", "scripts", "worker-lifecycle.mjs");
 

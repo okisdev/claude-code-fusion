@@ -259,10 +259,6 @@ export function terminalMetadata(output, json = false) {
   return { state: states[0], semantic };
 }
 
-function terminalState(output, json = false) {
-  return terminalMetadata(output, json)?.state ?? null;
-}
-
 function reportsDead(output, json = false) {
   if (json) {
     const record = parsedJson(output);

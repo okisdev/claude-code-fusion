@@ -1,8 +1,6 @@
-import { JUDGMENT_POSTURE } from "../posture.mjs";
 import { messageCode, tagMessage } from "../user-messages.mjs";
 import { verificationEvidence } from "../verification-command.mjs";
 import { recordAuditEvent } from "./audit.mjs";
-import { resolveMode } from "./config.mjs";
 import { BASH_TOOL, MAIN_LANE, NO_OP_BASH_COMMANDS, NO_OP_HEARTBEAT_DENY_MESSAGE_SLUG, NO_OP_HEARTBEAT_REASON } from "./constants.mjs";
 import { inFlightWorkerTaskSignature, totalDispatches } from "./dispatch.mjs";
 import { resolveReplayBudgetTokens } from "./replay.mjs";
@@ -10,7 +8,7 @@ import { normalizeState, readState, resetWriteWindow, withStateLock, writeState 
 import { extractBashCommand } from "./verification.mjs";
 import { denyOutput } from "./write.mjs";
 
-function handleBash(input, env, { sessionId, toolName, file, now, posture, writeHookText }) {
+function handleBash(input, env, { sessionId, toolName, file, now, writeHookText }) {
   if (toolName === BASH_TOOL) {
     const command = extractBashCommand(input.tool_input);
     if (input.hook_event_name === "PostToolUse") {
@@ -27,10 +25,8 @@ function handleBash(input, env, { sessionId, toolName, file, now, posture, write
         const writeCount = state.writesSinceDispatch;
         const replayTokens = state.writeReplayTokens;
         const dispatchCount = totalDispatches(state.dispatches);
-        if (posture === JUDGMENT_POSTURE && writeCount > 0) {
-          resetWriteWindow(state);
-          writeState(file, state);
-        }
+        resetWriteWindow(state);
+        writeState(file, state);
         return { writeCount, replayTokens, dispatchCount };
       });
       recordAuditEvent(
@@ -44,8 +40,6 @@ function handleBash(input, env, { sessionId, toolName, file, now, posture, write
           replayTokens: verification.replayTokens,
           dispatchCount: verification.dispatchCount,
           budget: resolveReplayBudgetTokens(env),
-          mode: resolveMode(env),
-          posture,
           evidence
         },
         env
@@ -86,7 +80,6 @@ function handleBash(input, env, { sessionId, toolName, file, now, posture, write
         dispatchCount,
         budget,
         mode: "enforce",
-        posture,
         messageCode: messageCode(NO_OP_HEARTBEAT_DENY_MESSAGE_SLUG)
       },
       env

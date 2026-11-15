@@ -1,7 +1,7 @@
 import { PEER_RESCUE_AGENT_NAMES } from "../engines.mjs";
 import fs from "node:fs";
 import path from "node:path";
-import { engineAcceptanceTransport, recordEngineAcceptance } from "../engine-acceptance.mjs";
+import { deliverWorkerEngineAcceptance, prepareEngineAcceptanceDelivery } from "../engine-acceptance.mjs";
 import { PEER_JOB_FOOTER_AGENTS, PEER_MANAGED_AGENTS, engineForAgentType, isEngineId } from "../engines.mjs";
 import { readEngineJobFailureKind } from "../engine-job-state.mjs";
 import { applyQueuedVerdict, backfillWorkerTaskOutputTelemetry, canonicalWorkerAgentType, isSettledWorker, WORKER_TERMINAL_STATUSES, markWorkerCollected, WORKER_COLLECTION_METHODS, workerRecordFile, writePrivateText } from "../worker-state.mjs";
@@ -318,29 +318,15 @@ function settleQueuedVerdict(record, now, env) {
   if (peerJobIds.length === 0 || !peerEngine) {
     return settled;
   }
-  const errors = [];
-  for (const jobId of peerJobIds) {
+  const queued = prepareEngineAcceptanceDelivery(settled, { jobs: peerJobIds.map((jobId) => ({ engine: peerEngine, jobId })), acceptFailedTransport: pendingVerdict.acceptFailedTransport === true });
+  queueMicrotask(() => {
     try {
-      const transport = engineAcceptanceTransport({ engine: peerEngine, jobId, acceptance: settled.acceptance, acceptFailedTransport: pendingVerdict.acceptFailedTransport === true, env });
-      recordEngineAcceptance({
-        engine: peerEngine,
-        jobId,
-        acceptance: settled.acceptance,
-        source: pendingVerdict.source,
-        reason: settled.acceptanceReason,
-        failureKind: settled.acceptanceFailureKind ?? null,
-        acceptFailedTransport: transport.acceptFailedTransport,
-        env
-      });
-    } catch (error) {
-      errors.push(`${jobId}: ${error instanceof Error ? error.message : String(error)}`);
+      deliverWorkerEngineAcceptance({ taskId: queued.taskId, env });
+    } catch {
+      void 0;
     }
-  }
-  if (errors.length === 0) {
-    const { engineSettlementError: _engineSettlementError, ...withoutEngineSettlementError } = settled;
-    return withoutEngineSettlementError;
-  }
-  return { ...settled, engineSettlementError: errors.join("; ") };
+  });
+  return queued;
 }
 
 function wrapperApiDeathEvidence(record, evidence) {

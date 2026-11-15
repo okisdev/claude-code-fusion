@@ -1,3 +1,4 @@
+import { fileURLToPath } from "node:url";
 import { engineResultCommand, isEngineId } from "../engines.mjs";
 import { tagMessage } from "../user-messages.mjs";
 import { canonicalWorkerAgentType, isPendingSettlement, isSettledWorker, WORKER_TERMINAL_STATUSES, readWorkerRecord, readSessionWorkerRecords, updateWorkerSessionState } from "../worker-state.mjs";
@@ -104,7 +105,7 @@ function collectorResultCommand(record) {
 }
 
 function settlementCommand(records) {
-  return `/fusion:stats --record ${records.map((record) => `${record.taskId}=accepted|rejected|unverified`).join(" --record ")}`;
+  return `node "${fileURLToPath(new URL("../../fusion-stats.mjs", import.meta.url))}" --record ${records.map((record) => `${record.taskId}=accepted|rejected|unverified`).join(" ")}`;
 }
 
 function collectorStopGate(input, env) {
@@ -222,7 +223,7 @@ function writeTerminalCollectionPending(input, records, env) {
   }
   const instructions = terminalUncollected.map((record) => terminalCollectionInstruction(record, env));
   instructions.push(
-    "Transport completion remains unverified until the result and verification evidence are reviewed. Record accepted or rejected explicitly through /fusion:stats."
+    `Transport completion remains unverified until the result and verification evidence are reviewed. Record the verdicts in one command: ${settlementCommand(terminalUncollected)}.`
   );
   writeStopGateBlock(input, env, "worker-lifecycle.terminal-collection-block", instructions.join(" "), terminalUncollected);
   return true;

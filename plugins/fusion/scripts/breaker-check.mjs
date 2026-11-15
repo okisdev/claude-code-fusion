@@ -369,7 +369,7 @@ function hostCheckAdvisories(engine, env) {
   }
 }
 
-function run(env = process.env, now = Date.now()) {
+function run(env = process.env, now = Date.now(), write = (text) => process.stdout.write(text)) {
   const lookbackMs = resolveLookbackMs(env);
   const engineLines = new Map();
   for (const engine of ENGINE_IDS) {
@@ -419,7 +419,7 @@ function run(env = process.env, now = Date.now()) {
     lines.push(...hostCheckAdvisories(engine, env));
   }
   if (lines.length > 0) {
-    process.stdout.write(`${tagMessage("breaker-check.breaker-advisory", lines.join("\n"))}\n`);
+    write(`${tagMessage("breaker-check.breaker-advisory", lines.join("\n"))}\n`);
   }
 }
 

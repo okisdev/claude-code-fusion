@@ -3,9 +3,12 @@
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { executeHook, readHookInput } from "./lib/guard/handler.mjs";
+import { renderHookResult } from "./lib/lifecycle/output.mjs";
 
 function main() {
-  executeHook(readHookInput());
+  const input = readHookInput();
+  const stdout = renderHookResult(executeHook(input), input?.hook_event_name ?? "PreToolUse");
+  if (stdout) process.stdout.write(stdout);
 }
 
 function isMain() {
@@ -20,5 +23,5 @@ export { DEFAULT_LOCK_TIMEOUT_MS } from "./lib/guard/constants.mjs";
 export { handleInlineDelegationHook } from "./lib/guard/handler.mjs";
 export { listAuditSegments, normalizeAuditEvent, readAuditEvents } from "./lib/guard/audit.mjs";
 export { normalizeSessionId, stateFile } from "./lib/guard/state.mjs";
-export { resolveAuditDir, resolveLockTimeoutMs, resolveMode, resolveStateDir, resolveTailAllowance, resolveTailMaxBytes, resolveZeroDispatchMaxBytes, resolveZeroDispatchWrites } from "./lib/guard/config.mjs";
+export { resolveAuditDir, resolveLockTimeoutMs, resolveStateDir } from "./lib/guard/config.mjs";
 export { totalDispatches } from "./lib/guard/dispatch.mjs";

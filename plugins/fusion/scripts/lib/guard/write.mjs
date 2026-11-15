@@ -1,7 +1,4 @@
-import { readRoutingDefaults } from "../model-table.mjs";
 import { sanitizeAuditPath } from "./dispatch.mjs";
-import { formatTokens } from "./replay.mjs";
-import { createHash } from "node:crypto";
 import path from "node:path";
 
 function extractWritePath(toolInput) {
@@ -10,34 +7,6 @@ function extractWritePath(toolInput) {
   }
   const raw = toolInput.file_path ?? toolInput.notebook_path ?? null;
   return typeof raw === "string" && raw.length > 0 ? raw : null;
-}
-
-function inlineWriteBytes(value) {
-  if (!value || typeof value !== "object") {
-    return 0;
-  }
-  if (Array.isArray(value)) {
-    return value.reduce((total, entry) => total + inlineWriteBytes(entry), 0);
-  }
-  let total = 0;
-  for (const [key, entry] of Object.entries(value)) {
-    if ((key === "new_string" || key === "content") && typeof entry === "string") {
-      total += Buffer.byteLength(entry);
-    } else if (entry && typeof entry === "object") {
-      total += inlineWriteBytes(entry);
-    }
-  }
-  return total;
-}
-
-function editReplacementBytes(toolInput) {
-  return typeof toolInput?.new_string === "string" ? Buffer.byteLength(toolInput.new_string) : null;
-}
-
-function writePathSignature(filePath, cwd) {
-  const base = typeof cwd === "string" && cwd ? cwd : process.cwd();
-  const target = typeof filePath === "string" ? filePath : "";
-  return createHash("sha256").update(path.resolve(base, target)).digest("hex");
 }
 
 function isInsideCwd(filePath, cwd) {
@@ -65,10 +34,6 @@ function extractAuditWritePath(filePath, cwd) {
   return sanitizeAuditPath(relative);
 }
 
-function budgetMultiple(replayTokens, budget) {
-  return Math.floor(replayTokens / budget);
-}
-
 function advisoryOutput(additionalContext) {
   return { hookSpecificOutput: { hookEventName: "PreToolUse", additionalContext } };
 }
@@ -81,34 +46,4 @@ function postToolAdvisoryOutput(additionalContext) {
   return { hookSpecificOutput: { hookEventName: "PostToolUse", additionalContext } };
 }
 
-function buildUnverifiedLine(writeCount, replayTokens) {
-  return `${writeCount} main loop ${writeCount === 1 ? "write is" : "writes are"} unverified in this window, and ${writeCount === 1 ? "its turn" : "their turns"} replayed ${formatTokens(replayTokens)} tokens of context.`;
-}
-
-function buildLaneHint(env = process.env) {
-  const { quick, volume } = readRoutingDefaults(env).codex;
-  return `Lanes: quick scoped work goes to the codex quick default ${quick.model} at effort ${quick.effort}; trivial or high volume work goes to the codex volume default ${volume.model} at effort ${volume.effort}; work needing the Claude Code tool surface goes to fusion:claude-worker.`;
-}
-
-function buildAdvisoryLine(writeCount, dispatchCount, replayTokens, env = process.env) {
-  const countSummary =
-    dispatchCount === 0
-      ? `${writeCount} inline ${writeCount === 1 ? "write" : "writes"} replayed ${formatTokens(replayTokens)} tokens of context this session with zero dispatches. `
-      : `${writeCount} inline ${writeCount === 1 ? "write" : "writes"} replayed ${formatTokens(replayTokens)} tokens of context since the most recent dispatch; this session has ${dispatchCount} dispatch${dispatchCount === 1 ? "" : "es"}. `;
-  return countSummary + buildLaneHint(env);
-}
-
-function buildUnverifiedAdvisory(writeCount, dispatchCount, replayTokens, env = process.env) {
-  const zeroDispatchClause = dispatchCount === 0 ? " This session has not dispatched yet; if the remaining work splits into independent packages, dispatch them together in one message, and three or more convene /fusion:ultra." : "";
-  return `${buildUnverifiedLine(writeCount, replayTokens)} Run this change's verification command once it is coherent, or hand the remaining work to a lane. ${buildLaneHint(env)}${zeroDispatchClause}`;
-}
-
-function buildTailAllowanceAdvisory(remainingTailSlots) {
-  return `The inline replay budget is exhausted. Tail allowance permits this small Edit to an already touched file; ${remainingTailSlots} tail ${remainingTailSlots === 1 ? "slot" : "slots"} remain in this dispatch window.`;
-}
-
-function buildZeroDispatchAdvisory(remainingWrites, remainingBytes) {
-  return `The inline replay budget is exhausted; this window remains within its inline relief bounds, with ${remainingWrites} ${remainingWrites === 1 ? "write" : "writes"} and ${remainingBytes} ${remainingBytes === 1 ? "byte" : "bytes"} left before enforcement resumes.`;
-}
-
-export { extractWritePath, inlineWriteBytes, editReplacementBytes, writePathSignature, isInsideCwd, isWorkspaceWritePath, extractAuditWritePath, budgetMultiple, advisoryOutput, denyOutput, postToolAdvisoryOutput, buildUnverifiedLine, buildLaneHint, buildAdvisoryLine, buildUnverifiedAdvisory, buildTailAllowanceAdvisory, buildZeroDispatchAdvisory };
+export { extractWritePath, isInsideCwd, isWorkspaceWritePath, extractAuditWritePath, advisoryOutput, denyOutput, postToolAdvisoryOutput };

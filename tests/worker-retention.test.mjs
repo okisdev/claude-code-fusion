@@ -126,3 +126,71 @@ test("rollup write failure leaves expired records available for a later sweep", 
   assert.strictEqual(fs.existsSync(path.join(workers, ".retention-sweep")), false);
   assert.deepStrictEqual(pruneExpiredWorkerRecords(env, now), { records: 1, sessions: 0 });
 });
+
+test("retention retries count each record once after rollup append succeeds and unlink fails", (t) => {
+  const { workers, env } = sandbox(t);
+  const now = Date.now();
+  const old = now - 40 * DAY_MS;
+  const record = {
+    createdAt: new Date(old).toISOString(),
+    transportStatus: "done",
+    startedAt: new Date(old).toISOString(),
+    finishedAt: new Date(old + 2000).toISOString(),
+    usage: { outputTokens: 10, uncachedTokens: 30, cacheReadInputTokens: 40 }
+  };
+  const first = writeJob(workers, "fusion-unlink-first", record, old);
+  const retry = writeJob(workers, "fusion-unlink-retry", record, old);
+  const originalRemove = fs.rmSync;
+  fs.rmSync = (file, ...args) => {
+    if (file === retry) {
+      assert.strictEqual(readWorkerRollups(env)[0].count, 2);
+      throw new Error("unlink unavailable");
+    }
+    return originalRemove(file, ...args);
+  };
+  try {
+    assert.deepStrictEqual(pruneExpiredWorkerRecords(env, now), { records: 1, sessions: 0 });
+  } finally {
+    fs.rmSync = originalRemove;
+  }
+  assert.strictEqual(fs.existsSync(first), false);
+  assert.strictEqual(fs.existsSync(retry), true);
+  const beforeRetry = readWorkerRollups(env);
+  assert.deepStrictEqual(pruneExpiredWorkerRecords(env, now + 6 * HOUR_MS), { records: 1, sessions: 0 });
+  assert.strictEqual(fs.existsSync(retry), false);
+  assert.deepStrictEqual(readWorkerRollups(env), beforeRetry);
+  assert.strictEqual(beforeRetry[0].count, 2);
+  assert.strictEqual(beforeRetry[0].wallClockMsSum, 4000);
+  assert.strictEqual(beforeRetry[0].outputTokensSum, 20);
+  assert.strictEqual(beforeRetry[0].uncachedTokensSum, 60);
+  assert.strictEqual(beforeRetry[0].cacheReadInputTokensSum, 80);
+});
+
+test("retention retries do not recount a rollup persisted before an interrupted sweep", (t) => {
+  const { workers, env } = sandbox(t);
+  const now = Date.now();
+  const old = now - 40 * DAY_MS;
+  const file = writeJob(workers, "fusion-rollup-interrupted", {
+    createdAt: new Date(old).toISOString(), transportStatus: "done"
+  }, old);
+  const originalWrite = fs.writeFileSync;
+  fs.writeFileSync = (target, content, ...args) => {
+    const result = originalWrite(target, content, ...args);
+    if (typeof target === "number" && typeof content === "string" && content.startsWith('{"schemaVersion":1,')) {
+      throw new Error("sweep interrupted after append");
+    }
+    return result;
+  };
+  try {
+    assert.throws(() => pruneExpiredWorkerRecords(env, now), /sweep interrupted after append/);
+  } finally {
+    fs.writeFileSync = originalWrite;
+  }
+  assert.strictEqual(fs.existsSync(file), true);
+  assert.strictEqual(fs.existsSync(path.join(workers, ".retention-sweep")), false);
+  const persisted = readWorkerRollups(env);
+  assert.strictEqual(persisted[0].count, 1);
+  assert.deepStrictEqual(pruneExpiredWorkerRecords(env, now), { records: 1, sessions: 0 });
+  assert.strictEqual(fs.existsSync(file), false);
+  assert.deepStrictEqual(readWorkerRollups(env), persisted);
+});

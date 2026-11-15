@@ -1,7 +1,7 @@
 import fs from "node:fs";
-import os from "node:os";
 import path from "node:path";
 
+import { resolveFusionDataDir } from "./worker-state.mjs";
 import { BREADTH_ENGINE_IDS, DEFAULT_BREADTH_ENGINE, ENGINES, ENGINE_IDS, isEngineId, routedEngineIds } from "./engines.mjs";
 
 export const MODEL_TABLE_START = "<!-- fusion:model-table:start -->";
@@ -45,7 +45,7 @@ export function resolveModelRoutingPath(env = process.env) {
   if (override && override.trim()) {
     return path.resolve(override.trim());
   }
-  return path.join(os.homedir(), ".claude", "plugins", "data", "fusion-claude-code-fusion", "model-routing.json");
+  return path.join(resolveFusionDataDir(env), "model-routing.json");
 }
 
 function isValidScore(value) {

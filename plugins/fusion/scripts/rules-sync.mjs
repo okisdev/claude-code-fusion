@@ -6,8 +6,8 @@ import { fileURLToPath } from "node:url";
 import { syncRulesToLive } from "./lib/rules-template.mjs";
 import { tagMessage } from "./lib/user-messages.mjs";
 
-export function main(env = process.env) {
-  return syncRulesToLive({ pluginRoot: env.CLAUDE_PLUGIN_ROOT, env });
+export function main(env = process.env, log = console.log) {
+  return syncRulesToLive({ pluginRoot: env.CLAUDE_PLUGIN_ROOT, env, log });
 }
 
 function isMain() {

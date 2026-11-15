@@ -1,8 +1,8 @@
 ---
 name: deep-reasoner
-description: Read only advisory lane on Fable at maximum effort. Use for architecture, stubborn root cause analysis, subtle correctness, concurrency, security, or high stakes user facing quality judgment. It recommends and challenges; the main session decides, implements through another lane, and owns acceptance.
+description: Read only advisory lane on Fable at high effort. Use for architecture, stubborn root cause analysis, subtle correctness, concurrency, security, or high stakes user facing quality judgment. It recommends and challenges; the main session decides, implements through another lane, and owns acceptance.
 model: fable
-effort: xhigh
+effort: high
 maxTurns: 80
 background: false
 tools: Read, Grep, Glob

@@ -10,8 +10,8 @@ import { claimParentContextAdvisory } from "../plugins/fusion/scripts/lib/lifecy
 
 const repoRoot = path.join(import.meta.dirname, "..");
 const script = path.join(repoRoot, "plugins", "fusion", "scripts", "fleet-posture.mjs");
-const LEGACY_CONTEXT = tagMessage("fleet-posture.strict-fleet-reminder", "fleet-default active: a goal that decomposes into three or more independent work packages convenes /fusion:ultra once bootstrap dependencies are resolved; explain narrower execution visibly in the reply.");
 const SESSION_LANES_CONTEXT = tagMessage("fleet-posture.session-lanes-reminder", "fusion lanes ready: codex gpt-6.1-sol for spec grade and deep review, gpt-6-sol and gpt-6-luna for quick and volume packages, grok under its four roles on the routing table's lane defaults, cursor under diversity for a model family no other lane carries and under burst for bounded worktree implementation, claude workers for the Claude surface. Independent packages dispatch together in one message; three or more convene /fusion:ultra; a single coherent change stays inline.");
+const DEEP_REASONER_HINT = tagMessage("fleet-posture.deep-reasoner-hint", "This reads as a design or root-cause question. Consult fusion:deep-reasoner with a scoped brief before deciding.");
 const advisoryNotice = (tokens) => tagMessage("fleet-posture.context-advisory", `The main loop context is ${Math.round(tokens / 1000)}k tokens and every turn replays it. /compact or a fresh session before the next goal cuts that cost.`);
 
 function makeSandbox(t) {
@@ -30,8 +30,8 @@ function envFor(sandbox, extra = {}) {
   return env;
 }
 
-function hookInput(sandbox, sessionId = "session-1") {
-  return JSON.stringify({ ...(sessionId === undefined ? {} : { session_id: sessionId }), prompt: "do work", cwd: sandbox.root, transcript_path: sandbox.transcript });
+function hookInput(sandbox, sessionId = "session-1", prompt = "do work") {
+  return JSON.stringify({ ...(sessionId === undefined ? {} : { session_id: sessionId }), prompt, cwd: sandbox.root, transcript_path: sandbox.transcript });
 }
 
 function writeTranscript(sandbox, tokens) {
@@ -74,7 +74,7 @@ function assertContext(result, additionalContext, systemMessage) {
   });
 }
 
-test("judgment posture emits the session lanes reminder once without guard state", (t) => {
+test("emits the session lanes reminder once without guard state", (t) => {
   const sandbox = makeSandbox(t);
 
   assertContext(run(sandbox), SESSION_LANES_CONTEXT);
@@ -82,6 +82,29 @@ test("judgment posture emits the session lanes reminder once without guard state
   assert.strictEqual(fs.existsSync(statePath(sandbox)), false);
   assert.strictEqual(fs.statSync(sessionLanesReminderPath(sandbox)).mode & 0o777, 0o600);
   assert.strictEqual(fs.statSync(path.dirname(sessionLanesReminderPath(sandbox))).mode & 0o777, 0o700);
+});
+
+test("design questions receive one deep reasoner hint on every matching prompt", (t) => {
+  const sandbox = makeSandbox(t);
+  assertContext(run(sandbox, hookInput(sandbox, "session-1", "思考一下为什么这个架构会失败")), `${SESSION_LANES_CONTEXT}\n\n${DEEP_REASONER_HINT}`);
+  assertContext(run(sandbox, hookInput(sandbox, "session-1", "WHY IS the root cause hard to find?")), DEEP_REASONER_HINT);
+  assertContext(run(sandbox, hookInput(sandbox, "session-1", "How should we redesign the API?"), { FUSION_FLEET_MODE: "off" }), DEEP_REASONER_HINT);
+});
+
+test("non-design and generated prompts do not receive a deep reasoner hint", (t) => {
+  const sandbox = makeSandbox(t);
+  const prompts = [
+    "fix the typo in README",
+    "/why is this slow",
+    "<task-notification><summary>why is this slow</summary></task-notification>",
+    JSON.stringify({ hook_event_name: "UserPromptSubmit", prompt: "why is this slow" }),
+    `why is this slow ${"x".repeat(4000)}`
+  ];
+  for (const prompt of prompts) {
+    assertSilent(run(sandbox, hookInput(sandbox, "session-1", prompt), { FUSION_FLEET_MODE: "off" }));
+  }
+  const metaInput = JSON.stringify({ ...JSON.parse(hookInput(sandbox, "session-1", "why is this slow")), isMeta: true, origin: { kind: "task-notification" } });
+  assertSilent(run(sandbox, metaInput, { FUSION_FLEET_MODE: "off" }));
 });
 
 test("parent context below threshold adds no advisory", (t) => {
@@ -211,31 +234,13 @@ test("the session lanes reminder names the selected breadth engine", (t) => {
   assert.doesNotMatch(context, /cursor under diversity/);
 });
 
-test("strict posture emits the legacy reminder without guard state", (t) => {
-  const sandbox = makeSandbox(t);
-
-  assertContext(run(sandbox, hookInput(sandbox), { FUSION_POSTURE: "strict" }), LEGACY_CONTEXT);
-  assert.strictEqual(fs.existsSync(statePath(sandbox)), false);
-  assert.strictEqual(fs.existsSync(sessionLanesReminderPath(sandbox)), false);
-});
-
-test("strict posture also emits the parent context advisory", (t) => {
-  const sandbox = makeSandbox(t);
-  writeTranscript(sandbox, 250000);
-  assertContext(run(sandbox, hookInput(sandbox), { FUSION_POSTURE: "strict" }), LEGACY_CONTEXT, advisoryNotice(250000));
-  assertContext(run(sandbox, hookInput(sandbox), { FUSION_POSTURE: "strict" }), LEGACY_CONTEXT);
-});
-
 test("FUSION_FLEET_MODE=off suppresses only fleet reminders", (t) => {
   const sandbox = makeSandbox(t);
   writeTranscript(sandbox, 250000);
 
   assertContext(run(sandbox, hookInput(sandbox), { FUSION_FLEET_MODE: "off" }), null, advisoryNotice(250000));
-  assertSilent(run(sandbox, hookInput(sandbox), { FUSION_FLEET_MODE: "off", FUSION_POSTURE: "strict" }));
+  assertSilent(run(sandbox, hookInput(sandbox), { FUSION_FLEET_MODE: "off" }));
   assert.strictEqual(fs.existsSync(sessionLanesReminderPath(sandbox)), false);
-  const strictSandbox = makeSandbox(t);
-  writeTranscript(strictSandbox, 250000);
-  assertContext(run(strictSandbox, hookInput(strictSandbox), { FUSION_FLEET_MODE: "off", FUSION_POSTURE: "strict" }), null, advisoryNotice(250000));
 });
 
 test("the fleet mode state file suppresses reminders but keeps the context advisory", (t) => {
@@ -245,7 +250,7 @@ test("the fleet mode state file suppresses reminders but keeps the context advis
   fs.writeFileSync(path.join(sandbox.dataDir, "fleet-mode"), "off\n", "utf8");
 
   assertContext(run(sandbox), null, advisoryNotice(250000));
-  assertSilent(run(sandbox, hookInput(sandbox), { FUSION_POSTURE: "strict" }));
+  assertSilent(run(sandbox, hookInput(sandbox), {}));
   assert.strictEqual(fs.existsSync(sessionLanesReminderPath(sandbox)), false);
 });
 
@@ -254,7 +259,7 @@ test("an enabled environment mode overrides a disabled state file", (t) => {
   fs.mkdirSync(sandbox.dataDir, { recursive: true });
   fs.writeFileSync(path.join(sandbox.dataDir, "fleet-mode"), "off\n", "utf8");
 
-  assertContext(run(sandbox, hookInput(sandbox), { FUSION_FLEET_MODE: "on", FUSION_POSTURE: "strict" }), LEGACY_CONTEXT);
+  assertContext(run(sandbox, hookInput(sandbox), { FUSION_FLEET_MODE: "on" }), SESSION_LANES_CONTEXT);
 });
 
 test("invalid guard state is silent after the session lanes reminder", (t) => {

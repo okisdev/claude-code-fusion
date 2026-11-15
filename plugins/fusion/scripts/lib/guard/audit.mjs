@@ -1,9 +1,9 @@
-import { POSTURE_VALUES } from "../posture.mjs";
 import { resolveAuditDir, resolveAuditMaxBytes, resolveAuditMaxFiles, resolveAuditRetentionDays } from "./config.mjs";
-import { AUDIT_FILE_PATTERN, AUDIT_SCHEMA_VERSION, BASH_TOOL, DAY_MS, DELEGATION_TOOLS, ENFORCEMENT_AUDIT_TOOLS, MAIN_LANE, MISSING_LAUNCH_RECOVERY_REASON, OUT_OF_WORKSPACE_EXEMPTION, READ_STREAK_ADVISORY_REASON, REAPED_WORKER_REDIRECT_AUDIT_DESCRIPTION, TAIL_ALLOW_AUDIT_EVENT, TASK_CONTROL_TOOLS, ZERO_DISPATCH_SOFTENED_AUDIT_EVENT } from "./constants.mjs";
+import { AUDIT_FILE_PATTERN, AUDIT_SCHEMA_VERSION, BASH_TOOL, DAY_MS, DELEGATION_TOOLS, ENFORCEMENT_AUDIT_TOOLS, MAIN_LANE, MISSING_LAUNCH_RECOVERY_REASON, READ_STREAK_ADVISORY_REASON, REAPED_WORKER_REDIRECT_AUDIT_DESCRIPTION, TASK_CONTROL_TOOLS } from "./constants.mjs";
 import { normalizeLane, sanitizeAuditPath, sanitizeAuditText } from "./dispatch.mjs";
 import { REPLAY_KINDS } from "./replay.mjs";
-import { normalizeSessionId, withStateLock } from "./state.mjs";
+import { normalizeSessionId } from "./state.mjs";
+import { withFileLock, writeFileAtomic } from "../storage.mjs";
 import { normalizeMessageId } from "./verification.mjs";
 import fs from "node:fs";
 import path from "node:path";
@@ -142,24 +142,24 @@ function appendAuditEvent(event, env = process.env) {
     due = currentTime - fs.statSync(stamp).mtimeMs >= 60 * 60 * 1000;
   } catch { void 0; }
   if (due) {
-    withStateLock(path.join(auditDir, ".retention"), () => {
+    withFileLock(path.join(auditDir, ".retention"), () => {
       let last = -Infinity;
       try { last = fs.statSync(stamp).mtimeMs; } catch { void 0; }
       if (currentTime - last < 60 * 60 * 1000) return;
       pruneExpiredAuditSegments(auditDir, Number.isFinite(nowMs) ? nowMs : currentTime, resolveAuditRetentionDays(env));
-      fs.writeFileSync(stamp, "", { mode: 0o600 });
+      writeFileAtomic(stamp, "");
       fs.utimesSync(stamp, new Date(currentTime), new Date(currentTime));
     });
   }
-  const rotated = withStateLock(path.join(auditDir, ".append"), () => {
+  const rotated = withFileLock(path.join(auditDir, ".append"), () => {
     const previous = readAuditPointer(auditDir, date)?.file;
     const file = selectAuditSegment(auditDir, date, resolveAuditMaxBytes(env), Buffer.byteLength(line));
     appendAuditLine(file, line);
-    fs.writeFileSync(path.join(auditDir, ".current"), path.basename(file), { mode: 0o600 });
+    writeFileAtomic(path.join(auditDir, ".current"), path.basename(file));
     return file !== previous;
   });
   if (rotated) {
-    withStateLock(path.join(auditDir, ".retention"), () => {
+    withFileLock(path.join(auditDir, ".retention"), () => {
       const active = fs.readFileSync(path.join(auditDir, ".current"), "utf8").trim();
       enforceAuditFileLimit(auditDir, resolveAuditMaxFiles(env), path.join(auditDir, active));
     });
@@ -172,11 +172,9 @@ function normalizeAuditEvent(event) {
   }
   const atMs = Date.parse(event.at);
   const session = normalizeSessionId(event.session);
-  const posturePresent = Object.hasOwn(event, "posture");
-  if (!Number.isFinite(atMs) || !session || (posturePresent && !POSTURE_VALUES.includes(event.posture))) {
+  if (!Number.isFinite(atMs) || !session) {
     return null;
   }
-  const posture = posturePresent ? { posture: event.posture } : {};
   const replay = Number.isSafeInteger(event.replayTokens) && event.replayTokens >= 0 ? { replayTokens: event.replayTokens } : {};
   const digest = Number.isInteger(event.messageCode) && event.messageCode >= 1000 && event.messageCode <= 9999 ? { messageCode: event.messageCode } : {};
   if (event.event === "write" && ENFORCEMENT_AUDIT_TOOLS.has(event.tool) && event.lane === MAIN_LANE) {
@@ -190,7 +188,9 @@ function normalizeAuditEvent(event) {
       tool: event.tool,
       ...digest,
       ...(safePath ? { path: safePath } : {}),
-      ...(event.exempt === OUT_OF_WORKSPACE_EXEMPTION ? { exempt: OUT_OF_WORKSPACE_EXEMPTION } : {})
+      ...(Number.isSafeInteger(event.writeCount) && event.writeCount >= 0 ? { writeCount: event.writeCount } : {}),
+      ...replay,
+      ...(Number.isSafeInteger(event.budget) && event.budget > 0 ? { budget: event.budget } : {})
     };
   }
   if (
@@ -203,7 +203,7 @@ function normalizeAuditEvent(event) {
     event.dispatchCount >= 0 &&
     Number.isInteger(event.budget) &&
     event.budget > 0 &&
-    (event.mode === "enforce" || event.mode === "advisory")
+    (event.mode === undefined || event.mode === "enforce" || event.mode === "advisory")
   ) {
     return {
       schemaVersion: AUDIT_SCHEMA_VERSION,
@@ -216,73 +216,14 @@ function normalizeAuditEvent(event) {
       dispatchCount: event.dispatchCount,
       budget: event.budget,
       ...replay,
-      mode: event.mode,
-      ...posture,
+      ...(event.mode ? { mode: event.mode } : {}),
       ...digest,
       ...(event.evidence === "exit-status" || event.evidence === "output-summary" ? { evidence: event.evidence } : {})
     };
   }
-  if (
-    (event.event === TAIL_ALLOW_AUDIT_EVENT || event.event === ZERO_DISPATCH_SOFTENED_AUDIT_EVENT) &&
-    ENFORCEMENT_AUDIT_TOOLS.has(event.tool) &&
-    event.lane === MAIN_LANE &&
-    Number.isInteger(event.writeCount) &&
-    event.writeCount >= 0 &&
-    Number.isInteger(event.dispatchCount) &&
-    event.dispatchCount >= 0 &&
-    Number.isInteger(event.budget) &&
-    event.budget > 0 &&
-    event.mode === "enforce"
-  ) {
+  if (["tail-allowed", "zero-dispatch-softened"].includes(event.event) && ENFORCEMENT_AUDIT_TOOLS.has(event.tool) && event.lane === MAIN_LANE) {
     const safePath = sanitizeAuditPath(event.path);
-    if (event.event === TAIL_ALLOW_AUDIT_EVENT && Number.isInteger(event.remainingTailSlots) && event.remainingTailSlots >= 0) {
-      return {
-        schemaVersion: AUDIT_SCHEMA_VERSION,
-        at: new Date(atMs).toISOString(),
-        session,
-        event: TAIL_ALLOW_AUDIT_EVENT,
-        lane: MAIN_LANE,
-        tool: event.tool,
-        ...(safePath ? { path: safePath } : {}),
-        writeCount: event.writeCount,
-        dispatchCount: event.dispatchCount,
-        budget: event.budget,
-        ...replay,
-        mode: "enforce",
-        ...posture,
-        ...digest,
-        remainingTailSlots: event.remainingTailSlots,
-        ...(event.suppressed === true ? { suppressed: true } : {})
-      };
-    }
-    if (
-      event.event === ZERO_DISPATCH_SOFTENED_AUDIT_EVENT &&
-      Number.isInteger(event.remainingZeroDispatchWrites) &&
-      event.remainingZeroDispatchWrites >= 0 &&
-      Number.isInteger(event.remainingZeroDispatchBytes) &&
-      event.remainingZeroDispatchBytes >= 0
-    ) {
-      return {
-        schemaVersion: AUDIT_SCHEMA_VERSION,
-        at: new Date(atMs).toISOString(),
-        session,
-        event: ZERO_DISPATCH_SOFTENED_AUDIT_EVENT,
-        lane: MAIN_LANE,
-        tool: event.tool,
-        ...(safePath ? { path: safePath } : {}),
-        writeCount: event.writeCount,
-        dispatchCount: event.dispatchCount,
-        budget: event.budget,
-        ...replay,
-        mode: "enforce",
-        ...posture,
-        ...digest,
-        remainingZeroDispatchWrites: event.remainingZeroDispatchWrites,
-        remainingZeroDispatchBytes: event.remainingZeroDispatchBytes,
-        ...(event.suppressed === true ? { suppressed: true } : {})
-      };
-    }
-    return null;
+    return { schemaVersion: AUDIT_SCHEMA_VERSION, at: new Date(atMs).toISOString(), session, event: event.event, lane: MAIN_LANE, tool: event.tool, ...digest, ...(safePath ? { path: safePath } : {}) };
   }
   if (event.event === "dispatch" && DELEGATION_TOOLS.has(event.tool)) {
     const lane = normalizeLane(event.lane);
@@ -303,9 +244,7 @@ function normalizeAuditEvent(event) {
           lane,
           tool: event.tool,
           reason: event.reason,
-          ...posture,
           ...digest,
-          ...(event.suppressed === true ? { suppressed: true } : {})
         }
       : null;
   }
@@ -327,17 +266,15 @@ function normalizeAuditEvent(event) {
   }
   if (event.event === "warn" && event.reason === READ_STREAK_ADVISORY_REASON && event.lane === MAIN_LANE &&
     (event.tool === BASH_TOOL || ["Read", "Grep", "Glob"].includes(event.tool)) &&
-    Number.isSafeInteger(event.streakTurns) && event.streakTurns >= 1) {
+    (event.replayTokens === undefined || Number.isSafeInteger(event.replayTokens) && event.replayTokens >= 0)) {
     return {
       schemaVersion: AUDIT_SCHEMA_VERSION,
       at: new Date(atMs).toISOString(),
       session,
       event: "warn",
       reason: READ_STREAK_ADVISORY_REASON,
-      streakTurns: event.streakTurns,
       ...replay,
       ...(replay.replayTokens !== undefined && Number.isSafeInteger(event.budget) && event.budget > 0 ? { budget: event.budget } : {}),
-      ...posture,
       ...digest,
       lane: MAIN_LANE,
       tool: event.tool
@@ -358,10 +295,8 @@ function normalizeAuditEvent(event) {
       lane: MAIN_LANE,
       tool: event.tool,
       description: REAPED_WORKER_REDIRECT_AUDIT_DESCRIPTION,
-      mode: event.mode,
-      ...posture,
+      ...(event.mode ? { mode: event.mode } : {}),
       ...digest,
-      ...(event.event === "warn" && event.suppressed === true ? { suppressed: true } : {})
     };
   }
   if (
@@ -389,10 +324,8 @@ function normalizeAuditEvent(event) {
       dispatchCount: event.dispatchCount,
       budget: event.budget,
       ...replay,
-      mode: event.mode,
-      ...posture,
+      ...(event.mode ? { mode: event.mode } : {}),
       ...digest,
-      ...(event.event === "warn" && event.suppressed === true ? { suppressed: true } : {})
     };
   }
   return null;

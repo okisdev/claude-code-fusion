@@ -5,7 +5,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { test } from "node:test";
 
-import { briefAdvisory, peerBrief } from "../plugins/fusion/scripts/brief-sensor.mjs";
+import { briefAdvisory, handleBriefSensor, peerBrief } from "../plugins/fusion/scripts/brief-sensor.mjs";
 import { messageTag } from "../plugins/fusion/scripts/lib/user-messages.mjs";
 
 const repoRoot = path.join(import.meta.dirname, "..");
@@ -114,6 +114,28 @@ test("briefAdvisory preserves check order and excludes clean findings", () => {
   assert.ok(!advisory.includes("It names no checkable completion condition"));
 });
 
+test("the in-process sensor aborts at 1.2 seconds and fails open at 1.5 seconds", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  let signal;
+  t.mock.method(globalThis, "fetch", (_url, options) => {
+    signal = options.signal;
+    return new Promise(() => {});
+  });
+  let settled = false;
+  const pending = handleBriefSensor(hookInput(), envFor("https://classifier.invalid")).then((result) => {
+    settled = true;
+    return result;
+  });
+  assert.strictEqual(signal.aborted, false);
+  t.mock.timers.tick(1_200);
+  assert.strictEqual(signal.aborted, true);
+  await Promise.resolve();
+  assert.strictEqual(settled, false);
+  t.mock.timers.tick(300);
+  assert.deepStrictEqual(await pending, {});
+  assert.strictEqual(settled, true);
+});
+
 test("the hook emits one advisory output without a permission decision", async (t) => {
   const server = await startServer(t, (_request, response) => response.end(JSON.stringify({ answers: answerSet(0.9) })));
   const result = await runHook(JSON.stringify(hookInput()), envFor(server.endpoint));
@@ -167,10 +189,12 @@ test("the hook fails open for classifier, key, peer, and stdin failures", async 
   assert.strictEqual(beforeMalformed, 1);
 });
 
-test("brief sensor is wired to Agent and Task PreToolUse hooks", () => {
+test("brief sensor shares the Agent and Task PreToolUse dispatcher", () => {
   const hooks = JSON.parse(fs.readFileSync(path.join(repoRoot, "plugins", "fusion", "hooks", "hooks.json"), "utf8"));
   const block = hooks.hooks.PreToolUse.find(({ matcher }) => matcher === "^(Agent|Task)$");
 
   assert.ok(block);
-  assert.ok(block.hooks.some(({ command, timeout }) => timeout === 10 && command.endsWith('scripts/brief-sensor.mjs"')));
+  assert.strictEqual(block.hooks.length, 1);
+  assert.ok(block.hooks.every(({ command, timeout }) => timeout === 10 && command.endsWith('scripts/fusion-hook.mjs"')));
+  assert.ok(!JSON.stringify(hooks).includes("brief-sensor.mjs"));
 });

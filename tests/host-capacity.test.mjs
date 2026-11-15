@@ -7,6 +7,7 @@ import { test } from "node:test";
 import { hostPeerCapacity, hostPeerCapacityDenial, createDispatch, reserveHostPeerCapacity } from "../plugins/fusion/scripts/lib/lifecycle/dispatch.mjs";
 import { workerLimits } from "../plugins/fusion/scripts/lib/lifecycle/budget.mjs";
 import { handlePreToolUse, handlePostToolUse } from "../plugins/fusion/scripts/lib/lifecycle/tools.mjs";
+import { collectHookResult, renderHookResult } from "../plugins/fusion/scripts/lib/lifecycle/output.mjs";
 import { buildFusionStats } from "../plugins/fusion/scripts/lib/stats/aggregation.mjs";
 import { renderFusionStats } from "../plugins/fusion/scripts/lib/stats/rendering.mjs";
 import { messageTag } from "../plugins/fusion/scripts/lib/user-messages.mjs";
@@ -82,15 +83,7 @@ test("host capacity skips old wrapper records before opening them", (t) => {
 });
 
 function hookOutput(callback) {
-  const original = process.stdout.write;
-  let output = "";
-  process.stdout.write = (chunk) => { output += chunk; return true; };
-  try {
-    callback();
-    return output;
-  } finally {
-    process.stdout.write = original;
-  }
+  return renderHookResult(collectHookResult(callback), "PreToolUse");
 }
 
 test("synchronous peer PreToolUse bursts reserve host slots and PostToolUse releases one", (t) => {

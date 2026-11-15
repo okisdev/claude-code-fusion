@@ -2,6 +2,7 @@ import { isVerificationCommand } from "../verification-command.mjs";
 import { recordAuditEvent } from "./audit.mjs";
 import { bashWriteEffect, isReadOnlyBash } from "./bash-effect.mjs";
 import { BASH_TOOL, DELEGATION_TOOLS, MAIN_LANE, READ_TOOLS, WRITE_TOOLS } from "./constants.mjs";
+import { updateReadStreak } from "./read-streak.mjs";
 import { isNewTurn, outranksReplayKind, readTurn, turnReplayTokens } from "./replay.mjs";
 import { normalizeState, readState, withAvailableStateLock, withStateLock, writeState } from "./state.mjs";
 import { extractBashCommand } from "./verification.mjs";
@@ -30,11 +31,13 @@ function recordTurn(input, env, { sessionId, toolName, file, now, cwd }) {
       state.turn.id ??= turn.id;
       if (raisedKind) state.turn.kind = kind;
     }
+    const result = { newTurn, kind, tokens: state.turn.tokens };
+    result.readStreak = updateReadStreak(state, env, { toolName, turn: result });
     writeState(file, state);
     if (newTurn || raisedKind) {
       recordAuditEvent({ at: now, session: sessionId, event: "replay", lane: MAIN_LANE, tool: toolName, turn: state.turn.key, kind: state.turn.kind, tokens: state.turn.tokens, measured: state.turn.measured }, env);
     }
-    return { newTurn, kind, tokens: state.turn.tokens };
+    return result;
   });
 }
 

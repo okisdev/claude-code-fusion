@@ -4,48 +4,34 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { handleLifecycleHook } from "./worker-lifecycle.mjs";
-import { handleInlineDelegationHook } from "./inline-delegation-guard.mjs";
+import { handleLifecycleHook, handlesLifecycleHook } from "./worker-lifecycle.mjs";
+import { mergeHookResults, renderHookResult } from "./lib/lifecycle/output.mjs";
 
-function parseOutput(stdout) {
-  return stdout.trim() ? JSON.parse(stdout) : null;
-}
+export { mergeHookResults } from "./lib/lifecycle/output.mjs";
 
-export function mergeHookResults(lifecycle, guard) {
-  const first = parseOutput(lifecycle.stdout);
-  const second = parseOutput(guard.stdout);
-  const outputs = [first, second].filter(Boolean);
-  const denial = outputs.find((output) => output.hookSpecificOutput?.permissionDecision === "deny" || output.decision === "block");
-  let output = null;
+const GUARD_TOOLS = new Set(["Read", "Grep", "Glob", "Edit", "Write", "NotebookEdit", "MultiEdit", "Bash", "Agent", "Task", "SendMessage", "TaskOutput", "TaskStop"]);
 
-  if (outputs.length > 0) {
-    output = { ...first, ...second };
-    const hookOutputs = outputs.map((item) => item.hookSpecificOutput).filter(Boolean);
-    if (hookOutputs.length > 0) {
-      const merged = { ...first?.hookSpecificOutput, ...second?.hookSpecificOutput, ...denial?.hookSpecificOutput };
-      if (denial) delete merged.updatedInput;
-      const contexts = hookOutputs.map((item) => item.additionalContext).filter((value) => typeof value === "string" && value.length > 0);
-      if (contexts.length > 0) merged.additionalContext = contexts.join("\n");
-      output.hookSpecificOutput = merged;
-    }
-    if (denial?.decision === "block") {
-      output.decision = "block";
-      output.reason = denial.reason;
-    }
-    const messages = outputs.map((item) => item.systemMessage).filter((value) => typeof value === "string" && value.length > 0);
-    if (messages.length > 0) output.systemMessage = messages.join("\n");
+export async function handleFusionHook(input, env = process.env) {
+  if (!input) return {};
+  const lifecycleHandled = handlesLifecycleHook(input);
+  const guardHandled = ["PreToolUse", "PostToolUse", "PostToolUseFailure"].includes(input.hook_event_name) && GUARD_TOOLS.has(input.tool_name) && !(typeof input.agent_id === "string" && input.agent_id.length > 0);
+  if (!lifecycleHandled && !guardHandled) return {};
+  const lifecycle = lifecycleHandled ? await handleLifecycleHook(input, env) : {};
+  if (input.hook_event_name === "PreToolUse" && lifecycle.decision === "deny") return lifecycle;
+  let result = lifecycle;
+  if (guardHandled) {
+    const { handleInlineDelegationHook } = await import("./inline-delegation-guard.mjs");
+    result = mergeHookResults(result, handleInlineDelegationHook(input, env));
   }
-
-  return {
-    stdout: output ? `${JSON.stringify(output)}\n` : "",
-    stderr: `${lifecycle.stderr}${guard.stderr}`,
-    exitCode: Math.max(lifecycle.exitCode, guard.exitCode)
-  };
-}
-
-export function handleFusionHook(input, env = process.env) {
-  if (!input) return { stdout: "", stderr: "", exitCode: 0 };
-  return mergeHookResults(handleLifecycleHook(input, env), handleInlineDelegationHook(input, env));
+  if (input.hook_event_name === "PreToolUse" && ["Agent", "Task"].includes(input.tool_name) && result.decision !== "deny") {
+    try {
+      const { handleBriefSensor } = await import("./brief-sensor.mjs");
+      result = mergeHookResults(result, await handleBriefSensor(input, env));
+    } catch {
+      void 0;
+    }
+  }
+  return result;
 }
 
 function readHookInput() {
@@ -64,8 +50,7 @@ function isMain() {
 }
 
 if (isMain()) {
-  const result = handleFusionHook(readHookInput());
-  if (result.stdout) process.stdout.write(result.stdout);
-  if (result.stderr) process.stderr.write(result.stderr);
-  process.exitCode = result.exitCode;
+  const input = readHookInput();
+  const stdout = renderHookResult(await handleFusionHook(input), input?.hook_event_name);
+  if (stdout) process.stdout.write(stdout);
 }

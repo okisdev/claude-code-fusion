@@ -1,4 +1,4 @@
-import { engineAcceptanceTransport, recordEngineAcceptance } from "../../lib/engine-acceptance.mjs";
+import { deliverWorkerEngineAcceptance, engineAcceptanceTransport, prepareEngineAcceptanceDelivery, recordEngineAcceptance, retryWorkerEngineAcceptances } from "../../lib/engine-acceptance.mjs";
 import { readEngineJobRecord } from "../../lib/engine-job-state.mjs";
 import { ENGINE_IDS, ENGINE_TERMINAL_STATUSES, engineDisplayName, engineDisplayNameList, engineStateRoots, isEngineId } from "../../lib/engines.mjs";
 import { WORKER_TERMINAL_STATUSES, readWorkerRecord, readWorkerRecords, recordWorkerAcceptance, validateWorkerAcceptance } from "../../lib/worker-state.mjs";
@@ -44,12 +44,19 @@ function settleWorkerRecord({ taskId, verdict, source, reason, failureKind, acce
   ].filter((id) => !previousJobIds.has(id)))] : [];
   if (peerJobIds.length === 0) {
     const settlement = recordWorkerAcceptance({ taskId, acceptance: verdict, env, source, reason, failureKind, acceptFailedTransport });
-    const worker = settlement.record;
+    let worker = settlement.record;
+    if (worker.engineAcceptanceDelivery) {
+      try {
+        worker = deliverWorkerEngineAcceptance({ taskId, env, asJson });
+      } catch {
+        void 0;
+      }
+    }
     writeRecordConfirmation({ kind: "worker", worker, queued: settlement.queued, asJson, stdout });
     return [worker];
   }
   validateWorkerAcceptance({ record: current, taskId, acceptance: verdict, source, reason, failureKind, acceptFailedTransport, engineLedgerWritten: true });
-  const settledPeers = [];
+  const jobs = [];
   for (const jobId of peerJobIds) {
     const finalPeer = jobId === peerJobId;
     const retainedEngines = finalPeer ? [] : ENGINE_IDS.filter((engine) => readEngineJobRecord(engine, jobId, env) !== null);
@@ -74,30 +81,33 @@ function settleWorkerRecord({ taskId, verdict, source, reason, failureKind, acce
       stderr.write(`Skipped engine settlement for ${engineDisplayName(engine)} job ${jobId}: error transport is not a salvage failure.\n`);
       continue;
     }
-    try {
-      recordEngineAcceptance({ engine, jobId, acceptance: verdict, source, reason, failureKind, acceptFailedTransport: transport.acceptFailedTransport, asJson, env });
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      if (!finalPeer) {
+    jobs.push({ engine, jobId });
+  }
+  let settlement;
+  try {
+    settlement = recordWorkerAcceptance({ taskId, acceptance: verdict, env, source, reason, failureKind, acceptFailedTransport, engineLedgerWritten: jobs.some(({ jobId }) => jobId === peerJobId), engineAcceptanceDelivery: (record) => prepareEngineAcceptanceDelivery(record, { jobs, acceptFailedTransport }).engineAcceptanceDelivery });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    throw new Error(`Fusion worker task ${taskId} was not settled: ${message}`);
+  }
+  let worker = settlement.record;
+  if (settlement.queued) {
+    writeRecordConfirmation({ kind: "worker", worker, queued: true, asJson, stdout });
+    return [worker];
+  }
+  worker = deliverWorkerEngineAcceptance({ taskId, asJson, env });
+  const settledPeers = [];
+  for (const { engine, jobId } of jobs) {
+    const entry = worker.engineAcceptanceDelivery.entries.find((candidate) => candidate.engine === engine && candidate.jobId === jobId);
+    if (entry.status !== "delivered") {
+      const message = entry.lastError ?? "Engine acceptance delivery is pending.";
+      if (jobId !== peerJobId) {
         stderr.write(`Skipped engine settlement for ${engineDisplayName(engine)} job ${jobId}: ${message}\n`);
         continue;
       }
       throw new Error(`Engine settlement failed for ${engineDisplayName(engine)} job ${jobId}: ${message}`);
     }
     settledPeers.push({ engine, jobId, acceptance: verdict });
-  }
-  let settlement;
-  try {
-    settlement = recordWorkerAcceptance({ taskId, acceptance: verdict, env, source, reason, failureKind, acceptFailedTransport, engineLedgerWritten: settledPeers.some(({ jobId }) => jobId === peerJobId) });
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    const settled = settledPeers.map(({ engine, jobId }) => `${engineDisplayName(engine)} job ${jobId}`).join(", ");
-    throw new Error(`${settled ? `Engine settlement succeeded for ${settled}, but ` : ""}Fusion worker task ${taskId} was not settled: ${message}`);
-  }
-  const worker = settlement.record;
-  if (settlement.queued) {
-    writeRecordConfirmation({ kind: "worker", worker, asJson, stdout });
-    return [worker];
   }
   writeRecordConfirmation({ kind: "worker", worker, asJson, stdout });
   for (const { engine, jobId } of settledPeers) {
@@ -109,11 +119,20 @@ function settleWorkerRecord({ taskId, verdict, source, reason, failureKind, acce
 function settleEngineRecord({ jobId, verdict, source, reason, failureKind, acceptFailedTransport = false, asJson, env, stdout }) {
   const engine = resolveEngineJob(jobId, env);
   const confirmation = { engine, jobId, acceptance: verdict };
-  recordEngineAcceptance({ engine, jobId, acceptance: verdict, source, reason, failureKind, acceptFailedTransport, asJson, env });
+  const settlements = readWorkerRecords(env).filter((candidate) => candidate.peerJobId === jobId).map((record) => recordWorkerAcceptance({ taskId: record.taskId, acceptance: verdict, env, source, reason, failureKind, acceptFailedTransport, engineLedgerWritten: record.peerEngine === engine, engineAcceptanceDelivery: (current) => prepareEngineAcceptanceDelivery(current, { jobs: [{ engine, jobId }], acceptFailedTransport }).engineAcceptanceDelivery }));
+  if (settlements.every((settlement) => settlement.queued)) {
+    const result = recordEngineAcceptance({ engine, jobId, acceptance: verdict, source, reason, failureKind, acceptFailedTransport, asJson, env });
+    if (!result.updated) throw result.error ?? new Error("Engine acceptance record update failed.");
+  }
+  for (const settlement of settlements.filter((candidate) => !candidate.queued)) {
+    const worker = deliverWorkerEngineAcceptance({ taskId: settlement.record.taskId, asJson, env });
+    const entry = worker.engineAcceptanceDelivery.entries.find((candidate) => candidate.engine === engine && candidate.jobId === jobId);
+    if (entry.status !== "delivered") throw new Error(entry.lastError ?? "Engine acceptance delivery is pending.");
+    settlement.record = worker;
+  }
   writeRecordConfirmation({ kind: "engine", engine, jobId, worker: confirmation, asJson, stdout });
   const writes = [confirmation];
-  for (const record of readWorkerRecords(env).filter((candidate) => candidate.peerJobId === jobId)) {
-    const settlement = recordWorkerAcceptance({ taskId: record.taskId, acceptance: verdict, env, source, reason, failureKind, acceptFailedTransport, engineLedgerWritten: record.peerEngine === engine });
+  for (const settlement of settlements) {
     writeRecordConfirmation({ kind: "worker", worker: settlement.record, queued: settlement.queued, asJson, stdout });
     writes.push(settlement.record);
   }
@@ -144,7 +163,7 @@ function validateEngineSettlement({ jobId, verdict, source, reason, failureKind,
   const engine = resolveEngineJob(jobId, env);
   requireTerminalEngineSettlement(engine, jobId, env);
   for (const record of readWorkerRecords(env).filter((candidate) => candidate.peerJobId === jobId)) {
-    validateWorkerAcceptance({ record, taskId: record.taskId, acceptance: verdict, source, reason, failureKind, acceptFailedTransport });
+    validateWorkerAcceptance({ record, taskId: record.taskId, acceptance: verdict, source, reason, failureKind, acceptFailedTransport, engineLedgerWritten: record.peerEngine === engine });
   }
 }
 
@@ -161,6 +180,8 @@ function validateRecordSettlements({ records, source, acceptFailedTransport, env
 
 export function settleRecords({ records, source, acceptFailedTransport = false, asJson, env, stdout, stderr }) {
   validateRecordSettlements({ records, source, acceptFailedTransport, env });
+  const requestedIds = new Set(records.map(({ id }) => id));
+  const skipTaskIds = new Set(readWorkerRecords(env).filter((record) => requestedIds.has(record.taskId) || requestedIds.has(record.peerJobId)).map((record) => record.taskId));
   const writes = [];
   const errors = [];
   for (const { id, verdict, reason = null, failureKind = null, acceptFailedTransport: pairAcceptFailedTransport } of records) {
@@ -177,5 +198,6 @@ export function settleRecords({ records, source, acceptFailedTransport = false, 
       stderr.write(`Failed to settle ${id}: ${error instanceof Error ? error.message : String(error)}\n`);
     }
   }
+  retryWorkerEngineAcceptances({ env, skipTaskIds });
   return { writes, errors };
 }

@@ -5,6 +5,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { ENGINES, PEER_JOB_FOOTER_AGENTS, isEngineId } from "./engines.mjs";
+import { readJsonFile, withFileLock, writeFileAtomic } from "./storage.mjs";
 
 const DATA_DIR_ENV = "FUSION_DATA_DIR";
 const WORKER_STATE_ENV = "FUSION_WORKER_STATE_DIR";
@@ -14,8 +15,6 @@ const DAY_MS = 24 * 60 * 60 * 1000;
 const RETENTION_SWEEP_INTERVAL_MS = 6 * 60 * 60 * 1000;
 const RETENTION_STAMP = ".retention-sweep";
 const RECORD_SIDECAR_SUFFIXES = ["final.txt", "brief.txt"];
-const LOCK_STALE_MS = 30_000;
-const LOCK_WAIT_MS = 10;
 export const DEFAULT_LOCK_TIMEOUT_MS = 5_000;
 const LOCK_TIMEOUT_ENV = "FUSION_LOCK_TIMEOUT_MS";
 const TRANSCRIPT_CHUNK_BYTES = 1024 * 1024;
@@ -81,63 +80,6 @@ export function resolveLockTimeoutMs(env = process.env) {
   return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : DEFAULT_LOCK_TIMEOUT_MS;
 }
 
-function waitForLock() {
-  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, LOCK_WAIT_MS);
-}
-
-function acquireLock(file) {
-  fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
-  try {
-    fs.chmodSync(path.dirname(file), 0o700);
-  } catch {
-    void 0;
-  }
-  const lockFile = `${file}.lock`;
-  const deadline = Date.now() + resolveLockTimeoutMs();
-  for (;;) {
-    try {
-      const descriptor = fs.openSync(lockFile, fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_WRONLY, 0o600);
-      fs.writeFileSync(descriptor, String(process.pid));
-      try {
-        fs.fchmodSync(descriptor, 0o600);
-      } catch {
-        void 0;
-      }
-      return () => {
-        fs.closeSync(descriptor);
-        fs.rmSync(lockFile, { force: true });
-      };
-    } catch (error) {
-      if (error?.code !== "EEXIST") {
-        throw error;
-      }
-      try {
-        if (Date.now() - fs.statSync(lockFile).mtimeMs > LOCK_STALE_MS) {
-          fs.rmSync(lockFile, { force: true });
-          continue;
-        }
-      } catch (statError) {
-        if (statError?.code === "ENOENT") {
-          continue;
-        }
-      }
-      if (Date.now() >= deadline) {
-        throw new Error("timed out waiting for Fusion worker state lock");
-      }
-      waitForLock();
-    }
-  }
-}
-
-function withLock(file, callback) {
-  const release = acquireLock(file);
-  try {
-    return callback();
-  } finally {
-    release();
-  }
-}
-
 export function resolveFusionDataDir(env = process.env) {
   const override = env[DATA_DIR_ENV];
   if (override && String(override).trim()) {
@@ -170,12 +112,12 @@ export function readPeerCapacityReservations(env = process.env) {
 
 export function withPeerCapacityReservations(env, callback) {
   const file = peerCapacityReservationsFile(env);
-  return withLock(file, () => {
+  return withFileLock(file, () => {
     const reservations = readPeerCapacityReservations(env);
     const before = JSON.stringify(reservations);
     const result = callback(reservations);
     if (JSON.stringify(reservations) !== before) {
-      writePrivateFile(file, `${JSON.stringify(reservations)}\n`);
+      writeFileAtomic(file, `${JSON.stringify(reservations)}\n`);
     }
     return result;
   });
@@ -264,12 +206,17 @@ function appendWorkerRollups(root, records) {
   if (!records.length) {
     return;
   }
+  const retired = new Set(readWorkerRollupRows(root).flatMap((row) => row.retirementIds ?? []));
   const rows = new Map();
-  for (const record of records) {
-    const row = workerRollup(record);
+  for (const { entry, record } of records) {
+    if (retired.has(entry)) {
+      continue;
+    }
+    const row = { ...workerRollup(record ?? {}), retirementIds: [entry] };
     const key = JSON.stringify([row.month, row.agentType, row.model, row.transportStatus, row.acceptance, row.failureKind]);
     const current = rows.get(key);
     if (current) {
+      current.retirementIds.push(entry);
       current.count += 1;
       current.wallClockMsSum += row.wallClockMsSum;
       current.outputTokensSum += row.outputTokensSum;
@@ -278,6 +225,9 @@ function appendWorkerRollups(root, records) {
     } else {
       rows.set(key, row);
     }
+  }
+  if (rows.size === 0) {
+    return;
   }
   ensurePrivateDirectory(root);
   const file = path.join(root, "rollup.jsonl");
@@ -290,10 +240,10 @@ function appendWorkerRollups(root, records) {
   }
 }
 
-export function readWorkerRollups(env = process.env) {
+function readWorkerRollupRows(root) {
   let content;
   try {
-    content = fs.readFileSync(path.join(resolveWorkerStateDir(env), "rollup.jsonl"), "utf8");
+    content = fs.readFileSync(path.join(root, "rollup.jsonl"), "utf8");
   } catch (error) {
     if (error?.code === "ENOENT") {
       return [];
@@ -301,6 +251,10 @@ export function readWorkerRollups(env = process.env) {
     throw error;
   }
   return content.split("\n").filter(Boolean).map((line) => JSON.parse(line));
+}
+
+export function readWorkerRollups(env = process.env) {
+  return readWorkerRollupRows(resolveWorkerStateDir(env)).map(({ retirementIds: _retirementIds, ...row }) => row);
 }
 
 export function pruneExpiredWorkerRecords(env = process.env, nowMs = Date.now(), { force = false } = {}) {
@@ -314,12 +268,12 @@ export function pruneExpiredWorkerRecords(env = process.env, nowMs = Date.now(),
   if (!force && retentionSweepIsRecent(stampFile, nowMs)) {
     return summary;
   }
-  return withLock(stampFile, () => {
+  return withFileLock(stampFile, () => {
     if (!force && retentionSweepIsRecent(stampFile, nowMs)) {
       return summary;
     }
     const result = sweepExpiredWorkerRecords(env, nowMs, root);
-    writePrivateFile(stampFile, String(nowMs));
+    writeFileAtomic(stampFile, String(nowMs));
     return result;
   });
 }
@@ -343,7 +297,7 @@ function sweepExpiredWorkerRecords(env, nowMs, root) {
     }
     expired.push({ entry, file, record });
   }
-  appendWorkerRollups(root, expired.map(({ record }) => record ?? {}));
+  appendWorkerRollups(root, expired);
   for (const { entry, file } of expired) {
     const taskId = entry.slice(0, -".json".length);
     for (const suffix of RECORD_SIDECAR_SUFFIXES) {
@@ -488,30 +442,12 @@ function ensurePrivateDirectory(directory) {
   }
 }
 
-function writePrivateFile(file, content) {
-  ensurePrivateDirectory(path.dirname(file));
-  const temporary = path.join(path.dirname(file), `.${path.basename(file)}.${process.pid}.${randomUUID()}.tmp`);
-  const descriptor = fs.openSync(temporary, fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_WRONLY, 0o600);
-  try {
-    fs.writeFileSync(descriptor, content);
-    fs.fchmodSync(descriptor, 0o600);
-  } finally {
-    fs.closeSync(descriptor);
-  }
-  fs.renameSync(temporary, file);
-  try {
-    fs.chmodSync(file, 0o600);
-  } catch {
-    void 0;
-  }
-}
-
 export function writePrivateText(file, text) {
-  writePrivateFile(file, text);
+  writeFileAtomic(file, text);
 }
 
 function writePrivateJson(file, value) {
-  writePrivateFile(file, `${JSON.stringify(value, null, 2)}\n`);
+  writeFileAtomic(file, `${JSON.stringify(value, null, 2)}\n`);
 }
 
 function canonicalCollectionMethod(value) {
@@ -573,7 +509,7 @@ export function readWorkerOutputFileTaskIds(sessionId, outputPath, env = process
 
 function readWorkerRecordFile(file) {
   try {
-    const value = JSON.parse(fs.readFileSync(file, "utf8"));
+    const value = readJsonFile(file, null);
     return value && typeof value === "object" && !Array.isArray(value) ? value : null;
   } catch {
     return null;
@@ -590,7 +526,7 @@ export function readWorkerSessionState(sessionId, env = process.env) {
 
 export function updateWorkerSessionState(sessionId, env, updater) {
   const file = workerSessionStateFile(sessionId, env);
-  return withLock(file, () => {
+  return withFileLock(file, () => {
     const current = readWorkerRecordFile(file);
     const next = updater(current);
     if (!next || typeof next !== "object" || Array.isArray(next)) {
@@ -603,7 +539,7 @@ export function updateWorkerSessionState(sessionId, env, updater) {
 
 export function updateWorkerRecord(taskId, env, updater) {
   const file = workerRecordFile(taskId, env);
-  return withLock(file, () => {
+  return withFileLock(file, () => {
     const current = readWorkerRecordFile(file);
     const next = updater(current);
     if (!next || typeof next !== "object" || Array.isArray(next)) {
@@ -675,7 +611,7 @@ export function createWorkerRecord(record, env = process.env) {
   if (sessionState && !sessionState.outputFiles) {
     buildWorkerOutputIndex(record.sessionId, env);
   }
-  return withLock(file, () => {
+  return withFileLock(file, () => {
     if (readWorkerRecordFile(file)) {
       throw new Error(`Fusion worker task ${record.taskId} already exists.`);
     }
@@ -831,12 +767,6 @@ export function readSessionWorkerRecords(env = process.env, sessionId, { strict 
     }
     return [];
   });
-}
-
-export function findWorkerRecord(predicate, env = process.env, options = {}) {
-  const matches = readWorkerRecords(env, options).filter(predicate);
-  matches.sort((left, right) => Date.parse(right.updatedAt ?? right.createdAt ?? "") - Date.parse(left.updatedAt ?? left.createdAt ?? ""));
-  return matches[0] ?? null;
 }
 
 function integer(value) {
@@ -1267,7 +1197,7 @@ export function isSettledWorker(record) {
   return record.acceptanceRecordedAt != null && record.awaitingVerdict !== true;
 }
 
-function updateWorkerAcceptance({ taskId, acceptance, env, source, safeReason, safeFailureKind, validateRecord, acceptFailedTransport = false, queueIfNonTerminal = false }) {
+function updateWorkerAcceptance({ taskId, acceptance, env, source, safeReason, safeFailureKind, validateRecord, acceptFailedTransport = false, queueIfNonTerminal = false, engineAcceptanceDelivery = null }) {
   let queued = false;
   const updated = updateWorkerRecord(taskId, env, (record) => {
     if (!record) {
@@ -1292,7 +1222,8 @@ function updateWorkerAcceptance({ taskId, acceptance, env, source, safeReason, s
       };
     }
     validateRecord(record);
-    return settleWorkerAcceptance(record, { acceptance, source, reason: safeReason, failureKind: safeFailureKind });
+    const settled = settleWorkerAcceptance(record, { acceptance, source, reason: safeReason, failureKind: safeFailureKind });
+    return { ...settled, ...(engineAcceptanceDelivery ? { engineAcceptanceDelivery: engineAcceptanceDelivery(settled) } : {}) };
   });
   return { record: updated, queued };
 }
@@ -1306,7 +1237,7 @@ export function validateWorkerAcceptance({ record, taskId, acceptance, source = 
   return { safeReason, safeFailureKind };
 }
 
-export function recordWorkerAcceptance({ taskId, acceptance, env = process.env, source = "main-loop", reason = null, failureKind = null, acceptFailedTransport = false, engineLedgerWritten = false }) {
+export function recordWorkerAcceptance({ taskId, acceptance, env = process.env, source = "main-loop", reason = null, failureKind = null, acceptFailedTransport = false, engineLedgerWritten = false, engineAcceptanceDelivery = null }) {
   const { safeReason, safeFailureKind } = validatedAcceptanceFields(acceptance, source, reason, failureKind);
   const result = updateWorkerAcceptance({
     taskId,
@@ -1317,6 +1248,7 @@ export function recordWorkerAcceptance({ taskId, acceptance, env = process.env, 
     safeFailureKind,
     acceptFailedTransport,
     queueIfNonTerminal: true,
+    engineAcceptanceDelivery,
     validateRecord(record) {
       workerAcceptanceGate(record, taskId, acceptance, acceptFailedTransport, engineLedgerWritten);
     }

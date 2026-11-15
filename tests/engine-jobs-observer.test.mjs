@@ -1,9 +1,11 @@
 import assert from "node:assert/strict";
+import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { test } from "node:test";
+import { setTimeout } from "node:timers/promises";
 
 import { fusionRepositoryKey, modelAuditSidecarPath, tokenUsageSidecarPath } from "../plugins/fusion/scripts/fusion-stats.mjs";
 import { engineJobsObserverStatePath, observeEngineJobs, observeEngineJobsSafely } from "../plugins/fusion/scripts/engine-jobs-observer.mjs";
@@ -32,6 +34,81 @@ function readJsonLines(file) {
     .split("\n")
     .map((line) => JSON.parse(line));
 }
+
+test("concurrent observers preserve every observed, unavailable, and notified update", { timeout: 30_000 }, async (t) => {
+  const root = sandbox(t);
+  const env = { FUSION_DATA_DIR: path.join(root, "fusion") };
+  const observedAt = "2026-07-22T00:00:00.000Z";
+  const stateFile = engineJobsObserverStatePath("grok", env);
+  const source = `
+    import fs from "node:fs";
+    import path from "node:path";
+    import { observeEngineJobs } from ${JSON.stringify(new URL("../plugins/fusion/scripts/engine-jobs-observer.mjs", import.meta.url).href)};
+    const [root, name, stateFile, observedAt] = process.argv.slice(1);
+    const ready = path.join(root, name + ".ready");
+    const release = path.join(root, "release");
+    const open = fs.openSync;
+    fs.openSync = (...args) => {
+      try { return open(...args); } catch (error) {
+        if (args[0] === stateFile + ".lock" && error.code === "EEXIST") fs.writeFileSync(ready, "waiting");
+        throw error;
+      }
+    };
+    const count = observeEngineJobs("grok", {
+      env: { FUSION_DATA_DIR: path.join(root, "fusion"), GROK_COMPANION_DATA: path.join(root, name) },
+      now: () => observedAt,
+      notify() {
+        fs.writeFileSync(ready, "notifying");
+        if (name === "first") {
+          const deadline = Date.now() + 20_000;
+          while (!fs.existsSync(release)) {
+            if (Date.now() > deadline) throw new Error("release timed out");
+            Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10);
+          }
+        }
+      }
+    });
+    if (count !== 2) throw new Error("expected two observations, received " + count);
+  `;
+  const start = (name) => {
+    const cwd = path.join(root, name + "-workspace");
+    writeEngineJob(path.join(root, name), cwd, name + "-available", { status: "done", usage: { output_tokens: 1 } });
+    writeEngineJob(path.join(root, name), cwd, name + "-unavailable", { status: "done" });
+    const child = spawn(process.execPath, ["--input-type=module", "--eval", source, root, name, stateFile, observedAt], {
+      env: { ...process.env, FUSION_LOCK_TIMEOUT_MS: "15000" }, stdio: ["ignore", "ignore", "pipe"]
+    });
+    let stderr = "";
+    child.stderr.on("data", (chunk) => { stderr += chunk; });
+    t.after(() => { if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL"); });
+    return new Promise((resolve, reject) => {
+      child.once("error", reject);
+      child.once("close", (code, signal) => resolve({ code, signal, stderr }));
+    });
+  };
+  const waitReady = async (name) => {
+    const deadline = Date.now() + 15_000;
+    while (!fs.existsSync(path.join(root, name + ".ready"))) {
+      assert.ok(Date.now() < deadline, name + " did not reach the observer transaction");
+      await setTimeout(10);
+    }
+  };
+  const first = start("first");
+  await waitReady("first");
+  const second = start("second");
+  try {
+    await waitReady("second");
+  } finally {
+    fs.writeFileSync(path.join(root, "release"), "");
+  }
+  for (const result of await Promise.all([first, second])) assert.strictEqual(result.code, 0, result.stderr || result.signal);
+  const state = JSON.parse(fs.readFileSync(stateFile, "utf8"));
+  assert.deepStrictEqual(state.observedJobIds, ["first-available", "second-available"]);
+  assert.deepStrictEqual(state.unavailableObservedAt, { "first-unavailable": observedAt, "second-unavailable": observedAt });
+  assert.deepStrictEqual(state.notifiedJobIds, ["first-available", "first-unavailable", "second-available", "second-unavailable"]);
+  assert.strictEqual(state.missingSince["first-available"], observedAt);
+  assert.strictEqual(state.missingSince["first-unavailable"], observedAt);
+  assert.strictEqual(fs.existsSync(`${stateFile}.lock`), false);
+});
 
 test("reobserves unavailable terminal jobs until usage becomes available", (t) => {
   const root = sandbox(t);

@@ -3,14 +3,50 @@
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { PEER_JOB_FOOTER_AGENTS, PEER_RESCUE_AGENT_NAMES } from "./lib/engines.mjs";
 import { tagMessage } from "./lib/user-messages.mjs";
-import { blockStop, denyTool, getOutputSink, setOutputSink, writeOutput } from "./lib/lifecycle/output.mjs";
-import { handleSessionEnd } from "./lib/lifecycle/session.mjs";
-import { handleStop } from "./lib/lifecycle/stop.mjs";
-import { handleSubagentStart, handleSubagentStop } from "./lib/lifecycle/subagents.mjs";
-import { handlePostToolUse, handlePreToolUse } from "./lib/lifecycle/tools.mjs";
+import { blockStop, collectHookResult, denyTool, renderHookResult, writeOutput } from "./lib/lifecycle/output.mjs";
 
-// Collection writes now live in lib/lifecycle/notifications.mjs; see markWorkerCollected(refreshed, WORKER_COLLECTION_METHODS.TASK_NOTIFICATION, now).
+const FUSION_WORKER_AGENT = /^(?:fusion:)?(?:fast-worker|claude-worker|trivial-worker|deep-reasoner|job-collector)$/;
+const HANDLERS = {
+  PreToolUse: ["tools", "handlePreToolUse"],
+  PostToolUse: ["tools", "handlePostToolUse"],
+  PostToolUseFailure: ["tools", "handlePostToolUse"],
+  SubagentStart: ["subagents", "handleSubagentStart"],
+  SubagentStop: ["subagents", "handleSubagentStop"],
+  Stop: ["stop", "handleStop"],
+  SessionEnd: ["session", "handleSessionEnd"]
+};
+
+function handlesLifecycleHook(input) {
+  if (!input) return false;
+  const worker = FUSION_WORKER_AGENT.test(input.agent_type);
+  const peer = PEER_JOB_FOOTER_AGENTS.has(input.agent_type);
+  const launch = ["Agent", "Task"].includes(input.tool_name);
+  const agentType = input.tool_input?.subagent_type;
+  const managedLaunch = FUSION_WORKER_AGENT.test(agentType) || PEER_RESCUE_AGENT_NAMES.has(agentType);
+  const message = input.tool_name === "SendMessage" && typeof input.tool_input?.to === "string";
+  const taskControl = ["TaskOutput", "TaskStop"].includes(input.tool_name);
+  switch (input.hook_event_name) {
+    case "PreToolUse":
+      if (launch) return managedLaunch || (agentType === "Explore" && !Object.hasOwn(input.tool_input, "model"));
+      return worker || message || (!input.agent_id && taskControl && typeof input.tool_input?.task_id === "string");
+    case "PostToolUse":
+    case "PostToolUseFailure":
+      if (message || (launch && input.hook_event_name === "PostToolUseFailure")) return true;
+      if (!input.agent_id && launch) return managedLaunch;
+      return worker || peer || (!input.agent_id && (taskControl || input.tool_name === "Read"));
+    case "SubagentStart":
+      return worker;
+    case "SubagentStop":
+      return worker || peer;
+    case "Stop":
+    case "SessionEnd":
+      return true;
+    default:
+      return false;
+  }
+}
 
 function readHookInput() {
   try {
@@ -25,63 +61,33 @@ function readHookInput() {
   }
 }
 
-function runHook(input, env = process.env) {
-  switch (input.hook_event_name) {
-    case "PreToolUse":
-      handlePreToolUse(input, env);
-      break;
-    case "PostToolUse":
-      handlePostToolUse(input, env, false);
-      break;
-    case "PostToolUseFailure":
-      handlePostToolUse(input, env, true);
-      break;
-    case "SubagentStart":
-      handleSubagentStart(input, env);
-      break;
-    case "SubagentStop":
-      handleSubagentStop(input, env);
-      break;
-    case "Stop":
-      handleStop(input, env);
-      break;
-    case "SessionEnd":
-      handleSessionEnd(input, env);
-      break;
-    default:
-      break;
-  }
-}
-
-function executeHook(input, env = process.env) {
-  if (!input) {
-    return;
-  }
+async function handleLifecycleHook(input, env = process.env) {
+  if (!handlesLifecycleHook(input)) return {};
+  let handler;
   try {
-    runHook(input, env);
-  } catch {
-    if (input.hook_event_name === "PreToolUse") {
-      writeOutput(denyTool(tagMessage("worker-lifecycle.state-unavailable", "Fusion lifecycle state is unavailable. Retry after restoring private worker state access.")));
-    } else if (input.hook_event_name === "Stop" || input.hook_event_name === "SubagentStop") {
-      writeOutput(blockStop(tagMessage("worker-lifecycle.state-unavailable", "Fusion lifecycle state is unavailable. Restore private worker state access before ending this task.")));
+    const [module, name] = HANDLERS[input.hook_event_name];
+    const handlers = await import(`./lib/lifecycle/${module}.mjs`);
+    handler = handlers[name];
+  } catch (error) {
+    handler = () => { throw error; };
+  }
+  return collectHookResult(() => {
+    try {
+      handler(input, env, input.hook_event_name === "PostToolUseFailure");
+    } catch {
+      if (input.hook_event_name === "PreToolUse") {
+        writeOutput(denyTool(tagMessage("worker-lifecycle.state-unavailable", "Fusion lifecycle state is unavailable. Retry after restoring private worker state access.")));
+      } else if (input.hook_event_name === "Stop" || input.hook_event_name === "SubagentStop") {
+        writeOutput(blockStop(tagMessage("worker-lifecycle.state-unavailable", "Fusion lifecycle state is unavailable. Restore private worker state access before ending this task.")));
+      }
     }
-  }
+  });
 }
 
-function handleLifecycleHook(input, env = process.env) {
-  let stdout = "";
-  const previousSink = getOutputSink();
-  setOutputSink((text) => { stdout += text; });
-  try {
-    executeHook(input, env);
-    return { stdout, stderr: "", exitCode: 0 };
-  } finally {
-    setOutputSink(previousSink);
-  }
-}
-
-function main() {
-  executeHook(readHookInput());
+async function main() {
+  const input = readHookInput();
+  const stdout = renderHookResult(await handleLifecycleHook(input), input?.hook_event_name);
+  if (stdout) process.stdout.write(stdout);
 }
 
 function isMain() {
@@ -89,12 +95,7 @@ function isMain() {
 }
 
 if (isMain()) {
-  main();
+  await main();
 }
 
-export { runHook, handleLifecycleHook };
-
-export { workerLimits } from "./lib/lifecycle/budget.mjs";
-export { validateWorkerBrief } from "./lib/lifecycle/dispatch.mjs";
-export { workerBudgetFailure } from "./lib/lifecycle/budget.mjs";
-export { settleOnlyRecords, reverifyInFlightRecords, runtimeTaskMissing, needsCancellation, reverifyCancellationRecords } from "./lib/lifecycle/stop.mjs";
+export { handleLifecycleHook, handlesLifecycleHook };

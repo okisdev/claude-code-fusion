@@ -21,6 +21,7 @@ import {
   workspaceRootsShareRepository
 } from "./fusion-stats.mjs";
 import { observeEngineJobsSafely } from "./engine-jobs-observer.mjs";
+import { retryWorkerEngineAcceptances } from "./lib/engine-acceptance.mjs";
 import { ENGINES, ENGINE_IDS, ENGINE_TERMINAL_STATUSES, engineResultCommand } from "./lib/engines.mjs";
 import { tagMessage } from "./lib/user-messages.mjs";
 
@@ -238,6 +239,7 @@ function formatOutcomeLine(record, engine = "codex") {
 }
 
 function observePeerJobs() {
+  retryWorkerEngineAcceptances();
   for (const engine of ENGINE_IDS) {
     if (engine === "codex") {
       continue;
