@@ -971,7 +971,7 @@ test("host check reports every blocker from an installed Grok companion in the e
   writeRecord(jobFile(path.join(sandbox.grokData, "state"), "workspace", "quota"), {
     status: "error", failureKind: "quota", finishedAt: new Date(Date.now() - 60000).toISOString()
   });
-  const result = run(sandbox);
+  const result = run(sandbox, { GROK_BIN: process.execPath });
   assert.strictEqual(result.status, 0);
   assert.match(result.stdout, /^fusion breaker advisory: treat the grok breaker.*\nGrok consult, write, review runs are blocked on this host \(sandbox\): Sandbox setup failed\.\nGrok consult runs are blocked on this host \(auth\): Sign in first\. \[fusion:/);
   assert.ok(result.stdout.endsWith(`${BREAKER_ADVISORY_TAG}\n`));
