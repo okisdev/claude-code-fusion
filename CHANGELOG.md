@@ -1,5 +1,11 @@
 # changelog
 
+## 0.0.80
+
+- the codex and grok plugin job monitors are gone. they started at session start and never exited, so every session that loaded the plugins kept live background work, never looked idle, and old versions' monitors piled up across upgrades. a manual `--background` receipt now names one Monitor watch on `<engine>-companion.mjs watch --job <id>` with the duration to request; the watch prints the job's completion line and exits, reports `orphaned` or `cleanup required` when the worker is gone or past its deadline, and exits with a re-arm line before the 30 minute Monitor cap. fusion orchestrated jobs never depended on the monitors.
+- engine acceptance delivery that failed after a settlement returned is retried at SubagentStop and Stop with backoff and a short budget, and an explicit `--record` settlement retries every pending delivery immediately. peer token observations are recorded at settlement.
+- `fusion-stats --unsettled` shows the 20 newest unsettled jobs from the last 7 days and says how many rows it hid; `--days n` widens the window and `--all` shows everything. one host listed about 330 rows back to july, which buried the session's own pending ids. rows without `finishedAt` use `createdAt`, and a repeated or invalid `--days` is rejected.
+
 ## 0.0.79
 
 - this release acts on a smoke test in fresh sessions on two hosts after 0.0.78, and verifies codex-cli 0.170.0 and grok 1.0.89.
