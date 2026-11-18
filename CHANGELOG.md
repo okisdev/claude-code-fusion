@@ -1,5 +1,19 @@
 # changelog
 
+## 0.0.78
+
+- this release verifies every companion against the engine CLIs installed on 2026-11-18 and adopts the claude code plugin surface changes since 2.1.300. codex was read from upstream source (rust-v0.162.1 to rust-v0.169.0), grok by comparing the 1.0.77 and 1.0.88 binaries (the public grok-build tree stops at 1.0.45), devin and cursor by probing the installed builds.
+- grok: the tested interval is 1.0.14 to before 1.0.89. on 1.0.88 a runtime socket symlink whose target grok's own deny list covers no longer blocks consult and review. write runs are refused while any per-home runtime socket exists (`~/.docker/desktop/docker.sock`, `~/.docker/run/docker.sock`, `~/.orbstack/run/docker.sock`), because a strict shell on macOS still reached the orbstack socket although grok listed it in `deny_paths`; removing the `/var/run/docker.sock` symlink does not lift that, stopping the engine does. prereleases do not get the 1.0.88 exemption. the contract records `deny_paths`, `platform: "macos/seatbelt"`, and that `--no-subagents` is honored headless.
+- codex: the tested interval is 0.154.0 to before 0.170.0, so `/codex:setup` reports ready on 0.169.0 again. since 0.169.0 untrusted directories keep project config and project mcp servers off even with workspace-write; the stderr warning is a diagnostic and the companion never passes `--trust`, which writes trust into the user's global config. "Policy-restricted capacity is unavailable" reads as `rate_limited`, model not found as `input`, a bare incomplete response as its own error. rollout partial text prefers `task_complete.last_agent_message` over the latest message.
+- devin: runs no longer import codex or kiro config. builds from 3000.13 run `acp --process-model in-process`, so the new background daemon cannot escape the job's process group and private home. the tested ceiling is 3000.15, and setup advises a verification pass for newer builds, as cursor's does.
+- cursor: verified on 2026.11.17-f532c45 with a real consult; the tested ceiling is 2026.12.01.
+- a claude worker whose model family hit its usage limit can rerun on another family before the reset, so deep-reasoner falls back to `model: opus` while fable is exhausted. aliases resolve through `ANTHROPIC_DEFAULT_*_MODEL` first, so a remapped alias cannot bypass the cooldown.
+- every plugin declares `engines: { "claude-code": ">=2.1.300" }`, and ci runs claude code 2.1.327.
+- TaskOutput handling is gone: claude code removed the tool in 2.1.277. SubagentStop collects from `last_assistant_message` unless the final turn handed its report back, and a placeholder (`waiting on <id>`, `await-output: pending`) is never accepted as a report, from SubagentStop or from a completion notification.
+- the codex volume lane runs gpt-6-sol at high: from 2026-10-29 gpt-6-luna at xhigh had 86.5% judged acceptance on write jobs, every rejection oversized, with no speed edge. breaker classification matches the codex companion.
+- bench: the lane runner drives devin, and the 2026-11-18 snapshot ran 72 attempts. every codex lane, including gpt-6.2-sol and gpt-6.2-astra, passed 9 of 9 on t05, t06, and t09, so gpt-6.1-sol stays the flagship default. devin burst keeps swe-2 at high (9 of 9) with kimi-k3.1-pro as the fallback (9 of 9); swe-2-flash failed 3 of 9.
+- tests: the codex jobs monitor sandboxes devin data (it scanned the real devin ledger every tick and missed its scan budget under the full suite), ready files wait for content, and the scripted codex fixture no longer leaks processes.
+
 ## 0.0.77
 
 - this release acts on a usage review of two hosts: fourteen days of transcripts (308 main sessions, about 4,300 USD of API-equivalent main loop cost) plus the fusion and peer ledgers. turns above 200,000 tokens of context took 72% of local cost and 79% on the second host; fusion bookkeeping took 2.7% and 4.9%.
