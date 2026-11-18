@@ -2412,7 +2412,7 @@ test("all plugin node hooks fail open without node and compact runs the session 
   for (const plugin of ["codex", "grok", "cursor", "fusion"]) {
     const hooks = JSON.parse(fs.readFileSync(path.join(repoRoot, "plugins", plugin, "hooks", "hooks.json"), "utf8")).hooks;
     for (const groups of Object.values(hooks)) for (const group of groups) for (const hook of group.hooks) {
-      if (!hook.command.includes("node ")) continue;
+      if (!hook.command.includes("node ") || hook.command.includes("session-start.mjs\" --compact")) continue;
       assert.ok(hook.command.startsWith("command -v node >/dev/null 2>&1 || exit 0; "), `${plugin}: ${hook.command}`);
       const result = spawnSync("/bin/sh", ["-c", hook.command], { env: { PATH: "/nonexistent", CLAUDE_PLUGIN_ROOT: "/nonexistent" }, encoding: "utf8" });
       assert.strictEqual(result.status, 0);
@@ -2421,7 +2421,11 @@ test("all plugin node hooks fail open without node and compact runs the session 
     }
     if (plugin === "fusion") {
       const compactCommand = hooks.SessionStart.find((group) => group.matcher === "compact").hooks[0].command;
-      assert.strictEqual(compactCommand, 'command -v node >/dev/null 2>&1 || exit 0; node "${CLAUDE_PLUGIN_ROOT}/scripts/session-start.mjs" --compact');
+      assert.strictEqual(compactCommand, `command -v node >/dev/null 2>&1 || { echo 'Fusion rules are in ~/.claude/rules/orchestration.md. Collect and settle any in-flight work. [fusion:9902]'; exit 0; }; node "\${CLAUDE_PLUGIN_ROOT}/scripts/session-start.mjs" --compact`);
+      const fallback = spawnSync("/bin/sh", ["-c", compactCommand], { env: { PATH: "/nonexistent", CLAUDE_PLUGIN_ROOT: "/nonexistent" }, encoding: "utf8" });
+      assert.strictEqual(fallback.status, 0);
+      assert.strictEqual(fallback.stdout, "Fusion rules are in ~/.claude/rules/orchestration.md. Collect and settle any in-flight work. [fusion:9902]\n");
+      assert.strictEqual(fallback.stderr, "");
     }
   }
 });
