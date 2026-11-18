@@ -1125,13 +1125,13 @@ test("an absolute deadline shortens the execution timeout", async (t) => {
   const startedAt = Date.now();
   const { outcome } = await runFixture(t, "hang", {
     deadlineMs: startedAt + 1200,
-    timeoutMs: 2000,
+    timeoutMs: 6000,
     terminationGraceMs: 100,
     waitForReady: true
   });
   assert.equal(outcome.failureKind, "timeout");
   assert.equal(outcome.timedOut, true);
-  assert.ok(Date.now() - startedAt < 3000);
+  assert.ok(Date.now() - startedAt < 4500, "the 1.2 s deadline, not the 6 s timeout, ends the run");
   await waitForProcessExit(outcome.pid);
 });
 
