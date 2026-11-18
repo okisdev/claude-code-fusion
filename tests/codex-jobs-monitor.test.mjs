@@ -119,6 +119,7 @@ function envFor(sandbox, extra = {}) {
   const env = { ...process.env };
   delete env.CLAUDE_CODE_SESSION_ID;
   delete env.FUSION_CODEX_COMPANION;
+  delete env.CLAUDE_PLUGIN_ROOT;
   return {
     ...env,
     FUSION_CODEX_STATE: sandbox.stateRoot,
@@ -138,6 +139,7 @@ function startMonitor(sandbox, env, { cwd = sandbox.workDir, script = monitorScr
     env,
     stdio: ["ignore", "pipe", "pipe"],
   });
+  const closed = once(child, "close");
   let started = false;
   child.once("spawn", () => {
     started = true;
@@ -154,6 +156,7 @@ function startMonitor(sandbox, env, { cwd = sandbox.workDir, script = monitorScr
   });
   return {
     child,
+    closed,
     started: () => started,
     lines: () => stdout.split("\n").filter(Boolean),
     stderr: () => stderr,
@@ -259,19 +262,17 @@ test("Codex monitor schedules slow scans while idle or foreign-owned and fast sc
   fs.utimesSync(staleFile, staleTime, staleTime);
   fs.utimesSync(staleSidecar, staleTime, staleTime);
   const env = envFor(sandbox, { ...probe.env, CLAUDE_CODE_SESSION_ID: "session-own", FUSION_CODEX_COMPANION: path.join(sandbox.root, "missing-companion.mjs") });
+  const foreign = seedJob(sandbox, { status: "running", claudeSessionId: "session-other" });
+  const own = seedJob(sandbox, { status: "running", claudeSessionId: "session-own" });
   const monitor = startMonitor(sandbox, env);
   await waitUntil(() => probe.delays().length >= 1);
-  assert.strictEqual(probe.delays()[0], 4000);
-  const foreign = seedJob(sandbox, { status: "running", claudeSessionId: "session-other" });
-  await waitUntil(() => probe.delays().length >= 2);
-  assert.strictEqual(probe.delays()[1], 4000);
-  const own = seedJob(sandbox, { status: "running", claudeSessionId: "session-own" });
-  await waitUntil(() => probe.delays().includes(1000));
+  assert.strictEqual(probe.delays()[0], 1000);
   writeJobRecordFile(own.file, { ...own.record, status: "done" });
   await waitUntil(() => probe.delays().slice(probe.delays().indexOf(1000) + 1).includes(4000));
   assert.strictEqual(fs.existsSync(staleSidecar), false);
   assert.ok(fs.existsSync(path.join(sandbox.fusionData, ".observation-prune-stamp")));
-  assert.strictEqual(monitor.child.exitCode, null, monitor.stderr());
+  assert.deepStrictEqual(await monitor.closed, [0, null], monitor.stderr());
+  assert.strictEqual(probe.delays().at(-1), 4000);
   fs.rmSync(foreign.file);
 });
 
@@ -279,6 +280,7 @@ test("Codex monitor prunes removed terminal jobs while keeping and deduplicating
   const sandbox = makeSandbox(t);
   const removed = seedJob(sandbox, { id: "removed-job", status: "running" });
   const retained = seedJob(sandbox, { id: "retained-job", status: "running" });
+  seedJob(sandbox, { id: "active-job", status: "running", pid: process.pid });
   const monitor = startMonitor(sandbox, envFor(sandbox, { CODEX_JOBS_MONITOR_INTERVAL_MS: "40", FUSION_CODEX_COMPANION: path.join(sandbox.root, "missing-companion.mjs") }));
   await waitUntil(() => readAnnouncedState(sandbox));
   writeJobRecordFile(removed.file, { ...removed.record, status: "done" });
@@ -390,7 +392,7 @@ test("a non-directory Grok state root leaves Codex announcements unchanged", asy
   assert.deepStrictEqual(lines, [
     `codex job ${record.id} done. collect with /codex:result ${record.id}; completion notices do not replace collection. ${MONITOR_TAG}`
   ]);
-  await assertMonitorStaysAlive(monitor);
+  assert.deepStrictEqual(await monitor.closed, [0, null], monitor.stderr());
 });
 
 test("a Grok observation produces no stdout", async (t) => {
@@ -444,6 +446,8 @@ test("a job transitioning to done emits exactly one correctly shaped line", asyn
   );
 
   await waitForAnnouncedRecord(sandbox, record.id);
+  assert.strictEqual(monitor.lines().length, 1);
+  assert.deepStrictEqual(await monitor.closed, [0, null], monitor.stderr());
   assert.strictEqual(monitor.lines().length, 1);
 });
 
@@ -1111,10 +1115,51 @@ test("skips silently when the state root does not exist", async (t) => {
   fs.rmSync(sandbox.stateRoot, { recursive: true, force: true });
   const monitor = startMonitor(sandbox, envFor(sandbox));
   t.after(() => monitor.child.kill("SIGKILL"));
-  await waitUntil(() => monitor.started());
+  assert.deepStrictEqual(await monitor.closed, [0, null], monitor.stderr());
   assert.deepStrictEqual(monitor.lines(), []);
   assert.strictEqual(monitor.stderr(), "");
   assert.strictEqual(fs.existsSync(sandbox.stateRoot), false);
+});
+
+test("an idle session exits silently even with foreign running jobs", async (t) => {
+  for (const foreign of [false, true]) {
+    const sandbox = makeSandbox(t);
+    if (foreign) seedJob(sandbox, { status: "running", claudeSessionId: "other-session" });
+    const monitor = startMonitor(sandbox, envFor(sandbox, { CLAUDE_CODE_SESSION_ID: "own-session" }));
+    assert.deepStrictEqual(await monitor.closed, [0, null], monitor.stderr());
+    assert.deepStrictEqual(monitor.lines(), []);
+    assert.strictEqual(monitor.stderr(), "");
+  }
+});
+
+test("overlapping skill monitors announce a shared job only once before exiting", async (t) => {
+  const sandbox = makeSandbox(t);
+  const { file, record } = seedJob(sandbox, { status: "running" });
+  const monitors = [startMonitor(sandbox, envFor(sandbox)), startMonitor(sandbox, envFor(sandbox))];
+  await waitUntil(() => readAnnouncedState(sandbox));
+  writeJobRecordFile(file, { ...record, status: "done" });
+  for (const monitor of monitors) assert.deepStrictEqual(await monitor.closed, [0, null], monitor.stderr());
+  const lines = monitors.flatMap((monitor) => monitor.lines());
+  assert.strictEqual(lines.length, 1);
+  assert.match(lines[0], new RegExp(`^codex job ${record.id} done\\.`));
+});
+
+test("a running monitor exits when its plugin root is removed or its installed version changes", async (t) => {
+  for (const change of ["removed", "upgraded", "uninstalled"]) {
+    const sandbox = makeSandbox(t);
+    const root = path.join(sandbox.root, "config", "plugins", "cache", "test-marketplace", "fusion", "0.0.78");
+    const registry = path.resolve(root, "../../../..", "installed_plugins.json");
+    fs.mkdirSync(root, { recursive: true });
+    fs.writeFileSync(registry, JSON.stringify({ version: 2, plugins: { "fusion@test-marketplace": [{ installPath: root }] } }));
+    seedJob(sandbox, { status: "running", pid: process.pid });
+    const monitor = startMonitor(sandbox, envFor(sandbox, { CLAUDE_PLUGIN_ROOT: root }));
+    await waitUntil(() => readAnnouncedState(sandbox));
+    if (change === "removed") fs.rmSync(root, { recursive: true });
+    else fs.writeFileSync(registry, JSON.stringify({ version: 2, plugins: change === "uninstalled" ? {} : { "fusion@test-marketplace": [{ installPath: path.join(path.dirname(root), "0.0.79") }] } }));
+    assert.deepStrictEqual(await monitor.closed, [0, null], monitor.stderr());
+    assert.deepStrictEqual(monitor.lines(), []);
+    assert.strictEqual(monitor.stderr(), "");
+  }
 });
 
 function writeFakePs(sandbox, output) {
@@ -1777,6 +1822,7 @@ fs.readdirSync = function (dir, ...args) {
 test("monitor scans parse only changed files and forget deleted file signatures", async (t) => {
   const sandbox = makeSandbox(t);
   const { file, record } = seedJob(sandbox, { id: "scan-job", request: { model: "gpt-5", effort: "high" } });
+  seedJob(sandbox, { id: "active-job", status: "running", pid: process.pid });
   const preload = path.join(sandbox.root, "count-job-reads.mjs");
   const log = path.join(sandbox.root, "reads.log");
   fs.writeFileSync(preload, `import fs from "node:fs";

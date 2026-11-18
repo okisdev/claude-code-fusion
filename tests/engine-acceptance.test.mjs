@@ -8,6 +8,8 @@ import { test } from "node:test";
 import { deliverWorkerEngineAcceptance, newestEngineCompanion, prepareEngineAcceptanceDelivery, recordEngineAcceptance, retryWorkerEngineAcceptances } from "../plugins/fusion/scripts/lib/engine-acceptance.mjs";
 import { settleQueuedVerdict } from "../plugins/fusion/scripts/lib/lifecycle/collection.mjs";
 import { createWorkerRecord, readWorkerRecord, recordWorkerAcceptance, reopenWorkerContinuation, updateWorkerRecord, workerRecordFile } from "../plugins/fusion/scripts/lib/worker-state.mjs";
+import { settleRecords } from "../plugins/fusion/scripts/lib/stats/settlement.mjs";
+import { tokenUsageSidecarPath } from "../plugins/fusion/scripts/lib/stats/evidence.mjs";
 
 function sandbox(t) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "engine-acceptance-test-"));
@@ -27,6 +29,26 @@ function cachedCompanion(home, version, modifiedAt) {
   fs.utimesSync(file, modifiedAt, modifiedAt);
   return file;
 }
+
+test("settlement observes peer token usage without starting a monitor", (t) => {
+  const root = sandbox(t);
+  const taskId = `fusion-${"d".repeat(24)}`;
+  const jobId = "e".repeat(32);
+  const env = { HOME: root, FUSION_DATA_DIR: path.join(root, "fusion"), FUSION_WORKER_STATE_DIR: path.join(root, "workers"), GROK_COMPANION_DATA: path.join(root, "grok"), CURSOR_COMPANION_DATA: path.join(root, "cursor"), DEVIN_COMPANION_DATA: path.join(root, "devin") };
+  const jobFile = path.join(env.GROK_COMPANION_DATA, "state", "workspace", "jobs", `${jobId}.json`);
+  fs.mkdirSync(path.dirname(jobFile), { recursive: true });
+  fs.writeFileSync(jobFile, JSON.stringify({ id: jobId, cwd: root, status: "done", usage: { inputTokens: 2, outputTokens: 1, totalTokens: 3 } }));
+  createWorkerRecord({ taskId, sessionId: "settlement-only", agentType: "fusion:claude-worker", workspaceRoot: root }, env);
+  updateWorkerRecord(taskId, env, (record) => ({ ...record, transportStatus: "done" }));
+  const result = settleRecords({ records: [{ id: taskId, verdict: "accepted" }], source: "main-loop", asJson: true, env, stdout: { write() {} }, stderr: { write(message) { assert.fail(message); } } });
+  assert.deepEqual(result.errors, []);
+  const observations = fs.readFileSync(tokenUsageSidecarPath(root, env), "utf8").trim().split("\n").map(JSON.parse);
+  assert.equal(observations.length, 1);
+  assert.equal(observations[0].jobId, jobId);
+  assert.equal(observations[0].engine, "grok");
+  assert.equal(observations[0].availability, "available");
+  assert.equal(observations[0].tokenUsage.totalTokens, 3);
+});
 
 test("record acceptance survives a removed workspace", (t) => {
   const root = sandbox(t);

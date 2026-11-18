@@ -65,6 +65,7 @@ function startMonitor(sandbox, env) {
     env,
     stdio: ["ignore", "pipe", "pipe"],
   });
+  const closed = once(child, "close");
   let started = false;
   child.once("spawn", () => {
     started = true;
@@ -87,6 +88,7 @@ function startMonitor(sandbox, env) {
   });
   return {
     child,
+    closed,
     started: () => started,
     lines: () => stdout.split("\n").filter(Boolean),
     stderr: () => stderr,
@@ -153,17 +155,15 @@ async function waitForAnnouncement(sandbox, key, sessionId = null) {
 test("Grok monitor schedules slow scans while idle or foreign-owned and fast scans for its active jobs", async (t) => {
   const sandbox = makeSandbox(t);
   const probe = monitorTimerProbe(sandbox);
+  seedMonitorRecord(sandbox, { status: "running", claudeSessionId: "session-other" });
+  const own = seedMonitorRecord(sandbox, { status: "running", claudeSessionId: "session-own" });
   const monitor = startMonitor(sandbox, envFor(sandbox, { ...probe.env, CLAUDE_CODE_SESSION_ID: "session-own" }));
   await waitUntil(() => probe.delays().length >= 1);
-  assert.strictEqual(probe.delays()[0], 4000);
-  seedMonitorRecord(sandbox, { status: "running", claudeSessionId: "session-other" });
-  await waitUntil(() => probe.delays().length >= 2);
-  assert.strictEqual(probe.delays()[1], 4000);
-  const own = seedMonitorRecord(sandbox, { status: "running", claudeSessionId: "session-own" });
-  await waitUntil(() => probe.delays().includes(1000));
+  assert.strictEqual(probe.delays()[0], 1000);
   fs.writeFileSync(own.file, `${JSON.stringify({ ...own.record, status: "done" })}\n`);
   await waitUntil(() => probe.delays().slice(probe.delays().indexOf(1000) + 1).includes(4000));
-  assert.strictEqual(monitor.child.exitCode, null, monitor.stderr());
+  assert.deepStrictEqual(await monitor.closed, [0, null], monitor.stderr());
+  assert.strictEqual(probe.delays().at(-1), 4000);
 });
 
 test("Grok monitor keeps a terminal job deduplicated across active and idle scans", async (t) => {
@@ -174,7 +174,7 @@ test("Grok monitor keeps a terminal job deduplicated across active and idle scan
   await waitUntil(() => probe.delays().includes(1000));
   fs.writeFileSync(file, `${JSON.stringify({ ...record, status: "done" })}\n`);
   await waitForAnnouncement(sandbox, announcedKey(sandbox.workDir, record.id, "done"));
-  await waitUntil(() => probe.delays().filter((delay) => delay === 4000).length >= 3);
+  assert.deepStrictEqual(await monitor.closed, [0, null], monitor.stderr());
   assert.strictEqual(monitor.lines().length, 1);
   assert.deepStrictEqual(readAnnouncedLedger(sandbox).keys, [announcedKey(sandbox.workDir, record.id, "done")]);
 });
@@ -232,6 +232,8 @@ test("a background job transitioning to done emits exactly one correctly shaped 
   );
 
   await waitForAnnouncement(sandbox, announcedKey(sandbox.workDir, record.id, "done"));
+  assert.strictEqual(monitor.lines().length, 1);
+  assert.deepStrictEqual(await monitor.closed, [0, null], monitor.stderr());
   assert.strictEqual(monitor.lines().length, 1);
 });
 
@@ -738,10 +740,51 @@ test("skips silently when the jobs directory does not exist", async (t) => {
   const sandbox = makeSandbox(t);
   fs.rmSync(sandbox.dataDir, { recursive: true, force: true });
   const monitor = startMonitor(sandbox, envFor(sandbox));
-  await waitUntil(() => monitor.started());
+  assert.deepStrictEqual(await monitor.closed, [0, null], monitor.stderr());
   assert.deepStrictEqual(monitor.lines(), []);
   assert.strictEqual(monitor.stderr(), "");
   assert.strictEqual(fs.existsSync(sandbox.dataDir), false);
+});
+
+test("an idle session exits silently even with foreign running jobs", async (t) => {
+  for (const foreign of [false, true]) {
+    const sandbox = makeSandbox(t);
+    if (foreign) seedMonitorRecord(sandbox, { status: "running", claudeSessionId: "other-session" });
+    const monitor = startMonitor(sandbox, envFor(sandbox, { CLAUDE_CODE_SESSION_ID: "own-session", GROK_JOBS_MONITOR_INTERVAL_MS: "50" }));
+    assert.deepStrictEqual(await monitor.closed, [0, null], monitor.stderr());
+    assert.deepStrictEqual(monitor.lines(), []);
+    assert.strictEqual(monitor.stderr(), "");
+  }
+});
+
+test("overlapping skill monitors announce a shared job only once before exiting", async (t) => {
+  const sandbox = makeSandbox(t);
+  const { file, record } = seedMonitorRecord(sandbox, { status: "running" });
+  const monitors = [startMonitor(sandbox, envFor(sandbox)), startMonitor(sandbox, envFor(sandbox))];
+  await waitUntil(() => readAnnouncedLedger(sandbox));
+  fs.writeFileSync(file, JSON.stringify({ ...record, status: "done" }));
+  for (const monitor of monitors) assert.deepStrictEqual(await monitor.closed, [0, null], monitor.stderr());
+  const lines = monitors.flatMap((monitor) => monitor.lines());
+  assert.strictEqual(lines.length, 1);
+  assert.match(lines[0], new RegExp(`^grok job ${record.id} done\\.`));
+});
+
+test("a running monitor exits when its plugin root is removed or its installed version changes", async (t) => {
+  for (const change of ["removed", "upgraded", "uninstalled"]) {
+    const sandbox = makeSandbox(t);
+    const root = path.join(sandbox.root, "config", "plugins", "cache", "test-marketplace", "grok", "0.0.78");
+    const registry = path.resolve(root, "../../../..", "installed_plugins.json");
+    fs.mkdirSync(root, { recursive: true });
+    fs.writeFileSync(registry, JSON.stringify({ version: 2, plugins: { "grok@test-marketplace": [{ installPath: root }] } }));
+    seedMonitorRecord(sandbox, { status: "running" });
+    const monitor = startMonitor(sandbox, envFor(sandbox, { CLAUDE_PLUGIN_ROOT: root }));
+    await waitUntil(() => readAnnouncedLedger(sandbox));
+    if (change === "removed") fs.rmSync(root, { recursive: true });
+    else fs.writeFileSync(registry, JSON.stringify({ version: 2, plugins: change === "uninstalled" ? {} : { "grok@test-marketplace": [{ installPath: path.join(path.dirname(root), "0.0.79") }] } }));
+    assert.deepStrictEqual(await monitor.closed, [0, null], monitor.stderr());
+    assert.deepStrictEqual(monitor.lines(), []);
+    assert.strictEqual(monitor.stderr(), "");
+  }
 });
 
 function tracedMonitor(sandbox, file) {

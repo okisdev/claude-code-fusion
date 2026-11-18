@@ -130,7 +130,7 @@ Protocol fixtures cover every supported event type, unknown extensions, malforme
 - `CODEX_COMPANION_PIDLESS_RUNNING_GRACE_MS` overrides the launch grace period.
 - `CODEX_COMPANION_WAIT_POLL_MS` and `CODEX_COMPANION_WAIT_TIMEOUT_MS` control bounded result waiting.
 - `CODEX_COMPANION_HISTORY_MAX_RECORDS` and `CODEX_COMPANION_HISTORY_MAX_BYTES` control managed terminal history retention.
-- `CODEX_JOBS_MONITOR_SESSIONS_DIR` overrides the Codex rollout tree used by Fusion's monitor for best effort model, effort, and token observations. When it is unset, the monitor uses `$CODEX_HOME/sessions` if `CODEX_HOME` is nonempty, then `~/.codex/sessions`; it scans every 15 seconds while this session has a running job and every 60 seconds otherwise, drops ledger entries for missing jobs, and prunes old observation sidecars at startup.
+- `CODEX_JOBS_MONITOR_SESSIONS_DIR` overrides the Codex rollout tree used by Fusion's monitor for best effort model, effort, and token observations. When it is unset, the monitor uses `$CODEX_HOME/sessions` if `CODEX_HOME` is nonempty, then `~/.codex/sessions`; it starts on the first Codex task, rescue, review, or adversarial review skill invocation, scans every 15 seconds while this session has a running job and every 60 seconds otherwise, exits after two consecutive idle scans or when its plugin installation is removed or superseded, drops ledger entries for missing jobs, and prunes old observation sidecars at startup. An exited monitor may not restart in the same session; direct callers retain the receipt and collect through result.
 - `FUSION_CODEX_STATE` selects one Codex state root for Fusion. The compatibility alias `FUSION_CODEX_STATE_DIR` also selects one root.
 
 ## Fusion integration

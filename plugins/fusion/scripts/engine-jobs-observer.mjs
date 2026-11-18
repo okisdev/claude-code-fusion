@@ -3,7 +3,7 @@
 import fs from "node:fs";
 import path from "node:path";
 
-import { appendModelAuditObservation, appendTokenUsageObservation, fusionRepositoryKey, modelAuditSidecarPath, resolveFusionDataDir, tokenUsageSidecarPath } from "./fusion-stats.mjs";
+import { appendModelAuditObservation, appendTokenUsageObservation, fusionRepositoryKey, modelAuditSidecarPath, resolveFusionDataDir, tokenUsageSidecarPath } from "./lib/stats/evidence.mjs";
 import { readJsonFile, withFileLock, writeFileAtomic } from "./lib/storage.mjs";
 import { ENGINE_TERMINAL_STATUSES, engineStateRoots, isEngineId } from "./lib/engines.mjs";
 

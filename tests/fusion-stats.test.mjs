@@ -231,7 +231,7 @@ test("Codex jobs monitor stays silent for an unchanged state directory", async (
 test("Codex jobs monitor tags its announce-only notification", async (t) => {
   const dir = sandbox(t);
   const stateRoot = path.join(dir, "codex-state");
-  writeCodexJob(stateRoot, dir, "monitor-terminal", { status: "done", completedAt: new Date().toISOString() });
+  writeCodexJob(stateRoot, dir, "monitor-running", { status: "running" });
   const result = await runMonitorUntil(
     dir,
     runtimeEnv(

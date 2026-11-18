@@ -24,6 +24,7 @@ import { observeEngineJobsSafely } from "./engine-jobs-observer.mjs";
 import { retryWorkerEngineAcceptances } from "./lib/engine-acceptance.mjs";
 import { ENGINES, ENGINE_IDS, ENGINE_TERMINAL_STATUSES, engineResultCommand } from "./lib/engines.mjs";
 import { tagMessage } from "./lib/user-messages.mjs";
+import { withFileLock } from "./lib/storage.mjs";
 
 const DEFAULT_POLL_INTERVAL_MS = 15000;
 const INTERVAL_ENV = "CODEX_JOBS_MONITOR_INTERVAL_MS";
@@ -124,6 +125,24 @@ function resolvePollIntervalMs(env = process.env) {
   const raw = env[INTERVAL_ENV];
   const parsed = Number.parseInt(String(raw), 10);
   return Number.isInteger(parsed) && parsed > 0 ? parsed : DEFAULT_POLL_INTERVAL_MS;
+}
+
+function pluginInstallationIsStale() {
+  const root = path.resolve(process.env.CLAUDE_PLUGIN_ROOT?.trim() || path.join(import.meta.dirname, ".."));
+  if (!fs.existsSync(root)) {
+    return true;
+  }
+  if (path.basename(path.resolve(root, "../../..")) !== "cache" || path.basename(path.dirname(root)) !== "fusion") {
+    return false;
+  }
+  try {
+    const registry = JSON.parse(fs.readFileSync(path.resolve(root, "../../../..", "installed_plugins.json"), "utf8"));
+    const marketplace = path.basename(path.resolve(root, "../.."));
+    const installed = registry.plugins?.[`fusion@${marketplace}`];
+    return registry.plugins != null && (!Array.isArray(installed) || !installed.some((entry) => typeof entry.installPath === "string" && path.resolve(entry.installPath) === root));
+  } catch {
+    return false;
+  }
 }
 
 function resolveStateRoot(env = process.env) {
@@ -883,9 +902,9 @@ function processSnapshot(snapshot, context) {
     return false;
   }
   const records = snapshot.records;
-  const hasActiveJob = records.some(({ record }) => record?.id && !ENGINE_TERMINAL_STATUSES.has(record.status) && belongsToMonitorSession(record, ownSessionId));
+  let hasActiveJob = records.some(({ record }) => record?.id && !ENGINE_TERMINAL_STATUSES.has(record.status) && belongsToMonitorSession(record, ownSessionId));
   for (const state of auditStates.values()) state.merged = null;
-  if (context.announceOnlyPending && records.length > 0) {
+  if (context.announceOnlyPending && hasActiveJob) {
     safeWriteLine(REPAIR_UNAVAILABLE_LINE);
     context.announceOnlyPending = false;
   }
@@ -931,6 +950,7 @@ function processSnapshot(snapshot, context) {
         try {
           fullRecord = JSON.parse(fs.readFileSync(entry.file, "utf8"));
         } catch {
+          hasActiveJob = true;
           continue;
         }
       }
@@ -1000,6 +1020,9 @@ function processSnapshot(snapshot, context) {
 }
 
 async function main() {
+  if (pluginInstallationIsStale()) {
+    return;
+  }
   const repair = await loadCompanionRepair();
   const root = resolveStateRoot();
   const cwd = process.cwd();
@@ -1023,30 +1046,42 @@ async function main() {
   let timer = null;
   installExitHandlers(() => clearTimeout(timer));
 
-  let hasActiveJob = false;
-  try {
-    const initialSnapshot = readWorkspaceJobsSnapshot(root, workspaceRoot, repositoryCache, snapshotCache);
-    hasActiveJob = processSnapshot(initialSnapshot, context);
-    if (!initialSnapshot.available) {
-      context.startupPending = false;
-    }
-  } catch {}
-  try {
-    observePeerJobs();
-  } catch {}
-
   const intervalMs = resolvePollIntervalMs();
+  let idleScans = 0;
+  let initialScan = true;
   const scan = () => {
+    if (pluginInstallationIsStale()) {
+      return;
+    }
     let active = false;
+    let snapshot;
     try {
-      active = processSnapshot(readWorkspaceJobsSnapshot(root, workspaceRoot, repositoryCache, snapshotCache), context);
-    } catch {}
+      snapshot = readWorkspaceJobsSnapshot(root, workspaceRoot, repositoryCache, snapshotCache);
+      if (snapshot.available) {
+        active = withFileLock(stateFile, () => {
+          const current = loadAnnounced(stateFile, workspaceRoot);
+          context.announced = current.announced;
+          context.terminalRecords = current.records;
+          if (initialScan && !loaded.malformed) context.loaded = current;
+          return processSnapshot(snapshot, context);
+        });
+      } else if (initialScan) {
+        context.startupPending = false;
+      }
+    } catch {
+      active = snapshot?.records.some(({ record }) => record?.id && belongsToMonitorSession(record, ownSessionId) && (!ENGINE_TERMINAL_STATUSES.has(record.status) || !context.announced.has(announcementKey(record.id, record.status)))) ?? false;
+    }
+    initialScan = false;
     try {
       observePeerJobs();
     } catch {}
+    idleScans = active ? 0 : idleScans + 1;
+    if (idleScans >= 2) {
+      return;
+    }
     timer = setTimeout(scan, active ? intervalMs : intervalMs * 4);
   };
-  timer = setTimeout(scan, hasActiveJob ? intervalMs : intervalMs * 4);
+  scan();
 }
 
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {

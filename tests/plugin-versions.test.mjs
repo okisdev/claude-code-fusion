@@ -22,3 +22,11 @@ test("marketplace and plugin manifest versions stay synchronized", () => {
   const changelog = fs.readFileSync(path.join(repoRoot, "CHANGELOG.md"), "utf8");
   assert.match(changelog, new RegExp(`^## ${marketplace.version.replaceAll(".", "\\.")}$`, "m"));
 });
+
+test("job monitors start only for skills that can detach jobs", () => {
+  for (const [plugin, skills] of [["fusion", ["codex:task", "codex:rescue", "codex:review", "codex:adversarial-review"]], ["grok", ["grok:task", "grok:review"]]]) {
+    const monitors = readJson(`plugins/${plugin}/monitors/monitors.json`);
+    assert.deepEqual(monitors.map((monitor) => monitor.when).sort(), skills.map((skill) => `on-skill-invoke:${skill}`).sort());
+    assert.equal(new Set(monitors.map((monitor) => monitor.name)).size, monitors.length);
+  }
+});

@@ -12,6 +12,7 @@ import {
   workspaceStateDir,
   writePrivateStateFile
 } from "./lib/state.mjs";
+import { withRecordLock } from "./lib/record-lock.mjs";
 
 const TERMINAL_STATUSES = new Set(["done", "error", "cancelled"]);
 const DEFAULT_POLL_INTERVAL_MS = 15000;
@@ -26,6 +27,24 @@ function resolvePollIntervalMs(env = process.env) {
   const raw = env[INTERVAL_ENV];
   const parsed = Number.parseInt(String(raw), 10);
   return Number.isInteger(parsed) && parsed > 0 ? parsed : DEFAULT_POLL_INTERVAL_MS;
+}
+
+function pluginInstallationIsStale() {
+  const root = path.resolve(process.env.CLAUDE_PLUGIN_ROOT?.trim() || path.join(import.meta.dirname, ".."));
+  if (!fs.existsSync(root)) {
+    return true;
+  }
+  if (path.basename(path.resolve(root, "../../..")) !== "cache" || path.basename(path.dirname(root)) !== "grok") {
+    return false;
+  }
+  try {
+    const registry = JSON.parse(fs.readFileSync(path.resolve(root, "../../../..", "installed_plugins.json"), "utf8"));
+    const marketplace = path.basename(path.resolve(root, "../.."));
+    const installed = registry.plugins?.[`grok@${marketplace}`];
+    return registry.plugins != null && (!Array.isArray(installed) || !installed.some((entry) => typeof entry.installPath === "string" && path.resolve(entry.installPath) === root));
+  } catch {
+    return false;
+  }
 }
 
 function resolveManagedGraceMs(env = process.env) {
@@ -279,7 +298,7 @@ function processSnapshot(snapshot, { ownSessionId, managedGraceMs, cwd, loaded, 
   if (!snapshot.available) {
     return false;
   }
-  const hasActiveJob = snapshot.records.some((record) => record?.id && !TERMINAL_STATUSES.has(record.status) && (!ownSessionId || record.claudeSessionId === ownSessionId));
+  let hasActiveJob = snapshot.records.some((record) => record?.id && !TERMINAL_STATUSES.has(record.status) && (!ownSessionId || record.claudeSessionId === ownSessionId));
   const liveKeys = new Set();
   const duplicateWorkspacesById = new Map();
   for (const record of snapshot.records) {
@@ -309,7 +328,8 @@ function processSnapshot(snapshot, { ownSessionId, managedGraceMs, cwd, loaded, 
     if (!TERMINAL_STATUSES.has(record.status)) {
       continue;
     }
-    if (managedDeliveryIsPending(record, managedGraceMs)) {
+    if (record.background === true && managedDeliveryIsPending(record, managedGraceMs)) {
+      hasActiveJob = true;
       continue;
     }
     const key = announcementKey(record);
@@ -352,6 +372,9 @@ function processSnapshot(snapshot, { ownSessionId, managedGraceMs, cwd, loaded, 
 }
 
 function main() {
+  if (pluginInstallationIsStale()) {
+    return;
+  }
   const dataDir = resolveDataDir();
   const cwd = process.cwd();
   const dir = jobsDir(dataDir, cwd);
@@ -370,24 +393,38 @@ function main() {
   let timer = null;
   installExitHandlers(() => clearTimeout(timer));
 
-  let hasActiveJob = false;
-  try {
-    const initialSnapshot = readSnapshot(context);
-    hasActiveJob = processSnapshot(initialSnapshot, context);
-    if (!initialSnapshot.available && initialSnapshot.complete) {
-      state.startupPending = false;
-    }
-  } catch {}
-
   const intervalMs = resolvePollIntervalMs();
+  let idleScans = 0;
+  let initialScan = true;
   const scan = () => {
+    if (pluginInstallationIsStale()) {
+      return;
+    }
     let active = false;
+    let snapshot;
     try {
-      active = processSnapshot(readSnapshot(context), context);
-    } catch {}
+      snapshot = readSnapshot(context);
+      if (snapshot.available) {
+        active = withRecordLock(stateFile, () => {
+          const current = loadAnnounced(stateFile);
+          context.announced = current.announced;
+          if (initialScan) context.loaded = current;
+          return processSnapshot(snapshot, context);
+        });
+      } else if (initialScan && snapshot.complete) {
+        state.startupPending = false;
+      }
+    } catch {
+      active = snapshot?.records.some((record) => (!ownSessionId || record.claudeSessionId === ownSessionId) && (!TERMINAL_STATUSES.has(record.status) || !context.announced.has(announcementKey(record)))) ?? false;
+    }
+    initialScan = false;
+    idleScans = active ? 0 : idleScans + 1;
+    if (idleScans >= 2) {
+      return;
+    }
     timer = setTimeout(scan, active ? intervalMs : intervalMs * 4);
   };
-  timer = setTimeout(scan, hasActiveJob ? intervalMs : intervalMs * 4);
+  scan();
 }
 
 main();
