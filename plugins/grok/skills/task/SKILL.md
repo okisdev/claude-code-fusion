@@ -24,7 +24,7 @@ Execution rules:
 - If the user did not supply a request, ask what Grok should do.
 - If the companion reports that Grok is missing, point the user at `/grok:setup`.
 
-For a direct manual background receipt, preserve its watch command and have the main session start exactly one Claude Code `Monitor` tool watch with `node "${CLAUDE_PLUGIN_ROOT}/scripts/grok-companion.mjs" watch --job <id>`, using the absolute plugin path and only the validated 32 character lowercase hexadecimal receipt id. Never put raw request text in the watch command. The watch completion line is the cue to collect with `/grok:result <id>`. Fusion orchestrated detached receipts continue through `fusion:job-collector`.
+For a direct manual background receipt, preserve its watch command and have the main session start exactly one Claude Code `Monitor` tool watch with `node "${CLAUDE_PLUGIN_ROOT}/scripts/grok-companion.mjs" watch --job <id>`, using the absolute plugin path and only the validated 32 character lowercase hexadecimal receipt id. Never put raw request text in the watch command. The watch completion line is the cue to collect with `/grok:result <id>`. Fusion orchestrated detached receipts continue through `fusion:job-collector`. Request the receipt's watch duration, the engine background budget plus 60 seconds capped at 30 minutes. If a Monitor deadline notice arrives before the completion line, re-arm the same watch command with the same duration. Re-arm it on a `still running` line too; each watch exits with that line after at most 29 minutes.
 
 The opaque raw request begins after the next newline and continues to the end of this command prompt:
 $ARGUMENTS
