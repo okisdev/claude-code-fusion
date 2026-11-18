@@ -1,6 +1,6 @@
 # Cursor companion contract
 
-This document is the Cursor instance of the engine agnostic [companion contract](companion-contract.md). It pins how the Cursor plugin drives the Cursor Agent CLI headlessly: binary resolution, the private home that isolates every run, per mode invocation, tool and sandbox policy, model resolution, the stream protocol, process supervision, failure classification, the job record, session continuity, review output, and the residual boundaries that the adapter cannot close. The contract was verified against Cursor Agent CLI build `2026.10.01-e373342` by reading its bundled source and by live probes on macOS.
+This document is the Cursor instance of the engine agnostic [companion contract](companion-contract.md). It pins how the Cursor plugin drives the Cursor Agent CLI headlessly: binary resolution, the private home that isolates every run, per mode invocation, tool and sandbox policy, model resolution, the stream protocol, process supervision, failure classification, the job record, session continuity, review output, and the residual boundaries that the adapter cannot close. The contract was verified against Cursor Agent CLI build `2026.11.17-f532c45` by reading its bundled source and by live probes on macOS.
 
 ## Role in Fusion
 
@@ -8,7 +8,7 @@ Cursor is a multi family harness: one CLI, one authentication domain, and one bi
 
 ## Binary and version
 
-The companion resolves the CLI as `cursor-agent`, never as the bare `agent` name, because other CLIs install an `agent` executable earlier on PATH (Grok does on macOS). `CURSOR_AGENT_BIN` overrides the path, which the test suite uses for its fake CLI. Preflight runs `cursor-agent --version`, which prints a build identifier of the form `YYYY.MM.DD-<hash>`, and records it on every job as `cursorVersion` together with the resolved executable path as `cursorBuildPath`. The tested interval is `[2026.10.01, 2026.11.01)` by build date. A build older than the floor fails preflight as `setup`; a build at or past the ceiling runs and `/cursor:setup` reports it as newer than the tested interval. The CLI updates itself on a timer two seconds after startup, so every managed run passes `--disable-auto-update`, and a build change between jobs is visible through the recorded build identity rather than assumed away.
+The companion resolves the CLI as `cursor-agent`, never as the bare `agent` name, because other CLIs install an `agent` executable earlier on PATH (Grok does on macOS). `CURSOR_AGENT_BIN` overrides the path, which the test suite uses for its fake CLI. Preflight runs `cursor-agent --version`, which prints a build identifier of the form `YYYY.MM.DD-<hash>`, and records it on every job as `cursorVersion` together with the resolved executable path as `cursorBuildPath`. The tested interval is `[2026.10.01, 2026.12.01)` by build date. A build older than the floor fails preflight as `setup`; a build at or past the ceiling runs and `/cursor:setup` reports it as newer than the tested interval. The CLI updates itself on a timer two seconds after startup, so every managed run passes `--disable-auto-update`, and a build change between jobs is visible through the recorded build identity rather than assumed away.
 
 ## Private home
 

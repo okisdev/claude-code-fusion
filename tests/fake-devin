@@ -8,7 +8,7 @@ if (args.includes("--version")) {
   process.stdout.write(`${process.env.FAKE_DEVIN_VERSION || "devin 3000.11.228 (8f3abc)"}\n`);
   process.exit(0);
 }
-if (args.length !== 1 || args[0] !== "acp") {
+if (args[0] !== "acp" || (args.length !== 1 && (args.length !== 3 || args[1] !== "--process-model" || args[2] !== "in-process"))) {
   process.stderr.write("Expected acp.\n");
   process.exit(2);
 }

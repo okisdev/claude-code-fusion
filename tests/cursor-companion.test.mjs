@@ -364,6 +364,13 @@ test("models and setup report the fake CLI", (t) => {
   assert.equal(setup.sandboxHelper.present, false);
 });
 
+test("setup advises verification for newer Cursor builds", (t) => {
+  const h = harness(t, { FAKE_CURSOR_VERSION: "2026.12.01-abcdef" }, { withoutHelper: true });
+  const report = JSON.parse(h.run(["setup", "--json"]).stdout);
+  assert.equal(report.compatibility, "newer than the tested interval");
+  assert.ok(report.nextSteps.includes("Cursor Agent version 2026.12.01-abcdef is newer than the tested interval (2026.10.01 to before 2026.12.01); run a verification pass."));
+});
+
 test("raw argument transport preserves brief and consumes its token", (t) => {
   const h = harness(t);
   const created = h.run(["transport-create"]);

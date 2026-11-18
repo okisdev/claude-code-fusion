@@ -143,6 +143,8 @@ export function buildJobConfig({ configDir, mode, cwd, realHome = os.homedir(), 
     read_config_from: {
       agents_standard: true,
       cursor: false,
+      codex: false,
+      kiro: false,
       windsurf: false,
       claude: false,
       copilot: false,

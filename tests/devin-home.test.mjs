@@ -187,7 +187,7 @@ test("job config contains the exact base policy and consult or review tool denie
       attribution: false,
       subagents_enabled: false,
       notify: "never",
-      read_config_from: { agents_standard: true, cursor: false, windsurf: false, claude: false, copilot: false, opencode: false, zed: false, cloud: false },
+      read_config_from: { agents_standard: true, cursor: false, codex: false, kiro: false, windsurf: false, claude: false, copilot: false, opencode: false, zed: false, cloud: false },
       permissions: {
         ask: [],
         deny: mode === "write" ? baseDeny : [...baseDeny, "edit", "exec"],

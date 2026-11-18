@@ -35,6 +35,13 @@ test("catalog parsing keeps family identities and selectable variant ids", () =>
   ] });
 });
 
+test("catalog parsing retains available cost and context metadata", () => {
+  const catalog = parseModelsJson(JSON.stringify({ families: [{ ...listing.families[0], variants: [
+    { ...listing.families[0].variants[0], cost_tier: "premium", max_context_tokens: 200000, max_output_tokens: 32000 }
+  ] }] }));
+  assert.deepEqual(catalog.families[0].variants[0], { uid: "swe-2-high", label: "SWE High", cost_tier: "premium", max_context_tokens: 200000 });
+});
+
 test("catalog parsing rejects malformed JSON and invalid family or variant shapes", () => {
   for (const value of ["{", "null", "{}", '{"families":{}}', JSON.stringify({ families: [{ ...listing.families[0], aliases: "swe" }] }), JSON.stringify({ families: [{ ...listing.families[0], family_uid: null }] }), JSON.stringify({ families: [{ ...listing.families[0], variants: [{}] }] })]) {
     assert.throws(() => parseModelsJson(value));

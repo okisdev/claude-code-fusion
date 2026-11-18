@@ -21,7 +21,11 @@ export function parseModelsJson(text) {
       aliases: family.aliases,
       variants: family.variants.map((variant) => {
         if (!variant || !nonemptyString(variant.model_uid) || !nonemptyString(variant.label)) invalidCatalog();
-        return { uid: variant.model_uid, label: variant.label };
+        return {
+          uid: variant.model_uid, label: variant.label,
+          ...(typeof variant.cost_tier === "string" ? { cost_tier: variant.cost_tier } : {}),
+          ...(Number.isSafeInteger(variant.max_context_tokens) && variant.max_context_tokens > 0 ? { max_context_tokens: variant.max_context_tokens } : {})
+        };
       })
     };
   }) };

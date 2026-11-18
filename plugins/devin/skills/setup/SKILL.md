@@ -12,7 +12,7 @@ Present the setup output to the user.
 
 - If the Devin CLI is missing, preserve the install guidance from the command output. The companion resolves `devin` on `PATH`; `DEVIN_BIN` overrides it.
 - Preserve the authentication check from `devin auth status`, the plan tier, and guidance to run `devin auth login` when needed. Credentials are linked into private XDG data storage and are never read or copied by the companion.
-- Preserve the compatibility line for `[3000.11, 3000.12)` by major and minor version. An older or unparseable build fails as `setup`; a newer build runs and is reported as newer than the tested interval.
+- Preserve the compatibility line for `[3000.11, 3000.15)` by major and minor version. An older or unparseable build fails as `setup`; a newer build runs and is reported as newer than the tested interval with verification advice.
 - Preserve the model catalog refresh result and the project configuration advisory.
 - Preserve warnings for `.devin/config.json`, `.devin/config.local.json`, `.devin/mcp_config.json`, and `.devin/mcp_config.local.json` in the working directory. These files can add permissions, hooks, MCP servers, or imports.
 - A direct `/devin:*` command without `--model` uses the account default model. Fusion routed dispatches carry an explicit model and effort from the routing table.

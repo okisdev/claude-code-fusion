@@ -12,7 +12,7 @@ Present the setup output to the user.
 
 - If the Cursor Agent CLI is missing, preserve the install guidance from the command output. The companion resolves the `cursor-agent` executable, never the bare `agent` name, because other CLIs install an `agent` executable earlier on PATH; `CURSOR_AGENT_BIN` overrides the path.
 - Preserve the authentication check, which runs `cursor-agent status`. On macOS the CLI's credentials are keychain items; on Linux authentication requires `CURSOR_API_KEY` in the companion environment.
-- Preserve the compatibility line for the tested interval `[2026.10.01, 2026.11.01)` by build date. A build older than the floor fails as `setup`; a build at or past the ceiling runs and is reported as newer than the tested interval.
+- Preserve the compatibility line for the tested interval `[2026.10.01, 2026.12.01)` by build date. A build older than the floor fails as `setup`; a build at or past the ceiling runs and is reported as newer than the tested interval.
 - Preserve the model catalog refresh result and the sandbox helper presence line. Managed runs fail as `sandbox` without the helper.
 - Preserve the project hook advisory for the working directory. Cursor runs hooks from the workspace's `.cursor/hooks.json`, `.claude/settings.json`, and `.claude/settings.local.json` outside its sandbox, and a `warning:` line names the files that define them.
 - A direct `/cursor:*` command without `--model` uses the model selected in the user's own `~/.cursor/cli-config.json`, so that file owns the interactive default. Fusion routed dispatches always carry an explicit model and effort from the routing table.

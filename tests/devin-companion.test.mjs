@@ -89,7 +89,7 @@ await import(${JSON.stringify(fileURLToPath(new URL("./fake-devin", import.meta.
     }
     fs.rmSync(temp, { recursive: true, force: true });
   });
-  return { temp, home, cwd, data, bin, env, run, jobs, messages, launched };
+  return { temp, home, cwd, data, bin, env, log, run, jobs, messages, launched };
 }
 
 function task(h, args = [], brief = "inspect") {
@@ -354,6 +354,15 @@ test("models and setup expose the family catalog and account plan", (t) => {
   assert.equal(report.planTier, "Pro");
   assert.equal(report.catalog.source, "cli");
   assert.deepEqual(report.projectConfigFiles, [path.join(h.cwd, ".devin", "config.json")]);
+});
+
+test("newer Devin builds receive verification advice and use the in-process ACP model", (t) => {
+  const h = harness(t, "success", { FAKE_DEVIN_VERSION: "devin 3000.15.0 (new)" });
+  const report = JSON.parse(h.run(["setup", "--json"]).stdout);
+  assert.equal(report.compatibility, "newer than the tested interval");
+  assert.deepEqual(report.nextSteps, ["Devin CLI version 3000.15.0 is newer than the tested interval (3000.11 to before 3000.15); run a verification pass."]);
+  assertDone(task(h));
+  assert.deepEqual(JSON.parse(fs.readFileSync(h.log, "utf8")).argv, ["acp", "--process-model", "in-process"]);
 });
 
 test("old or missing binary fails before job creation", (t) => {

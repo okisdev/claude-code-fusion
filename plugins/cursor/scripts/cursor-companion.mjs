@@ -81,6 +81,7 @@ function handleSetup(argv, transport, { commandArgs, output }) {
   try { probe = probeCursorVersion(bin); } catch (error) { detail = error.message; nextSteps.push(error.message); }
   const namedCursorAgent = path.basename(bin) === "cursor-agent";
   const compatibility = !probe ? "unknown" : compareCursorVersion(probe.version, TESTED_CURSOR_INTERVAL.floor) < 0 ? "older than the tested interval" : compareCursorVersion(probe.version, TESTED_CURSOR_INTERVAL.ceiling) >= 0 ? "newer than the tested interval" : "tested";
+  if (compatibility === "newer than the tested interval") nextSteps.push(`Cursor Agent version ${probe.version} is newer than the tested interval (${TESTED_CURSOR_INTERVAL.floor} to before ${TESTED_CURSOR_INTERVAL.ceiling}); run a verification pass.`);
   let auth = { authenticated: false, detail: "not checked" };
   let catalog = null;
   if (probe) {

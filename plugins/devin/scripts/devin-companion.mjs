@@ -47,7 +47,7 @@ async function runJob({ record, source, dataDir, brief, signal, timeoutMs, exitG
     }
     return changes;
   };
-  const outcome = await runDevin({ bin: record.devinBuildPath, cwd: record.cwd,
+  const outcome = await runDevin({ bin: record.devinBuildPath, cwd: record.cwd, version: record.devinVersion,
     env: buildDevinChildEnv({ homeDir, configDir: record.configDir, mode: record.mode }),
     brief, mode: record.mode, resumeSessionId: source?.sessionId, resolveSelection: selection,
     signal, timeoutMs, exitGraceMs, onSpawn: (child) => onProcess(child.pid), launchProcess });
@@ -82,6 +82,7 @@ function handleSetup(argv, transport, { commandArgs, output }) {
   try { probe = probeDevinVersion(bin); } catch (error) { detail = error.message; nextSteps.push(error.message); }
   const compatibility = !probe ? "unknown" : compareDevinVersion(probe.version, TESTED_DEVIN_INTERVAL.floor) < 0 ? "older than the tested interval" : compareDevinVersion(probe.version, TESTED_DEVIN_INTERVAL.ceiling) >= 0 ? "newer than the tested interval" : "tested";
   if (compatibility === "older than the tested interval") nextSteps.push(`Upgrade Devin to ${TESTED_DEVIN_INTERVAL.floor} or newer.`);
+  if (compatibility === "newer than the tested interval") nextSteps.push(`Devin CLI version ${probe.version} is newer than the tested interval (${TESTED_DEVIN_INTERVAL.floor} to before ${TESTED_DEVIN_INTERVAL.ceiling}); run a verification pass.`);
   let auth = { authenticated: false, detail: "not checked", planTier: null };
   let catalog = null;
   if (probe) {
