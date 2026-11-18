@@ -19,7 +19,6 @@ export function configureRawTransport(config) {
     sessionIdEnv,
     makeError,
     maxRawArgumentBytes,
-    allowUnwrittenByDefault = true,
     cleanupOnSessionMismatch = false,
     allowBackgroundDefault = true,
     allowStdin = false
@@ -29,7 +28,6 @@ export function configureRawTransport(config) {
     sessionIdEnv,
     makeError,
     maxRawArgumentBytes,
-    allowUnwrittenByDefault,
     cleanupOnSessionMismatch,
     allowBackgroundDefault,
     allowStdin,
@@ -285,7 +283,7 @@ function releaseVerifiedTransport(directory, file, ownerFile, identities, errorW
   cleanupVerifiedTransport(directory, file, ownerFile, identities.directory, identities.file, identities.owner, errorWithFailure);
 }
 
-export function consumeRawCommandTransport(token, { allowUnwritten = rawTransportConfig.allowUnwrittenByDefault, retain = false } = {}) {
+export function consumeRawCommandTransport(token, { allowMissing = false, retain = false } = {}) {
   const config = rawTransportConfig;
   const { sessionIdEnv, cleanupOnSessionMismatch, maxRawArgumentBytes, makeError: errorWithFailure } = config;
   const { directory, file, ownerFile } = transportPaths(token, config);
@@ -339,17 +337,10 @@ export function consumeRawCommandTransport(token, { allowUnwritten = rawTranspor
     }
     const bytes = readBoundedDescriptor(descriptor, maxRawArgumentBytes, errorWithFailure);
     let value;
-    if (bytes.length === 0) {
-      if (!allowUnwritten) {
-        throw errorWithFailure("The raw command transport is unwritten.", "input");
-      }
-      value = "";
-    } else {
-      try {
-        value = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
-      } catch {
-        throw errorWithFailure("Raw command arguments must be valid UTF-8.", "input");
-      }
+    try {
+      value = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+    } catch {
+      throw errorWithFailure("Raw command arguments must be valid UTF-8.", "input");
     }
     if (retain) {
       retained = true;
@@ -357,6 +348,9 @@ export function consumeRawCommandTransport(token, { allowUnwritten = rawTranspor
     }
     return value;
   } catch (error) {
+    if (allowMissing && error?.code === "ENOENT" && !identities.directory) {
+      return "";
+    }
     if (error?.failureKind) {
       throw error;
     }

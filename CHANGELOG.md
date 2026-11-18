@@ -1,5 +1,14 @@
 # changelog
 
+## 0.0.79
+
+- this release acts on a smoke test in fresh sessions on two hosts after 0.0.78, and verifies codex-cli 0.170.0 and grok 1.0.89.
+- the installed `~/.claude/rules/orchestration.md` is now the shipped template verbatim, identical on every machine. the machine's capability table, breadth seat, and lane defaults reach the session as context at startup, after `/clear`, and after compaction, and `/fusion:config` prints them instead of rewriting the rules file. an agent files sync that shared `~/.claude/rules` between hosts had pushed one host's empty table onto another mid session. without node, the compact hook still prints its reminder.
+- an empty raw request now means no arguments for every command, so a bare `/codex:setup` (and the other engines' argument free commands) runs on the first try; it failed on both hosts as "transport is unwritten". discarding an already consumed transport succeeds.
+- `fusion-stats --help` prints usage, and fixed read only flags such as `--unsettled`, `--all`, and `--audit --days n` run as direct arguments, so a session can list pending ids without waiting for the stop hook.
+- a managed grok run the companion killed on its own timeout before grok confirmed its sandbox or tool policy reports `timeout` instead of a sandbox or policy enforcement failure; the result stays refused.
+- codex-cli 0.170.0 changes only its doctor and mcp commands; a real task and consult ran clean, and the tested interval ends before 0.171.0. grok 1.0.89 keeps every flag the companion uses; a real consult ran clean, and the interval ends before 1.0.90.
+
 ## 0.0.78
 
 - this release verifies every companion against the engine CLIs installed on 2026-11-18 and adopts the claude code plugin surface changes since 2.1.300. codex was read from upstream source (rust-v0.162.1 to rust-v0.169.0), grok by comparing the 1.0.77 and 1.0.88 binaries (the public grok-build tree stops at 1.0.45), devin and cursor by probing the installed builds.

@@ -2,7 +2,7 @@
   "hooks": {
     "SessionStart": [
       {
-        "matcher": "startup",
+        "matcher": "startup|clear",
         "hooks": [
           {
             "type": "command",
@@ -16,7 +16,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "echo 'Fusion rules are in ~/.claude/rules/orchestration.md. Collect and settle any in-flight work. [fusion:9902]'",
+            "command": "command -v node >/dev/null 2>&1 || { echo 'Fusion rules are in ~/.claude/rules/orchestration.md. Collect and settle any in-flight work. [fusion:9902]'; exit 0; }; node \"${CLAUDE_PLUGIN_ROOT}/scripts/session-start.mjs\" --compact",
             "timeout": 5
           }
         ]

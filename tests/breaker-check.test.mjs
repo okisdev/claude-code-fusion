@@ -297,7 +297,7 @@ test("an in-window quota failure prints a grok breaker advisory", (t) => {
 });
 
 test("grok breaker version advice reports only a contract drift", (t) => {
-  assert.strictEqual(verifiedGrokVersion, "1.0.88");
+  assert.strictEqual(verifiedGrokVersion, "1.0.89");
   const changed = makeSandbox(t);
   writeRecord(jobFile(path.join(changed.grokData, "state"), "workspace", "changed"), {
     status: "error",
@@ -906,10 +906,10 @@ test("Codex version drift uses the registry verified version key", (t) => {
   writeRecord(jobFile(sandbox.codexState, "workspace", "auth"), {
     status: "error",
     failureKind: "auth",
-    codexVersion: "0.170.0",
+    codexVersion: "0.171.0",
     finishedAt: new Date(Date.now() - 2 * 60000).toISOString()
   });
-  assert.match(run(sandbox).stdout, /; codex 0\.170\.0 installed, contract verified on 0\.169\.0/);
+  assert.match(run(sandbox).stdout, /; codex 0\.171\.0 installed, contract verified on 0\.170\.0/);
 });
 
 test("a failure outside the lookback window is silent", (t) => {

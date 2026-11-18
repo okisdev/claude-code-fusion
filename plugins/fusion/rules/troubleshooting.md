@@ -2,6 +2,8 @@
 
 Reference material for plugins/fusion/rules/orchestration.md. This file is not synced to ~/.claude/rules and nothing installs it automatically; it exists for the orchestrator to consult when a delegation is failing, not as an always loaded rule. Codex runtime recovery must also preserve the foreground and durability invariants stated below.
 
+For missing or stale capability rows, breadth selection, or lane defaults, inspect `model-routing.json` with `/fusion:config` and refresh session context with a new session or `/compact`. `~/.claude/rules/orchestration.md` must match the shipped static template; use `/fusion:setup` to reconcile it rather than writing machine routing data into that file.
+
 ## Escalation ladders
 
 Failure driven implementation escalation among Claude workers runs only from `fusion:trivial-worker` to `fusion:claude-worker` when the Claude surface or privacy boundary is load bearing, or the package is structurally stranded with a stated `claude-fallback: <reason>` header; `fusion:deep-reasoner` is a separate advisory lane. Generic work returns to the Codex volume tiers. Peer failures are handled by the circuit breaker table below instead.

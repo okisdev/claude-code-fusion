@@ -771,7 +771,8 @@ test("claude-worker shares the fast worker lifecycle tier and hook matchers", (t
     assert.ok(hooks[event].some((group) => new RegExp(group.matcher).test("fusion:claude-worker")), event);
   }
   const compactCommand = hooks.SessionStart.find((group) => group.matcher === "compact")?.hooks?.[0]?.command;
-  const compactEcho = /^echo '(.+)'$/.exec(compactCommand)?.[1];
+  assert.match(compactCommand, /node "\$\{CLAUDE_PLUGIN_ROOT\}\/scripts\/session-start\.mjs" --compact$/);
+  const compactEcho = /echo '([^']+)'/.exec(compactCommand)?.[1];
   assert.ok(compactEcho?.endsWith(messageTag("session.compact-reposture")));
 });
 

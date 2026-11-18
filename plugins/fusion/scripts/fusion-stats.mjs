@@ -109,6 +109,19 @@ function isMain() {
 function runCli(argv = process.argv.slice(2)) {
   let transportConsumed = false;
   try {
+    if (argv.length === 1 && argv[0] === "--help") {
+      process.stdout.write([
+        "Usage: fusion-stats.mjs [--all] [--identities] [--by-day] [--json]",
+        "       fusion-stats.mjs --unsettled [--json]",
+        "       fusion-stats.mjs --audit [--days <1..3650> | --all] [--json]",
+        "       fusion-stats.mjs --prune-dead [--yes] [--json]",
+        "       fusion-stats.mjs --messages | --message <n>",
+        "       fusion-stats.mjs --record <id>=<accepted|rejected|unverified> [record options]",
+        "       fusion-stats.mjs --session <id> | --trace [--session <id>]",
+        "       fusion-stats.mjs --raw-args-token TOKEN"
+      ].join("\n") + "\n");
+      return;
+    }
     if (argv[0] === "transport-create") {
       if (argv.length !== 1) {
         throw new TypeError("transport-create does not accept arguments.");

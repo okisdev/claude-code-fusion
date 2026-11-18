@@ -98,7 +98,7 @@ async function main() {
     if (receivedArgv.length !== 2 || receivedArgv[0] !== "--raw-args-token") {
       throw errorWithFailure("transport-discard requires exactly one raw argument token.", "input");
     }
-    consumeRawCommandTransport(receivedArgv[1]);
+    consumeRawCommandTransport(receivedArgv[1], { allowMissing: true });
     return;
   }
   if (subcommand === "record-acceptance") {

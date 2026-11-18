@@ -94,7 +94,7 @@ const BACKGROUND_ABORT_CLAIM_WAIT_MS = 2000;
 const BACKGROUND_ABORT_CLEANUP_CONFIRM_MS = 1000;
 const BACKGROUND_ABORT_CLEANUP_POLL_MS = 50;
 const TESTED_VERSION_MIN = [0, 154, 0];
-const TESTED_VERSION_MAX = [0, 170, 0];
+const TESTED_VERSION_MAX = [0, 171, 0];
 const CONTINUE_PROMPT = "Continue from the current Codex thread state. Complete the next highest value step and continue until the task is resolved.";
 const RESUMABLE_FAILURE_KINDS = new Set(["timeout", "policy", "patch_thrash", "died"]);
 const WIND_DOWN_PROMPT = "Wind down: do not start new work. Finish the smallest coherent deliverable from the work already completed and report the files changed and the verification output.";
@@ -402,7 +402,6 @@ configureRawTransport({
   sessionIdEnv: SESSION_ID_ENV,
   makeError: (message, kind) => new CompanionError(message, kind),
   maxRawArgumentBytes: MAX_PROMPT_BYTES + 64 * 1024,
-  allowUnwrittenByDefault: false,
   cleanupOnSessionMismatch: true,
   allowBackgroundDefault: false,
   allowStdin: true
@@ -2121,7 +2120,7 @@ async function main() {
     if (receivedArgv.length !== 2 || receivedArgv[0] !== "--raw-args-token") {
       throw new CompanionError("transport-discard requires exactly one raw argument token.", "input");
     }
-    consumeRawCommandTransport(receivedArgv[1], { allowUnwritten: true });
+    consumeRawCommandTransport(receivedArgv[1], { allowMissing: true });
     return;
   }
   if (subcommand === "record-acceptance") {

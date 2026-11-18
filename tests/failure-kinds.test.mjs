@@ -35,6 +35,7 @@ const processInspectionTests = new Set([
   "external SIGKILL reports exit code 137 and generic failure",
   "large stderr is capped in the job log and rendered error",
   "timeout yields failure kind timeout",
+  "a timeout before Grok confirms its tool policy still yields failure kind timeout",
   "permission-cancelled turn yields failure kind permission",
   "permission-cancelled turn names the blocked call when the CLI reports it",
   "permission-cancelled turn reports explicit absence when the CLI omits the call",
@@ -447,6 +448,16 @@ test("timeout yields failure kind timeout", (t) => {
   const resultOutput = runCompanion(["result", record.id], { cwd: sandbox.workDir, env });
   assert.strictEqual(resultOutput.status, 0, resultOutput.stderr);
   assert.match(resultOutput.stdout, /^failure: timeout$/m);
+});
+
+test("a timeout before Grok confirms its tool policy still yields failure kind timeout", (t) => {
+  const sandbox = makeSandbox(t);
+  const env = envFor(sandbox, { FAKE_GROK_MODE: "hang-before-policy", GROK_COMPANION_TIMEOUT_MS: "500" });
+  const result = runCompanion(["task", "slow work"], { cwd: sandbox.workDir, env });
+  assert.notStrictEqual(result.status, 0);
+  assert.match(result.stderr, /^failure: timeout$/m);
+  assert.doesNotMatch(result.stderr, /tool policy enforcement failed/);
+  assert.strictEqual(jobRecords(sandbox.dataDir)[0].failureKind, "timeout");
 });
 
 test("permission-cancelled turn yields failure kind permission", (t) => {

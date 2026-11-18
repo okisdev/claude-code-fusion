@@ -715,7 +715,7 @@ test("structured raw transport preserves shell syntax without evaluating it", (t
   assert.equal(fs.existsSync(path.dirname(transport.file)), false);
 });
 
-test("raw transport rejects an unwritten input and removes the verified transport", (t) => {
+test("an empty raw task request reaches prompt validation and removes the verified transport", (t) => {
   const sandbox = makeSandbox(t);
   const env = envFor(sandbox);
   const created = runCompanion(["transport-create"], { cwd: sandbox.workDir, env });
@@ -725,7 +725,7 @@ test("raw transport rejects an unwritten input and removes the verified transpor
 
   const result = runCompanion(["task", "--raw-args-token", transport.token], { cwd: sandbox.workDir, env });
   assert.equal(result.status, 1);
-  assert.match(result.stderr, /raw command transport is unwritten/);
+  assert.match(result.stderr, /Provide a Codex task prompt or --prompt-file\./);
   assert.equal(jobRecords(sandbox).length, 0);
   assert.equal(fs.existsSync(transport.file), false);
   assert.equal(fs.existsSync(ownerFile), false);
@@ -1046,7 +1046,7 @@ test("task rejects an outdated Codex CLI before execution", (t) => {
 });
 
 test("task proceeds with tested, alpha hotfix, and newer Codex CLI versions", (t) => {
-  for (const version of ["0.154.0", "0.154.1", "0.155.0-alpha.5.1", "0.155.0", "0.156.0", "0.157.1", "0.162.1", "0.169.0", "0.170.0"]) {
+  for (const version of ["0.154.0", "0.154.1", "0.155.0-alpha.5.1", "0.155.0", "0.156.0", "0.157.1", "0.162.1", "0.169.0", "0.170.0", "0.171.0"]) {
     const sandbox = makeSandbox(t);
     const result = runCompanion(["task", "--json", "do work"], {
       cwd: sandbox.workDir,
@@ -2252,12 +2252,12 @@ test("setup verifies authentication and the tested Codex version interval", (t) 
   assert.doesNotMatch(apiKey.stdout, /codex-test-key/);
   const unsupported = runCompanion(["setup", "--json"], {
     cwd: sandbox.workDir,
-    env: envFor(sandbox, { FAKE_CODEX_VERSION: "0.170.0" })
+    env: envFor(sandbox, { FAKE_CODEX_VERSION: "0.171.0" })
   });
   assert.equal(unsupported.status, 1);
   const unsupportedReport = JSON.parse(unsupported.stdout);
   assert.equal(unsupportedReport.ready, false);
-  assert.match(unsupportedReport.compatibility, /newer than the tested interval \(0\.154\.0 to before 0\.170\.0\)/);
+  assert.match(unsupportedReport.compatibility, /newer than the tested interval \(0\.154\.0 to before 0\.171\.0\)/);
   assert.match(unsupportedReport.nextSteps.join("\n"), /A verification pass is advised\./);
 });
 

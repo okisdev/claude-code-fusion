@@ -179,7 +179,7 @@ test("R3: disk cache survives module reload and invalidates on each binary key f
   assert.equal(calls(sandbox, "--help").length, 1);
   assert.equal(calls(sandbox, "--version").length, 2);
 
-  probe({ ...env, FAKE_GROK_VERSION_OUTPUT: "grok 1.0.89 (different)" });
+  probe({ ...env, FAKE_GROK_VERSION_OUTPUT: "grok 1.0.90 (different)" });
   assert.equal(calls(sandbox, "--help").length, 2);
   const updated = new Date(Date.now() + 5000);
   fs.utimesSync(binary, updated, updated);

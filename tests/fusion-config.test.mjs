@@ -6,7 +6,7 @@ import path from "node:path";
 import { test } from "node:test";
 
 import { hashRulesTemplate } from "../plugins/fusion/scripts/lib/rules-template.mjs";
-import { resolveModelRoutingPath } from "../plugins/fusion/scripts/lib/model-table.mjs";
+import { DEFAULT_MODEL_TABLE_PLACEHOLDER, resolveModelRoutingPath } from "../plugins/fusion/scripts/lib/model-table.mjs";
 
 const repoRoot = path.join(import.meta.dirname, "..");
 const script = path.join(repoRoot, "plugins", "fusion", "scripts", "fusion-config.mjs");
@@ -16,7 +16,7 @@ const CANONICAL = `# Orchestration policy
 canonical rules content
 
 <!-- fusion:model-table:start -->
-Engine capability table: run /fusion:config to score your configured engines (intelligence, taste, cost, 1 to 5) and regenerate this block. Until scored, route by the qualitative lane descriptions in this document.
+This machine's capability table, breadth seat, and lane defaults arrive as session context at session start and after compaction; \`/fusion:config\` shows and edits them.
 <!-- fusion:model-table:end -->
 `;
 
@@ -95,7 +95,7 @@ test("Rejects a bad score with a usage error", (t) => {
   assert.strictEqual(fs.existsSync(box.modelRoutingFile), false);
 });
 
-test("Rescore keeps notes in routing data and config listing while refreshing rules without them", (t) => {
+test("Rescore keeps notes in routing data and prints the table without installing live rules", (t) => {
   const box = sandbox(t);
   const result = run(box, [
     "rescore",
@@ -127,16 +127,16 @@ test("Rescore keeps notes in routing data and config listing while refreshing ru
     assert.strictEqual(fs.statSync(path.dirname(box.modelRoutingFile)).mode & 0o777, 0o700);
     assert.strictEqual(fs.statSync(box.modelRoutingFile).mode & 0o777, 0o600);
   }
-  const live = fs.readFileSync(box.rulesFile, "utf8");
-  assert.match(live, /^\| codex \| codex \| openai \| 5 \| 4 \| 5 \|$/m);
-  assert.doesNotMatch(live, /primary implementation lane|\| Notes \|/);
+  assert.strictEqual(fs.existsSync(box.rulesFile), false);
+  assert.match(result.stdout, /^\| codex \| codex \| openai \| 5 \| 4 \| 5 \| primary implementation lane \|$/m);
+  assert.match(result.stdout, /Routing changes take effect in new sessions or after \/compact\./);
   const listing = run(box, ["show"]);
   assert.strictEqual(listing.status, 0, listing.stderr);
   assert.match(listing.stdout, /^\| Engine \| Lane \| Family \| Intelligence \| Taste \| Cost \| Notes \|$/m);
   assert.match(listing.stdout, /^\| codex \| codex \| openai \| 5 \| 4 \| 5 \| primary implementation lane \|$/m);
 });
 
-test("Set-default writes a lane choice and refreshes the live rules", (t) => {
+test("Set-default writes a lane choice and prints the updated defaults without installing live rules", (t) => {
   const box = sandbox(t);
   assert.strictEqual(
     run(box, ["rescore", "gpt-6-sol", "--intelligence", "5", "--taste", "4", "--cost", "4", "--lane", "codex"]).status,
@@ -147,7 +147,8 @@ test("Set-default writes a lane choice and refreshes the live rules", (t) => {
   assert.match(result.stdout, /Updated codex quick default to gpt-6-sol@high\./);
   const data = JSON.parse(fs.readFileSync(box.modelRoutingFile, "utf8"));
   assert.deepStrictEqual(data.defaults, { codex: { quick: { model: "gpt-6-sol", effort: "high" } } });
-  assert.match(fs.readFileSync(box.rulesFile, "utf8"), /^Lane defaults: codex quick gpt-6-sol@high, volume gpt-6-sol@high/m);
+  assert.match(result.stdout, /^Lane defaults: codex quick gpt-6-sol@high, volume gpt-6-sol@high/m);
+  assert.strictEqual(fs.existsSync(box.rulesFile), false);
   assert.strictEqual(
     run(box, ["rescore", "grok-4.7", "--intelligence", "5", "--taste", "4", "--cost", "4", "--lane", "grok"]).status,
     0
@@ -167,25 +168,27 @@ test("Set-breadth creates routing data, changes the rendered seat, and preserves
   const data = JSON.parse(fs.readFileSync(box.modelRoutingFile, "utf8"));
   assert.strictEqual(data.breadth, "devin");
   assert.deepStrictEqual(data.models, []);
-  assert.match(fs.readFileSync(box.rulesFile, "utf8"), /Breadth engine: Devin \(devin\)/);
+  assert.match(selected.stdout, /Breadth engine: Devin \(devin\)/);
   assert.strictEqual(run(box, ["rescore", "muse-wonder", "--intelligence", "5", "--taste", "5", "--cost", "3", "--lane", "devin", "--family", "anthropic"]).status, 0);
   assert.strictEqual(run(box, ["rescore", "composer-2.5", "--intelligence", "4", "--taste", "4", "--cost", "4", "--lane", "cursor", "--family", "cognition"]).status, 0);
   assert.strictEqual(run(box, ["set-default", "devin", "diversity", "muse-wonder", "xhigh"]).status, 0);
-  const live = fs.readFileSync(box.rulesFile, "utf8");
-  assert.match(live, /\| muse-wonder \| devin \| anthropic \|/);
-  assert.doesNotMatch(live, /\| composer-2\.5 \| cursor \|/);
-  assert.match(live, /devin diversity muse-wonder@xhigh/);
-  assert.doesNotMatch(live, /cursor diversity/);
+  const listing = run(box, ["show"]);
+  assert.strictEqual(listing.status, 0, listing.stderr);
+  assert.match(listing.stdout, /\| muse-wonder \| devin \| anthropic \|/);
+  assert.doesNotMatch(listing.stdout, /\| composer-2\.5 \| cursor \|/);
+  assert.match(listing.stdout, /devin diversity muse-wonder@xhigh/);
+  assert.doesNotMatch(listing.stdout, /cursor diversity/);
   const audit = JSON.parse(run(box, ["audit", "--json"]).stdout);
   assert.strictEqual(audit.breadth, "devin");
   assert.strictEqual(audit.engines.devin.listing.available, true);
   assert.deepStrictEqual(audit.engines.devin.defaultsAbsent, []);
   assert.strictEqual(Object.hasOwn(audit.defaults, "cursor"), false);
   assert.deepStrictEqual(audit.engines.cursor.unscored, []);
-  assert.strictEqual(run(box, ["set-breadth", "cursor"]).status, 0);
-  const switched = fs.readFileSync(box.rulesFile, "utf8");
-  assert.match(switched, /\| composer-2\.5 \| cursor \| cognition \|/);
-  assert.doesNotMatch(switched, /\| muse-wonder \| devin \|/);
+  const switched = run(box, ["set-breadth", "cursor"]);
+  assert.strictEqual(switched.status, 0, switched.stderr);
+  assert.match(switched.stdout, /\| composer-2\.5 \| cursor \| cognition \|/);
+  assert.doesNotMatch(switched.stdout, /\| muse-wonder \| devin \|/);
+  assert.strictEqual(fs.existsSync(box.rulesFile), false);
   assert.deepStrictEqual(JSON.parse(fs.readFileSync(box.modelRoutingFile, "utf8")).models.map((row) => row.id), ["muse-wonder", "composer-2.5"]);
 });
 
@@ -325,7 +328,9 @@ test("Cursor rescore requires family and accepts default effort", (t) => {
   assert.match(invalid.stderr, /models\[0\]\.family/);
   assert.strictEqual(run(box, [...args, "--family", "cursor"]).status, 0);
   assert.strictEqual(run(box, ["set-default", "cursor", "burst", "composer-2.5", "default"]).status, 0);
-  assert.match(fs.readFileSync(box.rulesFile, "utf8"), /\| composer-2\.5 \| cursor \| cursor \| 4 \| 4 \| 4 \|/);
+  const listing = run(box, ["show"]);
+  assert.strictEqual(listing.status, 0, listing.stderr);
+  assert.match(listing.stdout, /\| composer-2\.5 \| cursor \| cursor \| 4 \| 4 \| 4 \|/);
 });
 
 test("Set-default rejects a model absent from a live listing and names the listing source", (t) => {
@@ -355,23 +360,42 @@ test("Set-default warns and proceeds when the engine listing is unavailable", (t
   assert.match(result.stdout, /Updated codex quick default to gpt-6-sol@high/);
 });
 
-test("Config mutations report when local rules edits block routing table refresh", (t) => {
-  const box = sandbox(t);
-  assert.strictEqual(
-    run(box, ["rescore", "codex", "--intelligence", "5", "--taste", "4", "--cost", "5", "--lane", "codex"]).status,
-    0
-  );
-  const handEdited = fs.readFileSync(box.rulesFile, "utf8").replace("canonical rules content", "hand edited rules content");
-  fs.writeFileSync(box.rulesFile, handEdited, "utf8");
-  const result = run(box, ["set-cost-profile", "peer subscriptions flat rate"]);
-  assert.strictEqual(result.status, 0, result.stderr);
-  assert.match(
-    result.stdout,
-    /installed rules routing table was not refreshed because the installed rules file has local edits; run \/fusion:setup to reconcile/
-  );
-  assert.match(
-    result.stdout,
-    /does not match any shipped rules version \(local edits or a stale render\), run \/fusion:setup to reconcile/
-  );
-  assert.strictEqual(fs.readFileSync(box.rulesFile, "utf8"), handEdited);
+test("Every config mutation prints routing context while leaving missing, shipped, and hand edited rules untouched", (t) => {
+  for (const state of ["missing", "shipped", "hand-edited"]) {
+    const box = sandbox(t);
+    const content = state === "hand-edited" ? CANONICAL.replace("canonical rules content", "hand edited rules content") : CANONICAL;
+    if (state !== "missing") {
+      fs.mkdirSync(path.dirname(box.rulesFile), { recursive: true });
+      fs.writeFileSync(box.rulesFile, content);
+    }
+    const mtime = state === "missing" ? null : fs.statSync(box.rulesFile).mtimeMs;
+    const commands = [
+      ["remove", "missing"],
+      ["rescore", "gpt-6-sol", "--intelligence", "5", "--taste", "4", "--cost", "5", "--lane", "codex"],
+      ["set-default", "codex", "quick", "gpt-6-sol", "high"],
+      ["set-breadth", "devin"],
+      ["set-cost-profile", "peer subscriptions flat rate"],
+      ["remove", "missing"],
+      ["rescore", "grok-fast", "--intelligence", "3", "--taste", "3", "--cost", "5", "--lane", "grok"],
+      ["remove", "grok-fast"],
+      ["reset-defaults", "--yes"]
+    ];
+    for (const args of commands) {
+      const result = run(box, args);
+      assert.strictEqual(result.status, 0, `${state}: ${args.join(" ")}: ${result.stderr}`);
+      assert.match(result.stdout, /Routing changes take effect in new sessions or after \/compact\./);
+      assert.doesNotMatch(result.stdout, /local edits|\/fusion:setup|rules installed|rules updated/);
+      if (fs.existsSync(box.modelRoutingFile)) {
+        assert.match(result.stdout, /^\| Engine \| Lane \| Family \| Intelligence \| Taste \| Cost \| Notes \|$/m);
+      } else {
+        assert.ok(result.stdout.includes(DEFAULT_MODEL_TABLE_PLACEHOLDER));
+      }
+      if (state === "missing") {
+        assert.strictEqual(fs.existsSync(path.dirname(box.rulesFile)), false);
+      } else {
+        assert.strictEqual(fs.readFileSync(box.rulesFile, "utf8"), content);
+        assert.strictEqual(fs.statSync(box.rulesFile).mtimeMs, mtime);
+      }
+    }
+  }
 });

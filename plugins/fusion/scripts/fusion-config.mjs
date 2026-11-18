@@ -20,7 +20,6 @@ import {
 import { newestEngineCompanion } from "./lib/engine-acceptance.mjs";
 import { BREADTH_ENGINE_IDS, ENGINES, ENGINE_IDS, isEngineId, routedEngineIds } from "./lib/engines.mjs";
 import { withFileLock, writeFileAtomic } from "./lib/storage.mjs";
-import { syncRulesToLive } from "./lib/rules-template.mjs";
 
 class UsageError extends Error {}
 
@@ -101,13 +100,6 @@ function ensureOnlyOptions(options, allowed, command) {
       throw new UsageError(`${command} does not accept --${key}.`);
     }
   }
-}
-
-function resolvePluginRoot(env) {
-  if (env.CLAUDE_PLUGIN_ROOT && env.CLAUDE_PLUGIN_ROOT.trim()) {
-    return path.resolve(env.CLAUDE_PLUGIN_ROOT.trim());
-  }
-  return path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 }
 
 function readEngineModelListing(engine, env) {
@@ -193,26 +185,6 @@ function writeModelRoutingData(filePath, data) {
   }
   writeFileAtomic(filePath, `${JSON.stringify(validation.data, null, 2)}\n`);
   return validation.data;
-}
-
-function refreshLiveRules(env, stdout) {
-  const messages = [];
-  const result = syncRulesToLive({
-    pluginRoot: resolvePluginRoot(env),
-    env,
-    log(message) {
-      messages.push(message);
-    }
-  });
-  for (const message of messages) {
-    stdout.write(`${message}\n`);
-  }
-  if (result.status === "local-edits") {
-    stdout.write(
-      "fusion: installed rules routing table was not refreshed because the installed rules file has local edits; run /fusion:setup to reconcile.\n"
-    );
-  }
-  return result;
 }
 
 function showCommand(options, env, stdout) {
@@ -312,7 +284,6 @@ function setDefaultCommand(positionals, options, env, stdout) {
     stdout.write(`fusion-config: ${ENGINES[lane].displayName} model listing unavailable; model availability was not checked.\n`);
   }
   writeModelRoutingData(filePath, data);
-  refreshLiveRules(env, stdout);
   stdout.write(`Updated ${lane} ${role} default to ${model}@${effort}.\n`);
 }
 
@@ -326,7 +297,6 @@ function setBreadthCommand(positionals, options, env, stdout) {
   const data = loadEditableData(filePath);
   data.breadth = breadth;
   writeModelRoutingData(filePath, data);
-  refreshLiveRules(env, stdout);
   stdout.write(`Updated breadth engine to ${ENGINES[breadth].displayName} (${breadth}).\n`);
 }
 
@@ -371,7 +341,6 @@ function rescoreCommand(positionals, options, env, stdout) {
     data.models[index] = next;
   }
   writeModelRoutingData(filePath, data);
-  refreshLiveRules(env, stdout);
   stdout.write(`Updated model score for ${id}.\n`);
 }
 
@@ -383,7 +352,6 @@ function removeCommand(positionals, options, env, stdout) {
   const id = requireId(positionals[0]);
   const filePath = resolveModelRoutingPath(env);
   if (!fs.existsSync(filePath)) {
-    refreshLiveRules(env, stdout);
     stdout.write(`No model routing file exists at ${filePath}.\n`);
     return;
   }
@@ -391,12 +359,10 @@ function removeCommand(positionals, options, env, stdout) {
   const before = data.models.length;
   data.models = data.models.filter((model) => model.id !== id);
   if (data.models.length === before) {
-    refreshLiveRules(env, stdout);
     stdout.write(`No model score found for ${id}.\n`);
     return;
   }
   writeModelRoutingData(filePath, data);
-  refreshLiveRules(env, stdout);
   stdout.write(`Removed model score for ${id}.\n`);
 }
 
@@ -410,7 +376,6 @@ function setCostProfileCommand(positionals, options, env, stdout) {
   const data = loadEditableData(filePath);
   data.costProfile = text;
   writeModelRoutingData(filePath, data);
-  refreshLiveRules(env, stdout);
   stdout.write("Updated cost profile.\n");
 }
 
@@ -424,7 +389,6 @@ function resetDefaultsCommand(positionals, options, env, stdout) {
   }
   const filePath = resolveModelRoutingPath(env);
   fs.rmSync(filePath, { force: true });
-  refreshLiveRules(env, stdout);
   stdout.write(`Reset model routing defaults at ${filePath}.\n`);
 }
 
@@ -468,8 +432,15 @@ export function main(argv = process.argv.slice(2), { env = process.env, stdout =
           throw new UsageError(`Unknown command ${command}.\n${usage()}`);
       }
     };
-    return ["rescore", "set-default", "set-breadth", "remove", "set-cost-profile", "reset-defaults"].includes(command)
-      ? withFileLock(resolveModelRoutingPath(env), runCommand) : runCommand();
+    if (!["rescore", "set-default", "set-breadth", "remove", "set-cost-profile", "reset-defaults"].includes(command)) {
+      return runCommand();
+    }
+    return withFileLock(resolveModelRoutingPath(env), () => {
+      const status = runCommand();
+      showCommand({}, env, stdout);
+      stdout.write("Routing changes take effect in new sessions or after /compact.\n");
+      return status;
+    });
   } catch (error) {
     if (error instanceof UsageError) {
       stderr.write(`fusion-config: ${error.message}\n`);
