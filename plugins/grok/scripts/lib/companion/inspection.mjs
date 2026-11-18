@@ -6,6 +6,14 @@ import { JOB_ID_PATTERN, DEFAULT_HISTORY_LIMIT, HISTORY_STATUSES, HISTORY_MODES,
 import { output, errorWithFailure, failureOutcomeMessage, resolveCwd, findRequestedJobRecord, currentClaudeSessionId, parseHistoryLimit, commandArgs, resolveWaitPollMs, resolveWaitTimeoutMs, delayMs } from "./base.mjs";
 import { inputError, jobClassForRecord, memoryEnabledForRecord, terminalJob, sessionMemoryModes } from "./session.mjs";
 import { cleanupRequiredPatch, refreshRunningJobRecord, outcomeFields, observableRecord, failureResultPayload, retainedResultPayload } from "./outcome.mjs";
+import { watchJob } from "../job-watch.mjs";
+
+async function handleWatch(argv) {
+  await watchJob(argv, { engine: "grok", readJob: (jobId) => {
+    const found = findRequestedJobRecord(resolveDataDir(), jobId, {});
+    return found ? refreshRunningJobRecord(found).record : null;
+  } });
+}
 
 function handleStatus(argv, transport = {}) {
   const { options, positionals } = commandArgs(argv, {
@@ -359,4 +367,4 @@ async function handleCancel(argv, transport = {}) {
   output(options.json ? next : renderCancelReport(next), options.json);
 }
 
-export { handleStatus, handleHistory, handleResult, handleCancel };
+export { handleStatus, handleHistory, handleResult, handleCancel, handleWatch };

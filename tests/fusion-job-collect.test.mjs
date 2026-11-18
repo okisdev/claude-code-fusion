@@ -29,7 +29,6 @@ function isolatedEnv(root, extra = {}) {
     GROK_HOME: path.join(runtimeRoot, "grok-home"),
     CODEX_COMPANION_DATA: path.join(runtimeRoot, "codex-data"),
     CODEX_HOME: path.join(runtimeRoot, "codex-home"),
-    CODEX_JOBS_MONITOR_SESSIONS_DIR: path.join(runtimeRoot, "codex-sessions"),
     ...extra
   };
 }

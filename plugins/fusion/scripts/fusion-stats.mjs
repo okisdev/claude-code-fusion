@@ -74,7 +74,8 @@ export function main(argv = process.argv.slice(2), { env = process.env, cwd = pr
   }
 
   if (argv.includes("--unsettled")) {
-    const report = buildUnsettledReport({ env });
+    const rawDays = argumentValue(argv, "--days");
+    const report = buildUnsettledReport({ env, days: rawDays === null ? 7 : Number(rawDays), all: argv.includes("--all") });
     stdout.write(asJson ? `${JSON.stringify(report, null, 2)}\n` : renderUnsettledReport(report));
     return report;
   }
@@ -112,7 +113,7 @@ function runCli(argv = process.argv.slice(2)) {
     if (argv.length === 1 && argv[0] === "--help") {
       process.stdout.write([
         "Usage: fusion-stats.mjs [--all] [--identities] [--by-day] [--json]",
-        "       fusion-stats.mjs --unsettled [--json]",
+        "       fusion-stats.mjs --unsettled [--days <positive integer> | --all] [--json]",
         "       fusion-stats.mjs --audit [--days <1..3650> | --all] [--json]",
         "       fusion-stats.mjs --prune-dead [--yes] [--json]",
         "       fusion-stats.mjs --messages | --message <n>",

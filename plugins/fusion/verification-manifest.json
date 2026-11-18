@@ -115,7 +115,6 @@
   },
   {
     "paths": [
-      "plugins/fusion/scripts/codex-jobs-monitor.mjs",
       "plugins/fusion/scripts/engine-jobs-observer.mjs"
     ],
     "suites": [

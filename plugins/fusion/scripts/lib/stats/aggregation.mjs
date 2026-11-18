@@ -717,11 +717,11 @@ export function buildFusionStats({ all = false, env = process.env, cwd = process
 }
 
 function unsettledFinishedAt(raw) {
-  return nonEmptyString(raw?.finishedAt ?? raw?.completedAt ?? raw?.updatedAt);
+  return nonEmptyString(raw?.finishedAt ?? raw?.completedAt);
 }
 
 function unsettledTimestamp(entry) {
-  const timestamp = Date.parse(entry.finishedAt ?? "");
+  const timestamp = Date.parse(entry.finishedAt ?? entry.createdAt ?? "");
   return Number.isFinite(timestamp) ? timestamp : Number.NEGATIVE_INFINITY;
 }
 
@@ -733,6 +733,7 @@ function unsettledWorkerEntries(env) {
       id: nonEmptyString(record.taskId) ?? "unknown",
       description: nonEmptyString(record.description) ?? nonEmptyString(record.agentType) ?? "unknown",
       finishedAt: unsettledFinishedAt(record),
+      createdAt: nonEmptyString(record.createdAt),
       acceptance: "unverified"
     }));
 }
@@ -763,16 +764,20 @@ function unsettledEngineEntries(descriptor, env) {
       id,
       kind: descriptor.normalizeJob(raw).kind,
       finishedAt: unsettledFinishedAt(raw),
+      createdAt: nonEmptyString(raw.createdAt),
       acceptance: "unverified",
       ...(descriptor.usesSupersededJobs ? acceptanceProvenance(raw) : {})
     }];
   });
 }
 
-export function buildUnsettledReport({ env = process.env } = {}) {
-  const unsettled = [
+export function buildUnsettledReport({ env = process.env, days = 7, all = false, now = Date.now() } = {}) {
+  const entries = [
     ...unsettledWorkerEntries(env),
     ...ENGINE_IDS.flatMap((id) => unsettledEngineEntries(FILE_ENGINE_DESCRIPTORS[id], env))
   ].sort((left, right) => unsettledTimestamp(right) - unsettledTimestamp(left));
-  return { unsettled };
+  if (all) return { unsettled: entries, hidden: { older: 0, further: 0 } };
+  const since = now - days * 24 * 60 * 60 * 1000;
+  const recent = entries.filter((entry) => unsettledTimestamp(entry) >= since);
+  return { unsettled: recent.slice(0, 20), hidden: { older: entries.length - recent.length, further: Math.max(0, recent.length - 20) } };
 }

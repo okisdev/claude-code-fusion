@@ -546,7 +546,7 @@ export function readWorkerSessionState(sessionId, env = process.env) {
   return readWorkerRecordFile(workerSessionStateFile(sessionId, env));
 }
 
-export function updateWorkerSessionState(sessionId, env, updater) {
+export function updateWorkerSessionState(sessionId, env, updater, lockOptions) {
   const file = workerSessionStateFile(sessionId, env);
   return withFileLock(file, () => {
     const current = readWorkerRecordFile(file);
@@ -556,10 +556,14 @@ export function updateWorkerSessionState(sessionId, env, updater) {
     }
     writePrivateJson(file, next);
     return next;
-  });
+  }, lockOptions);
 }
 
-export function updateWorkerRecord(taskId, env, updater) {
+function pendingEngineAcceptance(record) {
+  return record?.engineAcceptanceDelivery?.entries?.some((entry) => entry.status === "pending" || entry.status === "failed") ?? false;
+}
+
+export function updateWorkerRecord(taskId, env, updater, lockOptions) {
   const file = workerRecordFile(taskId, env);
   return withFileLock(file, () => {
     const current = readWorkerRecordFile(file);
@@ -569,6 +573,15 @@ export function updateWorkerRecord(taskId, env, updater) {
     }
     const updated = compactWorkerRecord({ ...next, updatedAt: new Date().toISOString() });
     writePrivateJson(file, updated);
+    if (updated.sessionId && (pendingEngineAcceptance(current) || pendingEngineAcceptance(updated))) {
+      updateWorkerSessionState(updated.sessionId, env, (state) => {
+        if (!Array.isArray(state?.engineAcceptanceTaskIds)) return null;
+        if (state.engineAcceptanceTaskIds.includes(taskId) === pendingEngineAcceptance(updated)) return null;
+        const taskIds = state.engineAcceptanceTaskIds.filter((id) => id !== taskId);
+        if (pendingEngineAcceptance(updated)) taskIds.push(taskId);
+        return { ...(state ?? {}), engineAcceptanceTaskIds: taskIds };
+      }, lockOptions);
+    }
     if (updated.sessionId && (workerOutputPaths(current).join("\0") !== workerOutputPaths(updated).join("\0"))) {
       const sessionId = updated.sessionId;
       if (!readWorkerSessionState(sessionId, env)?.outputFiles) {
@@ -589,7 +602,7 @@ export function updateWorkerRecord(taskId, env, updater) {
       }
     }
     return updated;
-  });
+  }, lockOptions);
 }
 
 export function markWorkerCollected(record, method, collectedAt = new Date().toISOString()) {
@@ -627,7 +640,7 @@ export function createWorkerRecord(record, env = process.env) {
     void 0;
   }
   const sessionState = readWorkerSessionState(record.sessionId, env);
-  if (sessionState && !Array.isArray(sessionState.taskIds)) {
+  if (sessionState && (!Array.isArray(sessionState.taskIds) || !Array.isArray(sessionState.engineAcceptanceTaskIds))) {
     readSessionWorkerRecords(env, record.sessionId);
   }
   if (sessionState && !sessionState.outputFiles) {
@@ -710,6 +723,7 @@ export function createWorkerRecord(record, env = process.env) {
     updateWorkerSessionState(record.sessionId, env, (current) => ({
       ...(current ?? {}),
       taskIds: [...new Set([...(Array.isArray(current?.taskIds) ? current.taskIds : []), record.taskId])],
+      engineAcceptanceTaskIds: current?.engineAcceptanceTaskIds ?? [],
       outputFiles: current?.outputFiles ?? {}
     }));
     writePrivateJson(file, value);
@@ -755,16 +769,18 @@ export function readWorkerRecords(env = process.env, { strict = false, modifiedS
 }
 
 export function readSessionWorkerRecords(env = process.env, sessionId, { strict = false } = {}) {
-  let taskIds = readWorkerSessionState(sessionId, env)?.taskIds;
+  const session = readWorkerSessionState(sessionId, env);
+  const taskIds = session?.taskIds;
   if (!Array.isArray(taskIds)) {
     const records = readWorkerRecords(env, { strict }).filter((record) => record.sessionId === sessionId);
     updateWorkerSessionState(sessionId, env, (current) => ({
       ...(current ?? {}),
-      taskIds: [...new Set([...(Array.isArray(current?.taskIds) ? current.taskIds : []), ...records.map((record) => record.taskId)])]
+      taskIds: [...new Set([...(Array.isArray(current?.taskIds) ? current.taskIds : []), ...records.map((record) => record.taskId)])],
+      ...(records.some(pendingEngineAcceptance) ? { engineAcceptanceTaskIds: current?.engineAcceptanceTaskIds ?? records.filter(pendingEngineAcceptance).map((record) => record.taskId) } : {})
     }));
     return records;
   }
-  return [...new Set(taskIds)].flatMap((taskId) => {
+  const records = [...new Set(taskIds)].flatMap((taskId) => {
     let file;
     try {
       file = workerRecordFile(taskId, env);
@@ -791,6 +807,11 @@ export function readSessionWorkerRecords(env = process.env, sessionId, { strict 
     }
     return [];
   });
+  if (!Array.isArray(session.engineAcceptanceTaskIds) && records.some(pendingEngineAcceptance)) {
+    updateWorkerSessionState(sessionId, env, (current) => Array.isArray(current?.engineAcceptanceTaskIds) ? null
+      : { ...(current ?? {}), engineAcceptanceTaskIds: records.filter(pendingEngineAcceptance).map((record) => record.taskId) });
+  }
+  return records;
 }
 
 function integer(value) {

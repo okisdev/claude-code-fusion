@@ -3,6 +3,7 @@ import { parseArgs } from "../args.mjs";
 import { normalizeGrokSessionId, resolveGrokBin, resolveTimeoutMs, sandboxProfileForMode, runGrok, terminalRecordAttribution } from "../grok-exec.mjs";
 import { getProcessIdentity } from "../process-identity.mjs";
 import { renderBackgroundLaunch, renderTaskResult } from "../render.mjs";
+import { backgroundWatchReceipt } from "../job-watch.mjs";
 import { briefPath, clearQuotaCooldown, claimResumeSessionLease, createJobRecord, createJobRecordFile, generateJobId, jobFilePath, jobLogPath, launchRunningJobProcess, nowIso, readJobRecordFile, resolveDataDir, updateJobRecordFile, finishSuccessfulJobRecordFile, writeBrief } from "../state.mjs";
 import { CONTINUE_PROMPT } from "./config.mjs";
 import { resolveGrokCompanionVersion, probeGrokVersion, requireTestedGrokFloor, requireQuotaAvailable } from "./version.mjs";
@@ -144,6 +145,7 @@ async function handleTask(argv, transport = {}) {
       jobClass: record.jobClass,
       mode,
       background: true,
+      ...(record.delivery === "manual" ? backgroundWatchReceipt("grok", jobId) : {}),
       memoryEnabled: memory,
       resolvedModel: null,
       resolvedEffort: null,

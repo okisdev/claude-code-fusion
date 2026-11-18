@@ -1,4 +1,5 @@
 import { renderFooterLines } from "./render-footers.mjs";
+import { backgroundWatchReceipt } from "./job-watch.mjs";
 
 const VALID_VERDICTS = new Set(["approve", "request_changes"]);
 const VALID_SEVERITIES = new Set(["critical", "high", "medium", "low"]);
@@ -241,6 +242,7 @@ export function createCompanionRender({ engine, engineName, resolvedEffortField,
       `Started background job ${jobId}.`,
       `Check progress with /${engine}:status ${jobId}.`,
       `Fetch the result with /${engine}:result ${jobId}.`,
+      ...(delivery === "manual" ? [backgroundWatchReceipt(engine, jobId).watchInstruction] : []),
       "",
       ...renderFooterLines({ id: jobId, cwd, delivery, status: "running" }, engine),
       ""

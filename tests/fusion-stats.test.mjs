@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { spawn, spawnSync } from "node:child_process";
+import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -11,6 +11,7 @@ import {
   STATS_PROVIDER_REGISTRY,
   WORKSPACE_ENGINE_DESCRIPTORS,
   buildAuditReport,
+  main as runStats,
   appendModelAuditObservations,
   buildFleetUsageStats,
   clusterDispatchBursts,
@@ -39,14 +40,13 @@ import {
 } from "../plugins/fusion/scripts/fusion-stats.mjs";
 import { resolveStateDir as guardResolveStateDir, stateFile as guardStateFile } from "../plugins/fusion/scripts/inline-delegation-guard.mjs";
 import { createRawArgsTransport } from "../plugins/fusion/scripts/lib/raw-args-transport.mjs";
-import { MESSAGE_REGISTRY, messageCode, messageTag } from "../plugins/fusion/scripts/lib/user-messages.mjs";
+import { MESSAGE_REGISTRY, messageCode } from "../plugins/fusion/scripts/lib/user-messages.mjs";
 import { applyQueuedVerdict, createWorkerRecord, readWorkerRecord, recordWorkerAcceptance, reopenWorkerContinuation, updateWorkerRecord, workerElapsedMs, workerRecordFile } from "../plugins/fusion/scripts/lib/worker-state.mjs";
 import { isStrictDirectRecordArguments, parseRecordArguments, validateArgumentShape } from "../plugins/fusion/scripts/lib/stats/arguments.mjs";
 import { settlementCommand } from "../plugins/fusion/scripts/lib/lifecycle/stop.mjs";
 import { gitIsolation } from "./lib/git-fixture.mjs";
 
 const SCRIPT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "plugins", "fusion", "scripts", "fusion-stats.mjs");
-const CODEX_MONITOR_SCRIPT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "plugins", "fusion", "scripts", "codex-jobs-monitor.mjs");
 
 function sandbox(t) {
   const dir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "fusion-stats-test-")));
@@ -124,7 +124,6 @@ function runtimeEnv(env, extraEnv = {}) {
     GROK_HOME: path.join(root, "grok-home"),
     CODEX_COMPANION_DATA: path.join(root, "codex-data"),
     CODEX_HOME: path.join(root, "codex-home"),
-    CODEX_JOBS_MONITOR_SESSIONS_DIR: path.join(root, "codex-sessions"),
     ...extraEnv
   };
 }
@@ -147,102 +146,6 @@ function runDirect(env, extraArgs = [], extraEnv = {}) {
     env: runtimeEnv(env, extraEnv)
   });
 }
-
-function runMonitorUntil(cwd, env, { stateRoot, notification } = {}) {
-  return new Promise((resolve, reject) => {
-    let stdout = "";
-    let ready = false;
-    let settled = false;
-    let pollTimer;
-    const child = spawn(process.execPath, [CODEX_MONITOR_SCRIPT], { cwd, env, stdio: ["ignore", "pipe", "ignore"] });
-    const finish = () => {
-      if (ready || settled) {
-        return;
-      }
-      ready = true;
-      clearTimeout(pollTimer);
-      child.kill("SIGTERM");
-    };
-    const fail = (error) => {
-      if (settled) {
-        return;
-      }
-      settled = true;
-      clearTimeout(pollTimer);
-      if (!child.killed) {
-        child.kill("SIGTERM");
-      }
-      reject(error);
-    };
-    child.stdout.setEncoding("utf8");
-    child.stdout.on("data", (chunk) => {
-      stdout += chunk;
-      if (notification && stdout.includes(notification)) {
-        finish();
-      }
-    });
-    const waitForStateFile = () => {
-      if (settled || ready) {
-        return;
-      }
-      try {
-        if (fs.readdirSync(stateRoot).some((entry) => entry.startsWith("codex-jobs-monitor-announced"))) {
-          finish();
-          return;
-        }
-      } catch (error) {
-        fail(error);
-        return;
-      }
-      pollTimer = setTimeout(waitForStateFile, 10);
-    };
-    child.once("error", fail);
-    child.once("close", (status, signal) => {
-      if (!ready) {
-        fail(new Error(`codex jobs monitor exited before announcing readiness: ${status ?? signal}`));
-        return;
-      }
-      settled = true;
-      clearTimeout(pollTimer);
-      resolve({ status, signal, stdout });
-    });
-    if (stateRoot) {
-      waitForStateFile();
-    }
-  });
-}
-
-test("Codex jobs monitor stays silent for an unchanged state directory", async (t) => {
-  const dir = sandbox(t);
-  const stateRoot = path.join(dir, "codex-state");
-  fs.mkdirSync(stateRoot, { recursive: true });
-  const result = await runMonitorUntil(
-    dir,
-    runtimeEnv(
-      { cwd: dir, codexState: stateRoot },
-      { FUSION_CODEX_COMPANION: path.join(dir, "missing-codex-companion.mjs"), CODEX_JOBS_MONITOR_INTERVAL_MS: "1000" }
-    ),
-    { stateRoot }
-  );
-
-  assert.strictEqual(result.stdout, "");
-});
-
-test("Codex jobs monitor tags its announce-only notification", async (t) => {
-  const dir = sandbox(t);
-  const stateRoot = path.join(dir, "codex-state");
-  writeCodexJob(stateRoot, dir, "monitor-terminal", { status: "done", completedAt: new Date().toISOString() });
-  const result = await runMonitorUntil(
-    dir,
-    runtimeEnv(
-      { cwd: dir, codexState: stateRoot },
-      { FUSION_CODEX_COMPANION: path.join(dir, "missing-codex-companion.mjs"), CODEX_JOBS_MONITOR_INTERVAL_MS: "1000" }
-    ),
-    { notification: messageTag("codex-monitor.job-notification") }
-  );
-
-  assert.ok(result.stdout.trimEnd().endsWith(messageTag("codex-monitor.job-notification")));
-});
 
 function writeCodexAcceptanceCompanion(directory, jobFile = null) {
   const companion = path.join(directory, "codex-companion.mjs");
@@ -842,7 +745,7 @@ test("Cursor stats report models, billing pools, and exact token coverage", (t) 
   const trace = run({ cwd: dir, codexState: path.join(dir, "missing-codex") }, ["--trace", "--session", "cursor-session", "--json"], { CURSOR_COMPANION_DATA: dataDir });
   assert.strictEqual(trace.status, 0, trace.stderr);
   assert.deepStrictEqual(JSON.parse(trace.stdout).timeline.filter((entry) => entry.engine === "cursor").map((entry) => [entry.model, entry.effort, entry.join]), [["muse-spark-1.3-xhigh", "xhigh", "exact"]]);
-  const unsettled = run({ cwd: dir, codexState: path.join(dir, "missing-codex") }, ["--unsettled", "--json"], { CURSOR_COMPANION_DATA: dataDir });
+  const unsettled = run({ cwd: dir, codexState: path.join(dir, "missing-codex") }, ["--unsettled", "--all", "--json"], { CURSOR_COMPANION_DATA: dataDir });
   assert.strictEqual(unsettled.status, 0, unsettled.stderr);
   assert.deepStrictEqual(JSON.parse(unsettled.stdout).unsettled.filter((entry) => entry.engine === "cursor").map((entry) => entry.id).sort(), ["cursor-done", "cursor-quota", "cursor-unreported"]);
 });
@@ -872,7 +775,7 @@ test("Devin stats retain billing pools, usage, sessions, and unsettled jobs with
   assert.match(renderFusionStats(JSON.parse(result.stdout)), /## Devin[\s\S]*muse-wonder@xhigh \(api\): 1/);
   const session = run(base, ["--session", "devin-session", "--json"], options);
   assert.deepStrictEqual(JSON.parse(session.stdout).engines.devin.byStatus, { done: 1 });
-  const unsettled = run(base, ["--unsettled", "--json"], options);
+  const unsettled = run(base, ["--unsettled", "--all", "--json"], options);
   assert.deepStrictEqual(JSON.parse(unsettled.stdout).unsettled.filter((entry) => entry.engine === "devin").map((entry) => entry.id), ["devin-done"]);
 });
 
@@ -1980,6 +1883,7 @@ test("direct --help prints usage without loading a report", (t) => {
   const result = runDirect({ cwd: dir, codexState: path.join(dir, "missing") }, ["--help"]);
   assert.strictEqual(result.status, 0, result.stderr);
   assert.match(result.stdout, /^Usage: fusion-stats\.mjs/);
+  assert.match(result.stdout, /--unsettled \[--days <positive integer> \| --all\] \[--json\]/);
 });
 
 test("direct fixed report flags and audit days run without a transport", (t) => {
@@ -1987,6 +1891,8 @@ test("direct fixed report flags and audit days run without a transport", (t) => 
   const env = { cwd: dir, codexState: path.join(dir, "missing") };
   for (const [args, heading] of [
     [["--unsettled"], /# Fusion unsettled/],
+    [["--unsettled", "--days", "3"], /# Fusion unsettled/],
+    [["--unsettled", "--all"], /# Fusion unsettled/],
     [["--all"], /# Fusion stats/],
     [["--identities", "--by-day"], /# Fusion stats/],
     [["--audit", "--days", "3"], /# Fusion inline audit/]
@@ -1998,6 +1904,14 @@ test("direct fixed report flags and audit days run without a transport", (t) => 
   assert.strictEqual(isStrictDirectReportOrMaintenanceArguments(["--audit", "--days", "3"]), true);
   assert.strictEqual(isStrictDirectReportOrMaintenanceArguments(["--audit", "--days", "3", "--days", "4"]), false);
   assert.strictEqual(isStrictDirectReportOrMaintenanceArguments(["--audit", "--days", "text"]), false);
+  assert.strictEqual(isStrictDirectReportOrMaintenanceArguments(["--unsettled", "--days", "3"]), true);
+  assert.strictEqual(isStrictDirectReportOrMaintenanceArguments(["--unsettled", "--all"]), true);
+  for (const days of ["0", "-1", "+1", "1.5", "1x", "9007199254740992"]) {
+    assert.strictEqual(isStrictDirectReportOrMaintenanceArguments(["--unsettled", "--days", days]), false);
+    const result = runDirect(env, ["--unsettled", "--days", days]);
+    assert.notStrictEqual(result.status, 0, days);
+  }
+  assert.strictEqual(isStrictDirectReportOrMaintenanceArguments(["--unsettled", "--days", "3", "--days", "4"]), false);
 });
 
 test("bare direct invocation prints the Fusion stats report", (t) => {
@@ -2989,7 +2903,7 @@ test("--record continues a batch after a partial engine transport failure and ca
   const settledTaskId = `fusion-${"9".repeat(24)}`;
   const failedJobId = "a".repeat(32);
   const settledJobId = "b".repeat(32);
-  const env = { FUSION_WORKER_STATE_DIR: stateDir };
+  const env = { FUSION_WORKER_STATE_DIR: stateDir, FUSION_ACCEPTANCE_RETRY_BACKOFF_MS: "60000" };
   createTerminalWorker({ taskId: failedTaskId, env, workspaceRoot: dir, peerEngine: "codex", peerJobId: failedJobId });
   createTerminalWorker({ taskId: settledTaskId, env, workspaceRoot: dir, peerEngine: "codex", peerJobId: settledJobId });
   const args = ["--record", `${failedTaskId}=accepted`, "--record", `${settledTaskId}=accepted`];
@@ -3042,7 +2956,7 @@ for (const recordEngineId of [false, true]) {
   test(`--record ${recordEngineId ? "engine" : "worker"} delivery failure retries on the next unrelated CLI settlement`, (t) => {
     const dir = sandbox(t);
     const stateRoot = path.join(dir, "codex-state");
-    const env = { FUSION_WORKER_STATE_DIR: path.join(dir, "workers") };
+    const env = { FUSION_WORKER_STATE_DIR: path.join(dir, "workers"), FUSION_ACCEPTANCE_RETRY_BACKOFF_MS: "60000" };
     const taskId = `fusion-${"b".repeat(24)}`;
     const nextTaskId = `fusion-${"c".repeat(24)}`;
     const jobId = "d".repeat(32);
@@ -3933,7 +3847,7 @@ test("--unsettled lists terminal unverified jobs and preserves Codex acceptance 
   updateWorkerRecord("fusion-settled", { FUSION_WORKER_STATE_DIR: workerState }, (record) => ({ ...record, transportStatus: "done", acceptance: "rejected", finishedAt: "2026-07-21T00:04:00.000Z" }));
 
   const extraEnv = { FUSION_WORKER_STATE_DIR: workerState, GROK_COMPANION_DATA: grokData };
-  const json = run({ cwd: dir, codexState: stateRoot }, ["--unsettled", "--json"], extraEnv);
+  const json = run({ cwd: dir, codexState: stateRoot }, ["--unsettled", "--all", "--json"], extraEnv);
   assert.strictEqual(json.status, 0, json.stderr);
   const report = JSON.parse(json.stdout);
   assert.deepStrictEqual(report.unsettled.map((entry) => [entry.engine, entry.id]), [
@@ -3950,10 +3864,101 @@ test("--unsettled lists terminal unverified jobs and preserves Codex acceptance 
   assert.strictEqual(Object.hasOwn(withoutProvenance, "acceptanceRecordedAt"), false);
   assert.ok(!report.unsettled.some((entry) => entry.id === codexSupersededId));
 
-  const rendered = run({ cwd: dir, codexState: stateRoot }, ["--unsettled"], extraEnv);
+  const rendered = run({ cwd: dir, codexState: stateRoot }, ["--unsettled", "--all"], extraEnv);
   assert.strictEqual(rendered.status, 0, rendered.stderr);
   assert.match(rendered.stdout, /acceptance source: collector, acceptance recorded at: 2026-07-21T00:03:00.000Z/);
   assert.doesNotMatch(rendered.stdout.split("\n").find((line) => line.includes(codexNoProvenanceId)), /acceptance source|acceptance recorded at/);
+});
+
+test("--unsettled limits recent jobs, reports hidden counts, and widens with --days or --all", (t) => {
+  const dir = sandbox(t);
+  const stateRoot = path.join(dir, "codex-state");
+  const now = Date.now();
+  for (let index = 0; index < 22; index += 1) {
+    writeCodexJob(stateRoot, dir, `recent-${String(index).padStart(2, "0")}`, {
+      status: "done", jobClass: "task", finishedAt: new Date(now - (index + 1) * 60_000).toISOString()
+    });
+  }
+  writeCodexJob(stateRoot, dir, "middle", { status: "done", jobClass: "task", finishedAt: new Date(now - 3 * 86_400_000).toISOString() });
+  for (let index = 0; index < 2; index += 1) {
+    writeCodexJob(stateRoot, dir, `old-${index}`, { status: "done", jobClass: "task", finishedAt: new Date(now - (10 + index) * 86_400_000).toISOString() });
+  }
+  const target = { cwd: dir, codexState: stateRoot };
+  const current = runDirect(target, ["--unsettled", "--json"]);
+  assert.strictEqual(current.status, 0, current.stderr);
+  const report = JSON.parse(current.stdout);
+  assert.deepStrictEqual(report.unsettled.map((entry) => entry.id), Array.from({ length: 20 }, (_, index) => `recent-${String(index).padStart(2, "0")}`));
+  assert.deepStrictEqual(report.hidden, { older: 2, further: 3 });
+
+  const rendered = runDirect(target, ["--unsettled"]);
+  assert.strictEqual(rendered.status, 0, rendered.stderr);
+  assert.strictEqual(rendered.stdout.split("\n").filter((line) => line.startsWith("codex | ")).length, 20);
+  assert.match(rendered.stdout, /Hidden: 2 older, 3 further rows\. Use --days <n> or --all to see them\.\n$/);
+
+  const oneDay = runDirect(target, ["--unsettled", "--days", "1", "--json"]);
+  assert.strictEqual(oneDay.status, 0, oneDay.stderr);
+  assert.deepStrictEqual(JSON.parse(oneDay.stdout).hidden, { older: 3, further: 2 });
+  assert.strictEqual(JSON.parse(oneDay.stdout).unsettled.length, 20);
+
+  const all = runDirect(target, ["--unsettled", "--all", "--json"]);
+  assert.strictEqual(all.status, 0, all.stderr);
+  assert.deepStrictEqual(JSON.parse(all.stdout).hidden, { older: 0, further: 0 });
+  assert.deepStrictEqual(JSON.parse(all.stdout).unsettled.slice(-3).map((entry) => entry.id), ["middle", "old-0", "old-1"]);
+  assert.strictEqual(JSON.parse(all.stdout).unsettled.length, 25);
+});
+
+test("unsettled windows use creation when finish is missing and include future timestamps", (t) => {
+  const dir = sandbox(t);
+  const stateRoot = path.join(dir, "codex-state");
+  const now = Date.now();
+  const recent = new Date(now - 60_000).toISOString();
+  const old = new Date(now - 20 * 86_400_000).toISOString();
+  writeCodexJob(stateRoot, dir, "created-recent", { status: "done", createdAt: recent });
+  writeCodexJob(stateRoot, dir, "created-old", { status: "done", createdAt: old, updatedAt: recent });
+  writeCodexJob(stateRoot, dir, "future-finish", { status: "error", finishedAt: new Date(now + 86_400_000).toISOString() });
+  writeCodexJob(stateRoot, dir, "future-created", { status: "done", createdAt: new Date(now + 2 * 86_400_000).toISOString() });
+  const workerEnv = { FUSION_WORKER_STATE_DIR: path.join(dir, "workers") };
+  createWorkerRecord({ taskId: "fusion-created-recent", sessionId: "unsettled", agentType: "fusion:claude-worker", workspaceRoot: dir }, workerEnv);
+  updateWorkerRecord("fusion-created-recent", workerEnv, (record) => ({ ...record, transportStatus: "done", createdAt: recent, finishedAt: null }));
+  const result = runDirect({ cwd: dir, codexState: stateRoot }, ["--unsettled", "--json"], workerEnv);
+  assert.equal(result.status, 0, result.stderr);
+  const report = JSON.parse(result.stdout);
+  assert.deepEqual(new Set(report.unsettled.map((entry) => entry.id)), new Set(["created-recent", "future-finish", "future-created", "fusion-created-recent"]));
+  assert.deepEqual(report.hidden, { older: 1, further: 0 });
+  assert.equal(report.unsettled.find((entry) => entry.id === "created-recent").createdAt, recent);
+});
+
+test("an empty unsettled window acknowledges hidden older jobs", (t) => {
+  const dir = sandbox(t);
+  const stateRoot = path.join(dir, "codex-state");
+  writeCodexJob(stateRoot, dir, "old", { status: "done", finishedAt: new Date(Date.now() - 20 * 86_400_000).toISOString() });
+  const target = { cwd: dir, codexState: stateRoot };
+  const result = runDirect(target, ["--unsettled"]);
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /No unsettled jobs in the window\./);
+  assert.doesNotMatch(result.stdout, /No terminal jobs are awaiting/);
+  assert.match(result.stdout, /Hidden: 1 older, 0 further rows/);
+  const all = runDirect(target, ["--unsettled", "--all"]);
+  assert.equal(all.status, 0, all.stderr);
+  assert.match(all.stdout, /codex \| old/);
+});
+
+test("invalid or repeated days fail in direct, staged, and exported report paths", (t) => {
+  const dir = sandbox(t);
+  const target = { cwd: dir, codexState: path.join(dir, "codex-state") };
+  for (const mode of ["--unsettled", "--audit"]) {
+    for (const suffix of [["--days", "0"], ["--days", "-1"], ["--days", "+1"], ["--days", "1.5"], ["--days", "1x"], ["--days", "9007199254740992"], ["--days"], ["--days", "3", "--days", "4"], ["--all", "--days", "3", "--days", "4"], ["--all", "--days", "invalid"]]) {
+      const args = [mode, ...suffix];
+      assert.throws(() => runStats(args), /--days:/);
+      assert.throws(() => validateArgumentShape(args), /--days:/);
+      assert.equal(isStrictDirectReportOrMaintenanceArguments(args), false);
+      for (const runner of [runDirect, run]) {
+        const result = runner(target, args);
+        assert.notEqual(result.status, 0, args.join(" "));
+        assert.equal(result.stdout, "");
+      }
+    }
+  }
 });
 
 test("Claude worker stats report completed harness async deliveries separately from failures", (t) => {

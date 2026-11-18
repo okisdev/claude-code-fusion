@@ -46,7 +46,6 @@ const MESSAGE_REGISTRY = [
   { slug: "rules-sync.local-edits-notice", description: "Session start notice that the live rules file has local edits." },
   { slug: "rules-sync.model-table-warning", description: "Warning that the model routing table could not be rendered." },
   { slug: "session.compact-reposture", description: "Post compaction instruction to reload rules and settle in-flight work." },
-  { slug: "codex-monitor.job-notification", description: "Monitor line reporting a detached Codex job transition or observation." },
   { slug: "stats.raw-args-required", description: "Stats error that free text arguments must ride the raw args transport." },
   { slug: "stats.request-error", description: "Stats request error from invalid arguments or raw args transport." }
 ];

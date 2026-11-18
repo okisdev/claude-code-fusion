@@ -1,4 +1,5 @@
 import { renderFooterLines } from "./render-footers.mjs";
+import { backgroundWatchReceipt } from "./job-watch.mjs";
 
 function footer(record) {
   const details = [];
@@ -53,6 +54,7 @@ export function renderBackgroundLaunch(record) {
     `Codex job ${record.id} started in the background.`,
     `Use /codex:status ${record.id} to inspect it.`,
     `Use /codex:result ${record.id} to collect the terminal result.`,
+    ...((record.delivery ?? "manual") === "manual" ? [backgroundWatchReceipt("codex", record.id).watchInstruction] : []),
     "",
     ...renderFooterLines({ id: record.id, cwd: record.cwd, delivery: record.delivery ?? "manual", warnings: record.orphanCleanupWarning ? [record.orphanCleanupWarning] : [], status: "running" }, "codex"),
     ""

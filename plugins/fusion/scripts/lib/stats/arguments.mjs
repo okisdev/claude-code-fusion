@@ -95,6 +95,7 @@ export class UsageError extends Error {}
 export function validateArgumentShape(argv) {
   const flags = new Set(["--json", "--audit", "--all", "--prune-dead", "--yes", "--identities", "--by-day", "--messages", "--unsettled", "--trace", "--accept-failed-transport"]);
   const values = new Map([["--message", 1], ["--days", 1], ["--source", 1], ["--reason", 1], ["--failure-kind", 1], ["--reason-for", 2], ["--failure-kind-for", 2]]);
+  let daysSeen = false;
   for (let index = 0; index < argv.length; index += 1) {
     const token = argv[index];
     if (flags.has(token)) continue;
@@ -113,6 +114,12 @@ export function validateArgumentShape(argv) {
       continue;
     }
     if (values.has(token)) {
+      if (token === "--days") {
+        if (daysSeen) throw new UsageError("--days: must be specified only once");
+        daysSeen = true;
+        const value = argv[index + 1];
+        if (!/^[1-9]\d*$/.test(value ?? "") || !Number.isSafeInteger(Number(value))) throw new UsageError("--days: expected a positive integer");
+      }
       for (let offset = 1; offset <= values.get(token); offset += 1) {
         const value = argv[index + offset];
         if (typeof value !== "string" || !value || value.startsWith("--")) throw new UsageError(`${token}: missing value`);
@@ -136,7 +143,7 @@ export function validateArgumentShape(argv) {
     audit: new Set(["--audit", "--all", "--days", "--session", "--json"]),
     record: new Set(["--record", "--source", "--reason", "--reason-for", "--failure-kind", "--failure-kind-for", "--accept-failed-transport", "--json"]),
     prune: new Set(["--prune-dead", "--yes", "--json"]),
-    unsettled: new Set(["--unsettled", "--json"]),
+    unsettled: new Set(["--unsettled", "--days", "--all", "--json"]),
     trace: new Set(["--trace", "--session", "--json"]),
     session: new Set(["--session", "--json"]),
     report: new Set(["--json", "--all", "--identities", "--by-day"])
@@ -373,7 +380,7 @@ export function isStrictDirectReportOrMaintenanceArguments(argv) {
   const flags = new Set(["--json", "--audit", "--all", "--prune-dead", "--unsettled", "--identities", "--by-day"]);
   if (argv.includes("--days")) {
     const index = argv.indexOf("--days");
-    if (!argv.includes("--audit") || !/^[1-9]\d*$/.test(argv[index + 1] ?? "")) return false;
+    if ((!argv.includes("--audit") && !argv.includes("--unsettled")) || !/^[1-9]\d*$/.test(argv[index + 1] ?? "") || !Number.isSafeInteger(Number(argv[index + 1]))) return false;
     argv = [...argv.slice(0, index), ...argv.slice(index + 2)];
   }
   return argv.every((token) => flags.delete(token));

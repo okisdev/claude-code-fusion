@@ -22,3 +22,10 @@ test("marketplace and plugin manifest versions stay synchronized", () => {
   const changelog = fs.readFileSync(path.join(repoRoot, "CHANGELOG.md"), "utf8");
   assert.match(changelog, new RegExp(`^## ${marketplace.version.replaceAll(".", "\\.")}$`, "m"));
 });
+
+test("plugins ship no session job monitors", () => {
+  for (const plugin of ["fusion", "codex", "grok", "cursor", "devin"]) {
+    assert.equal(fs.existsSync(path.join(repoRoot, `plugins/${plugin}/monitors/monitors.json`)), false);
+    assert.equal(Object.hasOwn(readJson(`plugins/${plugin}/.claude-plugin/plugin.json`), "monitors"), false);
+  }
+});

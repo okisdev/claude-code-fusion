@@ -197,6 +197,7 @@ test("background task creates a job record and result prints the finished output
   assert.ok(result.stdout.includes(record.id));
   assert.ok(result.stdout.includes("/grok:status"));
   assert.ok(result.stdout.includes("/grok:result"));
+  assert.ok(result.stdout.includes(`node "${companion}" watch --job ${record.id}`));
   const done = await waitFor(() => {
     const current = jobRecords(sandbox.dataDir)[0];
     return current && current.status === "done" ? current : null;

@@ -7,7 +7,10 @@ import { test } from "node:test";
 
 import { deliverWorkerEngineAcceptance, newestEngineCompanion, prepareEngineAcceptanceDelivery, recordEngineAcceptance, retryWorkerEngineAcceptances } from "../plugins/fusion/scripts/lib/engine-acceptance.mjs";
 import { settleQueuedVerdict } from "../plugins/fusion/scripts/lib/lifecycle/collection.mjs";
-import { createWorkerRecord, readWorkerRecord, recordWorkerAcceptance, reopenWorkerContinuation, updateWorkerRecord, workerRecordFile } from "../plugins/fusion/scripts/lib/worker-state.mjs";
+import { createWorkerRecord, readSessionWorkerRecords, readWorkerRecord, readWorkerSessionState, recordWorkerAcceptance, reopenWorkerContinuation, updateWorkerRecord, workerRecordFile } from "../plugins/fusion/scripts/lib/worker-state.mjs";
+import { settleRecords } from "../plugins/fusion/scripts/lib/stats/settlement.mjs";
+import { tokenUsageSidecarPath } from "../plugins/fusion/scripts/lib/stats/evidence.mjs";
+import { handleLifecycleHook } from "../plugins/fusion/scripts/worker-lifecycle.mjs";
 
 function sandbox(t) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "engine-acceptance-test-"));
@@ -27,6 +30,26 @@ function cachedCompanion(home, version, modifiedAt) {
   fs.utimesSync(file, modifiedAt, modifiedAt);
   return file;
 }
+
+test("settlement observes peer token usage without starting a monitor", (t) => {
+  const root = sandbox(t);
+  const taskId = `fusion-${"d".repeat(24)}`;
+  const jobId = "e".repeat(32);
+  const env = { HOME: root, FUSION_DATA_DIR: path.join(root, "fusion"), FUSION_WORKER_STATE_DIR: path.join(root, "workers"), GROK_COMPANION_DATA: path.join(root, "grok"), CURSOR_COMPANION_DATA: path.join(root, "cursor"), DEVIN_COMPANION_DATA: path.join(root, "devin") };
+  const jobFile = path.join(env.GROK_COMPANION_DATA, "state", "workspace", "jobs", `${jobId}.json`);
+  fs.mkdirSync(path.dirname(jobFile), { recursive: true });
+  fs.writeFileSync(jobFile, JSON.stringify({ id: jobId, cwd: root, status: "done", usage: { inputTokens: 2, outputTokens: 1, totalTokens: 3 } }));
+  createWorkerRecord({ taskId, sessionId: "settlement-only", agentType: "fusion:claude-worker", workspaceRoot: root }, env);
+  updateWorkerRecord(taskId, env, (record) => ({ ...record, transportStatus: "done" }));
+  const result = settleRecords({ records: [{ id: taskId, verdict: "accepted" }], source: "main-loop", asJson: true, env, stdout: { write() {} }, stderr: { write(message) { assert.fail(message); } } });
+  assert.deepEqual(result.errors, []);
+  const observations = fs.readFileSync(tokenUsageSidecarPath(root, env), "utf8").trim().split("\n").map(JSON.parse);
+  assert.equal(observations.length, 1);
+  assert.equal(observations[0].jobId, jobId);
+  assert.equal(observations[0].engine, "grok");
+  assert.equal(observations[0].availability, "available");
+  assert.equal(observations[0].tokenUsage.totalTokens, 3);
+});
 
 test("record acceptance survives a removed workspace", (t) => {
   const root = sandbox(t);
@@ -112,7 +135,7 @@ function deliveryWorker(t, source) {
     'fs.appendFileSync(process.env.TEST_CALLS, `${JSON.stringify({ acceptance: worker.acceptance, args: process.argv.slice(2) })}\\n`);',
     source
   ].join("\n"));
-  const env = { ...process.env, HOME: root, FUSION_WORKER_STATE_DIR: path.join(root, "workers"), FUSION_CODEX_STATE: path.join(root, "state"), FUSION_CODEX_COMPANION: bin, TEST_CALLS: calls };
+  const env = { ...process.env, HOME: root, FUSION_WORKER_STATE_DIR: path.join(root, "workers"), FUSION_CODEX_STATE: path.join(root, "state"), FUSION_CODEX_COMPANION: bin, FUSION_ACCEPTANCE_RETRY_BACKOFF_MS: "0", TEST_CALLS: calls };
   env.TEST_WORKER_FILE = workerRecordFile(taskId, env);
   createWorkerRecord({ taskId, sessionId: "delivery-session", agentType: "codex:codex-rescue", workspaceRoot: root }, env);
   return { root, taskId, jobId, calls, env, bin };
@@ -122,6 +145,101 @@ function queueDelivery(box) {
   recordWorkerAcceptance({ taskId: box.taskId, acceptance: "accepted", env: box.env });
   return updateWorkerRecord(box.taskId, box.env, (record) => settleQueuedVerdict({ ...record, transportStatus: "done", peerEngine: "codex", peerJobId: box.jobId }, new Date().toISOString(), box.env));
 }
+
+test("tool hooks never retry engine acceptance delivery or alter it on denied launches", async (t) => {
+  const box = deliveryWorker(t, "");
+  updateWorkerRecord(box.taskId, box.env, (record) => prepareEngineAcceptanceDelivery({ ...record, transportStatus: "done", acceptance: "accepted", acceptanceRecordedAt: new Date().toISOString() }, { jobs: [{ engine: "codex", jobId: box.jobId }] }));
+  const before = fs.readFileSync(workerRecordFile(box.taskId, box.env), "utf8");
+  for (const input of [
+    { hook_event_name: "PreToolUse", tool_name: "Agent", tool_input: { subagent_type: "codex:codex-rescue", run_in_background: true } },
+    { hook_event_name: "PreToolUse", agent_type: "fusion:claude-worker", agent_id: "other-worker", tool_name: "Read", tool_input: {} },
+    { hook_event_name: "PostToolUse", tool_name: "Read", tool_input: { file_path: path.join(box.root, "unrelated.txt") }, tool_response: "unrelated" },
+    { hook_event_name: "PostToolUseFailure", agent_type: "fusion:claude-worker", agent_id: "other-worker", tool_name: "Read", tool_input: {} }
+  ]) {
+    await handleLifecycleHook({ ...input, session_id: "delivery-session" }, box.env);
+    assert.equal(fs.existsSync(box.calls), false);
+    assert.equal(fs.readFileSync(workerRecordFile(box.taskId, box.env), "utf8"), before);
+  }
+});
+
+test("session acceptance retries use their pending index without parsing unrelated records", (t) => {
+  const box = deliveryWorker(t, "");
+  const otherId = `fusion-${"f".repeat(24)}`;
+  createWorkerRecord({ taskId: otherId, sessionId: "delivery-session", agentType: "fusion:claude-worker", workspaceRoot: box.root }, box.env);
+  updateWorkerRecord(box.taskId, box.env, (record) => prepareEngineAcceptanceDelivery({ ...record, acceptance: "accepted", acceptanceRecordedAt: new Date().toISOString() }, { jobs: [{ engine: "codex", jobId: box.jobId }] }));
+  fs.writeFileSync(workerRecordFile(otherId, box.env), "unreadable unrelated record");
+  const originalRead = fs.readFileSync;
+  fs.readFileSync = (file, ...args) => {
+    assert.notEqual(file, workerRecordFile(otherId, box.env), "unrelated record parsed during retry");
+    return originalRead(file, ...args);
+  };
+  try {
+    retryWorkerEngineAcceptances({ env: box.env, sessionId: "another-session" });
+    assert.equal(fs.existsSync(box.calls), false);
+    retryWorkerEngineAcceptances({ env: box.env, sessionId: "delivery-session" });
+  } finally {
+    fs.readFileSync = originalRead;
+  }
+  assert.equal(readWorkerRecord(box.taskId, box.env).engineAcceptanceDelivery.status, "delivered");
+  assert.deepEqual(readWorkerSessionState("delivery-session", box.env).engineAcceptanceTaskIds, []);
+});
+
+test("bounded lifecycle retries time out quickly and back off by attempt count", async (t) => {
+  const box = deliveryWorker(t, 'setInterval(() => {}, 1000);');
+  box.env.FUSION_ACCEPTANCE_RETRY_TIMEOUT_MS = "100";
+  box.env.FUSION_ACCEPTANCE_RETRY_BACKOFF_MS = "60000";
+  updateWorkerRecord(box.taskId, box.env, (record) => prepareEngineAcceptanceDelivery({ ...record, transportStatus: "done", acceptance: "accepted", acceptanceRecordedAt: new Date().toISOString() }, { jobs: [{ engine: "codex", jobId: box.jobId }] }));
+  const input = { hook_event_name: "SubagentStop", session_id: "delivery-session", agent_type: "fusion:claude-worker", agent_id: "other-worker" };
+  const started = Date.now();
+  await handleLifecycleHook(input, box.env);
+  assert.ok(Date.now() - started < 1500);
+  const failed = readWorkerRecord(box.taskId, box.env);
+  assert.equal(failed.engineAcceptanceDelivery.status, "failed");
+  assert.equal(failed.engineAcceptanceDelivery.attempts, 1);
+  await handleLifecycleHook(input, box.env);
+  assert.equal(readWorkerRecord(box.taskId, box.env).engineAcceptanceDelivery.attempts, 1);
+  fs.writeFileSync(box.bin, 'import fs from "node:fs"; fs.appendFileSync(process.env.TEST_CALLS, "retry\\n");');
+  updateWorkerRecord(box.taskId, box.env, (record) => ({ ...record, engineAcceptanceDelivery: { ...record.engineAcceptanceDelivery, attempts: 2, entries: record.engineAcceptanceDelivery.entries.map((entry) => ({ ...entry, attempts: 2, updatedAt: new Date(Date.now() - 61_000).toISOString() })) } }));
+  await handleLifecycleHook(input, box.env);
+  assert.equal(readWorkerRecord(box.taskId, box.env).engineAcceptanceDelivery.attempts, 2);
+  updateWorkerRecord(box.taskId, box.env, (record) => ({ ...record, engineAcceptanceDelivery: { ...record.engineAcceptanceDelivery, entries: record.engineAcceptanceDelivery.entries.map((entry) => ({ ...entry, updatedAt: new Date(Date.now() - 121_000).toISOString() })) } }));
+  await handleLifecycleHook(input, box.env);
+  assert.equal(readWorkerRecord(box.taskId, box.env).engineAcceptanceDelivery.status, "delivered");
+  assert.equal(readWorkerRecord(box.taskId, box.env).engineAcceptanceDelivery.attempts, 3);
+});
+
+test("lifecycle retry budget bounds a backlog of slow acceptance deliveries", async (t) => {
+  const box = deliveryWorker(t, 'setInterval(() => {}, 1000);');
+  box.env.FUSION_ACCEPTANCE_RETRY_TIMEOUT_MS = "300";
+  const jobs = Array.from({ length: 10 }, (_, index) => ({ engine: "codex", jobId: index.toString(16).repeat(32) }));
+  updateWorkerRecord(box.taskId, box.env, (record) => prepareEngineAcceptanceDelivery({ ...record, transportStatus: "done", acceptance: "accepted", acceptanceRecordedAt: new Date().toISOString() }, { jobs }));
+  const started = Date.now();
+  await handleLifecycleHook({ hook_event_name: "SubagentStop", session_id: "delivery-session", agent_type: "fusion:claude-worker", agent_id: "other-worker" }, box.env);
+  assert.ok(Date.now() - started < 3000);
+  const delivery = readWorkerRecord(box.taskId, box.env).engineAcceptanceDelivery;
+  assert.ok(delivery.attempts > 0 && delivery.attempts < jobs.length);
+  assert.equal(delivery.entries.filter((entry) => entry.status === "failed").length, delivery.attempts);
+  assert.equal(delivery.entries.filter((entry) => entry.status === "pending").length, jobs.length - delivery.attempts);
+});
+
+test("legacy acceptance index migration retains every pending worker after a write", (t) => {
+  const box = deliveryWorker(t, "");
+  const otherId = `fusion-${"f".repeat(24)}`;
+  createWorkerRecord({ taskId: otherId, sessionId: "delivery-session", agentType: "codex:codex-rescue", workspaceRoot: box.root }, box.env);
+  for (const taskId of [box.taskId, otherId]) {
+    updateWorkerRecord(taskId, box.env, (record) => prepareEngineAcceptanceDelivery({ ...record, acceptance: "accepted", acceptanceRecordedAt: new Date().toISOString() }, { jobs: [{ engine: "codex", jobId: box.jobId }] }));
+  }
+  const sessionFile = path.join(box.env.FUSION_WORKER_STATE_DIR, "sessions", "delivery-session.json");
+  const { engineAcceptanceTaskIds, ...legacy } = readWorkerSessionState("delivery-session", box.env);
+  fs.writeFileSync(sessionFile, JSON.stringify(legacy));
+  updateWorkerRecord(box.taskId, box.env, (record) => ({ ...record, description: "updated before migration" }));
+  readSessionWorkerRecords(box.env, "delivery-session", { strict: true });
+  assert.deepEqual(readWorkerSessionState("delivery-session", box.env).engineAcceptanceTaskIds, [box.taskId, otherId]);
+  retryWorkerEngineAcceptances({ env: box.env, sessionId: "delivery-session" });
+  assert.equal(readWorkerRecord(box.taskId, box.env).engineAcceptanceDelivery.status, "delivered");
+  assert.equal(readWorkerRecord(otherId, box.env).engineAcceptanceDelivery.status, "delivered");
+  assert.deepEqual(readWorkerSessionState("delivery-session", box.env).engineAcceptanceTaskIds, []);
+});
 
 test("queued engine delivery runs after the lock releases and preserves concurrent worker updates", async (t) => {
   const workerState = new URL("../plugins/fusion/scripts/lib/worker-state.mjs", import.meta.url).href;
@@ -173,6 +291,29 @@ test("failed deliveries stop after five attempts and repeating the same verdict 
   assert.equal(failed.engineAcceptanceDelivery.entries[0].failures, 5);
   assert.equal(fs.readFileSync(box.calls, "utf8").trim().split("\n").length, 5);
 });
+
+for (const status of ["pending", "failed"]) {
+  test(`a lifecycle hook retries ${status} acceptance delivery after settlement without another verdict`, async (t) => {
+    const box = deliveryWorker(t, "");
+    updateWorkerRecord(box.taskId, box.env, (record) => {
+      const prepared = prepareEngineAcceptanceDelivery({ ...record, transportStatus: "done", acceptance: "accepted", acceptanceSource: "main-loop", acceptanceRecordedAt: new Date().toISOString() }, { jobs: [{ engine: "codex", jobId: box.jobId }] });
+      return { ...prepared, engineAcceptanceDelivery: { ...prepared.engineAcceptanceDelivery, status, entries: prepared.engineAcceptanceDelivery.entries.map((entry) => ({ ...entry, status, attempts: 1, failures: status === "failed" ? 1 : 0 })) } };
+    });
+    const input = { hook_event_name: status === "pending" ? "Stop" : "SubagentStop", session_id: "delivery-session", agent_type: "fusion:claude-worker", agent_id: "other-worker" };
+    await handleLifecycleHook({ ...input, session_id: "another-session" }, box.env);
+    assert.equal(fs.existsSync(box.calls), false);
+    await handleLifecycleHook(input, box.env);
+    const delivered = readWorkerRecord(box.taskId, box.env);
+    assert.equal(delivered.engineAcceptanceDelivery.status, "delivered");
+    assert.equal(delivered.engineAcceptanceDelivery.entries[0].attempts, 2);
+    assert.equal(delivered.acceptance, "accepted");
+    await handleLifecycleHook(input, box.env);
+    assert.equal(fs.readFileSync(box.calls, "utf8").trim().split("\n").length, 1);
+    updateWorkerRecord(box.taskId, box.env, (record) => ({ ...record, engineAcceptanceDelivery: { ...record.engineAcceptanceDelivery, status: "failed", entries: record.engineAcceptanceDelivery.entries.map((entry) => ({ ...entry, status: "failed", attempts: 5, failures: 5 })) } }));
+    await handleLifecycleHook(input, box.env);
+    assert.equal(fs.readFileSync(box.calls, "utf8").trim().split("\n").length, 1);
+  });
+}
 
 test("an interrupted delivery retries after its lease expires and survives a continuation", (t) => {
   const box = deliveryWorker(t, "");
@@ -245,8 +386,8 @@ fs.writeFileSync(process.env.TEST_ENGINE_VERDICT, acceptance);
   assert.deepEqual(fs.readFileSync(box.calls, "utf8").trim().split("\n").map((line) => JSON.parse(line).acceptance), ["accepted", "rejected"]);
 });
 
-for (const recovery of ["monitor", "same verdict"]) {
-  test(`a crash after claiming attempt five recovers through ${recovery}`, (t) => {
+for (const recovery of ["lifecycle", "same verdict"]) {
+  test(`a crash after claiming attempt five recovers through ${recovery}`, async (t) => {
     const acceptanceModule = new URL("../plugins/fusion/scripts/lib/engine-acceptance.mjs", import.meta.url).href;
     const box = deliveryWorker(t, `
 const attempts = fs.readFileSync(process.env.TEST_CALLS, "utf8").trim().split("\\n").length;
@@ -276,7 +417,7 @@ if (attempts === 5) process.kill(process.ppid, "SIGKILL");
       updateWorkerRecord(box.taskId, box.env, (record) => prepareEngineAcceptanceDelivery(record, { jobs }));
       deliverWorkerEngineAcceptance({ taskId: box.taskId, env: box.env });
     } else {
-      retryWorkerEngineAcceptances({ env: box.env });
+      await handleLifecycleHook({ hook_event_name: "SubagentStop", session_id: "delivery-session", agent_type: "fusion:claude-worker", agent_id: "other-worker" }, box.env);
     }
 
     const delivered = readWorkerRecord(box.taskId, box.env);

@@ -488,8 +488,8 @@ test("background collection distinguishes explicit Fusion receipts from foregrou
   assert.match(fs.readFileSync(path.join(repoRoot, "plugins", "fusion", "rules", "troubleshooting.md"), "utf8"), /Passing `run_in_background: false` does not make a dispatch synchronous/);
   assert.doesNotMatch(rules, /Managed Grok detachment is different/);
   assert.match(fs.readFileSync(path.join(repoRoot, "plugins", "fusion", "rules", "troubleshooting.md"), "utf8"), /Direct Codex, Grok, Cursor, and Devin slash commands with explicit `--background` return manual receipts for the user to inspect and collect through their status and result commands/);
-  assert.match(task, /Direct users inspect progress through `\/codex:status` and collect the deliverable through `\/codex:result`; when Fusion is installed, its monitor can notify them of completion/);
-  assert.match(rescue, /Direct users inspect progress through `\/codex:status` and collect the deliverable through `\/codex:result`; when Fusion is installed, its monitor can notify them of completion/);
+  assert.match(task, /Direct users inspect progress through `\/codex:status` and collect the deliverable through `\/codex:result`; the main session starts the receipt's per job watch through the Claude Code `Monitor` tool\./);
+  assert.match(rescue, /Direct users inspect progress through `\/codex:status` and collect the deliverable through `\/codex:result`; the main session starts the receipt's per job watch through the Claude Code `Monitor` tool\./);
 });
 
 test("Grok rules document source verified headless boundaries", () => {

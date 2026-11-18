@@ -1,3 +1,5 @@
+import { backgroundWatchReceipt } from "./job-watch.mjs";
+
 const VALID_VERDICTS = new Set(["approve", "needs-attention"]);
 const VALID_SEVERITIES = new Set(["high", "medium", "low"]);
 const SEVERITY_ORDER = ["high", "medium", "low"];
@@ -278,6 +280,7 @@ export function renderBackgroundLaunch(jobId, delivery, cwd) {
     `Started background job ${jobId}.`,
     `Check progress with /grok:status ${jobId}.`,
     `Fetch the result with /grok:result ${jobId}.`,
+    ...(delivery === "manual" ? [backgroundWatchReceipt("grok", jobId).watchInstruction] : []),
     `job: ${jobId}`,
     `sandbox: ${cwd}`,
     `delivery: ${delivery}`,

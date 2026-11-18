@@ -110,7 +110,6 @@ test("Devin registry contract matches the breadth companion", () => {
     versionField: devin.versionField,
     verifiedVersionKey: devin.verifiedVersionKey,
     acceptanceLedger: devin.acceptanceLedger,
-    ownMonitor: devin.ownMonitor,
     roles: devin.roles,
     defaultRole: devin.defaultRole,
     consultOnlyRoles: devin.consultOnlyRoles,
@@ -121,7 +120,7 @@ test("Devin registry contract matches the breadth companion", () => {
     companionFile: "devin-companion.mjs", companionEnv: "FUSION_DEVIN_COMPANION",
     hostCheck: false,
     dataDirName: "devin-claude-code-fusion", dataEnv: "DEVIN_COMPANION_DATA", stateEnvs: [],
-    versionField: "devinVersion", verifiedVersionKey: "devin", acceptanceLedger: false, ownMonitor: false,
+    versionField: "devinVersion", verifiedVersionKey: "devin", acceptanceLedger: false,
     roles: ["diversity", "burst"], defaultRole: null, consultOnlyRoles: ["diversity"],
     efforts: ["default", "none", "minimal", "low", "medium", "high", "xhigh", "max"],
     unavailablePrefix: "devin unavailable:"

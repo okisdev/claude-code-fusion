@@ -9,7 +9,7 @@ import { SESSION_ID_ENV } from "./lib/state.mjs";
 import { commandContext, output, errorWithFailure } from "./lib/companion/base.mjs";
 import { handleTask, handleTaskWorker } from "./lib/companion/task.mjs";
 import { handleReview, handleReviewWorker } from "./lib/companion/review.mjs";
-import { handleStatus, handleHistory, handleResult, handleCancel } from "./lib/companion/inspection.mjs";
+import { handleStatus, handleHistory, handleResult, handleCancel, handleWatch } from "./lib/companion/inspection.mjs";
 import { handleStats } from "./lib/companion/stats.mjs";
 import { handleSetup } from "./lib/companion/setup.mjs";
 import { probeGrokVersion } from "./lib/companion/version.mjs";
@@ -27,6 +27,7 @@ function printUsage() {
       "  node scripts/grok-companion.mjs review [--base <ref>] [--focus <text>] [--cwd <dir>] [--background] [--json]",
       "  node scripts/grok-companion.mjs status [job-id] [--cwd <dir>] [--json]",
       "  node scripts/grok-companion.mjs history [--all] [--limit <n>] [--cwd <dir>] [--json]",
+      "  node scripts/grok-companion.mjs watch --job <id>",
       "  node scripts/grok-companion.mjs result <job-id> [--cwd <dir>] [--wait] [--wait-timeout-ms <ms>] [--json]",
       "  node scripts/grok-companion.mjs await-output --file <path> [--slice-ms <n>]",
       "  node scripts/grok-companion.mjs cancel <job-id> [--cwd <dir>] [--json]",
@@ -63,6 +64,10 @@ async function main() {
   }
   if (subcommand === "await-output") {
     process.exitCode = await awaitOutput(receivedArgv);
+    return;
+  }
+  if (subcommand === "watch") {
+    await handleWatch(receivedArgv);
     return;
   }
   if (subcommand === "host-check") {

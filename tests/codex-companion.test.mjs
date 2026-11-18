@@ -1618,6 +1618,7 @@ test("explicit background launch returns a durable receipt and result wait colle
   assert.equal(running.status, "running");
   assert.equal(running.background, true);
   assert.equal(running.delivery, "manual");
+  assert.ok(launched.stdout.includes(`node "${companion}" watch --job ${running.id}`));
   assert.ok(running.launchApprovedAt);
   assert.equal(running.launchAbortRequestedAt, null);
   assert.ok(Number.isInteger(running.pid));
@@ -1642,6 +1643,7 @@ test("managed background delivery remains pending until result collection", asyn
   const launched = runCompanion(["task", "--background managed work"], { cwd: sandbox.workDir, env });
   assert.equal(launched.status, 0, launched.stderr);
   assert.match(launched.stdout, /delivery: managed/);
+  assert.doesNotMatch(launched.stdout, /watch --job/);
   const completed = await waitFor(() => {
     const record = jobRecords(sandbox)[0];
     return record?.status === "done" ? record : null;

@@ -4,6 +4,7 @@ import { ENGINE_IDS, ENGINE_TERMINAL_STATUSES, engineDisplayName, engineDisplayN
 import { WORKER_TERMINAL_STATUSES, readWorkerRecord, readWorkerRecords, recordWorkerAcceptance, validateWorkerAcceptance } from "../../lib/worker-state.mjs";
 import { FILE_ENGINE_DESCRIPTORS } from "./engine-evidence.mjs";
 import { ENGINE_JOB_ID_PATTERN, FUSION_TASK_ID_PATTERN, nonEmptyString } from "./evidence.mjs";
+import { observeEngineJobsSafely } from "../../engine-jobs-observer.mjs";
 
 function resolveEngineJob(jobId, env) {
   const found = ENGINE_IDS.filter((engine) => FILE_ENGINE_DESCRIPTORS[engine].enumerateJobs(engineStateRoots(engine, env)[0], { env }).some((job) => nonEmptyString(job?.id) === jobId));
@@ -199,5 +200,8 @@ export function settleRecords({ records, source, acceptFailedTransport = false, 
     }
   }
   retryWorkerEngineAcceptances({ env, skipTaskIds });
+  for (const engine of ENGINE_IDS.filter((engine) => engine !== "codex")) {
+    observeEngineJobsSafely(engine, { env });
+  }
   return { writes, errors };
 }

@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { backgroundWatchReceipt, watchJob } from "./lib/job-watch.mjs";
 
 import { spawn, spawnSync } from "node:child_process";
 import fs from "node:fs";
@@ -125,6 +126,7 @@ function printUsage() {
       "  node scripts/codex-companion.mjs cancel <job-id> [--cwd <dir>] [--json]",
       "  node scripts/codex-companion.mjs record-acceptance --job-id <32 lowercase hex> --acceptance <accepted|rejected|unverified> [--reason <text>] [--failure-kind <intent_override|scope_rewrite|wrong_approach|style_mismatch>] [--source <collector|main-loop|stats>] [--accept-failed-transport]",
       "  node scripts/codex-companion.mjs history [--json]",
+      "  node scripts/codex-companion.mjs watch --job <id>",
       "  node scripts/codex-companion.mjs models [--json]",
       "  node scripts/codex-companion.mjs setup [--cwd <dir>] [--json]"
     ].join("\n") + "\n"
@@ -1306,7 +1308,7 @@ async function executeRecord(found) {
 }
 
 function renderRecord(record, asJson, runningReceipt = false) {
-  const rendered = asJson ? `${JSON.stringify(record, null, 2)}\n`
+  const rendered = asJson ? `${JSON.stringify(runningReceipt && record.status === "running" && record.delivery === "manual" ? { ...record, ...backgroundWatchReceipt("codex", record.id) } : record, null, 2)}\n`
     : record.status === "running" ? runningReceipt ? renderBackgroundLaunch(record) : renderRunningResult(record)
       : renderTerminalResult(record);
   return new Promise((resolve, reject) => {
@@ -2107,6 +2109,13 @@ async function main() {
   }
   if (subcommand === "await-output") {
     process.exitCode = await awaitOutput(receivedArgv);
+    return;
+  }
+  if (subcommand === "watch") {
+    await watchJob(receivedArgv, { engine: "codex", readJob: (id) => {
+      const found = findRequestedJob(resolveDataDir(), id, {});
+      return found ? refreshRunningJobRecord(found) : null;
+    } });
     return;
   }
   if (subcommand === "transport-create") {

@@ -71,7 +71,7 @@ async function handleLifecycleHook(input, env = process.env) {
   } catch (error) {
     handler = () => { throw error; };
   }
-  return collectHookResult(() => {
+  const result = collectHookResult(() => {
     try {
       handler(input, env, input.hook_event_name === "PostToolUseFailure");
     } catch {
@@ -82,6 +82,15 @@ async function handleLifecycleHook(input, env = process.env) {
       }
     }
   });
+  if (input.session_id && ["SubagentStop", "Stop"].includes(input.hook_event_name)) {
+    try {
+      const { retryWorkerEngineAcceptances } = await import("./lib/engine-acceptance.mjs");
+      retryWorkerEngineAcceptances({ env, sessionId: input.session_id });
+    } catch {
+      void 0;
+    }
+  }
+  return result;
 }
 
 async function main() {
