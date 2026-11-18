@@ -52,7 +52,7 @@ function writeRollout() {
     {
       timestamp: now.toISOString(),
       type: "event_msg",
-      payload: { type: "agent_message", message: "Recovered diagnostic rollout output." }
+      payload: { type: "task_complete", last_agent_message: "Recovered diagnostic rollout output." }
     }
   ];
   fs.writeFileSync(path.join(directory, ["rollout-", threadId, ".jsonl"].join("")), entries.map((entry) => JSON.stringify(entry)).join("\\n") + "\\n");
