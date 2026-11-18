@@ -323,7 +323,7 @@
       disallowedToolIds.push(argument.slice("--disallowed-tools=".length));
     }
   }
-  if (sandboxProfile && !new Set(["tool-allowlist-warning", "tool-disallowed-warning", "tool-policy-no-evidence"]).has(mode)) {
+  if (sandboxProfile && !new Set(["tool-allowlist-warning", "tool-disallowed-warning", "tool-policy-no-evidence", "hang-before-policy"]).has(mode)) {
     process.stderr.write("DEBUG xai_grok_agent::builder: tools allowlist applied\n");
   }
   for (const toolId of disallowedToolIds.flatMap((value) => value.split(",").map((entry) => entry.trim()).filter(Boolean))) {
@@ -1083,7 +1083,7 @@
     return;
   }
 
-  if (mode === "hang") {
+  if (mode === "hang" || mode === "hang-before-policy") {
     process.on("SIGTERM", () => process.exit(143));
     setTimeout(() => process.exit(0), 120000);
     return;

@@ -2284,13 +2284,13 @@ async function closeGrokChild(run, code, signal) {
   if (run.settled) {
     return;
   }
-  if (run.managedRun && !run.sandboxVerified && !run.securityFailure) {
+  if (run.managedRun && !run.timedOut && !run.sandboxVerified && !run.securityFailure) {
     run.securityFailure = {
       kind: "sandbox",
       line: "Grok exited before publishing verified sandbox startup evidence."
     };
   }
-  if (run.managedRun && run.sandboxVerified && !run.policyApplied && !run.securityFailure) {
+  if (run.managedRun && !run.timedOut && run.sandboxVerified && !run.policyApplied && !run.securityFailure) {
     run.securityFailure = {
       kind: "policy",
       line: "Grok exited without confirming that the requested tool allowlist was applied."
