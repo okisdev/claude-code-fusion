@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
+import { spawnSync } from "node:child_process";
 
 function executionTimeoutProbe(root) {
   const file = path.join(root, "execution-timeouts.jsonl");
@@ -17,6 +18,16 @@ globalThis.setTimeout = (callback, delay, ...args) => {
     env: { NODE_OPTIONS: `--require=${preload}` },
     timeouts: () => fs.readFileSync(file, "utf8").trim().split("\n").filter(Boolean).map(JSON.parse)
   };
+}
+
+async function workerExited(jobId) {
+  const deadline = Date.now() + 10000;
+  while (Date.now() < deadline) {
+    const found = spawnSync("pgrep", ["-f", `task-worker --job-id ${jobId}`], { encoding: "utf8" });
+    if (found.status === 1) return;
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  assert.fail(`background worker for ${jobId} did not exit`);
 }
 
 export async function verifyExecutionBudgets(t, { engine, createHarness, model, foregroundTimeoutMs, backgroundTimeoutMs = foregroundTimeoutMs }) {
@@ -59,6 +70,7 @@ export async function verifyExecutionBudgets(t, { engine, createHarness, model, 
         await new Promise((resolve) => setTimeout(resolve, 25));
       }
       const [record] = h.jobs();
+      if (entry.background) await workerExited(record.id ?? record.jobId);
       assert.equal(record.status, "done");
       assert.equal(record.background, Boolean(entry.background));
       assert.equal(record.delivery, entry.background ? "manual" : "foreground");

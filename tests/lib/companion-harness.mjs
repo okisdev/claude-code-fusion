@@ -50,7 +50,7 @@ export function makeSandbox(t) {
         await cleanup();
       }
     } finally {
-      fs.rmSync(root, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
+      fs.rmSync(root, { recursive: true, force: true });
     }
   });
   const dataDir = path.join(root, "data");
