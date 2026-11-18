@@ -210,6 +210,7 @@ async function runReviewJob(record, jobFile, options = {}) {
   try {
     const prompt = fs.readFileSync(record.briefFile, "utf8");
     first = await runGrok({
+      grokVersion: record.grokVersion,
       briefFile: record.briefFile,
       prompt,
       mode: "consult",

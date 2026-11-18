@@ -158,6 +158,7 @@ async function handleTask(argv, transport = {}) {
   let result;
   try {
     result = await runGrok({
+      grokVersion: grok.version,
       briefFile,
       prompt,
       mode,
@@ -265,6 +266,7 @@ async function handleTaskWorker(argv) {
   try {
     const prompt = fs.readFileSync(record.briefFile, "utf8");
     const result = await runGrok({
+      grokVersion: record.grokVersion,
       briefFile: record.briefFile,
       prompt,
       mode: record.mode,

@@ -132,9 +132,9 @@ function managedRunHooks(bin, available, env = process.env, cwd = process.cwd())
   return { plugins: selected, hookFiles };
 }
 
-function hostEnvironmentAdvisory(env = process.env) {
+function hostEnvironmentAdvisory(env = process.env, version = null) {
   try {
-    const runtimeSocketSymlinks = runtimeSocketSymlinkEndpoints(runtimeSocketEndpoints({ env }));
+    const runtimeSocketSymlinks = runtimeSocketSymlinkEndpoints(runtimeSocketEndpoints({ env, version }), { env, version });
     const undeniedRuntimeSockets = existingUnixSockets(undeniedRuntimeSocketCandidates(env));
     const engine = runtimeSocketSymlinks.length === 0 ? null : runtimeSocketEngine(runtimeSocketSymlinks[0]);
     return {
@@ -146,9 +146,9 @@ function hostEnvironmentAdvisory(env = process.env) {
       remedy: runtimeSocketSymlinks.length > 0 ? runtimeSocketRemedy(runtimeSocketSymlinks[0], engine) : undeniedRuntimeSockets.length > 0 ? undeniedRuntimeSocketRemedy() : null,
       detail: runtimeSocketSymlinks.length === 0
         ? undeniedRuntimeSockets.length > 0
-          ? `no runtime-socket deny path is a symlink; socket ${undeniedRuntimeSockets[0]} is outside grok's strict runtime-socket deny list, so write runs are refused while it could drive that container engine and write outside the workspace`
-          : "no runtime-socket deny path is a symlink"
-        : `runtime-socket deny path is a symlink: ${runtimeSocketSymlinks.join(", ")}`
+          ? `no blocking runtime-socket symlinks; socket ${undeniedRuntimeSockets[0]} may remain reachable from Grok's macOS strict sandbox even when listed in deny_paths, so write runs are refused while it could drive that container engine and write outside the workspace`
+          : "no blocking runtime-socket symlinks"
+        : `blocking runtime-socket symlinks: ${runtimeSocketSymlinks.join(", ")}`
     };
   } catch (error) {
     return {
@@ -224,7 +224,7 @@ function handleSetup(argv, transport = {}) {
   const doctorCommand = doctorCommandAdvisory(bin, available);
   const shellEnvironmentPolicy = shellEnvironmentPolicyAdvisory(process.env);
   const hooks = managedRunHooks(bin, available, process.env);
-  const hostEnvironment = hostEnvironmentAdvisory(process.env);
+  const hostEnvironment = hostEnvironmentAdvisory(process.env, probe.version);
   const auth = grokAuthStatus(process.env);
 
   const dataDir = resolveDataDir();
@@ -263,7 +263,7 @@ function handleSetup(argv, transport = {}) {
   }
   if (quotaCooldown) nextSteps.push(`Grok quota cooldown is active until ${quotaCooldown.expiresAt}, set by job ${quotaCooldown.jobId}: ${quotaCooldown.message}. Run /grok:setup --clear-quota-cooldown to clear it.`);
   if (!hostEnvironment.ready && hostEnvironment.runtimeSocketSymlinks.length > 0) {
-    nextSteps.push(hostEnvironment.remedy ?? `Stop the Docker engine that creates ${hostEnvironment.runtimeSocketSymlinks.join(", ")}, or remove the symlink. Do not downgrade the sandbox.`);
+    nextSteps.push(hostEnvironment.remedy ?? runtimeSocketRemedy(hostEnvironment.runtimeSocketSymlinks[0], hostEnvironment.runtimeSocketEngine));
   }
   if (hostEnvironment.ready && !hostEnvironment.writeReady) {
     nextSteps.push(hostEnvironment.remedy);

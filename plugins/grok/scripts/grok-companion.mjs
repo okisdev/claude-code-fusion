@@ -12,11 +12,12 @@ import { handleReview, handleReviewWorker } from "./lib/companion/review.mjs";
 import { handleStatus, handleHistory, handleResult, handleCancel } from "./lib/companion/inspection.mjs";
 import { handleStats } from "./lib/companion/stats.mjs";
 import { handleSetup } from "./lib/companion/setup.mjs";
+import { probeGrokVersion } from "./lib/companion/version.mjs";
 import { handleModels } from "./lib/companion/models.mjs";
 import { handleRecordAcceptance } from "./lib/companion/acceptance.mjs";
 import { handleStopGate } from "./lib/companion/stop_gate.mjs";
 import { SELF_PATH } from "./lib/companion/paths.mjs";
-import { preflightRuntimeSocketEndpoints, preflightUndeniedRuntimeSocketEndpoints, runtimeSocketEndpoints } from "./lib/grok-exec.mjs";
+import { preflightRuntimeSocketEndpoints, preflightUndeniedRuntimeSocketEndpoints, resolveGrokBin } from "./lib/grok-exec.mjs";
 
 function printUsage() {
   console.log(
@@ -68,9 +69,10 @@ async function main() {
     if (receivedArgv.length > 1 || (receivedArgv.length === 1 && receivedArgv[0] !== "--json")) {
       throw errorWithFailure("host-check accepts only --json.", "input");
     }
+    const { version } = probeGrokVersion(resolveGrokBin());
     const blockers = [];
     for (const [check, modes] of [
-      [() => preflightRuntimeSocketEndpoints({ candidates: runtimeSocketEndpoints() }), ["consult", "write", "review"]],
+      [() => preflightRuntimeSocketEndpoints({ version }), ["consult", "write", "review"]],
       [() => preflightUndeniedRuntimeSocketEndpoints(), ["write"]]
     ]) {
       try {

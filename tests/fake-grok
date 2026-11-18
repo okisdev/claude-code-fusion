@@ -210,6 +210,11 @@
       };
     }
     if (event) {
+      if (event.event_type === "ProfileApplied" && /\b1\.0\.88\b/.test(process.env.FAKE_GROK_VERSION_OUTPUT ?? "")) {
+        event.platform = "macos/seatbelt";
+        event.deny_paths = [".docker/desktop/docker.sock", ".docker/run/docker.sock", ".orbstack/run/docker.sock"]
+          .map((suffix) => path.join(process.env.HOME, suffix));
+      }
       if (mode === "sandbox-event-growing") {
         const noiseBytes = Number(process.env.FAKE_GROK_SANDBOX_NOISE_BYTES) || 256 * 1024;
         fs.appendFileSync(eventFile, `${JSON.stringify({ event_type: "ProfileApplied", workspace: "/other-workspace", padding: "x".repeat(noiseBytes) })}\n`, "utf8");
@@ -678,9 +683,11 @@
     process.exit(0);
   }
 
-  if (mode === "review-ok") {
+  if (mode === "review-ok" || mode === "review-structured-multiple") {
     emit({
-      text: "```json\n" + JSON.stringify(reviewObject) + "\n```",
+      text: mode === "review-structured-multiple"
+        ? `${JSON.stringify({ verdict: "needs-attention", findings: [], next_steps: ["Review is still in progress."] })}\n\n${JSON.stringify(reviewObject)}`
+        : "```json\n" + JSON.stringify(reviewObject) + "\n```",
       ...(process.argv.includes("--json-schema") ? { structuredOutput: reviewObject } : {}),
       stopReason: "end_turn",
       sessionId: "33333333-3333-7333-8333-333333333333",
@@ -689,9 +696,11 @@
     process.exit(0);
   }
 
-  if (mode === "task-structured-success") {
+  if (mode === "task-structured-success" || mode === "task-structured-multiple") {
     emit({
-      text: "The requested task completed.",
+      text: mode === "task-structured-multiple"
+        ? `${JSON.stringify({ ...taskObject, status: "partial", summary: "Work is still in progress." })}\n\n${JSON.stringify(taskObject)}`
+        : "The requested task completed.",
       structuredOutput: taskObject,
       stopReason: "end_turn",
       sessionId: "55555555-5555-7555-8555-555555555555",
