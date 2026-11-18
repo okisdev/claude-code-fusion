@@ -79,7 +79,7 @@ The CLI starts in its own process group. On demand it can spawn a `worker-server
 | `rate_limited` | rate limit, too many requests, or HTTP 429 text |
 | `network` | DNS failure, connection refused or reset, or fetch failure before any result |
 | `sandbox` | `Sandbox mode is enabled but not available` or a sandbox helper failure |
-| `policy` | a tool outside the mode allowlist appeared in the stream |
+| `policy` | a tool outside the mode allowlist appeared in the stream; MCP server discovery is exempt because no MCP server is configured |
 | `protocol` | malformed stream, missing init, or a zero exit without a result event |
 | `timeout` | the run timeout elapsed and the group was terminated |
 | `process` | an unexpected signal or exit code 143 that the companion did not request |
@@ -115,7 +115,7 @@ Cursor stores a chat at `<home>/.cursor/chats/<md5 of the absolute workspace pat
 | `transport-create`, `transport-discard --raw-args-token <token>`, and `--raw-args-token <token>` on `task` and `review` | The raw arguments transport used by the rescue agent, identical in shape to the Grok companion's |
 | `task-worker`, `review-worker` | Internal background workers |
 
-`scripts/session-end-hook.mjs` runs at Claude Code SessionEnd, performs verified cleanup of this session's running jobs, and removes unused raw transports, as the Grok plugin's hook does. Defaults: `CURSOR_COMPANION_TIMEOUT_MS` 540000, `CURSOR_COMPANION_EXIT_GRACE_MS` 15000, `CURSOR_COMPANION_PIDLESS_RUNNING_GRACE_MS` as in Grok, `CURSOR_COMPANION_WAIT_TIMEOUT_MS` and `CURSOR_COMPANION_WAIT_POLL_MS` for `result --wait`.
+`scripts/session-end-hook.mjs` runs at Claude Code SessionEnd, performs verified cleanup of this session's running jobs, and removes unused raw transports, as the Grok plugin's hook does. Defaults: `CURSOR_COMPANION_TIMEOUT_MS` 540000 (900000 for a task launched with `--transport-background-shell`; the variable overrides both), `CURSOR_COMPANION_EXIT_GRACE_MS` 15000, `CURSOR_COMPANION_PIDLESS_RUNNING_GRACE_MS` as in Grok, `CURSOR_COMPANION_WAIT_TIMEOUT_MS` and `CURSOR_COMPANION_WAIT_POLL_MS` for `result --wait`.
 
 ## Residual boundaries
 
