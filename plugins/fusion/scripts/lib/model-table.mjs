@@ -11,7 +11,7 @@ export const MODEL_ROUTING_LANES = new Set([...ENGINE_IDS, "claude-trivial", "cl
 export const DEFAULT_ROUTING_DEFAULTS = {
   codex: {
     quick: { model: "gpt-6-sol", effort: "xhigh" },
-    volume: { model: "gpt-6-luna", effort: "xhigh" },
+    volume: { model: "gpt-6-sol", effort: "high" },
     flagship: { model: "gpt-6.1-sol", effort: "xhigh" }
   },
   grok: {

@@ -4,7 +4,7 @@ import { ENGINE_ID_ALTERNATION, PEER_JOB_FOOTER_AGENTS, engineDisplayNameList, e
 import { tagMessage } from "../user-messages.mjs";
 import { canonicalWorkerAgentType, isFusionWorkerAgent, WORKER_TERMINAL_STATUSES, markWorkerCollected, readPeerCapacityReservations, readWorkerRecord, readWorkerOutputFileTaskIds, readSessionWorkerRecords, refreshWorkerTranscript, reopenWorkerContinuation, WORKER_COLLECTION_METHODS } from "../worker-state.mjs";
 import { markBudgetFailure, workerBudgetFailure, workerRoundUsage } from "./budget.mjs";
-import { backfillCollectedTaskOutput, capturedPeerIdentity, collectedHarnessAsyncDelivery, infraFinishedAt, noTaskFoundError, outputFileFromLaunchResponse, peerIdentityBackfill, settleQueuedVerdict, settleReapedIfActive, settleWrapperApiDeath, taskOutputResultText, terminalCollectedRecord, terminalCollectionPending, withClaudeQuotaFailure, wrapperApiDeathEvidence } from "./collection.mjs";
+import { backfillCollectedTelemetry, capturedPeerIdentity, collectedHarnessAsyncDelivery, infraFinishedAt, noTaskFoundError, outputFileFromLaunchResponse, peerIdentityBackfill, settleQueuedVerdict, settleReapedIfActive, settleWrapperApiDeath, toolResultText, terminalCollectedRecord, terminalCollectionPending, withClaudeQuotaFailure, wrapperApiDeathEvidence } from "./collection.mjs";
 import { allowAgentWithTaskId, claimParentContextAdvisory, collectorRequestIdentity, createDispatch, engineInfraDenial, injectedPeerDefaults, latestUserRequestedBackground, latestUserText, leadingCompanionOptions, parentContextTokens, prestagePeerPrompt, promptText, releaseHostPeerCapacity, reserveHostPeerCapacity, validateWorkerBrief } from "./dispatch.mjs";
 import { reconcileTaskNotifications, taskNotificationTransition } from "./notifications.mjs";
 import { denyTool, hookOutput, writeOutput } from "./output.mjs";
@@ -17,7 +17,7 @@ function handlePreToolUse(input, env) {
     writeOutput(denyTool(tagMessage("worker-lifecycle.placeholder-handback-deny", "Keep running the await operation until it returns the real report. Hand back that report only after await completes.")));
     return;
   }
-  if (!input.agent_id && ["TaskStop", "TaskOutput"].includes(input.tool_name) && typeof input.tool_input?.task_id === "string") {
+  if (!input.agent_id && input.tool_name === "TaskStop" && typeof input.tool_input?.task_id === "string") {
     const taskId = input.tool_input.task_id;
     const now = new Date().toISOString();
     for (const record of readSessionWorkerRecords(env, input.session_id, { strict: true }).filter((candidate) => !WORKER_TERMINAL_STATUSES.has(candidate.transportStatus) && [candidate.backgroundTaskId, candidate.agentId].includes(taskId))) {
@@ -95,7 +95,7 @@ function handlePreToolUse(input, env) {
       return;
     }
     reconcileTaskNotifications(input, env);
-    const admissionDenial = engineInfraDenial(input.session_id, agentType, latestUserText(input.transcript_path), env);
+    const admissionDenial = engineInfraDenial(input.session_id, agentType, latestUserText(input.transcript_path), env, Date.now(), promptText(input.tool_input), input.tool_input?.model);
     if (admissionDenial) {
       writeOutput(denyTool(admissionDenial));
       return;
@@ -270,13 +270,13 @@ function handlePostToolUse(input, env, failed = false) {
       return;
     }
   }
-  if (!input.agent_id && ["Read", "TaskOutput", "TaskStop"].includes(input.tool_name)) {
+  if (!input.agent_id && ["Read", "TaskStop"].includes(input.tool_name)) {
     const taskId = typeof input.tool_input?.task_id === "string" ? input.tool_input.task_id : null;
     const readPath = typeof input.tool_input?.file_path === "string" ? path.resolve(input.cwd, input.tool_input.file_path) : null;
     const records = input.tool_name === "Read"
       ? (readPath ? readWorkerOutputFileTaskIds(input.session_id, readPath, env).map((id) => readWorkerRecord(id, env)).filter(Boolean) : [])
       : readSessionWorkerRecords(env, input.session_id, { strict: true });
-    if (["TaskOutput", "TaskStop"].includes(input.tool_name) && taskId && noTaskFoundError(input, failed)) {
+    if (input.tool_name === "TaskStop" && taskId && noTaskFoundError(input, failed)) {
       const now = new Date().toISOString();
       for (const record of records.filter((candidate) => candidate.sessionId === input.session_id && !WORKER_TERMINAL_STATUSES.has(candidate.transportStatus) && [candidate.backgroundTaskId, candidate.agentId].includes(taskId))) {
         settleReapedIfActive(record.taskId, now, env, (current) => current.sessionId === input.session_id && [current.backgroundTaskId, current.agentId].includes(taskId));
@@ -290,14 +290,11 @@ function handlePostToolUse(input, env, failed = false) {
       if (input.tool_name === "Read") {
         return terminalCollectionPending(record) && [record.outputFile, record.transcriptPath].some((collectionPath) => typeof collectionPath === "string" && path.resolve(collectionPath) === readPath);
       }
-      if (input.tool_name === "TaskOutput" && input.tool_input?.block !== true) {
-        return false;
-      }
       return taskId && [record.backgroundTaskId, record.agentId, record.taskId].includes(taskId);
     });
     if (!failed && input.tool_response?.is_error !== true && input.tool_response?.isError !== true) {
       const now = new Date().toISOString();
-      const collectedResultText = ["Read", "TaskOutput"].includes(input.tool_name) ? taskOutputResultText(input) : null;
+      const collectedResultText = input.tool_name === "Read" ? toolResultText(input) : null;
       if (input.tool_name !== "TaskStop" && !collectedResultText?.trim()) {
         return;
       }
@@ -307,7 +304,7 @@ function handlePostToolUse(input, env, failed = false) {
             return null;
           }
           const worker = current;
-          const peerIdentity = ["Read", "TaskOutput"].includes(input.tool_name) && PEER_JOB_FOOTER_AGENTS.has(worker.agentType)
+          const peerIdentity = input.tool_name === "Read" && PEER_JOB_FOOTER_AGENTS.has(worker.agentType)
             ? capturedPeerIdentity(worker.agentType, collectedResultText, worker.peerEngine, worker)
             : {};
           if (terminalCollectedRecord(worker)) {
@@ -316,15 +313,13 @@ function handlePostToolUse(input, env, failed = false) {
           const transportStatus = input.tool_name === "TaskStop" ? "cancelled" : "done";
           const collectionMethod = input.tool_name === "Read"
             ? WORKER_COLLECTION_METHODS.OUTPUT_FILE_READ
-            : input.tool_name === "TaskOutput"
-              ? WORKER_COLLECTION_METHODS.TASK_OUTPUT
-              : WORKER_COLLECTION_METHODS.TASK_STOP;
+            : WORKER_COLLECTION_METHODS.TASK_STOP;
           if (input.tool_name !== "TaskStop" && wrapperApiDeathEvidence(worker, collectedResultText)) {
-            return backfillCollectedTaskOutput(settleWrapperApiDeath(markWorkerCollected(worker, collectionMethod, now), collectedResultText, now, env), input);
+            return backfillCollectedTelemetry(settleWrapperApiDeath(markWorkerCollected(worker, collectionMethod, now), collectedResultText, now, env), input);
           }
           const classified = input.tool_name === "TaskStop" ? worker : withClaudeQuotaFailure(worker, collectedResultText, now);
           if (classified !== worker) {
-            return backfillCollectedTaskOutput(settleQueuedVerdict({ ...markWorkerCollected(classified, collectionMethod, now), transportStatus: "failed", finishedAt: infraFinishedAt(worker, now), lastActivityAt: now }, now, env), input);
+            return backfillCollectedTelemetry(settleQueuedVerdict({ ...markWorkerCollected(classified, collectionMethod, now), transportStatus: "failed", finishedAt: infraFinishedAt(worker, now), lastActivityAt: now }, now, env), input);
           }
           const harnessAsyncDelivery = collectedHarnessAsyncDelivery(worker, transportStatus);
           const updated = settleQueuedVerdict({
@@ -337,7 +332,7 @@ function handlePostToolUse(input, env, failed = false) {
             finishedAt: worker.finishedAt ?? now,
             lastActivityAt: now
           }, now, env);
-          return ["Read", "TaskOutput"].includes(input.tool_name) ? backfillCollectedTaskOutput(updated, input) : updated;
+          return input.tool_name === "Read" ? backfillCollectedTelemetry(updated, input) : updated;
         });
       }
     }

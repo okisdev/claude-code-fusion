@@ -4,7 +4,7 @@ import path from "node:path";
 import { deliverWorkerEngineAcceptance, prepareEngineAcceptanceDelivery } from "../engine-acceptance.mjs";
 import { PEER_JOB_FOOTER_AGENTS, PEER_MANAGED_AGENTS, engineForAgentType, isEngineId } from "../engines.mjs";
 import { readEngineJobFailureKind } from "../engine-job-state.mjs";
-import { applyQueuedVerdict, backfillWorkerTaskOutputTelemetry, canonicalWorkerAgentType, isFusionWorkerAgent, isSettledWorker, WORKER_TERMINAL_STATUSES, markWorkerCollected, WORKER_COLLECTION_METHODS, workerRecordFile, writePrivateText } from "../worker-state.mjs";
+import { applyQueuedVerdict, backfillWorkerTranscriptTelemetry, canonicalWorkerAgentType, claudeModelFamily, isFusionWorkerAgent, isSettledWorker, WORKER_TERMINAL_STATUSES, markWorkerCollected, WORKER_COLLECTION_METHODS, workerRecordFile, writePrivateText } from "../worker-state.mjs";
 import { updateLifecycleWorkerRecord } from "./records.mjs";
 import { FINAL_TEXT_MAX_BYTES, FINAL_TEXT_HEAD_BYTES, FINAL_TEXT_TAIL_BYTES, COLLECTOR_END_MARKER, COLLECTOR_TERMINAL_MARKER, COLLECTOR_OUTCOME_MARKER, TERMINAL_RUNTIME_TASK_STATUSES, ENGINE_JOB_ID_PATTERN, WRAPPER_API_DEATH_PATTERN, WRAPPER_API_DEATH_REASON } from "./constants.mjs";
 
@@ -100,7 +100,7 @@ function noTaskFoundError(input, failed) {
   return /No task found/i.test(text);
 }
 
-function taskOutputTranscriptPaths(input, record) {
+function collectedTranscriptPaths(input, record) {
   const response = input.tool_response && typeof input.tool_response === "object" ? input.tool_response : {};
   const nested = response.toolUseResult && typeof response.toolUseResult === "object" ? response.toolUseResult : {};
   const runtimeId = typeof record.backgroundTaskId === "string" && record.backgroundTaskId
@@ -110,8 +110,6 @@ function taskOutputTranscriptPaths(input, record) {
       : null;
   const direct = [
     input.agent_transcript_path,
-    input.task_output_path,
-    input.task_output_file,
     input.output_file,
     response.agentTranscriptPath,
     response.agent_transcript_path,
@@ -157,25 +155,8 @@ function resultTextParts(value) {
   return ["text", "content", "output", "result", "toolUseResult", "file"].flatMap((key) => resultTextParts(value[key]));
 }
 
-function documentedTaskOutputText(value) {
-  if (value && typeof value === "object" && !Array.isArray(value) && value.type === "text" && typeof value.text === "string") {
-    return value.text;
-  }
-  const content = Array.isArray(value) ? value : value?.content;
-  if (!Array.isArray(content)) {
-    return null;
-  }
-  const text = content.flatMap((block) => block?.type === "text" && typeof block.text === "string" ? [block.text] : []);
-  return text.length > 0 ? text.join("\n") : null;
-}
-
-function taskOutputResultText(input) {
-  const text = documentedTaskOutputText(input.tool_response) ?? resultTextParts(input.tool_response).join("\n");
-  if (!text) {
-    return null;
-  }
-  const outputSections = [...text.matchAll(/<output>([\s\S]*?)<\/output>/gi)].map((match) => match[1]);
-  return outputSections.length > 0 ? outputSections.join("\n") : text;
+function toolResultText(input) {
+  return resultTextParts(input.tool_response).join("\n") || null;
 }
 
 function absoluteOutputFile(value) {
@@ -223,7 +204,7 @@ function outputFileFromLaunchResponse(response, nested) {
     return direct;
   }
   for (const value of [response, nested]) {
-    const text = taskOutputResultText({ tool_response: value });
+    const text = toolResultText({ tool_response: value });
     for (const line of String(text ?? "").split(/\r?\n/)) {
       const match = line.match(/^\s*output_file:\s*(.+?)\s*$/i);
       const outputFile = absoluteOutputFile(match?.[1]);
@@ -295,9 +276,9 @@ function capturedPeerIdentity(agentType, text, peerEngine, record) {
     : {};
 }
 
-function backfillCollectedTaskOutput(record, input) {
-  for (const transcriptPath of taskOutputTranscriptPaths(input, record)) {
-    const backfilled = backfillWorkerTaskOutputTelemetry(record, transcriptPath);
+function backfillCollectedTelemetry(record, input) {
+  for (const transcriptPath of collectedTranscriptPaths(input, record)) {
+    const backfilled = backfillWorkerTranscriptTelemetry(record, transcriptPath);
     if (backfilled !== record) {
       return backfilled;
     }
@@ -355,7 +336,8 @@ function withClaudeQuotaFailure(record, evidence, now) {
   const agentType = canonicalWorkerAgentType(record.agentType);
   if (!isFusionWorkerAgent(agentType) || agentType === "fusion:job-collector") return record;
   const text = [evidence, record.finalText, record.notificationSummary, record.statusDetail].filter((value) => typeof value === "string").join("\n");
-  if (!/(?:^|\n)\s*(?:you(?:'|’)ve hit (?:your|the) [^\n]*limit|(?:usage|quota) limit (?:reached|exceeded)|(?:reached|exceeded) (?:your|the) usage limit|out of extra usage)/i.test(text)) return record;
+  const limit = text.match(/(?:^|\n)\s*(?:you(?:'|’)ve hit (?:your|the) [^\n]*limit|(?:usage|quota) limit (?:reached|exceeded)|(?:reached|exceeded) (?:your|the) usage limit|out of extra usage)/i);
+  if (!limit) return record;
   const reference = Date.parse(infraFinishedAt(record, now));
   const resetText = text.match(/\bresets?\s+([^\n·]+)/i)?.[1]?.trim() ?? null;
   let reset = NaN;
@@ -392,6 +374,7 @@ function withClaudeQuotaFailure(record, evidence, now) {
     ...record,
     failureKind: "quota",
     infraFailure: true,
+    quotaModelFamily: claudeModelFamily(limit[0]) ?? claudeModelFamily(record.resolvedModel) ?? claudeModelFamily(record.requestedModel) ?? claudeModelFamily(record.quotaModelFamily),
     quotaResetAt: new Date(Number.isFinite(reset) ? reset : reference + 60 * 60 * 1000).toISOString(),
     quotaResetText: Number.isFinite(reset) ? resetText : null
   };
@@ -489,4 +472,4 @@ function peerIdentityBackfill(record, identity, env) {
 }
 
 
-export { completedReport, structuredCollectorReport, retryInstruction, noTaskFoundError, taskOutputTranscriptPaths, collectedHarnessAsyncDelivery, resultTextParts, documentedTaskOutputText, taskOutputResultText, absoluteOutputFile, regularFileExists, durableSubagentTranscript, withDurableCancellationTranscript, withPeerFailureKind, outputFileFromLaunchResponse, finalTextArtifactPath, boundedFinalText, writeFinalTextArtifact, peerJobIdsFromCollectedResult, peerJobIdFromCollectedResult, mergedPeerJobIds, capturedPeerIdentity, backfillCollectedTaskOutput, settleQueuedVerdict, infraFinishedAt, withClaudeQuotaFailure, wrapperApiDeathEvidence, settleWrapperApiDeath, isAutoSettledWrapperApiDeath, statusEvidence, settleReapedWorker, settleReapedIfActive, runtimeTaskIsTerminal, terminalTransportObserved, terminalCollectionPending, terminalCollectedRecord, peerIdentityBackfill };
+export { completedReport, structuredCollectorReport, retryInstruction, noTaskFoundError, collectedTranscriptPaths, collectedHarnessAsyncDelivery, resultTextParts, toolResultText, absoluteOutputFile, regularFileExists, durableSubagentTranscript, withDurableCancellationTranscript, withPeerFailureKind, outputFileFromLaunchResponse, finalTextArtifactPath, boundedFinalText, writeFinalTextArtifact, peerJobIdsFromCollectedResult, peerJobIdFromCollectedResult, mergedPeerJobIds, capturedPeerIdentity, backfillCollectedTelemetry, settleQueuedVerdict, infraFinishedAt, withClaudeQuotaFailure, wrapperApiDeathEvidence, settleWrapperApiDeath, isAutoSettledWrapperApiDeath, statusEvidence, settleReapedWorker, settleReapedIfActive, runtimeTaskIsTerminal, terminalTransportObserved, terminalCollectionPending, terminalCollectedRecord, peerIdentityBackfill };

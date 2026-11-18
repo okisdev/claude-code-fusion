@@ -49,7 +49,7 @@ For anything that ships: correctness and safety, then user facing quality, then 
 | glm-5.2 | cursor | zhipu | 3 | 3 | 4 |
 Model notes (benchmarks, prices, latency) live in model-routing.json; `/fusion:config` shows them.
 
-Lane defaults: codex quick gpt-6-sol@xhigh, volume gpt-6-luna@xhigh, flagship gpt-6.1-sol@xhigh; grok burst grok-4.7-build-fast@low, independence grok-4.7-build-fast@low, live-web grok-4.7-build-fast@high, large-context grok-4.6@medium; cursor diversity muse-spark-1.3@xhigh, burst composer-2.5@default.
+Lane defaults: codex quick gpt-6-sol@xhigh, volume gpt-6-sol@high, flagship gpt-6.1-sol@xhigh; grok burst grok-4.7-build-fast@low, independence grok-4.7-build-fast@low, live-web grok-4.7-build-fast@high, large-context grok-4.6@medium; cursor diversity muse-spark-1.3@xhigh, burst composer-2.5@default.
 
 Scores feed the routing priorities above: intelligence proxies correctness and safety, taste is user facing quality, cost applies only as the final tie breaker.
 Scores are user-assigned via /fusion:config; re-score when the model lineup changes.

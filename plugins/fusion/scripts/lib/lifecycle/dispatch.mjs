@@ -9,9 +9,11 @@ import { readRoutingDefaults } from "../model-table.mjs";
 import { newestEngineCompanion } from "../engine-acceptance.mjs";
 import { engineHostBlockers } from "../engine-host-check.mjs";
 import { tagMessage } from "../user-messages.mjs";
-import { canonicalWorkerAgentType, createWorkerRecord, createWorkerTaskId, readPeerCapacityReservations, readWorkerRecord, readWorkerRecords, updateWorkerSessionState, withPeerCapacityReservations, workerRecordFile, writePrivateText, WORKER_TERMINAL_STATUSES } from "../worker-state.mjs";
+import { canonicalWorkerAgentType, claudeModelFamily, createWorkerRecord, createWorkerTaskId, readPeerCapacityReservations, readWorkerRecord, readWorkerRecords, updateWorkerSessionState, withPeerCapacityReservations, workerRecordFile, writePrivateText, WORKER_TERMINAL_STATUSES } from "../worker-state.mjs";
 import { workerLimits } from "./budget.mjs";
 import { sessionRecords, updateLifecycleWorkerRecord } from "./records.mjs";
+import { withClaudeQuotaFailure } from "./collection.mjs";
+import { finalAssistantTextFromTranscript } from "./notifications.mjs";
 import { PARENT_CONTEXT_ADVISORY_TOKENS_ENV, VERIFICATION_MANIFEST_ENV, DEFAULT_BRIEF_MAX_BYTES, SIZING_ADVISORY_BYTES, DEFAULT_PARENT_CONTEXT_ADVISORY_TOKENS, PARENT_CONTEXT_TAIL_MAX_BYTES, BRIEF_AGENTS } from "./constants.mjs";
 
 function allowAgentWithTaskId(toolInput, taskId, additionalContext = null) {
@@ -53,20 +55,36 @@ function optionValue(options, name) {
   return value.replace(/^(["'])(.*)\1$/s, "$2");
 }
 
-function engineInfraDenial(sessionId, agentType, userText, env, now = Date.now(), prompt = "") {
+function engineInfraDenial(sessionId, agentType, userText, env, now = Date.now(), prompt = "", model = null) {
   const canonical = canonicalWorkerAgentType(agentType);
   if (canonical && canonical !== "fusion:job-collector") {
     const name = canonical.slice(canonical.indexOf(":") + 1);
     if (new RegExp(String.raw`\b(?:fusion:)?${name}\b`, "i").test(userText ?? "")) return null;
-    const limited = sessionRecords(sessionId, env)
+    const requestedFamily = claudeModelFamily(model);
+    const limits = sessionRecords(sessionId, env)
       .filter((record) => canonicalWorkerAgentType(record.agentType) === canonical && WORKER_TERMINAL_STATUSES.has(record.transportStatus) && record.failureKind === "quota" && record.infraFailure === true && Date.parse(record.finishedAt ?? "") <= now)
       .map((record) => {
         const reset = Date.parse(record.quotaResetAt ?? "");
-        return { record, reset: Number.isFinite(reset) ? reset : Date.parse(record.finishedAt) + 60 * 60 * 1000 };
+        let family = claudeModelFamily(record.quotaModelFamily);
+        if (!family) {
+          family = withClaudeQuotaFailure(record, finalAssistantTextFromTranscript(record.transcriptPath), new Date(now).toISOString()).quotaModelFamily ?? claudeModelFamily(record.resolvedModel) ?? claudeModelFamily(record.requestedModel);
+          if (family) {
+            const migrated = updateLifecycleWorkerRecord(record.taskId, env, (current) => current?.failureKind === "quota" && WORKER_TERMINAL_STATUSES.has(current.transportStatus) && !claudeModelFamily(current.quotaModelFamily) ? { ...current, quotaModelFamily: family } : null);
+            family = claudeModelFamily(migrated?.quotaModelFamily) ?? family;
+          }
+        }
+        return { record, family, reset: Number.isFinite(reset) ? reset : Date.parse(record.finishedAt) + 60 * 60 * 1000 };
       })
       .filter(({ reset }) => reset > now)
-      .sort((left, right) => right.reset - left.reset)[0];
-    return limited ? tagMessage("worker-lifecycle.engine-infra-deny", `${canonical} hit its usage limit in this session. The quota resets ${limited.record.quotaResetText ? `${limited.record.quotaResetText} (${new Date(limited.reset).toISOString()})` : `at ${new Date(limited.reset).toISOString()} (1 hour fallback)`}. Route this package to another agent type, or name ${name} to retry.`) : null;
+      .sort((left, right) => right.reset - left.reset);
+    const limited = limits.find(({ family }) => !requestedFamily || !family || family === requestedFamily);
+    if (!limited) return null;
+    const familyName = limited.family ? limited.family[0].toUpperCase() + limited.family.slice(1) : "Claude";
+    const reset = limited.record.quotaResetText ? `${limited.record.quotaResetText} (${new Date(limited.reset).toISOString()})` : `${new Date(limited.reset).toISOString()} (1 hour fallback)`;
+    const fallback = limited.family && limited.family !== "opus" && !limits.some(({ family }) => !family || family === "opus")
+      ? "; rerun with model: opus to use Opus 5.5 meanwhile."
+      : limited.family ? "; rerun with model set to a different available Claude family meanwhile." : ".";
+    return tagMessage("worker-lifecycle.engine-infra-deny", `${familyName} usage limit until ${reset}${fallback} Route this package to another agent type, or name ${name} to retry.`);
   }
   const engine = engineForAgentType(agentType);
   if (!engine || new RegExp(String.raw`\b(?:${engine}|${engineDisplayName(engine)})\b`, "i").test(userText ?? "")) {
@@ -603,6 +621,7 @@ function createDispatch(input, agentType, userBackgroundAuthorized, env, validat
     sessionId: input.session_id,
     dispatchToolUseId: input.tool_use_id ?? null,
     agentType,
+    requestedModel: input.tool_input?.model,
     description: safeDescription(input.tool_input?.description),
     workspaceRoot: input.cwd,
     ...(PEER_RESCUE_AGENT_NAMES.has(agentType) ? { companionCwd: companionCwd(input, prompt) } : {}),

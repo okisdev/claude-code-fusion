@@ -3,6 +3,9 @@
   "name": "codex",
   "displayName": "Codex Companion",
   "version": "0.0.77",
+  "engines": {
+    "claude-code": ">=2.1.300"
+  },
   "description": "First party local Codex CLI delegation for tasks, reviews, resumable threads, and durable background jobs.",
   "author": {
     "name": "Harry Yep"

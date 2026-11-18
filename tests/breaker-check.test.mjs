@@ -157,6 +157,27 @@ test("text classified Codex connectivity failures map to network after stronger 
   assert.strictEqual(codexFailureKind("authentication failed; error sending request"), "auth");
 });
 
+test("Codex policy refusal diagnostics match the companion classification", () => {
+  for (const message of [
+    "This request violated the safety policy.",
+    "This violates our acceptable use policy.",
+    "This is a violation of an internal policy.",
+    "This violated policy.",
+    "This violates the safety policy; stream disconnected before completion"
+  ]) {
+    assert.strictEqual(codexFailureKind(message), "refused", message);
+  }
+  assert.strictEqual(codexFailureKind("collaboration policy violation"), "protocol");
+});
+
+test("Codex capacity diagnostics are transient rate limits", () => {
+  for (const message of ["Flex capacity unavailable.", "Policy-restricted capacity is unavailable."]) {
+    assert.strictEqual(codexFailureKind(message), "rate_limited", message);
+    assert.strictEqual(codexFailureKind(`${message} connection reset`), "rate_limited", message);
+    assert.strictEqual(codexFailureKind(`usage limit reached; ${message}`), "quota", message);
+  }
+});
+
 test("worker breaker parses recent ledger records once and skips 2,000 old files", (t) => {
   const sandbox = makeSandbox(t);
   const env = envFor(sandbox);
@@ -276,7 +297,7 @@ test("an in-window quota failure prints a grok breaker advisory", (t) => {
 });
 
 test("grok breaker version advice reports only a contract drift", (t) => {
-  assert.strictEqual(verifiedGrokVersion, "1.0.77");
+  assert.strictEqual(verifiedGrokVersion, "1.0.88");
   const changed = makeSandbox(t);
   writeRecord(jobFile(path.join(changed.grokData, "state"), "workspace", "changed"), {
     status: "error",
@@ -859,7 +880,7 @@ test("Cursor setup failure opens immediately and version drift is reported", (t)
   const result = run(sandbox);
   assert.strictEqual(result.status, 0);
   assert.match(result.stdout, /treat the cursor breaker as open.*last failure setup.*1 setup across 1 terminal jobs/);
-  assert.match(result.stdout, /; cursor 2026\.10\.02-abcdef0 installed, contract verified on 2026\.10\.01-e373342/);
+  assert.match(result.stdout, /; cursor 2026\.10\.02-abcdef0 installed, contract verified on 2026\.11\.17-f532c45/);
   assert.doesNotMatch(result.stdout, /cursor api pool breaker/);
 });
 
@@ -868,12 +889,12 @@ test("Devin breaker uses its billing pool and verified version", (t) => {
   const root = engineStateRoots("devin", envFor(sandbox))[0];
   writeRecord(jobFile(root, "workspace", "quota"), {
     id: "quota", engine: "devin", status: "error", failureKind: "quota", billingPool: "api",
-    devinVersion: "3000.11.229", finishedAt: new Date(Date.now() - 60_000).toISOString()
+    devinVersion: "3000.14.30822", finishedAt: new Date(Date.now() - 60_000).toISOString()
   });
   const result = run(sandbox);
   assert.strictEqual(result.status, 0);
   assert.match(result.stdout, /treat the devin api pool breaker as open.*last failure quota/);
-  assert.match(result.stdout, /devin 3000\.11\.229 installed, contract verified on 3000\.11\.228/);
+  assert.match(result.stdout, /devin 3000\.14\.30822 installed, contract verified on 3000\.14\.30821/);
   writeRecord(jobFile(root, "workspace", "recovered"), {
     id: "recovered", status: "done", billingPool: "api", finishedAt: new Date().toISOString()
   });
@@ -885,10 +906,10 @@ test("Codex version drift uses the registry verified version key", (t) => {
   writeRecord(jobFile(sandbox.codexState, "workspace", "auth"), {
     status: "error",
     failureKind: "auth",
-    codexVersion: "0.163.0",
+    codexVersion: "0.170.0",
     finishedAt: new Date(Date.now() - 2 * 60000).toISOString()
   });
-  assert.match(run(sandbox).stdout, /; codex 0\.163\.0 installed, contract verified on 0\.162\.1/);
+  assert.match(run(sandbox).stdout, /; codex 0\.170\.0 installed, contract verified on 0\.169\.0/);
 });
 
 test("a failure outside the lookback window is silent", (t) => {

@@ -50,6 +50,18 @@ test("Grok injects the selected role's effort when roles share a model", (t) => 
   assert.strictEqual(injectedPeerDefaults(otherModel, "grok:grok-rescue", env)?.prompt, `--effort medium ${otherModel}`);
 });
 
+test("Codex quick and volume use their own efforts when both default to Sol", (t) => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "fusion-lifecycle-defaults-"));
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+  const env = { FUSION_MODEL_ROUTING: path.join(directory, "missing.json") };
+
+  for (const [role, effort] of [["quick", "xhigh"], ["volume", "high"]]) {
+    const prompt = `lane: codex ${role}\ngoal: repair`;
+    assert.strictEqual(injectedPeerDefaults(prompt, "codex:codex-rescue", env)?.prompt, `--model gpt-6-sol --effort ${effort} -- ${prompt}`);
+    assert.strictEqual(injectedPeerDefaults(`--model gpt-6-sol -- ${prompt}`, "codex:codex-rescue", env)?.prompt, `--effort ${effort} --model gpt-6-sol -- ${prompt}`);
+  }
+});
+
 test("Cursor role fields with middle dot, comma, and semicolon separators get defaults", (t) => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), "fusion-lifecycle-defaults-"));
   t.after(() => fs.rmSync(directory, { recursive: true, force: true }));

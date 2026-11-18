@@ -147,7 +147,7 @@ test("Set-default writes a lane choice and refreshes the live rules", (t) => {
   assert.match(result.stdout, /Updated codex quick default to gpt-6-sol@high\./);
   const data = JSON.parse(fs.readFileSync(box.modelRoutingFile, "utf8"));
   assert.deepStrictEqual(data.defaults, { codex: { quick: { model: "gpt-6-sol", effort: "high" } } });
-  assert.match(fs.readFileSync(box.rulesFile, "utf8"), /^Lane defaults: codex quick gpt-6-sol@high, volume gpt-6-luna@xhigh/m);
+  assert.match(fs.readFileSync(box.rulesFile, "utf8"), /^Lane defaults: codex quick gpt-6-sol@high, volume gpt-6-sol@high/m);
   assert.strictEqual(
     run(box, ["rescore", "grok-4.7", "--intelligence", "5", "--taste", "4", "--cost", "4", "--lane", "grok"]).status,
     0
@@ -269,9 +269,9 @@ test("Audit reports listing drift, unscored models, and Cursor variants per engi
   assert.strictEqual(report.engines.codex.listing.source, "test listing");
   assert.deepStrictEqual(report.engines.codex.configuredButAbsent, ["gpt-5.5-missing"]);
   assert.deepStrictEqual(report.defaults.codex.quick, { model: "gpt-5.6-terra", effort: "high" });
+  assert.deepStrictEqual(report.defaults.codex.volume, { model: "gpt-6-sol", effort: "high" });
   assert.deepStrictEqual(report.defaults.grok.burst, { model: "grok-4.7-build-fast", effort: "low" });
   assert.deepStrictEqual(report.engines.codex.defaultsAbsent, [
-    { role: "volume", model: "gpt-6-luna" },
     { role: "flagship", model: "gpt-6.1-sol" }
   ]);
   assert.deepStrictEqual(report.engines.codex.unscored, ["gpt-5.7-new", "gpt-6-sol", "o3"]);
@@ -283,7 +283,8 @@ test("Audit reports listing drift, unscored models, and Cursor variants per engi
   assert.strictEqual(fs.readFileSync(box.modelRoutingFile, "utf8"), routingBeforeAudit);
   const text = run(box, ["audit"]);
   assert.match(text.stdout, /codex defaults: quick gpt-5\.6-terra@high/);
-  assert.match(text.stdout, /Codex defaults absent: volume gpt-6-luna, flagship gpt-6\.1-sol/);
+  assert.match(text.stdout, /volume gpt-6-sol@high/);
+  assert.match(text.stdout, /Codex defaults absent: flagship gpt-6\.1-sol/);
   assert.match(text.stdout, /Unconfigured gpt-\* newcomers: gpt-5\.7-new/);
   assert.match(text.stdout, /Cursor unscored models \(no routing seat\): cursor-new/);
 });

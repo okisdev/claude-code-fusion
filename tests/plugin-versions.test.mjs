@@ -17,6 +17,7 @@ test("marketplace and plugin manifest versions stay synchronized", () => {
     const manifest = readJson(`plugins/${name}/.claude-plugin/plugin.json`);
     assert.equal(entries.get(name)?.version, marketplace.version);
     assert.equal(manifest.version, marketplace.version);
+    assert.deepEqual(manifest.engines, { "claude-code": ">=2.1.300" }, `${name} must enforce the supported Claude Code floor`);
   }
   const changelog = fs.readFileSync(path.join(repoRoot, "CHANGELOG.md"), "utf8");
   assert.match(changelog, new RegExp(`^## ${marketplace.version.replaceAll(".", "\\.")}$`, "m"));

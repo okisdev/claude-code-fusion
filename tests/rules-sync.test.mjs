@@ -213,7 +213,7 @@ test("Rendered model scores do not look like local edits", (t) => {
   const sandbox = makeSandbox(t);
   writeModelRouting(sandbox.modelRoutingFile);
   const rendered = renderRulesContent(CANONICAL, { routingPath: sandbox.modelRoutingFile });
-  assert.match(rendered, /^Lane defaults: codex quick gpt-6-sol@xhigh, volume gpt-6-luna@xhigh, flagship gpt-6\.1-sol@xhigh; grok burst grok-4\.7-build-fast@low, independence grok-4\.7-build-fast@low, live-web grok-4\.7-build-fast@high, large-context grok-4\.6@medium; cursor diversity muse-spark-1\.3@xhigh, burst composer-2\.5@default\.$/m);
+  assert.match(rendered, /^Lane defaults: codex quick gpt-6-sol@xhigh, volume gpt-6-sol@high, flagship gpt-6\.1-sol@xhigh; grok burst grok-4\.7-build-fast@low, independence grok-4\.7-build-fast@low, live-web grok-4\.7-build-fast@high, large-context grok-4\.6@medium; cursor diversity muse-spark-1\.3@xhigh, burst composer-2\.5@default\.$/m);
   assert.strictEqual(hashRulesTemplate(rendered), hashRulesTemplate(CANONICAL));
   fs.mkdirSync(path.dirname(sandbox.rulesFile), { recursive: true });
   fs.writeFileSync(sandbox.rulesFile, rendered, "utf8");
@@ -236,7 +236,7 @@ test("Changing a lane default updates the live table without changing the rules 
   assert.strictEqual(result.status, 0, result.stderr);
   assert.strictEqual(result.stdout, "");
   const after = fs.readFileSync(sandbox.rulesFile, "utf8");
-  assert.match(after, /^Lane defaults: codex quick codex@max, volume gpt-6-luna@xhigh/m);
+  assert.match(after, /^Lane defaults: codex quick codex@max, volume gpt-6-sol@high/m);
   assert.strictEqual(hashRulesTemplate(after), hashRulesTemplate(before));
 });
 
@@ -338,7 +338,7 @@ test("Grok rules document source verified headless boundaries", () => {
   const security = fs.readFileSync(path.join(repoRoot, "SECURITY.md"), "utf8");
   const bridgeSentence = "The child sets all eighteen `GROK_CLAUDE_*_ENABLED`, `GROK_CURSOR_*_ENABLED`, and `GROK_CODEX_*_ENABLED` bridge variables to false; upstream currently consumes the six Claude and six Cursor cells plus the Codex sessions cell and reserves the other five Codex cells, and the child also pins `GROK_MANAGED_MCPS_ENABLED=false` because that variable has highest precedence over `[managed_mcps]` in `~/.grok/config.toml` and remote settings.";
   const hookClaim = "Grok loads hooks from plugins enabled in ~/.grok/config.toml and from ~/.grok/hooks/*.json inside managed runs, verified at 1.0.77. The GROK_CONFIG overlay does not disable them (the plugin stays loaded in GROK_HOOKS_LOG), and allow_managed_hooks_only is read only from policy layers that also bind interactive use, so /grok:setup names them and the repair is the user's [plugins] list.";
-  const subagentSentence = "Upstream parses `--no-subagents`, but the single-turn and agent resolvers do not forward it, while the interactive TUI does apply it; the hard Agent tool deny and `GROK_SUBAGENTS=0` are the effective headless controls.";
+  const subagentSentence = "`--no-subagents` disables headless subagent spawning (verified on 1.0.77 and 1.0.88); the hard Agent tool deny and `GROK_SUBAGENTS=0` remain independent controls.";
   const rustLogSentence = "Every run forces `RUST_LOG=xai_grok_agent::builder=debug,xai_grok_sandbox=warn,xai_grok_shell::session::acp_session::turn=warn`.";
   const bubblewrapSentence = "On Linux, a strict profile with deny paths re-executes under bubblewrap and refuses to start when `bwrap` is missing or unusable; macOS has no equivalent hard enforcement and relies on Seatbelt application plus best-effort tool denies.";
   const freshSessionSentence = "Orchestrator cache reread cost is context size times turns, so Fusion shows the user one notice at the first prompt or dispatch past `FUSION_PARENT_CONTEXT_ADVISORY_TOKENS` context tokens. Compacting or opening a fresh session is the user's decision, and the main session never recommends either unasked.";
@@ -507,7 +507,7 @@ test("Grok rules document source verified headless boundaries", () => {
   assert.match(contract, /Upstream ships ACP today/);
   assert.match(contract, /The companion has not adopted ACP yet and continues per-call invocation/);
   assert.match(codexContract, /failureKind: "setup".*below the tested minimum 0\.154\.0/);
-  assert.match(codexContract, /The tested interval runs from 0\.154\.0 up to but excluding 0\.163\.0; versions below 0\.154\.0 fail task and review preflight with a setup error; versions at or above 0\.163\.0 keep running task and review preflight while `\/codex:setup` reports not ready with exit code 1 as the compatibility advisory/);
+  assert.match(codexContract, /The tested interval runs from 0\.154\.0 up to but excluding 0\.170\.0; versions below 0\.154\.0 fail task and review preflight with a setup error; versions at or above 0\.170\.0 keep running task and review preflight while `\/codex:setup` reports not ready with exit code 1 as the compatibility advisory/);
   assert.match(codexContract, /Codex configuration parse failures under `--strict-config`.*failureKind: "process"/);
   assert.match(sharedContract, /The Grok instance adds `sandbox`[^\n]*`transport`[^\n]*`policy`[^\n]*`turn_limit`[^\n]*and `network`/);
   assert.match(sharedContract, /`setup`: The installed CLI version or installation lacks a required adapter capability and fails capability preflight/);

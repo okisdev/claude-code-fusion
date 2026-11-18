@@ -3,6 +3,9 @@
   "name": "fusion",
   "displayName": "Fusion Orchestrator",
   "version": "0.0.77",
+  "engines": {
+    "claude-code": ">=2.1.300"
+  },
   "description": "Multi-model orchestration: tier agents, routing rules, blind panel, ultra fleet, model config, and drift doctor.",
   "author": {
     "name": "Harry Yep"

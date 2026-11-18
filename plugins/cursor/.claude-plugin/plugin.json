@@ -3,6 +3,9 @@
   "name": "cursor",
   "displayName": "Cursor Companion",
   "version": "0.0.77",
+  "engines": {
+    "claude-code": ">=2.1.300"
+  },
   "description": "Local Cursor Agent CLI delegation: multi family consults, Composer implementation in owned worktrees, review, resumable history, background jobs, and setup health checks.",
   "author": {
     "name": "Harry Yep"

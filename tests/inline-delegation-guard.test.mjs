@@ -960,7 +960,7 @@ test("audit normalization accepts legacy event categories and discards retired f
     },
     { at, session: "session-1", event: "dispatch", lane: "codex", tool: "Agent", description: "legacy dispatch" },
     { at, session: "session-1", event: "warn", lane: "codex", tool: "Agent", reason: "missing-launch-recovered" },
-    { at, session: "session-1", event: "deny", lane: "main", tool: "TaskOutput", description: "reaped-worker-redirect", mode: "enforce" },
+    { at, session: "session-1", event: "deny", lane: "main", tool: "TaskStop", description: "reaped-worker-redirect", mode: "enforce" },
     { at, session: "session-1", event: "warn", lane: "main", tool: "TaskStop", description: "reaped-worker-redirect", mode: "advisory", suppressed: true },
     { at, session: "session-1", event: "deny", lane: "main", tool: "Edit", path: "file.txt", writeCount: 5, dispatchCount: 1, budget: 5, mode: "enforce" },
     { at, session: "session-1", event: "warn", lane: "main", tool: "Bash", writeCount: 5, dispatchCount: 1, budget: 5, mode: "advisory", suppressed: true },
@@ -1972,7 +1972,7 @@ function bashPayload(sandbox, { sessionId = "session-1", command = "true", agent
   return payload;
 }
 
-function taskControlPayload(sandbox, { sessionId = "session-1", toolName = "TaskOutput", taskId } = {}) {
+function taskControlPayload(sandbox, { sessionId = "session-1", toolName = "TaskStop", taskId } = {}) {
   return {
     hook_event_name: "PreToolUse",
     session_id: sessionId,
@@ -2079,55 +2079,6 @@ test("no-op Bash deny audits an enforcement event for Bash on the main lane", (t
     messageCode: messageCode("inline-guard.no-op-heartbeat-deny")
   });
   assert.ok(!Object.hasOwn(denies[0], "path"));
-});
-
-test("TaskOutput against a terminal Fusion worker redirects to its output file", (t) => {
-  const sandbox = makeSandbox(t);
-  const taskId = "fusion-abcdef0123456789abcdef01";
-  const backgroundTaskId = "peer-reaped-output";
-  const outputFile = path.join(sandbox.root, "tasks", "peer-reaped-output.txt");
-  seedInFlightWorker(sandbox, { taskId, backgroundTaskId, transportStatus: "done", outputFile });
-
-  const result = run(sandbox, taskControlPayload(sandbox, { taskId: backgroundTaskId }), workerStateEnv(sandbox));
-  assert.strictEqual(result.status, 0);
-  const output = JSON.parse(result.stdout);
-  assert.strictEqual(output.hookSpecificOutput.permissionDecision, "deny");
-  assert.match(output.hookSpecificOutput.permissionDecisionReason, new RegExp(outputFile));
-  assert.match(output.hookSpecificOutput.permissionDecisionReason, new RegExp(`/fusion:stats --record ${taskId}=<verdict>`));
-  assertMessageTagged(output.hookSpecificOutput.permissionDecisionReason, "inline-guard.reaped-worker-redirect");
-  const redirects = readAuditRecords(sandbox).filter((record) => record.tool === "TaskOutput" && record.event !== "replay");
-  assert.deepStrictEqual(redirects, [
-    {
-      schemaVersion: 1,
-      at: redirects[0].at,
-      session: "session-1",
-      event: "deny",
-      lane: "main",
-      tool: "TaskOutput",
-      description: "reaped-worker-redirect",
-      mode: "enforce",
-      messageCode: messageCode("inline-guard.reaped-worker-redirect")
-    }
-  ]);
-});
-
-test("TaskOutput against a running Fusion worker is allowed", (t) => {
-  const sandbox = makeSandbox(t);
-  const backgroundTaskId = "peer-running";
-  seedInFlightWorker(sandbox, { backgroundTaskId });
-
-  const result = run(sandbox, taskControlPayload(sandbox, { taskId: backgroundTaskId }), workerStateEnv(sandbox));
-  assert.strictEqual(result.status, 0);
-  assert.strictEqual(result.stdout, "");
-  assertSingleReplay(sandbox, "TaskOutput", "other");
-});
-
-test("TaskOutput with an unknown task id is allowed", (t) => {
-  const sandbox = makeSandbox(t);
-  const result = run(sandbox, taskControlPayload(sandbox, { taskId: "not-a-fusion-worker" }), workerStateEnv(sandbox));
-  assert.strictEqual(result.status, 0);
-  assert.strictEqual(result.stdout, "");
-  assertSingleReplay(sandbox, "TaskOutput", "other");
 });
 
 test("TaskStop against a terminal Fusion worker redirects to its transcript", (t) => {
@@ -2377,7 +2328,6 @@ test("every main lane tool is classified for replay before its existing handler"
     ["Bash", { command: "node fusion-stats.mjs --json" }, "other"],
     ["Bash", { command: "git status --short" }, "read"],
     ["Bash", { command: "node -v" }, "other"],
-    ["TaskOutput", { task_id: "unknown" }, "other"],
     ["TaskStop", { task_id: "unknown" }, "other"],
     ["Skill", {}, "other"]
   ];
@@ -2422,7 +2372,7 @@ test("legacy narrow wave state is discarded when the guard updates a session", (
   }
 });
 
-test("hooks configuration wires PreToolUse read, write, Bash, dispatch, TaskOutput, and TaskStop tools through the inline guard", () => {
+test("hooks configuration wires PreToolUse read, write, Bash, dispatch, and TaskStop tools through the inline guard", () => {
   const hooks = JSON.parse(fs.readFileSync(path.join(repoRoot, "plugins", "fusion", "hooks", "hooks.json"), "utf8")).hooks;
   const preToolHandlers = hooks.PreToolUse.flatMap((group) => group.hooks.map((hook) => ({ matcher: group.matcher, command: hook.command }))).filter((hook) => hook.command?.includes("fusion-hook.mjs"));
   assert.deepStrictEqual(preToolHandlers, [
@@ -2439,7 +2389,7 @@ test("hooks configuration wires PreToolUse read, write, Bash, dispatch, TaskOutp
       command: 'command -v node >/dev/null 2>&1 || exit 0; node "${CLAUDE_PLUGIN_ROOT}/scripts/fusion-hook.mjs"'
     },
     {
-      matcher: "^(TaskOutput|TaskStop)$",
+      matcher: "^TaskStop$",
       command: 'command -v node >/dev/null 2>&1 || exit 0; node "${CLAUDE_PLUGIN_ROOT}/scripts/fusion-hook.mjs"'
     }
   ]);

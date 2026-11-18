@@ -35,7 +35,7 @@
     ],
     "PreToolUse": [
       {
-        "matcher": "^(?!(?:Read|Grep|Glob|Edit|Write|NotebookEdit|MultiEdit|Bash|Agent|Task|SendMessage|TaskOutput|TaskStop)$).*$",
+        "matcher": "^(?!(?:Read|Grep|Glob|Edit|Write|NotebookEdit|MultiEdit|Bash|Agent|Task|SendMessage|TaskStop)$).*$",
         "hooks": [
           {
             "type": "command",
@@ -75,7 +75,7 @@
         ]
       },
       {
-        "matcher": "^(TaskOutput|TaskStop)$",
+        "matcher": "^TaskStop$",
         "hooks": [
           {
             "type": "command",
