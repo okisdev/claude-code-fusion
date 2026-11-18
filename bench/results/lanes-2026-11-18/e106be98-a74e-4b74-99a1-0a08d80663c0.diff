@@ -1,0 +1,89 @@
+diff --git a/concurrent.js b/concurrent.js
+new file mode 100644
+index 0000000..1fab69e
+--- /dev/null
++++ b/concurrent.js
+@@ -0,0 +1,55 @@
++import { app_error } from "./errors.js";
++
++export function map_concurrent(items, limit, worker) {
++  if (items.length === 0) {
++    return Promise.resolve([]);
++  }
++
++  if (!Number.isInteger(limit) || limit < 1) {
++    return Promise.reject(app_error("INVALID_CONCURRENCY_LIMIT", "Concurrency limit must be a positive integer"));
++  }
++
++  return new Promise((resolve, reject) => {
++    const results = new Array(items.length);
++    let next_index = 0;
++    let remaining = items.length;
++    let failed = false;
++
++    function run_next() {
++      if (failed || next_index === results.length) {
++        return;
++      }
++
++      const index = next_index;
++      next_index += 1;
++
++      Promise.resolve()
++        .then(() => {
++          if (!failed) {
++            return worker(items[index]);
++          }
++        })
++        .then(
++          (result) => {
++            results[index] = result;
++            remaining -= 1;
++
++            if (remaining === 0) {
++              resolve(results);
++            } else {
++              run_next();
++            }
++          },
++          (error) => {
++            failed = true;
++            reject(error);
++          },
++        );
++    }
++
++    const worker_count = Math.min(limit, items.length);
++    for (let index = 0; index < worker_count; index += 1) {
++      run_next();
++    }
++  });
++}
+diff --git a/retry.js b/retry.js
+new file mode 100644
+index 0000000..a590128
+--- /dev/null
++++ b/retry.js
+@@ -0,0 +1,22 @@
++import { app_error } from "./errors.js";
++import { delay_ms } from "./util.js";
++
++export function retry_with_backoff(operation, attempts, base_delay_ms) {
++  if (!Number.isInteger(attempts) || attempts < 1) {
++    return Promise.reject(app_error("RETRY_EXHAUSTED", "Attempts must be a positive integer"));
++  }
++
++  function attempt(remaining, wait_ms) {
++    return Promise.resolve()
++      .then(() => operation())
++      .catch((failure) => {
++        if (remaining === 1) {
++          throw app_error("RETRY_EXHAUSTED", failure?.message ?? String(failure));
++        }
++
++        return delay_ms(wait_ms).then(() => attempt(remaining - 1, wait_ms * 2));
++      });
++  }
++
++  return attempt(attempts, base_delay_ms);
++}

@@ -31,7 +31,7 @@ import {
   terminateProcessTreeSync
 } from "../plugins/codex/scripts/lib/codex-exec.mjs";
 import { failureOutcome, usageOutcome } from "../plugins/codex/scripts/lib/codex-outcome.mjs";
-import { applyRolloutRecovery } from "../plugins/codex/scripts/lib/codex-rollout.mjs";
+import { applyRolloutRecovery, recoverRolloutObservation } from "../plugins/codex/scripts/lib/codex-rollout.mjs";
 import { observedEventLine, parseCodexEventStream } from "../plugins/codex/scripts/lib/codex-events.mjs";
 import { appendJobEvent, createJobRecord, jobFilePath, writeJobRecordFile } from "../plugins/codex/scripts/lib/state.mjs";
 import {
@@ -54,11 +54,28 @@ const PATCH_VERIFICATION_FAILURE = "apply_patch verification failed: Failed to f
 
 function fixture(t) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "fusion-codex-exec-"));
-  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const childPidFile = path.join(dir, "child.pid");
+  const pids = new Set();
+  t.after(async () => {
+    try {
+      if (fs.existsSync(childPidFile)) {
+        pids.add(Number(fs.readFileSync(childPidFile, "utf8")));
+      }
+      for (const pid of pids) {
+        if (!Number.isInteger(pid) || pid <= 1) continue;
+        const ownsProcessGroup = process.platform !== "win32";
+        assert.equal(await terminateProcessTree(pid, { ownsProcessGroup, graceMs: 100, pollMs: 25 }), true);
+        await waitForProcessExit(pid, ownsProcessGroup);
+      }
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
   return {
     dir,
+    pids,
     argsFile: path.join(dir, "args.json"),
-    childPidFile: path.join(dir, "child.pid"),
+    childPidFile,
     eventsFile: path.join(dir, "events.jsonl"),
     interruptFile: path.join(dir, "interrupt.signal"),
     logFile: path.join(dir, "stderr.log"),
@@ -124,10 +141,11 @@ async function runFixture(t, mode, options = {}) {
     freshThread: options.freshThread,
     signal: options.signal,
     onSpawnAttempt: (pid) => {
+      files.pids.add(pid);
       if (options.readyBeforeTimeout) {
         const deadline = Date.now() + LOAD_TOLERANT_WAIT_TIMEOUT_MS;
         const pause = new Int32Array(new SharedArrayBuffer(4));
-        while (!fs.existsSync(files.readyFile)) {
+        while (!(fs.existsSync(files.readyFile) && fs.readFileSync(files.readyFile, "utf8") !== "")) {
           if (Date.now() >= deadline) throw new Error("Timed out waiting for Codex readiness before starting its timeout.");
           Atomics.wait(pause, 0, 0, LOAD_TOLERANT_POLL_INTERVAL_MS);
         }
@@ -172,7 +190,7 @@ async function waitUntil(predicate, timeoutMs = LOAD_TOLERANT_WAIT_TIMEOUT_MS) {
 }
 
 async function waitForFile(file) {
-  await waitUntil(() => fs.existsSync(file));
+  await waitUntil(() => fs.existsSync(file) && fs.readFileSync(file, "utf8") !== "");
   assert.equal(fs.readFileSync(file, "utf8"), "ready");
 }
 
@@ -278,11 +296,7 @@ test("a persisted leader identity cannot authorize signaling a leaderless proces
     stdio: "ignore"
   });
   leader.unref();
-  t.after(() => {
-    try {
-      process.kill(-leader.pid, "SIGKILL");
-    } catch {}
-  });
+  files.pids.add(leader.pid);
   await waitUntil(() => fs.existsSync(files.childPidFile));
   const childPid = Number(fs.readFileSync(files.childPidFile, "utf8"));
   const identity = getProcessIdentity(leader.pid);
@@ -619,6 +633,34 @@ test("rollout observation records resolved model and effort without treating req
   assert.equal(outcome.rolloutRecoveryStatus, "recovered");
 });
 
+test("rollout partial text prefers completion text, then the latest final answer, then the latest assistant message", async (t) => {
+  const message = (text, phase, role = "assistant") => ({
+    type: "response_item",
+    payload: { type: "message", role, phase, content: [{ type: "output_text", text }] }
+  });
+  const completed = (text) => ({ type: "event_msg", payload: { type: "task_complete", last_agent_message: text } });
+  for (const [name, entries, expected] of [
+    ["completion text outranks later response items", [message("final", "final_answer"), completed("completed"), message("later final", "final_answer"), message("later commentary", "commentary")], "completed"],
+    ["the latest completion text wins", [completed("old completion"), completed("new completion")], "new completion"],
+    ["the latest final answer outranks later commentary", [message("old final", "final_answer"), message("new final", "final_answer"), message("later commentary", "commentary")], "new final"],
+    ["the latest assistant message is the fallback", [message("old commentary", "commentary"), message("latest message"), message("user message", "final_answer", "user")], "latest message"],
+    ["empty completion and final text keep the fallback", [message("fallback", "commentary"), message("", "final_answer"), completed(null), completed("")], "fallback"],
+    ["legacy agent message events are ignored", [message("persisted message", "commentary"), { type: "event_msg", payload: { type: "agent_message", message: "legacy event" } }], "persisted message"]
+  ]) {
+    await t.test(name, (t) => {
+      const files = fixture(t);
+      const file = path.join(files.dir, "rollout.jsonl");
+      const timestamp = new Date().toISOString();
+      fs.writeFileSync(file, entries.map((entry) => JSON.stringify({ timestamp, ...entry })).join("\n") + "\n");
+      const observation = recoverRolloutObservation("thread-123", { file });
+      assert.equal(observation.matchedTurn, true);
+      assert.equal(observation.partialResultText, expected);
+      assert.equal(recoverRolloutObservation("thread-123", { file, resultMaxBytes: 4 }).partialResultText, expected.slice(0, 4));
+      assert.equal(recoverRolloutObservation("thread-123", { file, notBeforeMs: Date.now() + 10000 }).partialResultText, null);
+    });
+  }
+});
+
 test("a newer suffixed historical rollout is preferred over its bare predecessor", async (t) => {
   const files = fixture(t);
   const directory = path.join(files.dir, "codex-home", "sessions", "2000", "01", "01");
@@ -691,11 +733,6 @@ test("a collaboration tool event fails closed even when Codex emits a completed 
 test("a successful leader exit cleans every remaining process in its owned group", async (t) => {
   const { files, outcome } = await runFixture(t, "completed-with-group-child");
   const childPid = Number(fs.readFileSync(files.childPidFile, "utf8"));
-  t.after(() => {
-    try {
-      process.kill(childPid, "SIGKILL");
-    } catch {}
-  });
   assert.equal(outcome.status, "done");
   assert.equal(outcome.cleanupComplete, true);
   await waitForProcessExit(outcome.pid);
@@ -730,6 +767,7 @@ test("signals remain forwarded while natural exit cleanup escalates", async (t) 
     },
     stdio: ["ignore", "pipe", "pipe"]
   });
+  files.pids.add(harness.pid);
   const stdout = [];
   const stderr = [];
   harness.stdout.on("data", (chunk) => stdout.push(chunk));
@@ -739,14 +777,6 @@ test("signals remain forwarded while natural exit cleanup escalates", async (t) 
   await waitForFile(readyFile);
   await waitUntil(() => fs.existsSync(termFile));
   const childPid = Number(fs.readFileSync(files.childPidFile, "utf8"));
-  t.after(() => {
-    try {
-      process.kill(childPid, "SIGKILL");
-    } catch {}
-    try {
-      harness.kill("SIGKILL");
-    } catch {}
-  });
   harness.kill("SIGINT");
   const code = await new Promise((resolve, reject) => {
     harness.once("error", reject);
@@ -845,6 +875,46 @@ test("an unsupported Codex model is not classified as a network failure", () => 
   const message = "Error sending request: model gpt-5 is not supported";
   const outcome = failureOutcome({ terminalEvent: { type: "turn.failed" }, turnFailureMessage: message }, { exitCode: 1 }, "");
   assert.equal(outcome.failureKind, "error");
+});
+
+test("Codex capacity failures classify as rate limited", () => {
+  for (const message of ["Flex capacity unavailable.", "Policy-restricted capacity is unavailable. Please try again later."]) {
+    const outcome = failureOutcome({ terminalEvent: { type: "turn.failed" }, turnFailureMessage: message }, { exitCode: 1 }, "");
+    assert.equal(outcome.status, "error");
+    assert.equal(outcome.failureKind, "rate_limited", message);
+    assert.equal(outcome.errorMessage, message);
+    assert.equal(failureOutcome({ diagnostics: [] }, { exitCode: 1 }, message).failureKind, "rate_limited");
+  }
+});
+
+test("a terminal incomplete response stays a distinct error despite earlier connectivity diagnostics", () => {
+  const message = "Incomplete response returned, reason: max_output_tokens";
+  for (const state of [
+    { terminalEvent: { type: "turn.failed" }, turnFailureMessage: message },
+    { diagnostics: [{ type: "error", message }] },
+    { diagnostics: [{ type: "error", message: "Reconnecting..." }] },
+    { diagnostics: [] }
+  ]) {
+    const outcome = failureOutcome(state, { exitCode: 1 }, `Reconnecting...\n${message}\n`);
+    assert.equal(outcome.status, "error");
+    assert.equal(outcome.failureKind, "error");
+    assert.equal(outcome.errorMessage, message);
+  }
+});
+
+test("Codex model not found failures classify as input before network evidence", () => {
+  for (const message of [
+    "model_not_found: requested model is unavailable",
+    "The model 'missing-model' does not exist or you do not have access to it.",
+    "Unknown model: missing-model"
+  ]) {
+    const outcome = failureOutcome({ terminalEvent: { type: "turn.failed" }, turnFailureMessage: message }, { exitCode: 1 }, "stream disconnected before completion");
+    assert.equal(outcome.status, "error");
+    assert.equal(outcome.failureKind, "input", message);
+    assert.equal(outcome.errorMessage, message);
+    assert.equal(failureOutcome({ diagnostics: [] }, { exitCode: 1 }, message).failureKind, "input");
+  }
+  assert.equal(failureOutcome({ diagnostics: [] }, { exitCode: 1 }, "file does not exist").failureKind, "process");
 });
 
 test("Codex quota, rate limit, refusal, and auth evidence precedes network evidence", () => {
@@ -1071,11 +1141,6 @@ test("a clean exit with inherited output closes after the deadline without timin
     return;
   }
   const files = fixture(t);
-  t.after(() => {
-    if (fs.existsSync(files.childPidFile)) {
-      try { process.kill(Number(fs.readFileSync(files.childPidFile, "utf8")), "SIGKILL"); } catch { /* already exited */ }
-    }
-  });
   const startedAt = Date.now();
   const { outcome } = await runFixture(t, "scripted", {
     files,
@@ -1265,11 +1330,6 @@ test("timeout stops after INT when Codex gracefully reaps its group child", asyn
     readyBeforeTimeout: true
   });
   const childPid = Number(fs.readFileSync(files.childPidFile, "utf8"));
-  t.after(() => {
-    try {
-      process.kill(childPid, "SIGKILL");
-    } catch {}
-  });
   assert.equal(outcome.status, "error");
   assert.equal(outcome.failureKind, "timeout");
   assert.equal(outcome.signal, null);
@@ -1303,10 +1363,9 @@ test("timeout escalates from INT through TERM to KILL when Codex ignores INT and
 test("incomplete timeout cleanup remains nonterminal with process evidence", async (t) => {
   const startedAt = Date.now();
   const files = fixture(t);
-  try {
-    const { outcome } = await runFixture(t, "inherited-pipe", {
-      files,
-      script: scriptedCodex(`
+  const { outcome } = await runFixture(t, "inherited-pipe", {
+    files,
+    script: scriptedCodex(`
 const { spawn } = await import("node:child_process");
 const fs = await import("node:fs");
 const holder = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], {
@@ -1318,28 +1377,16 @@ holder.unref();
 fs.writeFileSync(process.env.FAKE_CODEX_READY_FILE, "ready");
 setInterval(() => {}, 1000);
 `),
-      timeoutMs: 2000,
-      terminationGraceMs: 50,
-      waitForReady: true
-    });
-    assert.equal(outcome.status, "running");
-    assert.equal(outcome.failureKind, "timeout");
-    assert.equal(outcome.cleanupComplete, false);
-    assert.ok(Number.isInteger(outcome.pid));
-    assert.ok(outcome.pidIdentity);
-    assert.ok(Date.now() - startedAt < LOAD_TOLERANT_WAIT_TIMEOUT_MS);
-  } finally {
-    if (fs.existsSync(files.childPidFile)) {
-      const pid = Number(fs.readFileSync(files.childPidFile, "utf8"));
-      if (Number.isInteger(pid) && pid > 1) {
-        try {
-          process.kill(pid, "SIGKILL");
-        } catch (error) {
-          if (error.code !== "ESRCH") throw error;
-        }
-      }
-    }
-  }
+    timeoutMs: 2000,
+    terminationGraceMs: 50,
+    waitForReady: true
+  });
+  assert.equal(outcome.status, "running");
+  assert.equal(outcome.failureKind, "timeout");
+  assert.equal(outcome.cleanupComplete, false);
+  assert.ok(Number.isInteger(outcome.pid));
+  assert.ok(outcome.pidIdentity);
+  assert.ok(Date.now() - startedAt < LOAD_TOLERANT_WAIT_TIMEOUT_MS);
 });
 
 test("stderr is kept separate from JSONL and bounded to the configured tail", async (t) => {
@@ -1353,6 +1400,22 @@ test("stderr is kept separate from JSONL and bounded to the configured tail", as
   assert.ok(outcome.stderrTail.endsWith("important-tail"));
   assert.equal(fs.readFileSync(files.logFile, "utf8"), outcome.stderrTail);
   assert.doesNotMatch(fs.readFileSync(files.eventsFile, "utf8"), /important-tail/);
+});
+
+test("untrusted project configuration warnings are retained without changing successful read or write outcomes", async (t) => {
+  const warning = "warning: Untrusted project-local configuration is disabled. Run `codex exec --trust` to allow project configuration and MCP servers for this and future chats in the project, including MCP commands outside the sandbox. Explicitly untrusted projects must have their trust setting updated first.";
+  for (const write of [false, true]) {
+    const { files, outcome, args } = await runFixture(t, "completed", {
+      argOptions: { write },
+      env: { FAKE_CODEX_STDERR: `${warning}\n` }
+    });
+    assert.equal(outcome.status, "done");
+    assert.equal(outcome.failureKind, null);
+    assert.equal(outcome.errorMessage, null);
+    assert.equal(outcome.stderrTail, `${warning}\n`);
+    assert.equal(fs.readFileSync(files.logFile, "utf8"), `${warning}\n`);
+    assert.equal(args.includes("--trust"), false);
+  }
 });
 
 test("renderable diagnostics redact credential shapes while the private log retains the raw tail", async (t) => {

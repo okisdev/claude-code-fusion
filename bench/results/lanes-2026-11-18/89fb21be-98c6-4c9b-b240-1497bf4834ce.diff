@@ -1,0 +1,90 @@
+diff --git a/concurrent.js b/concurrent.js
+new file mode 100644
+index 0000000..dbc9ab0
+--- /dev/null
++++ b/concurrent.js
+@@ -0,0 +1,56 @@
++import { app_error } from "./errors.js";
++
++export function map_concurrent(items, limit, worker) {
++  if (items.length === 0) {
++    return Promise.resolve([]);
++  }
++
++  if (!Number.isInteger(limit) || limit < 1) {
++    return Promise.reject(app_error("INVALID_CONCURRENCY_LIMIT", "Concurrency limit must be a positive integer"));
++  }
++
++  const results = new Array(items.length);
++  const worker_count = Math.min(limit, results.length);
++  let next_index = 0;
++  let remaining = results.length;
++  let failed = false;
++
++  return new Promise((resolve, reject) => {
++    function fail(error) {
++      failed = true;
++      reject(error);
++    }
++
++    function run_next() {
++      if (failed || next_index === results.length) {
++        return;
++      }
++
++      const index = next_index;
++      next_index += 1;
++
++      let result;
++      try {
++        result = worker(items[index]);
++      } catch (error) {
++        fail(error);
++        return;
++      }
++
++      Promise.resolve(result).then((value) => {
++        results[index] = value;
++        remaining -= 1;
++
++        if (remaining === 0) {
++          resolve(results);
++        } else {
++          run_next();
++        }
++      }, fail);
++    }
++
++    for (let slot = 0; slot < worker_count && !failed; slot += 1) {
++      run_next();
++    }
++  });
++}
+diff --git a/retry.js b/retry.js
+new file mode 100644
+index 0000000..0d2329e
+--- /dev/null
++++ b/retry.js
+@@ -0,0 +1,22 @@
++import { app_error } from "./errors.js";
++import { delay_ms } from "./util.js";
++
++export function retry_with_backoff(operation, attempts, base_delay_ms) {
++  if (!Number.isSafeInteger(attempts) || attempts < 1) {
++    return Promise.reject(app_error("RETRY_EXHAUSTED", "Attempts must be a positive safe integer"));
++  }
++
++  function run_attempt(remaining, backoff_ms) {
++    return Promise.resolve()
++      .then(() => operation())
++      .catch((error) => {
++        if (remaining === 1) {
++          throw app_error("RETRY_EXHAUSTED", error?.message ?? String(error));
++        }
++
++        return delay_ms(backoff_ms).then(() => run_attempt(remaining - 1, backoff_ms * 2));
++      });
++  }
++
++  return run_attempt(attempts, base_delay_ms);
++}

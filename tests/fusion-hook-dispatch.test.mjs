@@ -97,7 +97,7 @@ function compare(box, input, extra = {}) {
 
 test("each shared matcher uses one dispatcher process and lifecycle-only tools keep their command", () => {
   const shared = {
-    PreToolUse: ["Read", "Grep", "Glob", "Edit", "Write", "NotebookEdit", "MultiEdit", "Bash", "Agent", "Task", "SendMessage", "TaskOutput", "TaskStop"],
+    PreToolUse: ["Read", "Grep", "Glob", "Edit", "Write", "NotebookEdit", "MultiEdit", "Bash", "Agent", "Task", "SendMessage", "TaskStop"],
     PostToolUse: ["Agent", "Task", "Bash", "SendMessage", "Edit", "Write", "NotebookEdit", "MultiEdit"],
     PostToolUseFailure: ["Edit", "Write", "NotebookEdit", "MultiEdit", "Bash"]
   };
@@ -320,7 +320,7 @@ test("a guard denial wins over lifecycle output and retains its tagged reason", 
     createWorkerRecord({ taskId, sessionId: "fusion-dispatch", agentType: "fusion:claude-worker", workspaceRoot: box.cwd, limits: {} }, env);
     updateWorkerRecord(taskId, env, (record) => ({ ...record, transportStatus: "done", backgroundTaskId: taskId, outputFile: path.join(box.cwd, "result.txt") }));
   }
-  const input = payload(box, "PreToolUse", "TaskOutput", { task_id: taskId });
+  const input = payload(box, "PreToolUse", "TaskStop", { task_id: taskId });
   const { guard, dispatched } = compare(box, input);
   assert.equal(output(dispatched).hookSpecificOutput.permissionDecision, "deny");
   assert.equal(output(dispatched).hookSpecificOutput.permissionDecisionReason, output(guard).hookSpecificOutput.permissionDecisionReason);

@@ -1,0 +1,84 @@
+diff --git a/concurrent.js b/concurrent.js
+new file mode 100644
+index 0000000..c39e7b8
+--- /dev/null
++++ b/concurrent.js
+@@ -0,0 +1,42 @@
++export function map_concurrent(items, limit, worker) {
++  if (items.length === 0) {
++    return Promise.resolve([]);
++  }
++
++  const results = new Array(items.length);
++  let next_index = 0;
++  let first_error = null;
++
++  function run_next() {
++    if (first_error || next_index >= items.length) {
++      return Promise.resolve();
++    }
++    const index = next_index;
++    next_index += 1;
++    return Promise.resolve()
++      .then(() => worker(items[index], index))
++      .then(
++        (value) => {
++          results[index] = value;
++          return run_next();
++        },
++        (error) => {
++          if (first_error === null) {
++            first_error = error;
++          }
++        }
++      );
++  }
++
++  const slots = Math.min(Math.max(limit, 1), items.length);
++  const runners = [];
++  for (let i = 0; i < slots; i += 1) {
++    runners.push(run_next());
++  }
++  return Promise.all(runners).then(() => {
++    if (first_error !== null) {
++      return Promise.reject(first_error);
++    }
++    return results;
++  });
++}
+diff --git a/retry.js b/retry.js
+new file mode 100644
+index 0000000..508e28d
+--- /dev/null
++++ b/retry.js
+@@ -0,0 +1,30 @@
++import { app_error } from "./errors.js";
++import { delay_ms } from "./util.js";
++
++export function retry_with_backoff(operation, attempts, base_delay_ms) {
++  function failure_message(error) {
++    return error && error.message !== undefined ? error.message : String(error);
++  }
++
++  function run(attempt_index) {
++    return Promise.resolve()
++      .then(() => operation())
++      .catch((error) => {
++        if (attempt_index + 1 >= attempts) {
++          return Promise.reject(
++            app_error("RETRY_EXHAUSTED", failure_message(error))
++          );
++        }
++        return delay_ms(base_delay_ms * Math.pow(2, attempt_index)).then(() =>
++          run(attempt_index + 1)
++        );
++      });
++  }
++
++  if (attempts <= 0) {
++    return Promise.reject(
++      app_error("RETRY_EXHAUSTED", "no attempts available")
++    );
++  }
++  return run(0);
++}

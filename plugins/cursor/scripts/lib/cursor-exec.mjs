@@ -4,7 +4,7 @@ import path from "node:path";
 import { createProcessTransport, destroyRunStreams, executablePath, inheritChildEnv, runProcess, settleRun } from "./process-run.mjs";
 import { CURSOR_SESSION_ID_PATTERN } from "./cursor-home.mjs";
 
-export const TESTED_CURSOR_INTERVAL = { floor: "2026.10.01", ceiling: "2026.11.01" };
+export const TESTED_CURSOR_INTERVAL = { floor: "2026.10.01", ceiling: "2026.12.01" };
 
 const READ_TOOLS = ["read_tool_call", "grep_tool_call", "glob_tool_call", "ls_tool_call"];
 const WRITE_TOOLS = [...READ_TOOLS, "edit_tool_call", "delete_tool_call", "shell_tool_call", "update_todos_tool_call", "read_todos_tool_call"];

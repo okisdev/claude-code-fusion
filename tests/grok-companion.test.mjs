@@ -30,6 +30,7 @@ const processInspectionTests = new Set([
   "task accepts an explicit repository top level from a subdirectory",
   "task job records null repositoryTopLevel outside a git directory",
   "task passes an inline JSON schema and renders structured success",
+  "task consumes the last structuredOutput when 1.0.88 text contains multiple JSON documents",
   "task fails with failure kind error for a structured output error",
   "task fails with failure kind error for a null structured output",
   "task parses text compatibility output only when structuredOutput is absent"
@@ -320,6 +321,26 @@ test("task passes an inline JSON schema and renders structured success", (t) => 
   });
   assert.equal(human.status, 0, human.stderr);
   assert.match(human.stdout, /structured: parsed/);
+});
+
+test("task consumes the last structuredOutput when 1.0.88 text contains multiple JSON documents", (t) => {
+  const sandbox = makeSandbox(t);
+  const result = runCompanion(["task", "--json-schema", taskSchema, "--json", "complete the task"], {
+    cwd: sandbox.workDir,
+    env: envFor(sandbox, { FAKE_GROK_MODE: "task-structured-multiple", FAKE_GROK_VERSION_OUTPUT: "grok 1.0.88 (abcdef012345)" })
+  });
+  assert.equal(result.status, 0, result.stderr);
+  const payload = JSON.parse(result.stdout);
+  const documents = payload.text.split("\n\n").map((document) => JSON.parse(document));
+  assert.equal(documents.length, 2);
+  assert.equal(documents[0].status, "partial");
+  assert.equal(payload.structuredOutput.status, "completed");
+  assert.deepEqual(payload.structuredOutput, documents.at(-1));
+  assert.equal(payload.structuredOutputError, null);
+  const [record] = jobRecords(sandbox.dataDir);
+  assert.equal(record.status, "done");
+  assert.equal(record.grokVersion, "1.0.88");
+  assert.deepEqual(record.structuredOutput, payload.structuredOutput);
 });
 
 for (const [mode, description] of [

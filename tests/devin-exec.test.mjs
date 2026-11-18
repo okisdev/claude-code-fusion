@@ -60,13 +60,25 @@ test("binary resolution and version preflight use the executable on PATH", (t) =
 });
 
 test("versions compare dotted numeric parts with missing parts treated as zero", () => {
-  assert.deepEqual(TESTED_DEVIN_INTERVAL, { floor: "3000.11", ceiling: "3000.12" });
+  assert.deepEqual(TESTED_DEVIN_INTERVAL, { floor: "3000.11", ceiling: "3000.15" });
   assert.equal(compareDevinVersion("3000.11.0", TESTED_DEVIN_INTERVAL.floor), 0);
   assert.equal(compareDevinVersion("3000.11.228", TESTED_DEVIN_INTERVAL.floor), 1);
   assert.equal(compareDevinVersion("3000.11.228", TESTED_DEVIN_INTERVAL.ceiling), -1);
   assert.equal(compareDevinVersion("3000.9", "3000.11"), -1);
   assert.equal(compareDevinVersion("3000.11.10", "3000.11.9"), 1);
-  assert.equal(compareDevinVersion("3000.12", TESTED_DEVIN_INTERVAL.ceiling), 0);
+  assert.equal(compareDevinVersion("3000.15", TESTED_DEVIN_INTERVAL.ceiling), 0);
+});
+
+test("ACP stays in process only on builds that support the process model option", async (t) => {
+  for (const [version, args] of [
+    ["3000.12.43", ["acp"]],
+    ["3000.13.4", ["acp", "--process-model", "in-process"]],
+    ["3000.14.30821", ["acp", "--process-model", "in-process"]]
+  ]) {
+    const { result, log } = await fakeRun(t, "success", { version });
+    assert.equal(classifyDevinFailure(result), null, version);
+    assert.deepEqual(log.argv, args, version);
+  }
 });
 
 test("tools follow the contract for consult, review, and write", () => {

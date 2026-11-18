@@ -212,6 +212,9 @@ export function recoverRolloutObservation(threadId, options = {}) {
   let lastUsage = null;
   let startedSinceCount = false;
   let candidateStarts = 0;
+  let lastAgentMessage = null;
+  let finalAnswer = null;
+  let latestMessage = null;
   for (const [index, line] of rollout.lines.entries()) {
     if (index === rollout.continuityStart) {
       lastUsage = null;
@@ -252,15 +255,18 @@ export function recoverRolloutObservation(threadId, options = {}) {
       result.matchedTurn = true;
       result.cumulativeTokenUsage = normalizeCumulativeUsage(payload.info?.total_token_usage) ?? result.cumulativeTokenUsage;
     }
-    if (entry?.type === "event_msg" && payload?.type === "agent_message" && typeof payload.message === "string") {
+    if (entry?.type === "event_msg" && payload?.type === "task_complete" && typeof payload.last_agent_message === "string" && payload.last_agent_message) {
       result.matchedTurn = true;
-      result.partialResultText = boundedObservedText(payload.message, options.resultMaxBytes ?? DEFAULT_RESULT_MAX_BYTES);
+      lastAgentMessage = boundedObservedText(payload.last_agent_message, options.resultMaxBytes ?? DEFAULT_RESULT_MAX_BYTES);
     }
     if (entry?.type === "response_item" && payload?.type === "message" && payload.role === "assistant" && Array.isArray(payload.content)) {
       const text = payload.content.filter((item) => item?.type === "output_text" && typeof item.text === "string").map((item) => item.text).join("");
       if (text) {
         result.matchedTurn = true;
-        result.partialResultText = boundedObservedText(text, options.resultMaxBytes ?? DEFAULT_RESULT_MAX_BYTES);
+        latestMessage = boundedObservedText(text, options.resultMaxBytes ?? DEFAULT_RESULT_MAX_BYTES);
+        if (payload.phase === "final_answer") {
+          finalAnswer = latestMessage;
+        }
       }
     }
     if (entry?.type === "response_item" && ["custom_tool_call", "function_call"].includes(payload?.type) && ["spawn_agent", "spawn_agents_on_csv"].includes(payload?.name)) {
@@ -268,6 +274,7 @@ export function recoverRolloutObservation(threadId, options = {}) {
       result.collaborationTool = payload.name;
     }
   }
+  result.partialResultText = lastAgentMessage ?? finalAnswer ?? latestMessage;
   return result;
 }
 

@@ -16,6 +16,7 @@ import {
   grokCompanionCapabilities,
   jobRecords,
   makeSandbox,
+  processInspectionAvailable,
   readInvocations,
   repoRoot,
   runCompanion,
@@ -24,6 +25,10 @@ import {
 const { buildGrokArgs, processGroupAlive, resolveGrokCapabilities, runGrok, terminateExitedLeaderProcessGroup } = await import(
   path.join(repoRoot, "plugins", "grok", "scripts", "lib", "grok-exec.mjs")
 );
+const { consumeTaskStructuredResult, evaluateReviewResult } = await import(
+  path.join(repoRoot, "plugins", "grok", "scripts", "lib", "companion", "review.mjs")
+);
+const { compareVersion, parseVersion, supportedVersion } = await import("../plugins/grok/scripts/lib/companion/version.mjs");
 
 const requiredCapabilityProbes = [
   ["--prompt-file", "--prompt-file=/dev/null"],
@@ -113,6 +118,20 @@ test("managed runs reject Grok versions below the tested interval before model l
   assert.equal(records[0].status, "error");
   assert.equal(records[0].failureKind, "setup");
   assert.equal(records[0].grokVersion, "1.0.13");
+});
+
+test("version comparison orders prereleases before releases and ignores build metadata", () => {
+  const ordered = ["1.0.88-alpha", "1.0.88-alpha.1", "1.0.88-alpha.2", "1.0.88-alpha.10", "1.0.88-beta", "1.0.88-rc.1", "1.0.88"];
+  for (let index = 1; index < ordered.length; index += 1) {
+    const left = parseVersion(ordered[index - 1]);
+    const right = parseVersion(ordered[index]);
+    assert.equal(compareVersion(left, right), -1, ordered[index]);
+    assert.equal(compareVersion(right, left), 1, ordered[index]);
+  }
+  assert.equal(compareVersion(parseVersion("1.0.88-rc.1+build.2"), parseVersion("1.0.88-rc.1")), 0);
+  assert.equal(compareVersion(parseVersion("1.0.88+build.2"), [1, 0, 88]), 0);
+  assert.equal(supportedVersion("1.0.14-rc.1"), false);
+  assert.equal(supportedVersion("1.0.14"), true);
 });
 
 test("exited leader cleanup with no identity signals only the original process group", async () => {
@@ -377,21 +396,21 @@ test("setup accepts newer Grok builds with a warning and rejects older or unpars
   writeFreshAuth(newerSandbox);
   const newer = runCompanion(["setup", "--json"], {
     cwd: newerSandbox.workDir,
-    env: envFor(newerSandbox, { FAKE_GROK_VERSION_OUTPUT: "grok 1.0.78 (abcdef012345)" })
+    env: envFor(newerSandbox, { FAKE_GROK_VERSION_OUTPUT: "grok 1.0.89 (abcdef012345)" })
   });
   assert.equal(newer.status, 0, newer.stderr);
   const newerReport = JSON.parse(newer.stdout);
   assert.equal(newerReport.ready, true);
-  assert.equal(newerReport.compatibility, "newer than the tested interval (1.0.14 to before 1.0.78)");
-  assert.deepEqual(newerReport.nextSteps, ["Grok CLI version 1.0.78 is newer than the tested interval (1.0.14 to before 1.0.78); run a verification pass."]);
+  assert.equal(newerReport.compatibility, "newer than the tested interval (1.0.14 to before 1.0.89)");
+  assert.deepEqual(newerReport.nextSteps, ["Grok CLI version 1.0.89 is newer than the tested interval (1.0.14 to before 1.0.89); run a verification pass."]);
 
   const newerRendered = runCompanion(["setup"], {
     cwd: newerSandbox.workDir,
-    env: envFor(newerSandbox, { FAKE_GROK_VERSION_OUTPUT: "grok 1.0.78 (abcdef012345)" })
+    env: envFor(newerSandbox, { FAKE_GROK_VERSION_OUTPUT: "grok 1.0.89 (abcdef012345)" })
   });
   assert.equal(newerRendered.status, 0, newerRendered.stderr);
-  assert.match(newerRendered.stdout, /- compatibility: newer than the tested interval \(1\.0\.14 to before 1\.0\.78\)/);
-  assert.match(newerRendered.stdout, /^- Grok CLI version 1\.0\.78 is newer than the tested interval \(1\.0\.14 to before 1\.0\.78\); run a verification pass\.$/m);
+  assert.match(newerRendered.stdout, /- compatibility: newer than the tested interval \(1\.0\.14 to before 1\.0\.89\)/);
+  assert.match(newerRendered.stdout, /^- Grok CLI version 1\.0\.89 is newer than the tested interval \(1\.0\.14 to before 1\.0\.89\); run a verification pass\.$/m);
 
   const olderSandbox = makeSandbox(t);
   writeFreshAuth(olderSandbox);
@@ -402,8 +421,8 @@ test("setup accepts newer Grok builds with a warning and rejects older or unpars
   assert.equal(older.status, 0, older.stderr);
   const olderReport = JSON.parse(older.stdout);
   assert.equal(olderReport.ready, false);
-  assert.equal(olderReport.compatibility, "outside the tested interval (1.0.14 to before 1.0.78)");
-  assert.deepEqual(olderReport.nextSteps, ["Use a Grok CLI version in the tested interval (1.0.14 to before 1.0.78)."]);
+  assert.equal(olderReport.compatibility, "outside the tested interval (1.0.14 to before 1.0.89)");
+  assert.deepEqual(olderReport.nextSteps, ["Use a Grok CLI version in the tested interval (1.0.14 to before 1.0.89)."]);
 
   const unparseableSandbox = makeSandbox(t);
   writeFreshAuth(unparseableSandbox);
@@ -474,10 +493,11 @@ test("managed write runs refuse an undenied runtime socket before spawning Grok"
     (error) => {
       assert.equal(error.failureKind, "sandbox");
       assert.ok(error.message.includes(socket));
-      assert.match(error.message, /strict runtime-socket deny list does not cover/);
+      assert.match(error.message, /may remain reachable from Grok's macOS strict sandbox even when listed in deny_paths/);
       assert.match(error.message, /write shell could drive that container engine and write outside the workspace/);
-      assert.match(error.message, /orb stop/);
-      assert.match(error.message, /route the package to Codex, whose sandbox blocks the connect/);
+      assert.match(error.message, /Stop the container engine/);
+      assert.doesNotMatch(error.message, /orb stop/);
+      assert.match(error.message, /route writes to another lane/);
       assert.doesNotMatch(error.message, /downgrade/i);
       return true;
     }
@@ -496,6 +516,62 @@ test("managed consult runs proceed with an undenied runtime socket", async (t) =
   assert.equal(result.exitCode, 0);
   assert.equal(result.securityFailureKind, null);
   assert.equal(readInvocations(sandbox.argsFile).length, 1);
+});
+
+test("1.0.88 companion consult and review accept symlinks to covered socket targets", async (t) => {
+  if (!processInspectionAvailable()) {
+    t.skip("process inspection unavailable in this environment");
+    return;
+  }
+  for (const mode of ["task", "review"]) {
+    const sandbox = makeSandbox(t);
+    if (mode === "review") initFixtureRepo(sandbox.workDir);
+    const env = envFor(sandbox, {
+      FAKE_GROK_MODE: mode === "review" ? "review-structured-multiple" : "ok",
+      FAKE_GROK_VERSION_OUTPUT: "grok 1.0.88 (abcdef012345)"
+    });
+    const socket = path.join(env.HOME, ".orbstack/run/docker.sock");
+    fs.mkdirSync(path.dirname(socket), { recursive: true });
+    fs.writeFileSync(socket, "socket fixture");
+    const endpoint = path.join(sandbox.root, "docker.sock");
+    fs.symlinkSync(socket, endpoint);
+    env.GROK_COMPANION_RUNTIME_SOCKET_CANDIDATES = endpoint;
+    const result = runCompanion([mode, "--json", ...(mode === "task" ? ["inspect the workspace"] : [])], { cwd: sandbox.workDir, env });
+    assert.equal(result.status, 0, result.stderr);
+    const [record] = jobRecords(sandbox.dataDir);
+    assert.equal(record.status, "done");
+    assert.equal(record.grokVersion, "1.0.88");
+    assert.equal(readInvocations(sandbox.argsFile).filter((args) => args.includes("--prompt-file")).length, 1);
+    if (mode === "review") {
+      assert.equal(record.structuredOutput.verdict, "needs-attention");
+      assert.equal(record.structuredOutput.findings.length, 1);
+      assert.equal(record.structuredOutputError, null);
+    }
+  }
+});
+
+test("1.0.88 multi-document text uses the final structuredOutput for tasks and reviews", async (t) => {
+  for (const mode of ["task", "review"]) {
+    const sandbox = makeSandbox(t);
+    const result = await runGrok(directOptions(sandbox, `${mode}-structured-multiple`, {
+      grokVersion: "1.0.88",
+      jsonSchema: { type: "object" },
+      env: envFor(sandbox, { FAKE_GROK_MODE: `${mode}-structured-multiple`, FAKE_GROK_VERSION_OUTPUT: "grok 1.0.88 (abcdef012345)" })
+    }));
+    assert.equal(result.exitCode, 0);
+    assert.equal(result.parseError, null);
+    const documents = result.text.split("\n\n").map((document) => JSON.parse(document));
+    assert.equal(documents.length, 2);
+    assert.notDeepEqual(documents[0], documents[1]);
+    assert.deepEqual(result.structuredOutput, documents.at(-1));
+    const parsed = mode === "task" ? consumeTaskStructuredResult(result, true) : evaluateReviewResult(result);
+    assert.equal(parsed.valid, true, parsed.error);
+    assert.deepEqual(parsed.value, documents.at(-1));
+    const events = fs.readFileSync(path.join(sandbox.root, "grok-home/sessions/sandbox-events.jsonl"), "utf8").trim().split("\n").map((line) => JSON.parse(line));
+    const applied = events.find((event) => event.event_type === "ProfileApplied");
+    assert.equal(applied.platform, "macos/seatbelt");
+    assert.ok(applied.deny_paths.some((endpoint) => endpoint.endsWith("/.orbstack/run/docker.sock")));
+  }
 });
 
 test("setup reports write readiness for an undenied OrbStack socket", async (t) => {
@@ -524,8 +600,9 @@ test("setup reports write readiness for an undenied OrbStack socket", async (t) 
   assert.ok(report.hostEnvironment.detail.includes(socket));
   assert.match(report.hostEnvironment.detail, /write runs are refused/);
   assert.match(report.hostEnvironment.remedy, /write runs are refused/);
-  assert.match(report.hostEnvironment.remedy, /orb stop/);
-  assert.match(report.hostEnvironment.remedy, /Codex/);
+  assert.match(report.hostEnvironment.remedy, /Stop the container engine/);
+  assert.doesNotMatch(report.hostEnvironment.remedy, /orb stop/);
+  assert.match(report.hostEnvironment.remedy, /route writes to another lane/);
   assert.deepEqual(report.nextSteps, [report.hostEnvironment.remedy]);
 
   const rendered = runCompanion(["setup"], { cwd: sandbox.workDir, env });

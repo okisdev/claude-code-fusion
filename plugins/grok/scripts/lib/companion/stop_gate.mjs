@@ -104,6 +104,7 @@ async function handleStopGate() {
   let result;
   try {
     result = await runGrok({
+      grokVersion: grok.version,
       briefFile,
       prompt,
       mode: "consult",

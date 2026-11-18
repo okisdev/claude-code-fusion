@@ -1,0 +1,73 @@
+diff --git a/concurrent.js b/concurrent.js
+new file mode 100644
+index 0000000..4955e75
+--- /dev/null
++++ b/concurrent.js
+@@ -0,0 +1,40 @@
++import { app_error } from "./errors.js";
++
++export function map_concurrent(items, limit, worker) {
++  const count = items.length;
++  if (count === 0) {
++    return Promise.resolve([]);
++  }
++  if (!Number.isInteger(limit) || limit < 1) {
++    return Promise.reject(app_error("INVALID_LIMIT", "Limit must be a positive integer."));
++  }
++
++  return new Promise((resolve, reject) => {
++    const results = new Array(count);
++    let next_index = 0;
++    let completed = 0;
++
++    function run_next() {
++      if (next_index === count) return;
++      const index = next_index++;
++      Promise.resolve()
++        .then(() => worker(items[index], index))
++        .then((value) => {
++          results[index] = value;
++          completed += 1;
++          if (completed === count) {
++            resolve(results);
++          } else {
++            run_next();
++          }
++        }, (error) => {
++          next_index = count;
++          reject(error);
++        });
++    }
++
++    for (let i = 0; i < Math.min(limit, count); i++) {
++      run_next();
++    }
++  });
++}
+diff --git a/retry.js b/retry.js
+new file mode 100644
+index 0000000..42245bf
+--- /dev/null
++++ b/retry.js
+@@ -0,0 +1,21 @@
++import { app_error } from "./errors.js";
++import { delay_ms } from "./util.js";
++
++export function retry_with_backoff(operation, attempts, base_delay_ms) {
++  if (!Number.isInteger(attempts) || attempts < 1) {
++    return Promise.reject(app_error("RETRY_EXHAUSTED", "No attempts available."));
++  }
++
++  function run(remaining, wait_ms) {
++    return Promise.resolve()
++      .then(() => operation())
++      .catch((error) => {
++        if (remaining === 1) {
++          throw app_error("RETRY_EXHAUSTED", String(error?.message ?? error));
++        }
++        return delay_ms(wait_ms).then(() => run(remaining - 1, wait_ms * 2));
++      });
++  }
++
++  return run(attempts, base_delay_ms);
++}

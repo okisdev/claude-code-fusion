@@ -39,7 +39,7 @@ function classifiedFailureKind(message, fallback = "error") {
   if (/quota|insufficient (?:account )?(?:balance|credit|credits|funds)|balance (?:is )?exhausted|payment required|usage limit|billing|http(?:\/\d(?:\.\d)?)?\s+402|status(?: code)?\s*[:=]?\s*402/i.test(text)) {
     return "quota";
   }
-  if (/rate[ _-]?limit|too many requests|http(?:\/\d(?:\.\d)?)?\s+429|status(?: code)?\s*[:=]?\s*429/i.test(text) || text.includes("Flex capacity unavailable.")) {
+  if (/rate[ _-]?limit|too many requests|http(?:\/\d(?:\.\d)?)?\s+429|status(?: code)?\s*[:=]?\s*429/i.test(text) || text.includes("Flex capacity unavailable.") || text.includes("Policy-restricted capacity is unavailable")) {
     return "rate_limited";
   }
   if (/misalignment policy|cyber policy|violat(?:ed|es|ion of) (?:the |our |an? )?[a-z ]{0,40}policy|content policy/i.test(text) || [
@@ -51,6 +51,12 @@ function classifiedFailureKind(message, fallback = "error") {
   }
   if (/unauthori[sz]ed|unauthenticated|authentication|login required|invalid api key|api key/i.test(text)) {
     return "auth";
+  }
+  if (/\bmodel_not_found\b|\bunknown model\b|\bmodel\b[^\r\n]*\bdoes not exist\b/i.test(text)) {
+    return "input";
+  }
+  if (/Incomplete response returned, reason:/i.test(text)) {
+    return "error";
   }
   if (/workspace routing discovery timed out|stream disconnected before completion|error sending request for url|connection (?:refused|reset)|\b(?:ECONNRESET|ECONNREFUSED|ENOTFOUND|EAI_AGAIN)\b|getaddrinfo|network is unreachable|Reconnecting\.\.\./i.test(text)) {
     return "network";
@@ -116,7 +122,7 @@ export function failureOutcome(state, processOutcome, stderrTail) {
     const processMessage = processOutcome.signal
       ? `Codex exited with signal ${processOutcome.signal}.`
       : `Codex exited with code ${processOutcome.exitCode}.`;
-    const diagnosticMessage = state.turnFailureMessage || state.diagnostics.at(-1)?.message || null;
+    const diagnosticMessage = state.turnFailureMessage || stderrTail.match(/Incomplete response returned, reason:[^\r\n]*/gi)?.at(-1) || state.diagnostics.at(-1)?.message || null;
     const failureKind = classifiedFailureKind(`${diagnosticMessage ?? ""}\n${stderrTail}`, "process");
     return {
       status: "error",

@@ -326,13 +326,78 @@ test("Codex launches without tool ids still reserve their workspace slot", async
 test("Claude quota admission scopes the reset to the same agent type and session", (t) => {
   const box = sandbox(t);
   const now = Date.parse("2026-11-18T10:00:00.000Z");
-  workerRecord(box, { agentType: "fusion:deep-reasoner", failureKind: "quota", infraFailure: true, finishedAt: "2026-11-18T09:00:00.000Z", quotaResetAt: "2026-11-21T00:00:00.000Z", quotaResetText: "Nov 21" });
+  workerRecord(box, { agentType: "fusion:deep-reasoner", failureKind: "quota", infraFailure: true, quotaModelFamily: "fable", finishedAt: "2026-11-18T09:00:00.000Z", quotaResetAt: "2026-11-21T00:00:00.000Z", quotaResetText: "Nov 21" });
   const denial = engineInfraDenial("session-1", "deep-reasoner", "continue", box.env, now);
-  assert.match(denial, /quota resets Nov 21 \(2026-11-21T00:00:00.000Z\)/);
+  assert.equal(denial, tagMessage("worker-lifecycle.engine-infra-deny", "Fable usage limit until Nov 21 (2026-11-21T00:00:00.000Z); rerun with model: opus to use Opus 5.5 meanwhile. Route this package to another agent type, or name deep-reasoner to retry."));
   for (const text of ["use fusion:deep-reasoner", "use deep-reasoner"]) assert.equal(engineInfraDenial("session-1", "fusion:deep-reasoner", text, box.env, now), null);
   assert.equal(engineInfraDenial("other-session", "fusion:deep-reasoner", "continue", box.env, now), null);
   assert.equal(engineInfraDenial("session-1", "fusion:claude-worker", "continue", box.env, now), null);
   assert.equal(engineInfraDenial("session-1", "fusion:deep-reasoner", "continue", box.env, Date.parse("2026-11-21T00:00:00.000Z")), null);
+});
+
+test("Claude quota overrides compare families across aliases and versioned models", (t) => {
+  const box = sandbox(t);
+  const now = Date.parse("2026-11-18T10:00:00.000Z");
+  workerRecord(box, { agentType: "fusion:deep-reasoner", failureKind: "quota", infraFailure: true, quotaModelFamily: "fable", finishedAt: "2026-11-18T09:00:00.000Z", quotaResetAt: "2026-11-21T00:00:00.000Z" });
+  for (const model of ["fable", "fable[1m]", "claude-fable-5-1", "inherit", "unknown", null]) {
+    assert.match(engineInfraDenial("session-1", "deep-reasoner", "continue", box.env, now, "model: opus", model), /Fable usage limit/, String(model));
+  }
+  for (const model of ["opus", "opus[1m]", "claude-opus-5-5", "sonnet"]) {
+    assert.equal(engineInfraDenial("session-1", "deep-reasoner", "continue", box.env, now, "", model), null, model);
+  }
+  workerRecord(box, { agentType: "fusion:deep-reasoner", failureKind: "quota", infraFailure: true, quotaModelFamily: "opus", finishedAt: "2026-11-18T09:30:00.000Z", quotaResetAt: "2026-11-18T11:00:00.000Z" });
+  assert.match(engineInfraDenial("session-1", "deep-reasoner", "continue", box.env, now, "", "opus"), /Opus usage limit/);
+  assert.equal(engineInfraDenial("session-1", "deep-reasoner", "continue", box.env, Date.parse("2026-11-18T11:00:00.000Z"), "", "opus"), null);
+});
+
+test("Claude quota admission migrates saved family evidence without changing the reset", (t) => {
+  const box = sandbox(t);
+  const now = Date.parse("2026-11-18T10:00:00.000Z");
+  const reset = "2026-11-21T00:00:00.000Z";
+  const worker = workerRecord(box, { agentType: "fusion:deep-reasoner", failureKind: "quota", infraFailure: true, resolvedModel: "claude-opus-5-5", finalText: "You've hit your Fable limit · resets Nov 21", finishedAt: "2026-11-18T09:00:00.000Z", quotaResetAt: reset, quotaResetText: "Nov 21" });
+  assert.equal(engineInfraDenial("session-1", "deep-reasoner", "continue", box.env, now, "", "opus"), null);
+  const migrated = readWorkerRecords(box.env).find((record) => record.taskId === worker.taskId);
+  assert.equal(migrated.quotaModelFamily, "fable");
+  assert.equal(migrated.quotaResetAt, reset);
+  assert.match(engineInfraDenial("session-1", "deep-reasoner", "continue", box.env, now, "", "fable"), /Fable usage limit/);
+});
+
+for (const alias of ["opus", "sonnet", "haiku", "fable"]) {
+  test(`Claude quota resolves the configured ${alias} alias before admission`, (t) => {
+    const box = sandbox(t);
+    const now = Date.parse("2026-11-18T10:00:00.000Z");
+    const env = { ...box.env, [`ANTHROPIC_DEFAULT_${alias.toUpperCase()}_MODEL`]: "claude-fable-5-2" };
+    workerRecord(box, { agentType: "fusion:deep-reasoner", failureKind: "quota", infraFailure: true, quotaModelFamily: "fable", finishedAt: "2026-11-18T09:00:00.000Z", quotaResetAt: "2026-11-21T00:00:00.000Z" });
+    for (const model of [alias, `${alias}[1m]`]) {
+      const denial = engineInfraDenial("session-1", "deep-reasoner", "continue", env, now, "", model);
+      assert.match(denial, /Fable usage limit/, model);
+      if (alias === "opus") assert.doesNotMatch(denial, /rerun with model: opus/);
+    }
+    assert.equal(engineInfraDenial("session-1", "deep-reasoner", "continue", env, now, "", "claude-opus-5-5"), null);
+    env[`ANTHROPIC_DEFAULT_${alias.toUpperCase()}_MODEL`] = "claude-sonnet-5";
+    assert.equal(engineInfraDenial("session-1", "deep-reasoner", "continue", env, now, "", alias), null);
+    assert.match(engineInfraDenial("session-1", "deep-reasoner", "continue", env, now, "", "claude-fable-5-2"), /Fable usage limit/);
+    assert.equal(readWorkerRecords(box.env)[0].quotaModelFamily, "fable");
+  });
+}
+
+test("Claude quota admission migrates resolved model evidence when the error is unavailable", (t) => {
+  const box = sandbox(t);
+  const now = Date.parse("2026-11-18T10:00:00.000Z");
+  workerRecord(box, { agentType: "fusion:deep-reasoner", failureKind: "quota", infraFailure: true, resolvedModel: "claude-opus-5-5", finishedAt: "2026-11-18T09:00:00.000Z", quotaResetAt: "2026-11-21T00:00:00.000Z" });
+  assert.equal(engineInfraDenial("session-1", "deep-reasoner", "continue", box.env, now, "", "fable"), null);
+  assert.equal(readWorkerRecords(box.env)[0].quotaModelFamily, "opus");
+  assert.match(engineInfraDenial("session-1", "deep-reasoner", "continue", box.env, now, "", "opus"), /Opus usage limit/);
+});
+
+test("Claude quota admission migrates errors kept only in the worker transcript", (t) => {
+  const box = sandbox(t);
+  const now = Date.parse("2026-11-18T10:00:00.000Z");
+  const transcriptPath = path.join(box.root, "quota-worker.jsonl");
+  fs.writeFileSync(transcriptPath, `${JSON.stringify({ type: "assistant", message: { content: [{ type: "text", text: "You've hit your Fable limit · resets Nov 21" }] } })}\n`);
+  workerRecord(box, { agentType: "fusion:deep-reasoner", failureKind: "quota", infraFailure: true, transcriptPath, finishedAt: "2026-11-18T09:00:00.000Z", quotaResetAt: "2026-11-21T00:00:00.000Z" });
+  assert.equal(engineInfraDenial("session-1", "deep-reasoner", "continue", box.env, now, "", "opus"), null);
+  assert.equal(readWorkerRecords(box.env)[0].quotaModelFamily, "fable");
 });
 
 test("Claude quota without a parsed reset reopens after one hour", (t) => {
@@ -340,5 +405,6 @@ test("Claude quota without a parsed reset reopens after one hour", (t) => {
   const finished = Date.parse("2026-11-18T09:00:00.000Z");
   workerRecord(box, { agentType: "fusion:claude-worker", failureKind: "quota", infraFailure: true, finishedAt: new Date(finished).toISOString() });
   assert.match(engineInfraDenial("session-1", "claude-worker", "continue", box.env, finished + 3_599_999), /2026-11-18T10:00:00.000Z \(1 hour fallback\)/);
+  assert.match(engineInfraDenial("session-1", "claude-worker", "continue", box.env, finished + 3_599_999, "", "opus"), /usage limit/);
   assert.equal(engineInfraDenial("session-1", "claude-worker", "continue", box.env, finished + 3_600_000), null);
 });

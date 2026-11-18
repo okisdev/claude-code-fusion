@@ -16,7 +16,7 @@ function sandbox(t) {
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
   const bins = path.join(root, "bins");
   fs.mkdirSync(bins);
-  for (const name of ["codex", "grok", "cursor"]) {
+  for (const name of ["codex", "grok", "cursor", "devin"]) {
     const file = path.join(bins, name);
     fs.writeFileSync(file, "#!/usr/bin/env bash\nprintf '%s\\n' 'fake version'\n");
     fs.chmodSync(file, 0o755);
@@ -31,9 +31,11 @@ function sandbox(t) {
       FUSION_CODEX_COMPANION: companion,
       FUSION_GROK_COMPANION: companion,
       FUSION_CURSOR_COMPANION: companion,
+      FUSION_DEVIN_COMPANION: companion,
       CODEX_COMPANION_DATA: path.join(root, "codex-data"),
       GROK_COMPANION_DATA: path.join(root, "grok-data"),
       CURSOR_COMPANION_DATA: path.join(root, "cursor-data"),
+      DEVIN_COMPANION_DATA: path.join(root, "devin-data"),
       FAKE_VERIFY_LOG: path.join(root, "verify.log"),
       FAKE_VERIFY_FAIL: "0",
       FAKE_ARGS_FILE: path.join(root, "args.json"),
@@ -102,6 +104,18 @@ test("write pass records a staged diff and requested lane", (t) => {
   assert.deepEqual(invocation.args.slice(0, 8), ["task", "--write", "--json", "--model", "requested-model", "--effort", "xhigh", "--cwd"]);
   assert.equal(invocation.args.at(-1), "Edit the marker file.\n");
   assert.equal(fs.existsSync(invocation.cwd), false);
+});
+
+test("devin write attempt resolves the devin companion and records its versions", (t) => {
+  const s = sandbox(t);
+  const result = run(s, { engine: "devin" });
+  assert.equal(result.status, 0, result.stderr);
+  const [record] = records(s);
+  assert.equal(record.engine, "devin");
+  assert.equal(record.verdict, "pass");
+  assert.equal(record.cliVersion, "1.2.3");
+  const env = JSON.parse(fs.readFileSync(path.join(s.results, "env.json"), "utf8"));
+  assert.equal(env.engineCliVersions.devin, "fake version");
 });
 
 test("write verifier failure is a scored fail", (t) => {

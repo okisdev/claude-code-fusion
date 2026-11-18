@@ -21,9 +21,9 @@ const TRANSCRIPT_CHUNK_BYTES = 1024 * 1024;
 const TRANSCRIPT_REFRESH_BYTES = 8 * TRANSCRIPT_CHUNK_BYTES;
 const TRANSCRIPT_CARRY_BYTES = 64 * 1024;
 const TRANSCRIPT_HISTORY_ENTRIES = 64;
-const TASK_OUTPUT_TRANSCRIPT_MAX_BYTES = 50 * 1024 * 1024;
-const TASK_OUTPUT_TRANSCRIPT_CHUNK_BYTES = 64 * 1024;
-const TASK_OUTPUT_TRANSCRIPT_MAX_LINE_BYTES = 1024 * 1024;
+const TELEMETRY_TRANSCRIPT_MAX_BYTES = 50 * 1024 * 1024;
+const TELEMETRY_TRANSCRIPT_CHUNK_BYTES = 64 * 1024;
+const TELEMETRY_TRANSCRIPT_MAX_LINE_BYTES = 1024 * 1024;
 export const WORKER_TERMINAL_STATUSES = new Set(["done", "incomplete", "failed", "cancelled", "owner_ended"]);
 const ACCEPTANCE_STATES = new Set(["accepted", "rejected", "unverified"]);
 const SEMANTIC_FAILURE_KINDS = new Set(["intent_override", "scope_rewrite", "wrong_approach", "style_mismatch", "oversized"]);
@@ -338,6 +338,12 @@ export function canonicalWorkerAgentType(value) {
   return typeof value === "string" ? AGENT_TYPES.get(value) ?? null : null;
 }
 
+export function claudeModelFamily(value, env = {}) {
+  const alias = typeof value === "string" ? /^(fable|opus|sonnet|haiku)(?:\[1m\])?$/i.exec(value.trim())?.[1] : null;
+  if (alias) value = env[`ANTHROPIC_DEFAULT_${alias.toUpperCase()}_MODEL`]?.trim() || value;
+  return typeof value === "string" ? value.match(/\b(fable|opus|sonnet|haiku)\b/i)?.[1].toLowerCase() ?? null : null;
+}
+
 export function isFusionWorkerAgent(value) {
   return canonicalWorkerAgentType(value) != null;
 }
@@ -642,6 +648,7 @@ export function createWorkerRecord(record, env = process.env) {
       backgroundTaskId: null,
       agentType: canonicalWorkerAgentType(record.agentType) ?? record.agentType,
       lane: canonicalWorkerAgentType(record.agentType) ?? record.agentType,
+      requestedModel: typeof record.requestedModel === "string" ? record.requestedModel : null,
       description: record.description ?? null,
       workspaceRoot: path.resolve(record.workspaceRoot),
       ...(record.companionCwd ? { companionCwd: record.companionCwd } : {}),
@@ -987,7 +994,7 @@ function hasZeroWorkerUsage(record) {
   });
 }
 
-function taskOutputMessageUsage(value) {
+function transcriptMessageUsage(value) {
   if (value == null) {
     return emptyWorkerUsage();
   }
@@ -1023,12 +1030,12 @@ function addWorkerUsage(totals, usage) {
   return next;
 }
 
-function taskOutputTelemetryLine(line, telemetry) {
+function transcriptTelemetryLine(line, telemetry) {
   const entry = JSON.parse(line);
   if (entry?.type !== "assistant" || !entry.message || typeof entry.message !== "object") {
     return telemetry;
   }
-  const usage = taskOutputMessageUsage(entry.message.usage);
+  const usage = transcriptMessageUsage(entry.message.usage);
   if (!usage) {
     return null;
   }
@@ -1044,14 +1051,14 @@ function taskOutputTelemetryLine(line, telemetry) {
   return { turns: telemetry.turns + 1, toolCalls: telemetry.toolCalls + toolCalls, usage: nextUsage };
 }
 
-function taskOutputTelemetry(transcriptPath) {
+function transcriptTelemetry(transcriptPath) {
   if (typeof transcriptPath !== "string" || !path.isAbsolute(transcriptPath)) {
     return null;
   }
   let descriptor;
   try {
     const stat = fs.statSync(transcriptPath);
-    if (!stat.isFile() || stat.size > TASK_OUTPUT_TRANSCRIPT_MAX_BYTES) {
+    if (!stat.isFile() || stat.size > TELEMETRY_TRANSCRIPT_MAX_BYTES) {
       return null;
     }
     descriptor = fs.openSync(transcriptPath, "r");
@@ -1059,7 +1066,7 @@ function taskOutputTelemetry(transcriptPath) {
     let carry = "";
     let telemetry = { turns: 0, toolCalls: 0, usage: emptyWorkerUsage() };
     while (offset < stat.size) {
-      const buffer = Buffer.allocUnsafe(Math.min(TASK_OUTPUT_TRANSCRIPT_CHUNK_BYTES, stat.size - offset));
+      const buffer = Buffer.allocUnsafe(Math.min(TELEMETRY_TRANSCRIPT_CHUNK_BYTES, stat.size - offset));
       const read = fs.readSync(descriptor, buffer, 0, buffer.length, offset);
       if (read === 0) {
         break;
@@ -1068,21 +1075,21 @@ function taskOutputTelemetry(transcriptPath) {
       const text = `${carry}${buffer.subarray(0, read).toString("utf8")}`;
       const lines = text.split("\n");
       carry = lines.pop() ?? "";
-      if (Buffer.byteLength(carry) > TASK_OUTPUT_TRANSCRIPT_MAX_LINE_BYTES) {
+      if (Buffer.byteLength(carry) > TELEMETRY_TRANSCRIPT_MAX_LINE_BYTES) {
         return null;
       }
       for (const line of lines) {
         if (!line.trim()) {
           continue;
         }
-        telemetry = taskOutputTelemetryLine(line, telemetry);
+        telemetry = transcriptTelemetryLine(line, telemetry);
         if (!telemetry) {
           return null;
         }
       }
     }
     if (carry.trim()) {
-      telemetry = taskOutputTelemetryLine(carry, telemetry);
+      telemetry = transcriptTelemetryLine(carry, telemetry);
     }
     return telemetry;
   } catch {
@@ -1094,11 +1101,11 @@ function taskOutputTelemetry(transcriptPath) {
   }
 }
 
-export function backfillWorkerTaskOutputTelemetry(record, transcriptPath) {
+export function backfillWorkerTranscriptTelemetry(record, transcriptPath) {
   if (!hasZeroWorkerUsage(record)) {
     return record;
   }
-  const telemetry = taskOutputTelemetry(transcriptPath);
+  const telemetry = transcriptTelemetry(transcriptPath);
   if (!telemetry) {
     return record;
   }

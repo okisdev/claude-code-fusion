@@ -1,0 +1,147 @@
+diff --git a/csv-parser/index.js b/csv-parser/index.js
+index 92cb4c1..46daf49 100644
+--- a/csv-parser/index.js
++++ b/csv-parser/index.js
+@@ -1,3 +1,26 @@
+ export function parseCsvLine(line) {
+-  return line.split(",").map((field) => field.trim());
++  const fields = [];
++  let field = "";
++  let inQuotes = false;
++
++  for (let index = 0; index < line.length; index += 1) {
++    const character = line[index];
++
++    if (character === '"') {
++      if (inQuotes && line[index + 1] === '"') {
++        field += '"';
++        index += 1;
++      } else {
++        inQuotes = !inQuotes;
++      }
++    } else if (character === "," && !inQuotes) {
++      fields.push(field.trim());
++      field = "";
++    } else {
++      field += character;
++    }
++  }
++
++  fields.push(field.trim());
++  return fields;
+ }
+diff --git a/csv-parser/index.test.js b/csv-parser/index.test.js
+new file mode 100644
+index 0000000..f5bbf23
+--- /dev/null
++++ b/csv-parser/index.test.js
+@@ -0,0 +1,25 @@
++import assert from "node:assert/strict";
++import test from "node:test";
++import { parseCsvLine } from "./index.js";
++
++test("keeps quoted commas in their field", () => {
++  assert.deepEqual(parseCsvLine('team,"Park, Mina"'), ["team", "Park, Mina"]);
++  assert.deepEqual(parseCsvLine('"Park, Mina",team,"active, yes"'), [
++    "Park, Mina",
++    "team",
++    "active, yes",
++  ]);
++});
++
++test("decodes escaped double quotes within a quoted field", () => {
++  assert.deepEqual(parseCsvLine('team,"Park, ""Mina"""'), [
++    "team",
++    'Park, "Mina"',
++  ]);
++});
++
++test("preserves empty fields and trims surrounding whitespace", () => {
++  assert.deepEqual(parseCsvLine(" team , ,active,"), ["team", "", "active", ""]);
++  assert.deepEqual(parseCsvLine('"",team'), ["", "team"]);
++  assert.deepEqual(parseCsvLine(""), [""]);
++});
+diff --git a/duration-formatter/index.js b/duration-formatter/index.js
+index 5a94f9a..0bf7d36 100644
+--- a/duration-formatter/index.js
++++ b/duration-formatter/index.js
+@@ -1,6 +1,6 @@
+ export function formatDuration(totalSeconds) {
+   const seconds = Math.max(0, Math.trunc(totalSeconds));
+-  const minutes = Math.round(seconds / 60);
++  const minutes = Math.floor(seconds / 60);
+   const remainingSeconds = seconds - minutes * 60;
+   return minutes > 0 ? `${minutes}m ${remainingSeconds}s` : `${remainingSeconds}s`;
+ }
+diff --git a/duration-formatter/index.test.js b/duration-formatter/index.test.js
+new file mode 100644
+index 0000000..61edb7c
+--- /dev/null
++++ b/duration-formatter/index.test.js
+@@ -0,0 +1,25 @@
++import assert from "node:assert/strict";
++import test from "node:test";
++import { formatDuration } from "./index.js";
++
++test("uses completed minutes at minute and half-minute boundaries", () => {
++  for (const [seconds, expected] of [
++    [30, "30s"],
++    [59, "59s"],
++    [60, "1m 0s"],
++    [89, "1m 29s"],
++    [90, "1m 30s"],
++    [119, "1m 59s"],
++    [120, "2m 0s"],
++    [150, "2m 30s"],
++  ]) {
++    assert.equal(formatDuration(seconds), expected, `duration: ${seconds}`);
++  }
++});
++
++test("continues to clamp negative durations and truncate fractional seconds", () => {
++  assert.equal(formatDuration(-10), "0s");
++  assert.equal(formatDuration(0), "0s");
++  assert.equal(formatDuration(59.9), "59s");
++  assert.equal(formatDuration(90.9), "1m 30s");
++});
+diff --git a/path-matcher/index.js b/path-matcher/index.js
+index 577fa17..5d08dca 100644
+--- a/path-matcher/index.js
++++ b/path-matcher/index.js
+@@ -1,5 +1,5 @@
+ export function matchesPath(pattern, candidate) {
+   const escaped = pattern.replace(/[|\\{}()[\]^$+?.]/g, "\\$&");
+-  const source = escaped.replaceAll("*", ".*");
++  const source = escaped.replaceAll("*", "[^/]*");
+   return new RegExp(`^${source}$`).test(candidate);
+ }
+diff --git a/path-matcher/index.test.js b/path-matcher/index.test.js
+new file mode 100644
+index 0000000..3357b18
+--- /dev/null
++++ b/path-matcher/index.test.js
+@@ -0,0 +1,24 @@
++import assert from "node:assert/strict";
++import test from "node:test";
++import { matchesPath } from "./index.js";
++
++test("does not let wildcards cross a path separator", () => {
++  assert.equal(matchesPath("src/*.js", "src/nested/main.js"), false);
++  assert.equal(matchesPath("src/*.js", "src/nested/deep/main.js"), false);
++  assert.equal(matchesPath("src/*/main.js", "src/nested/deep/main.js"), false);
++});
++
++test("matches zero or more characters within one path segment", () => {
++  assert.equal(matchesPath("src/*.js", "src/main.js"), true);
++  assert.equal(matchesPath("src/*.js", "src/.js"), true);
++  assert.equal(matchesPath("src/*/main.js", "src/nested/main.js"), true);
++  assert.equal(matchesPath("src/m*n*.js", "src/main.js"), true);
++});
++
++test("keeps literal regular expression characters and full-path matching", () => {
++  assert.equal(matchesPath("src/*.js", "src/mainXjs"), false);
++  assert.equal(matchesPath("src/*.js", "src/main.js.bak"), false);
++  assert.equal(matchesPath("src/*.js", "other/src/main.js"), false);
++  assert.equal(matchesPath("src/[main]+(v1).js", "src/[main]+(v1).js"), true);
++  assert.equal(matchesPath("src/[main]+(v1).js", "src/mainv1.js"), false);
++});

@@ -1,0 +1,73 @@
+diff --git a/concurrent.js b/concurrent.js
+new file mode 100644
+index 0000000..4ab47c2
+--- /dev/null
++++ b/concurrent.js
+@@ -0,0 +1,44 @@
++export function map_concurrent(items, limit, worker) {
++  if (items.length === 0) {
++    return Promise.resolve([]);
++  }
++
++  return new Promise((resolve, reject) => {
++    const results = new Array(items.length);
++    let next_index = 0;
++    let completed = 0;
++    let rejected = false;
++
++    function run() {
++      if (next_index === items.length) {
++        return;
++      }
++      const index = next_index;
++      next_index += 1;
++      Promise.resolve()
++        .then(() => worker(items[index], index))
++        .then(
++          (result) => {
++            if (rejected) {
++              return;
++            }
++            results[index] = result;
++            completed += 1;
++            if (completed === items.length) {
++              resolve(results);
++            } else {
++              run();
++            }
++          },
++          (error) => {
++            rejected = true;
++            reject(error);
++          },
++        );
++    }
++
++    for (let index = 0; index < Math.min(limit, items.length); index += 1) {
++      run();
++    }
++  });
++}
+diff --git a/retry.js b/retry.js
+new file mode 100644
+index 0000000..08a2827
+--- /dev/null
++++ b/retry.js
+@@ -0,0 +1,17 @@
++import { app_error } from "./errors.js";
++import { delay_ms } from "./util.js";
++
++export function retry_with_backoff(operation, attempts, base_delay_ms) {
++  function attempt(remaining, delay) {
++    return Promise.resolve()
++      .then(operation)
++      .catch((failure) => {
++        if (remaining === 1) {
++          throw app_error("RETRY_EXHAUSTED", failure.message);
++        }
++        return delay_ms(delay).then(() => attempt(remaining - 1, delay * 2));
++      });
++  }
++
++  return attempt(attempts, base_delay_ms);
++}

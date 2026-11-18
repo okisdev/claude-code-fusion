@@ -3823,12 +3823,13 @@ test("R4 --all reports retired worker rollups separately from live workers", (t)
   assert.strictEqual(buildFusionStats({ env, cwd: dir }).retiredWorkers, undefined);
 });
 
-test("Claude worker stats group current collection methods for display", (t) => {
+test("Claude worker stats group current and stored collection methods for display", (t) => {
   const dir = sandbox(t);
   const env = { FUSION_WORKER_STATE_DIR: path.join(dir, "worker-state") };
   const workers = [
     ["fusion-method-stop", "subagent_stop"],
-    ["fusion-method-agent", "agent_result"]
+    ["fusion-method-agent", "agent_result"],
+    ["fusion-method-legacy", "task_output"]
   ];
   for (const [taskId, collectionMethod] of workers) {
     createWorkerRecord({ taskId, sessionId: "session-workers", dispatchToolUseId: taskId, agentType: "fusion:claude-worker", workspaceRoot: dir, limits: {} }, env);
@@ -3838,10 +3839,11 @@ test("Claude worker stats group current collection methods for display", (t) => 
   const stats = claudeWorkerStats({ all: true, env, cwd: dir });
   assert.strictEqual(normalizeCollectionMethod("subagent_stop"), "subagent_stop");
   assert.strictEqual(normalizeCollectionMethod("agent_result"), "agent_result");
+  assert.strictEqual(normalizeCollectionMethod("task_output"), "task_output");
   assert.strictEqual(normalizeCollectionMethod("Agent"), null);
-  assert.deepStrictEqual(stats.byCollectionMethod, { subagent_stop: 1, agent_result: 1 });
-  assert.deepStrictEqual(stats.identities.map((identity) => identity.collectionMethod).sort(), ["agent_result", "subagent_stop"]);
-  assert.match(renderFusionStats({ scope: dir, claudeWorkers: stats }), /By collection method:\n- agent_result: 1\n- subagent_stop: 1/);
+  assert.deepStrictEqual(stats.byCollectionMethod, { subagent_stop: 1, agent_result: 1, task_output: 1 });
+  assert.deepStrictEqual(stats.identities.map((identity) => identity.collectionMethod).sort(), ["agent_result", "subagent_stop", "task_output"]);
+  assert.match(renderFusionStats({ scope: dir, claudeWorkers: stats }), /By collection method:\n- agent_result: 1\n- subagent_stop: 1\n- task_output: 1/);
 });
 
 test("--unsettled lists terminal unverified jobs and preserves Codex acceptance provenance", (t) => {

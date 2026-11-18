@@ -322,7 +322,8 @@ function strandedHandbackFromTranscript(transcriptPath) {
 }
 
 function finalAssistantTextFromTranscript(transcriptPath) {
-  return finalReportFromTranscript(transcriptPath)?.text ?? null;
+  const text = finalReportFromTranscript(transcriptPath)?.text;
+  return text && !HANDBACK_PLACEHOLDER_PATTERN.test(text) ? text : null;
 }
 
 function taskNotificationTransition(record, notification, now, env) {
@@ -376,7 +377,7 @@ function taskNotificationTransition(record, notification, now, env) {
       }, now, env);
     }
     const harnessAsyncDelivery = collectedHarnessAsyncDelivery(refreshed, "done");
-    if (strandedHandbackFromTranscript(refreshed.transcriptPath) && !HANDBACK_PLACEHOLDER_PATTERN.test(finalText)) {
+    if (strandedHandbackFromTranscript(refreshed.transcriptPath)) {
       return settleQueuedVerdict({
         ...refreshed,
         transportStatus: "ready_uncollected",

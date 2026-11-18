@@ -9,7 +9,7 @@ import { mergeHookResults, renderHookResult } from "./lib/lifecycle/output.mjs";
 
 export { mergeHookResults } from "./lib/lifecycle/output.mjs";
 
-const GUARD_TOOLS = new Set(["Read", "Grep", "Glob", "Edit", "Write", "NotebookEdit", "MultiEdit", "Bash", "Agent", "Task", "SendMessage", "TaskOutput", "TaskStop"]);
+const GUARD_TOOLS = new Set(["Read", "Grep", "Glob", "Edit", "Write", "NotebookEdit", "MultiEdit", "Bash", "Agent", "Task", "SendMessage", "TaskStop"]);
 
 export async function handleFusionHook(input, env = process.env) {
   if (!input) return {};

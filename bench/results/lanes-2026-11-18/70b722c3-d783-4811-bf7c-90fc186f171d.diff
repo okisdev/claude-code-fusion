@@ -1,0 +1,92 @@
+diff --git a/concurrent.js b/concurrent.js
+new file mode 100644
+index 0000000..d9b1c3e
+--- /dev/null
++++ b/concurrent.js
+@@ -0,0 +1,50 @@
++import { app_error } from "./errors.js";
++
++export function map_concurrent(items, limit, worker) {
++  if (items.length === 0) {
++    return Promise.resolve([]);
++  }
++
++  if (!Number.isInteger(limit) || limit < 1) {
++    return Promise.reject(app_error("INVALID_ARGUMENT", "limit must be a positive integer"));
++  }
++
++  return new Promise((resolve, reject) => {
++    const results = new Array(items.length);
++    let next = 0;
++    let active = 0;
++    let completed = 0;
++    let settled = false;
++
++    function launch() {
++      while (!settled && active < limit && next < items.length) {
++        const index = next;
++        next += 1;
++        active += 1;
++
++        Promise.resolve()
++          .then(() => worker(items[index], index))
++          .then(
++            (result) => {
++              active -= 1;
++              results[index] = result;
++              completed += 1;
++
++              if (completed === items.length) {
++                settled = true;
++                resolve(results);
++              } else {
++                launch();
++              }
++            },
++            (error) => {
++              settled = true;
++              reject(error);
++            },
++          );
++      }
++    }
++
++    launch();
++  });
++}
+diff --git a/retry.js b/retry.js
+new file mode 100644
+index 0000000..f5e0158
+--- /dev/null
++++ b/retry.js
+@@ -0,0 +1,30 @@
++import { app_error } from "./errors.js";
++import { delay_ms } from "./util.js";
++
++export function retry_with_backoff(operation, attempts, base_delay_ms) {
++  if (!Number.isInteger(attempts) || attempts < 1) {
++    return Promise.reject(app_error("INVALID_ARGUMENT", "attempts must be a positive integer"));
++  }
++
++  if (!Number.isFinite(base_delay_ms) || base_delay_ms < 0) {
++    return Promise.reject(app_error("INVALID_ARGUMENT", "base_delay_ms must be a nonnegative number"));
++  }
++
++  let failures = 0;
++
++  function run() {
++    return Promise.resolve()
++      .then(() => operation())
++      .catch((error) => {
++        failures += 1;
++
++        if (failures === attempts) {
++          return Promise.reject(app_error("RETRY_EXHAUSTED", error?.message ?? String(error)));
++        }
++
++        return delay_ms(base_delay_ms * 2 ** (failures - 1)).then(run);
++      });
++  }
++
++  return run();
++}

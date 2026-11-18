@@ -828,7 +828,14 @@ function securityError(kind, message) {
   return error;
 }
 
-export function runtimeSocketEndpoints({ env = process.env, platform = process.platform, uid = typeof process.getuid === "function" ? process.getuid() : null } = {}) {
+function runtimeSocketSymlinkTargetsAllowed(version) {
+  const match = /^(\d+)\.(\d+)\.(\d+)(?:-([\w.-]+))?(?:\+[\w.-]+)?$/.exec(String(version ?? ""));
+  if (!match) return false;
+  const [major, minor, patch] = match.slice(1, 4).map(Number);
+  return major > 1 || (major === 1 && (minor > 0 || (minor === 0 && (patch > 88 || (patch === 88 && !match[4])))));
+}
+
+export function runtimeSocketEndpoints({ env = process.env, version = null, platform = process.platform, uid = typeof process.getuid === "function" ? process.getuid() : null } = {}) {
   if (Object.hasOwn(env, RUNTIME_SOCKET_CANDIDATES_ENV)) {
     return String(env[RUNTIME_SOCKET_CANDIDATES_ENV] ?? "")
       .split(":")
@@ -845,6 +852,9 @@ export function runtimeSocketEndpoints({ env = process.env, platform = process.p
     path.join(home, ".docker", "desktop", "docker.sock"),
     path.join(home, ".docker", "run", "docker.sock")
   ];
+  if (runtimeSocketSymlinkTargetsAllowed(version)) {
+    endpoints.push(path.join(home, ".orbstack", "run", "docker.sock"));
+  }
   if (platform === "linux" && Number.isInteger(uid) && uid >= 0) {
     const runtimeDir = `/run/user/${uid}`;
     endpoints.push(
@@ -861,7 +871,11 @@ export function undeniedRuntimeSocketCandidates(env = process.env) {
     return [...new Set(String(env[UNDENIED_RUNTIME_SOCKET_CANDIDATES_ENV] ?? "").split(":").filter(Boolean))];
   }
   const home = typeof env.HOME === "string" && env.HOME.trim() ? env.HOME : os.homedir();
-  return [path.join(home, ".orbstack", "run", "docker.sock")];
+  return [
+    path.join(home, ".docker", "desktop", "docker.sock"),
+    path.join(home, ".docker", "run", "docker.sock"),
+    path.join(home, ".orbstack", "run", "docker.sock")
+  ];
 }
 
 export function existingUnixSockets(candidates, lstat = fs.lstatSync) {
@@ -881,14 +895,25 @@ export function existingUnixSockets(candidates, lstat = fs.lstatSync) {
 }
 
 export function undeniedRuntimeSocketRemedy() {
-  return "Quit the container engine (for OrbStack, run `orb stop`), or route the package to Codex, whose sandbox blocks the connect. Grok write runs are refused while the socket exists.";
+  return "Stop the container engine, or route writes to another lane. Grok write runs are refused while the socket exists.";
 }
 
-export function runtimeSocketSymlinkEndpoints(candidates, lstat = fs.lstatSync) {
+export function runtimeSocketSymlinkEndpoints(candidates, { env = process.env, version = null, lstat = fs.lstatSync, realpath = fs.realpathSync } = {}) {
   const symlinks = [];
+  const deniedTargets = runtimeSocketSymlinkTargetsAllowed(version)
+    ? new Set(runtimeSocketEndpoints({ env: { HOME: env.HOME }, version }).map((endpoint) =>
+        path.join(normalizedFilesystemPath(path.dirname(endpoint)), path.basename(endpoint))))
+    : null;
   for (const endpoint of candidates) {
     try {
       if (lstat(endpoint).isSymbolicLink()) {
+        if (deniedTargets) {
+          try {
+            if (deniedTargets.has(realpath(endpoint))) continue;
+          } catch (error) {
+            if (!["ENOENT", "ENOTDIR", "ELOOP"].includes(error?.code)) throw error;
+          }
+        }
         symlinks.push(endpoint);
       }
     } catch (error) {
@@ -917,19 +942,14 @@ export function runtimeSocketEngine(endpoint, readlink = fs.readlinkSync) {
 }
 
 export function runtimeSocketRemedy(endpoint, engine) {
-  if (engine === "orbstack") {
-    return `OrbStack creates ${endpoint} through its admin helper. Run \`orb config set setup.use_admin false\`, remove the symlink with \`sudo rm ${endpoint}\`, and restart OrbStack; the docker CLI keeps working through the orbstack context, while features that need admin, such as host ports below 1024, stop until the setting is restored. Do not downgrade the sandbox.`;
-  }
-  if (engine === "docker-desktop") {
-    return `Docker Desktop creates ${endpoint} while "Allow the default Docker socket to be used" is enabled under Settings, Advanced. Disable it, remove the symlink with \`sudo rm ${endpoint}\`, and restart Docker Desktop; the docker CLI keeps working through the desktop context. Do not downgrade the sandbox.`;
-  }
-  return `Stop the Docker engine that creates ${endpoint}, or remove the symlink. Do not downgrade the sandbox.`;
+  const stop = engine === "orbstack" ? " (for OrbStack, run `orb stop`)" : engine === "docker-desktop" ? " (quit Docker Desktop)" : "";
+  return `Stop the container engine that owns ${endpoint}${stop}, or route writes to another lane. Do not downgrade the sandbox.`;
 }
 
-export function preflightRuntimeSocketEndpoints({ candidates = runtimeSocketEndpoints(), lstat = fs.lstatSync, readlink = fs.readlinkSync } = {}) {
+export function preflightRuntimeSocketEndpoints({ env = process.env, version = null, candidates = runtimeSocketEndpoints({ env, version }), lstat = fs.lstatSync, readlink = fs.readlinkSync, realpath = fs.realpathSync } = {}) {
   let symlinks;
   try {
-    symlinks = runtimeSocketSymlinkEndpoints(candidates, lstat);
+    symlinks = runtimeSocketSymlinkEndpoints(candidates, { env, version, lstat, realpath });
   } catch (error) {
     throw securityError("sandbox", `Unable to inspect Grok runtime-socket deny path: ${error.message}`);
   }
@@ -937,7 +957,7 @@ export function preflightRuntimeSocketEndpoints({ candidates = runtimeSocketEndp
     const endpoint = symlinks[0];
     throw securityError(
       "sandbox",
-      `Grok strict sandbox (runtime-socket deny policy, 1.0.4 through 1.0.77) refuses to start while ${endpoint} exists as a symlink. ${runtimeSocketRemedy(endpoint, runtimeSocketEngine(endpoint, readlink))}`
+      `Grok strict sandbox refuses runtime-socket symlink ${endpoint}${runtimeSocketSymlinkTargetsAllowed(version) ? " because its resolved target is outside the deny list or cannot be resolved" : " because this Grok version requires non-symlink endpoints"}. ${runtimeSocketRemedy(endpoint, runtimeSocketEngine(endpoint, readlink))}`
     );
   }
   return symlinks;
@@ -951,7 +971,7 @@ export function preflightUndeniedRuntimeSocketEndpoints(env = process.env) {
     throw securityError("sandbox", `Unable to inspect undenied Grok runtime sockets: ${error.message}`);
   }
   if (sockets.length > 0) {
-    throw securityError("sandbox", `Grok's strict runtime-socket deny list does not cover ${sockets[0]}, so a write shell could drive that container engine and write outside the workspace. ${undeniedRuntimeSocketRemedy()}`);
+    throw securityError("sandbox", `Runtime socket ${sockets[0]} may remain reachable from Grok's macOS strict sandbox even when listed in deny_paths, so a write shell could drive that container engine and write outside the workspace. ${undeniedRuntimeSocketRemedy()}`);
   }
   return sockets;
 }
@@ -2512,7 +2532,9 @@ export function runGrok(options) {
     capabilities = resolveGrokCapabilities(bin, env, deadline, options.cwd ?? process.cwd(), required);
     requireGrokCapabilities(capabilities, required);
     preflightRuntimeSocketEndpoints({
-      candidates: options.runtimeSocketEndpoints ?? runtimeSocketEndpoints({ env }),
+      env,
+      version: options.grokVersion,
+      candidates: options.runtimeSocketEndpoints ?? runtimeSocketEndpoints({ env, version: options.grokVersion }),
       lstat: options.runtimeSocketLstat ?? fs.lstatSync
     });
     if (requestedMode === "write") {

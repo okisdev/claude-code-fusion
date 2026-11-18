@@ -2,7 +2,10 @@
   "$schema": "https://json.schemastore.org/claude-code-plugin-manifest.json",
   "name": "fusion",
   "displayName": "Fusion Orchestrator",
-  "version": "0.0.77",
+  "version": "0.0.78",
+  "engines": {
+    "claude-code": ">=2.1.300"
+  },
   "description": "Multi-model orchestration: tier agents, routing rules, blind panel, ultra fleet, model config, and drift doctor.",
   "author": {
     "name": "Harry Yep"

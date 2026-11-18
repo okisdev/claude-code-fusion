@@ -5,7 +5,7 @@ const CODE_SPAN = 9000;
 
 const MESSAGE_REGISTRY = [
   { slug: "inline-guard.no-op-heartbeat-deny", description: "Denial of a no-op Bash command while Fusion tasks are in flight." },
-  { slug: "inline-guard.reaped-worker-redirect", description: "Denial of a TaskOutput or TaskStop probe of a reaped worker with the result path." },
+  { slug: "inline-guard.reaped-worker-redirect", description: "Denial of a TaskStop probe of a reaped worker with the result path." },
   { slug: "inline-guard.read-streak-advisory", description: "Advisory when consecutive main loop read only turns replay a full budget of context tokens." },
   { slug: "inline-guard.generic-agent-advisory", description: "Advisory that a generic or forked Agent ran a work package outside Fusion tracking." },
   { slug: "worker-lifecycle.foreground-wrapper-deny", description: "Denial of background delivery for a peer wrapper Agent." },

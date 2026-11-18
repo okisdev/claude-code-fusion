@@ -2,7 +2,7 @@ import { spawnSync } from "node:child_process";
 import path from "node:path";
 import { clearRunTimers, createProcessTransport, destroyRunStreams, executablePath, inheritChildEnv, runProcess, settleRun as settleProcessRun } from "./process-run.mjs";
 
-export const TESTED_DEVIN_INTERVAL = { floor: "3000.11", ceiling: "3000.12" };
+export const TESTED_DEVIN_INTERVAL = { floor: "3000.11", ceiling: "3000.15" };
 
 const READ_TOOLS = ["read", "grep", "glob", "find_file_by_name", "notebook_read", "todo_write", "web_search"];
 const WRITE_TOOLS = [...READ_TOOLS, "edit", "write", "notebook_edit", "exec", "get_output", "kill_shell", "write_to_process"];
@@ -325,7 +325,8 @@ function handleRunTimeout(run) {
 
 function startDevinRun(run, resolve) {
   const { timeoutMs, exitGraceMs, killGraceMs, signal, onSpawn } = run.options;
-  if (!startProcess(run, resolve, ["acp"], {
+  const args = ["acp", ...(run.options.version && compareDevinVersion(run.options.version, "3000.13") >= 0 ? ["--process-model", "in-process"] : [])];
+  if (!startProcess(run, resolve, args, {
     launchError(run, error, spawned) {
       if (spawned?.pid) {
         spawned.stdin.destroy();
@@ -358,8 +359,8 @@ function startDevinRun(run, resolve) {
   if (signal?.aborted) abortRun(run);
 }
 
-export function runDevin({ bin, cwd, env, brief, mode, resumeSessionId, resolveSelection, timeoutMs = 540000, exitGraceMs = 15000, killGraceMs = 5000, launchProcess, signal, onSpawn }) {
-  return runProcess({ bin, cwd, env, brief, mode, resumeSessionId, resolveSelection, timeoutMs, exitGraceMs, killGraceMs, launchProcess, signal, onSpawn }, {
+export function runDevin({ bin, cwd, env, brief, mode, version, resumeSessionId, resolveSelection, timeoutMs = 540000, exitGraceMs = 15000, killGraceMs = 5000, launchProcess, signal, onSpawn }) {
+  return runProcess({ bin, cwd, env, brief, mode, version, resumeSessionId, resolveSelection, timeoutMs, exitGraceMs, killGraceMs, launchProcess, signal, onSpawn }, {
     outcome: {
       resultText: "", resolvedEffort: null, stopReason: null, stopCause: null, appliedOptions: {}, rpcError: null,
       setupError: null, selectionError: null, toolCalls: 0

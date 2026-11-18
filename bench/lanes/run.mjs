@@ -13,10 +13,11 @@ import { readEngineJobRecord, resolveEngineStateRoots } from "../../plugins/fusi
 
 const DEFAULT_TASK_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "tasks");
 const CURSOR_PLUGIN_FILE = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..", "plugins", "cursor", ".claude-plugin", "plugin.json");
-const ENGINES = new Set(["codex", "grok", "cursor"]);
+const DEVIN_PLUGIN_FILE = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..", "plugins", "devin", ".claude-plugin", "plugin.json");
+const ENGINES = new Set(["codex", "grok", "cursor", "devin"]);
 const MODES = new Set(["write", "consult"]);
 const OPTIONS = new Set(["task", "engine", "mode", "repetition", "results", "model", "effort", "brief", "fixtures", "task-root", "timeout-ms", "verify-timeout-ms"]);
-const USAGE = "Usage: node bench/lanes/run.mjs --task <task-id> --engine <codex|grok|cursor> --mode <write|consult> --repetition <n> --results <dir> [--model <id>] [--effort <level>] [--brief <file>] [--fixtures <dir inside the task>] [--task-root <dir>] [--timeout-ms <n>] [--verify-timeout-ms <n>] (env: BENCH_VERIFY_TIMEOUT_MS; default: 600000 ms)";
+const USAGE = "Usage: node bench/lanes/run.mjs --task <task-id> --engine <codex|grok|cursor|devin> --mode <write|consult> --repetition <n> --results <dir> [--model <id>] [--effort <level>] [--brief <file>] [--fixtures <dir inside the task>] [--task-root <dir>] [--timeout-ms <n>] [--verify-timeout-ms <n>] (env: BENCH_VERIFY_TIMEOUT_MS; default: 600000 ms)";
 
 function parseArgs(argv) {
   const raw = {};
@@ -191,8 +192,8 @@ function writeEnvOnce(resultsDir, taskManifestHash) {
     date: new Date().toISOString(),
     nodeVersion: process.version,
     os: { platform: os.platform(), release: os.release() },
-    pluginVersions: { ...collectPluginVersions(process.env), cursor: readJsonFile(CURSOR_PLUGIN_FILE)?.version ?? null },
-    engineCliVersions: { codex: cliVersion("codex"), grok: cliVersion("grok"), cursor: cliVersion("cursor-agent") },
+    pluginVersions: { ...collectPluginVersions(process.env), cursor: readJsonFile(CURSOR_PLUGIN_FILE)?.version ?? null, devin: readJsonFile(DEVIN_PLUGIN_FILE)?.version ?? null },
+    engineCliVersions: { codex: cliVersion("codex"), grok: cliVersion("grok"), cursor: cliVersion("cursor-agent"), devin: cliVersion("devin") },
     taskManifestHash,
     manifestHash: taskManifestHash
   };

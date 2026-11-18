@@ -26,7 +26,7 @@ function handlesLifecycleHook(input) {
   const agentType = input.tool_input?.subagent_type;
   const managedLaunch = FUSION_WORKER_AGENT.test(agentType) || PEER_RESCUE_AGENT_NAMES.has(agentType);
   const message = input.tool_name === "SendMessage" && typeof input.tool_input?.to === "string";
-  const taskControl = ["TaskOutput", "TaskStop"].includes(input.tool_name);
+  const taskControl = input.tool_name === "TaskStop";
   switch (input.hook_event_name) {
     case "PreToolUse":
       if (launch) return managedLaunch || (agentType === "Explore" && !Object.hasOwn(input.tool_input, "model"));

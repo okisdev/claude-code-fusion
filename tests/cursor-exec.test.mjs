@@ -21,7 +21,7 @@ test("binary resolution and build date preflight", () => {
   assert.deepEqual(probeCursorVersion(bin), { version: "2026.10.01-e373342", buildPath: fs.realpathSync(bin) });
   assert.equal(compareCursorVersion("2026.10.01-ffff", "2026.10.01-0000"), 0);
   assert.ok(compareCursorVersion("2026.09.30-a", TESTED_CURSOR_INTERVAL.floor) < 0);
-  assert.ok(compareCursorVersion("2026.11.01-a", TESTED_CURSOR_INTERVAL.ceiling) === 0);
+  assert.ok(compareCursorVersion("2026.12.01-a", TESTED_CURSOR_INTERVAL.ceiling) === 0);
   assert.throws(() => probeCursorVersion("/missing/cursor-agent"), (error) => error.failureKind === "missing_cli");
 });
 
