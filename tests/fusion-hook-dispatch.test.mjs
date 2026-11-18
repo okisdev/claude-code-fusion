@@ -125,7 +125,7 @@ test("startup uses one process and retains the compact echo", () => {
   const startup = hooks.SessionStart.filter(({ matcher }) => matcher === "startup").flatMap(({ hooks }) => hooks);
   assert.equal(startup.length, 1);
   assert.equal(startup[0].command, 'command -v node >/dev/null 2>&1 || exit 0; node "${CLAUDE_PLUGIN_ROOT}/scripts/session-start.mjs"');
-  assert.equal(hooks.SessionStart.find(({ matcher }) => matcher === "compact").hooks[0].command, "echo 'Context was compacted. In one line, restate the execution posture and every in-flight Fusion task still owed collection, verification, or settlement. [fusion:9902]'");
+  assert.equal(hooks.SessionStart.find(({ matcher }) => matcher === "compact").hooks[0].command, "echo 'Fusion rules are in ~/.claude/rules/orchestration.md. Collect and settle any in-flight work. [fusion:9902]'");
 });
 
 test("ignored tools and agent types load no lifecycle handlers or guard modules", (t) => {
@@ -162,7 +162,10 @@ test("unhandled launch agent types skip lifecycle imports", (t) => {
     assert.equal(result.stdout, "");
   }
   assert.deepEqual(probe.loads().filter((url) => /\/lib\/lifecycle\/(?!output\.mjs)/.test(url)), []);
-  for (const agent_type of ["fast-worker", "fusion:fast-worker", "claude-worker", "fusion:claude-worker", "trivial-worker", "fusion:trivial-worker", "deep-reasoner", "fusion:deep-reasoner", "job-collector", "fusion:job-collector"]) {
+  for (const agent_type of ["fast-worker", "fusion:fast-worker"]) {
+    assert.equal(handlesLifecycleHook({ hook_event_name: "PreToolUse", tool_name: "Skill", agent_type }), false, agent_type);
+  }
+  for (const agent_type of ["claude-worker", "fusion:claude-worker", "trivial-worker", "fusion:trivial-worker", "deep-reasoner", "fusion:deep-reasoner", "job-collector", "fusion:job-collector"]) {
     assert.equal(handlesLifecycleHook({ hook_event_name: "PreToolUse", tool_name: "Skill", agent_type }), true, agent_type);
   }
 });

@@ -91,25 +91,23 @@ test("foreground defaults and shell override resolve independently", (t) => {
   }
 });
 
-test("shell timeout and flagship warning name the applied override", (t) => {
+test("shell timeout uses the applied override", (t) => {
   const sandbox = makeSandbox(t);
   const env = envFor(sandbox, {
     CODEX_COMPANION_TIMEOUT_MS: "2300",
     CODEX_COMPANION_BACKGROUND_SHELL_TIMEOUT_MS: "1500",
     FAKE_CODEX_MODE: "hang"
   });
-  const token = stageRawTask(sandbox, "--write --skip-git-repo-check --model gpt-6-astra wait for timeout", env);
+  const token = stageRawTask(sandbox, "--write --skip-git-repo-check wait for timeout", env);
   const result = runCompanion(["task", "--transport-default-write", "--transport-background-shell", "--raw-args-token", token], {
     cwd: sandbox.workDir, env, timeout: 15000
   });
   assert.equal(result.status, 1, result.stderr);
-  assert.match(result.stderr, /1\.5s flight budget/);
   const [record] = jobRecords(sandbox);
   assert.equal(record.timeoutMs, 1500);
   assert.equal(record.request.backgroundShellBudget, true);
   assert.equal(record.failureKind, "timeout");
   assert.equal(record.errorMessage, "Codex timed out after 1500ms.");
-  assert.ok(record.diagnostics.some((diagnostic) => diagnostic.message.includes("1.5s flight budget")));
 });
 
 test("foreground task deadline starts before the Codex version probe", (t) => {

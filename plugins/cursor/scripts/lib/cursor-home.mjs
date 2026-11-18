@@ -3,6 +3,9 @@ import { createHash } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { ensureHomeLink, ensurePrivateDirectories, removePrivateHome } from "./private-home.mjs";
+
+export { removePrivateHome } from "./private-home.mjs";
 
 export const CURSOR_SESSION_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
@@ -13,8 +16,7 @@ function sharedNpmCache(homeDir) {
   const cache = path.join(dataDir, "npm-cache");
   const stats = fs.lstatSync(cache, { throwIfNoEntry: false });
   if (stats && (!stats.isDirectory() || stats.isSymbolicLink())) throw new Error(`Invalid Cursor npm cache: ${cache}`);
-  fs.mkdirSync(cache, { recursive: true, mode: 0o700 });
-  fs.chmodSync(cache, 0o700);
+  ensurePrivateDirectories([cache]);
   return cache;
 }
 
@@ -26,21 +28,13 @@ export function buildPrivateHome({ homeDir, mode, cwd, env = process.env, realHo
   fs.mkdirSync(cursorDir, { recursive: true });
   const cache = sharedNpmCache(homeDir);
   const npmLink = path.join(homeDir, ".npm");
-  const npmStats = fs.lstatSync(npmLink, { throwIfNoEntry: false });
-  if (npmStats && (!npmStats.isSymbolicLink() || fs.readlinkSync(npmLink) !== cache)) removePrivateHome(npmLink);
-  if (!fs.lstatSync(npmLink, { throwIfNoEntry: false })) fs.symlinkSync(cache, npmLink, "dir");
+  ensureHomeLink(cache, npmLink, "dir");
   if (platform === "darwin") {
     const keychains = path.join(realHome, "Library", "Keychains");
     if (fs.existsSync(keychains)) {
       fs.mkdirSync(path.join(homeDir, "Library"), { recursive: true });
       const link = path.join(homeDir, "Library", "Keychains");
-      let current;
-      try { current = fs.lstatSync(link); } catch (error) { if (error.code !== "ENOENT") throw error; }
-      if (current && (!current.isSymbolicLink() || fs.readlinkSync(link) !== keychains)) {
-        removePrivateHome(link);
-        current = null;
-      }
-      if (!current) fs.symlinkSync(keychains, link);
+      ensureHomeLink(keychains, link);
     }
   }
   const configPath = path.join(cursorDir, "cli-config.json");
@@ -86,10 +80,7 @@ export function buildPrivateHome({ homeDir, mode, cwd, env = process.env, realHo
   }
   fs.writeFileSync(configPath, `${JSON.stringify(config, null, 2)}\n`, { mode: 0o600 });
   fs.writeFileSync(sandboxPath, `${JSON.stringify(sandbox, null, 2)}\n`, { mode: 0o600 });
-  for (const name of ["plugins", "skills-cursor"]) {
-    fs.mkdirSync(path.join(cursorDir, name), { recursive: true, mode: 0o555 });
-    fs.chmodSync(path.join(cursorDir, name), 0o555);
-  }
+  ensurePrivateDirectories(["plugins", "skills-cursor"].map((name) => path.join(cursorDir, name)), 0o555);
   return { homeDir, configPath, sandboxPath };
 }
 
@@ -130,16 +121,6 @@ export function projectHookFiles(cwd) {
       throw error;
     }
   });
-}
-
-export function removePrivateHome(homeDir) {
-  let stats;
-  try { stats = fs.lstatSync(homeDir); } catch (error) { if (error.code === "ENOENT") return; throw error; }
-  if (stats.isDirectory()) {
-    fs.chmodSync(homeDir, stats.mode | 0o700);
-    for (const name of fs.readdirSync(homeDir)) removePrivateHome(path.join(homeDir, name));
-  }
-  fs.rmSync(homeDir, { recursive: true, force: true });
 }
 
 function pruneHomeDirectory(directory, retained) {

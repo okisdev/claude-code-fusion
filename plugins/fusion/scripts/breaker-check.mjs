@@ -4,10 +4,9 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { spawnSync } from "node:child_process";
 
 import { ENGINES, ENGINE_IDS, PEER_RESCUE_AGENT_NAMES, engineStateRoots } from "./lib/engines.mjs";
-import { newestEngineCompanion } from "./lib/engine-acceptance.mjs";
+import { engineHostBlockers } from "./lib/engine-host-check.mjs";
 import { canonicalWorkerAgentType, readWorkerRecords } from "./lib/worker-state.mjs";
 import { tagMessage } from "./lib/user-messages.mjs";
 
@@ -40,6 +39,7 @@ const CODEX_FAILURE_PATTERNS = [
 const TRANSPORT_PERMISSION_PATTERN = /(?:sandbox|seatbelt|landlock).*(?:init|initializ|profile|policy)|(?:operation not permitted|\bEACCES\b|\bEPERM\b|permission denied).*(?:brief|prompt|transport|state|plugin|sandbox)|(?:brief|prompt|transport|state|plugin|sandbox).*(?:operation not permitted|\bEACCES\b|\bEPERM\b|permission denied)/i;
 const VERIFIED_VERSIONS_FILE = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "verified-versions.json");
 const FUSION_MANIFEST_FILE = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", ".claude-plugin", "plugin.json");
+const ENGINE_BIN_OVERRIDES = { codex: "CODEX_BIN", grok: "GROK_BIN", cursor: "CURSOR_AGENT_BIN", devin: "DEVIN_BIN" };
 
 function resolveLookbackMs(env = process.env) {
   const parsed = Number.parseFloat(String(env[LOOKBACK_ENV] ?? ""));
@@ -328,45 +328,33 @@ function wrapperDeliveryAdvisory(records, now, lookbackMs) {
     : null;
 }
 
-function hostCheckAdvisories(engine, env) {
-  const descriptor = ENGINES[engine];
-  if (!descriptor.hostCheck) {
-    return [];
-  }
-  try {
-    const override = typeof env[descriptor.companionEnv] === "string" ? env[descriptor.companionEnv].trim() : "";
-    if (override && (!path.isAbsolute(override) || !fs.statSync(override).isFile())) {
-      return [];
+function hostCheckAdvisories(engine, env, now) {
+  return engineHostBlockers(engine, env, now).map(({ kind, modes, message }) => `${ENGINES[engine].displayName} ${modes.join(", ")} runs are blocked on this host (${kind}): ${message}`);
+}
+
+function missingInstalledEngines(env) {
+  const configuredHome = typeof env.HOME === "string" ? env.HOME.trim() : "";
+  const home = path.isAbsolute(configuredHome) ? configuredHome : os.homedir();
+  return ENGINE_IDS.filter((engine) => {
+    const cache = path.join(home, ".claude", "plugins", "cache", "claude-code-fusion", engine);
+    try {
+      if (!fs.statSync(cache).isDirectory()) return false;
+    } catch {
+      return false;
     }
-    const companion = newestEngineCompanion(engine, env);
-    if (!companion) {
-      return [];
-    }
-    const configuredHome = typeof env.HOME === "string" ? env.HOME.trim() : "";
-    const home = path.isAbsolute(configuredHome) ? configuredHome : os.homedir();
-    const cacheRoot = path.join(home, ".claude", "plugins", "cache", "claude-code-fusion", engine);
-    if (!override && !companion.startsWith(`${cacheRoot}${path.sep}`)) {
-      return [];
-    }
-    const result = spawnSync(process.execPath, [companion, "host-check", "--json"], { encoding: "utf8", env, timeout: 2000 });
-    if (result.error || result.status !== 0) {
-      return [];
-    }
-    const value = JSON.parse(result.stdout);
-    const valid = Array.isArray(value?.blockers) && value.blockers.every((blocker) =>
-      blocker &&
-      typeof blocker.kind === "string" && blocker.kind.trim() && !/[\r\n]/.test(blocker.kind) &&
-      Array.isArray(blocker.modes) && blocker.modes.length > 0 &&
-      blocker.modes.every((mode) => ["consult", "write", "review"].includes(mode)) &&
-      typeof blocker.message === "string" && blocker.message.trim() && !/[\r\n]/.test(blocker.message)
-    );
-    if (!valid) {
-      return [];
-    }
-    return value.blockers.map(({ kind, modes, message }) => `${descriptor.displayName} ${modes.join(", ")} runs are blocked on this host (${kind}): ${message}`);
-  } catch {
-    return [];
-  }
+    const override = env[ENGINE_BIN_OVERRIDES[engine]];
+    const binary = typeof override === "string" && override.trim() ? override.trim() : engine === "cursor" ? "cursor-agent" : engine;
+    const candidates = binary.includes(path.sep) ? [path.resolve(binary)] : (env.PATH ?? "").split(path.delimiter).map((directory) => path.join(directory || ".", binary));
+    return !candidates.some((candidate) => {
+      try {
+        if (!fs.statSync(candidate).isFile()) return false;
+        fs.accessSync(candidate, fs.constants.X_OK);
+        return true;
+      } catch {
+        return false;
+      }
+    });
+  });
 }
 
 function run(env = process.env, now = Date.now(), write = (text) => process.stdout.write(text)) {
@@ -416,7 +404,11 @@ function run(env = process.env, now = Date.now(), write = (text) => process.stdo
     lines.push(deliveryAdvisory);
   }
   for (const engine of ENGINE_IDS) {
-    lines.push(...hostCheckAdvisories(engine, env));
+    lines.push(...hostCheckAdvisories(engine, env, now));
+  }
+  const missingEngines = missingInstalledEngines(env);
+  if (missingEngines.length) {
+    lines.push(`fusion engines unavailable (CLI missing): ${missingEngines.join(", ")}. Skip these lanes.`);
   }
   if (lines.length > 0) {
     write(`${tagMessage("breaker-check.breaker-advisory", lines.join("\n"))}\n`);

@@ -5,6 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
+import { verifyExecutionBudgets } from "./lib/execution-budget.mjs";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const companion = path.join(root, "plugins/devin/scripts/devin-companion.mjs");
@@ -301,6 +302,13 @@ test("raw transport consumes the staged request", (t) => {
   assertDone(result);
   assert.equal(fs.existsSync(created.file), false);
   assert.equal(h.messages().at(-1).params.prompt[0].text, "raw private brief");
+});
+
+test("Devin execution budgets follow the launch transport", async (t) => {
+  await verifyExecutionBudgets(t, {
+    engine: "devin", model: "swe-2", foregroundTimeoutMs: 540000,
+    createHarness: (t, env) => harness(t, "success", env)
+  });
 });
 
 test("auth, quota, policy and permission failures carry typed footers", (t) => {

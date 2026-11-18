@@ -1,13 +1,20 @@
-import { spawn, spawnSync } from "node:child_process";
+import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
+import { createProcessTransport, destroyRunStreams, executablePath, inheritChildEnv, runProcess, settleRun } from "./process-run.mjs";
 import { CURSOR_SESSION_ID_PATTERN } from "./cursor-home.mjs";
 
 export const TESTED_CURSOR_INTERVAL = { floor: "2026.10.01", ceiling: "2026.11.01" };
 
 const READ_TOOLS = ["read_tool_call", "grep_tool_call", "glob_tool_call", "ls_tool_call"];
 const WRITE_TOOLS = [...READ_TOOLS, "edit_tool_call", "delete_tool_call", "shell_tool_call", "update_todos_tool_call", "read_todos_tool_call"];
-const STDERR_MAX_BYTES = 64 * 1024;
+const { signalRunGroup, terminateRun, finishProcessGroup, startProcess } = createProcessTransport({
+  processLine: processCursorLine,
+  onStreamOverflow(run) {
+    run.outcome.protocolError ??= "Stream line exceeds size limit";
+    terminateRun(run);
+  }
+});
 
 function cursorBuildDate(value) {
   return String(value).slice(0, 10);
@@ -22,43 +29,12 @@ function processSignalable(pid) {
   }
 }
 
-function cursorGroupSignalable(pid) {
-  if (!Number.isInteger(pid) || pid <= 1) return false;
-  try {
-    process.kill(-pid, 0);
-    return true;
-  } catch (error) {
-    return error.code === "EPERM";
-  }
-}
-
-function launchCursorProcess(bin, args, cwd, env) {
-  return spawn(bin, args, { cwd, env, detached: true, stdio: ["pipe", "pipe", "pipe"] });
-}
-
 export function resolveCursorBin(env = process.env) {
   return env.CURSOR_AGENT_BIN?.trim() || "cursor-agent";
 }
 
-function joinCursorBinCandidate(directory, bin) {
-  return path.join(directory || ".", bin);
-}
-
-function executablePath(bin, env) {
-  const candidates = bin.includes(path.sep) ? [path.resolve(bin)] : String(env.PATH || "").split(path.delimiter).map((directory) => joinCursorBinCandidate(directory, bin));
-  for (const candidate of candidates) {
-    try {
-      fs.accessSync(candidate, fs.constants.X_OK);
-      return fs.realpathSync(candidate);
-    } catch {}
-  }
-  const error = new Error(`Cursor CLI executable not found: ${bin}`);
-  error.failureKind = "missing_cli";
-  throw error;
-}
-
 export function probeCursorVersion(bin, env = process.env) {
-  const buildPath = executablePath(bin, env);
+  const buildPath = executablePath(bin, env, "Cursor");
   const result = spawnSync(buildPath, ["--version"], { env, encoding: "utf8", timeout: 60000 });
   const version = String(result.stdout || "").trim();
   if (result.error || result.status !== 0 || !/^\d{4}\.\d{2}\.\d{2}-[0-9a-f]+$/.test(version)) {
@@ -98,13 +74,8 @@ export function buildCursorArgs({ mode, variant, cwd, resumeSessionId }) {
   return args;
 }
 
-function isAllowedChildEnvEntry(entry, allowed) {
-  return allowed.has(entry[0]) || entry[0].startsWith("LC_");
-}
-
 export function buildCursorChildEnv({ env = process.env, homeDir, dataDir }) {
-  const allowed = new Set(["PATH", "LANG", "LANGUAGE", "TERM", "COLORTERM", "TMPDIR", "TZ", "USER", "LOGNAME", "SHELL", "CURSOR_API_KEY", "JAVA_HOME", "GOROOT", "GOPATH", "CARGO_HOME", "RUSTUP_HOME", "PNPM_HOME", "BUN_INSTALL", "VOLTA_HOME", "MISE_DATA_DIR", "MISE_CONFIG_DIR", "MISE_CACHE_DIR", "ANDROID_HOME", "ANDROID_SDK_ROOT", "DEVELOPER_DIR", "SDKROOT"]);
-  const childEnv = Object.fromEntries(Object.entries(env).filter((entry) => isAllowedChildEnvEntry(entry, allowed)));
+  const childEnv = inheritChildEnv(env, ["CURSOR_API_KEY"]);
   childEnv.HOME = homeDir;
   childEnv.NODE_COMPILE_CACHE = path.join(dataDir, "compile-cache");
   return childEnv;
@@ -116,11 +87,6 @@ function underscoreLowercase(letter) {
 
 function toolName(key) {
   return key.replace(/[A-Z]/g, underscoreLowercase);
-}
-
-function appendTail(previous, chunk) {
-  const combined = Buffer.from(previous + chunk, "utf8");
-  return combined.subarray(Math.max(0, combined.length - STDERR_MAX_BYTES)).toString("utf8");
 }
 
 function isHomeEnvironmentEntry(value) {
@@ -186,36 +152,6 @@ export async function reapPrivateHomeHelpers(homeDir, { platform = process.platf
   return helpers;
 }
 
-function settleRun(run) {
-  if (run.settled) return;
-  run.settled = true;
-  clearTimeout(run.runTimer);
-  clearTimeout(run.exitTimer);
-  clearTimeout(run.killTimer);
-  clearTimeout(run.drainTimer);
-  clearTimeout(run.deadlineTimer);
-  run.options.signal?.removeEventListener("abort", run.abort);
-  run.resolve(run.outcome);
-}
-
-function signalRunGroup(run, signal) {
-  if (!Number.isInteger(run.pid) || run.pid <= 1) {
-    return;
-  }
-  try {
-    process.kill(-run.pid, signal);
-  } catch (error) {
-    if (error.code !== "ESRCH") {
-      run.outcome.stderrTail = appendTail(run.outcome.stderrTail, Buffer.from(`\n${error.message}`));
-    }
-  }
-}
-
-function terminateRun(run) {
-  signalRunGroup(run, "SIGTERM");
-  run.killTimer ??= setTimeout(() => signalRunGroup(run, "SIGKILL"), run.options.killGraceMs);
-}
-
 function abortRun(run) {
   if (run.settled) return;
   run.outcome.cancelled = true;
@@ -225,9 +161,7 @@ function abortRun(run) {
 async function drainRun(run) {
   if (run.settled || run.draining) return;
   run.draining = true;
-  run.child.stdout.destroy();
-  run.child.stderr.destroy();
-  run.child.stdin.destroy();
+  destroyRunStreams(run);
   signalRunGroup(run, "SIGKILL");
   await reapPrivateHomeHelpers(run.options.env?.HOME);
   settleRun(run);
@@ -274,7 +208,7 @@ function processCursorLine(run, line) {
     toolKeys = calls && typeof calls === "object" && !Array.isArray(calls) ? Object.keys(calls).filter(isToolCallKey) : [];
     for (const key of toolKeys) {
       const name = toolName(key);
-      if (!allowedToolsForMode(run.options.mode).includes(name)) {
+      if (name !== "mcp_list_servers_tool_call" && !allowedToolsForMode(run.options.mode).includes(name)) {
         outcome.policyViolation ??= name;
         terminateRun(run);
       }
@@ -327,35 +261,6 @@ function processCursorLine(run, line) {
   }
 }
 
-function handleStdoutData(run, chunk) {
-  run.stdoutRemainder += chunk;
-  let newline;
-  while ((newline = run.stdoutRemainder.indexOf("\n")) !== -1) {
-    processCursorLine(run, run.stdoutRemainder.slice(0, newline).replace(/\r$/, ""));
-    run.stdoutRemainder = run.stdoutRemainder.slice(newline + 1);
-  }
-  if (run.stdoutRemainder.length > 2 * 1024 * 1024) {
-    run.outcome.protocolError ??= "Stream line exceeds size limit";
-    run.stdoutRemainder = "";
-    terminateRun(run);
-  }
-}
-
-function handleStderrData(run, chunk) {
-  run.outcome.stderrTail = appendTail(run.outcome.stderrTail, chunk);
-}
-
-function handleStdinError(run, error) {
-  if (error.code !== "EPIPE") {
-    run.outcome.stderrTail = appendTail(run.outcome.stderrTail, Buffer.from(`\n${error.message}`));
-  }
-}
-
-function handleChildError(run, error) {
-  run.outcome.spawnError = error;
-  run.outcome.stderrTail = appendTail(run.outcome.stderrTail, Buffer.from(error.message));
-}
-
 function handleChildExit(run, code, signal) {
   run.outcome.exitCode = code;
   run.outcome.signal = signal;
@@ -385,14 +290,7 @@ async function handleChildClose(run, code, signal) {
   if (outcome.eventCount && !outcome.initSeen) {
     outcome.protocolError ??= "Missing init event";
   }
-  signalRunGroup(run, "SIGTERM");
-  const deadline = Date.now() + run.options.killGraceMs;
-  while (cursorGroupSignalable(run.pid) && Date.now() < deadline) {
-    await new Promise((done) => scheduleDelay(done, Math.min(50, deadline - Date.now())));
-  }
-  if (cursorGroupSignalable(run.pid)) {
-    signalRunGroup(run, "SIGKILL");
-  }
+  await finishProcessGroup(run);
   await reapPrivateHomeHelpers(run.options.env?.HOME);
   settleRun(run);
 }
@@ -410,46 +308,29 @@ function handleRunTimeout(run) {
 }
 
 function startCursorRun(run, resolve) {
-  run.resolve = resolve;
-  const { bin, args, cwd, env, brief, timeoutMs, exitGraceMs, killGraceMs, launchProcess, signal } = run.options;
-  try {
-    run.child = launchProcess ? launchProcess(() => launchCursorProcess(bin, args, cwd, env)) : launchCursorProcess(bin, args, cwd, env);
-  } catch (error) {
-    run.outcome.spawnError = error;
-    run.outcome.stderrTail = error.message;
-    resolve(run.outcome);
-    return;
-  }
-  run.pid = run.child.pid;
+  const { args, brief, timeoutMs, exitGraceMs, killGraceMs, signal } = run.options;
+  if (!startProcess(run, resolve, args, {
+    launchError(run, error) {
+      run.outcome.spawnError = error;
+      run.outcome.stderrTail = error.message;
+      run.resolve(run.outcome);
+    },
+    exit: handleChildExit,
+    close: handleChildClose
+  })) return;
   signal?.addEventListener("abort", run.abort, { once: true });
   if (signal?.aborted) abortRun(run);
-  run.child.stdout.setEncoding("utf8");
-  run.child.stderr.setEncoding("utf8");
-  run.child.stdout.on("data", (chunk) => handleStdoutData(run, chunk));
-  run.child.stderr.on("data", (chunk) => handleStderrData(run, chunk));
-  run.child.stdin.on("error", (error) => handleStdinError(run, error));
-  run.child.on("error", (error) => handleChildError(run, error));
-  run.child.on("exit", (code, childSignal) => handleChildExit(run, code, childSignal));
-  run.child.on("close", (code, childSignal) => handleChildClose(run, code, childSignal));
   run.deadlineTimer = setTimeout(() => handleDrainDeadline(run), timeoutMs + exitGraceMs + 2 * killGraceMs);
   run.runTimer = setTimeout(() => handleRunTimeout(run), timeoutMs);
   run.child.stdin.end(brief ?? "");
 }
 
 export function runCursor({ bin, args, cwd, env, brief, timeoutMs = 540000, exitGraceMs = 15000, killGraceMs = 5000, mode, launchProcess, signal, onInit }) {
-  const run = {
-    options: { bin, args, cwd, env, brief, timeoutMs, exitGraceMs, killGraceMs, mode, launchProcess, signal, onInit },
-    outcome: {
-      exitCode: null, signal: null, sessionId: null, requestId: null, resultText: null,
-      usage: null, observedModel: null, initSeen: false, resultSeen: false, protocolError: null,
-      policyViolation: null, timedOut: false, lateClose: false, cancelled: false, stderrTail: "", eventCount: 0
-    },
-    child: undefined, pid: undefined, resolve: undefined, abort: undefined,
-    closed: false, settled: false, draining: false, stdoutRemainder: "",
-    runTimer: undefined, exitTimer: undefined, killTimer: undefined, drainTimer: undefined, deadlineTimer: undefined
-  };
-  run.abort = () => abortRun(run);
-  return new Promise((resolve) => startCursorRun(run, resolve));
+  return runProcess({ bin, args, cwd, env, brief, timeoutMs, exitGraceMs, killGraceMs, mode, launchProcess, signal, onInit }, {
+    outcome: { initSeen: false, eventCount: 0 },
+    start: startCursorRun,
+    abort: abortRun
+  });
 }
 
 export function classifyCursorFailure(outcome) {

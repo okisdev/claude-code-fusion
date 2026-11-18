@@ -4,7 +4,7 @@ import path from "node:path";
 import { deliverWorkerEngineAcceptance, prepareEngineAcceptanceDelivery } from "../engine-acceptance.mjs";
 import { PEER_JOB_FOOTER_AGENTS, PEER_MANAGED_AGENTS, engineForAgentType, isEngineId } from "../engines.mjs";
 import { readEngineJobFailureKind } from "../engine-job-state.mjs";
-import { applyQueuedVerdict, backfillWorkerTaskOutputTelemetry, canonicalWorkerAgentType, isSettledWorker, WORKER_TERMINAL_STATUSES, markWorkerCollected, WORKER_COLLECTION_METHODS, workerRecordFile, writePrivateText } from "../worker-state.mjs";
+import { applyQueuedVerdict, backfillWorkerTaskOutputTelemetry, canonicalWorkerAgentType, isFusionWorkerAgent, isSettledWorker, WORKER_TERMINAL_STATUSES, markWorkerCollected, WORKER_COLLECTION_METHODS, workerRecordFile, writePrivateText } from "../worker-state.mjs";
 import { updateLifecycleWorkerRecord } from "./records.mjs";
 import { FINAL_TEXT_MAX_BYTES, FINAL_TEXT_HEAD_BYTES, FINAL_TEXT_TAIL_BYTES, COLLECTOR_END_MARKER, COLLECTOR_TERMINAL_MARKER, COLLECTOR_OUTCOME_MARKER, TERMINAL_RUNTIME_TASK_STATUSES, ENGINE_JOB_ID_PATTERN, WRAPPER_API_DEATH_PATTERN, WRAPPER_API_DEATH_REASON } from "./constants.mjs";
 
@@ -335,7 +335,66 @@ function wrapperApiDeathEvidence(record, evidence) {
   return PEER_RESCUE_AGENT_NAMES.has(record.agentType)
     && !record.peerJobId
     && !/^job: [0-9a-f]{32}\r?$/m.test(finalText)
-    && WRAPPER_API_DEATH_PATTERN.test(finalText);
+    && texts.some((text) => WRAPPER_API_DEATH_PATTERN.test(text));
+}
+
+function infraFinishedAt(record, now) {
+  const end = Date.parse(now);
+  const finished = Date.parse(record.finishedAt ?? "");
+  if (Number.isFinite(finished) && finished <= end) return record.finishedAt;
+  const start = Date.parse(record.lastContinuedAt ?? record.startedAt ?? record.createdAt ?? "");
+  const timestamps = [record.lastLivenessAt, record.lastProgressAt]
+    .map((value) => Date.parse(value ?? ""))
+    .filter((value) => Number.isFinite(value) && value <= end && (!Number.isFinite(start) || value >= start));
+  const activity = Date.parse(record.lastActivityAt ?? "");
+  if (timestamps.length === 0 && Number.isFinite(activity) && activity <= end && (!Number.isFinite(start) || activity >= start)) timestamps.push(activity);
+  return timestamps.length > 0 ? new Date(Math.max(...timestamps)).toISOString() : now;
+}
+
+function withClaudeQuotaFailure(record, evidence, now) {
+  const agentType = canonicalWorkerAgentType(record.agentType);
+  if (!isFusionWorkerAgent(agentType) || agentType === "fusion:job-collector") return record;
+  const text = [evidence, record.finalText, record.notificationSummary, record.statusDetail].filter((value) => typeof value === "string").join("\n");
+  if (!/(?:^|\n)\s*(?:you(?:'|’)ve hit (?:your|the) [^\n]*limit|(?:usage|quota) limit (?:reached|exceeded)|(?:reached|exceeded) (?:your|the) usage limit|out of extra usage)/i.test(text)) return record;
+  const reference = Date.parse(infraFinishedAt(record, now));
+  const resetText = text.match(/\bresets?\s+([^\n·]+)/i)?.[1]?.trim() ?? null;
+  let reset = NaN;
+  if (resetText) {
+    const date = resetText.match(/^([A-Za-z]{3,9}\s+\d{1,2})(?:,?\s+(\d{4}))?$/);
+    if (date) {
+      const year = new Date(reference).getFullYear();
+      reset = Date.parse(`${date[1]} ${date[2] ?? year}`);
+      if (!date[2] && reset <= reference) reset = Date.parse(`${date[1]} ${year + 1}`);
+    } else if (/^\d{4}-\d{2}-\d{2}/.test(resetText)) {
+      reset = Date.parse(resetText);
+    } else {
+      const time = resetText.match(/^(\d{1,2})(?::(\d{2}))?\s*(am|pm)(?:\s*\(([^)]+)\))?$/i);
+      if (time && Number(time[1]) >= 1 && Number(time[1]) <= 12 && Number(time[2] ?? 0) < 60) {
+        try {
+          const formatter = new Intl.DateTimeFormat("en-CA", { timeZone: time[4], year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", second: "2-digit", hourCycle: "h23" });
+          const parts = (at) => Object.fromEntries(formatter.formatToParts(at).map((part) => [part.type, part.value]));
+          const day = parts(reference);
+          const hour = Number(time[1]) % 12 + (time[3].toLowerCase() === "pm" ? 12 : 0);
+          const target = Date.UTC(Number(day.year), Number(day.month) - 1, Number(day.day), hour, Number(time[2] ?? 0));
+          reset = target;
+          for (let index = 0; index < 3; index += 1) {
+            const observed = parts(reset);
+            reset += target - Date.UTC(Number(observed.year), Number(observed.month) - 1, Number(observed.day), Number(observed.hour), Number(observed.minute), Number(observed.second));
+          }
+          if (reset <= reference) reset += 24 * 60 * 60 * 1000;
+        } catch {
+          reset = NaN;
+        }
+      }
+    }
+  }
+  return {
+    ...record,
+    failureKind: "quota",
+    infraFailure: true,
+    quotaResetAt: new Date(Number.isFinite(reset) ? reset : reference + 60 * 60 * 1000).toISOString(),
+    quotaResetText: Number.isFinite(reset) ? resetText : null
+  };
 }
 
 function settleWrapperApiDeath(record, evidence, now, env) {
@@ -355,7 +414,7 @@ function settleWrapperApiDeath(record, evidence, now, env) {
       failureKind: null,
       queuedAt: now
     },
-    finishedAt: record.finishedAt ?? now,
+    finishedAt: infraFinishedAt(record, now),
     lastActivityAt: now
   }, now, env);
 }
@@ -430,4 +489,4 @@ function peerIdentityBackfill(record, identity, env) {
 }
 
 
-export { completedReport, structuredCollectorReport, retryInstruction, noTaskFoundError, taskOutputTranscriptPaths, collectedHarnessAsyncDelivery, resultTextParts, documentedTaskOutputText, taskOutputResultText, absoluteOutputFile, regularFileExists, durableSubagentTranscript, withDurableCancellationTranscript, withPeerFailureKind, outputFileFromLaunchResponse, finalTextArtifactPath, boundedFinalText, writeFinalTextArtifact, peerJobIdsFromCollectedResult, peerJobIdFromCollectedResult, mergedPeerJobIds, capturedPeerIdentity, backfillCollectedTaskOutput, settleQueuedVerdict, wrapperApiDeathEvidence, settleWrapperApiDeath, isAutoSettledWrapperApiDeath, statusEvidence, settleReapedWorker, settleReapedIfActive, runtimeTaskIsTerminal, terminalTransportObserved, terminalCollectionPending, terminalCollectedRecord, peerIdentityBackfill };
+export { completedReport, structuredCollectorReport, retryInstruction, noTaskFoundError, taskOutputTranscriptPaths, collectedHarnessAsyncDelivery, resultTextParts, documentedTaskOutputText, taskOutputResultText, absoluteOutputFile, regularFileExists, durableSubagentTranscript, withDurableCancellationTranscript, withPeerFailureKind, outputFileFromLaunchResponse, finalTextArtifactPath, boundedFinalText, writeFinalTextArtifact, peerJobIdsFromCollectedResult, peerJobIdFromCollectedResult, mergedPeerJobIds, capturedPeerIdentity, backfillCollectedTaskOutput, settleQueuedVerdict, infraFinishedAt, withClaudeQuotaFailure, wrapperApiDeathEvidence, settleWrapperApiDeath, isAutoSettledWrapperApiDeath, statusEvidence, settleReapedWorker, settleReapedIfActive, runtimeTaskIsTerminal, terminalTransportObserved, terminalCollectionPending, terminalCollectedRecord, peerIdentityBackfill };

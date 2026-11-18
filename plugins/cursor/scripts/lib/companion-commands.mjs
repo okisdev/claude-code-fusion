@@ -5,8 +5,9 @@ import path from "node:path";
 import { isatty } from "node:tty";
 import { fileURLToPath } from "node:url";
 
-import { configureRawTransport, createRawCommandTransport as allocateRawCommandTransport, consumeRawCommandTransport, resolveCommandTransport } from "./raw-transport.mjs";
+import { configureRawTransport, createRawCommandTransport as allocateRawCommandTransport, consumeRawCommandTransport } from "./raw-transport.mjs";
 import { awaitOutput } from "./await-output.mjs";
+import { executionTimeoutMs, resolveExecutionTransport } from "./execution-budget.mjs";
 import { parseArgs, parseRawArgs, rawBooleanOptionRequested } from "./args.mjs";
 import { getProcessIdentity, processGroupAlive, processIdentityMatches, processIsDirectlyAlive } from "./process-identity.mjs";
 
@@ -23,6 +24,41 @@ export function errorWithFailure(message, failureKind = "input") {
 
 export function realUserHome() {
   return process.env.HOME || os.homedir();
+}
+
+export function createCleanupWaiter({ engine, reap }) {
+  const pidField = `${engine}Pid`;
+  const identityField = `${engine}PidIdentity`;
+  return async function waitForCleanup(record, { processOwned, cleanupProcessesAlive }) {
+    const deadline = Date.now() + 12000;
+    while (Date.now() < deadline) {
+      if (!cleanupProcessesAlive(record)) {
+        await reap?.(record);
+        return true;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+    for (const [pid, group] of [[record[pidField], true], [record.pid, record.background]]) {
+      if (pid !== process.pid && (group ? processGroupAlive(pid) : processIsDirectlyAlive(pid)) && (!processIsDirectlyAlive(pid) || processOwned(pid, pid === record.pid ? record.pidIdentity : record[identityField]))) {
+        try { process.kill(group ? -pid : pid, "SIGKILL"); } catch (error) { if (error.code !== "ESRCH") return false; }
+      }
+    }
+    const killDeadline = Date.now() + 500;
+    while (cleanupProcessesAlive(record) && Date.now() < killDeadline) await new Promise((resolve) => setTimeout(resolve, 25));
+    if (cleanupProcessesAlive(record)) return false;
+    await reap?.(record);
+    return true;
+  };
+}
+
+export function createModelsCommand({ engine, readCatalog, models }) {
+  return function handleModels(argv, transport, { commandArgs, output }) {
+    const { options, positionals } = commandArgs(argv, { booleanOptions: ["refresh", "json"] }, transport);
+    if (positionals.length) throw errorWithFailure("Models accepts only --refresh and --json.");
+    const catalog = readCatalog(options.refresh ? 0 : 3600000);
+    const report = { engine, models: models(catalog), source: catalog.source };
+    output(options.json ? report : report.models.map((model) => `${model.id} - ${model.displayName}`).join("\n") + "\n", options.json);
+  };
 }
 
 export function createCompanionCommands(adapter) {
@@ -189,7 +225,7 @@ export function createCompanionCommands(adapter) {
 
   async function runRecordedJob(record, file) {
     const dataDir = resolveDataDir();
-    const timeoutMs = positiveDuration(`${envPrefix}TIMEOUT_MS`, 540000);
+    const timeoutMs = positiveDuration(`${envPrefix}TIMEOUT_MS`, executionTimeoutMs(540000, record.request?.backgroundShellBudget));
     let outcome;
     let signalExitCode = null;
     try {
@@ -308,7 +344,7 @@ export function createCompanionCommands(adapter) {
     const record = createJobRecord({ id, companionVersion: COMPANION_VERSION, pid: background ? null : process.pid,
       mode, cwd, briefFile, background, claudeSessionId: currentClaudeSessionId(), jobClass: "task",
       role: taskRole(brief), ...prepared.fields, ...adapter.jobDirectory(dataDir, id),
-      request: { ...prepared.request, resumeSessionId: source?.sessionId ?? null,
+      request: { ...prepared.request, backgroundShellBudget: Boolean(transport.backgroundShell && !background), resumeSessionId: source?.sessionId ?? null,
         resumeSourceJobId: source?.id ?? null, outputJson: Boolean(options.json), ingress: transport.ingress } });
     if (source) record.resumedFromJobId = source.id;
     createJobRecordFile(file, record);
@@ -607,7 +643,7 @@ export function createCompanionCommands(adapter) {
       return;
     }
     if (command === "record-acceptance") { activeArgv = received; handleRecordAcceptance(received); return; }
-    const transport = resolveCommandTransport(received);
+    const transport = resolveExecutionTransport(command, received);
     activeArgv = transport.argv;
     activeIngress = transport.ingress;
     if (transport.defaultBackground && command !== "review" || transport.defaultWrite && command !== "task") throw errorWithFailure("The raw transport default is invalid for this command.");

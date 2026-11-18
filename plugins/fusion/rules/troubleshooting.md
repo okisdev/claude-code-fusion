@@ -41,7 +41,7 @@ When an engine is broken, use the other peers only where lane ownership or a pro
 
 The upstream Grok CLI has no default turn limit. An unset limit is unlimited. One turn is one main-agent model call plus its tool cycle; subagent calls are excluded. The companion now supplies `--max-turns 60` for both consult and write. Consult previously defaulted to 25 turns. When Grok reaches this limit, it writes the complete final JSON envelope to stdout before exiting 1 and writes `Error: max turns reached` to stderr. The companion salvages the stdout envelope, preserves partial text and usage fields, and classifies the terminal outcome as `failureKind: "turn_limit"`.
 
-Fixture heavy test authoring briefs are the dominant `turn_limit` and 570 second timeout failure family on the Grok lane. Route them to Codex, or to `fusion:claude-worker` only when the Claude surface is load bearing or the package is structurally stranded with a stated `claude-fallback: <reason>` header, or pre build the fixtures into the brief. The rescue wrapper performs a single scripted wind down resume before any redispatch is considered.
+Fixture heavy test authoring briefs are the dominant `turn_limit` and timeout failure family on the Grok lane. Route them to Codex, or to `fusion:claude-worker` only when the Claude surface is load bearing or the package is structurally stranded with a stated `claude-fallback: <reason>` header, or pre build the fixtures into the brief. The rescue wrapper performs a single scripted wind down resume before any redispatch is considered.
 
 The Grok headless JSON has no top-level `model` field. A model name appears only as a key in `modelUsage` when usage attaches, so model capture depends on that map. Error-path capture also depends on salvaging the envelope before classifying the turn limit failure. Missing `modelUsage` means that the resolved model remains unavailable.
 
@@ -52,8 +52,6 @@ Two truncation classes verified in production require recovery. A hard cap cut e
 For either signature, resume with SendMessage and instruct `write the deliverable now, no more scanning`. The resumed worker receives fresh turn headroom and a fresh lifecycle budget measured from the reopen, and typically finishes in minutes. The reopened record's `budgetBaseline` keeps the turn and token counts at the cut.
 
 The Fusion job collection bounded window is 540s while the Codex companion result wait allows 570s, so a job finishing inside that 30s gap times out the collector and is collected manually via `/codex:result`. A package dying twice on timeout is resized, not retried.
-
-The fleet reminder names the available lanes once per session. The fleet mode state file has no writer within the plugin, so suppressing the reminder needs `FUSION_FLEET_MODE=off` or an external write to that file.
 
 ## Codex startup and cache compatibility
 

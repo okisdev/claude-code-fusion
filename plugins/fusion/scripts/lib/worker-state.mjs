@@ -175,10 +175,24 @@ function rollupMonth(createdAt) {
   return Number.isFinite(timestamp) ? new Date(timestamp).toISOString().slice(0, 7) : null;
 }
 
-function rollupWallClockMs(record) {
+export function workerElapsedMs(record) {
   const started = Date.parse(record.startedAt ?? "");
   const finished = Date.parse(record.finishedAt ?? "");
-  return Number.isFinite(started) && Number.isFinite(finished) && finished >= started ? finished - started : 0;
+  if (!Number.isFinite(started) || !Number.isFinite(finished) || finished < started) return null;
+  const elapsed = finished - started;
+  const rounds = Array.isArray(record.continuations) ? record.continuations : [];
+  const continued = Date.parse(record.lastContinuedAt ?? "");
+  if (rounds.length === 0 || rounds.length !== (record.continuationCount ?? rounds.length) || !Number.isFinite(continued) || continued > finished) return elapsed;
+  let total = 0;
+  let previousEnd = started;
+  for (const round of rounds) {
+    const start = Date.parse(round.startedAt ?? "");
+    const end = Date.parse(round.finishedAt ?? "");
+    if (!Number.isFinite(start) || !Number.isFinite(end) || start < previousEnd || end < start || end > continued) return elapsed;
+    total += end - start;
+    previousEnd = end;
+  }
+  return total + finished - continued;
 }
 
 // rollup.jsonl schema v1: each line is an additive delta keyed by UTC createdAt
@@ -195,7 +209,7 @@ function workerRollup(record) {
     acceptance: record.acceptance ?? null,
     failureKind: record.failureKind ?? null,
     count: 1,
-    wallClockMsSum: rollupWallClockMs(record),
+    wallClockMsSum: workerElapsedMs(record) ?? 0,
     outputTokensSum: integer(record.usage?.outputTokens),
     uncachedTokensSum: integer(record.usage?.uncachedTokens),
     cacheReadInputTokensSum: integer(record.usage?.cacheReadInputTokens)
@@ -339,6 +353,8 @@ export function reopenWorkerContinuation(record, at = new Date().toISOString(), 
   const collectionMethod = record.collectionMethod ?? null;
   const continuation = settled ? {
     at,
+    startedAt: record.lastContinuedAt ?? record.startedAt ?? null,
+    finishedAt: record.finishedAt ?? null,
     peerJobId: record.peerJobId ?? null,
     peerJobIds,
     acceptance: record.acceptance,
@@ -628,6 +644,7 @@ export function createWorkerRecord(record, env = process.env) {
       lane: canonicalWorkerAgentType(record.agentType) ?? record.agentType,
       description: record.description ?? null,
       workspaceRoot: path.resolve(record.workspaceRoot),
+      ...(record.companionCwd ? { companionCwd: record.companionCwd } : {}),
       expectedDelivery: record.expectedDelivery ?? "foreground",
       userBackgroundAuthorized: record.userBackgroundAuthorized === true,
       transportStatus: "dispatching",

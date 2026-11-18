@@ -1,5 +1,23 @@
 # changelog
 
+## 0.0.77
+
+- this release acts on a usage review of two hosts: fourteen days of transcripts (308 main sessions, about 4,300 USD of API-equivalent main loop cost) plus the fusion and peer ledgers. turns above 200,000 tokens of context took 72% of local cost and 79% on the second host; fusion bookkeeping took 2.7% and 4.9%.
+- dispatch denies a launch that would fail before doing any work: an engine whose host check reports a blocker for the requested mode, a second codex wrapper in a workspace whose codex slot is held, and a claude worker type whose last run hit a usage limit, until the stated reset. all three grok jobs on the second host failed in 0 seconds right after the session start advisory named the blocker, and 14 codex wrappers in 14 days were rejected for a held workspace. naming the engine or agent in the prompt bypasses each denial.
+- a wrapper final text starting with `API Error:` is a wrapper death on every collection path, including Read and TaskOutput, instead of `done`. an infra death keeps its last liveness time as `finishedAt` instead of the sweep time, which reported 35,000 to 46,000 second wrappers.
+- a placeholder handback (`waiting on <id>`, `await-output: pending`) from a peer wrapper is denied, and a report stranded behind an already delivered handback is recovered from the subagent transcript and left for the orchestrator to read instead of counting as collected.
+- a worker brief missing envelope lines names every missing line in one denial with a copyable template. 36 briefs were rejected and 27 retried in two weeks, one field at a time.
+- `--record` accepts several `<id>=<verdict>` pairs after one flag, and `--reason` on an all accepted settlement is stored instead of rejected.
+- a codex write brief over 5 KB gets an advisory to split it. over seven days gpt-6.1-sol at xhigh timed out on 1% of write briefs under 2 KB, 16% at 3.5 to 5 KB, 23% at 5 to 7 KB, and 57% at 7 KB and up. the gpt-6-astra write deny and the codex companion's astra warning are gone.
+- grok, devin, and cursor tasks launched by their rescue wrapper with `--transport-background-shell` fly 900 seconds like codex; direct foreground calls keep 570 and 540. 7 devin runs and 15 grok consults hit the old caps in 30 days while successful runs commonly take 3 to 8 minutes.
+- devin and cursor no longer end a run as `policy` when the engine lists mcp servers; no server is configured.
+- the grok `independence` lane default runs at low effort: medium timed out 4 of 4 at the cap, low has a p90 of 150 seconds.
+- the per session lanes reminder is gone because it repeated the rules file, and with it `FUSION_FLEET_MODE` and the fleet mode file. the deep reasoner hint fires at most once per session and never on a prompt that asks to implement or fix.
+- session start names installed engines whose cli is missing from PATH, honoring `CODEX_BIN`, `GROK_BIN`, `CURSOR_AGENT_BIN`, and `DEVIN_BIN`.
+- codex job state runs on the shared job-state factory (state.mjs 1308 to 460 lines) and still reads, lists, collects, and prunes existing records. cursor and devin share process spawning, private homes, model catalogs, rendering, session end cleanup, run maintenance, and the review prompt through `shared/companion`.
+- the readme opens with what the plugin does, installs only the engines you use, and treats `/fusion:setup` as optional. docs fix the jev timeout (1.2 seconds), grok record retention (90 days), the unshipped best-of-n claim, the benchmark wording, the layout, and the engine contract timeout and policy rows.
+- the companion test sandbox retries its cleanup, so a background worker still writing its log no longer fails the run with `ENOTEMPTY`.
+
 ## 0.0.76
 
 - this release acts on a usage review of one host: fourteen days of transcripts, 306 main sessions and about 3,760 USD of API-equivalent main loop cost. requests above 200,000 tokens of context took 70% of it, turns started by task notifications 30%, fusion bookkeeping about 6.6%, and the rules file about 3%.

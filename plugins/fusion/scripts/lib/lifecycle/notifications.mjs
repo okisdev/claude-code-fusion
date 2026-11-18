@@ -3,9 +3,9 @@ import path from "node:path";
 import { PEER_JOB_FOOTER_AGENTS } from "../engines.mjs";
 import { WORKER_TERMINAL_STATUSES, markWorkerCollected, readWorkerSessionState, refreshWorkerTranscript, updateWorkerSessionState, WORKER_COLLECTION_METHODS } from "../worker-state.mjs";
 import { workerRoundUsage } from "./budget.mjs";
-import { absoluteOutputFile, capturedPeerIdentity, collectedHarnessAsyncDelivery, regularFileExists, settleQueuedVerdict, settleWrapperApiDeath, statusEvidence, writeFinalTextArtifact } from "./collection.mjs";
+import { absoluteOutputFile, capturedPeerIdentity, collectedHarnessAsyncDelivery, infraFinishedAt, regularFileExists, settleQueuedVerdict, settleWrapperApiDeath, statusEvidence, withClaudeQuotaFailure, wrapperApiDeathEvidence, writeFinalTextArtifact } from "./collection.mjs";
 import { sessionRecords, updateLifecycleWorkerRecord } from "./records.mjs";
-import { TASK_NOTIFICATION_SCAN_MAX_BYTES, TASK_NOTIFICATION_SCAN_CHUNK_BYTES, TASK_NOTIFICATION_MAX_LINE_BYTES, TASK_NOTIFICATION_FINAL_SCAN_MAX_BYTES, SUBAGENT_HANDBACK_TOOL, SUCCESSFUL_TASK_NOTIFICATION_STATUSES, CANCELLED_TASK_NOTIFICATION_STATUSES, FAILED_TASK_NOTIFICATION_STATUSES } from "./constants.mjs";
+import { TASK_NOTIFICATION_SCAN_MAX_BYTES, TASK_NOTIFICATION_SCAN_CHUNK_BYTES, TASK_NOTIFICATION_MAX_LINE_BYTES, TASK_NOTIFICATION_FINAL_SCAN_MAX_BYTES, SUBAGENT_HANDBACK_TOOL, HANDBACK_PLACEHOLDER_PATTERN, HANDBACK_ALREADY_DELIVERED_PATTERN, SUCCESSFUL_TASK_NOTIFICATION_STATUSES, CANCELLED_TASK_NOTIFICATION_STATUSES, FAILED_TASK_NOTIFICATION_STATUSES } from "./constants.mjs";
 
 function taskNotificationTextParts(value) {
   if (typeof value === "string") {
@@ -247,6 +247,7 @@ function finalReportFromTranscript(transcriptPath) {
   }
   const lines = text.split("\n");
   let toolResults = null;
+  const alreadyDelivered = new Set();
   for (let index = lines.length - 1; index >= 0; index -= 1) {
     const line = lines[index].replace(/\r$/, "");
     if (!line.trim() || Buffer.byteLength(line) > TASK_NOTIFICATION_MAX_LINE_BYTES) {
@@ -263,8 +264,11 @@ function finalReportFromTranscript(transcriptPath) {
       const calls = content.filter((block) => block?.type === "tool_use");
       if (calls.length > 0) {
         const [call] = calls;
-        const delivered = calls.length === 1 && call.name === SUBAGENT_HANDBACK_TOOL && toolResults?.get(call.id) === false && typeof call.input?.message === "string" && call.input.message.length > 0;
-        return delivered ? { text: call.input.message, handback: true } : null;
+        const handbackMessage = calls.length === 1 && call.name === SUBAGENT_HANDBACK_TOOL && typeof call.input?.message === "string" && call.input.message.length > 0 ? call.input.message : null;
+        if (handbackMessage && toolResults?.get(call.id) === false) {
+          return { text: handbackMessage, handback: true };
+        }
+        return handbackMessage && alreadyDelivered.has(call.id) ? { text: handbackMessage, handback: false } : null;
       }
       if (toolResults) {
         return null;
@@ -278,11 +282,43 @@ function finalReportFromTranscript(transcriptPath) {
       for (const block of content) {
         if (block?.type === "tool_result" && typeof block.tool_use_id === "string") {
           toolResults.set(block.tool_use_id, block.is_error === true);
+          if (block.is_error === true && HANDBACK_ALREADY_DELIVERED_PATTERN.test(taskNotificationTextParts(block.content).join("\n"))) {
+            alreadyDelivered.add(block.tool_use_id);
+          }
         }
       }
     }
   }
   return null;
+}
+
+function strandedHandbackFromTranscript(transcriptPath) {
+  const text = boundedTranscriptTail(transcriptPath);
+  if (text == null) {
+    return false;
+  }
+  const placeholders = new Set();
+  let stranded = false;
+  for (const line of text.split("\n")) {
+    if (!line.trim() || Buffer.byteLength(line) > TASK_NOTIFICATION_MAX_LINE_BYTES) {
+      continue;
+    }
+    let entry;
+    try {
+      entry = JSON.parse(line);
+    } catch {
+      continue;
+    }
+    for (const block of transcriptEntryContent(entry)) {
+      if (entry?.type === "assistant" && block?.type === "tool_use" && block.name === SUBAGENT_HANDBACK_TOOL && typeof block.input?.message === "string" && HANDBACK_PLACEHOLDER_PATTERN.test(block.input.message)) {
+        placeholders.add(block.id);
+      } else if (entry?.type === "user" && block?.type === "tool_result") {
+        const refused = block.is_error === true;
+        stranded ||= (placeholders.has(block.tool_use_id) && !refused) || (refused && HANDBACK_ALREADY_DELIVERED_PATTERN.test(taskNotificationTextParts(block.content).join("\n")));
+      }
+    }
+  }
+  return stranded;
 }
 
 function finalAssistantTextFromTranscript(transcriptPath) {
@@ -295,8 +331,19 @@ function taskNotificationTransition(record, notification, now, env) {
   }
   const { status } = notification;
   const refreshed = { ...refreshWorkerTranscript(record, record.transcriptPath), awaitingBackgroundCommand: undefined };
+  const finalText = finalAssistantTextFromTranscript(refreshed.transcriptPath);
+  const evidence = [finalText, statusEvidence(notification)].filter(Boolean).join("\n");
+  const cancelled = CANCELLED_TASK_NOTIFICATION_STATUSES.has(status);
+  const classified = cancelled ? refreshed : withClaudeQuotaFailure(refreshed, evidence, now);
+  if (!cancelled && (classified !== refreshed || wrapperApiDeathEvidence(refreshed, evidence))) {
+    return settleWrapperApiDeath(settleQueuedVerdict({
+      ...markWorkerCollected(classified, WORKER_COLLECTION_METHODS.TASK_NOTIFICATION, now),
+      transportStatus: "failed",
+      finishedAt: infraFinishedAt(refreshed, now),
+      lastActivityAt: now
+    }, now, env), evidence, now, env);
+  }
   if (SUCCESSFUL_TASK_NOTIFICATION_STATUSES.has(status)) {
-    const finalText = finalAssistantTextFromTranscript(refreshed.transcriptPath);
     const peerIdentity = PEER_JOB_FOOTER_AGENTS.has(refreshed.agentType)
       ? capturedPeerIdentity(refreshed.agentType, finalText ?? boundedTranscriptTailText(refreshed.transcriptPath), refreshed.peerEngine, refreshed)
       : {};
@@ -329,6 +376,18 @@ function taskNotificationTransition(record, notification, now, env) {
       }, now, env);
     }
     const harnessAsyncDelivery = collectedHarnessAsyncDelivery(refreshed, "done");
+    if (strandedHandbackFromTranscript(refreshed.transcriptPath) && !HANDBACK_PLACEHOLDER_PATTERN.test(finalText)) {
+      return settleQueuedVerdict({
+        ...refreshed,
+        transportStatus: "ready_uncollected",
+        failureKind: harnessAsyncDelivery ? null : refreshed.failureKind,
+        ...(harnessAsyncDelivery ? { deliveryMode: "harness_async" } : {}),
+        outputFile: finalTextFile,
+        ...peerIdentity,
+        finishedAt: refreshed.finishedAt ?? now,
+        lastActivityAt: now
+      }, now, env);
+    }
     return settleQueuedVerdict({
       ...markWorkerCollected(refreshed, WORKER_COLLECTION_METHODS.TASK_NOTIFICATION, now),
       transportStatus: "done",
@@ -340,7 +399,6 @@ function taskNotificationTransition(record, notification, now, env) {
       lastActivityAt: now
     }, now, env);
   }
-  const cancelled = CANCELLED_TASK_NOTIFICATION_STATUSES.has(status);
   const fallbackFailureKind = cancelled ? "cancelled" : "task_failed";
   const terminal = {
     ...markWorkerCollected(refreshed, WORKER_COLLECTION_METHODS.TASK_NOTIFICATION, now),
@@ -408,4 +466,4 @@ function reconcileTaskNotifications(input, env) {
 }
 
 
-export { taskNotificationTextParts, notificationField, taskNotificationsFromTranscriptLine, taskNotificationScanOffset, initialTaskNotificationScanOffset, parentTranscriptPathForTaskNotifications, scanTaskNotifications, transcriptEntryContent, boundedTranscriptTailText, pendingBackgroundCommandFromTranscript, finalReportFromTranscript, finalAssistantTextFromTranscript, taskNotificationTransition, reconcileTaskNotifications };
+export { taskNotificationTextParts, notificationField, taskNotificationsFromTranscriptLine, taskNotificationScanOffset, initialTaskNotificationScanOffset, parentTranscriptPathForTaskNotifications, scanTaskNotifications, transcriptEntryContent, boundedTranscriptTailText, pendingBackgroundCommandFromTranscript, finalReportFromTranscript, strandedHandbackFromTranscript, finalAssistantTextFromTranscript, taskNotificationTransition, reconcileTaskNotifications };

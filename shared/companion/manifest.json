@@ -33,14 +33,53 @@
   "job-state.mjs": [
     "plugins/grok/scripts/lib/job-state.mjs",
     "plugins/cursor/scripts/lib/job-state.mjs",
+    "plugins/codex/scripts/lib/job-state.mjs",
     "plugins/devin/scripts/lib/job-state.mjs"
   ],
   "companion-commands.mjs": [
     "plugins/cursor/scripts/lib/companion-commands.mjs",
     "plugins/devin/scripts/lib/companion-commands.mjs"
   ],
+  "execution-budget.mjs": [
+    "plugins/grok/scripts/lib/execution-budget.mjs",
+    "plugins/cursor/scripts/lib/execution-budget.mjs",
+    "plugins/devin/scripts/lib/execution-budget.mjs"
+  ],
   "render-footers.mjs": [
     "plugins/cursor/scripts/lib/render-footers.mjs",
+    "plugins/codex/scripts/lib/render-footers.mjs",
     "plugins/devin/scripts/lib/render-footers.mjs"
+  ],
+  "process-run.mjs": [
+    "plugins/cursor/scripts/lib/process-run.mjs",
+    "plugins/devin/scripts/lib/process-run.mjs"
+  ],
+  "private-home.mjs": [
+    "plugins/cursor/scripts/lib/private-home.mjs",
+    "plugins/devin/scripts/lib/private-home.mjs"
+  ],
+  "model-catalog.mjs": [
+    "plugins/cursor/scripts/lib/model-catalog.mjs",
+    "plugins/devin/scripts/lib/model-catalog.mjs"
+  ],
+  "companion-render.mjs": [
+    "plugins/cursor/scripts/lib/companion-render.mjs",
+    "plugins/devin/scripts/lib/companion-render.mjs"
+  ],
+  "run-maintenance.mjs": [
+    "plugins/cursor/scripts/lib/run-maintenance.mjs",
+    "plugins/devin/scripts/lib/run-maintenance.mjs"
+  ],
+  "session-end.mjs": [
+    "plugins/cursor/scripts/lib/session-end.mjs",
+    "plugins/devin/scripts/lib/session-end.mjs"
+  ],
+  "companion-state.mjs": [
+    "plugins/cursor/scripts/lib/companion-state.mjs",
+    "plugins/devin/scripts/lib/companion-state.mjs"
+  ],
+  "review.md": [
+    "plugins/cursor/prompts/review.md",
+    "plugins/devin/prompts/review.md"
   ]
 }

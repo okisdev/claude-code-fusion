@@ -7,8 +7,9 @@ import { fileURLToPath } from "node:url";
 import { BREADTH_ENGINE_IDS, ENGINES, ENGINE_ID_ALTERNATION, PEER_JOB_FOOTER_AGENTS, engineDisplayName, engineForAgentType, engineRoleFromBrief, routedEngineIds } from "../engines.mjs";
 import { readRoutingDefaults } from "../model-table.mjs";
 import { newestEngineCompanion } from "../engine-acceptance.mjs";
+import { engineHostBlockers } from "../engine-host-check.mjs";
 import { tagMessage } from "../user-messages.mjs";
-import { canonicalWorkerAgentType, createWorkerRecord, createWorkerTaskId, readPeerCapacityReservations, readWorkerRecords, updateWorkerSessionState, withPeerCapacityReservations, workerRecordFile, writePrivateText, WORKER_TERMINAL_STATUSES } from "../worker-state.mjs";
+import { canonicalWorkerAgentType, createWorkerRecord, createWorkerTaskId, readPeerCapacityReservations, readWorkerRecord, readWorkerRecords, updateWorkerSessionState, withPeerCapacityReservations, workerRecordFile, writePrivateText, WORKER_TERMINAL_STATUSES } from "../worker-state.mjs";
 import { workerLimits } from "./budget.mjs";
 import { sessionRecords, updateLifecycleWorkerRecord } from "./records.mjs";
 import { PARENT_CONTEXT_ADVISORY_TOKENS_ENV, VERIFICATION_MANIFEST_ENV, DEFAULT_BRIEF_MAX_BYTES, SIZING_ADVISORY_BYTES, DEFAULT_PARENT_CONTEXT_ADVISORY_TOKENS, PARENT_CONTEXT_TAIL_MAX_BYTES, BRIEF_AGENTS } from "./constants.mjs";
@@ -52,21 +53,29 @@ function optionValue(options, name) {
   return value.replace(/^(["'])(.*)\1$/s, "$2");
 }
 
-function flagshipWriteDenial(prompt, agentType, userText) {
-  if (engineForAgentType(agentType) !== ENGINES.codex.id) {
-    return null;
+function engineInfraDenial(sessionId, agentType, userText, env, now = Date.now(), prompt = "") {
+  const canonical = canonicalWorkerAgentType(agentType);
+  if (canonical && canonical !== "fusion:job-collector") {
+    const name = canonical.slice(canonical.indexOf(":") + 1);
+    if (new RegExp(String.raw`\b(?:fusion:)?${name}\b`, "i").test(userText ?? "")) return null;
+    const limited = sessionRecords(sessionId, env)
+      .filter((record) => canonicalWorkerAgentType(record.agentType) === canonical && WORKER_TERMINAL_STATUSES.has(record.transportStatus) && record.failureKind === "quota" && record.infraFailure === true && Date.parse(record.finishedAt ?? "") <= now)
+      .map((record) => {
+        const reset = Date.parse(record.quotaResetAt ?? "");
+        return { record, reset: Number.isFinite(reset) ? reset : Date.parse(record.finishedAt) + 60 * 60 * 1000 };
+      })
+      .filter(({ reset }) => reset > now)
+      .sort((left, right) => right.reset - left.reset)[0];
+    return limited ? tagMessage("worker-lifecycle.engine-infra-deny", `${canonical} hit its usage limit in this session. The quota resets ${limited.record.quotaResetText ? `${limited.record.quotaResetText} (${new Date(limited.reset).toISOString()})` : `at ${new Date(limited.reset).toISOString()} (1 hour fallback)`}. Route this package to another agent type, or name ${name} to retry.`) : null;
   }
-  const { options, brief, separated } = leadingCompanionOptions(prompt);
-  if (!separated || !options.includes("--write") || optionValue(options, "--model") !== "gpt-6-astra" || Buffer.byteLength(brief, "utf8") < 3000 || userText?.includes("gpt-6-astra")) {
-    return null;
-  }
-  return tagMessage("worker-lifecycle.flagship-write-deny", "gpt-6-astra write briefs of 3000 bytes or more time out on most flights. Split the package, or drop --model to use the codex flagship lane default.");
-}
-
-function engineInfraDenial(sessionId, agentType, userText, env, now = Date.now()) {
   const engine = engineForAgentType(agentType);
   if (!engine || new RegExp(String.raw`\b(?:${engine}|${engineDisplayName(engine)})\b`, "i").test(userText ?? "")) {
     return null;
+  }
+  const mode = leadingCompanionOptions(prompt).options.includes("--write") ? "write" : "consult";
+  const blockers = engineHostBlockers(engine, env, now).filter((blocker) => blocker.modes.includes(mode));
+  if (blockers.length > 0) {
+    return tagMessage("worker-lifecycle.engine-infra-deny", `${engineDisplayName(engine)} ${mode} runs are blocked on this host: ${blockers.map((blocker) => `${blocker.kind}: ${blocker.message}`).join("; ")} Route this package to another eligible lane, or name the engine to retry.`);
   }
   const newest = sessionRecords(sessionId, env)
     .filter((record) => WORKER_TERMINAL_STATUSES.has(record.transportStatus) && (record.peerEngine === engine || engineForAgentType(record.agentType) === engine) && Number.isFinite(Date.parse(record.finishedAt ?? "")))
@@ -223,7 +232,18 @@ function hostPeerCapacityDenial(env, now = Date.now(), totalMemoryBytes = os.tot
 }
 
 function peerReservationKey(input) {
-  return JSON.stringify([input.session_id, input.tool_use_id ?? `${input.tool_name}:${input.tool_input?.to ?? input.tool_input?.subagent_type}`]);
+  return JSON.stringify([input.session_id, input.tool_use_id ?? `${input.tool_name}:${input.tool_input?.to ?? input.tool_input?.subagent_type}:${companionCwd(input, input.tool_input?.message ?? promptText(input.tool_input))}`]);
+}
+
+function companionCwd(input, prompt = promptText(input.tool_input), fallback = input.cwd) {
+  const configured = optionValue(leadingCompanionOptions(prompt).options, "--cwd");
+  const base = typeof input.cwd === "string" && input.cwd ? input.cwd : process.cwd();
+  const cwd = path.resolve(base, configured ?? fallback ?? base);
+  try {
+    return fs.realpathSync(cwd);
+  } catch {
+    return cwd;
+  }
 }
 
 function reserveHostPeerCapacity(input, agentType, env, taskId = null, now = Date.now(), totalMemoryBytes = os.totalmem()) {
@@ -231,12 +251,21 @@ function reserveHostPeerCapacity(input, agentType, env, taskId = null, now = Dat
     const live = livePeerReservations(reservations, env, now);
     reservations.splice(0, reservations.length, ...live);
     const key = peerReservationKey(input);
-    if (reservations.some((reservation) => reservation.key === key)) {
+    if (reservations.some((reservation) => reservation.key === key) && (input.tool_use_id || engineForAgentType(agentType) !== "codex")) {
       return null;
+    }
+    const previous = taskId ? readWorkerRecord(taskId, env) : null;
+    const cwd = companionCwd(input, input.tool_input?.message ?? promptText(input.tool_input), previous?.companionCwd ?? previous?.workspaceRoot ?? input.cwd);
+    if (engineForAgentType(agentType) === "codex") {
+      const held = reservations.some((reservation) => engineForAgentType(reservation.agentType) === "codex" && (taskId === null || reservation.taskId !== taskId) && reservation.companionCwd === cwd)
+        || readWorkerRecords(env, { strict: true, modifiedSinceMs: now - workerLimits(ENGINES.codex.rescueAgent, env).wallClockMs }).some((record) => PEER_RESCUE_AGENT_NAMES.has(record.agentType) && engineForAgentType(record.agentType) === "codex" && record.taskId !== taskId && !WORKER_TERMINAL_STATUSES.has(record.transportStatus) && companionCwd({ cwd: record.companionCwd ?? record.workspaceRoot }) === cwd);
+      if (held) {
+        return tagMessage("worker-lifecycle.workspace-slot-deny", `Codex already has a wrapper running in ${cwd}. Use an isolated worktree with --cwd, or wait for that wrapper to finish.`);
+      }
     }
     const denial = hostPeerCapacityDenial(env, now, totalMemoryBytes, reservations);
     if (!denial) {
-      reservations.push({ key, sessionId: input.session_id, toolUseId: input.tool_use_id ?? null, taskId, agentType, at: now });
+      reservations.push({ key, sessionId: input.session_id, toolUseId: input.tool_use_id ?? null, taskId, agentType, companionCwd: cwd, at: now });
     }
     return denial;
   });
@@ -399,21 +428,16 @@ function validateWorkerBrief(prompt, agentType, env = process.env) {
     return { ok: false, reason: `Fusion worker brief exceeds ${maximumBytes} bytes; reduce it to the minimal self-contained task context.` };
   }
   const firstLine = prompt.split(/\r?\n/).find((line) => line.trim())?.trim();
-  if (firstLine !== "fusion-brief: v1") {
-    return { ok: false, reason: "Fusion worker briefs must start with `fusion-brief: v1`." };
-  }
   const required = [
+    [firstLine === "fusion-brief: v1", "fusion-brief: v1 (first line)"],
     [/^context-mode:\s*isolated\s*$/im, "context-mode: isolated"],
     [/^goal:\s*\S/im, "goal:"],
     [/^scope:\s*\S/im, "scope:"]
   ];
-  for (const [pattern, label] of required) {
-    if (!pattern.test(prompt)) {
-      return { ok: false, reason: `Fusion worker brief is missing \`${label}\`.` };
-    }
-  }
-  if (!/^(?:verification|acceptance):\s*\S/im.test(prompt)) {
-    return { ok: false, reason: "Fusion worker brief must include `verification:` for execution or `acceptance:` for analysis." };
+  const missing = required.filter(([check]) => typeof check === "boolean" ? !check : !check.test(prompt)).map(([, label]) => label);
+  if (!/^(?:verification|acceptance):\s*\S/im.test(prompt)) missing.push("verification: or acceptance:");
+  if (missing.length) {
+    return { ok: false, reason: `Fusion worker brief is missing required lines: ${missing.join(", ")}. Copy this envelope and fill each value:\n\nfusion-brief: v1\ncontext-mode: isolated\ngoal: <task goal>\nscope: <files or boundaries>\nverification: <check or acceptance criterion>` };
   }
   if (/\b(?:the conversation above|all previous messages|full parent transcript|inherit(?:ed)? conversation)\b/i.test(prompt)) {
     return { ok: false, reason: "Fusion workers receive a minimal isolated brief, not the parent conversation or transcript." };
@@ -581,6 +605,7 @@ function createDispatch(input, agentType, userBackgroundAuthorized, env, validat
     agentType,
     description: safeDescription(input.tool_input?.description),
     workspaceRoot: input.cwd,
+    ...(PEER_RESCUE_AGENT_NAMES.has(agentType) ? { companionCwd: companionCwd(input, prompt) } : {}),
     expectedDelivery: userBackgroundAuthorized ? "manual-background" : "foreground",
     userBackgroundAuthorized,
     parentTranscriptPath: typeof input.transcript_path === "string" ? input.transcript_path : null,
@@ -634,4 +659,4 @@ function briefArtifactPath(record, env) {
 }
 
 
-export { allowAgentWithTaskId, promptText, leadingCompanionOptions, optionValue, flagshipWriteDenial, engineInfraDenial, injectedPeerDefaults, prestagePeerPrompt, parentContextAdvisoryTokens, parentContextTokens, hostPeerCapacity, hostPeerCapacityDenial, reserveHostPeerCapacity, releaseHostPeerCapacity, verificationManifestPath, globToRegExp, readVerificationManifest, pathsNamedInBrief, missingVerificationSuites, briefAdvisories, validateWorkerBrief, externalUserText, latestUserText, latestUserRequestedBackground, safeDescription, completionContract, collectorRequestIdentity, createDispatch, claimParentContextAdvisory, briefArtifactPath };
+export { allowAgentWithTaskId, promptText, leadingCompanionOptions, optionValue, engineInfraDenial, injectedPeerDefaults, prestagePeerPrompt, parentContextAdvisoryTokens, parentContextTokens, hostPeerCapacity, hostPeerCapacityDenial, reserveHostPeerCapacity, releaseHostPeerCapacity, verificationManifestPath, globToRegExp, readVerificationManifest, pathsNamedInBrief, missingVerificationSuites, briefAdvisories, validateWorkerBrief, externalUserText, latestUserText, latestUserRequestedBackground, safeDescription, completionContract, collectorRequestIdentity, createDispatch, claimParentContextAdvisory, briefArtifactPath };

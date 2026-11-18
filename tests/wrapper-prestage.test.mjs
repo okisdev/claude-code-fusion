@@ -34,7 +34,7 @@ function sandbox(t) {
     TEMP: root
   };
   for (const engine of engines) {
-    env[ENGINES[engine].companionEnv] = path.join(repoRoot, `plugins/${engine}/scripts/${engine}-companion.mjs`);
+    env[ENGINES[engine].companionEnv] = engine === "grok" ? path.join(import.meta.dirname, "fixtures", "healthy-grok-companion.mjs") : path.join(repoRoot, `plugins/${engine}/scripts/${engine}-companion.mjs`);
     env[ENGINES[engine].dataEnv] = path.join(root, engine);
   }
   return { root, transcript, env };
@@ -147,6 +147,7 @@ test("only a deterministic leading mode stages an Agent request", (t) => {
     const output = runHook(box, event(box, "codex", prompt));
     assert.equal(output?.hookSpecificOutput?.updatedInput, undefined, prompt);
     assert.notEqual(output?.hookSpecificOutput?.permissionDecision, "deny", prompt);
+    runHook(box, { ...event(box, "codex", prompt), hook_event_name: "PostToolUse", tool_response: { status: "completed" } });
   }
   for (const [index, header] of ["read only", "READ-ONLY", "consult", "consultation"].entries()) {
     const output = runHook(box, event(box, "codex", `-- ${header}\nmodify no files`, { tool_use_id: `read-${index}` }));
@@ -212,7 +213,7 @@ test("SendMessage continuations and Task launches retain their raw request", (t)
   const continued = runHook(box, continuation);
   assert.equal(continued?.hookSpecificOutput?.updatedInput, undefined);
   assert.notEqual(continued?.hookSpecificOutput?.permissionDecision, "deny");
-  const task = runHook(box, { ...input, tool_name: "Task", tool_use_id: "task-1" });
+  const task = runHook(box, { ...input, tool_name: "Task", tool_use_id: "task-1", tool_input: { ...input.tool_input, prompt: `--cwd isolated-worktree ${prompt}` } });
   assert.equal(task?.hookSpecificOutput?.updatedInput, undefined);
   assert.notEqual(task?.hookSpecificOutput?.permissionDecision, "deny");
   assert.equal(fs.readdirSync(box.root).some((name) => name.includes("-companion-input-")), false);
@@ -220,7 +221,7 @@ test("SendMessage continuations and Task launches retain their raw request", (t)
 
 test("parallel same-engine requests without tool use ids retain their own briefs", (t) => {
   const box = sandbox(t);
-  const inputs = ["first brief", "second brief"].map((brief) => event(box, "codex", `--write -- ${brief}`, { tool_use_id: undefined }));
+  const inputs = ["first brief", "second brief"].map((brief, index) => event(box, "codex", `--cwd worktree-${index} --write -- ${brief}`, { tool_use_id: undefined }));
   for (const input of inputs) {
     const output = runHook(box, input);
     assert.notEqual(output?.hookSpecificOutput?.permissionDecision, "deny");
@@ -316,7 +317,7 @@ test("staged bytes and late brief artifacts retain injected defaults and parent 
   }));
   box.env.FUSION_MODEL_ROUTING = routing;
   fs.writeFileSync(box.transcript, `${JSON.stringify({ type: "assistant", message: { usage: { input_tokens: 1000, cache_read_input_tokens: 299000 } } })}\n`);
-  const prompt = "--write -- lane: codex quick · write\ngoal: fix quotes ' \" `code` $(literal) 多字节\nverification: node --test\n";
+  const prompt = "--cwd 'isolated worktree' --write -- lane: codex quick · write\ngoal: fix quotes ' \" `code` $(literal) 多字节\nverification: node --test\n";
   const input = event(box, "codex", prompt);
   const output = runHook(box, input);
   const staged = stagedTransport(t, box, "codex", output, "write");
@@ -332,6 +333,7 @@ test("staged bytes and late brief artifacts retain injected defaults and parent 
   assert.equal(record.description, "codex package");
   assert.equal(record.agentType, ENGINES.codex.rescueAgent);
   assert.equal(record.packageType, "implementation");
+  assert.equal(record.companionCwd, path.join(box.root, "isolated worktree"));
   assert.equal(record.parentTranscriptPath, box.transcript);
   assert.equal(record.parentTranscriptBytesAtDispatch, fs.statSync(box.transcript).size);
   assert.equal(record.parentContextTokensAtDispatch, 300000);
@@ -345,10 +347,10 @@ test("staged bytes and late brief artifacts retain injected defaults and parent 
   assert.equal(fs.readFileSync(record.briefFile, "utf8"), expected);
 });
 
-test("admission denial creates no transport", (t) => {
+test("large flagship writes stage transport", (t) => {
   const box = sandbox(t);
   const output = runHook(box, event(box, "codex", `--write --model gpt-6-astra -- ${"x".repeat(3000)}`));
-  assert.equal(output.hookSpecificOutput.permissionDecision, "deny");
-  assert.deepEqual(readPeerCapacityReservations(box.env), []);
-  assert.equal(fs.readdirSync(box.root).some((name) => name.includes("-companion-input-")), false);
+  assert.equal(output.hookSpecificOutput.permissionDecision, "allow");
+  assert.equal(readPeerCapacityReservations(box.env).length, 1);
+  assert.equal(fs.readdirSync(box.root).some((name) => name.includes("-companion-input-")), true);
 });

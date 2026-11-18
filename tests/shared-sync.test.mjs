@@ -29,11 +29,13 @@ test("check lists every drifted target and sync restores it", (t) => {
 
   const manifest = {
     "first.mjs": ["plugins/grok/first.mjs", "plugins/cursor/first.mjs"],
-    "second.mjs": ["plugins/grok/second.mjs"]
+    "second.mjs": ["plugins/grok/second.mjs"],
+    "review.md": ["plugins/cursor/prompts/review.md", "plugins/devin/prompts/review.md"]
   };
   fs.writeFileSync(path.join(companion, "manifest.json"), JSON.stringify(manifest));
   fs.writeFileSync(path.join(companion, "first.mjs"), Buffer.from([0, 255, 10]));
   fs.writeFileSync(path.join(companion, "second.mjs"), "second source\n");
+  fs.writeFileSync(path.join(companion, "review.md"), "# Review\n\nPreserve exact prompt bytes.\n");
 
   for (const [source, targets] of Object.entries(manifest)) {
     for (const target of targets) {
@@ -47,6 +49,7 @@ test("check lists every drifted target and sync restores it", (t) => {
   fs.writeFileSync(path.join(root, manifest["first.mjs"][0]), Buffer.from([0, 254, 10]));
   fs.writeFileSync(path.join(root, manifest["first.mjs"][1]), "different");
   fs.unlinkSync(path.join(root, manifest["second.mjs"][0]));
+  for (const target of manifest["review.md"]) fs.writeFileSync(path.join(root, target), "different prompt\n");
 
   const drift = runSync(fixtureScript, root, "--check");
   assert.equal(drift.status, 1, drift.stderr || drift.error?.message);

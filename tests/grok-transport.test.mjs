@@ -17,6 +17,7 @@ import {
   waitFor
 } from "./lib/companion-harness.mjs";
 import { initFixtureRepo } from "./lib/git-fixture.mjs";
+import { verifyExecutionBudgets } from "./lib/execution-budget.mjs";
 
 const {
   appendJobLog,
@@ -56,6 +57,19 @@ function ageRawTransport(transport, ageMs) {
   fs.writeFileSync(ownerFile, `${JSON.stringify({ ...owner, createdAt: Date.now() - ageMs })}\n`);
   fs.chmodSync(ownerFile, 0o600);
 }
+
+test("Grok execution budgets follow the launch transport", async (t) => {
+  await verifyExecutionBudgets(t, {
+    engine: "grok", foregroundTimeoutMs: 570000, backgroundTimeoutMs: 1800000,
+    createHarness(t, extraEnv) {
+      const sandbox = makeSandbox(t);
+      const env = envFor(sandbox, extraEnv);
+      return { root: sandbox.root, env,
+        run: (args) => runCompanion(args, { cwd: sandbox.workDir, env }),
+        jobs: () => jobRecords(sandbox.dataDir) };
+    }
+  });
+});
 
 test("every Grok slash command keeps raw arguments out of shell command text", () => {
   for (const name of ["task", "review", "status", "history", "result", "cancel", "stats", "setup"]) {

@@ -88,7 +88,7 @@ The `session/prompt` result is `{ stopReason, usage: { totalTokens, inputTokens,
 | `rate_limited` | rate limit, too many requests, or HTTP 429 text |
 | `network` | DNS failure, connection refused or reset, or fetch failure before the prompt result |
 | `permission` | `agent_stopped` cause `tool_rejected`, meaning a deny rule refused a tool call and the agent ended the turn |
-| `policy` | a tool outside the mode's list appeared in the stream |
+| `policy` | a tool outside the mode's list appeared in the stream; `request_scope` and `mcp_list_servers` are exempt because the first is refused like any permission request and the second finds no configured server |
 | `refused` | `stopReason: "refusal"`; the breaker ignores it, as for Codex |
 | `protocol` | malformed stream, unexpected response id, or an exit before the prompt result |
 | `timeout` | the run timeout elapsed and the group was terminated |

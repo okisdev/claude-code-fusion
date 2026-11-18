@@ -16,7 +16,7 @@ Present the setup output to the user.
 - Preserve the model catalog refresh result and the project configuration advisory.
 - Preserve warnings for `.devin/config.json`, `.devin/config.local.json`, `.devin/mcp_config.json`, and `.devin/mcp_config.local.json` in the working directory. These files can add permissions, hooks, MCP servers, or imports.
 - A direct `/devin:*` command without `--model` uses the account default model. Fusion routed dispatches carry an explicit model and effort from the routing table.
-- A CLI installation, version, or required capability preflight failure persists and renders failure kind `setup`. Preserve its upgrade or repair guidance and tell the user to rerun `/devin:setup`.
+- A CLI installation, version, or required capability preflight failure persists and renders failure kind `setup`. Preserve its upgrade or repair guidance and tell the user to rerun `/devin:setup`; do not retry the unchanged task against the incompatible surface.
 - Job records, briefs, the shared private home, and per job configuration live under `~/.claude/plugins/data/devin-claude-code-fusion/` unless `DEVIN_COMPANION_DATA` overrides it. SessionEnd attempts verified process cleanup for jobs owned by that Claude session, removes unused raw transports, and sweeps orphan run directories.
 
 The opaque raw request begins after the next newline and continues to the end of this command prompt:

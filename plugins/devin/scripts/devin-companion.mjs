@@ -5,11 +5,10 @@ import path from "node:path";
 import { resolveDevinBin, probeDevinVersion, compareDevinVersion, TESTED_DEVIN_INTERVAL, buildDevinChildEnv, runDevin, classifyDevinFailure } from "./lib/devin-exec.mjs";
 import { ensurePrivateHome, buildJobConfig, worktreeGitDirs, projectConfigFiles } from "./lib/devin-home.mjs";
 import { readModelCatalog, findCatalogFamily, createSelectionResolver, createSpeedResolver, billingPoolForModel, isPinnableFamily } from "./lib/devin-models.mjs";
-import { processGroupAlive, processIsDirectlyAlive } from "./lib/process-identity.mjs";
 import * as render from "./lib/render.mjs";
 import * as state from "./lib/state.mjs";
 import { cleanupRawCommandTransportsForSession } from "./lib/raw-transport.mjs";
-import { createCompanionCommands, errorWithFailure, realUserHome } from "./lib/companion-commands.mjs";
+import { createCleanupWaiter, createCompanionCommands, createModelsCommand, errorWithFailure, realUserHome } from "./lib/companion-commands.mjs";
 
 export { cleanupRawCommandTransportsForSession };
 
@@ -60,31 +59,17 @@ function outcomeFields(outcome) {
     stopCause: outcome.stopCause, effortApplied: outcome.effortApplied ?? false };
 }
 
-async function waitForCleanup(record, { processOwned, cleanupProcessesAlive }) {
-  const deadline = Date.now() + 12000;
-  while (Date.now() < deadline) {
-    if (!cleanupProcessesAlive(record)) return true;
-    await new Promise((resolve) => setTimeout(resolve, 50));
-  }
-  for (const [pid, group] of [[record.devinPid, true], [record.pid, record.background]]) {
-    if (pid !== process.pid && (group ? processGroupAlive(pid) : processIsDirectlyAlive(pid)) && (!processIsDirectlyAlive(pid) || processOwned(pid, pid === record.pid ? record.pidIdentity : record.devinPidIdentity))) {
-      try { process.kill(group ? -pid : pid, "SIGKILL"); } catch (error) { if (error.code !== "ESRCH") return false; }
-    }
-  }
-  const killDeadline = Date.now() + 500;
-  while (cleanupProcessesAlive(record) && Date.now() < killDeadline) await new Promise((resolve) => setTimeout(resolve, 25));
-  return !cleanupProcessesAlive(record);
-}
+const waitForCleanup = createCleanupWaiter({ engine: "devin" });
 
-function handleModels(argv, transport, { commandArgs, output }) {
-  const { options, positionals } = commandArgs(argv, { booleanOptions: ["refresh", "json"] }, transport);
-  if (positionals.length) throw errorWithFailure("Models accepts only --refresh and --json.");
-  const dataDir = state.resolveDataDir();
-  const { homeDir } = ensurePrivateHome({ dataDir, realHome: realUserHome() });
-  const catalog = readModelCatalog({ dataDir, bin: probeDevinVersion(resolveDevinBin()).buildPath, env: buildDevinChildEnv({ homeDir, configDir: path.join(homeDir, ".config"), mode: "consult" }), maxAgeMs: options.refresh ? 0 : 3600000 });
-  const report = { engine: "devin", models: catalog.families.filter(isPinnableFamily).map(({ slug, label }) => ({ id: slug, displayName: label })), source: catalog.source };
-  output(options.json ? report : report.models.map((model) => `${model.id} - ${model.displayName}`).join("\n") + "\n", options.json);
-}
+const handleModels = createModelsCommand({
+  engine: "devin",
+  readCatalog(maxAgeMs) {
+    const dataDir = state.resolveDataDir();
+    const { homeDir } = ensurePrivateHome({ dataDir, realHome: realUserHome() });
+    return readModelCatalog({ dataDir, bin: probeDevinVersion(resolveDevinBin()).buildPath, env: buildDevinChildEnv({ homeDir, configDir: path.join(homeDir, ".config"), mode: "consult" }), maxAgeMs });
+  },
+  models: (catalog) => catalog.families.filter(isPinnableFamily).map(({ slug, label }) => ({ id: slug, displayName: label }))
+});
 
 function handleSetup(argv, transport, { commandArgs, output }) {
   const { options, positionals } = commandArgs(argv, { booleanOptions: ["json"] }, transport);

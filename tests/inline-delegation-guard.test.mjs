@@ -293,8 +293,7 @@ test("legacy strict environment and persisted posture behave exactly like the de
     for (let index = 0; index < 2; index += 1) {
       const fleet = spawnSync(process.execPath, [path.join(repoRoot, "plugins/fusion/scripts/fleet-posture.mjs")], { env, input: prompt, encoding: "utf8" });
       assert.strictEqual(fleet.status, 0, fleet.stderr);
-      if (index === 0) assertMessageTagged(JSON.parse(fleet.stdout).hookSpecificOutput.additionalContext, "fleet-posture.session-lanes-reminder");
-      else assert.strictEqual(fleet.stdout, "");
+      assert.strictEqual(fleet.stdout, "");
       outputs.push(fleet.stdout);
     }
     const config = spawnSync(process.execPath, [path.join(repoRoot, "plugins/fusion/scripts/fusion-config.mjs"), "show", "--json"], { env, encoding: "utf8" });
@@ -2472,7 +2471,7 @@ test("all plugin node hooks fail open without node and compact text is exact", (
     }
     if (plugin === "fusion") {
       const compactCommand = hooks.SessionStart.flatMap((group) => group.hooks).find((hook) => hook.command.includes("[fusion:9902]"))?.command;
-      assert.strictEqual(compactCommand, "echo 'Context was compacted. In one line, restate the execution posture and every in-flight Fusion task still owed collection, verification, or settlement. [fusion:9902]'");
+      assert.strictEqual(compactCommand, "echo 'Fusion rules are in ~/.claude/rules/orchestration.md. Collect and settle any in-flight work. [fusion:9902]'");
     }
   }
 });

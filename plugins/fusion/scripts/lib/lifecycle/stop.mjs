@@ -345,7 +345,6 @@ function handleStop(input, env) {
         ...(successfulTerminal && worker.failureKind ? { recoveredFailureKind: worker.failureKind } : {}),
         cancelReason: failure?.reason ?? worker.cancelReason,
         stopBlockCount: advisoryRound ? worker.stopBlockCount ?? 0 : (worker.stopBlockCount ?? 0) + 1,
-        ...(wrapperApiDeath ? { finishedAt: worker.finishedAt ?? now, lastActivityAt: now } : {})
       };
       return wrapperApiDeath ? settleWrapperApiDeath(transitioned, statusEvidence(task), now, env) : transitioned;
     });

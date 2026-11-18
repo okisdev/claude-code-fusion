@@ -1,31 +1,27 @@
+import { renderFooterLines } from "./render-footers.mjs";
+
 function footer(record) {
-  const lines = [];
-  if (record.threadId) {
-    lines.push(`codex-session: ${record.threadId}`);
-  }
-  lines.push(`job: ${record.id}`);
-  if (/^[a-f0-9]{32}$/.test(record.request?.resumeSourceJobId ?? "")) {
-    lines.push(`resumed-from: ${record.request.resumeSourceJobId}`);
-  }
-  lines.push(`sandbox: ${record.cwd}`, `delivery: ${record.delivery ?? (record.background ? "manual" : "foreground")}`, `semantic: ${record.semanticStatus ?? "unverified"}`);
+  const details = [];
+  const warnings = [];
   if (record.request?.outputSchemaFile) {
-    lines.push(`structured: ${record.structuredOutputError ? "invalid" : Object.hasOwn(record, "structuredOutput") ? "parsed" : "unavailable"}`);
+    details.push(`structured: ${record.structuredOutputError ? "invalid" : Object.hasOwn(record, "structuredOutput") ? "parsed" : "unavailable"}`);
   }
-  if (record.orphanCleanupWarning) {
-    lines.push(`warning: ${record.orphanCleanupWarning}`);
-  }
+  if (record.orphanCleanupWarning) warnings.push(record.orphanCleanupWarning);
   if (["done", "error", "cancelled"].includes(record.status) && record.modelDrift) {
     if (Object.hasOwn(record.modelDrift, "requestedModel")) {
-      lines.push(`warning: the request named ${record.modelDrift.requestedModel} but the job ran ${record.modelDrift.resolvedModel}; Codex substituted the model, which after a Luna Reserve handoff means the account's advanced model allowance is exhausted.`);
+      warnings.push(`the request named ${record.modelDrift.requestedModel} but the job ran ${record.modelDrift.resolvedModel}; Codex substituted the model, which after a Luna Reserve handoff means the account's advanced model allowance is exhausted.`);
     } else {
-      lines.push(`warning: brief header names ${record.modelDrift.headerModel} but the job ran ${record.modelDrift.resolvedModel}; pass --model to select the model.`);
+      warnings.push(`brief header names ${record.modelDrift.headerModel} but the job ran ${record.modelDrift.resolvedModel}; pass --model to select the model.`);
     }
   }
-  lines.push(`state: ${record.status}`);
-  if (record.status === "error" || record.status === "cancelled") {
-    lines.push(`failure: ${record.failureKind ?? (record.status === "cancelled" ? "cancelled" : "error")}`);
-  }
-  return lines.join("\n");
+  return renderFooterLines({
+    ...record,
+    sessionId: record.threadId,
+    resumedFromJobId: /^[a-f0-9]{32}$/.test(record.request?.resumeSourceJobId ?? "") ? record.request.resumeSourceJobId : null,
+    delivery: record.delivery ?? (record.background ? "manual" : "foreground"),
+    semanticStatus: record.semanticStatus ?? "unverified",
+    warnings
+  }, "codex", details).join("\n");
 }
 
 function withFooter(body, record) {
@@ -58,11 +54,7 @@ export function renderBackgroundLaunch(record) {
     `Use /codex:status ${record.id} to inspect it.`,
     `Use /codex:result ${record.id} to collect the terminal result.`,
     "",
-    `job: ${record.id}`,
-    `sandbox: ${record.cwd}`,
-    `delivery: ${record.delivery ?? "manual"}`,
-    ...(record.orphanCleanupWarning ? [`warning: ${record.orphanCleanupWarning}`] : []),
-    "state: running",
+    ...renderFooterLines({ id: record.id, cwd: record.cwd, delivery: record.delivery ?? "manual", warnings: record.orphanCleanupWarning ? [record.orphanCleanupWarning] : [], status: "running" }, "codex"),
     ""
   ].join("\n");
 }
@@ -93,10 +85,7 @@ export function renderRunningResult(record) {
     `Elapsed: ${ageSeconds(record.startedAt ?? record.createdAt) ?? 0}s`,
     `Use /codex:status ${record.id} for progress.`,
     "",
-    `job: ${record.id}`,
-    `sandbox: ${record.cwd}`,
-    ...(record.orphanCleanupWarning ? [`warning: ${record.orphanCleanupWarning}`] : []),
-    "state: running",
+    ...renderFooterLines({ id: record.id, cwd: record.cwd, warnings: record.orphanCleanupWarning ? [record.orphanCleanupWarning] : [], status: "running" }, "codex"),
     ""
   ];
   return lines.join("\n");

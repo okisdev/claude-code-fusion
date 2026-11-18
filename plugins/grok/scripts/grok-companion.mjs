@@ -1,8 +1,9 @@
 #!/usr/bin/env node
 
 import path from "node:path";
-import { configureRawTransport, createRawCommandTransport as allocateRawCommandTransport, consumeRawCommandTransport, cleanupRawCommandTransportsForSession, resolveCommandTransport } from "./lib/raw-transport.mjs";
+import { configureRawTransport, createRawCommandTransport as allocateRawCommandTransport, consumeRawCommandTransport, cleanupRawCommandTransportsForSession } from "./lib/raw-transport.mjs";
 import { awaitOutput } from "./lib/await-output.mjs";
+import { resolveExecutionTransport } from "./lib/execution-budget.mjs";
 import { rawBooleanOptionRequested } from "./lib/args.mjs";
 import { SESSION_ID_ENV } from "./lib/state.mjs";
 import { commandContext, output, errorWithFailure } from "./lib/companion/base.mjs";
@@ -103,7 +104,7 @@ async function main() {
     handleRecordAcceptance(receivedArgv);
     return;
   }
-  const transport = resolveCommandTransport(receivedArgv);
+  const transport = resolveExecutionTransport(subcommand, receivedArgv);
   commandContext.argv = transport.argv;
   commandContext.ingress = transport.ingress;
   if (transport.defaultWrite && subcommand !== "task") {

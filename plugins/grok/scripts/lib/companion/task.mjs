@@ -98,6 +98,7 @@ async function handleTask(argv, transport = {}) {
       jobClass: "task",
       role,
       request: {
+        backgroundShellBudget: Boolean(transport.backgroundShell && !background),
         model: options.model ?? null,
         effort: options.effort ?? null,
         maxTurns,
@@ -153,7 +154,7 @@ async function handleTask(argv, transport = {}) {
   }
 
   const logFile = jobLogPath(dataDir, cwd, jobId);
-  const timeoutMs = resolveTimeoutMs({ env: process.env });
+  const timeoutMs = resolveTimeoutMs({ backgroundShell: record.request.backgroundShellBudget, env: process.env });
   let result;
   try {
     result = await runGrok({

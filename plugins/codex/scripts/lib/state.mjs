@@ -1,30 +1,20 @@
 import { createHash, randomBytes } from "node:crypto";
 import fs from "node:fs";
-import os from "node:os";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
 
 import { getProcessIdentity, isProcessAlive, processIdentityMatches } from "./codex-exec.mjs";
 import { observedEventLine } from "./codex-events.mjs";
-import { configureRecordLock, withRecordLock } from "./record-lock.mjs";
+import { withRecordLock } from "./record-lock.mjs";
+import { createJobState } from "./job-state.mjs";
 
-const DATA_DIR_ENV = "CODEX_COMPANION_DATA";
 const JOB_SCHEMA_VERSION = 1;
-const JOB_LOG_MAX_BYTES = 1024 * 1024;
 const JOB_EVENTS_MAX_BYTES = 8 * 1024 * 1024;
-const JOB_RECORD_SCAN_MAX_BYTES = 16 * 1024 * 1024;
-const LOG_TAIL_MAX_BYTES = 64 * 1024;
-const LOCK_TIMEOUT_ENV = "CODEX_COMPANION_LOCK_TIMEOUT_MS";
-const LOCK_RETRY_MS = 20;
-const PRIVATE_DIR_MODE = 0o700;
 const PRIVATE_FILE_MODE = 0o600;
 const STATE_MAX_BYTES_ENV = "CODEX_COMPANION_HISTORY_MAX_BYTES";
 const STATE_MAX_RECORDS_ENV = "CODEX_COMPANION_HISTORY_MAX_RECORDS";
 const RECORD_MAX_RECORDS_ENV = "CODEX_COMPANION_RECORD_MAX_RECORDS";
 const RECORD_RETENTION_DAYS_ENV = "CODEX_COMPANION_RECORD_RETENTION_DAYS";
-const GC_INTERVAL_MS = 60 * 1000;
-const ORPHAN_AGE_MS = 24 * 60 * 60 * 1000;
-const TEMP_AGE_MS = 60 * 60 * 1000;
 const JOB_STATUSES = new Set(["running", "done", "error", "cancelled"]);
 const DELIVERY_MODES = new Set(["foreground", "manual", "managed"]);
 const SEMANTIC_STATUSES = new Set(["accepted", "rejected", "unverified"]);
@@ -35,7 +25,6 @@ const JOB_REQUIRED_FIELDS = ["claudeSessionId", "delivery", "deliveryCollectedAt
   "semanticFailureKind", "semanticFailureMessage", "serviceTier", "resolvedModel", "resolvedEffort",
   "timeoutMs", "companionVersion"];
 const JOB_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
-const WORKSPACE_SLUG_PATTERN = /^.+-[a-f0-9]{16}$/;
 const GIT_CACHE_TTL_MS = 3000;
 const GIT_CACHE_MAX_ENTRIES = 128;
 const gitValueCache = new Map();
@@ -44,23 +33,52 @@ export const DEFAULT_JOB_HISTORY_MAX_BYTES = 512 * 1024 * 1024;
 export const DEFAULT_JOB_HISTORY_MAX_RECORDS = 256;
 export const DEFAULT_JOB_RECORD_MAX_RECORDS = 5000;
 export const DEFAULT_JOB_RECORD_RETENTION_DAYS = 90;
-export const DEFAULT_LOCK_TIMEOUT_MS = 5000;
 export const TERMINAL_STATUSES = new Set(["done", "error", "cancelled"]);
-export const SESSION_ID_ENV = "CLAUDE_CODE_SESSION_ID";
 
-export function resolveLockTimeoutMs(env = process.env) {
-  const raw = env[LOCK_TIMEOUT_ENV];
-  if (raw === undefined || raw === null || (typeof raw === "string" && !String(raw).trim())) {
-    return DEFAULT_LOCK_TIMEOUT_MS;
+const jobState = createJobState({
+  engine: "codex",
+  engineName: "Codex",
+  pidField: "codexPid",
+  dataDirEnv: "CODEX_COMPANION_DATA",
+  lockTimeoutEnv: "CODEX_COMPANION_LOCK_TIMEOUT_MS",
+  dataDirName: "codex-claude-code-fusion",
+  resolveWorkspace: canonicalWorkspaceRoot,
+  validateIdentifier,
+  compareRecords: (left, right) => String(right.createdAt ?? "").localeCompare(String(left.createdAt ?? "")),
+  recordFields: codexRecordFields,
+  history: { resolveLimits: resolveJobHistoryLimits, artifacts: expectedManagedArtifacts, protect: protectedManagedJobs },
+  migrate: migrateJobRecord,
+  validateRecord(record) {
+    assertJobRecord(record);
+    return true;
+  },
+  normalizeRecord(record) {
+    const { sessionId, modelDrift, codexBuildPath, requestId, requestedModel, observedModel, requestedEffort,
+      effortApplied, billingPool, role, usage, cleanupRequired, deliveryStatus, resultPayload, warnings, transportStatus, ...next } = record;
+    return modelDrift ? { ...next, modelDrift } : next;
+  },
+  recordLock: {
+    reaperClaimPath(lockDir, token, predecessorToken) {
+      return `${lockDir}.owner.${token}.reap${predecessorToken ? `-successor-${predecessorToken}` : ""}`;
+    },
+    onReleaseError(error) { throw error; }
+  },
+  onCorruptRecord: quarantineCorruptRecord,
+  onReadError(error) {
+    if (error?.code !== "ENOENT") throw error;
   }
-  const parsed = typeof raw === "number" ? raw : Number(String(raw).trim());
-  return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : DEFAULT_LOCK_TIMEOUT_MS;
-}
+});
+
+export const {
+  SESSION_ID_ENV, DEFAULT_LOCK_TIMEOUT_MS, resolveLockTimeoutMs, resolveDataDir,
+  workspaceSlug, workspaceStateDir, jobsDir, briefsDir, jobFilePath, jobLogPath, briefPath,
+  generateJobId, nowIso, readJobRecordFile, listJobRecords, listAllJobRecords, readLogTail, pruneJobState
+} = jobState;
+
+const atomicWriteFile = jobState.writePrivateStateFile;
 
 function requiredPath(value, label) {
-  if (typeof value !== "string" || !value.trim()) {
-    throw new TypeError(`${label} is required.`);
-  }
+  if (typeof value !== "string" || !value.trim()) throw new TypeError(`${label} is required.`);
   return path.resolve(value.trim());
 }
 
@@ -68,25 +86,19 @@ function canonicalPath(value) {
   const resolved = path.resolve(value);
   try {
     return fs.realpathSync.native(resolved);
-  } catch {
-    return resolved;
-  }
+  } catch { return resolved; }
 }
 
 function gitValue(cwd, args) {
   const key = `${cwd}\0${args.join("\0")}`;
   const cached = gitValueCache.get(key);
-  if (cached && cached.expiresAt > Date.now()) {
-    return cached.value;
-  }
+  if (cached && cached.expiresAt > Date.now()) return cached.value;
   gitValueCache.delete(key);
   const result = spawnSync("git", ["-C", cwd, ...args], {
     encoding: "utf8",
     stdio: ["ignore", "pipe", "ignore"]
   });
-  if (result.error || result.status !== 0) {
-    return null;
-  }
+  if (result.error || result.status !== 0) return null;
   const value = String(result.stdout ?? "").trim();
   if (value) {
     if (gitValueCache.size >= GIT_CACHE_MAX_ENTRIES) {
@@ -98,83 +110,9 @@ function gitValue(cwd, args) {
 }
 
 function validateIdentifier(value, label) {
-  if (typeof value !== "string" || !JOB_ID_PATTERN.test(value)) {
-    throw new TypeError(`${label} is invalid.`);
-  }
+  if (typeof value !== "string" || !JOB_ID_PATTERN.test(value)) throw new TypeError(`${label} is invalid.`);
   return value;
 }
-
-function ensurePrivateDir(dir) {
-  fs.mkdirSync(dir, { recursive: true, mode: PRIVATE_DIR_MODE });
-  fs.chmodSync(dir, PRIVATE_DIR_MODE);
-}
-
-function fsyncDirectory(dir) {
-  let descriptor;
-  try {
-    descriptor = fs.openSync(dir, "r");
-    fs.fsyncSync(descriptor);
-  } catch {
-    return;
-  } finally {
-    if (descriptor !== undefined) {
-      fs.closeSync(descriptor);
-    }
-  }
-}
-
-function atomicWriteFile(file, content, retryMissingDirectory = true) {
-  const dir = path.dirname(file);
-  const temp = `${file}.${process.pid}.${randomBytes(8).toString("hex")}.tmp`;
-  const deadline = Date.now() + resolveLockTimeoutMs();
-  let descriptor;
-  try {
-    while (descriptor === undefined) {
-      try {
-        ensurePrivateDir(dir);
-        descriptor = fs.openSync(temp, "wx", PRIVATE_FILE_MODE);
-      } catch (error) {
-        if (error?.code !== "ENOENT" || !retryMissingDirectory || Date.now() >= deadline) {
-          throw error;
-        }
-        sleepMs(LOCK_RETRY_MS);
-      }
-    }
-    fs.writeFileSync(descriptor, content, "utf8");
-    fs.chmodSync(temp, PRIVATE_FILE_MODE);
-    fs.fsyncSync(descriptor);
-    fs.closeSync(descriptor);
-    descriptor = undefined;
-    fs.renameSync(temp, file);
-    fsyncDirectory(dir);
-  } finally {
-    if (descriptor !== undefined) {
-      try {
-        fs.closeSync(descriptor);
-      } catch {}
-    }
-    try {
-      fs.rmSync(temp, { force: true });
-    } catch {}
-  }
-}
-
-function sleepMs(ms) {
-  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
-}
-
-configureRecordLock({
-  atomicWriteFile,
-  ensurePrivateDir,
-  ensurePrivateStatePath: ensurePrivateDir,
-  resolveLockTimeoutMs,
-  reaperClaimPath(lockDir, token, predecessorToken) {
-    return `${lockDir}.owner.${token}.reap${predecessorToken ? `-successor-${predecessorToken}` : ""}`;
-  },
-  onReleaseError(error) {
-    throw error;
-  }
-});
 
 function quarantineCorruptRecord(file) {
   const quarantine = `${file}.corrupt.${Date.now()}.${process.pid}.${randomBytes(4).toString("hex")}`;
@@ -182,40 +120,20 @@ function quarantineCorruptRecord(file) {
     fs.renameSync(file, quarantine);
     fs.chmodSync(quarantine, PRIVATE_FILE_MODE);
     return quarantine;
-  } catch {
-    return null;
-  }
+  } catch { return null; }
 }
 
 function assertJobRecord(record) {
-  if (!record || typeof record !== "object" || Array.isArray(record)) {
-    throw new TypeError("Job record must be an object.");
-  }
+  if (!record || typeof record !== "object" || Array.isArray(record)) throw new TypeError("Job record must be an object.");
   validateIdentifier(record.id, "Job id");
-  if (!JOB_STATUSES.has(record.status)) {
-    throw new TypeError("Job status is invalid.");
-  }
-  if (record.delivery != null && !DELIVERY_MODES.has(record.delivery)) {
-    throw new TypeError("Job delivery mode is invalid.");
-  }
-  if (record.semanticStatus != null && !SEMANTIC_STATUSES.has(record.semanticStatus)) {
-    throw new TypeError("Job semantic status is invalid.");
-  }
-  if (record.semanticFailureKind != null && record.semanticFailureKind !== "policy" && !SEMANTIC_FAILURE_KINDS.has(record.semanticFailureKind)) {
-    throw new TypeError("Job semantic failure kind is invalid.");
-  }
-  if (record.acceptanceSource != null && !ACCEPTANCE_SOURCES.has(record.acceptanceSource)) {
-    throw new TypeError("Job acceptance source is invalid.");
-  }
-  if (record.acceptanceRecordedAt != null && (typeof record.acceptanceRecordedAt !== "string" || !Number.isFinite(Date.parse(record.acceptanceRecordedAt)))) {
-    throw new TypeError("Job acceptance recorded timestamp is invalid.");
-  }
-  if (record.timeoutMs != null && (!Number.isSafeInteger(record.timeoutMs) || record.timeoutMs <= 0)) {
-    throw new TypeError("Job timeout is invalid.");
-  }
-  if (record.companionVersion != null && (typeof record.companionVersion !== "string" || !record.companionVersion.trim())) {
-    throw new TypeError("Job companion version is invalid.");
-  }
+  if (!JOB_STATUSES.has(record.status)) throw new TypeError("Job status is invalid.");
+  if (record.delivery != null && !DELIVERY_MODES.has(record.delivery)) throw new TypeError("Job delivery mode is invalid.");
+  if (record.semanticStatus != null && !SEMANTIC_STATUSES.has(record.semanticStatus)) throw new TypeError("Job semantic status is invalid.");
+  if (record.semanticFailureKind != null && record.semanticFailureKind !== "policy" && !SEMANTIC_FAILURE_KINDS.has(record.semanticFailureKind)) throw new TypeError("Job semantic failure kind is invalid.");
+  if (record.acceptanceSource != null && !ACCEPTANCE_SOURCES.has(record.acceptanceSource)) throw new TypeError("Job acceptance source is invalid.");
+  if (record.acceptanceRecordedAt != null && (typeof record.acceptanceRecordedAt !== "string" || !Number.isFinite(Date.parse(record.acceptanceRecordedAt)))) throw new TypeError("Job acceptance recorded timestamp is invalid.");
+  if (record.timeoutMs != null && (!Number.isSafeInteger(record.timeoutMs) || record.timeoutMs <= 0)) throw new TypeError("Job timeout is invalid.");
+  if (record.companionVersion != null && (typeof record.companionVersion !== "string" || !record.companionVersion.trim())) throw new TypeError("Job companion version is invalid.");
   if (record.schemaVersion !== JOB_SCHEMA_VERSION || record.engine !== "codex"
     || Object.hasOwn(record, "appliedServiceTier") || Object.hasOwn(record, "sessionId")
     || JOB_REQUIRED_FIELDS.some((field) => !Object.hasOwn(record, field))) {
@@ -294,43 +212,6 @@ function mergeRecord(existing, patch) {
   return next;
 }
 
-function appendBoundedFile(file, content, maximumBytes) {
-  ensurePrivateDir(path.dirname(file));
-  fs.appendFileSync(file, content, { encoding: "utf8", mode: PRIVATE_FILE_MODE });
-  fs.chmodSync(file, PRIVATE_FILE_MODE);
-  const size = fs.statSync(file).size;
-  if (size <= maximumBytes) {
-    return;
-  }
-  const descriptor = fs.openSync(file, "r");
-  try {
-    const buffer = Buffer.alloc(maximumBytes);
-    fs.readSync(descriptor, buffer, 0, maximumBytes, size - maximumBytes);
-    let retained = buffer.toString("utf8");
-    const firstLineEnd = retained.indexOf("\n");
-    if (firstLineEnd !== -1) {
-      retained = retained.slice(firstLineEnd + 1);
-    }
-    atomicWriteFile(file, retained);
-  } finally {
-    fs.closeSync(descriptor);
-  }
-}
-
-export function resolveDataDir(env = process.env) {
-  const override = env[DATA_DIR_ENV];
-  if (override && String(override).trim()) {
-    const resolved = String(override).trim();
-    if (!path.isAbsolute(resolved)) {
-      const error = new TypeError(`${DATA_DIR_ENV} must be an absolute path.`);
-      error.failureKind = "input";
-      throw error;
-    }
-    return path.resolve(resolved);
-  }
-  return path.join(os.homedir(), ".claude", "plugins", "data", "codex-claude-code-fusion");
-}
-
 export function canonicalWorkspaceRoot(cwd) {
   const resolved = requiredPath(cwd, "Working directory");
   const root = gitValue(resolved, ["rev-parse", "--show-toplevel"]);
@@ -340,9 +221,7 @@ export function canonicalWorkspaceRoot(cwd) {
 export function repositoryIdentity(cwd) {
   const resolved = requiredPath(cwd, "Working directory");
   const commonDir = gitValue(resolved, ["rev-parse", "--git-common-dir"]);
-  if (!commonDir) {
-    return canonicalWorkspaceRoot(resolved);
-  }
+  if (!commonDir) return canonicalWorkspaceRoot(resolved);
   return canonicalPath(path.isAbsolute(commonDir) ? commonDir : path.resolve(resolved, commonDir));
 }
 
@@ -350,358 +229,122 @@ export function repositoryKey(cwd) {
   return createHash("sha256").update(repositoryIdentity(cwd)).digest("hex").slice(0, 16);
 }
 
-export function workspaceSlug(cwd) {
-  const root = canonicalWorkspaceRoot(cwd);
-  const hash = createHash("sha256").update(root).digest("hex").slice(0, 16);
-  return `${path.basename(root) || "workspace"}-${hash}`;
-}
-
-export function workspaceStateDir(dataDir, cwd) {
-  return path.join(path.resolve(dataDir), "state", workspaceSlug(cwd));
-}
-
 export function withWorkspaceLock(dataDir, cwd, callback) {
-  if (typeof callback !== "function") {
-    throw new TypeError("Workspace lock callback must be a function.");
-  }
+  if (typeof callback !== "function") throw new TypeError("Workspace lock callback must be a function.");
   return withRecordLock(path.join(workspaceStateDir(dataDir, cwd), ".launch"), () => {
     const result = callback();
-    if (result && typeof result.then === "function") {
-      throw new TypeError("Workspace lock callback must be synchronous.");
-    }
+    if (result && typeof result.then === "function") throw new TypeError("Workspace lock callback must be synchronous.");
     return result;
   });
 }
 
 export function withThreadLock(dataDir, threadId, callback) {
-  if (typeof callback !== "function") {
-    throw new TypeError("Thread lock callback must be a function.");
-  }
+  if (typeof callback !== "function") throw new TypeError("Thread lock callback must be a function.");
   const id = validateIdentifier(threadId, "Thread id");
   const key = createHash("sha256").update(id).digest("hex");
   return withRecordLock(path.join(path.resolve(dataDir), "locks", "threads", key), () => {
     const result = callback();
-    if (result && typeof result.then === "function") {
-      throw new TypeError("Thread lock callback must be synchronous.");
-    }
+    if (result && typeof result.then === "function") throw new TypeError("Thread lock callback must be synchronous.");
     return result;
   });
-}
-
-export function jobsDir(dataDir, cwd) {
-  return path.join(workspaceStateDir(dataDir, cwd), "jobs");
-}
-
-export function briefsDir(dataDir, cwd) {
-  return path.join(workspaceStateDir(dataDir, cwd), "briefs");
-}
-
-export function jobFilePath(dataDir, cwd, jobId) {
-  return path.join(jobsDir(dataDir, cwd), `${validateIdentifier(jobId, "Job id")}.json`);
-}
-
-export function jobLogPath(dataDir, cwd, jobId) {
-  return path.join(jobsDir(dataDir, cwd), `${validateIdentifier(jobId, "Job id")}.log`);
 }
 
 export function jobEventsPath(dataDir, cwd, jobId) {
   return path.join(jobsDir(dataDir, cwd), `${validateIdentifier(jobId, "Job id")}.events.jsonl`);
 }
 
-export function briefPath(dataDir, cwd, name) {
-  return path.join(briefsDir(dataDir, cwd), `${validateIdentifier(name, "Brief name")}.md`);
-}
-
-export function generateJobId() {
-  return randomBytes(16).toString("hex");
-}
-
-export function nowIso() {
-  return new Date().toISOString();
-}
-
 export function createJobRecord(fields) {
-  if (!fields || typeof fields !== "object" || Array.isArray(fields)) {
-    throw new TypeError("Job fields must be an object.");
-  }
-  const id = validateIdentifier(fields.id, "Job id");
-  const cwd = requiredPath(fields.cwd, "Working directory");
-  const workspaceRoot = canonicalWorkspaceRoot(fields.workspaceRoot ?? cwd);
-  const identity = fields.repositoryIdentity ?? repositoryIdentity(workspaceRoot);
-  const createdAt = fields.createdAt ?? nowIso();
-  const sessionId = ownerSessionId(fields);
-  const status = fields.status ?? "running";
-  const record = {
-    schemaVersion: JOB_SCHEMA_VERSION,
-    engine: "codex",
-    id,
-    status,
-    phase: TERMINAL_STATUSES.has(status) ? null : fields.phase ?? "starting",
-    kind: fields.kind ?? fields.jobClass ?? "task",
-    jobClass: fields.jobClass ?? fields.kind ?? "task",
-    mode: fields.mode ?? "consult",
-    background: Boolean(fields.background),
-    delivery: fields.delivery ?? (fields.background ? "manual" : "foreground"),
-    deliveryCollectedAt: fields.deliveryCollectedAt ?? null,
-    cwd,
-    workspaceRoot,
-    repositoryTopLevel: gitValue(cwd, ["rev-parse", "--show-toplevel"]),
-    repositoryIdentity: identity,
-    repositoryKey: fields.repositoryKey ?? createHash("sha256").update(identity).digest("hex").slice(0, 16),
-    claudeSessionId: sessionId,
-    pid: fields.pid ?? null,
-    pidIdentity: fields.pidIdentity ?? null,
-    pidOwnsProcessGroup: Boolean(fields.pidOwnsProcessGroup),
-    codexPid: fields.codexPid ?? null,
-    codexPidIdentity: fields.codexPidIdentity ?? null,
-    codexPidIdentitySettled: Boolean(fields.codexPidIdentitySettled),
-    codexPidOwnsProcessGroup: Boolean(fields.codexPidOwnsProcessGroup),
-    threadId: fields.threadId ?? null,
-    turnId: fields.turnId ?? null,
-    briefFile: fields.briefFile ?? null,
-    logFile: fields.logFile ?? null,
-    eventsFile: fields.eventsFile ?? null,
-    artifactsPruned: Boolean(fields.artifactsPruned),
-    createdAt,
-    startedAt: fields.startedAt ?? null,
-    updatedAt: fields.updatedAt ?? createdAt,
-    heartbeatAt: fields.heartbeatAt ?? null,
-    deadlineAt: fields.deadlineAt ?? null,
-    launchApprovedAt: fields.launchApprovedAt ?? null,
-    launchAbortRequestedAt: fields.launchAbortRequestedAt ?? null,
-    finishedAt: fields.finishedAt ?? null,
-    collectedAt: fields.collectedAt ?? null,
-    exitCode: fields.exitCode ?? null,
-    resultText: fields.resultText ?? null,
-    partialResultText: fields.partialResultText ?? null,
-    tokenUsage: fields.tokenUsage ?? null,
-    cumulativeTokenUsage: fields.cumulativeTokenUsage ?? null,
-    tokenUsageAvailability: fields.tokenUsageAvailability ?? "unreported",
-    tokenUsageUnavailableReason: fields.tokenUsageUnavailableReason ?? null,
-    usageIsIncomplete: fields.usageIsIncomplete ?? null,
-    serviceTier: Object.hasOwn(fields, "serviceTier") ? fields.serviceTier : fields.request?.serviceTier ?? null,
-    resolvedModel: fields.resolvedModel ?? fields.request?.model ?? null,
-    resolvedEffort: fields.resolvedEffort ?? fields.request?.effort ?? null,
-    ...(fields.modelDrift ? { modelDrift: fields.modelDrift } : {}),
-    rolloutRecoveryStatus: fields.rolloutRecoveryStatus ?? null,
-    acceptanceSource: fields.acceptanceSource ?? null,
-    acceptanceRecordedAt: fields.acceptanceRecordedAt ?? null,
-    semanticStatus: fields.semanticStatus ?? "unverified",
-    semanticFailureKind: fields.semanticFailureKind ?? null,
-    semanticFailureMessage: fields.semanticFailureMessage ?? null,
-    diagnostics: fields.diagnostics ?? [],
-    protocolError: fields.protocolError ?? null,
-    resultSource: fields.resultSource ?? null,
-    unknownEventCount: fields.unknownEventCount ?? 0,
-    fileChangeCount: fields.fileChangeCount ?? null,
-    eventsTruncated: Boolean(fields.eventsTruncated),
-    errorMessage: fields.errorMessage ?? null,
-    errorTail: fields.errorTail ?? null,
-    failureKind: fields.failureKind ?? null,
-    cancelRequestedAt: fields.cancelRequestedAt ?? null,
-    codexVersion: fields.codexVersion ?? null,
-    timeoutMs: fields.timeoutMs ?? null,
-    companionVersion: fields.companionVersion ?? null,
-    request: fields.request ?? null
-  };
+  if (!fields || typeof fields !== "object" || Array.isArray(fields)) throw new TypeError("Job fields must be an object.");
+  const record = jobState.createJobRecord({
+    ...fields,
+    id: validateIdentifier(fields.id, "Job id"),
+    cwd: requiredPath(fields.cwd, "Working directory"),
+    pidIdentity: fields.pidIdentity ?? null
+  });
   assertJobRecord(record);
   return record;
 }
 
+function codexRecordFields(fields) {
+  const workspaceRoot = canonicalWorkspaceRoot(fields.workspaceRoot ?? fields.cwd);
+  const identity = fields.repositoryIdentity ?? repositoryIdentity(workspaceRoot);
+  const status = fields.status ?? "running";
+  const createdAt = fields.createdAt ?? nowIso();
+  return {
+    createdAt,
+    phase: TERMINAL_STATUSES.has(status) ? null : fields.phase ?? "starting",
+    kind: fields.kind ?? fields.jobClass ?? "task",
+    jobClass: fields.jobClass ?? fields.kind ?? "task",
+    mode: fields.mode ?? "consult",
+    workspaceRoot,
+    repositoryTopLevel: gitValue(fields.cwd, ["rev-parse", "--show-toplevel"]),
+    repositoryIdentity: identity,
+    repositoryKey: fields.repositoryKey ?? createHash("sha256").update(identity).digest("hex").slice(0, 16),
+    claudeSessionId: ownerSessionId(fields),
+    codexPid: fields.codexPid ?? null,
+    codexPidIdentity: fields.codexPidIdentity ?? null,
+    pidOwnsProcessGroup: Boolean(fields.pidOwnsProcessGroup),
+    codexPidIdentitySettled: Boolean(fields.codexPidIdentitySettled),
+    codexPidOwnsProcessGroup: Boolean(fields.codexPidOwnsProcessGroup),
+    artifactsPruned: Boolean(fields.artifactsPruned),
+    briefFile: fields.briefFile ?? null,
+    updatedAt: fields.updatedAt ?? createdAt,
+    tokenUsageAvailability: fields.tokenUsageAvailability ?? "unreported",
+    serviceTier: Object.hasOwn(fields, "serviceTier") ? fields.serviceTier : fields.request?.serviceTier ?? null,
+    resolvedModel: fields.resolvedModel ?? fields.request?.model ?? null,
+    resolvedEffort: fields.resolvedEffort ?? fields.request?.effort ?? null,
+    diagnostics: fields.diagnostics ?? [],
+    unknownEventCount: fields.unknownEventCount ?? 0,
+    eventsTruncated: Boolean(fields.eventsTruncated),
+    semanticStatus: fields.semanticStatus ?? "unverified",
+    ...Object.fromEntries([
+      "threadId", "turnId", "logFile", "eventsFile", "startedAt", "heartbeatAt", "deadlineAt",
+      "launchApprovedAt", "launchAbortRequestedAt", "finishedAt", "collectedAt", "deliveryCollectedAt", "exitCode",
+      "resultText", "partialResultText", "tokenUsage", "cumulativeTokenUsage", "tokenUsageUnavailableReason",
+      "rolloutRecoveryStatus", "acceptanceSource", "acceptanceRecordedAt", "semanticFailureKind",
+      "semanticFailureMessage", "protocolError", "resultSource", "fileChangeCount", "errorMessage",
+      "errorTail", "failureKind", "cancelRequestedAt", "timeoutMs"
+    ].map((key) => [key, fields[key] ?? null]))
+  };
+}
+
 export function writeJobRecordFile(file, record) {
   assertJobRecord(record);
-  withRecordLock(file, () => {
-    const existing = readJobRecordFile(file, true);
-    if (existing && TERMINAL_STATUSES.has(existing.status)) {
-      return;
-    }
-    atomicWriteFile(file, `${JSON.stringify(record, null, 2)}\n`);
-  });
-  return file;
-}
-
-export function readJobRecordFile(file, locked = false) {
-  let text;
-  try {
-    text = fs.readFileSync(file, "utf8");
-  } catch (error) {
-    if (error?.code === "ENOENT") {
-      return null;
-    }
-    throw error;
-  }
-  let parsed;
-  try {
-    parsed = JSON.parse(text);
-  } catch {
-    quarantineCorruptRecord(file);
-    return null;
-  }
-  let migrated;
-  try {
-    migrated = migrateJobRecord(parsed);
-    assertJobRecord(migrated);
-  } catch {
-    return null;
-  }
-  if (migrated === parsed) return parsed;
-  if (locked) {
-    atomicWriteFile(file, `${JSON.stringify(migrated, null, 2)}\n`);
-    return migrated;
-  }
-  return withRecordLock(file, () => readJobRecordFile(file, true));
-}
-
-export function updateJobRecordFile(file, patch) {
-  if (!patch || typeof patch !== "object" || Array.isArray(patch)) {
-    throw new TypeError("Job record patch must be an object.");
-  }
-  return withRecordLock(file, () => {
-    const existing = readJobRecordFile(file, true);
-    if (!existing) {
-      throw new Error(`No job record found at ${file}.`);
-    }
-    if (TERMINAL_STATUSES.has(existing.status)) {
-      return existing;
-    }
-    const next = mergeRecord(existing, patch);
-    atomicWriteFile(file, `${JSON.stringify(next, null, 2)}\n`);
-    return next;
-  });
+  return jobState.writeJobRecordFile(file, record);
 }
 
 export function updateJobRecordFileWithCurrent(file, updater, options = {}) {
-  if (typeof updater !== "function") {
-    throw new TypeError("Job record updater must be a function.");
-  }
-  const allowTerminal = options.allowTerminal === true;
-  return withRecordLock(file, () => {
-    const existing = readJobRecordFile(file, true);
-    if (!existing) {
-      throw new Error(`No job record found at ${file}.`);
-    }
-    if (TERMINAL_STATUSES.has(existing.status) && !allowTerminal) {
-      return existing;
-    }
-    const patch = updater({ ...existing });
-    if (!patch || patch === existing) {
-      return existing;
-    }
-    const next = mergeRecord(existing, patch);
-    atomicWriteFile(file, `${JSON.stringify(next, null, 2)}\n`);
-    return next;
-  });
+  if (typeof updater !== "function") throw new TypeError("Job record updater must be a function.");
+  return jobState.updateJobRecordFileWithCurrent(file, (current) => {
+    const patch = updater({ ...current });
+    return patch ? mergeRecord(current, patch) : current;
+  }, options);
+}
+
+export function updateJobRecordFile(file, patch) {
+  if (!patch || typeof patch !== "object" || Array.isArray(patch)) throw new TypeError("Job record patch must be an object.");
+  return updateJobRecordFileWithCurrent(file, () => patch);
 }
 
 export function finishJobRecordFile(file, patch) {
-  if (!patch || typeof patch !== "object" || Array.isArray(patch)) {
-    throw new TypeError("Job record patch must be an object.");
-  }
-  if (!TERMINAL_STATUSES.has(patch.status)) {
-    throw new TypeError("A terminal job status is required.");
-  }
-  return withRecordLock(file, () => {
-    const existing = readJobRecordFile(file, true);
-    if (!existing) {
-      throw new Error(`No job record found at ${file}.`);
-    }
-    if (TERMINAL_STATUSES.has(existing.status)) {
-      return existing;
-    }
-    const next = mergeRecord(existing, patch);
-    atomicWriteFile(file, `${JSON.stringify(next, null, 2)}\n`);
-    return next;
-  });
+  if (!TERMINAL_STATUSES.has(patch?.status)) throw new TypeError("A terminal job status is required.");
+  return updateJobRecordFile(file, patch);
 }
 
 export function markJobCollectedFile(file, collectedAt = nowIso()) {
-  if (typeof collectedAt !== "string" || !Number.isFinite(Date.parse(collectedAt))) {
-    throw new TypeError("A valid collection timestamp is required.");
-  }
-  return withRecordLock(file, () => {
-    const existing = readJobRecordFile(file, true);
-    if (!existing) {
-      throw new Error(`No job record found at ${file}.`);
-    }
-    if (!TERMINAL_STATUSES.has(existing.status) || existing.collectedAt) {
-      return existing;
-    }
-    const next = {
+  if (typeof collectedAt !== "string" || !Number.isFinite(Date.parse(collectedAt))) throw new TypeError("A valid collection timestamp is required.");
+  return jobState.updateJobRecordFileWithCurrent(file, (existing) => {
+    if (!TERMINAL_STATUSES.has(existing.status) || existing.collectedAt) return existing;
+    return {
       ...existing,
       collectedAt,
       deliveryCollectedAt: existing.delivery === "foreground" ? existing.deliveryCollectedAt ?? null : existing.deliveryCollectedAt ?? collectedAt
     };
-    assertJobRecord(next);
-    atomicWriteFile(file, `${JSON.stringify(next, null, 2)}\n`);
-    return next;
-  });
-}
-
-export function listJobRecords(dataDir, cwd) {
-  const dir = jobsDir(dataDir, cwd);
-  let entries;
-  try {
-    entries = fs.readdirSync(dir);
-  } catch (error) {
-    if (error?.code === "ENOENT") {
-      return [];
-    }
-    throw error;
-  }
-  const records = [];
-  for (const entry of entries) {
-    if (!entry.endsWith(".json")) {
-      continue;
-    }
-    const record = readJobRecordFile(path.join(dir, entry));
-    if (record?.id === entry.slice(0, -".json".length)) {
-      records.push(record);
-    }
-  }
-  return records.sort((left, right) => String(right.createdAt ?? "").localeCompare(String(left.createdAt ?? "")));
-}
-
-export function listAllJobRecords(dataDir) {
-  const stateRoot = path.join(path.resolve(dataDir), "state");
-  let workspaces;
-  try {
-    workspaces = fs.readdirSync(stateRoot);
-  } catch (error) {
-    if (error?.code === "ENOENT") {
-      return [];
-    }
-    throw error;
-  }
-  const results = [];
-  for (const workspace of workspaces) {
-    const dir = path.join(stateRoot, workspace, "jobs");
-    let entries;
-    try {
-      entries = fs.readdirSync(dir);
-    } catch {
-      continue;
-    }
-    for (const entry of entries) {
-      if (!entry.endsWith(".json")) {
-        continue;
-      }
-      const file = path.join(dir, entry);
-      const record = readJobRecordFile(file);
-      if (record?.id === entry.slice(0, -".json".length)) {
-        results.push({ record, file });
-      }
-    }
-  }
-  return results.sort((left, right) => {
-    const timestamp = String(right.record.createdAt ?? "").localeCompare(String(left.record.createdAt ?? ""));
-    return timestamp || left.file.localeCompare(right.file);
-  });
+  }, { allowTerminal: true });
 }
 
 export function latestJobRecordForThread(dataDir, threadId, cwd = null) {
-  if (typeof threadId !== "string" || !threadId.trim()) {
-    return null;
-  }
+  if (typeof threadId !== "string" || !threadId.trim()) return null;
   const records = cwd ? listJobRecords(dataDir, cwd) : listAllJobRecords(dataDir).map(({ record }) => record);
   const candidates = records.filter((record) => record.jobClass === "task" && (record.threadId === threadId || (!cwd && record.request?.resumeThreadId === threadId)));
   candidates.sort((left, right) => {
@@ -712,9 +355,7 @@ export function latestJobRecordForThread(dataDir, threadId, cwd = null) {
 }
 
 function retentionLimit(value, fallback) {
-  if (value === undefined || value === null || (typeof value === "string" && !value.trim())) {
-    return fallback;
-  }
+  if (value === undefined || value === null || (typeof value === "string" && !value.trim())) return fallback;
   const parsed = typeof value === "number" ? value : Number(String(value ?? "").trim());
   return Number.isSafeInteger(parsed) && parsed >= 0 ? parsed : fallback;
 }
@@ -728,21 +369,6 @@ export function resolveJobHistoryLimits(env = process.env) {
   };
 }
 
-function regularFileDescriptor(file) {
-  try {
-    const stat = fs.lstatSync(file);
-    if (!stat.isFile()) {
-      return { kind: "unsafe" };
-    }
-    return { dev: stat.dev, file, ino: stat.ino, kind: "regular", mtimeMs: stat.mtimeMs, size: stat.size };
-  } catch (error) {
-    if (error?.code === "ENOENT") {
-      return { file, kind: "missing", size: 0 };
-    }
-    throw error;
-  }
-}
-
 function expectedManagedArtifacts(workspaceDir, id) {
   const jobs = path.join(workspaceDir, "jobs");
   return [
@@ -754,114 +380,6 @@ function expectedManagedArtifacts(workspaceDir, id) {
     { file: path.join(jobs, `${id}.partial.txt`) },
     { file: path.join(jobs, `${id}.partial-result.txt`) }
   ];
-}
-
-function readManagedJobEntry(workspace, workspaceDir, file, id, locked = false) {
-  let recordDescriptor = regularFileDescriptor(file);
-  if (recordDescriptor.kind !== "regular" || recordDescriptor.size > JOB_RECORD_SCAN_MAX_BYTES) {
-    return null;
-  }
-  const record = readJobRecordFile(file, locked);
-  if (!record) return null;
-  recordDescriptor = regularFileDescriptor(file);
-  if (recordDescriptor.kind !== "regular" || recordDescriptor.size > JOB_RECORD_SCAN_MAX_BYTES) return null;
-  if (record.schemaVersion !== JOB_SCHEMA_VERSION || record.engine !== "codex" || record.id !== id) {
-    return null;
-  }
-  if (record.request !== null && (typeof record.request !== "object" || Array.isArray(record.request))) {
-    return null;
-  }
-  const resumeSourceJobId = record.request?.resumeSourceJobId ?? null;
-  if (resumeSourceJobId !== null && (typeof resumeSourceJobId !== "string" || !JOB_ID_PATTERN.test(resumeSourceJobId))) {
-    return null;
-  }
-  if (record.collectedAt !== null && record.collectedAt !== undefined && (typeof record.collectedAt !== "string" || !Number.isFinite(Date.parse(record.collectedAt)))) {
-    return null;
-  }
-  const createdTimestamp = Date.parse(record.createdAt ?? "");
-  const timestamp = Date.parse(record.finishedAt ?? record.updatedAt ?? record.createdAt ?? "");
-  if (!Number.isFinite(createdTimestamp) || !Number.isFinite(timestamp)) {
-    return null;
-  }
-  const files = [];
-  for (const artifact of expectedManagedArtifacts(workspaceDir, id)) {
-    const configured = artifact.field ? record[artifact.field] : undefined;
-    if (artifact.field && configured !== null && configured !== undefined && (typeof configured !== "string" || path.resolve(configured) !== artifact.file)) {
-      return null;
-    }
-    const descriptor = regularFileDescriptor(artifact.file);
-    if (descriptor.kind === "unsafe" || (artifact.field && (configured === null || configured === undefined) && descriptor.kind !== "missing")) {
-      return null;
-    }
-    if (descriptor.kind === "regular") {
-      files.push({ ...descriptor, tier: artifact.field === "briefFile" ? "light" : "heavy" });
-    }
-  }
-  files.push({ ...recordDescriptor, tier: "light" });
-  return {
-    bytes: files.reduce((total, descriptor) => total + descriptor.size, 0),
-    artifactBytes: files.filter((descriptor) => descriptor.tier === "heavy").reduce((total, descriptor) => total + descriptor.size, 0),
-    createdAt: record.createdAt,
-    file,
-    files,
-    id,
-    key: `${workspace}\0${id}`,
-    record,
-    resumeSourceJobId,
-    timestamp,
-    workspace
-  };
-}
-
-function scanManagedJobState(dataDir) {
-  const stateRoot = path.join(path.resolve(dataDir), "state");
-  let workspaces;
-  try {
-    workspaces = fs.readdirSync(stateRoot, { withFileTypes: true });
-  } catch (error) {
-    if (error?.code === "ENOENT") {
-      return { entries: [], unrecognizedRecords: 0, workspaceDirs: [] };
-    }
-    throw error;
-  }
-  const entries = [];
-  let unrecognizedRecords = 0;
-  const workspaceDirs = [];
-  for (const workspaceEntry of workspaces) {
-    if (!workspaceEntry.isDirectory()) {
-      continue;
-    }
-    const workspace = workspaceEntry.name;
-    const workspaceDir = path.join(stateRoot, workspace);
-    if (WORKSPACE_SLUG_PATTERN.test(workspace)) {
-      workspaceDirs.push(workspaceDir);
-    }
-    const dir = path.join(workspaceDir, "jobs");
-    let jobEntries;
-    try {
-      jobEntries = fs.readdirSync(dir, { withFileTypes: true });
-    } catch {
-      continue;
-    }
-    for (const jobEntry of jobEntries) {
-      if (!jobEntry.name.endsWith(".json")) {
-        continue;
-      }
-      const id = jobEntry.name.slice(0, -".json".length);
-      const file = path.join(dir, jobEntry.name);
-      if (!jobEntry.isFile() || !JOB_ID_PATTERN.test(id)) {
-        unrecognizedRecords += 1;
-        continue;
-      }
-      const entry = readManagedJobEntry(workspace, workspaceDir, file, id);
-      if (entry) {
-        entries.push(entry);
-      } else {
-        unrecognizedRecords += 1;
-      }
-    }
-  }
-  return { entries, unrecognizedRecords, workspaceDirs };
 }
 
 function protectedManagedJobs(entries, claudeSessionId, protectedJobFiles, resumeWorkspaceJobFiles) {
@@ -905,348 +423,10 @@ function protectedManagedJobs(entries, claudeSessionId, protectedJobFiles, resum
   return protectedKeys;
 }
 
-function unlinkManagedDescriptor(descriptor) {
-  let current;
-  try {
-    current = fs.lstatSync(descriptor.file);
-  } catch (error) {
-    return error?.code === "ENOENT";
-  }
-  if (!current.isFile() || current.dev !== descriptor.dev || current.ino !== descriptor.ino) {
-    return false;
-  }
-  try {
-    fs.unlinkSync(descriptor.file);
-    return true;
-  } catch (error) {
-    return error?.code === "ENOENT";
-  }
-}
-
-function removeEmptyManagedDirectory(dir) {
-  try {
-    if (!fs.lstatSync(dir).isDirectory()) {
-      return false;
-    }
-    fs.rmdirSync(dir);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-function removeEmptyManagedWorkspace(workspaceDir) {
-  removeEmptyManagedDirectory(path.join(workspaceDir, "briefs"));
-  removeEmptyManagedDirectory(path.join(workspaceDir, "jobs"));
-  removeEmptyManagedDirectory(workspaceDir);
-}
-
-function resumeProtectionChanged(entry, current, protection) {
-  const jobs = path.dirname(entry.file);
-  const workspaceDir = path.dirname(jobs);
-  let changed = false;
-  const seen = new Set();
-  for (const name of fs.readdirSync(jobs)) {
-    if (!name.endsWith(".json")) continue;
-    const id = name.slice(0, -".json".length);
-    if (!JOB_ID_PATTERN.test(id)) continue;
-    const file = path.join(jobs, name);
-    seen.add(file);
-    const descriptor = regularFileDescriptor(file);
-    const previous = protection.descriptors.get(file);
-    if (descriptor.kind === previous?.kind && descriptor.dev === previous?.dev &&
-        descriptor.ino === previous?.ino && descriptor.size === previous?.size &&
-        descriptor.mtimeMs === previous?.mtimeMs) continue;
-    changed = true;
-    protection.descriptors.set(file, descriptor);
-    const refreshed = file === entry.file ? current : readManagedJobEntry(entry.workspace, workspaceDir, file, id);
-    if (refreshed) protection.entries.set(file, refreshed);
-    else protection.entries.delete(file);
-  }
-  for (const [file, known] of protection.entries) {
-    if (known.workspace === entry.workspace && !seen.has(file)) {
-      changed = true;
-      protection.entries.delete(file);
-      protection.descriptors.delete(file);
-    }
-  }
-  if (changed) {
-    protection.currentKeys = protectedManagedJobs(
-      [...protection.entries.values()], protection.claudeSessionId,
-      protection.protectedJobFiles, protection.resumeWorkspaceJobFiles
-    );
-  }
-  return changed;
-}
-
-function deleteManagedJobEntry(entry, tier, protection) {
-  return withRecordLock(entry.file, () => {
-    const workspaceDir = path.dirname(path.dirname(entry.file));
-    const refreshed = readManagedJobEntry(entry.workspace, workspaceDir, entry.file, entry.id, true);
-    if (!refreshed || !TERMINAL_STATUSES.has(refreshed.record.status)
-        || (refreshed.record.background && !refreshed.record.collectedAt)) {
-      return null;
-    }
-    resumeProtectionChanged(entry, refreshed, protection);
-    if (protection.snapshotKeys.has(refreshed.key) || protection.currentKeys.has(refreshed.key)) {
-      return null;
-    }
-    if (tier === "heavy" && refreshed.record.artifactsPruned) {
-      return null;
-    }
-    const files = refreshed.files.filter((descriptor) => tier === "light" || descriptor.tier === "heavy");
-    // If a file was replaced after the scan, leave this job for the next sweep.
-    if (refreshed.record.updatedAt !== entry.record.updatedAt && tier === "light") {
-      return null;
-    }
-    for (const descriptor of files.filter((candidate) => candidate.file !== entry.file)) {
-      if (!unlinkManagedDescriptor(descriptor)) {
-        return null;
-      }
-    }
-    if (tier === "heavy") {
-      const next = { ...refreshed.record, artifactsPruned: true };
-      atomicWriteFile(entry.file, `${JSON.stringify(next, null, 2)}\n`);
-      return { bytes: refreshed.artifactBytes, record: next };
-    }
-    const recordDescriptor = files.find((descriptor) => descriptor.file === entry.file);
-    if (!recordDescriptor || !unlinkManagedDescriptor(recordDescriptor)) {
-      return null;
-    }
-    removeEmptyManagedWorkspace(workspaceDir);
-    removeEmptyManagedDirectory(path.dirname(workspaceDir));
-    return { bytes: refreshed.bytes, record: null };
-  });
-}
-
-function artifactJobId(name) {
-  for (const suffix of [".events.jsonl", ".stdout.log", ".stderr.log", ".partial.txt", ".partial-result.txt", ".log"]) {
-    if (name.endsWith(suffix)) {
-      const id = name.slice(0, -suffix.length);
-      return JOB_ID_PATTERN.test(id) ? id : null;
-    }
-  }
-  return null;
-}
-
-function temporaryJobId(name) {
-  const match = /^(.+?)(?:\.json|\.events\.jsonl|\.stdout\.log|\.stderr\.log|\.partial\.txt|\.partial-result\.txt|\.log)(?:\..+)?\.tmp$/.exec(name);
-  const id = match?.[1] ?? name.slice(0, -".tmp".length);
-  return JOB_ID_PATTERN.test(id) ? id : null;
-}
-
-function sweepOrphanJobs(workspaceDirs, now) {
-  let removed = 0;
-  for (const workspaceDir of workspaceDirs) {
-    const jobs = path.join(workspaceDir, "jobs");
-    let names;
-    try {
-      names = fs.readdirSync(jobs);
-    } catch {
-      continue;
-    }
-    const namesSet = new Set(names);
-    for (const name of names) {
-      const temporary = name.endsWith(".tmp");
-      const id = temporary ? temporaryJobId(name) : artifactJobId(name);
-      if (!id) {
-        continue;
-      }
-      const file = path.join(jobs, name);
-      const recordFile = path.join(jobs, `${id}.json`);
-      const descriptor = regularFileDescriptor(file);
-      if (descriptor.kind !== "regular" || now - descriptor.mtimeMs < (temporary ? TEMP_AGE_MS : ORPHAN_AGE_MS)) {
-        continue;
-      }
-      if (!temporary && (namesSet.has(`${id}.json`) || names.some((candidate) => candidate.startsWith(`${id}.json.corrupt.`)))) {
-        continue;
-      }
-      withRecordLock(recordFile, () => {
-        const current = regularFileDescriptor(file);
-        if (current.kind !== "regular") {
-          return;
-        }
-        const age = now - current.mtimeMs;
-        if (age < (temporary ? TEMP_AGE_MS : ORPHAN_AGE_MS)) {
-          return;
-        }
-        // Any record, including a future or corrupt one, owns its sibling files.
-        if (!temporary && (fs.existsSync(recordFile) || names.some((candidate) => candidate.startsWith(`${id}.json.corrupt.`)))) {
-          return;
-        }
-        if (unlinkManagedDescriptor(current)) {
-          removed += 1;
-        }
-      });
-    }
-  }
-  return removed;
-}
-
-function readGcStamp(file) {
-  try {
-    const value = JSON.parse(fs.readFileSync(file, "utf8"));
-    return value && typeof value === "object" ? value : null;
-  } catch {
-    return null;
-  }
-}
-
-function recentSweepCanSkip(dataDir, stamp, limits, now) {
-  if (!stamp || now - stamp.at >= GC_INTERVAL_MS || now < stamp.at ||
-      ["maxBytes", "maxRecords", "recordMaxRecords", "recordRetentionDays"].some((key) => stamp[key] !== limits[key])) {
-    return false;
-  }
-  // This pass reads directory names and file sizes, never job JSON.
-  const known = new Set(stamp.recordFiles ?? []);
-  let newRecords = 0;
-  let artifactBytes = 0;
-  const root = path.join(path.resolve(dataDir), "state");
-  let workspaces;
-  try { workspaces = fs.readdirSync(root, { withFileTypes: true }); } catch (error) {
-    if (error?.code === "ENOENT") return true;
-    throw error;
-  }
-  for (const workspace of workspaces) {
-    if (!workspace.isDirectory() || !WORKSPACE_SLUG_PATTERN.test(workspace.name)) continue;
-    const jobs = path.join(root, workspace.name, "jobs");
-    let names;
-    try { names = fs.readdirSync(jobs); } catch { continue; }
-    for (const name of names) {
-      const file = path.join(jobs, name);
-      if (name.endsWith(".json") && !known.has(file)) newRecords += 1;
-      if (!artifactJobId(name)) continue;
-      const descriptor = regularFileDescriptor(file);
-      if (descriptor.kind === "regular") artifactBytes += descriptor.size;
-    }
-  }
-  return stamp.afterRecords + newRecords <= limits.maxRecords * 1.1 &&
-    artifactBytes <= limits.maxBytes * 1.1 &&
-    stamp.afterLightRecords + newRecords <= limits.recordMaxRecords * 1.1;
-}
-
-function failure(limits, error) {
-  const { maxBytes, maxRecords, recordMaxRecords, recordRetentionDays } = limits;
-  return {
-    afterBytes: null,
-    afterRecords: null,
-    deletedBytes: 0,
-    deletedRecords: 0,
-    errorMessage: error instanceof Error ? error.message : String(error),
-    maxBytes,
-    maxRecords,
-    recordMaxRecords,
-    recordRetentionDays,
-    ok: false,
-    quotaSatisfied: false,
-    unrecognizedRecords: null
-  };
-}
-
-export function pruneJobState(dataDir, options = {}) {
-  const defaults = resolveJobHistoryLimits(options.env ?? process.env);
-  const maxBytes = retentionLimit(options.maxBytes, defaults.maxBytes);
-  const maxRecords = retentionLimit(options.maxRecords, defaults.maxRecords);
-  const recordMaxRecords = retentionLimit(options.recordMaxRecords, defaults.recordMaxRecords);
-  const recordRetentionDays = retentionLimit(options.recordRetentionDays, defaults.recordRetentionDays);
-  const limits = { maxBytes, maxRecords, recordMaxRecords, recordRetentionDays };
-  try {
-    return withRecordLock(path.join(path.resolve(dataDir), "locks", "history-gc"), () => {
-      const stampFile = path.join(path.resolve(dataDir), "history-gc-stamp.json");
-      const now = Date.now();
-      const stamp = readGcStamp(stampFile);
-      if (recentSweepCanSkip(dataDir, stamp, limits, now)) {
-        const { recordFiles, ...previous } = stamp;
-        return { ...previous, deletedBytes: 0, deletedRecords: 0, deletedOrphans: 0, prunedArtifacts: 0, ok: true, skipped: true, errorMessage: null };
-      }
-      const { entries, unrecognizedRecords, workspaceDirs } = scanManagedJobState(dataDir);
-      const protectedKeys = protectedManagedJobs(entries, options.claudeSessionId, options.protectedJobFiles, options.resumeWorkspaceJobFiles);
-      const protection = {
-        entries: new Map(entries.map((entry) => [entry.file, entry])),
-        descriptors: new Map(entries.map((entry) => [entry.file, entry.files.find((descriptor) => descriptor.file === entry.file)])),
-        snapshotKeys: protectedKeys,
-        currentKeys: protectedKeys,
-        claudeSessionId: options.claudeSessionId,
-        protectedJobFiles: options.protectedJobFiles,
-        resumeWorkspaceJobFiles: options.resumeWorkspaceJobFiles
-      };
-      let afterBytes = entries.reduce((total, entry) => total + entry.artifactBytes, 0);
-      let afterRecords = entries.filter((entry) => !entry.record.artifactsPruned).length;
-      let afterLightRecords = entries.length;
-      let deletedBytes = 0;
-      let deletedRecords = 0;
-      let prunedArtifacts = 0;
-      const prunedKeys = new Set();
-      const candidates = entries
-        .filter((entry) => TERMINAL_STATUSES.has(entry.record.status) && !protectedKeys.has(entry.key))
-        .sort((left, right) => left.timestamp - right.timestamp || left.file.localeCompare(right.file));
-      for (const entry of candidates) {
-        if (afterRecords <= maxRecords && afterBytes <= maxBytes) {
-          break;
-        }
-        if (entry.record.artifactsPruned) continue;
-        const removed = deleteManagedJobEntry(entry, "heavy", protection);
-        if (!removed) {
-          continue;
-        }
-        afterRecords -= 1;
-        afterBytes = Math.max(0, afterBytes - removed.bytes);
-        deletedBytes += removed.bytes;
-        prunedArtifacts += 1;
-        prunedKeys.add(entry.key);
-      }
-      const cutoff = now - recordRetentionDays * 24 * 60 * 60 * 1000;
-      for (const entry of candidates) {
-        if (afterLightRecords <= recordMaxRecords && (recordRetentionDays === 0 || entry.timestamp >= cutoff)) break;
-        if (afterLightRecords <= recordMaxRecords && entry.timestamp >= cutoff) continue;
-        const removed = deleteManagedJobEntry(entry, "light", protection);
-        if (!removed) continue;
-        afterLightRecords -= 1;
-        deletedRecords += 1;
-        deletedBytes += removed.bytes;
-        if (!entry.record.artifactsPruned && !prunedKeys.has(entry.key)) {
-          afterRecords -= 1;
-          afterBytes = Math.max(0, afterBytes - entry.artifactBytes);
-        }
-      }
-      const deletedOrphans = sweepOrphanJobs(workspaceDirs, now);
-      for (const workspaceDir of workspaceDirs) {
-        removeEmptyManagedWorkspace(workspaceDir);
-      }
-      removeEmptyManagedDirectory(path.join(path.resolve(dataDir), "state"));
-      const result = {
-        at: now,
-        afterBytes,
-        afterRecords,
-        afterLightRecords,
-        deletedBytes,
-        deletedRecords,
-        deletedOrphans,
-        prunedArtifacts,
-        errorMessage: null,
-        maxBytes,
-        maxRecords,
-        recordMaxRecords,
-        recordRetentionDays,
-        ok: true,
-        quotaSatisfied: afterRecords <= maxRecords && afterBytes <= maxBytes && afterLightRecords <= recordMaxRecords,
-        unrecognizedRecords,
-        recordFiles: entries.map((entry) => entry.file)
-      };
-      atomicWriteFile(stampFile, `${JSON.stringify(result)}\n`);
-      return { ...result, recordFiles: undefined };
-    }, 0);
-  } catch (error) {
-    return failure(limits, error);
-  }
-}
-
 export function findJobRecordById(dataDir, jobId) {
   const id = validateIdentifier(jobId, "Job id");
   const matches = listAllJobRecords(dataDir).filter((entry) => entry.record.id === id);
-  if (matches.length > 1) {
-    throw new Error(`Job id ${id} is ambiguous across workspaces. Pass --cwd to select one workspace.`);
-  }
+  if (matches.length > 1) throw new Error(`Job id ${id} is ambiguous across workspaces. Pass --cwd to select one workspace.`);
   return matches[0] ?? null;
 }
 
@@ -1265,7 +445,7 @@ export function appendJobLog(logFile, text) {
   if (!raw) {
     return;
   }
-  appendBoundedFile(logFile, raw.endsWith("\n") ? raw : `${raw}\n`, JOB_LOG_MAX_BYTES);
+  jobState.appendJobLog(logFile, raw, { trimIncompleteLine: true });
 }
 
 export function appendJobEvent(eventsFile, event) {
@@ -1276,33 +456,5 @@ export function appendJobEvent(eventsFile, event) {
   if (!value) {
     return;
   }
-  appendBoundedFile(eventsFile, `${observedEventLine(value)}\n`, JOB_EVENTS_MAX_BYTES);
-}
-
-export function readLogTail(logFile, maxLines = 20) {
-  if (!logFile) {
-    return "";
-  }
-  let size;
-  try {
-    size = fs.statSync(logFile).size;
-  } catch (error) {
-    if (error?.code === "ENOENT") {
-      return "";
-    }
-    throw error;
-  }
-  const bytes = Math.min(size, LOG_TAIL_MAX_BYTES);
-  const buffer = Buffer.alloc(bytes);
-  const descriptor = fs.openSync(logFile, "r");
-  try {
-    fs.readSync(descriptor, buffer, 0, bytes, size - bytes);
-  } finally {
-    fs.closeSync(descriptor);
-  }
-  const content = buffer.toString("utf8").trimEnd();
-  if (!content) {
-    return "";
-  }
-  return content.split(/\r?\n/).slice(-maxLines).join("\n");
+  jobState.appendJobLog(eventsFile, observedEventLine(value), { maxBytes: JOB_EVENTS_MAX_BYTES, trimIncompleteLine: true });
 }

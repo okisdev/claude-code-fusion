@@ -38,14 +38,6 @@ const processInspectionTests = new Set([
   "identity-replaced owners are terminalized without signaling the live replacement",
   "task stays foreground by default and persists the complete terminal record",
   "task records completed file changes",
-  "flagship foreground write warning is emitted before execution and recorded",
-  "flagship warning is limited to foreground write tasks",
-  "flagship warning uses recent job records for its stat",
-  "flagship warning ignores old file mtimes while counting recent records",
-  "flagship warning falls back below the minimum sample",
-  "flagship warning tolerates malformed job files",
-  "flagship warning applies the cap after filtering matching records",
-  "flagship warning skips oversized job files",
   "task resolves an output schema, forwards it, and records parsed structured output",
   "task retains a non-JSON agent message and records the structured parsing error",
   "option shaped text after a task prompt cannot enable background or change execution settings",
@@ -565,70 +557,7 @@ test("task records completed file changes", (t) => {
   assert.equal(jobRecords(sandbox)[0].fileChangeCount, 2);
 });
 
-test("flagship foreground write warning is emitted before execution and recorded", (t) => {
-  const sandbox = makeSandbox(t);
-  initializeGitRepository(sandbox);
-  const traceCodex = path.join(sandbox.root, "trace-codex");
-  fs.writeFileSync(
-    traceCodex,
-    [
-      "#!/usr/bin/env node",
-      "if (process.argv.includes('--version')) {",
-      "  process.stdout.write('codex-cli 0.154.0\\n');",
-      "  require('node:fs').unlinkSync(process.argv[1]);",
-      "}"
-    ].join("\n"),
-    { mode: 0o755 }
-  );
-  const result = runCompanion(["task", "--write", "--model", "gpt-6-astra", "implement the flagship-safe change"], {
-    cwd: sandbox.workDir,
-    env: envFor(sandbox, {
-      CODEX_BIN: traceCodex
-    })
-  });
-  const warning = "warning: foreground gpt-6-astra write tasks run against a 570s flight budget and the flagship's time to first token at max runs into minutes. Keep effort at xhigh, split the package, or route quick shapes to the Codex quick default and volume shapes to the volume default in the Fusion routing table.";
-
-  assert.equal(result.status, 1, result.stderr);
-  assert.equal(result.stderr, `${warning}\n`);
-  const [record] = jobRecords(sandbox);
-  assert.equal(record.failureKind, "missing_cli");
-  assert.equal(record.diagnostics.filter((diagnostic) => diagnostic.type === "warning" && diagnostic.message === warning).length, 1);
-});
-
-test("flagship warning is limited to foreground write tasks", async (t) => {
-  const warning = "warning: foreground gpt-6-astra write tasks run against a 570s flight budget and the flagship's time to first token at max runs into minutes. Keep effort at xhigh, split the package, or route quick shapes to the Codex quick default and volume shapes to the volume default in the Fusion routing table.";
-  const cases = [
-    { args: ["task", "--write", "--model", "gpt-5.6-terra", "use terra"], write: true },
-    { args: ["task", "--model", "gpt-6-astra", "use flagship in consult mode"], write: false }
-  ];
-  for (const entry of cases) {
-    const sandbox = makeSandbox(t);
-    if (entry.write) {
-      initializeGitRepository(sandbox);
-    }
-    const result = runCompanion(entry.args, {
-      cwd: sandbox.workDir,
-      env: envFor(sandbox)
-    });
-    assert.equal(result.status, 0, result.stderr);
-    assert.equal(result.stderr, "");
-    assert.equal(jobRecords(sandbox)[0].diagnostics.some((diagnostic) => diagnostic.message === warning), false);
-  }
-
-  const background = makeSandbox(t);
-  initializeGitRepository(background);
-  const env = envFor(background);
-  const launched = runCompanion(["task", "--background", "--write", "--model", "gpt-6-astra", "use flagship in the background"], { cwd: background.workDir, env });
-  assert.equal(launched.status, 0, launched.stderr);
-  assert.equal(launched.stderr, "");
-  const completed = await waitFor(() => {
-    const [record] = jobRecords(background);
-    return record?.status === "done" ? record : null;
-  });
-  assert.equal(completed.diagnostics.some((diagnostic) => diagnostic.message === warning), false);
-});
-
-function seedFlagshipJobRecords(sandbox, entries) {
+function seedJobRecords(sandbox, entries) {
   const records = [];
   for (const entry of entries) {
     const id = randomBytes(16).toString("hex");
@@ -653,53 +582,10 @@ function seedFlagshipJobRecords(sandbox, entries) {
   return records;
 }
 
-test("flagship warning uses recent job records for its stat", (t) => {
-  const sandbox = makeSandbox(t);
-  initializeGitRepository(sandbox);
-  seedFlagshipJobRecords(sandbox, [
-    { failureKind: "timeout", request: { model: "gpt-6-astra" } },
-    { failureKind: "timeout", request: { model: "gpt-6-astra" } },
-    { request: {}, resolvedModel: "gpt-6-astra" },
-    { request: { model: "gpt-6-astra" } }
-  ]);
-  const result = runCompanion(["task", "--write", "--model", "gpt-6-astra", "implement the measured change"], {
-    cwd: sandbox.workDir,
-    env: envFor(sandbox)
-  });
-  const warning = "warning: 50% of foreground gpt-6-astra write tasks timed out in the last 7 days (2 of 4). Sized to the 570s flight budget? Keep effort at xhigh, split the package, or route quick shapes to the Codex quick default and volume shapes to the volume default in the Fusion routing table.";
-
-  assert.equal(result.status, 0, result.stderr);
-  assert.equal(result.stderr, `${warning}\n`);
-  assert.equal(jobRecords(sandbox).filter((record) => record.diagnostics.some((diagnostic) => diagnostic.message === warning)).length, 1);
-});
-
-test("flagship warning ignores old file mtimes while counting recent records", (t) => {
-  const sandbox = makeSandbox(t);
-  initializeGitRepository(sandbox);
-  const [old, ...recent] = seedFlagshipJobRecords(sandbox, [
-    { failureKind: "timeout", request: { model: "gpt-6-astra" } },
-    { failureKind: "timeout", request: { model: "gpt-6-astra" } },
-    { request: { model: "gpt-6-astra" } },
-    { request: { model: "gpt-6-astra" } },
-    { request: { model: "gpt-6-astra" } }
-  ]);
-  const oldMtime = new Date(Date.now() - 8 * 24 * 60 * 60 * 1000);
-  fs.utimesSync(old.file, oldMtime, oldMtime);
-  assert.ok(fs.statSync(old.file).mtimeMs < Date.now() - 7 * 24 * 60 * 60 * 1000);
-  assert.equal(recent.length, 4);
-
-  const result = runCompanion(["task", "--write", "--model", "gpt-6-astra", "count recent history"], {
-    cwd: sandbox.workDir,
-    env: envFor(sandbox)
-  });
-  assert.equal(result.status, 0, result.stderr);
-  assert.match(result.stderr, /25% of foreground gpt-6-astra write tasks timed out in the last 7 days \(1 of 4\)/);
-});
-
 test("workspace reservation probes Git a bounded number of times across many jobs", (t) => {
   const sandbox = makeSandbox(t);
   initializeGitRepository(sandbox);
-  seedFlagshipJobRecords(sandbox, Array.from({ length: 120 }, () => ({ request: { model: "gpt-test" } })));
+  seedJobRecords(sandbox, Array.from({ length: 120 }, () => ({ request: { model: "gpt-test" } })));
   const bin = path.join(sandbox.root, "bin");
   const traceFile = path.join(sandbox.root, "git.log");
   const realGit = spawnSync("sh", ["-c", "command -v git"], { encoding: "utf8" }).stdout.trim();
@@ -721,105 +607,6 @@ test("workspace reservation probes Git a bounded number of times across many job
   assert.ok(calls.length > 0);
   assert.ok(calls.length <= 10, `Expected at most 10 Git calls, saw ${calls.length}.`);
   assert.equal(jobRecords(sandbox).length, 121);
-});
-
-test("flagship warning falls back below the minimum sample", (t) => {
-  const sandbox = makeSandbox(t);
-  initializeGitRepository(sandbox);
-  seedFlagshipJobRecords(sandbox, [
-    { failureKind: "timeout", request: { model: "gpt-6-astra" } },
-    { request: { model: "gpt-6-astra" } },
-    { request: { model: "gpt-6-astra" } }
-  ]);
-  const result = runCompanion(["task", "--write", "--model", "gpt-6-astra", "implement the fallback change"], {
-    cwd: sandbox.workDir,
-    env: envFor(sandbox)
-  });
-  const warning = "warning: foreground gpt-6-astra write tasks run against a 570s flight budget and the flagship's time to first token at max runs into minutes. Keep effort at xhigh, split the package, or route quick shapes to the Codex quick default and volume shapes to the volume default in the Fusion routing table.";
-
-  assert.equal(result.status, 0, result.stderr);
-  assert.equal(result.stderr, `${warning}\n`);
-  assert.equal(jobRecords(sandbox).filter((record) => record.diagnostics.some((diagnostic) => diagnostic.message === warning)).length, 1);
-});
-
-test("flagship warning tolerates malformed job files", (t) => {
-  const sandbox = makeSandbox(t);
-  initializeGitRepository(sandbox);
-  seedFlagshipJobRecords(sandbox, [
-    { failureKind: "timeout", request: { model: "gpt-6-astra" } },
-    { request: { model: "gpt-6-astra" } },
-    { request: { model: "gpt-6-astra" } },
-    { request: { model: "gpt-6-astra" } }
-  ]);
-  const jobsDirectory = path.dirname(jobFilePath(sandbox.dataDir, sandbox.workDir, "malformed-job"));
-  fs.writeFileSync(path.join(jobsDirectory, "malformed-job.json"), "{not valid json\n");
-  const result = runCompanion(["task", "--write", "--model", "gpt-6-astra", "implement despite malformed history"], {
-    cwd: sandbox.workDir,
-    env: envFor(sandbox)
-  });
-  const warning = "warning: 25% of foreground gpt-6-astra write tasks timed out in the last 7 days (1 of 4). Sized to the 570s flight budget? Keep effort at xhigh, split the package, or route quick shapes to the Codex quick default and volume shapes to the volume default in the Fusion routing table.";
-
-  assert.equal(result.status, 0, result.stderr);
-  assert.equal(result.stderr, `${warning}\n`);
-  assert.equal(jobRecords(sandbox).filter((record) => record.diagnostics.some((diagnostic) => diagnostic.message === warning)).length, 1);
-});
-
-test("flagship warning applies the cap after filtering matching records", (t) => {
-  const sandbox = makeSandbox(t);
-  initializeGitRepository(sandbox);
-  const now = Date.now();
-  const flagshipModifiedAt = new Date(now - 2 * 60 * 1000);
-  const nonFlagshipModifiedAt = new Date(now - 60 * 1000);
-  const flagshipRecords = seedFlagshipJobRecords(sandbox, [
-    { createdAt: new Date(now - 2 * 60 * 1000).toISOString(), failureKind: "timeout", request: { model: "gpt-6-astra" } },
-    { createdAt: new Date(now - 2 * 60 * 1000).toISOString(), failureKind: "timeout", request: { model: "gpt-6-astra" } },
-    { createdAt: new Date(now - 2 * 60 * 1000).toISOString(), request: { model: "gpt-6-astra" } },
-    { createdAt: new Date(now - 2 * 60 * 1000).toISOString(), request: { model: "gpt-6-astra" } }
-  ]);
-  const nonFlagshipRecords = seedFlagshipJobRecords(
-    sandbox,
-    Array.from({ length: 600 }, () => ({ createdAt: new Date(now - 60 * 1000).toISOString(), request: { model: "gpt-5.6-terra" } }))
-  );
-  for (const { file } of flagshipRecords) {
-    fs.utimesSync(file, flagshipModifiedAt, flagshipModifiedAt);
-  }
-  for (const { file } of nonFlagshipRecords) {
-    fs.utimesSync(file, nonFlagshipModifiedAt, nonFlagshipModifiedAt);
-  }
-
-  const result = runCompanion(["task", "--write", "--model", "gpt-6-astra", "calculate from matching history"], {
-    cwd: sandbox.workDir,
-    env: envFor(sandbox)
-  });
-  const warning = "warning: 50% of foreground gpt-6-astra write tasks timed out in the last 7 days (2 of 4). Sized to the 570s flight budget? Keep effort at xhigh, split the package, or route quick shapes to the Codex quick default and volume shapes to the volume default in the Fusion routing table.";
-
-  assert.equal(result.status, 0, result.stderr);
-  assert.equal(result.stderr, `${warning}\n`);
-});
-
-test("flagship warning skips oversized job files", (t) => {
-  const sandbox = makeSandbox(t);
-  initializeGitRepository(sandbox);
-  seedFlagshipJobRecords(sandbox, [
-    { failureKind: "timeout", request: { model: "gpt-6-astra" } },
-    { request: { model: "gpt-6-astra" } },
-    { request: { model: "gpt-6-astra" } },
-    { request: { model: "gpt-6-astra" } }
-  ]);
-  const jobsDirectory = path.dirname(jobFilePath(sandbox.dataDir, sandbox.workDir, "oversized-job"));
-  const oversizedFile = path.join(jobsDirectory, "oversized-job.json");
-  fs.writeFileSync(oversizedFile, "");
-  fs.truncateSync(oversizedFile, 16 * 1024 * 1024 + 1);
-  assert.ok(fs.statSync(oversizedFile).size > 16 * 1024 * 1024);
-
-  const result = runCompanion(["task", "--write", "--model", "gpt-6-astra", "ignore oversized history"], {
-    cwd: sandbox.workDir,
-    env: envFor(sandbox)
-  });
-  const warning = "warning: 25% of foreground gpt-6-astra write tasks timed out in the last 7 days (1 of 4). Sized to the 570s flight budget? Keep effort at xhigh, split the package, or route quick shapes to the Codex quick default and volume shapes to the volume default in the Fusion routing table.";
-
-  assert.equal(result.status, 0, result.stderr);
-  assert.equal(result.stderr, `${warning}\n`);
 });
 
 test("task resolves an output schema, forwards it, and records parsed structured output", (t) => {

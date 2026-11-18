@@ -8,9 +8,7 @@ import { test } from "node:test";
 import { messageTag, tagMessage } from "../plugins/fusion/scripts/lib/user-messages.mjs";
 import { claimParentContextAdvisory } from "../plugins/fusion/scripts/lib/lifecycle/dispatch.mjs";
 
-const repoRoot = path.join(import.meta.dirname, "..");
-const script = path.join(repoRoot, "plugins", "fusion", "scripts", "fleet-posture.mjs");
-const SESSION_LANES_CONTEXT = tagMessage("fleet-posture.session-lanes-reminder", "fusion lanes ready: codex gpt-6.1-sol for spec grade and deep review, gpt-6-sol and gpt-6-luna for quick and volume packages, grok under its four roles on the routing table's lane defaults, cursor under diversity for a model family no other lane carries and under burst for bounded worktree implementation, claude workers for the Claude surface. Independent packages dispatch together in one message; three or more convene /fusion:ultra; a single coherent change stays inline.");
+const script = path.join(import.meta.dirname, "..", "plugins", "fusion", "scripts", "fleet-posture.mjs");
 const DEEP_REASONER_HINT = tagMessage("fleet-posture.deep-reasoner-hint", "This reads as a design or root-cause question. Consult fusion:deep-reasoner with a scoped brief before deciding.");
 const advisoryNotice = (tokens) => tagMessage("fleet-posture.context-advisory", `The main loop context is ${Math.round(tokens / 1000)}k tokens and every turn replays it. /compact or a fresh session before the next goal cuts that cost.`);
 
@@ -20,263 +18,163 @@ function makeSandbox(t) {
   return { root, dataDir: path.join(root, "fusion-data"), stateDir: path.join(root, "inline-guard"), workerStateDir: path.join(root, "workers"), transcript: path.join(root, "transcript.jsonl") };
 }
 
-function envFor(sandbox, extra = {}) {
-  const env = { ...process.env, FUSION_DATA_DIR: sandbox.dataDir, FUSION_INLINE_GUARD_STATE: sandbox.stateDir, FUSION_WORKER_STATE_DIR: sandbox.workerStateDir, FUSION_MODEL_ROUTING: path.join(sandbox.root, "missing-model-routing.json"), ...extra };
-  for (const name of ["FUSION_FLEET_MODE", "FUSION_POSTURE", "FUSION_PARENT_CONTEXT_ADVISORY_TOKENS"]) {
-    if (!Object.hasOwn(extra, name)) {
-      delete env[name];
-    }
-  }
-  return env;
+function envFor(box, extra = {}) {
+  return { ...process.env, FUSION_DATA_DIR: box.dataDir, FUSION_INLINE_GUARD_STATE: box.stateDir, FUSION_WORKER_STATE_DIR: box.workerStateDir, ...extra };
 }
 
-function hookInput(sandbox, sessionId = "session-1", prompt = "do work") {
-  return JSON.stringify({ ...(sessionId === undefined ? {} : { session_id: sessionId }), prompt, cwd: sandbox.root, transcript_path: sandbox.transcript });
+function input(box, prompt = "do work", sessionId = "session-1") {
+  return JSON.stringify({ session_id: sessionId, prompt, transcript_path: box.transcript });
 }
 
-function writeTranscript(sandbox, tokens) {
-  fs.appendFileSync(sandbox.transcript, `${JSON.stringify({ type: "assistant", message: { usage: { input_tokens: tokens, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 } } })}\n`);
+function run(box, prompt = "do work", extraEnv = {}, sessionId = "session-1") {
+  return spawnSync(process.execPath, [script], { input: input(box, prompt, sessionId), env: envFor(box, extraEnv), encoding: "utf8" });
 }
 
-function statePath(sandbox, sessionId = "session-1") {
-  return path.join(sandbox.stateDir, `${sessionId}.json`);
-}
-
-function sessionLanesReminderPath(sandbox, sessionId = "session-1") {
-  return path.join(sandbox.dataDir, "fleet-posture", "session-lanes-reminders", `${sessionId}.marker`);
-}
-
-function writeState(sandbox, state, sessionId = "session-1") {
-  fs.mkdirSync(sandbox.stateDir, { recursive: true });
-  fs.writeFileSync(statePath(sandbox, sessionId), JSON.stringify(state), "utf8");
-}
-
-function run(sandbox, input = hookInput(sandbox), extraEnv = {}) {
-  return spawnSync(process.execPath, [script], {
-    input,
-    env: envFor(sandbox, extraEnv),
-    encoding: "utf8"
-  });
-}
-
-function assertSilent(result) {
-  assert.strictEqual(result.status, 0);
-  assert.strictEqual(result.stdout, "");
+function assertContext(result, additionalContext = null, systemMessage = null) {
+  assert.strictEqual(result.status, 0, result.stderr);
   assert.strictEqual(result.stderr, "");
+  const expected = { ...(additionalContext ? { hookSpecificOutput: { hookEventName: "UserPromptSubmit", additionalContext } } : {}), ...(systemMessage ? { systemMessage } : {}) };
+  if (Object.keys(expected).length) assert.deepStrictEqual(JSON.parse(result.stdout), expected);
+  else assert.strictEqual(result.stdout, "");
 }
 
-function assertContext(result, additionalContext, systemMessage) {
-  assert.strictEqual(result.status, 0);
-  assert.strictEqual(result.stderr, "");
-  assert.deepStrictEqual(JSON.parse(result.stdout), {
-    ...(additionalContext ? { hookSpecificOutput: { hookEventName: "UserPromptSubmit", additionalContext } } : {}),
-    ...(systemMessage ? { systemMessage } : {})
-  });
+function writeTranscript(box, tokens) {
+  fs.appendFileSync(box.transcript, `${JSON.stringify({ type: "assistant", message: { usage: { input_tokens: tokens, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 } } })}\n`);
 }
 
-test("emits the session lanes reminder once without guard state", (t) => {
-  const sandbox = makeSandbox(t);
+function hintMarkerPath(box, sessionId = "session-1") {
+  return path.join(box.dataDir, "fleet-posture", "deep-reasoner-hints", `${sessionId}.marker`);
+}
 
-  assertContext(run(sandbox), SESSION_LANES_CONTEXT);
-  assertSilent(run(sandbox));
-  assert.strictEqual(fs.existsSync(statePath(sandbox)), false);
-  assert.strictEqual(fs.statSync(sessionLanesReminderPath(sandbox)).mode & 0o777, 0o600);
-  assert.strictEqual(fs.statSync(path.dirname(sessionLanesReminderPath(sandbox))).mode & 0o777, 0o700);
+test("ordinary prompts emit no session lanes reminder or marker", (t) => {
+  const box = makeSandbox(t);
+  assertContext(run(box));
+  assertContext(run(box));
+  assert.strictEqual(fs.existsSync(path.join(box.dataDir, "fleet-posture", "session-lanes-reminders")), false);
 });
 
-test("design questions receive one deep reasoner hint on every matching prompt", (t) => {
-  const sandbox = makeSandbox(t);
-  assertContext(run(sandbox, hookInput(sandbox, "session-1", "思考一下为什么这个架构会失败")), `${SESSION_LANES_CONTEXT}\n\n${DEEP_REASONER_HINT}`);
-  assertContext(run(sandbox, hookInput(sandbox, "session-1", "WHY IS the root cause hard to find?")), DEEP_REASONER_HINT);
-  assertContext(run(sandbox, hookInput(sandbox, "session-1", "How should we redesign the API?"), { FUSION_FLEET_MODE: "off" }), DEEP_REASONER_HINT);
+test("design questions receive one hint per session", (t) => {
+  const box = makeSandbox(t);
+  assertContext(run(box, "思考一下为什么这个架构会失败"), DEEP_REASONER_HINT);
+  assertContext(run(box, "WHY IS the root cause hard to find?"));
+  assertContext(run(box, "How should we redesign the API?", {}, "session-2"), DEEP_REASONER_HINT);
+  const marker = hintMarkerPath(box);
+  assert.strictEqual(fs.statSync(marker).mode & 0o777, 0o600);
+  assert.strictEqual(fs.statSync(path.dirname(marker)).mode & 0o777, 0o700);
 });
 
-test("non-design and generated prompts do not receive a deep reasoner hint", (t) => {
-  const sandbox = makeSandbox(t);
+test("implementation requests and generated prompts never receive a design hint", (t) => {
+  const box = makeSandbox(t);
   const prompts = [
-    "fix the typo in README",
-    "/why is this slow",
-    "<task-notification><summary>why is this slow</summary></task-notification>",
+    "分析这个架构然后解决问题直到全部重构修复完成为止",
+    "分析并实现解决方案", "思考后改代码", "why is this slow? fix it", "redesign and implement it", "how should we ship it?", "分析后走流程",
+    "/why is this slow", "<task-notification><summary>why is this slow</summary></task-notification>",
     JSON.stringify({ hook_event_name: "UserPromptSubmit", prompt: "why is this slow" }),
     `why is this slow ${"x".repeat(4000)}`
   ];
-  for (const prompt of prompts) {
-    assertSilent(run(sandbox, hookInput(sandbox, "session-1", prompt), { FUSION_FLEET_MODE: "off" }));
-  }
-  const metaInput = JSON.stringify({ ...JSON.parse(hookInput(sandbox, "session-1", "why is this slow")), isMeta: true, origin: { kind: "task-notification" } });
-  assertSilent(run(sandbox, metaInput, { FUSION_FLEET_MODE: "off" }));
+  for (const prompt of prompts) assertContext(run(box, prompt));
+  assertContext(spawnSync(process.execPath, [script], { input: JSON.stringify({ session_id: "session-1", prompt: "why is this slow", isMeta: true }), env: envFor(box), encoding: "utf8" }));
+  assertContext(run(box, "why is this slow", {}, ""));
 });
 
 test("parent context below threshold adds no advisory", (t) => {
-  const sandbox = makeSandbox(t);
-  writeTranscript(sandbox, 249999);
-  assertContext(run(sandbox), SESSION_LANES_CONTEXT);
-  assertSilent(run(sandbox));
-  assert.strictEqual(fs.existsSync(path.join(sandbox.workerStateDir, "sessions", "session-1.json")), false);
+  const box = makeSandbox(t);
+  writeTranscript(box, 249999);
+  assertContext(run(box));
+  assert.strictEqual(fs.existsSync(path.join(box.workerStateDir, "sessions", "session-1.json")), false);
 });
 
 test("parent context advisory sends once at each threshold across prompts", (t) => {
-  const sandbox = makeSandbox(t);
-  assertContext(run(sandbox), SESSION_LANES_CONTEXT);
-  writeTranscript(sandbox, 250000);
-  assertContext(run(sandbox), null, advisoryNotice(250000));
-  assertSilent(run(sandbox));
-  writeTranscript(sandbox, 800000);
-  assertContext(run(sandbox), null, advisoryNotice(800000));
-  assertSilent(run(sandbox));
+  const box = makeSandbox(t);
+  writeTranscript(box, 250000);
+  assertContext(run(box), null, advisoryNotice(250000));
+  assertContext(run(box));
+  writeTranscript(box, 800000);
+  assertContext(run(box), null, advisoryNotice(800000));
+  assertContext(run(box));
 });
 
 test("a first reading past both thresholds shows one notice", (t) => {
-  const sandbox = makeSandbox(t);
-  assertContext(run(sandbox), SESSION_LANES_CONTEXT);
-  writeTranscript(sandbox, 800000);
-  assertContext(run(sandbox), null, advisoryNotice(800000));
-  assertSilent(run(sandbox));
+  const box = makeSandbox(t);
+  writeTranscript(box, 800000);
+  assertContext(run(box), null, advisoryNotice(800000));
+  assertContext(run(box));
 });
 
-test("first prompt combines the session reminder and parent context advisory", (t) => {
-  const sandbox = makeSandbox(t);
-  writeTranscript(sandbox, 250000);
-  assertContext(run(sandbox), SESSION_LANES_CONTEXT, advisoryNotice(250000));
-  assertSilent(run(sandbox));
+test("a design hint and context advisory can appear together", (t) => {
+  const box = makeSandbox(t);
+  writeTranscript(box, 250000);
+  assertContext(run(box, "why is this slow?"), DEEP_REASONER_HINT, advisoryNotice(250000));
+  assertContext(run(box, "why is this slow?"));
 });
 
-test("a dispatch claim suppresses the prompt advisory", (t) => {
-  const sandbox = makeSandbox(t);
-  assertContext(run(sandbox), SESSION_LANES_CONTEXT);
-  writeTranscript(sandbox, 250000);
-  assert.strictEqual(claimParentContextAdvisory("session-1", 250000, envFor(sandbox)), advisoryNotice(250000));
-  assertSilent(run(sandbox));
+test("dispatch claim suppresses a prompt advisory", (t) => {
+  const box = makeSandbox(t);
+  writeTranscript(box, 250000);
+  assert.strictEqual(claimParentContextAdvisory("session-1", 250000, envFor(box)), advisoryNotice(250000));
+  assertContext(run(box));
 });
 
 test("an unreadable transcript leaves other prompt output intact", (t) => {
-  const sandbox = makeSandbox(t);
-  assert.strictEqual(fs.existsSync(sandbox.transcript), false);
-  assertContext(run(sandbox), SESSION_LANES_CONTEXT);
-  assertSilent(run(sandbox));
+  const box = makeSandbox(t);
+  assert.strictEqual(fs.existsSync(box.transcript), false);
+  assertContext(run(box, "why is this slow?"), DEEP_REASONER_HINT);
 });
 
 test("an advisory claim failure leaves other prompt output intact", (t) => {
-  const sandbox = makeSandbox(t);
-  writeTranscript(sandbox, 250000);
-  fs.writeFileSync(sandbox.workerStateDir, "blocked");
-  assertContext(run(sandbox), SESSION_LANES_CONTEXT);
-});
-
-test("a fleet reminder claim failure leaves the context advisory intact", (t) => {
-  const sandbox = makeSandbox(t);
-  writeTranscript(sandbox, 250000);
-  fs.writeFileSync(sandbox.dataDir, "blocked");
-  assertContext(run(sandbox), null, advisoryNotice(250000));
-});
-
-test("the narrow wave reminder and marker are gone", (t) => {
-  const sandbox = makeSandbox(t);
-  writeState(sandbox, { consecutiveNarrowWaves: 2 });
-  const original = fs.readFileSync(statePath(sandbox), "utf8");
-  assertContext(run(sandbox), SESSION_LANES_CONTEXT);
-  assertSilent(run(sandbox));
-  assert.throws(() => messageTag("fleet-posture.narrow-wave-reminder"), RangeError);
-  assert.strictEqual(fs.existsSync(path.join(sandbox.dataDir, "fleet-posture", "narrow-wave-reminders")), false);
-  assert.strictEqual(fs.readFileSync(statePath(sandbox), "utf8"), original);
+  const box = makeSandbox(t);
+  writeTranscript(box, 250000);
+  fs.writeFileSync(box.workerStateDir, "blocked");
+  assertContext(run(box, "why is this slow?"), DEEP_REASONER_HINT);
 });
 
 test("a new session claim cleans old markers and legacy reminders once", (t) => {
-  const sandbox = makeSandbox(t);
-  const markerDirectory = path.dirname(sessionLanesReminderPath(sandbox));
+  const box = makeSandbox(t);
+  const markerDirectory = path.dirname(hintMarkerPath(box));
   const oldMarker = path.join(markerDirectory, "old-session.marker");
   const recentMarker = path.join(markerDirectory, "recent-session.marker");
-  const legacyDirectory = path.join(sandbox.dataDir, "fleet-posture", "narrow-wave-reminders");
+  const legacyDirectories = ["session-lanes-reminders", "narrow-wave-reminders"].map((name) => path.join(box.dataDir, "fleet-posture", name));
   fs.mkdirSync(markerDirectory, { recursive: true });
-  fs.writeFileSync(oldMarker, "\n", "utf8");
+  fs.writeFileSync(oldMarker, "\n");
   fs.utimesSync(oldMarker, new Date(Date.now() - 49 * 60 * 60 * 1000), new Date(Date.now() - 49 * 60 * 60 * 1000));
-  fs.writeFileSync(recentMarker, "\n", "utf8");
-  fs.mkdirSync(legacyDirectory, { recursive: true });
-  fs.writeFileSync(path.join(legacyDirectory, "session-1.marker"), "\n", "utf8");
+  fs.writeFileSync(recentMarker, "\n");
+  for (const directory of legacyDirectories) {
+    fs.mkdirSync(directory);
+    fs.writeFileSync(path.join(directory, "session-1.marker"), "\n");
+  }
 
-  assertContext(run(sandbox), SESSION_LANES_CONTEXT);
+  assertContext(run(box, "why is this slow?"), DEEP_REASONER_HINT);
   assert.strictEqual(fs.existsSync(oldMarker), false);
   assert.strictEqual(fs.existsSync(recentMarker), true);
-  assert.strictEqual(fs.existsSync(legacyDirectory), false);
+  for (const directory of legacyDirectories) assert.strictEqual(fs.existsSync(directory), false);
 
   const secondOldMarker = path.join(markerDirectory, "second-old-session.marker");
-  fs.writeFileSync(secondOldMarker, "\n", "utf8");
+  fs.writeFileSync(secondOldMarker, "\n");
   fs.utimesSync(secondOldMarker, new Date(Date.now() - 49 * 60 * 60 * 1000), new Date(Date.now() - 49 * 60 * 60 * 1000));
-  fs.mkdirSync(legacyDirectory, { recursive: true });
-  fs.writeFileSync(path.join(legacyDirectory, "session-1.marker"), "\n", "utf8");
+  for (const directory of legacyDirectories) {
+    fs.mkdirSync(directory);
+    fs.writeFileSync(path.join(directory, "session-1.marker"), "\n");
+  }
 
-  assertSilent(run(sandbox));
+  assertContext(run(box, "why is this slow?"));
   assert.strictEqual(fs.existsSync(secondOldMarker), true);
-  assert.strictEqual(fs.existsSync(legacyDirectory), true);
+  for (const directory of legacyDirectories) assert.strictEqual(fs.existsSync(directory), true);
 });
 
-test("session lanes reminder renders the routing table's codex defaults", (t) => {
-  const sandbox = makeSandbox(t);
-  const routingFile = path.join(sandbox.root, "model-routing.json");
-  const models = ["quick-choice", "volume-choice", "flagship-choice"].map((id) => ({ id, lane: "codex", intelligence: 5, taste: 4, cost: 3 }));
-  fs.writeFileSync(routingFile, JSON.stringify({
-    schemaVersion: 1,
-    updatedAt: "2026-07-04T00:00:00.000Z",
-    costProfile: "",
-    models,
-    defaults: { codex: { quick: { model: "quick-choice", effort: "high" }, volume: { model: "volume-choice", effort: "low" }, flagship: { model: "flagship-choice", effort: "max" } } }
-  }), "utf8");
-  assertContext(run(sandbox, hookInput(sandbox), { FUSION_MODEL_ROUTING: routingFile }), tagMessage("fleet-posture.session-lanes-reminder", "fusion lanes ready: codex flagship-choice for spec grade and deep review, quick-choice and volume-choice for quick and volume packages, grok under its four roles on the routing table's lane defaults, cursor under diversity for a model family no other lane carries and under burst for bounded worktree implementation, claude workers for the Claude surface. Independent packages dispatch together in one message; three or more convene /fusion:ultra; a single coherent change stays inline."));
-});
-
-test("the session lanes reminder names the selected breadth engine", (t) => {
-  const sandbox = makeSandbox(t);
-  const routingFile = path.join(sandbox.root, "breadth-routing.json");
-  const models = [{ id: "quick-choice", lane: "codex", intelligence: 5, taste: 4, cost: 3, notes: "" }];
-  fs.writeFileSync(routingFile, JSON.stringify({ schemaVersion: 1, updatedAt: "2026-07-04T00:00:00.000Z", costProfile: "", breadth: "devin", models }), "utf8");
-  const context = JSON.parse(run(sandbox, hookInput(sandbox), { FUSION_MODEL_ROUTING: routingFile }).stdout).hookSpecificOutput.additionalContext;
-  assert.match(context, /devin under diversity for a model family no other lane carries and under burst for bounded worktree implementation/);
-  assert.doesNotMatch(context, /cursor under diversity/);
-});
-
-test("FUSION_FLEET_MODE=off suppresses only fleet reminders", (t) => {
-  const sandbox = makeSandbox(t);
-  writeTranscript(sandbox, 250000);
-
-  assertContext(run(sandbox, hookInput(sandbox), { FUSION_FLEET_MODE: "off" }), null, advisoryNotice(250000));
-  assertSilent(run(sandbox, hookInput(sandbox), { FUSION_FLEET_MODE: "off" }));
-  assert.strictEqual(fs.existsSync(sessionLanesReminderPath(sandbox)), false);
-});
-
-test("the fleet mode state file suppresses reminders but keeps the context advisory", (t) => {
-  const sandbox = makeSandbox(t);
-  writeTranscript(sandbox, 250000);
-  fs.mkdirSync(sandbox.dataDir, { recursive: true });
-  fs.writeFileSync(path.join(sandbox.dataDir, "fleet-mode"), "off\n", "utf8");
-
-  assertContext(run(sandbox), null, advisoryNotice(250000));
-  assertSilent(run(sandbox, hookInput(sandbox), {}));
-  assert.strictEqual(fs.existsSync(sessionLanesReminderPath(sandbox)), false);
-});
-
-test("an enabled environment mode overrides a disabled state file", (t) => {
-  const sandbox = makeSandbox(t);
-  fs.mkdirSync(sandbox.dataDir, { recursive: true });
-  fs.writeFileSync(path.join(sandbox.dataDir, "fleet-mode"), "off\n", "utf8");
-
-  assertContext(run(sandbox, hookInput(sandbox), { FUSION_FLEET_MODE: "on" }), SESSION_LANES_CONTEXT);
-});
-
-test("invalid guard state is silent after the session lanes reminder", (t) => {
-  const sandbox = makeSandbox(t);
-
-  fs.mkdirSync(sandbox.stateDir, { recursive: true });
-  fs.writeFileSync(statePath(sandbox), "{not json", "utf8");
-  assertContext(run(sandbox), SESSION_LANES_CONTEXT);
-  assertSilent(run(sandbox));
-  assertSilent(run(sandbox, hookInput(sandbox, undefined)));
+test("the narrow wave reminder and marker are gone", (t) => {
+  const box = makeSandbox(t);
+  const statePath = path.join(box.stateDir, "session-1.json");
+  fs.mkdirSync(box.stateDir);
+  fs.writeFileSync(statePath, JSON.stringify({ consecutiveNarrowWaves: 2 }));
+  const original = fs.readFileSync(statePath, "utf8");
+  assertContext(run(box, "why is this slow?"), DEEP_REASONER_HINT);
+  assertContext(run(box));
+  assert.throws(() => messageTag("fleet-posture.narrow-wave-reminder"), RangeError);
+  assert.strictEqual(fs.existsSync(path.join(box.dataDir, "fleet-posture", "narrow-wave-reminders")), false);
+  assert.strictEqual(fs.readFileSync(statePath, "utf8"), original);
 });
 
 test("malformed hook input is silent", (t) => {
-  const sandbox = makeSandbox(t);
-  const result = run(sandbox, "{not json");
-
-  assert.strictEqual(result.status, 0);
-  assert.strictEqual(result.stdout, "");
-  assert.strictEqual(result.stderr, "");
+  const box = makeSandbox(t);
+  assertContext(spawnSync(process.execPath, [script], { input: "{not json", env: envFor(box), encoding: "utf8" }));
 });
