@@ -1,6 +1,4 @@
-import { spawnSync } from "node:child_process";
-import fs from "node:fs";
-import path from "node:path";
+import { createModelCatalog } from "./model-catalog.mjs";
 
 function invalidCatalog() {
   throw new Error("Invalid Devin model catalog.");
@@ -29,31 +27,17 @@ export function parseModelsJson(text) {
   }) };
 }
 
-export function readModelCatalog({ dataDir, bin, env = process.env, maxAgeMs = 3600000, now = Date.now(), run = spawnSync }) {
-  const cachePath = path.join(dataDir, "models-cache.json");
-  try {
-    const cached = JSON.parse(fs.readFileSync(cachePath, "utf8"));
-    if (Array.isArray(cached.families) && Number.isFinite(cached.fetchedAt)
-      && now >= cached.fetchedAt && now - cached.fetchedAt < maxAgeMs) {
-      return { families: cached.families, source: "cache" };
-    }
-  } catch (error) {
-    if (error.code !== "ENOENT" && !(error instanceof SyntaxError)) throw error;
-  }
-  const result = run(bin, ["models", "list", "--format", "json"], {
-    env, encoding: "utf8", timeout: 60000, maxBuffer: 2 * 1024 * 1024
-  });
-  if (result.error || result.status !== 0) {
+export const readModelCatalog = createModelCatalog({
+  key: "families",
+  args: ["models", "list", "--format", "json"],
+  directoryMode: 0o700,
+  parse: (result) => parseModelsJson(result.stdout).families,
+  fail(result) {
     const error = new Error(`Devin model listing failed: ${String(result.error?.message || result.stderr || result.stdout || "unknown error").trim()}`);
     error.failureKind = result.error?.code === "ENOENT" ? "missing_cli" : "error";
     throw error;
   }
-  const { families } = parseModelsJson(result.stdout);
-  fs.mkdirSync(dataDir, { recursive: true, mode: 0o700 });
-  fs.writeFileSync(cachePath, `${JSON.stringify({ families, fetchedAt: now })}\n`, { mode: 0o600 });
-  fs.chmodSync(cachePath, 0o600);
-  return { families, source: "cli" };
-}
+});
 
 function inputError(message) {
   const error = new Error(message);

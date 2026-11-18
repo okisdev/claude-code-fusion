@@ -1,33 +1,25 @@
-import { spawn, spawnSync } from "node:child_process";
-import fs from "node:fs";
+import { spawnSync } from "node:child_process";
 import path from "node:path";
+import { clearRunTimers, createProcessTransport, destroyRunStreams, executablePath, inheritChildEnv, runProcess, settleRun as settleProcessRun } from "./process-run.mjs";
 
 export const TESTED_DEVIN_INTERVAL = { floor: "3000.11", ceiling: "3000.12" };
 
 const READ_TOOLS = ["read", "grep", "glob", "find_file_by_name", "notebook_read", "todo_write", "web_search"];
 const WRITE_TOOLS = [...READ_TOOLS, "edit", "write", "notebook_edit", "exec", "get_output", "kill_shell", "write_to_process"];
-const STDERR_MAX_BYTES = 64 * 1024;
 const STREAM_MAX_BYTES = 2 * 1024 * 1024;
+const { appendTail, signalRunGroup, terminateRun: terminateProcessRun, finishProcessGroup, startProcess } = createProcessTransport({
+  processLine: processDevinLine,
+  streamLength: Buffer.byteLength,
+  preserveStderrUtf8: true,
+  onStreamOverflow: (run) => failProtocol(run, "Stream line exceeds size limit")
+});
 
 export function resolveDevinBin(env = process.env) {
   return env.DEVIN_BIN?.trim() || "devin";
 }
 
-function executablePath(bin, env) {
-  const candidates = bin.includes(path.sep) ? [path.resolve(bin)] : String(env.PATH || "").split(path.delimiter).map((directory) => path.join(directory || ".", bin));
-  for (const candidate of candidates) {
-    try {
-      fs.accessSync(candidate, fs.constants.X_OK);
-      return fs.realpathSync(candidate);
-    } catch {}
-  }
-  const error = new Error(`Devin CLI executable not found: ${bin}`);
-  error.failureKind = "missing_cli";
-  throw error;
-}
-
 export function probeDevinVersion(bin, env = process.env) {
-  const buildPath = executablePath(bin, env);
+  const buildPath = executablePath(bin, env, "Devin");
   const result = spawnSync(buildPath, ["--version"], { env, encoding: "utf8", timeout: 60000 });
   const output = String(result.stdout || "").trim();
   const version = output.match(/^devin (\d+(?:\.\d+)+) \([^\s()]+\)$/)?.[1];
@@ -56,8 +48,7 @@ export function toolsForMode(mode) {
 }
 
 export function buildDevinChildEnv({ env = process.env, homeDir, configDir, mode }) {
-  const allowed = new Set(["PATH", "LANG", "LANGUAGE", "TERM", "COLORTERM", "TMPDIR", "TZ", "USER", "LOGNAME", "SHELL", "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY", "http_proxy", "https_proxy", "all_proxy", "no_proxy", "JAVA_HOME", "GOROOT", "GOPATH", "CARGO_HOME", "RUSTUP_HOME", "PNPM_HOME", "BUN_INSTALL", "VOLTA_HOME", "MISE_DATA_DIR", "MISE_CONFIG_DIR", "MISE_CACHE_DIR", "ANDROID_HOME", "ANDROID_SDK_ROOT", "DEVELOPER_DIR", "SDKROOT"]);
-  const childEnv = Object.fromEntries(Object.entries(env).filter(([key]) => allowed.has(key) || key.startsWith("LC_")));
+  const childEnv = inheritChildEnv(env, ["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY", "http_proxy", "https_proxy", "all_proxy", "no_proxy"]);
   childEnv.HOME = homeDir;
   childEnv.XDG_DATA_HOME = path.join(homeDir, ".local", "share");
   childEnv.XDG_STATE_HOME = path.join(homeDir, ".local", "state");
@@ -68,52 +59,13 @@ export function buildDevinChildEnv({ env = process.env, homeDir, configDir, mode
   return childEnv;
 }
 
-function appendTail(previous, chunk) {
-  const combined = Buffer.from(previous + chunk, "utf8");
-  let start = Math.max(0, combined.length - STDERR_MAX_BYTES);
-  while (start < combined.length && (combined[start] & 0xc0) === 0x80) start += 1;
-  return combined.subarray(start).toString("utf8");
-}
-
-function devinGroupSignalable(pid) {
-  if (!Number.isInteger(pid) || pid <= 1) return false;
-  try {
-    process.kill(-pid, 0);
-    return true;
-  } catch (error) {
-    return error.code === "EPERM";
-  }
-}
-
-function signalRunGroup(run, signal) {
-  if (!Number.isInteger(run.pid) || run.pid <= 1) return;
-  try {
-    process.kill(-run.pid, signal);
-  } catch (error) {
-    if (error.code !== "ESRCH") run.outcome.stderrTail = appendTail(run.outcome.stderrTail, `\n${error.message}`);
-  }
-}
-
-function clearRunTimers(run) {
-  clearTimeout(run.runTimer);
-  clearTimeout(run.exitTimer);
-  clearTimeout(run.killTimer);
-  clearTimeout(run.drainTimer);
-  clearTimeout(run.deadlineTimer);
-}
-
 function releaseRequests(run) {
   for (const request of run.pending.values()) request.resolve(undefined);
   run.pending.clear();
 }
 
 function settleRun(run) {
-  if (run.settled) return;
-  run.settled = true;
-  clearRunTimers(run);
-  releaseRequests(run);
-  run.options.signal?.removeEventListener("abort", run.abort);
-  run.resolve(run.outcome);
+  settleProcessRun(run, releaseRequests);
 }
 
 function finishRun(run) {
@@ -126,11 +78,9 @@ function finishRun(run) {
 }
 
 function terminateRun(run) {
-  signalRunGroup(run, "SIGTERM");
-  run.killTimer ??= setTimeout(() => {
-    signalRunGroup(run, "SIGKILL");
+  terminateProcessRun(run, () => {
     run.drainTimer ??= setTimeout(() => drainRun(run), run.options.killGraceMs);
-  }, run.options.killGraceMs);
+  });
 }
 
 function writeMessage(run, message) {
@@ -235,7 +185,7 @@ function processToolUpdate(run, update) {
   }
   if (!run.tools.has(id)) run.outcome.toolCalls += 1;
   run.tools.set(id, tool);
-  if (tool !== "request_scope" && !run.allowedTools.includes(tool)) {
+  if (tool !== "request_scope" && tool !== "mcp_list_servers" && !run.allowedTools.includes(tool)) {
     run.outcome.policyViolation ??= { tool };
     finishRun(run);
     terminateRun(run);
@@ -324,20 +274,6 @@ function processDevinLine(run, line) {
   }
 }
 
-function handleStdoutData(run, chunk) {
-  run.stdoutRemainder += chunk;
-  let newline;
-  while ((newline = run.stdoutRemainder.indexOf("\n")) !== -1) {
-    const line = run.stdoutRemainder.slice(0, newline).replace(/\r$/, "");
-    run.stdoutRemainder = run.stdoutRemainder.slice(newline + 1);
-    processDevinLine(run, line);
-  }
-  if (Buffer.byteLength(run.stdoutRemainder) > STREAM_MAX_BYTES) {
-    run.stdoutRemainder = "";
-    failProtocol(run, "Stream line exceeds size limit");
-  }
-}
-
 function finishStream(run) {
   if (run.stdoutRemainder.trim()) processDevinLine(run, run.stdoutRemainder);
   run.stdoutRemainder = "";
@@ -348,9 +284,7 @@ function drainRun(run) {
   if (run.settled || run.draining) return;
   run.draining = true;
   finishStream(run);
-  run.child.stdout.destroy();
-  run.child.stderr.destroy();
-  run.child.stdin.destroy();
+  destroyRunStreams(run);
   signalRunGroup(run, "SIGKILL");
   settleRun(run);
 }
@@ -379,12 +313,7 @@ async function handleChildClose(run, code, signal) {
   run.outcome.exitCode = code;
   run.outcome.signal = signal;
   finishStream(run);
-  signalRunGroup(run, "SIGTERM");
-  const deadline = Date.now() + run.options.killGraceMs;
-  while (devinGroupSignalable(run.pid) && Date.now() < deadline) {
-    await new Promise((done) => setTimeout(done, Math.min(50, deadline - Date.now())));
-  }
-  if (devinGroupSignalable(run.pid)) signalRunGroup(run, "SIGKILL");
+  await finishProcessGroup(run);
   settleRun(run);
 }
 
@@ -394,60 +323,32 @@ function handleRunTimeout(run) {
   cancelRun(run);
 }
 
-function launchDevinProcess(bin, cwd, env) {
-  return spawn(bin, ["acp"], { cwd, env, detached: true, stdio: ["pipe", "pipe", "pipe"] });
-}
-
 function startDevinRun(run, resolve) {
-  run.resolve = resolve;
-  const { bin, cwd, env, timeoutMs, exitGraceMs, killGraceMs, launchProcess, signal, onSpawn } = run.options;
-  let spawned;
-  const launch = () => {
-    spawned = launchDevinProcess(bin, cwd, env);
-    spawned.on("error", () => {});
-    return spawned;
-  };
-  try {
-    run.child = launchProcess ? launchProcess(launch) : launch();
-  } catch (error) {
-    if (spawned?.pid) {
-      spawned.stdin.destroy();
-      try {
-        process.kill(-spawned.pid, "SIGKILL");
-      } catch {}
+  const { timeoutMs, exitGraceMs, killGraceMs, signal, onSpawn } = run.options;
+  if (!startProcess(run, resolve, ["acp"], {
+    launchError(run, error, spawned) {
+      if (spawned?.pid) {
+        spawned.stdin.destroy();
+        try { process.kill(-spawned.pid, "SIGKILL"); } catch {}
+      }
+      run.outcome.spawnError = error;
+      run.outcome.stderrTail = appendTail("", error.message);
+      settleRun(run);
+    },
+    stdinError(run) {
+      if (!run.ending) failProtocol(run, "Failed to write ACP request");
+    },
+    error: finishRun,
+    exit: handleChildExit,
+    close: handleChildClose,
+    spawn(run) {
+      try { onSpawn?.(run.child); }
+      catch (error) { failSetup(run, error.message); return; }
+      initializeSession(run).catch((error) => {
+        if (!run.ending && !run.settled) failSetup(run, error.message);
+      });
     }
-    run.outcome.spawnError = error;
-    run.outcome.stderrTail = appendTail("", error.message);
-    settleRun(run);
-    return;
-  }
-  run.pid = run.child.pid;
-  run.child.stdout.setEncoding("utf8");
-  run.child.stderr.setEncoding("utf8");
-  run.child.stdout.on("data", (chunk) => handleStdoutData(run, chunk));
-  run.child.stderr.on("data", (chunk) => { run.outcome.stderrTail = appendTail(run.outcome.stderrTail, chunk); });
-  run.child.stdin.on("error", (error) => {
-    if (error.code !== "EPIPE") run.outcome.stderrTail = appendTail(run.outcome.stderrTail, `\n${error.message}`);
-    if (!run.ending) failProtocol(run, "Failed to write ACP request");
-  });
-  run.child.on("error", (error) => {
-    run.outcome.spawnError = error;
-    run.outcome.stderrTail = appendTail(run.outcome.stderrTail, error.message);
-    finishRun(run);
-  });
-  run.child.on("exit", (code, childSignal) => handleChildExit(run, code, childSignal));
-  run.child.on("close", (code, childSignal) => handleChildClose(run, code, childSignal));
-  run.child.once("spawn", () => {
-    try {
-      onSpawn?.(run.child);
-    } catch (error) {
-      failSetup(run, error.message);
-      return;
-    }
-    initializeSession(run).catch((error) => {
-      if (!run.ending && !run.settled) failSetup(run, error.message);
-    });
-  });
+  })) return;
   run.deadlineTimer = setTimeout(() => {
     handleRunTimeout(run);
     drainRun(run);
@@ -458,21 +359,18 @@ function startDevinRun(run, resolve) {
 }
 
 export function runDevin({ bin, cwd, env, brief, mode, resumeSessionId, resolveSelection, timeoutMs = 540000, exitGraceMs = 15000, killGraceMs = 5000, launchProcess, signal, onSpawn }) {
-  const run = {
-    options: { bin, cwd, env, brief, mode, resumeSessionId, resolveSelection, timeoutMs, exitGraceMs, killGraceMs, launchProcess, signal, onSpawn },
+  return runProcess({ bin, cwd, env, brief, mode, resumeSessionId, resolveSelection, timeoutMs, exitGraceMs, killGraceMs, launchProcess, signal, onSpawn }, {
     outcome: {
-      exitCode: null, signal: null, sessionId: null, requestId: null, resultText: "", usage: null,
-      observedModel: null, resolvedEffort: null, stopReason: null, stopCause: null, appliedOptions: {}, rpcError: null,
-      protocolError: null, setupError: null, policyViolation: null, selectionError: null,
-      timedOut: false, lateClose: false, cancelled: false, stderrTail: "", toolCalls: 0, resultSeen: false
+      resultText: "", resolvedEffort: null, stopReason: null, stopCause: null, appliedOptions: {}, rpcError: null,
+      setupError: null, selectionError: null, toolCalls: 0
     },
-    child: undefined, pid: undefined, resolve: undefined, abort: undefined,
-    closed: false, exited: false, settled: false, draining: false, ending: false, promptSent: false,
-    stdoutRemainder: "", nextId: 1, pending: new Map(), configOptions: [], tools: new Map(), allowedTools: toolsForMode(mode),
-    runTimer: undefined, exitTimer: undefined, killTimer: undefined, drainTimer: undefined, deadlineTimer: undefined
-  };
-  run.abort = () => abortRun(run);
-  return new Promise((resolve) => startDevinRun(run, resolve));
+    state: {
+      exited: false, ending: false, promptSent: false,
+      nextId: 1, pending: new Map(), configOptions: [], tools: new Map(), allowedTools: toolsForMode(mode)
+    },
+    start: startDevinRun,
+    abort: abortRun
+  });
 }
 
 export function classifyDevinFailure(outcome) {

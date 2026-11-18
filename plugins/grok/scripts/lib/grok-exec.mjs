@@ -3,6 +3,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { isDeepStrictEqual } from "node:util";
+import { executionTimeoutMs } from "./execution-budget.mjs";
 
 import {
   getProcessIdentity,
@@ -221,13 +222,13 @@ export function resolveGrokBin(env = process.env) {
   return override && override.trim() ? override.trim() : "grok";
 }
 
-export function resolveTimeoutMs({ background = false, env = process.env } = {}) {
+export function resolveTimeoutMs({ background = false, backgroundShell = false, env = process.env } = {}) {
   const raw = Number(env[TIMEOUT_ENV]);
   const configured = Number.isFinite(raw) && raw > 0 ? Math.floor(raw) : null;
   if (background) {
     return Math.min(configured ?? BACKGROUND_TIMEOUT_CAP_MS, BACKGROUND_TIMEOUT_CAP_MS);
   }
-  return configured ?? DEFAULT_FOREGROUND_TIMEOUT_MS;
+  return configured ?? executionTimeoutMs(DEFAULT_FOREGROUND_TIMEOUT_MS, backgroundShell);
 }
 
 function resolvePidlessRunningGraceMs(env = process.env) {
@@ -2489,7 +2490,7 @@ export function runGrok(options) {
   const startedAt = Date.now();
   const env = resolveGrokAuthPaths(options.env ?? process.env, options.cwd ?? process.cwd());
   const bin = options.bin ?? resolveGrokBin(env);
-  const timeoutMs = options.timeoutMs ?? resolveTimeoutMs({ background: Boolean(options.background), env });
+  const timeoutMs = options.timeoutMs ?? resolveTimeoutMs({ background: Boolean(options.background), backgroundShell: Boolean(options.backgroundShell), env });
   const managedRun = !options.args;
   const deadline = managedRun ? options.managedDeadline ?? startedAt + timeoutMs : null;
   requireDeadline(deadline);

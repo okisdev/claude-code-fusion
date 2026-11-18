@@ -1,4 +1,4 @@
-export function renderFooterLines(record, engine) {
+export function renderFooterLines(record, engine, detailLines = []) {
   const lines = [];
   if (record.sessionId) {
     lines.push(`${engine}-session: ${record.sessionId}`);
@@ -19,6 +19,7 @@ export function renderFooterLines(record, engine) {
   if (record.semanticStatus) {
     lines.push(`semantic: ${record.semanticStatus}`);
   }
+  lines.push(...detailLines);
   for (const warning of record.warnings ?? []) {
     lines.push(`warning: ${String(warning).replace(/[\r\n]+/g, " ")}`);
   }
@@ -27,4 +28,9 @@ export function renderFooterLines(record, engine) {
     lines.push(`failure: ${record.failureKind ?? (record.status === "cancelled" ? "cancelled" : "error")}`);
   }
   return lines;
+}
+
+export function renderFailure(message, failureKind, json = false) {
+  return json ? `${JSON.stringify({ status: "error", failureKind, message }, null, 2)}\n`
+    : `${message}\n${renderFooterLines({ status: "error", failureKind }).join("\n")}\n`;
 }

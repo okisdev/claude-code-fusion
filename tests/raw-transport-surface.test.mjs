@@ -164,10 +164,17 @@ test("every forwarder launches in a background shell, awaits the output file, an
   }
 });
 
-test("only the Codex rescue launch carries the fixed background shell option", () => {
-  const codex = fs.readFileSync(path.join(repoRoot, "plugins/codex/agents/codex-rescue.md"), "utf8");
-  assert.ok(codex.includes('task --transport-background-shell --raw-args-token TOKEN'));
-  for (const file of ["plugins/grok/agents/grok-rescue.md", "plugins/grok/agents/grok-review-runner.md", "plugins/cursor/agents/cursor-rescue.md", "plugins/devin/agents/devin-rescue.md", "plugins/fusion/agents/job-collector.md"]) {
+test("every rescue launch carries the fixed background shell option", () => {
+  for (const engine of ["codex", "grok", "cursor", "devin"]) {
+    const file = `plugins/${engine}/agents/${engine}-rescue.md`;
+    const content = fs.readFileSync(path.join(repoRoot, file), "utf8");
+    assert.ok(content.includes(`scripts/${engine}-companion.mjs" task --transport-background-shell --raw-args-token TOKEN`), file);
+    assert.match(content, /the fixed `task` subcommand, the fixed background shell option, the optional fixed write default/, file);
+    if (engine !== "codex") {
+      assert.match(content, /When using the write default, place it before `--transport-background-shell`\./, file);
+    }
+  }
+  for (const file of ["plugins/grok/agents/grok-review-runner.md", "plugins/fusion/agents/job-collector.md"]) {
     const content = fs.readFileSync(path.join(repoRoot, file), "utf8");
     assert.doesNotMatch(content, /--transport-background-shell/, file);
   }
@@ -183,6 +190,7 @@ test("runtime skills describe the forwarder launch and keep direct slash command
     assert.match(runtime, /so a forwarder never ends its turn or writes a waiting line while the await operation prints pending/, file);
     assert.match(runtime, /A companion run directly by the main session through a slash command, with no forwarder agent, is a foreground `Bash` call with `timeout: 600000`/, file);
     assert.doesNotMatch(runtime, /waiting on <background id>/, file);
+    assert.match(runtime, /adds the fixed option `--transport-background-shell` to its task launch/, file);
   }
   const codex = fs.readFileSync(path.join(repoRoot, "plugins/codex/skills/codex-cli-runtime/SKILL.md"), "utf8");
   assert.match(codex, /adds the fixed option `--transport-background-shell` to its task launch/);

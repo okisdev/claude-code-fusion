@@ -5,11 +5,10 @@ import path from "node:path";
 import { resolveCursorBin, probeCursorVersion, compareCursorVersion, TESTED_CURSOR_INTERVAL, buildCursorArgs, buildCursorChildEnv, runCursor, classifyCursorFailure, reapPrivateHomeHelpers } from "./lib/cursor-exec.mjs";
 import { buildPrivateHome, copyChatForResume, cursorChatDir, projectHookFiles, CURSOR_SESSION_ID_PATTERN } from "./lib/cursor-home.mjs";
 import { readModelCatalog, resolveCursorModel } from "./lib/cursor-models.mjs";
-import { processGroupAlive, processIsDirectlyAlive } from "./lib/process-identity.mjs";
 import * as render from "./lib/render.mjs";
 import * as state from "./lib/state.mjs";
 import { cleanupRawCommandTransportsForSession } from "./lib/raw-transport.mjs";
-import { createCompanionCommands, errorWithFailure, realUserHome } from "./lib/companion-commands.mjs";
+import { createCleanupWaiter, createCompanionCommands, createModelsCommand, errorWithFailure, realUserHome } from "./lib/companion-commands.mjs";
 
 export { cleanupRawCommandTransportsForSession };
 
@@ -63,34 +62,13 @@ async function runJob({ record, source, dataDir, brief, signal, timeoutMs, exitG
     signal, timeoutMs, exitGraceMs, onInit: onProcess, launchProcess });
 }
 
-async function waitForCleanup(record, { processOwned, cleanupProcessesAlive }) {
-  const deadline = Date.now() + 12000;
-  while (Date.now() < deadline) {
-    if (!cleanupProcessesAlive(record)) {
-      await reapPrivateHomeHelpers(record.homeDir);
-      return true;
-    }
-    await new Promise((resolve) => setTimeout(resolve, 50));
-  }
-  for (const [pid, group] of [[record.cursorPid, true], [record.pid, record.background]]) {
-    if (pid !== process.pid && (group ? processGroupAlive(pid) : processIsDirectlyAlive(pid)) && (!processIsDirectlyAlive(pid) || processOwned(pid, pid === record.pid ? record.pidIdentity : record.cursorPidIdentity))) {
-      try { process.kill(group ? -pid : pid, "SIGKILL"); } catch (error) { if (error.code !== "ESRCH") return false; }
-    }
-  }
-  const killDeadline = Date.now() + 500;
-  while (cleanupProcessesAlive(record) && Date.now() < killDeadline) await new Promise((resolve) => setTimeout(resolve, 25));
-  if (cleanupProcessesAlive(record)) return false;
-  await reapPrivateHomeHelpers(record.homeDir);
-  return true;
-}
+const waitForCleanup = createCleanupWaiter({ engine: "cursor", reap: (record) => reapPrivateHomeHelpers(record.homeDir) });
 
-function handleModels(argv, transport, { commandArgs, output }) {
-  const { options, positionals } = commandArgs(argv, { booleanOptions: ["refresh", "json"] }, transport);
-  if (positionals.length) throw errorWithFailure("Models accepts only --refresh and --json.");
-  const catalog = readModelCatalog({ dataDir: state.resolveDataDir(), bin: resolveCursorBin(), maxAgeMs: options.refresh ? 0 : 3600000 });
-  const report = { engine: "cursor", models: catalog.models.map(({ id, displayName }) => ({ id, displayName })), source: catalog.source };
-  output(options.json ? report : report.models.map((model) => `${model.id} - ${model.displayName}`).join("\n") + "\n", options.json);
-}
+const handleModels = createModelsCommand({
+  engine: "cursor",
+  readCatalog: (maxAgeMs) => readModelCatalog({ dataDir: state.resolveDataDir(), bin: resolveCursorBin(), maxAgeMs }),
+  models: (catalog) => catalog.models.map(({ id, displayName }) => ({ id, displayName }))
+});
 
 function handleSetup(argv, transport, { commandArgs, output }) {
   const { options, positionals } = commandArgs(argv, { booleanOptions: ["json"] }, transport);

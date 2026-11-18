@@ -1,6 +1,4 @@
-import { spawnSync } from "node:child_process";
-import fs from "node:fs";
-import path from "node:path";
+import { createModelCatalog } from "./model-catalog.mjs";
 
 import { classifyCursorFailure } from "./cursor-exec.mjs";
 
@@ -16,38 +14,30 @@ export function parseModelsListing(text) {
   return models;
 }
 
-export function readModelCatalog({ dataDir, bin, env = process.env, maxAgeMs = 3600000, now = Date.now(), run = spawnSync }) {
-  const cachePath = path.join(dataDir, "models-cache.json");
-  try {
-    const cached = JSON.parse(fs.readFileSync(cachePath, "utf8"));
-    if (Array.isArray(cached.models) && Number.isFinite(cached.fetchedAt) && now >= cached.fetchedAt && now - cached.fetchedAt < maxAgeMs) {
-      return { models: cached.models, fetchedAt: cached.fetchedAt, source: "cache" };
-    }
-  } catch (error) {
-    if (error.code !== "ENOENT" && !(error instanceof SyntaxError)) {
-      throw error;
-    }
-  }
-  const result = run(bin, ["models"], { env, encoding: "utf8", timeout: 60000, maxBuffer: 2 * 1024 * 1024 });
-  const models = result.status === 0 ? parseModelsListing(result.stdout) : [];
-  if (result.error || result.status !== 0 || models.length === 0) {
-    const detail = String(result.error?.message || result.stderr || result.stdout || "Model listing was empty.").trim();
-    const error = new Error(`Cursor model listing failed: ${detail}`);
-    const kind = classifyCursorFailure({
-      exitCode: result.status === 0 ? 1 : result.status,
-      stderrTail: detail,
-      spawnError: result.error,
-      protocolError: null
-    });
-    error.failureKind = ["auth", "network", "missing_cli", "quota", "rate_limited"].includes(kind) ? kind : "error";
-    throw error;
-  }
-  const catalog = { models, fetchedAt: now };
-  fs.mkdirSync(dataDir, { recursive: true });
-  fs.writeFileSync(cachePath, `${JSON.stringify(catalog)}\n`, { mode: 0o600 });
-  fs.chmodSync(cachePath, 0o600);
-  return { ...catalog, source: "cli" };
+function failModelListing(result) {
+  const detail = String(result.error?.message || result.stderr || result.stdout || "Model listing was empty.").trim();
+  const error = new Error(`Cursor model listing failed: ${detail}`);
+  const kind = classifyCursorFailure({
+    exitCode: result.status === 0 ? 1 : result.status,
+    stderrTail: detail,
+    spawnError: result.error,
+    protocolError: null
+  });
+  error.failureKind = ["auth", "network", "missing_cli", "quota", "rate_limited"].includes(kind) ? kind : "error";
+  throw error;
 }
+
+export const readModelCatalog = createModelCatalog({
+  key: "models",
+  args: ["models"],
+  includeFetchedAt: true,
+  fail: failModelListing,
+  parse(result) {
+    const models = parseModelsListing(result.stdout);
+    if (!models.length) failModelListing(result);
+    return models;
+  }
+});
 
 export function billingPoolForModel(id) {
   return id.startsWith("composer-") ? "first-party" : "api";

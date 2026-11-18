@@ -81,6 +81,20 @@ test("forbidden tools before init and after result terminate immediately", async
   }
 });
 
+test("MCP server discovery is ignored without ending the run in every mode", async (t) => {
+  for (const mode of ["consult", "write", "review"]) {
+    const root = fixture(t);
+    const result = await runCursor({ bin, args: buildCursorArgs({ mode, variant: "composer-2.5", cwd: root }), cwd: root,
+      env: { ...process.env, FAKE_CURSOR_SCENARIO: "mcp_list_servers" }, brief: "inspect", timeoutMs: 2000,
+      exitGraceMs: 100, killGraceMs: 100, mode });
+    assert.equal(classifyCursorFailure(result), null, mode);
+    assert.equal(result.policyViolation, null, mode);
+    assert.equal(result.resultText, "fake result", mode);
+    assert.equal(result.resultSeen, true, mode);
+    assert.equal(result.eventCount, 9, mode);
+  }
+});
+
 test("a result before the run deadline gets only exit grace", async (t) => {
   const root = fixture(t);
   const result = await runCursor({ bin, args: buildCursorArgs({ mode: "consult", variant: "composer-2.5", cwd: root }), cwd: root, env: { ...process.env, FAKE_CURSOR_SCENARIO: "near_deadline" }, brief: "inspect", timeoutMs: 5000, exitGraceMs: 3000, killGraceMs: 100, mode: "consult" });

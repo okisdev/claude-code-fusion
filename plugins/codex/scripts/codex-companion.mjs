@@ -9,7 +9,9 @@ import { fileURLToPath } from "node:url";
 
 import { configureRawTransport, createRawCommandTransport as allocateRawCommandTransport, consumeRawCommandTransport, pruneRawCommandTransports, resolveCommandTransport } from "./lib/raw-transport.mjs";
 import { awaitOutput } from "./lib/await-output.mjs";
-import { parseArgs, parseRawArgs, parseServiceTier, splitRawArgumentString } from "./lib/args.mjs";
+import { resolveTimeoutMs } from "./lib/job-state.mjs";
+import { renderFailure } from "./lib/render-footers.mjs";
+import { parseArgs, parseRawArgs, parseServiceTier, parseRecordAcceptanceArgs, splitRawArgumentString } from "./lib/args.mjs";
 import {
   buildReviewArgs,
   buildTaskArgs,
@@ -94,19 +96,9 @@ const BACKGROUND_ABORT_CLEANUP_POLL_MS = 50;
 const TESTED_VERSION_MIN = [0, 154, 0];
 const TESTED_VERSION_MAX = [0, 163, 0];
 const CONTINUE_PROMPT = "Continue from the current Codex thread state. Complete the next highest value step and continue until the task is resolved.";
-const RECORD_ACCEPTANCE_JOB_ID_PATTERN = /^[a-f0-9]{32}$/;
-const RECORD_ACCEPTANCE_VALUES = new Set(["accepted", "rejected", "unverified"]);
-const RECORD_ACCEPTANCE_SOURCES = new Set(["collector", "main-loop", "stats"]);
-const SEMANTIC_FAILURE_KINDS = new Set(["intent_override", "scope_rewrite", "wrong_approach", "style_mismatch", "oversized"]);
 const RESUMABLE_FAILURE_KINDS = new Set(["timeout", "policy", "patch_thrash", "died"]);
 const WIND_DOWN_PROMPT = "Wind down: do not start new work. Finish the smallest coherent deliverable from the work already completed and report the files changed and the verification output.";
 const JOB_ID_PATTERN = /^[a-f0-9]{32}$/;
-const FLAGSHIP_MODEL = "gpt-6-astra";
-const FLAGSHIP_WARNING_MIN_SAMPLE = 4;
-const FLAGSHIP_WARNING_MAX_FILES = 500;
-const FLAGSHIP_WARNING_MAX_EXAMINED_FILES = 5000;
-const FLAGSHIP_WARNING_MAX_FILE_BYTES = 16 * 1024 * 1024;
-const FLAGSHIP_WARNING_WINDOW_MS = 7 * 24 * 60 * 60 * 1000;
 const SWIFTPM_SANDBOX_NOTE = "Environment note from the Codex companion: SwiftPM cannot nest its own sandbox-exec inside this sandbox, so run SwiftPM with --disable-sandbox, for example swift build --disable-sandbox and swift test --disable-sandbox.";
 let activeCommandArgv = null;
 let cachedCompanionVersion = null;
@@ -139,13 +131,6 @@ function printUsage() {
   );
 }
 
-function normalizeArgv(argv) {
-  if (argv.length !== 1) {
-    return argv;
-  }
-  return splitRawArgumentString(argv[0]);
-}
-
 function commandArgs(rawArgv, config) {
   try {
     if (rawArgv.length === 1) {
@@ -157,66 +142,10 @@ function commandArgs(rawArgv, config) {
   }
 }
 
-function serviceTierOption(value) {
-  try {
-    return parseServiceTier(value);
-  } catch (error) {
-    throw new CompanionError(error.message, "input");
-  }
-}
-
 function rejectPersistentEffort(value) {
   if (typeof value === "string" && value.trim().toLowerCase() === "persistent") {
     throw new CompanionError("The persistent reasoning effort switches Codex into its open ended persistent mode, which cannot run inside a bounded companion flight. Choose another effort.", "input");
   }
-}
-
-function recordAcceptanceArgs(argv) {
-  const options = {};
-  for (let index = 0; index < argv.length; index += 1) {
-    const token = argv[index];
-    if (token === "--accept-failed-transport" || token === "--json") {
-      const flag = token === "--json" ? "json" : "acceptFailedTransport";
-      if (options[flag]) {
-        throw new CompanionError(`The ${token} option may be provided only once.`, "input");
-      }
-      options[flag] = true;
-      continue;
-    }
-    const key = token === "--job-id" ? "jobId" : token === "--acceptance" ? "acceptance" : token === "--reason" ? "reason" : token === "--failure-kind" ? "failureKind" : token === "--source" ? "source" : null;
-    if (!key) {
-      throw new CompanionError("The record-acceptance command accepts only --job-id, --acceptance, --reason, --failure-kind, --source, --accept-failed-transport, and --json.", "input");
-    }
-    if (Object.hasOwn(options, key)) {
-      throw new CompanionError(`${token} may be provided only once.`, "input");
-    }
-    const value = argv[index + 1];
-    if (value === undefined) {
-      throw new CompanionError(`${token} requires a value.`, "input");
-    }
-    options[key] = value;
-    index += 1;
-  }
-  if (!RECORD_ACCEPTANCE_JOB_ID_PATTERN.test(options.jobId ?? "")) {
-    throw new CompanionError("The --job-id option must be a 32 character lowercase hexadecimal job id.", "input");
-  }
-  if (!RECORD_ACCEPTANCE_VALUES.has(options.acceptance)) {
-    throw new CompanionError("The --acceptance option must be accepted, rejected, or unverified.", "input");
-  }
-  if (options.failureKind !== undefined && !SEMANTIC_FAILURE_KINDS.has(options.failureKind)) {
-    throw new CompanionError("The --failure-kind option must be intent_override, scope_rewrite, wrong_approach, style_mismatch, or oversized.", "input");
-  }
-  if (options.failureKind !== undefined && options.acceptance !== "rejected") {
-    throw new CompanionError("The --failure-kind option is valid only with --acceptance rejected.", "input");
-  }
-  if (options.acceptance === "rejected" && !options.reason?.trim()) {
-    throw new CompanionError("A rejected acceptance requires --reason.", "input");
-  }
-  options.source ??= "stats";
-  if (!RECORD_ACCEPTANCE_SOURCES.has(options.source)) {
-    throw new CompanionError("The --source option must be collector, main-loop, or stats.", "input");
-  }
-  return options;
 }
 
 function output(value, asJson = false) {
@@ -241,7 +170,7 @@ function handleModels(argv) {
     }
   } catch (error) {
     const message = `Could not read Codex models cache ${filePath}: ${error.message}`;
-    process.stderr.write(argv[0] === "--json" ? `${JSON.stringify({ status: "error", failureKind: "input", message }, null, 2)}\n` : `${message}\nstate: error\nfailure: input\n`);
+    process.stderr.write(renderFailure(message, "input", argv[0] === "--json"));
     process.exitCode = 1;
     return;
   }
@@ -382,28 +311,10 @@ function nonnegativeInteger(value, label) {
   return number;
 }
 
-function positiveEnvMs(name, fallback, env = process.env) {
-  const value = env[name];
-  if (value == null || !String(value).trim()) {
-    return fallback;
-  }
-  const number = Number(value);
-  return Number.isSafeInteger(number) && number > 0 ? number : fallback;
-}
-
-function nonnegativeEnvMs(name, fallback, env = process.env) {
-  const value = env[name];
-  if (value == null || !String(value).trim()) {
-    return fallback;
-  }
-  const number = Number(value);
-  return Number.isSafeInteger(number) && number >= 0 ? number : fallback;
-}
-
 function resolveExecutionTimeout(background, backgroundShellBudget = false, env = process.env) {
   const name = background ? BACKGROUND_TIMEOUT_ENV : backgroundShellBudget ? BACKGROUND_SHELL_TIMEOUT_ENV : FOREGROUND_TIMEOUT_ENV;
   const fallback = background ? DEFAULT_BACKGROUND_TIMEOUT_MS : backgroundShellBudget ? DEFAULT_BACKGROUND_SHELL_TIMEOUT_MS : DEFAULT_FOREGROUND_TIMEOUT_MS;
-  return positiveEnvMs(name, fallback, env);
+  return resolveTimeoutMs(env[name], fallback);
 }
 
 function companionVersion() {
@@ -423,25 +334,14 @@ function backgroundDelivery(env = process.env) {
 }
 
 function resolvePidlessGrace(env = process.env) {
-  return nonnegativeEnvMs(PIDLESS_GRACE_ENV, DEFAULT_PIDLESS_GRACE_MS, env);
-}
-
-function resolveWaitPoll(env = process.env) {
-  return positiveEnvMs(WAIT_POLL_ENV, DEFAULT_WAIT_POLL_MS, env);
+  return resolveTimeoutMs(env[PIDLESS_GRACE_ENV], DEFAULT_PIDLESS_GRACE_MS, 0);
 }
 
 function resolveWaitTimeout(options, env = process.env) {
   if (options["wait-timeout-ms"] != null) {
     return Math.min(nonnegativeInteger(options["wait-timeout-ms"], "--wait-timeout-ms"), MAX_WAIT_TIMEOUT_MS);
   }
-  const value = env[WAIT_TIMEOUT_ENV];
-  if (value != null && String(value).trim()) {
-    const number = Number(value);
-    if (Number.isSafeInteger(number) && number >= 0) {
-      return Math.min(number, MAX_WAIT_TIMEOUT_MS);
-    }
-  }
-  return DEFAULT_WAIT_TIMEOUT_MS;
+  return Math.min(resolveTimeoutMs(env[WAIT_TIMEOUT_ENV], DEFAULT_WAIT_TIMEOUT_MS, 0), MAX_WAIT_TIMEOUT_MS);
 }
 
 function readStdinIfPiped() {
@@ -847,98 +747,6 @@ function currentProcessIdentity() {
   return identity;
 }
 
-function isFlagshipForegroundWriteRequest({ background, model, write }) {
-  return !background && write && typeof model === "string" && model.trim().toLowerCase() === FLAGSHIP_MODEL;
-}
-
-function scanFlagshipForegroundWriteStat(dataDir) {
-  try {
-    const now = Date.now();
-    const cutoff = now - FLAGSHIP_WARNING_WINDOW_MS;
-    const stateRoot = path.join(path.resolve(dataDir), "state");
-    const files = [];
-    for (const workspace of fs.readdirSync(stateRoot, { withFileTypes: true })) {
-      if (!workspace.isDirectory()) {
-        continue;
-      }
-      const directory = path.join(stateRoot, workspace.name, "jobs");
-      let entries;
-      try {
-        entries = fs.readdirSync(directory, { withFileTypes: true });
-      } catch (error) {
-        if (error?.code === "ENOENT") {
-          continue;
-        }
-        return null;
-      }
-      for (const entry of entries) {
-        if (!entry.isFile() || !entry.name.endsWith(".json")) {
-          continue;
-        }
-        const file = path.join(directory, entry.name);
-        try {
-          const stats = fs.statSync(file);
-          if (stats.mtimeMs >= cutoff) {
-            files.push({ file, modifiedAt: stats.mtimeMs, size: stats.size });
-          }
-        } catch {}
-      }
-    }
-    files.sort((left, right) => right.modifiedAt - left.modifiedAt || left.file.localeCompare(right.file));
-
-    let total = 0;
-    let timeouts = 0;
-    let examined = 0;
-    for (const { file, modifiedAt, size } of files) {
-      if (modifiedAt < cutoff || examined >= FLAGSHIP_WARNING_MAX_EXAMINED_FILES || total >= FLAGSHIP_WARNING_MAX_FILES) {
-        break;
-      }
-      examined += 1;
-      if (size > FLAGSHIP_WARNING_MAX_FILE_BYTES) {
-        continue;
-      }
-      let record;
-      try {
-        record = JSON.parse(fs.readFileSync(file, "utf8"));
-      } catch {
-        continue;
-      }
-      if (!record || typeof record !== "object" || Array.isArray(record)) {
-        continue;
-      }
-      const createdAt = Date.parse(record.createdAt);
-      if (!Number.isFinite(createdAt) || createdAt < cutoff || createdAt > now) {
-        continue;
-      }
-      const request = record.request;
-      if (!request || typeof request !== "object" || Array.isArray(request) || !request.write || request.background || record.background) {
-        continue;
-      }
-      const model = request.model || record.resolvedModel;
-      if (model !== FLAGSHIP_MODEL) {
-        continue;
-      }
-      total += 1;
-      if (record.failureKind === "timeout") {
-        timeouts += 1;
-      }
-    }
-    return { timeouts, total };
-  } catch {
-    return null;
-  }
-}
-
-function flagshipForegroundWriteWarning(dataDir, timeoutMs) {
-  const stat = scanFlagshipForegroundWriteStat(dataDir);
-  const flightBudget = `${timeoutMs / 1000}s`;
-  if (!stat || stat.total < FLAGSHIP_WARNING_MIN_SAMPLE) {
-    return `warning: foreground gpt-6-astra write tasks run against a ${flightBudget} flight budget and the flagship's time to first token at max runs into minutes. Keep effort at xhigh, split the package, or route quick shapes to the Codex quick default and volume shapes to the volume default in the Fusion routing table.`;
-  }
-  const percentage = Math.round((100 * stat.timeouts) / stat.total);
-  return `warning: ${percentage}% of foreground gpt-6-astra write tasks timed out in the last 7 days (${stat.timeouts} of ${stat.total}). Sized to the ${flightBudget} flight budget? Keep effort at xhigh, split the package, or route quick shapes to the Codex quick default and volume shapes to the volume default in the Fusion routing table.`;
-}
-
 function shellArgument(value) {
   return `'${String(value).replaceAll("'", "'\\''")}'`;
 }
@@ -1141,7 +949,7 @@ function inheritedRouting(record, options, defaultServiceTier) {
     inherited = true;
   }
   if (!explicitServiceTier && Object.hasOwn(source, "serviceTier")) {
-    serviceTier = source.serviceTier === null ? null : serviceTierOption(source.serviceTier);
+    serviceTier = source.serviceTier === null ? null : parseServiceTier(source.serviceTier);
     inherited = true;
   }
   return { effort, inherited, model, serviceTier };
@@ -1696,7 +1504,7 @@ async function handleTask(rawArgv, transport = {}) {
       optionsBeforePositionals: true,
       valueOptions: ["cwd", "effort", "model", "output-schema", "prompt-file", "resume", "service-tier"]
     });
-    const serviceTier = serviceTierOption(options["service-tier"]);
+    const serviceTier = parseServiceTier(options["service-tier"]);
     rejectPersistentEffort(options.effort);
     const cwd = resolveCwd(options);
     rejectImplicitSubdirectoryCwd(cwd, options);
@@ -1746,11 +1554,6 @@ async function handleTask(rawArgv, transport = {}) {
       ...(routing.inherited ? { inheritedFromThread: true } : {})
     };
     validateExecutionRequest(cwd, request);
-    const warning = isFlagshipForegroundWriteRequest({ background, model: request.model, write: request.write }) ? flagshipForegroundWriteWarning(dataDir, timeoutMs) : null;
-    const diagnostics = warning ? [{ type: "warning", message: warning }] : [];
-    if (warning) {
-      process.stderr.write(`${warning}\n`);
-    }
     const found = createReservedJob({
       background,
       brief: prompt,
@@ -1758,7 +1561,6 @@ async function handleTask(rawArgv, transport = {}) {
       companionVersion: companionVersion(),
       cwd,
       dataDir,
-      diagnostics,
       jobClass: "task",
       mode: write ? "write" : "consult",
       request,
@@ -1830,7 +1632,7 @@ async function handleReview(rawArgv, adversarial = false, transport = {}) {
   }
   const cwd = resolveCwd(options);
   rejectImplicitSubdirectoryCwd(cwd, options);
-  const serviceTier = serviceTierOption(options["service-tier"]);
+  const serviceTier = parseServiceTier(options["service-tier"]);
   rejectPersistentEffort(options.effort);
   const probe = preflightCodex(cwd);
   const target = reviewTarget(options);
@@ -1878,7 +1680,7 @@ async function handleReview(rawArgv, adversarial = false, transport = {}) {
 }
 
 async function waitForBackgroundLaunchApproval(file, record) {
-  const deadline = Date.now() + positiveEnvMs(BACKGROUND_LAUNCH_APPROVAL_TIMEOUT_ENV, BACKGROUND_LAUNCH_APPROVAL_TIMEOUT_MS);
+  const deadline = Date.now() + resolveTimeoutMs(process.env[BACKGROUND_LAUNCH_APPROVAL_TIMEOUT_ENV], BACKGROUND_LAUNCH_APPROVAL_TIMEOUT_MS);
   let current = record;
   for (;;) {
     current = readJobRecordFile(file) ?? current;
@@ -2022,7 +1824,7 @@ function delay(ms) {
 
 async function waitForResult(found, options) {
   const deadline = Date.now() + resolveWaitTimeout(options);
-  const pollMs = resolveWaitPoll();
+  const pollMs = resolveTimeoutMs(process.env[WAIT_POLL_ENV], DEFAULT_WAIT_POLL_MS);
   let record = found.record;
   for (;;) {
     record = await refreshRunningJobRecord({ record, file: found.file });
@@ -2137,7 +1939,7 @@ async function handleCancel(rawArgv) {
 }
 
 async function handleRecordAcceptance(argv) {
-  const { acceptance, acceptFailedTransport, failureKind, jobId, json, reason, source } = recordAcceptanceArgs(argv);
+  const { acceptance, acceptFailedTransport, failureKind, jobId, json, reason, source } = parseRecordAcceptanceArgs(argv);
   const found = findJobRecordById(resolveDataDir(), jobId);
   if (!found) {
     throw new CompanionError(`No job record found for ${jobId}.`, "input");
@@ -2146,20 +1948,11 @@ async function handleRecordAcceptance(argv) {
     if (acceptance === "accepted" && current.status !== "done" && !acceptFailedTransport) {
       throw new CompanionError(`Codex job ${current.id} has transport status ${current.status}. Pass --accept-failed-transport to record accepted.`, "input");
     }
-    if (acceptance !== "rejected") {
-      return {
-        acceptanceRecordedAt: nowIso(),
-        acceptanceSource: source,
-        semanticFailureKind: null,
-        semanticFailureMessage: null,
-        semanticStatus: acceptance
-      };
-    }
     return {
       acceptanceRecordedAt: nowIso(),
       acceptanceSource: source,
-      semanticFailureKind: failureKind ?? null,
-      semanticFailureMessage: reason,
+      semanticFailureKind: acceptance === "rejected" ? failureKind ?? null : null,
+      semanticFailureMessage: acceptance === "rejected" ? reason : null,
       semanticStatus: acceptance
     };
   }, { allowTerminal: true });
@@ -2396,7 +2189,7 @@ async function main() {
 function wantsJsonError() {
   const raw = activeCommandArgv ?? process.argv.slice(3);
   try {
-    return normalizeArgv(raw).some((token) => token === "--json" || token === "--json=true");
+    return (raw.length === 1 ? splitRawArgumentString(raw[0]) : raw).some((token) => token === "--json" || token === "--json=true");
   } catch {
     return raw.some((token) => token.includes("--json"));
   }
@@ -2405,10 +2198,7 @@ function wantsJsonError() {
 function renderTopLevelError(error) {
   const message = redactDiagnostic(oneLine(error?.message ?? error, "Codex companion failed."));
   const failureKind = failureKindForError(error);
-  if (wantsJsonError()) {
-    return `${JSON.stringify({ status: "error", failureKind, message }, null, 2)}\n`;
-  }
-  return `${message}\nstate: error\nfailure: ${failureKind}\n`;
+  return renderFailure(message, failureKind, wantsJsonError());
 }
 
 if (process.argv[1] && path.resolve(process.argv[1]) === SELF_PATH) {

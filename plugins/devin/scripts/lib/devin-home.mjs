@@ -3,6 +3,7 @@ import fs from "node:fs";
 import { createRequire } from "node:module";
 import os from "node:os";
 import path from "node:path";
+import { ensureHomeLink, ensurePrivateDirectories } from "./private-home.mjs";
 import { withRecordLock } from "./record-lock.mjs";
 import { listAllJobRecords } from "./state.mjs";
 import { processGroupAlive, processIdentityMatches, processIsDirectlyAlive, validProcessIdentity } from "./process-identity.mjs";
@@ -76,28 +77,22 @@ export function realCredentialsPath({ env = process.env, realHome = os.homedir()
 
 export function ensurePrivateHome({ dataDir, env = process.env, realHome = os.homedir() }) {
   const homeDir = path.join(dataDir, "home");
-  for (const directory of [
+  ensurePrivateDirectories([
     homeDir,
     path.join(homeDir, ".local"),
     path.join(homeDir, ".local", "share"),
     path.join(homeDir, ".local", "share", "devin"),
     path.join(homeDir, ".local", "state"),
     path.join(homeDir, ".cache")
-  ]) {
-    fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
-    fs.chmodSync(directory, 0o700);
-  }
+  ]);
   const link = path.join(homeDir, ".local", "share", "devin", "credentials.toml");
   const target = realCredentialsPath({ env, realHome });
-  const stats = fs.lstatSync(link, { throwIfNoEntry: false });
-  if (stats && (!stats.isSymbolicLink() || fs.readlinkSync(link) !== target)) fs.rmSync(link, { recursive: true, force: true });
-  if (!fs.lstatSync(link, { throwIfNoEntry: false })) fs.symlinkSync(target, link);
+  ensureHomeLink(target, link);
   const privateCli = path.join(homeDir, ".local", "share", "devin", "cli");
   const privateSessions = path.join(privateCli, "sessions.db");
   const realCli = path.join(path.dirname(target), "cli");
   const realSessions = path.join(realCli, "sessions.db");
-  fs.mkdirSync(privateCli, { recursive: true, mode: 0o700 });
-  fs.chmodSync(privateCli, 0o700);
+  ensurePrivateDirectories([privateCli]);
   fs.mkdirSync(realCli, { recursive: true });
   try {
     withRecordLock(path.join(dataDir, ".devin-session-migration.json"), () => {
@@ -122,10 +117,7 @@ export function ensurePrivateHome({ dataDir, env = process.env, realHome = os.ho
 export function buildJobConfig({ configDir, mode, cwd, realHome = os.homedir(), gitDirs = {}, env = process.env, homeDir = null }) {
   if (!["consult", "review", "write"].includes(mode)) throw new Error(`Invalid Devin mode: ${mode}`);
   const devinDir = path.join(configDir, "devin");
-  fs.mkdirSync(configDir, { recursive: true, mode: 0o700 });
-  fs.mkdirSync(devinDir, { recursive: true, mode: 0o700 });
-  fs.chmodSync(configDir, 0o700);
-  fs.chmodSync(devinDir, 0o700);
+  ensurePrivateDirectories([configDir, devinDir]);
   const sensitiveDirs = [
     ".ssh", ".gnupg", ".aws", ".azure", ".kube", ".docker", ".config", ".local/share",
     ".claude", ".codex", ".grok", ".cursor", ".devin", "Library/Keychains", "Library/Application Support"

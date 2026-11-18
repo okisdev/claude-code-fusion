@@ -128,6 +128,11 @@ if (scenario === "hang") {
   }
   emit(result);
 } else {
+  if (scenario === "mcp_list_servers") {
+    const call = { type: "tool_call", subtype: "started", call_id: "mcp-list", tool_call: { mcpListServersToolCall: { args: {} } } };
+    emit(call);
+    emit({ ...call, subtype: "completed", tool_call: { mcpListServersToolCall: { args: {}, result: { error: "No MCP servers configured" } } } });
+  }
   emit({ type: "user", message: "brief received" });
   emit({ type: "thinking", subtype: "delta", text: "thinking" });
   emit({ type: "tool_call", subtype: "started", call_id: "call-1", tool_call: { readToolCall: { args: { path: "README.md" } }, hookAdditionalContexts: [], toolCallId: "tool-1", startedAtMs: "1" } });

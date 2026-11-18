@@ -235,6 +235,19 @@ test("other agent requests receive method-not-found errors", async (t) => {
   assert.deepEqual(log.messages.at(-1), { jsonrpc: "2.0", id: "client-request", error: { code: -32601, message: "Method not found" } });
 });
 
+test("mcp_list_servers is ignored without ending the run in every mode", async (t) => {
+  for (const mode of ["consult", "write", "review"]) {
+    const { result, log } = await fakeRun(t, "mcp_list_servers", { mode });
+    assert.equal(classifyDevinFailure(result), null, mode);
+    assert.equal(result.policyViolation, null, mode);
+    assert.equal(result.resultText, "fake result", mode);
+    assert.equal(result.stopReason, "end_turn", mode);
+    assert.equal(result.toolCalls, 3, mode);
+    assert.equal(log.messages.some((message) => message.method === "session/cancel"), false, mode);
+    assert.deepEqual(log.messages[1].params.mcpServers, [], mode);
+  }
+});
+
 test("forbidden tools terminate before initialization, during updates, and after the result", async (t) => {
   for (const scenario of ["forbidden_before_init", "forbidden_tool", "forbidden_update", "forbidden_after_result"]) {
     let pid;

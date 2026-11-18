@@ -6,6 +6,7 @@ import test from "node:test";
 
 import {
   recordedProcessGroupsClean,
+  resolveTimeoutMs,
   runGrok,
   terminateRecordedProcessGroups,
   terminateRecordedProcessGroupsSync
@@ -13,6 +14,24 @@ import {
 import { getProcessIdentity, validProcessIdentity } from "../plugins/grok/scripts/lib/process-identity.mjs";
 import { createJobRecord, generateJobId, jobFilePath, readJobRecordFile, writeJobRecordFile } from "../plugins/grok/scripts/lib/state.mjs";
 import { envFor, killGroups, makeSandbox, pidAlive, readInvocations, runCompanion, waitFor } from "./lib/companion-harness.mjs";
+
+test("background shell budgets preserve foreground defaults, overrides, and detached caps", () => {
+  for (const [options, timeout, expected] of [
+    [{}, undefined, 570000],
+    [{ backgroundShell: true }, undefined, 900000],
+    [{}, "2400", 2400],
+    [{ backgroundShell: true }, "2400", 2400],
+    [{}, "invalid", 570000],
+    [{ backgroundShell: true }, "invalid", 900000],
+    [{ backgroundShell: true }, "0", 900000],
+    [{ backgroundShell: true }, "1500.9", 1500],
+    [{ background: true, backgroundShell: true }, undefined, 1800000],
+    [{ background: true, backgroundShell: true }, "2400", 2400],
+    [{ background: true, backgroundShell: true }, "9000000", 1800000]
+  ]) {
+    assert.equal(resolveTimeoutMs({ ...options, env: { GROK_COMPANION_TIMEOUT_MS: timeout } }), expected);
+  }
+});
 
 function options(sandbox, env, extra = {}) {
   return {

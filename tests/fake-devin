@@ -98,6 +98,10 @@ async function prompt(id) {
     tool("request_scope");
     return emit({ id: "scope-permission", method: "session/request_permission", params: { sessionId, toolCall: { toolCallId: "request_scope:0#ab" }, options: [{ optionId: "allow_once", kind: "allow_once" }] } });
   }
+  if (scenario === "mcp_list_servers") {
+    tool("mcp_list_servers");
+    update({ sessionUpdate: "tool_call_update", toolCallId: "mcp_list_servers:0#ab", status: "failed", rawOutput: "No MCP servers configured" });
+  }
   if (scenario === "forbidden_tool") return tool("webfetch");
   if (scenario === "forbidden_update") {
     tool("read");

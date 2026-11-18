@@ -8,6 +8,7 @@ import test from "node:test";
 import { fileURLToPath } from "node:url";
 import { getProcessIdentity, processIdentityMatches } from "../plugins/cursor/scripts/lib/process-identity.mjs";
 import { jobFilePath } from "../plugins/cursor/scripts/lib/state.mjs";
+import { verifyExecutionBudgets } from "./lib/execution-budget.mjs";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const companion = path.join(root, "plugins/cursor/scripts/cursor-companion.mjs");
@@ -373,6 +374,13 @@ test("raw argument transport preserves brief and consumes its token", (t) => {
   assertDone(result);
   assert.equal(h.invocations()[0].stdin, "cursor-role: diversity\nraw brief");
   assert.equal(fs.existsSync(file), false);
+});
+
+test("Cursor execution budgets follow the launch transport", async (t) => {
+  await verifyExecutionBudgets(t, {
+    engine: "cursor", model: "composer-2.5", foregroundTimeoutMs: 540000,
+    createHarness: (t, env) => harness(t, env)
+  });
 });
 
 function reviewWorkspace(h) {
