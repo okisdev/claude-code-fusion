@@ -1,0 +1,88 @@
+diff --git a/concurrent.js b/concurrent.js
+new file mode 100644
+index 0000000..f5c71cc
+--- /dev/null
++++ b/concurrent.js
+@@ -0,0 +1,52 @@
++import { app_error } from "./errors.js";
++
++export function map_concurrent(items, limit, worker) {
++  if (items.length === 0) {
++    return Promise.resolve([]);
++  }
++
++  if (!Number.isInteger(limit) || limit <= 0) {
++    return Promise.reject(
++      app_error("INVALID_CONCURRENCY", "Concurrency limit must be a positive integer"),
++    );
++  }
++
++  return new Promise((resolve, reject) => {
++    const results = new Array(items.length);
++    let next_index = 0;
++    let completed = 0;
++    let failed = false;
++
++    function run_next() {
++      if (failed || next_index >= results.length) {
++        return;
++      }
++
++      const index = next_index;
++      next_index += 1;
++
++      Promise.resolve()
++        .then(() => worker(items[index]))
++        .then(
++          (result) => {
++            results[index] = result;
++            completed += 1;
++
++            if (completed === results.length) {
++              resolve(results);
++            } else {
++              run_next();
++            }
++          },
++          (error) => {
++            failed = true;
++            reject(error);
++          },
++        );
++    }
++
++    for (let index = 0; index < Math.min(limit, results.length); index += 1) {
++      run_next();
++    }
++  });
++}
+diff --git a/retry.js b/retry.js
+new file mode 100644
+index 0000000..877ca5d
+--- /dev/null
++++ b/retry.js
+@@ -0,0 +1,24 @@
++import { app_error } from "./errors.js";
++import { delay_ms } from "./util.js";
++
++export function retry_with_backoff(operation, attempts, base_delay_ms) {
++  if (attempts <= 0) {
++    return Promise.reject(app_error("RETRY_EXHAUSTED", "No attempts were made"));
++  }
++
++  function run_attempt(attempt) {
++    return Promise.resolve()
++      .then(() => operation())
++      .catch((error) => {
++        if (attempt >= attempts) {
++          throw app_error("RETRY_EXHAUSTED", error?.message ?? String(error));
++        }
++
++        return delay_ms(base_delay_ms * 2 ** (attempt - 1)).then(() =>
++          run_attempt(attempt + 1),
++        );
++      });
++  }
++
++  return run_attempt(1);
++}

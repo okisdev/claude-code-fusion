@@ -1,0 +1,73 @@
+diff --git a/concurrent.js b/concurrent.js
+new file mode 100644
+index 0000000..1231e72
+--- /dev/null
++++ b/concurrent.js
+@@ -0,0 +1,41 @@
++import { app_error } from "./errors.js";
++
++export function map_concurrent(items, limit, worker) {
++  const count = items.length;
++  if (count === 0) {
++    return Promise.resolve([]);
++  }
++
++  if (!Number.isInteger(limit) || limit < 1) {
++    return Promise.reject(app_error("INVALID_LIMIT", "Worker limit must be a positive integer"));
++  }
++
++  return new Promise((resolve, reject) => {
++    const results = new Array(count);
++    let next_index = 0;
++    let completed = 0;
++    let failed = false;
++
++    function start_worker() {
++      const index = next_index++;
++      Promise.resolve().then(() => worker(items[index])).then((result) => {
++        if (failed) return;
++
++        results[index] = result;
++        completed += 1;
++        if (completed === count) {
++          resolve(results);
++        } else if (next_index < count) {
++          start_worker();
++        }
++      }, (error) => {
++        failed = true;
++        reject(error);
++      });
++    }
++
++    for (let slot = 0; slot < Math.min(limit, count); slot += 1) {
++      start_worker();
++    }
++  });
++}
+diff --git a/retry.js b/retry.js
+new file mode 100644
+index 0000000..62efb14
+--- /dev/null
++++ b/retry.js
+@@ -0,0 +1,20 @@
++import { app_error } from "./errors.js";
++import { delay_ms } from "./util.js";
++
++export function retry_with_backoff(operation, attempts, base_delay_ms) {
++  if (!Number.isInteger(attempts) || attempts < 1) {
++    return Promise.reject(app_error("RETRY_EXHAUSTED", "No attempts available"));
++  }
++
++  function try_operation(remaining, wait_ms) {
++    return Promise.resolve().then(() => operation()).catch((failure) => {
++      if (remaining === 1) {
++        throw app_error("RETRY_EXHAUSTED", failure?.message ?? String(failure));
++      }
++
++      return delay_ms(wait_ms).then(() => try_operation(remaining - 1, wait_ms * 2));
++    });
++  }
++
++  return try_operation(attempts, base_delay_ms);
++}

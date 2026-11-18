@@ -1,0 +1,72 @@
+diff --git a/concurrent.js b/concurrent.js
+new file mode 100644
+index 0000000..febc03c
+--- /dev/null
++++ b/concurrent.js
+@@ -0,0 +1,41 @@
++import { app_error } from './errors.js';
++
++export function map_concurrent(items, limit, worker) {
++  if (items.length === 0) {
++    return Promise.resolve([]);
++  }
++  if (!Number.isInteger(limit) || limit < 1) {
++    return Promise.reject(app_error('INVALID_LIMIT', 'limit must be a positive integer'));
++  }
++
++  return new Promise((resolve, reject) => {
++    const results = new Array(items.length);
++    let next_index = 0;
++    let active = 0;
++    let completed = 0;
++    let settled = false;
++
++    function start_workers() {
++      while (!settled && active < limit && next_index < items.length) {
++        const index = next_index++;
++        active++;
++        Promise.resolve().then(() => worker(items[index], index)).then((result) => {
++          active--;
++          results[index] = result;
++          completed++;
++          if (completed === items.length) {
++            settled = true;
++            resolve(results);
++          } else {
++            start_workers();
++          }
++        }, (error) => {
++          settled = true;
++          reject(error);
++        });
++      }
++    }
++
++    start_workers();
++  });
++}
+diff --git a/retry.js b/retry.js
+new file mode 100644
+index 0000000..c750ccc
+--- /dev/null
++++ b/retry.js
+@@ -0,0 +1,19 @@
++import { app_error } from './errors.js';
++import { delay_ms } from './util.js';
++
++export function retry_with_backoff(operation, attempts, base_delay_ms) {
++  if (!Number.isInteger(attempts) || attempts < 1) {
++    return Promise.reject(app_error('INVALID_ATTEMPTS', 'attempts must be a positive integer'));
++  }
++
++  function run(remaining, delay) {
++    return Promise.resolve().then(operation).catch((failure) => {
++      if (remaining === 1) {
++        return Promise.reject(app_error('RETRY_EXHAUSTED', failure?.message ?? String(failure)));
++      }
++      return delay_ms(delay).then(() => run(remaining - 1, delay * 2));
++    });
++  }
++
++  return run(attempts, base_delay_ms);
++}

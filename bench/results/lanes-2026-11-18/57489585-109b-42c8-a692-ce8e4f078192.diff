@@ -1,0 +1,84 @@
+diff --git a/concurrent.js b/concurrent.js
+new file mode 100644
+index 0000000..9dbd514
+--- /dev/null
++++ b/concurrent.js
+@@ -0,0 +1,52 @@
++export function map_concurrent(items, limit, worker) {
++  return new Promise((resolve, reject) => {
++    if (items.length === 0) {
++      resolve([]);
++      return;
++    }
++
++    const results = new Array(items.length);
++    let next_index = 0;
++    let completed = 0;
++    let settled = false;
++
++    function run_next() {
++      if (settled || next_index >= items.length) {
++        return;
++      }
++
++      const index = next_index;
++      next_index += 1;
++
++      Promise.resolve()
++        .then(() => worker(items[index], index))
++        .then(
++          (result) => {
++            if (settled) {
++              return;
++            }
++            results[index] = result;
++            completed += 1;
++            if (completed === items.length) {
++              settled = true;
++              resolve(results);
++              return;
++            }
++            run_next();
++          },
++          (error) => {
++            if (settled) {
++              return;
++            }
++            settled = true;
++            reject(error);
++          },
++        );
++    }
++
++    const initial_workers = Math.min(limit, items.length);
++    for (let index = 0; index < initial_workers; index += 1) {
++      run_next();
++    }
++  });
++}
+diff --git a/retry.js b/retry.js
+new file mode 100644
+index 0000000..ce27148
+--- /dev/null
++++ b/retry.js
+@@ -0,0 +1,20 @@
++import { app_error } from "./errors.js";
++import { delay_ms } from "./util.js";
++
++export function retry_with_backoff(operation, attempts, base_delay_ms) {
++  function run(remaining, delay) {
++    return Promise.resolve()
++      .then(operation)
++      .catch((error) => {
++        if (remaining <= 1) {
++          throw app_error(
++            "RETRY_EXHAUSTED",
++            error && error.message !== undefined ? error.message : String(error),
++          );
++        }
++        return delay_ms(delay).then(() => run(remaining - 1, delay * 2));
++      });
++  }
++
++  return run(attempts, base_delay_ms);
++}

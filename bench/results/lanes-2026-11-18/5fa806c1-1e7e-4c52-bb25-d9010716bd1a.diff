@@ -1,0 +1,54 @@
+diff --git a/concurrent.js b/concurrent.js
+new file mode 100644
+index 0000000..b7660ca
+--- /dev/null
++++ b/concurrent.js
+@@ -0,0 +1,25 @@
++export function map_concurrent(items, limit, worker) {
++  const results = new Array(items.length);
++  let next_index = 0;
++
++  function run_next() {
++    const index = next_index;
++    next_index += 1;
++    if (index >= items.length) {
++      return Promise.resolve();
++    }
++    return Promise.resolve()
++      .then(() => worker(items[index]))
++      .then((result) => {
++        results[index] = result;
++        return run_next();
++      });
++  }
++
++  const runners = [];
++  for (let index = 0; index < Math.min(limit, items.length); index += 1) {
++    runners.push(run_next());
++  }
++
++  return Promise.all(runners).then(() => results);
++}
+diff --git a/retry.js b/retry.js
+new file mode 100644
+index 0000000..9440a0e
+--- /dev/null
++++ b/retry.js
+@@ -0,0 +1,17 @@
++import { app_error } from "./errors.js";
++import { delay_ms } from "./util.js";
++
++export function retry_with_backoff(operation, attempts, base_delay_ms) {
++  function attempt(remaining, delay) {
++    return Promise.resolve()
++      .then(() => operation())
++      .catch((error) => {
++        if (remaining === 1) {
++          throw app_error("RETRY_EXHAUSTED", error.message);
++        }
++        return delay_ms(delay).then(() => attempt(remaining - 1, delay * 2));
++      });
++  }
++
++  return attempt(attempts, base_delay_ms);
++}

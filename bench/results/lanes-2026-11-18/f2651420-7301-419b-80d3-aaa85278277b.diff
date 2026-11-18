@@ -1,0 +1,75 @@
+diff --git a/concurrent.js b/concurrent.js
+new file mode 100644
+index 0000000..5705615
+--- /dev/null
++++ b/concurrent.js
+@@ -0,0 +1,43 @@
++import { app_error } from './errors.js';
++
++export function map_concurrent(items, limit, worker) {
++  if (items.length === 0) {
++    return Promise.resolve([]);
++  }
++
++  if (!Number.isInteger(limit) || limit < 1) {
++    return Promise.reject(app_error('INVALID_LIMIT', 'limit must be a positive integer'));
++  }
++
++  return new Promise((resolve, reject) => {
++    const results = new Array(items.length);
++    let next = 0;
++    let active = 0;
++    let completed = 0;
++    let failed = false;
++
++    function launch() {
++      while (!failed && active < limit && next < items.length) {
++        const index = next++;
++        active++;
++
++        Promise.resolve().then(() => worker(items[index], index)).then((result) => {
++          active--;
++          results[index] = result;
++          completed++;
++
++          if (completed === items.length) {
++            resolve(results);
++          } else {
++            launch();
++          }
++        }, (error) => {
++          failed = true;
++          reject(error);
++        });
++      }
++    }
++
++    launch();
++  });
++}
+diff --git a/retry.js b/retry.js
+new file mode 100644
+index 0000000..41fc79e
+--- /dev/null
++++ b/retry.js
+@@ -0,0 +1,20 @@
++import { app_error } from './errors.js';
++import { delay_ms } from './util.js';
++
++export function retry_with_backoff(operation, attempts, base_delay_ms) {
++  function run(attempt) {
++    return Promise.resolve().then(operation).catch((error) => {
++      if (attempt >= attempts) {
++        return Promise.reject(app_error('RETRY_EXHAUSTED', error?.message ?? String(error)));
++      }
++
++      return delay_ms(base_delay_ms * 2 ** (attempt - 1)).then(() => run(attempt + 1));
++    });
++  }
++
++  if (attempts <= 0) {
++    return Promise.reject(app_error('RETRY_EXHAUSTED', 'No attempts were made'));
++  }
++
++  return run(1);
++}

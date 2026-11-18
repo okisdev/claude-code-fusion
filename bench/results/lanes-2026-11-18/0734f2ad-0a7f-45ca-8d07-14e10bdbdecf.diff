@@ -1,0 +1,76 @@
+diff --git a/concurrent.js b/concurrent.js
+new file mode 100644
+index 0000000..60a05a6
+--- /dev/null
++++ b/concurrent.js
+@@ -0,0 +1,44 @@
++import { app_error } from "./errors.js";
++
++export function map_concurrent(items, limit, worker) {
++  const count = items.length;
++  if (count === 0) {
++    return Promise.resolve([]);
++  }
++  if (!Number.isInteger(limit) || limit < 1) {
++    return Promise.reject(app_error("INVALID_LIMIT", "Concurrency limit must be a positive integer"));
++  }
++
++  const results = new Array(count);
++  let next_index = 0;
++  let remaining = count;
++  let failed = false;
++
++  return new Promise((resolve, reject) => {
++    function run_next() {
++      if (failed || next_index === count) {
++        return;
++      }
++
++      const index = next_index++;
++      Promise.resolve().then(() => worker(items[index])).then((result) => {
++        results[index] = result;
++        remaining -= 1;
++        if (remaining === 0) {
++          resolve(results);
++          return;
++        }
++
++        run_next();
++      }, (error) => {
++        failed = true;
++        reject(error);
++      });
++    }
++
++    const worker_count = Math.min(limit, count);
++    for (let slot = 0; slot < worker_count; slot++) {
++      run_next();
++    }
++  });
++}
+diff --git a/retry.js b/retry.js
+new file mode 100644
+index 0000000..d046d85
+--- /dev/null
++++ b/retry.js
+@@ -0,0 +1,20 @@
++import { app_error } from "./errors.js";
++import { delay_ms } from "./util.js";
++
++export function retry_with_backoff(operation, attempts, base_delay_ms) {
++  if (!Number.isInteger(attempts) || attempts < 1) {
++    return Promise.reject(app_error("RETRY_EXHAUSTED", "No retry attempts were made"));
++  }
++
++  function run_attempt(remaining, delay) {
++    return Promise.resolve().then(() => operation()).catch((failure) => {
++      if (remaining === 1) {
++        throw app_error("RETRY_EXHAUSTED", failure?.message ?? String(failure));
++      }
++
++      return delay_ms(delay).then(() => run_attempt(remaining - 1, delay * 2));
++    });
++  }
++
++  return run_attempt(attempts, base_delay_ms);
++}
