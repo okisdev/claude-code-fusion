@@ -41,14 +41,16 @@ function makeSandbox(t) {
   const fusionData = path.join(root, "fusion-data");
   const grokData = path.join(root, "grok-data");
   const cursorData = path.join(root, "cursor-data");
+  const devinData = path.join(root, "devin-data");
   const sessionsDir = path.join(root, "sessions");
   fs.mkdirSync(stateRoot, { recursive: true });
   fs.mkdirSync(workDir, { recursive: true });
   fs.mkdirSync(fusionData, { recursive: true });
   fs.mkdirSync(grokData, { recursive: true });
   fs.mkdirSync(cursorData, { recursive: true });
+  fs.mkdirSync(devinData, { recursive: true });
   fs.mkdirSync(sessionsDir, { recursive: true });
-  const sandbox = { root, stateRoot, workDir, fusionData, grokData, cursorData, sessionsDir, children: new Set() };
+  const sandbox = { root, stateRoot, workDir, fusionData, grokData, cursorData, devinData, sessionsDir, children: new Set() };
   t.after(async () => {
     const closing = [...sandbox.children].map((child) => {
       if (child.exitCode != null || child.signalCode != null) {
@@ -123,6 +125,7 @@ function envFor(sandbox, extra = {}) {
     FUSION_DATA_DIR: sandbox.fusionData,
     GROK_COMPANION_DATA: sandbox.grokData,
     CURSOR_COMPANION_DATA: sandbox.cursorData,
+    DEVIN_COMPANION_DATA: sandbox.devinData,
     CODEX_JOBS_MONITOR_SESSIONS_DIR: sandbox.sessionsDir,
     CODEX_JOBS_MONITOR_INTERVAL_MS: "50",
     ...extra,
@@ -234,7 +237,7 @@ globalThis.setTimeout = (callback, delay, ...args) => {
 `);
   return {
     env: { NODE_OPTIONS: `${process.env.NODE_OPTIONS ?? ""} --import=${preload}`.trim(), MONITOR_TIMER_LOG: log, CODEX_JOBS_MONITOR_INTERVAL_MS: "1000" },
-    delays: () => fs.existsSync(log) ? fs.readFileSync(log, "utf8").trim().split("\n").map(Number) : []
+    delays: () => fs.existsSync(log) ? fs.readFileSync(log, "utf8").split("\n").filter(Boolean).map(Number) : []
   };
 }
 

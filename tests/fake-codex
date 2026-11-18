@@ -161,7 +161,7 @@ function writeRollout({ message = "Recovered partial Codex output." } = {}) {
         effort: process.env.FAKE_CODEX_RESOLVED_EFFORT || "xhigh"
       }
     },
-    { timestamp: now.toISOString(), type: "event_msg", payload: { type: "agent_message", message, phase: "commentary" } },
+    { timestamp: now.toISOString(), type: "response_item", payload: { type: "message", role: "assistant", phase: "commentary", content: [{ type: "output_text", text: message }] } },
     { timestamp: now.toISOString(), type: "event_msg", payload: { type: "token_count", info: { total_token_usage: usage } } }
   ];
   fs.writeFileSync(file, `${entries.map((entry) => JSON.stringify(entry)).join("\n")}\n`);
@@ -170,7 +170,7 @@ function writeRollout({ message = "Recovered partial Codex output." } = {}) {
 if (process.env.FAKE_CODEX_STDERR) {
   process.stderr.write(process.env.FAKE_CODEX_STDERR);
 }
-if (process.env.FAKE_CODEX_READY_FILE) {
+if (process.env.FAKE_CODEX_READY_FILE && mode !== "interrupt-cleanup") {
   fs.writeFileSync(process.env.FAKE_CODEX_READY_FILE, "ready");
 }
 
