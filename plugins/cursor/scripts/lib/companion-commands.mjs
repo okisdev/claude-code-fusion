@@ -7,6 +7,7 @@ import { fileURLToPath } from "node:url";
 
 import { configureRawTransport, createRawCommandTransport as allocateRawCommandTransport, consumeRawCommandTransport } from "./raw-transport.mjs";
 import { awaitOutput } from "./await-output.mjs";
+import { backgroundWatchReceipt, watchJob } from "./job-watch.mjs";
 import { executionTimeoutMs, resolveExecutionTransport } from "./execution-budget.mjs";
 import { parseArgs, parseRawArgs, rawBooleanOptionRequested } from "./args.mjs";
 import { getProcessIdentity, processGroupAlive, processIdentityMatches, processIsDirectlyAlive } from "./process-identity.mjs";
@@ -200,6 +201,7 @@ export function createCompanionCommands(adapter) {
       effortApplied: record.effortApplied, billingPool: record.billingPool, usage: record.usage,
       usageIsIncomplete: record.usageIsIncomplete, ...adapter.payloadFields(record), warnings: record.warnings,
       failureKind: record.failureKind,
+      ...(record.background && record.status === "running" && record.delivery === "manual" ? backgroundWatchReceipt(engine, record.id) : {}),
       ...(record.jobClass === "review" ? { valid: record.status === "done", review: record.review ?? null, parseError: record.parseError ?? null } : {}),
       ...(record.status === "done" ? { text: record.resultText } : { message: record.errorMessage })
     };
@@ -625,13 +627,20 @@ export function createCompanionCommands(adapter) {
   }
 
   function printUsage() {
-    output(`Usage: ${engine}-companion.mjs <task|review|status|result|await-output|cancel|history|models|setup|record-acceptance|transport-create|transport-discard> [options]\n`);
+    output(`Usage: ${engine}-companion.mjs <task|review|status|result|watch|await-output|cancel|history|models|setup|record-acceptance|transport-create|transport-discard> [options]\nwatch --job <id> waits silently for completion.\n`);
   }
 
   async function main() {
     const [command, ...received] = process.argv.slice(2);
     if (!command || command === "help" || command === "--help") { printUsage(); return; }
     if (command === "await-output") { process.exitCode = await awaitOutput(received); return; }
+    if (command === "watch") {
+      await watchJob(received, { engine, readJob: (id) => {
+        const found = requestedJob(resolveDataDir(), id, {});
+        return found ? refreshRunning(found) : null;
+      } });
+      return;
+    }
     if (command === "transport-create") {
       if (received.length) throw errorWithFailure("transport-create accepts no arguments.");
       createRawCommandTransport();

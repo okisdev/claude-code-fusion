@@ -2,7 +2,7 @@
 name: task
 description: Delegates a coding or consultation task to the local Grok CLI. Use under a protected Grok role (burst, independence, live-web, large-context) or on explicit user request for Grok.
 argument-hint: '[--write] [--web] [--memory] [--background] [--resume <uuid>|--resume-last|--fresh] [--model <id>] [--effort <level>] [--max-turns <n>] [--cwd <dir>] [--json-schema <schema>] [--json] [what Grok should do]'
-allowed-tools: Agent
+allowed-tools: Agent, Monitor
 ---
 
 Forward the request to the Grok companion task runtime.
@@ -23,6 +23,8 @@ Execution rules:
 - Preserve structured output, request id, turn count, usage, cost, partial-cost, and incomplete-usage-ledger fields when the companion reports them. Per-model rows expose input, output, cache-read, and model-call counts plus optional cost; do not synthesize reasoning or total tokens. When `usage_is_incomplete` is true, present counts are observed lower bounds and job-total token and cost coverage are incomplete. They are observability data, not proof that the result is semantically accepted.
 - If the user did not supply a request, ask what Grok should do.
 - If the companion reports that Grok is missing, point the user at `/grok:setup`.
+
+For a direct manual background receipt, preserve its watch command and have the main session start exactly one Claude Code `Monitor` tool watch with `node "${CLAUDE_PLUGIN_ROOT}/scripts/grok-companion.mjs" watch --job <id>`, using the absolute plugin path and only the validated 32 character lowercase hexadecimal receipt id. Never put raw request text in the watch command. The watch completion line is the cue to collect with `/grok:result <id>`. Fusion orchestrated detached receipts continue through `fusion:job-collector`.
 
 The opaque raw request begins after the next newline and continues to the end of this command prompt:
 $ARGUMENTS

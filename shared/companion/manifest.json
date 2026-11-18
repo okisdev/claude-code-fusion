@@ -1,4 +1,10 @@
 {
+  "job-watch.mjs": [
+    "plugins/codex/scripts/lib/job-watch.mjs",
+    "plugins/grok/scripts/lib/job-watch.mjs",
+    "plugins/cursor/scripts/lib/job-watch.mjs",
+    "plugins/devin/scripts/lib/job-watch.mjs"
+  ],
   "await-output.mjs": [
     "plugins/grok/scripts/lib/await-output.mjs",
     "plugins/cursor/scripts/lib/await-output.mjs",

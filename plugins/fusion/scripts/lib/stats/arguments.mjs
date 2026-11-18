@@ -95,6 +95,7 @@ export class UsageError extends Error {}
 export function validateArgumentShape(argv) {
   const flags = new Set(["--json", "--audit", "--all", "--prune-dead", "--yes", "--identities", "--by-day", "--messages", "--unsettled", "--trace", "--accept-failed-transport"]);
   const values = new Map([["--message", 1], ["--days", 1], ["--source", 1], ["--reason", 1], ["--failure-kind", 1], ["--reason-for", 2], ["--failure-kind-for", 2]]);
+  let daysSeen = false;
   for (let index = 0; index < argv.length; index += 1) {
     const token = argv[index];
     if (flags.has(token)) continue;
@@ -113,6 +114,12 @@ export function validateArgumentShape(argv) {
       continue;
     }
     if (values.has(token)) {
+      if (token === "--days") {
+        if (daysSeen) throw new UsageError("--days: must be specified only once");
+        daysSeen = true;
+        const value = argv[index + 1];
+        if (!/^[1-9]\d*$/.test(value ?? "") || !Number.isSafeInteger(Number(value))) throw new UsageError("--days: expected a positive integer");
+      }
       for (let offset = 1; offset <= values.get(token); offset += 1) {
         const value = argv[index + offset];
         if (typeof value !== "string" || !value || value.startsWith("--")) throw new UsageError(`${token}: missing value`);

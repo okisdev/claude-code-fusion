@@ -6,6 +6,9 @@ import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 import { verifyExecutionBudgets } from "./lib/execution-budget.mjs";
+import { verifyJobWatch } from "./lib/job-watch-harness.mjs";
+
+verifyJobWatch("devin");
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const companion = path.join(root, "plugins/devin/scripts/devin-companion.mjs");
@@ -262,6 +265,7 @@ test("background result wait collects delivery", (t) => {
   assert.equal(launch.status, 0, launch.stdout + launch.stderr);
   assert.match(launch.stdout, /state: running\n$/);
   const id = h.jobs()[0].id;
+  assert.ok(launch.stdout.includes(`node "${companion}" watch --job ${id}`));
   assertDone(h.run(["result", id, "--wait"]));
   assert.equal(h.jobs()[0].delivery, "manual");
   assert.ok(h.jobs()[0].deliveryCollectedAt);

@@ -10,6 +10,7 @@ import { settleQueuedVerdict } from "../plugins/fusion/scripts/lib/lifecycle/col
 import { createWorkerRecord, readWorkerRecord, recordWorkerAcceptance, reopenWorkerContinuation, updateWorkerRecord, workerRecordFile } from "../plugins/fusion/scripts/lib/worker-state.mjs";
 import { settleRecords } from "../plugins/fusion/scripts/lib/stats/settlement.mjs";
 import { tokenUsageSidecarPath } from "../plugins/fusion/scripts/lib/stats/evidence.mjs";
+import { handleLifecycleHook } from "../plugins/fusion/scripts/worker-lifecycle.mjs";
 
 function sandbox(t) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "engine-acceptance-test-"));
@@ -196,6 +197,29 @@ test("failed deliveries stop after five attempts and repeating the same verdict 
   assert.equal(fs.readFileSync(box.calls, "utf8").trim().split("\n").length, 5);
 });
 
+for (const status of ["pending", "failed"]) {
+  test(`a lifecycle hook retries ${status} acceptance delivery after settlement without another verdict`, async (t) => {
+    const box = deliveryWorker(t, "");
+    updateWorkerRecord(box.taskId, box.env, (record) => {
+      const prepared = prepareEngineAcceptanceDelivery({ ...record, transportStatus: "done", acceptance: "accepted", acceptanceSource: "main-loop", acceptanceRecordedAt: new Date().toISOString() }, { jobs: [{ engine: "codex", jobId: box.jobId }] });
+      return { ...prepared, engineAcceptanceDelivery: { ...prepared.engineAcceptanceDelivery, status, entries: prepared.engineAcceptanceDelivery.entries.map((entry) => ({ ...entry, status, attempts: 1, failures: status === "failed" ? 1 : 0 })) } };
+    });
+    const input = { hook_event_name: "PostToolUse", session_id: "delivery-session", tool_name: "Read", tool_input: { file_path: path.join(box.root, "unrelated.txt") }, tool_response: "unrelated" };
+    await handleLifecycleHook({ ...input, session_id: "another-session" }, box.env);
+    assert.equal(fs.existsSync(box.calls), false);
+    await handleLifecycleHook(input, box.env);
+    const delivered = readWorkerRecord(box.taskId, box.env);
+    assert.equal(delivered.engineAcceptanceDelivery.status, "delivered");
+    assert.equal(delivered.engineAcceptanceDelivery.entries[0].attempts, 2);
+    assert.equal(delivered.acceptance, "accepted");
+    await handleLifecycleHook(input, box.env);
+    assert.equal(fs.readFileSync(box.calls, "utf8").trim().split("\n").length, 1);
+    updateWorkerRecord(box.taskId, box.env, (record) => ({ ...record, engineAcceptanceDelivery: { ...record.engineAcceptanceDelivery, status: "failed", entries: record.engineAcceptanceDelivery.entries.map((entry) => ({ ...entry, status: "failed", attempts: 5, failures: 5 })) } }));
+    await handleLifecycleHook(input, box.env);
+    assert.equal(fs.readFileSync(box.calls, "utf8").trim().split("\n").length, 1);
+  });
+}
+
 test("an interrupted delivery retries after its lease expires and survives a continuation", (t) => {
   const box = deliveryWorker(t, "");
   updateWorkerRecord(box.taskId, box.env, (record) => prepareEngineAcceptanceDelivery({ ...record, transportStatus: "done", acceptance: "accepted", acceptanceSource: "main-loop", acceptanceRecordedAt: new Date().toISOString(), peerJobId: box.jobId }, { jobs: [{ engine: "codex", jobId: box.jobId }] }));
@@ -267,8 +291,8 @@ fs.writeFileSync(process.env.TEST_ENGINE_VERDICT, acceptance);
   assert.deepEqual(fs.readFileSync(box.calls, "utf8").trim().split("\n").map((line) => JSON.parse(line).acceptance), ["accepted", "rejected"]);
 });
 
-for (const recovery of ["monitor", "same verdict"]) {
-  test(`a crash after claiming attempt five recovers through ${recovery}`, (t) => {
+for (const recovery of ["lifecycle", "same verdict"]) {
+  test(`a crash after claiming attempt five recovers through ${recovery}`, async (t) => {
     const acceptanceModule = new URL("../plugins/fusion/scripts/lib/engine-acceptance.mjs", import.meta.url).href;
     const box = deliveryWorker(t, `
 const attempts = fs.readFileSync(process.env.TEST_CALLS, "utf8").trim().split("\\n").length;
@@ -298,7 +322,7 @@ if (attempts === 5) process.kill(process.ppid, "SIGKILL");
       updateWorkerRecord(box.taskId, box.env, (record) => prepareEngineAcceptanceDelivery(record, { jobs }));
       deliverWorkerEngineAcceptance({ taskId: box.taskId, env: box.env });
     } else {
-      retryWorkerEngineAcceptances({ env: box.env });
+      await handleLifecycleHook({ hook_event_name: "PostToolUse", session_id: "delivery-session", tool_name: "Read", tool_input: { file_path: path.join(box.root, "unrelated.txt") }, tool_response: "unrelated" }, box.env);
     }
 
     const delivered = readWorkerRecord(box.taskId, box.env);

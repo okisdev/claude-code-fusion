@@ -75,9 +75,6 @@ export function main(argv = process.argv.slice(2), { env = process.env, cwd = pr
 
   if (argv.includes("--unsettled")) {
     const rawDays = argumentValue(argv, "--days");
-    if (rawDays !== null && (!/^[1-9]\d*$/.test(rawDays) || !Number.isSafeInteger(Number(rawDays)))) {
-      throw new UsageError("--days: expected a positive integer");
-    }
     const report = buildUnsettledReport({ env, days: rawDays === null ? 7 : Number(rawDays), all: argv.includes("--all") });
     stdout.write(asJson ? `${JSON.stringify(report, null, 2)}\n` : renderUnsettledReport(report));
     return report;

@@ -35,7 +35,7 @@ function readJsonLines(file) {
     .map((line) => JSON.parse(line));
 }
 
-test("concurrent observers preserve every observed, unavailable, and notified update", { timeout: 30_000 }, async (t) => {
+test("concurrent observers preserve every observed and unavailable update", { timeout: 30_000 }, async (t) => {
   const root = sandbox(t);
   const env = { FUSION_DATA_DIR: path.join(root, "fusion") };
   const observedAt = "2026-07-22T00:00:00.000Z";
@@ -56,9 +56,8 @@ test("concurrent observers preserve every observed, unavailable, and notified up
     };
     const count = observeEngineJobs("grok", {
       env: { FUSION_DATA_DIR: path.join(root, "fusion"), GROK_COMPANION_DATA: path.join(root, name) },
-      now: () => observedAt,
-      notify() {
-        fs.writeFileSync(ready, "notifying");
+      now() {
+        fs.writeFileSync(ready, "observing");
         if (name === "first") {
           const deadline = Date.now() + 20_000;
           while (!fs.existsSync(release)) {
@@ -66,6 +65,7 @@ test("concurrent observers preserve every observed, unavailable, and notified up
             Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10);
           }
         }
+        return observedAt;
       }
     });
     if (count !== 2) throw new Error("expected two observations, received " + count);
@@ -104,7 +104,6 @@ test("concurrent observers preserve every observed, unavailable, and notified up
   const state = JSON.parse(fs.readFileSync(stateFile, "utf8"));
   assert.deepStrictEqual(state.observedJobIds, ["first-available", "second-available"]);
   assert.deepStrictEqual(state.unavailableObservedAt, { "first-unavailable": observedAt, "second-unavailable": observedAt });
-  assert.deepStrictEqual(state.notifiedJobIds, ["first-available", "first-unavailable", "second-available", "second-unavailable"]);
   assert.strictEqual(state.missingSince["first-available"], observedAt);
   assert.strictEqual(state.missingSince["first-unavailable"], observedAt);
   assert.strictEqual(fs.existsSync(`${stateFile}.lock`), false);
@@ -299,10 +298,7 @@ test("Cursor terminal records produce observations while unreadable records are 
   writeEngineJob(cursorData, workspaceRoot, "cursor-error", { status: "error", resolvedModel: "auto" });
   const unreadableFile = path.join(cursorData, "state", engineWorkspaceSlug(workspaceRoot), "jobs", "cursor-unreadable.json");
   fs.writeFileSync(unreadableFile, "{");
-  const notified = [];
-
-  assert.strictEqual(observeEngineJobs("cursor", { env, now: () => "2026-07-22T00:00:00.000Z", notify: (record) => notified.push([record.id, record.status]) }), 2);
-  assert.deepStrictEqual(notified, [["cursor-done", "done"], ["cursor-error", "error"]]);
+  assert.strictEqual(observeEngineJobs("cursor", { env, now: () => "2026-07-22T00:00:00.000Z" }), 2);
   assert.deepStrictEqual(readJsonLines(tokenUsageSidecarPath(workspaceRoot, env)).map(({ jobId, engine, availability, source }) => ({ jobId, engine, availability, source })), [
     { jobId: "cursor-done", engine: "cursor", availability: "available", source: "cursor-job-record" },
     { jobId: "cursor-error", engine: "cursor", availability: "unavailable", source: "cursor-job-record" }
@@ -312,9 +308,7 @@ test("Cursor terminal records produce observations while unreadable records are 
     { jobId: "cursor-done", engine: "cursor", model: "auto", source: "cursor-job-record" },
     { jobId: "cursor-error", engine: "cursor", model: "auto", source: "cursor-job-record" }
   ]);
-  assert.deepStrictEqual(JSON.parse(fs.readFileSync(engineJobsObserverStatePath("cursor", env), "utf8")).notifiedJobIds, ["cursor-done", "cursor-error"]);
-  assert.strictEqual(observeEngineJobs("cursor", { env, now: () => "2026-07-22T00:00:01.000Z", notify: (record) => notified.push([record.id, record.status]) }), 1);
-  assert.strictEqual(notified.length, 2);
+  assert.strictEqual(observeEngineJobs("cursor", { env, now: () => "2026-07-22T00:00:01.000Z" }), 1);
 });
 
 test("observer scans reread changed files and forget deleted files", (t) => {
@@ -378,11 +372,8 @@ test("observer reads atomic record replacement with unchanged size and mtime", (
   assert.equal(replacedStat.mtimeMs, previousStat.mtimeMs);
   assert.notEqual(replacedStat.ino, previousStat.ino);
 
-  const notified = [];
-  assert.equal(observeEngineJobs("grok", { env, notify: (record) => notified.push(record) }), 1);
-  assert.equal(notified.length, 1);
-  assert.equal(notified[0].status, "done");
-  assert.equal(notified[0].marker, "long");
+  assert.equal(observeEngineJobs("grok", { env }), 1);
+  assert.equal(readJsonLines(tokenUsageSidecarPath(cwd, env))[0].jobId, initial.id);
 });
 
 test("observer prunes missing observed and notified ids after 30 days without idle rewrites", (t) => {
@@ -394,20 +385,21 @@ test("observer prunes missing observed and notified ids after 30 days without id
   writeEngineJob(data, cwd, "old-job", { status: "done", usage: { input_tokens: 1 } });
   const file = path.join(data, "state", engineWorkspaceSlug(cwd), "jobs", "old-job.json");
   const stateFile = engineJobsObserverStatePath("cursor", env);
-  const notify = () => {};
-  observeEngineJobs("cursor", { env, now: () => "2026-07-01T00:00:00.000Z", notify });
+  observeEngineJobs("cursor", { env, now: () => "2026-07-01T00:00:00.000Z" });
+  const legacy = JSON.parse(fs.readFileSync(stateFile, "utf8"));
+  fs.writeFileSync(stateFile, JSON.stringify({ ...legacy, notifiedJobIds: ["old-job"] }));
   assert.deepEqual(JSON.parse(fs.readFileSync(stateFile, "utf8")).observedJobIds, ["old-job"]);
   const beforeIdle = fs.readFileSync(stateFile, "utf8");
   const oldTime = new Date("2020-01-01T00:00:00.000Z");
   fs.utimesSync(stateFile, oldTime, oldTime);
-  observeEngineJobs("cursor", { env, now: () => "2026-07-02T00:00:00.000Z", notify });
+  observeEngineJobs("cursor", { env, now: () => "2026-07-02T00:00:00.000Z" });
   assert.equal(fs.readFileSync(stateFile, "utf8"), beforeIdle);
   assert.equal(fs.statSync(stateFile).mtimeMs, oldTime.getTime());
   fs.rmSync(file);
-  observeEngineJobs("cursor", { env, now: () => "2026-07-03T00:00:00.000Z", notify });
+  observeEngineJobs("cursor", { env, now: () => "2026-07-03T00:00:00.000Z" });
   const missing = JSON.parse(fs.readFileSync(stateFile, "utf8"));
   assert.equal(missing.missingSince["old-job"], "2026-07-03T00:00:00.000Z");
-  observeEngineJobs("cursor", { env, now: () => "2026-08-03T00:00:00.000Z", notify });
+  observeEngineJobs("cursor", { env, now: () => "2026-08-03T00:00:00.000Z" });
   const pruned = JSON.parse(fs.readFileSync(stateFile, "utf8"));
   assert.deepEqual(pruned.observedJobIds, []);
   assert.deepEqual(pruned.notifiedJobIds ?? [], []);

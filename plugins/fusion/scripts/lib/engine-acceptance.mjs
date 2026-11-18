@@ -9,7 +9,7 @@ import { ENGINES, isEngineId } from "./engines.mjs";
 import { readEngineJobRecord } from "./engine-job-state.mjs";
 import { RESUMABLE_CODEX_FAILURE_KINDS } from "./stats/evidence.mjs";
 import { withFileLock } from "./storage.mjs";
-import { readWorkerRecord, readWorkerRecords, updateWorkerRecord, workerRecordFile } from "./worker-state.mjs";
+import { readSessionWorkerRecords, readWorkerRecord, readWorkerRecords, updateWorkerRecord, workerRecordFile } from "./worker-state.mjs";
 
 const ACCEPTANCE_TIMEOUT_MS = 10_000;
 const DELIVERY_ATTEMPT_LIMIT = 5;
@@ -244,8 +244,10 @@ export function deliverWorkerEngineAcceptance({ taskId, env = process.env, asJso
   return readWorkerRecord(taskId, env);
 }
 
-export function retryWorkerEngineAcceptances({ env = process.env, skipTaskIds = new Set() } = {}) {
-  for (const record of readWorkerRecords(env)) {
+export function retryWorkerEngineAcceptances({ env = process.env, skipTaskIds = new Set(), sessionId = null } = {}) {
+  const records = sessionId === null ? readWorkerRecords(env) : readSessionWorkerRecords(env, sessionId, { strict: true });
+  for (const record of records) {
+    if (sessionId !== null && record.sessionId !== sessionId) continue;
     if (skipTaskIds.has(record.taskId) || !record.engineAcceptanceDelivery?.entries?.some(retryableDelivery)) continue;
     try {
       deliverWorkerEngineAcceptance({ taskId: record.taskId, env });

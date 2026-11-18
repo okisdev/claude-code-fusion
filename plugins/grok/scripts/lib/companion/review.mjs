@@ -5,6 +5,7 @@ import { parseArgs } from "../args.mjs";
 import { resolveGrokBin, resolveTimeoutMs, sandboxProfileForMode, runGrok } from "../grok-exec.mjs";
 import { getProcessIdentity } from "../process-identity.mjs";
 import { extractFirstJsonObject, renderBackgroundLaunch, renderReviewFallback, renderReviewResult, renderTaskResult, validateReviewOutput } from "../render.mjs";
+import { backgroundWatchReceipt } from "../job-watch.mjs";
 import { briefPath, createJobRecord, createJobRecordFile, generateJobId, jobFilePath, jobLogPath, launchRunningJobProcess, nowIso, readJobRecordFile, resolveDataDir, updateJobRecordFile, writeBrief } from "../state.mjs";
 import { REVIEW_OUTPUT_SCHEMA } from "./config.mjs";
 import { resolveGrokCompanionVersion, probeGrokVersion, requireTestedGrokFloor, requireQuotaAvailable } from "./version.mjs";
@@ -358,6 +359,7 @@ async function handleReview(argv, transport = {}) {
       jobClass: "review",
       mode: "consult",
       background: true,
+      ...(record.delivery === "manual" ? backgroundWatchReceipt("grok", jobId) : {}),
       memoryEnabled: false,
       resolvedModel: null,
       resolvedEffort: null,

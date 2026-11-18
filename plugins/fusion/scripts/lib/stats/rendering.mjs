@@ -380,7 +380,7 @@ export function renderFusionStats(report, { identities = false, byDay = false } 
 export function renderUnsettledReport(report) {
   const lines = ["# Fusion unsettled jobs"];
   if (report.unsettled.length === 0) {
-    lines.push("", "No terminal jobs are awaiting semantic acceptance.");
+    lines.push("", report.hidden.older || report.hidden.further ? "No unsettled jobs in the window." : "No terminal jobs are awaiting semantic acceptance.");
   } else {
     lines.push("", "Engine | ID | Description or kind | Finished at | Semantic verdict");
     for (const entry of report.unsettled) {

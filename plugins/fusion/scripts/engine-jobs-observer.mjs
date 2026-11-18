@@ -178,7 +178,7 @@ function terminalRecords(engine, env) {
     .sort((left, right) => left.record.id.localeCompare(right.record.id)), liveIds, complete };
 }
 
-export function observeEngineJobs(engine, { env = process.env, now = () => new Date().toISOString(), notify } = {}) {
+export function observeEngineJobs(engine, { env = process.env, now = () => new Date().toISOString() } = {}) {
   const stateFile = engineJobsObserverStatePath(engine, env);
   return withFileLock(stateFile, () => {
     const { observedJobIds, unavailableObservedAt, notifiedJobIds, missingSince } = loadObserverState(stateFile);
@@ -209,19 +209,6 @@ export function observeEngineJobs(engine, { env = process.env, now = () => new D
     }
     for (const entry of records) {
       const record = entry.record;
-      const ownSessionId = typeof env.CLAUDE_CODE_SESSION_ID === "string" && env.CLAUDE_CODE_SESSION_ID.trim() ? env.CLAUDE_CODE_SESSION_ID.trim() : null;
-      const recordSessionId = typeof record.claudeSessionId === "string" && record.claudeSessionId.trim() ? record.claudeSessionId.trim() : null;
-      if (notify && !notifiedJobIds.has(record.id) && (!ownSessionId || !recordSessionId || ownSessionId === recordSessionId) && (!Object.hasOwn(record, "background") || record.background === true)) {
-        let fullRecord;
-        try {
-          fullRecord = JSON.parse(fs.readFileSync(entry.file, "utf8"));
-        } catch {
-          continue;
-        }
-        notify(fullRecord);
-        notifiedJobIds.add(record.id);
-        changed = true;
-      }
       if (observedJobIds.has(record.id)) {
         continue;
       }

@@ -65,6 +65,8 @@ async function handleLifecycleHook(input, env = process.env) {
   if (!handlesLifecycleHook(input)) return {};
   let handler;
   try {
+    const { retryWorkerEngineAcceptances } = await import("./lib/engine-acceptance.mjs");
+    if (input.session_id) retryWorkerEngineAcceptances({ env, sessionId: input.session_id });
     const [module, name] = HANDLERS[input.hook_event_name];
     const handlers = await import(`./lib/lifecycle/${module}.mjs`);
     handler = handlers[name];

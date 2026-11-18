@@ -23,10 +23,9 @@ test("marketplace and plugin manifest versions stay synchronized", () => {
   assert.match(changelog, new RegExp(`^## ${marketplace.version.replaceAll(".", "\\.")}$`, "m"));
 });
 
-test("job monitors start only for skills that can detach jobs", () => {
-  for (const [plugin, skills] of [["fusion", ["codex:task", "codex:rescue", "codex:review", "codex:adversarial-review"]], ["grok", ["grok:task", "grok:review"]]]) {
-    const monitors = readJson(`plugins/${plugin}/monitors/monitors.json`);
-    assert.deepEqual(monitors.map((monitor) => monitor.when).sort(), skills.map((skill) => `on-skill-invoke:${skill}`).sort());
-    assert.equal(new Set(monitors.map((monitor) => monitor.name)).size, monitors.length);
+test("plugins ship no session job monitors", () => {
+  for (const plugin of ["fusion", "codex", "grok", "cursor", "devin"]) {
+    assert.equal(fs.existsSync(path.join(repoRoot, `plugins/${plugin}/monitors/monitors.json`)), false);
+    assert.equal(Object.hasOwn(readJson(`plugins/${plugin}/.claude-plugin/plugin.json`), "monitors"), false);
   }
 });

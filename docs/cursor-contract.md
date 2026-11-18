@@ -108,6 +108,7 @@ Cursor stores a chat at `<home>/.cursor/chats/<md5 of the absolute workspace pat
 | `task [--write] [--model <id>] [--effort <effort>] [--resume <session-id> \| --resume-last \| --fresh] [--background] [--cwd <dir>] [--json] [-- <brief>]` | Consult by default, write with `--write`; the brief comes after `--` or from stdin; `--background` returns a manual receipt; the outcome ends with the shared footer block and `cursor-session:` |
 | `review [--scope auto\|working-tree\|branch] [--base <ref>] [--focus <text>] [--model <id>] [--effort <effort>] [--cwd <dir>] [--background] [--json]` | Read only review of local Git state with the validated JSON verdict |
 | `status [<job-id>] [--all] [--cwd <dir>] [--json]`, `result <job-id> [--wait] [--cwd <dir>] [--json]`, `cancel <job-id> [--cwd <dir>] [--json]` | Shared lifecycle with liveness verification |
+| `watch --job <id>` | Silent 15 second polling until one completion line, followed by exit 0; unknown ids fail |
 | `history [--all] [--limit <n>] [--cwd <dir>] [--json]` | Safe metadata projection with resumable session ids |
 | `models [--refresh] [--json]` | The parsed account catalog from the cache or the CLI |
 | `setup [--json]` | Binary path and name check, build against the tested interval, authentication (`cursor-agent status`), catalog refresh, sandbox helper presence, and the project hook advisory for the working directory |
@@ -116,6 +117,8 @@ Cursor stores a chat at `<home>/.cursor/chats/<md5 of the absolute workspace pat
 | `task-worker`, `review-worker` | Internal background workers |
 
 `scripts/session-end-hook.mjs` runs at Claude Code SessionEnd, performs verified cleanup of this session's running jobs, and removes unused raw transports, as the Grok plugin's hook does. Defaults: `CURSOR_COMPANION_TIMEOUT_MS` 540000 (900000 for a task launched with `--transport-background-shell`; the variable overrides both), `CURSOR_COMPANION_EXIT_GRACE_MS` 15000, `CURSOR_COMPANION_PIDLESS_RUNNING_GRACE_MS` as in Grok, `CURSOR_COMPANION_WAIT_TIMEOUT_MS` and `CURSOR_COMPANION_WAIT_POLL_MS` for `result --wait`.
+
+For a manual background receipt, the main session starts one Claude Code `Monitor` tool watch with the absolute command `node "<plugin root>/scripts/cursor-companion.mjs" watch --job <id>`. The watch reuses the job reader and liveness check every 15 seconds, prints nothing while running, prints one terminal line with job id, state, failure kind when present, and `/cursor:result <id>`, then exits 0. Unknown ids exit nonzero with a clear message. The completion line is the cue to collect the result. Fusion orchestrated detached jobs retain `fusion:job-collector`.
 
 ## Residual boundaries
 

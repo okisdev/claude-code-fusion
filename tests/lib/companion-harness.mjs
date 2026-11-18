@@ -10,7 +10,6 @@ export const repoRoot = path.join(import.meta.dirname, "..", "..");
 export const companion = path.join(repoRoot, "plugins", "grok", "scripts", "grok-companion.mjs");
 export const fakeGrok = path.join(repoRoot, "tests", "fake-grok");
 export const stateModulePath = path.join(repoRoot, "plugins", "grok", "scripts", "lib", "state.mjs");
-export const jobsMonitor = path.join(repoRoot, "plugins", "grok", "scripts", "jobs-monitor.mjs");
 export const grokCompanionCapabilities = [
   "--prompt-file",
   "--output-format",
@@ -115,8 +114,6 @@ export function envFor(sandbox, extra = {}, options = {}) {
     "GROK_COMPANION_WAIT_POLL_MS",
     "GROK_COMPANION_WAIT_TIMEOUT_MS",
     "GROK_CONSULT_ALLOW",
-    "GROK_JOBS_MONITOR_INTERVAL_MS",
-    "GROK_JOBS_MONITOR_MANAGED_GRACE_MS",
     "GROK_MEMORY",
     "GROK_SUBAGENTS",
     "GROK_CLAUDE_SKILLS_ENABLED",

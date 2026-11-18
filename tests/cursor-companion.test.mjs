@@ -9,6 +9,9 @@ import { fileURLToPath } from "node:url";
 import { getProcessIdentity, processIdentityMatches } from "../plugins/cursor/scripts/lib/process-identity.mjs";
 import { jobFilePath } from "../plugins/cursor/scripts/lib/state.mjs";
 import { verifyExecutionBudgets } from "./lib/execution-budget.mjs";
+import { verifyJobWatch } from "./lib/job-watch-harness.mjs";
+
+verifyJobWatch("cursor");
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const companion = path.join(root, "plugins/cursor/scripts/cursor-companion.mjs");
@@ -410,6 +413,7 @@ test("background task launches, reports running, and collects a result", async (
   assert.equal(launched.status, 0, launched.stdout + launched.stderr);
   assert.match(launched.stdout, /state: running\n$/);
   const id = h.jobs()[0].id;
+  assert.ok(launched.stdout.includes(`node "${companion}" watch --job ${id}`));
   const result = h.run(["result", id, "--wait"]);
   assertDone(result);
   assert.equal(h.jobs()[0].status, "done");
