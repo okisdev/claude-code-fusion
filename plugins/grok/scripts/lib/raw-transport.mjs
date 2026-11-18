@@ -19,7 +19,6 @@ export function configureRawTransport(config) {
     sessionIdEnv,
     makeError,
     maxRawArgumentBytes,
-    allowUnwrittenByDefault = false,
     cleanupOnSessionMismatch = false,
     allowBackgroundDefault = true,
     allowStdin = false
@@ -29,7 +28,6 @@ export function configureRawTransport(config) {
     sessionIdEnv,
     makeError,
     maxRawArgumentBytes,
-    allowUnwrittenByDefault,
     cleanupOnSessionMismatch,
     allowBackgroundDefault,
     allowStdin,
@@ -80,14 +78,6 @@ function sameFileIdentity(left, right) {
   return left && right && left.dev === right.dev && left.ino === right.ino;
 }
 
-function requestIdentity(stats) {
-  return Object.fromEntries(["dev", "ino", "size", "mtimeNs"].map((key) => [key, String(stats[key])]));
-}
-
-function sameRequestIdentity(left, right) {
-  return Object.keys(left).every((key) => left[key] === right?.[key]);
-}
-
 function readTransportOwner(ownerFile, errorWithFailure) {
   let descriptor;
   try {
@@ -110,9 +100,7 @@ function readTransportOwner(ownerFile, errorWithFailure) {
       throw errorWithFailure("The raw command transport owner record is invalid.", "permission");
     }
     const record = JSON.parse(buffer.subarray(0, bytesRead).toString("utf8"));
-    if (!Number.isSafeInteger(record?.createdAt) || record.createdAt <= 0 || (record.sessionHash !== null && !/^[a-f0-9]{64}$/.test(record.sessionHash)) ||
-        !["dev", "ino", "size", "mtimeNs"].every((key) => typeof record.requestIdentity?.[key] === "string" && /^\d+$/.test(record.requestIdentity[key])) ||
-        record.requestIdentity.size !== "0") {
+    if (!Number.isSafeInteger(record?.createdAt) || record.createdAt <= 0 || (record.sessionHash !== null && !/^[a-f0-9]{64}$/.test(record.sessionHash))) {
       throw errorWithFailure("The raw command transport owner record is invalid.", "permission");
     }
     return { identity: pathStats, record };
@@ -242,7 +230,7 @@ export function createRawCommandTransport() {
       fileCreated = true;
       fs.closeSync(descriptor);
       fs.chmodSync(file, 0o600);
-      fs.writeFileSync(ownerFile, `${JSON.stringify({ createdAt: Date.now(), sessionHash: transportSessionHash(process.env[sessionIdEnv] ?? null), requestIdentity: requestIdentity(fs.statSync(file, { bigint: true })) })}\n`, {
+      fs.writeFileSync(ownerFile, `${JSON.stringify({ createdAt: Date.now(), sessionHash: transportSessionHash(process.env[sessionIdEnv] ?? null) })}\n`, {
         flag: "wx",
         mode: 0o600
       });
@@ -295,7 +283,7 @@ function releaseVerifiedTransport(directory, file, ownerFile, identities, errorW
   cleanupVerifiedTransport(directory, file, ownerFile, identities.directory, identities.file, identities.owner, errorWithFailure);
 }
 
-export function consumeRawCommandTransport(token, { allowUnwritten = rawTransportConfig.allowUnwrittenByDefault, allowMissing = false, retain = false } = {}) {
+export function consumeRawCommandTransport(token, { allowMissing = false, retain = false } = {}) {
   const config = rawTransportConfig;
   const { sessionIdEnv, cleanupOnSessionMismatch, maxRawArgumentBytes, makeError: errorWithFailure } = config;
   const { directory, file, ownerFile } = transportPaths(token, config);
@@ -349,17 +337,10 @@ export function consumeRawCommandTransport(token, { allowUnwritten = rawTranspor
     }
     const bytes = readBoundedDescriptor(descriptor, maxRawArgumentBytes, errorWithFailure);
     let value;
-    if (bytes.length === 0) {
-      if (!allowUnwritten && sameRequestIdentity(owner.record.requestIdentity, requestIdentity(fs.fstatSync(descriptor, { bigint: true })))) {
-        throw errorWithFailure("The raw command transport is unwritten.", "input");
-      }
-      value = "";
-    } else {
-      try {
-        value = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
-      } catch {
-        throw errorWithFailure("Raw command arguments must be valid UTF-8.", "input");
-      }
+    try {
+      value = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+    } catch {
+      throw errorWithFailure("Raw command arguments must be valid UTF-8.", "input");
     }
     if (retain) {
       retained = true;

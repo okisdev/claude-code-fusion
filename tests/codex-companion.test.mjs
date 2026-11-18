@@ -715,7 +715,7 @@ test("structured raw transport preserves shell syntax without evaluating it", (t
   assert.equal(fs.existsSync(path.dirname(transport.file)), false);
 });
 
-test("raw transport rejects an unwritten input and removes the verified transport", (t) => {
+test("an empty raw task request reaches prompt validation and removes the verified transport", (t) => {
   const sandbox = makeSandbox(t);
   const env = envFor(sandbox);
   const created = runCompanion(["transport-create"], { cwd: sandbox.workDir, env });
@@ -725,7 +725,7 @@ test("raw transport rejects an unwritten input and removes the verified transpor
 
   const result = runCompanion(["task", "--raw-args-token", transport.token], { cwd: sandbox.workDir, env });
   assert.equal(result.status, 1);
-  assert.match(result.stderr, /raw command transport is unwritten/);
+  assert.match(result.stderr, /Provide a Codex task prompt or --prompt-file\./);
   assert.equal(jobRecords(sandbox).length, 0);
   assert.equal(fs.existsSync(transport.file), false);
   assert.equal(fs.existsSync(ownerFile), false);

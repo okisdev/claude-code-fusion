@@ -639,7 +639,7 @@ export function createCompanionCommands(adapter) {
     }
     if (command === "transport-discard") {
       if (received.length !== 2 || received[0] !== "--raw-args-token") throw errorWithFailure("transport-discard requires exactly one raw argument token.");
-      consumeRawCommandTransport(received[1], { allowUnwritten: true, allowMissing: true });
+      consumeRawCommandTransport(received[1], { allowMissing: true });
       return;
     }
     if (command === "record-acceptance") { activeArgv = received; handleRecordAcceptance(received); return; }

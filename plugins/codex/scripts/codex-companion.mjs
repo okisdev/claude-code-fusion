@@ -402,7 +402,6 @@ configureRawTransport({
   sessionIdEnv: SESSION_ID_ENV,
   makeError: (message, kind) => new CompanionError(message, kind),
   maxRawArgumentBytes: MAX_PROMPT_BYTES + 64 * 1024,
-  allowUnwrittenByDefault: false,
   cleanupOnSessionMismatch: true,
   allowBackgroundDefault: false,
   allowStdin: true
@@ -2121,7 +2120,7 @@ async function main() {
     if (receivedArgv.length !== 2 || receivedArgv[0] !== "--raw-args-token") {
       throw new CompanionError("transport-discard requires exactly one raw argument token.", "input");
     }
-    consumeRawCommandTransport(receivedArgv[1], { allowUnwritten: true, allowMissing: true });
+    consumeRawCommandTransport(receivedArgv[1], { allowMissing: true });
     return;
   }
   if (subcommand === "record-acceptance") {

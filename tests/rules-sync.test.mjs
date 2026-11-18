@@ -84,12 +84,17 @@ function writeModelRouting(file) {
   );
 }
 
-function runSession(sandbox, compact = false) {
+function runSession(sandbox, source = "startup") {
   const companion = path.join(sandbox.root, "host-check.mjs");
   fs.writeFileSync(companion, 'process.stdout.write(JSON.stringify({ blockers: [] }));');
-  return spawnSync(process.execPath, [path.join(repoRoot, "plugins", "fusion", "scripts", "session-start.mjs"), ...(compact ? ["--compact"] : [])], {
+  const hooks = JSON.parse(fs.readFileSync(path.join(repoRoot, "plugins", "fusion", "hooks", "hooks.json"), "utf8")).hooks;
+  const group = hooks.SessionStart.find((entry) => new RegExp(`^(?:${entry.matcher})$`).test(source));
+  assert.ok(group, `No SessionStart hook matches ${source}.`);
+  const command = group.hooks[0].command.replaceAll("${CLAUDE_PLUGIN_ROOT}", path.join(repoRoot, "plugins", "fusion"));
+  return spawnSync("/bin/sh", ["-c", command], {
     env: {
       ...process.env,
+      PATH: `${path.dirname(process.execPath)}${path.delimiter}${process.env.PATH ?? ""}`,
       CLAUDE_PLUGIN_ROOT: sandbox.pluginRoot,
       FUSION_RULES_FILE: sandbox.rulesFile,
       FUSION_MODEL_ROUTING: sandbox.modelRoutingFile,
@@ -144,7 +149,7 @@ test("Rules sync installs identical bytes for missing, scored, empty, and invali
   for (const content of installed) assert.deepStrictEqual(content, installed[0]);
 });
 
-test("Startup and compact provide scored or empty routing tables and placeholders for missing or invalid data", (t) => {
+test("Startup, clear, and compact hooks provide scored or empty routing tables and placeholders for missing or invalid data", (t) => {
   for (const state of ["missing", "scored", "empty", "invalid-json", "invalid-schema"]) {
     const sandbox = makeSandbox(t);
     if (state === "scored" || state === "empty") {
@@ -159,18 +164,20 @@ test("Startup and compact provide scored or empty routing tables and placeholder
     if (state === "invalid-schema") fs.writeFileSync(sandbox.modelRoutingFile, JSON.stringify({ models: [] }));
     const routing = readModelRoutingFile(sandbox.modelRoutingFile);
     const expected = routing.ok ? renderModelTable(routing.data) : DEFAULT_MODEL_TABLE_PLACEHOLDER;
-    for (const compact of [false, true]) {
-      const result = runSession(sandbox, compact);
+    for (const source of ["startup", "clear", "compact"]) {
+      const result = runSession(sandbox, source);
       assert.strictEqual(result.error, undefined);
       assert.strictEqual(result.status, 0, result.stderr);
       const output = JSON.parse(result.stdout);
       assert.strictEqual(output.hookSpecificOutput.hookEventName, "SessionStart");
       const context = output.hookSpecificOutput.additionalContext;
-      assert.ok(context.endsWith(expected), `${state}, compact=${compact}`);
-      if (compact) {
+      assert.ok(context.endsWith(expected), `${state}, source=${source}`);
+      if (source === "compact") {
         assert.strictEqual(context, `${tagMessage("session.compact-reposture", "Fusion rules are in ~/.claude/rules/orchestration.md. Collect and settle any in-flight work.")}\n${expected}`);
-      } else {
+      } else if (source === "startup") {
         assert.ok(context.startsWith(tagMessage("rules-sync.rules-installed", "fusion: routing rules installed (run /fusion:setup for the optional permission check)")));
+      } else {
+        assert.strictEqual(context, expected);
       }
       if (state === "scored") {
         assert.match(context, /^\| codex \| codex \| openai \| 5 \| 4 \| 5 \|$/m);
@@ -189,6 +196,19 @@ test("Startup and compact provide scored or empty routing tables and placeholder
   }
 });
 
+test("The compact hook emits its tagged reminder when Node is missing", (t) => {
+  const sandbox = makeSandbox(t);
+  const hooks = JSON.parse(fs.readFileSync(path.join(repoRoot, "plugins", "fusion", "hooks", "hooks.json"), "utf8")).hooks;
+  const command = hooks.SessionStart.find((group) => group.matcher === "compact").hooks[0].command;
+  const result = spawnSync("/bin/sh", ["-c", command], {
+    env: { ...process.env, PATH: sandbox.root, CLAUDE_PLUGIN_ROOT: sandbox.pluginRoot },
+    encoding: "utf8"
+  });
+  assert.strictEqual(result.status, 0, result.stderr);
+  assert.strictEqual(result.stderr, "");
+  assert.strictEqual(result.stdout, `${tagMessage("session.compact-reposture", "Fusion rules are in ~/.claude/rules/orchestration.md. Collect and settle any in-flight work.")}\n`);
+});
+
 test("Compaction reloads changed scores, breadth, and lane defaults while preserving local rule edits", (t) => {
   const sandbox = makeSandbox(t);
   writeModelRouting(sandbox.modelRoutingFile);
@@ -202,7 +222,7 @@ test("Compaction reloads changed scores, breadth, and lane defaults while preser
   fs.writeFileSync(sandbox.modelRoutingFile, JSON.stringify(data));
   fs.writeFileSync(sandbox.rulesFile, UNKNOWN_VERSION);
   const mtime = fs.statSync(sandbox.rulesFile).mtimeMs;
-  const result = runSession(sandbox, true);
+  const result = runSession(sandbox, "compact");
   assert.strictEqual(result.status, 0, result.stderr);
   assert.strictEqual(result.stderr, "");
   const context = JSON.parse(result.stdout).hookSpecificOutput.additionalContext;

@@ -121,13 +121,15 @@ test("each shared matcher uses one dispatcher process and lifecycle-only tools k
   }
 });
 
-test("startup and compact each use one session context process", () => {
-  const startup = hooks.SessionStart.filter(({ matcher }) => matcher === "startup").flatMap(({ hooks }) => hooks);
-  assert.equal(startup.length, 1);
-  assert.equal(startup[0].command, 'command -v node >/dev/null 2>&1 || exit 0; node "${CLAUDE_PLUGIN_ROOT}/scripts/session-start.mjs"');
+test("startup, clear, and compact each use one session context process", () => {
+  for (const source of ["startup", "clear"]) {
+    const startup = hooks.SessionStart.filter(({ matcher }) => new RegExp(`^(?:${matcher})$`).test(source)).flatMap(({ hooks }) => hooks);
+    assert.equal(startup.length, 1, source);
+    assert.equal(startup[0].command, 'command -v node >/dev/null 2>&1 || exit 0; node "${CLAUDE_PLUGIN_ROOT}/scripts/session-start.mjs"');
+  }
   const compact = hooks.SessionStart.filter(({ matcher }) => matcher === "compact").flatMap(({ hooks }) => hooks);
   assert.equal(compact.length, 1);
-  assert.equal(compact[0].command, 'command -v node >/dev/null 2>&1 || exit 0; node "${CLAUDE_PLUGIN_ROOT}/scripts/session-start.mjs" --compact');
+  assert.equal(compact[0].command, 'command -v node >/dev/null 2>&1 || { echo \'Fusion rules are in ~/.claude/rules/orchestration.md. Collect and settle any in-flight work. [fusion:9902]\'; exit 0; }; node "${CLAUDE_PLUGIN_ROOT}/scripts/session-start.mjs" --compact');
 });
 
 test("ignored tools and agent types load no lifecycle handlers or guard modules", (t) => {
