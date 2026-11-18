@@ -769,10 +769,13 @@ function unsettledEngineEntries(descriptor, env) {
   });
 }
 
-export function buildUnsettledReport({ env = process.env } = {}) {
-  const unsettled = [
+export function buildUnsettledReport({ env = process.env, days = 7, all = false, now = Date.now() } = {}) {
+  const entries = [
     ...unsettledWorkerEntries(env),
     ...ENGINE_IDS.flatMap((id) => unsettledEngineEntries(FILE_ENGINE_DESCRIPTORS[id], env))
   ].sort((left, right) => unsettledTimestamp(right) - unsettledTimestamp(left));
-  return { unsettled };
+  if (all) return { unsettled: entries, hidden: { older: 0, further: 0 } };
+  const since = now - days * 24 * 60 * 60 * 1000;
+  const recent = entries.filter((entry) => unsettledTimestamp(entry) >= since && unsettledTimestamp(entry) <= now);
+  return { unsettled: recent.slice(0, 20), hidden: { older: entries.length - recent.length, further: Math.max(0, recent.length - 20) } };
 }

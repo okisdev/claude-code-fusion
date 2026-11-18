@@ -381,15 +381,16 @@ export function renderUnsettledReport(report) {
   const lines = ["# Fusion unsettled jobs"];
   if (report.unsettled.length === 0) {
     lines.push("", "No terminal jobs are awaiting semantic acceptance.");
-    return `${lines.join("\n")}\n`;
+  } else {
+    lines.push("", "Engine | ID | Description or kind | Finished at | Semantic verdict");
+    for (const entry of report.unsettled) {
+      const provenance = [
+        entry.acceptanceSource ? `acceptance source: ${entry.acceptanceSource}` : null,
+        entry.acceptanceRecordedAt ? `acceptance recorded at: ${entry.acceptanceRecordedAt}` : null
+      ].filter(Boolean).join(", ");
+      lines.push(`${entry.engine} | ${entry.id} | ${entry.description ?? entry.kind ?? "unknown"} | ${entry.finishedAt ?? ""} | ${entry.acceptance}${provenance ? ` (${provenance})` : ""}`);
+    }
   }
-  lines.push("", "Engine | ID | Description or kind | Finished at | Semantic verdict");
-  for (const entry of report.unsettled) {
-    const provenance = [
-      entry.acceptanceSource ? `acceptance source: ${entry.acceptanceSource}` : null,
-      entry.acceptanceRecordedAt ? `acceptance recorded at: ${entry.acceptanceRecordedAt}` : null
-    ].filter(Boolean).join(", ");
-    lines.push(`${entry.engine} | ${entry.id} | ${entry.description ?? entry.kind ?? "unknown"} | ${entry.finishedAt ?? ""} | ${entry.acceptance}${provenance ? ` (${provenance})` : ""}`);
-  }
+  lines.push(``, `Hidden: ${report.hidden.older} older, ${report.hidden.further} further rows. Use --days <n> or --all to see them.`);
   return `${lines.join("\n")}\n`;
 }

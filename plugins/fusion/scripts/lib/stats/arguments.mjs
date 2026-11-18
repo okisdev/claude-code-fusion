@@ -136,7 +136,7 @@ export function validateArgumentShape(argv) {
     audit: new Set(["--audit", "--all", "--days", "--session", "--json"]),
     record: new Set(["--record", "--source", "--reason", "--reason-for", "--failure-kind", "--failure-kind-for", "--accept-failed-transport", "--json"]),
     prune: new Set(["--prune-dead", "--yes", "--json"]),
-    unsettled: new Set(["--unsettled", "--json"]),
+    unsettled: new Set(["--unsettled", "--days", "--all", "--json"]),
     trace: new Set(["--trace", "--session", "--json"]),
     session: new Set(["--session", "--json"]),
     report: new Set(["--json", "--all", "--identities", "--by-day"])
@@ -373,7 +373,7 @@ export function isStrictDirectReportOrMaintenanceArguments(argv) {
   const flags = new Set(["--json", "--audit", "--all", "--prune-dead", "--unsettled", "--identities", "--by-day"]);
   if (argv.includes("--days")) {
     const index = argv.indexOf("--days");
-    if (!argv.includes("--audit") || !/^[1-9]\d*$/.test(argv[index + 1] ?? "")) return false;
+    if ((!argv.includes("--audit") && !argv.includes("--unsettled")) || !/^[1-9]\d*$/.test(argv[index + 1] ?? "") || !Number.isSafeInteger(Number(argv[index + 1]))) return false;
     argv = [...argv.slice(0, index), ...argv.slice(index + 2)];
   }
   return argv.every((token) => flags.delete(token));
