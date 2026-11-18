@@ -109,7 +109,8 @@ test("every executable private transport surface follows its declared Write tran
     if (file === "plugins/fusion/skills/stats/SKILL.md") {
       assert.match(content, /sole carve-outs are three strict direct forms: a verdict settlement/, file);
       assert.match(content, /repeatable `--record` flags, each carrying one or more `<id>=<accepted\|rejected\|unverified>\[:accept-failed-transport\]` pairs, optional `--source collector\|main-loop`, optional `--reason <text>`, `--reason-for <id> <text>`, `--failure-kind <kind>`, and `--failure-kind-for <id> <kind>`, and the value free `--json` and `--accept-failed-transport` flags, where every direct text value matches/, file);
-      assert.match(content, /a value free report or maintenance request made only of any combination of `--json`, `--audit`, `--all`, `--prune-dead`, `--identities`, and `--by-day`, each at most once/, file);
+      assert.match(content, /a report or maintenance request made only of any combination of `--json`, `--audit`, `--all`, `--prune-dead`, `--unsettled`, `--identities`, and `--by-day`, each at most once, with optional `--days <positive integer>` only alongside `--audit`/, file);
+      assert.match(content, /Those arguments may be passed directly, including a bare report request\. `--help` prints the CLI usage\./, file);
       assert.match(content, /Anything else, including text outside the direct charset and `--session <id>`, still uses the raw-args transport exactly as described above\./, file);
       assert.match(content, /`--reason-for <id> <text>` may appear anywhere in the argument list and binds to its matching `--record` id; `--reason <text>` applies to every rejected pair without a per-pair `--reason-for`\./, file);
       assert.match(content, /`--failure-kind-for <id> <kind>` may appear anywhere in the argument list and binds to its matching rejected `--record` id; `--failure-kind <kind>` applies to every rejected pair without its own `--failure-kind-for`\./, file);
@@ -236,3 +237,46 @@ test("Codex transport-discard removes an unwritten staged request without error"
   assert.equal(discarded.stdout, "");
   assert.equal(fs.existsSync(directory), false);
 });
+
+for (const engine of ["codex", "grok", "cursor", "devin"]) {
+  test(`${engine} accepts a written empty request, rejects an untouched one, and permits discard after consumption`, (t) => {
+    const companion = path.join(repoRoot, `plugins/${engine}/scripts/${engine}-companion.mjs`);
+    const env = transportEnv(t, `raw-transport-empty-${engine}-${process.pid}`);
+    const data = path.dirname(env.HOME);
+    env.GROK_COMPANION_DATA = path.join(data, "grok-data");
+    env.CURSOR_COMPANION_DATA = path.join(data, "cursor-data");
+    env.DEVIN_COMPANION_DATA = path.join(data, "devin-data");
+    const run = (args) => spawnSync(process.execPath, [companion, ...args], { encoding: "utf8", env });
+
+    for (const command of engine === "codex" ? ["setup", "status"] : ["status"]) {
+      const created = run(["transport-create"]);
+      assert.equal(created.status, 0, created.stderr);
+      const transport = JSON.parse(created.stdout);
+      const directory = path.dirname(transport.file);
+      t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+      fs.writeFileSync(transport.file, "");
+      const result = run([command, "--raw-args-token", transport.token]);
+      if (command === "setup") {
+        assert.match(result.stdout, /Codex CLI:/);
+        assert.doesNotMatch(result.stderr, /raw command transport is unwritten/);
+      } else {
+        assert.equal(result.status, 0, result.stderr);
+      }
+      assert.equal(fs.existsSync(directory), false);
+      const discarded = run(["transport-discard", "--raw-args-token", transport.token]);
+      assert.equal(discarded.status, 0, discarded.stderr);
+      assert.equal(discarded.stdout, "");
+    }
+
+    const created = run(["transport-create"]);
+    assert.equal(created.status, 0, created.stderr);
+    const transport = JSON.parse(created.stdout);
+    const directory = path.dirname(transport.file);
+    t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+    fs.chmodSync(transport.file, 0o600);
+    const untouched = run(["status", "--raw-args-token", transport.token]);
+    assert.equal(untouched.status, 1, untouched.stderr);
+    assert.match(untouched.stderr, /raw command transport is unwritten/);
+    assert.equal(fs.existsSync(directory), false);
+  });
+}

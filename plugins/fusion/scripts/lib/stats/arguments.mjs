@@ -370,7 +370,12 @@ export function isStrictDirectReportOrMaintenanceArguments(argv) {
   if (argv.length === 2 && argv[0] === "--message" && isIntegerToken(argv[1])) {
     return true;
   }
-  const flags = new Set(["--json", "--audit", "--all", "--prune-dead", "--identities", "--by-day"]);
+  const flags = new Set(["--json", "--audit", "--all", "--prune-dead", "--unsettled", "--identities", "--by-day"]);
+  if (argv.includes("--days")) {
+    const index = argv.indexOf("--days");
+    if (!argv.includes("--audit") || !/^[1-9]\d*$/.test(argv[index + 1] ?? "")) return false;
+    argv = [...argv.slice(0, index), ...argv.slice(index + 2)];
+  }
   return argv.every((token) => flags.delete(token));
 }
 

@@ -1975,6 +1975,31 @@ test("direct --audit prints the audit report", (t) => {
   assert.match(result.stdout, /# Fusion inline audit/);
 });
 
+test("direct --help prints usage without loading a report", (t) => {
+  const dir = sandbox(t);
+  const result = runDirect({ cwd: dir, codexState: path.join(dir, "missing") }, ["--help"]);
+  assert.strictEqual(result.status, 0, result.stderr);
+  assert.match(result.stdout, /^Usage: fusion-stats\.mjs/);
+});
+
+test("direct fixed report flags and audit days run without a transport", (t) => {
+  const dir = sandbox(t);
+  const env = { cwd: dir, codexState: path.join(dir, "missing") };
+  for (const [args, heading] of [
+    [["--unsettled"], /# Fusion unsettled/],
+    [["--all"], /# Fusion stats/],
+    [["--identities", "--by-day"], /# Fusion stats/],
+    [["--audit", "--days", "3"], /# Fusion inline audit/]
+  ]) {
+    const result = runDirect(env, args);
+    assert.strictEqual(result.status, 0, `${args.join(" ")}: ${result.stderr}`);
+    assert.match(result.stdout, heading);
+  }
+  assert.strictEqual(isStrictDirectReportOrMaintenanceArguments(["--audit", "--days", "3"]), true);
+  assert.strictEqual(isStrictDirectReportOrMaintenanceArguments(["--audit", "--days", "3", "--days", "4"]), false);
+  assert.strictEqual(isStrictDirectReportOrMaintenanceArguments(["--audit", "--days", "text"]), false);
+});
+
 test("bare direct invocation prints the Fusion stats report", (t) => {
   const dir = sandbox(t);
 
