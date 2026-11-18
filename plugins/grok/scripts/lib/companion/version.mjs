@@ -40,7 +40,7 @@ function probeGrokVersion(bin, env = process.env) {
     windowsHide: true
   });
   const rawVersion = String(result.stdout || result.stderr || "").trim();
-  const match = rawVersion.match(/\b\d+\.\d+\.\d+\b/);
+  const match = rawVersion.match(/\b\d+\.\d+\.\d+\b(?:-[\w.-]+)?(?:\+[\w.-]+)?/);
   const probe = {
     available: !result.error && result.status === 0,
     bin,
@@ -71,16 +71,33 @@ function requireTestedGrokFloor(probe) {
 }
 
 function parseVersion(value) {
-  const match = String(value ?? "").match(/^(\d+)\.(\d+)\.(\d+)/);
-  return match ? match.slice(1).map(Number) : null;
+  const match = String(value ?? "").match(/^(\d+)\.(\d+)\.(\d+)(?:-([\w.-]+))?(?:\+[\w.-]+)?$/);
+  return match ? [...match.slice(1, 4).map(Number), ...(match[4] ? [match[4]] : [])] : null;
 }
 
 function compareVersion(left, right) {
-  for (let index = 0; index < Math.max(left.length, right.length); index += 1) {
+  for (let index = 0; index < 3; index += 1) {
     const difference = (left[index] ?? 0) - (right[index] ?? 0);
     if (difference !== 0) {
       return Math.sign(difference);
     }
+  }
+  if (left[3] === right[3]) return 0;
+  if (!left[3]) return 1;
+  if (!right[3]) return -1;
+  const leftPrerelease = left[3].split(".");
+  const rightPrerelease = right[3].split(".");
+  for (let index = 0; index < Math.max(leftPrerelease.length, rightPrerelease.length); index += 1) {
+    const a = leftPrerelease[index];
+    const b = rightPrerelease[index];
+    if (a === b) continue;
+    if (a === undefined) return -1;
+    if (b === undefined) return 1;
+    const aNumeric = /^\d+$/.test(a);
+    const bNumeric = /^\d+$/.test(b);
+    if (aNumeric && bNumeric) return Math.sign(Number(a) - Number(b));
+    if (aNumeric !== bNumeric) return aNumeric ? -1 : 1;
+    return a < b ? -1 : 1;
   }
   return 0;
 }

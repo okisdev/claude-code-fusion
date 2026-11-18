@@ -338,7 +338,9 @@ export function canonicalWorkerAgentType(value) {
   return typeof value === "string" ? AGENT_TYPES.get(value) ?? null : null;
 }
 
-export function claudeModelFamily(value) {
+export function claudeModelFamily(value, env = {}) {
+  const alias = typeof value === "string" ? /^(fable|opus|sonnet|haiku)(?:\[1m\])?$/i.exec(value.trim())?.[1] : null;
+  if (alias) value = env[`ANTHROPIC_DEFAULT_${alias.toUpperCase()}_MODEL`]?.trim() || value;
   return typeof value === "string" ? value.match(/\b(fable|opus|sonnet|haiku)\b/i)?.[1].toLowerCase() ?? null : null;
 }
 

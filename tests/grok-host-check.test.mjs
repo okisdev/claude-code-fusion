@@ -98,7 +98,9 @@ test("host-check and setup accept a denied-target symlink on 1.0.88 while refusi
     assert.equal(report.hostEnvironment.ready, ready);
     assert.equal(report.hostEnvironment.writeReady, false);
     assert.deepEqual(report.hostEnvironment.runtimeSocketSymlinks, ready ? [] : [endpoint]);
-    assert.match(report.hostEnvironment.remedy, /orb stop/);
+    assert.match(report.hostEnvironment.remedy, /Stop the container engine/);
+    if (ready) assert.doesNotMatch(report.hostEnvironment.remedy, /orb stop/);
+    else assert.match(report.hostEnvironment.remedy, /orb stop/);
     assert.doesNotMatch(report.hostEnvironment.remedy, /sudo rm|setup\.use_admin/);
     if (ready) {
       assert.equal(report.compatibility, "tested");
@@ -107,5 +109,26 @@ test("host-check and setup accept a denied-target symlink on 1.0.88 while refusi
     const rendered = runCompanion(["setup"], { cwd: sandbox.workDir, env: versionEnv });
     assert.equal(rendered.status, 0, rendered.stderr);
     assert.ok(rendered.stdout.includes(report.hostEnvironment.remedy));
+  }
+});
+
+test("host-check and setup preserve prereleases below the runtime-socket exemption", (t) => {
+  for (const version of ["1.0.88-rc.1", "1.0.88-rc.1+build.2", "1.0.88", "1.0.88+build.2"]) {
+    const sandbox = makeSandbox(t);
+    const env = envFor(sandbox);
+    const target = path.join(env.HOME, ".docker", "desktop", "docker.sock");
+    fs.mkdirSync(path.dirname(target), { recursive: true });
+    fs.writeFileSync(target, "socket fixture");
+    const endpoint = path.join(sandbox.root, "docker.sock");
+    fs.symlinkSync(target, endpoint);
+    const currentEnv = { ...env, FAKE_GROK_VERSION_OUTPUT: `grok ${version} (abcdef012345)`, GROK_COMPANION_RUNTIME_SOCKET_CANDIDATES: endpoint };
+    const blockers = JSON.parse(check(sandbox, currentEnv, true)).blockers;
+    const prerelease = version.includes("-rc");
+    assert.deepEqual(blockers.map(({ modes }) => modes), prerelease ? [["consult", "write", "review"]] : [], version);
+    const setup = runCompanion(["setup", "--json"], { cwd: sandbox.workDir, env: currentEnv });
+    assert.equal(setup.status, 0, setup.stderr);
+    const report = JSON.parse(setup.stdout);
+    assert.equal(report.grok.detail, `grok ${version} (abcdef012345)`);
+    assert.equal(report.ready, !prerelease, version);
   }
 });

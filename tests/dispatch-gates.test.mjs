@@ -362,6 +362,25 @@ test("Claude quota admission migrates saved family evidence without changing the
   assert.match(engineInfraDenial("session-1", "deep-reasoner", "continue", box.env, now, "", "fable"), /Fable usage limit/);
 });
 
+for (const alias of ["opus", "sonnet", "haiku", "fable"]) {
+  test(`Claude quota resolves the configured ${alias} alias before admission`, (t) => {
+    const box = sandbox(t);
+    const now = Date.parse("2026-11-18T10:00:00.000Z");
+    const env = { ...box.env, [`ANTHROPIC_DEFAULT_${alias.toUpperCase()}_MODEL`]: "claude-fable-5-2" };
+    workerRecord(box, { agentType: "fusion:deep-reasoner", failureKind: "quota", infraFailure: true, quotaModelFamily: "fable", finishedAt: "2026-11-18T09:00:00.000Z", quotaResetAt: "2026-11-21T00:00:00.000Z" });
+    for (const model of [alias, `${alias}[1m]`]) {
+      const denial = engineInfraDenial("session-1", "deep-reasoner", "continue", env, now, "", model);
+      assert.match(denial, /Fable usage limit/, model);
+      if (alias === "opus") assert.doesNotMatch(denial, /rerun with model: opus/);
+    }
+    assert.equal(engineInfraDenial("session-1", "deep-reasoner", "continue", env, now, "", "claude-opus-5-5"), null);
+    env[`ANTHROPIC_DEFAULT_${alias.toUpperCase()}_MODEL`] = "claude-sonnet-5";
+    assert.equal(engineInfraDenial("session-1", "deep-reasoner", "continue", env, now, "", alias), null);
+    assert.match(engineInfraDenial("session-1", "deep-reasoner", "continue", env, now, "", "claude-fable-5-2"), /Fable usage limit/);
+    assert.equal(readWorkerRecords(box.env)[0].quotaModelFamily, "fable");
+  });
+}
+
 test("Claude quota admission migrates resolved model evidence when the error is unavailable", (t) => {
   const box = sandbox(t);
   const now = Date.parse("2026-11-18T10:00:00.000Z");

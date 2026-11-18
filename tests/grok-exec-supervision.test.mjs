@@ -120,10 +120,10 @@ test("runtime-socket symlink policy resolves exact deny-list targets only on 1.0
     fs.mkdirSync(path.dirname(target), { recursive: true });
     fs.writeFileSync(target, "socket fixture");
     fs.symlinkSync(path.relative(path.dirname(endpoint), target), endpoint);
-    for (const version of ["1.0.88", "1.0.89", "1.1.0", "2.0.0"]) {
+    for (const version of ["1.0.88", "1.0.88+build.2", "1.0.89-rc.1", "1.0.89", "1.1.0", "2.0.0"]) {
       assert.deepEqual(preflightRuntimeSocketEndpoints({ env, version, candidates: [endpoint] }), []);
     }
-    for (const version of [null, "unknown", "1.0.77", "1.0.87"]) {
+    for (const version of [null, "unknown", "1.0.77", "1.0.87", "1.0.88-rc.1", "1.0.88-rc.1+build.2"]) {
       assert.throws(() => preflightRuntimeSocketEndpoints({ env, version, candidates: [endpoint] }), (error) => error.failureKind === "sandbox");
     }
     fs.unlinkSync(endpoint);
@@ -145,6 +145,35 @@ test("runtime-socket symlink policy resolves exact deny-list targets only on 1.0
     fs.unlinkSync(endpoint);
   }
 });
+
+for (const suffix of [".docker/desktop/docker.sock", ".docker/run/docker.sock", ".orbstack/run/docker.sock"]) {
+  test(`managed writes block the default per-home socket ${suffix} before spawn`, async (t) => {
+    const sandbox = makeSandbox(t);
+    const env = envFor(sandbox);
+    delete env.GROK_COMPANION_UNDENIED_SOCKET_CANDIDATES;
+    const socket = path.join(env.HOME, suffix);
+    const originalLstat = fs.lstatSync;
+    t.mock.method(fs, "lstatSync", (candidate, ...args) => candidate === socket
+      ? { isSocket: () => true, isSymbolicLink: () => false }
+      : originalLstat(candidate, ...args));
+    let launchCalled = false;
+
+    await assert.rejects(async () => runGrok(runOptions(sandbox, {
+      grokVersion: "1.0.88",
+      mode: "write",
+      env,
+      launchProcess: () => { launchCalled = true; throw new Error("unexpected child launch"); }
+    })), (error) => {
+      assert.equal(error.failureKind, "sandbox");
+      assert.ok(error.message.includes(socket), error.message);
+      assert.match(error.message, /Stop the container engine/);
+      assert.doesNotMatch(error.message, /orb stop/);
+      return true;
+    });
+    assert.equal(launchCalled, false);
+    assert.equal(fs.existsSync(sandbox.argsFile), false);
+  });
+}
 
 test("runtime-socket remedies name the engine that owns the symlink", (t) => {
   const sandbox = makeSandbox(t);

@@ -829,10 +829,10 @@ function securityError(kind, message) {
 }
 
 function runtimeSocketSymlinkTargetsAllowed(version) {
-  const match = /^(\d+)\.(\d+)\.(\d+)$/.exec(String(version ?? ""));
+  const match = /^(\d+)\.(\d+)\.(\d+)(?:-([\w.-]+))?(?:\+[\w.-]+)?$/.exec(String(version ?? ""));
   if (!match) return false;
-  const [major, minor, patch] = match.slice(1).map(Number);
-  return major > 1 || (major === 1 && (minor > 0 || (minor === 0 && patch >= 88)));
+  const [major, minor, patch] = match.slice(1, 4).map(Number);
+  return major > 1 || (major === 1 && (minor > 0 || (minor === 0 && (patch > 88 || (patch === 88 && !match[4])))));
 }
 
 export function runtimeSocketEndpoints({ env = process.env, version = null, platform = process.platform, uid = typeof process.getuid === "function" ? process.getuid() : null } = {}) {
@@ -871,7 +871,11 @@ export function undeniedRuntimeSocketCandidates(env = process.env) {
     return [...new Set(String(env[UNDENIED_RUNTIME_SOCKET_CANDIDATES_ENV] ?? "").split(":").filter(Boolean))];
   }
   const home = typeof env.HOME === "string" && env.HOME.trim() ? env.HOME : os.homedir();
-  return [path.join(home, ".orbstack", "run", "docker.sock")];
+  return [
+    path.join(home, ".docker", "desktop", "docker.sock"),
+    path.join(home, ".docker", "run", "docker.sock"),
+    path.join(home, ".orbstack", "run", "docker.sock")
+  ];
 }
 
 export function existingUnixSockets(candidates, lstat = fs.lstatSync) {
@@ -891,7 +895,7 @@ export function existingUnixSockets(candidates, lstat = fs.lstatSync) {
 }
 
 export function undeniedRuntimeSocketRemedy() {
-  return "Stop the container engine (for OrbStack, run `orb stop`), or route writes to another lane. Grok write runs are refused while the socket exists.";
+  return "Stop the container engine, or route writes to another lane. Grok write runs are refused while the socket exists.";
 }
 
 export function runtimeSocketSymlinkEndpoints(candidates, { env = process.env, version = null, lstat = fs.lstatSync, realpath = fs.realpathSync } = {}) {

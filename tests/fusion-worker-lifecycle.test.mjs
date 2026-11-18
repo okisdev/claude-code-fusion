@@ -3462,6 +3462,38 @@ test("a report delivered through SubagentHandback settles the worker at Subagent
   assert.doesNotMatch(stop(box).stdout, /"decision":"block"/);
 });
 
+test("SubagentStop recovers a final handback instead of its nonempty preamble", (t) => {
+  for (const accounted of [false, true]) {
+    const box = sandbox(t);
+    const workerTranscript = handbackWorker(box, "handback-preamble", "coverage");
+    const preamble = "Here are the verification results.";
+    const report = "verified report\ndelivery: complete\ncoverage: complete";
+    writeHandback(workerTranscript, report);
+    fs.writeFileSync(workerTranscript, `${JSON.stringify({ type: "assistant", message: { content: [{ type: "text", text: preamble }] } })}\n${fs.readFileSync(workerTranscript, "utf8")}`);
+    if (accounted) updateWorkerRecord(record(box).taskId, envFor(box), (current) => refreshWorkerTranscript(current, workerTranscript));
+    const stopped = handbackStop(box, "handback-preamble", workerTranscript, "fusion:claude-worker", preamble);
+    assert.strictEqual(stopped.status, 0, stopped.stderr);
+    assert.strictEqual(stopped.stdout, "");
+    const collected = record(box);
+    assert.strictEqual(collected.transportStatus, "done");
+    assert.strictEqual(collected.collectionMethod, "subagent_stop");
+    assert.strictEqual(fs.readFileSync(collected.outputFile, "utf8"), report);
+  }
+});
+
+test("SubagentStop never writes a placeholder last assistant message as its report", (t) => {
+  for (const placeholder of ["waiting on pending-report", "await-output: pending"]) {
+    const box = sandbox(t);
+    const workerTranscript = handbackWorker(box, "placeholder-message", "coverage");
+    fs.writeFileSync(workerTranscript, `${JSON.stringify({ type: "assistant", message: { content: [{ type: "thinking", thinking: "still working" }] } })}\n`);
+    const stopped = handbackStop(box, "placeholder-message", workerTranscript, "fusion:claude-worker", placeholder);
+    assert.strictEqual(stopped.status, 0, stopped.stderr);
+    assert.strictEqual(JSON.parse(stopped.stdout).decision, "block");
+    assert.strictEqual(record(box).outputFile, null);
+    assert.strictEqual(record(box).collectedAt, null);
+  }
+});
+
 test("a SubagentHandback report without markers is collected at SubagentStop and asks only for a verdict", (t) => {
   const box = sandbox(t);
   const workerTranscript = handbackWorker(box, "handback-bare", "coverage");
@@ -3528,6 +3560,36 @@ test("a completed notification collects a SubagentHandback report that SubagentS
   assert.strictEqual(fs.readFileSync(collected.outputFile, "utf8"), report);
 });
 
+test("completed notifications leave placeholder final text uncollected for Stop and Read", (t) => {
+  for (const agentType of ["fusion:claude-worker", "grok:grok-rescue"]) {
+    for (const handback of [false, true]) {
+      for (const placeholder of ["waiting on pending-report", "await-output: pending"]) {
+        const box = sandbox(t);
+        const workerTranscript = handbackWorker(box, "placeholder-notified", "coverage", agentType);
+        if (handback) writeHandback(workerTranscript, placeholder);
+        else fs.writeFileSync(workerTranscript, `${JSON.stringify({ type: "assistant", message: { content: [{ type: "text", text: placeholder }] } })}\n`);
+        fs.appendFileSync(box.transcript, `${JSON.stringify({ type: "user", message: { content: "<task-notification><task-id>placeholder-notified</task-id><status>completed</status><summary>Agent finished</summary></task-notification>" } })}\n`);
+
+        const stopped = stop(box);
+        assert.strictEqual(stopped.status, 0, stopped.stderr);
+        const pending = record(box);
+        assert.strictEqual(pending.transportStatus, "incomplete");
+        assert.strictEqual(pending.failureKind, "missing_final_text");
+        assert.strictEqual(pending.collectedAt, null);
+        assert.strictEqual(pending.outputFile, null);
+        const decision = JSON.parse(stopped.stdout);
+        assert.strictEqual(decision.decision, "block");
+        assert.ok(decision.reason.includes(`Call Read with file_path=${workerTranscript}`), decision.reason);
+
+        const read = run(box, { hook_event_name: "PostToolUse", session_id: "session-1", cwd: box.cwd, transcript_path: box.transcript, tool_name: "Read", tool_input: { file_path: workerTranscript }, tool_response: { type: "text", text: fs.readFileSync(workerTranscript, "utf8") } });
+        assert.strictEqual(read.status, 0, read.stderr);
+        assert.strictEqual(record(box).collectionMethod, "output_file_read");
+        assert.ok(record(box).collectedAt);
+      }
+    }
+  }
+});
+
 const strandedHandbackFixture = path.join(repoRoot, "tests", "fixtures", "stranded-handback", "peer-wrapper-handback.jsonl");
 
 function strandedPeerWorker(box, agentId, runtimeAsync) {
@@ -3554,7 +3616,7 @@ test("a real report stranded behind a delivered waiting handback is left for the
 
 test("SubagentStop after a refused second handback recovers the real report without collecting it", (t) => {
   for (const runtimeAsync of [true, false]) {
-    for (const lastMessage of ["", " \n\t ", null, "waiting on bgshell01", "await-output: pending", "an earlier report of yours was already delivered"]) {
+    for (const lastMessage of ["", " \n\t ", null, "waiting on bgshell01", "await-output: pending", "an earlier report of yours was already delivered", "Here are the completed results."]) {
       const box = sandbox(t);
       const workerTranscript = strandedPeerWorker(box, "stranded-stopped", runtimeAsync);
       const stopped = handbackStop(box, "stranded-stopped", workerTranscript, "codex:codex-rescue", lastMessage);

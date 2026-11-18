@@ -28,6 +28,7 @@ const { buildGrokArgs, processGroupAlive, resolveGrokCapabilities, runGrok, term
 const { consumeTaskStructuredResult, evaluateReviewResult } = await import(
   path.join(repoRoot, "plugins", "grok", "scripts", "lib", "companion", "review.mjs")
 );
+const { compareVersion, parseVersion, supportedVersion } = await import("../plugins/grok/scripts/lib/companion/version.mjs");
 
 const requiredCapabilityProbes = [
   ["--prompt-file", "--prompt-file=/dev/null"],
@@ -117,6 +118,20 @@ test("managed runs reject Grok versions below the tested interval before model l
   assert.equal(records[0].status, "error");
   assert.equal(records[0].failureKind, "setup");
   assert.equal(records[0].grokVersion, "1.0.13");
+});
+
+test("version comparison orders prereleases before releases and ignores build metadata", () => {
+  const ordered = ["1.0.88-alpha", "1.0.88-alpha.1", "1.0.88-alpha.2", "1.0.88-alpha.10", "1.0.88-beta", "1.0.88-rc.1", "1.0.88"];
+  for (let index = 1; index < ordered.length; index += 1) {
+    const left = parseVersion(ordered[index - 1]);
+    const right = parseVersion(ordered[index]);
+    assert.equal(compareVersion(left, right), -1, ordered[index]);
+    assert.equal(compareVersion(right, left), 1, ordered[index]);
+  }
+  assert.equal(compareVersion(parseVersion("1.0.88-rc.1+build.2"), parseVersion("1.0.88-rc.1")), 0);
+  assert.equal(compareVersion(parseVersion("1.0.88+build.2"), [1, 0, 88]), 0);
+  assert.equal(supportedVersion("1.0.14-rc.1"), false);
+  assert.equal(supportedVersion("1.0.14"), true);
 });
 
 test("exited leader cleanup with no identity signals only the original process group", async () => {
@@ -480,7 +495,8 @@ test("managed write runs refuse an undenied runtime socket before spawning Grok"
       assert.ok(error.message.includes(socket));
       assert.match(error.message, /may remain reachable from Grok's macOS strict sandbox even when listed in deny_paths/);
       assert.match(error.message, /write shell could drive that container engine and write outside the workspace/);
-      assert.match(error.message, /orb stop/);
+      assert.match(error.message, /Stop the container engine/);
+      assert.doesNotMatch(error.message, /orb stop/);
       assert.match(error.message, /route writes to another lane/);
       assert.doesNotMatch(error.message, /downgrade/i);
       return true;
@@ -584,7 +600,8 @@ test("setup reports write readiness for an undenied OrbStack socket", async (t) 
   assert.ok(report.hostEnvironment.detail.includes(socket));
   assert.match(report.hostEnvironment.detail, /write runs are refused/);
   assert.match(report.hostEnvironment.remedy, /write runs are refused/);
-  assert.match(report.hostEnvironment.remedy, /orb stop/);
+  assert.match(report.hostEnvironment.remedy, /Stop the container engine/);
+  assert.doesNotMatch(report.hostEnvironment.remedy, /orb stop/);
   assert.match(report.hostEnvironment.remedy, /route writes to another lane/);
   assert.deepEqual(report.nextSteps, [report.hostEnvironment.remedy]);
 

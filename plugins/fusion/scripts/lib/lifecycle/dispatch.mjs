@@ -60,7 +60,7 @@ function engineInfraDenial(sessionId, agentType, userText, env, now = Date.now()
   if (canonical && canonical !== "fusion:job-collector") {
     const name = canonical.slice(canonical.indexOf(":") + 1);
     if (new RegExp(String.raw`\b(?:fusion:)?${name}\b`, "i").test(userText ?? "")) return null;
-    const requestedFamily = claudeModelFamily(model);
+    const requestedFamily = claudeModelFamily(model, env);
     const limits = sessionRecords(sessionId, env)
       .filter((record) => canonicalWorkerAgentType(record.agentType) === canonical && WORKER_TERMINAL_STATUSES.has(record.transportStatus) && record.failureKind === "quota" && record.infraFailure === true && Date.parse(record.finishedAt ?? "") <= now)
       .map((record) => {
@@ -81,7 +81,8 @@ function engineInfraDenial(sessionId, agentType, userText, env, now = Date.now()
     if (!limited) return null;
     const familyName = limited.family ? limited.family[0].toUpperCase() + limited.family.slice(1) : "Claude";
     const reset = limited.record.quotaResetText ? `${limited.record.quotaResetText} (${new Date(limited.reset).toISOString()})` : `${new Date(limited.reset).toISOString()} (1 hour fallback)`;
-    const fallback = limited.family && limited.family !== "opus" && !limits.some(({ family }) => !family || family === "opus")
+    const opusFamily = claudeModelFamily("opus", env);
+    const fallback = opusFamily === "opus" && limited.family && limited.family !== opusFamily && !limits.some(({ family }) => !family || family === opusFamily)
       ? "; rerun with model: opus to use Opus 5.5 meanwhile."
       : limited.family ? "; rerun with model set to a different available Claude family meanwhile." : ".";
     return tagMessage("worker-lifecycle.engine-infra-deny", `${familyName} usage limit until ${reset}${fallback} Route this package to another agent type, or name ${name} to retry.`);

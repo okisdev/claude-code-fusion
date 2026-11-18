@@ -61,11 +61,11 @@ function handleSubagentStop(input, env) {
   }
   let refreshed = refreshRecord(record, input, env);
   const lastMessage = typeof input.last_assistant_message === "string" && input.last_assistant_message.trim() ? input.last_assistant_message : "";
-  const recoverHandback = !lastMessage || HANDBACK_PLACEHOLDER_PATTERN.test(lastMessage) || HANDBACK_ALREADY_DELIVERED_PATTERN.test(lastMessage);
+  const recoverHandback = !lastMessage || HANDBACK_PLACEHOLDER_PATTERN.test(lastMessage) || HANDBACK_ALREADY_DELIVERED_PATTERN.test(lastMessage) || !completedReport(refreshed, lastMessage) || refreshed.transcriptOffset !== record.transcriptOffset;
   const report = recoverHandback ? finalReportFromTranscript(refreshed.transcriptPath) : null;
   const handedBack = report?.handback === true;
   const stranded = recoverHandback && !handedBack && strandedHandbackFromTranscript(refreshed.transcriptPath);
-  const message = handedBack || (stranded && report?.text) ? report.text : lastMessage || report?.text || "";
+  const message = handedBack || (stranded && report?.text) ? report.text : [lastMessage, report?.text].find((text) => typeof text === "string" && text.trim() && !HANDBACK_PLACEHOLDER_PATTERN.test(text)) ?? "";
   const at = new Date().toISOString();
   const classified = withClaudeQuotaFailure(refreshed, message, at);
   if (classified !== refreshed && !WORKER_TERMINAL_STATUSES.has(refreshed.transportStatus)) {
@@ -75,7 +75,7 @@ function handleSubagentStop(input, env) {
     return;
   }
   if (!WORKER_TERMINAL_STATUSES.has(refreshed.transportStatus)) {
-    const backgroundCommand = (!PEER_MANAGED_AGENT_NAMES.has(refreshed.agentType) && completedReport(refreshed, message)) ? null : pendingBackgroundCommandFromTranscript(refreshed.transcriptPath, refreshed.awaitingBackgroundCommand, message.trim().match(/(?:^|\n)waiting on ([\w-]+)$/)?.[1]);
+    const backgroundCommand = (!PEER_MANAGED_AGENT_NAMES.has(refreshed.agentType) && completedReport(refreshed, message)) ? null : pendingBackgroundCommandFromTranscript(refreshed.transcriptPath, refreshed.awaitingBackgroundCommand, (message || lastMessage).trim().match(/(?:^|\n)waiting on ([\w-]+)$/)?.[1]);
     if (backgroundCommand) {
       const now = new Date().toISOString();
       refreshed = updateLifecycleWorkerRecord(refreshed.taskId, env, (current) => current && !WORKER_TERMINAL_STATUSES.has(current.transportStatus) ? {
