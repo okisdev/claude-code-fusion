@@ -34,7 +34,7 @@ function writeRouting(file, data) {
   fs.writeFileSync(file, `${JSON.stringify(data, null, 2)}\n`, "utf8");
 }
 
-test("Rules table renders scores without Notes and points to config", (t) => {
+test("Session context table renders scores without Notes and points to config", (t) => {
   const dir = sandbox(t);
   const file = path.join(dir, "model-routing.json");
   writeRouting(file, {

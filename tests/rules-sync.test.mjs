@@ -6,18 +6,20 @@ import path from "node:path";
 import { test } from "node:test";
 
 import { buildRulesManifest } from "../plugins/fusion/scripts/generate-rules-manifest.mjs";
-import { hashRulesTemplate, renderRulesContent } from "../plugins/fusion/scripts/lib/rules-template.mjs";
+import { DEFAULT_MODEL_TABLE_PLACEHOLDER, readModelRoutingFile, renderModelTable } from "../plugins/fusion/scripts/lib/model-table.mjs";
+import { hashRulesTemplate } from "../plugins/fusion/scripts/lib/rules-template.mjs";
 import { messageTag, tagMessage } from "../plugins/fusion/scripts/lib/user-messages.mjs";
 
 const repoRoot = path.join(import.meta.dirname, "..");
 const script = path.join(repoRoot, "plugins", "fusion", "scripts", "rules-sync.mjs");
+const STATIC_MODEL_CONTEXT = "This machine's capability table, breadth seat, and lane defaults arrive as session context at session start and after compaction; `/fusion:config` shows and edits them.";
 
 const CANONICAL = `# Orchestration policy
 
 canonical rules content
 
 <!-- fusion:model-table:start -->
-Engine capability table: run /fusion:config to score your configured engines (intelligence, taste, cost, 1 to 5) and regenerate this block. Until scored, route by the qualitative lane descriptions in this document.
+${STATIC_MODEL_CONTEXT}
 <!-- fusion:model-table:end -->
 
 canonical routing footer
@@ -82,6 +84,28 @@ function writeModelRouting(file) {
   );
 }
 
+function runSession(sandbox, compact = false) {
+  const companion = path.join(sandbox.root, "host-check.mjs");
+  fs.writeFileSync(companion, 'process.stdout.write(JSON.stringify({ blockers: [] }));');
+  return spawnSync(process.execPath, [path.join(repoRoot, "plugins", "fusion", "scripts", "session-start.mjs"), ...(compact ? ["--compact"] : [])], {
+    env: {
+      ...process.env,
+      CLAUDE_PLUGIN_ROOT: sandbox.pluginRoot,
+      FUSION_RULES_FILE: sandbox.rulesFile,
+      FUSION_MODEL_ROUTING: sandbox.modelRoutingFile,
+      FUSION_DATA_DIR: path.join(sandbox.root, "data"),
+      FUSION_WORKER_STATE_DIR: path.join(sandbox.root, "workers"),
+      FUSION_CODEX_STATE: path.join(sandbox.root, "codex"),
+      GROK_COMPANION_DATA: path.join(sandbox.root, "grok"),
+      CURSOR_COMPANION_DATA: path.join(sandbox.root, "cursor"),
+      DEVIN_COMPANION_DATA: path.join(sandbox.root, "devin"),
+      FUSION_GROK_COMPANION: companion
+    },
+    encoding: "utf8",
+    timeout: 30_000
+  });
+}
+
 test("Missing live file installs the canonical rules and prints the installed line", (t) => {
   const sandbox = makeSandbox(t);
   const result = run(sandbox);
@@ -93,7 +117,105 @@ test("Missing live file installs the canonical rules and prints the installed li
   assert.strictEqual(fs.readFileSync(sandbox.rulesFile, "utf8"), CANONICAL);
 });
 
-test("Live file matching the rendered canonical content prints nothing and is left untouched", (t) => {
+test("Rules sync installs identical bytes for missing, scored, empty, and invalid routing data", (t) => {
+  const installed = [];
+  for (const state of ["missing", "scored", "empty", "invalid"]) {
+    const sandbox = makeSandbox(t);
+    if (state === "scored" || state === "empty") writeModelRouting(sandbox.modelRoutingFile);
+    if (state === "empty") {
+      const data = JSON.parse(fs.readFileSync(sandbox.modelRoutingFile, "utf8"));
+      data.models = [];
+      data.breadth = "devin";
+      fs.writeFileSync(sandbox.modelRoutingFile, JSON.stringify(data));
+    }
+    if (state === "invalid") fs.writeFileSync(sandbox.modelRoutingFile, "{ invalid");
+    const result = run(sandbox);
+    assert.strictEqual(result.status, 0, result.stderr);
+    assert.strictEqual(result.stderr, "");
+    installed.push(fs.readFileSync(sandbox.rulesFile));
+    assert.deepStrictEqual(installed.at(-1), Buffer.from(CANONICAL), state);
+    const mtime = fs.statSync(sandbox.rulesFile).mtimeMs;
+    const again = run(sandbox);
+    assert.strictEqual(again.status, 0, again.stderr);
+    assert.strictEqual(again.stdout, "");
+    assert.strictEqual(again.stderr, "");
+    assert.strictEqual(fs.statSync(sandbox.rulesFile).mtimeMs, mtime);
+  }
+  for (const content of installed) assert.deepStrictEqual(content, installed[0]);
+});
+
+test("Startup and compact provide scored or empty routing tables and placeholders for missing or invalid data", (t) => {
+  for (const state of ["missing", "scored", "empty", "invalid-json", "invalid-schema"]) {
+    const sandbox = makeSandbox(t);
+    if (state === "scored" || state === "empty") {
+      writeModelRouting(sandbox.modelRoutingFile);
+      if (state === "empty") {
+        const data = JSON.parse(fs.readFileSync(sandbox.modelRoutingFile, "utf8"));
+        data.models = [];
+        fs.writeFileSync(sandbox.modelRoutingFile, JSON.stringify(data));
+      }
+    }
+    if (state === "invalid-json") fs.writeFileSync(sandbox.modelRoutingFile, "{ invalid");
+    if (state === "invalid-schema") fs.writeFileSync(sandbox.modelRoutingFile, JSON.stringify({ models: [] }));
+    const routing = readModelRoutingFile(sandbox.modelRoutingFile);
+    const expected = routing.ok ? renderModelTable(routing.data) : DEFAULT_MODEL_TABLE_PLACEHOLDER;
+    for (const compact of [false, true]) {
+      const result = runSession(sandbox, compact);
+      assert.strictEqual(result.error, undefined);
+      assert.strictEqual(result.status, 0, result.stderr);
+      const output = JSON.parse(result.stdout);
+      assert.strictEqual(output.hookSpecificOutput.hookEventName, "SessionStart");
+      const context = output.hookSpecificOutput.additionalContext;
+      assert.ok(context.endsWith(expected), `${state}, compact=${compact}`);
+      if (compact) {
+        assert.strictEqual(context, `${tagMessage("session.compact-reposture", "Fusion rules are in ~/.claude/rules/orchestration.md. Collect and settle any in-flight work.")}\n${expected}`);
+      } else {
+        assert.ok(context.startsWith(tagMessage("rules-sync.rules-installed", "fusion: routing rules installed (run /fusion:setup for the optional permission check)")));
+      }
+      if (state === "scored") {
+        assert.match(context, /^\| codex \| codex \| openai \| 5 \| 4 \| 5 \|$/m);
+        assert.match(context, /^Breadth engine: Cursor \(cursor\)/m);
+        assert.match(context, /^Lane defaults: codex quick gpt-6-sol@xhigh/m);
+        assert.doesNotMatch(context, /primary implementation lane|\| Notes \|/);
+      }
+      if (state.startsWith("invalid")) {
+        assert.match(result.stderr, /fusion: model routing file invalid/);
+        assert.ok(result.stderr.trimEnd().endsWith(messageTag("rules-sync.model-table-warning")));
+      } else {
+        assert.strictEqual(result.stderr, "");
+      }
+      assert.strictEqual(fs.readFileSync(sandbox.rulesFile, "utf8"), CANONICAL);
+    }
+  }
+});
+
+test("Compaction reloads changed scores, breadth, and lane defaults while preserving local rule edits", (t) => {
+  const sandbox = makeSandbox(t);
+  writeModelRouting(sandbox.modelRoutingFile);
+  const startup = runSession(sandbox);
+  assert.strictEqual(startup.status, 0, startup.stderr);
+  const data = JSON.parse(fs.readFileSync(sandbox.modelRoutingFile, "utf8"));
+  data.models[0].intelligence = 2;
+  data.models.push({ id: "muse-wonder", lane: "devin", family: "anthropic", intelligence: 5, taste: 5, cost: 3 });
+  data.breadth = "devin";
+  data.defaults = { codex: { quick: { model: "codex", effort: "max" } } };
+  fs.writeFileSync(sandbox.modelRoutingFile, JSON.stringify(data));
+  fs.writeFileSync(sandbox.rulesFile, UNKNOWN_VERSION);
+  const mtime = fs.statSync(sandbox.rulesFile).mtimeMs;
+  const result = runSession(sandbox, true);
+  assert.strictEqual(result.status, 0, result.stderr);
+  assert.strictEqual(result.stderr, "");
+  const context = JSON.parse(result.stdout).hookSpecificOutput.additionalContext;
+  assert.match(context, /^\| codex \| codex \| openai \| 2 \| 4 \| 5 \|$/m);
+  assert.match(context, /^\| muse-wonder \| devin \| anthropic \| 5 \| 5 \| 3 \|$/m);
+  assert.match(context, /^Breadth engine: Devin \(devin\)/m);
+  assert.match(context, /^Lane defaults: codex quick codex@max/m);
+  assert.doesNotMatch(context, /cursor diversity|local edits/);
+  assert.strictEqual(fs.readFileSync(sandbox.rulesFile, "utf8"), UNKNOWN_VERSION);
+  assert.strictEqual(fs.statSync(sandbox.rulesFile).mtimeMs, mtime);
+});
+
+test("Live file matching the static canonical content prints nothing and is left untouched", (t) => {
   const sandbox = makeSandbox(t);
   fs.mkdirSync(path.dirname(sandbox.rulesFile), { recursive: true });
   fs.writeFileSync(sandbox.rulesFile, CANONICAL, "utf8");
@@ -149,7 +271,9 @@ test("session startup preserves sequential rules and breaker output", (t) => {
       const check = execute("breaker-check");
       resetRules();
       const combined = execute("session-start");
-      assert.strictEqual(combined.stdout, sync.stdout + check.stdout, `${rules}, breaker=${breaker}`);
+      assert.deepStrictEqual(JSON.parse(combined.stdout), {
+        hookSpecificOutput: { hookEventName: "SessionStart", additionalContext: sync.stdout + check.stdout + DEFAULT_MODEL_TABLE_PLACEHOLDER }
+      }, `${rules}, breaker=${breaker}`);
       assert.strictEqual(combined.stderr, sync.stderr + check.stderr, `${rules}, breaker=${breaker}`);
       assert.strictEqual(check.stdout.includes("breaker as open"), breaker);
       if (rules === "unchanged") assert.strictEqual(sync.stdout, "");
@@ -175,7 +299,7 @@ test("An installed earlier template with a Notes table upgrades from its manifes
   const previous = CANONICAL
     .replace("canonical rules content", "previous shipped rules content")
     .replace(
-      "Engine capability table: run /fusion:config to score your configured engines (intelligence, taste, cost, 1 to 5) and regenerate this block. Until scored, route by the qualitative lane descriptions in this document.",
+      STATIC_MODEL_CONTEXT,
       "| Engine | Lane | Family | Intelligence | Taste | Cost | Notes |\n|---|---|---|---:|---:|---:|---|\n| codex | codex | openai | 5 | 4 | 5 | primary implementation lane |"
     );
   assert.notStrictEqual(hashRulesTemplate(previous), hashRulesTemplate(CANONICAL));
@@ -190,10 +314,30 @@ test("An installed earlier template with a Notes table upgrades from its manifes
   assert.strictEqual(result.status, 0, result.stderr);
   assert.strictEqual(result.stdout, `${tagMessage("rules-sync.rules-updated", "fusion: routing rules updated to the current plugin version")}\n`);
   const updated = fs.readFileSync(sandbox.rulesFile, "utf8");
-  assert.strictEqual(updated, renderRulesContent(CANONICAL, { routingPath: sandbox.modelRoutingFile }));
-  assert.match(updated, /^\| codex \| codex \| openai \| 5 \| 4 \| 5 \|$/m);
-  assert.match(updated, /^Model notes \(benchmarks, prices, latency\) live in model-routing\.json; `\/fusion:config` shows them\.$/m);
-  assert.doesNotMatch(updated, /\| Notes \|/);
+  assert.strictEqual(updated, CANONICAL);
+  assert.doesNotMatch(updated, /^\| Engine \||^\| codex \||^Lane defaults:/m);
+});
+
+test("Previously shipped rules with scored or header-only tables upgrade using the committed manifest", (t) => {
+  const sandbox = makeSandbox(t);
+  const previous = runGit(repoRoot, ["show", "HEAD:plugins/fusion/rules/orchestration.md"]);
+  const manifest = runGit(repoRoot, ["show", "HEAD:plugins/fusion/rules-manifest.json"]);
+  assert.ok(JSON.parse(manifest).hashes.includes(hashRulesTemplate(previous)));
+  fs.writeFileSync(path.join(sandbox.pluginRoot, "rules-manifest.json"), manifest);
+  fs.mkdirSync(path.dirname(sandbox.rulesFile), { recursive: true });
+  writeModelRouting(sandbox.modelRoutingFile);
+  const scored = renderModelTable(readModelRoutingFile(sandbox.modelRoutingFile).data);
+  const headerOnly = "| Engine | Lane | Family | Intelligence | Taste | Cost |\n|---|---|---|---:|---:|---:|";
+  for (const table of [scored, headerOnly]) {
+    const live = previous.replace(/<!-- fusion:model-table:start -->\n[\s\S]*?\n<!-- fusion:model-table:end -->/, `<!-- fusion:model-table:start -->\n${table}\n<!-- fusion:model-table:end -->`);
+    assert.notStrictEqual(live, previous);
+    assert.strictEqual(hashRulesTemplate(live), hashRulesTemplate(previous));
+    fs.writeFileSync(sandbox.rulesFile, live);
+    const result = run(sandbox);
+    assert.strictEqual(result.status, 0, result.stderr);
+    assert.strictEqual(result.stdout, `${tagMessage("rules-sync.rules-updated", "fusion: routing rules updated to the current plugin version")}\n`);
+    assert.strictEqual(fs.readFileSync(sandbox.rulesFile, "utf8"), CANONICAL);
+  }
 });
 
 test("Live file with unknown content is left untouched and prints the local edits line", (t) => {
@@ -204,31 +348,33 @@ test("Live file with unknown content is left untouched and prints the local edit
   assert.strictEqual(result.status, 0);
   assert.strictEqual(
     result.stdout,
-    `${tagMessage("rules-sync.local-edits-notice", `fusion: ${sandbox.rulesFile} does not match any shipped rules version (local edits or a stale render), run /fusion:setup to reconcile; the scored model table is preserved`)}\n`
+    `${tagMessage("rules-sync.local-edits-notice", `fusion: ${sandbox.rulesFile} does not match any shipped rules version (local edits), run /fusion:setup to reconcile; the live rules are preserved`)}\n`
   );
   assert.strictEqual(fs.readFileSync(sandbox.rulesFile, "utf8"), UNKNOWN_VERSION);
 });
 
-test("Rendered model scores do not look like local edits", (t) => {
+test("Previously rendered model scores upgrade to static rules without looking like local edits", (t) => {
   const sandbox = makeSandbox(t);
   writeModelRouting(sandbox.modelRoutingFile);
-  const rendered = renderRulesContent(CANONICAL, { routingPath: sandbox.modelRoutingFile });
+  const rendered = CANONICAL.replace(STATIC_MODEL_CONTEXT, renderModelTable(readModelRoutingFile(sandbox.modelRoutingFile).data));
   assert.match(rendered, /^Lane defaults: codex quick gpt-6-sol@xhigh, volume gpt-6-sol@high, flagship gpt-6\.1-sol@xhigh; grok burst grok-4\.7-build-fast@low, independence grok-4\.7-build-fast@low, live-web grok-4\.7-build-fast@high, large-context grok-4\.6@medium; cursor diversity muse-spark-1\.3@xhigh, burst composer-2\.5@default\.$/m);
   assert.strictEqual(hashRulesTemplate(rendered), hashRulesTemplate(CANONICAL));
   fs.mkdirSync(path.dirname(sandbox.rulesFile), { recursive: true });
   fs.writeFileSync(sandbox.rulesFile, rendered, "utf8");
   const result = run(sandbox);
   assert.strictEqual(result.status, 0);
-  assert.strictEqual(result.stdout, "");
-  assert.strictEqual(fs.readFileSync(sandbox.rulesFile, "utf8"), rendered);
+  assert.strictEqual(result.stdout, `${tagMessage("rules-sync.rules-updated", "fusion: routing rules updated to the current plugin version")}\n`);
+  assert.strictEqual(fs.readFileSync(sandbox.rulesFile, "utf8"), CANONICAL);
+  assert.strictEqual(run(sandbox).stdout, "");
 });
 
-test("Changing a lane default updates the live table without changing the rules template hash", (t) => {
+test("Changing a lane default leaves the static live rules and modification time unchanged", (t) => {
   const sandbox = makeSandbox(t);
   writeModelRouting(sandbox.modelRoutingFile);
-  const before = renderRulesContent(CANONICAL, { routingPath: sandbox.modelRoutingFile });
+  const before = CANONICAL;
   fs.mkdirSync(path.dirname(sandbox.rulesFile), { recursive: true });
   fs.writeFileSync(sandbox.rulesFile, before, "utf8");
+  const mtime = fs.statSync(sandbox.rulesFile).mtimeMs;
   const routing = JSON.parse(fs.readFileSync(sandbox.modelRoutingFile, "utf8"));
   routing.defaults = { codex: { quick: { model: "codex", effort: "max" } } };
   fs.writeFileSync(sandbox.modelRoutingFile, `${JSON.stringify(routing)}\n`, "utf8");
@@ -236,35 +382,35 @@ test("Changing a lane default updates the live table without changing the rules 
   assert.strictEqual(result.status, 0, result.stderr);
   assert.strictEqual(result.stdout, "");
   const after = fs.readFileSync(sandbox.rulesFile, "utf8");
-  assert.match(after, /^Lane defaults: codex quick codex@max, volume gpt-6-sol@high/m);
+  assert.strictEqual(after, CANONICAL);
+  assert.strictEqual(fs.statSync(sandbox.rulesFile).mtimeMs, mtime);
   assert.strictEqual(hashRulesTemplate(after), hashRulesTemplate(before));
 });
 
-test("Invalid model routing leaves the existing live table intact and warns", (t) => {
+test("Invalid model routing does not affect rules sync or preserve a previously rendered table", (t) => {
   const sandbox = makeSandbox(t);
   writeModelRouting(sandbox.modelRoutingFile);
-  const rendered = renderRulesContent(CANONICAL, { routingPath: sandbox.modelRoutingFile });
+  const rendered = CANONICAL.replace(STATIC_MODEL_CONTEXT, renderModelTable(readModelRoutingFile(sandbox.modelRoutingFile).data));
   fs.mkdirSync(path.dirname(sandbox.rulesFile), { recursive: true });
   fs.writeFileSync(sandbox.rulesFile, rendered, "utf8");
   fs.writeFileSync(sandbox.modelRoutingFile, "{ not json", "utf8");
   const result = run(sandbox);
   assert.strictEqual(result.status, 0);
-  assert.strictEqual(result.stdout, "");
-  assert.match(result.stderr, new RegExp(`^fusion: model routing file invalid at ${sandbox.modelRoutingFile.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}:`));
-  assert.ok(result.stderr.trimEnd().endsWith(messageTag("rules-sync.model-table-warning")));
-  assert.strictEqual(fs.readFileSync(sandbox.rulesFile, "utf8"), rendered);
+  assert.strictEqual(result.stdout, `${tagMessage("rules-sync.rules-updated", "fusion: routing rules updated to the current plugin version")}\n`);
+  assert.strictEqual(result.stderr, "");
+  assert.strictEqual(fs.readFileSync(sandbox.rulesFile, "utf8"), CANONICAL);
 });
 
-test("Missing model routing replaces a scored live table with the placeholder", (t) => {
+test("Missing model routing upgrades a scored live table to the static template", (t) => {
   const sandbox = makeSandbox(t);
   writeModelRouting(sandbox.modelRoutingFile);
-  const rendered = renderRulesContent(CANONICAL, { routingPath: sandbox.modelRoutingFile });
+  const rendered = CANONICAL.replace(STATIC_MODEL_CONTEXT, renderModelTable(readModelRoutingFile(sandbox.modelRoutingFile).data));
   fs.mkdirSync(path.dirname(sandbox.rulesFile), { recursive: true });
   fs.writeFileSync(sandbox.rulesFile, rendered, "utf8");
   fs.rmSync(sandbox.modelRoutingFile, { force: true });
   const result = run(sandbox);
   assert.strictEqual(result.status, 0);
-  assert.strictEqual(result.stdout, "");
+  assert.strictEqual(result.stdout, `${tagMessage("rules-sync.rules-updated", "fusion: routing rules updated to the current plugin version")}\n`);
   assert.strictEqual(result.stderr, "");
   assert.strictEqual(fs.readFileSync(sandbox.rulesFile, "utf8"), CANONICAL);
 });
@@ -278,7 +424,7 @@ test("Hand edited template content still looks like local edits", (t) => {
   assert.strictEqual(result.status, 0);
   assert.strictEqual(
     result.stdout,
-    `${tagMessage("rules-sync.local-edits-notice", `fusion: ${sandbox.rulesFile} does not match any shipped rules version (local edits or a stale render), run /fusion:setup to reconcile; the scored model table is preserved`)}\n`
+    `${tagMessage("rules-sync.local-edits-notice", `fusion: ${sandbox.rulesFile} does not match any shipped rules version (local edits), run /fusion:setup to reconcile; the live rules are preserved`)}\n`
   );
   assert.strictEqual(fs.readFileSync(sandbox.rulesFile, "utf8"), handEdited);
 });
@@ -293,16 +439,19 @@ test("Rules sync logs unexpected failures without blocking the session", (t) => 
   assert.ok(result.stderr.trimEnd().endsWith(messageTag("rules-sync.sync-failed")));
 });
 
-test("Doctor and setup describe template hash comparison for live rules", () => {
+test("Doctor and setup distinguish exact static rules from normalized legacy upgrades and read routing data", () => {
   const doctor = fs.readFileSync(path.join(repoRoot, "plugins", "fusion", "skills", "doctor", "SKILL.md"), "utf8");
   const setup = fs.readFileSync(path.join(repoRoot, "plugins", "fusion", "skills", "setup", "SKILL.md"), "utf8");
   assert.match(doctor, /hashRulesTemplate/);
-  assert.match(doctor, /A user selected live model table may differ from the scored canonical table/);
+  assert.match(doctor, /Compare the exact bytes/);
+  assert.match(doctor, /model IDs in `model-routing\.json`/);
+  assert.match(doctor, /show --json/);
   assert.match(setup, /hashRulesTemplate/);
-  assert.match(setup, /do not compare raw bytes/);
-  assert.match(setup, /A live table may differ from the scored canonical table/);
-  assert.doesNotMatch(setup, /is identical/);
-  assert.doesNotMatch(setup, /write the canonical content/);
+  assert.match(setup, /Install these exact bytes/);
+  assert.match(setup, /Previously rendered tables and older shipped templates upgrade/);
+  assert.match(setup, /write the canonical content/);
+  assert.match(setup, /Read capability rows from `model-routing\.json`/);
+  for (const text of [doctor, setup]) assert.doesNotMatch(text, /renderRulesContent|scored canonical table|live capability table/);
 });
 
 test("background collection distinguishes explicit Fusion receipts from foreground peer delivery", () => {
@@ -507,7 +656,7 @@ test("Grok rules document source verified headless boundaries", () => {
   assert.match(contract, /Upstream ships ACP today/);
   assert.match(contract, /The companion has not adopted ACP yet and continues per-call invocation/);
   assert.match(codexContract, /failureKind: "setup".*below the tested minimum 0\.154\.0/);
-  assert.match(codexContract, /The tested interval runs from 0\.154\.0 up to but excluding 0\.170\.0; versions below 0\.154\.0 fail task and review preflight with a setup error; versions at or above 0\.170\.0 keep running task and review preflight while `\/codex:setup` reports not ready with exit code 1 as the compatibility advisory/);
+  assert.match(codexContract, /The tested interval runs from 0\.154\.0 up to but excluding 0\.171\.0; versions below 0\.154\.0 fail task and review preflight with a setup error; versions at or above 0\.171\.0 keep running task and review preflight while `\/codex:setup` reports not ready with exit code 1 as the compatibility advisory/);
   assert.match(codexContract, /Codex configuration parse failures under `--strict-config`.*failureKind: "process"/);
   assert.match(sharedContract, /The Grok instance adds `sandbox`[^\n]*`transport`[^\n]*`policy`[^\n]*`turn_limit`[^\n]*and `network`/);
   assert.match(sharedContract, /`setup`: The installed CLI version or installation lacks a required adapter capability and fails capability preflight/);
@@ -541,13 +690,17 @@ test("Grok rules document source verified headless boundaries", () => {
 test("The shipped rules manifest contains the current rules file template hash", () => {
   const rulesPath = path.join(repoRoot, "plugins", "fusion", "rules", "orchestration.md");
   const manifestPath = path.join(repoRoot, "plugins", "fusion", "rules-manifest.json");
-  const currentHash = hashRulesTemplate(fs.readFileSync(rulesPath, "utf8"));
+  const canonical = fs.readFileSync(rulesPath, "utf8");
+  const currentHash = hashRulesTemplate(canonical);
+  assert.strictEqual(canonical.split("<!-- fusion:model-table:start -->\n")[1].split("\n<!-- fusion:model-table:end -->")[0], STATIC_MODEL_CONTEXT);
   const manifest = JSON.parse(fs.readFileSync(manifestPath, "utf8"));
   assert.strictEqual(manifest.format, 2);
   assert.ok(
     manifest.hashes.includes(currentHash),
     "plugins/fusion/rules-manifest.json is stale, run node plugins/fusion/scripts/generate-rules-manifest.mjs"
   );
+  const previous = JSON.parse(runGit(repoRoot, ["show", "HEAD:plugins/fusion/rules-manifest.json"]));
+  for (const hash of previous.hashes) assert.ok(manifest.hashes.includes(hash), `missing previously shipped hash ${hash}`);
 });
 
 test("Rules manifest generator hashes only HEAD history and working tree content", (t) => {

@@ -33,26 +33,7 @@ Inline work gate: one coherent change covered by one verification command runnab
 For anything that ships: correctness and safety, then user facing quality, then latency, then quota cost; cost only breaks ties. Route by the capability success depends on, not the task's surface type. Capability monopolies hard route: X and live platform reads go to Grok `live-web`; families no other lane serves go to the breadth engine; hooks, subagent files, MCP, and the privacy boundary go to Claude workers; a browser pass on the app under test and anything that must reach GitHub's API stay in the main session or a Claude worker, because peer sandboxes bind no port and reach no network, and a peer reviewing a PR gets its context staged into the workspace first; judgment dense authorship stays in the main session. Capability scores never change lane ownership by themselves.
 
 <!-- fusion:model-table:start -->
-| Engine | Lane | Family | Intelligence | Taste | Cost |
-|---|---|---|---:|---:|---:|
-| grok-4.6 | grok | xai | 4 | 3 | 5 |
-| gpt-6-astra | codex | openai | 5 | 4 | 2 |
-| gpt-6-sol | codex | openai | 4 | 3 | 4 |
-| gpt-6.1-sol | codex | openai | 5 | 3 | 4 |
-| gpt-6-luna | codex | openai | 3 | 3 | 5 |
-| grok-4.7 | grok | xai | 4 | 3 | 4 |
-| grok-4.7-build-fast | grok | xai | 4 | 3 | 3 |
-| composer-2.5 | cursor | cursor | 3 | 3 | 5 |
-| muse-spark-1.3 | cursor | meta | 4 | 3 | 3 |
-| gemini-3.8-flash | cursor | google | 3 | 3 | 4 |
-| kimi-k3 | cursor | moonshot | 4 | 3 | 4 |
-| glm-5.2 | cursor | zhipu | 3 | 3 | 4 |
-Model notes (benchmarks, prices, latency) live in model-routing.json; `/fusion:config` shows them.
-
-Lane defaults: codex quick gpt-6-sol@xhigh, volume gpt-6-sol@high, flagship gpt-6.1-sol@xhigh; grok burst grok-4.7-build-fast@low, independence grok-4.7-build-fast@low, live-web grok-4.7-build-fast@high, large-context grok-4.6@medium; cursor diversity muse-spark-1.3@xhigh, burst composer-2.5@default.
-
-Scores feed the routing priorities above: intelligence proxies correctness and safety, taste is user facing quality, cost applies only as the final tie breaker.
-Scores are user-assigned via /fusion:config; re-score when the model lineup changes.
+This machine's capability table, breadth seat, and lane defaults arrive as session context at session start and after compaction; `/fusion:config` shows and edits them.
 <!-- fusion:model-table:end -->
 
 | Brief shape | Lane |

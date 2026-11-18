@@ -121,11 +121,13 @@ test("each shared matcher uses one dispatcher process and lifecycle-only tools k
   }
 });
 
-test("startup uses one process and retains the compact echo", () => {
+test("startup and compact each use one session context process", () => {
   const startup = hooks.SessionStart.filter(({ matcher }) => matcher === "startup").flatMap(({ hooks }) => hooks);
   assert.equal(startup.length, 1);
   assert.equal(startup[0].command, 'command -v node >/dev/null 2>&1 || exit 0; node "${CLAUDE_PLUGIN_ROOT}/scripts/session-start.mjs"');
-  assert.equal(hooks.SessionStart.find(({ matcher }) => matcher === "compact").hooks[0].command, "echo 'Fusion rules are in ~/.claude/rules/orchestration.md. Collect and settle any in-flight work. [fusion:9902]'");
+  const compact = hooks.SessionStart.filter(({ matcher }) => matcher === "compact").flatMap(({ hooks }) => hooks);
+  assert.equal(compact.length, 1);
+  assert.equal(compact[0].command, 'command -v node >/dev/null 2>&1 || exit 0; node "${CLAUDE_PLUGIN_ROOT}/scripts/session-start.mjs" --compact');
 });
 
 test("ignored tools and agent types load no lifecycle handlers or guard modules", (t) => {
