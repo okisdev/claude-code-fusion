@@ -190,21 +190,22 @@ function deliveryFailures(entry) {
   return entry.failures ?? Math.max(0, entry.attempts - Number(Boolean(entry.attemptId)));
 }
 
-function retryableDelivery(entry, env) {
+function retryableDelivery(entry, env, respectBackoff) {
+  if (!["pending", "failed"].includes(entry.status) || deliveryFailures(entry) >= DELIVERY_ATTEMPT_LIMIT
+    || (entry.attemptId && !(Date.now() - Date.parse(entry.updatedAt) > ACCEPTANCE_TIMEOUT_MS + 1_000))) return false;
+  if (!respectBackoff || entry.attempts === 0) return true;
   const configured = Number(env.FUSION_ACCEPTANCE_RETRY_BACKOFF_MS);
   const backoffMs = Number.isSafeInteger(configured) && configured >= 0 ? configured : 1000;
   const delayMs = Math.min(backoffMs * 2 ** Math.max(0, entry.attempts - 1), 60 * 60 * 1000);
-  return ["pending", "failed"].includes(entry.status) && deliveryFailures(entry) < DELIVERY_ATTEMPT_LIMIT
-    && (!entry.attemptId || Date.now() - Date.parse(entry.updatedAt) > ACCEPTANCE_TIMEOUT_MS + 1_000)
-    && (entry.attempts === 0 || Date.now() - Date.parse(entry.updatedAt) >= delayMs);
+  return Date.now() - Date.parse(entry.updatedAt) >= delayMs;
 }
 
-export function deliverWorkerEngineAcceptance({ taskId, env = process.env, asJson = false, timeoutMs = ACCEPTANCE_TIMEOUT_MS, deadline = Infinity }) {
+export function deliverWorkerEngineAcceptance({ taskId, env = process.env, asJson = false, timeoutMs = ACCEPTANCE_TIMEOUT_MS, deadline = Infinity, respectBackoff = false }) {
   const snapshot = readWorkerRecord(taskId, env);
   const lockOptions = Number.isFinite(deadline) ? { timeoutMs: 0 } : undefined;
   for (const candidate of snapshot?.engineAcceptanceDelivery?.entries ?? []) {
     if (Date.now() >= deadline) break;
-    if (!retryableDelivery(candidate, env)) continue;
+    if (!retryableDelivery(candidate, env, respectBackoff)) continue;
     const lock = path.join(path.dirname(workerRecordFile(taskId, env)), `.acceptance-${candidate.engine}-${candidate.jobId}`);
     let acquired = false;
     try {
@@ -216,7 +217,7 @@ export function deliverWorkerEngineAcceptance({ taskId, env = process.env, asJso
           updateWorkerRecord(taskId, env, (record) => {
             const entries = record?.engineAcceptanceDelivery?.entries;
             const current = entries?.find((entry) => entry.engine === candidate.engine && entry.jobId === candidate.jobId);
-            if (!current || !retryableDelivery(current, env)) return null;
+            if (!current || !retryableDelivery(current, env, respectBackoff)) return null;
             claimed = { ...current, status: "pending", attempts: current.attempts + 1, failures: deliveryFailures(current), attemptId: randomUUID(), updatedAt: new Date().toISOString() };
             return { ...record, engineAcceptanceDelivery: deliveryState(entries.map((entry) => entry.id === claimed.id ? claimed : entry)) };
           }, lockOptions);
@@ -252,6 +253,7 @@ export function deliverWorkerEngineAcceptance({ taskId, env = process.env, asJso
 }
 
 export function retryWorkerEngineAcceptances({ env = process.env, skipTaskIds = new Set(), sessionId = null } = {}) {
+  const respectBackoff = sessionId !== null;
   const configuredTimeout = Number(env.FUSION_ACCEPTANCE_RETRY_TIMEOUT_MS);
   const timeoutMs = sessionId === null ? ACCEPTANCE_TIMEOUT_MS : Math.min(Number.isSafeInteger(configuredTimeout) && configuredTimeout > 0 ? configuredTimeout : 500, 500);
   const deadline = sessionId === null ? Infinity : Date.now() + 2000;
@@ -261,9 +263,9 @@ export function retryWorkerEngineAcceptances({ env = process.env, skipTaskIds = 
     const record = sessionId === null ? candidate : readWorkerRecord(candidate, env);
     if (!record) continue;
     if (sessionId !== null && record.sessionId !== sessionId) continue;
-    if (skipTaskIds.has(record.taskId) || !record.engineAcceptanceDelivery?.entries?.some((entry) => retryableDelivery(entry, env))) continue;
+    if (skipTaskIds.has(record.taskId) || !record.engineAcceptanceDelivery?.entries?.some((entry) => retryableDelivery(entry, env, respectBackoff))) continue;
     try {
-      deliverWorkerEngineAcceptance({ taskId: record.taskId, env, timeoutMs, deadline });
+      deliverWorkerEngineAcceptance({ taskId: record.taskId, env, timeoutMs, deadline, respectBackoff });
     } catch {
       continue;
     }

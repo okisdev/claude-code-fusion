@@ -2903,7 +2903,7 @@ test("--record continues a batch after a partial engine transport failure and ca
   const settledTaskId = `fusion-${"9".repeat(24)}`;
   const failedJobId = "a".repeat(32);
   const settledJobId = "b".repeat(32);
-  const env = { FUSION_WORKER_STATE_DIR: stateDir };
+  const env = { FUSION_WORKER_STATE_DIR: stateDir, FUSION_ACCEPTANCE_RETRY_BACKOFF_MS: "60000" };
   createTerminalWorker({ taskId: failedTaskId, env, workspaceRoot: dir, peerEngine: "codex", peerJobId: failedJobId });
   createTerminalWorker({ taskId: settledTaskId, env, workspaceRoot: dir, peerEngine: "codex", peerJobId: settledJobId });
   const args = ["--record", `${failedTaskId}=accepted`, "--record", `${settledTaskId}=accepted`];
@@ -2956,7 +2956,7 @@ for (const recordEngineId of [false, true]) {
   test(`--record ${recordEngineId ? "engine" : "worker"} delivery failure retries on the next unrelated CLI settlement`, (t) => {
     const dir = sandbox(t);
     const stateRoot = path.join(dir, "codex-state");
-    const env = { FUSION_WORKER_STATE_DIR: path.join(dir, "workers") };
+    const env = { FUSION_WORKER_STATE_DIR: path.join(dir, "workers"), FUSION_ACCEPTANCE_RETRY_BACKOFF_MS: "60000" };
     const taskId = `fusion-${"b".repeat(24)}`;
     const nextTaskId = `fusion-${"c".repeat(24)}`;
     const jobId = "d".repeat(32);
