@@ -40,7 +40,9 @@ import {
 import { resolveStateDir as guardResolveStateDir, stateFile as guardStateFile } from "../plugins/fusion/scripts/inline-delegation-guard.mjs";
 import { createRawArgsTransport } from "../plugins/fusion/scripts/lib/raw-args-transport.mjs";
 import { MESSAGE_REGISTRY, messageCode, messageTag } from "../plugins/fusion/scripts/lib/user-messages.mjs";
-import { applyQueuedVerdict, createWorkerRecord, readWorkerRecord, recordWorkerAcceptance, updateWorkerRecord, workerRecordFile } from "../plugins/fusion/scripts/lib/worker-state.mjs";
+import { applyQueuedVerdict, createWorkerRecord, readWorkerRecord, recordWorkerAcceptance, reopenWorkerContinuation, updateWorkerRecord, workerElapsedMs, workerRecordFile } from "../plugins/fusion/scripts/lib/worker-state.mjs";
+import { isStrictDirectRecordArguments, parseRecordArguments, validateArgumentShape } from "../plugins/fusion/scripts/lib/stats/arguments.mjs";
+import { settlementCommand } from "../plugins/fusion/scripts/lib/lifecycle/stop.mjs";
 import { gitIsolation } from "./lib/git-fixture.mjs";
 
 const SCRIPT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "plugins", "fusion", "scripts", "fusion-stats.mjs");
@@ -2135,6 +2137,55 @@ test("message digest direct arguments satisfy the strict report allowlist", () =
   assert.strictEqual(isStrictDirectReportOrMaintenanceArguments(["--message", "not-an-integer"]), false);
 });
 
+test("record grammar accepts consecutive mixed pairs, repeated flags, and the Stop command", () => {
+  const ids = ["a", "b", "c"].map((letter) => `fusion-${letter.repeat(24)}`);
+  const argv = ["--record", `${ids[0]}=accepted`, `${ids[1]}=rejected`, "--reason", "Verification failed.", "--record", `${ids[2]}=unverified`];
+  assert.doesNotThrow(() => validateArgumentShape(argv));
+  assert.strictEqual(isStrictDirectRecordArguments(argv), true);
+  assert.deepStrictEqual(parseRecordArguments(argv).records.map(({ id, verdict, reason }) => ({ id, verdict, reason })), [
+    { id: ids[0], verdict: "accepted", reason: null },
+    { id: ids[1], verdict: "rejected", reason: "Verification failed." },
+    { id: ids[2], verdict: "unverified", reason: null }
+  ]);
+  const command = settlementCommand(ids.map((taskId) => ({ taskId })));
+  assert.strictEqual(command.match(/--record/g).length, 1);
+  const printedArgs = command.slice(command.indexOf("--record")).replaceAll("accepted|rejected|unverified", "accepted").split(" ");
+  assert.doesNotThrow(() => validateArgumentShape(printedArgs));
+  assert.strictEqual(parseRecordArguments(printedArgs).records.length, 3);
+  for (const invalid of ["invalid", `${ids[1]}=bogus`]) {
+    assert.throws(() => parseRecordArguments(["--record", `${ids[0]}=accepted`, invalid]));
+    assert.strictEqual(isStrictDirectRecordArguments(["--record", `${ids[0]}=accepted`, invalid]), false);
+  }
+});
+
+test("worker elapsed stats sum continuation rounds and leave legacy spans unchanged", (t) => {
+  const dir = sandbox(t);
+  const env = { ...process.env, FUSION_WORKER_STATE_DIR: path.join(dir, "workers"), FUSION_DATA_DIR: path.join(dir, "data") };
+  const worker = createWorkerRecord({ taskId: `fusion-${"d".repeat(24)}`, sessionId: "session-rounds", agentType: "fusion:claude-worker", workspaceRoot: dir }, env);
+  let current = updateWorkerRecord(worker.taskId, env, (record) => ({ ...record, transportStatus: "done", acceptance: "accepted", startedAt: "2026-11-18T00:00:00.000Z", finishedAt: "2026-11-18T00:01:00.000Z" }));
+  current = reopenWorkerContinuation(current, "2026-11-18T01:00:00.000Z");
+  current = { ...current, transportStatus: "done", acceptance: "accepted", finishedAt: "2026-11-18T01:02:00.000Z" };
+  current = reopenWorkerContinuation(current, "2026-11-18T05:00:00.000Z");
+  current = updateWorkerRecord(worker.taskId, env, () => ({ ...current, transportStatus: "done", finishedAt: "2026-11-18T05:03:00.000Z" }));
+  assert.strictEqual(workerElapsedMs(current), 360_000);
+  assert.strictEqual(claudeWorkerStats({ all: true, env, cwd: dir }).meanWallClockSeconds, 360);
+  const legacySpan = 18_180_000;
+  for (const continuations of [[], [{ acceptance: "accepted" }], [{ startedAt: "invalid", finishedAt: current.finishedAt }]]) {
+    const legacy = { ...current, continuations };
+    assert.strictEqual(workerElapsedMs(legacy), legacySpan);
+  }
+});
+
+test("Claude quota is excluded from semantic failure statistics", (t) => {
+  const dir = sandbox(t);
+  const env = { ...process.env, FUSION_WORKER_STATE_DIR: path.join(dir, "workers"), FUSION_DATA_DIR: path.join(dir, "data") };
+  const worker = createWorkerRecord({ taskId: `fusion-${"e".repeat(24)}`, sessionId: "quota-session", agentType: "fusion:deep-reasoner", workspaceRoot: dir }, env);
+  updateWorkerRecord(worker.taskId, env, (record) => ({ ...record, transportStatus: "failed", acceptance: "rejected", failureKind: "quota", infraFailure: true }));
+  const stats = claudeWorkerStats({ all: true, env, cwd: dir });
+  assert.deepStrictEqual(stats.infrastructureDeaths, { total: 1, byKind: { quota: 1 } });
+  assert.strictEqual(stats.judgedExcludingInfrastructure.judged, 0);
+});
+
 test("--record settles a Fusion task and its Codex peer with direct strict argv", (t) => {
   const dir = sandbox(t);
   const stateRoot = path.join(dir, "codex-state");
@@ -3022,23 +3073,26 @@ test("--record broadcasts --reason to rejected pairs without a per-pair reason",
   assert.strictEqual(readWorkerRecord(thirdTaskId, env).acceptanceReason, "specific failure");
 });
 
-test("--record rejects a broadcast --reason without rejected pairs", (t) => {
+test("--record keeps a broadcast --reason on accepted pairs", (t) => {
   const dir = sandbox(t);
   const stateDir = path.join(dir, "worker-state");
   const taskId = `fusion-${"7".repeat(24)}`;
+  const secondTaskId = `fusion-${"8".repeat(24)}`;
   const env = { FUSION_WORKER_STATE_DIR: stateDir };
   createTerminalWorker({ taskId, env, workspaceRoot: dir });
+  createTerminalWorker({ taskId: secondTaskId, env, workspaceRoot: dir });
 
   const result = run(
     { cwd: dir, codexState: path.join(dir, "missing") },
-    ["--record", `${taskId}=accepted`, "--reason", "This must not apply."],
+    ["--record", `${taskId}=accepted`, `${secondTaskId}=accepted`, "--reason", "Verified together."],
     env
   );
 
-  assert.notStrictEqual(result.status, 0);
-  assert.match(result.stderr, /--reason requires at least one rejected --record pair\./);
-  assert.match(result.stderr, /^example: --record <id>=rejected --reason-for <id> "why it failed"$/m);
-  assert.strictEqual(readWorkerRecord(taskId, env).acceptance, "unverified");
+  assert.strictEqual(result.status, 0, result.stderr);
+  for (const id of [taskId, secondTaskId]) {
+    assert.strictEqual(readWorkerRecord(id, env).acceptance, "accepted");
+    assert.strictEqual(readWorkerRecord(id, env).acceptanceReason, "Verified together.");
+  }
 });
 
 test("--record validates every batch pair before writing", (t) => {

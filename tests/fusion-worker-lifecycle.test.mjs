@@ -8,7 +8,7 @@ import { test } from "node:test";
 import { fusionRepositoryKey } from "../plugins/fusion/scripts/fusion-stats.mjs";
 import { messageTag, tagMessage } from "../plugins/fusion/scripts/lib/user-messages.mjs";
 import { pendingBackgroundCommandFromTranscript } from "../plugins/fusion/scripts/lib/lifecycle/notifications.mjs";
-import { settleReapedWorker, settleWrapperApiDeath } from "../plugins/fusion/scripts/lib/lifecycle/collection.mjs";
+import { settleReapedWorker, settleWrapperApiDeath, withClaudeQuotaFailure } from "../plugins/fusion/scripts/lib/lifecycle/collection.mjs";
 import { createWorkerRecord, readWorkerSessionState, readWorkerRecords, recordWorkerAcceptance, refreshWorkerTranscript, reopenWorkerContinuation, updateWorkerRecord, WORKER_COLLECTION_METHODS } from "../plugins/fusion/scripts/lib/worker-state.mjs";
 import { needsCancellation, reverifyCancellationRecords, reverifyInFlightRecords, runtimeTaskMissing, settleOnlyRecords } from "../plugins/fusion/scripts/lib/lifecycle/stop.mjs";
 import { validateWorkerBrief } from "../plugins/fusion/scripts/lib/lifecycle/dispatch.mjs";
@@ -41,6 +41,7 @@ function envFor(box, extra = {}) {
     ...process.env,
     FUSION_WORKER_STATE_DIR: box.state,
     FUSION_DATA_DIR: path.join(box.root, "fusion-data"),
+    FUSION_GROK_COMPANION: path.join(import.meta.dirname, "fixtures", "healthy-grok-companion.mjs"),
     ...extra,
   };
 }
@@ -457,6 +458,17 @@ test("brief sizing validation rejects invalid and repeated values", () => {
   const repeated = validateWorkerBrief(`${brief()}sizing: small\nsizing: large\n`, "fusion:claude-worker");
   assert.strictEqual(repeated.ok, false);
   assert.match(repeated.reason, /may appear once/);
+});
+
+test("brief validation reports every missing envelope line with a copyable template", () => {
+  const empty = validateWorkerBrief("implement the task", "fusion:claude-worker");
+  assert.strictEqual(empty.ok, false);
+  assert.match(empty.reason, /fusion-brief: v1 \(first line\).*context-mode: isolated.*goal:.*scope:.*verification: or acceptance:/);
+  assert.match(empty.reason, /fusion-brief: v1\ncontext-mode: isolated\ngoal: <task goal>\nscope: <files or boundaries>\nverification: <check or acceptance criterion>/);
+  const partial = validateWorkerBrief("fusion-brief: v1\ngoal: inspect file\nacceptance: describe it", "fusion:deep-reasoner");
+  assert.strictEqual(partial.ok, false);
+  assert.match(partial.reason, /context-mode: isolated, scope:/);
+  assert.doesNotMatch(partial.reason.split("Copy this envelope")[0], /verification: or acceptance:/);
 });
 
 test("the timing seams override a brief sizing hint while the token budgets follow the hint", (t) => {
@@ -985,6 +997,8 @@ test("SendMessage reopens a settled peer round and notification collects the nex
   assert.strictEqual(reopened.failureKind, null);
   assert.deepStrictEqual(reopened.continuations, [{
     at: reopened.lastContinuedAt,
+    startedAt: settled.startedAt,
+    finishedAt: settled.finishedAt,
     peerJobId: firstJobId,
     peerJobIds: [firstJobId],
     acceptance: "accepted",
@@ -1812,7 +1826,7 @@ test("a moved collector completes seven counted turns without denying its resume
   assert.strictEqual(fs.readFileSync(completed.outputFile, "utf8"), finalMessage);
 });
 
-for (const agentType of ["codex:codex-rescue", "grok:grok-rescue", "grok:grok-review-runner", "cursor:cursor-rescue", "devin:devin-rescue", "fusion:fast-worker", "fusion:claude-worker", "fusion:trivial-worker", "fusion:deep-reasoner", "fusion:job-collector"]) {
+for (const agentType of ["codex:codex-rescue", "grok:grok-rescue", "grok:grok-review-runner", "cursor:cursor-rescue", "devin:devin-rescue", "fusion:claude-worker", "fusion:trivial-worker", "fusion:deep-reasoner", "fusion:job-collector"]) {
   test(`${agentType} relays a background Bash result after its interim stop without a delivery retry`, (t) => {
     for (const status of ["completed", "failed"]) {
       const box = sandbox(t);
@@ -3493,6 +3507,44 @@ test("a completed notification collects a SubagentHandback report that SubagentS
   assert.strictEqual(collected.transportStatus, "done");
   assert.strictEqual(collected.collectionMethod, "task_notification");
   assert.strictEqual(fs.readFileSync(collected.outputFile, "utf8"), report);
+});
+
+const strandedHandbackFixture = path.join(repoRoot, "tests", "fixtures", "stranded-handback", "peer-wrapper-handback.jsonl");
+
+function strandedPeerWorker(box, agentId, runtimeAsync) {
+  const workerTranscript = handbackWorker(box, agentId, "transport", "codex:codex-rescue", runtimeAsync);
+  fs.copyFileSync(strandedHandbackFixture, workerTranscript);
+  return workerTranscript;
+}
+
+test("a real report stranded behind a delivered waiting handback is left for the orchestrator to Read", (t) => {
+  const box = sandbox(t);
+  const workerTranscript = strandedPeerWorker(box, "stranded-notified", true);
+  fs.appendFileSync(box.transcript, `${JSON.stringify({ type: "user", message: { content: `<task-notification>\n<task-id>stranded-notified</task-id>\n<status>completed</status>\n<summary>Agent finished</summary>\n</task-notification>` } })}\n`);
+  const decision = JSON.parse(stop(box).stdout);
+  const pending = record(box);
+  assert.strictEqual(pending.transportStatus, "ready_uncollected");
+  assert.strictEqual(pending.collectedAt ?? null, null);
+  assert.match(fs.readFileSync(pending.outputFile, "utf8"), /state: done/);
+  assert.doesNotMatch(fs.readFileSync(pending.outputFile, "utf8"), /^waiting on/);
+  assert.strictEqual(pending.peerJobId, "0123456789abcdef0123456789abcdef");
+  assert.strictEqual(decision.decision, "block");
+  assert.ok(decision.reason.includes(`Call Read with file_path=${pending.outputFile}`), decision.reason);
+  assert.ok(workerTranscript);
+});
+
+test("SubagentStop after a refused second handback recovers the real report without collecting it", (t) => {
+  for (const runtimeAsync of [true, false]) {
+    const box = sandbox(t);
+    const workerTranscript = strandedPeerWorker(box, "stranded-stopped", runtimeAsync);
+    const stopped = handbackStop(box, "stranded-stopped", workerTranscript, "codex:codex-rescue");
+    assert.strictEqual(stopped.stdout, "", stopped.stderr);
+    const pending = record(box);
+    assert.strictEqual(pending.collectedAt ?? null, null, String(runtimeAsync));
+    assert.strictEqual(pending.transportStatus, "ready_uncollected", String(runtimeAsync));
+    assert.match(fs.readFileSync(pending.outputFile, "utf8"), /state: done/);
+    assert.strictEqual(pending.peerJobId, "0123456789abcdef0123456789abcdef");
+  }
 });
 
 test("a refused SubagentHandback call is not a delivered report", (t) => {
@@ -6375,4 +6427,157 @@ test("peer wrapper launches are denied while the host runs its peer capacity", (
   updateWorkerRecord("fusion-host-peer-0", envFor(box), (record) => ({ ...record, transportStatus: "done" }));
   const allowed = run(box, dispatch(box, { subagent_type: "grok:grok-rescue", prompt: "bounded peer brief" })).stdout;
   assert.ok(!allowed || JSON.parse(allowed).hookSpecificOutput.permissionDecision !== "deny");
+});
+
+for (const toolName of ["Read", "TaskOutput"]) {
+  test(`${toolName} collects a wrapper API Error as infrastructure death at its last liveness`, (t) => {
+    const box = sandbox(t);
+    const worker = createWorkerRecord({ taskId: `fusion-${"a".repeat(24)}`, sessionId: "session-1", agentType: "codex:codex-rescue", workspaceRoot: box.cwd, createdAt: "2026-11-17T14:49:00.000Z" }, envFor(box));
+    const outputFile = path.join(box.root, "api-error.output");
+    const message = "API Error: Can't reach the API server (ENOTFOUND)";
+    fs.writeFileSync(outputFile, message);
+    updateWorkerRecord(worker.taskId, envFor(box), (current) => ({ ...current, agentId: "api-error-worker", transportStatus: "ready_uncollected", runtimeAsync: true, outputFile, startedAt: "2026-11-17T14:49:00.000Z", lastLivenessAt: "2026-11-17T14:50:00.000Z", lastProgressAt: "2026-11-17T14:49:30.000Z" }));
+    const result = run(box, {
+      hook_event_name: "PostToolUse", session_id: "session-1", cwd: box.cwd, transcript_path: box.transcript,
+      tool_name: toolName,
+      tool_input: toolName === "Read" ? { file_path: outputFile } : { task_id: "api-error-worker", block: true },
+      tool_response: { content: [{ type: "text", text: message }] }
+    });
+    assert.strictEqual(result.status, 0, result.stderr);
+    const settled = record(box);
+    assert.strictEqual(settled.transportStatus, "failed");
+    assert.strictEqual(settled.failureKind, "delivery");
+    assert.strictEqual(settled.infraFailure, true);
+    assert.strictEqual(settled.acceptance, "rejected");
+    assert.strictEqual(settled.collectionMethod, toolName === "Read" ? "output_file_read" : "task_output");
+    assert.strictEqual(settled.finishedAt, "2026-11-17T14:50:00.000Z");
+  });
+}
+
+test("Stop discovers a wrapper API death without counting the delay before its sweep", (t) => {
+  const box = sandbox(t);
+  const worker = createWorkerRecord({ taskId: `fusion-${"b".repeat(24)}`, sessionId: "session-1", agentType: "grok:grok-rescue", workspaceRoot: box.cwd, createdAt: "2026-11-17T14:49:00.000Z" }, envFor(box));
+  updateWorkerRecord(worker.taskId, envFor(box), (current) => ({ ...current, agentId: "late-sweep", transportStatus: "running", startedAt: "2026-11-17T14:49:00.000Z", lastLivenessAt: "2026-11-17T14:49:30.000Z", lastProgressAt: "2026-11-17T14:50:00.000Z" }));
+  run(box, { hook_event_name: "Stop", session_id: "session-1", cwd: box.cwd, transcript_path: box.transcript, background_tasks: [{ id: "late-sweep", type: "subagent", status: "failed", summary: "API Error: Can't reach the API server (ENOTFOUND)" }] });
+  assert.strictEqual(record(box).finishedAt, "2026-11-17T14:50:00.000Z");
+  assert.strictEqual(record(box).acceptance, "rejected");
+});
+
+test("wrapper API death finish times preserve terminal evidence and reject invalid liveness", (t) => {
+  const box = sandbox(t);
+  const now = "2026-11-18T00:39:00.000Z";
+  const worker = { agentType: "codex:codex-rescue", transportStatus: "running", startedAt: "2026-11-17T14:49:00.000Z", lastLivenessAt: "invalid", lastProgressAt: "2026-11-19T00:00:00.000Z" };
+  assert.strictEqual(settleWrapperApiDeath(worker, "API Error: ENOTFOUND", now, envFor(box)).finishedAt, now);
+  assert.strictEqual(settleWrapperApiDeath({ ...worker, finishedAt: "2026-11-17T14:50:00.000Z" }, "API Error: ENOTFOUND", now, envFor(box)).finishedAt, "2026-11-17T14:50:00.000Z");
+  assert.strictEqual(settleWrapperApiDeath({ ...worker, lastLivenessAt: "2026-11-17T14:50:00.000Z", lastActivityAt: now }, "API Error: ENOTFOUND", now, envFor(box)).finishedAt, "2026-11-17T14:50:00.000Z");
+  assert.strictEqual(settleWrapperApiDeath(worker, "The report quotes this error:\nAPI Error: ENOTFOUND", now, envFor(box)), worker);
+});
+
+test("Codex dispatch records retain the effective quoted or relative cwd after prestaging", (t) => {
+  for (const argument of ["--cwd 'work tree'", '--cwd="work tree"', ""]) {
+    const box = sandbox(t);
+    const payload = dispatch(box, { subagent_type: "codex:codex-rescue", prompt: `${argument} --write -- bounded package` });
+    const worktree = path.join(box.cwd, "work tree");
+    fs.mkdirSync(worktree);
+    run(box, payload);
+    run(box, { ...payload, hook_event_name: "PostToolUse", tool_response: { isAsync: true, agentId: "cwd-wrapper" } });
+    assert.strictEqual(record(box).companionCwd, argument ? worktree : box.cwd);
+    assert.strictEqual(record(box).workspaceRoot, box.cwd);
+  }
+});
+
+test("a resumed Codex wrapper reserves and retains its continuation cwd", (t) => {
+  const box = sandbox(t);
+  const taskId = `fusion-${"c".repeat(24)}`;
+  createAcceptedCollectedRecord(box, taskId, "cwd-continuation", "codex:codex-rescue");
+  const message = "--cwd 'next worktree' -- bounded follow up";
+  const input = { hook_event_name: "PreToolUse", session_id: "session-1", tool_use_id: "cwd-resume", cwd: box.cwd, transcript_path: box.transcript, tool_name: "SendMessage", tool_input: { to: "cwd-continuation", message } };
+  const pre = run(box, input);
+  assert.strictEqual(pre.status, 0, pre.stderr);
+  assert.strictEqual(pre.stdout, "");
+  run(box, { ...input, hook_event_name: "PostToolUse", tool_response: { resumedAgentId: "cwd-continuation" } });
+  assert.strictEqual(record(box).companionCwd, path.join(box.cwd, "next worktree"));
+  const denied = run(box, { ...dispatch(box, { subagent_type: "codex:codex-rescue", prompt: message }), tool_use_id: "cwd-collision" });
+  assert.strictEqual(JSON.parse(denied.stdout).hookSpecificOutput.permissionDecision, "deny");
+  assert.match(JSON.parse(denied.stdout).hookSpecificOutput.permissionDecisionReason, /isolated worktree/);
+});
+
+test("Codex write sizing warns from 5 KB while other briefs retain the 8 KiB threshold", (t) => {
+  for (const [agentType, options, bytes, warning] of [
+    ["codex:codex-rescue", "--write -- ", 4999, false],
+    ["codex-rescue", "--write -- ", 5000, true],
+    ["codex:codex-rescue", "--write -- sizing: large\n", 7000, true],
+    ["codex:codex-rescue", "-- consult mentions --write\n", 7000, false],
+    ["grok:grok-rescue", "--write -- ", 7000, false],
+    ["grok:grok-rescue", "--write -- ", 8193, true]
+  ]) {
+    const box = sandbox(t);
+    const prompt = options + "x".repeat(bytes - Buffer.byteLength(options));
+    const result = run(box, dispatch(box, { subagent_type: agentType, prompt }));
+    assert.strictEqual(result.status, 0, result.stderr);
+    const output = result.stdout ? JSON.parse(result.stdout).hookSpecificOutput : null;
+    assert.notStrictEqual(output?.permissionDecision, "deny");
+    assert.strictEqual(/Sizing advisory/.test(output?.additionalContext ?? ""), warning, `${agentType} ${bytes}`);
+    if (warning && agentType.startsWith("codex")) {
+      assert.match(output.additionalContext, /23%.*57%/);
+      assert.match(output.additionalContext, /Split this package/);
+    }
+  }
+});
+
+test("peer rescue handbacks deny placeholders and allow completed reports", (t) => {
+  const box = sandbox(t);
+  for (const agent_type of ["codex:codex-rescue", "codex-rescue", "grok:grok-rescue", "grok-rescue", "cursor:cursor-rescue", "devin:devin-rescue"]) {
+    for (const message of ["waiting on bg-123", "await-output: pending"]) {
+      const result = run(box, { hook_event_name: "PreToolUse", session_id: "session-1", cwd: box.cwd, agent_id: "peer", agent_type, tool_name: "SubagentHandback", tool_input: { message } });
+      const decision = JSON.parse(result.stdout).hookSpecificOutput;
+      assert.strictEqual(decision.permissionDecision, "deny", agent_type);
+      assert.match(decision.permissionDecisionReason, /Keep running the await operation/);
+    }
+    assert.strictEqual(run(box, { hook_event_name: "PreToolUse", session_id: "session-1", cwd: box.cwd, agent_id: "peer", agent_type, tool_name: "SubagentHandback", tool_input: { message: `report\njob: ${"a".repeat(32)}\nstate: done` } }).stdout, "");
+  }
+  assert.strictEqual(run(box, { hook_event_name: "PreToolUse", session_id: "session-1", cwd: box.cwd, agent_id: "managed", agent_type: "grok:grok-review-runner", tool_name: "SubagentHandback", tool_input: { message: "await-output: pending" } }).stdout, "");
+});
+
+test("failed Claude usage notifications stop the next same-agent dispatch before launch", (t) => {
+  const box = sandbox(t);
+  const workerTranscript = handbackWorker(box, "quota-worker", "coverage", "fusion:deep-reasoner");
+  const reset = new Date(Date.now() + 3 * 24 * 60 * 60 * 1000).toISOString();
+  const message = `You've hit your Fable limit · resets ${reset}`;
+  fs.writeFileSync(workerTranscript, `${JSON.stringify({ type: "assistant", message: { content: [{ type: "text", text: message }] } })}\n`);
+  fs.appendFileSync(box.transcript, `${JSON.stringify({ type: "user", message: { content: "<task-notification><task-id>quota-worker</task-id><status>failed</status><summary>task_failed</summary></task-notification>" } })}\n`);
+  const denied = run(box, { ...dispatch(box, { subagent_type: "fusion:deep-reasoner" }), tool_use_id: "quota-retry" });
+  assert.strictEqual(JSON.parse(denied.stdout).hookSpecificOutput.permissionDecision, "deny");
+  assert.match(JSON.parse(denied.stdout).hookSpecificOutput.permissionDecisionReason, /hit its usage limit/);
+  const failed = record(box);
+  assert.strictEqual(failed.failureKind, "quota");
+  assert.strictEqual(failed.infraFailure, true);
+  assert.strictEqual(failed.quotaResetAt, reset);
+  fs.appendFileSync(box.transcript, `${JSON.stringify({ type: "user", message: { content: "use fusion:deep-reasoner" } })}\n`);
+  const bypassed = run(box, { ...dispatch(box, { subagent_type: "fusion:deep-reasoner" }), tool_use_id: "quota-user-retry" });
+  assert.strictEqual(JSON.parse(bypassed.stdout).hookSpecificOutput.permissionDecision, "allow");
+});
+
+test("Claude usage reset parsing supports dates, clock times, and the one hour fallback", () => {
+  const now = "2026-11-18T10:00:00.000Z";
+  const worker = { agentType: "fusion:deep-reasoner", failureKind: "task_failed" };
+  for (const [suffix, reset] of [
+    [" · resets Nov 21", new Date(2026, 10, 21).toISOString()],
+    [" · resets Jan 2", new Date(2027, 0, 2).toISOString()],
+    [" · resets 3pm (Asia/Taipei)", "2026-11-19T07:00:00.000Z"],
+    [" · resets 12:30pm (UTC)", "2026-11-18T12:30:00.000Z"],
+    [" · resets eventually", "2026-11-18T11:00:00.000Z"],
+    ["", "2026-11-18T11:00:00.000Z"]
+  ]) {
+    const classified = withClaudeQuotaFailure(worker, `You've hit your Fable limit${suffix}`, now);
+    assert.strictEqual(classified.failureKind, "quota");
+    assert.strictEqual(classified.infraFailure, true);
+    assert.strictEqual(classified.quotaResetAt, reset);
+  }
+  assert.strictEqual(withClaudeQuotaFailure(worker, "ordinary task failure", now), worker);
+  assert.strictEqual(withClaudeQuotaFailure(worker, "The report quotes this error: You've hit your limit", now), worker);
+  assert.strictEqual(withClaudeQuotaFailure({ ...worker, startedAt: "2026-11-17T14:49:00.000Z", lastLivenessAt: "2026-11-17T14:50:00.000Z" }, "You've hit your Fable limit", now).quotaResetAt, "2026-11-17T15:50:00.000Z");
+  assert.strictEqual(withClaudeQuotaFailure({ ...worker, startedAt: "2026-11-18T09:00:00.000Z", lastLivenessAt: "2026-11-18T10:00:00.000Z" }, "You've hit your Fable limit · resets Nov 21", "2026-11-22T00:00:00.000Z").quotaResetAt, new Date(2026, 10, 21).toISOString());
+  const peer = { agentType: "codex:codex-rescue" };
+  assert.strictEqual(withClaudeQuotaFailure(peer, "You've hit your limit", now), peer);
 });

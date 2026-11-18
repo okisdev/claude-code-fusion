@@ -1,18 +1,22 @@
 import { PEER_RESCUE_AGENT_NAMES, PEER_MANAGED_AGENT_NAMES } from "../engines.mjs";
 import path from "node:path";
-import { ENGINE_ID_ALTERNATION, PEER_JOB_FOOTER_AGENTS, engineDisplayNameList } from "../engines.mjs";
+import { ENGINE_ID_ALTERNATION, PEER_JOB_FOOTER_AGENTS, engineDisplayNameList, engineForAgentType } from "../engines.mjs";
 import { tagMessage } from "../user-messages.mjs";
-import { canonicalWorkerAgentType, isFusionWorkerAgent, WORKER_TERMINAL_STATUSES, markWorkerCollected, readWorkerRecord, readWorkerOutputFileTaskIds, readSessionWorkerRecords, refreshWorkerTranscript, reopenWorkerContinuation, WORKER_COLLECTION_METHODS } from "../worker-state.mjs";
+import { canonicalWorkerAgentType, isFusionWorkerAgent, WORKER_TERMINAL_STATUSES, markWorkerCollected, readPeerCapacityReservations, readWorkerRecord, readWorkerOutputFileTaskIds, readSessionWorkerRecords, refreshWorkerTranscript, reopenWorkerContinuation, WORKER_COLLECTION_METHODS } from "../worker-state.mjs";
 import { markBudgetFailure, workerBudgetFailure, workerRoundUsage } from "./budget.mjs";
-import { backfillCollectedTaskOutput, capturedPeerIdentity, collectedHarnessAsyncDelivery, noTaskFoundError, outputFileFromLaunchResponse, peerIdentityBackfill, settleQueuedVerdict, settleReapedIfActive, taskOutputResultText, terminalCollectedRecord, terminalCollectionPending } from "./collection.mjs";
-import { allowAgentWithTaskId, claimParentContextAdvisory, collectorRequestIdentity, createDispatch, engineInfraDenial, flagshipWriteDenial, injectedPeerDefaults, latestUserRequestedBackground, latestUserText, parentContextTokens, prestagePeerPrompt, promptText, releaseHostPeerCapacity, reserveHostPeerCapacity, validateWorkerBrief } from "./dispatch.mjs";
+import { backfillCollectedTaskOutput, capturedPeerIdentity, collectedHarnessAsyncDelivery, infraFinishedAt, noTaskFoundError, outputFileFromLaunchResponse, peerIdentityBackfill, settleQueuedVerdict, settleReapedIfActive, settleWrapperApiDeath, taskOutputResultText, terminalCollectedRecord, terminalCollectionPending, withClaudeQuotaFailure, wrapperApiDeathEvidence } from "./collection.mjs";
+import { allowAgentWithTaskId, claimParentContextAdvisory, collectorRequestIdentity, createDispatch, engineInfraDenial, injectedPeerDefaults, latestUserRequestedBackground, latestUserText, leadingCompanionOptions, parentContextTokens, prestagePeerPrompt, promptText, releaseHostPeerCapacity, reserveHostPeerCapacity, validateWorkerBrief } from "./dispatch.mjs";
 import { reconcileTaskNotifications, taskNotificationTransition } from "./notifications.mjs";
 import { denyTool, hookOutput, writeOutput } from "./output.mjs";
 import { activeSessionRecords, clearContinuationRequest, findSessionWorkerRecord, isAttributedTranscriptPath, parentTranscriptByteSize, recordForAgent, refreshRecord, sendMessageResumed, updateLifecycleWorkerRecord } from "./records.mjs";
 import { canonicalToolResponseUsage } from "./usage.mjs";
-import { READ_ONLY_TOOLS } from "./constants.mjs";
+import { CODEX_WRITE_SIZING_ADVISORY_BYTES, HANDBACK_PLACEHOLDER_PATTERN, READ_ONLY_TOOLS, SIZING_ADVISORY_BYTES, SUBAGENT_HANDBACK_TOOL } from "./constants.mjs";
 
 function handlePreToolUse(input, env) {
+  if (input.tool_name === SUBAGENT_HANDBACK_TOOL && PEER_RESCUE_AGENT_NAMES.has(input.agent_type) && typeof input.tool_input?.message === "string" && HANDBACK_PLACEHOLDER_PATTERN.test(input.tool_input.message)) {
+    writeOutput(denyTool(tagMessage("worker-lifecycle.placeholder-handback-deny", "Keep running the await operation until it returns the real report. Hand back that report only after await completes.")));
+    return;
+  }
   if (!input.agent_id && ["TaskStop", "TaskOutput"].includes(input.tool_name) && typeof input.tool_input?.task_id === "string") {
     const taskId = input.tool_input.task_id;
     const now = new Date().toISOString();
@@ -40,8 +44,8 @@ function handlePreToolUse(input, env) {
         writeOutput(denyTool(tagMessage("worker-lifecycle.foreground-wrapper-deny", `${engineDisplayNameList()} wrapper Agents use foreground delivery. Keep the Agent foreground; an explicitly requested companion \`--background\` receipt stays inside that foreground wrapper call.`)));
         return;
       }
-      const userText = latestUserText(input.transcript_path);
-      const admissionDenial = flagshipWriteDenial(promptText(input.tool_input), agentType, userText) ?? engineInfraDenial(input.session_id, agentType, userText, env);
+      reconcileTaskNotifications(input, env);
+      const admissionDenial = engineInfraDenial(input.session_id, agentType, latestUserText(input.transcript_path), env, Date.now(), promptText(input.tool_input));
       if (admissionDenial) {
         writeOutput(denyTool(admissionDenial));
         return;
@@ -55,8 +59,17 @@ function handlePreToolUse(input, env) {
       const finalInput = injection ? { ...input.tool_input, prompt: injection.prompt } : input.tool_input;
       const stagedPrompt = prestagePeerPrompt({ ...input, tool_input: finalInput }, env);
       const advisory = claimParentContextAdvisory(input.session_id, parentContextTokens(input.transcript_path), env);
-      if (stagedPrompt || injection || advisory) {
-        writeOutput({ ...(stagedPrompt || injection ? { hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision: "allow", updatedInput: { ...finalInput, ...(stagedPrompt ? { prompt: stagedPrompt } : {}) }, ...(injection?.context ? { additionalContext: injection.context } : {}) } } : {}), ...(advisory ? { systemMessage: advisory } : {}) });
+      const prompt = promptText(input.tool_input);
+      const briefBytes = Buffer.byteLength(prompt);
+      const codexWrite = engineForAgentType(agentType) === "codex" && leadingCompanionOptions(prompt).options.includes("--write");
+      const sizing = codexWrite && briefBytes >= CODEX_WRITE_SIZING_ADVISORY_BYTES
+        ? "Sizing advisory: Codex write briefs of 5 to 7 KB had a measured 23% timeout rate in the last 7 days; briefs of 7 KB or more had a 57% timeout rate (gpt-6.1-sol@xhigh). Split this package into smaller briefs."
+        : !codexWrite && briefBytes > SIZING_ADVISORY_BYTES && !/^sizing:\s*\S/im.test(prompt)
+          ? "Sizing advisory: this brief exceeds 8192 bytes without a `sizing:` field. Add `sizing: large` or split the package into smaller briefs."
+          : null;
+      const additionalContext = [injection?.context, sizing ? tagMessage("worker-lifecycle.dispatch-advisory", sizing) : null].filter(Boolean).join("\n\n");
+      if (stagedPrompt || injection || advisory || sizing) {
+        writeOutput({ ...(stagedPrompt || injection || sizing ? { hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision: "allow", updatedInput: { ...finalInput, ...(stagedPrompt ? { prompt: stagedPrompt } : {}) }, ...(additionalContext ? { additionalContext } : {}) } } : {}), ...(advisory ? { systemMessage: advisory } : {}) });
       }
       return;
     }
@@ -81,6 +94,12 @@ function handlePreToolUse(input, env) {
       writeOutput(denyTool(tagMessage("worker-lifecycle.background-authorization-deny", "Fusion workers may detach only when the latest user message explicitly contains `--background`. Remove background mode and collect the result in this turn.")));
       return;
     }
+    reconcileTaskNotifications(input, env);
+    const admissionDenial = engineInfraDenial(input.session_id, agentType, latestUserText(input.transcript_path), env);
+    if (admissionDenial) {
+      writeOutput(denyTool(admissionDenial));
+      return;
+    }
     const record = createDispatch(input, agentType, userBackgroundAuthorized, env, validation);
     const parentAdvisory = claimParentContextAdvisory(record.sessionId, record.parentContextTokensAtDispatch, env);
     const additionalContext = (validation.advisories ?? []).join("\n\n");
@@ -89,8 +108,17 @@ function handlePreToolUse(input, env) {
   }
   if (input.tool_name === "SendMessage" && typeof input.tool_input?.to === "string") {
     const recipient = input.tool_input.to;
-    const record = findSessionWorkerRecord((candidate) => (PEER_RESCUE_AGENT_NAMES.has(candidate.agentType) || isFusionWorkerAgent(candidate.agentType)) && [candidate.agentId, candidate.backgroundTaskId].includes(recipient), input.session_id, env);
+    let record = findSessionWorkerRecord((candidate) => (PEER_RESCUE_AGENT_NAMES.has(candidate.agentType) || isFusionWorkerAgent(candidate.agentType)) && [candidate.agentId, candidate.backgroundTaskId].includes(recipient), input.session_id, env);
+    if (isFusionWorkerAgent(record?.agentType)) {
+      reconcileTaskNotifications(input, env);
+      record = readWorkerRecord(record.taskId, env);
+    }
     if (record) {
+      const admissionDenial = engineInfraDenial(input.session_id, record.agentType, latestUserText(input.transcript_path), env, Date.now(), input.tool_input.message);
+      if (admissionDenial) {
+        writeOutput(denyTool(admissionDenial));
+        return;
+      }
       if (PEER_RESCUE_AGENT_NAMES.has(record.agentType) && WORKER_TERMINAL_STATUSES.has(record.transportStatus)) {
         const capacityDenial = reserveHostPeerCapacity(input, record.agentType, env, record.taskId);
         if (capacityDenial) {
@@ -172,6 +200,7 @@ function handlePostToolUse(input, env, failed = false) {
     const record = findSessionWorkerRecord((candidate) => (PEER_RESCUE_AGENT_NAMES.has(candidate.agentType) || isFusionWorkerAgent(candidate.agentType)) && [candidate.agentId, candidate.backgroundTaskId].includes(recipient), input.session_id, env);
     if (record) {
       const at = new Date().toISOString();
+      const reservedCwd = PEER_RESCUE_AGENT_NAMES.has(record.agentType) ? readPeerCapacityReservations(env).find((reservation) => reservation.taskId === record.taskId)?.companionCwd : null;
       updateLifecycleWorkerRecord(record.taskId, env, (current) => {
         if (!current || current.sessionId !== input.session_id || ![current.agentId, current.backgroundTaskId].includes(recipient)) {
           return null;
@@ -187,7 +216,8 @@ function handlePostToolUse(input, env, failed = false) {
         const next = WORKER_TERMINAL_STATUSES.has(collected.transportStatus) && !alreadyReopened
           ? reopenWorkerContinuation(collected, at, current.continuationRequestedTranscriptBytes ?? parentTranscriptByteSize(current, input))
           : collected;
-        return current.continuationRequestedAt ? clearContinuationRequest(next) : next === current ? null : next;
+        const continued = next !== collected && reservedCwd ? { ...next, companionCwd: reservedCwd } : next;
+        return current.continuationRequestedAt ? clearContinuationRequest(continued) : continued === current ? null : continued;
       });
     }
     releaseHostPeerCapacity(input, env);
@@ -289,6 +319,13 @@ function handlePostToolUse(input, env, failed = false) {
             : input.tool_name === "TaskOutput"
               ? WORKER_COLLECTION_METHODS.TASK_OUTPUT
               : WORKER_COLLECTION_METHODS.TASK_STOP;
+          if (input.tool_name !== "TaskStop" && wrapperApiDeathEvidence(worker, collectedResultText)) {
+            return backfillCollectedTaskOutput(settleWrapperApiDeath(markWorkerCollected(worker, collectionMethod, now), collectedResultText, now, env), input);
+          }
+          const classified = input.tool_name === "TaskStop" ? worker : withClaudeQuotaFailure(worker, collectedResultText, now);
+          if (classified !== worker) {
+            return backfillCollectedTaskOutput(settleQueuedVerdict({ ...markWorkerCollected(classified, collectionMethod, now), transportStatus: "failed", finishedAt: infraFinishedAt(worker, now), lastActivityAt: now }, now, env), input);
+          }
           const harnessAsyncDelivery = collectedHarnessAsyncDelivery(worker, transportStatus);
           const updated = settleQueuedVerdict({
             ...markWorkerCollected(worker, collectionMethod, now),

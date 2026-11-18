@@ -30,7 +30,7 @@ Inline work gate: one coherent change covered by one verification command runnab
 
 ## Routing
 
-For anything that ships: correctness and safety, then user facing quality, then latency, then quota cost; cost only breaks ties. Route by the capability success depends on, not the task's surface type. Capability monopolies hard route: X and live platform reads go to Grok `live-web`; families no other lane serves go to the breadth engine; hooks, subagent files, MCP, and the privacy boundary go to Claude workers; judgment dense authorship stays in the main session. Capability scores never change lane ownership by themselves.
+For anything that ships: correctness and safety, then user facing quality, then latency, then quota cost; cost only breaks ties. Route by the capability success depends on, not the task's surface type. Capability monopolies hard route: X and live platform reads go to Grok `live-web`; families no other lane serves go to the breadth engine; hooks, subagent files, MCP, and the privacy boundary go to Claude workers; a browser pass on the app under test and anything that must reach GitHub's API stay in the main session or a Claude worker, because peer sandboxes bind no port and reach no network, and a peer reviewing a PR gets its context staged into the workspace first; judgment dense authorship stays in the main session. Capability scores never change lane ownership by themselves.
 
 <!-- fusion:model-table:start -->
 | Engine | Lane | Family | Intelligence | Taste | Cost |
@@ -49,7 +49,7 @@ For anything that ships: correctness and safety, then user facing quality, then 
 | glm-5.2 | cursor | zhipu | 3 | 3 | 4 |
 Model notes (benchmarks, prices, latency) live in model-routing.json; `/fusion:config` shows them.
 
-Lane defaults: codex quick gpt-6-sol@xhigh, volume gpt-6-luna@xhigh, flagship gpt-6.1-sol@xhigh; grok burst grok-4.7-build-fast@low, independence grok-4.7-build-fast@medium, live-web grok-4.7-build-fast@high, large-context grok-4.6@medium; cursor diversity muse-spark-1.3@xhigh, burst composer-2.5@default.
+Lane defaults: codex quick gpt-6-sol@xhigh, volume gpt-6-luna@xhigh, flagship gpt-6.1-sol@xhigh; grok burst grok-4.7-build-fast@low, independence grok-4.7-build-fast@low, live-web grok-4.7-build-fast@high, large-context grok-4.6@medium; cursor diversity muse-spark-1.3@xhigh, burst composer-2.5@default.
 
 Scores feed the routing priorities above: intelligence proxies correctness and safety, taste is user facing quality, cost applies only as the final tie breaker.
 Scores are user-assigned via /fusion:config; re-score when the model lineup changes.

@@ -27,6 +27,16 @@ function worker(box, taskId, sessionId, agentType = "codex:codex-rescue", extra 
   return createWorkerRecord({ taskId, sessionId, agentType, workspaceRoot: box.cwd, limits: { stallMs: 600_000 }, ...extra }, box.env);
 }
 
+function peerCwd(box, index) {
+  const cwd = path.join(box.root, `peer-${index}`);
+  fs.mkdirSync(cwd, { recursive: true });
+  return cwd;
+}
+
+function peerPrompt(box, index) {
+  return `--cwd ${peerCwd(box, index)} -- brief`;
+}
+
 test("host peer capacity follows total physical memory with a floor of two", () => {
   assert.equal(hostPeerCapacity(0), 2);
   assert.equal(hostPeerCapacity(16 * GiB), 5);
@@ -89,7 +99,7 @@ function hookOutput(callback) {
 test("synchronous peer PreToolUse bursts reserve host slots and PostToolUse releases one", (t) => {
   const box = sandbox(t);
   const capacity = hostPeerCapacity(os.totalmem());
-  const input = (index) => ({ session_id: "session-a", tool_use_id: `peer-${index}`, tool_name: "Agent", tool_input: { subagent_type: "codex:codex-rescue", prompt: "brief" } });
+  const input = (index) => ({ session_id: "session-a", tool_use_id: `peer-${index}`, tool_name: "Agent", tool_input: { subagent_type: "codex:codex-rescue", prompt: peerPrompt(box, index) } });
   for (let index = 0; index < capacity; index += 1) {
     assert.equal(hookOutput(() => handlePreToolUse(input(index), box.env)), "");
   }
@@ -104,7 +114,7 @@ test("synchronous peer PreToolUse bursts reserve host slots and PostToolUse rele
 
 test("stale peer reservations are pruned before capacity is checked", (t) => {
   const box = sandbox(t);
-  const input = (index) => ({ session_id: "session-a", tool_use_id: `peer-${index}`, tool_name: "Agent", tool_input: { subagent_type: "codex:codex-rescue" } });
+  const input = (index) => ({ session_id: "session-a", tool_use_id: `peer-${index}`, tool_name: "Agent", tool_input: { subagent_type: "codex:codex-rescue", prompt: peerPrompt(box, index) } });
   for (let index = 0; index < 5; index += 1) {
     assert.equal(reserveHostPeerCapacity(input(index), "codex:codex-rescue", box.env, null, Date.now(), 16 * GiB), null);
   }
@@ -116,9 +126,9 @@ test("stale peer reservations are pruned before capacity is checked", (t) => {
 
 test("a peer record and its launch reservation occupy one slot", (t) => {
   const box = sandbox(t);
-  const input = (index) => ({ session_id: "session-a", tool_use_id: `peer-${index}`, tool_name: "Agent", tool_input: { subagent_type: "codex:codex-rescue" } });
+  const input = (index) => ({ session_id: "session-a", tool_use_id: `peer-${index}`, tool_name: "Agent", tool_input: { subagent_type: "codex:codex-rescue", prompt: peerPrompt(box, index) } });
   assert.equal(reserveHostPeerCapacity(input(0), "codex:codex-rescue", box.env, null, Date.now(), 16 * GiB), null);
-  worker(box, "fusion-async-peer", "session-a", "codex:codex-rescue", { dispatchToolUseId: "peer-0" });
+  worker(box, "fusion-async-peer", "session-a", "codex:codex-rescue", { dispatchToolUseId: "peer-0", companionCwd: peerCwd(box, 0) });
   for (let index = 1; index < 5; index += 1) {
     assert.equal(reserveHostPeerCapacity(input(index), "codex:codex-rescue", box.env, null, Date.now(), 16 * GiB), null);
   }
@@ -139,9 +149,9 @@ test("SendMessage cannot reopen a terminal peer when host capacity is full", (t)
   const taskId = "fusion-terminal-peer";
   worker(box, taskId, "session-a");
   updateWorkerRecord(taskId, box.env, (record) => ({ ...record, agentId: "terminal-peer", transportStatus: "done" }));
-  const launch = (index) => ({ session_id: "session-b", tool_use_id: `peer-${index}`, tool_name: "Agent", tool_input: { subagent_type: "codex:codex-rescue", prompt: "brief" } });
+  const launch = (index) => ({ session_id: "session-b", tool_use_id: `peer-${index}`, tool_name: "Agent", tool_input: { subagent_type: "codex:codex-rescue", prompt: peerPrompt(box, index) } });
   for (let index = 0; index < capacity; index += 1) {
-    hookOutput(() => handlePreToolUse(launch(index), box.env));
+    assert.equal(hookOutput(() => handlePreToolUse(launch(index), box.env)), "");
   }
   const message = { session_id: "session-a", tool_use_id: "message-1", tool_name: "SendMessage", tool_input: { to: "terminal-peer", message: "continue" } };
   assert.match(hookOutput(() => handlePreToolUse(message, box.env)), new RegExp(messageTag("worker-lifecycle.host-capacity-deny")));

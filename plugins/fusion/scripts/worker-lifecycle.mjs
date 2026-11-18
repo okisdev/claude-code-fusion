@@ -7,7 +7,7 @@ import { PEER_JOB_FOOTER_AGENTS, PEER_RESCUE_AGENT_NAMES } from "./lib/engines.m
 import { tagMessage } from "./lib/user-messages.mjs";
 import { blockStop, collectHookResult, denyTool, renderHookResult, writeOutput } from "./lib/lifecycle/output.mjs";
 
-const FUSION_WORKER_AGENT = /^(?:fusion:)?(?:fast-worker|claude-worker|trivial-worker|deep-reasoner|job-collector)$/;
+const FUSION_WORKER_AGENT = /^(?:fusion:)?(?:claude-worker|trivial-worker|deep-reasoner|job-collector)$/;
 const HANDLERS = {
   PreToolUse: ["tools", "handlePreToolUse"],
   PostToolUse: ["tools", "handlePostToolUse"],
@@ -30,7 +30,7 @@ function handlesLifecycleHook(input) {
   switch (input.hook_event_name) {
     case "PreToolUse":
       if (launch) return managedLaunch || (agentType === "Explore" && !Object.hasOwn(input.tool_input, "model"));
-      return worker || message || (!input.agent_id && taskControl && typeof input.tool_input?.task_id === "string");
+      return worker || (input.tool_name === "SubagentHandback" && PEER_RESCUE_AGENT_NAMES.has(input.agent_type)) || message || (!input.agent_id && taskControl && typeof input.tool_input?.task_id === "string");
     case "PostToolUse":
     case "PostToolUseFailure":
       if (message || (launch && input.hook_event_name === "PostToolUseFailure")) return true;

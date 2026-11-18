@@ -4,9 +4,9 @@ import { PEER_JOB_FOOTER_AGENTS } from "../engines.mjs";
 import { tagMessage } from "../user-messages.mjs";
 import { canonicalWorkerAgentType, isFusionWorkerAgent, WORKER_TERMINAL_STATUSES, markWorkerCollected, WORKER_COLLECTION_METHODS } from "../worker-state.mjs";
 import { workerBudgetFailure } from "./budget.mjs";
-import { capturedPeerIdentity, completedReport, finalTextArtifactPath, mergedPeerJobIds, peerIdentityBackfill, retryInstruction, settleQueuedVerdict, settleWrapperApiDeath, statusEvidence, structuredCollectorReport, terminalCollectedRecord, wrapperApiDeathEvidence, writeFinalTextArtifact } from "./collection.mjs";
+import { capturedPeerIdentity, completedReport, finalTextArtifactPath, infraFinishedAt, mergedPeerJobIds, peerIdentityBackfill, retryInstruction, settleQueuedVerdict, settleWrapperApiDeath, statusEvidence, structuredCollectorReport, terminalCollectedRecord, withClaudeQuotaFailure, wrapperApiDeathEvidence, writeFinalTextArtifact } from "./collection.mjs";
 import { blockStop, hookOutput, writeOutput } from "./output.mjs";
-import { finalReportFromTranscript, pendingBackgroundCommandFromTranscript } from "./notifications.mjs";
+import { finalReportFromTranscript, pendingBackgroundCommandFromTranscript, strandedHandbackFromTranscript } from "./notifications.mjs";
 import { pendingDispatchForStart, recordForAgent, refreshRecord, updateLifecycleWorkerRecord } from "./records.mjs";
 import { EXECUTION_AGENTS } from "./constants.mjs";
 
@@ -62,7 +62,17 @@ function handleSubagentStop(input, env) {
   let refreshed = refreshRecord(record, input, env);
   const report = finalReportFromTranscript(refreshed.transcriptPath);
   const handedBack = report?.handback === true;
-  const message = handedBack ? report.text : typeof input.last_assistant_message === "string" ? input.last_assistant_message : "";
+  const stranded = !handedBack && strandedHandbackFromTranscript(refreshed.transcriptPath);
+  const lastMessage = typeof input.last_assistant_message === "string" ? input.last_assistant_message : "";
+  const message = handedBack || (stranded && lastMessage.length === 0 && report?.text) ? report.text : lastMessage;
+  const at = new Date().toISOString();
+  const classified = withClaudeQuotaFailure(refreshed, message, at);
+  if (classified !== refreshed && !WORKER_TERMINAL_STATUSES.has(refreshed.transportStatus)) {
+    updateLifecycleWorkerRecord(refreshed.taskId, env, (current) => current && !WORKER_TERMINAL_STATUSES.has(current.transportStatus)
+      ? settleQueuedVerdict({ ...markWorkerCollected(withClaudeQuotaFailure(current, message, at), WORKER_COLLECTION_METHODS.SUBAGENT_STOP, at), transportStatus: "failed", finishedAt: infraFinishedAt(current, at), lastActivityAt: at }, at, env)
+      : null);
+    return;
+  }
   if (!WORKER_TERMINAL_STATUSES.has(refreshed.transportStatus)) {
     const backgroundCommand = (!PEER_MANAGED_AGENT_NAMES.has(refreshed.agentType) && completedReport(refreshed, message)) ? null : pendingBackgroundCommandFromTranscript(refreshed.transcriptPath, refreshed.awaitingBackgroundCommand, message.trim().match(/(?:^|\n)waiting on ([\w-]+)$/)?.[1]);
     if (backgroundCommand) {
@@ -92,7 +102,7 @@ function handleSubagentStop(input, env) {
   if (refreshed.awaitingBackgroundCommand) {
     refreshed = updateLifecycleWorkerRecord(refreshed.taskId, env, (current) => current ? { ...current, awaitingBackgroundCommand: undefined } : null);
   }
-  let finalTextFile = isFusionWorkerAgent(refreshed.agentType) && message.length > 0 ? finalTextArtifactPath(refreshed, env) : null;
+  let finalTextFile = (isFusionWorkerAgent(refreshed.agentType) || stranded) && message.length > 0 ? finalTextArtifactPath(refreshed, env) : null;
   if (finalTextFile) {
     try {
       finalTextFile = writeFinalTextArtifact(refreshed, message, env);
@@ -141,9 +151,10 @@ function handleSubagentStop(input, env) {
     const successfulCompletion = complete && !failure && trustedCollectorReport?.kind !== "outcome" && !collectorProtocolFailure;
     const subagentStopCollected = (successfulCompletion || handedBack) && finalTextFile != null && !collectorContract;
     const peerHandbackPending = handedBack && !complete && !isFusionWorkerAgent(worker.agentType);
+    const strandedUncollected = stranded && successfulCompletion && finalTextFile != null && !collectorContract;
     return settleQueuedVerdict({
-      ...((runtimeAsync && !subagentStopCollected) || peerHandbackPending ? worker : markWorkerCollected(worker, WORKER_COLLECTION_METHODS.SUBAGENT_STOP, now)),
-      transportStatus: complete && (trustedCollectorReport?.kind === "outcome" || collectorProtocolFailure) ? "incomplete" : complete ? runtimeAsync && !subagentStopCollected ? "ready_uncollected" : "done" : failure ? "failed" : "incomplete",
+      ...((runtimeAsync && !subagentStopCollected) || peerHandbackPending || strandedUncollected ? worker : markWorkerCollected(worker, WORKER_COLLECTION_METHODS.SUBAGENT_STOP, now)),
+      transportStatus: complete && (trustedCollectorReport?.kind === "outcome" || collectorProtocolFailure) ? "incomplete" : complete ? (runtimeAsync && !subagentStopCollected) || strandedUncollected ? "ready_uncollected" : "done" : failure ? "failed" : "incomplete",
       failureKind: failure?.failureKind ?? (trustedCollectorReport?.kind === "outcome" ? `collection_${trustedCollectorReport.collectionOutcome}` : collectorProtocolFailure ? "collection_protocol" : complete ? null : "delivery"),
       ...(failure ? { limitKind: failure.limitKind, cancelReason: failure.reason } : {}),
       inFlightSince: undefined,

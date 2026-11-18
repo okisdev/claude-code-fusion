@@ -4,27 +4,20 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { resolveFusionDataDir } from "./lib/worker-state.mjs";
-import { readRoutingDefaults } from "./lib/model-table.mjs";
 import { normalizeSessionId } from "./inline-delegation-guard.mjs";
 import { tagMessage } from "./lib/user-messages.mjs";
 import { parentContextTokens, claimParentContextAdvisory } from "./lib/lifecycle/dispatch.mjs";
 
-const FLEET_MODE_ENV = "FUSION_FLEET_MODE";
-const FLEET_MODE_FILE = "fleet-mode";
 const DEEP_REASONER_HINT = tagMessage("fleet-posture.deep-reasoner-hint", "This reads as a design or root-cause question. Consult fusion:deep-reasoner with a scoped brief before deciding.");
 const DESIGN_QUESTION_PATTERN = /思考|分析|重构|架构|根本|为什么|怎么设计|root cause|architecture|redesign|refactor|why does|why is|how should we/i;
+const IMPLEMENTATION_PATTERN = /实现|修复|解决|改|implement|fix|ship|走流程/i;
 
 function isDesignQuestion(input) {
   const prompt = input?.prompt;
   if (typeof prompt !== "string" || prompt.length > 4000 || input.isMeta === true || input.origin?.kind === "task-notification") return false;
   const trimmed = prompt.trimStart();
   if (trimmed.startsWith("/") || /<task-notification\b/i.test(trimmed) || /^\{[\s\S]*"(?:hook_event_name|hookEventName|hookSpecificOutput|tool_name|tool_input|session_id)"\s*:/.test(trimmed)) return false;
-  return DESIGN_QUESTION_PATTERN.test(prompt);
-}
-
-function sessionLanesReminder(env = process.env) {
-  const { breadth, codex: { flagship, quick, volume } } = readRoutingDefaults(env);
-  return tagMessage("fleet-posture.session-lanes-reminder", `fusion lanes ready: codex ${flagship.model} for spec grade and deep review, ${quick.model} and ${volume.model} for quick and volume packages, grok under its four roles on the routing table's lane defaults, ${breadth} under diversity for a model family no other lane carries and under burst for bounded worktree implementation, claude workers for the Claude surface. Independent packages dispatch together in one message; three or more convene /fusion:ultra; a single coherent change stays inline.`);
+  return DESIGN_QUESTION_PATTERN.test(prompt) && !IMPLEMENTATION_PATTERN.test(prompt);
 }
 
 function readHookInput() {
@@ -37,17 +30,6 @@ function readHookInput() {
     return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : null;
   } catch {
     return null;
-  }
-}
-
-function fleetEnabled(env = process.env) {
-  if (env[FLEET_MODE_ENV] !== undefined) {
-    return env[FLEET_MODE_ENV] !== "off";
-  }
-  try {
-    return fs.readFileSync(path.join(resolveFusionDataDir(env), FLEET_MODE_FILE), "utf8").trim() !== "off";
-  } catch {
-    return true;
   }
 }
 
@@ -70,10 +52,12 @@ function cleanupReminderMarkers(directory, dataDirectory) {
   } catch {
     void 0;
   }
-  try {
-    fs.rmSync(path.join(dataDirectory, "fleet-posture", "narrow-wave-reminders"), { recursive: true, force: true });
-  } catch {
-    void 0;
+  for (const legacy of ["session-lanes-reminders", "narrow-wave-reminders"]) {
+    try {
+      fs.rmSync(path.join(dataDirectory, "fleet-posture", legacy), { recursive: true, force: true });
+    } catch {
+      void 0;
+    }
   }
 }
 
@@ -128,14 +112,13 @@ function main() {
   } catch {
     void 0;
   }
-  if (fleetEnabled()) {
+  if (isDesignQuestion(input)) {
     try {
-      if (claimReminder(input, "session-lanes-reminders")) contexts.unshift(sessionLanesReminder());
+      if (claimReminder(input, "deep-reasoner-hints")) contexts.push(DEEP_REASONER_HINT);
     } catch {
       void 0;
     }
   }
-  if (isDesignQuestion(input)) contexts.push(DEEP_REASONER_HINT);
   if (contexts.length || advisory) {
     process.stdout.write(`${JSON.stringify({ ...(contexts.length ? { hookSpecificOutput: { hookEventName: "UserPromptSubmit", additionalContext: contexts.join("\n\n") } } : {}), ...(advisory ? { systemMessage: advisory } : {}) })}\n`);
   }

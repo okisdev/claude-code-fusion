@@ -187,11 +187,7 @@ export function parseRecordArguments(argv, { allowPerPairReasons = false } = {})
       records.push(parseRecordPair(argv[index + 1]));
       index += 1;
       while (typeof argv[index + 1] === "string" && !argv[index + 1].startsWith("--")) {
-        try {
-          records.push(parseRecordPair(argv[index + 1]));
-        } catch {
-          break;
-        }
+        records.push(parseRecordPair(argv[index + 1]));
         index += 1;
       }
       continue;
@@ -279,9 +275,6 @@ export function parseRecordArguments(argv, { allowPerPairReasons = false } = {})
     throw recordReasonGrammarError("At least one --record <id>=<verdict> pair is required.");
   }
   const rejectedRecords = records.filter((record) => record.verdict === "rejected");
-  if (reason !== null && rejectedRecords.length === 0) {
-    throw recordReasonGrammarError("--reason requires at least one rejected --record pair.");
-  }
   if (failureKind !== null && rejectedRecords.length === 0) {
     throw new TypeError("--failure-kind requires at least one rejected --record pair.");
   }
@@ -301,7 +294,7 @@ export function parseRecordArguments(argv, { allowPerPairReasons = false } = {})
     if (record.verdict !== "rejected" && reasonsById.has(record.id)) {
       throw recordReasonGrammarError(`--reason-for applies only to rejected record ${record.id}.`);
     }
-    record.reason = record.verdict === "rejected" ? reasonsById.get(record.id) ?? reason : null;
+    record.reason = record.verdict === "rejected" ? reasonsById.get(record.id) ?? reason : rejectedRecords.length === 0 ? reason : null;
     record.failureKind = record.verdict === "rejected" ? failureKindsById.get(record.id) ?? failureKind : null;
     if (record.verdict === "rejected") {
       if (record.reason === null) {
@@ -323,11 +316,7 @@ export function isStrictDirectRecordArguments(argv) {
         records += 1;
         index += 1;
         while (typeof argv[index + 1] === "string" && !argv[index + 1].startsWith("--")) {
-          try {
-            parseRecordPair(argv[index + 1]);
-          } catch {
-            break;
-          }
+          parseRecordPair(argv[index + 1]);
           records += 1;
           index += 1;
         }

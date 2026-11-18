@@ -6,10 +6,10 @@ import path from "node:path";
 import { test } from "node:test";
 
 import { BREADTH_ENGINE_IDS, ENGINES, ENGINE_IDS } from "../plugins/fusion/scripts/lib/engines.mjs";
-import { latestUserRequestedBackground, latestUserText } from "../plugins/fusion/scripts/lib/lifecycle/dispatch.mjs";
+import { engineInfraDenial, latestUserRequestedBackground, latestUserText } from "../plugins/fusion/scripts/lib/lifecycle/dispatch.mjs";
 import { renderHookResult } from "../plugins/fusion/scripts/lib/lifecycle/output.mjs";
 import { tagMessage } from "../plugins/fusion/scripts/lib/user-messages.mjs";
-import { createWorkerRecord, readPeerCapacityReservations, updateWorkerRecord } from "../plugins/fusion/scripts/lib/worker-state.mjs";
+import { createWorkerRecord, readPeerCapacityReservations, readWorkerRecords, updateWorkerRecord } from "../plugins/fusion/scripts/lib/worker-state.mjs";
 import { handleLifecycleHook } from "../plugins/fusion/scripts/worker-lifecycle.mjs";
 
 function sandbox(t) {
@@ -29,7 +29,7 @@ function sandbox(t) {
       TMPDIR: root,
       TMP: root,
       TEMP: root,
-      ...Object.fromEntries(ENGINE_IDS.map((engine) => [ENGINES[engine].companionEnv, path.resolve(import.meta.dirname, `../plugins/${engine}/scripts/${ENGINES[engine].companionFile}`)]))
+      ...Object.fromEntries(ENGINE_IDS.map((engine) => [ENGINES[engine].companionEnv, path.resolve(import.meta.dirname, engine === "grok" ? "fixtures/healthy-grok-companion.mjs" : `../plugins/${engine}/scripts/${ENGINES[engine].companionFile}`)]))
     }
   };
 }
@@ -91,8 +91,6 @@ function assertStaged(box, output, prompt, engine = "codex") {
   assert.equal(fs.existsSync(file), false);
 }
 
-const flagshipMessage = "gpt-6-astra write briefs of 3000 bytes or more time out on most flights. Split the package, or drop --model to use the codex flagship lane default.";
-
 function infraMessage(engine, kind, elapsed = 5, remaining = 25) {
   return `${ENGINES[engine].displayName} failed with failure: ${kind} ${elapsed} minutes ago in this session. Route this package to another eligible lane. It reopens after ${remaining} minutes or after you name the engine in a message.`;
 }
@@ -123,73 +121,17 @@ test("Task launches share the Explore model default", async (t) => {
   assert.equal((await launch(box, { subagent_type: "Explore" }, { tool_name: "Task" })).updatedInput.model, "sonnet");
 });
 
-for (const [bytes, brief] of [[2999, "a".repeat(2999)], [3000, "a".repeat(3000)], [2999, `${"界".repeat(999)}ab`], [3000, "界".repeat(1000)]]) {
-  test(`flagship writes with ${bytes} UTF-8 bytes and ${brief.length} characters enforce the boundary`, async (t) => {
-    const box = sandbox(t);
-    assert.equal(Buffer.byteLength(brief, "utf8"), bytes);
-    const output = await launch(box, { prompt: `--write --model gpt-6-astra -- ${brief}` });
-    if (bytes === 3000) {
-      assertDenied(box, output, "worker-lifecycle.flagship-write-deny", flagshipMessage);
-    } else {
-      assertStaged(box, output, `--write --model gpt-6-astra -- ${brief}`);
-      assert.equal(readPeerCapacityReservations(box.env).length, 1);
-    }
-  });
-}
-
-for (const options of ["--write --model=gpt-6-astra", '--model "gpt-6-astra" --write', "--cwd '/tmp/repo with spaces' --write --model 'gpt-6-astra'"]) {
-  test(`flagship writes parse leading companion options: ${options}`, async (t) => {
-    const box = sandbox(t);
-    assertDenied(box, await launch(box, { prompt: `${options} -- ${"x".repeat(3000)}` }), "worker-lifecycle.flagship-write-deny", flagshipMessage);
-  });
-}
-
-test("flagship gate only counts the separated brief and explicit write model options", async (t) => {
+test("large flagship write briefs stage without a model-specific gate", async (t) => {
   const box = sandbox(t);
-  for (const [prompt, staged] of [
-    [`--cwd /${"d".repeat(3000)} --write --model gpt-6-astra -- small brief`, true],
-    [`--model gpt-6-astra -- ${"x".repeat(3000)}`, false],
-    [`--write --model gpt-6.1-sol -- ${"x".repeat(3000)}`, true],
-    [`--write -- ${"x".repeat(3000)}`, true],
-    [`--write --model gpt-6-astra ${"x".repeat(3000)}`, true],
-    [`review --write --model gpt-6-astra -- ${"x".repeat(3000)}`, false],
-    [`--model gpt-6-astra -- ${"x".repeat(3000)} --write`, false],
-    [`--write -- ${"x".repeat(3000)} --model gpt-6-astra`, true]
-  ]) {
-    const output = await launch(box, { prompt });
-    if (staged) {
-      assertStaged(box, output, prompt);
-    } else {
-      assert.equal(output, null, prompt.slice(0, 80));
-    }
-  }
-});
-
-test("flagship writes accept the latest user's literal model request", async (t) => {
-  const box = sandbox(t);
-  writeTranscript(box, [userMessage("use gpt-6-astra for this package")]);
   const prompt = `--write --model gpt-6-astra -- ${"x".repeat(3000)}`;
   assertStaged(box, await launch(box, { prompt }), prompt);
   assert.equal(readPeerCapacityReservations(box.env).length, 1);
 });
 
-test("flagship exemptions do not come from older users, assistant text, or tool results", async (t) => {
-  const box = sandbox(t);
-  writeTranscript(box, [
-    userMessage("use gpt-6-astra"),
-    userMessage("implement the package"),
-    { type: "assistant", message: { content: "gpt-6-astra" } },
-    { ...userMessage("gpt-6-astra"), toolUseResult: {} },
-    { ...userMessage("gpt-6-astra"), sourceToolAssistantUUID: "assistant-1" },
-    { type: "user", message: { content: [{ type: "tool_result", content: "gpt-6-astra" }] } }
-  ]);
-  assertDenied(box, await launch(box, { prompt: `--write --model gpt-6-astra -- ${"x".repeat(3000)}` }), "worker-lifecycle.flagship-write-deny", flagshipMessage);
-});
-
-test("bare rescue names enforce the flagship gate and other engines remain eligible", async (t) => {
+test("bare rescue names and other engines can stage large write briefs", async (t) => {
   const box = sandbox(t);
   const prompt = `--write --model gpt-6-astra -- ${"x".repeat(3000)}`;
-  assertDenied(box, await launch(box, { subagent_type: "codex-rescue", prompt }), "worker-lifecycle.flagship-write-deny", flagshipMessage);
+  assertStaged(box, await launch(box, { subagent_type: "codex-rescue", prompt }), prompt);
   for (const engine of ENGINE_IDS.filter((id) => id !== ENGINES.codex.id)) {
     assertStaged(box, await launch(box, { subagent_type: ENGINES[engine].rescueAgent, prompt }), prompt, engine);
   }
@@ -273,7 +215,7 @@ test("engine stops ignore other sessions, engines, nonterminal records, and othe
   const box = sandbox(t);
   workerRecord(box, { sessionId: "other-session" });
   workerRecord(box, { agentType: ENGINES.grok.rescueAgent });
-  workerRecord(box, { transportStatus: "running" });
+  workerRecord(box, { transportStatus: "running", companionCwd: path.join(box.root, "isolated") });
   assert.equal(await launch(box), null);
   for (const kind of [null, "timeout", "network", "intent_override"]) {
     workerRecord(box, { peerFailureKind: kind });
@@ -310,14 +252,14 @@ test("the transcript reader serves model, engine, and background authorization",
   assert.equal(latestUserRequestedBackground(box.transcript), false);
 });
 
-test("model and engine exemptions each apply only to their own gate", async (t) => {
+test("engine exemption depends on the latest user message", async (t) => {
   const box = sandbox(t);
   workerRecord(box);
   const input = { prompt: `--write --model gpt-6-astra -- ${"x".repeat(3000)}` };
   writeTranscript(box, [userMessage("use Codex")]);
-  assertDenied(box, await launch(box, input), "worker-lifecycle.flagship-write-deny", flagshipMessage);
+  assertStaged(box, await launch(box, input), input.prompt);
   writeTranscript(box, [userMessage("use gpt-6-astra")]);
-  assertDenied(box, await launch(box, input), "worker-lifecycle.engine-infra-deny", infraMessage(ENGINES.codex.id, "sandbox"));
+  assert.equal((await launch(box, input))?.permissionDecisionReason, tagMessage("worker-lifecycle.engine-infra-deny", infraMessage(ENGINES.codex.id, "sandbox")));
 });
 
 test("missing transcripts grant no admission exemptions", async (t) => {
@@ -325,7 +267,78 @@ test("missing transcripts grant no admission exemptions", async (t) => {
   fs.unlinkSync(box.transcript);
   assert.equal(latestUserText(box.transcript), null);
   assert.equal(latestUserRequestedBackground(box.transcript), false);
-  assertDenied(box, await launch(box, { prompt: `--write --model gpt-6-astra -- ${"x".repeat(3000)}` }), "worker-lifecycle.flagship-write-deny", flagshipMessage);
+  assertStaged(box, await launch(box, { prompt: `--write --model gpt-6-astra -- ${"x".repeat(3000)}` }), `--write --model gpt-6-astra -- ${"x".repeat(3000)}`);
   workerRecord(box);
-  assertDenied(box, await launch(box), "worker-lifecycle.engine-infra-deny", infraMessage(ENGINES.codex.id, "sandbox"));
+  assert.equal((await launch(box))?.permissionDecisionReason, tagMessage("worker-lifecycle.engine-infra-deny", infraMessage(ENGINES.codex.id, "sandbox")));
+});
+
+test("host blockers deny the first dispatch only for the leading brief mode", async (t) => {
+  const box = sandbox(t);
+  const companion = path.join(box.root, "grok-companion.mjs");
+  fs.writeFileSync(companion, `if (process.argv[2] !== "host-check") process.exit(2); process.stdout.write(${JSON.stringify(JSON.stringify({ blockers: [{ kind: "sandbox", modes: ["write"], message: "Socket blocks writes." }] }))});`);
+  box.env.FUSION_GROK_COMPANION = companion;
+  const denied = await launch(box, { subagent_type: "grok-rescue", prompt: "--cwd '/tmp/My Project' --write -- bounded package" });
+  assert.equal(denied.permissionDecision, "deny");
+  assert.match(denied.permissionDecisionReason, /Grok write runs are blocked on this host: sandbox: Socket blocks writes/);
+  assert.deepEqual(readPeerCapacityReservations(box.env), []);
+  assert.equal(await launch(box, { subagent_type: "grok:grok-rescue", prompt: "-- consult mentioning --write in prose" }), null);
+  writeTranscript(box, [userMessage("use Grok")]);
+  assert.equal(await launch(box, { subagent_type: "grok:grok-rescue", prompt: "--write -- bounded package" }), null);
+});
+
+test("Codex workspace slots cover other sessions, every nonterminal status, and path aliases", async (t) => {
+  const box = sandbox(t);
+  const link = path.join(box.root, "repo-link");
+  fs.symlinkSync(box.root, link, "dir");
+  const worker = workerRecord(box, { sessionId: "other-session", transportStatus: "running", peerFailureKind: null });
+  for (const transportStatus of ["dispatching", "running", "pending_async", "ready_uncollected", "ready_background", "cancel_requested"]) {
+    updateWorkerRecord(worker.taskId, box.env, (record) => ({ ...record, transportStatus }));
+    const denied = await launch(box, { subagent_type: "codex-rescue", prompt: `--cwd '${link}' -- bounded package` });
+    assert.equal(denied.permissionDecision, "deny", transportStatus);
+    assert.match(denied.permissionDecisionReason, /Use an isolated worktree with --cwd, or wait/);
+  }
+  assert.equal(await launch(box, { prompt: "--cwd 'isolated worktree' -- bounded package" }), null);
+  assert.equal((await launch(box, {}, { tool_name: "Bash", tool_input: { command: "/codex --write" } })), null);
+  updateWorkerRecord(worker.taskId, box.env, (record) => ({ ...record, transportStatus: "done" }));
+  assert.equal(await launch(box, {}, { tool_use_id: "after-completion" }), null);
+});
+
+test("Codex reservations reject simultaneous launches before worker records exist", async (t) => {
+  const box = sandbox(t);
+  assert.equal(await launch(box), null);
+  assert.deepEqual(readWorkerRecords(box.env), []);
+  const denied = await launch(box, {}, { tool_use_id: "tool-2", session_id: "other-session" });
+  assert.equal(denied.permissionDecision, "deny");
+  assert.match(denied.permissionDecisionReason, /Codex already has a wrapper running/);
+  assert.equal(readPeerCapacityReservations(box.env).length, 1);
+  assert.equal(await launch(box, { prompt: "--cwd worktree -- bounded package" }, { tool_use_id: "tool-3" }), null);
+});
+
+test("Codex launches without tool ids still reserve their workspace slot", async (t) => {
+  const box = sandbox(t);
+  assert.equal(await launch(box, {}, { tool_use_id: undefined }), null);
+  const denied = await launch(box, { prompt: "a second package" }, { tool_use_id: undefined });
+  assert.equal(denied.permissionDecision, "deny");
+  assert.match(denied.permissionDecisionReason, /workspace-slot-deny|isolated worktree/);
+  assert.equal(readPeerCapacityReservations(box.env).length, 1);
+});
+
+test("Claude quota admission scopes the reset to the same agent type and session", (t) => {
+  const box = sandbox(t);
+  const now = Date.parse("2026-11-18T10:00:00.000Z");
+  workerRecord(box, { agentType: "fusion:deep-reasoner", failureKind: "quota", infraFailure: true, finishedAt: "2026-11-18T09:00:00.000Z", quotaResetAt: "2026-11-21T00:00:00.000Z", quotaResetText: "Nov 21" });
+  const denial = engineInfraDenial("session-1", "deep-reasoner", "continue", box.env, now);
+  assert.match(denial, /quota resets Nov 21 \(2026-11-21T00:00:00.000Z\)/);
+  for (const text of ["use fusion:deep-reasoner", "use deep-reasoner"]) assert.equal(engineInfraDenial("session-1", "fusion:deep-reasoner", text, box.env, now), null);
+  assert.equal(engineInfraDenial("other-session", "fusion:deep-reasoner", "continue", box.env, now), null);
+  assert.equal(engineInfraDenial("session-1", "fusion:claude-worker", "continue", box.env, now), null);
+  assert.equal(engineInfraDenial("session-1", "fusion:deep-reasoner", "continue", box.env, Date.parse("2026-11-21T00:00:00.000Z")), null);
+});
+
+test("Claude quota without a parsed reset reopens after one hour", (t) => {
+  const box = sandbox(t);
+  const finished = Date.parse("2026-11-18T09:00:00.000Z");
+  workerRecord(box, { agentType: "fusion:claude-worker", failureKind: "quota", infraFailure: true, finishedAt: new Date(finished).toISOString() });
+  assert.match(engineInfraDenial("session-1", "claude-worker", "continue", box.env, finished + 3_599_999), /2026-11-18T10:00:00.000Z \(1 hour fallback\)/);
+  assert.equal(engineInfraDenial("session-1", "claude-worker", "continue", box.env, finished + 3_600_000), null);
 });

@@ -1,6 +1,6 @@
 import fs from "node:fs";
 import { BREADTH_ENGINE_IDS, ENGINES, ENGINE_IDS, ENGINE_TERMINAL_STATUSES, PEER_RESCUE_AGENT_NAMES, engineStateRoots } from "../../lib/engines.mjs";
-import { canonicalWorkerAgentType, WORKER_TERMINAL_STATUSES, readWorkerRecords, readWorkerRollups } from "../../lib/worker-state.mjs";
+import { canonicalWorkerAgentType, WORKER_TERMINAL_STATUSES, readWorkerRecords, readWorkerRollups, workerElapsedMs } from "../../lib/worker-state.mjs";
 import { FILE_ENGINE_DESCRIPTORS, checkedUsageAddition, codexSku, isSupersededCodexJob, loadAllObservationCandidates, normalizeClaudeWorkerUsage, observationForJob, scopedObservationForJob, summarizeCodexSkuTelemetry, tokenUsageForJob } from "./engine-evidence.mjs";
 import { CODEX_ACCEPTANCE_STATES, RESUMABLE_CODEX_FAILURE_KINDS, TOKEN_USAGE_FILENAME, bump, fusionWorkspaceKey, loadTokenUsageObservations, nonEmptyString, normalizeCollectionMethod, readCodexJobEvidence, readWorkspaceJobFiles, resolveCodexJobEffort, resolveCodexJobModel, resolveGitWorkspaceRoot, resolveStateRoot, selectPreferredJobs, workspaceRootsShareRepository } from "./evidence.mjs";
 import { buildCoercionLedger, buildFleetUsageStats, readStatsAuditEvents } from "./fleet.mjs";
@@ -418,10 +418,9 @@ export function claudeWorkerStats({ all = false, env = process.env, cwd = proces
     } else {
       unreportedUsage += 1;
     }
-    const started = Date.parse(record.startedAt ?? "");
-    const finished = Date.parse(record.finishedAt ?? "");
-    if (Number.isFinite(started) && Number.isFinite(finished) && finished >= started) {
-      durationSum += (finished - started) / 1000;
+    const elapsed = workerElapsedMs(record);
+    if (elapsed !== null) {
+      durationSum += elapsed / 1000;
       durationCount += 1;
     }
     const created = Date.parse(record.createdAt ?? "");
