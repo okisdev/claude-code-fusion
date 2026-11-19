@@ -7,6 +7,8 @@ import { absoluteOutputFile, capturedPeerIdentity, collectedHarnessAsyncDelivery
 import { sessionRecords, updateLifecycleWorkerRecord } from "./records.mjs";
 import { TASK_NOTIFICATION_SCAN_MAX_BYTES, TASK_NOTIFICATION_SCAN_CHUNK_BYTES, TASK_NOTIFICATION_MAX_LINE_BYTES, TASK_NOTIFICATION_FINAL_SCAN_MAX_BYTES, SUBAGENT_HANDBACK_TOOL, HANDBACK_PLACEHOLDER_PATTERN, HANDBACK_ALREADY_DELIVERED_PATTERN, SUCCESSFUL_TASK_NOTIFICATION_STATUSES, CANCELLED_TASK_NOTIFICATION_STATUSES, FAILED_TASK_NOTIFICATION_STATUSES } from "./constants.mjs";
 
+const TASK_NOTIFICATION_TAG_PATTERN = /<task-notification(?:\s[^>]*)?\s*>/i;
+
 function taskNotificationTextParts(value) {
   if (typeof value === "string") {
     return [value];
@@ -43,7 +45,7 @@ function taskNotificationsFromTranscriptLine(line) {
   const texts = taskNotificationTextParts(entry.message?.content).concat(taskNotificationTextParts(entry.content));
   const notifications = [];
   for (const text of texts) {
-    const blocks = text.matchAll(/<task-notification(?:\s[^>]*)?\s*>([\s\S]*?)<\/task-notification\s*>/gi);
+    const blocks = text.matchAll(new RegExp(`${TASK_NOTIFICATION_TAG_PATTERN.source}([\\s\\S]*?)<\\/task-notification\\s*>`, "gi"));
     for (const block of blocks) {
       const taskId = /<task-id\s*>\s*([^<\s]+)\s*<\/task-id\s*>/i.exec(block[1])?.[1] ?? null;
       const status = /<status\s*>\s*([^<]+?)\s*<\/status\s*>/i.exec(block[1])?.[1]?.trim().toLowerCase() ?? null;
@@ -295,6 +297,12 @@ function finalReportFromTranscript(transcriptPath) {
             alreadyDelivered.add(block.tool_use_id);
           }
         }
+      }
+    } else if (pendingHandback && entry?.type === "user") {
+      const texts = taskNotificationTextParts(entry.message?.content).concat(taskNotificationTextParts(entry.content));
+      const continuedRun = texts.some((text) => TASK_NOTIFICATION_TAG_PATTERN.test(text) || /(?:^Stop hook feedback:|<system-reminder>\s*SubagentStop hook blocking error)/.test(text.trimStart()));
+      if (texts.some((text) => text.trim()) && !continuedRun) {
+        return pendingHandback;
       }
     }
   }
