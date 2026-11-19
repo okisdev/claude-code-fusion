@@ -7,6 +7,7 @@ import { fileURLToPath } from "node:url";
 
 import {
   DEFAULT_MODEL_TABLE_PLACEHOLDER,
+  DEFAULT_MODEL_ROUTING_MODELS,
   MODEL_ROUTING_SCHEMA_VERSION,
   MODEL_ROUTING_LANES,
   readModelRoutingFile,
@@ -162,7 +163,7 @@ function defaultData() {
     schemaVersion: MODEL_ROUTING_SCHEMA_VERSION,
     updatedAt: new Date().toISOString(),
     costProfile: "",
-    models: []
+    models: DEFAULT_MODEL_ROUTING_MODELS.map((model) => ({ ...model }))
   };
 }
 

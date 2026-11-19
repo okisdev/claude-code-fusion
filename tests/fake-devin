@@ -20,7 +20,7 @@ const record = () => { if (!logFile) return; fs.writeFileSync(`${logFile}.tmp`, 
 const emit = (event) => fs.writeSync(1, `${JSON.stringify({ jsonrpc: "2.0", ...event })}\n`);
 const reply = (id, result) => emit({ id, result });
 const fail = (id, message, code = -32000, data) => emit({ id, error: { code, message, ...(data === undefined ? {} : { data }) } });
-let sessionId = "artistic-breeze";
+let sessionId = process.env.FAKE_DEVIN_SESSION_ID || "artistic-breeze";
 let promptId;
 let configOptions = [
   { id: "mode", type: "select", currentValue: "accept-edits", options: ["accept-edits", "ask", "plan", "bypass"].map((value) => ({ value })) },
@@ -152,9 +152,16 @@ async function handleMessage(message) {
   }
   if (method === "session/new" || method === "session/load") {
     if (params.sessionId) sessionId = params.sessionId;
-    if (method === "session/load") text("old conversation before load result");
+    if (method === "session/load") {
+      text("old conversation before load result");
+      tool(scenario === "replay_forbidden_tool" ? "edit" : "read", "replayed:0#ab");
+      tool(scenario === "replay_forbidden_update" ? "webfetch" : "read", "replayed:0#ab", "tool_call_update");
+    }
     reply(id, { ...(scenario === "missing_session" || method === "session/load" ? {} : { sessionId }), modes: { currentModeId: "accept-edits", availableModes: [] }, configOptions });
-    if (method === "session/load") text("old conversation after load result");
+    if (method === "session/load") {
+      text("old conversation after load result");
+      if (scenario === "replay_forbidden_after_load") tool("webfetch", "replayed:1#ab");
+    }
     return;
   }
   if (method === "session/set_config_option") {

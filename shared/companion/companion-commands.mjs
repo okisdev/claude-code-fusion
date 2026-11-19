@@ -261,6 +261,7 @@ export function createCompanionCommands(adapter) {
     const modelDrift = adapter.modelDrift(record, outcome);
     const warnings = [...record.warnings];
     if (outcome.lateClose) warnings.push("late_close");
+    warnings.push(...(adapter.outcomeWarnings?.(outcome) ?? []));
     if (modelDrift) warnings.push(adapter.driftWarning(modelDrift));
     if (signalExitCode !== null) {
       finishSuccessfulJobRecordFile(file, { status: "cancelled", finishedAt: nowIso(), exitCode: outcome.exitCode,

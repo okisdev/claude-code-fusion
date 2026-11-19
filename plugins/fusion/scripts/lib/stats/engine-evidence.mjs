@@ -1,6 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
-import { BREADTH_ENGINE_IDS, ENGINES, ENGINE_TERMINAL_STATUSES, engineDataDir } from "../../lib/engines.mjs";
+import { ENGINES, ENGINE_IDS, ENGINE_TERMINAL_STATUSES, engineDataDir } from "../../lib/engines.mjs";
 import { readModelRoutingFile, resolveModelRoutingPath } from "../../lib/model-table.mjs";
 import { LANE_SIGNAL_MIN_JUDGED_JOBS, LANE_SIGNAL_TRAILING_JOBS, LANE_SIGNAL_WINDOW_MS, LAST_SEVEN_DAYS_MS, RESUMABLE_CODEX_FAILURE_KINDS, fusionRepositoryKey, fusionWorkspaceKey, loadModelAuditObservations, modelAuditSidecarPath, modelObservationRank, nonEmptyString, observationTimestamp, readCodexJobEvidence, readWorkspaceJobFiles, resolveCodexJobEffort, resolveCodexJobModel, resolveFusionDataDir, resolveGitWorkspaceRoot, workspaceKeyMatchesRepository, workspaceRootsShareRepository } from "./evidence.mjs";
 
@@ -112,7 +112,7 @@ export const FILE_ENGINE_DESCRIPTORS = {
       return resolveCodexJobEffort(raw, observation);
     }
   },
-  ...Object.fromEntries(BREADTH_ENGINE_IDS.map((id, index) => [id, {
+  ...Object.fromEntries(ENGINE_IDS.filter((id) => id !== "codex" && id !== "grok").map((id, index) => [id, {
     id,
     displayOrder: index + 2,
     defaultStateRoot: (env) => path.join(engineDataDir(id, env), "state"),
@@ -150,7 +150,7 @@ export const FILE_ENGINE_DESCRIPTORS = {
       return nonEmptyString(raw?.resolvedModel) ?? "unknown";
     },
     resolveEffort(raw) {
-      return raw?.effortApplied === true ? nonEmptyString(raw?.requestedEffort) : null;
+      return raw?.effortApplied === true ? nonEmptyString(raw?.resolvedEffort) ?? nonEmptyString(raw?.requestedEffort) : null;
     },
     resolveMode(raw) {
       return nonEmptyString(raw?.mode) ?? "unknown";
@@ -161,7 +161,7 @@ export const FILE_ENGINE_DESCRIPTORS = {
       }
       return nonEmptyString(raw?.failureKind) ?? (raw.status === "cancelled" ? "cancelled" : "error");
     },
-    resolveTokenUsage: breadthTokenUsageForJob,
+    resolveTokenUsage: peerTokenUsageForJob,
     emptyTokenTotals: { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, totalTokens: 0 },
     resolveBillingPool(raw) {
       return nonEmptyString(raw?.billingPool);
@@ -403,7 +403,7 @@ function grokTokenUsageForJob(raw) {
   return { availability: raw?.usage != null || raw?.modelUsage != null ? "partial" : "unavailable", usage: null };
 }
 
-function breadthTokenUsageForJob(raw) {
+function peerTokenUsageForJob(raw) {
   const value = raw?.usage;
   if (value == null) {
     return { availability: "unavailable", usage: null };
@@ -415,13 +415,15 @@ function breadthTokenUsageForJob(raw) {
     const input = integerTokenField(value.inputTokens);
     const output = integerTokenField(value.outputTokens);
     const cachedRead = integerTokenField(value.cachedReadTokens);
+    const cachedWrite = integerTokenField(value.cachedWriteTokens ?? 0);
+    const thought = integerTokenField(value.thoughtTokens ?? 0);
     const total = integerTokenField(value.totalTokens);
-    if ([input, output, cachedRead, total].some((field) => field == null) || cachedRead > input || BigInt(input) + BigInt(output) !== BigInt(total)) {
+    if ([input, output, cachedRead, cachedWrite, thought, total].some((field) => field == null) || BigInt(cachedRead) + BigInt(cachedWrite) > BigInt(input) || (BigInt(input) + BigInt(output) !== BigInt(total) && BigInt(input) + BigInt(output) + BigInt(thought) !== BigInt(total))) {
       return { availability: "partial", usage: null };
     }
     return {
       availability: "available",
-      usage: { inputTokens: input - cachedRead, outputTokens: output, cacheReadTokens: cachedRead, cacheWriteTokens: 0, totalTokens: total }
+      usage: { inputTokens: input - cachedRead - cachedWrite, outputTokens: total - input, cacheReadTokens: cachedRead, cacheWriteTokens: cachedWrite, totalTokens: total }
     };
   }
   const fields = ["inputTokens", "outputTokens", "cacheReadTokens", "cacheWriteTokens"].map((field) => integerTokenField(value[field]));

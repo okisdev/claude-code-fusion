@@ -10,7 +10,7 @@ const bin = path.resolve("tests/fake-devin");
 
 function fixture(t) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "devin-exec-test-"));
-  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 }));
   return root;
 }
 
@@ -137,13 +137,24 @@ test("usage preserves missing and additional keys", async (t) => {
   assert.deepEqual(extra.result.usage, { totalTokens: 11914, inputTokens: 11875, outputTokens: 39, cachedReadTokens: 11552, vendorTokens: 7 });
 });
 
-test("resume sends session/load and excludes all replayed text before prompting", async (t) => {
+test("resume sends session/load, excludes replay text, and checks allowed replay tools", async (t) => {
   const { result, log, root } = await fakeRun(t, "success", { resumeSessionId: "resumed-breeze" });
   assert.equal(classifyDevinFailure(result), null);
   assert.equal(result.resultText, "fake result");
   assert.equal(result.sessionId, "resumed-breeze");
+  assert.equal(result.toolCalls, 3);
   assert.deepEqual(log.messages[1], { jsonrpc: "2.0", id: 2, method: "session/load", params: { sessionId: "resumed-breeze", cwd: root, mcpServers: [] } });
   assert.equal(log.messages.some((message) => message.method === "session/new"), false);
+});
+
+test("resume enforces tool policy before prompting throughout session load", async (t) => {
+  for (const scenario of ["replay_forbidden_tool", "replay_forbidden_update", "replay_forbidden_after_load"]) {
+    const { result, log } = await fakeRun(t, scenario, { resumeSessionId: "resumed-breeze" });
+    assert.equal(classifyDevinFailure(result), "policy", scenario);
+    assert.equal(result.timedOut, false, scenario);
+    assert.equal(log.messages.some((message) => message.method === "session/prompt"), false, scenario);
+    assert.equal(result.resultText, "", scenario);
+  }
 });
 
 test("model and effort selection receive updated options and apply each pair in order", async (t) => {

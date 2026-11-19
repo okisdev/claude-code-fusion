@@ -34,12 +34,12 @@ function readJson(relativePath) {
 }
 
 test("engine constants and definitions are frozen", () => {
-  assert.deepStrictEqual(ENGINE_IDS, ["codex", "grok", "cursor", "devin"]);
+  assert.deepStrictEqual(ENGINE_IDS, ["codex", "grok", "cursor", "devin", "agy"]);
   assert.deepStrictEqual(BREADTH_ENGINE_IDS, ["cursor", "devin"]);
   assert.strictEqual(DEFAULT_BREADTH_ENGINE, "cursor");
-  assert.deepStrictEqual(routedEngineIds(), ["codex", "grok", "cursor"]);
-  assert.deepStrictEqual(routedEngineIds("devin"), ["codex", "grok", "devin"]);
-  assert.strictEqual(ENGINE_ID_ALTERNATION, "codex|grok|cursor|devin");
+  assert.deepStrictEqual(routedEngineIds(), ["codex", "grok", "cursor", "agy"]);
+  assert.deepStrictEqual(routedEngineIds("devin"), ["codex", "grok", "devin", "agy"]);
+  assert.strictEqual(ENGINE_ID_ALTERNATION, "codex|grok|cursor|devin|agy");
   assert.ok(Object.isFrozen(ENGINES));
   assert.ok(Object.isFrozen(ENGINE_IDS));
   assert.ok(Object.isFrozen(BREADTH_ENGINE_IDS));
@@ -59,7 +59,8 @@ test("consult only roles are defined by the engine registry", () => {
     codex: [],
     grok: ["live-web", "large-context"],
     cursor: ["diversity"],
-    devin: ["diversity"]
+    devin: ["diversity"],
+    agy: ["independence", "large-context"]
   });
   for (const id of ENGINE_IDS) {
     assert.ok(ENGINES[id].consultOnlyRoles.every((role) => ENGINES[id].roles.includes(role)));
@@ -132,15 +133,15 @@ test("engine terminal statuses are exact", () => {
 });
 
 test("peer agent sets are exact", () => {
-  assert.deepStrictEqual(PEER_RESCUE_AGENTS, new Set(["codex:codex-rescue", "grok:grok-rescue", "cursor:cursor-rescue", "devin:devin-rescue"]));
+  assert.deepStrictEqual(PEER_RESCUE_AGENTS, new Set(["codex:codex-rescue", "grok:grok-rescue", "cursor:cursor-rescue", "devin:devin-rescue", "agy:agy-rescue"]));
   assert.deepStrictEqual(PEER_MANAGED_AGENTS, new Set(["grok:grok-review-runner"]));
-  assert.deepStrictEqual(PEER_JOB_FOOTER_AGENTS, new Set(["codex:codex-rescue", "grok:grok-rescue", "cursor:cursor-rescue", "devin:devin-rescue", "grok:grok-review-runner"]));
-  assert.deepStrictEqual(PEER_RESCUE_AGENT_NAMES, new Set(["codex:codex-rescue", "codex-rescue", "grok:grok-rescue", "grok-rescue", "cursor:cursor-rescue", "cursor-rescue", "devin:devin-rescue", "devin-rescue"]));
+  assert.deepStrictEqual(PEER_JOB_FOOTER_AGENTS, new Set(["codex:codex-rescue", "grok:grok-rescue", "cursor:cursor-rescue", "devin:devin-rescue", "agy:agy-rescue", "grok:grok-review-runner"]));
+  assert.deepStrictEqual(PEER_RESCUE_AGENT_NAMES, new Set(["codex:codex-rescue", "codex-rescue", "grok:grok-rescue", "grok-rescue", "cursor:cursor-rescue", "cursor-rescue", "devin:devin-rescue", "devin-rescue", "agy:agy-rescue", "agy-rescue"]));
   assert.deepStrictEqual(PEER_MANAGED_AGENT_NAMES, new Set(["grok:grok-review-runner", "grok-review-runner"]));
 });
 
 test("isEngineId accepts only registered engine ids", () => {
-  for (const value of ["codex", "grok", "cursor", "devin"]) {
+  for (const value of ["codex", "grok", "cursor", "devin", "agy"]) {
     assert.strictEqual(isEngineId(value), true);
   }
   for (const value of ["claude", "", null, undefined, 1, "toString", "constructor"]) {
@@ -209,9 +210,9 @@ test("engineResultCommand formats only registered engine commands", () => {
 });
 
 test("engine display lists use the requested conjunction", () => {
-  assert.strictEqual(engineIdChoices(), "codex, grok, cursor, or devin");
-  assert.strictEqual(engineDisplayNameList(), "Codex, Grok, Cursor, and Devin");
-  assert.strictEqual(engineDisplayNameList("disjunction"), "Codex, Grok, Cursor, or Devin");
+  assert.strictEqual(engineIdChoices(), "codex, grok, cursor, devin, or agy");
+  assert.strictEqual(engineDisplayNameList(), "Codex, Grok, Cursor, Devin, and Antigravity");
+  assert.strictEqual(engineDisplayNameList("disjunction"), "Codex, Grok, Cursor, Devin, or Antigravity");
 });
 
 test("engine definitions match plugin files and marketplace entries", () => {
@@ -284,5 +285,31 @@ test("fusion scripts take engine identity from the registry", () => {
     for (const literal of literals) {
       assert.ok(!source.includes(literal), `${path.relative(repoRoot, file)} repeats the engine literal ${literal}`);
     }
+  }
+});
+
+test("Antigravity registry contract defines the Google subscription lane", () => {
+  assert.deepStrictEqual(ENGINES.agy, {
+    id: "agy", displayName: "Antigravity", seat: null, family: "google",
+    rescueAgent: "agy:agy-rescue", managedAgents: [],
+    companionFile: "agy-companion.mjs", companionEnv: "FUSION_AGY_COMPANION", hostCheck: false,
+    dataDirName: "agy-claude-code-fusion", dataEnv: "AGY_COMPANION_DATA", stateEnvs: [],
+    versionField: "agyVersion", verifiedVersionKey: "agy", acceptanceLedger: false,
+    roles: ["independence", "large-context", "burst"], defaultRole: null,
+    consultOnlyRoles: ["independence", "large-context"], efforts: ["default", "low", "medium", "high", "xhigh"],
+    unavailablePrefix: "agy unavailable:"
+  });
+  assert.strictEqual(engineForAgentType("agy:agy-rescue"), "agy");
+  assert.strictEqual(engineForAgentType("agy-rescue"), "agy");
+  assert.strictEqual(engineDisplayName("agy"), "Antigravity");
+  assert.strictEqual(engineDataDir("agy", { HOME: "/h" }), "/h/.claude/plugins/data/agy-claude-code-fusion");
+  assert.deepStrictEqual(engineStateRoots("agy", { HOME: "/h", AGY_COMPANION_DATA: "/a" }), ["/a/state"]);
+  assert.strictEqual(engineResultCommand("agy", "job-id"), "/agy:result job-id");
+  for (const role of ENGINES.agy.roles) {
+    assert.strictEqual(engineRoleFromBrief("agy", `lane: agy ${role} | acceptance: bounded result`), role);
+    assert.strictEqual(engineRoleFromBrief("agy", `lane: panel | agy-role: ${role}`), role);
+  }
+  for (const brief of ["lane: agy", "agy-role: diversity", "grok-role: burst", "agy-role: quick"]) {
+    assert.strictEqual(engineRoleFromBrief("agy", brief), null);
   }
 });

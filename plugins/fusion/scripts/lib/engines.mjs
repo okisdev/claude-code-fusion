@@ -100,6 +100,28 @@ const ENGINES = Object.freeze({
     consultOnlyRoles: ["diversity"],
     efforts: ["default", "none", "minimal", "low", "medium", "high", "xhigh", "max"],
     unavailablePrefix: "devin unavailable:"
+  }),
+  agy: engine({
+    id: "agy",
+    displayName: "Antigravity",
+    seat: null,
+    family: "google",
+    rescueAgent: "agy:agy-rescue",
+    managedAgents: [],
+    companionFile: "agy-companion.mjs",
+    companionEnv: "FUSION_AGY_COMPANION",
+    hostCheck: false,
+    dataDirName: "agy-claude-code-fusion",
+    dataEnv: "AGY_COMPANION_DATA",
+    stateEnvs: [],
+    versionField: "agyVersion",
+    verifiedVersionKey: "agy",
+    acceptanceLedger: false,
+    roles: ["independence", "large-context", "burst"],
+    defaultRole: null,
+    consultOnlyRoles: ["independence", "large-context"],
+    efforts: ["default", "low", "medium", "high", "xhigh"],
+    unavailablePrefix: "agy unavailable:"
   })
 });
 

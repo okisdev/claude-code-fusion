@@ -127,7 +127,7 @@ test("invalid files and options produce one error line and exit 2", async (t) =>
 test("each companion entry script routes await-output to the shared handler", (t) => {
   const content = Buffer.from("companion result\n");
   const file = fixture(t, Buffer.concat([content, Buffer.from("[exited with code 0]\n")]));
-  for (const engine of ["codex", "grok", "cursor", "devin"]) {
+  for (const engine of ["codex", "grok", "cursor", "devin", "agy"]) {
     const script = path.join(repoRoot, "plugins", engine, "scripts", `${engine}-companion.mjs`);
     const result = spawnSync(process.execPath, [script, "await-output", "--file", file], { cwd: repoRoot });
     assert.equal(result.status, 0, `${engine}: ${result.stderr}`);

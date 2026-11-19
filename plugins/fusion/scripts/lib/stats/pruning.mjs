@@ -1,8 +1,10 @@
 import fs from "node:fs";
 import path from "node:path";
-import { BREADTH_ENGINE_IDS, ENGINES, engineDataDir } from "../../lib/engines.mjs";
+import { ENGINES, ENGINE_IDS, engineDataDir } from "../../lib/engines.mjs";
 import { WORKSPACE_ENGINE_DESCRIPTORS, listWorkspaceEntries } from "./aggregation.mjs";
 import { DAY_MS, PRUNE_EVIDENCE, isPathPositivelyAbsent, resolveFusionDataDir } from "./evidence.mjs";
+
+const RUN_DIRECTORY_ENGINES = ENGINE_IDS.filter((id) => id !== "codex" && id !== "grok");
 
 function isWorkspaceDead(jobs, descriptor) {
   for (const raw of jobs) {
@@ -162,7 +164,7 @@ function scanObservationDirectories(env, ageMs, requireDeadWorkspace, now = Date
     .filter(Boolean);
 }
 
-function breadthRunCandidate(dir, recorded, now) {
+function peerRunCandidate(dir, recorded, now) {
   const jobId = path.basename(dir);
   if (recorded.has(jobId)) return null;
   try {
@@ -171,14 +173,14 @@ function breadthRunCandidate(dir, recorded, now) {
   } catch { return null; }
 }
 
-function scanOrphanBreadthRuns(id, env, now = Date.now()) {
+function scanOrphanPeerRuns(id, env, now = Date.now()) {
   if (!env[ENGINES[id].dataEnv] && !env.HOME) return [];
   const root = path.join(engineDataDir(id, env), "runs");
   const recorded = existingEngineJobIds(env, WORKSPACE_ENGINE_DESCRIPTORS.filter((entry) => entry.id === id));
   let entries;
   try { entries = fs.readdirSync(root, { withFileTypes: true }); } catch { return []; }
   return entries.filter((entry) => entry.isDirectory())
-    .map((entry) => breadthRunCandidate(path.join(root, entry.name), recorded, now))
+    .map((entry) => peerRunCandidate(path.join(root, entry.name), recorded, now))
     .filter(Boolean);
 }
 
@@ -223,7 +225,7 @@ export function findDeadWorkspaces(env = process.env) {
   }
   dead.acceptance = findUnusedAcceptanceObservations(env);
   dead.observations = scanObservationDirectories(env, 30 * DAY_MS, true);
-  for (const id of BREADTH_ENGINE_IDS) dead[`${id}Runs`] = scanOrphanBreadthRuns(id, env);
+  for (const id of RUN_DIRECTORY_ENGINES) dead[`${id}Runs`] = scanOrphanPeerRuns(id, env);
   return dead;
 }
 
@@ -234,7 +236,7 @@ export function pruneDeadWorkspaces({ env = process.env, yes = false, beforeRemo
   }
   const removed = {};
   for (const [engineId, candidates] of Object.entries(dead)) {
-    if (engineId === "acceptance" || engineId === "observations" || BREADTH_ENGINE_IDS.some((id) => engineId === `${id}Runs`)) {
+    if (engineId === "acceptance" || engineId === "observations" || RUN_DIRECTORY_ENGINES.some((id) => engineId === `${id}Runs`)) {
       continue;
     }
     removed[engineId] = [];
@@ -251,14 +253,14 @@ export function pruneDeadWorkspaces({ env = process.env, yes = false, beforeRemo
     }
   }
   const currentJobs = existingEngineJobIds(env);
-  for (const key of ["observations", ...BREADTH_ENGINE_IDS.map((id) => `${id}Runs`)]) {
-    const id = BREADTH_ENGINE_IDS.find((engine) => key === `${engine}Runs`);
-    const currentBreadthJobs = id ? existingEngineJobIds(env, WORKSPACE_ENGINE_DESCRIPTORS.filter((entry) => entry.id === id)) : null;
+  for (const key of ["observations", ...RUN_DIRECTORY_ENGINES.map((id) => `${id}Runs`)]) {
+    const id = RUN_DIRECTORY_ENGINES.find((engine) => key === `${engine}Runs`);
+    const currentPeerJobs = id ? existingEngineJobIds(env, WORKSPACE_ENGINE_DESCRIPTORS.filter((entry) => entry.id === id)) : null;
     removed[key] = [];
     for (const candidate of dead[key]) {
       const current = key === "observations"
         ? observationDirectoryCandidate(candidate.dir, 30 * DAY_MS, true, currentJobs, Date.now())
-        : breadthRunCandidate(candidate.dir, currentBreadthJobs, Date.now());
+        : peerRunCandidate(candidate.dir, currentPeerJobs, Date.now());
       if (!current || current.mtimeMs !== candidate.mtimeMs) continue;
       fs.rmSync(candidate.dir, { recursive: true, force: true });
       removed[key].push(candidate);

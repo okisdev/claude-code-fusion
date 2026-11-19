@@ -39,7 +39,7 @@ const CODEX_FAILURE_PATTERNS = [
 const TRANSPORT_PERMISSION_PATTERN = /(?:sandbox|seatbelt|landlock).*(?:init|initializ|profile|policy)|(?:operation not permitted|\bEACCES\b|\bEPERM\b|permission denied).*(?:brief|prompt|transport|state|plugin|sandbox)|(?:brief|prompt|transport|state|plugin|sandbox).*(?:operation not permitted|\bEACCES\b|\bEPERM\b|permission denied)/i;
 const VERIFIED_VERSIONS_FILE = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "verified-versions.json");
 const FUSION_MANIFEST_FILE = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", ".claude-plugin", "plugin.json");
-const ENGINE_BIN_OVERRIDES = { codex: "CODEX_BIN", grok: "GROK_BIN", cursor: "CURSOR_AGENT_BIN", devin: "DEVIN_BIN" };
+const ENGINE_BIN_OVERRIDES = { codex: "CODEX_BIN", grok: "GROK_BIN", cursor: "CURSOR_AGENT_BIN", devin: "DEVIN_BIN", agy: "AGY_BIN" };
 
 function resolveLookbackMs(env = process.env) {
   const parsed = Number.parseFloat(String(env[LOOKBACK_ENV] ?? ""));
@@ -148,7 +148,7 @@ function engineFailure(record, now, lookbackMs, engine) {
   }
   const failureKind = normalizedRecordedFailureKind(record, record.failureKind);
   const timestamp = recordTimestamp(record);
-  if (!supportedBreakerFailure(record, failureKind) || timestamp == null || !isWithinLookback(timestamp, now, lookbackMs)) {
+  if ((!supportedBreakerFailure(record, failureKind) && !(engine === ENGINES.agy.id && failureKind === "policy")) || timestamp == null || !isWithinLookback(timestamp, now, lookbackMs)) {
     return null;
   }
   const version = record[ENGINES[engine].versionField];
@@ -220,7 +220,7 @@ function latestBreakerFailure(records, failureReader, now, lookbackMs, { scope =
     if (outcome.ignored) {
       continue;
     }
-    if (HARD_FAILURE_KINDS.has(outcome.failureKind) || outcome.failureKind === "permission") {
+    if (HARD_FAILURE_KINDS.has(outcome.failureKind) || outcome.failureKind === "permission" || (engine === ENGINES.agy.id && outcome.failureKind === "policy")) {
       immediate = { failureKind: outcome.failureKind, timestamp: outcome.timestamp, version: outcome.version };
       previousTransientFailure = null;
       repeatedTransientFailure = null;

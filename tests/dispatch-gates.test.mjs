@@ -6,7 +6,7 @@ import path from "node:path";
 import { test } from "node:test";
 
 import { BREADTH_ENGINE_IDS, ENGINES, ENGINE_IDS } from "../plugins/fusion/scripts/lib/engines.mjs";
-import { engineInfraDenial, latestUserRequestedBackground, latestUserText } from "../plugins/fusion/scripts/lib/lifecycle/dispatch.mjs";
+import { engineInfraDenial, injectedPeerDefaults, latestUserRequestedBackground, latestUserText } from "../plugins/fusion/scripts/lib/lifecycle/dispatch.mjs";
 import { renderHookResult } from "../plugins/fusion/scripts/lib/lifecycle/output.mjs";
 import { tagMessage } from "../plugins/fusion/scripts/lib/user-messages.mjs";
 import { createWorkerRecord, readPeerCapacityReservations, readWorkerRecords, updateWorkerRecord } from "../plugins/fusion/scripts/lib/worker-state.mjs";
@@ -119,6 +119,22 @@ test("Explore preserves explicit models and other agent types receive no model d
 test("Task launches share the Explore model default", async (t) => {
   const box = sandbox(t);
   assert.equal((await launch(box, { subagent_type: "Explore" }, { tool_name: "Task" })).updatedInput.model, "sonnet");
+});
+
+test("Antigravity dispatch fills every protected role and preserves explicit options", (t) => {
+  const box = sandbox(t);
+  for (const [role, effort] of [["independence", "high"], ["large-context", "high"], ["burst", "medium"]]) {
+    const prompt = `--cwd "${box.root}" -- agy-role: ${role} | acceptance: bounded result`;
+    for (const agent of [ENGINES.agy.rescueAgent, "agy-rescue"]) {
+      const injected = injectedPeerDefaults(prompt, agent, box.env);
+      assert.equal(injected.prompt, `--model gemini-4-neon --effort ${effort} ${prompt}`);
+      assert.match(injected.context, new RegExp(`agy ${role} lane default`));
+    }
+    assert.equal(injectedPeerDefaults(`--model gemini-4-argon --effort xhigh ${prompt}`, ENGINES.agy.rescueAgent, box.env), null);
+  }
+  for (const header of ["agy-role: diversity", "lane: agy", "goal: user selected task"]) {
+    assert.equal(injectedPeerDefaults(header, ENGINES.agy.rescueAgent, box.env), null);
+  }
 });
 
 test("large flagship write briefs stage without a model-specific gate", async (t) => {

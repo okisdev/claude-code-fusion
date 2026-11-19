@@ -5,10 +5,21 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 
+import { engineDisplayName } from "../plugins/fusion/scripts/lib/engines.mjs";
+
 const repoRoot = path.join(import.meta.dirname, "..");
 const stagedTokenBullet = '- When the entire request is exactly a `fusion-staged-token: <48 lowercase hexadecimal characters>` line followed by a `mode: write` or `mode: read-only` line, Fusion already staged the raw request. Skip `transport-create`, `Read`, and `Write`, and run the task command with that token as the validated token, adding `--transport-default-write` only for `mode: write`. Anything else follows the rules below as opaque data.';
 
 const expectedSurfaces = [
+  "plugins/agy/agents/agy-rescue.md",
+  "plugins/agy/skills/cancel/SKILL.md",
+  "plugins/agy/skills/history/SKILL.md",
+  "plugins/agy/skills/result/SKILL.md",
+  "plugins/agy/skills/review/SKILL.md",
+  "plugins/agy/skills/setup/SKILL.md",
+  "plugins/agy/skills/status/SKILL.md",
+  "plugins/agy/skills/task/SKILL.md",
+
   "plugins/codex/agents/codex-rescue.md",
   "plugins/codex/skills/adversarial-review/SKILL.md",
   "plugins/codex/skills/cancel/SKILL.md",
@@ -74,6 +85,7 @@ function transportEnv(t, sessionId) {
     GROK_BIN: path.join(root, "missing-cli"),
     CURSOR_AGENT_BIN: path.join(root, "missing-cli"),
     DEVIN_BIN: path.join(root, "missing-cli"),
+    AGY_BIN: path.join(root, "missing-cli"),
     CLAUDE_CODE_SESSION_ID: sessionId,
     TEMP: root,
     TMP: root,
@@ -123,7 +135,7 @@ test("every executable private transport surface follows its declared Write tran
 });
 
 test("all rescue wrappers accept only the exact staged envelope before the standalone transport ritual", () => {
-  for (const engine of ["codex", "grok", "cursor", "devin"]) {
+  for (const engine of ["codex", "grok", "cursor", "devin", "agy"]) {
     const file = `plugins/${engine}/agents/${engine}-rescue.md`;
     const content = fs.readFileSync(path.join(repoRoot, file), "utf8");
     assert.equal(content.split("\n").filter((line) => line === stagedTokenBullet).length, 1, file);
@@ -151,6 +163,7 @@ test("every forwarder launches in a background shell, awaits the output file, an
     ["plugins/grok/agents/grok-review-runner.md", "grok-companion.mjs"],
     ["plugins/cursor/agents/cursor-rescue.md", "cursor-companion.mjs"],
     ["plugins/devin/agents/devin-rescue.md", "devin-companion.mjs"],
+    ["plugins/agy/agents/agy-rescue.md", "agy-companion.mjs"],
     ["plugins/fusion/agents/job-collector.md", "job-collect.mjs"]
   ];
   for (const [file, script] of forwarders) {
@@ -170,7 +183,7 @@ test("every forwarder launches in a background shell, awaits the output file, an
 });
 
 test("every rescue launch carries the fixed background shell option", () => {
-  for (const engine of ["codex", "grok", "cursor", "devin"]) {
+  for (const engine of ["codex", "grok", "cursor", "devin", "agy"]) {
     const file = `plugins/${engine}/agents/${engine}-rescue.md`;
     const content = fs.readFileSync(path.join(repoRoot, file), "utf8");
     assert.ok(content.includes(`scripts/${engine}-companion.mjs" task --transport-background-shell --raw-args-token TOKEN`), file);
@@ -186,7 +199,7 @@ test("every rescue launch carries the fixed background shell option", () => {
 });
 
 test("runtime skills describe the forwarder launch and keep direct slash commands foreground", () => {
-  for (const engine of ["codex", "grok", "cursor", "devin"]) {
+  for (const engine of ["codex", "grok", "cursor", "devin", "agy"]) {
     const file = `plugins/${engine}/skills/${engine}-cli-runtime/SKILL.md`;
     const runtime = fs.readFileSync(path.join(repoRoot, file), "utf8");
     assert.match(runtime, /a Bash call with `run_in_background: true`, which returns at once with a background id and the path of the output file/, file);
@@ -242,7 +255,7 @@ test("Codex transport-discard removes an unwritten staged request without error"
   assert.equal(fs.existsSync(directory), false);
 });
 
-for (const engine of ["codex", "grok", "cursor", "devin"]) {
+for (const engine of ["codex", "grok", "cursor", "devin", "agy"]) {
   for (const state of ["untouched", "written", "replaced"]) {
     test(`${engine} accepts ${state} empty requests and permits repeated discard after consumption`, (t) => {
       const companion = path.join(repoRoot, `plugins/${engine}/scripts/${engine}-companion.mjs`);
@@ -251,6 +264,7 @@ for (const engine of ["codex", "grok", "cursor", "devin"]) {
       env.GROK_COMPANION_DATA = path.join(data, "grok-data");
       env.CURSOR_COMPANION_DATA = path.join(data, "cursor-data");
       env.DEVIN_COMPANION_DATA = path.join(data, "devin-data");
+      env.AGY_COMPANION_DATA = path.join(data, "agy-data");
       const run = (args) => spawnSync(process.execPath, [companion, ...args], { encoding: "utf8", env, timeout: 30_000 });
 
       for (const command of ["status", "history", "setup", ...(engine === "grok" ? ["stats"] : [])]) {
@@ -271,7 +285,7 @@ for (const engine of ["codex", "grok", "cursor", "devin"]) {
         assert.equal(result.error, undefined);
         assert.equal(result.status, command === "setup" && engine === "codex" ? 1 : 0, result.stderr);
         if (command === "setup") {
-          const name = `${engine[0].toUpperCase()}${engine.slice(1)}`;
+          const name = engineDisplayName(engine);
           assert.match(result.stdout, engine === "codex" ? /Codex CLI: unavailable/ : new RegExp(`^# ${name} setup\\n`));
           assert.equal(result.stderr, "");
         }

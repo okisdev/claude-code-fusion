@@ -1,5 +1,13 @@
 # changelog
 
+## 0.0.82
+
+- new `agy` plugin: Antigravity, Google's agent CLI, joins as the native lane for the Google model family on the user's Google AI subscription, so its quota is separate from every other lane. it drives `agy acp` (verified on 1.5.12) with `gemini-4-neon` by default and three protected roles: `independence` and `large-context` consult read only, and `burst` edits files inside an orchestrator owned worktree without running commands. contract in `docs/agy-contract.md`.
+- containment comes from the ACP permission policy, not from agy's `--sandbox`, which blocks credential reads but lets shell writes reach the home directory (measured). consult and review run in `default` mode and write runs in `accept-edits`; every permission request is refused except one read only command that passes an allowlist parser (literal POSIX quoting, per program and per git subcommand flag allowlists; quoting tricks such as `$'-exec'`, `git grep --open-files-in-pager`, and `rg -z` are refused). a forbidden tool ends the job as `policy`; a sandbox bypass request is refused, and a bypassed command that still completes ends the job as `policy`.
+- isolation keeps the real `HOME`, because agy's login lives in the macOS login keychain, and moves settings, MCP, and conversations to a private `--gemini-dir`, reset before every run. a private failing `open` leads the child `PATH`, so a run that needs a login fails as `auth` instead of opening a browser window. `DEVELOPER_DIR` is set from `xcode-select -p` on macOS, because the sandbox denies the xcrun link the `/usr/bin/git` shim reads and every `git` command failed without it.
+- fusion routes the Google family to Antigravity: `agy-role:` headers, lane defaults and capability rows for gemini 4 neon, hydrogen, and argon, stats, breaker, smoke, doctor, and ultra. breadth `diversity` no longer seats a Google model, and a panel fills a missing track with Antigravity before the breadth engine.
+- devin no longer fails a resumed session as `policy` because `session/load` replayed an earlier tool call; tool policy still applies to every update, and a job that failed as `policy` is no longer offered for `--resume-last`.
+
 ## 0.0.81
 
 - every row `fusion-stats --unsettled` lists can now be settled with `--record`, so the list can reach zero. one host had 260 rows it could not clear.

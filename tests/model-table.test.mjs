@@ -54,8 +54,8 @@ test("Session context table renders scores without Notes and points to config", 
   assert.match(table, /^\|---\|---\|---\|---:\|---:\|---:\|$/m);
   assert.match(table, /^\| codex \| codex \| openai \| 5 \| 4 \| 5 \|$/m);
   assert.doesNotMatch(table, /primary implementation lane|\| Notes \|/);
-  assert.match(table, /^Lane defaults: codex quick gpt-6-sol@xhigh, volume gpt-6-sol@high, flagship gpt-6\.1-sol@xhigh; grok burst grok-4\.7-build-fast@low, independence grok-4\.7-build-fast@low, live-web grok-4\.7-build-fast@high, large-context grok-4\.6@medium; cursor diversity muse-spark-1\.3@xhigh, burst composer-2\.5@default\.$/m);
-  assert.match(table, /\| grok-fast \| grok \| xai \| 3 \| 3 \| 5 \|\nBreadth engine: Cursor \(cursor\); its briefs go to cursor:cursor-rescue with `cursor-role: diversity` or `cursor-role: burst`, and Devin holds no routing seat\.\nModel notes \(benchmarks, prices, latency\) live in model-routing\.json; `\/fusion:config` shows them\.\n\nLane defaults: [^\n]+\n\nScores feed/);
+  assert.match(table, /^Lane defaults: codex quick gpt-6-sol@xhigh, volume gpt-6-sol@high, flagship gpt-6\.1-sol@xhigh; grok burst grok-4\.7-build-fast@low, independence grok-4\.7-build-fast@low, live-web grok-4\.7-build-fast@high, large-context grok-4\.6@medium; cursor diversity muse-spark-1\.3@xhigh, burst composer-2\.5@default; agy independence gemini-4-neon@high, large-context gemini-4-neon@high, burst gemini-4-neon@medium\.$/m);
+  assert.match(table, /\| grok-fast \| grok \| xai \| 3 \| 3 \| 5 \|\nBreadth engine: Cursor \(cursor\); its briefs go to cursor:cursor-rescue with `cursor-role: diversity` or `cursor-role: burst`, and Devin holds no routing seat\.\nBreadth diversity excludes the claude family and the google family served by Antigravity \(agy\); route google consults to agy:agy-rescue\.\nModel notes \(benchmarks, prices, latency\) live in model-routing\.json; `\/fusion:config` shows them\.\n\nLane defaults: [^\n]+\n\nScores feed/);
   assert.match(
     table,
     /^Scores feed the routing priorities above: intelligence proxies correctness and safety, taste is user facing quality, cost applies only as the final tie breaker\.$/m
@@ -84,7 +84,8 @@ test("Routing defaults merge file choices over the seed and preserve only suppor
     codex: { ...DEFAULT_ROUTING_DEFAULTS.codex, quick: { model: "gpt-6-sol", effort: "high" } },
     grok: { ...DEFAULT_ROUTING_DEFAULTS.grok, independence: { model: "grok-4.7", effort: "max" } },
     cursor: DEFAULT_ROUTING_DEFAULTS.cursor,
-    devin: DEFAULT_ROUTING_DEFAULTS.devin
+    devin: DEFAULT_ROUTING_DEFAULTS.devin,
+    agy: DEFAULT_ROUTING_DEFAULTS.agy
   });
   assert.match(renderModelTableFromFile(file), /Lane defaults: codex quick gpt-6-sol@high, volume gpt-6-sol@high, flagship gpt-6\.1-sol@xhigh; grok burst grok-4\.7-build-fast@low, independence grok-4\.7@max/);
 });
@@ -229,4 +230,25 @@ test("Model routing validation rejects duplicate lane and id pairs", () => {
     ]
   });
   assert.strictEqual(distinctLanes.ok, true);
+});
+
+test("Breadth diversity excludes Google and Claude families for both breadth engines", () => {
+  for (const lane of ["cursor", "devin"]) {
+    for (const family of ["google", "anthropic", "claude", "meta", "moonshot"]) {
+      const row = { id: "family-model", lane, family, intelligence: 4, taste: 3, cost: 4 };
+      const data = { ...ROUTING, models: [...ROUTING.models, row], defaults: { [lane]: { diversity: { model: row.id, effort: "high" } } } };
+      const result = validateModelRoutingData(data);
+      if (["google", "anthropic", "claude"].includes(family)) {
+        assert.strictEqual(result.ok, false);
+        assert.match(result.reason, /family eligible for breadth diversity/);
+        assert.match(result.reason, /google family served by Antigravity/);
+      } else {
+        assert.strictEqual(result.ok, true, result.reason);
+      }
+      assert.strictEqual(validateModelRoutingData({ ...data, defaults: undefined }).ok, true);
+    }
+    const table = renderModelTableFromContents(JSON.stringify({ ...ROUTING, breadth: lane }));
+    assert.match(table, /Breadth diversity excludes the claude family and the google family served by Antigravity \(agy\)/);
+    assert.match(table, /agy independence gemini-4-neon@high, large-context gemini-4-neon@high, burst gemini-4-neon@medium/);
+  }
 });

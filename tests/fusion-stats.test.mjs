@@ -104,7 +104,7 @@ function writeCursorJob(dataDir, cwd, id, fields) {
 
 function runtimeEnv(env, extraEnv = {}) {
   const inherited = Object.fromEntries(
-    Object.entries(process.env).filter(([key]) => key !== "HOME" && key !== "CLAUDE_CODE_SESSION_ID" && !/^(?:FUSION|GROK|CODEX|CURSOR|DEVIN)_/.test(key))
+    Object.entries(process.env).filter(([key]) => key !== "HOME" && key !== "CLAUDE_CODE_SESSION_ID" && !/^(?:FUSION|GROK|CODEX|CURSOR|DEVIN|AGY)_/.test(key))
   );
   const root = path.join(path.resolve(env.cwd), ".fusion-stats-runtime");
   return {
@@ -122,6 +122,7 @@ function runtimeEnv(env, extraEnv = {}) {
     GROK_COMPANION_DATA: path.join(root, "grok-data"),
     CURSOR_COMPANION_DATA: path.join(root, "cursor-data"),
     DEVIN_COMPANION_DATA: path.join(root, "devin-data"),
+    AGY_COMPANION_DATA: path.join(root, "agy-data"),
     GROK_HOME: path.join(root, "grok-home"),
     CODEX_COMPANION_DATA: path.join(root, "codex-data"),
     CODEX_HOME: path.join(root, "codex-home"),
@@ -701,7 +702,7 @@ test("Grok job records contribute resolved and unknown models without a companio
 });
 
 test("file-based engine stats use the descriptor registry", () => {
-  assert.deepStrictEqual(Object.keys(FILE_ENGINE_DESCRIPTORS), ["grok", "codex", "cursor", "devin"]);
+  assert.deepStrictEqual(Object.keys(FILE_ENGINE_DESCRIPTORS), ["grok", "codex", "cursor", "devin", "agy"]);
   assert.strictEqual(FILE_ENGINE_DESCRIPTORS.codex.stateEnvVar, "FUSION_CODEX_STATE");
   assert.strictEqual(FILE_ENGINE_DESCRIPTORS.codex.defaultStateRoot({}), path.join(os.homedir(), ".claude", "plugins", "data", "codex-claude-code-fusion", "state"));
   assert.strictEqual(FILE_ENGINE_DESCRIPTORS.codex.defaultStateRoot({ CODEX_COMPANION_DATA: "/adapter-data" }), "/adapter-data/state");
@@ -1266,7 +1267,7 @@ test("pruneDeadWorkspaces never touches a workspace with any running job even wi
 
 test("WORKSPACE_ENGINE_DESCRIPTORS covers every peer engine", () => {
   const ids = WORKSPACE_ENGINE_DESCRIPTORS.map((descriptor) => descriptor.id);
-  assert.deepStrictEqual(ids.sort(), ["codex", "cursor", "devin", "grok"]);
+  assert.deepStrictEqual(ids.sort(), ["agy", "codex", "cursor", "devin", "grok"]);
 });
 
 test("prune-dead treats any unreadable job record as unsafe for the whole workspace", (t) => {
@@ -5018,4 +5019,74 @@ test("wrapper delivery groups recent rescue records by version and honors scope"
   const result = runDirect({ cwd: dir, codexState: env.FUSION_CODEX_STATE }, ["--json"], env);
   assert.strictEqual(result.status, 0, result.stderr);
   assert.deepStrictEqual(JSON.parse(result.stdout).wrapperDelivery, report.wrapperDelivery);
+});
+
+test("Antigravity stats retain resolved effort, subscription billing, tokens, and unsettled evidence", (t) => {
+  const dir = sandbox(t);
+  const data = path.join(dir, "agy-data");
+  const jobs = path.join(data, "state", grokWorkspaceSlug(dir), "jobs");
+  fs.mkdirSync(jobs, { recursive: true });
+  const jobId = "a".repeat(32);
+  fs.writeFileSync(path.join(jobs, `${jobId}.json`), JSON.stringify({
+    id: jobId, engine: "agy", cwd: dir, status: "done", role: "independence", mode: "consult",
+    resolvedModel: "gemini-4-neon", requestedEffort: "default", resolvedEffort: "high", effortApplied: true,
+    claudeSessionId: "agy-session", createdAt: "2026-10-13T00:00:00.000Z", billingPool: "subscription",
+    usage: { inputTokens: 500, outputTokens: 100, cachedReadTokens: 100, cachedWriteTokens: 20, thoughtTokens: 50, totalTokens: 650 }
+  }));
+  const options = { AGY_COMPANION_DATA: data };
+  const base = { cwd: dir, codexState: path.join(dir, "missing-codex") };
+  const result = run(base, ["--json"], options);
+  assert.strictEqual(result.status, 0, result.stderr);
+  const report = JSON.parse(result.stdout);
+  assert.strictEqual(report.agy.available, true);
+  assert.deepStrictEqual(report.agy.byModel, { "gemini-4-neon@high (subscription)": 1 });
+  assert.deepStrictEqual(report.agy.tokenUsage.totals, { inputTokens: 380, outputTokens: 150, cacheReadTokens: 100, cacheWriteTokens: 20, totalTokens: 650 });
+  assert.match(renderFusionStats(report), /## Antigravity[\s\S]*gemini-4-neon@high \(subscription\): 1/);
+  const session = run(base, ["--session", "agy-session", "--json"], options);
+  assert.deepStrictEqual(JSON.parse(session.stdout).engines.agy.byStatus, { done: 1 });
+  const trace = run(base, ["--trace", "--session", "agy-session", "--json"], options);
+  assert.deepStrictEqual(JSON.parse(trace.stdout).timeline.filter((row) => row.engine === "agy").map((row) => [row.model, row.effort]), [["gemini-4-neon", "high"]]);
+  const unsettled = run(base, ["--unsettled", "--all", "--json"], options);
+  assert.deepStrictEqual(JSON.parse(unsettled.stdout).unsettled.filter((row) => row.engine === "agy").map((row) => row.id), [jobId]);
+  const argsFile = path.join(dir, "acceptance-args.json");
+  const companion = path.join(dir, "acceptance.mjs");
+  fs.writeFileSync(companion, `import fs from "node:fs"; fs.writeFileSync(${JSON.stringify(argsFile)}, JSON.stringify(process.argv.slice(2)));\n`);
+  const settled = runDirect(base, ["--record", `${jobId}=accepted`], { ...options, FUSION_AGY_COMPANION: companion });
+  assert.strictEqual(settled.status, 0, settled.stderr);
+  assert.match(settled.stdout, /Recorded accepted for Antigravity job/);
+  assert.deepStrictEqual(JSON.parse(fs.readFileSync(argsFile, "utf8")), ["record-acceptance", "--job-id", jobId, "--acceptance", "accepted", "--source", "main-loop"]);
+});
+
+test("Antigravity token evidence rejects inconsistent counters without inventing totals", () => {
+  const resolve = FILE_ENGINE_DESCRIPTORS.agy.resolveTokenUsage;
+  const usage = { inputTokens: 500, outputTokens: 100, cachedReadTokens: 100, cachedWriteTokens: 20, thoughtTokens: 50, totalTokens: 650 };
+  for (const invalid of [{ totalTokens: 649 }, { cachedWriteTokens: 401 }, { thoughtTokens: -1 }, { cachedReadTokens: null }]) {
+    assert.deepStrictEqual(resolve({ usage: { ...usage, ...invalid } }), { availability: "partial", usage: null });
+  }
+  const included = resolve({ usage: { ...usage, totalTokens: 600 } });
+  assert.strictEqual(included.availability, "available");
+  assert.strictEqual(included.usage.outputTokens, 100);
+});
+
+test("Antigravity pruning removes orphan runs while preserving runs with job records", (t) => {
+  const dir = sandbox(t);
+  const data = path.join(dir, "agy-data");
+  const jobs = path.join(data, "state", "workspace", "jobs");
+  fs.mkdirSync(jobs, { recursive: true });
+  fs.writeFileSync(path.join(jobs, "retained.json"), JSON.stringify({ id: "retained", cwd: dir, status: "done" }));
+  for (const id of ["orphan", "retained", "recent"]) {
+    const run = path.join(data, "runs", id);
+    fs.mkdirSync(run, { recursive: true });
+    const old = new Date(Date.now() - 2 * 60 * 60 * 1000);
+    if (id !== "recent") fs.utimesSync(run, old, old);
+  }
+  const options = { AGY_COMPANION_DATA: data };
+  const base = { cwd: dir, codexState: path.join(dir, "missing-codex") };
+  const dry = run(base, ["--prune-dead", "--json"], options);
+  assert.strictEqual(dry.status, 0, dry.stderr);
+  assert.deepStrictEqual(JSON.parse(dry.stdout).dead.agyRuns.map((row) => row.jobId), ["orphan"]);
+  const applied = run(base, ["--prune-dead", "--yes", "--json"], options);
+  assert.strictEqual(applied.status, 0, applied.stderr);
+  assert.strictEqual(fs.existsSync(path.join(data, "runs", "orphan")), false);
+  for (const id of ["retained", "recent"]) assert.strictEqual(fs.existsSync(path.join(data, "runs", id)), true);
 });
