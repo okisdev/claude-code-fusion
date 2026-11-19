@@ -119,7 +119,7 @@ const { cancelJobRecord, run } = createCompanionCommands({
   cancelledFields: (outcome) => ({ sessionId: outcome.sessionId, usage: outcome.usage, ...outcomeFields(outcome) }),
   modelDrift: () => null,
   driftWarning: () => "model_mismatch",
-  failureMessage: (outcome) => outcome.policyViolation ? `Antigravity called forbidden tool ${outcome.policyViolation.tool}${outcome.policyViolation.bypassSandbox ? " with sandbox bypass" : ""}.` : outcome.selectionError?.message || outcome.setupError || outcome.rpcError?.message,
+  failureMessage: (outcome) => outcome.policyViolation ? `Antigravity called forbidden tool ${outcome.policyViolation.tool}${outcome.policyViolation.bypassSandbox ? " with sandbox bypass" : ""}.` : outcome.selectionError?.message || outcome.setupError || outcome.rpcError?.message || (outcome.permissionsRejected > 0 && !outcome.resultText?.trim() ? `Antigravity refused ${outcome.permissionsRejected} permission request(s) and returned no result, so the turn ended early.` : null),
   classifyFailure: classifyAgyFailure,
   prepareJob, runJob, waitForCleanup, handleModels, handleSetup
 });

@@ -1842,6 +1842,27 @@ test("audit rotates by size without losing write or replay records", (t) => {
   assert.strictEqual(audit.events.filter((event) => event.event === "deny").length, 0);
 });
 
+test("audit malformed counts include only segments and timestamps overlapping the window", (t) => {
+  const sandbox = makeSandbox(t);
+  fs.mkdirSync(sandbox.auditDir, { recursive: true });
+  const event = { schemaVersion: 1, at: "2026-11-18T10:00:00.000Z", session: "session-1", event: "dispatch", lane: "codex", tool: "Agent" };
+  for (const [day, lines] of [
+    ["2026-11-07", ["{old", "null", JSON.stringify(event)]],
+    ["2026-11-16", ["{boundary"]],
+    ["2026-11-19", ["{recent", JSON.stringify({ at: event.at }), JSON.stringify({ at: "2026-11-07T10:00:00.000Z" }), JSON.stringify({ at: "2026-11-20T10:00:00.000Z" })]],
+    ["2026-11-20", ["{future"]]
+  ]) {
+    fs.writeFileSync(path.join(sandbox.auditDir, `events-${day}.jsonl`), `${lines.join("\n")}\n`);
+  }
+  const sinceMs = Date.parse("2026-11-16T12:00:00.000Z");
+  const untilMs = Date.parse("2026-11-19T12:00:00.000Z");
+  const scoped = readAuditEvents({ auditDir: sandbox.auditDir, sinceMs, untilMs });
+  assert.strictEqual(scoped.malformedCount, 3);
+  assert.deepStrictEqual(scoped.events, [event]);
+  assert.strictEqual(readAuditEvents({ auditDir: sandbox.auditDir, since: new Date(sinceMs).toISOString(), until: new Date(untilMs).toISOString() }).malformedCount, 3);
+  assert.strictEqual(readAuditEvents({ auditDir: sandbox.auditDir }).malformedCount, 8);
+});
+
 test("audit enforces its rotated file cap", (t) => {
   const sandbox = makeSandbox(t);
   const extraEnv = { FUSION_INLINE_GUARD_AUDIT_MAX_BYTES: "1", FUSION_INLINE_GUARD_AUDIT_MAX_FILES: "2" };

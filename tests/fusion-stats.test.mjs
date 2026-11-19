@@ -44,6 +44,7 @@ import { MESSAGE_REGISTRY, messageCode } from "../plugins/fusion/scripts/lib/use
 import { applyQueuedVerdict, createWorkerRecord, readWorkerRecord, recordWorkerAcceptance, reopenWorkerContinuation, updateWorkerRecord, workerElapsedMs, workerRecordFile } from "../plugins/fusion/scripts/lib/worker-state.mjs";
 import { isStrictDirectRecordArguments, parseRecordArguments, validateArgumentShape } from "../plugins/fusion/scripts/lib/stats/arguments.mjs";
 import { settlementCommand } from "../plugins/fusion/scripts/lib/lifecycle/stop.mjs";
+import { readStatsAuditEvents } from "../plugins/fusion/scripts/lib/stats/fleet.mjs";
 import { gitIsolation } from "./lib/git-fixture.mjs";
 import { createJobRecord as createGrokJobRecord } from "../plugins/grok/scripts/lib/state.mjs";
 
@@ -3626,6 +3627,27 @@ test("audit reports verification evidence without exposing command output", (t) 
   assert.doesNotMatch(rendered, /tests\/|pass 1073|fail 0/);
 });
 
+test("three day audit reports count malformed entries only in overlapping segments and timestamps", (t) => {
+  const dir = sandbox(t);
+  const auditDir = path.join(dir, "audit");
+  fs.mkdirSync(auditDir);
+  const event = { schemaVersion: 1, at: "2026-11-18T10:00:00.000Z", session: "session-a", event: "dispatch", lane: "codex", tool: "Agent" };
+  for (const [day, lines] of [
+    ["2026-11-07", ["{old", "null", JSON.stringify(event)]],
+    ["2026-11-16", ["{boundary"]],
+    ["2026-11-19", ["{recent", JSON.stringify({ at: event.at }), JSON.stringify({ at: "2026-11-07T10:00:00.000Z" }), JSON.stringify({ at: "2026-11-20T10:00:00.000Z" })]],
+    ["2026-11-20", ["{future"]]
+  ]) {
+    fs.writeFileSync(path.join(auditDir, `events-${day}.jsonl`), `${lines.join("\n")}\n`);
+  }
+  const env = { FUSION_INLINE_GUARD_AUDIT_DIR: auditDir };
+  const report = buildAuditReport({ env, days: 3, now: Date.parse("2026-11-19T12:00:00.000Z") });
+  assert.strictEqual(report.malformedCount, 3);
+  assert.strictEqual(report.totalEvents, 1);
+  assert.match(renderAuditReport(report), /Malformed audit entries skipped: 3/);
+  assert.strictEqual(readStatsAuditEvents(env).malformedCount, 8);
+});
+
 test("session stats and trace fall back to the long-term audit after short-lived state expires", (t) => {
   const dir = sandbox(t);
   const auditDir = path.join(dir, "audit");
@@ -5066,6 +5088,18 @@ test("Antigravity token evidence rejects inconsistent counters without inventing
   const included = resolve({ usage: { ...usage, totalTokens: 600 } });
   assert.strictEqual(included.availability, "available");
   assert.strictEqual(included.usage.outputTokens, 100);
+});
+
+test("Antigravity stats preserve permission failure kinds", (t) => {
+  const dir = sandbox(t);
+  const data = path.join(dir, "agy-data");
+  const jobs = path.join(data, "state", grokWorkspaceSlug(dir), "jobs");
+  fs.mkdirSync(jobs, { recursive: true });
+  const id = "b".repeat(32);
+  fs.writeFileSync(path.join(jobs, `${id}.json`), JSON.stringify({ id, engine: "agy", cwd: dir, status: "error", failureKind: "permission", permissionsRejected: 1, resultText: "" }));
+  const stats = fileBasedEngineStats(FILE_ENGINE_DESCRIPTORS.agy, { env: { AGY_COMPANION_DATA: data }, cwd: dir });
+  assert.deepStrictEqual(stats.byStatus, { error: 1 });
+  assert.deepStrictEqual(stats.byFailureKind, { permission: 1 });
 });
 
 test("Antigravity pruning removes orphan runs while preserving runs with job records", (t) => {

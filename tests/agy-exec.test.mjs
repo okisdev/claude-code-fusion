@@ -189,6 +189,17 @@ test("other agent requests receive method-not-found errors", async (t) => {
   assert.deepEqual(log.messages.at(-1), { jsonrpc: "2.0", id: "client-request", error: { code: -32601, message: "Method not found" } });
 });
 
+test("permission refusals without result text fail even after a successful end_turn", async (t) => {
+  for (const scenario of ["permission_empty", "permission_whitespace"]) {
+    const { result } = await fakeRun(t, scenario);
+    assert.equal(result.exitCode, 0);
+    assert.equal(result.stopReason, "end_turn");
+    assert.equal(result.permissionsRejected, 1);
+    assert.equal(result.resultText.trim(), "");
+    assert.equal(classifyAgyFailure(result), "permission");
+  }
+});
+
 test("forbidden tools terminate before initialization, during updates, and after the result", async (t) => {
   for (const scenario of ["forbidden_before_init", "forbidden_tool", "forbidden_update", "forbidden_after_result"]) {
     let pid;

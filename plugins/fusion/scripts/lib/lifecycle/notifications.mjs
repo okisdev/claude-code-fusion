@@ -247,6 +247,7 @@ function finalReportFromTranscript(transcriptPath) {
   }
   const lines = text.split("\n");
   let toolResults = null;
+  let pendingHandback = null;
   const alreadyDelivered = new Set();
   for (let index = lines.length - 1; index >= 0; index -= 1) {
     const line = lines[index].replace(/\r$/, "");
@@ -262,11 +263,19 @@ function finalReportFromTranscript(transcriptPath) {
     const content = transcriptEntryContent(entry);
     if (entry?.type === "assistant") {
       const calls = content.filter((block) => block?.type === "tool_use");
+      if (pendingHandback) {
+        if (calls.some((call) => call.name === SUBAGENT_HANDBACK_TOOL && toolResults?.get(call.id) === false)) return null;
+        continue;
+      }
       if (calls.length > 0) {
         const [call] = calls;
-        const handbackMessage = calls.length === 1 && call.name === SUBAGENT_HANDBACK_TOOL && typeof call.input?.message === "string" && call.input.message.length > 0 ? call.input.message : null;
+        const handbackMessage = calls.length === 1 && call.name === SUBAGENT_HANDBACK_TOOL && typeof call.input?.message === "string" && call.input.message.trim().length > 0 ? call.input.message : null;
         if (handbackMessage && toolResults?.get(call.id) === false) {
           return { text: handbackMessage, handback: true };
+        }
+        if (handbackMessage && !toolResults?.has(call.id)) {
+          pendingHandback = { text: handbackMessage, handback: true };
+          continue;
         }
         return handbackMessage && alreadyDelivered.has(call.id) ? { text: handbackMessage, handback: false } : null;
       }
@@ -289,7 +298,7 @@ function finalReportFromTranscript(transcriptPath) {
       }
     }
   }
-  return null;
+  return pendingHandback;
 }
 
 function strandedHandbackFromTranscript(transcriptPath) {
@@ -315,10 +324,11 @@ function strandedHandbackFromTranscript(transcriptPath) {
       } else if (entry?.type === "user" && block?.type === "tool_result") {
         const refused = block.is_error === true;
         stranded ||= (placeholders.has(block.tool_use_id) && !refused) || (refused && HANDBACK_ALREADY_DELIVERED_PATTERN.test(taskNotificationTextParts(block.content).join("\n")));
+        placeholders.delete(block.tool_use_id);
       }
     }
   }
-  return stranded;
+  return stranded || placeholders.size > 0;
 }
 
 function finalAssistantTextFromTranscript(transcriptPath) {

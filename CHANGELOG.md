@@ -1,5 +1,12 @@
 # changelog
 
+## 0.0.83
+
+- a Claude worker that dies on a Claude usage limit is now classified as `quota`, so the dispatch gate holds same family dispatches until the reset. the classifier only matched the limit phrase at the start of a line, but the harness reports it mid line (`... API error: You've hit your Fable limit · resets Nov 21 at 12am (Asia/Taipei)`); one host sent nine deep-reasoner dispatches into an exhausted Fable quota over two days. the mid line form is read only from the harness failure summary, never from a worker's own report, so a report quoting the message stays healthy. the `Mon DD at Ham (TZ)` reset form is parsed, a reset that passed within the last week stays in the past instead of rolling a year ahead, and a repeated local time on a DST fold resolves to the next occurrence.
+- a wrapper whose report arrived through `SubagentHandback` is no longer blocked with a relay retry when the stop hook runs before the handback's tool result reaches the transcript. a pending second handback after an earlier delivered one still counts as undelivered, because the harness delivers only the first. on the host running auto mode, 28 to 56 percent of wrappers were retried after a delivered report.
+- an Antigravity run that refuses a permission request and returns an empty result now fails as `permission` with a message saying so, instead of ending `done` with nothing to deliver.
+- `fusion-stats --audit --days <n>` and the fleet report count malformed audit lines only inside the requested window; a three day report showed 880 malformed lines that all came from months old segments.
+
 ## 0.0.82
 
 - new `agy` plugin: Antigravity, Google's agent CLI, joins as the native lane for the Google model family on the user's Google AI subscription, so its quota is separate from every other lane. it drives `agy acp` (verified on 1.5.12) with `gemini-4-neon` by default and three protected roles: `independence` and `large-context` consult read only, and `burst` edits files inside an orchestrator owned worktree without running commands. contract in `docs/agy-contract.md`.
