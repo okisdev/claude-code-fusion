@@ -1,5 +1,14 @@
 # changelog
 
+## 0.0.81
+
+- every row `fusion-stats --unsettled` lists can now be settled with `--record`, so the list can reach zero. one host had 260 rows it could not clear.
+- an explicit `unverified` verdict settles a job. `--unsettled` used to keep listing jobs already recorded as `unverified`; only the collector's placeholder verdict still counts as unsettled.
+- old grok jobs with short ids (such as `3a13daf9`) are accepted by `--record` and grok `record-acceptance`, using the id grammar the grok job store already uses. a missing or bad id in a multi id `--record` call no longer stops the other ids from settling.
+- a collector record with no verified peer identity can be recorded as `unverified` or `rejected`; `accepted` is still refused, now with a clean error instead of a stack trace.
+- when an engine job record no longer exists, its acceptance delivery is marked skipped and is not retried at every stop hook. `--record` succeeds and says engine settlement was skipped.
+- the setup, status, result, cancel, history, and stats skills spell out the full `transport-create` and `transport-discard` commands, as the task skills already did.
+
 ## 0.0.80
 
 - the codex and grok plugin job monitors are gone. they started at session start and never exited, so every session that loaded the plugins kept live background work, never looked idle, and old versions' monitors piled up across upgrades. a manual `--background` receipt now names one Monitor watch on `<engine>-companion.mjs watch --job <id>` with the duration to request; the watch prints the job's completion line and exits, reports `orphaned` or `cleanup required` when the worker is gone or past its deadline, and exits with a re-arm line before the 30 minute Monitor cap. fusion orchestrated jobs never depended on the monitors.

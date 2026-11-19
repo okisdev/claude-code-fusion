@@ -40,8 +40,15 @@ function sandbox(t) {
 function envFor(box, extra = {}) {
   return {
     ...process.env,
+    HOME: box.root,
     FUSION_WORKER_STATE_DIR: box.state,
     FUSION_DATA_DIR: path.join(box.root, "fusion-data"),
+    FUSION_CODEX_STATE: path.join(box.root, "codex-state"),
+    FUSION_CODEX_STATE_DIR: path.join(box.root, "codex-state-compat"),
+    CODEX_COMPANION_DATA: path.join(box.root, "codex-data"),
+    GROK_COMPANION_DATA: path.join(box.root, "grok-data"),
+    CURSOR_COMPANION_DATA: path.join(box.root, "cursor-data"),
+    DEVIN_COMPANION_DATA: path.join(box.root, "devin-data"),
     FUSION_GROK_COMPANION: path.join(import.meta.dirname, "fixtures", "healthy-grok-companion.mjs"),
     ...extra,
   };
@@ -109,6 +116,12 @@ function writeCodexAcceptanceCompanion(box) {
   return companion;
 }
 
+function seedCodexJobs(box, ids) {
+  const directory = path.join(envFor(box).FUSION_CODEX_STATE, "workspace", "jobs");
+  fs.mkdirSync(directory, { recursive: true });
+  for (const id of ids) fs.writeFileSync(path.join(directory, `${id}.json`), JSON.stringify({ id, workspaceRoot: box.cwd, status: "done" }));
+}
+
 function brief() {
   return "fusion-brief: v1\ncontext-mode: isolated\ngoal: implement one fix\nscope: src/a.ts\nverification: node --test\n";
 }
@@ -145,6 +158,41 @@ function createSettleOnlyRecord(box, taskId) {
   const collectedAt = new Date().toISOString();
   return updateWorkerRecord(worker.taskId, envFor(box), (current) => ({ ...current, transportStatus: "done", collectedAt, collectionMethod: WORKER_COLLECTION_METHODS.SUBAGENT_STOP, awaitingVerdict: true, awaitingVerdictArmedAt: collectedAt }));
 }
+
+test("Stop and SubagentStop retire missing engine deliveries even after the retry cap", (t) => {
+  const box = sandbox(t);
+  const env = envFor(box, { HOME: box.root, CURSOR_COMPANION_DATA: path.join(box.root, "cursor"), FUSION_ACCEPTANCE_RETRY_BACKOFF_MS: "60000" });
+  const jobId = "58b39b7735eb35642d878b6e9915bded";
+  const taskId = `fusion-${"a".repeat(24)}`;
+  createWorkerRecord({ taskId, sessionId: "session-1", agentType: "cursor:cursor-rescue", completionContract: "transport", workspaceRoot: box.cwd }, env);
+  updateWorkerRecord(taskId, env, (record) => ({
+    ...record,
+    transportStatus: "done",
+    peerEngine: "cursor",
+    peerJobId: jobId,
+    acceptance: "unverified",
+    acceptanceSource: "main-loop",
+    acceptanceRecordedAt: "2026-10-02T06:34:38.599Z",
+    awaitingVerdict: false,
+    engineSettlementError: "previous failure",
+    engineAcceptanceDelivery: {
+      status: "failed", attempts: 5, lastError: "previous failure",
+      entries: [{ engine: "cursor", jobId, id: "old-delivery", acceptance: "unverified", source: "main-loop", status: "failed", attempts: 5, failures: 5, lastError: "previous failure", updatedAt: new Date().toISOString() }]
+    }
+  }));
+  for (const hook_event_name of ["Stop", "SubagentStop", "Stop"]) {
+    const result = run(box, { hook_event_name, session_id: "session-1", cwd: box.cwd, transcript_path: box.transcript, agent_id: "other-worker", agent_type: "fusion:claude-worker" }, env);
+    assert.strictEqual(result.status, 0, result.stderr);
+    const worker = record(box);
+    assert.strictEqual(worker.acceptance, "unverified");
+    assert.strictEqual(worker.acceptanceRecordedAt, "2026-10-02T06:34:38.599Z");
+    assert.strictEqual(worker.engineAcceptanceDelivery.status, "skipped");
+    assert.strictEqual(worker.engineAcceptanceDelivery.attempts, 5);
+    assert.strictEqual(worker.engineAcceptanceDelivery.entries[0].skipReason, "record-missing");
+    assert.strictEqual(worker.engineSettlementError, undefined);
+    assert.deepStrictEqual(readWorkerSessionState("session-1", env).engineAcceptanceTaskIds, []);
+  }
+});
 
 function createAcceptedCollectedRecord(box, taskId, agentId, agentType = "fusion:claude-worker") {
   const worker = createWorkerRecord({
@@ -1067,6 +1115,7 @@ test("SendMessage collects a ready peer round without a parent notification befo
   const box = sandbox(t);
   const firstJobId = "a".repeat(32);
   const nextJobId = "b".repeat(32);
+  seedCodexJobs(box, [firstJobId, nextJobId]);
   const firstTranscript = path.join(box.root, "first-peer.jsonl");
   const nextTranscript = path.join(box.root, "next-peer.jsonl");
   const argsFile = path.join(box.root, "peer-acceptance.jsonl");
@@ -6229,6 +6278,7 @@ test("queued accepted verdicts re-arm settlement after cancelled and incomplete 
 test("a queued rejected done transition records the linked engine verdict with a semantic failure kind", (t) => {
   const box = sandbox(t);
   const peerJobId = "d".repeat(32);
+  seedCodexJobs(box, [peerJobId]);
   const argsFile = path.join(box.root, "codex-companion-args.json");
   const companion = writeCodexAcceptanceCompanion(box);
   const workerTranscript = path.join(box.root, "queued-peer-notification.output");
@@ -6267,6 +6317,7 @@ test("next queued verdict settles every unsettled peer job without resettling ea
   const earlierId = "a".repeat(32);
   const firstId = "b".repeat(32);
   const nextId = "c".repeat(32);
+  seedCodexJobs(box, [earlierId, firstId, nextId]);
   const argsFile = path.join(box.root, "codex-companion-args.jsonl");
   const companion = path.join(box.root, "codex-companion-log.mjs");
   fs.writeFileSync(companion, 'import fs from "node:fs";\nfs.appendFileSync(process.env.FUSION_TEST_CODEX_COMPANION_ARGS, JSON.stringify(process.argv.slice(2)) + "\\n");\n');

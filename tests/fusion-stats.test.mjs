@@ -45,6 +45,7 @@ import { applyQueuedVerdict, createWorkerRecord, readWorkerRecord, recordWorkerA
 import { isStrictDirectRecordArguments, parseRecordArguments, validateArgumentShape } from "../plugins/fusion/scripts/lib/stats/arguments.mjs";
 import { settlementCommand } from "../plugins/fusion/scripts/lib/lifecycle/stop.mjs";
 import { gitIsolation } from "./lib/git-fixture.mjs";
+import { createJobRecord as createGrokJobRecord } from "../plugins/grok/scripts/lib/state.mjs";
 
 const SCRIPT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "plugins", "fusion", "scripts", "fusion-stats.mjs");
 
@@ -1980,11 +1981,17 @@ test("stats validates all arguments before reading state or writing a verdict", 
   const id = "a".repeat(32);
   const file = writeCodexJob(state, dir, id, { status: "done" });
   const before = fs.readFileSync(file, "utf8");
-  for (const args of [["--audit", "--bogus"], ["--audit", "--record", `${id}=accepted`], ["--record", `${id}=accepted`, "--bogus"], ["--record", "bad=accepted"], ["--record"], ["--audit", "--days"]]) {
+  for (const args of [["--audit", "--bogus"], ["--audit", "--record", `${id}=accepted`], ["--record", `${id}=accepted`, "--bogus"], ["--record", "bad=accepted"], ["--record", "=accepted"], ["--record"], ["--audit", "--days"]]) {
     const result = run({ cwd: dir, codexState: state }, args);
-    assert.strictEqual(result.status, 2, result.stderr);
-    assert.match(result.stderr, /^Usage: /);
-    assert.strictEqual(result.stderr.trim().split("\n").length, 1);
+    if (args[1] === "bad=accepted") {
+      assert.strictEqual(result.status, 1, result.stderr);
+      assert.match(result.stderr, /Engine job bad was not found/);
+      assert.match(result.stderr, /^state: error$/m);
+    } else {
+      assert.strictEqual(result.status, 2, result.stderr);
+      assert.match(result.stderr, /^Usage: /);
+      assert.strictEqual(result.stderr.trim().split("\n").length, 1);
+    }
     assert.strictEqual(result.stdout, "");
     assert.strictEqual(fs.readFileSync(file, "utf8"), before);
   }
@@ -2136,6 +2143,8 @@ test("--record settles a Fusion task and its Codex peer with direct strict argv"
   const env = { FUSION_WORKER_STATE_DIR: stateDir };
   createTerminalWorker({ taskId, env, workspaceRoot: dir, peerEngine: "codex", peerJobId: jobId });
 
+  writeCodexJob(stateRoot, dir, jobId, { status: "done", jobClass: "task" });
+
   const result = runDirect(
     { cwd: dir, codexState: stateRoot },
     ["--record", `${taskId}=accepted`],
@@ -2158,6 +2167,8 @@ test("--record settles a Codex collector task through the Codex ledger", (t) => 
   const env = { FUSION_WORKER_STATE_DIR: stateDir };
   createWorkerRecord({ taskId, sessionId: "session-settlement", dispatchToolUseId: `tool-${taskId}`, agentType: "fusion:job-collector", workspaceRoot: dir, completionContract: "collector", limits: {} }, env);
   updateWorkerRecord(taskId, env, (record) => ({ ...record, transportStatus: "done", peerEngine: "codex", peerJobId: jobId, peerTransportStatus: "done" }));
+
+  writeCodexJob(stateRoot, dir, jobId, { status: "done", jobClass: "task" });
 
   const result = runDirect(
     { cwd: dir, codexState: stateRoot },
@@ -2253,6 +2264,8 @@ test("--record preserves a terminal worker verdict for retry when its engine com
     awaitingVerdict: true,
     awaitingVerdictArmedAt: "2026-07-22T00:00:00.000Z"
   }));
+
+  writeCodexJob(path.join(dir, "missing"), dir, jobId, { status: "done", jobClass: "task" });
 
   const result = runDirect(
     { cwd: dir, codexState: path.join(dir, "missing") },
@@ -2481,6 +2494,8 @@ test("--record batches mixed verdicts with per-pair rejection reasons and failur
   const env = { FUSION_WORKER_STATE_DIR: stateDir };
   createTerminalWorker({ taskId: firstTaskId, env, workspaceRoot: dir });
   createTerminalWorker({ taskId: secondTaskId, env, workspaceRoot: dir, peerEngine: "codex", peerJobId: jobId });
+
+  writeCodexJob(path.join(dir, "missing"), dir, jobId, { status: "done", jobClass: "task" });
 
   const result = run(
     { cwd: dir, codexState: path.join(dir, "missing") },
@@ -2909,6 +2924,9 @@ test("--record continues a batch after a partial engine transport failure and ca
   const args = ["--record", `${failedTaskId}=accepted`, "--record", `${settledTaskId}=accepted`];
   const companion = writeSelectiveCodexAcceptanceCompanion(dir, failedJobId);
 
+  writeCodexJob(path.join(dir, "missing"), dir, failedJobId, { status: "done", jobClass: "task" });
+  writeCodexJob(path.join(dir, "missing"), dir, settledJobId, { status: "done", jobClass: "task" });
+
   const result = runDirect(
     { cwd: dir, codexState: path.join(dir, "missing") },
     args,
@@ -3034,7 +3052,7 @@ test("--record keeps a broadcast --reason on accepted pairs", (t) => {
   }
 });
 
-test("--record validates every batch pair before writing", (t) => {
+test("--record settles valid batch pairs despite missing ids", (t) => {
   const dir = sandbox(t);
   const stateDir = path.join(dir, "worker-state");
   const presentTaskId = `fusion-${"6".repeat(24)}`;
@@ -3050,8 +3068,82 @@ test("--record validates every batch pair before writing", (t) => {
 
   assert.notStrictEqual(result.status, 0);
   assert.match(result.stderr, new RegExp(`Fusion worker task ${missingTaskId} was not found`));
-  assert.strictEqual(result.stdout, "");
-  assert.strictEqual(readWorkerRecord(presentTaskId, env).acceptance, "unverified");
+  assert.strictEqual(result.stdout, `Recorded accepted for Fusion worker task ${presentTaskId}.\n`);
+  assert.strictEqual(readWorkerRecord(presentTaskId, env).acceptance, "accepted");
+});
+
+test("--unsettled legacy Grok jobs remain settleable across bad batch ids", (t) => {
+  const dir = sandbox(t);
+  const stateRoot = path.join(dir, "codex-state");
+  const grokData = path.join(dir, "grok-data");
+  const ids = ["3a13daf9", "Legacy.job_1-2", `fusion-${"f".repeat(24)}`];
+  for (const id of ids) writeGrokJob(grokData, dir, id, createGrokJobRecord({ id, cwd: dir, status: "done", mode: "consult", briefFile: null, background: false }));
+  const env = { GROK_COMPANION_DATA: grokData };
+  const runtime = { cwd: dir, codexState: stateRoot };
+  const before = runDirect(runtime, ["--unsettled", "--all", "--json"], env);
+  assert.equal(before.status, 0, before.stderr);
+  assert.deepEqual(JSON.parse(before.stdout).unsettled.map((entry) => entry.id).sort(), [...ids].sort());
+  const result = runDirect(runtime, ["--record", "missing-job=unverified", `${ids[0]}=unverified`, "../escape=unverified", `${ids[1]}=unverified`, `${ids[2]}=unverified`], env);
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /Failed to settle missing-job/);
+  assert.match(result.stderr, /Failed to settle \.\.\/escape/);
+  assert.match(result.stderr, /^state: error$/m);
+  assert.doesNotMatch(result.stderr, /\n\s+at |file:\/\//);
+  for (const id of ids) assert.ok(result.stdout.includes(`Recorded unverified for Grok job ${id}.`), result.stderr);
+  const after = runDirect(runtime, ["--unsettled", "--all", "--json"], env);
+  assert.equal(after.status, 0, after.stderr);
+  assert.deepEqual(JSON.parse(after.stdout).unsettled, []);
+});
+
+test("--record settles collectors without peer identity only as unverified or rejected", (t) => {
+  const dir = sandbox(t);
+  const env = { FUSION_WORKER_STATE_DIR: path.join(dir, "workers") };
+  const runtime = { cwd: dir, codexState: path.join(dir, "missing") };
+  for (const [index, verdict] of ["accepted", "unverified", "rejected"].entries()) {
+    const taskId = `fusion-${String(index).repeat(24)}`;
+    createWorkerRecord({ taskId, sessionId: "legacy-collector", agentType: "fusion:job-collector", completionContract: "collector", workspaceRoot: dir }, env);
+    updateWorkerRecord(taskId, env, (record) => ({ ...record, transportStatus: "done", acceptance: "unverified", awaitingVerdict: true, collectedAt: "2026-10-02T06:34:38.599Z" }));
+    const result = run(runtime, ["--record", `${taskId}=${verdict}`, ...(verdict === "rejected" ? ["--reason", "No verified collection identity."] : [])], env);
+    const worker = readWorkerRecord(taskId, env);
+    if (verdict === "accepted") {
+      assert.equal(result.status, 1);
+      assert.match(result.stderr, /does not contain a verified peer collection identity/);
+      assert.match(result.stderr, /^state: error$/m);
+      assert.doesNotMatch(result.stderr, /\n\s+at |file:\/\//);
+      assert.equal(worker.acceptanceRecordedAt, undefined);
+      assert.equal(worker.awaitingVerdict, true);
+    } else {
+      assert.equal(result.status, 0, result.stderr);
+      assert.equal(worker.acceptance, verdict);
+      assert.ok(worker.acceptanceRecordedAt);
+      assert.equal(worker.awaitingVerdict, false);
+    }
+    assert.equal(worker.engineAcceptanceDelivery, undefined);
+  }
+});
+
+test("--record skips missing engine records and preserves terminal worker verdicts", (t) => {
+  const dir = sandbox(t);
+  const taskId = `fusion-${"4".repeat(24)}`;
+  const jobId = "58b39b7735eb35642d878b6e9915bded";
+  const env = { FUSION_WORKER_STATE_DIR: path.join(dir, "workers") };
+  createTerminalWorker({ taskId, env, workspaceRoot: dir, peerEngine: "cursor", peerJobId: jobId });
+  updateWorkerRecord(taskId, env, (record) => ({ ...record, agentType: "cursor:cursor-rescue", completionContract: "transport", collectedAt: "2026-10-02T06:34:38.599Z", awaitingVerdict: true }));
+  const runtime = { cwd: dir, codexState: path.join(dir, "missing") };
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    const result = runDirect(runtime, ["--record", `${taskId}=unverified`], env);
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(result.stdout, `Recorded unverified for Fusion worker task ${taskId}.\n`);
+    assert.match(result.stderr, /Skipped engine settlement for Cursor job .*engine record no longer exists/);
+    const worker = readWorkerRecord(taskId, env);
+    assert.equal(worker.acceptance, "unverified");
+    assert.ok(worker.acceptanceRecordedAt);
+    assert.equal(worker.awaitingVerdict, false);
+    assert.equal(worker.engineAcceptanceDelivery.status, "skipped");
+    assert.equal(worker.engineAcceptanceDelivery.entries[0].status, "skipped");
+    assert.equal(worker.engineAcceptanceDelivery.entries[0].skipReason, "record-missing");
+    assert.equal(worker.engineAcceptanceDelivery.attempts, 0);
+  }
 });
 
 test("--record refuses the derived superseded classification without changing a Codex job", (t) => {
@@ -3803,6 +3895,14 @@ test("--unsettled lists terminal unverified jobs and preserves Codex acceptance 
     acceptanceRecordedAt: "2026-07-21T00:03:00.000Z",
     finishedAt: "2026-07-21T00:03:00.000Z"
   });
+  writeCodexJob(stateRoot, dir, "f".repeat(32), {
+    status: "done",
+    jobClass: "task",
+    acceptance: "unverified",
+    acceptanceSource: "main-loop",
+    acceptanceRecordedAt: "2026-07-21T00:03:30.000Z",
+    finishedAt: "2026-07-21T00:03:30.000Z"
+  });
   writeCodexJob(stateRoot, dir, codexNoProvenanceId, {
     status: "done",
     jobClass: "review",
@@ -3845,6 +3945,8 @@ test("--unsettled lists terminal unverified jobs and preserves Codex acceptance 
   updateWorkerRecord("fusion-unsettled", { FUSION_WORKER_STATE_DIR: workerState }, (record) => ({ ...record, transportStatus: "done", finishedAt: "2026-07-21T00:01:00.000Z" }));
   createWorkerRecord({ taskId: "fusion-settled", sessionId: "session-workers", dispatchToolUseId: "tool-settled", agentType: "fusion:claude-worker", workspaceRoot: dir, limits: {} }, { FUSION_WORKER_STATE_DIR: workerState });
   updateWorkerRecord("fusion-settled", { FUSION_WORKER_STATE_DIR: workerState }, (record) => ({ ...record, transportStatus: "done", acceptance: "rejected", finishedAt: "2026-07-21T00:04:00.000Z" }));
+  createWorkerRecord({ taskId: "fusion-recorded-unverified", sessionId: "session-workers", dispatchToolUseId: "tool-recorded-unverified", agentType: "fusion:claude-worker", workspaceRoot: dir, limits: {} }, { FUSION_WORKER_STATE_DIR: workerState });
+  updateWorkerRecord("fusion-recorded-unverified", { FUSION_WORKER_STATE_DIR: workerState }, (record) => ({ ...record, transportStatus: "done", acceptance: "unverified", acceptanceRecordedAt: "2026-07-21T00:04:30.000Z", finishedAt: "2026-07-21T00:04:30.000Z" }));
 
   const extraEnv = { FUSION_WORKER_STATE_DIR: workerState, GROK_COMPANION_DATA: grokData };
   const json = run({ cwd: dir, codexState: stateRoot }, ["--unsettled", "--all", "--json"], extraEnv);

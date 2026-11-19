@@ -170,9 +170,6 @@ function parseRecordPair(value) {
   const overrideSuffix = ":accept-failed-transport";
   const acceptFailedTransport = rawVerdict.endsWith(overrideSuffix);
   const verdict = acceptFailedTransport ? rawVerdict.slice(0, -overrideSuffix.length) : rawVerdict;
-  if (!FUSION_TASK_ID_PATTERN.test(id) && !ENGINE_JOB_ID_PATTERN.test(id)) {
-    throw recordReasonGrammarError("--record id must be a Fusion task id or a 32 character engine job id.");
-  }
   if (!RECORD_VERDICTS.has(verdict)) {
     throw recordReasonGrammarError("--record verdict must be accepted, rejected, or unverified.");
   }

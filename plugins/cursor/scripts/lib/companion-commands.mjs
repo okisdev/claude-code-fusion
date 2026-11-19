@@ -4,6 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { isatty } from "node:tty";
 import { fileURLToPath } from "node:url";
+import { JOB_ID_PATTERN as STORED_JOB_ID_PATTERN } from "./job-id.mjs";
 
 import { configureRawTransport, createRawCommandTransport as allocateRawCommandTransport, consumeRawCommandTransport } from "./raw-transport.mjs";
 import { awaitOutput } from "./await-output.mjs";
@@ -609,7 +610,7 @@ export function createCompanionCommands(adapter) {
     });
     if (positionals.length) throw errorWithFailure("Record acceptance accepts no positional arguments.");
     const id = options["job-id"];
-    if (!JOB_ID_PATTERN.test(String(id ?? ""))) throw errorWithFailure("The --job-id option must be a 32 character lowercase hexadecimal job id.");
+    if (!STORED_JOB_ID_PATTERN.test(String(id ?? ""))) throw errorWithFailure("The --job-id option must be a valid stored job id.");
     if (!ACCEPTANCE_VALUES.has(options.acceptance)) throw errorWithFailure("The --acceptance option must be accepted, rejected, or unverified.");
     if (options["failure-kind"] !== undefined && (!SEMANTIC_FAILURE_KINDS.has(options["failure-kind"]) || options.acceptance !== "rejected")) throw errorWithFailure("The --failure-kind option requires rejected acceptance and a known semantic failure kind.");
     if (options.acceptance === "rejected" && !options.reason?.trim()) throw errorWithFailure("A rejected acceptance requires --reason.");

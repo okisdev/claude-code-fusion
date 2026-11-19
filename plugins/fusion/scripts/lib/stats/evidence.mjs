@@ -23,7 +23,7 @@ const TERMINAL_LEDGER_PREFIX = "codex-jobs-monitor-announced";
 export const PRUNE_EVIDENCE = Symbol("pruneEvidence");
 export const DAY_MS = 24 * 60 * 60 * 1000;
 export const FUSION_TASK_ID_PATTERN = /^fusion-[0-9a-f]{24}$/;
-export const ENGINE_JOB_ID_PATTERN = /^[0-9a-f]{32}$/;
+export { JOB_ID_PATTERN as ENGINE_JOB_ID_PATTERN } from "../job-id.mjs";
 export const RECORD_VERDICTS = new Set(["accepted", "rejected", "unverified"]);
 export const RESUMABLE_CODEX_FAILURE_KINDS = new Set(["timeout", "policy", "patch_thrash"]);
 export const SEMANTIC_FAILURE_KINDS = new Set(["intent_override", "scope_rewrite", "wrong_approach", "style_mismatch", "oversized"]);

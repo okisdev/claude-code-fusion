@@ -163,12 +163,18 @@ export function recordEngineAcceptance({ engine, jobId, acceptance, source, reas
 function deliveryState(entries) {
   const failures = entries.filter((entry) => entry.status === "failed");
   return {
-    status: entries.every((entry) => entry.status === "delivered") ? "delivered" : failures.length ? "failed" : "pending",
+    status: entries.every((entry) => entry.status === "delivered" || entry.status === "skipped") ? entries.some((entry) => entry.status === "skipped") ? "skipped" : "delivered" : failures.length ? "failed" : "pending",
     attempts: entries.reduce((total, entry) => total + entry.attempts, 0),
     lastError: failures.map((entry) => `${entry.jobId}: ${entry.lastError}`).join("; ") || null,
     updatedAt: new Date().toISOString(),
     entries
   };
+}
+
+function withDeliveryState(record, entries) {
+  const state = deliveryState(entries);
+  const { engineSettlementError: _engineSettlementError, ...updated } = record;
+  return { ...updated, engineAcceptanceDelivery: state, ...(state.lastError ? { engineSettlementError: state.lastError } : {}) };
 }
 
 export function prepareEngineAcceptanceDelivery(record, { jobs, acceptFailedTransport = false }) {
@@ -205,7 +211,7 @@ export function deliverWorkerEngineAcceptance({ taskId, env = process.env, asJso
   const lockOptions = Number.isFinite(deadline) ? { timeoutMs: 0 } : undefined;
   for (const candidate of snapshot?.engineAcceptanceDelivery?.entries ?? []) {
     if (Date.now() >= deadline) break;
-    if (!retryableDelivery(candidate, env, respectBackoff)) continue;
+    if (!["pending", "failed"].includes(candidate.status)) continue;
     const lock = path.join(path.dirname(workerRecordFile(taskId, env)), `.acceptance-${candidate.engine}-${candidate.jobId}`);
     let acquired = false;
     try {
@@ -217,7 +223,13 @@ export function deliverWorkerEngineAcceptance({ taskId, env = process.env, asJso
           updateWorkerRecord(taskId, env, (record) => {
             const entries = record?.engineAcceptanceDelivery?.entries;
             const current = entries?.find((entry) => entry.engine === candidate.engine && entry.jobId === candidate.jobId);
-            if (!current || !retryableDelivery(current, env, respectBackoff)) return null;
+            if (!current || !["pending", "failed"].includes(current.status)) return null;
+            if (readEngineJobRecord(current.engine, current.jobId, env) === null) {
+              return withDeliveryState(record, entries.map((entry) => entry.id === current.id
+                ? { ...entry, status: "skipped", skipReason: "record-missing", lastError: null, attemptId: null, updatedAt: new Date().toISOString() }
+                : entry));
+            }
+            if (!retryableDelivery(current, env, respectBackoff)) return null;
             claimed = { ...current, status: "pending", attempts: current.attempts + 1, failures: deliveryFailures(current), attemptId: randomUUID(), updatedAt: new Date().toISOString() };
             return { ...record, engineAcceptanceDelivery: deliveryState(entries.map((entry) => entry.id === claimed.id ? claimed : entry)) };
           }, lockOptions);
@@ -230,17 +242,19 @@ export function deliverWorkerEngineAcceptance({ taskId, env = process.env, asJso
           } catch (error) {
             lastError = error instanceof Error ? error.message : String(error);
           }
+          let recordMissing = false;
+          if (lastError !== null) {
+            try { recordMissing = readEngineJobRecord(claimed.engine, claimed.jobId, env) === null; } catch { void 0; }
+          }
           let replaced = false;
           updateWorkerRecord(taskId, env, (record) => {
             const entries = record?.engineAcceptanceDelivery?.entries;
             replaced = entries?.some((entry) => entry.engine === claimed.engine && entry.jobId === claimed.jobId && entry.id !== claimed.id);
             if (!entries?.some((entry) => entry.id === claimed.id && entry.attemptId === claimed.attemptId)) return null;
             const updatedEntries = entries.map((entry) => entry.id === claimed.id && entry.attemptId === claimed.attemptId
-              ? { ...entry, status: lastError ? "failed" : "delivered", failures: claimed.failures + Number(lastError !== null), lastError, attemptId: null, updatedAt: new Date().toISOString() }
+              ? { ...entry, status: recordMissing ? "skipped" : lastError ? "failed" : "delivered", ...(recordMissing ? { skipReason: "record-missing" } : {}), failures: claimed.failures + Number(lastError !== null), lastError: recordMissing ? null : lastError, attemptId: null, updatedAt: new Date().toISOString() }
               : entry);
-            const state = deliveryState(updatedEntries);
-            const { engineSettlementError: _engineSettlementError, ...updated } = record;
-            return { ...updated, engineAcceptanceDelivery: state, ...(state.lastError ? { engineSettlementError: state.lastError } : {}) };
+            return withDeliveryState(record, updatedEntries);
           }, lockOptions);
           if (!replaced) break;
         }
@@ -263,7 +277,7 @@ export function retryWorkerEngineAcceptances({ env = process.env, skipTaskIds = 
     const record = sessionId === null ? candidate : readWorkerRecord(candidate, env);
     if (!record) continue;
     if (sessionId !== null && record.sessionId !== sessionId) continue;
-    if (skipTaskIds.has(record.taskId) || !record.engineAcceptanceDelivery?.entries?.some((entry) => retryableDelivery(entry, env, respectBackoff))) continue;
+    if (skipTaskIds.has(record.taskId) || !record.engineAcceptanceDelivery?.entries?.some((entry) => ["pending", "failed"].includes(entry.status))) continue;
     try {
       deliverWorkerEngineAcceptance({ taskId: record.taskId, env, timeoutMs, deadline, respectBackoff });
     } catch {

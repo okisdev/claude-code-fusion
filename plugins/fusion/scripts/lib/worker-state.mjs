@@ -1167,13 +1167,22 @@ function validatedAcceptanceFields(acceptance, source, reason, failureKind) {
   return { safeReason, safeFailureKind: failureKind ?? null };
 }
 
+export function hasUnverifiedCollectorIdentity(record) {
+  const collector = canonicalWorkerAgentType(record.agentType) === "fusion:job-collector" || record.completionContract === "collector";
+  const verifiedIdentity = isEngineId(record.peerEngine) && /^[a-f0-9]{32}$/.test(record.peerJobId ?? "") && Boolean(record.peerTransportStatus);
+  return collector && !verifiedIdentity;
+}
+
 function workerAcceptanceGate(record, taskId, acceptance, acceptFailedTransport, engineLedgerWritten = false) {
   const collector = canonicalWorkerAgentType(record.agentType) === "fusion:job-collector" || record.completionContract === "collector";
-  if (collector && !engineLedgerWritten && isEngineId(record.peerEngine) && ENGINES[record.peerEngine].acceptanceLedger) {
+  if (collector && !engineLedgerWritten && isEngineId(record.peerEngine) && ENGINES[record.peerEngine].acceptanceLedger && (acceptance === "accepted" || !hasUnverifiedCollectorIdentity(record))) {
     throw new Error(`Fusion collector task ${taskId} acceptance must be recorded through the ${ENGINES[record.peerEngine].displayName} acceptance ledger.`);
   }
-  if (collector && (!isEngineId(record.peerEngine) || !/^[a-f0-9]{32}$/.test(record.peerJobId ?? "") || !record.peerTransportStatus)) {
-    throw new Error(`Fusion collector task ${taskId} does not contain a verified peer collection identity.`);
+  if (hasUnverifiedCollectorIdentity(record)) {
+    if (acceptance === "accepted") {
+      throw new Error(`Fusion collector task ${taskId} does not contain a verified peer collection identity.`);
+    }
+    return;
   }
   if (acceptance === "accepted" && record.transportStatus === "failed" && !acceptFailedTransport) {
     throw new Error(`Fusion worker task ${taskId} has transport status failed. Pass --accept-failed-transport to record accepted.`);

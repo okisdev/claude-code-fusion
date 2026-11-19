@@ -147,3 +147,21 @@ test("record-acceptance rejects unknown job ids", (t) => {
   assert.equal(result.stdout, "");
   assert.match(result.stderr, new RegExp(`No job record found for ${id}`));
 });
+
+test("record-acceptance settles legacy and store-valid job ids and rejects unsafe paths", (t) => {
+  const sandbox = makeSandbox(t);
+  for (const id of ["3a13daf9", "Legacy.job_1-2", "a", "Z".repeat(128), `fusion-${"a".repeat(24)}`]) {
+    seedTerminalJob(sandbox, { id, status: "done" });
+    const result = runCompanion(["record-acceptance", "--job-id", id, "--acceptance", "unverified"], { cwd: sandbox.workDir, env: envFor(sandbox) });
+    assert.equal(result.status, 0, result.stderr);
+    const record = jobRecords(sandbox.dataDir).find((record) => record.id === id);
+    assert.equal(record.semanticStatus, "unverified");
+    assert.equal(record.acceptanceSource, "stats");
+    assert.ok(record.acceptanceRecordedAt);
+  }
+  for (const id of ["../escape", ".hidden", "a/b", "a".repeat(129)]) {
+    const result = runCompanion(["record-acceptance", "--job-id", id, "--acceptance", "unverified"], { cwd: sandbox.workDir, env: envFor(sandbox) });
+    assert.equal(result.status, 1);
+    assert.match(result.stderr, /failure: input/);
+  }
+});

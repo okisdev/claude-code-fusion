@@ -62,7 +62,8 @@ export function main(argv = process.argv.slice(2), { env = process.env, cwd = pr
     const request = parseRecordArguments(argv, { allowPerPairReasons: rawArgs });
     const result = settleRecords({ ...request, env, stdout, stderr });
     if (result.errors.length > 0) {
-      throw new Error(`${result.errors.length} record settlement ${result.errors.length === 1 ? "failed" : "failures"}.`);
+      stderr.write(`${tagMessage("stats.request-error", `${result.errors.length} record settlement ${result.errors.length === 1 ? "failed" : "failures"}.`)}\nstate: error\nfailure: input\n`);
+      return { ...result, exitCode: 1 };
     }
     return result.writes;
   }
