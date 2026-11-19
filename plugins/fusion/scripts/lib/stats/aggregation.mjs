@@ -1,6 +1,6 @@
 import fs from "node:fs";
 import { BREADTH_ENGINE_IDS, ENGINES, ENGINE_IDS, ENGINE_TERMINAL_STATUSES, PEER_RESCUE_AGENT_NAMES, engineStateRoots } from "../../lib/engines.mjs";
-import { canonicalWorkerAgentType, WORKER_TERMINAL_STATUSES, readWorkerRecords, readWorkerRollups, workerElapsedMs } from "../../lib/worker-state.mjs";
+import { canonicalWorkerAgentType, WORKER_TERMINAL_STATUSES, isSettledWorker, readWorkerRecords, readWorkerRollups, workerElapsedMs } from "../../lib/worker-state.mjs";
 import { FILE_ENGINE_DESCRIPTORS, checkedUsageAddition, codexSku, isSupersededCodexJob, loadAllObservationCandidates, normalizeClaudeWorkerUsage, observationForJob, scopedObservationForJob, summarizeCodexSkuTelemetry, tokenUsageForJob } from "./engine-evidence.mjs";
 import { CODEX_ACCEPTANCE_STATES, RESUMABLE_CODEX_FAILURE_KINDS, TOKEN_USAGE_FILENAME, bump, fusionWorkspaceKey, loadTokenUsageObservations, nonEmptyString, normalizeCollectionMethod, readCodexJobEvidence, readWorkspaceJobFiles, resolveCodexJobEffort, resolveCodexJobModel, resolveGitWorkspaceRoot, resolveStateRoot, selectPreferredJobs, workspaceRootsShareRepository } from "./evidence.mjs";
 import { buildCoercionLedger, buildFleetUsageStats, readStatsAuditEvents } from "./fleet.mjs";
@@ -727,7 +727,7 @@ function unsettledTimestamp(entry) {
 
 function unsettledWorkerEntries(env) {
   return readWorkerRecords(env)
-    .filter((record) => WORKER_TERMINAL_STATUSES.has(record.transportStatus) && semanticAcceptance(record) === "unverified")
+    .filter((record) => WORKER_TERMINAL_STATUSES.has(record.transportStatus) && semanticAcceptance(record) === "unverified" && !isSettledWorker(record))
     .map((record) => ({
       engine: "fusion",
       id: nonEmptyString(record.taskId) ?? "unknown",
@@ -752,7 +752,7 @@ function unsettledEngineEntries(descriptor, env) {
       return [];
     }
     const acceptance = semanticAcceptance(raw, descriptor.usesSupersededJobs && isSupersededCodexJob(raw, scoped));
-    if (acceptance !== "unverified") {
+    if (acceptance !== "unverified" || (nonEmptyString(raw?.acceptanceRecordedAt) && raw?.acceptanceSource !== "collector")) {
       return [];
     }
     const id = nonEmptyString(raw?.id);

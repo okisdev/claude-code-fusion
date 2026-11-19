@@ -3,6 +3,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { configureRecordLock, withRecordLock } from "./record-lock.mjs";
+import { JOB_ID_PATTERN } from "./job-id.mjs";
 
 import {
   getProcessIdentity,
@@ -29,7 +30,6 @@ export function resolveTimeoutMs(value, fallback = DEFAULT_LOCK_TIMEOUT_MS, mini
 }
 
 const JOB_RECORD_SCAN_MAX_BYTES = 16 * 1024 * 1024;
-const JOB_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 const WORKSPACE_SLUG_PATTERN = /^.+-[a-f0-9]{16}$/;
 const GC_INTERVAL_MS = 60 * 1000;
 const ORPHAN_AGE_MS = 24 * 60 * 60 * 1000;

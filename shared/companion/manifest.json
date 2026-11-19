@@ -1,4 +1,11 @@
 {
+  "job-id.mjs": [
+    "plugins/grok/scripts/lib/job-id.mjs",
+    "plugins/cursor/scripts/lib/job-id.mjs",
+    "plugins/codex/scripts/lib/job-id.mjs",
+    "plugins/devin/scripts/lib/job-id.mjs",
+    "plugins/fusion/scripts/lib/job-id.mjs"
+  ],
   "job-watch.mjs": [
     "plugins/codex/scripts/lib/job-watch.mjs",
     "plugins/grok/scripts/lib/job-watch.mjs",

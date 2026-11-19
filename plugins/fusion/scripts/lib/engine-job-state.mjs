@@ -2,8 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 
 import { engineStateRoots } from "./engines.mjs";
-
-const ENGINE_JOB_ID_PATTERN = /^[0-9a-f]{32}$/;
+import { JOB_ID_PATTERN as ENGINE_JOB_ID_PATTERN } from "./job-id.mjs";
 
 export function resolveEngineStateRoots(engine, env = process.env) {
   return engineStateRoots(engine, env);
@@ -17,7 +16,8 @@ export function readEngineJobRecord(engine, jobId, env = process.env) {
     let workspaces;
     try {
       workspaces = fs.readdirSync(stateRoot, { withFileTypes: true });
-    } catch {
+    } catch (error) {
+      if (error.code !== "ENOENT") throw error;
       continue;
     }
     for (const workspace of workspaces) {
@@ -29,8 +29,9 @@ export function readEngineJobRecord(engine, jobId, env = process.env) {
         if (record && typeof record === "object" && !Array.isArray(record)) {
           return record;
         }
-      } catch {
-        void 0;
+        throw new TypeError(`Invalid ${engine} job record for ${jobId}.`);
+      } catch (error) {
+        if (error.code !== "ENOENT") throw error;
       }
     }
   }
@@ -38,6 +39,11 @@ export function readEngineJobRecord(engine, jobId, env = process.env) {
 }
 
 export function readEngineJobFailureKind(engine, jobId, env = process.env) {
-  const failureKind = readEngineJobRecord(engine, jobId, env)?.failureKind;
+  let failureKind;
+  try {
+    failureKind = readEngineJobRecord(engine, jobId, env)?.failureKind;
+  } catch {
+    return null;
+  }
   return typeof failureKind === "string" && failureKind.trim() ? failureKind.trim() : null;
 }

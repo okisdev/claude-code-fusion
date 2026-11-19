@@ -1,7 +1,7 @@
 import { deliverWorkerEngineAcceptance, engineAcceptanceTransport, prepareEngineAcceptanceDelivery, recordEngineAcceptance, retryWorkerEngineAcceptances } from "../../lib/engine-acceptance.mjs";
 import { readEngineJobRecord } from "../../lib/engine-job-state.mjs";
 import { ENGINE_IDS, ENGINE_TERMINAL_STATUSES, engineDisplayName, engineDisplayNameList, engineStateRoots, isEngineId } from "../../lib/engines.mjs";
-import { WORKER_TERMINAL_STATUSES, readWorkerRecord, readWorkerRecords, recordWorkerAcceptance, validateWorkerAcceptance } from "../../lib/worker-state.mjs";
+import { WORKER_TERMINAL_STATUSES, hasUnverifiedCollectorIdentity, readWorkerRecord, readWorkerRecords, recordWorkerAcceptance, validateWorkerAcceptance } from "../../lib/worker-state.mjs";
 import { FILE_ENGINE_DESCRIPTORS } from "./engine-evidence.mjs";
 import { ENGINE_JOB_ID_PATTERN, FUSION_TASK_ID_PATTERN, nonEmptyString } from "./evidence.mjs";
 import { observeEngineJobsSafely } from "../../engine-jobs-observer.mjs";
@@ -36,7 +36,7 @@ function writeRecordConfirmation({ kind, engine = null, jobId = null, worker = n
 
 function settleWorkerRecord({ taskId, verdict, source, reason, failureKind, acceptFailedTransport = false, asJson, env, stdout, stderr }) {
   const current = readWorkerRecord(taskId, env);
-  const terminal = WORKER_TERMINAL_STATUSES.has(current?.transportStatus);
+  const terminal = WORKER_TERMINAL_STATUSES.has(current?.transportStatus) && !hasUnverifiedCollectorIdentity(current);
   const peerJobId = terminal && typeof current.peerJobId === "string" && ENGINE_JOB_ID_PATTERN.test(current.peerJobId) ? current.peerJobId : null;
   const previousJobIds = new Set((Array.isArray(current?.continuations) ? current.continuations : []).flatMap((round) => Array.isArray(round?.peerJobIds) ? round.peerJobIds : []));
   const peerJobIds = terminal ? [...new Set([
@@ -46,7 +46,7 @@ function settleWorkerRecord({ taskId, verdict, source, reason, failureKind, acce
   if (peerJobIds.length === 0) {
     const settlement = recordWorkerAcceptance({ taskId, acceptance: verdict, env, source, reason, failureKind, acceptFailedTransport });
     let worker = settlement.record;
-    if (worker.engineAcceptanceDelivery) {
+    if (worker.engineAcceptanceDelivery && !hasUnverifiedCollectorIdentity(worker)) {
       try {
         worker = deliverWorkerEngineAcceptance({ taskId, env, asJson });
       } catch {
@@ -100,6 +100,10 @@ function settleWorkerRecord({ taskId, verdict, source, reason, failureKind, acce
   const settledPeers = [];
   for (const { engine, jobId } of jobs) {
     const entry = worker.engineAcceptanceDelivery.entries.find((candidate) => candidate.engine === engine && candidate.jobId === jobId);
+    if (entry.status === "skipped" && entry.skipReason === "record-missing") {
+      stderr.write(`Skipped engine settlement for ${engineDisplayName(engine)} job ${jobId}: the engine record no longer exists.\n`);
+      continue;
+    }
     if (entry.status !== "delivered") {
       const message = entry.lastError ?? "Engine acceptance delivery is pending.";
       if (jobId !== peerJobId) {
@@ -142,7 +146,7 @@ function settleEngineRecord({ jobId, verdict, source, reason, failureKind, accep
 
 function validateWorkerSettlement({ taskId, verdict, source, reason, failureKind, acceptFailedTransport, env }) {
   const current = readWorkerRecord(taskId, env);
-  const peerJobId = WORKER_TERMINAL_STATUSES.has(current?.transportStatus) && typeof current.peerJobId === "string" && ENGINE_JOB_ID_PATTERN.test(current.peerJobId) ? current.peerJobId : null;
+  const peerJobId = WORKER_TERMINAL_STATUSES.has(current?.transportStatus) && !hasUnverifiedCollectorIdentity(current) && typeof current.peerJobId === "string" && ENGINE_JOB_ID_PATTERN.test(current.peerJobId) ? current.peerJobId : null;
   validateWorkerAcceptance({ record: current, taskId, acceptance: verdict, source, reason, failureKind, acceptFailedTransport, engineLedgerWritten: peerJobId !== null });
   if (peerJobId && !isEngineId(current.peerEngine)) {
     resolveEngineJob(peerJobId, env);
@@ -168,29 +172,47 @@ function validateEngineSettlement({ jobId, verdict, source, reason, failureKind,
   }
 }
 
-function validateRecordSettlements({ records, source, acceptFailedTransport, env }) {
-  for (const { id, verdict, reason = null, failureKind = null, acceptFailedTransport: pairAcceptFailedTransport } of records) {
-    const pairOverride = acceptFailedTransport || pairAcceptFailedTransport;
-    if (FUSION_TASK_ID_PATTERN.test(id)) {
-      validateWorkerSettlement({ taskId: id, verdict, source, reason, failureKind, acceptFailedTransport: pairOverride, env });
-    } else {
-      validateEngineSettlement({ jobId: id, verdict, source, reason, failureKind, acceptFailedTransport: pairOverride, env });
-    }
+function workerSettlementTarget(id, env) {
+  if (!ENGINE_JOB_ID_PATTERN.test(id)) {
+    throw new TypeError("--record id must be a Fusion task id or a valid stored engine job id.");
   }
+  if (!FUSION_TASK_ID_PATTERN.test(id)) return false;
+  const worker = readWorkerRecord(id, env);
+  const engineJob = ENGINE_IDS.some((engine) => readEngineJobRecord(engine, id, env) !== null);
+  if (worker && engineJob) {
+    throw new Error(`Record id ${id} exists in both Fusion worker and engine job state.`);
+  }
+  return Boolean(worker) || !engineJob;
 }
 
 export function settleRecords({ records, source, acceptFailedTransport = false, asJson, env, stdout, stderr }) {
-  validateRecordSettlements({ records, source, acceptFailedTransport, env });
   const requestedIds = new Set(records.map(({ id }) => id));
   const skipTaskIds = new Set(readWorkerRecords(env).filter((record) => requestedIds.has(record.taskId) || requestedIds.has(record.peerJobId)).map((record) => record.taskId));
   const writes = [];
   const errors = [];
   for (const { id, verdict, reason = null, failureKind = null, acceptFailedTransport: pairAcceptFailedTransport } of records) {
+    if (!ENGINE_JOB_ID_PATTERN.test(id)) continue;
     const pairOverride = acceptFailedTransport || pairAcceptFailedTransport;
     try {
-      if (FUSION_TASK_ID_PATTERN.test(id)) {
+      if (FUSION_TASK_ID_PATTERN.test(id) && readWorkerRecord(id, env)) {
+        validateWorkerSettlement({ taskId: id, verdict, source, reason, failureKind, acceptFailedTransport: pairOverride, env });
+      } else if (ENGINE_IDS.some((engine) => readEngineJobRecord(engine, id, env) !== null)) {
+        validateEngineSettlement({ jobId: id, verdict, source, reason, failureKind, acceptFailedTransport: pairOverride, env });
+      }
+    } catch (error) {
+      if (error instanceof TypeError) throw error;
+      stderr.write(`Failed to settle ${id}: ${error instanceof Error ? error.message : String(error)}\n`);
+      return { writes, errors: [{ id, error }] };
+    }
+  }
+  for (const { id, verdict, reason = null, failureKind = null, acceptFailedTransport: pairAcceptFailedTransport } of records) {
+    const pairOverride = acceptFailedTransport || pairAcceptFailedTransport;
+    try {
+      if (workerSettlementTarget(id, env)) {
+        validateWorkerSettlement({ taskId: id, verdict, source, reason, failureKind, acceptFailedTransport: pairOverride, env });
         writes.push(...settleWorkerRecord({ taskId: id, verdict, source, reason, failureKind, acceptFailedTransport: pairOverride, asJson, env, stdout, stderr }));
       } else {
+        validateEngineSettlement({ jobId: id, verdict, source, reason, failureKind, acceptFailedTransport: pairOverride, env });
         writes.push(...settleEngineRecord({ jobId: id, verdict, source, reason, failureKind, acceptFailedTransport: pairOverride, asJson, env, stdout }));
       }
     } catch (error) {

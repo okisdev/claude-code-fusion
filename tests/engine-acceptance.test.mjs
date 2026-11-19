@@ -9,6 +9,7 @@ import { deliverWorkerEngineAcceptance, newestEngineCompanion, prepareEngineAcce
 import { settleQueuedVerdict } from "../plugins/fusion/scripts/lib/lifecycle/collection.mjs";
 import { createWorkerRecord, readSessionWorkerRecords, readWorkerRecord, readWorkerSessionState, recordWorkerAcceptance, reopenWorkerContinuation, updateWorkerRecord, workerRecordFile } from "../plugins/fusion/scripts/lib/worker-state.mjs";
 import { settleRecords } from "../plugins/fusion/scripts/lib/stats/settlement.mjs";
+import { readEngineJobFailureKind, readEngineJobRecord } from "../plugins/fusion/scripts/lib/engine-job-state.mjs";
 import { tokenUsageSidecarPath } from "../plugins/fusion/scripts/lib/stats/evidence.mjs";
 import { handleLifecycleHook } from "../plugins/fusion/scripts/worker-lifecycle.mjs";
 
@@ -137,9 +138,62 @@ function deliveryWorker(t, source) {
   ].join("\n"));
   const env = { ...process.env, HOME: root, FUSION_WORKER_STATE_DIR: path.join(root, "workers"), FUSION_CODEX_STATE: path.join(root, "state"), FUSION_CODEX_COMPANION: bin, FUSION_ACCEPTANCE_RETRY_BACKOFF_MS: "0", TEST_CALLS: calls };
   env.TEST_WORKER_FILE = workerRecordFile(taskId, env);
+  seedEngineJobs({ root, env }, [{ jobId }]);
   createWorkerRecord({ taskId, sessionId: "delivery-session", agentType: "codex:codex-rescue", workspaceRoot: root }, env);
   return { root, taskId, jobId, calls, env, bin };
 }
+
+function seedEngineJobs(box, jobs) {
+  const directory = path.join(box.env.FUSION_CODEX_STATE, "workspace", "jobs");
+  fs.mkdirSync(directory, { recursive: true });
+  for (const { jobId } of jobs) fs.writeFileSync(path.join(directory, `${jobId}.json`), JSON.stringify({ id: jobId, workspaceRoot: box.root, status: "done" }));
+}
+
+test("missing engine records are checked in the store rather than companion error text", (t) => {
+  const box = deliveryWorker(t, 'process.stderr.write("No job record found for this job."); process.exitCode = 1;');
+  updateWorkerRecord(box.taskId, box.env, (record) => prepareEngineAcceptanceDelivery({ ...record, transportStatus: "done", acceptance: "unverified", acceptanceRecordedAt: new Date().toISOString() }, { jobs: [{ engine: "codex", jobId: box.jobId }] }));
+  deliverWorkerEngineAcceptance({ taskId: box.taskId, env: box.env });
+  assert.equal(readWorkerRecord(box.taskId, box.env).engineAcceptanceDelivery.status, "failed");
+  assert.equal(readWorkerRecord(box.taskId, box.env).engineAcceptanceDelivery.attempts, 1);
+  fs.unlinkSync(path.join(box.env.FUSION_CODEX_STATE, "workspace", "jobs", `${box.jobId}.json`));
+  retryWorkerEngineAcceptances({ env: box.env, sessionId: "delivery-session" });
+  const worker = readWorkerRecord(box.taskId, box.env);
+  assert.equal(worker.engineAcceptanceDelivery.status, "skipped");
+  assert.equal(worker.engineAcceptanceDelivery.attempts, 1);
+  assert.equal(worker.engineAcceptanceDelivery.entries[0].skipReason, "record-missing");
+  assert.equal(worker.acceptance, "unverified");
+  assert.equal(fs.readFileSync(box.calls, "utf8").trim().split("\n").length, 1);
+});
+
+test("an engine record removed during delivery becomes terminal despite an unrelated error", (t) => {
+  const box = deliveryWorker(t, 'fs.unlinkSync(process.env.TEST_JOB_FILE); process.stderr.write("store rotated"); process.exitCode = 1;');
+  box.env.TEST_JOB_FILE = path.join(box.env.FUSION_CODEX_STATE, "workspace", "jobs", `${box.jobId}.json`);
+  updateWorkerRecord(box.taskId, box.env, (record) => prepareEngineAcceptanceDelivery({ ...record, transportStatus: "done", acceptance: "accepted", acceptanceRecordedAt: new Date().toISOString() }, { jobs: [{ engine: "codex", jobId: box.jobId }] }));
+  deliverWorkerEngineAcceptance({ taskId: box.taskId, env: box.env });
+  const worker = readWorkerRecord(box.taskId, box.env);
+  assert.equal(worker.engineAcceptanceDelivery.status, "skipped");
+  assert.equal(worker.engineAcceptanceDelivery.attempts, 1);
+  assert.equal(worker.engineAcceptanceDelivery.entries[0].skipReason, "record-missing");
+  assert.equal(worker.engineSettlementError, undefined);
+  assert.equal(worker.acceptance, "accepted");
+  retryWorkerEngineAcceptances({ env: box.env });
+  assert.equal(fs.readFileSync(box.calls, "utf8").trim().split("\n").length, 1);
+});
+
+test("an unreadable engine record remains pending until the store can be read", (t) => {
+  const box = deliveryWorker(t, "");
+  const file = path.join(box.env.FUSION_CODEX_STATE, "workspace", "jobs", `${box.jobId}.json`);
+  updateWorkerRecord(box.taskId, box.env, (record) => prepareEngineAcceptanceDelivery({ ...record, transportStatus: "done", acceptance: "accepted", acceptanceRecordedAt: new Date().toISOString() }, { jobs: [{ engine: "codex", jobId: box.jobId }] }));
+  fs.writeFileSync(file, "incomplete write");
+  retryWorkerEngineAcceptances({ env: box.env });
+  const pending = readWorkerRecord(box.taskId, box.env);
+  assert.equal(pending.engineAcceptanceDelivery.status, "pending");
+  assert.equal(pending.engineAcceptanceDelivery.attempts, 0);
+  assert.equal(fs.existsSync(box.calls), false);
+  seedEngineJobs(box, [{ jobId: box.jobId }]);
+  retryWorkerEngineAcceptances({ env: box.env });
+  assert.equal(readWorkerRecord(box.taskId, box.env).engineAcceptanceDelivery.status, "delivered");
+});
 
 function queueDelivery(box) {
   recordWorkerAcceptance({ taskId: box.taskId, acceptance: "accepted", env: box.env });
@@ -212,6 +266,7 @@ test("lifecycle retry budget bounds a backlog of slow acceptance deliveries", as
   const box = deliveryWorker(t, 'setInterval(() => {}, 1000);');
   box.env.FUSION_ACCEPTANCE_RETRY_TIMEOUT_MS = "300";
   const jobs = Array.from({ length: 10 }, (_, index) => ({ engine: "codex", jobId: index.toString(16).repeat(32) }));
+  seedEngineJobs(box, jobs);
   updateWorkerRecord(box.taskId, box.env, (record) => prepareEngineAcceptanceDelivery({ ...record, transportStatus: "done", acceptance: "accepted", acceptanceRecordedAt: new Date().toISOString() }, { jobs }));
   const started = Date.now();
   await handleLifecycleHook({ hook_event_name: "SubagentStop", session_id: "delivery-session", agent_type: "fusion:claude-worker", agent_id: "other-worker" }, box.env);
@@ -337,6 +392,7 @@ test("a retry delivers failed peers without resending peers already delivered", 
   const box = deliveryWorker(t, 'if (process.argv.includes("f".repeat(32)) && !fs.existsSync(process.env.TEST_READY)) { process.stderr.write("temporary failure"); process.exitCode = 1; }');
   box.env.TEST_READY = path.join(box.root, "ready");
   const jobs = [{ engine: "codex", jobId: box.jobId }, { engine: "codex", jobId: "f".repeat(32) }];
+  seedEngineJobs(box, jobs);
   updateWorkerRecord(box.taskId, box.env, (record) => prepareEngineAcceptanceDelivery({ ...record, transportStatus: "done", acceptance: "accepted", acceptanceSource: "main-loop", acceptanceRecordedAt: new Date().toISOString() }, { jobs }));
   deliverWorkerEngineAcceptance({ taskId: box.taskId, env: box.env });
   assert.deepEqual(readWorkerRecord(box.taskId, box.env).engineAcceptanceDelivery.entries.map((entry) => entry.status), ["delivered", "failed"]);
@@ -456,3 +512,15 @@ for (const engine of ["codex", "grok", "cursor", "devin"]) {
     }
   });
 }
+
+test("an unreadable engine job record yields no failure kind on the hook path but fails strict reads", (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "fusion-engine-job-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const jobs = path.join(root, "workspace-0123456789abcdef", "jobs");
+  fs.mkdirSync(jobs, { recursive: true });
+  const jobId = "a".repeat(32);
+  fs.writeFileSync(path.join(jobs, `${jobId}.json`), "{\"status\":");
+  const env = { FUSION_CODEX_STATE: root };
+  assert.equal(readEngineJobFailureKind("codex", jobId, env), null);
+  assert.throws(() => readEngineJobRecord("codex", jobId, env), SyntaxError);
+});

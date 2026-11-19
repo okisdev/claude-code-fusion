@@ -1,5 +1,4 @@
-
-
+import { JOB_ID_PATTERN as RECORD_ACCEPTANCE_JOB_ID_PATTERN } from "../job-id.mjs";
 const STOP_GATE_OPTION_ENV = "CLAUDE_PLUGIN_OPTION_STOP_GATE";
 const CONTINUITY_POLICY_ENV = "GROK_COMPANION_CONTINUITY_POLICY";
 const STOP_GATE_TIMEOUT_MS = 240000;
@@ -9,7 +8,6 @@ const WAIT_TIMEOUT_ENV = "GROK_COMPANION_WAIT_TIMEOUT_MS";
 const BACKGROUND_DELIVERY_ENV = "GROK_COMPANION_BACKGROUND_DELIVERY";
 const DEFAULT_WAIT_POLL_MS = 2000;
 const DEFAULT_WAIT_TIMEOUT_MS = 570000;
-const RECORD_ACCEPTANCE_JOB_ID_PATTERN = /^[a-f0-9]{32}$/;
 const RECORD_ACCEPTANCE_SOURCES = new Set(["collector", "main-loop", "stats"]);
 const RECORD_ACCEPTANCE_VALUES = new Set(["accepted", "rejected", "unverified"]);
 const SEMANTIC_FAILURE_KINDS = new Set(["intent_override", "scope_rewrite", "wrong_approach", "style_mismatch", "oversized"]);

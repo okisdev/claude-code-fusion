@@ -30,7 +30,7 @@ function recordAcceptanceArgs(argv) {
     index += 1;
   }
   if (!RECORD_ACCEPTANCE_JOB_ID_PATTERN.test(options.jobId ?? "")) {
-    throw errorWithFailure("The --job-id option must be a 32 character lowercase hexadecimal job id.", "input");
+    throw errorWithFailure("The --job-id option must be a valid stored job id.", "input");
   }
   if (!RECORD_ACCEPTANCE_VALUES.has(options.acceptance)) {
     throw errorWithFailure("The --acceptance option must be accepted, rejected, or unverified.", "input");
