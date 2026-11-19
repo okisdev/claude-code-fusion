@@ -1,5 +1,9 @@
 # changelog
 
+## 0.0.84
+
+- a wrapper the coordinator resumed with a follow-up message is no longer blocked with a relay retry after it hands back again. 0.0.83 treated the earlier run's delivered handback as proof the new one would be refused; a genuine follow-up prompt now starts a new run, while a task notification or stop hook feedback still does not. 7 of 61 retried wrappers on the auto mode host were resumed ones.
+
 ## 0.0.83
 
 - a Claude worker that dies on a Claude usage limit is now classified as `quota`, so the dispatch gate holds same family dispatches until the reset. the classifier only matched the limit phrase at the start of a line, but the harness reports it mid line (`... API error: You've hit your Fable limit · resets Nov 21 at 12am (Asia/Taipei)`); one host sent nine deep-reasoner dispatches into an exhausted Fable quota over two days. the mid line form is read only from the harness failure summary, never from a worker's own report, so a report quoting the message stays healthy. the `Mon DD at Ham (TZ)` reset form is parsed, a reset that passed within the last week stays in the past instead of rolling a year ahead, and a repeated local time on a DST fold resolves to the next occurrence.

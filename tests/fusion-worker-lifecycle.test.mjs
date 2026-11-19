@@ -3546,6 +3546,57 @@ test("pending handbacks recover their report before the tool result is written",
   }
 });
 
+for (const [name, followUp, newRun] of [
+  ["a meta follow-up prompt", { isMeta: true, message: { role: "user", content: [{ type: "text", text: "The coordinator sent a message while you were working: --write --cwd /example/repo -- finish the next package" }] } }, true],
+  ["a follow-up prompt", { message: { content: [{ type: "text", text: "Verify the next package and report the results." }] } }, true],
+  ["a string follow-up prompt", { message: { content: "Verify the next package and report the results." } }, true],
+  ["a background-task notification", { message: { content: [{ type: "text", text: "<task-notification><task-id>background-1</task-id><status>completed</status></task-notification>" }] } }, false],
+  ["a background-task notification without status fields", { message: { content: "<task-notification>The background task finished.</task-notification>" } }, false],
+  ["stop hook feedback", { message: { content: [{ type: "text", text: "Stop hook feedback: return the completed report." }] } }, false],
+  ["a SubagentStop blocking reminder", { message: { content: [{ type: "text", text: "<system-reminder>\nSubagentStop hook blocking error: return the completed report.\n</system-reminder>" }] } }, false],
+  ["text accompanying a tool result", { message: { content: [{ type: "text", text: "The prior report was delivered." }, { type: "tool_result", tool_use_id: "handback-1", content: "success" }] } }, false]
+]) {
+  test(`pending handbacks respect run boundaries after ${name}`, (t) => {
+    const box = sandbox(t);
+    const workerTranscript = path.join(box.root, "resumed-handback.jsonl");
+    const report = "run 2 report";
+    writeHandback(workerTranscript, "run 1 report");
+    fs.appendFileSync(workerTranscript, [
+      { type: "user", ...followUp },
+      { type: "assistant", message: { content: [{ type: "tool_use", id: "bash-2", name: "Bash", input: { command: "node --version" } }] } },
+      { type: "user", message: { content: [{ type: "tool_result", tool_use_id: "bash-2", content: "v26.13.1" }] } },
+      { type: "assistant", message: { content: [{ type: "tool_use", id: "handback-2", name: "SubagentHandback", input: { message: report } }] } }
+    ].map((entry) => `${JSON.stringify(entry)}\n`).join(""));
+    assert.deepStrictEqual(finalReportFromTranscript(workerTranscript), newRun ? { text: report, handback: true } : null);
+  });
+}
+
+test("SubagentStop accepts a resumed Codex rescue pending handback without a retry", (t) => {
+  for (const runtimeAsync of [true, false]) {
+    const box = sandbox(t);
+    const agentId = "resumed-peer";
+    const workerTranscript = handbackWorker(box, agentId, "transport", "codex:codex-rescue", runtimeAsync);
+    const jobId = "b".repeat(32);
+    const report = `run 2 companion output\njob: ${jobId}\nstate: done`;
+    writeHandback(workerTranscript, `run 1 companion output\njob: ${"a".repeat(32)}\nstate: done`);
+    fs.appendFileSync(workerTranscript, [
+      { type: "user", isMeta: true, message: { role: "user", content: [{ type: "text", text: "The coordinator sent a message while you were working: --write --cwd /example/repo -- finish the next package" }] } },
+      { type: "assistant", message: { content: [{ type: "tool_use", id: "bash-2", name: "Bash", input: { command: "node --version" } }] } },
+      { type: "user", message: { content: [{ type: "tool_result", tool_use_id: "bash-2", content: "v26.13.1" }] } },
+      { type: "assistant", message: { content: [{ type: "tool_use", id: "handback-2", name: "SubagentHandback", input: { message: report } }] } }
+    ].map((entry) => `${JSON.stringify(entry)}\n`).join(""));
+    const stopped = handbackStop(box, agentId, workerTranscript, "codex:codex-rescue");
+    assert.strictEqual(stopped.status, 0, stopped.stderr);
+    assert.strictEqual(stopped.stdout, "", stopped.stderr);
+    const resumed = record(box);
+    assert.strictEqual(resumed.retryCount, 0);
+    assert.strictEqual(resumed.transportStatus, runtimeAsync ? "ready_uncollected" : "done");
+    assert.strictEqual(resumed.collectedAt != null, !runtimeAsync);
+    assert.strictEqual(resumed.failureKind, null);
+    assert.strictEqual(resumed.peerJobId, jobId);
+  }
+});
+
 test("SubagentStop accepts a pending Codex rescue handback without a retry", (t) => {
   for (const runtimeAsync of [true, false]) {
     const box = sandbox(t);
