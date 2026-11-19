@@ -3547,20 +3547,24 @@ test("pending handbacks recover their report before the tool result is written",
 });
 
 test("SubagentStop accepts a pending Codex rescue handback without a retry", (t) => {
-  const box = sandbox(t);
-  const workerTranscript = handbackWorker(box, "pending-peer", "transport", "codex:codex-rescue");
-  const jobId = "a".repeat(32);
-  const report = `companion output\njob: ${jobId}\nstate: done`;
-  writeHandback(workerTranscript, report);
-  fs.writeFileSync(workerTranscript, `${fs.readFileSync(workerTranscript, "utf8").trimEnd().split("\n").slice(0, -2).join("\n")}\n`);
-  const stopped = handbackStop(box, "pending-peer", workerTranscript, "codex:codex-rescue");
-  assert.strictEqual(stopped.status, 0, stopped.stderr);
-  assert.strictEqual(stopped.stdout, "");
-  const pending = record(box);
-  assert.strictEqual(pending.retryCount, 0);
-  assert.strictEqual(pending.transportStatus, "ready_uncollected");
-  assert.strictEqual(pending.failureKind, null);
-  assert.strictEqual(pending.peerJobId, jobId);
+  for (const runtimeAsync of [true, false]) {
+    const box = sandbox(t);
+    const workerTranscript = handbackWorker(box, "pending-peer", "transport", "codex:codex-rescue", runtimeAsync);
+    const jobId = "a".repeat(32);
+    const report = `companion output\njob: ${jobId}\nstate: done`;
+    writeHandback(workerTranscript, report);
+    fs.writeFileSync(workerTranscript, `${fs.readFileSync(workerTranscript, "utf8").trimEnd().split("\n").slice(0, -2).join("\n")}\n`);
+    assert.deepStrictEqual(finalReportFromTranscript(workerTranscript), { text: report, handback: true });
+    const stopped = handbackStop(box, "pending-peer", workerTranscript, "codex:codex-rescue");
+    assert.strictEqual(stopped.status, 0, stopped.stderr);
+    assert.strictEqual(stopped.stdout, "");
+    const pending = record(box);
+    assert.strictEqual(pending.retryCount, 0);
+    assert.strictEqual(pending.transportStatus, runtimeAsync ? "ready_uncollected" : "done");
+    assert.strictEqual(pending.collectedAt != null, !runtimeAsync);
+    assert.strictEqual(pending.failureKind, null);
+    assert.strictEqual(pending.peerJobId, jobId);
+  }
 });
 
 test("SubagentStop never writes a placeholder last assistant message as its report", (t) => {
@@ -3679,6 +3683,32 @@ function strandedPeerWorker(box, agentId, runtimeAsync) {
   fs.copyFileSync(strandedHandbackFixture, workerTranscript);
   return workerTranscript;
 }
+
+test("a pending second handback after a delivered report is not treated as delivered", (t) => {
+  for (const runtimeAsync of [true, false]) {
+    const box = sandbox(t);
+    const workerTranscript = strandedPeerWorker(box, "pending-second-handback", runtimeAsync);
+    const entries = fs.readFileSync(workerTranscript, "utf8").trimEnd().split("\n");
+    fs.writeFileSync(workerTranscript, `${entries.slice(0, -1).join("\n")}\n`);
+    assert.strictEqual(finalReportFromTranscript(workerTranscript), null);
+    const stopped = handbackStop(box, "pending-second-handback", workerTranscript, "codex:codex-rescue");
+    assert.strictEqual(stopped.status, 0, stopped.stderr);
+    assert.strictEqual(JSON.parse(stopped.stdout).decision, "block");
+    const pending = record(box);
+    assert.strictEqual(pending.collectedAt ?? null, null);
+    assert.strictEqual(pending.transportStatus, "running");
+    assert.strictEqual(pending.retryCount, 1);
+  }
+});
+
+test("a pending handback remains deliverable after an earlier refused handback", (t) => {
+  const box = sandbox(t);
+  const workerTranscript = strandedPeerWorker(box, "pending-after-refusal", false);
+  const entries = fs.readFileSync(workerTranscript, "utf8").trimEnd().split("\n").slice(0, -1).map((line) => JSON.parse(line));
+  entries[4].message.content[0].is_error = true;
+  fs.writeFileSync(workerTranscript, entries.map((entry) => `${JSON.stringify(entry)}\n`).join(""));
+  assert.deepStrictEqual(finalReportFromTranscript(workerTranscript), { text: entries.at(-1).message.content[0].input.message, handback: true });
+});
 
 test("a real report stranded behind a delivered waiting handback is left for the orchestrator to Read", (t) => {
   const box = sandbox(t);
@@ -6678,6 +6708,62 @@ test("Claude quota records identify the limited family from the error or dispatc
   assert.strictEqual(withClaudeQuotaFailure({ ...worker, requestedModel: "fable", resolvedModel: "claude-opus-5-5" }, "Usage limit exceeded", now).quotaModelFamily, "opus");
   assert.strictEqual(withClaudeQuotaFailure({ ...worker, resolvedModel: "claude-opus-5-5" }, "You've hit your Fable limit", now).quotaModelFamily, "fable");
   assert.strictEqual(withClaudeQuotaFailure(worker, "You've hit your limit", now).quotaModelFamily, null);
+});
+
+test("Claude quota detection accepts mid-line API errors only from harness fields", () => {
+  const now = "2026-11-17T00:00:00.000Z";
+  const worker = { agentType: "fusion:deep-reasoner" };
+  const evidence = "Analysis: the fixture contains API error: You've hit your Fable limit · resets Nov 21 at 12am (Asia/Taipei)\ndelivery: complete\ncoverage: complete";
+  assert.strictEqual(withClaudeQuotaFailure(worker, evidence, now), worker);
+  const reported = { ...worker, finalText: evidence };
+  assert.strictEqual(withClaudeQuotaFailure(reported, null, now), reported);
+  const summary = "Agent \"X\" failed: Agent terminated early due to an API error: You've hit your Fable limit · resets Nov 21 at 12am (Asia/Taipei) (error type rate_limit, HTTP 429, ...)";
+  for (const field of ["notificationSummary", "statusDetail"]) {
+    const classified = withClaudeQuotaFailure({ ...worker, [field]: summary }, evidence, now);
+    assert.strictEqual(classified.failureKind, "quota");
+    assert.strictEqual(classified.quotaModelFamily, "fable");
+    assert.strictEqual(classified.quotaResetAt, "2026-11-20T16:00:00.000Z");
+  }
+  for (const message of ["You've hit your Fable limit", "error: You've hit your Fable limit", "report\nYou've hit your Fable limit"]) {
+    assert.strictEqual(withClaudeQuotaFailure(worker, message, now).failureKind, "quota");
+    assert.strictEqual(withClaudeQuotaFailure({ ...worker, finalText: message }, null, now).failureKind, "quota");
+  }
+});
+
+test("Claude dated quota resets retain recently elapsed times and roll across the year", (t) => {
+  for (const [reference, resetText, expected] of [
+    ["2026-11-21T00:00:01Z", "Nov 21 at 12am (UTC)", "2026-11-21T00:00:00.000Z"],
+    ["2026-11-21T00:00:01Z", "Nov 21", new Date(2026, 10, 21).toISOString()],
+    ["2026-11-28T00:00:00Z", "Nov 21 at 12am (UTC)", "2026-11-21T00:00:00.000Z"],
+    ["2026-12-30T00:00:00Z", "Jan 2 at 12am (UTC)", "2027-01-02T00:00:00.000Z"],
+    ["2026-12-30T00:00:00Z", "Jan 2", new Date(2027, 0, 2).toISOString()],
+    ["2026-11-21T00:00:01Z", "12am (UTC)", "2026-11-22T00:00:00.000Z"]
+  ]) {
+    const box = sandbox(t);
+    const worker = createWorkerRecord({ taskId: `fusion-${"e".repeat(24)}`, sessionId: "session-1", agentType: "fusion:deep-reasoner", workspaceRoot: box.cwd }, envFor(box));
+    const failed = withClaudeQuotaFailure({ ...worker, transportStatus: "failed", finishedAt: reference }, `You've hit your Fable limit · resets ${resetText}`, reference);
+    assert.strictEqual(failed.quotaResetAt, expected, resetText);
+    updateWorkerRecord(worker.taskId, envFor(box), () => failed);
+    const denied = engineInfraDenial("session-1", "fusion:deep-reasoner", "", envFor(box), Date.parse(reference), "", "fable");
+    if (Date.parse(expected) <= Date.parse(reference)) assert.strictEqual(denied, null);
+    else assert.match(denied, /usage limit until/);
+  }
+});
+
+test("Claude quota resets choose the next occurrence of a repeated local time", () => {
+  const worker = { agentType: "fusion:deep-reasoner" };
+  for (const resetText of ["Nov 1, 2026 at 1:30am (America/New_York)", "Nov 1 at 1:30am (America/New_York)"]) {
+    for (const [reference, expected] of [
+      ["2026-11-01T05:00:00Z", "2026-11-01T05:30:00.000Z"],
+      ["2026-11-01T05:30:00Z", "2026-11-01T06:30:00.000Z"],
+      ["2026-11-01T05:45:00Z", "2026-11-01T06:30:00.000Z"],
+      ["2026-11-01T06:30:00Z", "2026-11-01T06:30:00.000Z"],
+      ["2026-11-01T06:45:00Z", "2026-11-01T06:30:00.000Z"]
+    ]) {
+      const classified = withClaudeQuotaFailure(worker, `You've hit your Fable limit · resets ${resetText}`, reference);
+      assert.strictEqual(classified.quotaResetAt, expected, `${resetText}: ${reference}`);
+    }
+  }
 });
 
 test("Claude harness quota summaries preserve model family and dated reset times", (t) => {
