@@ -5,6 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import { test } from "node:test";
 
+import { ENGINE_IDS } from "../plugins/fusion/scripts/lib/engines.mjs";
 import { deliverWorkerEngineAcceptance, newestEngineCompanion, prepareEngineAcceptanceDelivery, recordEngineAcceptance, retryWorkerEngineAcceptances } from "../plugins/fusion/scripts/lib/engine-acceptance.mjs";
 import { settleQueuedVerdict } from "../plugins/fusion/scripts/lib/lifecycle/collection.mjs";
 import { createWorkerRecord, readSessionWorkerRecords, readWorkerRecord, readWorkerSessionState, recordWorkerAcceptance, reopenWorkerContinuation, updateWorkerRecord, workerRecordFile } from "../plugins/fusion/scripts/lib/worker-state.mjs";
@@ -484,7 +485,7 @@ if (attempts === 5) process.kill(process.ppid, "SIGKILL");
   });
 }
 
-for (const engine of ["codex", "grok", "cursor", "devin"]) {
+for (const engine of ENGINE_IDS) {
   test(`${engine} companion repeated acceptance preserves the job and verdict`, async (t) => {
     const root = sandbox(t);
     const data = path.join(root, "data");

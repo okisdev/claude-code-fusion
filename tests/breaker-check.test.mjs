@@ -54,7 +54,7 @@ function writeCompanion(file, source) {
 function envFor(sandbox, extra = {}) {
   const inherited = Object.fromEntries(
     Object.entries(process.env).filter(
-      ([key]) => key !== "HOME" && key !== "CLAUDE_CODE_SESSION_ID" && !/^(?:FUSION|GROK|CODEX|CURSOR|DEVIN)_/.test(key)
+      ([key]) => key !== "HOME" && key !== "CLAUDE_CODE_SESSION_ID" && !/^(?:FUSION|GROK|CODEX|CURSOR|DEVIN|AGY)_/.test(key)
     )
   );
   return {
@@ -82,7 +82,7 @@ test("installed engines with missing CLI binaries produce one routing line", (t)
   const box = makeSandbox(t);
   const bin = path.join(box.root, "bin");
   fs.mkdirSync(bin);
-  for (const engine of ["codex", "grok", "cursor", "devin"]) {
+  for (const engine of ["codex", "grok", "cursor", "devin", "agy"]) {
     fs.mkdirSync(path.join(box.home, ".claude", "plugins", "cache", "claude-code-fusion", engine), { recursive: true });
   }
   for (const binary of ["codex", "cursor-agent"]) {
@@ -92,10 +92,10 @@ test("installed engines with missing CLI binaries produce one routing line", (t)
   }
   const missing = run(box, { PATH: bin });
   assert.strictEqual(missing.status, 0, missing.stderr);
-  assert.match(missing.stdout, /fusion engines unavailable \(CLI missing\): grok, devin\. Skip these lanes\./);
+  assert.match(missing.stdout, /fusion engines unavailable \(CLI missing\): grok, devin, agy\. Skip these lanes\./);
   assert.strictEqual(missing.stdout.trim().split("\n").length, 1);
 
-  for (const binary of ["grok", "devin"]) {
+  for (const binary of ["grok", "devin", "agy"]) {
     const file = path.join(bin, binary);
     fs.writeFileSync(file, "#!/bin/sh\nexit 0\n");
     fs.chmodSync(file, 0o700);
@@ -112,10 +112,10 @@ test("installed engines honor executable absolute and PATH binary overrides", (t
   const box = makeSandbox(t);
   const bin = path.join(box.root, "bin");
   fs.mkdirSync(bin);
-  for (const engine of ["codex", "grok", "cursor", "devin"]) {
+  for (const engine of ["codex", "grok", "cursor", "devin", "agy"]) {
     fs.mkdirSync(path.join(box.home, ".claude", "plugins", "cache", "claude-code-fusion", engine), { recursive: true });
   }
-  for (const binary of ["codex", "grok", "cursor-agent", "devin", "codex-custom", "grok-custom", "cursor-custom", "devin-custom"]) {
+  for (const binary of ["codex", "grok", "cursor-agent", "devin", "agy", "codex-custom", "grok-custom", "cursor-custom", "devin-custom", "agy-custom"]) {
     const file = path.join(bin, binary);
     fs.writeFileSync(file, "#!/bin/sh\nexit 0\n");
     fs.chmodSync(file, 0o700);
@@ -124,12 +124,13 @@ test("installed engines honor executable absolute and PATH binary overrides", (t
     CODEX_BIN: path.join(bin, "codex-custom"),
     GROK_BIN: "grok-custom",
     CURSOR_AGENT_BIN: path.join(bin, "cursor-custom"),
-    DEVIN_BIN: "devin-custom"
+    DEVIN_BIN: "devin-custom",
+    AGY_BIN: "agy-custom"
   };
   assert.strictEqual(run(box, { PATH: bin, ...overrides }).stdout, "");
-  assert.strictEqual(run(box, { PATH: bin, CODEX_BIN: "codex-custom", GROK_BIN: path.join(bin, "grok-custom"), CURSOR_AGENT_BIN: "cursor-custom", DEVIN_BIN: path.join(bin, "devin-custom") }).stdout, "");
+  assert.strictEqual(run(box, { PATH: bin, CODEX_BIN: "codex-custom", GROK_BIN: path.join(bin, "grok-custom"), CURSOR_AGENT_BIN: "cursor-custom", DEVIN_BIN: path.join(bin, "devin-custom"), AGY_BIN: path.join(bin, "agy-custom") }).stdout, "");
 
-  for (const [engine, key] of [["codex", "CODEX_BIN"], ["grok", "GROK_BIN"], ["cursor", "CURSOR_AGENT_BIN"], ["devin", "DEVIN_BIN"]]) {
+  for (const [engine, key] of [["codex", "CODEX_BIN"], ["grok", "GROK_BIN"], ["cursor", "CURSOR_AGENT_BIN"], ["devin", "DEVIN_BIN"], ["agy", "AGY_BIN"]]) {
     for (const invalid of [path.join(box.root, "missing-binary"), "missing-binary"]) {
       const result = run(box, { PATH: bin, ...overrides, [key]: invalid });
       assert.strictEqual(result.status, 0, result.stderr);
@@ -242,7 +243,7 @@ test("engine breaker skips old job files before reading across every engine and 
   const now = Date.now();
   const oldFiles = new Set();
   const recentFiles = new Set();
-  for (const engine of ["codex", "grok", "cursor", "devin"]) {
+  for (const engine of ["codex", "grok", "cursor", "devin", "agy"]) {
     const stateRoot = engineStateRoots(engine, env)[0];
     for (const workspace of ["one", "two"]) {
       const old = jobFile(stateRoot, workspace, `${engine}-old`);
@@ -273,8 +274,8 @@ test("engine breaker skips old job files before reading across every engine and 
     process.stdout.write = originalWrite;
   }
   assert.strictEqual(oldReads, 0);
-  assert.strictEqual(recentReads, 4);
-  for (const engine of ["codex", "grok", "cursor", "devin"]) {
+  assert.strictEqual(recentReads, 5);
+  for (const engine of ["codex", "grok", "cursor", "devin", "agy"]) {
     assert.match(output, new RegExp(`treat the ${engine} breaker as open.*1 auth across 1 terminal jobs`));
   }
   assert.ok(output.endsWith(`${BREAKER_ADVISORY_TAG}\n`));
@@ -1088,4 +1089,38 @@ test("malformed records are skipped and the check still exits 0", (t) => {
   assert.strictEqual(result.status, 0);
   assert.strictEqual(result.stdout, "");
   assert.strictEqual(result.stderr, "");
+});
+
+test("Antigravity breaker scopes quota and capacity failures to the subscription pool", (t) => {
+  const sandbox = makeSandbox(t);
+  const env = { AGY_COMPANION_DATA: path.join(sandbox.root, "agy-data") };
+  const root = engineStateRoots("agy", envFor(sandbox, env))[0];
+  const write = (id, failureKind, ago) => writeRecord(jobFile(root, "workspace", id), {
+    id, engine: "agy", status: "error", failureKind, billingPool: "subscription",
+    agyVersion: "1.5.13", finishedAt: new Date(Date.now() - ago).toISOString()
+  });
+  write("capacity-one", "rate_limited", 120_000);
+  assert.strictEqual(run(sandbox, env).stdout, "");
+  write("capacity-two", "rate_limited", 60_000);
+  const limited = run(sandbox, env);
+  assert.strictEqual(limited.status, 0, limited.stderr);
+  assert.match(limited.stdout, /agy subscription pool breaker as open.*last failure rate_limited/);
+  assert.match(limited.stdout, /agy 1\.5\.13 installed, contract verified on 1\.5\.12/);
+  writeRecord(jobFile(root, "workspace", "recovered"), { id: "recovered", status: "done", billingPool: "subscription", finishedAt: new Date().toISOString() });
+  assert.strictEqual(run(sandbox, env).stdout, "");
+  fs.rmSync(jobFile(root, "workspace", "recovered"));
+  write("quota", "quota", 1000);
+  assert.match(run(sandbox, env).stdout, /agy subscription pool breaker as open.*last failure quota/);
+});
+
+test("Antigravity policy failures open the engine breaker and refusals stay local", (t) => {
+  const sandbox = makeSandbox(t);
+  const env = { AGY_COMPANION_DATA: path.join(sandbox.root, "agy-data") };
+  const root = engineStateRoots("agy", envFor(sandbox, env))[0];
+  const file = jobFile(root, "workspace", "failed");
+  writeRecord(file, { id: "failed", status: "error", failureKind: "refused", finishedAt: new Date().toISOString() });
+  assert.strictEqual(run(sandbox, env).stdout, "");
+  writeRecord(file, { id: "failed", status: "error", failureKind: "policy", billingPool: "subscription", finishedAt: new Date().toISOString() });
+  assert.match(run(sandbox, env).stdout, /agy breaker as open.*last failure policy/);
+  assert.doesNotMatch(run(sandbox, env).stdout, /agy subscription pool breaker/);
 });

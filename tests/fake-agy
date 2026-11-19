@@ -1,0 +1,214 @@
+#!/usr/bin/env node
+import { spawn } from "node:child_process";
+import fs from "node:fs";
+import path from "node:path";
+import readline from "node:readline";
+
+const args = process.argv.slice(2);
+if (args.includes("--version")) {
+  const flagsFile = process.env.HOME && path.join(process.env.HOME, ".fake-agy-version.json");
+  const flags = flagsFile && fs.existsSync(flagsFile) ? JSON.parse(fs.readFileSync(flagsFile, "utf8")) : {};
+  if (flags.logFile) fs.writeFileSync(flags.logFile, JSON.stringify({ geminiApiKey: process.env.GEMINI_API_KEY, home: process.env.HOME, path: process.env.PATH }));
+  process.stdout.write(`${flags.version ?? process.env.FAKE_AGY_VERSION ?? "1.5.12"}\n`);
+  process.exit(0);
+}
+if (args.length !== 8 || args[0] !== "acp" || args[1] !== "--disable-telemetry" || args[2] !== "--include-default-customizations=false" || args[3] !== "--sandbox" || args[4] !== "--gemini-dir" || !args[5]?.startsWith("/") || args[6] !== "--app-data-dir" || args[7] !== "agy") {
+  process.stderr.write("Expected isolated ACP invocation.\n");
+  process.exit(2);
+}
+
+const scenario = process.env.FAKE_AGY_SCENARIO || "success";
+const logFile = process.env.FAKE_AGY_LOG;
+const log = { argv: args, cwd: process.cwd(), firstPathEntry: (process.env.PATH || "").split(path.delimiter)[0], messages: [], signals: [], stdinEnded: false };
+const record = () => { if (!logFile) return; fs.writeFileSync(`${logFile}.tmp`, `${JSON.stringify(log)}\n`); fs.renameSync(`${logFile}.tmp`, logFile); };
+const emit = (event) => fs.writeSync(1, `${JSON.stringify({ jsonrpc: "2.0", ...event })}\n`);
+const reply = (id, result) => emit({ id, result });
+const fail = (id, message, code = -32000, data) => emit({ id, error: { code, message, ...(data === undefined ? {} : { data }) } });
+let sessionId = process.env.FAKE_AGY_SESSION_ID || "a0123456-789a-4bcd-8ef0-123456789abc";
+let promptId;
+let configOptions = [
+  { id: "mode", type: "select", currentValue: "default", options: ["default", "accept-edits"].map((value) => ({ value })) },
+  { id: "model", type: "select", currentValue: process.env.FAKE_AGY_CURRENT_MODEL || "gemini-4-neon", options: ["gemini-4-neon", "gemini-4-argon", "gemini-4-hydrogen", "gemini-3.8-flash", "gemini-pro-orchestrator-preview", "claude-opus-4.8"].map((value) => ({ value, name: value })) },
+  { id: "thought_level", type: "select", currentValue: "high", options: ["low", "medium", "high", "xhigh"].map((value) => ({ value })) }
+];
+
+const update = (value) => emit({ method: "session/update", params: { sessionId, update: value } });
+const text = (value) => update({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: value } });
+const tool = (name, id = `${name}:0#ab`, sessionUpdate = "tool_call", rawInput = {}, status) => update({ sessionUpdate, toolCallId: id, name, title: "Ran tool", kind: "execute", rawInput, ...(status ? { status } : {}) });
+
+function result() {
+  const usage = { totalTokens: 11914, inputTokens: 11875, outputTokens: 39 };
+  if (scenario !== "no_cache_usage") usage.cachedReadTokens = 11552;
+  usage.thoughtTokens = 12;
+  usage.cachedWriteTokens = 0;
+  if (scenario === "extra_usage") usage.vendorTokens = 7;
+  const value = { stopReason: scenario === "refusal" ? "refusal" : "end_turn", usage };
+  if (scenario === "missing_stop_reason") delete value.stopReason;
+  if (scenario === "no_final_newline") fs.writeSync(1, JSON.stringify({ jsonrpc: "2.0", id: promptId, result: value }));
+  else reply(promptId, value);
+}
+
+function success() {
+  update({ sessionUpdate: "agent_thought_chunk", content: { type: "text", text: "hidden thought" } });
+  update({ sessionUpdate: "usage_update", used: 999999 });
+  update({ sessionUpdate: "plan", entries: [] });
+  tool("read_file");
+  update({ sessionUpdate: "tool_call_update", toolCallId: "read_file:0#ab", status: "completed" });
+  tool("search_web");
+  text("fake ");
+  text("result");
+  result();
+}
+
+async function helper(detached, resistant) {
+  const child = spawn(process.execPath, ["-e", `process.on('SIGTERM', () => { if (!${resistant}) process.exit(0); }); process.send('ready'); setInterval(() => {}, 1000);`], { detached, stdio: ["ignore", detached ? 1 : "ignore", "ignore", "ipc"] });
+  if (process.env.FAKE_AGY_HELPER_PID_FILE) fs.writeFileSync(process.env.FAKE_AGY_HELPER_PID_FILE, String(child.pid));
+  await new Promise((resolve) => child.once("message", resolve));
+  child.disconnect();
+  child.unref();
+}
+
+async function prompt(id) {
+  promptId = id;
+  if (process.env.FAKE_AGY_PROMPT_FILE) fs.writeFileSync(process.env.FAKE_AGY_PROMPT_FILE, "ready");
+  const errors = {
+    quota: "Usage limit reached for this account",
+    capacity: "No capacity available",
+    unavailable: "UNAVAILABLE",
+    http503: "HTTP 503",
+    language_server: "Language server failed to start",
+    rate_limit: "Too many requests (429)",
+    network: "fetch failed: getaddrinfo ENOTFOUND agy.ai",
+    rpc_error: "Internal server error"
+  };
+  if (errors[scenario]) return fail(id, errors[scenario]);
+  if (scenario === "auth_required") {
+    return fail(id, "Authentication required");
+  }
+  if (scenario === "garbage") return fs.writeSync(1, "not json\n");
+  if (scenario === "non_object") return fs.writeSync(1, "[]\n");
+  if (scenario === "unknown_id") return reply(99999, {});
+  if (scenario === "malformed_response") return emit({ id, result: {}, error: { code: -32000, message: "bad" } });
+  if (scenario === "malformed_error") return emit({ id, error: "bad" });
+  if (scenario === "oversized_line") return fs.writeSync(1, "x".repeat(2 * 1024 * 1024 + 1));
+  if (scenario === "no_result") return process.exit(0);
+  if (scenario === "no_result_nonzero") return process.exit(7);
+  if (scenario === "hang") return;
+  if (scenario === "early_signal") return process.kill(process.pid, "SIGUSR2");
+  if (scenario === "unknown_request") return emit({ id: "client-request", method: "fs/read_text_file", params: {} });
+  if (scenario.startsWith("permission")) {
+    text("before permission");
+    const rawInput = { CommandLine: process.env.FAKE_AGY_COMMAND || (scenario === "permission_write" ? "touch outside" : "git status --short"), ...(scenario === "permission_bypass" ? { BypassSandbox: true } : {}) };
+    const name = process.env.FAKE_AGY_PERMISSION_TOOL || (scenario === "permission_read" ? "read_file" : scenario === "permission_edit" ? "edit_file" : "run_command");
+    const options = scenario === "permission_no_reject" ? [{ optionId: "approval", kind: "allow_once" }] : scenario === "permission_no_allow" ? [{ optionId: "denial", kind: "reject_once" }] : [{ optionId: "persist", kind: "allow_always" }, { optionId: "denial", kind: "reject_once" }, { optionId: "approval", kind: "allow_once" }];
+    return emit({ id: 0, method: "session/request_permission", params: { sessionId, toolCall: { toolCallId: "command", name, rawInput }, options } });
+  }
+  if (scenario === "bypass" || scenario === "bypass_update") {
+    tool("run_command", "command", "tool_call", { CommandLine: "pwd", BypassSandbox: false });
+    const announced = tool("run_command", "command", scenario === "bypass_update" ? "tool_call_update" : "tool_call", { BypassSandbox: true }, scenario === "bypass_update" ? "completed" : "in_progress");
+    if (scenario === "bypass_update") return announced;
+  }
+  if (scenario === "bypass_update_no_name") {
+    tool("run_command", "command", "tool_call", { CommandLine: "pwd" });
+    return update({ sessionUpdate: "tool_call_update", toolCallId: "command", rawInput: { BypassSandbox: true }, status: "completed" });
+  }
+  if (scenario === "forbidden_tool") return tool(process.env.FAKE_AGY_FORBIDDEN_TOOL || "invoke_subagent");
+  if (scenario === "forbidden_update") {
+    tool("read_file");
+    return tool("mcp_external", "read_file:0#ab", "tool_call_update");
+  }
+  if (scenario === "web_search") tool("search_web");
+  if (scenario === "missing_tool") return update({ sessionUpdate: "tool_call", toolCallId: "unknown" });
+  if (scenario === "write_tool") tool(process.env.FAKE_AGY_WRITE_TOOL || "write_file");
+  if (scenario === "escape_stdio" || scenario === "spawn_helper" || scenario === "resistant_group") await helper(scenario === "escape_stdio", scenario === "resistant_group");
+  if (scenario === "split_utf8") {
+    const line = Buffer.from(`${JSON.stringify({ jsonrpc: "2.0", method: "session/update", params: { sessionId, update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "é 中文" } } } })}\n`);
+    const split = line.indexOf(0xc3) + 1;
+    fs.writeSync(1, line.subarray(0, split));
+    fs.writeSync(2, Buffer.from([0xc3]));
+    setTimeout(() => {
+      fs.writeSync(1, line.subarray(split));
+      fs.writeSync(2, Buffer.from([0xa9, 0x0a]));
+      result();
+    }, 20);
+    return;
+  }
+  if (scenario === "stderr_tail") fs.writeSync(2, `${"é".repeat(40000)}tail\n`);
+  if (scenario === "network_after_result") fs.writeSync(2, "fetch failed: ECONNRESET\n");
+  success();
+  if (scenario === "forbidden_after_result") tool(process.env.FAKE_AGY_FORBIDDEN_TOOL || "invoke_subagent");
+  if (scenario === "unexpected_signal") process.kill(process.pid, "SIGUSR2");
+  if (scenario === "no_final_newline") process.exit(0);
+  if (scenario === "nonzero_success") process.exit(7);
+}
+
+async function handleMessage(message) {
+  log.messages.push(message);
+  record();
+  const { id, method, params } = message;
+  if (!method) {
+    if (scenario.startsWith("permission")) {
+      if (message.result?.outcome?.optionId === "approval") text(" allowed");
+      return result();
+    }
+    return success();
+  }
+
+  if (method === "session/cancel") return;
+  if (method === "initialize") {
+    if (scenario === "slow_init") return;
+    if (scenario === "forbidden_before_init") return tool(process.env.FAKE_AGY_FORBIDDEN_TOOL || "invoke_subagent");
+    if (scenario === "initialize_error") return fail(id, "Initialization failed");
+    return reply(id, { protocolVersion: scenario === "bad_protocol_version" ? 2 : 1, agentInfo: { name: "Antigravity", version: "1.5.12" }, agentCapabilities: { loadSession: true }, authMethods: [{ id: "login", name: "Log in" }] });
+  }
+  if (method === "session/new" || method === "session/load") {
+    if (scenario === "session_auth") return fail(id, "Authentication required");
+    if (params.sessionId) sessionId = params.sessionId;
+    if (method === "session/load") {
+      text("old conversation before load result");
+      tool(scenario === "replay_forbidden_tool" ? "edit_file" : "read_file", "replayed:0#ab");
+      tool(scenario === "replay_forbidden_update" ? "mcp_external" : "read_file", "replayed:0#ab", "tool_call_update");
+      if (scenario === "replay_bypass") tool("run_command", "replayed:1#ab", "tool_call_update", { BypassSandbox: true }, "completed");
+    }
+    reply(id, { ...(scenario === "missing_session" ? {} : { sessionId }), modes: { currentModeId: "accept-edits", availableModes: [] }, configOptions });
+    if (method === "session/load") {
+      text("old conversation after load result");
+      if (scenario === "replay_forbidden_after_load") tool("invoke_subagent", "replayed:2#ab");
+    }
+    return;
+  }
+  if (method === "session/set_mode") {
+    if (process.env.FAKE_AGY_REJECT_CONFIG === "mode") return fail(id, "Invalid mode", -32602);
+    configOptions.find((option) => option.id === "mode").currentValue = process.env.FAKE_AGY_MISMATCH_CONFIG === "mode" ? "mismatch" : params.modeId;
+    return reply(id, {});
+  }
+  if (method === "session/set_config_option") {
+    const { configId, value } = params;
+    const option = configOptions.find((entry) => entry.id === configId);
+    if (!option || process.env.FAKE_AGY_REJECT_CONFIG === configId || !option.options.some((entry) => entry.value === value)) return fail(id, "Invalid params", -32602, `Invalid value '${value}' for config option '${configId}'`);
+    if (process.env.FAKE_AGY_MISMATCH_CONFIG !== configId) option.currentValue = value;
+    else option.currentValue = "mismatch";
+    if (configId === "thought_level" && scenario === "drift_model") configOptions.find((entry) => entry.id === "model").currentValue = "gemini-4-argon";
+    if (configId === "thought_level" && scenario === "drift_mode") configOptions.find((entry) => entry.id === "mode").currentValue = "accept-edits";
+    reply(id, { configOptions });
+    return;
+  }
+  if (method === "session/prompt") return prompt(id);
+  fail(id, "Method not found", -32601);
+}
+
+record();
+process.on("SIGTERM", () => {
+  log.signals.push("SIGTERM");
+  record();
+  if (scenario !== "late_close" && scenario !== "terminal_late_close") setTimeout(() => process.exit(0), 30);
+});
+const input = readline.createInterface({ input: process.stdin });
+input.on("line", (line) => { handleMessage(JSON.parse(line)).catch((error) => { process.stderr.write(`${error.message}\n`); process.exit(1); }); });
+input.on("close", () => {
+  log.stdinEnded = true;
+  record();
+  if (scenario === "late_close" || scenario === "terminal_late_close") setInterval(() => {}, 1000);
+  else if (scenario === "delayed_exit") setTimeout(() => process.exit(0), 300);
+  else process.exit(0);
+});

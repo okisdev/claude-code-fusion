@@ -150,7 +150,7 @@ test("Ultra expands capacity without changing lane ownership", () => {
 test("the panel stays blind, asymmetric, evidence weighted, and main judged", () => {
   assert.match(panel, /In the standard external panel, every engine receives the same neutral brief, works with no knowledge of the other panelists/);
   assert.match(panel, /Never include a candidate answer, a leaning, any prior model opinion, or any context from this conversation\./);
-  assert.match(panel, /Its first line is the single routing header required by policy and includes `lane: panel`, `grok-role: independence` \(one of the four permitted Grok roles\), and the explicit acceptance criteria/);
+  assert.match(panel, /Its first line is the single routing header required by policy and includes `lane: panel`, `grok-role: independence` \(one of the four permitted Grok roles\), `agy-role: independence`, and the explicit acceptance criteria/);
   assert.match(panel, /invoke `grok:grok-rescue` and `codex:codex-rescue` with the identical brief as their direct prompt/);
   assert.match(panel, /Do not set `run_in_background`; parallel tool calls provide overlap while each result remains owned and collected/);
   assert.match(panel, /A panel never runs with fewer than two tracks\./);

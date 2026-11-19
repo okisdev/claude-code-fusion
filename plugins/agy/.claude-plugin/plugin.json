@@ -1,0 +1,23 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-plugin-manifest.json",
+  "name": "agy",
+  "displayName": "Antigravity Companion",
+  "version": "0.0.82",
+  "engines": {
+    "claude-code": ">=2.1.300"
+  },
+  "description": "Local Antigravity CLI delegation: Google consults, large context analysis, bounded file edits in owned worktrees, review, resumable history, background jobs, and setup health checks.",
+  "author": {
+    "name": "Harry Yep"
+  },
+  "homepage": "https://github.com/okisdev/claude-code-fusion",
+  "repository": "https://github.com/okisdev/claude-code-fusion",
+  "license": "MIT",
+  "keywords": [
+    "antigravity",
+    "gemini",
+    "delegation",
+    "code-review",
+    "orchestration"
+  ]
+}

@@ -377,7 +377,7 @@ test("Previously rendered model scores upgrade to static rules without looking l
   const sandbox = makeSandbox(t);
   writeModelRouting(sandbox.modelRoutingFile);
   const rendered = CANONICAL.replace(STATIC_MODEL_CONTEXT, renderModelTable(readModelRoutingFile(sandbox.modelRoutingFile).data));
-  assert.match(rendered, /^Lane defaults: codex quick gpt-6-sol@xhigh, volume gpt-6-sol@high, flagship gpt-6\.1-sol@xhigh; grok burst grok-4\.7-build-fast@low, independence grok-4\.7-build-fast@low, live-web grok-4\.7-build-fast@high, large-context grok-4\.6@medium; cursor diversity muse-spark-1\.3@xhigh, burst composer-2\.5@default\.$/m);
+  assert.match(rendered, /^Lane defaults: codex quick gpt-6-sol@xhigh, volume gpt-6-sol@high, flagship gpt-6\.1-sol@xhigh; grok burst grok-4\.7-build-fast@low, independence grok-4\.7-build-fast@low, live-web grok-4\.7-build-fast@high, large-context grok-4\.6@medium; cursor diversity muse-spark-1\.3@xhigh, burst composer-2\.5@default; agy independence gemini-4-neon@high, large-context gemini-4-neon@high, burst gemini-4-neon@medium\.$/m);
   assert.strictEqual(hashRulesTemplate(rendered), hashRulesTemplate(CANONICAL));
   fs.mkdirSync(path.dirname(sandbox.rulesFile), { recursive: true });
   fs.writeFileSync(sandbox.rulesFile, rendered, "utf8");
@@ -480,14 +480,14 @@ test("background collection distinguishes explicit Fusion receipts from foregrou
   const rescue = fs.readFileSync(path.join(repoRoot, "plugins", "codex", "skills", "rescue", "SKILL.md"), "utf8");
   const troubleshootingText = fs.readFileSync(path.join(repoRoot, "plugins", "fusion", "rules", "troubleshooting.md"), "utf8");
   assert.match(troubleshootingText, /this obligation applies to a manual receipt that crosses into the main session from a detached job launched by Fusion orchestration/);
-  assert.match(troubleshootingText, /closed direct prompt containing exactly one standalone `engine: codex\|grok\|cursor\|devin` line and one standalone `job: <32 lowercase hexadecimal characters>` line/);
+  assert.match(troubleshootingText, /closed direct prompt containing exactly one standalone `engine: codex\|grok\|cursor\|devin\|agy` line and one standalone `job: <32 lowercase hexadecimal characters>` line/);
   assert.doesNotMatch(troubleshootingText, /`engine: codex\|grok` line/);
   assert.match(rules, /A detached receipt Fusion created is collected with `fusion:job-collector`\./);
   assert.match(fs.readFileSync(path.join(repoRoot, "plugins", "fusion", "rules", "troubleshooting.md"), "utf8"), /The lifecycle binds the collected marker to this dispatch identity\./);
   assert.match(fs.readFileSync(path.join(repoRoot, "plugins", "fusion", "rules", "troubleshooting.md"), "utf8"), /Grok, Cursor, and Devin rescue wrappers also launch their companion calls in background shells and wait through `await-output` slices; expected duration does not authorize managed detachment\./);
   assert.match(fs.readFileSync(path.join(repoRoot, "plugins", "fusion", "rules", "troubleshooting.md"), "utf8"), /Passing `run_in_background: false` does not make a dispatch synchronous/);
   assert.doesNotMatch(rules, /Managed Grok detachment is different/);
-  assert.match(fs.readFileSync(path.join(repoRoot, "plugins", "fusion", "rules", "troubleshooting.md"), "utf8"), /Direct Codex, Grok, Cursor, and Devin slash commands with explicit `--background` return manual receipts for the user to inspect and collect through their status and result commands/);
+  assert.match(fs.readFileSync(path.join(repoRoot, "plugins", "fusion", "rules", "troubleshooting.md"), "utf8"), /Direct Codex, Grok, Cursor, Devin, and Antigravity slash commands with explicit `--background` return manual receipts for the user to inspect and collect through their status and result commands/);
   assert.match(task, /Direct users inspect progress through `\/codex:status` and collect the deliverable through `\/codex:result`; the main session starts the receipt's per job watch through the Claude Code `Monitor` tool\./);
   assert.match(rescue, /Direct users inspect progress through `\/codex:status` and collect the deliverable through `\/codex:result`; the main session starts the receipt's per job watch through the Claude Code `Monitor` tool\./);
 });

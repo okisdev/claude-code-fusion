@@ -147,6 +147,15 @@
   },
   {
     "paths": [
+      "plugins/agy/**/*.mjs",
+      "tests/fake-agy"
+    ],
+    "suites": [
+      "tests/agy-*.test.mjs"
+    ]
+  },
+  {
+    "paths": [
       "plugins/fusion/scripts/lib/lifecycle/**/*.mjs"
     ],
     "suites": [

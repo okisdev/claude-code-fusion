@@ -27,8 +27,18 @@ export const DEFAULT_ROUTING_DEFAULTS = {
   devin: {
     diversity: { model: "muse-wonder", effort: "xhigh" },
     burst: { model: "swe-2", effort: "high" }
+  },
+  agy: {
+    independence: { model: "gemini-4-neon", effort: "high" },
+    "large-context": { model: "gemini-4-neon", effort: "high" },
+    burst: { model: "gemini-4-neon", effort: "medium" }
   }
 };
+export const DEFAULT_MODEL_ROUTING_MODELS = [
+  { id: "gemini-4-neon", lane: "agy", family: ENGINES.agy.family, intelligence: 5, taste: 4, cost: 4 },
+  { id: "gemini-4-hydrogen", lane: "agy", family: ENGINES.agy.family, intelligence: 4, taste: 3, cost: 5 },
+  { id: "gemini-4-argon", lane: "agy", family: ENGINES.agy.family, intelligence: 4, taste: 3, cost: 4 }
+];
 const ROUTING_DEFAULT_EFFORTS = new Set(["low", "medium", "high", "xhigh", "max"]);
 
 function laneEfforts(lane) {
@@ -39,6 +49,7 @@ export const DEFAULT_MODEL_TABLE_PLACEHOLDER =
 const MODEL_TABLE_PRIORITY_SENTENCE =
   "Scores feed the routing priorities above: intelligence proxies correctness and safety, taste is user facing quality, cost applies only as the final tie breaker.";
 const MODEL_TABLE_SCORE_SENTENCE = "Scores are user-assigned via /fusion:config; re-score when the model lineup changes.";
+const BREADTH_DIVERSITY_EXCLUSION = `Breadth diversity excludes the claude family and the ${ENGINES.agy.family} family served by ${ENGINES.agy.displayName} (${ENGINES.agy.id}); route ${ENGINES.agy.family} consults to ${ENGINES.agy.rescueAgent}.`;
 
 export function resolveModelRoutingPath(env = process.env) {
   const override = env.FUSION_MODEL_ROUTING;
@@ -168,6 +179,12 @@ export function validateModelRoutingData(value) {
         if (!models.some((row) => row.lane === lane && row.id === model)) {
           return invalid(`Expected defaults.${lane}.${role}.model to match a model in the ${lane} lane.`);
         }
+        if (ENGINES[lane].seat === "breadth" && role === "diversity") {
+          const family = models.find((row) => row.lane === lane && row.id === model).family;
+          if (["claude", "anthropic", ENGINES.agy.family].includes(family)) {
+            return invalid(`Expected defaults.${lane}.${role}.model to use a family eligible for breadth diversity. ${BREADTH_DIVERSITY_EXCLUSION}`);
+          }
+        }
         defaults[lane][role] = { model, effort: choice.effort };
       }
     }
@@ -252,6 +269,7 @@ export function renderModelTable(data, { includeNotes = false } = {}) {
   const defaultSentence = routedEngineIds(breadth).map((lane) => ENGINES[lane].roles.map((role, index) => `${index === 0 ? `${lane} ` : ""}${role} ${tableCell(defaults[lane][role].model)}@${defaults[lane][role].effort}`).join(", ")).join("; ");
   lines.push(
     `Breadth engine: ${ENGINES[breadth].displayName} (${breadth}); its briefs go to ${ENGINES[breadth].rescueAgent} with \`${breadth}-role: diversity\` or \`${breadth}-role: burst\`, and ${ENGINES[otherBreadth].displayName} holds no routing seat.`,
+    BREADTH_DIVERSITY_EXCLUSION,
     ...(includeNotes ? [] : ["Model notes (benchmarks, prices, latency) live in model-routing.json; `/fusion:config` shows them."]),
     "",
     `Lane defaults: ${defaultSentence}.`,

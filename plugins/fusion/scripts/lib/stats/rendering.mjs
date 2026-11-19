@@ -1,4 +1,4 @@
-import { BREADTH_ENGINE_IDS, ENGINES } from "../engines.mjs";
+import { ENGINES, ENGINE_IDS } from "../engines.mjs";
 import { STATS_PROVIDER_REGISTRY, WORKSPACE_ENGINE_DESCRIPTORS, acceptanceSummary } from "./aggregation.mjs";
 import { FLEET_SHAPED_MIN_WIDTH, hasCoercionLedgerData } from "./fleet.mjs";
 import { formatTraceModel } from "./reports.mjs";
@@ -104,7 +104,7 @@ export function renderPruneReport(result) {
       lines.push(`- ${candidate.dir} (${candidate.jobCount} job${candidate.jobCount === 1 ? "" : "s"})`);
     }
   }
-  for (const [key, title] of [["observations", "Observation sidecars"], ...BREADTH_ENGINE_IDS.map((id) => [`${id}Runs`, `Orphan ${ENGINES[id].displayName} runs`])]) {
+  for (const [key, title] of [["observations", "Observation sidecars"], ...ENGINE_IDS.filter((id) => id !== "codex" && id !== "grok").map((id) => [`${id}Runs`, `Orphan ${ENGINES[id].displayName} runs`])]) {
     lines.push("", `## ${title}`, "");
     const candidates = result.dead[key] ?? [];
     lines.push(...(candidates.length ? candidates.map((entry) => `- ${entry.dir}`) : ["none found"]));

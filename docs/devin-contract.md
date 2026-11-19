@@ -103,7 +103,7 @@ Records live at `<data>/state/<workspace>/jobs/<id>.json`, where `<data>` is `DE
 
 ## Sessions
 
-Sessions live in the shared session database, so `--resume <session-id>` and `--resume-last` call `session/load` on the parent job's session, and resume only a terminal job of the same workspace and mode. A resumed session keeps its model unless the request names one. `--fresh` ignores continuity. A job's config directory is removed when the job reaches a terminal status. A sweep at task start and SessionEnd removes run directories without job records once they are older than one hour, at most once every 10 minutes per data root. The CLI owns retention of its session database.
+Sessions live in the shared session database, so `--resume <session-id>` and `--resume-last` call `session/load` on the parent job's session, and resume only a terminal job of the same workspace and mode whose failure kind is not `policy`; `--resume-last` skips policy failures, an explicit `--resume` fails as `input` when no eligible job owns the session, and history marks those jobs as not resumable. A resumed session keeps its model unless the request names one. `--fresh` ignores continuity. A job's config directory is removed when the job reaches a terminal status. A sweep at task start and SessionEnd removes run directories without job records once they are older than one hour, at most once every 10 minutes per data root. The CLI owns retention of its session database.
 
 ## Review
 

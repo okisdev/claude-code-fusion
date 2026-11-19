@@ -47,6 +47,7 @@ if (args.join(" ") === "models list --format json") { process.stdout.write(${JSO
 if (args.join(" ") === "auth status") { process.stdout.write("Authenticated\\nPlan: Pro\\n"); process.exit(0); }
 process.env.FAKE_DEVIN_SCENARIO = ${JSON.stringify(scenario === "review_ok" || scenario === "review_invalid" ? "success" : scenario)};
 process.env.FAKE_DEVIN_LOG = ${JSON.stringify(log)};
+${extraEnv.FAKE_DEVIN_SESSION_ID ? `process.env.FAKE_DEVIN_SESSION_ID = ${JSON.stringify(extraEnv.FAKE_DEVIN_SESSION_ID)};` : ""}
 ${extraEnv.FAKE_DEVIN_REJECT_CONFIG ? `process.env.FAKE_DEVIN_REJECT_CONFIG = ${JSON.stringify(extraEnv.FAKE_DEVIN_REJECT_CONFIG)};` : ""}
 ${extraEnv.FAKE_DEVIN_MISMATCH_CONFIG ? `process.env.FAKE_DEVIN_MISMATCH_CONFIG = ${JSON.stringify(extraEnv.FAKE_DEVIN_MISMATCH_CONFIG)};` : ""}
 ${extraEnv.FAKE_DEVIN_MODEL_LABEL ? `process.env.FAKE_DEVIN_MODEL_LABEL = ${JSON.stringify(extraEnv.FAKE_DEVIN_MODEL_LABEL)};` : ""}
@@ -229,7 +230,7 @@ test("unavailable account family fails as setup and unsupported effort as input"
   assert.deepEqual(h.jobs().map((job) => job.status), ["error", "error"]);
 });
 
-test("resume loads the parent session and excludes replayed text", (t) => {
+test("resume loads the parent session, checks replay tools, and excludes replayed text", (t) => {
   const h = harness(t);
   assertDone(task(h));
   const parent = h.jobs()[0];
@@ -239,6 +240,28 @@ test("resume loads the parent session and excludes replayed text", (t) => {
   assert.match(resumed.stdout, new RegExp(`resumed-from: ${parent.id}`));
   assert.equal(h.jobs().find((job) => job.id !== parent.id).resumedFromJobId, parent.id);
   assert.ok(h.messages().some((message) => message.method === "session/load" && message.params.sessionId === parent.sessionId));
+});
+
+test("resume skips policy failures, refuses explicit policy sessions, and reports them as not resumable", (t) => {
+  const h = harness(t);
+  assertDone(task(h));
+  const parent = h.jobs()[0];
+  const forbidden = harness(t, "forbidden_tool", { FAKE_DEVIN_SESSION_ID: "policy-session" });
+  h.env.DEVIN_BIN = forbidden.bin;
+  const failed = task(h);
+  assert.equal(failed.status, 1, failed.stdout + failed.stderr);
+  const policy = h.jobs().find((job) => job.id !== parent.id);
+  assert.equal(policy.failureKind, "policy");
+  assert.notEqual(policy.sessionId, parent.sessionId);
+  h.env.DEVIN_BIN = h.bin;
+  const explicit = h.run(["task", "--resume", policy.sessionId, "--", "continue"]);
+  assert.equal(explicit.status, 1, explicit.stdout + explicit.stderr);
+  assert.match(explicit.stderr, /No finished consult Devin task owns session/);
+  assert.match(explicit.stderr, /failure: input/);
+  assert.equal(h.jobs().length, 2);
+  assertDone(h.run(["task", "--resume-last", "--", "continue"]));
+  assert.equal(h.jobs().find((job) => job.resumedFromJobId).resumedFromJobId, parent.id);
+  assert.equal(JSON.parse(h.run(["history", "--json"]).stdout).jobs.find((job) => job.jobId === policy.id).resumable, false);
 });
 
 test("review renders a validated verdict and invalid output fails", (t) => {

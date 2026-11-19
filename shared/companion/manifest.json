@@ -4,95 +4,114 @@
     "plugins/cursor/scripts/lib/job-id.mjs",
     "plugins/codex/scripts/lib/job-id.mjs",
     "plugins/devin/scripts/lib/job-id.mjs",
+    "plugins/agy/scripts/lib/job-id.mjs",
     "plugins/fusion/scripts/lib/job-id.mjs"
   ],
   "job-watch.mjs": [
     "plugins/codex/scripts/lib/job-watch.mjs",
     "plugins/grok/scripts/lib/job-watch.mjs",
     "plugins/cursor/scripts/lib/job-watch.mjs",
-    "plugins/devin/scripts/lib/job-watch.mjs"
+    "plugins/devin/scripts/lib/job-watch.mjs",
+    "plugins/agy/scripts/lib/job-watch.mjs"
   ],
   "await-output.mjs": [
     "plugins/grok/scripts/lib/await-output.mjs",
     "plugins/cursor/scripts/lib/await-output.mjs",
     "plugins/codex/scripts/lib/await-output.mjs",
     "plugins/devin/scripts/lib/await-output.mjs",
+    "plugins/agy/scripts/lib/await-output.mjs",
     "plugins/fusion/scripts/lib/await-output.mjs"
   ],
   "process-identity.mjs": [
     "plugins/grok/scripts/lib/process-identity.mjs",
     "plugins/cursor/scripts/lib/process-identity.mjs",
     "plugins/codex/scripts/lib/process-identity.mjs",
-    "plugins/devin/scripts/lib/process-identity.mjs"
+    "plugins/devin/scripts/lib/process-identity.mjs",
+    "plugins/agy/scripts/lib/process-identity.mjs"
   ],
   "record-lock.mjs": [
     "plugins/grok/scripts/lib/record-lock.mjs",
     "plugins/cursor/scripts/lib/record-lock.mjs",
     "plugins/codex/scripts/lib/record-lock.mjs",
-    "plugins/devin/scripts/lib/record-lock.mjs"
+    "plugins/devin/scripts/lib/record-lock.mjs",
+    "plugins/agy/scripts/lib/record-lock.mjs"
   ],
   "raw-transport.mjs": [
     "plugins/grok/scripts/lib/raw-transport.mjs",
     "plugins/cursor/scripts/lib/raw-transport.mjs",
     "plugins/codex/scripts/lib/raw-transport.mjs",
-    "plugins/devin/scripts/lib/raw-transport.mjs"
+    "plugins/devin/scripts/lib/raw-transport.mjs",
+    "plugins/agy/scripts/lib/raw-transport.mjs"
   ],
   "args.mjs": [
     "plugins/grok/scripts/lib/args.mjs",
     "plugins/cursor/scripts/lib/args.mjs",
     "plugins/codex/scripts/lib/shared-args.mjs",
-    "plugins/devin/scripts/lib/args.mjs"
+    "plugins/devin/scripts/lib/args.mjs",
+    "plugins/agy/scripts/lib/args.mjs"
   ],
   "job-state.mjs": [
     "plugins/grok/scripts/lib/job-state.mjs",
     "plugins/cursor/scripts/lib/job-state.mjs",
     "plugins/codex/scripts/lib/job-state.mjs",
-    "plugins/devin/scripts/lib/job-state.mjs"
+    "plugins/devin/scripts/lib/job-state.mjs",
+    "plugins/agy/scripts/lib/job-state.mjs"
   ],
   "companion-commands.mjs": [
     "plugins/cursor/scripts/lib/companion-commands.mjs",
-    "plugins/devin/scripts/lib/companion-commands.mjs"
+    "plugins/devin/scripts/lib/companion-commands.mjs",
+    "plugins/agy/scripts/lib/companion-commands.mjs"
   ],
   "execution-budget.mjs": [
     "plugins/grok/scripts/lib/execution-budget.mjs",
     "plugins/cursor/scripts/lib/execution-budget.mjs",
-    "plugins/devin/scripts/lib/execution-budget.mjs"
+    "plugins/devin/scripts/lib/execution-budget.mjs",
+    "plugins/agy/scripts/lib/execution-budget.mjs"
   ],
   "render-footers.mjs": [
     "plugins/cursor/scripts/lib/render-footers.mjs",
     "plugins/codex/scripts/lib/render-footers.mjs",
-    "plugins/devin/scripts/lib/render-footers.mjs"
+    "plugins/devin/scripts/lib/render-footers.mjs",
+    "plugins/agy/scripts/lib/render-footers.mjs"
   ],
   "process-run.mjs": [
     "plugins/cursor/scripts/lib/process-run.mjs",
-    "plugins/devin/scripts/lib/process-run.mjs"
+    "plugins/devin/scripts/lib/process-run.mjs",
+    "plugins/agy/scripts/lib/process-run.mjs"
   ],
   "private-home.mjs": [
     "plugins/cursor/scripts/lib/private-home.mjs",
-    "plugins/devin/scripts/lib/private-home.mjs"
+    "plugins/devin/scripts/lib/private-home.mjs",
+    "plugins/agy/scripts/lib/private-home.mjs"
   ],
   "model-catalog.mjs": [
     "plugins/cursor/scripts/lib/model-catalog.mjs",
-    "plugins/devin/scripts/lib/model-catalog.mjs"
+    "plugins/devin/scripts/lib/model-catalog.mjs",
+    "plugins/agy/scripts/lib/model-catalog.mjs"
   ],
   "companion-render.mjs": [
     "plugins/cursor/scripts/lib/companion-render.mjs",
-    "plugins/devin/scripts/lib/companion-render.mjs"
+    "plugins/devin/scripts/lib/companion-render.mjs",
+    "plugins/agy/scripts/lib/companion-render.mjs"
   ],
   "run-maintenance.mjs": [
     "plugins/cursor/scripts/lib/run-maintenance.mjs",
-    "plugins/devin/scripts/lib/run-maintenance.mjs"
+    "plugins/devin/scripts/lib/run-maintenance.mjs",
+    "plugins/agy/scripts/lib/run-maintenance.mjs"
   ],
   "session-end.mjs": [
     "plugins/cursor/scripts/lib/session-end.mjs",
-    "plugins/devin/scripts/lib/session-end.mjs"
+    "plugins/devin/scripts/lib/session-end.mjs",
+    "plugins/agy/scripts/lib/session-end.mjs"
   ],
   "companion-state.mjs": [
     "plugins/cursor/scripts/lib/companion-state.mjs",
-    "plugins/devin/scripts/lib/companion-state.mjs"
+    "plugins/devin/scripts/lib/companion-state.mjs",
+    "plugins/agy/scripts/lib/companion-state.mjs"
   ],
   "review.md": [
     "plugins/cursor/prompts/review.md",
-    "plugins/devin/prompts/review.md"
+    "plugins/devin/prompts/review.md",
+    "plugins/agy/prompts/review.md"
   ]
 }

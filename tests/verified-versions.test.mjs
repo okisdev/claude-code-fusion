@@ -15,11 +15,12 @@ test("verified peer CLI versions are complete and well formed", () => {
   assert.doesNotThrow(() => {
     verifiedVersions = readVerifiedVersions();
   });
-  assert.deepEqual(Object.keys(verifiedVersions).sort(), ["codex-cli", "cursor", "devin", "grok", "verifiedAt"]);
-  assert.deepEqual(verifiedVersions, { "codex-cli": "0.170.0", grok: "1.0.89", cursor: "2026.11.17-f532c45", devin: "3000.14.30821", verifiedAt: "2026-11-18" });
+  assert.deepEqual(Object.keys(verifiedVersions).sort(), ["agy", "codex-cli", "cursor", "devin", "grok", "verifiedAt"]);
+  assert.deepEqual(verifiedVersions, { "codex-cli": "0.170.0", grok: "1.0.89", cursor: "2026.11.17-f532c45", devin: "3000.14.30821", agy: "1.5.12", verifiedAt: "2026-11-18" });
   assert.match(verifiedVersions["codex-cli"], /^\d+\.\d+\.\d+$/);
   assert.match(verifiedVersions.grok, /^\d+\.\d+\.\d+$/);
   assert.match(verifiedVersions.cursor, /^\d{4}\.\d{2}\.\d{2}-[a-f0-9]+$/);
+  assert.match(verifiedVersions.agy, /^\d+\.\d+\.\d+$/);
   assert.match(verifiedVersions.devin, /^\d+\.\d+\.\d+$/);
   assert.match(verifiedVersions.verifiedAt, /^\d{4}-\d{2}-\d{2}$/);
 });
@@ -29,6 +30,7 @@ test("README records the verified peer CLI versions", () => {
   const readme = fs.readFileSync(path.join(repoRoot, "README.md"), "utf8");
   assert.ok(readme.includes(`codex-cli ${verifiedVersions["codex-cli"]}`));
   assert.ok(readme.includes(`grok ${verifiedVersions.grok}`));
+  assert.ok(readme.includes(`Antigravity CLI ${verifiedVersions.agy}`));
 });
 
 test("doctor checks the verified versions source", () => {

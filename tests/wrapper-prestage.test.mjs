@@ -7,14 +7,14 @@ import path from "node:path";
 import test from "node:test";
 import { pathToFileURL } from "node:url";
 
-import { ENGINES, engineRoleFromBrief } from "../plugins/fusion/scripts/lib/engines.mjs";
+import { ENGINES, ENGINE_IDS, engineRoleFromBrief } from "../plugins/fusion/scripts/lib/engines.mjs";
 import { briefArtifactPath } from "../plugins/fusion/scripts/lib/lifecycle/dispatch.mjs";
 import { readPeerCapacityReservations, readWorkerRecords } from "../plugins/fusion/scripts/lib/worker-state.mjs";
 
 const repoRoot = path.resolve(import.meta.dirname, "..");
 const hook = path.join(repoRoot, "plugins/fusion/scripts/fusion-hook.mjs");
 const lifecycle = path.join(repoRoot, "plugins/fusion/scripts/worker-lifecycle.mjs");
-const engines = ["codex", "grok", "cursor", "devin"];
+const engines = ENGINE_IDS;
 const sessionId = "wrapper-prestage-session";
 
 function sandbox(t) {
@@ -171,10 +171,13 @@ test("consult only routed roles prestage read only while write takes precedence"
     ["grok", "lane: panel | grok-role: large-context", true],
     ["cursor", "lane: cursor diversity", true],
     ["devin", "lane: devin diversity", true],
+    ["agy", "lane: agy independence", true],
+    ["agy", "lane: panel | agy-role: large-context", true],
     ["codex", "lane: codex quick", false],
     ["grok", "lane: grok burst", false],
     ["cursor", "lane: cursor burst", false],
-    ["devin", "lane: devin burst", false]
+    ["devin", "lane: devin burst", false],
+    ["agy", "lane: agy burst", false]
   ];
   for (const [index, [engine, header, consultOnly]] of cases.entries()) {
     for (const write of [false, true]) {

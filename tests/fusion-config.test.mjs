@@ -6,7 +6,7 @@ import path from "node:path";
 import { test } from "node:test";
 
 import { hashRulesTemplate } from "../plugins/fusion/scripts/lib/rules-template.mjs";
-import { DEFAULT_MODEL_TABLE_PLACEHOLDER, resolveModelRoutingPath } from "../plugins/fusion/scripts/lib/model-table.mjs";
+import { DEFAULT_MODEL_TABLE_PLACEHOLDER, DEFAULT_MODEL_ROUTING_MODELS, resolveModelRoutingPath } from "../plugins/fusion/scripts/lib/model-table.mjs";
 
 const repoRoot = path.join(import.meta.dirname, "..");
 const script = path.join(repoRoot, "plugins", "fusion", "scripts", "fusion-config.mjs");
@@ -31,7 +31,7 @@ function sandbox(t) {
     `${JSON.stringify({ format: 2, hashes: [hashRulesTemplate(CANONICAL)] }, null, 2)}\n`,
     "utf8"
   );
-  const companions = Object.fromEntries(["codex", "grok", "cursor", "devin"].map((engine) => {
+  const companions = Object.fromEntries(["codex", "grok", "cursor", "devin", "agy"].map((engine) => {
     const file = path.join(root, `${engine}-companion.mjs`);
     const models = engine === "codex"
       ? ["gpt-5.6-terra", "gpt-5.7-new", "gpt-6-sol", "o3"]
@@ -39,7 +39,9 @@ function sandbox(t) {
         ? ["grok-4.7-build-fast", "grok-new"]
         : engine === "cursor"
           ? ["muse-spark-1.3-xhigh", "composer-2.5", "cursor-new"]
-          : ["muse-wonder-xhigh", "swe-2", "devin-new"];
+          : engine === "devin"
+            ? ["muse-wonder-xhigh", "swe-2", "devin-new"]
+            : ["gemini-4-neon", "gemini-4-hydrogen", "gemini-4-argon"];
     fs.writeFileSync(file, `if (process.argv.slice(2).join(" ") !== "models --json") process.exit(2);\nprocess.stdout.write(JSON.stringify(${JSON.stringify({ engine, models: models.map((id) => ({ id, displayName: id })), source: "test listing" })}));\n`);
     return [engine, file];
   }));
@@ -68,6 +70,7 @@ function run(sandbox, args, overrides = {}) {
       FUSION_GROK_COMPANION: sandbox.companions.grok,
       FUSION_CURSOR_COMPANION: sandbox.companions.cursor,
       FUSION_DEVIN_COMPANION: sandbox.companions.devin,
+      FUSION_AGY_COMPANION: sandbox.companions.agy,
       ...overrides
     }
   });
@@ -114,8 +117,9 @@ test("Rescore keeps notes in routing data and prints the table without installin
   assert.strictEqual(result.status, 0, result.stderr);
   const data = JSON.parse(fs.readFileSync(box.modelRoutingFile, "utf8"));
   assert.strictEqual(data.schemaVersion, 1);
-  assert.strictEqual(data.models.length, 1);
-  assert.deepStrictEqual(data.models[0], {
+  assert.strictEqual(data.models.length, 4);
+  assert.deepStrictEqual(data.models.slice(0, 3), DEFAULT_MODEL_ROUTING_MODELS);
+  assert.deepStrictEqual(data.models[3], {
     id: "codex",
     lane: "codex",
     intelligence: 5,
@@ -167,14 +171,14 @@ test("Set-breadth creates routing data, changes the rendered seat, and preserves
   assert.match(selected.stdout, /Updated breadth engine to Devin \(devin\)/);
   const data = JSON.parse(fs.readFileSync(box.modelRoutingFile, "utf8"));
   assert.strictEqual(data.breadth, "devin");
-  assert.deepStrictEqual(data.models, []);
+  assert.deepStrictEqual(data.models, DEFAULT_MODEL_ROUTING_MODELS);
   assert.match(selected.stdout, /Breadth engine: Devin \(devin\)/);
-  assert.strictEqual(run(box, ["rescore", "muse-wonder", "--intelligence", "5", "--taste", "5", "--cost", "3", "--lane", "devin", "--family", "anthropic"]).status, 0);
+  assert.strictEqual(run(box, ["rescore", "muse-wonder", "--intelligence", "5", "--taste", "5", "--cost", "3", "--lane", "devin", "--family", "meta"]).status, 0);
   assert.strictEqual(run(box, ["rescore", "composer-2.5", "--intelligence", "4", "--taste", "4", "--cost", "4", "--lane", "cursor", "--family", "cognition"]).status, 0);
   assert.strictEqual(run(box, ["set-default", "devin", "diversity", "muse-wonder", "xhigh"]).status, 0);
   const listing = run(box, ["show"]);
   assert.strictEqual(listing.status, 0, listing.stderr);
-  assert.match(listing.stdout, /\| muse-wonder \| devin \| anthropic \|/);
+  assert.match(listing.stdout, /\| muse-wonder \| devin \| meta \|/);
   assert.doesNotMatch(listing.stdout, /\| composer-2\.5 \| cursor \|/);
   assert.match(listing.stdout, /devin diversity muse-wonder@xhigh/);
   assert.doesNotMatch(listing.stdout, /cursor diversity/);
@@ -189,7 +193,7 @@ test("Set-breadth creates routing data, changes the rendered seat, and preserves
   assert.match(switched.stdout, /\| composer-2\.5 \| cursor \| cognition \|/);
   assert.doesNotMatch(switched.stdout, /\| muse-wonder \| devin \|/);
   assert.strictEqual(fs.existsSync(box.rulesFile), false);
-  assert.deepStrictEqual(JSON.parse(fs.readFileSync(box.modelRoutingFile, "utf8")).models.map((row) => row.id), ["muse-wonder", "composer-2.5"]);
+  assert.deepStrictEqual(JSON.parse(fs.readFileSync(box.modelRoutingFile, "utf8")).models.map((row) => row.id), [...DEFAULT_MODEL_ROUTING_MODELS.map((row) => row.id), "muse-wonder", "composer-2.5"]);
 });
 
 test("Set-default rejects invalid choices and leaves the routing file unchanged", (t) => {
@@ -224,7 +228,7 @@ test("Show json parses after a score is configured", (t) => {
   assert.strictEqual(data.filePath, box.modelRoutingFile);
   assert.strictEqual(data.configured, true);
   assert.strictEqual(data.valid, true);
-  assert.strictEqual(data.data.models[0].id, "grok-fast");
+  assert.strictEqual(data.data.models[3].id, "grok-fast");
   assert.match(data.table, /^\| grok-fast \| grok \| xai \| 3 \| 3 \| 5 \|  \|$/m);
 });
 
@@ -259,7 +263,7 @@ test("Audit reports listing drift, unscored models, and Cursor variants per engi
     run(box, ["rescore", "grok-4-missing", "--intelligence", "4", "--taste", "4", "--cost", "5", "--lane", "grok"]).status,
     0
   );
-  assert.strictEqual(run(box, ["rescore", "muse-spark-1.3", "--intelligence", "4", "--taste", "5", "--cost", "3", "--lane", "cursor", "--family", "anthropic"]).status, 0);
+  assert.strictEqual(run(box, ["rescore", "muse-spark-1.3", "--intelligence", "4", "--taste", "5", "--cost", "3", "--lane", "cursor", "--family", "meta"]).status, 0);
   assert.strictEqual(run(box, ["rescore", "composer-2.5", "--intelligence", "4", "--taste", "4", "--cost", "4", "--lane", "cursor", "--family", "cursor"]).status, 0);
   assert.strictEqual(run(box, ["set-default", "codex", "quick", "gpt-5.6-terra", "high"]).status, 0);
   assert.strictEqual(run(box, ["set-default", "cursor", "diversity", "muse-spark-1.3", "xhigh"]).status, 0);
@@ -325,7 +329,7 @@ test("Cursor rescore requires family and accepts default effort", (t) => {
   const args = ["rescore", "composer-2.5", "--intelligence", "4", "--taste", "4", "--cost", "4", "--lane", "cursor"];
   const invalid = run(box, args);
   assert.strictEqual(invalid.status, 1);
-  assert.match(invalid.stderr, /models\[0\]\.family/);
+  assert.match(invalid.stderr, /models\[3\]\.family/);
   assert.strictEqual(run(box, [...args, "--family", "cursor"]).status, 0);
   assert.strictEqual(run(box, ["set-default", "cursor", "burst", "composer-2.5", "default"]).status, 0);
   const listing = run(box, ["show"]);
@@ -397,5 +401,27 @@ test("Every config mutation prints routing context while leaving missing, shippe
         assert.strictEqual(fs.statSync(box.rulesFile).mtimeMs, mtime);
       }
     }
+  }
+});
+
+test("Antigravity seeds Google scores and config rejects Google breadth diversity defaults", (t) => {
+  const box = sandbox(t);
+  for (const [role, effort] of [["independence", "high"], ["large-context", "high"], ["burst", "medium"]]) {
+    const result = run(box, ["set-default", "agy", role, "gemini-4-neon", effort]);
+    assert.strictEqual(result.status, 0, result.stderr);
+    assert.match(result.stdout, /gemini-4-neon \| agy \| google \| 5 \| 4 \| 4/);
+    assert.match(result.stdout, /gemini-4-hydrogen \| agy \| google \| 4 \| 3 \| 5/);
+    assert.match(result.stdout, /gemini-4-argon \| agy \| google \| 4 \| 3 \| 4/);
+  }
+  const audit = JSON.parse(run(box, ["audit", "--json"]).stdout);
+  assert.strictEqual(audit.engines.agy.listing.available, true);
+  assert.deepStrictEqual(audit.engines.agy.defaultsAbsent, []);
+  for (const lane of ["cursor", "devin"]) {
+    assert.strictEqual(run(box, ["rescore", `gemini-${lane}`, "--lane", lane, "--family", "google", "--intelligence", "5", "--taste", "4", "--cost", "4"]).status, 0);
+    const before = fs.readFileSync(box.modelRoutingFile, "utf8");
+    const refused = run(box, ["set-default", lane, "diversity", `gemini-${lane}`, "high"]);
+    assert.strictEqual(refused.status, 1);
+    assert.match(refused.stderr, /google family served by Antigravity/);
+    assert.strictEqual(fs.readFileSync(box.modelRoutingFile, "utf8"), before);
   }
 });
