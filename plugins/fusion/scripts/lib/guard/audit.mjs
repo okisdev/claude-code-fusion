@@ -354,11 +354,13 @@ function readAuditEvents({ auditDir, env = process.env, sessionId = null, sinceM
   let malformedCount = 0;
   const segments = listAuditSegments(root).sort((left, right) => left.date.localeCompare(right.date) || left.index - right.index);
   for (const segment of segments) {
+    const segmentStart = Date.parse(`${segment.date}T00:00:00.000Z`);
+    const countMalformed = !(segmentStart + DAY_MS <= lowerBound || segmentStart > upperBound);
     let text;
     try {
       text = fs.readFileSync(segment.file, "utf8");
     } catch {
-      malformedCount += 1;
+      if (countMalformed) malformedCount += 1;
       continue;
     }
     for (const line of text.split("\n")) {
@@ -366,10 +368,13 @@ function readAuditEvents({ auditDir, env = process.env, sessionId = null, sinceM
         continue;
       }
       try {
-        const event = normalizeAuditEvent(JSON.parse(line));
+        const value = JSON.parse(line);
+        const timestamp = Date.parse(value?.at);
+        if (timestamp < lowerBound || timestamp > upperBound) continue;
+        const event = normalizeAuditEvent(value);
         const atMs = Date.parse(event?.at);
         if (!event) {
-          malformedCount += 1;
+          if (countMalformed) malformedCount += 1;
           continue;
         }
         if (atMs < lowerBound || atMs > upperBound || (session && event.session !== session)) {
@@ -377,7 +382,7 @@ function readAuditEvents({ auditDir, env = process.env, sessionId = null, sinceM
         }
         events.push(event);
       } catch {
-        malformedCount += 1;
+        if (countMalformed) malformedCount += 1;
       }
     }
   }

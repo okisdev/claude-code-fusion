@@ -336,10 +336,10 @@ function withClaudeQuotaFailure(record, evidence, now) {
   const agentType = canonicalWorkerAgentType(record.agentType);
   if (!isFusionWorkerAgent(agentType) || agentType === "fusion:job-collector") return record;
   const text = [evidence, record.finalText, record.notificationSummary, record.statusDetail].filter((value) => typeof value === "string").join("\n");
-  const limit = text.match(/(?:^|\n)\s*(?:you(?:'|’)ve hit (?:your|the) [^\n]*limit|(?:usage|quota) limit (?:reached|exceeded)|(?:reached|exceeded) (?:your|the) usage limit|out of extra usage)/i);
+  const limit = text.match(/(?:(?:^|\n)\s*(?:error:\s*)?|\bAPI error:\s*)(?:you(?:'|’)ve hit (?:your|the) [^\n·]*?\blimit\b|(?:usage|quota) limit (?:reached|exceeded)|(?:reached|exceeded) (?:your|the) usage limit|out of extra usage)/i);
   if (!limit) return record;
   const reference = Date.parse(infraFinishedAt(record, now));
-  const resetText = text.match(/\bresets?\s+([^\n·]+)/i)?.[1]?.trim() ?? null;
+  const resetText = text.match(/\bresets?\s+([^\n·]+?)(?=\s+\(error\b|[\n·]|$)/i)?.[1]?.trim() ?? null;
   let reset = NaN;
   if (resetText) {
     const date = resetText.match(/^([A-Za-z]{3,9}\s+\d{1,2})(?:,?\s+(\d{4}))?$/);
@@ -350,20 +350,24 @@ function withClaudeQuotaFailure(record, evidence, now) {
     } else if (/^\d{4}-\d{2}-\d{2}/.test(resetText)) {
       reset = Date.parse(resetText);
     } else {
-      const time = resetText.match(/^(\d{1,2})(?::(\d{2}))?\s*(am|pm)(?:\s*\(([^)]+)\))?$/i);
-      if (time && Number(time[1]) >= 1 && Number(time[1]) <= 12 && Number(time[2] ?? 0) < 60) {
+      const time = resetText.match(/^(?:([A-Za-z]{3,9}\s+\d{1,2})(?:,?\s+(\d{4}))?\s+at\s+)?(\d{1,2})(?::(\d{2}))?\s*(am|pm)(?:\s*\(([^)]+)\))?$/i);
+      if (time && Number(time[3]) >= 1 && Number(time[3]) <= 12 && Number(time[4] ?? 0) < 60) {
         try {
-          const formatter = new Intl.DateTimeFormat("en-CA", { timeZone: time[4], year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", second: "2-digit", hourCycle: "h23" });
+          const formatter = new Intl.DateTimeFormat("en-CA", { timeZone: time[6], year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", second: "2-digit", hourCycle: "h23" });
           const parts = (at) => Object.fromEntries(formatter.formatToParts(at).map((part) => [part.type, part.value]));
           const day = parts(reference);
-          const hour = Number(time[1]) % 12 + (time[3].toLowerCase() === "pm" ? 12 : 0);
-          const target = Date.UTC(Number(day.year), Number(day.month) - 1, Number(day.day), hour, Number(time[2] ?? 0));
-          reset = target;
-          for (let index = 0; index < 3; index += 1) {
-            const observed = parts(reset);
-            reset += target - Date.UTC(Number(observed.year), Number(observed.month) - 1, Number(observed.day), Number(observed.hour), Number(observed.minute), Number(observed.second));
+          const calendar = time[1] ? new Date(`${time[1]} ${time[2] ?? day.year} 00:00:00 GMT`) : new Date(Date.UTC(Number(day.year), Number(day.month) - 1, Number(day.day)));
+          const hour = Number(time[3]) % 12 + (time[5].toLowerCase() === "pm" ? 12 : 0);
+          let target = Date.UTC(calendar.getUTCFullYear(), calendar.getUTCMonth(), calendar.getUTCDate(), hour, Number(time[4] ?? 0));
+          for (let attempt = 0; attempt < 2; attempt += 1) {
+            reset = target;
+            for (let index = 0; index < 3; index += 1) {
+              const observed = parts(reset);
+              reset += target - Date.UTC(Number(observed.year), Number(observed.month) - 1, Number(observed.day), Number(observed.hour), Number(observed.minute), Number(observed.second));
+            }
+            if (reset > reference || time[2]) break;
+            target = time[1] ? Date.UTC(calendar.getUTCFullYear() + 1, calendar.getUTCMonth(), calendar.getUTCDate(), hour, Number(time[4] ?? 0)) : target + 24 * 60 * 60 * 1000;
           }
-          if (reset <= reference) reset += 24 * 60 * 60 * 1000;
         } catch {
           reset = NaN;
         }

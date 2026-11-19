@@ -264,8 +264,8 @@ function finalReportFromTranscript(transcriptPath) {
       const calls = content.filter((block) => block?.type === "tool_use");
       if (calls.length > 0) {
         const [call] = calls;
-        const handbackMessage = calls.length === 1 && call.name === SUBAGENT_HANDBACK_TOOL && typeof call.input?.message === "string" && call.input.message.length > 0 ? call.input.message : null;
-        if (handbackMessage && toolResults?.get(call.id) === false) {
+        const handbackMessage = calls.length === 1 && call.name === SUBAGENT_HANDBACK_TOOL && typeof call.input?.message === "string" && call.input.message.trim().length > 0 ? call.input.message : null;
+        if (handbackMessage && toolResults?.get(call.id) !== true) {
           return { text: handbackMessage, handback: true };
         }
         return handbackMessage && alreadyDelivered.has(call.id) ? { text: handbackMessage, handback: false } : null;
@@ -315,10 +315,11 @@ function strandedHandbackFromTranscript(transcriptPath) {
       } else if (entry?.type === "user" && block?.type === "tool_result") {
         const refused = block.is_error === true;
         stranded ||= (placeholders.has(block.tool_use_id) && !refused) || (refused && HANDBACK_ALREADY_DELIVERED_PATTERN.test(taskNotificationTextParts(block.content).join("\n")));
+        placeholders.delete(block.tool_use_id);
       }
     }
   }
-  return stranded;
+  return stranded || placeholders.size > 0;
 }
 
 function finalAssistantTextFromTranscript(transcriptPath) {

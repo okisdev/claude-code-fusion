@@ -196,6 +196,29 @@ test("refused permission requests render a warning with the successful outcome",
   assert.match(result.stdout, /warning: permission_refused: 1 request\(s\) refused, which ends the Antigravity turn early\nstate: done\n$/);
 });
 
+test("refused permission requests without a result persist and render a permission failure", (t) => {
+  for (const [scenario, args] of [["permission_empty", []], ["permission_whitespace", ["--json"]]]) {
+    const h = harness(t, scenario);
+    const result = task(h, args);
+    assert.equal(result.status, 1, result.stdout + result.stderr);
+    const record = h.jobs()[0];
+    assert.equal(record.status, "error");
+    assert.equal(record.exitCode, 0);
+    assert.equal(record.stopReason, "end_turn");
+    assert.equal(record.permissionsRejected, 1);
+    assert.equal(record.failureKind, "permission");
+    assert.equal(record.errorMessage, "Antigravity refused 1 permission request(s) and returned no result, so the turn ended early.");
+    if (args.length) {
+      const payload = JSON.parse(result.stdout);
+      assert.equal(payload.failureKind, "permission");
+      assert.equal(payload.permissionsRejected, 1);
+    } else {
+      assert.match(result.stdout + result.stderr, /state: error\nfailure: permission\n$/);
+      assert.match(result.stdout + result.stderr, /Antigravity refused 1 permission request\(s\) and returned no result/);
+    }
+  }
+});
+
 test("resumes only same mode and workspace, checks replay tools, excludes replay text, and fresh ignores continuity", (t) => {
   const h = harness(t, "success", { FAKE_AGY_CURRENT_MODEL: "gemini-4-argon" });
   assertDone(task(h, ["--model", "gemini-4-argon"]));

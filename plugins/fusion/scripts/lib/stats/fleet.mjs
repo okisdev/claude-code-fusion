@@ -208,11 +208,13 @@ export function readStatsAuditEvents(env, { sessionId = null, sinceMs = null, un
   try {
     const segments = listGuardAuditSegments(resolveGuardAuditDir(env)).sort((left, right) => left.date.localeCompare(right.date) || left.index - right.index);
     for (const segment of segments) {
+      const segmentStart = Date.parse(`${segment.date}T00:00:00.000Z`);
+      const countMalformed = !((sinceMs != null && segmentStart + 86400000 <= sinceMs) || (untilMs != null && segmentStart > untilMs));
       let text;
       try {
         text = fs.readFileSync(segment.file, "utf8");
       } catch {
-        malformedCount += 1;
+        if (countMalformed) malformedCount += 1;
         continue;
       }
       firstDay = firstDay ?? segment.date;
@@ -223,9 +225,11 @@ export function readStatsAuditEvents(env, { sessionId = null, sinceMs = null, un
         }
         try {
           const value = JSON.parse(line);
+          const timestamp = Date.parse(value?.at);
+          if ((sinceMs != null && timestamp < sinceMs) || (untilMs != null && timestamp > untilMs)) continue;
           const guardEvent = normalizeGuardAuditEvent(value);
           if (!guardEvent) {
-            malformedCount += 1;
+            if (countMalformed) malformedCount += 1;
           } else {
             const atMs = Date.parse(guardEvent.at);
             if ((sessionId == null || guardEvent.session === sessionId) && (sinceMs == null || atMs >= sinceMs) && (untilMs == null || atMs <= untilMs)) {
@@ -238,7 +242,7 @@ export function readStatsAuditEvents(env, { sessionId = null, sinceMs = null, un
             order += 1;
           }
         } catch {
-          malformedCount += 1;
+          if (countMalformed) malformedCount += 1;
         }
       }
     }
