@@ -39,6 +39,11 @@ export function readEngineJobRecord(engine, jobId, env = process.env) {
 }
 
 export function readEngineJobFailureKind(engine, jobId, env = process.env) {
-  const failureKind = readEngineJobRecord(engine, jobId, env)?.failureKind;
+  let failureKind;
+  try {
+    failureKind = readEngineJobRecord(engine, jobId, env)?.failureKind;
+  } catch {
+    return null;
+  }
   return typeof failureKind === "string" && failureKind.trim() ? failureKind.trim() : null;
 }

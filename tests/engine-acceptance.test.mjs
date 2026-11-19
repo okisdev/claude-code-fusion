@@ -9,6 +9,7 @@ import { deliverWorkerEngineAcceptance, newestEngineCompanion, prepareEngineAcce
 import { settleQueuedVerdict } from "../plugins/fusion/scripts/lib/lifecycle/collection.mjs";
 import { createWorkerRecord, readSessionWorkerRecords, readWorkerRecord, readWorkerSessionState, recordWorkerAcceptance, reopenWorkerContinuation, updateWorkerRecord, workerRecordFile } from "../plugins/fusion/scripts/lib/worker-state.mjs";
 import { settleRecords } from "../plugins/fusion/scripts/lib/stats/settlement.mjs";
+import { readEngineJobFailureKind, readEngineJobRecord } from "../plugins/fusion/scripts/lib/engine-job-state.mjs";
 import { tokenUsageSidecarPath } from "../plugins/fusion/scripts/lib/stats/evidence.mjs";
 import { handleLifecycleHook } from "../plugins/fusion/scripts/worker-lifecycle.mjs";
 
@@ -511,3 +512,15 @@ for (const engine of ["codex", "grok", "cursor", "devin"]) {
     }
   });
 }
+
+test("an unreadable engine job record yields no failure kind on the hook path but fails strict reads", (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "fusion-engine-job-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const jobs = path.join(root, "workspace-0123456789abcdef", "jobs");
+  fs.mkdirSync(jobs, { recursive: true });
+  const jobId = "a".repeat(32);
+  fs.writeFileSync(path.join(jobs, `${jobId}.json`), "{\"status\":");
+  const env = { FUSION_CODEX_STATE: root };
+  assert.equal(readEngineJobFailureKind("codex", jobId, env), null);
+  assert.throws(() => readEngineJobRecord("codex", jobId, env), SyntaxError);
+});
