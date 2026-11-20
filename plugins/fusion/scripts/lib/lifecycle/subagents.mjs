@@ -62,7 +62,8 @@ function handleSubagentStop(input, env) {
   let refreshed = refreshRecord(record, input, env);
   const lastMessage = typeof input.last_assistant_message === "string" && input.last_assistant_message.trim() ? input.last_assistant_message : "";
   const recoverHandback = !lastMessage || HANDBACK_PLACEHOLDER_PATTERN.test(lastMessage) || HANDBACK_ALREADY_DELIVERED_PATTERN.test(lastMessage) || !completedReport(refreshed, lastMessage) || refreshed.transcriptOffset !== record.transcriptOffset;
-  const report = recoverHandback ? finalReportFromTranscript(refreshed.transcriptPath) : null;
+  const transcriptReport = recoverHandback ? finalReportFromTranscript(refreshed.transcriptPath) : null;
+  const report = recoverHandback && !transcriptReport && refreshed.handbackReport ? { text: refreshed.handbackReport, handback: true } : transcriptReport;
   const handedBack = report?.handback === true;
   const stranded = recoverHandback && !handedBack && strandedHandbackFromTranscript(refreshed.transcriptPath);
   const message = handedBack || (stranded && report?.text) ? report.text : [lastMessage, report?.text].find((text) => typeof text === "string" && text.trim() && !HANDBACK_PLACEHOLDER_PATTERN.test(text)) ?? "";

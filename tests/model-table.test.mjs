@@ -25,6 +25,10 @@ const ROUTING = {
   ]
 };
 
+const isolatedHome = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "fusion-model-table-home-")));
+process.env.HOME = isolatedHome;
+process.on("exit", () => fs.rmSync(isolatedHome, { recursive: true, force: true }));
+
 function sandbox(t) {
   const dir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "fusion-model-table-test-")));
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
