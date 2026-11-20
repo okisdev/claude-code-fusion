@@ -66,15 +66,21 @@ function preToolUse(input, env) {
       const advisory = claimParentContextAdvisory(input.session_id, parentContextTokens(input.transcript_path), env);
       const prompt = promptText(input.tool_input);
       const briefBytes = Buffer.byteLength(prompt);
-      const codexWrite = engineForAgentType(agentType) === "codex" && leadingCompanionOptions(prompt).options.includes("--write");
+      const codexOptions = engineForAgentType(agentType) === "codex" ? leadingCompanionOptions(prompt).options : [];
+      const codexWrite = codexOptions.includes("--write");
       const sizing = codexWrite && briefBytes >= CODEX_WRITE_SIZING_ADVISORY_BYTES
-        ? "Sizing advisory: Codex write briefs of 5 to 7 KB had a measured 23% timeout rate in the last 7 days; briefs of 7 KB or more had a 57% timeout rate (gpt-6.1-sol@xhigh). Split this package into smaller briefs."
+        ? "Sizing advisory: Codex write briefs timed out in 20% of runs at 3 to 5 KB, 24% at 5 to 7 KB, and 59% at 7 KB or more over a measured 7 days, against 3% under 3 KB. Split this package into briefs under 3 KB."
         : !codexWrite && briefBytes > SIZING_ADVISORY_BYTES && !/^sizing:\s*\S/im.test(prompt)
           ? "Sizing advisory: this brief exceeds 8192 bytes without a `sizing:` field. Add `sizing: large` or split the package into smaller briefs."
           : null;
-      const additionalContext = [injection?.context, sizing ? tagMessage("worker-lifecycle.dispatch-advisory", sizing) : null].filter(Boolean).join("\n\n");
-      if (stagedPrompt || injection || advisory || sizing) {
-        writeOutput({ ...(stagedPrompt || injection || sizing ? { hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision: "allow", updatedInput: { ...finalInput, ...(stagedPrompt ? { prompt: stagedPrompt } : {}) }, ...(additionalContext ? { additionalContext } : {}) } } : {}), ...(advisory ? { systemMessage: advisory } : {}) });
+      const effortIndex = codexOptions.indexOf("--effort");
+      const maxEffort = codexWrite && (codexOptions.includes("--effort=max") || (effortIndex >= 0 && codexOptions[effortIndex + 1] === "max"))
+        ? "Effort advisory: Codex writes at --effort max timed out in 23% of runs over a measured 7 days, against 14% at xhigh. Use xhigh unless the package needs max."
+        : null;
+      const advisories = [sizing, maxEffort].filter(Boolean);
+      const additionalContext = [injection?.context, ...advisories.map((text) => tagMessage("worker-lifecycle.dispatch-advisory", text))].filter(Boolean).join("\n\n");
+      if (stagedPrompt || injection || advisory || advisories.length) {
+        writeOutput({ ...(stagedPrompt || injection || advisories.length ? { hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision: "allow", updatedInput: { ...finalInput, ...(stagedPrompt ? { prompt: stagedPrompt } : {}) }, ...(additionalContext ? { additionalContext } : {}) } } : {}), ...(advisory ? { systemMessage: advisory } : {}) });
       }
       return;
     }

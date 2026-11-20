@@ -127,18 +127,21 @@ function poolForCostTier(tier) {
   return typeof tier === "string" && tier.toLowerCase() === "free" ? "free" : "credits";
 }
 
-export function billingPoolForModel(catalog, slugOrUid) {
+export function billingPoolForModel(catalog, slugOrUid, effort = "default") {
   const name = String(slugOrUid ?? "").toLowerCase();
   for (const family of catalog.families) {
     const variant = family.variants.find((item) => item.uid.toLowerCase() === name);
     if (variant) return poolForCostTier(variant.cost_tier);
     if ([family.slug, ...family.aliases].some((value) => value.toLowerCase() === name)) {
-      return poolForCostTier(family.variants[0]?.cost_tier);
+      const suffix = `-${String(effort).toLowerCase()}`;
+      const served = effort === "default" ? null : family.variants.find((item) => item.uid.toLowerCase().endsWith(suffix));
+      return poolForCostTier((served ?? family.variants[0])?.cost_tier);
     }
   }
   return "credits";
 }
 
 export function costClassForPool(pool) {
-  return pool === "free" || pool === "first-party" ? "free" : "metered";
+  if (pool === "free" || pool === "first-party") return "free";
+  return pool === "credits" ? "included" : "metered";
 }

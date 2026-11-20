@@ -263,14 +263,14 @@ test("Show derives Devin billing from its cache into rows, defaults, and config 
   const { data, table } = JSON.parse(shown.stdout);
   assert.equal(data.schemaVersion, MODEL_ROUTING_SCHEMA_VERSION);
   assert.equal(data.updatedAt, original.updatedAt);
-  assert.deepEqual(data.models.map(({ pool, costClass }) => ({ pool, costClass })), [{ pool: "free", costClass: "free" }, { pool: "credits", costClass: "metered" }]);
+  assert.deepEqual(data.models.map(({ pool, costClass }) => ({ pool, costClass })), [{ pool: "free", costClass: "free" }, { pool: "credits", costClass: "included" }]);
   assert.deepEqual(data.defaults.devin.burst, { ...original.defaults.devin.burst, pool: "free", costClass: "free" });
-  assert.deepEqual(data.defaults.devin.diversity, { ...original.defaults.devin.diversity, pool: "credits", costClass: "metered" });
+  assert.deepEqual(data.defaults.devin.diversity, { ...original.defaults.devin.diversity, pool: "credits", costClass: "included" });
   assert.deepEqual(JSON.parse(fs.readFileSync(box.modelRoutingFile, "utf8")), original);
   assert.match(table, /^\| swe-2 \| devin \| cognition \| 4 \| 4 \| 4 \| free \| free \|  \|$/m);
-  assert.match(table, /^\| muse-wonder \| devin \| cognition \| 4 \| 4 \| 4 \| metered \| credits \|  \|$/m);
+  assert.match(table, /^\| muse-wonder \| devin \| cognition \| 4 \| 4 \| 4 \| included \| credits \|  \|$/m);
   assert.match(table, /burst swe-2@high \(pool: free, cost class: free\)/);
-  assert.match(table, /diversity muse-wonder@xhigh \(pool: credits, cost class: metered\)/);
+  assert.match(table, /diversity muse-wonder@xhigh \(pool: credits, cost class: included\)/);
   const text = run(box, ["show"], env);
   assert.equal(text.status, 0, text.stderr);
   assert.ok(text.stdout.includes(table));

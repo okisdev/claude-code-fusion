@@ -226,6 +226,7 @@ test("classifyCursorFailure prefers quota over setup when model message mentions
   );
   assert.equal(classifyCursorFailure({ exitCode: 1, stderrTail: "Invalid --allowed-tools value: foo" }), "setup");
   assert.equal(classifyCursorFailure({ exitCode: 1, stderrTail: "unknown option --bogus" }), "setup");
+  assert.equal(classifyCursorFailure({ exitCode: 1, stderrTail: "ActionRequiredError: Model unavailable on Free Free includes Grok 4.7, Grok 4.6, and Auto with fixed settings. Switch to an included model to continue." }), "setup");
 });
 
 test("classifyCursorFailure does not treat bare ENOENT in stderr as missing_cli", () => {

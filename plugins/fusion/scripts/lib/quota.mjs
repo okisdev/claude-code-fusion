@@ -7,6 +7,8 @@ import { readRoutingDefaults } from "./model-table.mjs";
 import { writeFileAtomic } from "./storage.mjs";
 import { resolveFusionDataDir } from "./worker-state.mjs";
 
+export const NEAR_EXHAUSTION_PERCENT = 90;
+
 function validResult(value, engine = value?.engine) {
   const nullableNumber = (number) => number === null || (Number.isFinite(number) && number >= 0);
   const isoDate = (date) => typeof date === "string" && Number.isFinite(Date.parse(date));
@@ -78,7 +80,12 @@ export function pacingLines(results) {
       const elapsedText = elapsed === null || elapsed > 100 ? "" : ` with ${Math.round(elapsed)}% of ${window} elapsed`;
       const pacing = pool.pacing === null ? "" : ` (pacing ${pool.pacing.toFixed(1)})`;
       const reset = pool.resetsAt === null ? "" : `, resets ${new Date(pool.resetsAt).toISOString().slice(0, 10)}`;
-      lines.push(`${ENGINES[result.engine].displayName} pool ${pool.pool} is ${pool.pacing > 1.15 ? "over pace" : "near capacity"}: ${usage}${elapsedText}${pacing}${reset}. Prefer free or included pools for quick and volume shapes until it is back on pace.`);
+      const exhausted = pool.usedPercent >= NEAR_EXHAUSTION_PERCENT;
+      const state = exhausted ? "near exhaustion" : pool.pacing > 1.15 ? "over pace" : "near capacity";
+      const advice = exhausted
+        ? "Reserve it for packages that need it: route flagship packages too to free or included pools, split to fit them, until it resets."
+        : "Prefer free or included pools for quick and volume shapes until it is back on pace.";
+      lines.push(`${ENGINES[result.engine].displayName} pool ${pool.pool} is ${state}: ${usage}${elapsedText}${pacing}${reset}. ${advice}`);
     }
   }
   return lines;

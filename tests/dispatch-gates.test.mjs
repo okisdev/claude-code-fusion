@@ -145,6 +145,11 @@ test("peer dispatch records preserve the original mode, model, and pool", (t) =>
   assert.equal(record.mode, "write");
   assert.equal(record.requestedModel, "gpt-6.1-sol");
   assert.equal(record.billingPool, "codex");
+  for (const [agentType, pool] of [["codex:codex-rescue", "codex"], ["grok:grok-rescue", "grok"], ["agy:agy-rescue", "agy"]]) {
+    const bare = createDispatch({ session_id: "session-1", tool_use_id: `bare-${pool}`, cwd: box.root, tool_input: { prompt: "--write -- port the routes" } }, agentType, false, box.env);
+    assert.equal(bare.requestedModel, null);
+    assert.equal(bare.billingPool, pool);
+  }
 });
 
 for (const mode of ["write", "consult"]) {
@@ -283,30 +288,21 @@ function pacingSetup(box, { breadth = "devin", tier = "free", pools = [{ pool: "
 
 test("Metered lane defaults warn only when the same engine offers an eligible prepaid row", (t) => {
   const box = sandbox(t);
-  for (const engine of ["cursor", "devin"]) {
-    pacingSetup(box, { breadth: engine, tier: "premium" });
-    const role = engine === "cursor" ? "diversity" : "burst";
-    const model = engine === "cursor" ? "muse-spark-1.3" : "swe-2";
-    const prompt = `lane: ${engine} ${role}`;
-    const sentence = `${model} bills a metered pool; pass --model explicitly to keep using it, or pick a free or included model with /fusion:config.`;
-    const withoutAlternative = injectedPeerDefaults(prompt, `${engine}:${engine}-rescue`, box.env);
-    assert.doesNotMatch(withoutAlternative.context, /bills a metered pool/);
-    if (engine === "devin") fs.writeFileSync(path.join(box.env.DEVIN_COMPANION_DATA, "models-cache.json"), JSON.stringify({ fetchedAt: Date.now(), families: [
-      { slug: "swe-2", aliases: [], variants: [{ uid: "swe-2-high", cost_tier: "premium" }] },
-      { slug: "swe-free", aliases: [], variants: [{ uid: "swe-free-high", cost_tier: "free" }] }
-    ] }));
-    fs.writeFileSync(box.env.FUSION_MODEL_ROUTING, JSON.stringify({ schemaVersion: 2, updatedAt: new Date().toISOString(), costProfile: "", breadth: engine, models: [
-      { id: engine === "cursor" ? "composer-2.5" : "swe-free", lane: engine, family: "cognition", intelligence: 3, taste: 3, cost: 3 }
-    ] }));
-    const implicit = injectedPeerDefaults(prompt, `${engine}:${engine}-rescue`, box.env);
-    assert.match(implicit.prompt, new RegExp(`^--model ${model.replaceAll(".", "\\.")} --effort `));
-    assert.ok(implicit.context.includes(sentence));
-    const effortOnly = injectedPeerDefaults(`--effort high -- ${prompt}`, `${engine}:${engine}-rescue`, box.env);
-    assert.ok(effortOnly.context.includes(sentence));
-    const explicit = injectedPeerDefaults(`--model ${model} -- ${prompt}`, `${engine}:${engine}-rescue`, box.env);
-    assert.doesNotMatch(explicit.context, /bills a metered pool/);
-    assert.equal(injectedPeerDefaults(`--model ${model} --effort high -- ${prompt}`, `${engine}:${engine}-rescue`, box.env), null);
-  }
+  pacingSetup(box, { breadth: "cursor" });
+  const prompt = "lane: cursor diversity";
+  const sentence = "muse-spark-1.3 bills a metered pool; pass --model explicitly to keep using it, or pick a free or included model with /fusion:config.";
+  assert.doesNotMatch(injectedPeerDefaults(prompt, "cursor:cursor-rescue", box.env).context, /bills a metered pool/);
+  fs.writeFileSync(box.env.FUSION_MODEL_ROUTING, JSON.stringify({ schemaVersion: 2, updatedAt: new Date().toISOString(), costProfile: "", breadth: "cursor", models: [
+    { id: "composer-2.5", lane: "cursor", family: "cognition", intelligence: 3, taste: 3, cost: 3 }
+  ] }));
+  const implicit = injectedPeerDefaults(prompt, "cursor:cursor-rescue", box.env);
+  assert.match(implicit.prompt, /^--model muse-spark-1\.3 --effort /);
+  assert.ok(implicit.context.includes(sentence));
+  assert.ok(injectedPeerDefaults(`--effort high -- ${prompt}`, "cursor:cursor-rescue", box.env).context.includes(sentence));
+  assert.doesNotMatch(injectedPeerDefaults(`--model muse-spark-1.3 -- ${prompt}`, "cursor:cursor-rescue", box.env).context, /bills a metered pool/);
+  assert.equal(injectedPeerDefaults(`--model muse-spark-1.3 --effort high -- ${prompt}`, "cursor:cursor-rescue", box.env), null);
+  pacingSetup(box, { tier: "premium" });
+  assert.doesNotMatch(injectedPeerDefaults("lane: devin burst", "devin:devin-rescue", box.env).context, /bills a metered pool/);
   pacingSetup(box);
   assert.doesNotMatch(injectedPeerDefaults("lane: devin burst", "devin:devin-rescue", box.env).context, /bills a metered pool/);
   pacingSetup(box, { breadth: "cursor" });
@@ -379,18 +375,42 @@ test("Dispatch bounds a hung quota read and caches its failure", (t) => {
 test("Pacing advisory requires Codex, a quick or volume shape, and a confirmed prepaid burst pool", (t) => {
   const box = sandbox(t);
   const calls = pacingSetup(box);
-  for (const [prompt, agent] of [["lane: codex flagship", "codex:codex-rescue"], ["bounded package", "codex:codex-rescue"], ["lane: grok burst", "grok:grok-rescue"], ["lane: codex quick", "fusion:claude-worker"]]) {
+  for (const [prompt, agent] of [["lane: grok burst", "grok:grok-rescue"], ["lane: codex quick", "fusion:claude-worker"]]) {
     assert.equal(codexPacingAdvisory(prompt, agent, box.env), null);
   }
   assert.equal(fs.existsSync(calls), false);
-  for (const options of [{ tier: "premium" }]) {
-    pacingSetup(box, options);
-    assert.equal(codexPacingAdvisory("lane: codex quick", "codex:codex-rescue", box.env), null);
-  }
-  pacingSetup(box);
-  fs.rmSync(path.join(box.env.DEVIN_COMPANION_DATA, "models-cache.json"));
+  for (const prompt of ["lane: codex flagship", "bounded package"]) assert.equal(codexPacingAdvisory(prompt, "codex:codex-rescue", box.env), null);
+  pacingSetup(box, { breadth: "cursor" });
+  fs.writeFileSync(box.env.FUSION_MODEL_ROUTING, JSON.stringify({ schemaVersion: 2, updatedAt: new Date().toISOString(), costProfile: "", breadth: "cursor", models: [
+    { id: "muse-spark-1.3", lane: "cursor", family: "meta", intelligence: 3, taste: 3, cost: 3 }
+  ], defaults: { cursor: { burst: { model: "muse-spark-1.3", effort: "xhigh" } } } }));
   assert.equal(codexPacingAdvisory("lane: codex quick", "codex:codex-rescue", box.env), null);
-  assert.equal(fs.existsSync(calls), false);
+  const cacheless = sandbox(t);
+  const cachelessCalls = pacingSetup(cacheless);
+  fs.rmSync(path.join(cacheless.env.DEVIN_COMPANION_DATA, "models-cache.json"));
+  assert.equal(codexPacingAdvisory("lane: codex quick", "codex:codex-rescue", cacheless.env), null);
+  assert.equal(fs.existsSync(cachelessCalls), false);
+  pacingSetup(box, { tier: "premium" });
+  assert.match(codexPacingAdvisory("lane: codex quick", "codex:codex-rescue", box.env), /devin burst lane on its prepaid pool/);
+});
+
+test("Near exhaustion advisory covers every Codex package shape while pacing stays quick and volume only", (t) => {
+  for (const [usedPercent, prompt, expected] of [
+    [90, "lane: codex flagship", /near exhaustion \(90% used until \d{4}-\d{2}-\d{2}\); unless this package needs Codex, split it into briefs under 3 KB for devin-role: burst/],
+    [95, "bounded package", /near exhaustion \(95% used/],
+    [98, "lane: codex quick", /near exhaustion \(98% used.*agy-role: burst/],
+    [89, "lane: codex flagship", null],
+    [89, "lane: codex quick", /over pace \(pacing 2\.7\)/]
+  ]) {
+    const box = sandbox(t);
+    pacingSetup(box, { pools: [{ pool: "codex", pacing: 2.7, usedPercent, resetsAt: new Date(Date.now() + 86_400_000).toISOString() }] });
+    const advisory = codexPacingAdvisory(prompt, "codex:codex-rescue", box.env);
+    if (expected) assert.match(advisory, expected, `${usedPercent} ${prompt}`);
+    else assert.equal(advisory, null, `${usedPercent} ${prompt}`);
+  }
+  const expired = sandbox(t);
+  pacingSetup(expired, { pools: [{ pool: "codex", pacing: 2.7, usedPercent: 99, resetsAt: new Date(Date.now() - 60_000).toISOString() }] });
+  assert.equal(codexPacingAdvisory("lane: codex flagship", "codex:codex-rescue", expired.env), null);
 });
 
 test("Pacing advisory accepts Cursor's included burst and probes Codex alone", (t) => {
@@ -745,7 +765,7 @@ test("Codex workspace slots cover other sessions, every nonterminal status, and 
     updateWorkerRecord(worker.taskId, box.env, (record) => ({ ...record, transportStatus }));
     const denied = await launch(box, { subagent_type: "codex-rescue", prompt: `--cwd '${link}' -- bounded package` });
     assert.equal(denied.permissionDecision, "deny", transportStatus);
-    assert.match(denied.permissionDecisionReason, /Use an isolated worktree with --cwd, or wait/);
+    assert.match(denied.permissionDecisionReason, /burst on its prepaid pool before a second Codex worktree\. Otherwise use an isolated worktree with --cwd, or wait/);
   }
   assert.equal(await launch(box, { prompt: "--cwd 'isolated worktree' -- bounded package" }), null);
   assert.equal((await launch(box, {}, { tool_name: "Bash", tool_input: { command: "/codex --write" } })), null);

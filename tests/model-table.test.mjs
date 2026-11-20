@@ -62,10 +62,10 @@ test("Billing metadata derives from each engine and the cached Devin catalog", (
     ["devin", "swe-2", "free", "free"],
     ["devin", "swe", "free", "free"],
     ["devin", "swe-2-fast", "free", "free"],
-    ["devin", "mixed", "credits", "metered"],
+    ["devin", "mixed", "credits", "included"],
     ["devin", "mixed-free", "free", "free"],
-    ["devin", "mixed-paid", "credits", "metered"],
-    ["devin", "muse-wonder", "credits", "metered"],
+    ["devin", "mixed-paid", "credits", "included"],
+    ["devin", "muse-wonder", "credits", "included"],
     ["devin", "unknown", null, null],
     ["other", "unknown", null, null],
     ["claude-fast", "sonnet", null, null]
@@ -78,7 +78,7 @@ test("Billing metadata derives from each engine and the cached Devin catalog", (
   assert.match(table, /\| muse-spark-1\.3 \| cursor \| cognition \| 3 \| 3 \| 3 \| metered \|/);
   const defaults = readRoutingDefaults({ ...env, FUSION_MODEL_ROUTING: path.join(dir, "missing.json") });
   assert.deepEqual(defaults.devin.burst, { model: "swe-2", effort: "high", pool: "free", costClass: "free" });
-  assert.deepEqual(defaults.devin.diversity, { model: "muse-wonder", effort: "xhigh", pool: "credits", costClass: "metered" });
+  assert.deepEqual(defaults.devin.diversity, { model: "muse-wonder", effort: "xhigh", pool: "credits", costClass: "included" });
   for (const lane of ["codex", "grok", "agy"]) {
     for (const choice of Object.values(defaults[lane])) {
       assert.equal(choice.pool, lane);
@@ -87,6 +87,29 @@ test("Billing metadata derives from each engine and the cached Devin catalog", (
   }
   assert.deepEqual(defaults.cursor.burst, { model: "composer-2.5", effort: "default", pool: "first-party", costClass: "included" });
   assert.deepEqual(defaults.cursor.diversity, { model: "muse-spark-1.3", effort: "xhigh", pool: "api", costClass: "metered" });
+});
+
+test("A Devin family default bills the pool of the variant its effort serves", (t) => {
+  const dir = sandbox(t);
+  const dataDir = path.join(dir, "devin");
+  fs.mkdirSync(dataDir);
+  fs.writeFileSync(path.join(dataDir, "models-cache.json"), JSON.stringify({
+    fetchedAt: Date.now(),
+    families: [
+      { slug: "swe-2", aliases: [], variants: [{ uid: "swe-2-high", cost_tier: "Free" }, { uid: "swe-2-high-lightning", cost_tier: "High cost" }] },
+      { slug: "muse-wonder", aliases: [], variants: [{ uid: "muse-wonder-xhigh", cost_tier: "High cost" }] }
+    ]
+  }));
+  const env = { HOME: dir, DEVIN_COMPANION_DATA: dataDir };
+  const models = [
+    { id: "swe-2", lane: "devin", family: "cognition", intelligence: 4, taste: 3, cost: 5 },
+    { id: "muse-wonder", lane: "devin", family: "meta", intelligence: 4, taste: 4, cost: 4 }
+  ];
+  const result = validateModelRoutingData({ ...ROUTING, breadth: "devin", models, defaults: { devin: { burst: { model: "swe-2", effort: "high" }, diversity: { model: "muse-wonder", effort: "xhigh" } } } }, { env });
+  assert.equal(result.ok, true, result.reason);
+  assert.deepEqual(result.data.models.map(({ id, pool, costClass }) => [id, pool, costClass]), [["swe-2", "credits", "included"], ["muse-wonder", "credits", "included"]]);
+  assert.deepEqual(result.data.defaults.devin.burst, { model: "swe-2", effort: "high", pool: "free", costClass: "free" });
+  assert.deepEqual(result.data.defaults.devin.diversity, { model: "muse-wonder", effort: "xhigh", pool: "credits", costClass: "included" });
 });
 
 test("Devin billing resolves the installed companion and canonical cache directory", (t) => {
@@ -140,7 +163,7 @@ test("Routing reads derive billing metadata from the current Devin cache without
     fs.writeFileSync(path.join(dir, "models-cache.json"), JSON.stringify({ fetchedAt: Date.now(), families: [{ slug: "swe-2", aliases: [], variants: [{ uid: "swe-2-model", cost_tier: tier }] }] }));
     const result = readModelRoutingFile(file, { env });
     assert.equal(result.ok, true, result.reason);
-    assert.equal(result.data.models[0].costClass, tier === "free" ? "free" : "metered");
+    assert.equal(result.data.models[0].costClass, tier === "free" ? "free" : "included");
     assert.equal(result.data.defaults.devin.burst.costClass, result.data.models[0].costClass);
     assert.deepEqual(JSON.parse(fs.readFileSync(file, "utf8")), stored);
   }

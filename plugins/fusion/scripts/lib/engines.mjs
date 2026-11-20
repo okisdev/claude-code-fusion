@@ -186,6 +186,10 @@ function homeDir(env) {
   return absolutePath(env.HOME) ?? os.homedir();
 }
 
+function fixedEnginePool(id) {
+  return ENGINES[id] && ENGINES[id].seat !== "breadth" ? id : null;
+}
+
 function engineDataDir(id, env = process.env) {
   if (!isEngineId(id)) {
     return null;
@@ -245,6 +249,7 @@ export {
   PEER_RESCUE_AGENTS,
   PEER_RESCUE_AGENT_NAMES,
   engineDataDir,
+  fixedEnginePool,
   engineDisplayName,
   engineDisplayNameList,
   engineForAgentType,

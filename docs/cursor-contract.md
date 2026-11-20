@@ -73,7 +73,7 @@ The CLI starts in its own process group. On demand it can spawn a `worker-server
 | Kind | Evidence |
 |---|---|
 | `missing_cli` | the executable cannot be found or spawned |
-| `setup` | the build is below the tested floor, `--version` output is unparseable, the CLI rejects an adapter flag or tool identifier (`Invalid --allowed-tools value`), or rejects a catalog model (`Cannot use this model`) |
+| `setup` | the build is below the tested floor, `--version` output is unparseable, the CLI rejects an adapter flag or tool identifier (`Invalid --allowed-tools value`), or rejects a catalog model (`Cannot use this model`, or `Model unavailable on <plan>` when the account plan excludes it) |
 | `auth` | `Authentication required`, `Not logged in`, `Unauthorized`, or HTTP 401 or 403 |
 | `quota` | usage limit, quota, spend limit, insufficient credit, or HTTP 402 text |
 | `rate_limited` | rate limit, too many requests, or HTTP 429 text |

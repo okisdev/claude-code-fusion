@@ -44,7 +44,7 @@ function requireEngine(engine) {
 
 const moduleDirectory = path.dirname(fileURLToPath(import.meta.url));
 
-function fusionVersion() {
+export function fusionVersion() {
   const pluginRoot = path.resolve(moduleDirectory, "..", "..");
   if (path.basename(pluginRoot) !== "fusion") {
     return path.basename(pluginRoot);
@@ -92,6 +92,24 @@ function compareVersions(left, right) {
     }
   }
   return a.prerelease.length - b.prerelease.length;
+}
+
+export function newerInstalledFusionVersion(env = process.env) {
+  const running = fusionVersion();
+  if (running === null) {
+    return null;
+  }
+  const base = path.join(configuredHome(env), ".claude", "plugins", "cache", "claude-code-fusion", "fusion");
+  try {
+    const newest = fs
+      .readdirSync(base)
+      .filter((version) => semanticVersion(version) && regularFile(path.join(base, version, "scripts", "session-start.mjs")))
+      .sort(compareVersions)
+      .at(-1);
+    return newest && compareVersions(newest, running) > 0 ? newest : null;
+  } catch {
+    return null;
+  }
 }
 
 export function engineAcceptanceTransport({ engine, jobId, acceptance, acceptFailedTransport = false, env = process.env }) {

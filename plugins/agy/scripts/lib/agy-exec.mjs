@@ -436,6 +436,7 @@ export function classifyAgyFailure(outcome) {
   if (outcome.signal && !outcome.lateClose && (!outcome.protocolError || outcome.protocolError === "Exit before prompt result")) return "process";
   if (outcome.protocolError) return "protocol";
   if (outcome.permissionsRejected > 0 && !outcome.resultText?.trim()) return "permission";
+  if (/^\u26a0\s*(?:\w+\s+)?quota reached\b/i.test(outcome.resultText?.trim().split("\n").at(-1) ?? "")) return "quota";
   if (!outcome.rpcError && (outcome.resultSeen && outcome.stopReason === "end_turn" || outcome.sessionReady)) return null;
   if (outcome.stopReason === "refusal") return "refused";
   if (!outcome.resultSeen && !outcome.rpcError) return "protocol";

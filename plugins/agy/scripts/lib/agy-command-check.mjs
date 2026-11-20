@@ -24,25 +24,63 @@ const FIND_FLAGS = flagPolicy(
   "-name -iname -path -ipath -wholename -regex -iregex -type -maxdepth -mindepth -size -mtime -mmin -newer"
 );
 
+function unsafeCharacter(character) {
+  return character !== " " && character !== "\t" && /[\s\x00-\x1f\x7f-\x9f\u200b-\u200d\u2060\ufeff]/u.test(character);
+}
+
 function words(command) {
   const result = [];
   let word = "";
+  let first = "";
   let quote = null;
   let started = false;
-  for (const character of command) {
-    if (quote) {
-      if (character === quote) quote = null;
-      else word += character;
-    } else if (character === "'" || character === '"') {
+  for (let index = 0; index < command.length; index += 1) {
+    const character = command[index];
+    if (unsafeCharacter(character)) return null;
+    if (quote === "'") {
+      if (character === "'") quote = null;
+      else {
+        word += character;
+        first ||= character;
+      }
+      continue;
+    }
+    if (quote === '"') {
+      if (character === '"') quote = null;
+      else if ("$`".includes(character)) return null;
+      else if (character === "\\" && index + 1 < command.length && '$`"\\'.includes(command[index + 1])) {
+        word += command[index + 1];
+        first ||= command[index + 1];
+        index += 1;
+      } else {
+        word += character;
+        first ||= character;
+      }
+      continue;
+    }
+    if (character === "'" || character === '"') {
       quote = character;
       started = true;
-    } else if (/\s/.test(character)) {
+    } else if (character === " " || character === "\t") {
       if (started) result.push(word);
       word = "";
+      first = "";
       started = false;
-    } else {
-      if ("*?[]{}()".includes(character) || !started && "~#!=".includes(character)) return null;
+    } else if (character === "\\") {
+      const escaped = command[index + 1];
+      if (escaped === undefined || unsafeCharacter(escaped)) return null;
+      word += escaped;
+      first ||= escaped;
+      index += 1;
+      started = true;
+    } else if ("$;|&><`{}()".includes(character)) return null;
+    else if ("*?[]".includes(character)) {
+      if (!first || "-*?[]".includes(first)) return null;
       word += character;
+    } else {
+      if (!started && "~#!=".includes(character)) return null;
+      word += character;
+      first ||= character;
       started = true;
     }
   }
@@ -94,13 +132,13 @@ function allowedFind(args) {
 }
 
 export function isReadOnlyCommand(command) {
-  if (typeof command !== "string" || /[\r\n$;|&><`\\\0]/.test(command)) return false;
+  if (typeof command !== "string") return false;
   const tokens = words(command);
   if (!tokens?.length || /[/=]/.test(tokens[0]) || !PROGRAMS.has(tokens[0])) return false;
   const [program, ...args] = tokens;
   if (program === "tail") {
     const end = args.indexOf("--");
-    return !args.slice(0, end < 0 ? args.length : end).some((argument) => /^--follow(?:=|$)|^-[^-]*[fF]/.test(argument));
+    return !args.slice(0, end < 0 ? args.length : end).some((argument) => /^--f|^-[^-]*[fF]/.test(argument));
   }
   if (program === "find") return allowedFind(args);
   if (program === "rg") return allowedFlags(args, RG_FLAGS, { attachedValues: true });

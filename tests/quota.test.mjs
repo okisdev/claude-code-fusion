@@ -7,6 +7,7 @@ import { test } from "node:test";
 import { ENGINES, ENGINE_IDS, routedEngineIds } from "../plugins/fusion/scripts/lib/engines.mjs";
 import { DEFAULT_MODEL_TABLE_PLACEHOLDER } from "../plugins/fusion/scripts/lib/model-table.mjs";
 import { pacingLines, quotaResults } from "../plugins/fusion/scripts/lib/quota.mjs";
+import { messageTag } from "../plugins/fusion/scripts/lib/user-messages.mjs";
 
 const scripts = path.join(import.meta.dirname, "..", "plugins", "fusion", "scripts");
 const observedAt = "2026-11-20T00:00:00.000Z";
@@ -58,6 +59,10 @@ test("pacing lines use strict pace and inclusive usage thresholds for every pool
   assert.match(lines[0], /near capacity: 85% used/);
   assert.match(lines[1], /pool secondary is near capacity: 86% used\./);
   assert.doesNotMatch(lines.join(""), /null|NaN|Infinity|[\u2013\u2014]/);
+  const exhausted = pacingLines([report([{ ...pool, usedPercent: 90, pacing: 3.1 }])])[0];
+  assert.match(exhausted, /is near exhaustion: 90% used/);
+  assert.match(exhausted, /route flagship packages too to free or included pools/);
+  assert.match(pacingLines([report([{ ...pool, usedPercent: 89.9, pacing: 3.1 }])])[0], /is over pace: 89\.9% used.*quick and volume shapes/);
 });
 
 test("pacing lines preserve unknown fields and describe short windows", () => {
@@ -159,6 +164,21 @@ test("session start, compaction, and fleet posture include the same quota lines"
   assert.equal(posture.hookSpecificOutput.hookEventName, "UserPromptSubmit");
   assert.equal(posture.hookSpecificOutput.additionalContext, expectedLine);
   assert.equal(fs.readFileSync(calls, "utf8"), "call\n");
+});
+
+test("session start and compaction warn when a newer fusion plugin is installed", (t) => {
+  const box = sandbox(t);
+  const tag = messageTag("session.plugin-stale");
+  const context = (args) => hook(box, "session-start", args).hookSpecificOutput.additionalContext;
+  for (const args of [[], ["--compact"]]) {
+    assert.ok(!context(args).includes(tag));
+  }
+  const cached = path.join(box.root, ".claude", "plugins", "cache", "claude-code-fusion", "fusion", "99.0.0", "scripts", "session-start.mjs");
+  fs.mkdirSync(path.dirname(cached), { recursive: true });
+  fs.writeFileSync(cached, "export {};\n");
+  for (const args of [[], ["--compact"]]) {
+    assert.ok(context(args).includes(`while 99.0.0 is installed, so its hooks and rules predate the update. Restart the session to load 99.0.0. ${tag}\n`));
+  }
 });
 
 test("quota failures leave session start and fleet posture functional", (t) => {

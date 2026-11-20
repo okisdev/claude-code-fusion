@@ -7,6 +7,7 @@ import { run as checkBreaker } from "./breaker-check.mjs";
 import { renderModelTableFromFile, resolveModelRoutingPath } from "./lib/model-table.mjs";
 import { tagMessage } from "./lib/user-messages.mjs";
 import { pacingLines, quotaResults } from "./lib/quota.mjs";
+import { fusionVersion, newerInstalledFusionVersion } from "./lib/engine-acceptance.mjs";
 
 function main(env = process.env, compact = false) {
   const output = [];
@@ -25,6 +26,12 @@ function main(env = process.env, compact = false) {
       void 0;
     }
   }
+  try {
+    const newer = newerInstalledFusionVersion(env);
+    if (newer) {
+      output.push(`${tagMessage("session.plugin-stale", `This session runs Fusion ${fusionVersion()} while ${newer} is installed, so its hooks and rules predate the update. Restart the session to load ${newer}.`)}\n`);
+    }
+  } catch {}
   try {
     for (const line of pacingLines(quotaResults(env))) output.push(`${line}\n`);
   } catch {}

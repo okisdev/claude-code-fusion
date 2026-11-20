@@ -3,7 +3,7 @@ import { createRequire } from "node:module";
 import path from "node:path";
 
 import { resolveFusionDataDir } from "./worker-state.mjs";
-import { BREADTH_ENGINE_IDS, DEFAULT_BREADTH_ENGINE, ENGINES, ENGINE_IDS, engineDataDir, isEngineId, routedEngineIds } from "./engines.mjs";
+import { BREADTH_ENGINE_IDS, DEFAULT_BREADTH_ENGINE, ENGINES, ENGINE_IDS, engineDataDir, fixedEnginePool, isEngineId, routedEngineIds } from "./engines.mjs";
 import { newestEngineCompanion } from "./engine-acceptance.mjs";
 
 const require = createRequire(import.meta.url);
@@ -94,8 +94,8 @@ function devinModelCatalog(env) {
   }
 }
 
-function modelBilling(lane, model, devin) {
-  if (["codex", "grok", "agy"].includes(lane)) return { pool: lane, costClass: "included" };
+function modelBilling(lane, model, devin, effort = "default") {
+  if (fixedEnginePool(lane)) return { pool: lane, costClass: "included" };
   if (lane === "cursor") {
     const pool = model.startsWith("composer-") ? "first-party" : "api";
     return { pool, costClass: pool === "first-party" ? "included" : "metered" };
@@ -103,8 +103,9 @@ function modelBilling(lane, model, devin) {
   if (lane === "devin" && devin) {
     try {
       const family = devin.findCatalogFamily(devin.catalog, model, { write: true });
-      const mixedFamily = [family.slug, ...family.aliases].includes(model) && family.variants.some((variant) => variant.cost_tier !== "free");
-      const pool = mixedFamily ? "credits" : devin.billingPoolForModel(devin.catalog, model);
+      const familyName = [family.slug, ...family.aliases].includes(model);
+      const pools = new Set(family.variants.map((variant) => devin.billingPoolForModel(devin.catalog, variant.uid)));
+      const pool = familyName && effort === "default" && pools.size > 1 ? "credits" : devin.billingPoolForModel(devin.catalog, model, effort);
       return { pool, costClass: devin.costClassForPool(pool) };
     } catch {}
   }
@@ -219,7 +220,7 @@ export function validateModelRoutingData(value, { env = process.env } = {}) {
             return invalid(`Expected defaults.${lane}.${role}.model to use a family eligible for breadth diversity. ${BREADTH_DIVERSITY_EXCLUSION}`);
           }
         }
-        const { pool, costClass } = models.find((row) => row.lane === lane && row.id === model);
+        const { pool, costClass } = lane === "devin" ? modelBilling(lane, model, catalog, choice.effort) : models.find((row) => row.lane === lane && row.id === model);
         defaults[lane][role] = { model, effort: choice.effort, pool, costClass };
       }
     }
@@ -245,7 +246,7 @@ function mergeRoutingDefaults(defaults = {}, env = process.env) {
       lane,
       Object.fromEntries(ENGINES[lane].roles.map((role) => {
         const choice = defaults[lane]?.[role] ?? DEFAULT_ROUTING_DEFAULTS[lane][role];
-        return [role, { ...choice, ...modelBilling(lane, choice.model, catalog) }];
+        return [role, { ...choice, ...modelBilling(lane, choice.model, catalog, choice.effort) }];
       }))
     ])
   );

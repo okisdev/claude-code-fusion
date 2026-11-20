@@ -98,7 +98,8 @@ test("Codex admission preserves primary ownership before overflow", () => {
     readme,
     /then route generic overflow to the Codex volume tiers and reserve `fusion:claude-worker` for packages carrying `claude-fallback: <reason>`, where the reason is one of `network`, `toolchain`, `long-build`, `claude-surface`, `privacy`, or `no-healthy-lane`/
   );
-  assert.match(rules, /while Codex is over pace the breadth engine's prepaid `burst` pool takes a quick or volume package before a second Codex worktree/);
+  assert.match(rules, /Codex slot is free; otherwise the breadth engine's prepaid `burst` pool for a worktree eligible package whose brief fits under 3 KB; otherwise an isolated Codex worktree/);
+  assert.match(rules, /Once a Codex pool is near exhaustion \(90% used before its reset\), flagship packages leave Codex too unless they need it/);
   assert.match(rules, /Never pick a metered pool unless the user named it\./);
   assert.equal(frontmatterValue(codexRescue, "background"), "false");
 });
