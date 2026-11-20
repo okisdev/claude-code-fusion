@@ -8,7 +8,7 @@ import test from "node:test";
 import { fileURLToPath } from "node:url";
 import { getProcessIdentity, processIdentityMatches } from "../plugins/cursor/scripts/lib/process-identity.mjs";
 import { jobFilePath } from "../plugins/cursor/scripts/lib/state.mjs";
-import { verifyExecutionBudgets } from "./lib/execution-budget.mjs";
+import { executionTimeoutProbe, verifyExecutionBudgets } from "./lib/execution-budget.mjs";
 import { verifyJobWatch } from "./lib/job-watch-harness.mjs";
 
 verifyJobWatch("cursor");
@@ -153,10 +153,19 @@ test("late result close keeps a done outcome with a warning", (t) => {
 test("a timed out Cursor job reports its timeout duration in every result surface", (t) => {
   const timeoutMs = 250;
   const h = harness(t, { FAKE_CURSOR_SCENARIO: "hang", CURSOR_COMPANION_TIMEOUT_MS: String(timeoutMs), CURSOR_COMPANION_EXIT_GRACE_MS: "100" });
+  const probe = executionTimeoutProbe(h.temp, timeoutMs);
+  Object.assign(h.env, probe.env);
   const result = task(h, ["--json"]);
   assert.equal(result.status, 1, result.stdout + result.stderr);
   const [record] = h.jobs();
-  const message = `Cursor timed out after ${timeoutMs}ms and was terminated.`;
+  const message = "Cursor timed out after 240000ms and was terminated.";
+  assert.deepEqual(probe.timeouts(), [timeoutMs, 240000]);
+  assert.deepEqual(record.salvage, { attempted: true, outcome: "timeout", originalPid: record.salvage.originalPid,
+    resumePid: record.salvage.resumePid, resumePidIdentity: record.salvage.resumePidIdentity });
+  assert.ok(Number.isInteger(record.salvage.originalPid) && record.salvage.originalPid > 1);
+  assert.ok(Number.isInteger(record.salvage.resumePid) && record.salvage.resumePid > 1);
+  assert.notEqual(record.salvage.resumePid, record.salvage.originalPid);
+  assert.ok(record.salvage.resumePidIdentity);
   assert.equal(record.status, "error");
   assert.equal(record.failureKind, "timeout");
   assert.equal(record.errorMessage, message);
@@ -171,6 +180,31 @@ test("a timed out Cursor job reports its timeout duration in every result surfac
   assert.equal(text.status, 0, text.stdout + text.stderr);
   assert.ok(text.stdout.includes(message));
   assert.match(text.stdout, /state: error\nfailure: timeout\n$/);
+});
+
+test("a timed out Cursor task resumes in its existing private home", (t) => {
+  const h = harness(t, { FAKE_CURSOR_SCENARIO: "wind_down", CURSOR_COMPANION_TIMEOUT_MS: "1500", CURSOR_COMPANION_EXIT_GRACE_MS: "100" });
+  const probe = executionTimeoutProbe(h.temp, 1500);
+  Object.assign(h.env, probe.env);
+  const result = task(h);
+  assertDone(result);
+  assert.deepEqual(probe.timeouts(), [1500, 240000]);
+  assert.equal(h.jobs().length, 1);
+  const [record] = h.jobs();
+  assert.deepEqual(record.salvage, { attempted: true, outcome: "done", originalPid: record.salvage.originalPid,
+    resumePid: record.salvage.resumePid, resumePidIdentity: record.salvage.resumePidIdentity });
+  assert.ok(Number.isInteger(record.salvage.originalPid) && record.salvage.originalPid > 1);
+  assert.ok(Number.isInteger(record.salvage.resumePid) && record.salvage.resumePid > 1);
+  assert.notEqual(record.salvage.resumePid, record.salvage.originalPid);
+  assert.ok(record.salvage.resumePidIdentity);
+  assert.equal(record.semanticFailureKind, "timeout_salvaged");
+  const [initial, resumed] = h.invocations();
+  assert.equal(h.invocations().length, 2);
+  assert.equal(resumed.HOME, initial.HOME);
+  assert.equal(resumed.HOME, record.homeDir);
+  assert.equal(resumed.argv[resumed.argv.indexOf("--resume") + 1], record.sessionId);
+  assert.match(resumed.stdin, /^Your time budget is exhausted\. Stop exploring\./);
+  assert.match(result.stdout, /warning: timeout_salvaged\nstate: done\n$/);
 });
 
 test("unknown model and auto fail before job creation", (t) => {

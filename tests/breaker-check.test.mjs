@@ -7,6 +7,7 @@ import { test } from "node:test";
 import { advisoryLine, codexFailureKind, run as runBreakerCheck } from "../plugins/fusion/scripts/breaker-check.mjs";
 import { engineStateRoots } from "../plugins/fusion/scripts/lib/engines.mjs";
 import { engineHostBlockers } from "../plugins/fusion/scripts/lib/engine-host-check.mjs";
+import { engineHealth, readEngineHealthRecords, withEngineHealthRecords } from "../plugins/fusion/scripts/lib/engine-health.mjs";
 import { engineInfraDenial } from "../plugins/fusion/scripts/lib/lifecycle/dispatch.mjs";
 import { messageTag } from "../plugins/fusion/scripts/lib/user-messages.mjs";
 
@@ -547,6 +548,7 @@ test("Grok network failures open only after a consecutive retry and success rese
   const stateRoot = path.join(sandbox.grokData, "state");
   writeRecord(jobFile(stateRoot, "workspace", "network-first"), {
     status: "error",
+    mode: "consult",
     failureKind: "network",
     finishedAt: new Date(Date.now() - 4 * 60000).toISOString()
   });
@@ -554,16 +556,18 @@ test("Grok network failures open only after a consecutive retry and success rese
 
   writeRecord(jobFile(stateRoot, "workspace", "network-second"), {
     status: "error",
+    mode: "consult",
     failureKind: "network",
     finishedAt: new Date(Date.now() - 3 * 60000).toISOString()
   });
   const opened = run(sandbox);
   assert.strictEqual(opened.status, 0);
-  assert.match(opened.stdout, new RegExp(`^fusion breaker advisory: treat the grok breaker as open unless verified recovered; last failure network \\d+ minutes? ago \\(2 network across 2 terminal jobs, 12h window\\)\\. Route new work to another eligible healthy lane\\. ${ESCAPED_BREAKER_ADVISORY_TAG}\\n$`));
+  assert.match(opened.stdout, new RegExp(`^fusion breaker advisory: treat the grok breaker as open unless verified recovered; last failure network \\d+ minutes? ago \\(2 network across 2 terminal jobs, 12h window, consult mode\\)\\. Route new work to another eligible healthy lane\\. ${ESCAPED_BREAKER_ADVISORY_TAG}\\n$`));
   assert.strictEqual(opened.stderr, "");
 
   writeRecord(jobFile(stateRoot, "workspace", "network-recovered"), {
     status: "done",
+    mode: "consult",
     failureKind: null,
     finishedAt: new Date(Date.now() - 2 * 60000).toISOString()
   });
@@ -894,7 +898,7 @@ test("Devin breaker uses its billing pool and verified version", (t) => {
   });
   const result = run(sandbox);
   assert.strictEqual(result.status, 0);
-  assert.match(result.stdout, /treat the devin api pool breaker as open.*last failure quota/);
+  assert.match(result.stdout, /treat the devin credits pool breaker as open.*last failure quota/);
   assert.match(result.stdout, /devin 3000\.14\.30822 installed, contract verified on 3000\.14\.30821/);
   writeRecord(jobFile(root, "workspace", "recovered"), {
     id: "recovered", status: "done", billingPool: "api", finishedAt: new Date().toISOString()
@@ -1113,14 +1117,234 @@ test("Antigravity breaker scopes quota and capacity failures to the subscription
   assert.match(run(sandbox, env).stdout, /agy subscription pool breaker as open.*last failure quota/);
 });
 
-test("Antigravity policy failures open the engine breaker and refusals stay local", (t) => {
+test("Antigravity policy failures open only their mode and refusals stay local", (t) => {
   const sandbox = makeSandbox(t);
   const env = { AGY_COMPANION_DATA: path.join(sandbox.root, "agy-data") };
   const root = engineStateRoots("agy", envFor(sandbox, env))[0];
   const file = jobFile(root, "workspace", "failed");
   writeRecord(file, { id: "failed", status: "error", failureKind: "refused", finishedAt: new Date().toISOString() });
   assert.strictEqual(run(sandbox, env).stdout, "");
-  writeRecord(file, { id: "failed", status: "error", failureKind: "policy", billingPool: "subscription", finishedAt: new Date().toISOString() });
+  writeRecord(file, { id: "failed", status: "error", mode: "consult", failureKind: "policy", billingPool: "subscription", finishedAt: new Date().toISOString() });
   assert.match(run(sandbox, env).stdout, /agy breaker as open.*last failure policy/);
   assert.doesNotMatch(run(sandbox, env).stdout, /agy subscription pool breaker/);
+  assert.equal(engineHealth("agy", "write", "subscription", { env: envFor(sandbox, env) }).healthy, true);
+  assert.equal(engineHealth("agy", "consult", "subscription", { env: envFor(sandbox, env) }).scope, "mode");
+});
+
+for (const failureKind of ["timeout", "stall", "died", "policy", "permission", "turn_limit", "network", "process", "patch_thrash", "exec_lost"]) {
+  test(`repeated Devin write ${failureKind} failures preserve package and mode scopes`, (t) => {
+    const box = makeSandbox(t);
+    const env = envFor(box);
+    const now = Date.now();
+    const root = engineStateRoots("devin", env)[0];
+    for (const [index, minutes] of [[1, 4], [2, 2]]) {
+      writeRecord(jobFile(root, "workspace", `write-${index}`), {
+        id: `write-${index}`, status: "error", mode: "write", failureKind,
+        billingPool: "first-party", finishedAt: new Date(now - minutes * 60_000).toISOString()
+      });
+    }
+    const write = engineHealth("devin", "write", "api", { env, now });
+    if (["policy", "permission", "turn_limit"].includes(failureKind)) {
+      assert.equal(write.healthy, true);
+      assert.equal(write.reason, null);
+      assert.equal(run(box).stdout, "");
+    } else {
+      assert.equal(write.healthy, false);
+      assert.equal(write.reason, failureKind);
+      assert.equal(write.scope, "mode");
+      assert.equal(write.until, now - 2 * 60_000 + 12 * 60 * 60_000);
+      assert.match(run(box).stdout, new RegExp(`devin breaker.*${failureKind}.*write mode`));
+    }
+    assert.equal(engineHealth("devin", "consult", "first-party", { env, now }).healthy, true);
+    assert.equal(engineHealth("devin", "review", "api", { env, now }).healthy, true);
+  });
+}
+
+for (const engine of ["codex", "grok", "cursor", "devin", "agy"]) {
+  for (const failureKind of ["policy", "permission", "turn_limit"]) {
+    test(`${engine} repeated ${failureKind} keeps package failures local`, (t) => {
+      const box = makeSandbox(t);
+      const env = envFor(box);
+      const now = Date.now();
+      for (const index of [1, 2]) writeRecord(jobFile(engineStateRoots(engine, env)[0], "workspace", `local-${index}`), {
+        id: `local-${index}`, status: "error", mode: "write", failureKind,
+        errorMessage: "permission denied for tool invocation", finishedAt: new Date(now - index * 60_000).toISOString()
+      });
+      const health = engineHealth(engine, "write", null, { env, now });
+      assert.equal(health.healthy, engine !== "agy" || failureKind !== "policy");
+      assert.equal(engineHealth(engine, "consult", null, { env, now }).healthy, true);
+    });
+  }
+}
+
+test("transport permission failures still open immediately while cancelled outcomes never feed streaks", (t) => {
+  const box = makeSandbox(t);
+  const env = envFor(box);
+  const now = Date.now();
+  const root = engineStateRoots("devin", env)[0];
+  const file = jobFile(root, "workspace", "failure");
+  writeRecord(file, { id: "failure", status: "failed", mode: "write", failureKind: "permission", errorMessage: "permission denied initializing prompt transport", finishedAt: new Date(now - 60_000).toISOString() });
+  assert.equal(engineHealth("devin", "write", null, { env, now }).reason, "permission");
+  for (const failureKind of ["auth", "quota", "timeout", "policy", "permission", "turn_limit"]) {
+    writeRecord(file, { id: "failure", status: "cancelled", mode: "write", failureKind, errorMessage: "permission denied initializing prompt transport", finishedAt: new Date(now - 60_000).toISOString() });
+    assert.equal(engineHealth("devin", "write", null, { env, now }).healthy, true, failureKind);
+  }
+  writeRecord(file, { id: "failure", status: "error", mode: "write", failureKind: "timeout", finishedAt: new Date(now - 3 * 60_000).toISOString() });
+  writeRecord(jobFile(root, "workspace", "cancelled"), { id: "cancelled", status: "cancelled", mode: "write", failureKind: "timeout", finishedAt: new Date(now - 2 * 60_000).toISOString() });
+  assert.equal(engineHealth("devin", "write", null, { env, now }).healthy, true);
+  writeRecord(jobFile(root, "workspace", "second"), { id: "second", status: "failed", mode: "write", failureKind: "timeout", finishedAt: new Date(now - 60_000).toISOString() });
+  const health = engineHealth("devin", "write", null, { env, now });
+  assert.equal(health.healthy, false);
+  assert.equal(health.failures[0].kindCount, 2);
+  assert.equal(health.failures[0].terminalCount, 2);
+});
+
+for (const [legacy, current] of [["first-party", "free"], ["api", "credits"]]) {
+  test(`Devin compares legacy ${legacy} with ${current} for failure and recovery`, (t) => {
+    const box = makeSandbox(t);
+    const env = envFor(box);
+    const now = Date.now();
+    const root = engineStateRoots("devin", env)[0];
+    writeRecord(jobFile(root, "workspace", "quota"), { id: "quota", status: "error", failureKind: "quota", billingPool: legacy, finishedAt: new Date(now - 2 * 60_000).toISOString() });
+    for (const pool of [legacy, current, null]) assert.equal(engineHealth("devin", "write", pool, { env, now }).healthy, false);
+    writeRecord(jobFile(root, "workspace", "recovery"), { id: "recovery", status: "done", billingPool: current, finishedAt: new Date(now - 60_000).toISOString() });
+    for (const pool of [legacy, current, null]) assert.equal(engineHealth("devin", "write", pool, { env, now }).healthy, true);
+  });
+}
+
+test("mode-less historical failures apply to both modes while package types retain their scope", (t) => {
+  const box = makeSandbox(t);
+  const env = envFor(box);
+  const now = Date.now();
+  const root = engineStateRoots("devin", env)[0];
+  for (const index of [1, 2]) writeRecord(jobFile(root, "workspace", `legacy-${index}`), { id: `legacy-${index}`, status: "error", failureKind: "timeout", finishedAt: new Date(now - index * 60_000).toISOString() });
+  for (const mode of ["write", "consult", "review"]) assert.equal(engineHealth("devin", mode, null, { env, now }).healthy, false);
+  writeRecord(jobFile(root, "workspace", "recovery"), { id: "recovery", status: "done", finishedAt: new Date(now).toISOString() });
+  for (const mode of ["write", "consult"]) assert.equal(engineHealth("devin", mode, null, { env, now }).healthy, true);
+  for (const index of [1, 2]) writeRecord(jobFile(root, "workspace", `legacy-${index}`), { id: `legacy-${index}`, status: "error", packageType: "implementation", failureKind: "timeout", finishedAt: new Date(now + index * 1000).toISOString() });
+  assert.equal(engineHealth("devin", "write", null, { env, now: now + 3000 }).healthy, false);
+  assert.equal(engineHealth("devin", "consult", null, { env, now: now + 3000 }).healthy, true);
+});
+
+test("unknown pools count any exhausted pool without combining streaks or cross-pool recoveries", (t) => {
+  const box = makeSandbox(t);
+  const env = envFor(box);
+  const now = Date.now();
+  const root = engineStateRoots("devin", env)[0];
+  const write = (id, billingPool, status, failureKind, age) => writeRecord(jobFile(root, "workspace", id), { id, billingPool, status, failureKind, finishedAt: new Date(now - age).toISOString() });
+  write("free-rate", "free", "error", "rate_limited", 4_000);
+  write("credits-rate", "credits", "error", "rate_limited", 3_000);
+  assert.equal(engineHealth("devin", "write", null, { env, now }).healthy, true);
+  write("free-quota", "free", "failed", "quota", 2_000);
+  write("credits-success", "credits", "done", null, 1_000);
+  const health = engineHealth("devin", "write", null, { env, now });
+  assert.equal(health.healthy, false);
+  assert.equal(health.reason, "quota");
+  assert.equal(health.failures[0].pool, "free");
+  assert.equal(engineHealth("devin", "write", "credits", { env, now }).healthy, true);
+});
+
+test("one hook snapshot memoizes disk reads and later hooks observe new outcomes", (t) => {
+  const box = makeSandbox(t);
+  const env = envFor(box);
+  const now = Date.now();
+  const root = engineStateRoots("devin", env)[0];
+  let scans = 0;
+  const readdir = fs.readdirSync;
+  t.mock.method(fs, "readdirSync", (directory, ...args) => {
+    if (directory === root) scans += 1;
+    return readdir(directory, ...args);
+  });
+  withEngineHealthRecords(() => {
+    const records = readEngineHealthRecords(env, now);
+    assert.strictEqual(readEngineHealthRecords(env, now + 1), records);
+    writeRecord(jobFile(root, "workspace", "failure"), { id: "failure", status: "error", failureKind: "auth", finishedAt: new Date(now).toISOString() });
+    assert.equal(engineHealth("devin", "write", null, { env, now, records }).healthy, true);
+    assert.equal(engineHealth("devin", "consult", null, { env, now }).healthy, true);
+    assert.equal(scans, 1);
+  });
+  withEngineHealthRecords(() => {
+    assert.equal(engineHealth("devin", "write", null, { env, now }).healthy, false);
+    assert.equal(scans, 2);
+  });
+});
+
+test("breaker advisory dedup retains different failure kinds for ambiguous pool labels", (t) => {
+  const box = makeSandbox(t);
+  const env = envFor(box);
+  const root = engineStateRoots("devin", env)[0];
+  const now = Date.now();
+  for (const [id, billingPool, failureKind, age] of [["quota", null, "quota", 3_000], ["rate-one", "null", "rate_limited", 2_000], ["rate-two", "null", "rate_limited", 1_000]]) {
+    writeRecord(jobFile(root, "workspace", id), { id, billingPool, status: "error", failureKind, finishedAt: new Date(now - age).toISOString() });
+  }
+  let output = "";
+  runBreakerCheck(env, now, (text) => { output += text; });
+  assert.match(output, /last failure quota/);
+  assert.match(output, /last failure rate_limited/);
+  assert.equal(output.split("last failure quota").length - 1, 1);
+  assert.equal(output.split("last failure rate_limited").length - 1, 1);
+});
+
+test("quota and rate limits share a billing pool across modes without poisoning another pool", (t) => {
+  const box = makeSandbox(t);
+  const env = envFor(box);
+  const now = Date.now();
+  const root = engineStateRoots("devin", env)[0];
+  for (const failureKind of ["quota", "rate_limited"]) {
+    fs.rmSync(root, { recursive: true, force: true });
+    for (const [index, mode] of [[1, "write"], [2, "consult"]]) {
+      writeRecord(jobFile(root, "workspace", `failure-${index}`), {
+        id: `failure-${index}`, status: "error", mode, failureKind,
+        billingPool: "first-party", finishedAt: new Date(now - (3 - index) * 60_000).toISOString()
+      });
+    }
+    for (const mode of ["write", "consult", "review"]) {
+      const health = engineHealth("devin", mode, "first-party", { env, now });
+      assert.equal(health.healthy, false);
+      assert.equal(health.scope, "pool");
+      assert.equal(engineHealth("devin", mode, "api", { env, now }).healthy, true);
+    }
+  }
+});
+
+for (const failureKind of ["auth", "missing_cli", "setup", "protocol", "transport", "sandbox"]) {
+  test(`${failureKind} remains engine wide across modes and pools`, (t) => {
+    const box = makeSandbox(t);
+    const env = envFor(box);
+    const now = Date.now();
+    writeRecord(jobFile(engineStateRoots("devin", env)[0], "workspace", "failure"), {
+      id: "failure", status: "error", mode: "write", failureKind,
+      billingPool: "first-party", finishedAt: new Date(now - 60_000).toISOString()
+    });
+    for (const mode of ["write", "consult", "review"]) {
+      for (const pool of [null, "api", "first-party"]) {
+        const health = engineHealth("devin", mode, pool, { env, now });
+        assert.equal(health.healthy, false);
+        assert.equal(health.scope, "engine");
+      }
+    }
+  });
+}
+
+test("host blockers preserve write and consult scopes in unified health", (t) => {
+  const box = makeSandbox(t);
+  const companion = writeCompanion(path.join(box.root, "grok-companion.mjs"), `process.stdout.write(JSON.stringify({blockers:[{kind:"sandbox",modes:["write"],message:"Writes blocked."}]}));`);
+  const env = envFor(box, { FUSION_GROK_COMPANION: companion });
+  assert.equal(engineHealth("grok", "write", null, { env }).healthy, false);
+  assert.equal(engineHealth("grok", "consult", null, { env }).healthy, true);
+  assert.equal(engineHealth("grok", "review", null, { env }).healthy, true);
+});
+
+test("a consult success cannot recover write timeouts and a wrapper cannot double count its peer", (t) => {
+  const box = makeSandbox(t);
+  const env = envFor(box);
+  const now = Date.now();
+  const root = engineStateRoots("devin", env)[0];
+  writeRecord(jobFile(root, "workspace", "write-1"), { id: "write-1", status: "error", mode: "write", failureKind: "timeout", finishedAt: new Date(now - 4 * 60_000).toISOString() });
+  writeWorkerRecord(box, "wrapper", { taskId: "wrapper", agentType: "devin:devin-rescue", peerEngine: "devin", peerJobId: "write-1", packageType: "implementation", transportStatus: "failed", peerFailureKind: "timeout", finishedAt: new Date(now - 3 * 60_000).toISOString() });
+  assert.equal(engineHealth("devin", "write", null, { env, now }).healthy, true);
+  writeRecord(jobFile(root, "workspace", "write-2"), { id: "write-2", status: "error", mode: "write", failureKind: "timeout", finishedAt: new Date(now - 2 * 60_000).toISOString() });
+  writeRecord(jobFile(root, "workspace", "consult-ok"), { id: "consult-ok", status: "done", mode: "consult", finishedAt: new Date(now - 60_000).toISOString() });
+  assert.equal(engineHealth("devin", "write", null, { env, now }).healthy, false);
+  assert.equal(engineHealth("devin", "consult", null, { env, now }).healthy, true);
 });

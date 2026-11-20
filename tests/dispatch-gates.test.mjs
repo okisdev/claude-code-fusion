@@ -5,8 +5,9 @@ import os from "node:os";
 import path from "node:path";
 import { test } from "node:test";
 
-import { BREADTH_ENGINE_IDS, ENGINES, ENGINE_IDS } from "../plugins/fusion/scripts/lib/engines.mjs";
-import { engineInfraDenial, injectedPeerDefaults, latestUserRequestedBackground, latestUserText } from "../plugins/fusion/scripts/lib/lifecycle/dispatch.mjs";
+import { ENGINES, ENGINE_IDS, engineStateRoots } from "../plugins/fusion/scripts/lib/engines.mjs";
+import { engineHealth } from "../plugins/fusion/scripts/lib/engine-health.mjs";
+import { codexPacingAdvisory, createDispatch, engineInfraDenial, injectedPeerDefaults, latestUserRequestedBackground, latestUserText, validateWorkerBrief } from "../plugins/fusion/scripts/lib/lifecycle/dispatch.mjs";
 import { renderHookResult } from "../plugins/fusion/scripts/lib/lifecycle/output.mjs";
 import { tagMessage } from "../plugins/fusion/scripts/lib/user-messages.mjs";
 import { createWorkerRecord, readPeerCapacityReservations, readWorkerRecords, updateWorkerRecord } from "../plugins/fusion/scripts/lib/worker-state.mjs";
@@ -17,18 +18,25 @@ function sandbox(t) {
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
   const transcript = path.join(root, "parent.jsonl");
   fs.writeFileSync(transcript, "");
+  const binaries = Object.fromEntries(Object.entries({ codex: "CODEX_BIN", grok: "GROK_BIN", cursor: "CURSOR_AGENT_BIN", devin: "DEVIN_BIN", agy: "AGY_BIN" }).map(([engine, key]) => {
+    const file = path.join(root, `${engine}-cli`);
+    fs.writeFileSync(file, "#!/bin/sh\nexit 0\n", { mode: 0o700 });
+    return [key, file];
+  }));
   return {
     root,
     transcript,
     sequence: 0,
     env: {
       ...process.env,
+      HOME: root,
       FUSION_WORKER_STATE_DIR: path.join(root, "workers"),
       FUSION_DATA_DIR: path.join(root, "data"),
       FUSION_MODEL_ROUTING: path.join(root, "missing-routing.json"),
       TMPDIR: root,
       TMP: root,
       TEMP: root,
+      ...binaries,
       ...Object.fromEntries(ENGINE_IDS.map((engine) => [ENGINES[engine].companionEnv, path.resolve(import.meta.dirname, engine === "grok" ? "fixtures/healthy-grok-companion.mjs" : `../plugins/${engine}/scripts/${ENGINES[engine].companionFile}`)]))
     }
   };
@@ -95,6 +103,437 @@ function infraMessage(engine, kind, elapsed = 5, remaining = 25) {
   return `${ENGINES[engine].displayName} failed with failure: ${kind} ${elapsed} minutes ago in this session. Route this package to another eligible lane. It reopens after ${remaining} minutes or after you name the engine in a message.`;
 }
 
+function fallbackBrief(reason = null) {
+  return `fusion-brief: v1\ncontext-mode: isolated\ngoal: implement a bounded fix\nscope: src/a.mjs\nverification: node --test\n${reason === null ? "" : `claude-fallback: ${reason}\n`}`;
+}
+
+function healthJob(box, engine, id, fields = {}) {
+  const jobs = path.join(engineStateRoots(engine, box.env)[0], "workspace", "jobs");
+  fs.mkdirSync(jobs, { recursive: true });
+  fs.writeFileSync(path.join(jobs, `${id}.json`), JSON.stringify({
+    id, status: "error", mode: "write", claudeSessionId: "session-1",
+    finishedAt: new Date(Date.now() - 60_000).toISOString(), ...fields
+  }));
+}
+
+test("dispatch resolves implicit and explicit model pools from routing before history", (t) => {
+  const box = sandbox(t);
+  healthJob(box, "codex", "quota", { failureKind: "quota", billingPool: "codex", requestedModel: "different-model" });
+  for (const model of ["gpt-6.1-sol", "gpt-6-sol"]) {
+    healthJob(box, "codex", model, { status: "done", requestedModel: model, billingPool: "obsolete-pool" });
+  }
+  for (const prompt of ["lane: codex flagship", "lane: codex quick", "--model gpt-6-sol -- lane: codex flagship", "--model=gpt-6.1-sol --write -- bounded"]) {
+    assert.match(engineInfraDenial("session-1", "codex:codex-rescue", "continue", box.env, Date.now(), prompt), /failure: quota/, prompt);
+  }
+  healthJob(box, "codex", "custom", { status: "done", requestedModel: "custom-model", billingPool: "custom-pool" });
+  assert.equal(engineInfraDenial("session-1", "codex:codex-rescue", "continue", box.env, Date.now(), "--model custom-model --write -- bounded"), null);
+  fs.writeFileSync(box.env.FUSION_MODEL_ROUTING, JSON.stringify({ schemaVersion: 2, updatedAt: new Date().toISOString(), costProfile: "", models: [{ id: "custom-model", lane: "codex", intelligence: 5, taste: 4, cost: 3 }] }));
+  assert.match(engineInfraDenial("session-1", "codex:codex-rescue", "continue", box.env, Date.now(), "--model custom-model --write -- bounded"), /failure: quota/);
+  assert.match(engineInfraDenial("session-1", "codex:codex-rescue", "continue", box.env, Date.now(), "--model unknown-model --write -- bounded"), /failure: quota/);
+});
+
+test("a table row with an unknown pool remains conservative instead of trusting stale history", (t) => {
+  const box = sandbox(t);
+  healthJob(box, "devin", "quota", { failureKind: "quota", billingPool: "free", requestedModel: "another-model" });
+  healthJob(box, "devin", "stale", { status: "done", requestedModel: "swe-2", billingPool: "credits" });
+  assert.match(engineInfraDenial("session-1", "devin:devin-rescue", "continue", box.env, Date.now(), "lane: devin burst"), /failure: quota/);
+});
+
+test("peer dispatch records preserve the original mode, model, and pool", (t) => {
+  const box = sandbox(t);
+  const record = createDispatch({ session_id: "session-1", tool_use_id: "record-choice", cwd: box.root, tool_input: { prompt: "--write --model gpt-6.1-sol -- lane: codex flagship" } }, "codex:codex-rescue", false, box.env);
+  assert.equal(record.mode, "write");
+  assert.equal(record.requestedModel, "gpt-6.1-sol");
+  assert.equal(record.billingPool, "codex");
+});
+
+for (const mode of ["write", "consult"]) {
+  test(`SendMessage uses the original ${mode} mode and pool despite message contents`, async (t) => {
+    const box = sandbox(t);
+    const recipient = workerRecord(box, { agentType: "devin:devin-rescue", agentId: "original-worker", transportStatus: "done", peerFailureKind: null, mode, packageType: mode === "write" ? "implementation" : "consult", requestedModel: "swe-2", billingPool: "free", finishedAt: new Date(Date.now() - 10 * 60_000).toISOString() });
+    for (const index of [1, 2]) healthJob(box, "devin", `timeout-${index}`, { failureKind: "timeout", billingPool: "free" });
+    const output = await launch(box, {}, { tool_name: "SendMessage", tool_input: { to: recipient.agentId, message: mode === "write" ? "--model muse-wonder -- lane: devin diversity · consult" : "--model muse-wonder --write -- implement this" } });
+    if (mode === "write") {
+      assert.equal(output.permissionDecision, "deny");
+      assert.match(output.permissionDecisionReason, /failure: timeout/);
+    } else {
+      assert.notEqual(output?.permissionDecision, "deny");
+    }
+  });
+}
+
+test("SendMessage uses the saved billing pool after routing defaults change", async (t) => {
+  const box = sandbox(t);
+  const recipient = workerRecord(box, { agentType: "devin:devin-rescue", agentId: "original-worker", mode: "write", requestedModel: "swe-2", peerBillingPool: "credits", billingPool: "free", finishedAt: new Date(Date.now() - 10 * 60_000).toISOString() });
+  healthJob(box, "devin", "quota", { failureKind: "quota", billingPool: "credits" });
+  const output = await launch(box, {}, { tool_name: "SendMessage", tool_input: { to: recipient.agentId, message: "--model swe-2 -- lane: devin burst" } });
+  assert.equal(output.permissionDecision, "deny");
+  assert.match(output.permissionDecisionReason, /failure: quota/);
+});
+
+test("SendMessage checks the recorded Claude model instead of a model named in the message", async (t) => {
+  const box = sandbox(t);
+  workerRecord(box, { agentType: "fusion:claude-worker", failureKind: "quota", infraFailure: true, quotaModelFamily: "fable", quotaResetAt: new Date(Date.now() + 60_000).toISOString() });
+  const opus = workerRecord(box, { agentType: "fusion:claude-worker", agentId: "opus-worker", requestedModel: "opus", resolvedModel: "claude-opus-5-5", transportStatus: "running", failureKind: null, peerFailureKind: null, finishedAt: null });
+  const fable = workerRecord(box, { agentType: "fusion:claude-worker", agentId: "fable-worker", requestedModel: "fable", resolvedModel: "claude-fable-5-1", transportStatus: "running", failureKind: null, peerFailureKind: null, finishedAt: null });
+  const allowed = await launch(box, {}, { tool_name: "SendMessage", tool_input: { to: opus.agentId, message: "model: fable\ncontinue" } });
+  assert.notEqual(allowed?.permissionDecision, "deny");
+  const denied = await launch(box, {}, { tool_name: "SendMessage", tool_input: { to: fable.agentId, message: "model: opus\ncontinue" } });
+  assert.equal(denied.permissionDecision, "deny");
+  assert.match(denied.permissionDecisionReason, /Fable usage limit/);
+});
+
+for (const engine of ENGINE_IDS) {
+  test(`no-healthy-lane checks the routed ${engine} write pool instead of historical pools`, (t) => {
+    const box = sandbox(t);
+    pacingSetup(box, { breadth: engine === "devin" ? "devin" : "cursor" });
+    for (const other of ["codex", "grok", engine === "devin" ? "devin" : "cursor", "agy"].filter((other) => other !== engine)) {
+      workerRecord(box, { agentType: ENGINES[other].rescueAgent });
+    }
+    const pool = engine === "devin" ? "free" : engine === "cursor" ? "first-party" : engine;
+    healthJob(box, engine, "quota", { failureKind: "quota", billingPool: pool });
+    healthJob(box, engine, "other-pool", { status: "done", billingPool: "unrelated" });
+    assert.equal(validateWorkerBrief(fallbackBrief("no-healthy-lane"), "fusion:claude-worker", box.env).ok, true);
+    healthJob(box, engine, "quota", { failureKind: "quota", billingPool: "unrelated" });
+    const healthy = validateWorkerBrief(fallbackBrief("no-healthy-lane"), "fusion:claude-worker", box.env);
+    assert.equal(healthy.ok, false);
+    assert.ok(healthy.reason.includes(`Healthy lanes: ${engine}.`));
+  });
+}
+
+for (const packageType of ["consult", "review", "research", "design"]) {
+  test(`no-healthy-lane uses ${packageType} package health`, (t) => {
+    const box = sandbox(t);
+    for (const engine of ["codex", "grok", "cursor", "agy"]) {
+      for (const index of [1, 2]) healthJob(box, engine, `write-${index}`, { failureKind: "timeout" });
+    }
+    const prompt = `${fallbackBrief("no-healthy-lane")}package-type: ${packageType}\n`;
+    const validation = validateWorkerBrief(prompt, "fusion:claude-worker", box.env);
+    assert.equal(validation.ok, false);
+    assert.match(validation.reason, /consult mode/);
+    assert.match(validation.reason, /Healthy lanes: codex, grok, cursor, agy/);
+  });
+}
+
+test("no-healthy-lane treats a missing or nonexecutable routed CLI as unhealthy", (t) => {
+  const box = sandbox(t);
+  for (const engine of ["grok", "cursor", "agy"]) workerRecord(box, { agentType: ENGINES[engine].rescueAgent });
+  const prompt = fallbackBrief("no-healthy-lane");
+  assert.equal(validateWorkerBrief(prompt, "fusion:claude-worker", box.env).ok, false);
+  fs.chmodSync(box.env.CODEX_BIN, 0o600);
+  assert.equal(validateWorkerBrief(prompt, "fusion:claude-worker", box.env).ok, true);
+  fs.unlinkSync(box.env.CODEX_BIN);
+  assert.equal(validateWorkerBrief(prompt, "fusion:claude-worker", box.env).ok, true);
+});
+
+test("envelope fields accept case, whitespace, colon spacing, and one trailing period", async (t) => {
+  const box = sandbox(t);
+  const prompt = "\n  FuSiOn-BrIeF : V1.  \n  CoNtExT-MoDe : IsOlAtEd. \n GoAl : inspect one file. \n ScOpE : src/a.mjs. \n AcCePtAnCe : bounded result. \n ClAuDe-FaLlBaCk : PrIvAcY. \n PaCkAgE-TyPe : ReViEw. \n SiZiNg : SmAlL. \n\nclaude-fallback: network\npackage-type: implementation\nsizing: invalid\n";
+  const validation = validateWorkerBrief(prompt, "fusion:claude-worker", box.env);
+  assert.equal(validation.ok, true);
+  assert.equal(validation.fallbackReason, "privacy");
+  assert.equal(validation.packageType, "review");
+  assert.equal(validation.sizing, "small");
+  const output = await launch(box, { subagent_type: "fusion:claude-worker", prompt });
+  assert.equal(output.permissionDecision, "allow");
+  assert.match(output.updatedInput.prompt, /FuSiOn-BrIeF : V1\.  \nfusion-task-id:/);
+  assert.equal(readWorkerRecords(box.env)[0].fallbackReason, "privacy");
+  assert.equal(validateWorkerBrief(fallbackBrief("privacy.."), "fusion:claude-worker", box.env).ok, false);
+});
+
+test("body fields cannot supply or duplicate fallback and required envelope fields", (t) => {
+  const box = sandbox(t);
+  const missingFallback = `${fallbackBrief()}\nclaude-fallback: privacy\n`;
+  assert.equal(validateWorkerBrief(missingFallback, "fusion:claude-worker", box.env).ok, false);
+  for (const field of ["context-mode: isolated", "goal: implement a bounded fix", "scope: src/a.mjs", "verification: node --test"]) {
+    const prompt = `${fallbackBrief("privacy").replace(`${field}\n`, "")}\n${field}\n`;
+    assert.equal(validateWorkerBrief(prompt, "fusion:claude-worker", box.env).ok, false, field);
+  }
+  const quoted = `${fallbackBrief("privacy")}\nclaude-fallback: no-healthy-lane\n`;
+  assert.equal(validateWorkerBrief(quoted, "fusion:claude-worker", box.env).fallbackReason, "privacy");
+});
+
+test("dispatch admission and advisory share one health read per hook invocation", async (t) => {
+  const box = sandbox(t);
+  pacingSetup(box);
+  const root = engineStateRoots("codex", box.env)[0];
+  let reads = 0;
+  const readdir = fs.readdirSync;
+  t.mock.method(fs, "readdirSync", (directory, ...args) => {
+    if (directory === root) reads += 1;
+    return readdir(directory, ...args);
+  });
+  await launch(box, { prompt: "lane: codex quick" });
+  assert.equal(reads, 1);
+  await launch(box, { prompt: "--cwd another-worktree -- lane: codex quick" }, { tool_use_id: "another-hook" });
+  assert.equal(reads, 2);
+});
+
+function pacingSetup(box, { breadth = "devin", tier = "free", pools = [{ pool: "codex", pacing: 2.7 }], available = true } = {}) {
+  box.env.DEVIN_COMPANION_DATA = path.join(box.root, "devin-data");
+  fs.mkdirSync(box.env.DEVIN_COMPANION_DATA, { recursive: true });
+  fs.writeFileSync(path.join(box.env.DEVIN_COMPANION_DATA, "models-cache.json"), JSON.stringify({ fetchedAt: Date.now(), families: [{ slug: "swe-2", aliases: [], variants: [{ uid: "swe-2-high", cost_tier: tier }] }] }));
+  fs.writeFileSync(box.env.FUSION_MODEL_ROUTING, JSON.stringify({ schemaVersion: 1, updatedAt: new Date().toISOString(), costProfile: "", breadth, models: [] }));
+  const quota = { engine: "codex", available, observedAt: new Date().toISOString(), note: null, pools: pools.map((pool) => ({ costClass: "included", usedPercent: 79, windowMinutes: 10080, resetsAt: null, ...pool })) };
+  const calls = path.join(box.root, "quota-calls");
+  box.env.FUSION_CODEX_COMPANION = path.join(box.root, "quota-companion.mjs");
+  fs.writeFileSync(box.env.FUSION_CODEX_COMPANION, `import fs from "node:fs"; if (process.argv.slice(2).join(" ") !== "quota --json") process.exit(2); fs.appendFileSync(${JSON.stringify(calls)}, ${JSON.stringify("call\n")}); process.stdout.write(JSON.stringify(${JSON.stringify(quota)}));`);
+  return calls;
+}
+
+test("Metered lane defaults warn only when the same engine offers an eligible prepaid row", (t) => {
+  const box = sandbox(t);
+  for (const engine of ["cursor", "devin"]) {
+    pacingSetup(box, { breadth: engine, tier: "premium" });
+    const role = engine === "cursor" ? "diversity" : "burst";
+    const model = engine === "cursor" ? "muse-spark-1.3" : "swe-2";
+    const prompt = `lane: ${engine} ${role}`;
+    const sentence = `${model} bills a metered pool; pass --model explicitly to keep using it, or pick a free or included model with /fusion:config.`;
+    const withoutAlternative = injectedPeerDefaults(prompt, `${engine}:${engine}-rescue`, box.env);
+    assert.doesNotMatch(withoutAlternative.context, /bills a metered pool/);
+    if (engine === "devin") fs.writeFileSync(path.join(box.env.DEVIN_COMPANION_DATA, "models-cache.json"), JSON.stringify({ fetchedAt: Date.now(), families: [
+      { slug: "swe-2", aliases: [], variants: [{ uid: "swe-2-high", cost_tier: "premium" }] },
+      { slug: "swe-free", aliases: [], variants: [{ uid: "swe-free-high", cost_tier: "free" }] }
+    ] }));
+    fs.writeFileSync(box.env.FUSION_MODEL_ROUTING, JSON.stringify({ schemaVersion: 2, updatedAt: new Date().toISOString(), costProfile: "", breadth: engine, models: [
+      { id: engine === "cursor" ? "composer-2.5" : "swe-free", lane: engine, family: "cognition", intelligence: 3, taste: 3, cost: 3 }
+    ] }));
+    const implicit = injectedPeerDefaults(prompt, `${engine}:${engine}-rescue`, box.env);
+    assert.match(implicit.prompt, new RegExp(`^--model ${model.replaceAll(".", "\\.")} --effort `));
+    assert.ok(implicit.context.includes(sentence));
+    const effortOnly = injectedPeerDefaults(`--effort high -- ${prompt}`, `${engine}:${engine}-rescue`, box.env);
+    assert.ok(effortOnly.context.includes(sentence));
+    const explicit = injectedPeerDefaults(`--model ${model} -- ${prompt}`, `${engine}:${engine}-rescue`, box.env);
+    assert.doesNotMatch(explicit.context, /bills a metered pool/);
+    assert.equal(injectedPeerDefaults(`--model ${model} --effort high -- ${prompt}`, `${engine}:${engine}-rescue`, box.env), null);
+  }
+  pacingSetup(box);
+  assert.doesNotMatch(injectedPeerDefaults("lane: devin burst", "devin:devin-rescue", box.env).context, /bills a metered pool/);
+  pacingSetup(box, { breadth: "cursor" });
+  const cursorBurst = injectedPeerDefaults("lane: cursor burst", "cursor:cursor-rescue", box.env);
+  assert.match(cursorBurst.prompt, /^--model composer-2\.5 /);
+  assert.doesNotMatch(cursorBurst.context, /bills a metered pool/);
+  assert.doesNotMatch(injectedPeerDefaults("lane: codex quick", "codex:codex-rescue", box.env).context, /bills a metered pool/);
+  pacingSetup(box);
+  fs.rmSync(path.join(box.env.DEVIN_COMPANION_DATA, "models-cache.json"));
+  assert.doesNotMatch(injectedPeerDefaults("lane: devin burst", "devin:devin-rescue", box.env).context, /bills a metered pool/);
+});
+
+test("Metered diversity notice ignores prepaid rows from another engine or an ineligible family", (t) => {
+  const box = sandbox(t);
+  pacingSetup(box, { breadth: "cursor" });
+  const rows = [
+    { id: "composer-2.5", lane: "cursor", family: "anthropic", intelligence: 3, taste: 3, cost: 3 },
+    { id: "swe-2", lane: "devin", family: "cognition", intelligence: 3, taste: 3, cost: 3 }
+  ];
+  fs.writeFileSync(box.env.FUSION_MODEL_ROUTING, JSON.stringify({ schemaVersion: 2, updatedAt: new Date().toISOString(), costProfile: "", breadth: "cursor", models: rows }));
+  const injected = injectedPeerDefaults("lane: cursor diversity", "cursor:cursor-rescue", box.env);
+  assert.doesNotMatch(injected.context, /bills a metered pool/);
+});
+
+test("Codex quick and volume dispatches receive the routed prepaid burst advisory", async (t) => {
+  const box = sandbox(t);
+  const calls = pacingSetup(box);
+  for (const [sizing, prompt] of [["quick", "lane: codex quick"], ["volume", "--model gpt-6-sol --effort high -- codex-role: volume | bounded package"]]) {
+    const output = await launch(box, { prompt });
+    assert.equal(output.permissionDecision, "allow");
+    assert.ok(output.additionalContext.includes(`Codex is over pace (pacing 2.7); this ${sizing} package fits the devin burst lane on its prepaid pool. Prefer devin-role: burst unless the package needs Codex.`));
+    assert.equal(output.updatedInput.prompt.includes(prompt), true);
+  }
+  assert.equal(fs.readFileSync(calls, "utf8"), "call\n");
+});
+
+test("Dispatch pacing cache survives another process and refreshes expired or changed probes", (t) => {
+  const box = sandbox(t);
+  const calls = pacingSetup(box);
+  const expected = codexPacingAdvisory("lane: codex quick", "codex:codex-rescue", box.env);
+  assert.match(expected, /Codex is over pace/);
+  const script = `import { codexPacingAdvisory } from ${JSON.stringify(new URL("../plugins/fusion/scripts/lib/lifecycle/dispatch.mjs", import.meta.url).href)}; process.stdout.write(JSON.stringify(codexPacingAdvisory("lane: codex quick", "codex:codex-rescue", process.env)));`;
+  const cached = spawnSync(process.execPath, ["--input-type=module", "-e", script], { env: box.env, encoding: "utf8" });
+  assert.equal(cached.status, 0, cached.stderr);
+  assert.equal(JSON.parse(cached.stdout), expected);
+  assert.equal(fs.readFileSync(calls, "utf8"), "call\n");
+  const file = path.join(box.env.FUSION_DATA_DIR, "quota-codex.json");
+  const cache = JSON.parse(fs.readFileSync(file, "utf8"));
+  fs.writeFileSync(file, JSON.stringify({ ...cache, fetchedAt: Date.now() - 60_001 }));
+  assert.equal(codexPacingAdvisory("lane: codex quick", "codex:codex-rescue", box.env), expected);
+  assert.equal(fs.readFileSync(calls, "utf8"), "call\ncall\n");
+  pacingSetup(box, { pools: [{ pool: "codex", pacing: 1 }] });
+  assert.equal(codexPacingAdvisory("lane: codex quick", "codex:codex-rescue", box.env), null);
+  fs.writeFileSync(file, "{invalid");
+  assert.equal(codexPacingAdvisory("lane: codex quick", "codex:codex-rescue", box.env), null);
+  assert.equal(fs.readFileSync(calls, "utf8"), "call\ncall\ncall\ncall\n");
+});
+
+test("Dispatch bounds a hung quota read and caches its failure", (t) => {
+  const box = sandbox(t);
+  const calls = pacingSetup(box);
+  fs.writeFileSync(box.env.FUSION_CODEX_COMPANION, `import fs from "node:fs"; fs.appendFileSync(${JSON.stringify(calls)}, ${JSON.stringify("call\n")}); process.on("SIGTERM", () => {}); setInterval(() => {}, 1000);`);
+  const started = Date.now();
+  assert.equal(codexPacingAdvisory("lane: codex quick", "codex:codex-rescue", box.env), null);
+  assert.ok(Date.now() - started < 1500);
+  assert.equal(codexPacingAdvisory("lane: codex quick", "codex:codex-rescue", box.env), null);
+  assert.equal(fs.readFileSync(calls, "utf8"), "call\n");
+});
+
+test("Pacing advisory requires Codex, a quick or volume shape, and a confirmed prepaid burst pool", (t) => {
+  const box = sandbox(t);
+  const calls = pacingSetup(box);
+  for (const [prompt, agent] of [["lane: codex flagship", "codex:codex-rescue"], ["bounded package", "codex:codex-rescue"], ["lane: grok burst", "grok:grok-rescue"], ["lane: codex quick", "fusion:claude-worker"]]) {
+    assert.equal(codexPacingAdvisory(prompt, agent, box.env), null);
+  }
+  assert.equal(fs.existsSync(calls), false);
+  for (const options of [{ tier: "premium" }]) {
+    pacingSetup(box, options);
+    assert.equal(codexPacingAdvisory("lane: codex quick", "codex:codex-rescue", box.env), null);
+  }
+  pacingSetup(box);
+  fs.rmSync(path.join(box.env.DEVIN_COMPANION_DATA, "models-cache.json"));
+  assert.equal(codexPacingAdvisory("lane: codex quick", "codex:codex-rescue", box.env), null);
+  assert.equal(fs.existsSync(calls), false);
+});
+
+test("Pacing advisory accepts Cursor's included burst and probes Codex alone", (t) => {
+  const box = sandbox(t);
+  const calls = pacingSetup(box, { breadth: "cursor" });
+  const otherCalls = path.join(box.root, "other-quota-calls");
+  box.env.FUSION_GROK_COMPANION = path.join(box.root, "grok-quota.mjs");
+  fs.writeFileSync(box.env.FUSION_GROK_COMPANION, `import fs from "node:fs"; fs.appendFileSync(${JSON.stringify(otherCalls)}, "call\\n");`);
+  const advisory = codexPacingAdvisory("lane: codex quick", "codex:codex-rescue", box.env);
+  assert.match(advisory, /cursor burst lane on its prepaid pool/);
+  assert.equal(fs.readFileSync(calls, "utf8"), "call\n");
+  assert.equal(fs.existsSync(otherCalls), false);
+});
+
+test("Pacing advisory ignores at-threshold, unknown, unrelated, and unavailable quota", (t) => {
+  for (const options of [
+    { pools: [{ pool: "codex", pacing: 1.15 }] },
+    { pools: [{ pool: "codex", pacing: null }] },
+    { pools: [{ pool: "other", pacing: 2.7 }] },
+    { pools: [] },
+    { available: false }
+  ]) {
+    const box = sandbox(t);
+    pacingSetup(box, options);
+    assert.equal(codexPacingAdvisory("lane: codex quick", "codex:codex-rescue", box.env), null);
+  }
+  const box = sandbox(t);
+  pacingSetup(box, { pools: [{ pool: "codex", pacing: 1.150001 }] });
+  assert.match(codexPacingAdvisory("lane: codex volume", "codex-rescue", box.env), /this volume package fits the devin burst lane/);
+});
+
+test("Pacing advisory respects breadth write health and the burst billing pool", (t) => {
+  for (const [failureKind, pool, packageType, expected] of [["auth", null, "consult", false], ["quota", "free", "implementation", false], ["quota", "credits", "implementation", true], ["timeout", null, "consult", true], ["timeout", null, "implementation", false]]) {
+    const box = sandbox(t);
+    const calls = pacingSetup(box);
+    const failure = { agentType: "devin:devin-rescue", peerFailureKind: failureKind, peerBillingPool: pool, packageType };
+    workerRecord(box, failure);
+    if (failureKind === "timeout") workerRecord(box, failure);
+    const result = codexPacingAdvisory("lane: codex quick", "codex:codex-rescue", box.env);
+    assert.equal(typeof result === "string", expected, `${failureKind} ${pool} ${packageType}`);
+    assert.equal(fs.existsSync(calls), expected);
+  }
+  const box = sandbox(t);
+  const calls = pacingSetup(box);
+  workerRecord(box, { agentType: "devin:devin-rescue", sessionId: "other-session", peerFailureKind: "auth" });
+  assert.equal(codexPacingAdvisory("lane: codex quick", "codex:codex-rescue", box.env), null);
+  assert.equal(fs.existsSync(calls), false);
+});
+
+for (const agent of ["fusion:claude-worker", "fusion:trivial-worker", "claude-worker", "trivial-worker"]) {
+  test(`${agent} denies missing, unknown, and duplicate fallback reasons`, async (t) => {
+    const box = sandbox(t);
+    for (const reason of [null, "generic", "privacy\nclaude-fallback: network", "privacy extra"]) {
+      const output = await launch(box, { subagent_type: agent, prompt: fallbackBrief(reason) });
+      assert.equal(output.permissionDecision, "deny");
+      assert.match(output.permissionDecisionReason, /network, toolchain, long-build, claude-surface, privacy, no-healthy-lane/);
+      assert.match(output.permissionDecisionReason, /\nclaude-fallback: claude-surface/);
+      assert.deepEqual(readWorkerRecords(box.env), []);
+    }
+  });
+
+  test(`${agent} accepts and persists each fallback reason`, async (t) => {
+    const box = sandbox(t);
+    for (const engine of ["codex", "grok", "cursor", "agy"]) workerRecord(box, { agentType: ENGINES[engine].rescueAgent });
+    for (const reason of ["network", "toolchain", "long-build", "claude-surface", "privacy", "no-healthy-lane"]) {
+      const output = await launch(box, { subagent_type: agent, prompt: fallbackBrief(reason) }, { tool_use_id: reason });
+      assert.equal(output.permissionDecision, "allow");
+      const record = readWorkerRecords(box.env).find((record) => record.dispatchToolUseId === reason);
+      assert.equal(record.fallbackReason, reason);
+    }
+  });
+}
+
+test("deep-reasoner advice requires no Claude fallback reason", async (t) => {
+  const box = sandbox(t);
+  const output = await launch(box, { subagent_type: "fusion:deep-reasoner", prompt: fallbackBrief() });
+  assert.equal(output.permissionDecision, "allow");
+  assert.equal(readWorkerRecords(box.env)[0].fallbackReason, null);
+});
+
+test("no-healthy-lane names healthy write lanes and accepts only after every lane fails", async (t) => {
+  const box = sandbox(t);
+  for (const engine of ["grok", "cursor", "agy"]) workerRecord(box, { agentType: ENGINES[engine].rescueAgent });
+  const input = { subagent_type: "fusion:claude-worker", prompt: fallbackBrief("no-healthy-lane") };
+  const denied = await launch(box, input);
+  assert.equal(denied.permissionDecision, "deny");
+  assert.match(denied.permissionDecisionReason, /Healthy lanes: codex\./);
+  workerRecord(box);
+  assert.equal((await launch(box, input)).permissionDecision, "allow");
+});
+
+test("no-healthy-lane follows the selected breadth engine", async (t) => {
+  const box = sandbox(t);
+  fs.writeFileSync(box.env.FUSION_MODEL_ROUTING, JSON.stringify({
+    schemaVersion: 1, updatedAt: new Date().toISOString(), costProfile: "test", models: [], breadth: "devin"
+  }));
+  for (const engine of ["codex", "grok", "agy"]) workerRecord(box, { agentType: ENGINES[engine].rescueAgent });
+  const input = { subagent_type: "fusion:trivial-worker", prompt: fallbackBrief("no-healthy-lane") };
+  const denied = await launch(box, input);
+  assert.equal(denied.permissionDecision, "deny");
+  assert.match(denied.permissionDecisionReason, /Healthy lanes: devin\./);
+  workerRecord(box, { agentType: ENGINES.devin.rescueAgent });
+  assert.equal((await launch(box, input)).permissionDecision, "allow");
+});
+
+test("dispatch scopes a recorded model's quota pool without denying another model's pool", (t) => {
+  const box = sandbox(t);
+  pacingSetup(box);
+  fs.writeFileSync(path.join(box.env.DEVIN_COMPANION_DATA, "models-cache.json"), JSON.stringify({ fetchedAt: Date.now(), families: [
+    { slug: "swe-2", aliases: [], variants: [{ uid: "swe-2-high", cost_tier: "free" }] },
+    { slug: "muse-wonder", aliases: [], variants: [{ uid: "muse-wonder-high", cost_tier: "premium" }] }
+  ] }));
+  const now = Date.now();
+  const jobs = path.join(engineStateRoots("devin", box.env)[0], "workspace", "jobs");
+  fs.mkdirSync(jobs, { recursive: true });
+  for (const [id, fields] of [
+    ["first-party-quota", { status: "error", failureKind: "quota", billingPool: "first-party", requestedModel: "swe-2" }],
+    ["api-success", { status: "done", billingPool: "api", requestedModel: "muse-wonder" }]
+  ]) {
+    fs.writeFileSync(path.join(jobs, `${id}.json`), JSON.stringify({ id, mode: "write", claudeSessionId: "session-1", finishedAt: new Date(now - 60_000).toISOString(), ...fields }));
+  }
+  assert.match(engineInfraDenial("session-1", "devin:devin-rescue", "continue", box.env, now, "lane: devin burst"), /failure: quota/);
+  assert.equal(engineInfraDenial("session-1", "devin:devin-rescue", "continue", box.env, now, "--model muse-wonder --write -- bounded"), null);
+});
+
+test("dispatch reuses write detection for mode headers, transport defaults, and burst roles", (t) => {
+  const box = sandbox(t);
+  const now = Date.now();
+  for (const minutes of [4, 2]) workerRecord(box, {
+    agentType: ENGINES.devin.rescueAgent,
+    packageType: "implementation",
+    peerFailureKind: "timeout",
+    finishedAt: new Date(now - minutes * 60_000).toISOString()
+  });
+  for (const prompt of ["--write -- bounded", "--transport-default-write -- bounded", "mode: write\nbounded", "lane: devin burst", "devin-role: burst"]) {
+    assert.match(engineInfraDenial("session-1", "devin:devin-rescue", "continue", box.env, now, prompt), /failure: timeout/);
+  }
+  for (const prompt of ["lane: devin diversity", "-- consult mentioning --write in prose", "mode: review\nbounded", "lane: devin burst · read-only"]) {
+    assert.equal(engineInfraDenial("session-1", "devin:devin-rescue", "continue", box.env, now, prompt), null);
+  }
+  assert.equal(engineHealth("devin", "review", null, { env: box.env, now }).healthy, true);
+});
+
 test("Explore defaults to sonnet and preserves every other input field", async (t) => {
   const box = sandbox(t);
   const input = { subagent_type: "Explore", prompt: "find the entry point", description: "trace entry", run_in_background: true };
@@ -159,12 +598,7 @@ for (const engine of ENGINE_IDS) {
       const box = sandbox(t);
       workerRecord(box, { agentType: ENGINES[engine].rescueAgent, peerFailureKind: kind });
       const output = await launch(box, { subagent_type: ENGINES[engine].rescueAgent });
-      if (kind === "quota" && BREADTH_ENGINE_IDS.includes(engine)) {
-        assert.equal(output, null);
-        assert.equal(readPeerCapacityReservations(box.env).length, 1);
-      } else {
-        assertDenied(box, output, "worker-lifecycle.engine-infra-deny", infraMessage(engine, kind));
-      }
+      assertDenied(box, output, "worker-lifecycle.engine-infra-deny", infraMessage(engine, kind));
     });
   }
 }

@@ -4,10 +4,12 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { BREADTH_ENGINE_IDS, ENGINES, ENGINE_ID_ALTERNATION, PEER_JOB_FOOTER_AGENTS, engineDisplayName, engineForAgentType, engineRoleFromBrief, routedEngineIds } from "../engines.mjs";
-import { readRoutingDefaults } from "../model-table.mjs";
+import { ENGINES, ENGINE_ID_ALTERNATION, PEER_JOB_FOOTER_AGENTS, engineDisplayName, engineForAgentType, engineRoleFromBrief, routedEngineIds } from "../engines.mjs";
+import { readModelRoutingFile, readRoutingDefaults, resolveModelRoutingPath } from "../model-table.mjs";
+import { quotaResults } from "../quota.mjs";
 import { newestEngineCompanion } from "../engine-acceptance.mjs";
-import { engineHostBlockers } from "../engine-host-check.mjs";
+import { engineHealth, readEngineHealthRecords } from "../engine-health.mjs";
+import { engineCliAvailable } from "../../breaker-check.mjs";
 import { tagMessage } from "../user-messages.mjs";
 import { canonicalWorkerAgentType, claudeModelFamily, createWorkerRecord, createWorkerTaskId, readPeerCapacityReservations, readWorkerRecord, readWorkerRecords, updateWorkerSessionState, withPeerCapacityReservations, workerRecordFile, writePrivateText, WORKER_TERMINAL_STATUSES } from "../worker-state.mjs";
 import { workerLimits } from "./budget.mjs";
@@ -21,12 +23,18 @@ function allowAgentWithTaskId(toolInput, taskId, additionalContext = null) {
   const marker = `fusion-task-id: ${taskId}`;
   const lines = prompt.split(/\r?\n/).filter((line) => !/^fusion-task-id:\s*/i.test(line.trim()));
   const firstNonBlankLine = lines.findIndex((line) => line.trim());
-  lines.splice(lines[firstNonBlankLine]?.trim() === "fusion-brief: v1" ? firstNonBlankLine + 1 : 0, 0, marker);
+  lines.splice(/^fusion-brief\s*:\s*v1\.?$/i.test(lines[firstNonBlankLine]?.trim() ?? "") ? firstNonBlankLine + 1 : 0, 0, marker);
   return { hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision: "allow", updatedInput: { ...toolInput, prompt: lines.join("\n") }, ...(additionalContext ? { additionalContext } : {}) } };
 }
 
 function promptText(toolInput) {
   return typeof toolInput?.prompt === "string" ? toolInput.prompt : "";
+}
+
+function briefEnvelope(prompt) {
+  const lines = prompt.trimStart().split(/\r?\n/);
+  const end = lines.findIndex((line) => !line.trim());
+  return lines.slice(0, end < 0 ? lines.length : end).map((line) => line.trim().replace(/\.$/, "").trim().replace(/^([^:]+):\s*/, (_, key) => `${key.trim()}: `).toLowerCase());
 }
 
 function leadingCompanionOptions(prompt) {
@@ -55,7 +63,25 @@ function optionValue(options, name) {
   return value.replace(/^(["'])(.*)\1$/s, "$2");
 }
 
-function engineInfraDenial(sessionId, agentType, userText, env, now = Date.now(), prompt = "", model = null) {
+function dispatchEngineChoice(engine, prompt, env, records = null) {
+  const { options, brief } = leadingCompanionOptions(prompt);
+  const defaults = readRoutingDefaults(env, { warn: null })[engine];
+  const role = engineRoleFromBrief(engine, brief);
+  const explicitModel = optionValue(options, "--model");
+  const choice = explicitModel === null ? defaults?.[role] : Object.values(defaults ?? {}).find((row) => row.model === explicitModel) ??
+    readModelRoutingFile(resolveModelRoutingPath(env), { env }).data?.models.find((row) => row.lane === engine && row.id === explicitModel);
+  const model = explicitModel ?? choice?.model ?? null;
+  if (choice) return { model, pool: choice.pool };
+  if (!model) return { model, pool: null };
+  records ??= readEngineHealthRecords(env);
+  const pool = (records.engines.get(engine) ?? [])
+    .filter((record) => [record.requestedModel, record.resolvedModel, record.model].includes(model) && record.billingPool)
+    .sort((left, right) => Date.parse(right.finishedAt ?? right.updatedAt ?? "") - Date.parse(left.finishedAt ?? left.updatedAt ?? ""))[0]?.billingPool ?? null;
+  return { model, pool };
+}
+
+function engineInfraDenial(sessionId, agentType, userText, env, now = Date.now(), prompt = "", model = null, dispatchRecord = null) {
+  model ??= dispatchRecord?.resolvedModel ?? dispatchRecord?.requestedModel;
   const canonical = canonicalWorkerAgentType(agentType);
   if (canonical && canonical !== "fusion:job-collector") {
     const name = canonical.slice(canonical.indexOf(":") + 1);
@@ -91,26 +117,20 @@ function engineInfraDenial(sessionId, agentType, userText, env, now = Date.now()
   if (!engine || new RegExp(String.raw`\b(?:${engine}|${engineDisplayName(engine)})\b`, "i").test(userText ?? "")) {
     return null;
   }
-  const mode = leadingCompanionOptions(prompt).options.includes("--write") ? "write" : "consult";
-  const blockers = engineHostBlockers(engine, env, now).filter((blocker) => blocker.modes.includes(mode));
-  if (blockers.length > 0) {
-    return tagMessage("worker-lifecycle.engine-infra-deny", `${engineDisplayName(engine)} ${mode} runs are blocked on this host: ${blockers.map((blocker) => `${blocker.kind}: ${blocker.message}`).join("; ")} Route this package to another eligible lane, or name the engine to retry.`);
+  const mode = dispatchRecord
+    ? dispatchRecord.mode === "write" || (!dispatchRecord.mode && dispatchRecord.packageType === "implementation") ? "write" : "consult"
+    : fallbackPackageType(agentType, prompt) === "implementation" ? "write" : "consult";
+  const records = readEngineHealthRecords(env, now);
+  const pool = dispatchRecord ? dispatchRecord.peerBillingPool ?? dispatchRecord.billingPool ?? null : dispatchEngineChoice(engine, prompt, env, records).pool;
+  const health = engineHealth(engine, mode, pool, { env, now, sessionId, records });
+  if (health.healthy) return null;
+  if (health.blockers.length > 0) {
+    return tagMessage("worker-lifecycle.engine-infra-deny", `${engineDisplayName(engine)} ${mode} runs are blocked on this host: ${health.blockers.map((blocker) => `${blocker.kind}: ${blocker.message}`).join("; ")} Route this package to another eligible lane, or name the engine to retry.`);
   }
-  const newest = sessionRecords(sessionId, env)
-    .filter((record) => WORKER_TERMINAL_STATUSES.has(record.transportStatus) && (record.peerEngine === engine || engineForAgentType(record.agentType) === engine) && Number.isFinite(Date.parse(record.finishedAt ?? "")))
-    .sort((left, right) => Date.parse(right.finishedAt) - Date.parse(left.finishedAt))[0];
-  const kind = newest?.peerFailureKind;
-  if (!["sandbox", "auth", "setup"].includes(kind) && !(kind === "quota" && !BREADTH_ENGINE_IDS.includes(engine))) {
-    return null;
-  }
-  const elapsedMs = now - Date.parse(newest.finishedAt);
-  const stopMs = 30 * 60 * 1000;
-  if (elapsedMs < 0 || elapsedMs >= stopMs) {
-    return null;
-  }
+  const elapsedMs = now - health.failures[0].timestamp;
   const elapsedMinutes = Math.floor(elapsedMs / 60_000);
-  const remainingMinutes = Math.ceil((stopMs - elapsedMs) / 60_000);
-  return tagMessage("worker-lifecycle.engine-infra-deny", `${engineDisplayName(engine)} failed with failure: ${kind} ${elapsedMinutes} minutes ago in this session. Route this package to another eligible lane. It reopens after ${remainingMinutes} minutes or after you name the engine in a message.`);
+  const remainingMinutes = Math.ceil((health.until - now) / 60_000);
+  return tagMessage("worker-lifecycle.engine-infra-deny", `${engineDisplayName(engine)} failed with failure: ${health.reason} ${elapsedMinutes} minutes ago in this session. Route this package to another eligible lane. It reopens after ${remainingMinutes} minutes or after you name the engine in a message.`);
 }
 
 function injectedPeerDefaults(prompt, agentType, env) {
@@ -147,25 +167,58 @@ function injectedPeerDefaults(prompt, agentType, env) {
     const matched = model !== null && model !== choice.model ? Object.values(defaults[engine]).find((entry) => entry.model === model) : null;
     filled.push("--effort", matched?.effort ?? choice.effort);
   }
-  if (filled.length === 0) {
+  const pacing = codexPacingAdvisory(prompt, agentType, env);
+  const prepaidAlternative = model === null && choice.costClass === "metered" &&
+    (readModelRoutingFile(resolveModelRoutingPath(env), { env }).data?.models ?? []).some((row) =>
+      row.lane === engine && row.id !== choice.model && ["free", "included"].includes(row.costClass) &&
+      (role !== "diversity" || !["claude", "anthropic", ENGINES.agy.family].includes(row.family)));
+  if (filled.length === 0 && !pacing) {
     return null;
   }
   return {
-    prompt: `${filled.join(" ")} ${separated ? prompt : `-- ${prompt}`}`,
-    context: tagMessage("worker-lifecycle.lane-default-injection", `Filled ${filled.join(" ")} from the routing table's ${lane} lane default.`)
+    prompt: filled.length ? `${filled.join(" ")} ${separated ? prompt : `-- ${prompt}`}` : prompt,
+    context: [
+      filled.length ? tagMessage("worker-lifecycle.lane-default-injection", `Filled ${filled.join(" ")} from the routing table's ${lane} lane default.${prepaidAlternative ? ` ${choice.model} bills a metered pool; pass --model explicitly to keep using it, or pick a free or included model with /fusion:config.` : ""}`) : null,
+      pacing ? tagMessage("worker-lifecycle.dispatch-advisory", pacing) : null
+    ].filter(Boolean).join("\n\n")
   };
 }
 
+function dispatchCodexPacing(env) {
+  const pools = quotaResults(env, { engines: ["codex"], timeoutMs: 800 })
+    .filter((result) => result.engine === "codex" && result.available)
+    .flatMap((result) => result.pools)
+    .filter((pool) => pool.pool === "codex" && Number.isFinite(pool.pacing));
+  return pools.length ? Math.max(...pools.map((pool) => pool.pacing)) : null;
+}
+
+function codexPacingAdvisory(prompt, agentType, env) {
+  if (engineForAgentType(agentType) !== "codex" || typeof prompt !== "string") return null;
+  const { brief } = leadingCompanionOptions(prompt);
+  const sizing = engineRoleFromBrief("codex", brief);
+  if (!["quick", "volume"].includes(sizing)) return null;
+  const defaults = readRoutingDefaults(env, { warn: null });
+  const breadth = defaults.breadth;
+  const burst = defaults[breadth].burst;
+  if (!["free", "included"].includes(burst.costClass) || !engineHealth(breadth, "write", burst.pool, { env }).healthy) return null;
+  const pacing = dispatchCodexPacing(env);
+  if (!(pacing > 1.15)) return null;
+  return `Codex is over pace (pacing ${pacing.toFixed(1)}); this ${sizing} package fits the ${breadth} burst lane on its prepaid pool. Prefer ${breadth}-role: burst unless the package needs Codex.`;
+}
+
 function prestagePeerPrompt(input, env) {
-  if (input.tool_name !== "Agent" || !input.tool_use_id) {
+  if (!["Agent", "Task"].includes(input.tool_name) || !input.tool_use_id) {
     return null;
   }
   const prompt = promptText(input.tool_input);
   const { options, brief, separated } = leadingCompanionOptions(prompt);
   const engine = engineForAgentType(input.tool_input?.subagent_type);
   const role = engineRoleFromBrief(engine, separated ? brief : prompt);
-  const mode = options.includes("--write") ? "write"
-    : (separated && /\bread[ -]only\b|\bconsult\b/i.test(brief.split(/\r?\n/, 1)[0])) || ENGINES[engine]?.consultOnlyRoles.includes(role) ? "read-only" : null;
+  const header = (separated ? brief : prompt).split(/\r?\n/).find((line) => line.trim())?.trim() ?? "";
+  const review = /(?:^|[|·,;]\s*)operation\s*:\s*review(?![\w-])/i.test(header);
+  const mode = review ? "read-only"
+    : options.includes("--write") ? "write"
+    : (separated && /\bread[ -]only\b|\bconsult\b/i.test(header)) || ENGINES[engine]?.consultOnlyRoles.includes(role) ? "read-only" : null;
   if (!mode) {
     return null;
   }
@@ -185,7 +238,7 @@ function prestagePeerPrompt(input, env) {
       throw new Error("Invalid transport creation result.");
     }
     fs.writeFileSync(transport.file, prompt, "utf8");
-    const stagedPrompt = `fusion-staged-token: ${transport.token}\nmode: ${mode}`;
+    const stagedPrompt = `fusion-staged-token: ${transport.token}\nmode: ${mode}${review && ["devin", "cursor", "agy"].includes(engine) ? "\noperation: review" : ""}`;
     withPeerCapacityReservations(env, (reservations) => {
       const reservation = reservations.find((entry) => entry.key === peerReservationKey(input));
       if (!reservation) {
@@ -442,39 +495,64 @@ function validateWorkerBrief(prompt, agentType, env = process.env) {
   if (!BRIEF_AGENTS.has(canonical)) {
     return { ok: true };
   }
+  const fallbackWorker = ["fusion:claude-worker", "fusion:trivial-worker"].includes(canonical);
+  const fallbackReasons = ["network", "toolchain", "long-build", "claude-surface", "privacy", "no-healthy-lane"];
+  const envelopeLines = briefEnvelope(prompt);
+  const envelope = envelopeLines.join("\n");
+  const fallbackLines = envelopeLines.filter((line) => /^claude-fallback:/.test(line));
+  const fallbackReason = fallbackWorker && fallbackLines.length === 1 ? fallbackLines[0].match(/^claude-fallback:\s*([^\s]+)\s*$/)?.[1] : null;
   const maximumBytes = DEFAULT_BRIEF_MAX_BYTES;
   if (Buffer.byteLength(prompt) > maximumBytes) {
     return { ok: false, reason: `Fusion worker brief exceeds ${maximumBytes} bytes; reduce it to the minimal self-contained task context.` };
   }
-  const firstLine = prompt.split(/\r?\n/).find((line) => line.trim())?.trim();
+  const firstLine = envelopeLines[0];
   const required = [
     [firstLine === "fusion-brief: v1", "fusion-brief: v1 (first line)"],
     [/^context-mode:\s*isolated\s*$/im, "context-mode: isolated"],
     [/^goal:\s*\S/im, "goal:"],
     [/^scope:\s*\S/im, "scope:"]
   ];
-  const missing = required.filter(([check]) => typeof check === "boolean" ? !check : !check.test(prompt)).map(([, label]) => label);
-  if (!/^(?:verification|acceptance):\s*\S/im.test(prompt)) missing.push("verification: or acceptance:");
-  if (missing.length) {
-    return { ok: false, reason: `Fusion worker brief is missing required lines: ${missing.join(", ")}. Copy this envelope and fill each value:\n\nfusion-brief: v1\ncontext-mode: isolated\ngoal: <task goal>\nscope: <files or boundaries>\nverification: <check or acceptance criterion>` };
+  const missing = required.filter(([check]) => typeof check === "boolean" ? !check : !check.test(envelope)).map(([, label]) => label);
+  if (!/^(?:verification|acceptance):\s*\S/im.test(envelope)) missing.push("verification: or acceptance:");
+  if (fallbackWorker && fallbackLines.length === 0) missing.push(`claude-fallback: (${fallbackReasons.join(", ")})`);
+  if (fallbackWorker && fallbackLines.length > 0 && !fallbackReasons.includes(fallbackReason)) {
+    return { ok: false, reason: `Fusion worker brief requires exactly one \`claude-fallback:\` line with one of: ${fallbackReasons.join(", ")}. Copy this example and choose the reason:\n\nclaude-fallback: claude-surface` };
   }
+  if (missing.length) {
+    return { ok: false, reason: `Fusion worker brief is missing required lines: ${missing.join(", ")}. Copy this envelope and fill each value:\n\nfusion-brief: v1\ncontext-mode: isolated\ngoal: <task goal>\nscope: <files or boundaries>\nverification: <check or acceptance criterion>${fallbackWorker ? "\nclaude-fallback: claude-surface" : ""}` };
+  }
+
   if (/\b(?:the conversation above|all previous messages|full parent transcript|inherit(?:ed)? conversation)\b/i.test(prompt)) {
     return { ok: false, reason: "Fusion workers receive a minimal isolated brief, not the parent conversation or transcript." };
   }
-  if (/^fusion-task-id:\s*/im.test(prompt)) {
+  if (/^fusion-task-id:\s*/im.test(envelope)) {
     return { ok: false, reason: "`fusion-task-id` is reserved for the lifecycle guard." };
   }
-  const packageTypeLines = prompt.split(/\r?\n/).filter((line) => /^package-type\s*:/i.test(line.trim()));
+  const packageTypeLines = envelopeLines.filter((line) => /^package-type:/.test(line));
   if (packageTypeLines.length > 1) {
     return { ok: false, reason: "Fusion worker brief `package-type:` may appear once and must be one of `implementation`, `consult`, `review`, `research`, or `design`." };
   }
   const packageType = packageTypeLines.length === 1
     ? packageTypeLines[0].match(/^package-type\s*:\s*(implementation|consult|review|research|design)\s*$/i)?.[1]?.toLowerCase()
-    : /^verification:\s*\S/im.test(prompt) ? "implementation" : "consult";
+    : /^verification:\s*\S/im.test(envelope) ? "implementation" : "consult";
   if (!packageType) {
     return { ok: false, reason: "Fusion worker brief `package-type:` must be one of `implementation`, `consult`, `review`, `research`, or `design`." };
   }
-  const sizingLines = prompt.split(/\r?\n/).filter((line) => /^sizing\s*:/i.test(line.trim()));
+  if (fallbackReason === "no-healthy-lane") {
+    const now = Date.now();
+    const records = readEngineHealthRecords(env, now);
+    const defaults = readRoutingDefaults(env, { warn: null });
+    const mode = packageType === "implementation" ? "write" : "consult";
+    const healthy = routedEngineIds(defaults.breadth).filter((engine) => engineCliAvailable(engine, env) &&
+      (engine === "codex" ? ["flagship", "quick"] : ["burst"]).some((role) => {
+        const choice = defaults[engine]?.[role];
+        return choice && !ENGINES[engine].consultOnlyRoles.includes(role) && engineHealth(engine, mode, choice.pool, { env, now, records }).healthy;
+      }));
+    if (healthy.length) {
+      return { ok: false, reason: `Fusion worker brief claude-fallback: no-healthy-lane requires every implementation peer lane to be unhealthy for ${mode} mode. Healthy lanes: ${healthy.join(", ")}. Route this package to a healthy lane.` };
+    }
+  }
+  const sizingLines = envelopeLines.filter((line) => /^sizing:/.test(line));
   if (sizingLines.length > 1) {
     return { ok: false, reason: "Fusion worker brief `sizing:` may appear once and must be one of `small`, `standard`, or `large`." };
   }
@@ -484,10 +562,10 @@ function validateWorkerBrief(prompt, agentType, env = process.env) {
       return { ok: false, reason: "Fusion worker brief `sizing:` must be one of `small`, `standard`, or `large`." };
     }
     const briefBytes = Buffer.byteLength(prompt);
-    return { ok: true, sizing, packageType, briefBytes, advisories: briefAdvisories(prompt, briefBytes, true, env) };
+    return { ok: true, sizing, packageType, briefBytes, ...(fallbackReason ? { fallbackReason } : {}), advisories: briefAdvisories(prompt, briefBytes, true, env) };
   }
   const briefBytes = Buffer.byteLength(prompt);
-  return { ok: true, packageType, briefBytes, advisories: briefAdvisories(prompt, briefBytes, false, env) };
+  return { ok: true, packageType, briefBytes, ...(fallbackReason ? { fallbackReason } : {}), advisories: briefAdvisories(prompt, briefBytes, false, env) };
 }
 
 function externalUserText(entry) {
@@ -601,6 +679,10 @@ function fallbackPackageType(agentType, prompt) {
   if (/(?:^|\s)--(?:write|transport-default-write)(?=\s|$)/.test(peerPromptPrefix)) {
     return "implementation";
   }
+  if (/^mode:\s*write\s*$/im.test(prompt)) return "implementation";
+  const { brief } = leadingCompanionOptions(prompt);
+  if (/^mode:\s*(?:consult|review|read[ -]only)\s*$/im.test(brief) || /\bread[ -]only\b|\bconsult\b/i.test(brief.split(/\r?\n/, 1)[0])) return "consult";
+  if (engineRoleFromBrief(engineForAgentType(agentType), brief) === "burst") return "implementation";
   return /^verification:\s*\S/im.test(prompt) ? "implementation" : "consult";
 }
 
@@ -610,6 +692,8 @@ function createDispatch(input, agentType, userBackgroundAuthorized, env, validat
     ? readPeerCapacityReservations(env).find((entry) => entry.key === peerReservationKey(input) && entry.agentType === agentType)
     : null;
   const prompt = typeof reservation?.originalPrompt === "string" ? reservation.originalPrompt : promptText(input.tool_input);
+  const peerChoice = PEER_RESCUE_AGENT_NAMES.has(agentType) ? dispatchEngineChoice(engineForAgentType(agentType), prompt, env) : null;
+  const packageType = validation.packageType ?? fallbackPackageType(agentType, prompt);
   const collectorIdentity = canonicalWorkerAgentType(agentType) === "fusion:job-collector" ? collectorRequestIdentity(prompt) : null;
   let parentTranscriptBytesAtDispatch = null;
   try {
@@ -622,7 +706,8 @@ function createDispatch(input, agentType, userBackgroundAuthorized, env, validat
     sessionId: input.session_id,
     dispatchToolUseId: input.tool_use_id ?? null,
     agentType,
-    requestedModel: input.tool_input?.model,
+    requestedModel: peerChoice ? peerChoice.model : input.tool_input?.model,
+    ...(peerChoice ? { mode: packageType === "implementation" ? "write" : "consult", billingPool: peerChoice.pool } : {}),
     description: safeDescription(input.tool_input?.description),
     workspaceRoot: input.cwd,
     ...(PEER_RESCUE_AGENT_NAMES.has(agentType) ? { companionCwd: companionCwd(input, prompt) } : {}),
@@ -631,8 +716,9 @@ function createDispatch(input, agentType, userBackgroundAuthorized, env, validat
     parentTranscriptPath: typeof input.transcript_path === "string" ? input.transcript_path : null,
     parentTranscriptBytesAtDispatch,
     parentContextTokensAtDispatch: parentContextTokens(input.transcript_path),
-    packageType: validation.packageType ?? fallbackPackageType(agentType, prompt),
+    packageType,
     briefBytes: validation.briefBytes ?? null,
+    fallbackReason: validation.fallbackReason ?? null,
     completionContract: completionContract(agentType, prompt),
     ...collectorIdentity,
     limits: workerLimits(agentType, env, validation.sizing)
@@ -679,4 +765,4 @@ function briefArtifactPath(record, env) {
 }
 
 
-export { allowAgentWithTaskId, promptText, leadingCompanionOptions, optionValue, engineInfraDenial, injectedPeerDefaults, prestagePeerPrompt, parentContextAdvisoryTokens, parentContextTokens, hostPeerCapacity, hostPeerCapacityDenial, reserveHostPeerCapacity, releaseHostPeerCapacity, verificationManifestPath, globToRegExp, readVerificationManifest, pathsNamedInBrief, missingVerificationSuites, briefAdvisories, validateWorkerBrief, externalUserText, latestUserText, latestUserRequestedBackground, safeDescription, completionContract, collectorRequestIdentity, createDispatch, claimParentContextAdvisory, briefArtifactPath };
+export { allowAgentWithTaskId, promptText, leadingCompanionOptions, optionValue, engineInfraDenial, injectedPeerDefaults, codexPacingAdvisory, prestagePeerPrompt, parentContextAdvisoryTokens, parentContextTokens, hostPeerCapacity, hostPeerCapacityDenial, reserveHostPeerCapacity, releaseHostPeerCapacity, verificationManifestPath, globToRegExp, readVerificationManifest, pathsNamedInBrief, missingVerificationSuites, briefAdvisories, validateWorkerBrief, externalUserText, latestUserText, latestUserRequestedBackground, safeDescription, completionContract, collectorRequestIdentity, createDispatch, claimParentContextAdvisory, briefArtifactPath };

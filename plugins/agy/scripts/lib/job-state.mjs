@@ -417,7 +417,8 @@ export function createJobState({
   function resumeOwnerMayStillRun(record, now = Date.now()) {
     const processes = [
       [record.pid, record.pidIdentity],
-      [record[enginePidField], record[engineIdentityField]]
+      [record[enginePidField], record[engineIdentityField]],
+      [record.salvage?.resumePid, record.salvage?.resumePidIdentity]
     ].filter(([pid]) => Number.isInteger(pid) && pid > 1);
     if (processes.some(([pid, identity]) => recordedResumeOwnerProcessIsAlive(pid, identity))) return true;
     if (processes.length > 0) return false;
@@ -510,7 +511,7 @@ export function createJobState({
 
   function launchRunningJobProcess(file, launch, options = {}) {
     return withRecordLock(file, () => {
-      const processRole = options.processRole === "worker" ? "worker" : engine;
+      const processRole = ["worker", "resume"].includes(options.processRole) ? options.processRole : engine;
       const processLabel = processRole === "worker" ? "Background worker" : `${engineName} process`;
       const existing = readJobRecordFile(file, true);
       if (!existing) throw new Error(`No job record found at ${file}.`);
@@ -527,8 +528,8 @@ export function createJobState({
         error.processRole = processRole;
         if (existing.cleanupRequired) {
           error.cleanupRequired = true;
-          error.pid = processRole === "worker" ? existing.pid ?? null : existing[enginePidField] ?? null;
-          error.pidIdentity = processRole === "worker" ? existing.pidIdentity ?? null : existing[engineIdentityField] ?? null;
+          error.pid = processRole === "worker" ? existing.pid ?? null : existing.salvage?.resumePid ?? existing[enginePidField] ?? null;
+          error.pidIdentity = processRole === "worker" ? existing.pidIdentity ?? null : existing.salvage?.resumePidIdentity ?? existing[engineIdentityField] ?? null;
         }
         throw error;
       }
@@ -544,8 +545,9 @@ export function createJobState({
       const identityField = processRole === "worker" ? "pidIdentity" : engineIdentityField;
       const next = {
         ...existing,
-        [pidField]: pid,
-        [identityField]: launched?.identity ?? null
+        ...(processRole === "resume"
+          ? { salvage: { ...existing.salvage, resumePid: pid, resumePidIdentity: launched?.identity ?? null } }
+          : { [pidField]: pid, [identityField]: launched?.identity ?? null })
       };
       atomicWriteFile(file, `${JSON.stringify(next, null, 2)}\n`);
       return { ...launched, record: next };

@@ -215,6 +215,7 @@ function renderEngine(lines, name, stats, { identities = false } = {}) {
   renderAcceptanceAnomalies(lines, stats.acceptanceAnomalies);
   renderCounts(lines, "By mode", stats.byMode ?? {});
   renderCounts(lines, "By agent", stats.byAgent ?? {});
+  if (stats.fallbackReasons) renderCounts(lines, "Claude fallback reasons", stats.fallbackReasons);
   renderCounts(lines, "By delivery", stats.byDelivery ?? {});
   renderCounts(lines, "By collection method", stats.byCollectionMethod ?? {});
   renderCounts(lines, "By kind", stats.byKind ?? {});

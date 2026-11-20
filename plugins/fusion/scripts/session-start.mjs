@@ -6,6 +6,7 @@ import { main as syncRules } from "./rules-sync.mjs";
 import { run as checkBreaker } from "./breaker-check.mjs";
 import { renderModelTableFromFile, resolveModelRoutingPath } from "./lib/model-table.mjs";
 import { tagMessage } from "./lib/user-messages.mjs";
+import { pacingLines, quotaResults } from "./lib/quota.mjs";
 
 function main(env = process.env, compact = false) {
   const output = [];
@@ -24,6 +25,9 @@ function main(env = process.env, compact = false) {
       void 0;
     }
   }
+  try {
+    for (const line of pacingLines(quotaResults(env))) output.push(`${line}\n`);
+  } catch {}
   output.push(renderModelTableFromFile(resolveModelRoutingPath(env), undefined, {
     warn: (message) => console.error(tagMessage("rules-sync.model-table-warning", message))
   }));

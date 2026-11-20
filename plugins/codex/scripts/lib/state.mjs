@@ -72,7 +72,7 @@ const jobState = createJobState({
 export const {
   SESSION_ID_ENV, DEFAULT_LOCK_TIMEOUT_MS, resolveLockTimeoutMs, resolveDataDir,
   workspaceSlug, workspaceStateDir, jobsDir, briefsDir, jobFilePath, jobLogPath, briefPath,
-  generateJobId, nowIso, readJobRecordFile, listJobRecords, listAllJobRecords, readLogTail, pruneJobState
+  generateJobId, nowIso, readJobRecordFile, listJobRecords, listAllJobRecords, readLogTail, pruneJobState, writePrivateStateFile
 } = jobState;
 
 const atomicWriteFile = jobState.writePrivateStateFile;

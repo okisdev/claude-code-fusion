@@ -148,7 +148,7 @@ test("does not infer terminal state from prose", (t) => {
     status: '  process.stdout.write("Job completed successfully.\\n");',
     result: '  process.stdout.write("must not run\\n");'
   });
-  const output = runCollector(t, companion, { capMs: 750 });
+  const output = runCollector(t, companion, { capMs: 750, totalCapMs: 750 });
   assert.strictEqual(output.status, 2, output.stderr);
   assert.match(output.stdout, /^Job completed successfully\.\ncollector: timeout engine=codex job=[a-f0-9]{32} elapsed=\d+s\n$/);
 });
@@ -159,9 +159,159 @@ test("prints the last status output on timeout", (t) => {
     status: '  process.stdout.write("Status: running\\npid: 123 alive\\n");',
     result: '  process.stdout.write("must not run\\n");'
   });
-  const output = runCollector(t, companion, { intervalMs: 2, capMs: 750 });
+  const output = runCollector(t, companion, { intervalMs: 2, capMs: 750, totalCapMs: 750 });
   assert.strictEqual(output.status, 2, output.stderr);
   assert.match(output.stdout, /^Status: running\npid: 123 alive\ncollector: timeout engine=codex job=[a-f0-9]{32} elapsed=\d+s\n$/);
+});
+
+test("prints exactly one pending line at the slice cap while the job keeps running", (t) => {
+  const root = makeSandbox(t);
+  const companion = writeCompanion(root, {
+    status: '  process.stdout.write("Status: running\\npid: 123 alive\\n");',
+    result: '  process.stdout.write("must not run\\n");'
+  });
+  const output = runCollector(t, companion, { intervalMs: 1, capMs: 300 });
+  assert.strictEqual(output.status, 0, output.stderr);
+  assert.strictEqual(output.stdout, "job-collect: pending\n");
+});
+
+test("a second invocation with the same token continues and collects a finished job", (t) => {
+  const root = makeSandbox(t);
+  const modeFile = path.join(root, "mode");
+  fs.writeFileSync(modeFile, "running", "utf8");
+  const companion = writeCompanion(root, {
+    status: '  const mode = fs.readFileSync(process.env.MODE_FILE, "utf8").trim();\n  process.stdout.write(mode === "done" ? "state: done\\n" : "Status: running\\npid: 123 alive\\n");',
+    result: '  process.stdout.write("continued result\\n");'
+  });
+  const env = collectorEnvironment(companion, { MODE_FILE: modeFile });
+  const transport = stageRequest(t, env, { engine: "codex", jobId, json: false, intervalMs: 1, capMs: 300, deadRerunStatus: false });
+  const first = spawnSync(process.execPath, [collector, "--raw-args-token", transport.token], { encoding: "utf8", env, timeout: 10_000 });
+  assert.strictEqual(first.status, 0, first.stderr);
+  assert.strictEqual(first.stdout, "job-collect: pending\n");
+  assert.strictEqual(fs.existsSync(path.dirname(transport.file)), true);
+  fs.writeFileSync(modeFile, "done", "utf8");
+  const second = spawnSync(process.execPath, [collector, "--raw-args-token", transport.token], { encoding: "utf8", env, timeout: 10_000 });
+  assert.strictEqual(second.status, 0, second.stderr);
+  assert.match(second.stdout, /^continued result\ncollector: state=done semantic=unverified engine=codex job=[a-f0-9]{32} elapsed=\d+s\n$/);
+  assert.strictEqual(fs.existsSync(path.dirname(transport.file)), false);
+});
+
+test("a terminal status at the slice cap continues before fetching the result", (t) => {
+  const root = makeSandbox(t);
+  const capFile = path.join(root, "slice-expired");
+  const resultFile = path.join(root, "result-fetched");
+  const companion = writeCompanion(root, {
+    status: '  fs.writeFileSync(process.env.CAP_FILE, "expired");\n  process.stdout.write("state: done\\n");',
+    result: '  fs.writeFileSync(process.env.RESULT_FILE, "fetched");\n  process.stdout.write("continued result\\n");'
+  });
+  const driver = path.join(root, "collector-clock.mjs");
+  fs.writeFileSync(driver, `import fs from "node:fs";\nimport { runCli } from ${JSON.stringify(collector)};\nconst startedAt = Date.now();\nDate.now = () => startedAt + (fs.existsSync(process.env.CAP_FILE) ? 5000 : 0);\nprocess.exitCode = await runCli(process.argv.slice(2));\n`);
+  const env = collectorEnvironment(companion, { CAP_FILE: capFile, RESULT_FILE: resultFile });
+  const transport = stageRequest(t, env, { engine: "codex", jobId, capMs: 5000, totalCapMs: 10000 });
+  const first = spawnSync(process.execPath, [driver, "--raw-args-token", transport.token], { encoding: "utf8", env, timeout: 10_000 });
+  assert.strictEqual(first.status, 0, first.stderr);
+  assert.strictEqual(first.stdout, "job-collect: pending\n");
+  assert.strictEqual(fs.existsSync(resultFile), false);
+  assert.strictEqual(fs.existsSync(path.join(path.dirname(transport.file), "collect-state.json")), true);
+  const second = spawnSync(process.execPath, [collector, "--raw-args-token", transport.token], { encoding: "utf8", env, timeout: 10_000 });
+  assert.strictEqual(second.status, 0, second.stderr);
+  assert.match(second.stdout, /^continued result\ncollector: state=done semantic=unverified engine=codex job=[a-f0-9]{32} elapsed=\d+s\n$/);
+  assert.strictEqual(fs.existsSync(resultFile), true);
+  assert.strictEqual(fs.existsSync(path.dirname(transport.file)), false);
+});
+
+test("a result call capped by the slice continues and fetches on the next invocation", (t) => {
+  const root = makeSandbox(t);
+  const modeFile = path.join(root, "result-mode");
+  const companion = writeCompanion(root, {
+    status: '  process.stdout.write("state: done\\n");',
+    result: '  if (!fs.existsSync(process.env.MODE_FILE)) {\n    fs.writeFileSync(process.env.MODE_FILE, "ready");\n    setTimeout(() => process.stdout.write("too late\\n"), 5000);\n  } else process.stdout.write("continued result\\n");'
+  });
+  const env = collectorEnvironment(companion, { MODE_FILE: modeFile });
+  const transport = stageRequest(t, env, { engine: "codex", jobId, capMs: 750, totalCapMs: 10000 });
+  const first = spawnSync(process.execPath, [collector, "--raw-args-token", transport.token], { encoding: "utf8", env, timeout: 10_000 });
+  assert.strictEqual(first.status, 0, first.stderr);
+  assert.strictEqual(first.stdout, "job-collect: pending\n");
+  assert.strictEqual(fs.existsSync(modeFile), true);
+  const stateFile = path.join(path.dirname(transport.file), "collect-state.json");
+  assert.strictEqual(fs.existsSync(stateFile), true);
+  const second = spawnSync(process.execPath, [collector, "--raw-args-token", transport.token], { encoding: "utf8", env, timeout: 10_000 });
+  assert.strictEqual(second.status, 0, second.stderr);
+  assert.match(second.stdout, /^continued result\ncollector: state=done semantic=unverified engine=codex job=[a-f0-9]{32} elapsed=\d+s\n$/);
+  assert.strictEqual(fs.existsSync(stateFile), false);
+  assert.strictEqual(fs.existsSync(path.dirname(transport.file)), false);
+});
+
+test("a continuation cleans up its state when companion resolution fails", (t) => {
+  const root = makeSandbox(t);
+  const companion = writeCompanion(root, {
+    status: '  process.stdout.write("state: running\\n");',
+    result: '  process.stdout.write("must not run\\n");'
+  });
+  const env = collectorEnvironment(companion);
+  const transport = stageRequest(t, env, { engine: "codex", jobId, capMs: 300 });
+  const first = spawnSync(process.execPath, [collector, "--raw-args-token", transport.token], { encoding: "utf8", env, timeout: 10_000 });
+  assert.strictEqual(first.status, 0, first.stderr);
+  assert.strictEqual(first.stdout, "job-collect: pending\n");
+  const directory = path.dirname(transport.file);
+  const stateFile = path.join(directory, "collect-state.json");
+  assert.strictEqual(fs.existsSync(stateFile), true);
+  fs.unlinkSync(companion);
+  const second = spawnSync(process.execPath, [collector, "--raw-args-token", transport.token], { encoding: "utf8", env, timeout: 10_000 });
+  assert.strictEqual(second.status, 1, second.stderr);
+  assert.match(second.stderr, /companion/i);
+  assert.strictEqual(fs.existsSync(stateFile), false);
+  assert.strictEqual(fs.existsSync(directory), false);
+});
+
+test("reports the job uncollected once the total budget is exhausted", (t) => {
+  const root = makeSandbox(t);
+  const companion = writeCompanion(root, {
+    status: '  process.stdout.write("Status: running\\npid: 123 alive\\n");',
+    result: '  process.stdout.write("must not run\\n");'
+  });
+  const env = collectorEnvironment(companion);
+  const transport = stageRequest(t, env, { engine: "codex", jobId, json: false, intervalMs: 1, capMs: 200, totalCapMs: 300, deadRerunStatus: false });
+  const first = spawnSync(process.execPath, [collector, "--raw-args-token", transport.token], { encoding: "utf8", env, timeout: 10_000 });
+  assert.strictEqual(first.status, 0, first.stderr);
+  assert.strictEqual(first.stdout, "job-collect: pending\n");
+  const stateFile = path.join(path.dirname(transport.file), "collect-state.json");
+  const state = JSON.parse(fs.readFileSync(stateFile, "utf8"));
+  fs.writeFileSync(stateFile, `${JSON.stringify({ startedAt: state.startedAt - 300_000 })}\n`, "utf8");
+  const second = spawnSync(process.execPath, [collector, "--raw-args-token", transport.token], { encoding: "utf8", env, timeout: 10_000 });
+  assert.strictEqual(second.status, 2, second.stderr);
+  assert.match(second.stdout, /^collector: timeout engine=codex job=[a-f0-9]{32} elapsed=\d+s\n$/);
+  assert.strictEqual(fs.existsSync(path.dirname(transport.file)), false);
+});
+
+test("a total budget smaller than one slice ends the first invocation uncollected", (t) => {
+  const root = makeSandbox(t);
+  const companion = writeCompanion(root, {
+    status: '  process.stdout.write("Status: running\\npid: 123 alive\\n");',
+    result: '  process.stdout.write("must not run\\n");'
+  });
+  const output = runCollector(t, companion, { intervalMs: 1, capMs: 5_000, totalCapMs: 300 });
+  assert.strictEqual(output.status, 2, output.stderr);
+  assert.match(output.stdout, /^Status: running\npid: 123 alive\ncollector: timeout engine=codex job=[a-f0-9]{32} elapsed=\d+s\n$/);
+});
+
+test("validates the total collection budget", (t) => {
+  const root = makeSandbox(t);
+  const companion = writeCompanion(root, { status: "", result: "" });
+  const over = runCollector(t, companion, { totalCapMs: 1_800_001 });
+  assert.strictEqual(over.status, 1);
+  assert.match(over.stderr, /totalCapMs cannot exceed 1800000/);
+  const negative = runCollector(t, companion, { totalCapMs: -1 });
+  assert.strictEqual(negative.status, 1);
+  assert.match(negative.stderr, /totalCapMs must be a non-negative safe integer/);
+  const doneRoot = makeSandbox(t);
+  const doneCompanion = writeCompanion(doneRoot, {
+    status: '  process.stdout.write("state: done\\n");',
+    result: '  process.stdout.write("max budget result\\n");'
+  });
+  const atMax = runCollector(t, doneCompanion, { totalCapMs: 1_800_000 });
+  assert.strictEqual(atMax.status, 0, atMax.stderr);
+  assert.match(atMax.stdout, /^max budget result\ncollector: state=done semantic=unverified engine=codex job=[a-f0-9]{32} elapsed=\d+s\n$/);
 });
 
 test("rejects a collection cap above the foreground tool window", (t) => {
@@ -192,7 +342,7 @@ test("the wall clock cap terminates a stuck result process", (t) => {
     result: '  setTimeout(() => process.stdout.write("too late\\n"), 5_000);'
   });
   const startedAt = Date.now();
-  const output = runCollector(t, companion, { capMs: 750 });
+  const output = runCollector(t, companion, { capMs: 750, totalCapMs: 750 });
   assert.strictEqual(output.status, 2, output.stderr);
   assert.ok(Date.now() - startedAt < 2_500);
   assert.match(output.stdout, /^job: test\nstate: done\ncollector: timeout engine=codex job=[a-f0-9]{32} elapsed=\d+s\n$/);
@@ -302,7 +452,7 @@ test("ignores a state line outside the final metadata footer", (t) => {
     status: '  process.stdout.write("state: done\\nstill running\\n");',
     result: '  process.stdout.write("must not run\\n");'
   });
-  const output = runCollector(t, companion, { capMs: 750 });
+  const output = runCollector(t, companion, { capMs: 750, totalCapMs: 750 });
   assert.strictEqual(output.status, 2, output.stderr);
   assert.match(output.stdout, /^state: done\nstill running\ncollector: timeout engine=codex job=[a-f0-9]{32} elapsed=\d+s\n$/);
 });

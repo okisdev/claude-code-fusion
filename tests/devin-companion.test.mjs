@@ -5,8 +5,9 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
-import { verifyExecutionBudgets } from "./lib/execution-budget.mjs";
+import { executionTimeoutProbe, verifyExecutionBudgets } from "./lib/execution-budget.mjs";
 import { verifyJobWatch } from "./lib/job-watch-harness.mjs";
+import { quota } from "../plugins/devin/scripts/devin-companion.mjs";
 
 verifyJobWatch("devin");
 
@@ -14,7 +15,7 @@ const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const companion = path.join(root, "plugins/devin/scripts/devin-companion.mjs");
 const fake = path.join(root, "tests/fake-devin");
 
-function harness(t, scenario = "success", extraEnv = {}) {
+function harness(t, scenario = "success", extraEnv = {}, variants = null) {
   const temp = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "devin-companion-test-")));
   const home = path.join(temp, "home");
   const cwd = path.join(temp, "workspace");
@@ -33,11 +34,16 @@ function harness(t, scenario = "success", extraEnv = {}) {
     for (const name of ["ps", "sysctl"]) fs.chmodSync(path.join(identityBin, name), 0o755);
   }
   const catalog = { families: [
-    { family_label: "SWE-2", family_uid: "swe-2", slug: "swe-2", aliases: ["swe"], variants: [{ model_uid: "swe-2-high", label: "SWE-2 High" }] },
-    { family_label: "Kimi K3", family_uid: "kimi-k3", slug: "kimi-k3", aliases: [], variants: [{ model_uid: "kimi-k3-high", label: "Kimi K3" }] },
-    { family_label: "Unavailable", family_uid: "unavailable", slug: "unavailable", aliases: [], variants: [{ model_uid: "unavailable-high", label: "Unavailable High" }] },
+    { family_label: "SWE-2", family_uid: "swe-2", slug: "swe-2", aliases: ["swe"], variants: variants ?? [{ model_uid: "swe-2-high", label: "SWE-2 High", cost_tier: "free" }] },
+    { family_label: "Kimi K3", family_uid: "kimi-k3", slug: "kimi-k3", aliases: [], variants: [{ model_uid: "kimi-k3-high", label: "Kimi K3", cost_tier: "premium" }] },
+    { family_label: "Unavailable", family_uid: "unavailable", slug: "unavailable", aliases: [], variants: [{ model_uid: "unavailable-high", label: "Unavailable High", cost_tier: "premium" }] },
     { family_label: "Adaptive", family_uid: "Adaptive", slug: "adaptive", aliases: [], variants: [{ model_uid: "adaptive", label: "Adaptive" }] },
-    { family_label: "Fusion", family_uid: "fusion", slug: "fusion", aliases: [], variants: [{ model_uid: "fusion-swe-2-medium", label: "Fusion" }] }
+    { family_label: "Fusion", family_uid: "fusion", slug: "fusion", aliases: [], variants: [
+      { model_uid: "fusion-swe-2-medium", label: "Fusion", cost_tier: "free" },
+      { model_uid: "fusion-gpt-6-sol-sidekick-swe-2-high", label: "GPT-6 Sol + SWE-2 High", cost_tier: "free" },
+      { model_uid: "fusion-claude-opus-5-sidekick-swe-2-high", label: "Claude Opus 5 + SWE-2 High", cost_tier: "free" },
+      { model_uid: "kimi-k3-high", label: "Kimi K3" }
+    ] }
   ] };
   const review = { verdict: "request_changes", summary: "Needs a fix.", findings: [{ severity: "high", file: "sample.txt", line: 1, title: "Bad value", body: "Use the expected value." }] };
   const code = `#!/usr/bin/env node
@@ -135,7 +141,7 @@ test("consult records ACP fields and a contiguous Devin footer", (t) => {
   assert.equal(record.observedModel, "SWE-2 High");
   assert.equal(record.stopCause, "complete");
   assert.deepEqual(record.usage, { totalTokens: 11914, inputTokens: 11875, outputTokens: 39, cachedReadTokens: 11552 });
-  assert.equal(record.billingPool, "first-party");
+  assert.equal(record.billingPool, "free");
   assert.equal(record.effortApplied, false);
   assert.equal(fs.existsSync(record.configDir), false);
   assert.match(result.stdout, /devin-session: artistic-breeze\njob: [a-f0-9]{32}\nsandbox: /);
@@ -154,6 +160,22 @@ test("a turn served by another model renders model_mismatch", (t) => {
   assert.deepEqual(record.warnings, ["model_mismatch"]);
   assert.match(result.stdout, /warning: model_mismatch\nstate: done\n$/);
 });
+
+for (const model of ["swe-2", "swe"]) {
+  for (const [uid, pool, label] of [["swe-2-high", "free", "SWE-2 High"], ["kimi-k3-high", "credits", "Kimi K3"]]) {
+    test(`${model} records the ${pool} pool of the offered variant`, (t) => {
+      const h = harness(t, "success", { FAKE_DEVIN_MODEL_LABEL: label }, [
+        { model_uid: "unavailable-high", label: "Unavailable", cost_tier: pool === "free" ? "premium" : "free" },
+        { model_uid: uid, label, cost_tier: pool === "free" ? "free" : "premium" }
+      ]);
+      const result = h.run(["task", "--model", model, "--json", "--", "inspect"]);
+      assert.equal(result.status, 0, result.stdout + result.stderr);
+      assert.equal(h.jobs()[0].resolvedModel, uid);
+      assert.equal(h.jobs()[0].billingPool, pool);
+      assert.equal(JSON.parse(result.stdout).billingPool, pool);
+    });
+  }
+}
 
 test("write mode uses a private home, sandbox and scoped config", (t) => {
   const h = harness(t);
@@ -215,6 +237,91 @@ test("unknown and adaptive models fail before a job exists", (t) => {
     assert.match(result.stderr, /failure: input/);
   }
   assert.deepEqual(h.jobs(), []);
+});
+
+test("write tasks pin fusion pairings and record the planner and sidekick", (t) => {
+  const h = harness(t);
+  const result = h.run(["task", "--write", "--model", "fusion-gpt-6-sol-sidekick-swe-2-high", "--", "lane: devin burst\nimplement"]);
+  assertDone(result);
+  const [record] = h.jobs();
+  assert.equal(record.mode, "write");
+  assert.equal(record.role, "burst");
+  assert.equal(record.requestedModel, "fusion-gpt-6-sol-sidekick-swe-2-high");
+  assert.equal(record.resolvedModel, "kimi-k3-high");
+  assert.equal(record.observedModel, "SWE-2 High");
+  assert.equal(record.billingPool, "free");
+  assert.deepEqual(record.request.pairing, { planner: "gpt-6-sol", sidekick: "swe-2-high" });
+  assert.equal(record.modelDrift, null);
+  assert.deepEqual(record.warnings, []);
+});
+
+test("fusion pairings refuse read only jobs, claude planners, and unpinned names", (t) => {
+  const h = harness(t);
+  for (const args of [
+    ["task", "--model", "fusion-gpt-6-sol-sidekick-swe-2-high", "--", "inspect"],
+    ["task", "--write", "--model", "fusion-claude-opus-5-sidekick-swe-2-high", "--", "implement"],
+    ["task", "--write", "--model", "fusion", "--", "implement"],
+    ["task", "--write", "--model", "adaptive", "--", "implement"],
+    ["task", "--write", "--model", "fusion-gpt-9-sol-sidekick-swe-2-high", "--", "implement"]
+  ]) {
+    const result = h.run(args);
+    assert.equal(result.status, 1, `${args.join(" ")}\n${result.stdout}${result.stderr}`);
+    assert.match(result.stderr, /failure: input/);
+  }
+  const review = harness(t);
+  reviewWorkspace(review);
+  const refused = review.run(["review", "--model", "fusion-gpt-6-sol-sidekick-swe-2-high"]);
+  assert.equal(refused.status, 1, refused.stdout + refused.stderr);
+  assert.match(refused.stderr, /failure: input/);
+  assert.deepEqual(h.jobs(), []);
+  assert.deepEqual(review.jobs(), []);
+});
+
+test("the write transport default enables pairings for staged tasks", (t) => {
+  const h = harness(t);
+  const created = JSON.parse(h.run(["transport-create"]).stdout);
+  fs.writeFileSync(created.file, "--model fusion-gpt-6-sol-sidekick-swe-2-high -- implement");
+  const result = h.run(["task", "--transport-default-write", "--raw-args-token", created.token]);
+  assertDone(result);
+  const [record] = h.jobs();
+  assert.equal(record.mode, "write");
+  assert.deepEqual(record.request.pairing, { planner: "gpt-6-sol", sidekick: "swe-2-high" });
+});
+
+test("a pairing turn served by its planner or sidekick is not model drift", (t) => {
+  const planned = harness(t, "success", { FAKE_DEVIN_MODEL_LABEL: "GPT-6 Sol" });
+  assertDone(planned.run(["task", "--write", "--model", "fusion-gpt-6-sol-sidekick-swe-2-high", "--", "implement"]));
+  assert.equal(planned.jobs()[0].observedModel, "GPT-6 Sol");
+  assert.equal(planned.jobs()[0].modelDrift, null);
+  assert.deepEqual(planned.jobs()[0].warnings, []);
+  const other = harness(t, "success", { FAKE_DEVIN_MODEL_LABEL: "Gemini 9 Pro" });
+  assertDone(other.run(["task", "--write", "--model", "fusion-gpt-6-sol-sidekick-swe-2-high", "--", "implement"]));
+  assert.deepEqual(other.jobs()[0].warnings, ["model_mismatch"]);
+});
+
+for (const observed of ["swe-2-high-pro", "GPT-6 Sol Pro"]) {
+  test(`a pairing warns when ${observed} only shares a label prefix`, (t) => {
+    const h = harness(t, "success", { FAKE_DEVIN_MODEL_LABEL: observed });
+    const result = h.run(["task", "--write", "--model", "fusion-gpt-6-sol-sidekick-swe-2-high", "--", "implement"]);
+    assertDone(result);
+    const [record] = h.jobs();
+    assert.equal(record.observedModel, observed);
+    assert.deepEqual(record.modelDrift, { requested: "kimi-k3-high", observed });
+    assert.deepEqual(record.warnings, ["model_mismatch"]);
+    assert.match(result.stdout, /warning: model_mismatch\nstate: done\n$/);
+  });
+}
+
+test("the quota adapter reports a free pool and a metered credits pool", () => {
+  const report = quota({ env: {}, dataDir: "/tmp/devin-data" });
+  assert.equal(report.engine, "devin");
+  assert.equal(report.available, true);
+  assert.ok(Date.parse(report.observedAt));
+  assert.deepEqual(report.pools, [
+    { pool: "free", costClass: "free", usedPercent: null, windowMinutes: null, resetsAt: null, pacing: null },
+    { pool: "credits", costClass: "metered", usedPercent: null, windowMinutes: null, resetsAt: null, pacing: null }
+  ]);
+  assert.equal(report.note, "Devin exposes no usage meter; credits are treated as metered until the user marks them included.");
 });
 
 test("unavailable account family fails as setup and unsupported effort as input", (t) => {
@@ -345,20 +452,51 @@ test("auth, quota, policy and permission failures carry typed footers", (t) => {
     assert.equal(result.status, 1, result.stdout + result.stderr);
     assert.match(result.stdout, new RegExp(`failure: ${kind}\\n$`));
     assert.equal(h.jobs()[0].failureKind, kind);
-    if (kind === "quota") assert.equal(h.jobs()[0].billingPool, "first-party");
+    if (kind === "quota") assert.equal(h.jobs()[0].billingPool, "free");
   }
 });
 
 test("a timed out Devin job records its timeout duration", (t) => {
   const timeoutMs = 250;
   const h = harness(t, "hang", { DEVIN_COMPANION_TIMEOUT_MS: String(timeoutMs), DEVIN_COMPANION_EXIT_GRACE_MS: "100" });
+  const probe = executionTimeoutProbe(h.temp, timeoutMs);
+  Object.assign(h.env, probe.env);
   const result = task(h, ["--json"]);
   assert.equal(result.status, 1, result.stdout + result.stderr);
   const record = h.jobs()[0];
-  const message = `Devin timed out after ${timeoutMs}ms and was terminated.`;
+  const message = "Devin timed out after 240000ms and was terminated.";
+  assert.deepEqual(probe.timeouts(), [timeoutMs, 240000]);
+  assert.deepEqual(record.salvage, { attempted: true, outcome: "timeout", originalPid: record.salvage.originalPid,
+    resumePid: record.salvage.resumePid, resumePidIdentity: record.salvage.resumePidIdentity });
+  assert.ok(Number.isInteger(record.salvage.originalPid) && record.salvage.originalPid > 1);
+  assert.ok(Number.isInteger(record.salvage.resumePid) && record.salvage.resumePid > 1);
+  assert.notEqual(record.salvage.resumePid, record.salvage.originalPid);
+  assert.ok(record.salvage.resumePidIdentity);
   assert.equal(record.failureKind, "timeout");
   assert.equal(record.errorMessage, message);
   assert.equal(JSON.parse(result.stdout).message, message);
+});
+
+test("a timed out Devin task resumes its session once and delivers the wind down report", (t) => {
+  const h = harness(t, "wind_down", { DEVIN_COMPANION_TIMEOUT_MS: "1500", DEVIN_COMPANION_EXIT_GRACE_MS: "100" });
+  const probe = executionTimeoutProbe(h.temp, 1500);
+  Object.assign(h.env, probe.env);
+  const result = task(h);
+  assertDone(result);
+  assert.deepEqual(probe.timeouts(), [1500, 240000]);
+  assert.equal(h.jobs().length, 1);
+  const [record] = h.jobs();
+  assert.deepEqual(record.salvage, { attempted: true, outcome: "done", originalPid: record.salvage.originalPid,
+    resumePid: record.salvage.resumePid, resumePidIdentity: record.salvage.resumePidIdentity });
+  assert.ok(Number.isInteger(record.salvage.originalPid) && record.salvage.originalPid > 1);
+  assert.ok(Number.isInteger(record.salvage.resumePid) && record.salvage.resumePid > 1);
+  assert.notEqual(record.salvage.resumePid, record.salvage.originalPid);
+  assert.ok(record.salvage.resumePidIdentity);
+  assert.equal(record.semanticFailureKind, "timeout_salvaged");
+  assert.equal(record.resultText, "fake result");
+  assert.ok(h.messages().some((message) => message.method === "session/load" && message.params.sessionId === record.sessionId));
+  assert.match(h.messages().find((message) => message.method === "session/prompt").params.prompt[0].text, /^Your time budget is exhausted\. Stop exploring\./);
+  assert.match(result.stdout, /warning: timeout_salvaged\nstate: done\n$/);
 });
 
 test("models and setup expose the family catalog and account plan", (t) => {

@@ -2,6 +2,7 @@ import { PEER_RESCUE_AGENT_NAMES, PEER_MANAGED_AGENT_NAMES } from "../engines.mj
 import path from "node:path";
 import { ENGINE_ID_ALTERNATION, PEER_JOB_FOOTER_AGENTS, engineDisplayNameList, engineForAgentType } from "../engines.mjs";
 import { tagMessage } from "../user-messages.mjs";
+import { withEngineHealthRecords } from "../engine-health.mjs";
 import { canonicalWorkerAgentType, isFusionWorkerAgent, WORKER_TERMINAL_STATUSES, markWorkerCollected, readPeerCapacityReservations, readWorkerRecord, readWorkerOutputFileTaskIds, readSessionWorkerRecords, refreshWorkerTranscript, reopenWorkerContinuation, WORKER_COLLECTION_METHODS } from "../worker-state.mjs";
 import { markBudgetFailure, workerBudgetFailure, workerRoundUsage } from "./budget.mjs";
 import { backfillCollectedTelemetry, capturedPeerIdentity, collectedHarnessAsyncDelivery, infraFinishedAt, noTaskFoundError, outputFileFromLaunchResponse, peerIdentityBackfill, settleQueuedVerdict, settleReapedIfActive, settleWrapperApiDeath, toolResultText, terminalCollectedRecord, terminalCollectionPending, withClaudeQuotaFailure, wrapperApiDeathEvidence } from "./collection.mjs";
@@ -13,6 +14,10 @@ import { canonicalToolResponseUsage } from "./usage.mjs";
 import { CODEX_WRITE_SIZING_ADVISORY_BYTES, HANDBACK_PLACEHOLDER_PATTERN, READ_ONLY_TOOLS, SIZING_ADVISORY_BYTES, SUBAGENT_HANDBACK_TOOL } from "./constants.mjs";
 
 function handlePreToolUse(input, env) {
+  return withEngineHealthRecords(() => preToolUse(input, env));
+}
+
+function preToolUse(input, env) {
   if (input.tool_name === SUBAGENT_HANDBACK_TOOL && PEER_RESCUE_AGENT_NAMES.has(input.agent_type) && typeof input.tool_input?.message === "string" && HANDBACK_PLACEHOLDER_PATTERN.test(input.tool_input.message)) {
     writeOutput(denyTool(tagMessage("worker-lifecycle.placeholder-handback-deny", "Keep running the await operation until it returns the real report. Hand back that report only after await completes.")));
     return;
@@ -114,7 +119,7 @@ function handlePreToolUse(input, env) {
       record = readWorkerRecord(record.taskId, env);
     }
     if (record) {
-      const admissionDenial = engineInfraDenial(input.session_id, record.agentType, latestUserText(input.transcript_path), env, Date.now(), input.tool_input.message);
+      const admissionDenial = engineInfraDenial(input.session_id, record.agentType, latestUserText(input.transcript_path), env, Date.now(), "", null, record);
       if (admissionDenial) {
         writeOutput(denyTool(admissionDenial));
         return;

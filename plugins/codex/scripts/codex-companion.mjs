@@ -11,6 +11,7 @@ import { fileURLToPath } from "node:url";
 import { configureRawTransport, createRawCommandTransport as allocateRawCommandTransport, consumeRawCommandTransport, pruneRawCommandTransports, resolveCommandTransport } from "./lib/raw-transport.mjs";
 import { awaitOutput } from "./lib/await-output.mjs";
 import { resolveTimeoutMs } from "./lib/job-state.mjs";
+import { codexHome, latestRolloutRateLimits } from "./lib/codex-rollout.mjs";
 import { renderFailure } from "./lib/render-footers.mjs";
 import { parseArgs, parseRawArgs, parseServiceTier, parseRecordAcceptanceArgs, splitRawArgumentString } from "./lib/args.mjs";
 import {
@@ -61,7 +62,8 @@ import {
   withThreadLock,
   withWorkspaceLock,
   writeBrief,
-  writeJobRecordFile
+  writeJobRecordFile,
+  writePrivateStateFile
 } from "./lib/state.mjs";
 
 const SELF_PATH = fileURLToPath(import.meta.url);
@@ -100,6 +102,16 @@ const CONTINUE_PROMPT = "Continue from the current Codex thread state. Complete 
 const RESUMABLE_FAILURE_KINDS = new Set(["timeout", "policy", "patch_thrash", "died"]);
 const WIND_DOWN_PROMPT = "Wind down: do not start new work. Finish the smallest coherent deliverable from the work already completed and report the files changed and the verification output.";
 const JOB_ID_PATTERN = /^[a-f0-9]{32}$/;
+const QUOTA_PLAN_COST_CLASS = new Map([
+  ["plus", "included"],
+  ["pro", "included"],
+  ["team", "included"],
+  ["business", "included"],
+  ["enterprise", "included"],
+  ["edu", "included"],
+  ["api", "metered"],
+  ["usage", "metered"]
+]);
 const SWIFTPM_SANDBOX_NOTE = "Environment note from the Codex companion: SwiftPM cannot nest its own sandbox-exec inside this sandbox, so run SwiftPM with --disable-sandbox, for example swift build --disable-sandbox and swift test --disable-sandbox.";
 let activeCommandArgv = null;
 let cachedCompanionVersion = null;
@@ -128,6 +140,7 @@ function printUsage() {
       "  node scripts/codex-companion.mjs history [--json]",
       "  node scripts/codex-companion.mjs watch --job <id>",
       "  node scripts/codex-companion.mjs models [--json]",
+      "  node scripts/codex-companion.mjs quota [--json]",
       "  node scripts/codex-companion.mjs setup [--cwd <dir>] [--json]"
     ].join("\n") + "\n"
   );
@@ -191,6 +204,65 @@ function handleModels(argv) {
   }
   const listing = [...models.values()];
   output(argv[0] === "--json" ? { engine: "codex", models: listing, source: filePath } : `${listing.map((model) => model.id).join("\n")}${listing.length ? "\n" : ""}`, argv[0] === "--json");
+}
+
+function validQuotaPool(pool) {
+  if (!pool || typeof pool !== "object" || Array.isArray(pool)) {
+    return false;
+  }
+  const nullable = (value, valid) => value === null || valid(value);
+  return typeof pool.pool === "string" && pool.pool.length > 0
+    && nullable(pool.costClass, (value) => value === "included" || value === "metered")
+    && nullable(pool.usedPercent, (value) => Number.isFinite(value) && value >= 0)
+    && nullable(pool.windowMinutes, (value) => Number.isFinite(value) && value > 0)
+    && nullable(pool.resetsAt, (value) => typeof value === "string" && Number.isFinite(Date.parse(value)))
+    && nullable(pool.pacing, (value) => Number.isFinite(value) && value >= 0);
+}
+
+function handleQuota(argv) {
+  const { positionals } = commandArgs(argv, { booleanOptions: ["json"] });
+  if (positionals.length) throw new CompanionError("The quota command accepts only --json.", "input");
+  const at = Date.now();
+  const home = codexHome();
+  let file;
+  try {
+    file = path.join(resolveDataDir(), "quota.json");
+    const cached = JSON.parse(fs.readFileSync(file, "utf8"));
+    if (cached.home === home && Number.isFinite(cached.at) && at >= cached.at && at - cached.at < 60_000 && cached.report?.engine === "codex" && typeof cached.report.available === "boolean" && Array.isArray(cached.report.pools) && cached.report.pools.every(validQuotaPool)) {
+      output(cached.report, true);
+      return;
+    }
+  } catch {}
+  let report = { engine: "codex", available: false, observedAt: new Date(at).toISOString(), pools: [], note: "No rate_limits telemetry found in Codex rollouts." };
+  try {
+    const observation = latestRolloutRateLimits();
+    if (observation) {
+      const observedAt = observation.observedAt;
+      const observedMs = Date.parse(observedAt ?? "");
+      const costClass = QUOTA_PLAN_COST_CLASS.get(observation.rateLimits.plan_type) ?? null;
+      const pools = [["codex", observation.rateLimits.primary], ["codex-secondary", observation.rateLimits.secondary]]
+        .filter(([, window]) => window && typeof window === "object" && !Array.isArray(window))
+        .map(([pool, window]) => {
+          let usedPercent = Number.isFinite(window.used_percent) && window.used_percent >= 0 ? window.used_percent : null;
+          const windowMinutes = Number.isFinite(window.window_minutes) && window.window_minutes > 0 ? window.window_minutes : null;
+          const resetMs = Number.isFinite(window.resets_at) && window.resets_at > 0 ? window.resets_at * 1000 : NaN;
+          const resetsAt = Number.isFinite(resetMs) && Math.abs(resetMs) <= 8.64e15 ? new Date(resetMs).toISOString() : null;
+          if ((Number.isFinite(resetMs) && resetMs <= at) || (windowMinutes !== null && Number.isFinite(observedMs) && at - observedMs > windowMinutes * 60_000)) {
+            usedPercent = null;
+          }
+          const elapsed = windowMinutes && resetsAt && Number.isFinite(observedMs) ? 1 - (resetMs - observedMs) / (windowMinutes * 60_000) : null;
+          const pacing = usedPercent !== null && elapsed > 0 && elapsed < 1 ? usedPercent / (100 * elapsed) : null;
+          return { pool, costClass, usedPercent, windowMinutes, resetsAt, pacing: Number.isFinite(pacing) ? pacing : null };
+        });
+      report = { ...report, available: pools.length > 0, observedAt: observedAt ?? report.observedAt, pools, note: pools.length ? null : "Codex rate_limits telemetry has no quota windows." };
+    }
+  } catch (error) {
+    report.note = `Could not read Codex quota telemetry: ${error.message}`;
+  }
+  try {
+    if (file) writePrivateStateFile(file, `${JSON.stringify({ home, at, report })}\n`);
+  } catch {}
+  output(report, true);
 }
 
 function resolveCwd(options = {}) {
@@ -2170,6 +2242,9 @@ async function main() {
       break;
     case "models":
       handleModels(rawArgv);
+      break;
+    case "quota":
+      handleQuota(rawArgv);
       break;
     case "result":
       await handleResult(rawArgv);

@@ -6,6 +6,7 @@ import { createSelectionResolver } from "./agy-models.mjs";
 import { clearRunTimers, createProcessTransport, destroyRunStreams, executablePath, inheritChildEnv, runProcess, settleRun as settleProcessRun } from "./process-run.mjs";
 
 export const TESTED_AGY_INTERVAL = { floor: "1.5", ceiling: "1.6" };
+export const OPERATING_LIMITS_NOTE = "Operating limits: read files with your file tools. A shell command is allowed only when it is a single read only program (ls, pwd, cat, head, tail, wc, stat, grep, rg, find, or git status, log, show, diff, ls-files, grep, blame, rev-parse, or branch) with no pipes, redirection, variables, or chained commands; any other command or tool request is refused and ends your turn.";
 
 const READ_TOOLS = ["read_file", "search_web", "run_command"];
 const WRITE_TOOLS = [...READ_TOOLS, "edit_file", "write_file"];
@@ -48,6 +49,14 @@ export function toolsForMode(mode) {
   if (mode === "consult" || mode === "review") return [...READ_TOOLS];
   if (mode === "write") return [...WRITE_TOOLS];
   throw new Error(`Invalid Antigravity mode: ${mode}`);
+}
+
+const CREDENTIAL_FIELD = /(--[\w-]*(?:token|key|secret|password|auth|bearer|authorization)[\w-]*[ \t]*(?:[=:][ \t]*|[ \t]+)|[\w-]*(?:token|key|secret|password|auth|bearer|authorization)[\w-]*[ \t]*[=:][ \t]*|bearer[ \t]+)((?:bearer|basic|digest|negotiate|oauth|token)[ \t]+)?("[^"]*"|'[^']*'|[^\s'"]+)/gi;
+
+export function redactCredentialValue(value) {
+  return String(value)
+    .replace(CREDENTIAL_FIELD, "$1$2[redacted]")
+    .replace(/[A-Za-z0-9+/_=-]{24,}/g, "[redacted]");
 }
 
 let resolvedDeveloperDir;
@@ -191,7 +200,7 @@ async function initializeSession(run) {
   }
   await configureSession(run);
   run.outcome.resolvedEffort = run.configOptions?.find((option) => option?.id === "thought_level")?.currentValue ?? null;
-  await requestAgy(run, "session/prompt", { sessionId: run.outcome.sessionId, prompt: [{ type: "text", text: brief ?? "" }] });
+  await requestAgy(run, "session/prompt", { sessionId: run.outcome.sessionId, prompt: [{ type: "text", text: `${OPERATING_LIMITS_NOTE}\n\n${brief ?? ""}` }] });
 }
 
 function processToolUpdate(run, update) {
@@ -266,7 +275,13 @@ function permissionOutcome(run, params) {
   const option = allowed ? options.find((entry) => entry?.kind === "allow_once" && typeof entry.optionId === "string") : null;
   const selected = option ?? options.find((entry) => entry?.kind === "reject_once" && typeof entry.optionId === "string");
   if (option) run.outcome.permissionsAllowed += 1;
-  else run.outcome.permissionsRejected += 1;
+  else {
+    run.outcome.permissionsRejected += 1;
+    if (run.outcome.refusedPermissions.length < 5) {
+      const command = tool?.rawInput?.CommandLine;
+      run.outcome.refusedPermissions.push({ tool: typeof tool?.name === "string" ? tool.name : null, command: typeof command === "string" ? redactCredentialValue(command).slice(0, 200) : null });
+    }
+  }
   return { outcome: selected ? { outcome: "selected", optionId: selected.optionId } : { outcome: "cancelled" } };
 }
 
@@ -392,7 +407,7 @@ export function runAgy({ bin, cwd, env, brief, mode, version, geminiDir, session
   return runProcess({ bin, cwd, env: childEnv, brief, mode, version, geminiDir, sessionOnly, resumeSessionId, resolveSelection, timeoutMs, exitGraceMs, killGraceMs, launchProcess, signal, onSpawn }, {
     outcome: {
       resultText: "", resolvedEffort: null, stopReason: null, appliedOptions: {}, rpcError: null,
-      setupError: null, selectionError: null, toolCalls: 0, permissionsAllowed: 0, permissionsRejected: 0
+      setupError: null, selectionError: null, toolCalls: 0, permissionsAllowed: 0, permissionsRejected: 0, refusedPermissions: []
     },
     state: {
       exited: false, ending: false, promptSent: false,

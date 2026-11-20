@@ -4,9 +4,9 @@ export function executionTimeoutMs(foregroundTimeoutMs, backgroundShell = false)
   return backgroundShell ? 900000 : foregroundTimeoutMs;
 }
 
-export function resolveExecutionTransport(command, argv) {
+export function resolveExecutionTransport(command, argv, backgroundShellCommands = ["task"]) {
   const flagIndex = argv[0] === "--transport-default-write" ? 1 : 0;
-  if (command !== "task" || argv[flagIndex] !== "--transport-background-shell") {
+  if (!backgroundShellCommands.includes(command) || argv[flagIndex] !== "--transport-background-shell") {
     return resolveCommandTransport(argv);
   }
   const transportArgv = argv.toSpliced(flagIndex, 1);

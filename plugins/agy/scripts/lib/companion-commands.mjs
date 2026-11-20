@@ -40,8 +40,8 @@ export function createCleanupWaiter({ engine, reap }) {
       }
       await new Promise((resolve) => setTimeout(resolve, 50));
     }
-    for (const [pid, group] of [[record[pidField], true], [record.pid, record.background]]) {
-      if (pid !== process.pid && (group ? processGroupAlive(pid) : processIsDirectlyAlive(pid)) && (!processIsDirectlyAlive(pid) || processOwned(pid, pid === record.pid ? record.pidIdentity : record[identityField]))) {
+    for (const [pid, identity, group] of [[record.salvage?.resumePid ?? record[pidField], record.salvage?.resumePidIdentity ?? record[identityField], true], [record.pid, record.pidIdentity, record.background]]) {
+      if (pid !== process.pid && (group ? processGroupAlive(pid) : processIsDirectlyAlive(pid)) && (!processIsDirectlyAlive(pid) || processOwned(pid, identity))) {
         try { process.kill(group ? -pid : pid, "SIGKILL"); } catch (error) { if (error.code !== "ESRCH") return false; }
       }
     }
@@ -202,6 +202,7 @@ export function createCompanionCommands(adapter) {
       effortApplied: record.effortApplied, billingPool: record.billingPool, usage: record.usage,
       usageIsIncomplete: record.usageIsIncomplete, ...adapter.payloadFields(record), warnings: record.warnings,
       failureKind: record.failureKind,
+      ...(record.salvage ? { salvage: record.salvage, semanticFailureKind: record.semanticFailureKind } : {}),
       ...(record.background && record.status === "running" && record.delivery === "manual" ? backgroundWatchReceipt(engine, record.id) : {}),
       ...(record.jobClass === "review" ? { valid: record.status === "done", review: record.review ?? null, parseError: record.parseError ?? null } : {}),
       ...(record.status === "done" ? { text: record.resultText } : { message: record.errorMessage })
@@ -215,12 +216,12 @@ export function createCompanionCommands(adapter) {
     return renderTaskResult({ text: `Job ${record.id} failed.\n\n${record.errorMessage ?? `${engineName} returned an error.`}${tail}`, record });
   }
 
-  function finishFailure(file, outcome, kind, warnings, modelDrift, timeoutMs) {
+  function finishFailure(file, outcome, kind, warnings, modelDrift, timeoutMs, salvageAttempted) {
     const message = kind === "timeout" ? `${engineName} timed out after ${timeoutMs}ms and was terminated.` : adapter.failureMessage(outcome) || outcome.protocolError || outcome.stderrTail?.trim() || outcome.spawnError?.message || `${engineName} exited with ${outcome.exitCode ?? outcome.signal ?? "an error"}.`;
     return finishSuccessfulJobRecordFile(file, {
       status: "error", finishedAt: nowIso(), exitCode: outcome.exitCode, sessionId: outcome.sessionId,
       requestId: outcome.requestId, resultText: outcome.resultText, observedModel: outcome.observedModel,
-      usage: outcome.usage, usageIsIncomplete: outcome.usage == null, warnings, modelDrift,
+      usage: outcome.usage, usageIsIncomplete: Boolean(salvageAttempted) || outcome.usage == null, warnings, modelDrift,
       ...adapter.outcomeFields(outcome),
       failureKind: kind, errorMessage: message.split(/\r?\n/)[0], errorTail: String(outcome.stderrTail || message).slice(-65536)
     });
@@ -228,8 +229,10 @@ export function createCompanionCommands(adapter) {
 
   async function runRecordedJob(record, file) {
     const dataDir = resolveDataDir();
-    const timeoutMs = positiveDuration(`${envPrefix}TIMEOUT_MS`, executionTimeoutMs(540000, record.request?.backgroundShellBudget));
+    let timeoutMs = positiveDuration(`${envPrefix}TIMEOUT_MS`, executionTimeoutMs(540000, record.request?.backgroundShellBudget));
     let outcome;
+    let initialOutcome;
+    let salvageAttempted = false;
     let signalExitCode = null;
     try {
       const brief = fs.readFileSync(record.briefFile, "utf8");
@@ -245,24 +248,67 @@ export function createCompanionCommands(adapter) {
       }]);
       for (const [signal, handler] of handlers) process.on(signal, handler);
       try {
-        outcome = await adapter.runJob({ record, source, dataDir, brief, signal: controller.signal, timeoutMs,
+        const runOptions = { record, source, dataDir, brief, signal: controller.signal, timeoutMs,
           exitGraceMs: positiveDuration(`${envPrefix}EXIT_GRACE_MS`, 15000),
-          onProcess: (pid) => updateJobRecordFileWithCurrent(file, (current) => current.status === "running" && current[pidField] === pid ? { ...current, [identityField]: getProcessIdentity(pid) } : current),
+          onProcess: (pid) => updateJobRecordFileWithCurrent(file, (current) => {
+            if (current.status !== "running") return current;
+            if (salvageAttempted && current.salvage?.resumePid === pid) return { ...current, salvage: { ...current.salvage, resumePidIdentity: getProcessIdentity(pid) } };
+            return current[pidField] === pid ? { ...current, [identityField]: getProcessIdentity(pid) } : current;
+          }),
           launchProcess: (launch) => launchRunningJobProcess(file, () => {
             const child = launch();
             return { child, identity: getProcessIdentity(child.pid) };
-          }).child });
+          }, { processRole: salvageAttempted ? "resume" : engine }).child };
+        outcome = await adapter.runJob(runOptions);
+        const kind = outcome.spawnError?.failureKind ?? adapter.classifyFailure(outcome);
+        if (kind === "timeout" && record.jobClass === "task" && adapter.supportsWindDown === true
+          && signalExitCode === null && !outcome.cancelled && sessionIdPattern.test(outcome.sessionId)) {
+          const resumable = { ...record, ...adapter.outcomeFields(outcome), sessionId: outcome.sessionId };
+          const resumeEligible = adapter.resumeEligible(resumable);
+          const originalPid = readJobRecordFile(file)?.[pidField];
+          const cleanupDeadline = Date.now() + 3000;
+          while (resumeEligible && processGroupAlive(originalPid) && Date.now() < cleanupDeadline && !controller.signal.aborted) {
+            await new Promise((resolve) => setTimeout(resolve, Math.min(50, cleanupDeadline - Date.now())));
+          }
+          if (resumeEligible && !processGroupAlive(originalPid) && !controller.signal.aborted) {
+            const current = updateJobRecordFileWithCurrent(file, (current) => {
+              if (current.status !== "running" || current.cancelRequestedAt != null || current.cleanupRequired || current.salvage?.attempted) return current;
+              salvageAttempted = true;
+              return { ...current, sessionId: outcome.sessionId, deadlineAt: new Date(Date.now() + 240000).toISOString(),
+                salvage: { attempted: true, originalPid: originalPid ?? null } };
+            });
+            if (salvageAttempted) {
+              initialOutcome = outcome;
+              if (outcome.stderrTail) appendJobLog(jobLogPath(dataDir, record.cwd, record.id), outcome.stderrTail);
+              timeoutMs = 240000;
+              adapter.validateResumeSource(resumable, record.cwd);
+              claimResumeSessionLease(dataDir, record.cwd, outcome.sessionId, record.id);
+              outcome = await adapter.runJob({ ...runOptions,
+                record: { ...current, request: { ...current.request, resumeSessionId: outcome.sessionId } },
+                source: resumable,
+                brief: "Your time budget is exhausted. Stop exploring. Within a few minutes, finish or revert any half applied edit so the workspace is consistent, then reply with a final report: what is done, what is not done, files changed, and how to verify.",
+                timeoutMs });
+            }
+          }
+        }
       } finally {
         for (const [signal, handler] of handlers) process.removeListener(signal, handler);
       }
     } catch (error) {
       outcome = { exitCode: null, stderrTail: error.message, spawnError: error, resultSeen: false };
     }
+    const kind = outcome.spawnError?.failureKind ?? adapter.classifyFailure(outcome);
+    if (salvageAttempted) {
+      outcome.sessionId ??= readJobRecordFile(file)?.sessionId;
+      updateJobRecordFileWithCurrent(file, (current) => ({ ...current,
+        salvage: { ...current.salvage, outcome: kind === "timeout" ? "timeout" : kind || signalExitCode !== null ? "error" : "done" } }));
+    }
     const modelDrift = adapter.modelDrift(record, outcome);
     const warnings = [...record.warnings];
     if (outcome.lateClose) warnings.push("late_close");
     warnings.push(...(adapter.outcomeWarnings?.(outcome) ?? []));
     if (modelDrift) warnings.push(adapter.driftWarning(modelDrift));
+    if (salvageAttempted && !kind && signalExitCode === null) warnings.push("timeout_salvaged");
     if (signalExitCode !== null) {
       finishSuccessfulJobRecordFile(file, { status: "cancelled", finishedAt: nowIso(), exitCode: outcome.exitCode,
         observedModel: outcome.observedModel, modelDrift, warnings, ...adapter.cancelledFields(outcome),
@@ -270,10 +316,9 @@ export function createCompanionCommands(adapter) {
       process.exit(signalExitCode);
     }
     if (outcome.stderrTail) appendJobLog(jobLogPath(dataDir, record.cwd, record.id), outcome.stderrTail);
-    const kind = outcome.spawnError?.failureKind ?? adapter.classifyFailure(outcome);
-    if (kind) return finishFailure(file, outcome, kind, warnings, modelDrift, timeoutMs);
+    if (kind) return finishFailure(file, salvageAttempted ? { ...outcome, resultText: initialOutcome.resultText, stderrTail: initialOutcome.stderrTail } : outcome, kind, warnings, modelDrift, timeoutMs, salvageAttempted);
     const common = { finishedAt: nowIso(), exitCode: outcome.exitCode, sessionId: outcome.sessionId, requestId: outcome.requestId,
-      observedModel: outcome.observedModel, usage: outcome.usage, usageIsIncomplete: outcome.usage == null,
+      observedModel: outcome.observedModel, usage: outcome.usage, usageIsIncomplete: salvageAttempted || outcome.usage == null,
       warnings, modelDrift, ...adapter.outcomeFields(outcome) };
     if (record.jobClass === "review") {
       const parsed = extractFirstJsonObject(outcome.resultText);
@@ -286,7 +331,8 @@ export function createCompanionCommands(adapter) {
       return finishSuccessfulJobRecordFile(file, { ...common, status: "done", failureKind: null,
         review: validation.value, resultText: renderReviewResult(validation.value, { targetLabel: record.request.reviewTargetLabel }) });
     }
-    return finishSuccessfulJobRecordFile(file, { ...common, status: "done", resultText: outcome.resultText, failureKind: null });
+    return finishSuccessfulJobRecordFile(file, { ...common, status: "done", resultText: outcome.resultText, failureKind: null,
+      ...(salvageAttempted ? { semanticFailureKind: "timeout_salvaged" } : {}) });
   }
 
   async function spawnBackgroundWorker(record, file) {
@@ -333,13 +379,14 @@ export function createCompanionCommands(adapter) {
     }, transport);
     const cwd = resolveCwd(options);
     validateImplicitCwd(options, cwd);
-    const mode = (options.write ?? transport.defaultWrite) ? "write" : "consult";
+    const write = Boolean(options.write ?? transport.defaultWrite);
+    const mode = write ? "write" : "consult";
     const dataDir = resolveDataDir();
     adapter.sweep(dataDir);
     const source = resumeSource(dataDir, cwd, mode, options);
     const brief = (positionalText ?? positionals.join(" ")).trim() || readStdinIfPiped().trim();
     if (!brief) throw errorWithFailure("Provide a brief after -- or on stdin.");
-    const prepared = adapter.prepareJob(options, dataDir, cwd);
+    const prepared = adapter.prepareJob(options, dataDir, cwd, { write });
     const id = generateJobId();
     if (source) claimResumeSessionLease(dataDir, cwd, source.sessionId, id, { preflight: true });
     const briefFile = briefPath(dataDir, cwd, id);
@@ -423,7 +470,7 @@ export function createCompanionCommands(adapter) {
     })[key] ?? match);
     const dataDir = resolveDataDir();
     adapter.sweep(dataDir);
-    const prepared = adapter.prepareJob(options, dataDir, cwd);
+    const prepared = adapter.prepareJob(options, dataDir, cwd, { write: false });
     const id = generateJobId();
     const background = Boolean(options.background || transport.defaultBackground);
     const briefFile = briefPath(dataDir, cwd, id);
@@ -431,7 +478,7 @@ export function createCompanionCommands(adapter) {
     const record = createJobRecord({ id, companionVersion: COMPANION_VERSION, pid: background ? null : process.pid,
       mode: "review", cwd, briefFile, background, claudeSessionId: currentClaudeSessionId(), jobClass: "review",
       ...prepared.fields, ...adapter.jobDirectory(dataDir, id),
-      request: { ...prepared.request, reviewTargetLabel: target.label,
+      request: { ...prepared.request, reviewTargetLabel: target.label, backgroundShellBudget: Boolean(transport.backgroundShell && !background),
         outputJson: Boolean(options.json), ingress: transport.ingress } });
     createJobRecordFile(file, record);
     try { writeBrief(dataDir, cwd, id, prompt); }
@@ -462,8 +509,8 @@ export function createCompanionCommands(adapter) {
   function runningAlive(record) {
     if (record.status !== "running") return false;
     if (record.pid) return processOwned(record.pid, record.pidIdentity);
-    if (processOwned(record[pidField], record[identityField])) return true;
-    if (!record.pid && !record[pidField]) {
+    if (processOwned(record.salvage?.resumePid ?? record[pidField], record.salvage?.resumePidIdentity ?? record[identityField])) return true;
+    if (!record.pid && !record[pidField] && !record.salvage?.resumePid) {
       return Date.now() - Date.parse(record.createdAt) < positiveDuration(`${envPrefix}PIDLESS_RUNNING_GRACE_MS`, 15000);
     }
     return false;
@@ -471,7 +518,7 @@ export function createCompanionCommands(adapter) {
 
   function terminateOwned(record) {
     const driverOwned = Number.isInteger(record.pid) && record.pid > 1 && record.pid !== process.pid && processIsDirectlyAlive(record.pid) && processOwned(record.pid, record.pidIdentity);
-    const targets = [[record[pidField], record[identityField], true, driverOwned], [record.pid, record.pidIdentity, record.background, false]];
+    const targets = [[record.salvage?.resumePid ?? record[pidField], record.salvage?.resumePidIdentity ?? record[identityField], true, driverOwned], [record.pid, record.pidIdentity, record.background, false]];
     if (targets.some(([pid, identity, , covered]) => !covered && Number.isInteger(pid) && pid > 1 && pid !== process.pid && processIsDirectlyAlive(pid) && !processOwned(pid, identity))) return false;
     let safe = true;
     for (const [pid, identity, group] of targets) {
@@ -485,7 +532,7 @@ export function createCompanionCommands(adapter) {
   }
 
   function cleanupProcessesAlive(record) {
-    return processGroupAlive(record[pidField]) || (record.pid !== process.pid && processIsDirectlyAlive(record.pid));
+    return processGroupAlive(record.salvage?.resumePid ?? record[pidField]) || (record.pid !== process.pid && processIsDirectlyAlive(record.pid));
   }
 
   function waitForCleanup(record) {
@@ -629,7 +676,7 @@ export function createCompanionCommands(adapter) {
   }
 
   function printUsage() {
-    output(`Usage: ${engine}-companion.mjs <task|review|status|result|watch|await-output|cancel|history|models|setup|record-acceptance|transport-create|transport-discard> [options]\nwatch --job <id> waits silently for completion.\n`);
+    output(`Usage: ${engine}-companion.mjs <task|review|status|result|watch|await-output|cancel|history|models|quota|setup|record-acceptance|transport-create|transport-discard> [options]\nwatch --job <id> waits silently for completion.\n`);
   }
 
   async function main() {
@@ -654,7 +701,7 @@ export function createCompanionCommands(adapter) {
       return;
     }
     if (command === "record-acceptance") { activeArgv = received; handleRecordAcceptance(received); return; }
-    const transport = resolveExecutionTransport(command, received);
+    const transport = resolveExecutionTransport(command, received, ["task", "review"]);
     activeArgv = transport.argv;
     activeIngress = transport.ingress;
     if (transport.defaultBackground && command !== "review" || transport.defaultWrite && command !== "task") throw errorWithFailure("The raw transport default is invalid for this command.");
@@ -668,6 +715,18 @@ export function createCompanionCommands(adapter) {
       case "cancel": await handleCancel(transport.argv, transport); break;
       case "history": await handleHistory(transport.argv, transport); break;
       case "models": adapter.handleModels(transport.argv, transport, { commandArgs, output }); break;
+      case "quota": {
+        const { positionals } = commandArgs(transport.argv, { booleanOptions: ["json"] }, transport);
+        if (positionals.length) throw errorWithFailure("Quota accepts only --json.");
+        let report = { engine, available: false, observedAt: nowIso(), pools: [], note: `quota telemetry not exposed by ${engine}` };
+        try {
+          report = await adapter.quota?.({ env: process.env, dataDir: resolveDataDir() }) ?? report;
+        } catch (error) {
+          report.note = `Could not read quota telemetry: ${error.message}`;
+        }
+        output(report, true);
+        break;
+      }
       case "setup": adapter.handleSetup(transport.argv, transport, { commandArgs, output }); break;
       default: throw errorWithFailure(`Unknown subcommand: ${command}.`);
     }
