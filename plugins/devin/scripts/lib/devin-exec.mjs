@@ -172,11 +172,6 @@ async function initializeSession(run) {
   run.outcome.sessionId = sessionId;
   run.configOptions = session.configOptions;
   await configureSession(run);
-  const modelOption = run.configOptions?.find((option) => option?.id === "model");
-  if (modelOption?.currentValue && Object.hasOwn(run.outcome.appliedOptions, "model")) {
-    run.outcome.appliedOptions.model = modelOption.currentValue;
-    run.outcome.selectedDisplayName = modelOption.options?.find((option) => option?.value === modelOption.currentValue)?.name ?? null;
-  }
   run.outcome.resolvedEffort = run.configOptions?.find((option) => option?.id === "thought_level")?.currentValue ?? null;
   await requestDevin(run, "session/prompt", { sessionId: run.outcome.sessionId, prompt: [{ type: "text", text: brief ?? "" }] });
 }

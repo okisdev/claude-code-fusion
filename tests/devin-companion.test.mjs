@@ -44,7 +44,7 @@ function harness(t, scenario = "success", extraEnv = {}, variants = null) {
       { model_uid: "fusion-claude-opus-5-sidekick-swe-2-high", label: "Claude Opus 5 + SWE-2 High", cost_tier: "free" },
       { model_uid: "kimi-k3-high", label: "Kimi K3" }
     ] },
-    ...(scenario === "model_switch" ? [{ family_label: "Muse Wonder", family_uid: "muse-wonder", slug: "muse-wonder", aliases: [], variants: [
+    ...(scenario === "thought_variant" ? [{ family_label: "Muse Wonder", family_uid: "muse-wonder", slug: "muse-wonder", aliases: [], variants: [
       { model_uid: "muse-wonder-1-0-high", label: "Muse Wonder High", cost_tier: "free" },
       { model_uid: "muse-wonder-1-0-xhigh", label: "Muse Wonder XHigh", cost_tier: "free" }
     ] }] : [])
@@ -55,7 +55,7 @@ import fs from "node:fs";
 const args = process.argv.slice(2);
 if (args.join(" ") === "models list --format json") { process.stdout.write(${JSON.stringify(JSON.stringify(catalog) + "\n")}); process.exit(0); }
 if (args.join(" ") === "auth status") { process.stdout.write("Authenticated\\nPlan: Pro\\n"); process.exit(0); }
-process.env.FAKE_DEVIN_SCENARIO = ${JSON.stringify(["review_ok", "review_invalid", "model_switch"].includes(scenario) ? "success" : scenario)};
+process.env.FAKE_DEVIN_SCENARIO = ${JSON.stringify(["review_ok", "review_invalid", "thought_variant"].includes(scenario) ? "success" : scenario)};
 process.env.FAKE_DEVIN_LOG = ${JSON.stringify(log)};
 ${extraEnv.FAKE_DEVIN_SESSION_ID ? `process.env.FAKE_DEVIN_SESSION_ID = ${JSON.stringify(extraEnv.FAKE_DEVIN_SESSION_ID)};` : ""}
 ${extraEnv.FAKE_DEVIN_REJECT_CONFIG ? `process.env.FAKE_DEVIN_REJECT_CONFIG = ${JSON.stringify(extraEnv.FAKE_DEVIN_REJECT_CONFIG)};` : ""}
@@ -76,9 +76,9 @@ if (args[0] === "acp") {
     }
     return original(fd, data, ...rest);
   };` : ""}
-  ${scenario === "model_switch" ? `let liveModel = "muse-wonder-1-0-high";
+  ${scenario === "thought_variant" ? `let liveModel = "muse-wonder-1-0-high";
   let liveOptions = null;
-  const museOptions = [{ value: "muse-wonder-1-0-high", name: "Muse Wonder High" }, { value: "muse-wonder-1-0-xhigh", name: "Muse Wonder XHigh" }];
+  const museOptions = [{ value: "muse-wonder-1-0-high", name: "Muse Wonder" }];
   const realWriteSync = fs.writeSync;
   fs.writeSync = (fd, data, ...rest) => {
     if (fd === 1 && typeof data === "string") {
@@ -93,8 +93,7 @@ if (args[0] === "acp") {
             if (invalid[2] === "model") {
               liveOptions = [...liveOptions.filter((option) => option.id !== "thought_level"), { id: "thought_level", type: "select", currentValue: "high", options: ["minimal", "low", "medium", "high", "xhigh", "max"].map((value) => ({ value })) }];
             } else {
-              liveModel = "muse-wonder-1-0-xhigh";
-              liveOptions = liveOptions.map((option) => option.id === "thought_level" ? { ...option, currentValue: "xhigh" } : option.id === "model" ? { ...option, currentValue: liveModel } : option);
+              liveOptions = liveOptions.map((option) => option.id === "thought_level" ? { ...option, currentValue: "xhigh" } : option);
             }
             data = JSON.stringify({ jsonrpc: "2.0", id: event.id, result: { configOptions: liveOptions } }) + "\\n";
           }
@@ -192,8 +191,8 @@ test("a turn served by another model renders model_mismatch", (t) => {
   assert.match(result.stdout, /warning: model_mismatch\nstate: done\n$/);
 });
 
-test("an effort driven variant switch resolves the served model and only real drift warns", (t) => {
-  const h = harness(t, "model_switch", { FAKE_DEVIN_MODEL_LABEL: "Muse Wonder XHigh" });
+test("the thought level picks the served variant while the model option keeps the family default", (t) => {
+  const h = harness(t, "thought_variant", { FAKE_DEVIN_MODEL_LABEL: "Muse Wonder XHigh" });
   const result = h.run(["task", "--model", "muse-wonder", "--effort", "xhigh", "--", "inspect"]);
   assertDone(result);
   const [record] = h.jobs();
@@ -203,7 +202,7 @@ test("an effort driven variant switch resolves the served model and only real dr
   assert.equal(record.observedModel, "Muse Wonder XHigh");
   assert.equal(record.modelDrift, null);
   assert.deepEqual(record.warnings, []);
-  const drifted = harness(t, "model_switch", { FAKE_DEVIN_MODEL_LABEL: "SWE-2 High" });
+  const drifted = harness(t, "thought_variant", { FAKE_DEVIN_MODEL_LABEL: "SWE-2 High" });
   assertDone(drifted.run(["task", "--model", "muse-wonder", "--effort", "xhigh", "--", "inspect"]));
   const [drift] = drifted.jobs();
   assert.equal(drift.resolvedModel, "muse-wonder-1-0-xhigh");

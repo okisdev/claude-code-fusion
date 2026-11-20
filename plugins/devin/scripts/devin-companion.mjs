@@ -54,11 +54,13 @@ async function runJob({ record, source, dataDir, brief, signal, timeoutMs, exitG
   buildJobConfig({ configDir: record.configDir, mode: record.mode, cwd: record.cwd, realHome: realUserHome(), homeDir, gitDirs: record.mode === "write" ? worktreeGitDirs(record.cwd) : {} });
   const resolver = record.request?.model ? createSelectionResolver({ family: record.request.family, effort: record.request.effort }) : createSpeedResolver();
   let billingPool = record.billingPool;
+  let selectedDisplayName = null;
+  const familyRequest = record.request?.family && [record.request.family.slug, ...record.request.family.aliases].some((name) => name.toLowerCase() === record.request.model.toLowerCase());
   const selection = (context) => {
     const changes = resolver(context);
-    if (context.stage === "model" && changes[0]
-      && [record.request.family.slug, ...record.request.family.aliases].some((name) => name.toLowerCase() === record.request.model.toLowerCase())) {
-      billingPool = billingPoolForModel({ families: [record.request.family] }, changes[0].value);
+    if (context.stage === "model" && changes[0]) {
+      selectedDisplayName = context.configOptions.find((item) => item.id === "model")?.options?.find((item) => item.value === changes[0].value)?.name ?? null;
+      if (familyRequest) billingPool = billingPoolForModel({ families: [record.request.family] }, changes[0].value);
     }
     return changes;
   };
@@ -66,7 +68,13 @@ async function runJob({ record, source, dataDir, brief, signal, timeoutMs, exitG
     env: buildDevinChildEnv({ homeDir, configDir: record.configDir, mode: record.mode }),
     brief, mode: record.mode, resumeSessionId: source?.sessionId, resolveSelection: selection,
     signal, timeoutMs, exitGraceMs, onSpawn: (child) => onProcess(child.pid), launchProcess });
-  return { ...outcome, effortApplied: resolver?.effortApplied ?? false, billingPool };
+  const effort = outcome.appliedOptions?.thought_level;
+  const served = effort && outcome.appliedOptions?.model && record.request?.family?.variants.find((variant) => variant.uid.toLowerCase().endsWith(`-${effort.toLowerCase()}`));
+  if (served) {
+    return { ...outcome, appliedOptions: { ...outcome.appliedOptions, model: served.uid }, effortApplied: resolver?.effortApplied ?? false, selectedDisplayName: served.label,
+      billingPool: familyRequest ? billingPoolForModel({ families: [record.request.family] }, served.uid) : billingPool };
+  }
+  return { ...outcome, effortApplied: resolver?.effortApplied ?? false, selectedDisplayName, billingPool };
 }
 
 function outcomeFields(outcome) {
