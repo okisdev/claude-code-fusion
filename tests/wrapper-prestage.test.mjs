@@ -197,8 +197,9 @@ test("consult only routed roles prestage read only while write takes precedence"
 });
 
 test("an operation review routing header stages the three line review form", (t) => {
-  const box = sandbox(t);
+  let box;
   for (const [engine, role] of [["devin", "diversity"], ["cursor", "diversity"], ["agy", "independence"]]) {
+    box = sandbox(t);
     const prompt = `-- ${engine}-role: ${role} | operation: review | acceptance: findings cite file:line\nreview the working tree diff`;
     const input = event(box, engine, prompt, { tool_use_id: `review-${engine}` });
     const output = runHook(box, input);
@@ -218,7 +219,8 @@ test("an operation review routing header stages the three line review form", (t)
 });
 
 test("operation review forces read only staging while other headers keep the two line form", (t) => {
-  const box = sandbox(t);
+  let box;
+  box = sandbox(t);
   const review = runHook(box, event(box, "devin", "--write -- devin-role: burst | operation: review\nreview the wave diff", { tool_use_id: "burst-review" }));
   const matched = review?.hookSpecificOutput?.updatedInput?.prompt.match(/^fusion-staged-token: ([a-f0-9]{48})\nmode: read-only\noperation: review$/);
   assert.ok(matched, JSON.stringify(review));
@@ -227,6 +229,7 @@ test("operation review forces read only staging while other headers keep the two
   assert.equal(consume(box, "devin", matched[1]).status, 0);
   runHook(box, { ...event(box, "devin", "unused", { tool_use_id: "burst-review" }), hook_event_name: "PostToolUse", tool_input: review.hookSpecificOutput.updatedInput, tool_response: { isAsync: true, agentId: "burst-review-peer" } });
   for (const [index, header] of ["devin-role: diversity", "devin-role: diversity | operation: task", "devin-role: diversity | operation: reviewer"].entries()) {
+    box = sandbox(t);
     const input = event(box, "devin", `-- ${header}\ninspect the package`, { tool_use_id: `header-${index}` });
     const staged = stagedTransport(t, box, "devin", runHook(box, input), "read-only");
     assert.equal(consume(box, "devin", staged.token).status, 0);
@@ -248,8 +251,9 @@ test("operation review headers stage the two line form for codex and grok", (t) 
 });
 
 test("operation review is a header field separated from prose", (t) => {
-  const box = sandbox(t);
+  let box;
   for (const [index, header] of ["operation: review", "devin-role: diversity; operation: review", "devin-role: diversity, operation: review", "devin-role: diversity · operation: review"].entries()) {
+    box = sandbox(t);
     const output = runHook(box, event(box, "devin", `-- ${header}\nreview the working tree diff`, { tool_use_id: `separator-${index}` }));
     const matched = output?.hookSpecificOutput?.updatedInput?.prompt.match(/^fusion-staged-token: ([a-f0-9]{48})\nmode: read-only\noperation: review$/);
     assert.ok(matched, `${header}: ${JSON.stringify(output)}`);
@@ -263,6 +267,7 @@ test("operation review is a header field separated from prose", (t) => {
     "--write -- devin-role: burst operation: review\nreview the wave diff",
     "--write -- devin-role: burst | reoperation: review\nreview the wave diff"
   ].entries()) {
+    box = sandbox(t);
     const input = event(box, "devin", prompt, { tool_use_id: `prose-${index}` });
     const output = runHook(box, input);
     const staged = stagedTransport(t, box, "devin", output, "write");
@@ -273,7 +278,8 @@ test("operation review is a header field separated from prose", (t) => {
 });
 
 test("the staged header is the first non blank brief line like role detection", (t) => {
-  const box = sandbox(t);
+  let box;
+  box = sandbox(t);
   const review = runHook(box, event(box, "devin", "\n  \ndevin-role: diversity | operation: review\nreview the diff", { tool_use_id: "blank-header" }));
   const matched = review?.hookSpecificOutput?.updatedInput?.prompt.match(/^fusion-staged-token: ([a-f0-9]{48})\nmode: read-only\noperation: review$/);
   assert.ok(matched, JSON.stringify(review));
@@ -281,10 +287,12 @@ test("the staged header is the first non blank brief line like role detection", 
   t.after(() => fs.rmSync(path.dirname(file), { recursive: true, force: true }));
   assert.equal(consume(box, "devin", matched[1]).status, 0);
   runHook(box, { ...event(box, "devin", "unused", { tool_use_id: "blank-header" }), hook_event_name: "PostToolUse", tool_input: review.hookSpecificOutput.updatedInput, tool_response: { isAsync: true, agentId: "blank-header-peer" } });
+  box = sandbox(t);
   const consult = runHook(box, event(box, "codex", "-- \n\nread only\nmodify no files", { tool_use_id: "blank-consult" }));
   const staged = stagedTransport(t, box, "codex", consult, "read-only");
   assert.equal(consume(box, "codex", staged.token).status, 0);
   runHook(box, { ...event(box, "codex", "unused", { tool_use_id: "blank-consult" }), hook_event_name: "PostToolUse", tool_input: staged.input, tool_response: { isAsync: true, agentId: "blank-consult-peer" } });
+  box = sandbox(t);
   const prose = runHook(box, event(box, "devin", "--write --\n\nreview the operation: review notes", { tool_use_id: "blank-prose" }));
   const proseStaged = stagedTransport(t, box, "devin", prose, "write");
   assert.equal(consume(box, "devin", proseStaged.token).status, 0);
