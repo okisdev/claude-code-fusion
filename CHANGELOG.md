@@ -1,5 +1,9 @@
 # changelog
 
+## 0.0.87
+
+- a Devin run records the variant its thought level serves, read from the model catalog, so `muse-wonder` at `xhigh` records `muse-wonder-1-0-xhigh` and `swe-2` at `max` records `swe-2-max` with no false `model_mismatch`. Devin keeps its model option at the family default and picks the variant from `thought_level`; 0.0.86 waited for the model option to change, which the real CLI never does, so the 0.0.86 smoke wave still warned (#114).
+
 ## 0.0.86
 
 - a peer wrapper that hands its report back through `SubagentHandback` no longer gets a relay retry when SubagentStop runs before the handback reaches the wrapper transcript. the PostToolUse hook keeps the handback text on the worker record and SubagentStop uses it when the transcript has nothing yet, so the task completes with its job footer instead of staying `pending_async` with no peer job. the 0.0.85 smoke wave left the Antigravity probe uncollected this way on a host running auto mode (#113).
