@@ -43,7 +43,11 @@ function harness(t, scenario = "success", extraEnv = {}, variants = null) {
       { model_uid: "fusion-gpt-6-sol-sidekick-swe-2-high", label: "GPT-6 Sol + SWE-2 High", cost_tier: "free" },
       { model_uid: "fusion-claude-opus-5-sidekick-swe-2-high", label: "Claude Opus 5 + SWE-2 High", cost_tier: "free" },
       { model_uid: "kimi-k3-high", label: "Kimi K3" }
-    ] }
+    ] },
+    ...(scenario === "model_switch" ? [{ family_label: "Muse Wonder", family_uid: "muse-wonder", slug: "muse-wonder", aliases: [], variants: [
+      { model_uid: "muse-wonder-1-0-high", label: "Muse Wonder High", cost_tier: "free" },
+      { model_uid: "muse-wonder-1-0-xhigh", label: "Muse Wonder XHigh", cost_tier: "free" }
+    ] }] : [])
   ] };
   const review = { verdict: "request_changes", summary: "Needs a fix.", findings: [{ severity: "high", file: "sample.txt", line: 1, title: "Bad value", body: "Use the expected value." }] };
   const code = `#!/usr/bin/env node
@@ -51,7 +55,7 @@ import fs from "node:fs";
 const args = process.argv.slice(2);
 if (args.join(" ") === "models list --format json") { process.stdout.write(${JSON.stringify(JSON.stringify(catalog) + "\n")}); process.exit(0); }
 if (args.join(" ") === "auth status") { process.stdout.write("Authenticated\\nPlan: Pro\\n"); process.exit(0); }
-process.env.FAKE_DEVIN_SCENARIO = ${JSON.stringify(scenario === "review_ok" || scenario === "review_invalid" ? "success" : scenario)};
+process.env.FAKE_DEVIN_SCENARIO = ${JSON.stringify(["review_ok", "review_invalid", "model_switch"].includes(scenario) ? "success" : scenario)};
 process.env.FAKE_DEVIN_LOG = ${JSON.stringify(log)};
 ${extraEnv.FAKE_DEVIN_SESSION_ID ? `process.env.FAKE_DEVIN_SESSION_ID = ${JSON.stringify(extraEnv.FAKE_DEVIN_SESSION_ID)};` : ""}
 ${extraEnv.FAKE_DEVIN_REJECT_CONFIG ? `process.env.FAKE_DEVIN_REJECT_CONFIG = ${JSON.stringify(extraEnv.FAKE_DEVIN_REJECT_CONFIG)};` : ""}
@@ -71,6 +75,33 @@ if (args[0] === "acp") {
       } catch {}
     }
     return original(fd, data, ...rest);
+  };` : ""}
+  ${scenario === "model_switch" ? `let liveModel = "muse-wonder-1-0-high";
+  let liveOptions = null;
+  const museOptions = [{ value: "muse-wonder-1-0-high", name: "Muse Wonder High" }, { value: "muse-wonder-1-0-xhigh", name: "Muse Wonder XHigh" }];
+  const realWriteSync = fs.writeSync;
+  fs.writeSync = (fd, data, ...rest) => {
+    if (fd === 1 && typeof data === "string") {
+      try {
+        const event = JSON.parse(data);
+        if (Array.isArray(event.result?.configOptions)) {
+          liveOptions = event.result.configOptions.map((option) => option.id === "model" ? { ...option, currentValue: liveModel, options: museOptions } : option);
+          data = JSON.stringify({ ...event, result: { ...event.result, configOptions: liveOptions } }) + "\\n";
+        } else if (event.error && liveOptions) {
+          const invalid = /^Invalid value '([^']+)' for config option '([^']+)'$/.exec(String(event.error.data));
+          if (invalid && (invalid[2] === "model" && invalid[1] === liveModel || invalid[2] === "thought_level" && invalid[1] === "xhigh")) {
+            if (invalid[2] === "model") {
+              liveOptions = [...liveOptions.filter((option) => option.id !== "thought_level"), { id: "thought_level", type: "select", currentValue: "high", options: ["minimal", "low", "medium", "high", "xhigh", "max"].map((value) => ({ value })) }];
+            } else {
+              liveModel = "muse-wonder-1-0-xhigh";
+              liveOptions = liveOptions.map((option) => option.id === "thought_level" ? { ...option, currentValue: "xhigh" } : option.id === "model" ? { ...option, currentValue: liveModel } : option);
+            }
+            data = JSON.stringify({ jsonrpc: "2.0", id: event.id, result: { configOptions: liveOptions } }) + "\\n";
+          }
+        }
+      } catch {}
+    }
+    return realWriteSync(fd, data, ...rest);
   };` : ""}
 }
 await import(${JSON.stringify(fileURLToPath(new URL("./fake-devin", import.meta.url)))});
@@ -159,6 +190,25 @@ test("a turn served by another model renders model_mismatch", (t) => {
   assert.equal(record.observedModel, "SWE-1.6 Slow");
   assert.deepEqual(record.warnings, ["model_mismatch"]);
   assert.match(result.stdout, /warning: model_mismatch\nstate: done\n$/);
+});
+
+test("an effort driven variant switch resolves the served model and only real drift warns", (t) => {
+  const h = harness(t, "model_switch", { FAKE_DEVIN_MODEL_LABEL: "Muse Wonder XHigh" });
+  const result = h.run(["task", "--model", "muse-wonder", "--effort", "xhigh", "--", "inspect"]);
+  assertDone(result);
+  const [record] = h.jobs();
+  assert.equal(record.resolvedModel, "muse-wonder-1-0-xhigh");
+  assert.equal(record.resolvedEffort, "xhigh");
+  assert.equal(record.effortApplied, true);
+  assert.equal(record.observedModel, "Muse Wonder XHigh");
+  assert.equal(record.modelDrift, null);
+  assert.deepEqual(record.warnings, []);
+  const drifted = harness(t, "model_switch", { FAKE_DEVIN_MODEL_LABEL: "SWE-2 High" });
+  assertDone(drifted.run(["task", "--model", "muse-wonder", "--effort", "xhigh", "--", "inspect"]));
+  const [drift] = drifted.jobs();
+  assert.equal(drift.resolvedModel, "muse-wonder-1-0-xhigh");
+  assert.deepEqual(drift.modelDrift, { requested: "muse-wonder-1-0-xhigh", observed: "SWE-2 High" });
+  assert.deepEqual(drift.warnings, ["model_mismatch"]);
 });
 
 for (const model of ["swe-2", "swe"]) {

@@ -3683,6 +3683,37 @@ test("a placeholder handed back by a peer rescue wrapper is not collected and th
   }
 });
 
+test("a peer handback recorded at PostToolUse settles at SubagentStop while the wrapper transcript lags", (t) => {
+  const fixture = fs.readFileSync(path.join(import.meta.dirname, "fixtures", "agy-handback", "wrapper-transcript.jsonl"), "utf8").trimEnd().split("\n");
+  const report = JSON.parse(fixture[2]).message.content[0].input.message;
+  for (const agentType of ["agy:agy-rescue", "codex:codex-rescue", "grok:grok-rescue", "devin:devin-rescue", "cursor:cursor-rescue"]) {
+    const box = sandbox(t);
+    const agentId = `lag-${agentType.split(":")[0]}`;
+    const workerTranscript = handbackWorker(box, agentId, "transport", agentType);
+    fs.writeFileSync(workerTranscript, `${fixture.slice(0, 2).join("\n")}\n`);
+    const posted = run(box, { hook_event_name: "PostToolUse", session_id: "session-1", cwd: box.cwd, transcript_path: box.transcript, agent_transcript_path: workerTranscript, agent_id: agentId, agent_type: agentType, tool_name: "SubagentHandback", tool_input: { message: report }, tool_response: { success: true, message: "Report delivered to your caller." } });
+    assert.strictEqual(posted.status, 0, posted.stderr);
+
+    const stopped = handbackStop(box, agentId, workerTranscript, agentType);
+    assert.strictEqual(stopped.status, 0, stopped.stderr);
+    assert.strictEqual(stopped.stdout, "", agentType);
+    const settled = record(box);
+    assert.strictEqual(settled.retryCount, 0, agentType);
+    assert.strictEqual(settled.relayFooterMissing, undefined, agentType);
+    assert.strictEqual(settled.transportStatus, "ready_uncollected", agentType);
+    assert.strictEqual(settled.peerJobId, "9ada8fbc97cf39480be3cb47c8df1808", agentType);
+
+    fs.writeFileSync(workerTranscript, `${fixture.join("\n")}\n`);
+    fs.appendFileSync(box.transcript, `${JSON.stringify({ type: "user", message: { content: `<task-notification>\n<task-id>${agentId}</task-id>\n<status>completed</status>\n<summary>Agent "probe" finished</summary>\n<result>This agent's report was delivered to you as a message from "${agentId}" (its SubagentHandback call).</result>\n</task-notification>` } })}\n`);
+    assert.doesNotMatch(stop(box).stdout, /"decision":"block"/, agentType);
+    const collected = record(box);
+    assert.strictEqual(collected.transportStatus, "done", agentType);
+    assert.strictEqual(collected.collectionMethod, "task_notification", agentType);
+    assert.strictEqual(collected.peerJobId, "9ada8fbc97cf39480be3cb47c8df1808", agentType);
+    assert.strictEqual(fs.readFileSync(collected.outputFile, "utf8"), report);
+  }
+});
+
 test("a completed notification collects a SubagentHandback report that SubagentStop never settled", (t) => {
   const box = sandbox(t);
   const workerTranscript = handbackWorker(box, "handback-notified", "coverage");

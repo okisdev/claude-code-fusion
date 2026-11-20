@@ -1,5 +1,12 @@
 # changelog
 
+## 0.0.86
+
+- a peer wrapper that hands its report back through `SubagentHandback` no longer gets a relay retry when SubagentStop runs before the handback reaches the wrapper transcript. the PostToolUse hook keeps the handback text on the worker record and SubagentStop uses it when the transcript has nothing yet, so the task completes with its job footer instead of staying `pending_async` with no peer job. the 0.0.85 smoke wave left the Antigravity probe uncollected this way on a host running auto mode (#113).
+- a Devin run whose effort setting moves the model to another variant now records the variant Devin serves, so `muse-wonder` at `xhigh` reports `muse-wonder-1-0-xhigh` with no false `model_mismatch` (#114).
+- the `/fusion:smoke` worker probe and the ultra skill name the `claude-fallback:` line the dispatch hook requires, so the smoke wave no longer burns a blocked dispatch before its worker probe (#115).
+- the model table tests no longer read the host's real Devin model cache, which made two routing default tests fail once a Devin run had refreshed it.
+
 ## 0.0.85
 
 - quota is now a routing input. the codex companion answers `quota --json` from the `rate_limits` in its rollout log, every shared companion answers the same contract, and session start plus the fleet report name any pool that is over pace. while Codex is over pace, quick and volume packages go to the breadth engine's prepaid `burst` pool before a second Codex worktree, and no rule picks a metered pool unless the user named it. one host had burned 79 percent of its Codex weekly window in two days while its Devin plan sat almost unused (72 jobs and 2.6M tokens in three weeks against 3291 Codex jobs).

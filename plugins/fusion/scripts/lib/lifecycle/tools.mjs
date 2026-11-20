@@ -11,7 +11,7 @@ import { reconcileTaskNotifications, taskNotificationTransition } from "./notifi
 import { denyTool, hookOutput, writeOutput } from "./output.mjs";
 import { activeSessionRecords, clearContinuationRequest, findSessionWorkerRecord, isAttributedTranscriptPath, parentTranscriptByteSize, recordForAgent, refreshRecord, sendMessageResumed, updateLifecycleWorkerRecord } from "./records.mjs";
 import { canonicalToolResponseUsage } from "./usage.mjs";
-import { CODEX_WRITE_SIZING_ADVISORY_BYTES, HANDBACK_PLACEHOLDER_PATTERN, READ_ONLY_TOOLS, SIZING_ADVISORY_BYTES, SUBAGENT_HANDBACK_TOOL } from "./constants.mjs";
+import { CODEX_WRITE_SIZING_ADVISORY_BYTES, FINAL_TEXT_MAX_BYTES, HANDBACK_PLACEHOLDER_PATTERN, READ_ONLY_TOOLS, SIZING_ADVISORY_BYTES, SUBAGENT_HANDBACK_TOOL } from "./constants.mjs";
 
 function handlePreToolUse(input, env) {
   return withEngineHealthRecords(() => preToolUse(input, env));
@@ -424,6 +424,7 @@ function handlePostToolUse(input, env, failed = false) {
     return;
   }
   const now = new Date().toISOString();
+  const handbackMessage = !failed && input.tool_name === SUBAGENT_HANDBACK_TOOL && typeof input.tool_input?.message === "string" && input.tool_input.message.trim() && !HANDBACK_PLACEHOLDER_PATTERN.test(input.tool_input.message) ? input.tool_input.message.slice(-FINAL_TEXT_MAX_BYTES) : null;
   let emitTurnWindDown = false;
   let emitTokenWindDown = false;
   let emitUncachedWindDown = false;
@@ -447,6 +448,7 @@ function handlePostToolUse(input, env, failed = false) {
       inFlightSince: undefined,
       ...(!failed ? { lastLivenessAt: now } : {}),
       ...(progress ? { lastProgressAt: now, progressEvents: (refreshed.progressEvents ?? 0) + 1 } : {}),
+      ...(handbackMessage ? { handbackReport: handbackMessage } : {}),
       ...(emitTurnWindDown ? { windDownContextSentAt: now } : {}),
       ...(emitTokenWindDown ? { tokenWindDownSentAt: now } : {}),
       ...(emitUncachedWindDown ? { uncachedWindDownSentAt: now } : {})
