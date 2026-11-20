@@ -5,21 +5,12 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { ENGINES, ENGINE_IDS, PEER_RESCUE_AGENT_NAMES, engineStateRoots } from "./lib/engines.mjs";
-import { engineHostBlockers } from "./lib/engine-host-check.mjs";
-import { canonicalWorkerAgentType, readWorkerRecords } from "./lib/worker-state.mjs";
+import { ENGINES, ENGINE_IDS, PEER_RESCUE_AGENT_NAMES } from "./lib/engines.mjs";
+import { engineHealth, readEngineHealthRecords } from "./lib/engine-health.mjs";
 import { tagMessage } from "./lib/user-messages.mjs";
 
-const LOOKBACK_ENV = "FUSION_BREAKER_LOOKBACK_HOURS";
 const DEFAULT_LOOKBACK_HOURS = 12;
 const WORKER_BREAKER_LANES = ["fusion:claude-worker", "fusion:trivial-worker"];
-const HARD_FAILURE_KINDS = new Set(["quota", "auth", "missing_cli", "setup", "protocol", "transport", "sandbox"]);
-const REPEATED_FAILURE_KINDS = new Set(["rate_limited", "timeout", "stall", "network", "process", "died", "patch_thrash", "exec_lost"]);
-const POOL_SCOPED_KINDS = new Set(["quota", "rate_limited"]);
-const BREAKER_FAILURE_KINDS = new Set([...HARD_FAILURE_KINDS, ...REPEATED_FAILURE_KINDS, "permission"]);
-const FAILURE_STATUSES = new Set(["error", "failed"]);
-const SUCCESS_STATUSES = new Set(["done", "completed"]);
-const TERMINAL_STATUSES = new Set([...FAILURE_STATUSES, ...SUCCESS_STATUSES, "cancelled"]);
 const CODEX_FAILURE_PATTERNS = [
   [
     "quota",
@@ -36,128 +27,9 @@ const CODEX_FAILURE_PATTERNS = [
   ["transport", /transport (?:preflight|initialization|handshake|failed)|broken pipe|\bEPIPE\b|failed to (?:spawn|launch)|protocol stream closed/i],
   ["permission", /\b(?:EACCES|EPERM)\b|operation not permitted|permission denied/i]
 ];
-const TRANSPORT_PERMISSION_PATTERN = /(?:sandbox|seatbelt|landlock).*(?:init|initializ|profile|policy)|(?:operation not permitted|\bEACCES\b|\bEPERM\b|permission denied).*(?:brief|prompt|transport|state|plugin|sandbox)|(?:brief|prompt|transport|state|plugin|sandbox).*(?:operation not permitted|\bEACCES\b|\bEPERM\b|permission denied)/i;
 const VERIFIED_VERSIONS_FILE = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "verified-versions.json");
 const FUSION_MANIFEST_FILE = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", ".claude-plugin", "plugin.json");
 const ENGINE_BIN_OVERRIDES = { codex: "CODEX_BIN", grok: "GROK_BIN", cursor: "CURSOR_AGENT_BIN", devin: "DEVIN_BIN", agy: "AGY_BIN" };
-
-function resolveLookbackMs(env = process.env) {
-  const parsed = Number.parseFloat(String(env[LOOKBACK_ENV] ?? ""));
-  const hours = Number.isFinite(parsed) && parsed > 0 ? parsed : DEFAULT_LOOKBACK_HOURS;
-  return hours * 60 * 60 * 1000;
-}
-
-function readJobRecords(stateRoot, modifiedSinceMs) {
-  const records = [];
-  let workspaces;
-  try {
-    workspaces = fs.readdirSync(stateRoot, { withFileTypes: true });
-  } catch {
-    return records;
-  }
-  for (const workspace of workspaces) {
-    if (!workspace.isDirectory()) {
-      continue;
-    }
-    const jobsDir = path.join(stateRoot, workspace.name, "jobs");
-    let entries;
-    try {
-      entries = fs.readdirSync(jobsDir, { withFileTypes: true });
-    } catch {
-      continue;
-    }
-    for (const entry of entries) {
-      if (!entry.isFile() || !entry.name.endsWith(".json")) {
-        continue;
-      }
-      try {
-        const file = path.join(jobsDir, entry.name);
-        if (fs.statSync(file).mtimeMs < modifiedSinceMs) {
-          continue;
-        }
-        const record = JSON.parse(fs.readFileSync(file, "utf8"));
-        if (record && typeof record === "object" && !Array.isArray(record)) {
-          records.push(record);
-        }
-      } catch {
-        void 0;
-      }
-    }
-  }
-  return records;
-}
-
-function readDeduplicatedJobRecords(stateRoots, modifiedSinceMs) {
-  const recordsWithoutIds = [];
-  const byId = new Map();
-  for (const root of stateRoots) {
-    for (const record of readJobRecords(root, modifiedSinceMs)) {
-      const id = typeof record.id === "string" && record.id.trim() ? record.id.trim() : null;
-      if (!id) {
-        recordsWithoutIds.push(record);
-        continue;
-      }
-      const current = byId.get(id);
-      if (!current || (TERMINAL_STATUSES.has(record.status) && !TERMINAL_STATUSES.has(current.status)) || (TERMINAL_STATUSES.has(record.status) === TERMINAL_STATUSES.has(current.status) && (recordTimestamp(record) ?? Number.NEGATIVE_INFINITY) > (recordTimestamp(current) ?? Number.NEGATIVE_INFINITY))) {
-        byId.set(id, record);
-      }
-    }
-  }
-  return [...recordsWithoutIds, ...byId.values()];
-}
-
-function finishedAtMs(value) {
-  if (typeof value !== "string" || !value.trim()) {
-    return null;
-  }
-  const parsed = Date.parse(value);
-  return Number.isFinite(parsed) ? parsed : null;
-}
-
-function isWithinLookback(timestamp, now, lookbackMs) {
-  const ageMs = now - timestamp;
-  return ageMs >= 0 && ageMs <= lookbackMs;
-}
-
-function recordFailureText(record) {
-  return [record?.errorMessage, record?.errorTail, record?.cancelReason].filter((value) => typeof value === "string").join("\n");
-}
-
-function permissionBreaksTransport(record, failureKind) {
-  return failureKind === "permission" && TRANSPORT_PERMISSION_PATTERN.test(recordFailureText(record));
-}
-
-function supportedBreakerFailure(record, failureKind) {
-  if (failureKind === "permission") {
-    return permissionBreaksTransport(record, failureKind);
-  }
-  return BREAKER_FAILURE_KINDS.has(failureKind);
-}
-
-function normalizedRecordedFailureKind(record, value) {
-  const failureKind = typeof value === "string" ? value.trim().toLowerCase() : "";
-  if (failureKind === "policy" && /collaboration policy violation|companion protocol violation|transport protocol violation|delegated Codex execution attempted the disabled \w+ tool/i.test(recordFailureText(record))) {
-    return "protocol";
-  }
-  return failureKind;
-}
-
-function engineFailure(record, now, lookbackMs, engine) {
-  if (!FAILURE_STATUSES.has(record.status)) {
-    return null;
-  }
-  const failureKind = normalizedRecordedFailureKind(record, record.failureKind);
-  const timestamp = recordTimestamp(record);
-  if ((!supportedBreakerFailure(record, failureKind) && !(engine === ENGINES.agy.id && failureKind === "policy")) || timestamp == null || !isWithinLookback(timestamp, now, lookbackMs)) {
-    return null;
-  }
-  const version = record[ENGINES[engine].versionField];
-  return {
-    failureKind,
-    timestamp,
-    version: typeof version === "string" && version.trim() ? version.trim() : null
-  };
-}
 
 function codexFailureKind(errorMessage) {
   if (typeof errorMessage !== "string" || !errorMessage.trim()) {
@@ -169,80 +41,6 @@ function codexFailureKind(errorMessage) {
     }
   }
   return null;
-}
-
-function recordTimestamp(record) {
-  return finishedAtMs(record.finishedAt ?? record.completedAt ?? record.updatedAt);
-}
-
-function newerFailure(left, right) {
-  if (left == null) {
-    return right;
-  }
-  if (right == null) {
-    return left;
-  }
-  return right.timestamp > left.timestamp ? right : left;
-}
-
-// scope "engine" counts only failures that are not pool scoped, "pool" only pool scoped ones, null counts every failure.
-function latestBreakerFailure(records, failureReader, now, lookbackMs, { scope = null, engine = null } = {}) {
-  const outcomes = [];
-  for (const record of records) {
-    const timestamp = recordTimestamp(record);
-    if (timestamp == null || !isWithinLookback(timestamp, now, lookbackMs)) {
-      continue;
-    }
-    const failure = failureReader(record, now, lookbackMs, engine);
-    if (TERMINAL_STATUSES.has(record.status)) {
-      const kind = failure?.failureKind ?? normalizedRecordedFailureKind(record, record.failureKind);
-      const ignored = FAILURE_STATUSES.has(record.status) && scope !== null && (scope === "pool") !== POOL_SCOPED_KINDS.has(kind);
-      outcomes.push({
-        failureKind: ignored ? null : failure?.failureKind ?? null,
-        ignored,
-        status: record.status,
-        timestamp,
-        version: failure?.version ?? null
-      });
-    }
-  }
-  outcomes.sort((left, right) => left.timestamp - right.timestamp);
-  let immediate = null;
-  let previousTransientFailure = null;
-  let repeatedTransientFailure = null;
-  for (const outcome of outcomes) {
-    if (SUCCESS_STATUSES.has(outcome.status)) {
-      immediate = null;
-      previousTransientFailure = null;
-      repeatedTransientFailure = null;
-      continue;
-    }
-    if (outcome.ignored) {
-      continue;
-    }
-    if (HARD_FAILURE_KINDS.has(outcome.failureKind) || outcome.failureKind === "permission" || (engine === ENGINES.agy.id && outcome.failureKind === "policy")) {
-      immediate = { failureKind: outcome.failureKind, timestamp: outcome.timestamp, version: outcome.version };
-      previousTransientFailure = null;
-      repeatedTransientFailure = null;
-      continue;
-    }
-    if (!REPEATED_FAILURE_KINDS.has(outcome.failureKind)) {
-      previousTransientFailure = null;
-      repeatedTransientFailure = null;
-      continue;
-    }
-    if (previousTransientFailure && previousTransientFailure.failureKind === outcome.failureKind && outcome.timestamp - previousTransientFailure.timestamp <= lookbackMs) {
-      repeatedTransientFailure = { failureKind: outcome.failureKind, timestamp: outcome.timestamp, version: outcome.version };
-    }
-    previousTransientFailure = outcome;
-  }
-  const failure = newerFailure(immediate, repeatedTransientFailure);
-  if (failure == null) {
-    return null;
-  }
-  const kindCount = outcomes.filter((outcome) => outcome.failureKind === failure.failureKind).length;
-  const terminalCount = outcomes.length;
-  return { ...failure, kindCount, terminalCount };
 }
 
 function formatAge(timestamp, now) {
@@ -284,25 +82,7 @@ function versionAdvisorySuffix(engine, failure) {
 
 function advisoryLine(engine, failure, now, lookbackMs = DEFAULT_LOOKBACK_HOURS * 60 * 60 * 1000, pool = null) {
   const hoursText = formatLookbackHours(lookbackMs);
-  return `fusion breaker advisory: treat the ${engine}${pool === null ? "" : ` ${pool} pool`} breaker as open unless verified recovered; last failure ${failure.failureKind} ${formatAge(failure.timestamp, now)} (${failure.kindCount} ${failure.failureKind} across ${failure.terminalCount} terminal jobs, ${hoursText}h window). Route new work to another eligible healthy lane.${versionAdvisorySuffix(engine, failure)}`;
-}
-
-function workerFailure(record, now, lookbackMs) {
-  if (!new Set(["failed", "incomplete", "owner_ended"]).has(record.transportStatus)) {
-    return null;
-  }
-  const failureKind = typeof record.failureKind === "string" ? record.failureKind.trim().toLowerCase() : "";
-  const timestamp = finishedAtMs(record.finishedAt ?? record.updatedAt);
-  if (!REPEATED_FAILURE_KINDS.has(failureKind) || timestamp == null || !isWithinLookback(timestamp, now, lookbackMs)) {
-    return null;
-  }
-  return { failureKind, timestamp };
-}
-
-function workerBreakerRecords(records, lane) {
-  return records
-    .filter((record) => canonicalWorkerAgentType(record.agentType) === lane)
-    .map((record) => ({ ...record, status: record.transportStatus === "done" ? "done" : ["failed", "incomplete", "owner_ended"].includes(record.transportStatus) ? "failed" : record.transportStatus }));
+  return `fusion breaker advisory: treat the ${engine}${pool === null ? "" : ` ${pool} pool`} breaker as open unless verified recovered; last failure ${failure.failureKind} ${formatAge(failure.timestamp, now)} (${failure.kindCount} ${failure.failureKind} across ${failure.terminalCount} terminal jobs, ${hoursText}h window${failure.scope === "mode" ? `, ${failure.mode} mode` : ""}). Route new work to another eligible healthy lane.${versionAdvisorySuffix(engine, failure)}`;
 }
 
 function wrapperDeliveryAdvisory(records, now, lookbackMs) {
@@ -319,8 +99,8 @@ function wrapperDeliveryAdvisory(records, now, lookbackMs) {
     return null;
   }
   const wrappers = records.filter((record) => {
-    const timestamp = recordTimestamp(record);
-    return PEER_RESCUE_AGENT_NAMES.has(record.agentType) && record.companionVersion === version && timestamp != null && isWithinLookback(timestamp, now, lookbackMs);
+    const timestamp = Date.parse(record.finishedAt ?? record.completedAt ?? record.updatedAt ?? "");
+    return PEER_RESCUE_AGENT_NAMES.has(record.agentType) && record.companionVersion === version && Number.isFinite(timestamp) && now >= timestamp && now - timestamp <= lookbackMs;
   });
   const deliveries = wrappers.filter((record) => record.failureKind === "delivery").length;
   return wrappers.length >= 20 && deliveries * 4 >= wrappers.length
@@ -328,8 +108,19 @@ function wrapperDeliveryAdvisory(records, now, lookbackMs) {
     : null;
 }
 
-function hostCheckAdvisories(engine, env, now) {
-  return engineHostBlockers(engine, env, now).map(({ kind, modes, message }) => `${ENGINES[engine].displayName} ${modes.join(", ")} runs are blocked on this host (${kind}): ${message}`);
+function engineCliAvailable(engine, env) {
+  const override = env[ENGINE_BIN_OVERRIDES[engine]];
+  const binary = typeof override === "string" && override.trim() ? override.trim() : engine === "cursor" ? "cursor-agent" : engine;
+  const candidates = binary.includes(path.sep) ? [path.resolve(binary)] : (env.PATH ?? "").split(path.delimiter).map((directory) => path.join(directory || ".", binary));
+  return candidates.some((candidate) => {
+    try {
+      if (!fs.statSync(candidate).isFile()) return false;
+      fs.accessSync(candidate, fs.constants.X_OK);
+      return true;
+    } catch {
+      return false;
+    }
+  });
 }
 
 function missingInstalledEngines(env) {
@@ -342,70 +133,38 @@ function missingInstalledEngines(env) {
     } catch {
       return false;
     }
-    const override = env[ENGINE_BIN_OVERRIDES[engine]];
-    const binary = typeof override === "string" && override.trim() ? override.trim() : engine === "cursor" ? "cursor-agent" : engine;
-    const candidates = binary.includes(path.sep) ? [path.resolve(binary)] : (env.PATH ?? "").split(path.delimiter).map((directory) => path.join(directory || ".", binary));
-    return !candidates.some((candidate) => {
-      try {
-        if (!fs.statSync(candidate).isFile()) return false;
-        fs.accessSync(candidate, fs.constants.X_OK);
-        return true;
-      } catch {
-        return false;
-      }
-    });
+    return !engineCliAvailable(engine, env);
   });
 }
 
 function run(env = process.env, now = Date.now(), write = (text) => process.stdout.write(text)) {
-  const lookbackMs = resolveLookbackMs(env);
-  const engineLines = new Map();
-  for (const engine of ENGINE_IDS) {
-    const lines = [];
-    const records = readDeduplicatedJobRecords(engineStateRoots(engine, env), now - lookbackMs);
-    const pools = new Map();
-    for (const record of records) {
-      const pool = typeof record.billingPool === "string" ? record.billingPool : null;
-      if (!pools.has(pool)) {
-        pools.set(pool, []);
+  const records = readEngineHealthRecords(env, now);
+  const { lookbackMs, workers: workerRecords } = records;
+  const lines = [];
+  const hostLines = new Set();
+  for (const engine of ["grok", ...ENGINE_IDS.filter((id) => id !== "grok"), ...WORKER_BREAKER_LANES]) {
+    const seen = new Set();
+    const pools = new Set([null, ...(records.engines.get(engine) ?? []).map((record) => record.billingPool ?? null)]);
+    for (const mode of ["consult", "write"]) {
+      for (const pool of pools) {
+        const health = engineHealth(engine, mode, pool, { env, now, records });
+        for (const failure of health.failures) {
+          const key = `${failure.scope}:${failure.mode}:${failure.pool}:${failure.failureKind}`;
+          if (seen.has(key)) continue;
+          seen.add(key);
+          lines.push(advisoryLine(engine, failure, now, lookbackMs, failure.pool));
+        }
+        for (const { kind, modes, message } of health.blockers) {
+          hostLines.add(`${ENGINES[engine].displayName} ${modes.join(", ")} runs are blocked on this host (${kind}): ${message}`);
+        }
       }
-      pools.get(pool).push(record);
-    }
-    if (!pools.size || (pools.size === 1 && pools.has(null))) {
-      const failure = latestBreakerFailure(records, engineFailure, now, lookbackMs, { engine });
-      if (failure) {
-        lines.push(advisoryLine(engine, failure, now, lookbackMs));
-      }
-      engineLines.set(engine, lines);
-      continue;
-    }
-    const engineFailureResult = latestBreakerFailure(records, engineFailure, now, lookbackMs, { scope: "engine", engine });
-    if (engineFailureResult) {
-      lines.push(advisoryLine(engine, engineFailureResult, now, lookbackMs));
-    }
-    for (const [pool, poolRecords] of pools) {
-      const poolFailure = latestBreakerFailure(poolRecords, engineFailure, now, lookbackMs, { scope: "pool", engine });
-      if (poolFailure) {
-        lines.push(advisoryLine(engine, poolFailure, now, lookbackMs, pool));
-      }
-    }
-    engineLines.set(engine, lines);
-  }
-  const lines = [...(engineLines.get("grok") ?? []), ...ENGINE_IDS.filter((engine) => engine !== "grok").flatMap((engine) => engineLines.get(engine) ?? [])];
-  const workerRecords = readWorkerRecords(env, { modifiedSinceMs: now - lookbackMs, modifiedBeforeMs: now });
-  for (const lane of WORKER_BREAKER_LANES) {
-    const worker = latestBreakerFailure(workerBreakerRecords(workerRecords, lane), workerFailure, now, lookbackMs);
-    if (worker) {
-      lines.push(advisoryLine(lane, worker, now, lookbackMs));
     }
   }
   const deliveryAdvisory = wrapperDeliveryAdvisory(workerRecords, now, lookbackMs);
   if (deliveryAdvisory) {
     lines.push(deliveryAdvisory);
   }
-  for (const engine of ENGINE_IDS) {
-    lines.push(...hostCheckAdvisories(engine, env, now));
-  }
+  lines.push(...hostLines);
   const missingEngines = missingInstalledEngines(env);
   if (missingEngines.length) {
     lines.push(`fusion engines unavailable (CLI missing): ${missingEngines.join(", ")}. Skip these lanes.`);
@@ -431,4 +190,4 @@ if (isMain()) {
   main();
 }
 
-export { advisoryLine, codexFailureKind, formatAge, run };
+export { advisoryLine, codexFailureKind, engineCliAvailable, formatAge, run };

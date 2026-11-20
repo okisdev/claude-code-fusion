@@ -89,5 +89,6 @@ test("collector agent stages a closed request schema instead of executable text"
   assert.match(agent, /exactly one standalone `job: <32 lowercase hexadecimal characters>` line/);
   assert.match(agent, /exactly one JSON object containing only `engine`, `jobId`, `json`, `intervalMs`, `capMs`, and `deadRerunStatus`/);
   assert.match(agent, /transport-discard --raw-args-token TOKEN/);
+  assert.match(agent, /exactly `job-collect: pending`, run the identical background launch call again with the same token/);
   assert.doesNotMatch(agent, /shell fragment.*from the prompt.*invoke/i);
 });

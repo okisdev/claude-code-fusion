@@ -41,7 +41,7 @@ import {
 import { resolveStateDir as guardResolveStateDir, stateFile as guardStateFile } from "../plugins/fusion/scripts/inline-delegation-guard.mjs";
 import { createRawArgsTransport } from "../plugins/fusion/scripts/lib/raw-args-transport.mjs";
 import { MESSAGE_REGISTRY, messageCode } from "../plugins/fusion/scripts/lib/user-messages.mjs";
-import { applyQueuedVerdict, createWorkerRecord, readWorkerRecord, recordWorkerAcceptance, reopenWorkerContinuation, updateWorkerRecord, workerElapsedMs, workerRecordFile } from "../plugins/fusion/scripts/lib/worker-state.mjs";
+import { applyQueuedVerdict, createWorkerRecord, pruneExpiredWorkerRecords, readWorkerRecord, recordWorkerAcceptance, reopenWorkerContinuation, updateWorkerRecord, workerElapsedMs, workerRecordFile } from "../plugins/fusion/scripts/lib/worker-state.mjs";
 import { isStrictDirectRecordArguments, parseRecordArguments, validateArgumentShape } from "../plugins/fusion/scripts/lib/stats/arguments.mjs";
 import { settlementCommand } from "../plugins/fusion/scripts/lib/lifecycle/stop.mjs";
 import { readStatsAuditEvents } from "../plugins/fusion/scripts/lib/stats/fleet.mjs";
@@ -3871,10 +3871,34 @@ test("R4 --all reports retired worker rollups separately from live workers", (t)
     byAgent: { "fusion:claude-worker": 2, "fusion:reviewer": 1 },
     byAcceptance: { accepted: 2, rejected: 1 },
     byFailureKind: { none: 2, timeout: 1 },
+    fallbackReasons: { unrecorded: 2 },
     tokenSums: { outputTokens: 25, uncachedTokens: 36, cacheReadInputTokens: 47 }
   });
   assert.match(renderFusionStats(all), /## Retired Claude workers[\s\S]*Total jobs: 3[\s\S]*Token sums: 25 output, 36 uncached, 47 cache read input/);
   assert.strictEqual(buildFusionStats({ env, cwd: dir }).retiredWorkers, undefined);
+});
+
+test("Claude fallback reasons render in text and JSON with historical records unrecorded", (t) => {
+  const dir = sandbox(t);
+  const env = { ...process.env, HOME: dir, FUSION_WORKER_STATE_DIR: path.join(dir, "workers"), FUSION_DATA_DIR: path.join(dir, "data") };
+  const reasons = ["network", "toolchain", "long-build", "claude-surface", "privacy", "no-healthy-lane"];
+  for (const [index, fallbackReason] of [...reasons, null, null].entries()) {
+    const taskId = `fusion-fallback-${index}`;
+    createWorkerRecord({ taskId, sessionId: "fallback-stats", agentType: index % 2 ? "fusion:trivial-worker" : "fusion:claude-worker", workspaceRoot: dir, fallbackReason }, env);
+    if (fallbackReason === null) updateWorkerRecord(taskId, env, ({ fallbackReason: _reason, ...record }) => record);
+  }
+  for (const agentType of ["fusion:deep-reasoner", "fusion:job-collector"]) {
+    createWorkerRecord({ taskId: `fusion-${agentType.split(":")[1]}`, sessionId: "fallback-stats", agentType, workspaceRoot: dir }, env);
+  }
+  const expected = { ...Object.fromEntries(reasons.map((reason) => [reason, 1])), unrecorded: 2 };
+  const stats = claudeWorkerStats({ all: true, env, cwd: dir });
+  assert.deepEqual(stats.fallbackReasons, expected);
+  const text = renderFusionStats({ scope: dir, claudeWorkers: stats });
+  assert.match(text, /Claude fallback reasons:/);
+  for (const [reason, count] of Object.entries(expected)) assert.ok(text.includes(`- ${reason}: ${count}`));
+  let output = "";
+  runStats(["--all", "--json"], { env, cwd: dir, stdout: { write: (chunk) => { output += chunk; } } });
+  assert.deepEqual(JSON.parse(output).claudeWorkers.fallbackReasons, expected);
 });
 
 test("Claude worker stats group current and stored collection methods for display", (t) => {
@@ -5123,4 +5147,27 @@ test("Antigravity pruning removes orphan runs while preserving runs with job rec
   assert.strictEqual(applied.status, 0, applied.stderr);
   assert.strictEqual(fs.existsSync(path.join(data, "runs", "orphan")), false);
   for (const id of ["retained", "recent"]) assert.strictEqual(fs.existsSync(path.join(data, "runs", id)), true);
+});
+
+
+test("retired worker stats preserve fallback reasons through retention", (t) => {
+  const dir = sandbox(t);
+  const env = runtimeEnv({ cwd: dir, codexState: path.join(dir, "missing-codex") }, { FUSION_WORKER_RETENTION_DAYS: "30" });
+  const now = Date.now();
+  const old = now - 40 * 24 * 60 * 60_000;
+  const reasons = ["network", "toolchain", "long-build", "claude-surface", "privacy", "no-healthy-lane", "privacy", null, null];
+  for (const [index, fallbackReason] of reasons.entries()) {
+    const taskId = `fusion-retired-fallback-${index}`;
+    createTerminalWorker({ taskId, env, workspaceRoot: dir });
+    updateWorkerRecord(taskId, env, (record) => ({ ...record, agentType: index % 2 ? "fusion:trivial-worker" : "fusion:claude-worker", fallbackReason, createdAt: new Date(old).toISOString() }));
+    fs.utimesSync(workerRecordFile(taskId, env), old / 1000, old / 1000);
+  }
+  assert.equal(pruneExpiredWorkerRecords(env, now, { force: true }).records, reasons.length);
+  const report = buildFusionStats({ all: true, env, cwd: dir });
+  assert.equal(report.claudeWorkers.totalJobs, 0);
+  const expected = { network: 1, toolchain: 1, "long-build": 1, "claude-surface": 1, privacy: 2, "no-healthy-lane": 1, unrecorded: 2 };
+  assert.deepEqual(report.retiredWorkers.fallbackReasons, expected);
+  let output = "";
+  runStats(["--all", "--json"], { env, cwd: dir, stdout: { write: (chunk) => { output += chunk; } } });
+  assert.deepEqual(JSON.parse(output).retiredWorkers.fallbackReasons, expected);
 });

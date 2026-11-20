@@ -9,13 +9,15 @@ const DEFAULT_ROLLOUT_HEAD_MAX_BYTES = 8 * 1024 * 1024;
 const DEFAULT_ROLLOUT_TAIL_MAX_BYTES = 16 * 1024 * 1024;
 const MAX_COMPRESSED_ROLLOUT_BYTES = 64 * 1024 * 1024;
 const MAX_ROLLOUT_SCAN_ENTRIES = 50000;
+const RATE_LIMIT_ROLLOUT_SCAN_FILES = 8;
+const RATE_LIMIT_ROLLOUT_TAIL_BYTES = 2 * 1024 * 1024;
 const THREAD_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 
 function observedString(value) {
   return typeof value === "string" && value.trim() ? value.trim() : null;
 }
 
-function codexHome(env) {
+export function codexHome(env = process.env) {
   const configured = observedString(env?.CODEX_HOME);
   return path.resolve(configured ?? path.join(os.homedir(), ".codex"));
 }
@@ -77,6 +79,14 @@ function findRolloutPath(threadId, env, allowHistoricalScan = false) {
   if (latest || !allowHistoricalScan) {
     return latest?.file ?? null;
   }
+  for (const candidate of historicalRolloutCandidates(env, namePattern)) {
+    latest = preferredRolloutCandidate(latest, candidate);
+  }
+  return latest?.file ?? null;
+}
+
+function historicalRolloutCandidates(env, namePattern) {
+  const candidates = [];
   let scanned = 0;
   for (const root of [path.join(codexHome(env), "sessions"), path.join(codexHome(env), "archived_sessions")]) {
     const stack = [root];
@@ -104,12 +114,25 @@ function findRolloutPath(threadId, env, allowHistoricalScan = false) {
         }
         try {
           const stats = fs.statSync(candidate);
-          latest = preferredRolloutCandidate(latest, { compressed, file: candidate, mtimeMs: stats.mtimeMs });
+          candidates.push({ compressed, file: candidate, mtimeMs: stats.mtimeMs });
         } catch {}
       }
     }
   }
-  return latest?.file ?? null;
+  return candidates;
+}
+
+export function latestRolloutRateLimits(env = process.env) {
+  const candidates = historicalRolloutCandidates(env, /^rollout-.*\.jsonl(?:\.zst)?$/)
+    .sort((left, right) => right.mtimeMs - left.mtimeMs || left.file.localeCompare(right.file))
+    .slice(0, RATE_LIMIT_ROLLOUT_SCAN_FILES);
+  for (const { file } of candidates) {
+    const observation = recoverRolloutObservation(null, { file, resultMaxBytes: 0, headMaxBytes: 0, tailMaxBytes: RATE_LIMIT_ROLLOUT_TAIL_BYTES });
+    if (observation.rateLimits) {
+      return { rateLimits: observation.rateLimits, observedAt: observation.rateLimitsObservedAt };
+    }
+  }
+  return null;
 }
 
 function readFileSlice(descriptor, start, length) {
@@ -193,6 +216,8 @@ export function recoverRolloutObservation(threadId, options = {}) {
     found: false,
     matchedTurn: false,
     partialResultText: null,
+    rateLimits: null,
+    rateLimitsObservedAt: null,
     resolvedEffort: null,
     resolvedModel: null,
     source: null,
@@ -254,6 +279,10 @@ export function recoverRolloutObservation(threadId, options = {}) {
     if (entry?.type === "event_msg" && payload?.type === "token_count") {
       result.matchedTurn = true;
       result.cumulativeTokenUsage = normalizeCumulativeUsage(payload.info?.total_token_usage) ?? result.cumulativeTokenUsage;
+      if (payload.rate_limits && typeof payload.rate_limits === "object" && !Array.isArray(payload.rate_limits)) {
+        result.rateLimits = payload.rate_limits;
+        result.rateLimitsObservedAt = Number.isFinite(timestamp) ? new Date(timestamp).toISOString() : null;
+      }
     }
     if (entry?.type === "event_msg" && payload?.type === "task_complete" && typeof payload.last_agent_message === "string" && payload.last_agent_message) {
       result.matchedTurn = true;

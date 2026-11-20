@@ -1,6 +1,6 @@
 import fs from "node:fs";
 
-import { resolveAgyBin, probeAgyVersion, compareAgyVersion, TESTED_AGY_INTERVAL, buildAgyChildEnv, runAgy, classifyAgyFailure } from "./lib/agy-exec.mjs";
+import { resolveAgyBin, probeAgyVersion, compareAgyVersion, TESTED_AGY_INTERVAL, buildAgyChildEnv, runAgy, classifyAgyFailure, redactCredentialValue } from "./lib/agy-exec.mjs";
 import { prepareGeminiDirectory, projectConfigFiles } from "./lib/agy-home.mjs";
 import { readModelCatalog, resolveModelRequest, createSelectionResolver } from "./lib/agy-models.mjs";
 import * as render from "./lib/render.mjs";
@@ -36,6 +36,12 @@ function outcomeFields(outcome) {
     stopReason: outcome.stopReason ?? null, agentVersion: outcome.agentVersion ?? null,
     permissionsAllowed: outcome.permissionsAllowed ?? 0, permissionsRejected: outcome.permissionsRejected ?? 0,
     toolCalls: outcome.toolCalls ?? 0, effortApplied: outcome.effortApplied ?? false };
+}
+
+function refusedDetail(outcome) {
+  const entries = Array.isArray(outcome.refusedPermissions) ? outcome.refusedPermissions : [];
+  const detail = entries.map((entry) => [entry?.tool, entry?.command].filter((part) => typeof part === "string" && part).map((part) => redactCredentialValue(part)).join(": ")).filter(Boolean).join(", ");
+  return detail ? ` (${detail})` : "";
 }
 
 const waitForCleanup = createCleanupWaiter({ engine: "agy" });
@@ -105,6 +111,7 @@ async function setupReport() {
 
 const { cancelJobRecord, run } = createCompanionCommands({
   engine: "agy", engineName: "Antigravity", entryUrl: import.meta.url, state, render,
+  supportsWindDown: true,
   sessionIdPattern: state.AGY_SESSION_ID_PATTERN,
   sweep: state.sweepAgyRuns,
   jobDirectory: (dataDir, id) => ({ configDir: state.runConfigDir(dataDir, id) }),
@@ -115,11 +122,11 @@ const { cancelJobRecord, run } = createCompanionCommands({
   payloadFields: (record) => ({ stopReason: record.stopReason, agentVersion: record.agentVersion, permissionsAllowed: record.permissionsAllowed, permissionsRejected: record.permissionsRejected }),
   historyFields: (record) => ({ resolvedEffort: record.resolvedEffort }),
   outcomeFields,
-  outcomeWarnings: (outcome) => outcome.permissionsRejected ? [`permission_refused: ${outcome.permissionsRejected} request(s) refused, which ends the Antigravity turn early`] : [],
+  outcomeWarnings: (outcome) => outcome.permissionsRejected ? [`permission_refused: ${outcome.permissionsRejected} request(s) refused${refusedDetail(outcome)}, which ends the Antigravity turn early`] : [],
   cancelledFields: (outcome) => ({ sessionId: outcome.sessionId, usage: outcome.usage, ...outcomeFields(outcome) }),
   modelDrift: () => null,
   driftWarning: () => "model_mismatch",
-  failureMessage: (outcome) => outcome.policyViolation ? `Antigravity called forbidden tool ${outcome.policyViolation.tool}${outcome.policyViolation.bypassSandbox ? " with sandbox bypass" : ""}.` : outcome.selectionError?.message || outcome.setupError || outcome.rpcError?.message || (outcome.permissionsRejected > 0 && !outcome.resultText?.trim() ? `Antigravity refused ${outcome.permissionsRejected} permission request(s) and returned no result, so the turn ended early.` : null),
+  failureMessage: (outcome) => outcome.policyViolation ? `Antigravity called forbidden tool ${outcome.policyViolation.tool}${outcome.policyViolation.bypassSandbox ? " with sandbox bypass" : ""}.` : outcome.selectionError?.message || outcome.setupError || outcome.rpcError?.message || (outcome.permissionsRejected > 0 && !outcome.resultText?.trim() ? `Antigravity refused ${outcome.permissionsRejected} permission request(s)${refusedDetail(outcome)} and returned no result, so the turn ended early.` : null),
   classifyFailure: classifyAgyFailure,
   prepareJob, runJob, waitForCleanup, handleModels, handleSetup
 });

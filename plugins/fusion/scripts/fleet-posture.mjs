@@ -7,6 +7,7 @@ import { resolveFusionDataDir } from "./lib/worker-state.mjs";
 import { normalizeSessionId } from "./inline-delegation-guard.mjs";
 import { tagMessage } from "./lib/user-messages.mjs";
 import { parentContextTokens, claimParentContextAdvisory } from "./lib/lifecycle/dispatch.mjs";
+import { pacingLines, quotaResults } from "./lib/quota.mjs";
 
 const DEEP_REASONER_HINT = tagMessage("fleet-posture.deep-reasoner-hint", "This reads as a design or root-cause question. Consult fusion:deep-reasoner with a scoped brief before deciding.");
 const DESIGN_QUESTION_PATTERN = /思考|分析|重构|架构|根本|为什么|怎么设计|root cause|architecture|redesign|refactor|why does|why is|how should we/i;
@@ -106,6 +107,9 @@ function main() {
     return;
   }
   const contexts = [];
+  try {
+    contexts.push(...pacingLines(quotaResults()));
+  } catch {}
   let advisory = null;
   try {
     advisory = claimParentContextAdvisory(input.session_id, parentContextTokens(input.transcript_path), process.env);

@@ -9,6 +9,7 @@ import { buildRulesManifest } from "../plugins/fusion/scripts/generate-rules-man
 import { DEFAULT_MODEL_TABLE_PLACEHOLDER, readModelRoutingFile, renderModelTable } from "../plugins/fusion/scripts/lib/model-table.mjs";
 import { hashRulesTemplate } from "../plugins/fusion/scripts/lib/rules-template.mjs";
 import { messageTag, tagMessage } from "../plugins/fusion/scripts/lib/user-messages.mjs";
+import { ENGINES } from "../plugins/fusion/scripts/lib/engines.mjs";
 
 const repoRoot = path.join(import.meta.dirname, "..");
 const script = path.join(repoRoot, "plugins", "fusion", "scripts", "rules-sync.mjs");
@@ -94,6 +95,7 @@ function runSession(sandbox, source = "startup") {
   return spawnSync("/bin/sh", ["-c", command], {
     env: {
       ...process.env,
+      ...Object.fromEntries(Object.values(ENGINES).map((engine) => [engine.companionEnv, path.join(sandbox.root, `missing-${engine.id}.mjs`)])),
       PATH: `${path.dirname(process.execPath)}${path.delimiter}${process.env.PATH ?? ""}`,
       CLAUDE_PLUGIN_ROOT: sandbox.pluginRoot,
       FUSION_RULES_FILE: sandbox.rulesFile,
@@ -101,9 +103,7 @@ function runSession(sandbox, source = "startup") {
       FUSION_DATA_DIR: path.join(sandbox.root, "data"),
       FUSION_WORKER_STATE_DIR: path.join(sandbox.root, "workers"),
       FUSION_CODEX_STATE: path.join(sandbox.root, "codex"),
-      GROK_COMPANION_DATA: path.join(sandbox.root, "grok"),
-      CURSOR_COMPANION_DATA: path.join(sandbox.root, "cursor"),
-      DEVIN_COMPANION_DATA: path.join(sandbox.root, "devin"),
+      ...Object.fromEntries(Object.values(ENGINES).map((engine) => [engine.dataEnv, path.join(sandbox.root, engine.id)])),
       FUSION_GROK_COMPANION: companion
     },
     encoding: "utf8",
@@ -180,7 +180,7 @@ test("Startup, clear, and compact hooks provide scored or empty routing tables a
         assert.strictEqual(context, expected);
       }
       if (state === "scored") {
-        assert.match(context, /^\| codex \| codex \| openai \| 5 \| 4 \| 5 \|$/m);
+        assert.match(context, /^\| codex \| codex \| openai \| 5 \| 4 \| 5 \| included \|$/m);
         assert.match(context, /^Breadth engine: Cursor \(cursor\)/m);
         assert.match(context, /^Lane defaults: codex quick gpt-6-sol@xhigh/m);
         assert.doesNotMatch(context, /primary implementation lane|\| Notes \|/);
@@ -226,8 +226,8 @@ test("Compaction reloads changed scores, breadth, and lane defaults while preser
   assert.strictEqual(result.status, 0, result.stderr);
   assert.strictEqual(result.stderr, "");
   const context = JSON.parse(result.stdout).hookSpecificOutput.additionalContext;
-  assert.match(context, /^\| codex \| codex \| openai \| 2 \| 4 \| 5 \|$/m);
-  assert.match(context, /^\| muse-wonder \| devin \| anthropic \| 5 \| 5 \| 3 \|$/m);
+  assert.match(context, /^\| codex \| codex \| openai \| 2 \| 4 \| 5 \| included \|$/m);
+  assert.match(context, /^\| muse-wonder \| devin \| anthropic \| 5 \| 5 \| 3 \| unknown \|$/m);
   assert.match(context, /^Breadth engine: Devin \(devin\)/m);
   assert.match(context, /^Lane defaults: codex quick codex@max/m);
   assert.doesNotMatch(context, /cursor diversity|local edits/);
@@ -255,15 +255,14 @@ test("session startup preserves sequential rules and breaker output", (t) => {
       fs.writeFileSync(companion, 'process.stdout.write(JSON.stringify({ blockers: [] }));');
       const env = {
         ...process.env,
+        ...Object.fromEntries(Object.values(ENGINES).map((engine) => [engine.companionEnv, path.join(sandbox.root, `missing-${engine.id}.mjs`)])),
         CLAUDE_PLUGIN_ROOT: sandbox.pluginRoot,
         FUSION_RULES_FILE: sandbox.rulesFile,
         FUSION_MODEL_ROUTING: sandbox.modelRoutingFile,
         FUSION_WORKER_STATE_DIR: path.join(sandbox.root, "workers"),
         FUSION_DATA_DIR: path.join(sandbox.root, "data"),
         FUSION_CODEX_STATE: path.join(sandbox.root, "codex"),
-        GROK_COMPANION_DATA: path.join(sandbox.root, "grok"),
-        CURSOR_COMPANION_DATA: path.join(sandbox.root, "cursor"),
-        DEVIN_COMPANION_DATA: path.join(sandbox.root, "devin"),
+        ...Object.fromEntries(Object.values(ENGINES).map((engine) => [engine.dataEnv, path.join(sandbox.root, engine.id)])),
         FUSION_GROK_COMPANION: companion,
         FUSION_BREAKER_LOOKBACK_HOURS: "12"
       };

@@ -18,6 +18,7 @@ if (args.length !== 8 || args[0] !== "acp" || args[1] !== "--disable-telemetry" 
 }
 
 const scenario = process.env.FAKE_AGY_SCENARIO || "success";
+let resumed = false;
 const logFile = process.env.FAKE_AGY_LOG;
 const log = { argv: args, cwd: process.cwd(), firstPathEntry: (process.env.PATH || "").split(path.delimiter)[0], messages: [], signals: [], stdinEnded: false };
 const record = () => { if (!logFile) return; fs.writeFileSync(`${logFile}.tmp`, `${JSON.stringify(log)}\n`); fs.renameSync(`${logFile}.tmp`, logFile); };
@@ -93,7 +94,7 @@ async function prompt(id) {
   if (scenario === "oversized_line") return fs.writeSync(1, "x".repeat(2 * 1024 * 1024 + 1));
   if (scenario === "no_result") return process.exit(0);
   if (scenario === "no_result_nonzero") return process.exit(7);
-  if (scenario === "hang") return;
+  if (scenario === "hang" || scenario === "wind_down" && !resumed) return;
   if (scenario === "early_signal") return process.kill(process.pid, "SIGUSR2");
   if (scenario === "unknown_request") return emit({ id: "client-request", method: "fs/read_text_file", params: {} });
   if (scenario.startsWith("permission")) {
@@ -164,6 +165,7 @@ async function handleMessage(message) {
     return reply(id, { protocolVersion: scenario === "bad_protocol_version" ? 2 : 1, agentInfo: { name: "Antigravity", version: "1.5.12" }, agentCapabilities: { loadSession: true }, authMethods: [{ id: "login", name: "Log in" }] });
   }
   if (method === "session/new" || method === "session/load") {
+    resumed = method === "session/load";
     if (scenario === "session_auth") return fail(id, "Authentication required");
     if (params.sessionId) sessionId = params.sessionId;
     if (method === "session/load") {

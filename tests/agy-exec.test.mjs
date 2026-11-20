@@ -4,7 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 
-import { buildAgyChildEnv, classifyAgyFailure, compareAgyVersion, probeAgyVersion, resolveAgyBin, runAgy, TESTED_AGY_INTERVAL, toolsForMode } from "../plugins/agy/scripts/lib/agy-exec.mjs";
+import { buildAgyChildEnv, classifyAgyFailure, compareAgyVersion, OPERATING_LIMITS_NOTE, probeAgyVersion, redactCredentialValue, resolveAgyBin, runAgy, TESTED_AGY_INTERVAL, toolsForMode } from "../plugins/agy/scripts/lib/agy-exec.mjs";
 
 const bin = path.resolve("tests/fake-agy");
 
@@ -97,7 +97,7 @@ test("success records exact usage, agent version, isolated flags, and handshake"
   assert.deepEqual(log.messages[0].params, { protocolVersion: 1, clientCapabilities: { fs: { readTextFile: false, writeTextFile: false }, terminal: false } });
   assert.deepEqual(log.messages[1].params, { cwd: root, mcpServers: [] });
   assert.deepEqual(log.messages[2].params, { sessionId: result.sessionId, modeId: "default" });
-  assert.equal(log.messages.at(-1).params.prompt[0].text, "private brief\n");
+  assert.equal(log.messages.at(-1).params.prompt[0].text, `${OPERATING_LIMITS_NOTE}\n\nprivate brief\n`);
 });
 
 test("usage preserves absent and additional keys", async (t) => {
@@ -172,12 +172,124 @@ test("invalid set values retain the RPC error and fail setup without prompting",
   assert.equal(mode.log.messages.some((message) => message.method === "session/prompt"), false);
 });
 
+test("the operating limits note precedes the brief and names the allowlist in every mode", async (t) => {
+  for (const mode of ["consult", "review", "write"]) {
+    const { log } = await fakeRun(t, "success", { mode });
+    assert.equal(log.messages.at(-1).params.prompt[0].text, `${OPERATING_LIMITS_NOTE}\n\nprivate brief\n`, mode);
+  }
+  for (const program of ["ls", "pwd", "cat", "head", "tail", "wc", "stat", "grep", "rg", "find", "git"]) {
+    assert.ok(OPERATING_LIMITS_NOTE.includes(program), program);
+  }
+});
+
+function refuseBin(t, refusals) {
+  const root = fixture(t);
+  const bin = path.join(root, "agy");
+  fs.writeFileSync(bin, `#!/usr/bin/env node
+import readline from "node:readline";
+const refusals = ${JSON.stringify(refusals)};
+const session = "a0123456-789a-4bcd-8ef0-123456789abc";
+const emit = (event) => process.stdout.write(JSON.stringify({ jsonrpc: "2.0", ...event }) + "\\n");
+let promptId;
+let index = 0;
+const request = () => emit({ id: index, method: "session/request_permission", params: { sessionId: session, toolCall: refusals[index], options: [{ optionId: "deny", kind: "reject_once" }] } });
+const input = readline.createInterface({ input: process.stdin });
+input.on("line", (line) => {
+  const message = JSON.parse(line);
+  if (!message.method) {
+    index += 1;
+    if (index < refusals.length) request();
+    else emit({ id: promptId, result: { stopReason: "end_turn", usage: {} } });
+    return;
+  }
+  if (message.method === "initialize") return emit({ id: message.id, result: { protocolVersion: 1, agentInfo: { name: "Antigravity", version: "1.5.12" } } });
+  if (message.method === "session/new") return emit({ id: message.id, result: { sessionId: session, configOptions: [] } });
+  if (message.method === "session/set_mode") return emit({ id: message.id, result: {} });
+  if (message.method === "session/prompt") { promptId = message.id; return request(); }
+  emit({ id: message.id, error: { code: -32601, message: "Method not found" } });
+});
+input.on("close", () => process.exit(0));
+`, { mode: 0o755 });
+  return { root, bin };
+}
+
+test("refused permission requests record tool and truncated command, capped at five", async (t) => {
+  const long = `rm ${"xx ".repeat(80)}`;
+  const { root, bin: fake } = refuseBin(t, [
+    { name: "run_command", rawInput: { CommandLine: long } },
+    { name: "read_file", rawInput: {} },
+    { name: "edit_file" },
+    { name: "run_command", rawInput: { CommandLine: "touch f0" } },
+    { name: "run_command", rawInput: { CommandLine: "touch f1" } },
+    { name: "run_command", rawInput: { CommandLine: "touch f2" } },
+    { name: "run_command", rawInput: { CommandLine: "touch f3" } }
+  ]);
+  const result = await runAgy({ bin: fake, cwd: root, env: process.env, geminiDir: root, brief: "b", timeoutMs: 5000, exitGraceMs: 75, killGraceMs: 75, mode: "consult", resolveSelection: async () => [] });
+  assert.equal(result.permissionsAllowed, 0);
+  assert.equal(result.permissionsRejected, 7);
+  assert.equal(result.refusedPermissions.length, 5);
+  assert.deepEqual(result.refusedPermissions[0], { tool: "run_command", command: long.slice(0, 200) });
+  assert.deepEqual(result.refusedPermissions[1], { tool: "read_file", command: null });
+  assert.deepEqual(result.refusedPermissions[2], { tool: "edit_file", command: null });
+  assert.deepEqual(result.refusedPermissions[4], { tool: "run_command", command: "touch f1" });
+  assert.equal(classifyAgyFailure(result), "permission");
+});
+
+test("refused permission commands record credential shaped values redacted", async (t) => {
+  const secret = "s3cr3t-token-value";
+  for (const [command, expected] of [
+    [`curl --token ${secret} https://example.invalid`, "curl --token [redacted] https://example.invalid"],
+    [`curl --token=${secret} https://example.invalid`, "curl --token=[redacted] https://example.invalid"],
+    [`env TOKEN=${secret} curl https://example.invalid`, "env TOKEN=[redacted] curl https://example.invalid"],
+    [`curl -H 'Authorization: Bearer ${secret}'`, "curl -H 'Authorization: Bearer [redacted]'"],
+    [`curl -H 'Authorization: Bearer ${secret}' --api-key ${secret}`, "curl -H 'Authorization: Bearer [redacted]' --api-key [redacted]"],
+    [`echo ${"a1b2c3d4".repeat(4)}`, "echo [redacted]"],
+    [`echo ${"deadbeef".repeat(3)} suffix`, "echo [redacted] suffix"]
+  ]) {
+    const { result } = await fakeRun(t, "permission_write", { env: { FAKE_AGY_COMMAND: command } });
+    assert.deepEqual(result.refusedPermissions, [{ tool: "run_command", command: expected }], command);
+    assert.ok(!JSON.stringify(result.refusedPermissions).includes(secret), command);
+  }
+});
+
+test("redactCredentialValue masks every credential form and stays idempotent", () => {
+  for (const [input, expected] of [
+    ["--token abc", "--token [redacted]"],
+    ["--token=abc", "--token=[redacted]"],
+    ["--token 'a b c'", "--token [redacted]"],
+    ["TOKEN=abc", "TOKEN=[redacted]"],
+    ["token: abc", "token: [redacted]"],
+    ["--api-key abc", "--api-key [redacted]"],
+    ["X-Api-Key: abc", "X-Api-Key: [redacted]"],
+    ["--secret xyz", "--secret [redacted]"],
+    ["password=hunter2", "password=[redacted]"],
+    ["--auth xyz", "--auth [redacted]"],
+    ["Authorization: Bearer abc", "Authorization: Bearer [redacted]"],
+    ["Bearer abc", "Bearer [redacted]"],
+    ["--bearer abc", "--bearer [redacted]"],
+    [`run ${"a1b2c3d4".repeat(4)}`, "run [redacted]"],
+    [`run ${"0123456789abcdef01234567"}`, "run [redacted]"],
+    ["run shorttoken123 here", "run shorttoken123 here"]
+  ]) {
+    assert.equal(redactCredentialValue(input), expected, input);
+    assert.equal(redactCredentialValue(expected), expected, input);
+  }
+});
+
 test("permission selection uses kind, counts decisions, and cancels without reject", async (t) => {
-  for (const [scenario, allowed, optionId] of [["permission", true, "approval"], ["permission_write", false, "denial"], ["permission_read", false, "denial"], ["permission_edit", false, "denial"], ["permission_no_allow", false, "denial"], ["permission_no_reject", false, null]]) {
+  for (const [scenario, allowed, optionId, refused] of [
+    ["permission", true, "approval", []],
+    ["permission_write", false, "denial", [{ tool: "run_command", command: "touch outside" }]],
+    ["permission_read", false, "denial", [{ tool: "read_file", command: "git status --short" }]],
+    ["permission_edit", false, "denial", [{ tool: "edit_file", command: "git status --short" }]],
+    ["permission_no_allow", false, "denial", [{ tool: "run_command", command: "git status --short" }]],
+    ["permission_no_reject", false, null, [{ tool: "run_command", command: "touch x" }]]
+  ]) {
     const { result, log } = await fakeRun(t, scenario, { env: scenario === "permission_no_reject" ? { FAKE_AGY_COMMAND: "touch x" } : {} });
     assert.equal(classifyAgyFailure(result), null, scenario);
     assert.equal(result.permissionsAllowed, allowed ? 1 : 0, scenario);
     assert.equal(result.permissionsRejected, allowed ? 0 : 1, scenario);
+    assert.deepEqual(result.refusedPermissions, refused, scenario);
     assert.deepEqual(log.messages.at(-1), { jsonrpc: "2.0", id: 0, result: { outcome: optionId ? { outcome: "selected", optionId } : { outcome: "cancelled" } } }, scenario);
     assert.equal(result.resultText, allowed ? "before permission allowed" : "before permission");
   }

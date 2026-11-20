@@ -7,6 +7,8 @@ import { test } from "node:test";
 import {
   DEFAULT_MODEL_TABLE_PLACEHOLDER,
   DEFAULT_ROUTING_DEFAULTS,
+  MODEL_ROUTING_SCHEMA_VERSION,
+  readModelRoutingFile,
   readRoutingDefaults,
   renderModelTableFromContents,
   renderModelTableFromFile,
@@ -14,7 +16,7 @@ import {
 } from "../plugins/fusion/scripts/lib/model-table.mjs";
 
 const ROUTING = {
-  schemaVersion: 1,
+  schemaVersion: MODEL_ROUTING_SCHEMA_VERSION,
   updatedAt: "2026-07-04T00:00:00.000Z",
   costProfile: "",
   models: [
@@ -34,11 +36,117 @@ function writeRouting(file, data) {
   fs.writeFileSync(file, `${JSON.stringify(data, null, 2)}\n`, "utf8");
 }
 
+test("Billing metadata derives from each engine and the cached Devin catalog", (t) => {
+  const dir = sandbox(t);
+  const dataDir = path.join(dir, "devin");
+  fs.mkdirSync(dataDir);
+  fs.writeFileSync(path.join(dataDir, "models-cache.json"), JSON.stringify({
+    fetchedAt: Date.now() - 2 * 60 * 60_000,
+    families: [
+      { slug: "swe-2", aliases: ["swe"], variants: [{ uid: "swe-2-fast", cost_tier: "free" }, { uid: "swe-2-deep", cost_tier: "free" }] },
+      { slug: "mixed", aliases: [], variants: [{ uid: "mixed-free", cost_tier: "free" }, { uid: "mixed-paid", cost_tier: "premium" }] },
+      { slug: "muse-wonder", aliases: [], variants: [{ uid: "muse-wonder-xhigh", cost_tier: "premium" }] }
+    ]
+  }));
+  const env = { HOME: dir, DEVIN_COMPANION_DATA: dataDir };
+  const cases = [
+    ["codex", "gpt-6-sol", "codex", "included"],
+    ["grok", "grok-4.7", "grok", "included"],
+    ["agy", "gemini-4-neon", "agy", "included"],
+    ["cursor", "composer-2.5", "first-party", "included"],
+    ["cursor", "muse-spark-1.3", "api", "metered"],
+    ["devin", "swe-2", "free", "free"],
+    ["devin", "swe", "free", "free"],
+    ["devin", "swe-2-fast", "free", "free"],
+    ["devin", "mixed", "credits", "metered"],
+    ["devin", "mixed-free", "free", "free"],
+    ["devin", "mixed-paid", "credits", "metered"],
+    ["devin", "muse-wonder", "credits", "metered"],
+    ["devin", "unknown", null, null],
+    ["other", "unknown", null, null],
+    ["claude-fast", "sonnet", null, null]
+  ];
+  const result = validateModelRoutingData({ ...ROUTING, models: cases.map(([lane, id]) => ({ lane, id, family: "cognition", intelligence: 3, taste: 3, cost: 3, pool: "incorrect", costClass: "free" })) }, { env });
+  assert.equal(result.ok, true, result.reason);
+  assert.deepEqual(result.data.models.map(({ lane, id, pool, costClass }) => [lane, id, pool, costClass]), cases);
+  const table = renderModelTableFromContents(JSON.stringify(result.data), undefined, { env });
+  assert.match(table, /\| composer-2\.5 \| cursor \| cognition \| 3 \| 3 \| 3 \| included \|/);
+  assert.match(table, /\| muse-spark-1\.3 \| cursor \| cognition \| 3 \| 3 \| 3 \| metered \|/);
+  const defaults = readRoutingDefaults({ ...env, FUSION_MODEL_ROUTING: path.join(dir, "missing.json") });
+  assert.deepEqual(defaults.devin.burst, { model: "swe-2", effort: "high", pool: "free", costClass: "free" });
+  assert.deepEqual(defaults.devin.diversity, { model: "muse-wonder", effort: "xhigh", pool: "credits", costClass: "metered" });
+  for (const lane of ["codex", "grok", "agy"]) {
+    for (const choice of Object.values(defaults[lane])) {
+      assert.equal(choice.pool, lane);
+      assert.equal(choice.costClass, "included");
+    }
+  }
+  assert.deepEqual(defaults.cursor.burst, { model: "composer-2.5", effort: "default", pool: "first-party", costClass: "included" });
+  assert.deepEqual(defaults.cursor.diversity, { model: "muse-spark-1.3", effort: "xhigh", pool: "api", costClass: "metered" });
+});
+
+test("Devin billing resolves the installed companion and canonical cache directory", (t) => {
+  const dir = sandbox(t);
+  const scripts = path.join(dir, ".claude", "plugins", "cache", "claude-code-fusion", "devin", "999.0.0", "scripts");
+  fs.mkdirSync(path.join(scripts, "lib"), { recursive: true });
+  fs.writeFileSync(path.join(scripts, "devin-companion.mjs"), "throw new Error('Companion must not execute.');\n");
+  for (const name of ["devin-models.mjs", "model-catalog.mjs"]) {
+    fs.copyFileSync(path.join(import.meta.dirname, "..", "plugins", "devin", "scripts", "lib", name), path.join(scripts, "lib", name));
+  }
+  const cacheDir = path.join(dir, ".claude", "plugins", "data", "devin-claude-code-fusion");
+  fs.mkdirSync(cacheDir, { recursive: true });
+  const cache = path.join(cacheDir, "models-cache.json");
+  const data = { ...ROUTING, models: [{ id: "swe-2", lane: "devin", family: "cognition", intelligence: 4, taste: 3, cost: 5 }], defaults: { devin: { burst: { model: "swe-2", effort: "high" } } } };
+  for (const contents of [null, "{broken", JSON.stringify({ families: [null], fetchedAt: Date.now() }), JSON.stringify({ families: [{ slug: "swe-2", aliases: [], variants: [{ uid: "swe-2-free", cost_tier: "free" }] }], fetchedAt: Date.now() })]) {
+    if (contents !== null) fs.writeFileSync(cache, contents);
+    const result = validateModelRoutingData(data, { env: { HOME: dir } });
+    assert.equal(result.ok, true, result.reason);
+    const known = contents?.includes("swe-2-free");
+    assert.equal(result.data.models[0].pool, known ? "free" : null);
+    assert.equal(result.data.models[0].costClass, known ? "free" : null);
+    assert.equal(result.data.defaults.devin.burst.costClass, known ? "free" : null);
+  }
+});
+
+test("Reading schema version 1 migrates rows and defaults in memory without writing", (t) => {
+  const dir = sandbox(t);
+  const file = path.join(dir, "model-routing.json");
+  const original = { ...ROUTING, schemaVersion: 1, costProfile: "subscriptions", defaults: { codex: { quick: { model: "gpt-6-sol", effort: "high" } } } };
+  writeRouting(file, original);
+  const result = readModelRoutingFile(file, { env: { HOME: dir } });
+  assert.equal(result.ok, true, result.reason);
+  assert.equal(result.data.schemaVersion, MODEL_ROUTING_SCHEMA_VERSION);
+  assert.equal(result.data.updatedAt, original.updatedAt);
+  assert.equal(result.data.costProfile, original.costProfile);
+  assert.deepEqual(result.data.models[0], { ...original.models[0], pool: "codex", costClass: "included" });
+  assert.deepEqual(result.data.defaults.codex.quick, { ...original.defaults.codex.quick, pool: "codex", costClass: "included" });
+  assert.deepEqual(JSON.parse(fs.readFileSync(file, "utf8")), original);
+  assert.deepEqual(readModelRoutingFile(file, { env: { HOME: dir } }), result);
+  assert.deepEqual(fs.readdirSync(dir), ["model-routing.json"]);
+});
+
+test("Routing reads derive billing metadata from the current Devin cache without writing", (t) => {
+  const dir = sandbox(t);
+  const file = path.join(dir, "model-routing.json");
+  const env = { HOME: dir, DEVIN_COMPANION_DATA: dir };
+  const stored = { ...ROUTING, models: [{ id: "swe-2", lane: "devin", family: "cognition", intelligence: 4, taste: 3, cost: 5 }], defaults: { devin: { burst: { model: "swe-2", effort: "high" } } } };
+  writeRouting(file, stored);
+  assert.equal(readModelRoutingFile(file, { env }).data.defaults.devin.burst.costClass, null);
+  for (const tier of ["free", "premium"]) {
+    fs.writeFileSync(path.join(dir, "models-cache.json"), JSON.stringify({ fetchedAt: Date.now(), families: [{ slug: "swe-2", aliases: [], variants: [{ uid: "swe-2-model", cost_tier: tier }] }] }));
+    const result = readModelRoutingFile(file, { env });
+    assert.equal(result.ok, true, result.reason);
+    assert.equal(result.data.models[0].costClass, tier === "free" ? "free" : "metered");
+    assert.equal(result.data.defaults.devin.burst.costClass, result.data.models[0].costClass);
+    assert.deepEqual(JSON.parse(fs.readFileSync(file, "utf8")), stored);
+  }
+});
+
 test("Session context table renders scores without Notes and points to config", (t) => {
   const dir = sandbox(t);
   const file = path.join(dir, "model-routing.json");
   writeRouting(file, {
-    schemaVersion: 1,
+    schemaVersion: MODEL_ROUTING_SCHEMA_VERSION,
     updatedAt: "2026-07-04T00:00:00.000Z",
     costProfile: "peer subscriptions flat rate",
     models: [
@@ -50,12 +158,12 @@ test("Session context table renders scores without Notes and points to config", 
   const table = renderModelTableFromFile(file);
   assert.strictEqual(renderModelTableFromContents(fs.readFileSync(file, "utf8")), table);
   assert.match(table, /^Cost profile: peer subscriptions flat rate$/m);
-  assert.match(table, /^\| Engine \| Lane \| Family \| Intelligence \| Taste \| Cost \|$/m);
-  assert.match(table, /^\|---\|---\|---\|---:\|---:\|---:\|$/m);
-  assert.match(table, /^\| codex \| codex \| openai \| 5 \| 4 \| 5 \|$/m);
+  assert.match(table, /^\| Engine \| Lane \| Family \| Intelligence \| Taste \| Cost \| Cost class \|$/m);
+  assert.match(table, /^\|---\|---\|---\|---:\|---:\|---:\|---\|$/m);
+  assert.match(table, /^\| codex \| codex \| openai \| 5 \| 4 \| 5 \| included \|$/m);
   assert.doesNotMatch(table, /primary implementation lane|\| Notes \|/);
   assert.match(table, /^Lane defaults: codex quick gpt-6-sol@xhigh, volume gpt-6-sol@high, flagship gpt-6\.1-sol@xhigh; grok burst grok-4\.7-build-fast@low, independence grok-4\.7-build-fast@low, live-web grok-4\.7-build-fast@high, large-context grok-4\.6@medium; cursor diversity muse-spark-1\.3@xhigh, burst composer-2\.5@default; agy independence gemini-4-neon@high, large-context gemini-4-neon@high, burst gemini-4-neon@medium\.$/m);
-  assert.match(table, /\| grok-fast \| grok \| xai \| 3 \| 3 \| 5 \|\nBreadth engine: Cursor \(cursor\); its briefs go to cursor:cursor-rescue with `cursor-role: diversity` or `cursor-role: burst`, and Devin holds no routing seat\.\nBreadth diversity excludes the claude family and the google family served by Antigravity \(agy\); route google consults to agy:agy-rescue\.\nModel notes \(benchmarks, prices, latency\) live in model-routing\.json; `\/fusion:config` shows them\.\n\nLane defaults: [^\n]+\n\nScores feed/);
+  assert.match(table, /\| grok-fast \| grok \| xai \| 3 \| 3 \| 5 \| included \|\nBreadth engine: Cursor \(cursor\); its briefs go to cursor:cursor-rescue with `cursor-role: diversity` or `cursor-role: burst`, and Devin holds no routing seat\.\nBreadth diversity excludes the claude family and the google family served by Antigravity \(agy\); route google consults to agy:agy-rescue\.\nModel notes \(benchmarks, prices, latency\) live in model-routing\.json; `\/fusion:config` shows them\.\n\nLane defaults: [^\n]+\n\nScores feed/);
   assert.match(
     table,
     /^Scores feed the routing priorities above: intelligence proxies correctness and safety, taste is user facing quality, cost applies only as the final tie breaker\.$/m
@@ -70,19 +178,19 @@ test("Routing defaults merge file choices over the seed and preserve only suppor
     ...ROUTING,
     defaults: {
       codex: { quick: { model: " gpt-6-sol ", effort: "high", ignored: true } },
-      grok: { independence: { model: "grok-4.7", effort: "max" } }
+      grok: { independence: { model: "grok-4.7", effort: "max", pool: "grok", costClass: "included" } }
     }
   });
   const validated = validateModelRoutingData(JSON.parse(fs.readFileSync(file, "utf8")));
   assert.strictEqual(validated.ok, true);
   assert.deepStrictEqual(validated.data.defaults, {
-    codex: { quick: { model: "gpt-6-sol", effort: "high" } },
-    grok: { independence: { model: "grok-4.7", effort: "max" } }
+    codex: { quick: { model: "gpt-6-sol", effort: "high", pool: "codex", costClass: "included" } },
+    grok: { independence: { model: "grok-4.7", effort: "max", pool: "grok", costClass: "included" } }
   });
   assert.deepStrictEqual(readRoutingDefaults({ FUSION_MODEL_ROUTING: file }), {
     breadth: "cursor",
-    codex: { ...DEFAULT_ROUTING_DEFAULTS.codex, quick: { model: "gpt-6-sol", effort: "high" } },
-    grok: { ...DEFAULT_ROUTING_DEFAULTS.grok, independence: { model: "grok-4.7", effort: "max" } },
+    codex: { ...DEFAULT_ROUTING_DEFAULTS.codex, quick: { model: "gpt-6-sol", effort: "high", pool: "codex", costClass: "included" } },
+    grok: { ...DEFAULT_ROUTING_DEFAULTS.grok, independence: { model: "grok-4.7", effort: "max", pool: "grok", costClass: "included" } },
     cursor: DEFAULT_ROUTING_DEFAULTS.cursor,
     devin: DEFAULT_ROUTING_DEFAULTS.devin,
     agy: DEFAULT_ROUTING_DEFAULTS.agy
@@ -96,10 +204,10 @@ test("Routing file flagship choice overrides the shipped default", (t) => {
   writeRouting(file, {
     ...ROUTING,
     models: [...ROUTING.models, { id: "gpt-6-astra", lane: "codex", intelligence: 5, taste: 4, cost: 2 }],
-    defaults: { codex: { flagship: { model: "gpt-6-astra", effort: "xhigh" } } }
+    defaults: { codex: { flagship: { model: "gpt-6-astra", effort: "xhigh", pool: "codex", costClass: "included" } } }
   });
-  assert.deepStrictEqual(DEFAULT_ROUTING_DEFAULTS.codex.flagship, { model: "gpt-6.1-sol", effort: "xhigh" });
-  assert.deepStrictEqual(readRoutingDefaults({ FUSION_MODEL_ROUTING: file }).codex.flagship, { model: "gpt-6-astra", effort: "xhigh" });
+  assert.deepStrictEqual(DEFAULT_ROUTING_DEFAULTS.codex.flagship, { model: "gpt-6.1-sol", effort: "xhigh", pool: "codex", costClass: "included" });
+  assert.deepStrictEqual(readRoutingDefaults({ FUSION_MODEL_ROUTING: file }).codex.flagship, { model: "gpt-6-astra", effort: "xhigh", pool: "codex", costClass: "included" });
   assert.match(renderModelTableFromFile(file), /flagship gpt-6-astra@xhigh/);
 });
 

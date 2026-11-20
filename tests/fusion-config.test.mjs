@@ -1,12 +1,14 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
+import childProcess from "node:child_process";
 import fs from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
 import os from "node:os";
 import path from "node:path";
 import { test } from "node:test";
 
 import { hashRulesTemplate } from "../plugins/fusion/scripts/lib/rules-template.mjs";
-import { DEFAULT_MODEL_TABLE_PLACEHOLDER, DEFAULT_MODEL_ROUTING_MODELS, resolveModelRoutingPath } from "../plugins/fusion/scripts/lib/model-table.mjs";
+import { DEFAULT_MODEL_TABLE_PLACEHOLDER, DEFAULT_MODEL_ROUTING_MODELS, MODEL_ROUTING_SCHEMA_VERSION, resolveModelRoutingPath } from "../plugins/fusion/scripts/lib/model-table.mjs";
 
 const repoRoot = path.join(import.meta.dirname, "..");
 const script = path.join(repoRoot, "plugins", "fusion", "scripts", "fusion-config.mjs");
@@ -116,7 +118,7 @@ test("Rescore keeps notes in routing data and prints the table without installin
   ]);
   assert.strictEqual(result.status, 0, result.stderr);
   const data = JSON.parse(fs.readFileSync(box.modelRoutingFile, "utf8"));
-  assert.strictEqual(data.schemaVersion, 1);
+  assert.strictEqual(data.schemaVersion, MODEL_ROUTING_SCHEMA_VERSION);
   assert.strictEqual(data.models.length, 4);
   assert.deepStrictEqual(data.models.slice(0, 3), DEFAULT_MODEL_ROUTING_MODELS);
   assert.deepStrictEqual(data.models[3], {
@@ -125,6 +127,8 @@ test("Rescore keeps notes in routing data and prints the table without installin
     intelligence: 5,
     taste: 4,
     cost: 5,
+    pool: "codex",
+    costClass: "included",
     notes: "primary implementation lane"
   });
   if (process.platform !== "win32") {
@@ -132,12 +136,12 @@ test("Rescore keeps notes in routing data and prints the table without installin
     assert.strictEqual(fs.statSync(box.modelRoutingFile).mode & 0o777, 0o600);
   }
   assert.strictEqual(fs.existsSync(box.rulesFile), false);
-  assert.match(result.stdout, /^\| codex \| codex \| openai \| 5 \| 4 \| 5 \| primary implementation lane \|$/m);
+  assert.match(result.stdout, /^\| codex \| codex \| openai \| 5 \| 4 \| 5 \| included \| codex \| primary implementation lane \|$/m);
   assert.match(result.stdout, /Routing changes take effect in new sessions or after \/compact\./);
   const listing = run(box, ["show"]);
   assert.strictEqual(listing.status, 0, listing.stderr);
-  assert.match(listing.stdout, /^\| Engine \| Lane \| Family \| Intelligence \| Taste \| Cost \| Notes \|$/m);
-  assert.match(listing.stdout, /^\| codex \| codex \| openai \| 5 \| 4 \| 5 \| primary implementation lane \|$/m);
+  assert.match(listing.stdout, /^\| Engine \| Lane \| Family \| Intelligence \| Taste \| Cost \| Cost class \| Pool \| Notes \|$/m);
+  assert.match(listing.stdout, /^\| codex \| codex \| openai \| 5 \| 4 \| 5 \| included \| codex \| primary implementation lane \|$/m);
 });
 
 test("Set-default writes a lane choice and prints the updated defaults without installing live rules", (t) => {
@@ -150,8 +154,8 @@ test("Set-default writes a lane choice and prints the updated defaults without i
   assert.strictEqual(result.status, 0, result.stderr);
   assert.match(result.stdout, /Updated codex quick default to gpt-6-sol@high\./);
   const data = JSON.parse(fs.readFileSync(box.modelRoutingFile, "utf8"));
-  assert.deepStrictEqual(data.defaults, { codex: { quick: { model: "gpt-6-sol", effort: "high" } } });
-  assert.match(result.stdout, /^Lane defaults: codex quick gpt-6-sol@high, volume gpt-6-sol@high/m);
+  assert.deepStrictEqual(data.defaults, { codex: { quick: { model: "gpt-6-sol", effort: "high", pool: "codex", costClass: "included" } } });
+  assert.match(result.stdout, /^Lane defaults: codex quick gpt-6-sol@high \(pool: codex, cost class: included\), volume gpt-6-sol@high/m);
   assert.strictEqual(fs.existsSync(box.rulesFile), false);
   assert.strictEqual(
     run(box, ["rescore", "grok-4.7", "--intelligence", "5", "--taste", "4", "--cost", "4", "--lane", "grok"]).status,
@@ -229,7 +233,51 @@ test("Show json parses after a score is configured", (t) => {
   assert.strictEqual(data.configured, true);
   assert.strictEqual(data.valid, true);
   assert.strictEqual(data.data.models[3].id, "grok-fast");
-  assert.match(data.table, /^\| grok-fast \| grok \| xai \| 3 \| 3 \| 5 \|  \|$/m);
+  assert.match(data.table, /^\| grok-fast \| grok \| xai \| 3 \| 3 \| 5 \| included \| grok \|  \|$/m);
+});
+
+test("Show derives Devin billing from its cache into rows, defaults, and config output without writing", (t) => {
+  const box = sandbox(t);
+  fs.mkdirSync(path.join(box.root, "lib"));
+  for (const name of ["devin-models.mjs", "model-catalog.mjs"]) {
+    fs.copyFileSync(path.join(repoRoot, "plugins", "devin", "scripts", "lib", name), path.join(box.root, "lib", name));
+  }
+  const devinData = path.join(box.root, "devin-data");
+  fs.mkdirSync(devinData);
+  fs.writeFileSync(path.join(devinData, "models-cache.json"), JSON.stringify({ fetchedAt: Date.now(), families: [
+    { slug: "swe-2", aliases: [], variants: [{ uid: "swe-2-high", cost_tier: "free" }] },
+    { slug: "muse-wonder", aliases: [], variants: [{ uid: "muse-wonder-xhigh", cost_tier: "premium" }] }
+  ] }));
+  const original = {
+    schemaVersion: 1,
+    updatedAt: "2026-11-20T00:00:00.000Z",
+    costProfile: "",
+    breadth: "devin",
+    models: ["swe-2", "muse-wonder"].map((id) => ({ id, lane: "devin", family: "cognition", intelligence: 4, taste: 4, cost: 4 })),
+    defaults: { devin: { burst: { model: "swe-2", effort: "high" }, diversity: { model: "muse-wonder", effort: "xhigh" } } }
+  };
+  fs.writeFileSync(box.modelRoutingFile, JSON.stringify(original));
+  const env = { HOME: box.root, DEVIN_COMPANION_DATA: devinData };
+  const shown = run(box, ["show", "--json"], env);
+  assert.equal(shown.status, 0, shown.stderr);
+  const { data, table } = JSON.parse(shown.stdout);
+  assert.equal(data.schemaVersion, MODEL_ROUTING_SCHEMA_VERSION);
+  assert.equal(data.updatedAt, original.updatedAt);
+  assert.deepEqual(data.models.map(({ pool, costClass }) => ({ pool, costClass })), [{ pool: "free", costClass: "free" }, { pool: "credits", costClass: "metered" }]);
+  assert.deepEqual(data.defaults.devin.burst, { ...original.defaults.devin.burst, pool: "free", costClass: "free" });
+  assert.deepEqual(data.defaults.devin.diversity, { ...original.defaults.devin.diversity, pool: "credits", costClass: "metered" });
+  assert.deepEqual(JSON.parse(fs.readFileSync(box.modelRoutingFile, "utf8")), original);
+  assert.match(table, /^\| swe-2 \| devin \| cognition \| 4 \| 4 \| 4 \| free \| free \|  \|$/m);
+  assert.match(table, /^\| muse-wonder \| devin \| cognition \| 4 \| 4 \| 4 \| metered \| credits \|  \|$/m);
+  assert.match(table, /burst swe-2@high \(pool: free, cost class: free\)/);
+  assert.match(table, /diversity muse-wonder@xhigh \(pool: credits, cost class: metered\)/);
+  const text = run(box, ["show"], env);
+  assert.equal(text.status, 0, text.stderr);
+  assert.ok(text.stdout.includes(table));
+  fs.writeFileSync(box.modelRoutingFile, JSON.stringify(original));
+  const edited = run(box, ["set-cost-profile", "mixed pools"], env);
+  assert.equal(edited.status, 0, edited.stderr);
+  assert.deepEqual(JSON.parse(fs.readFileSync(box.modelRoutingFile, "utf8")).defaults, data.defaults);
 });
 
 test("Show reports an invalid model routing file explicitly", (t) => {
@@ -275,9 +323,9 @@ test("Audit reports listing drift, unscored models, and Cursor variants per engi
   assert.strictEqual(report.engines.codex.listing.available, true);
   assert.strictEqual(report.engines.codex.listing.source, "test listing");
   assert.deepStrictEqual(report.engines.codex.configuredButAbsent, ["gpt-5.5-missing"]);
-  assert.deepStrictEqual(report.defaults.codex.quick, { model: "gpt-5.6-terra", effort: "high" });
-  assert.deepStrictEqual(report.defaults.codex.volume, { model: "gpt-6-sol", effort: "high" });
-  assert.deepStrictEqual(report.defaults.grok.burst, { model: "grok-4.7-build-fast", effort: "low" });
+  assert.deepStrictEqual(report.defaults.codex.quick, { model: "gpt-5.6-terra", effort: "high", pool: "codex", costClass: "included" });
+  assert.deepStrictEqual(report.defaults.codex.volume, { model: "gpt-6-sol", effort: "high", pool: "codex", costClass: "included" });
+  assert.deepStrictEqual(report.defaults.grok.burst, { model: "grok-4.7-build-fast", effort: "low", pool: "grok", costClass: "included" });
   assert.deepStrictEqual(report.engines.codex.defaultsAbsent, [
     { role: "flagship", model: "gpt-6.1-sol" }
   ]);
@@ -322,6 +370,24 @@ test("Audit isolates invalid JSON and failed companion exits", (t) => {
   assert.match(report.engines.codex.listing.reason, /invalid JSON/);
   assert.strictEqual(report.engines.grok.listing.available, true);
   assert.strictEqual(report.engines.cursor.listing.reason, "catalog failed");
+});
+
+test("Audit handles a failed model listing with null stderr", async (t) => {
+  const box = sandbox(t);
+  const original = childProcess.spawnSync;
+  childProcess.spawnSync = () => ({ status: 1, stderr: null, error: null });
+  syncBuiltinESMExports();
+  try {
+    const { main } = await import(`../plugins/fusion/scripts/fusion-config.mjs?null-stderr=${Date.now()}`);
+    let output = "";
+    const env = { HOME: box.root, FUSION_DATA_DIR: box.fusionData, FUSION_MODEL_ROUTING: box.modelRoutingFile,
+      ...Object.fromEntries(Object.entries(box.companions).map(([engine, file]) => [`FUSION_${engine.toUpperCase()}_COMPANION`, file])) };
+    assert.equal(main(["audit", "--json"], { env, stdout: { write(text) { output += text; } } }), 0);
+    assert.equal(JSON.parse(output).engines.codex.listing.reason, "exit 1");
+  } finally {
+    childProcess.spawnSync = original;
+    syncBuiltinESMExports();
+  }
 });
 
 test("Cursor rescore requires family and accepts default effort", (t) => {
@@ -390,7 +456,7 @@ test("Every config mutation prints routing context while leaving missing, shippe
       assert.match(result.stdout, /Routing changes take effect in new sessions or after \/compact\./);
       assert.doesNotMatch(result.stdout, /local edits|\/fusion:setup|rules installed|rules updated/);
       if (fs.existsSync(box.modelRoutingFile)) {
-        assert.match(result.stdout, /^\| Engine \| Lane \| Family \| Intelligence \| Taste \| Cost \| Notes \|$/m);
+        assert.match(result.stdout, /^\| Engine \| Lane \| Family \| Intelligence \| Taste \| Cost \| Cost class \| Pool \| Notes \|$/m);
       } else {
         assert.ok(result.stdout.includes(DEFAULT_MODEL_TABLE_PLACEHOLDER));
       }

@@ -90,13 +90,13 @@ test("expired records append grouped additive rollups before removal", (t) => {
   assert.strictEqual(rows.length, 3);
   assert.deepStrictEqual(rows.find((row) => row.acceptance === "accepted"), {
     schemaVersion: 1, month: "2026-07", agentType: "fusion:claude-worker", model: "opus",
-    transportStatus: "done", acceptance: "accepted", failureKind: null, count: 2,
+    transportStatus: "done", acceptance: "accepted", failureKind: null, fallbackReason: null, count: 2,
     wallClockMsSum: 4000, outputTokensSum: 14, uncachedTokensSum: 35, cacheReadInputTokensSum: 46
   });
   assert.strictEqual(rows.find((row) => row.acceptance === "rejected").count, 1);
   assert.deepStrictEqual(rows.find((row) => row.month === null), {
     schemaVersion: 1, month: null, agentType: null, model: null,
-    transportStatus: null, acceptance: null, failureKind: null, count: 1,
+    transportStatus: null, acceptance: null, failureKind: null, fallbackReason: null, count: 1,
     wallClockMsSum: 0, outputTokensSum: 0, uncachedTokensSum: 0, cacheReadInputTokensSum: 0
   });
   writeJob(workers, "fusion-rollup-later", record(), old);
@@ -125,6 +125,22 @@ test("rollup write failure leaves expired records available for a later sweep", 
   assert.strictEqual(fs.existsSync(file), true);
   assert.strictEqual(fs.existsSync(path.join(workers, ".retention-sweep")), false);
   assert.deepStrictEqual(pruneExpiredWorkerRecords(env, now), { records: 1, sessions: 0 });
+});
+
+test("retention preserves fallback reasons as separate rollup dimensions", (t) => {
+  const { workers, env } = sandbox(t);
+  const now = Date.now();
+  const old = now - 40 * DAY_MS;
+  for (const [index, fallbackReason] of ["privacy", "network", "privacy", null].entries()) {
+    writeJob(workers, `fusion-fallback-${index}`, {
+      createdAt: new Date(old).toISOString(), agentType: "fusion:claude-worker",
+      transportStatus: "done", acceptance: "accepted", ...(fallbackReason ? { fallbackReason } : {})
+    }, old);
+  }
+  assert.equal(pruneExpiredWorkerRecords(env, now).records, 4);
+  const rows = readWorkerRollups(env);
+  assert.equal(rows.length, 3);
+  assert.deepEqual(Object.fromEntries(rows.map((row) => [row.fallbackReason ?? "unrecorded", row.count])), { privacy: 2, network: 1, unrecorded: 1 });
 });
 
 test("retention retries count each record once after rollup append succeeds and unlink fails", (t) => {

@@ -4,7 +4,7 @@ import path from "node:path";
 
 import { resolveDevinBin, probeDevinVersion, compareDevinVersion, TESTED_DEVIN_INTERVAL, buildDevinChildEnv, runDevin, classifyDevinFailure } from "./lib/devin-exec.mjs";
 import { ensurePrivateHome, buildJobConfig, worktreeGitDirs, projectConfigFiles } from "./lib/devin-home.mjs";
-import { readModelCatalog, findCatalogFamily, createSelectionResolver, createSpeedResolver, billingPoolForModel, isPinnableFamily } from "./lib/devin-models.mjs";
+import { readModelCatalog, findCatalogFamily, createSelectionResolver, createSpeedResolver, billingPoolForModel, costClassForPool, pairingForModel, isPinnableFamily } from "./lib/devin-models.mjs";
 import * as render from "./lib/render.mjs";
 import * as state from "./lib/state.mjs";
 import { cleanupRawCommandTransportsForSession } from "./lib/raw-transport.mjs";
@@ -12,27 +12,41 @@ import { createCleanupWaiter, createCompanionCommands, createModelsCommand, erro
 
 export { cleanupRawCommandTransportsForSession };
 
-function prepareJob(options, dataDir, cwd) {
+function prepareJob(options, dataDir, cwd, { write }) {
   const probe = probeDevinVersion(resolveDevinBin());
   if (compareDevinVersion(probe.version, TESTED_DEVIN_INTERVAL.floor) < 0) throw errorWithFailure(`Devin CLI ${probe.version} is below tested floor ${TESTED_DEVIN_INTERVAL.floor}.`, "setup");
   const { homeDir } = ensurePrivateHome({ dataDir, realHome: realUserHome() });
   fs.mkdirSync(path.join(homeDir, ".config"), { recursive: true, mode: 0o700 });
   const catalog = readModelCatalog({ dataDir, bin: probe.buildPath, env: buildDevinChildEnv({ homeDir, configDir: path.join(homeDir, ".config"), mode: "consult" }) });
-  const family = options.model ? findCatalogFamily(catalog, options.model) : null;
+  const family = options.model ? findCatalogFamily(catalog, options.model, { write }) : null;
+  const pairing = options.model ? pairingForModel(options.model) : null;
   const effort = options.effort ?? "default";
   if (!family && effort !== "default") throw errorWithFailure("--effort requires --model unless effort is default.");
   return {
     fields: { devinVersion: probe.version, devinBuildPath: probe.buildPath,
-      requestedModel: options.model ?? null, requestedEffort: effort, billingPool: family ? billingPoolForModel(family.slug) : null,
+      requestedModel: options.model ?? null, requestedEffort: effort, billingPool: family ? billingPoolForModel(catalog, options.model) : null,
       warnings: projectConfigFiles(cwd).map((file) => `project configuration may affect Devin permissions: ${file}`) },
-    request: { model: options.model ?? null, family, effort }
+    request: { model: options.model ?? null, family, effort, ...(pairing ? { pairing } : {}) }
   };
 }
 
+function normalizedModelLabel(value) {
+  return String(value).trim().toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
+}
+
 function servedBySelectedModel(observed, selected) {
-  const label = observed.trim().toLowerCase();
-  const name = selected.trim().toLowerCase();
-  return label === name || label.startsWith(`${name} `);
+  const label = normalizedModelLabel(observed);
+  const name = normalizedModelLabel(selected);
+  return label === name;
+}
+
+function quota({ env, dataDir } = {}) {
+  return { engine: "devin", available: true, observedAt: new Date().toISOString(),
+    pools: [
+      { pool: "free", costClass: costClassForPool("free"), usedPercent: null, windowMinutes: null, resetsAt: null, pacing: null },
+      { pool: "credits", costClass: costClassForPool("credits"), usedPercent: null, windowMinutes: null, resetsAt: null, pacing: null }
+    ],
+    note: "Devin exposes no usage meter; credits are treated as metered until the user marks them included." };
 }
 
 async function runJob({ record, source, dataDir, brief, signal, timeoutMs, exitGraceMs, onProcess, launchProcess }) {
@@ -40,10 +54,14 @@ async function runJob({ record, source, dataDir, brief, signal, timeoutMs, exitG
   buildJobConfig({ configDir: record.configDir, mode: record.mode, cwd: record.cwd, realHome: realUserHome(), homeDir, gitDirs: record.mode === "write" ? worktreeGitDirs(record.cwd) : {} });
   const resolver = record.request?.model ? createSelectionResolver({ family: record.request.family, effort: record.request.effort }) : createSpeedResolver();
   let selectedDisplayName = null;
+  let billingPool = record.billingPool;
   const selection = (context) => {
     const changes = resolver(context);
     if (context.stage === "model" && changes[0]) {
       selectedDisplayName = context.configOptions.find((item) => item.id === "model")?.options?.find((item) => item.value === changes[0].value)?.name ?? null;
+      if ([record.request.family.slug, ...record.request.family.aliases].some((name) => name.toLowerCase() === record.request.model.toLowerCase())) {
+        billingPool = billingPoolForModel({ families: [record.request.family] }, changes[0].value);
+      }
     }
     return changes;
   };
@@ -51,12 +69,12 @@ async function runJob({ record, source, dataDir, brief, signal, timeoutMs, exitG
     env: buildDevinChildEnv({ homeDir, configDir: record.configDir, mode: record.mode }),
     brief, mode: record.mode, resumeSessionId: source?.sessionId, resolveSelection: selection,
     signal, timeoutMs, exitGraceMs, onSpawn: (child) => onProcess(child.pid), launchProcess });
-  return { ...outcome, effortApplied: resolver?.effortApplied ?? false, selectedDisplayName };
+  return { ...outcome, effortApplied: resolver?.effortApplied ?? false, selectedDisplayName, billingPool };
 }
 
 function outcomeFields(outcome) {
   return { resolvedModel: outcome.appliedOptions?.model ?? null, resolvedEffort: outcome.resolvedEffort ?? null,
-    stopCause: outcome.stopCause, effortApplied: outcome.effortApplied ?? false };
+    stopCause: outcome.stopCause, effortApplied: outcome.effortApplied ?? false, billingPool: outcome.billingPool };
 }
 
 const waitForCleanup = createCleanupWaiter({ engine: "devin" });
@@ -115,6 +133,7 @@ function handleSetup(argv, transport, { commandArgs, output }) {
 
 const { cancelJobRecord, run } = createCompanionCommands({
   engine: "devin", engineName: "Devin", entryUrl: import.meta.url, state, render,
+  supportsWindDown: true,
   sessionIdPattern: state.DEVIN_SESSION_ID_PATTERN,
   sweep: state.sweepDevinRuns,
   jobDirectory: (dataDir, id) => ({ configDir: state.runConfigDir(dataDir, id) }),
@@ -126,14 +145,16 @@ const { cancelJobRecord, run } = createCompanionCommands({
   historyFields: (record) => ({ resolvedEffort: record.resolvedEffort }),
   outcomeFields,
   cancelledFields: (outcome) => ({ sessionId: outcome.sessionId, requestId: outcome.requestId, usage: outcome.usage, ...outcomeFields(outcome) }),
-  modelDrift: (record, outcome) => outcome.appliedOptions?.model && outcome.selectedDisplayName && outcome.observedModel && !servedBySelectedModel(outcome.observedModel, outcome.selectedDisplayName)
+  modelDrift: (record, outcome) => outcome.appliedOptions?.model && outcome.selectedDisplayName && outcome.observedModel
+    && ![outcome.selectedDisplayName, outcome.appliedOptions.model, record.request?.pairing?.planner, record.request?.pairing?.sidekick].filter(Boolean)
+      .some((name) => servedBySelectedModel(outcome.observedModel, name))
     ? { requested: outcome.appliedOptions.model, observed: outcome.observedModel } : null,
   driftWarning: () => "model_mismatch",
   failureMessage: (outcome) => outcome.policyViolation ? `Devin called forbidden tool ${outcome.policyViolation.tool}.` : outcome.selectionError?.message || outcome.setupError || outcome.rpcError?.message,
   classifyFailure: classifyDevinFailure,
-  prepareJob, runJob, waitForCleanup, handleModels, handleSetup
+  prepareJob, runJob, waitForCleanup, handleModels, handleSetup, quota
 });
 
-export { cancelJobRecord };
+export { cancelJobRecord, quota };
 
 run();

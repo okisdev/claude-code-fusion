@@ -351,6 +351,7 @@ export function claudeWorkerStats({ all = false, env = process.env, cwd = proces
   const byStatus = {};
   const byAcceptance = {};
   const byAgent = {};
+  const fallbackReasons = {};
   const infrastructureDeaths = { total: 0, byKind: {} };
   const judgedExcludingInfrastructure = acceptanceSummary();
   const byFailureKind = {};
@@ -372,6 +373,9 @@ export function claudeWorkerStats({ all = false, env = process.env, cwd = proces
     const status = nonEmptyString(record.transportStatus) ?? "unknown";
     bump(byStatus, status);
     bump(byAgent, nonEmptyString(record.agentType) ?? "unknown");
+    if (["fusion:claude-worker", "fusion:trivial-worker"].includes(canonicalWorkerAgentType(record.agentType))) {
+      bump(fallbackReasons, nonEmptyString(record.fallbackReason) ?? "unrecorded");
+    }
     bump(byDelivery, nonEmptyString(record.expectedDelivery) ?? "unknown");
     const collectionMethod = normalizeCollectionMethod(record.collectionMethod);
     if (collectionMethod) {
@@ -457,6 +461,7 @@ export function claudeWorkerStats({ all = false, env = process.env, cwd = proces
     acceptanceScope: "terminal transport jobs only",
     pendingTransportJobs,
     byAgent,
+    fallbackReasons,
     byFailureKind,
     harnessAsyncDeliveries,
     byDelivery,
@@ -551,6 +556,7 @@ function retiredWorkerStats(env) {
     byAgent: {},
     byAcceptance: {},
     byFailureKind: {},
+    fallbackReasons: {},
     tokenSums: { outputTokens: 0, uncachedTokens: 0, cacheReadInputTokens: 0 }
   };
   for (const row of readWorkerRollups(env)) {
@@ -558,6 +564,10 @@ function retiredWorkerStats(env) {
       continue;
     }
     stats.totalJobs += row.count;
+    if (["fusion:claude-worker", "fusion:trivial-worker"].includes(canonicalWorkerAgentType(row.agentType))) {
+      const reason = nonEmptyString(row.fallbackReason) ?? "unrecorded";
+      stats.fallbackReasons[reason] = (stats.fallbackReasons[reason] ?? 0) + row.count;
+    }
     stats.byAgent[row.agentType ?? "unknown"] = (stats.byAgent[row.agentType ?? "unknown"] ?? 0) + row.count;
     stats.byAcceptance[row.acceptance ?? "unknown"] = (stats.byAcceptance[row.acceptance ?? "unknown"] ?? 0) + row.count;
     stats.byFailureKind[row.failureKind ?? "none"] = (stats.byFailureKind[row.failureKind ?? "none"] ?? 0) + row.count;

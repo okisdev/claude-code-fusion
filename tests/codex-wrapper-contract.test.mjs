@@ -37,7 +37,7 @@ function run(box, payload, extra = {}) {
 }
 
 function brief() {
-  return "fusion-brief: v1\ncontext-mode: isolated\ngoal: implement one fix\nscope: src/a.ts\nverification: node --test\n";
+  return "fusion-brief: v1\ncontext-mode: isolated\nclaude-fallback: claude-surface\ngoal: implement one fix\nscope: src/a.ts\nverification: node --test\n";
 }
 
 function dispatch(box, overrides = {}) {

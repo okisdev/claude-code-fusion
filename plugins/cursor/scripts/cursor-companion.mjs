@@ -53,7 +53,7 @@ function prepareJob(options, dataDir, cwd) {
 
 async function runJob({ record, source, dataDir, brief, signal, timeoutMs, exitGraceMs, onProcess, launchProcess }) {
   buildPrivateHome({ homeDir: record.homeDir, mode: record.mode, cwd: record.cwd, realHome: realUserHome() });
-  if (source && !copyChatForResume({ fromHome: source.homeDir, toHome: record.homeDir, cwd: record.cwd, sessionId: source.sessionId })) {
+  if (source && source.homeDir !== record.homeDir && !copyChatForResume({ fromHome: source.homeDir, toHome: record.homeDir, cwd: record.cwd, sessionId: source.sessionId })) {
     throw errorWithFailure(`Cursor chat ${source.sessionId} was not found in the parent private home.`);
   }
   return runCursor({ bin: record.cursorBuildPath,
@@ -112,6 +112,7 @@ function handleSetup(argv, transport, { commandArgs, output }) {
 
 const { cancelJobRecord, run } = createCompanionCommands({
   engine: "cursor", engineName: "Cursor", entryUrl: import.meta.url, state, render,
+  supportsWindDown: true,
   sessionIdPattern: CURSOR_SESSION_ID_PATTERN,
   sweep: state.sweepCursorHomes,
   jobDirectory: (dataDir, id) => ({ homeDir: state.runHomeDir(dataDir, id) }),

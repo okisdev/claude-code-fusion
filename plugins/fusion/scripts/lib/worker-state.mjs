@@ -196,7 +196,7 @@ export function workerElapsedMs(record) {
 }
 
 // rollup.jsonl schema v1: each line is an additive delta keyed by UTC createdAt
-// month (YYYY-MM), agentType, model, transportStatus, acceptance, failureKind.
+// month (YYYY-MM), agentType, model, transportStatus, acceptance, failureKind, fallbackReason.
 // count and the four *Sum fields total records selected for removal in that sweep.
 // Missing historical dimensions use null; unavailable measurements contribute 0.
 function workerRollup(record) {
@@ -208,6 +208,7 @@ function workerRollup(record) {
     transportStatus: record.transportStatus ?? null,
     acceptance: record.acceptance ?? null,
     failureKind: record.failureKind ?? null,
+    fallbackReason: record.fallbackReason ?? null,
     count: 1,
     wallClockMsSum: workerElapsedMs(record) ?? 0,
     outputTokensSum: integer(record.usage?.outputTokens),
@@ -227,7 +228,7 @@ function appendWorkerRollups(root, records) {
       continue;
     }
     const row = { ...workerRollup(record ?? {}), retirementIds: [entry] };
-    const key = JSON.stringify([row.month, row.agentType, row.model, row.transportStatus, row.acceptance, row.failureKind]);
+    const key = JSON.stringify([row.month, row.agentType, row.model, row.transportStatus, row.acceptance, row.failureKind, row.fallbackReason]);
     const current = rows.get(key);
     if (current) {
       current.retirementIds.push(entry);
@@ -662,6 +663,7 @@ export function createWorkerRecord(record, env = process.env) {
       agentType: canonicalWorkerAgentType(record.agentType) ?? record.agentType,
       lane: canonicalWorkerAgentType(record.agentType) ?? record.agentType,
       requestedModel: typeof record.requestedModel === "string" ? record.requestedModel : null,
+      ...(record.mode ? { mode: record.mode, billingPool: record.billingPool ?? null } : {}),
       description: record.description ?? null,
       workspaceRoot: path.resolve(record.workspaceRoot),
       ...(record.companionCwd ? { companionCwd: record.companionCwd } : {}),
@@ -709,6 +711,7 @@ export function createWorkerRecord(record, env = process.env) {
       packageType: record.packageType ?? "consult",
       briefBytes: Number.isSafeInteger(record.briefBytes) ? record.briefBytes : null,
       briefFile: record.briefFile ?? null,
+      fallbackReason: record.fallbackReason ?? null,
       completionContract: record.completionContract ?? "verification",
       ...(record.expectedPeerEngine && record.expectedPeerJobId ? { expectedPeerEngine: record.expectedPeerEngine, expectedPeerJobId: record.expectedPeerJobId } : {}),
       createdAt: record.createdAt ?? now,

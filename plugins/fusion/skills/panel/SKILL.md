@@ -1,6 +1,6 @@
 ---
 name: panel
-description: Convenes a blind Codex and Grok panel on one neutral brief, seats Antigravity before the breadth engine for a missing track, and adjudicates the verdicts.
+description: Convenes a blind panel of every healthy external track (Codex, Grok, Antigravity, and the breadth engine) on one neutral brief and adjudicates the verdicts.
 when_to_use: Proactively use when the user is stuck between two approaches, faces a design or architecture decision where being wrong is expensive, has a diagnosis that resisted one fix, or asks to compare options or get multiple opinions.
 argument-hint: '[decision or question to adjudicate]'
 allowed-tools: Agent, Read, AskUserQuestion
@@ -23,8 +23,9 @@ Launch the panel:
 
 - In one tool message, invoke `grok:grok-rescue` and `codex:codex-rescue` with the identical brief as their direct prompt. Use plain `grok-rescue` or `codex-rescue` if the namespaced form is not found. Do not set `run_in_background`; parallel tool calls provide overlap while each result remains owned and collected.
 - Never set background mode on the Codex Agent and never add `--background` to its brief. Complexity, expected duration, and model choice do not change this rule.
-- Add `agy:agy-rescue` as the third parallel track when the user asks for a wider panel; its identical brief already carries `agy-role: independence`. It is a read only Google family consult.
-- Add the selected breadth engine's `<breadth>:<breadth>-rescue` agent as a further parallel track only when the user asks for more tracks. Its copy of the identical brief adds `<breadth>-role: diversity` to the routing header, and its leading companion options pick a model from a family that is neither the orchestrator's nor OpenAI's nor xAI's nor Google's, using the breadth diversity lane default unless the routing table scores a better unseated family.
+- In the same message, add `agy:agy-rescue` as a parallel track; its identical brief already carries `agy-role: independence`. It is a read only Google family consult.
+- In the same message, add the selected breadth engine's `<breadth>:<breadth>-rescue` agent as a parallel track. Its copy of the identical brief adds `<breadth>-role: diversity` to the routing header, and its leading companion options pick a model from a family that is neither the orchestrator's nor OpenAI's nor xAI's nor Google's, using the breadth diversity lane default unless the routing table scores a better unseated family.
+- Skip at compose time any track the session context reports blocked or unhealthy for consults (a host check blocker or an open breaker), instead of launching it and rerunning; name each skipped track in the synthesis.
 - Add `fusion:deep-reasoner` as a parallel track only when the user asks for it or the question hinges on Claude native long horizon reasoning. Its prompt must use the `fusion-brief: v1` isolated envelope.
 
 Degrade when a track is unavailable:
@@ -36,7 +37,7 @@ Degrade when a track is unavailable:
 
 Wait and stay blind:
 
-- Wait for every track to return before synthesizing anything.
+- Synthesize once the Codex track and at least one track from another family have returned (any two tracks when Codex is skipped). A track that returns later is folded in as an attributed addendum to the verdict, never discarded and never a reason to rerun the panel. Never poll for a missing track.
 - Never paste one engine's output into another engine's prompt. This applies to follow ups too: a follow up to an engine may reference only the original brief and that engine's own prior output.
 
 Adjudicate with a structured analysis first:

@@ -5,7 +5,9 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
+import { OPERATING_LIMITS_NOTE } from "../plugins/agy/scripts/lib/agy-exec.mjs";
 import { verifyJobWatch } from "./lib/job-watch-harness.mjs";
+import { executionTimeoutProbe } from "./lib/execution-budget.mjs";
 
 verifyJobWatch("agy");
 
@@ -129,6 +131,14 @@ test("consult records Antigravity fields, subscription pool, and contiguous foot
   assert.deepEqual(h.messages().map((message) => message.method), ["initialize", "session/new", "session/set_mode", "session/set_config_option", "session/set_config_option", "session/prompt"]);
 });
 
+test("the operating limits note precedes the brief in consult and burst", (t) => {
+  const h = harness(t);
+  assertDone(task(h, [], "consult brief"));
+  assert.equal(h.messages().at(-1).params.prompt[0].text, `${OPERATING_LIMITS_NOTE}\n\nconsult brief`);
+  assertDone(task(h, ["--write"], "burst brief"));
+  assert.equal(h.messages().at(-1).params.prompt[0].text, `${OPERATING_LIMITS_NOTE}\n\nburst brief`);
+});
+
 test("write selects accept-edits, retains HOME, resets settings, and pins effort", (t) => {
   const h = harness(t, "write_tool", { GEMINI_API_KEY: "drop", GOOGLE_API_KEY: "drop", AGY_MODEL: "drop" });
   assertDone(task(h, ["--write", "--effort", "xhigh"], "lane: agy burst\nimplement"));
@@ -193,7 +203,7 @@ test("refused permission requests render a warning with the successful outcome",
   const result = task(h);
   assertDone(result);
   assert.equal(h.jobs()[0].permissionsRejected, 1);
-  assert.match(result.stdout, /warning: permission_refused: 1 request\(s\) refused, which ends the Antigravity turn early\nstate: done\n$/);
+  assert.match(result.stdout, /warning: permission_refused: 1 request\(s\) refused \(run_command: touch outside\), which ends the Antigravity turn early\nstate: done\n$/);
 });
 
 test("refused permission requests without a result persist and render a permission failure", (t) => {
@@ -207,16 +217,32 @@ test("refused permission requests without a result persist and render a permissi
     assert.equal(record.stopReason, "end_turn");
     assert.equal(record.permissionsRejected, 1);
     assert.equal(record.failureKind, "permission");
-    assert.equal(record.errorMessage, "Antigravity refused 1 permission request(s) and returned no result, so the turn ended early.");
+    assert.equal(record.errorMessage, "Antigravity refused 1 permission request(s) (read_file: git status --short) and returned no result, so the turn ended early.");
     if (args.length) {
       const payload = JSON.parse(result.stdout);
       assert.equal(payload.failureKind, "permission");
       assert.equal(payload.permissionsRejected, 1);
     } else {
       assert.match(result.stdout + result.stderr, /state: error\nfailure: permission\n$/);
-      assert.match(result.stdout + result.stderr, /Antigravity refused 1 permission request\(s\) and returned no result/);
+      assert.match(result.stdout + result.stderr, /Antigravity refused 1 permission request\(s\) \(read_file: git status --short\) and returned no result/);
     }
   }
+});
+
+test("refused permission details redact credential shaped values", (t) => {
+  const secret = "s3cr3t-token-value";
+  const warned = harness(t, "permission_write", { FAKE_AGY_COMMAND: `curl -H 'Authorization: Bearer ${secret}' --api-key ${secret}`, FAKE_AGY_PERMISSION_TOOL: "run_command" });
+  const warnedResult = task(warned);
+  assertDone(warnedResult);
+  assert.match(warnedResult.stdout, /run_command: curl -H 'Authorization: Bearer \[redacted\]' --api-key \[redacted\]/);
+  assert.ok(!warnedResult.stdout.includes(secret));
+  const failed = harness(t, "permission_empty", { FAKE_AGY_COMMAND: `env TOKEN=${secret} curl`, FAKE_AGY_PERMISSION_TOOL: "run_command" });
+  const failedResult = task(failed);
+  assert.equal(failedResult.status, 1, failedResult.stdout + failedResult.stderr);
+  const record = failed.jobs()[0];
+  assert.equal(record.failureKind, "permission");
+  assert.equal(record.errorMessage, "Antigravity refused 1 permission request(s) (run_command: env TOKEN=[redacted] curl) and returned no result, so the turn ended early.");
+  assert.ok(!(failedResult.stdout + failedResult.stderr + JSON.stringify(record)).includes(secret));
 });
 
 test("resumes only same mode and workspace, checks replay tools, excludes replay text, and fresh ignores continuity", (t) => {
@@ -333,8 +359,29 @@ test("raw transport consumes staged input without interpreting shell syntax", (t
   fs.writeFileSync(created.file, `--model gemini-4-neon -- ${brief}`);
   assertDone(h.run(["task", "--raw-args-token", created.token]));
   assert.equal(fs.existsSync(created.file), false);
-  assert.equal(h.messages().at(-1).params.prompt[0].text, brief);
+  assert.equal(h.messages().at(-1).params.prompt[0].text, `${OPERATING_LIMITS_NOTE}\n\n${brief}`);
   assert.equal(fs.existsSync(path.join(h.cwd, "nope")), false);
+});
+
+test("a timed out Antigravity task resumes its session for wind down", (t) => {
+  const h = harness(t, "wind_down", { AGY_COMPANION_TIMEOUT_MS: "1500", AGY_COMPANION_EXIT_GRACE_MS: "100" });
+  const probe = executionTimeoutProbe(h.temp, 1500);
+  Object.assign(h.env, probe.env);
+  const result = task(h);
+  assertDone(result);
+  assert.deepEqual(probe.timeouts(), [1500, 240000]);
+  assert.equal(h.jobs().length, 1);
+  const [record] = h.jobs();
+  assert.deepEqual(record.salvage, { attempted: true, outcome: "done", originalPid: record.salvage.originalPid,
+    resumePid: record.salvage.resumePid, resumePidIdentity: record.salvage.resumePidIdentity });
+  assert.ok(Number.isInteger(record.salvage.originalPid) && record.salvage.originalPid > 1);
+  assert.ok(Number.isInteger(record.salvage.resumePid) && record.salvage.resumePid > 1);
+  assert.notEqual(record.salvage.resumePid, record.salvage.originalPid);
+  assert.ok(record.salvage.resumePidIdentity);
+  assert.equal(record.semanticFailureKind, "timeout_salvaged");
+  assert.ok(h.messages().some((message) => message.method === "session/load" && message.params.sessionId === record.sessionId));
+  assert.match(h.messages().find((message) => message.method === "session/prompt").params.prompt[0].text, /\n\nYour time budget is exhausted\. Stop exploring\./);
+  assert.match(result.stdout, /warning: timeout_salvaged\nstate: done\n$/);
 });
 
 test("execution budgets follow launch transport without relying on process enumeration", async (t) => {

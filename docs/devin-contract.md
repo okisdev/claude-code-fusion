@@ -57,9 +57,9 @@ Resolution of a requested model and effort:
 1. The requested model may be a family slug (`kimi-k3`, `glm-5.2`, `swe-2`), a family alias, or a variant uid. A name that matches no catalog family fails before job creation as `input` and lists the catalog's families. Inside the run, the companion selects the session `model` option whose value is one of that family's variant uids; a family the account cannot use has no such option and fails the job as `setup`, listing the account's usable families.
 2. After setting the model, `default` effort leaves `thought_level` at the model's default; any other effort must be one of the `thought_level` values, and an effort the model does not offer fails the job as `input` listing the offered values. A model without a `thought_level` option records `effortApplied: false`.
 3. `speed` is always set to `standard` when offered, including for a run that names no model, because `fast` bills at a multiple of the list price.
-4. `adaptive` and every `fusion-*` pairing are refused as `input`, because they route to models the session does not pin.
+4. `adaptive` and `fusion-*` pairings are refused as `input` for read only jobs, because they route to models the session does not pin. A write task may pin an exact `fusion-<planner>-sidekick-swe-2-<tier>` variant uid, which records the planner and sidekick on the job, unless the planner is a Claude family model, which would not be an independent lane.
 
-The agent reports the model that served the turn in `_cognition.ai/agent_stopped` (`stats.modelLabel`) and `_cognition.ai/turn_stats`. The companion records it as `observedModel`; when it differs from the selected option's display name the companion renders a `model_mismatch` warning and keeps the transport outcome. `billingPool` is `first-party` for `swe-*` models and `api` for every other model.
+The agent reports the model that served the turn in `_cognition.ai/agent_stopped` (`stats.modelLabel`) and `_cognition.ai/turn_stats`. The companion records it as `observedModel`; when it differs from the selected option's display name — or, for a pairing, names neither the planner nor the sidekick — the companion renders a `model_mismatch` warning and keeps the transport outcome. `billingPool` is `free` for variants whose catalog `cost_tier` is free and `credits` for every priced tier.
 
 ## Protocol stream
 

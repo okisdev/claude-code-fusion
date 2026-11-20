@@ -3,14 +3,17 @@ import fs from "node:fs";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
 
-function executionTimeoutProbe(root) {
+export function executionTimeoutProbe(root, maxTimeoutMs) {
   const file = path.join(root, "execution-timeouts.jsonl");
   const preload = path.join(root, "execution-timeouts.cjs");
   fs.writeFileSync(file, "");
   fs.writeFileSync(preload, `const fs = require("node:fs");
 const original = globalThis.setTimeout;
 globalThis.setTimeout = (callback, delay, ...args) => {
-  if (/^\\(\\)\\s*=>\\s*(?:handleRunTimeout|expireGrokRun)\\(/.test(String(callback))) fs.appendFileSync(${JSON.stringify(file)}, JSON.stringify(delay) + "\\n");
+  if (/^\\(\\)\\s*=>\\s*(?:handleRunTimeout|expireGrokRun)\\(/.test(String(callback))) {
+    fs.appendFileSync(${JSON.stringify(file)}, JSON.stringify(delay) + "\\n");
+    delay = Math.min(delay, ${maxTimeoutMs ?? "Infinity"});
+  }
   return original(callback, delay, ...args);
 };
 `);
@@ -89,7 +92,7 @@ export async function verifyExecutionBudgets(t, { engine, createHarness, model, 
     });
   }
 
-  await t.test("wrapper flag requires a task transport with exactly one token", (t) => {
+  await t.test("wrapper flag requires a supported transport with exactly one token", (t) => {
     const h = createHarness(t, { [timeoutEnv]: "" });
     const created = h.run(["transport-create"]);
     assert.equal(created.status, 0, created.stderr);
@@ -100,7 +103,8 @@ export async function verifyExecutionBudgets(t, { engine, createHarness, model, 
       ["task", "--transport-background-shell", "--transport-default-write", "--raw-args-token", transport.token],
       ["task", "--transport-background-shell", "--transport-background-shell", "--raw-args-token", transport.token],
       ["task", "--transport-background-shell", "--raw-args-token", transport.token, "--json"],
-      ["review", "--transport-background-shell", "--raw-args-token", transport.token]
+      [engine === "grok" ? "review" : "status", "--transport-background-shell", "--raw-args-token", transport.token],
+      ["review", "--transport-background-shell", "--raw-args-token", transport.token, "--json"]
     ]) {
       const result = h.run(args);
       assert.equal(result.status, 1, result.stdout + result.stderr);

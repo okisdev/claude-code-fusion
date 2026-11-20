@@ -114,7 +114,7 @@ function readEngineModelListing(engine, env) {
   }
   const result = spawnSync(process.execPath, [companion, "models", "--json"], { encoding: "utf8", env, timeout: 60_000 });
   if (result.error || result.status !== 0) {
-    return { available: false, reason: result.error?.message || result.stderr.trim() || `exit ${result.status}` };
+    return { available: false, reason: result.error?.message || result.stderr?.trim() || `exit ${result.status}` };
   }
   try {
     const data = JSON.parse(result.stdout);
@@ -133,7 +133,7 @@ function matchesListing(engine, id, listedIds) {
 
 function auditModelDrift(env) {
   const modelRoutingFile = resolveModelRoutingPath(env);
-  const routing = readModelRoutingFile(modelRoutingFile);
+  const routing = readModelRoutingFile(modelRoutingFile, { env });
   const defaults = readRoutingDefaults(env, { warn: null });
   const routed = new Set(routedEngineIds(defaults.breadth));
   const engines = Object.fromEntries(ENGINE_IDS.map((engine) => {
@@ -167,20 +167,20 @@ function defaultData() {
   };
 }
 
-function loadEditableData(filePath) {
+function loadEditableData(filePath, env) {
   if (!fs.existsSync(filePath)) {
     return defaultData();
   }
-  const result = readModelRoutingFile(filePath);
+  const result = readModelRoutingFile(filePath, { env });
   if (!result.ok) {
     throw new UsageError(`Cannot edit ${filePath}: ${result.reason}`);
   }
   return result.data;
 }
 
-function writeModelRoutingData(filePath, data) {
+function writeModelRoutingData(filePath, data, env) {
   data.updatedAt = new Date().toISOString();
-  const validation = validateModelRoutingData(data);
+  const validation = validateModelRoutingData(data, { env });
   if (!validation.ok) {
     throw new UsageError(`Cannot write model routing file: ${validation.reason}`);
   }
@@ -191,8 +191,8 @@ function writeModelRoutingData(filePath, data) {
 function showCommand(options, env, stdout) {
   ensureOnlyOptions(options, new Set(["json"]), "show");
   const filePath = resolveModelRoutingPath(env);
-  const result = readModelRoutingFile(filePath);
-  const table = result.ok ? renderModelTable(result.data, { includeNotes: true }) : result.missing ? DEFAULT_MODEL_TABLE_PLACEHOLDER : null;
+  const result = readModelRoutingFile(filePath, { env });
+  const table = result.ok ? renderModelTable(result.data, { includeNotes: true, env }) : result.missing ? DEFAULT_MODEL_TABLE_PLACEHOLDER : null;
   if (options.json) {
     stdout.write(
       `${JSON.stringify(
@@ -234,7 +234,7 @@ function auditCommand(options, env, stdout) {
     lines.push(`Invalid model routing file: ${report.error}`);
   }
   for (const [lane, roles] of Object.entries(report.defaults)) {
-    lines.push(`${lane} defaults: ${Object.entries(roles).map(([role, choice]) => `${role} ${choice.model}@${choice.effort}`).join(", ")}`);
+    lines.push(`${lane} defaults: ${Object.entries(roles).map(([role, choice]) => `${role} ${choice.model}@${choice.effort} (pool: ${choice.pool ?? "unknown"}, cost class: ${choice.costClass ?? "unknown"})`).join(", ")}`);
   }
   for (const engine of ENGINE_IDS) {
     const { listing, configuredButAbsent, defaultsAbsent, unscored } = report.engines[engine];
@@ -268,11 +268,11 @@ function setDefaultCommand(positionals, options, env, stdout) {
   }
   const model = requireId(rawModel);
   const filePath = resolveModelRoutingPath(env);
-  const data = loadEditableData(filePath);
+  const data = loadEditableData(filePath, env);
   data.defaults ??= {};
   data.defaults[lane] ??= {};
   data.defaults[lane][role] = { model, effort };
-  const validation = validateModelRoutingData(data);
+  const validation = validateModelRoutingData(data, { env });
   if (!validation.ok) {
     throw new UsageError(`Cannot write model routing file: ${validation.reason}`);
   }
@@ -284,7 +284,7 @@ function setDefaultCommand(positionals, options, env, stdout) {
   } else {
     stdout.write(`fusion-config: ${ENGINES[lane].displayName} model listing unavailable; model availability was not checked.\n`);
   }
-  writeModelRoutingData(filePath, data);
+  writeModelRoutingData(filePath, data, env);
   stdout.write(`Updated ${lane} ${role} default to ${model}@${effort}.\n`);
 }
 
@@ -295,9 +295,9 @@ function setBreadthCommand(positionals, options, env, stdout) {
   }
   const breadth = positionals[0];
   const filePath = resolveModelRoutingPath(env);
-  const data = loadEditableData(filePath);
+  const data = loadEditableData(filePath, env);
   data.breadth = breadth;
-  writeModelRoutingData(filePath, data);
+  writeModelRoutingData(filePath, data, env);
   stdout.write(`Updated breadth engine to ${ENGINES[breadth].displayName} (${breadth}).\n`);
 }
 
@@ -314,7 +314,7 @@ function rescoreCommand(positionals, options, env, stdout) {
     throw new UsageError(`Expected --lane to be one of ${[...MODEL_ROUTING_LANES].join(", ")}.`);
   }
   const filePath = resolveModelRoutingPath(env);
-  const data = loadEditableData(filePath);
+  const data = loadEditableData(filePath, env);
   const index = data.models.findIndex((model) => model.id === id);
   const current = index === -1 ? { id } : data.models[index];
   const next = {
@@ -341,7 +341,7 @@ function rescoreCommand(positionals, options, env, stdout) {
   } else {
     data.models[index] = next;
   }
-  writeModelRoutingData(filePath, data);
+  writeModelRoutingData(filePath, data, env);
   stdout.write(`Updated model score for ${id}.\n`);
 }
 
@@ -356,14 +356,14 @@ function removeCommand(positionals, options, env, stdout) {
     stdout.write(`No model routing file exists at ${filePath}.\n`);
     return;
   }
-  const data = loadEditableData(filePath);
+  const data = loadEditableData(filePath, env);
   const before = data.models.length;
   data.models = data.models.filter((model) => model.id !== id);
   if (data.models.length === before) {
     stdout.write(`No model score found for ${id}.\n`);
     return;
   }
-  writeModelRoutingData(filePath, data);
+  writeModelRoutingData(filePath, data, env);
   stdout.write(`Removed model score for ${id}.\n`);
 }
 
@@ -374,9 +374,9 @@ function setCostProfileCommand(positionals, options, env, stdout) {
     throw new UsageError("Expected set-cost-profile <text>.");
   }
   const filePath = resolveModelRoutingPath(env);
-  const data = loadEditableData(filePath);
+  const data = loadEditableData(filePath, env);
   data.costProfile = text;
-  writeModelRoutingData(filePath, data);
+  writeModelRoutingData(filePath, data, env);
   stdout.write("Updated cost profile.\n");
 }
 

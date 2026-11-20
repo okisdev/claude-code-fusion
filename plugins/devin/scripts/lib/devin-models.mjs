@@ -54,12 +54,26 @@ export function isPinnableFamily(family) {
   return slug !== "adaptive" && !slug.startsWith("fusion") && !family.variants.some((variant) => variant.uid.toLowerCase().startsWith("fusion"));
 }
 
-export function findCatalogFamily(catalog, requested) {
+export function pairingForModel(requested) {
+  const match = /^fusion-(.+)-sidekick-(swe-2-.+)$/.exec(String(requested ?? "").toLowerCase());
+  return match ? { planner: match[1], sidekick: match[2] } : null;
+}
+
+export function findCatalogFamily(catalog, requested, { write = false } = {}) {
   const name = String(requested ?? "").toLowerCase();
-  if (["adaptive", "default", "auto"].includes(name) || name.startsWith("fusion")) {
+  const families = catalog.families;
+  const pairing = name.startsWith("fusion") ? pairingForModel(name) : null;
+  if (["adaptive", "default", "auto"].includes(name) || name.startsWith("fusion") && !pairing) {
     throw inputError(`Devin model ${requested} cannot be pinned.`);
   }
-  const families = catalog.families;
+  if (pairing) {
+    const owner = families.find((item) => item.variants.some((variant) => variant.uid.toLowerCase() === name));
+    const claudePlanner = pairing.planner === "claude" || pairing.planner.startsWith("claude-");
+    if (!write || claudePlanner || !owner) {
+      throw inputError(`Devin model ${requested} cannot be pinned.`);
+    }
+    return owner;
+  }
   const family = families.find((item) => [item.slug, ...item.aliases, ...item.variants.map((variant) => variant.uid)]
     .some((value) => value.toLowerCase() === name));
   if (!family) throw inputError(`Unknown Devin model ${requested}. Available families: ${families.map((item) => item.slug).join(", ")}`);
@@ -109,6 +123,22 @@ export function createSpeedResolver() {
   return resolver;
 }
 
-export function billingPoolForModel(slugOrUid) {
-  return slugOrUid.toLowerCase().startsWith("swe-") ? "first-party" : "api";
+function poolForCostTier(tier) {
+  return typeof tier === "string" && tier.toLowerCase() === "free" ? "free" : "credits";
+}
+
+export function billingPoolForModel(catalog, slugOrUid) {
+  const name = String(slugOrUid ?? "").toLowerCase();
+  for (const family of catalog.families) {
+    const variant = family.variants.find((item) => item.uid.toLowerCase() === name);
+    if (variant) return poolForCostTier(variant.cost_tier);
+    if ([family.slug, ...family.aliases].some((value) => value.toLowerCase() === name)) {
+      return poolForCostTier(family.variants[0]?.cost_tier);
+    }
+  }
+  return "credits";
+}
+
+export function costClassForPool(pool) {
+  return pool === "free" || pool === "first-party" ? "free" : "metered";
 }

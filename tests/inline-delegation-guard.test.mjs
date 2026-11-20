@@ -14,6 +14,8 @@ import {
 import { messageCode, messageTag, tagMessage } from "../plugins/fusion/scripts/lib/user-messages.mjs";
 import { normalizeState } from "../plugins/fusion/scripts/lib/guard/state.mjs";
 import { resolveAuditDir, resolveStateDir } from "../plugins/fusion/scripts/lib/guard/config.mjs";
+import { ENGINES } from "../plugins/fusion/scripts/lib/engines.mjs";
+import { createWorkerRecord, updateWorkerRecord } from "../plugins/fusion/scripts/lib/worker-state.mjs";
 
 const repoRoot = path.join(import.meta.dirname, "..");
 const script = path.join(repoRoot, "plugins", "fusion", "scripts", "inline-delegation-guard.mjs");
@@ -288,7 +290,7 @@ test("legacy strict environment and persisted posture behave exactly like the de
     const after = readState(sandbox, "session-1");
     assert.strictEqual(after.writesSinceDispatch, 0);
     assert.strictEqual(after.writeReplayTokens, 0);
-    const env = envFor(sandbox, extraEnv);
+    const env = envFor(sandbox, { ...extraEnv, ...Object.fromEntries(Object.values(ENGINES).map((engine) => [engine.companionEnv, path.join(sandbox.root, `missing-${engine.id}.mjs`)])) });
     const prompt = JSON.stringify({ session_id: "session-1", cwd: sandbox.workDir });
     for (let index = 0; index < 2; index += 1) {
       const fleet = spawnSync(process.execPath, [path.join(repoRoot, "plugins/fusion/scripts/fleet-posture.mjs")], { env, input: prompt, encoding: "utf8" });
@@ -851,6 +853,132 @@ test("dispatch, verify, and settle records evidence with zero inline writes", (t
   assert.strictEqual(event.writeCount, 0);
   assert.strictEqual(event.dispatchCount, 1);
   assert.strictEqual(event.evidence, "exit-status");
+});
+
+function reviewWaveWorkerEnv(sandbox, extra = {}) {
+  return {
+    FUSION_WORKER_STATE_DIR: path.join(sandbox.root, "workers"),
+    ...Object.fromEntries(Object.values(ENGINES).map((engine) => [engine.dataEnv, path.join(sandbox.root, `${engine.id}-data`)])),
+    ...extra
+  };
+}
+
+function createSettledWorker(sandbox, taskId, { packageType = "implementation", agentType = "fusion:claude-worker" } = {}) {
+  const env = { ...process.env, ...reviewWaveWorkerEnv(sandbox) };
+  createWorkerRecord({ taskId, sessionId: "session-1", agentType, workspaceRoot: sandbox.workDir, packageType, limits: {} }, env);
+  return updateWorkerRecord(taskId, env, (record) => ({ ...record, transportStatus: "done", finishedAt: record.createdAt ?? null }));
+}
+
+function settlementPayload(sandbox, taskId, { verdict = "accepted", toolResponse, toolUseId = `settle-${taskId}` } = {}) {
+  return {
+    ...verificationPayload(sandbox, {
+      command: `node fusion-stats.mjs --record ${taskId}=${verdict}`,
+      toolResponse: toolResponse ?? { stdout: `Recorded ${verdict} for Fusion worker task ${taskId}.\n` }
+    }),
+    tool_use_id: toolUseId
+  };
+}
+
+test("an accepted implementation settlement suggests one cross family review and throttles per session", (t) => {
+  const sandbox = makeSandbox(t);
+  const env = reviewWaveWorkerEnv(sandbox);
+  const firstTaskId = `fusion-${"a".repeat(24)}`;
+  const secondTaskId = `fusion-${"b".repeat(24)}`;
+  createSettledWorker(sandbox, firstTaskId);
+  createSettledWorker(sandbox, secondTaskId);
+
+  const emitted = run(sandbox, settlementPayload(sandbox, firstTaskId), env);
+  assert.strictEqual(emitted.status, 0, emitted.stderr);
+  const context = JSON.parse(emitted.stdout).hookSpecificOutput.additionalContext;
+  assert.strictEqual(
+    context,
+    "Wave settled. Dispatch one cross family review of the working tree diff now, in the same message as your next work: cursor:cursor-rescue with header `cursor-role: diversity | operation: review | acceptance: findings cite file:line`."
+  );
+
+  const throttled = run(sandbox, settlementPayload(sandbox, secondTaskId), env);
+  assert.strictEqual(throttled.status, 0, throttled.stderr);
+  assert.strictEqual(throttled.stdout, "");
+  assert.ok(Number.isFinite(Date.parse(readState(sandbox, "session-1").reviewSuggestedAt)));
+});
+
+test("the settled review suggestion names the routed breadth engine and only accepted implementation packages", (t) => {
+  const sandbox = makeSandbox(t);
+  const routing = path.join(sandbox.root, "model-routing.json");
+  fs.writeFileSync(routing, JSON.stringify({
+    schemaVersion: 1,
+    updatedAt: "2026-07-01T00:00:00.000Z",
+    costProfile: "",
+    breadth: "devin",
+    models: []
+  }));
+  const env = reviewWaveWorkerEnv(sandbox, { FUSION_MODEL_ROUTING: routing });
+  const taskId = `fusion-${"c".repeat(24)}`;
+  const consultTaskId = `fusion-${"d".repeat(24)}`;
+  createSettledWorker(sandbox, taskId);
+  createSettledWorker(sandbox, consultTaskId, { packageType: "consult" });
+
+  for (const [label, payload] of [
+    ["a consult package", settlementPayload(sandbox, consultTaskId)],
+    ["a rejected verdict", settlementPayload(sandbox, taskId, { verdict: "rejected", toolResponse: { stdout: `Recorded rejected for Fusion worker task ${taskId}.\n` } })],
+    ["an unrecorded acceptance", settlementPayload(sandbox, taskId, { toolResponse: { stdout: `Queued accepted for ${taskId}; applies when the record turns terminal.\n` } })],
+    ["a failed settlement", settlementPayload(sandbox, taskId, { toolResponse: { exitCode: 1, stderr: `Failed to settle ${taskId}: boom\n` } })],
+    ["an unknown task", settlementPayload(sandbox, `fusion-${"e".repeat(24)}`)]
+  ]) {
+    const result = run(sandbox, payload, env);
+    assert.strictEqual(result.status, 0, `${label}: ${result.stderr}`);
+    assert.strictEqual(result.stdout, "", label);
+    const file = stateFileFor(sandbox, "session-1");
+    assert.strictEqual(fs.existsSync(file) ? JSON.parse(fs.readFileSync(file, "utf8")).reviewSuggestedAt : null, null, label);
+  }
+
+  const emitted = run(sandbox, settlementPayload(sandbox, taskId), env);
+  const context = JSON.parse(emitted.stdout).hookSpecificOutput.additionalContext;
+  assert.strictEqual(
+    context,
+    "Wave settled. Dispatch one cross family review of the working tree diff now, in the same message as your next work: devin:devin-rescue with header `devin-role: diversity | operation: review | acceptance: findings cite file:line`."
+  );
+});
+
+test("the settled review suggestion falls back to Antigravity when breadth consult health is unhealthy", (t) => {
+  const sandbox = makeSandbox(t);
+  const now = "2026-07-21T00:10:00.000Z";
+  const routing = path.join(sandbox.root, "model-routing.json");
+  fs.writeFileSync(routing, JSON.stringify({
+    schemaVersion: 1,
+    updatedAt: "2026-07-01T00:00:00.000Z",
+    costProfile: "",
+    breadth: "devin",
+    models: []
+  }));
+  const env = reviewWaveWorkerEnv(sandbox, { FUSION_MODEL_ROUTING: routing });
+  const taskId = `fusion-${"f".repeat(24)}`;
+  const failureTaskId = `fusion-${"0".repeat(24)}`;
+  createSettledWorker(sandbox, taskId);
+  const workerEnv = { ...process.env, ...env };
+  createWorkerRecord({ taskId: failureTaskId, sessionId: "session-1", agentType: "devin:devin-rescue", workspaceRoot: sandbox.workDir, packageType: "consult", limits: {} }, workerEnv);
+  updateWorkerRecord(failureTaskId, workerEnv, (record) => ({ ...record, transportStatus: "failed", failureKind: "auth", finishedAt: "2026-07-21T00:05:00.000Z" }));
+
+  const emitted = run(sandbox, settlementPayload(sandbox, taskId), { ...env, FUSION_TEST_NOW: now });
+  assert.strictEqual(emitted.status, 0, emitted.stderr);
+  const context = JSON.parse(emitted.stdout).hookSpecificOutput.additionalContext;
+  assert.strictEqual(
+    context,
+    "Wave settled. Dispatch one cross family review of the working tree diff now, in the same message as your next work: agy:agy-rescue with header `agy-role: independence | operation: review | acceptance: findings cite file:line`."
+  );
+});
+
+test("the settled review suggestion re-arms thirty minutes after the last emission", (t) => {
+  const sandbox = makeSandbox(t);
+  const env = reviewWaveWorkerEnv(sandbox);
+  const taskId = `fusion-${"1".repeat(24)}`;
+  createSettledWorker(sandbox, taskId);
+  const at = (iso) => run(sandbox, settlementPayload(sandbox, taskId, { toolUseId: `settle-${iso}` }), { ...env, FUSION_TEST_NOW: iso });
+  const first = at("2026-07-21T00:00:00.000Z");
+  assert.match(JSON.parse(first.stdout).hookSpecificOutput.additionalContext, /^Wave settled\./);
+  const repeat = at("2026-07-21T00:29:00.000Z");
+  assert.strictEqual(repeat.stdout, "");
+  const rearmed = at("2026-07-21T00:31:00.000Z");
+  assert.match(JSON.parse(rearmed.stdout).hookSpecificOutput.additionalContext, /^Wave settled\./);
 });
 
 test("an unrecognized Bash command does not reset the write window", (t) => {

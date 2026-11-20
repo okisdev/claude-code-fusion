@@ -123,7 +123,7 @@ function seedCodexJobs(box, ids) {
 }
 
 function brief() {
-  return "fusion-brief: v1\ncontext-mode: isolated\ngoal: implement one fix\nscope: src/a.ts\nverification: node --test\n";
+  return "fusion-brief: v1\ncontext-mode: isolated\nclaude-fallback: claude-surface\ngoal: implement one fix\nscope: src/a.ts\nverification: node --test\n";
 }
 
 function collectorPrompt(engine, jobId) {
@@ -570,7 +570,7 @@ test("package-type envelopes validate, default, and persist their byte length", 
   }
 
   assert.strictEqual(validateWorkerBrief(brief(), "fusion:claude-worker").packageType, "implementation");
-  assert.strictEqual(validateWorkerBrief("fusion-brief: v1\ncontext-mode: isolated\ngoal: inspect one file\nscope: src/a.ts\nacceptance: identify the behavior\n", "fusion:claude-worker").packageType, "consult");
+  assert.strictEqual(validateWorkerBrief("fusion-brief: v1\ncontext-mode: isolated\nclaude-fallback: claude-surface\ngoal: inspect one file\nscope: src/a.ts\nacceptance: identify the behavior\n", "fusion:claude-worker").packageType, "consult");
 
   const duplicate = validateWorkerBrief(`${brief()}package-type: review\npackage-type: research\n`, "fusion:claude-worker");
   assert.strictEqual(duplicate.ok, false);
@@ -609,7 +609,7 @@ test("package-type envelopes validate, default, and persist their byte length", 
 
 test("verification manifest advisories identify missing suites and stay silent for complete verification", (t) => {
   const incomplete = sandbox(t);
-  const prompt = "fusion-brief: v1\ncontext-mode: isolated\ngoal: update plugins/fusion/scripts/worker-lifecycle.mjs\nscope: plugins/fusion/scripts/worker-lifecycle.mjs\nverification: node --test tests/fusion-worker-lifecycle.test.mjs\n";
+  const prompt = "fusion-brief: v1\ncontext-mode: isolated\nclaude-fallback: claude-surface\ngoal: update plugins/fusion/scripts/worker-lifecycle.mjs\nscope: plugins/fusion/scripts/worker-lifecycle.mjs\nverification: node --test tests/fusion-worker-lifecycle.test.mjs\n";
   const launched = JSON.parse(run(incomplete, dispatch(incomplete, { prompt })).stdout).hookSpecificOutput;
   assert.strictEqual(launched.permissionDecision, "allow");
   assert.match(launched.additionalContext, /Verification advisory/);
@@ -626,7 +626,7 @@ test("verification manifest advisories identify missing suites and stay silent f
 
 test("verification manifest failures are silent and the environment override supplies requirements", (t) => {
   const missing = sandbox(t);
-  const prompt = "fusion-brief: v1\ncontext-mode: isolated\ngoal: update plugins/fusion/scripts/worker-lifecycle.mjs\nscope: plugins/fusion/scripts/worker-lifecycle.mjs\nverification: node --test\n";
+  const prompt = "fusion-brief: v1\ncontext-mode: isolated\nclaude-fallback: claude-surface\ngoal: update plugins/fusion/scripts/worker-lifecycle.mjs\nscope: plugins/fusion/scripts/worker-lifecycle.mjs\nverification: node --test\n";
   const missingLaunch = JSON.parse(run(missing, dispatch(missing, { prompt }), { FUSION_VERIFICATION_MANIFEST: path.join(missing.root, "missing-manifest.json") }).stdout).hookSpecificOutput;
   assert.strictEqual(missingLaunch.permissionDecision, "allow");
   assert.strictEqual(missingLaunch.additionalContext, undefined);
@@ -634,7 +634,7 @@ test("verification manifest failures are silent and the environment override sup
   const overridden = sandbox(t);
   const manifest = path.join(overridden.root, "verification-manifest.json");
   fs.writeFileSync(manifest, JSON.stringify([{ paths: ["src/custom.mjs"], suites: ["tests/custom.test.mjs"] }]));
-  const overridePrompt = "fusion-brief: v1\ncontext-mode: isolated\ngoal: update src/custom.mjs\nscope: src/custom.mjs\nverification: node --test\n";
+  const overridePrompt = "fusion-brief: v1\ncontext-mode: isolated\nclaude-fallback: claude-surface\ngoal: update src/custom.mjs\nscope: src/custom.mjs\nverification: node --test\n";
   const overrideLaunch = JSON.parse(run(overridden, dispatch(overridden, { prompt: overridePrompt }), { FUSION_VERIFICATION_MANIFEST: manifest }).stdout).hookSpecificOutput;
   assert.strictEqual(overrideLaunch.permissionDecision, "allow");
   assert.match(overrideLaunch.additionalContext, /tests\/custom\.test\.mjs/);
@@ -650,7 +650,7 @@ test("oversized briefs without sizing advise a large package and combine with ve
   assert.match(sizingLaunch.additionalContext, /split the package/);
 
   const combined = sandbox(t);
-  const combinedPrompt = `fusion-brief: v1\ncontext-mode: isolated\ngoal: update plugins/fusion/scripts/worker-lifecycle.mjs\nscope: plugins/fusion/scripts/worker-lifecycle.mjs\nverification: node --test tests/fusion-worker-lifecycle.test.mjs\n${"x".repeat(8_193)}\n`;
+  const combinedPrompt = `fusion-brief: v1\ncontext-mode: isolated\nclaude-fallback: claude-surface\ngoal: update plugins/fusion/scripts/worker-lifecycle.mjs\nscope: plugins/fusion/scripts/worker-lifecycle.mjs\nverification: node --test tests/fusion-worker-lifecycle.test.mjs\n${"x".repeat(8_193)}\n`;
   const combinedLaunch = JSON.parse(run(combined, dispatch(combined, { prompt: combinedPrompt })).stdout).hookSpecificOutput;
   assert.strictEqual(combinedLaunch.permissionDecision, "allow");
   assert.match(combinedLaunch.additionalContext, /Verification advisory/);
@@ -764,7 +764,7 @@ test("SubagentStart requires verdict envelopes for execution and coverage worker
   const coverage = sandbox(t);
   run(coverage, dispatch(coverage, {
     subagent_type: "fusion:trivial-worker",
-    prompt: "fusion-brief: v1\ncontext-mode: isolated\ngoal: inspect one file\nscope: src/a.ts\nacceptance: identify the behavior\n"
+    prompt: "fusion-brief: v1\ncontext-mode: isolated\nclaude-fallback: claude-surface\ngoal: inspect one file\nscope: src/a.ts\nacceptance: identify the behavior\n"
   }));
   const coverageStart = run(coverage, {
     hook_event_name: "SubagentStart",
@@ -4405,7 +4405,7 @@ test("an acceptance brief uses the analysis completion contract", (t) => {
   const box = sandbox(t);
   run(box, dispatch(box, {
     subagent_type: "fusion:trivial-worker",
-    prompt: "fusion-brief: v1\ncontext-mode: isolated\ngoal: inspect one file\nscope: src/a.ts\nacceptance: identify the behavior\n"
+    prompt: "fusion-brief: v1\ncontext-mode: isolated\nclaude-fallback: claude-surface\ngoal: inspect one file\nscope: src/a.ts\nacceptance: identify the behavior\n"
   }));
   assert.strictEqual(record(box).completionContract, "coverage");
   run(box, {
@@ -4431,7 +4431,7 @@ test("an acceptance brief uses the analysis completion contract", (t) => {
 });
 
 test("completion markers accept decorated and reordered terminal blocks without dropping delivery", (t) => {
-  const coveragePrompt = "fusion-brief: v1\ncontext-mode: isolated\ngoal: inspect one file\nscope: src/a.ts\nacceptance: identify the behavior\n";
+  const coveragePrompt = "fusion-brief: v1\ncontext-mode: isolated\nclaude-fallback: claude-surface\ngoal: inspect one file\nscope: src/a.ts\nacceptance: identify the behavior\n";
   const cases = [
     ["fusion:claude-worker", brief(), "result\n`verification: passed (6 tests)`\n**delivery: complete**\n```\n", true],
     ["fusion:claude-worker", brief(), "result\ncoverage: complete\ndelivery: complete\nverification: passed", true],

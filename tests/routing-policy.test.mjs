@@ -96,8 +96,10 @@ test("Codex admission preserves primary ownership before overflow", () => {
   assert.match(readme, /Codex is the primary implementation lane and default deep external reviewer\./);
   assert.match(
     readme,
-    /then route generic overflow to the Codex volume tiers and reserve `fusion:claude-worker` for Claude-surface work or structurally stranded packages carrying `claude-fallback: <reason>`\./
+    /then route generic overflow to the Codex volume tiers and reserve `fusion:claude-worker` for packages carrying `claude-fallback: <reason>`, where the reason is one of `network`, `toolchain`, `long-build`, `claude-surface`, `privacy`, or `no-healthy-lane`/
   );
+  assert.match(rules, /while Codex is over pace the breadth engine's prepaid `burst` pool takes a quick or volume package before a second Codex worktree/);
+  assert.match(rules, /Never pick a metered pool unless the user named it\./);
   assert.equal(frontmatterValue(codexRescue, "background"), "false");
 });
 

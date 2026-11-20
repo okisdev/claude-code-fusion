@@ -196,6 +196,120 @@ test("consult only routed roles prestage read only while write takes precedence"
   }
 });
 
+test("an operation review routing header stages the three line review form", (t) => {
+  let box;
+  for (const [engine, role] of [["devin", "diversity"], ["cursor", "diversity"], ["agy", "independence"]]) {
+    box = sandbox(t);
+    const prompt = `-- ${engine}-role: ${role} | operation: review | acceptance: findings cite file:line\nreview the working tree diff`;
+    const input = event(box, engine, prompt, { tool_use_id: `review-${engine}` });
+    const output = runHook(box, input);
+    const result = output?.hookSpecificOutput;
+    assert.equal(result?.permissionDecision, "allow", `${engine}: ${JSON.stringify(output)}`);
+    const matched = result.updatedInput?.prompt.match(/^fusion-staged-token: ([a-f0-9]{48})\nmode: read-only\noperation: review$/);
+    assert.ok(matched, `${engine}: ${JSON.stringify(output)}`);
+    const file = path.join(box.root, `${engine}-companion-input-${matched[1]}`, "request");
+    t.after(() => fs.rmSync(path.dirname(file), { recursive: true, force: true }));
+    const stagedBytes = fs.readFileSync(file, "utf8");
+    assert.ok(stagedBytes.endsWith(prompt), `${engine}: ${stagedBytes}`);
+    const consumed = consume(box, engine, matched[1]);
+    assert.equal(consumed.status, 0, consumed.stderr);
+    assert.equal(consumed.stdout, stagedBytes);
+    runHook(box, { ...input, hook_event_name: "PostToolUse", tool_input: result.updatedInput, tool_response: { isAsync: true, agentId: `review-peer-${engine}` } });
+  }
+});
+
+test("operation review forces read only staging while other headers keep the two line form", (t) => {
+  let box;
+  box = sandbox(t);
+  const review = runHook(box, event(box, "devin", "--write -- devin-role: burst | operation: review\nreview the wave diff", { tool_use_id: "burst-review" }));
+  const matched = review?.hookSpecificOutput?.updatedInput?.prompt.match(/^fusion-staged-token: ([a-f0-9]{48})\nmode: read-only\noperation: review$/);
+  assert.ok(matched, JSON.stringify(review));
+  const file = path.join(box.root, `devin-companion-input-${matched[1]}`, "request");
+  t.after(() => fs.rmSync(path.dirname(file), { recursive: true, force: true }));
+  assert.equal(consume(box, "devin", matched[1]).status, 0);
+  runHook(box, { ...event(box, "devin", "unused", { tool_use_id: "burst-review" }), hook_event_name: "PostToolUse", tool_input: review.hookSpecificOutput.updatedInput, tool_response: { isAsync: true, agentId: "burst-review-peer" } });
+  for (const [index, header] of ["devin-role: diversity", "devin-role: diversity | operation: task", "devin-role: diversity | operation: reviewer"].entries()) {
+    box = sandbox(t);
+    const input = event(box, "devin", `-- ${header}\ninspect the package`, { tool_use_id: `header-${index}` });
+    const staged = stagedTransport(t, box, "devin", runHook(box, input), "read-only");
+    assert.equal(consume(box, "devin", staged.token).status, 0);
+    runHook(box, { ...input, hook_event_name: "PostToolUse", tool_input: staged.input, tool_response: { isAsync: true, agentId: `header-peer-${index}` } });
+  }
+});
+
+test("operation review headers stage the two line form for codex and grok", (t) => {
+  const box = sandbox(t);
+  for (const [engine, role] of [["codex", "quick"], ["grok", "independence"]]) {
+    const prompt = `-- ${engine}-role: ${role} | operation: review | acceptance: findings cite file:line\nreview the working tree diff`;
+    const input = event(box, engine, prompt, { tool_use_id: `review-two-line-${engine}` });
+    const output = runHook(box, input);
+    const staged = stagedTransport(t, box, engine, output, "read-only");
+    assert.ok(fs.readFileSync(staged.file, "utf8").endsWith(prompt));
+    assert.equal(consume(box, engine, staged.token).status, 0);
+    runHook(box, { ...input, hook_event_name: "PostToolUse", tool_input: staged.input, tool_response: { isAsync: true, agentId: `review-two-line-${engine}` } });
+  }
+});
+
+test("operation review is a header field separated from prose", (t) => {
+  let box;
+  for (const [index, header] of ["operation: review", "devin-role: diversity; operation: review", "devin-role: diversity, operation: review", "devin-role: diversity · operation: review"].entries()) {
+    box = sandbox(t);
+    const output = runHook(box, event(box, "devin", `-- ${header}\nreview the working tree diff`, { tool_use_id: `separator-${index}` }));
+    const matched = output?.hookSpecificOutput?.updatedInput?.prompt.match(/^fusion-staged-token: ([a-f0-9]{48})\nmode: read-only\noperation: review$/);
+    assert.ok(matched, `${header}: ${JSON.stringify(output)}`);
+    const file = path.join(box.root, `devin-companion-input-${matched[1]}`, "request");
+    t.after(() => fs.rmSync(path.dirname(file), { recursive: true, force: true }));
+    assert.equal(consume(box, "devin", matched[1]).status, 0);
+    runHook(box, { ...event(box, "devin", "unused", { tool_use_id: `separator-${index}` }), hook_event_name: "PostToolUse", tool_input: output.hookSpecificOutput.updatedInput, tool_response: { isAsync: true, agentId: `separator-peer-${index}` } });
+  }
+  for (const [index, prompt] of [
+    "--write -- goal: run the operation: review suite end to end\nscope: the diff",
+    "--write -- devin-role: burst operation: review\nreview the wave diff",
+    "--write -- devin-role: burst | reoperation: review\nreview the wave diff"
+  ].entries()) {
+    box = sandbox(t);
+    const input = event(box, "devin", prompt, { tool_use_id: `prose-${index}` });
+    const output = runHook(box, input);
+    const staged = stagedTransport(t, box, "devin", output, "write");
+    assert.ok(fs.readFileSync(staged.file, "utf8").endsWith(prompt), prompt);
+    assert.equal(consume(box, "devin", staged.token).status, 0);
+    runHook(box, { ...input, hook_event_name: "PostToolUse", tool_input: staged.input, tool_response: { isAsync: true, agentId: `prose-peer-${index}` } });
+  }
+});
+
+test("the staged header is the first non blank brief line like role detection", (t) => {
+  let box;
+  box = sandbox(t);
+  const review = runHook(box, event(box, "devin", "\n  \ndevin-role: diversity | operation: review\nreview the diff", { tool_use_id: "blank-header" }));
+  const matched = review?.hookSpecificOutput?.updatedInput?.prompt.match(/^fusion-staged-token: ([a-f0-9]{48})\nmode: read-only\noperation: review$/);
+  assert.ok(matched, JSON.stringify(review));
+  const file = path.join(box.root, `devin-companion-input-${matched[1]}`, "request");
+  t.after(() => fs.rmSync(path.dirname(file), { recursive: true, force: true }));
+  assert.equal(consume(box, "devin", matched[1]).status, 0);
+  runHook(box, { ...event(box, "devin", "unused", { tool_use_id: "blank-header" }), hook_event_name: "PostToolUse", tool_input: review.hookSpecificOutput.updatedInput, tool_response: { isAsync: true, agentId: "blank-header-peer" } });
+  box = sandbox(t);
+  const consult = runHook(box, event(box, "codex", "-- \n\nread only\nmodify no files", { tool_use_id: "blank-consult" }));
+  const staged = stagedTransport(t, box, "codex", consult, "read-only");
+  assert.equal(consume(box, "codex", staged.token).status, 0);
+  runHook(box, { ...event(box, "codex", "unused", { tool_use_id: "blank-consult" }), hook_event_name: "PostToolUse", tool_input: staged.input, tool_response: { isAsync: true, agentId: "blank-consult-peer" } });
+  box = sandbox(t);
+  const prose = runHook(box, event(box, "devin", "--write --\n\nreview the operation: review notes", { tool_use_id: "blank-prose" }));
+  const proseStaged = stagedTransport(t, box, "devin", prose, "write");
+  assert.equal(consume(box, "devin", proseStaged.token).status, 0);
+  runHook(box, { ...event(box, "devin", "unused", { tool_use_id: "blank-prose" }), hook_event_name: "PostToolUse", tool_input: proseStaged.input, tool_response: { isAsync: true, agentId: "blank-prose-peer" } });
+});
+
+test("the review wrappers carry the staged review command rule", () => {
+  for (const engine of ["devin", "cursor", "agy"]) {
+    const file = `plugins/${engine}/agents/${engine}-rescue.md`;
+    const content = fs.readFileSync(path.join(repoRoot, file), "utf8");
+    assert.ok(content.includes("`operation: review`"), file);
+    assert.ok(content.includes(`node "\${CLAUDE_PLUGIN_ROOT}/scripts/${engine}-companion.mjs" review --transport-background-shell --raw-args-token TOKEN`), file);
+    assert.match(content, /instead of the task command/, file);
+    assert.match(content, /same await-output loop/, file);
+  }
+});
+
 test("leading write options stage without a brief separator", (t) => {
   const box = sandbox(t);
   for (const [index, prompt] of ["--write", "--write modify the parser", '--model "model with spaces" --write modify the parser'].entries()) {
@@ -207,7 +321,7 @@ test("leading write options stage without a brief separator", (t) => {
   }
 });
 
-test("SendMessage continuations and Task launches retain their raw request", (t) => {
+test("SendMessage continuations keep raw prompts while Task launches stage", (t) => {
   const box = sandbox(t);
   const prompt = "--write -- read-only consult";
   const input = event(box, "codex", prompt);
@@ -216,10 +330,15 @@ test("SendMessage continuations and Task launches retain their raw request", (t)
   const continued = runHook(box, continuation);
   assert.equal(continued?.hookSpecificOutput?.updatedInput, undefined);
   assert.notEqual(continued?.hookSpecificOutput?.permissionDecision, "deny");
-  const task = runHook(box, { ...input, tool_name: "Task", tool_use_id: "task-1", tool_input: { ...input.tool_input, prompt: `--cwd isolated-worktree ${prompt}` } });
-  assert.equal(task?.hookSpecificOutput?.updatedInput, undefined);
-  assert.notEqual(task?.hookSpecificOutput?.permissionDecision, "deny");
-  assert.equal(fs.readdirSync(box.root).some((name) => name.includes("-companion-input-")), false);
+  const taskPrompt = `--cwd isolated-worktree ${prompt}`;
+  const task = runHook(box, { ...input, tool_name: "Task", tool_use_id: "task-1", tool_input: { ...input.tool_input, prompt: taskPrompt } });
+  const staged = stagedTransport(t, box, "codex", task, "write");
+  assert.equal(fs.readFileSync(staged.file, "utf8"), taskPrompt);
+  assert.equal(consume(box, "codex", staged.token).status, 0);
+  runHook(box, { ...input, tool_name: "Task", tool_use_id: "task-1", hook_event_name: "PostToolUse", tool_input: staged.input, tool_response: { isAsync: true, agentId: "task-peer-1" } });
+  const record = readWorkerRecords(box.env).find((entry) => entry.agentId === "task-peer-1");
+  assert.ok(record);
+  assert.equal(fs.readFileSync(record.briefFile, "utf8"), taskPrompt);
 });
 
 test("parallel same-engine requests without tool use ids retain their own briefs", (t) => {

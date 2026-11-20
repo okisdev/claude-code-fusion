@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
 import { spawn } from "node:child_process";
+import { createHash } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -16,13 +17,17 @@ const SELF_PATH = fileURLToPath(import.meta.url);
 const DEFAULT_INTERVAL_MS = 20_000;
 const DEFAULT_CAP_MS = 540_000;
 const MAX_CAP_MS = 540_000;
+const DEFAULT_TOTAL_CAP_MS = 960_000;
+const MAX_TOTAL_CAP_MS = 1_800_000;
+const TRANSPORT_DIRECTORY_PREFIX = "fusion-raw-args-";
+const COLLECTION_STATE_FILE = "collect-state.json";
 const STDERR_TAIL_LINES = 20;
 const JOB_ID_PATTERN = /^[a-f0-9]{32}$/;
 const TOKEN_PATTERN = /^[a-f0-9]{48}$/;
 const TERMINAL_STATES = new Set(["done", "error", "cancelled", "completed", "failed"]);
 const SEMANTIC_STATES = new Set(["accepted", "rejected", "unverified"]);
 const FOOTER_FIELD = /^\s*(?:[a-z][a-z0-9_-]*-session|job|delivery|semantic|state|failure)\s*:\s*/i;
-const REQUEST_FIELDS = new Set(["engine", "jobId", "json", "intervalMs", "capMs", "deadRerunStatus"]);
+const REQUEST_FIELDS = new Set(["engine", "jobId", "json", "intervalMs", "capMs", "deadRerunStatus", "totalCapMs"]);
 
 function usage() {
   return "Usage: node job-collect.mjs await-output --file <path> [--slice-ms <n>] | transport-create | transport-discard --raw-args-token <token> | --raw-args-token <token>";
@@ -127,12 +132,17 @@ function parseCollectionRequest(raw) {
   if (capMs > MAX_CAP_MS) {
     throw new UsageError(`capMs cannot exceed ${MAX_CAP_MS}.`);
   }
+  const totalCapMs = parseInteger(request.totalCapMs, DEFAULT_TOTAL_CAP_MS, "totalCapMs");
+  if (totalCapMs > MAX_TOTAL_CAP_MS) {
+    throw new UsageError(`totalCapMs cannot exceed ${MAX_TOTAL_CAP_MS}.`);
+  }
   return {
     engine: request.engine,
     jobId: request.jobId,
     json: parseBoolean(request.json, false, "json"),
     intervalMs: parseInteger(request.intervalMs, DEFAULT_INTERVAL_MS, "intervalMs"),
     capMs,
+    totalCapMs,
     deadRerunStatus: parseBoolean(request.deadRerunStatus, false, "deadRerunStatus")
   };
 }
@@ -309,78 +319,147 @@ function collectorOutcomeLine(options, outcome, startedAt) {
   return `collector: ${outcome} engine=${options.engine} job=${options.jobId} elapsed=${elapsedSeconds(startedAt)}s`;
 }
 
-export async function collect(options, { env = process.env } = {}) {
-  const companion = resolveCompanion(options.engine, { env });
-  const startedAt = Date.now();
+function transportDirectoryFor(token) {
+  const candidates = [os.tmpdir(), process.platform === "win32" ? "C:\\Windows\\Temp" : "/private/tmp", "/tmp"];
+  for (const candidate of candidates) {
+    const directory = path.join(candidate, `${TRANSPORT_DIRECTORY_PREFIX}${token}`);
+    try {
+      if (fs.lstatSync(directory).isDirectory()) {
+        return directory;
+      }
+    } catch {}
+  }
+  return path.join(candidates[0], `${TRANSPORT_DIRECTORY_PREFIX}${token}`);
+}
+
+function sessionHash(sessionId) {
+  return typeof sessionId === "string" && sessionId.trim() ? createHash("sha256").update(sessionId.trim()).digest("hex") : null;
+}
+
+function collectionStartedAt(file) {
+  try {
+    const state = JSON.parse(fs.readFileSync(file, "utf8"));
+    return Number.isFinite(state?.startedAt) ? state.startedAt : null;
+  } catch {
+    return null;
+  }
+}
+
+function writePrivateTransportFile(file, contents) {
+  try {
+    fs.writeFileSync(file, contents, { flag: "wx", mode: 0o600 });
+  } catch (error) {
+    if (error?.code !== "EEXIST") {
+      throw error;
+    }
+    fs.unlinkSync(file);
+    fs.writeFileSync(file, contents, { flag: "wx", mode: 0o600 });
+  }
+  fs.chmodSync(file, 0o600);
+}
+
+function stageContinuation(continuation, env, startedAt) {
+  fs.mkdirSync(continuation.directory, { recursive: true, mode: 0o700 });
+  fs.chmodSync(continuation.directory, 0o700);
+  writePrivateTransportFile(path.join(continuation.directory, COLLECTION_STATE_FILE), `${JSON.stringify({ startedAt })}\n`);
+  writePrivateTransportFile(path.join(continuation.directory, "request"), continuation.raw);
+  writePrivateTransportFile(path.join(continuation.directory, "owner.json"), `${JSON.stringify({ createdAt: Date.now(), sessionHash: sessionHash(env.CLAUDE_CODE_SESSION_ID) })}\n`);
+}
+
+export async function collect(options, { env = process.env, continuation = null } = {}) {
+  const invocationStartedAt = Date.now();
+  const stateFile = continuation ? path.join(continuation.directory, COLLECTION_STATE_FILE) : null;
+  const startedAt = (stateFile ? collectionStartedAt(stateFile) : null) ?? invocationStartedAt;
+  const sliceRemainingMs = () => options.capMs - (Date.now() - invocationStartedAt);
+  const budgetRemainingMs = () => options.totalCapMs - (Date.now() - startedAt);
+  const remainingMs = () => Math.min(sliceRemainingMs(), budgetRemainingMs());
+  let pending = false;
   let consecutiveStatusErrors = 0;
   let lastStatusOutput = "";
 
-  for (;;) {
-    const remaining = options.capMs - (Date.now() - startedAt);
-    if (remaining <= 0) {
-      writeOutputWithFinalLine(lastStatusOutput, collectorOutcomeLine(options, "timeout", startedAt));
-      return 2;
+  const finishAtCap = () => {
+    if (continuation && sliceRemainingMs() <= 0 && budgetRemainingMs() > 0 && lastStatusOutput) {
+      stageContinuation(continuation, env, startedAt);
+      process.stdout.write("job-collect: pending\n");
+      pending = true;
+      return 0;
     }
-    const status = await runCompanion(companion, "status", options, remaining);
-    if (status.stdout) {
-      lastStatusOutput = status.stdout;
-    }
-    if (status.timedOut) {
-      writeOutputWithFinalLine(lastStatusOutput, collectorOutcomeLine(options, "timeout", startedAt));
-      return 2;
-    }
-    if (status.code === 0) {
-      consecutiveStatusErrors = 0;
-    } else {
-      consecutiveStatusErrors += 1;
-      if (consecutiveStatusErrors >= 2) {
-        writeOutputWithFinalLine(stderrTail(status.stderr), collectorOutcomeLine(options, "status-error", startedAt));
-        return 4;
-      }
-    }
+    writeOutputWithFinalLine(lastStatusOutput, collectorOutcomeLine(options, "timeout", startedAt));
+    return 2;
+  };
 
-    if (reportsDead(lastStatusOutput, options.json)) {
-      if (options.deadRerunStatus) {
-        const refreshRemaining = options.capMs - (Date.now() - startedAt);
-        if (refreshRemaining <= 0) {
-          writeOutputWithFinalLine(lastStatusOutput, collectorOutcomeLine(options, "timeout", startedAt));
-          return 2;
-        }
-        const refreshed = await runCompanion(companion, "status", options, refreshRemaining);
-        if (refreshed.timedOut) {
-          writeOutputWithFinalLine(refreshed.stdout || lastStatusOutput, collectorOutcomeLine(options, "timeout", startedAt));
-          return 2;
-        }
-        if (refreshed.stdout) {
-          lastStatusOutput = refreshed.stdout;
+  try {
+    const companion = resolveCompanion(options.engine, { env });
+    for (;;) {
+      const remaining = remainingMs();
+      if (remaining <= 0) {
+        return finishAtCap();
+      }
+      const status = await runCompanion(companion, "status", options, remaining);
+      if (status.stdout) {
+        lastStatusOutput = status.stdout;
+      }
+      if (status.timedOut) {
+        return finishAtCap();
+      }
+      if (status.code === 0) {
+        consecutiveStatusErrors = 0;
+      } else {
+        consecutiveStatusErrors += 1;
+        if (consecutiveStatusErrors >= 2) {
+          writeOutputWithFinalLine(stderrTail(status.stderr), collectorOutcomeLine(options, "status-error", startedAt));
+          return 4;
         }
       }
-      writeOutputWithFinalLine(lastStatusOutput, collectorOutcomeLine(options, "dead", startedAt));
-      return 3;
-    }
 
-    const terminal = terminalMetadata(lastStatusOutput, options.json);
-    if (terminal) {
-      const resultRemaining = options.capMs - (Date.now() - startedAt);
-      if (resultRemaining <= 0) {
-        writeOutputWithFinalLine(lastStatusOutput, collectorOutcomeLine(options, "timeout", startedAt));
-        return 2;
+      if (reportsDead(lastStatusOutput, options.json)) {
+        if (options.deadRerunStatus) {
+          const refreshRemaining = remainingMs();
+          if (refreshRemaining <= 0) {
+            writeOutputWithFinalLine(lastStatusOutput, collectorOutcomeLine(options, "timeout", startedAt));
+            return 2;
+          }
+          const refreshed = await runCompanion(companion, "status", options, refreshRemaining);
+          if (refreshed.timedOut) {
+            writeOutputWithFinalLine(refreshed.stdout || lastStatusOutput, collectorOutcomeLine(options, "timeout", startedAt));
+            return 2;
+          }
+          if (refreshed.stdout) {
+            lastStatusOutput = refreshed.stdout;
+          }
+        }
+        writeOutputWithFinalLine(lastStatusOutput, collectorOutcomeLine(options, "dead", startedAt));
+        return 3;
       }
-      const result = await runCompanion(companion, "result", options, resultRemaining);
-      if (result.timedOut) {
-        writeOutputWithFinalLine(lastStatusOutput, collectorOutcomeLine(options, "timeout", startedAt));
-        return 2;
-      }
-      writeOutputWithFinalLine(result.stdout, collectorTerminalLine(options, terminal, startedAt));
-      return result.code;
-    }
 
-    const elapsed = Date.now() - startedAt;
-    if (elapsed >= options.capMs) {
-      writeOutputWithFinalLine(lastStatusOutput, collectorOutcomeLine(options, "timeout", startedAt));
-      return 2;
+      const terminal = terminalMetadata(lastStatusOutput, options.json);
+      if (terminal) {
+        const resultRemaining = remainingMs();
+        if (resultRemaining <= 0) {
+          return finishAtCap();
+        }
+        const result = await runCompanion(companion, "result", options, resultRemaining);
+        if (result.timedOut) {
+          return finishAtCap();
+        }
+        writeOutputWithFinalLine(result.stdout, collectorTerminalLine(options, terminal, startedAt));
+        return result.code;
+      }
+
+      if (remainingMs() <= 0) {
+        return finishAtCap();
+      }
+      await sleep(Math.min(options.intervalMs, remainingMs()));
     }
-    await sleep(Math.min(options.intervalMs, options.capMs - elapsed));
+  } finally {
+    if (!pending && continuation) {
+      try {
+        fs.unlinkSync(stateFile);
+      } catch {}
+      try {
+        fs.rmdirSync(continuation.directory);
+      } catch {}
+    }
   }
 }
 
@@ -401,8 +480,10 @@ export async function runCli(argv, { env = process.env } = {}) {
     return 0;
   }
   const token = tokenFromArgv(argv);
-  const request = parseCollectionRequest(consumeRawArgsTransport(token, { sessionId: env.CLAUDE_CODE_SESSION_ID }));
-  return collect(request, { env });
+  const directory = transportDirectoryFor(token);
+  const raw = consumeRawArgsTransport(token, { sessionId: env.CLAUDE_CODE_SESSION_ID });
+  const request = parseCollectionRequest(raw);
+  return collect(request, { env, continuation: { directory, raw } });
 }
 
 if (process.argv[1] && path.resolve(process.argv[1]) === SELF_PATH) {

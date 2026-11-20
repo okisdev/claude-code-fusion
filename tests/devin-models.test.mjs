@@ -4,7 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 
-import { billingPoolForModel, createSelectionResolver, createSpeedResolver, findCatalogFamily, parseModelsJson, readModelCatalog } from "../plugins/devin/scripts/lib/devin-models.mjs";
+import { billingPoolForModel, costClassForPool, createSelectionResolver, createSpeedResolver, findCatalogFamily, pairingForModel, parseModelsJson, readModelCatalog } from "../plugins/devin/scripts/lib/devin-models.mjs";
 
 const listing = {
   families: [
@@ -100,6 +100,33 @@ test("family lookup refuses unpinned automatic and fusion models", () => {
   }
 });
 
+test("family lookup pins fusion pairings for write jobs only", () => {
+  const catalog = parseModelsJson(JSON.stringify({ families: [...listing.families, {
+    family_label: "Fusion", family_uid: "fusion", slug: "fusion", aliases: [],
+    variants: [
+      { model_uid: "fusion-gpt-6-sol-sidekick-swe-2-high", label: "GPT-6 Sol + SWE-2 High" },
+      { model_uid: "fusion-claude-opus-5-sidekick-swe-2-high", label: "Claude Opus 5 + SWE-2 High" }
+    ]
+  }] }));
+  const family = findCatalogFamily(catalog, "fusion-gpt-6-sol-sidekick-swe-2-high", { write: true });
+  assert.equal(family.slug, "fusion");
+  assert.equal(findCatalogFamily(catalog, "FUSION-GPT-6-SOL-SIDEKICK-SWE-2-HIGH", { write: true }), family);
+  assert.throws(() => findCatalogFamily(catalog, "fusion-gpt-6-sol-sidekick-swe-2-high"), (error) => error.failureKind === "input" && /cannot be pinned/.test(error.message));
+  assert.throws(() => findCatalogFamily(catalog, "fusion-gpt-6-sol-sidekick-swe-2-high", { write: false }), (error) => error.failureKind === "input");
+  assert.throws(() => findCatalogFamily(catalog, "fusion-claude-opus-5-sidekick-swe-2-high", { write: true }), (error) => error.failureKind === "input" && /cannot be pinned/.test(error.message));
+  for (const name of ["fusion", "adaptive", "default", "auto", "fusion-gpt-9-sol-sidekick-swe-2-high", "fusion-gpt-6-sol-sidekick-swe-1-high", "fusion-gpt-6-sol-sidekick-swe-2"]) {
+    assert.throws(() => findCatalogFamily(catalog, name, { write: true }), (error) => error.failureKind === "input");
+  }
+});
+
+test("pairing uids parse into planner and sidekick parts", () => {
+  assert.deepEqual(pairingForModel("fusion-gpt-6.1-sol-sidekick-swe-2-flash-high"), { planner: "gpt-6.1-sol", sidekick: "swe-2-flash-high" });
+  assert.deepEqual(pairingForModel("FUSION-CLAUDE-FABLE-5.1-SIDEKICK-SWE-2-MAX"), { planner: "claude-fable-5.1", sidekick: "swe-2-max" });
+  assert.equal(pairingForModel("swe-2-high"), null);
+  assert.equal(pairingForModel("fusion"), null);
+  assert.equal(pairingForModel("fusion-gpt-6-sol-sidekick-kimi-k3-high"), null);
+});
+
 test("model selection uses a variant offered by the live ACP session", () => {
   const family = parseModelsJson(JSON.stringify(listing)).families[0];
   const resolve = createSelectionResolver({ family });
@@ -157,10 +184,44 @@ test("unsupported effort lists available values as input failure", () => {
   assert.equal(resolve.effortApplied, false);
 });
 
-test("billing pool follows the selected family or variant", () => {
-  assert.equal(billingPoolForModel("swe-2"), "first-party");
-  assert.equal(billingPoolForModel("swe-2-high"), "first-party");
-  assert.equal(billingPoolForModel("kimi-k3-high"), "api");
+test("billing pool follows the cost tier of the resolved variant", () => {
+  const catalog = parseModelsJson(JSON.stringify({ families: [
+    { ...listing.families[0], variants: [
+      { ...listing.families[0].variants[0], cost_tier: "free" },
+      { ...listing.families[0].variants[1], cost_tier: "free" }
+    ] },
+    { ...listing.families[1], variants: [{ ...listing.families[1].variants[0], cost_tier: "premium" }] },
+    { family_label: "Fusion", family_uid: "fusion", slug: "fusion", aliases: [], variants: [
+      { model_uid: "fusion-gpt-6-sol-sidekick-swe-2-high", label: "GPT-6 Sol + SWE-2 High", cost_tier: "free" }
+    ] }
+  ] }));
+  assert.equal(billingPoolForModel(catalog, "swe-2"), "free");
+  assert.equal(billingPoolForModel(catalog, "swe-2-high"), "free");
+  assert.equal(billingPoolForModel(catalog, "glm"), "credits");
+  assert.equal(billingPoolForModel(catalog, "glm-5-2"), "credits");
+  assert.equal(billingPoolForModel(catalog, "fusion-gpt-6-sol-sidekick-swe-2-high"), "free");
+  assert.equal(billingPoolForModel(catalog, "unknown"), "credits");
+});
+
+test("cost class maps pools and legacy record pool names", () => {
+  assert.equal(costClassForPool("free"), "free");
+  assert.equal(costClassForPool("credits"), "metered");
+  assert.equal(costClassForPool("first-party"), "free");
+  assert.equal(costClassForPool("api"), "metered");
+});
+
+test("mixed family and alias pools follow the selected variant", () => {
+  const family = { slug: "swe-2", aliases: ["swe"], variants: [
+    { uid: "swe-2-high", cost_tier: "free" },
+    { uid: "swe-2-max", cost_tier: "premium" }
+  ] };
+  const catalog = { families: [family] };
+  for (const name of ["swe-2", "swe", "SWE"]) assert.equal(billingPoolForModel(catalog, name), "free");
+  for (const uid of ["swe-2-high", "swe-2-max"]) {
+    const resolver = createSelectionResolver({ family });
+    const [selection] = resolver({ stage: "model", configOptions: [{ id: "model", options: [{ value: uid }] }] });
+    assert.equal(billingPoolForModel(catalog, selection.value), uid === "swe-2-high" ? "free" : "credits");
+  }
 });
 
 test("the speed resolver pins standard speed when no model is requested", () => {

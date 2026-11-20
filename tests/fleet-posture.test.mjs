@@ -7,6 +7,7 @@ import { test } from "node:test";
 
 import { messageTag, tagMessage } from "../plugins/fusion/scripts/lib/user-messages.mjs";
 import { claimParentContextAdvisory } from "../plugins/fusion/scripts/lib/lifecycle/dispatch.mjs";
+import { ENGINES } from "../plugins/fusion/scripts/lib/engines.mjs";
 
 const script = path.join(import.meta.dirname, "..", "plugins", "fusion", "scripts", "fleet-posture.mjs");
 const DEEP_REASONER_HINT = tagMessage("fleet-posture.deep-reasoner-hint", "This reads as a design or root-cause question. Consult fusion:deep-reasoner with a scoped brief before deciding.");
@@ -19,7 +20,7 @@ function makeSandbox(t) {
 }
 
 function envFor(box, extra = {}) {
-  return { ...process.env, FUSION_DATA_DIR: box.dataDir, FUSION_INLINE_GUARD_STATE: box.stateDir, FUSION_WORKER_STATE_DIR: box.workerStateDir, ...extra };
+  return { ...process.env, ...Object.fromEntries(Object.values(ENGINES).map((engine) => [engine.companionEnv, path.join(box.root, `missing-${engine.id}.mjs`)])), FUSION_DATA_DIR: box.dataDir, FUSION_INLINE_GUARD_STATE: box.stateDir, FUSION_WORKER_STATE_DIR: box.workerStateDir, ...extra };
 }
 
 function input(box, prompt = "do work", sessionId = "session-1") {
