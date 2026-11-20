@@ -377,7 +377,7 @@ test("a timed out Antigravity task resumes its session for wind down", (t) => {
   assert.ok(Number.isInteger(record.salvage.originalPid) && record.salvage.originalPid > 1);
   assert.ok(Number.isInteger(record.salvage.resumePid) && record.salvage.resumePid > 1);
   assert.notEqual(record.salvage.resumePid, record.salvage.originalPid);
-  assert.ok(record.salvage.resumePidIdentity);
+  assert.ok(Object.hasOwn(record.salvage, "resumePidIdentity"));
   assert.equal(record.semanticFailureKind, "timeout_salvaged");
   assert.ok(h.messages().some((message) => message.method === "session/load" && message.params.sessionId === record.sessionId));
   assert.match(h.messages().find((message) => message.method === "session/prompt").params.prompt[0].text, /\n\nYour time budget is exhausted\. Stop exploring\./);

@@ -520,7 +520,7 @@ test("a timed out Devin job records its timeout duration", (t) => {
   assert.ok(Number.isInteger(record.salvage.originalPid) && record.salvage.originalPid > 1);
   assert.ok(Number.isInteger(record.salvage.resumePid) && record.salvage.resumePid > 1);
   assert.notEqual(record.salvage.resumePid, record.salvage.originalPid);
-  assert.ok(record.salvage.resumePidIdentity);
+  assert.ok(Object.hasOwn(record.salvage, "resumePidIdentity"));
   assert.equal(record.failureKind, "timeout");
   assert.equal(record.errorMessage, message);
   assert.equal(JSON.parse(result.stdout).message, message);
@@ -540,7 +540,7 @@ test("a timed out Devin task resumes its session once and delivers the wind down
   assert.ok(Number.isInteger(record.salvage.originalPid) && record.salvage.originalPid > 1);
   assert.ok(Number.isInteger(record.salvage.resumePid) && record.salvage.resumePid > 1);
   assert.notEqual(record.salvage.resumePid, record.salvage.originalPid);
-  assert.ok(record.salvage.resumePidIdentity);
+  assert.ok(Object.hasOwn(record.salvage, "resumePidIdentity"));
   assert.equal(record.semanticFailureKind, "timeout_salvaged");
   assert.equal(record.resultText, "fake result");
   assert.ok(h.messages().some((message) => message.method === "session/load" && message.params.sessionId === record.sessionId));

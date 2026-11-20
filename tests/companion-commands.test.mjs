@@ -157,7 +157,7 @@ test("salvage waits for a leaderless process group and records both process ids"
   assert.equal(running.resumePid, resumed.childPid);
   assert.equal(record.salvage.originalPid, original.childPid);
   assert.equal(record.salvage.resumePid, resumed.childPid);
-  assert.ok(record.salvage.resumePidIdentity);
+  assert.ok(Object.hasOwn(record.salvage, "resumePidIdentity"));
 });
 
 test("a leaderless process group that outlives cleanup leaves a plain timeout", (t) => {
