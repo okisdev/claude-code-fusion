@@ -346,7 +346,7 @@ export function classifyCursorFailure(outcome) {
   if (/Authentication required|Not logged in|Unauthorized|\b(?:401|403)\b/i.test(message)) return "auth";
   if (/usage limit|quota|spend limit|insufficient credit|\b402\b/i.test(message)) return "quota";
   if (/rate.?limit|too many requests|\b429\b/i.test(message)) return "rate_limited";
-  if (/Invalid --allowed-tools value|Cannot use this model|unknown (?:option|argument)|unrecognized (?:option|argument)/i.test(message)) return "setup";
+  if (/Invalid --allowed-tools value|Cannot use this model|Model unavailable on|Switch to an included model|unknown (?:option|argument)|unrecognized (?:option|argument)/i.test(message)) return "setup";
   if (/ENOTFOUND|EAI_AGAIN|ECONNREFUSED|ECONNRESET|DNS|fetch fail|network|socket hang up/i.test(message)) return "network";
   if (/Sandbox mode is enabled but not available|sandbox helper fail|sandbox denied|sandbox unavailable|operation not permitted by sandbox/i.test(message)) return "sandbox";
   if (outcome.signal || outcome.exitCode === 143) return "process";

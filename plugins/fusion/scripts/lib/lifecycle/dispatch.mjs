@@ -4,9 +4,9 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { ENGINES, ENGINE_ID_ALTERNATION, PEER_JOB_FOOTER_AGENTS, engineDisplayName, engineForAgentType, engineRoleFromBrief, routedEngineIds } from "../engines.mjs";
+import { ENGINES, ENGINE_ID_ALTERNATION, PEER_JOB_FOOTER_AGENTS, engineDisplayName, engineForAgentType, engineRoleFromBrief, fixedEnginePool, routedEngineIds } from "../engines.mjs";
 import { readModelRoutingFile, readRoutingDefaults, resolveModelRoutingPath } from "../model-table.mjs";
-import { quotaResults } from "../quota.mjs";
+import { NEAR_EXHAUSTION_PERCENT, quotaResults } from "../quota.mjs";
 import { newestEngineCompanion } from "../engine-acceptance.mjs";
 import { engineHealth, readEngineHealthRecords } from "../engine-health.mjs";
 import { engineCliAvailable } from "../../breaker-check.mjs";
@@ -72,11 +72,11 @@ function dispatchEngineChoice(engine, prompt, env, records = null) {
     readModelRoutingFile(resolveModelRoutingPath(env), { env }).data?.models.find((row) => row.lane === engine && row.id === explicitModel);
   const model = explicitModel ?? choice?.model ?? null;
   if (choice) return { model, pool: choice.pool };
-  if (!model) return { model, pool: null };
+  if (!model) return { model, pool: fixedEnginePool(engine) };
   records ??= readEngineHealthRecords(env);
   const pool = (records.engines.get(engine) ?? [])
     .filter((record) => [record.requestedModel, record.resolvedModel, record.model].includes(model) && record.billingPool)
-    .sort((left, right) => Date.parse(right.finishedAt ?? right.updatedAt ?? "") - Date.parse(left.finishedAt ?? left.updatedAt ?? ""))[0]?.billingPool ?? null;
+    .sort((left, right) => Date.parse(right.finishedAt ?? right.updatedAt ?? "") - Date.parse(left.finishedAt ?? left.updatedAt ?? ""))[0]?.billingPool ?? fixedEnginePool(engine);
   return { model, pool };
 }
 
@@ -184,25 +184,30 @@ function injectedPeerDefaults(prompt, agentType, env) {
   };
 }
 
-function dispatchCodexPacing(env) {
+function dispatchCodexQuota(env) {
   const pools = quotaResults(env, { engines: ["codex"], timeoutMs: 800 })
     .filter((result) => result.engine === "codex" && result.available)
     .flatMap((result) => result.pools)
-    .filter((pool) => pool.pool === "codex" && Number.isFinite(pool.pacing));
-  return pools.length ? Math.max(...pools.map((pool) => pool.pacing)) : null;
+    .filter((pool) => pool.pool === "codex" && (pool.resetsAt === null || Date.parse(pool.resetsAt) > Date.now()));
+  const pacings = pools.map((pool) => pool.pacing).filter(Number.isFinite);
+  const exhausted = pools.filter((pool) => pool.usedPercent >= NEAR_EXHAUSTION_PERCENT).sort((left, right) => right.usedPercent - left.usedPercent)[0] ?? null;
+  return { pacing: pacings.length ? Math.max(...pacings) : null, exhausted };
 }
 
 function codexPacingAdvisory(prompt, agentType, env) {
   if (engineForAgentType(agentType) !== "codex" || typeof prompt !== "string") return null;
   const { brief } = leadingCompanionOptions(prompt);
   const sizing = engineRoleFromBrief("codex", brief);
-  if (!["quick", "volume"].includes(sizing)) return null;
   const defaults = readRoutingDefaults(env, { warn: null });
   const breadth = defaults.breadth;
   const burst = defaults[breadth].burst;
   if (!["free", "included"].includes(burst.costClass) || !engineHealth(breadth, "write", burst.pool, { env }).healthy) return null;
-  const pacing = dispatchCodexPacing(env);
-  if (!(pacing > 1.15)) return null;
+  const { pacing, exhausted } = dispatchCodexQuota(env);
+  if (exhausted) {
+    const reset = exhausted.resetsAt ? ` until ${new Date(exhausted.resetsAt).toISOString().slice(0, 10)}` : "";
+    return `Codex is near exhaustion (${Number(exhausted.usedPercent.toFixed(1))}% used${reset}); unless this package needs Codex, split it into briefs under 3 KB for ${breadth}-role: burst on its prepaid pool, or agy-role: burst for edit only work.`;
+  }
+  if (!["quick", "volume"].includes(sizing) || !(pacing > 1.15)) return null;
   return `Codex is over pace (pacing ${pacing.toFixed(1)}); this ${sizing} package fits the ${breadth} burst lane on its prepaid pool. Prefer ${breadth}-role: burst unless the package needs Codex.`;
 }
 
@@ -332,7 +337,10 @@ function reserveHostPeerCapacity(input, agentType, env, taskId = null, now = Dat
       const held = reservations.some((reservation) => engineForAgentType(reservation.agentType) === "codex" && (taskId === null || reservation.taskId !== taskId) && reservation.companionCwd === cwd)
         || readWorkerRecords(env, { strict: true, modifiedSinceMs: now - workerLimits(ENGINES.codex.rescueAgent, env).wallClockMs }).some((record) => PEER_RESCUE_AGENT_NAMES.has(record.agentType) && engineForAgentType(record.agentType) === "codex" && record.taskId !== taskId && !WORKER_TERMINAL_STATUSES.has(record.transportStatus) && companionCwd({ cwd: record.companionCwd ?? record.workspaceRoot }) === cwd);
       if (held) {
-        return tagMessage("worker-lifecycle.workspace-slot-deny", `Codex already has a wrapper running in ${cwd}. Use an isolated worktree with --cwd, or wait for that wrapper to finish.`);
+        const defaults = readRoutingDefaults(env, { warn: null });
+        const burst = defaults[defaults.breadth].burst;
+        const breadthFirst = ["free", "included"].includes(burst.costClass) ? ` A worktree eligible package that fits a brief under 3 KB goes to ${defaults.breadth}-role: burst on its prepaid pool before a second Codex worktree.` : "";
+        return tagMessage("worker-lifecycle.workspace-slot-deny", `Codex already has a wrapper running in ${cwd}.${breadthFirst} Otherwise use an isolated worktree with --cwd, or wait for that wrapper to finish.`);
       }
     }
     const denial = hostPeerCapacityDenial(env, now, totalMemoryBytes, reservations);

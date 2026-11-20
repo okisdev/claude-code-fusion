@@ -589,3 +589,10 @@ test("permission checks refuse unsafe commands in every mode and allow sandboxed
     assert.equal(result.permissionsAllowed, 1);
   }
 });
+
+test("an in band quota notice as the final line fails as quota", () => {
+  const base = { resultSeen: true, sessionReady: true, stopReason: "end_turn", permissionsRejected: 0 };
+  assert.equal(classifyAgyFailure({ ...base, resultText: "\n⚠ Individual quota reached. Please upgrade your subscription to increase your limits. Resets in 2h47m9s.\n" }), "quota");
+  assert.equal(classifyAgyFailure({ ...base, resultText: "Partial findings.\n⚠ Individual quota reached. Resets in 1h." }), "quota");
+  assert.equal(classifyAgyFailure({ ...base, resultText: "The quota reached its limit in the old code path." }), null);
+});

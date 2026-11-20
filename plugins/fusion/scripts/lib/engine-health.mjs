@@ -1,6 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
-import { ENGINES, ENGINE_IDS, engineForAgentType, engineStateRoots } from "./engines.mjs";
+import { ENGINES, ENGINE_IDS, engineForAgentType, engineStateRoots, fixedEnginePool } from "./engines.mjs";
 import { engineHostBlockers } from "./engine-host-check.mjs";
 import { canonicalWorkerAgentType, readWorkerRecords } from "./worker-state.mjs";
 
@@ -37,7 +37,7 @@ function recordMode(record) {
 function normalizedPool(engine, pool) {
   if (engine === "devin" && pool === "first-party") return "free";
   if (engine === "devin" && pool === "api") return "credits";
-  return pool ?? null;
+  return pool ?? fixedEnginePool(engine);
 }
 
 function failureKind(record) {

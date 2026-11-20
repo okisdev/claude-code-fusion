@@ -6678,10 +6678,10 @@ test("a resumed Codex wrapper reserves and retains its continuation cwd", (t) =>
   assert.match(JSON.parse(denied.stdout).hookSpecificOutput.permissionDecisionReason, /isolated worktree/);
 });
 
-test("Codex write sizing warns from 5 KB while other briefs retain the 8 KiB threshold", (t) => {
+test("Codex write sizing warns from 3 KB while other briefs retain the 8 KiB threshold", (t) => {
   for (const [agentType, options, bytes, warning] of [
-    ["codex:codex-rescue", "--write -- ", 4999, false],
-    ["codex-rescue", "--write -- ", 5000, true],
+    ["codex:codex-rescue", "--write -- ", 2999, false],
+    ["codex-rescue", "--write -- ", 3000, true],
     ["codex:codex-rescue", "--write -- sizing: large\n", 7000, true],
     ["codex:codex-rescue", "-- consult mentions --write\n", 7000, false],
     ["grok:grok-rescue", "--write -- ", 7000, false],
@@ -6695,9 +6695,19 @@ test("Codex write sizing warns from 5 KB while other briefs retain the 8 KiB thr
     assert.notStrictEqual(output?.permissionDecision, "deny");
     assert.strictEqual(/Sizing advisory/.test(output?.additionalContext ?? ""), warning, `${agentType} ${bytes}`);
     if (warning && agentType.startsWith("codex")) {
-      assert.match(output.additionalContext, /23%.*57%/);
-      assert.match(output.additionalContext, /Split this package/);
+      assert.match(output.additionalContext, /20%.*24%.*59%.*3%/);
+      assert.match(output.additionalContext, /Split this package into briefs under 3 KB/);
     }
+  }
+});
+
+test("Codex writes at max effort get an effort advisory", (t) => {
+  for (const [options, warning] of [["--write --effort max -- ", true], ["--write --effort=max -- ", true], ["--write --effort xhigh -- ", false], ["--effort max -- ", false]]) {
+    const box = sandbox(t);
+    const result = run(box, dispatch(box, { subagent_type: "codex:codex-rescue", prompt: `${options}small package` }));
+    assert.strictEqual(result.status, 0, result.stderr);
+    const output = result.stdout ? JSON.parse(result.stdout).hookSpecificOutput : null;
+    assert.strictEqual(/Effort advisory: Codex writes at --effort max/.test(output?.additionalContext ?? ""), warning, options);
   }
 });
 

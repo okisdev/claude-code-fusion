@@ -361,16 +361,16 @@ for (const observed of ["swe-2-high-pro", "GPT-6 Sol Pro"]) {
   });
 }
 
-test("the quota adapter reports a free pool and a metered credits pool", () => {
+test("the quota adapter reports a free pool and an included credits pool", () => {
   const report = quota({ env: {}, dataDir: "/tmp/devin-data" });
   assert.equal(report.engine, "devin");
   assert.equal(report.available, true);
   assert.ok(Date.parse(report.observedAt));
   assert.deepEqual(report.pools, [
     { pool: "free", costClass: "free", usedPercent: null, windowMinutes: null, resetsAt: null, pacing: null },
-    { pool: "credits", costClass: "metered", usedPercent: null, windowMinutes: null, resetsAt: null, pacing: null }
+    { pool: "credits", costClass: "included", usedPercent: null, windowMinutes: null, resetsAt: null, pacing: null }
   ]);
-  assert.equal(report.note, "Devin exposes no usage meter; credits are treated as metered until the user marks them included.");
+  assert.equal(report.note, "Devin exposes no usage meter; credits are the subscription's prepaid allowance.");
 });
 
 test("unavailable account family fails as setup and unsupported effort as input", (t) => {

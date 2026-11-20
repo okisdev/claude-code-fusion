@@ -24,7 +24,7 @@ function prepareJob(options, dataDir, cwd, { write }) {
   if (!family && effort !== "default") throw errorWithFailure("--effort requires --model unless effort is default.");
   return {
     fields: { devinVersion: probe.version, devinBuildPath: probe.buildPath,
-      requestedModel: options.model ?? null, requestedEffort: effort, billingPool: family ? billingPoolForModel(catalog, options.model) : null,
+      requestedModel: options.model ?? null, requestedEffort: effort, billingPool: family ? billingPoolForModel(catalog, options.model, effort) : null,
       warnings: projectConfigFiles(cwd).map((file) => `project configuration may affect Devin permissions: ${file}`) },
     request: { model: options.model ?? null, family, effort, ...(pairing ? { pairing } : {}) }
   };
@@ -46,7 +46,7 @@ function quota({ env, dataDir } = {}) {
       { pool: "free", costClass: costClassForPool("free"), usedPercent: null, windowMinutes: null, resetsAt: null, pacing: null },
       { pool: "credits", costClass: costClassForPool("credits"), usedPercent: null, windowMinutes: null, resetsAt: null, pacing: null }
     ],
-    note: "Devin exposes no usage meter; credits are treated as metered until the user marks them included." };
+    note: "Devin exposes no usage meter; credits are the subscription's prepaid allowance." };
 }
 
 async function runJob({ record, source, dataDir, brief, signal, timeoutMs, exitGraceMs, onProcess, launchProcess }) {

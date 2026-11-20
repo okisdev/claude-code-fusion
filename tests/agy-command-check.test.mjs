@@ -2,15 +2,43 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { isReadOnlyCommand } from "../plugins/agy/scripts/lib/agy-command-check.mjs";
 
-for (const command of ["ls -la", "pwd", "cat README.md", "head -n 20 README.md", "tail -n 10 log.txt", "wc -l README.md", "stat README.md", "grep -n TODO src", "rg --files", "rg -n 'two words' src", 'cat "a file.txt"', "find . -name '*.mjs'", "find . -type f -print", "git status --short", "git log --oneline -5", "git show --stat", "git diff --cached --stat", "git ls-files --cached", "git grep --cached", "git rev-parse --show-toplevel", "git branch", "git branch --list -a -r -v", "git status path", "git log main", "git show HEAD", "git diff HEAD", "git ls-files src", "git grep pattern", "git blame file", "git rev-parse HEAD", "git branch --show-current", "git branch -av", "  pwd\t "]) {
+for (const command of ["ls -la", "pwd", "cat README.md", "head -n 20 README.md", "tail -n 10 log.txt", "wc -l README.md", "stat README.md", "grep -n TODO src", "rg --files", "rg -n 'two words' src", 'cat "a file.txt"', "find . -name '*.mjs'", "find . -type f -print", "git status --short", "git log --oneline -5", "git show --stat", "git diff --cached --stat", "git ls-files --cached", "git grep --cached", "git rev-parse --show-toplevel", "git branch", "git branch --list -a -r -v", "git status path", "git log main", "git show HEAD", "git diff HEAD", "git ls-files src", "git grep pattern", "git blame file", "git rev-parse HEAD", "git branch --show-current", "git branch -av", "  pwd\t ",
+  'rg -n "kSecAttrAccessGroup|appGroupIdentifier|keychain-access-groups" apps/apple',
+  'rg "next/|use client|server-only|:\\s*any\\b|as any\\b" apps/web/routes/auth',
+  "find apps/web/.legacy/app/[org] -maxdepth 4 -type f",
+  "find apps/web/.legacy/app/\\[org\\]/knowledge -type f",
+  "find . \\( -name a -o -name b \\) -type f"
+]) {
   test(`accepts ${command}`, () => assert.equal(isReadOnlyCommand(command), true));
 }
-for (const metacharacter of ["\n", "\r", ";", "|", "&", ">", "<", "`", "$", "$(", "${", "\\", "\0"]) {
-  test(`refuses metacharacter ${JSON.stringify(metacharacter)}`, () => {
-    assert.equal(isReadOnlyCommand(`cat a${metacharacter}b`), false);
-    assert.equal(isReadOnlyCommand(`cat 'a${metacharacter}b'`), false);
+for (const metacharacter of ["\n", "\r", "\0"]) {
+  test(`refuses control character ${JSON.stringify(metacharacter)} anywhere`, () => {
+    for (const command of [`cat a${metacharacter}b`, `cat 'a${metacharacter}b'`, `cat "a${metacharacter}b"`, `cat a\\${metacharacter}b`]) assert.equal(isReadOnlyCommand(command), false);
   });
 }
+for (const metacharacter of [";", "|", "&", ">", "<"]) {
+  test(`refuses unquoted metacharacter ${metacharacter}`, () => {
+    assert.equal(isReadOnlyCommand(`cat a${metacharacter}b`), false);
+    assert.equal(isReadOnlyCommand(`cat 'a${metacharacter}b'`), true);
+    assert.equal(isReadOnlyCommand(`cat "a${metacharacter}b"`), true);
+    assert.equal(isReadOnlyCommand(`cat a\\${metacharacter}b`), true);
+  });
+}
+for (const metacharacter of ["$", "`"]) {
+  test(`refuses expansion character ${JSON.stringify(metacharacter)}`, () => {
+    assert.equal(isReadOnlyCommand(`cat a${metacharacter}b`), false);
+    assert.equal(isReadOnlyCommand(`cat 'a${metacharacter}b'`), true);
+    assert.equal(isReadOnlyCommand(`cat "a${metacharacter}b"`), false);
+    assert.equal(isReadOnlyCommand(`cat a\\${metacharacter}b`), true);
+    assert.equal(isReadOnlyCommand(`cat "a\\${metacharacter}b"`), true);
+  });
+}
+test("refuses unquoted expansion syntax", () => {
+  for (const command of ["cat $(x)", "cat ${x}", "cat `x`", "cat a\\", "cat \"a\\"]) assert.equal(isReadOnlyCommand(command), false);
+});
+test("accepts literal backslash escapes", () => {
+  for (const command of ["cat a\\b", "cat a\\ b", "cat \\~x", 'cat "a\\b"', 'cat "a\\xb"']) assert.equal(isReadOnlyCommand(command), true);
+});
 for (const flag of ["-exec", "-execdir", "-ok", "-okdir", "-delete", "-fprint", "-fprint0", "-fprintf", "-fls"]) {
   test(`refuses find ${flag}`, () => {
     for (const spelling of [flag, `'${flag}'`, `"${flag}"`, flag.slice(0, 2) + "''" + flag.slice(2)]) assert.equal(isReadOnlyCommand(`find . ${spelling} target`), false);
@@ -50,9 +78,17 @@ for (const command of [
   test(`accepts parsed command ${JSON.stringify(command)}`, () => assert.equal(isReadOnlyCommand(command), true));
 }
 
-for (const character of "*?[]{}()") {
+for (const character of "{}()") {
   test(`rejects unquoted shell syntax ${character}`, () => {
     for (const argument of [character, `a${character}b`, `'a'${character}`]) assert.equal(isReadOnlyCommand(`cat ${argument}`), false);
+    for (const quote of ["'", '"']) assert.equal(isReadOnlyCommand(`cat ${quote}a${character}b${quote}`), true);
+    assert.equal(isReadOnlyCommand(`cat a\\${character}b`), true);
+  });
+}
+for (const character of "*?[]") {
+  test(`checks unquoted glob syntax ${character}`, () => {
+    for (const argument of [character, `${character}x`, `-${character}x`, `'${character}'x${character}`]) assert.equal(isReadOnlyCommand(`cat ${argument}`), false);
+    for (const argument of [`a${character}b`, `'a'${character}b`, `a\\${character}b`, `\\${character}b`]) assert.equal(isReadOnlyCommand(`cat ${argument}`), true);
     for (const quote of ["'", '"']) assert.equal(isReadOnlyCommand(`cat ${quote}a${character}b${quote}`), true);
   });
 }
@@ -142,4 +178,19 @@ for (const [subcommand, [bare, required, optional]] of Object.entries(gitFlags))
     assert.equal(isReadOnlyCommand(`git ${subcommand} HEAD --unknown`), false);
     assert.equal(isReadOnlyCommand(`git ${subcommand} -Z`), false);
   });
+}
+
+for (const separator of ["\v", "\f", "\u00a0", "\u1680", "\u2028", "\u3000", "\ufeff", "\u200b", "\u0085", "\x1b", "\x7f"]) {
+  test(`refuses shell word character ${JSON.stringify(separator)} that splits only for the checker`, () => {
+    for (const command of [`rg x${separator}-e --pre=sh script.sh`, `git log --format=x${separator}-- --output=/tmp/out`, `find src x${separator}-name -delete`, `cat${separator}/x`, `cat 'a${separator}b'`, `cat "a${separator}b"`, `cat a\\${separator}b`]) {
+      assert.equal(isReadOnlyCommand(command), false, JSON.stringify(command));
+    }
+  });
+}
+test("accepts tab separated words and escaped spaces", () => {
+  assert.equal(isReadOnlyCommand("cat\tREADME.md"), true);
+  assert.equal(isReadOnlyCommand("cat a\\ file.txt"), true);
+});
+for (const command of ["tail --f x", "tail --fo x", "tail --foll=name x", "tail --follow x"]) {
+  test(`refuses tail follow prefix ${command}`, () => assert.equal(isReadOnlyCommand(command), false));
 }

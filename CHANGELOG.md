@@ -1,5 +1,17 @@
 # changelog
 
+## 0.0.88
+
+- a Devin family default bills the pool of the variant its effort serves, so `swe-2` at `high` routes on the `free` pool instead of `credits`; the old check compared a lowercase `free` against the catalog's `Free` and filed every family with a priced variant under credits. Devin `credits` are now the subscription's prepaid allowance (`included`), not metered. together these had kept the over pace advisory and the metered rule from ever routing work to Devin burst: one host sent 17 burst packages to Antigravity and none to Devin while Codex ran at 3.1 times pace.
+- once a Codex pool is 90 percent used before its reset, session start and the dispatch hook call it near exhaustion and advise every package shape, flagship included, to split onto the breadth engine's prepaid `burst` pool or Antigravity `burst` unless it needs Codex. both hosts had reached 96 and 98 percent with five days left.
+- Codex admission sends a worktree eligible package whose brief fits under 3 KB to the breadth engine's prepaid `burst` pool before a second Codex worktree, and the workspace slot deny says so.
+- the Codex write sizing advisory starts at 3 KB, and a Codex write at `--effort max` gets an advisory to use xhigh. over 7 days Codex writes timed out in 3 percent of runs under 3 KB, 20 percent at 3 to 5 KB, 24 percent at 5 to 7 KB, and 59 percent at 7 KB or more, and in 23 percent of runs at max against 14 percent at xhigh.
+- the Antigravity read only command check is quote aware: single quoted text is literal and double quotes refuse only ` and backticks, so `rg -n "a|b" dir` and `find app/[org] -type f` pass instead of ending the turn. 8 of 26 Antigravity runs in a day had failed on such refusals. only space and tab separate words now; any other whitespace or control character rejects the command, which closes a bypass where a vertical tab split a word for the check but not for the shell, and `tail` refuses every `--f` prefix of `--follow`.
+- an Antigravity turn whose final line is its `⚠ ... quota reached` notice fails as `quota` instead of finishing as done with the notice as its result.
+- a Cursor `Model unavailable on <plan>` failure is `setup`, so a plan that excludes the model closes the engine instead of failing each dispatch as a generic error.
+- Codex, Grok, and Antigravity dispatches without `--model` record their engine pool, and health and breaker reports match records that carry none, so these jobs no longer fall outside pool scoped health.
+- session start and compaction say when a newer Fusion version is installed than the one the session runs. 24 Codex jobs across two hosts ran on 0.0.84 after 0.0.87 was installed.
+
 ## 0.0.87
 
 - a Devin run records the variant its thought level serves, read from the model catalog, so `muse-wonder` at `xhigh` records `muse-wonder-1-0-xhigh` and `swe-2` at `max` records `swe-2-max` with no false `model_mismatch`. Devin keeps its model option at the family default and picks the variant from `thought_level`; 0.0.86 waited for the model option to change, which the real CLI never does, so the 0.0.86 smoke wave still warned (#114).

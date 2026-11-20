@@ -6,7 +6,7 @@ import path from "node:path";
 import { test } from "node:test";
 
 import { ENGINE_IDS } from "../plugins/fusion/scripts/lib/engines.mjs";
-import { deliverWorkerEngineAcceptance, newestEngineCompanion, prepareEngineAcceptanceDelivery, recordEngineAcceptance, retryWorkerEngineAcceptances } from "../plugins/fusion/scripts/lib/engine-acceptance.mjs";
+import { deliverWorkerEngineAcceptance, newestEngineCompanion, newerInstalledFusionVersion, prepareEngineAcceptanceDelivery, recordEngineAcceptance, retryWorkerEngineAcceptances } from "../plugins/fusion/scripts/lib/engine-acceptance.mjs";
 import { settleQueuedVerdict } from "../plugins/fusion/scripts/lib/lifecycle/collection.mjs";
 import { createWorkerRecord, readSessionWorkerRecords, readWorkerRecord, readWorkerSessionState, recordWorkerAcceptance, reopenWorkerContinuation, updateWorkerRecord, workerRecordFile } from "../plugins/fusion/scripts/lib/worker-state.mjs";
 import { settleRecords } from "../plugins/fusion/scripts/lib/stats/settlement.mjs";
@@ -513,6 +513,31 @@ for (const engine of ENGINE_IDS) {
     }
   });
 }
+
+test("newerInstalledFusionVersion reports only a strictly newer cached fusion plugin", (t) => {
+  const root = sandbox(t);
+  const home = path.join(root, "home");
+  const current = JSON.parse(fs.readFileSync(new URL("../plugins/fusion/.claude-plugin/plugin.json", import.meta.url), "utf8")).version;
+  const env = { HOME: home };
+  const cachedFusion = (version) => {
+    const file = path.join(home, ".claude", "plugins", "cache", "claude-code-fusion", "fusion", version, "scripts", "session-start.mjs");
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, "export {};\n");
+    return file;
+  };
+
+  assert.equal(newerInstalledFusionVersion(env), null);
+  cachedFusion("not-a-version");
+  assert.equal(newerInstalledFusionVersion(env), null);
+  cachedFusion("0.0.1");
+  assert.equal(newerInstalledFusionVersion(env), null);
+  cachedFusion(current);
+  assert.equal(newerInstalledFusionVersion(env), null);
+  fs.mkdirSync(path.join(home, ".claude", "plugins", "cache", "claude-code-fusion", "fusion", "999.0.0"), { recursive: true });
+  assert.equal(newerInstalledFusionVersion(env), null);
+  cachedFusion("999.0.0");
+  assert.equal(newerInstalledFusionVersion(env), "999.0.0");
+});
 
 test("an unreadable engine job record yields no failure kind on the hook path but fails strict reads", (t) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "fusion-engine-job-"));
