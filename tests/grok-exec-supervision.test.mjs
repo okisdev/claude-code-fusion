@@ -197,7 +197,8 @@ test("runtime-socket remedies name the engine that owns the symlink", (t) => {
   assert.equal(runtimeSocketEngine(path.join(sandbox.root, "missing.sock")), null);
   assert.match(runtimeSocketRemedy(orbstackEndpoint, "orbstack"), /orb stop/);
   assert.match(runtimeSocketRemedy(desktopEndpoint, "docker-desktop"), /quit Docker Desktop/);
-  assert.equal(runtimeSocketRemedy(plainEndpoint, null), `Stop the container engine that owns ${plainEndpoint}, or route writes to another lane. Do not downgrade the sandbox.`);
+  assert.equal(runtimeSocketRemedy(plainEndpoint, null), `Stop the container engine that owns ${plainEndpoint} (it resolves to ${plainTarget}), or route writes to another lane. Do not downgrade the sandbox.`);
+  assert.equal(runtimeSocketRemedy(path.join(sandbox.root, "missing.sock"), null), `Stop the container engine that owns ${path.join(sandbox.root, "missing.sock")}, or route writes to another lane. Do not downgrade the sandbox.`);
   for (const remedy of [runtimeSocketRemedy(orbstackEndpoint, "orbstack"), runtimeSocketRemedy(desktopEndpoint, "docker-desktop"), runtimeSocketRemedy(plainEndpoint, null)]) {
     assert.match(remedy, /Do not downgrade the sandbox\.$/);
     assert.doesNotMatch(remedy, /sudo rm|remove the symlink|setup\.use_admin/);

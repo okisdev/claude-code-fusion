@@ -391,6 +391,8 @@ test("Pacing advisory requires Codex, a quick or volume shape, and a confirmed p
   assert.equal(codexPacingAdvisory("lane: codex quick", "codex:codex-rescue", cacheless.env), null);
   assert.equal(fs.existsSync(cachelessCalls), false);
   pacingSetup(box, { tier: "premium" });
+  assert.equal(codexPacingAdvisory("lane: codex quick", "codex:codex-rescue", box.env), null);
+  pacingSetup(box, { tier: "free" });
   assert.match(codexPacingAdvisory("lane: codex quick", "codex:codex-rescue", box.env), /devin burst lane on its prepaid pool/);
 });
 

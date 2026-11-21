@@ -233,6 +233,7 @@ export function createCompanionCommands(adapter) {
     let outcome;
     let initialOutcome;
     let salvageAttempted = false;
+    let emptyTurn = false;
     let signalExitCode = null;
     try {
       const brief = fs.readFileSync(record.briefFile, "utf8");
@@ -261,7 +262,8 @@ export function createCompanionCommands(adapter) {
           }, { processRole: salvageAttempted ? "resume" : engine }).child };
         outcome = await adapter.runJob(runOptions);
         const kind = outcome.spawnError?.failureKind ?? adapter.classifyFailure(outcome);
-        if (kind === "timeout" && record.jobClass === "task" && adapter.supportsWindDown === true
+        emptyTurn = kind === "error" && record.jobClass === "task" && adapter.emptyTurn?.(outcome) === true;
+        if ((kind === "timeout" && record.jobClass === "task" && adapter.supportsWindDown === true || emptyTurn)
           && signalExitCode === null && !outcome.cancelled && sessionIdPattern.test(outcome.sessionId)) {
           const resumable = { ...record, ...adapter.outcomeFields(outcome), sessionId: outcome.sessionId };
           const resumeEligible = adapter.resumeEligible(resumable);
@@ -275,7 +277,7 @@ export function createCompanionCommands(adapter) {
               if (current.status !== "running" || current.cancelRequestedAt != null || current.cleanupRequired || current.salvage?.attempted) return current;
               salvageAttempted = true;
               return { ...current, sessionId: outcome.sessionId, deadlineAt: new Date(Date.now() + 240000).toISOString(),
-                salvage: { attempted: true, originalPid: originalPid ?? null } };
+                salvage: { attempted: true, originalPid: originalPid ?? null, ...(emptyTurn ? { reason: "empty_turn" } : {}) } };
             });
             if (salvageAttempted) {
               initialOutcome = outcome;
@@ -286,7 +288,9 @@ export function createCompanionCommands(adapter) {
               outcome = await adapter.runJob({ ...runOptions,
                 record: { ...current, request: { ...current.request, resumeSessionId: outcome.sessionId } },
                 source: resumable,
-                brief: "Your time budget is exhausted. Stop exploring. Within a few minutes, finish or revert any half applied edit so the workspace is consistent, then reply with a final report: what is done, what is not done, files changed, and how to verify.",
+                brief: emptyTurn
+                  ? "Your last turn ended without a response. Continue from where you stopped, then reply with your final answer to the original request."
+                  : "Your time budget is exhausted. Stop exploring. Within a few minutes, finish or revert any half applied edit so the workspace is consistent, then reply with a final report: what is done, what is not done, files changed, and how to verify.",
                 timeoutMs });
             }
           }
@@ -308,7 +312,7 @@ export function createCompanionCommands(adapter) {
     if (outcome.lateClose) warnings.push("late_close");
     warnings.push(...(adapter.outcomeWarnings?.(outcome) ?? []));
     if (modelDrift) warnings.push(adapter.driftWarning(modelDrift));
-    if (salvageAttempted && !kind && signalExitCode === null) warnings.push("timeout_salvaged");
+    if (salvageAttempted && !kind && signalExitCode === null) warnings.push(emptyTurn ? "empty_turn_continued" : "timeout_salvaged");
     if (signalExitCode !== null) {
       finishSuccessfulJobRecordFile(file, { status: "cancelled", finishedAt: nowIso(), exitCode: outcome.exitCode,
         observedModel: outcome.observedModel, modelDrift, warnings, ...adapter.cancelledFields(outcome),
@@ -332,7 +336,7 @@ export function createCompanionCommands(adapter) {
         review: validation.value, resultText: renderReviewResult(validation.value, { targetLabel: record.request.reviewTargetLabel }) });
     }
     return finishSuccessfulJobRecordFile(file, { ...common, status: "done", resultText: outcome.resultText, failureKind: null,
-      ...(salvageAttempted ? { semanticFailureKind: "timeout_salvaged" } : {}) });
+      ...(salvageAttempted && !emptyTurn ? { semanticFailureKind: "timeout_salvaged" } : {}) });
   }
 
   async function spawnBackgroundWorker(record, file) {

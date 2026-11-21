@@ -46,7 +46,7 @@ function quota({ env, dataDir } = {}) {
       { pool: "free", costClass: costClassForPool("free"), usedPercent: null, windowMinutes: null, resetsAt: null, pacing: null },
       { pool: "credits", costClass: costClassForPool("credits"), usedPercent: null, windowMinutes: null, resetsAt: null, pacing: null }
     ],
-    note: "Devin exposes no usage meter; credits are the subscription's prepaid allowance." };
+    note: "Devin exposes no usage meter; credits bill per token, so routing treats them as metered." };
 }
 
 async function runJob({ record, source, dataDir, brief, signal, timeoutMs, exitGraceMs, onProcess, launchProcess }) {
@@ -139,6 +139,7 @@ function handleSetup(argv, transport, { commandArgs, output }) {
 const { cancelJobRecord, run } = createCompanionCommands({
   engine: "devin", engineName: "Devin", entryUrl: import.meta.url, state, render,
   supportsWindDown: true,
+  emptyTurn: (outcome) => outcome.stopCause === "empty_response",
   sessionIdPattern: state.DEVIN_SESSION_ID_PATTERN,
   sweep: state.sweepDevinRuns,
   jobDirectory: (dataDir, id) => ({ configDir: state.runConfigDir(dataDir, id) }),

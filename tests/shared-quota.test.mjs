@@ -31,7 +31,7 @@ test("the devin companion reports its free and metered pools through the shared 
   const report = JSON.parse(result.stdout);
   assert.equal(report.engine, "devin");
   assert.equal(report.available, true);
-  assert.deepEqual(report.pools.map((pool) => [pool.pool, pool.costClass]), [["free", "free"], ["credits", "included"]]);
+  assert.deepEqual(report.pools.map((pool) => [pool.pool, pool.costClass]), [["free", "free"], ["credits", "metered"]]);
 });
 
 test("shared quota calls the optional adapter with env and dataDir and tolerates errors", (t) => {

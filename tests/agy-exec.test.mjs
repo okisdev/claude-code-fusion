@@ -295,6 +295,42 @@ test("permission selection uses kind, counts decisions, and cancels without reje
   }
 });
 
+test("read_file outside the workspace is allowed unless the resolved path is sensitive", async (t) => {
+  const outside = fs.mkdtempSync(path.join(os.tmpdir(), "agy-read-"));
+  t.after(() => fs.rmSync(outside, { recursive: true, force: true }));
+  const home = path.join(outside, "home");
+  fs.mkdirSync(path.join(home, ".ssh"), { recursive: true });
+  fs.mkdirSync(path.join(home, ".cargo", "registry"), { recursive: true });
+  fs.writeFileSync(path.join(home, ".ssh", "id_ed25519"), "secret");
+  fs.writeFileSync(path.join(home, ".netrc"), "secret");
+  fs.writeFileSync(path.join(home, ".cargo", "registry", "lib.rs"), "source");
+  fs.writeFileSync(path.join(outside, "review.diff"), "diff");
+  fs.symlinkSync(path.join(home, ".ssh", "id_ed25519"), path.join(outside, "linked.diff"));
+  const vault = path.join(outside, "vault");
+  fs.mkdirSync(vault);
+  fs.writeFileSync(path.join(vault, "credentials"), "secret");
+  fs.symlinkSync(vault, path.join(home, ".aws"));
+  fs.writeFileSync(path.join(outside, "netrc-target"), "secret");
+  fs.rmSync(path.join(home, ".netrc"));
+  fs.symlinkSync(path.join(outside, "netrc-target"), path.join(home, ".netrc"));
+  for (const [label, target, allowed] of [
+    ["scratchpad file", path.join(outside, "review.diff"), true],
+    ["dependency source", path.join(home, ".cargo", "registry", "lib.rs"), true],
+    ["sensitive directory", path.join(home, ".ssh", "id_ed25519"), false],
+    ["sensitive file", path.join(home, ".netrc"), false],
+    ["symlink into a sensitive directory", path.join(outside, "linked.diff"), false],
+    ["target of a symlinked sensitive directory", path.join(vault, "credentials"), false],
+    ["target of a symlinked sensitive file", path.join(outside, "netrc-target"), false],
+    ["missing file", path.join(outside, "missing.diff"), false],
+    ["relative path", "review.diff", false]
+  ]) {
+    const { result, log } = await fakeRun(t, "permission_read", { realHome: home, env: { FAKE_AGY_READ_PATH: target } });
+    assert.equal(result.permissionsAllowed, allowed ? 1 : 0, label);
+    assert.equal(result.permissionsRejected, allowed ? 0 : 1, label);
+    assert.deepEqual(log.messages.at(-1).result, { outcome: { outcome: "selected", optionId: allowed ? "approval" : "denial" } }, label);
+  }
+});
+
 test("other agent requests receive method-not-found errors", async (t) => {
   const { result, log } = await fakeRun(t, "unknown_request");
   assert.equal(classifyAgyFailure(result), null);

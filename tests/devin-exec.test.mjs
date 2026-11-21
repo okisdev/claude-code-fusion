@@ -124,7 +124,7 @@ test("success records text, exact usage, metadata, and the ACP handshake", async
   assert.equal(log.stdinEnded, true);
   assert.deepEqual(log.messages, [
     { jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: 1, clientCapabilities: { fs: { readTextFile: false, writeTextFile: false }, terminal: false } } },
-    { jsonrpc: "2.0", id: 2, method: "session/new", params: { cwd: root, mcpServers: [] } },
+    { jsonrpc: "2.0", id: 2, method: "session/new", params: { cwd: root, mcpServers: [], _meta: { delegated: true } } },
     { jsonrpc: "2.0", id: 3, method: "session/set_config_option", params: { sessionId: "artistic-breeze", configId: "mode", value: "ask" } },
     { jsonrpc: "2.0", id: 4, method: "session/prompt", params: { sessionId: "artistic-breeze", prompt: [{ type: "text", text: "private brief\n" }] } }
   ]);
@@ -275,9 +275,25 @@ test("forbidden tools terminate before initialization, during updates, and after
   for (const scenario of ["forbidden_before_init", "forbidden_tool", "forbidden_update", "forbidden_after_result"]) {
     let pid;
     const { result } = await fakeRun(t, scenario, { onSpawn: (child) => { pid = child.pid; } });
-    assert.deepEqual(result.policyViolation, { tool: "webfetch" }, scenario);
+    assert.deepEqual(result.policyViolation, { tool: "invoke_subagent" }, scenario);
     assert.equal(classifyDevinFailure(result), "policy", scenario);
     assert.equal(result.timedOut, false, scenario);
+    assert.throws(() => process.kill(-pid, 0), (error) => error.code === "ESRCH");
+  }
+});
+
+test("webfetch denied by the configuration continues the run, and a running webfetch fails as policy", async (t) => {
+  for (const mode of ["consult", "write", "review"]) {
+    const denied = await fakeRun(t, "webfetch_denied", { mode });
+    assert.equal(denied.result.policyViolation, null, mode);
+    assert.equal(classifyDevinFailure(denied.result), null, mode);
+    assert.equal(denied.result.resultText, "fake result", mode);
+    assert.equal(denied.result.stopReason, "end_turn", mode);
+    let pid;
+    const running = await fakeRun(t, "webfetch_running", { mode, onSpawn: (child) => { pid = child.pid; } });
+    assert.deepEqual(running.result.policyViolation, { tool: "webfetch" }, mode);
+    assert.equal(classifyDevinFailure(running.result), "policy", mode);
+    assert.equal(running.result.timedOut, false, mode);
     assert.throws(() => process.kill(-pid, 0), (error) => error.code === "ESRCH");
   }
 });

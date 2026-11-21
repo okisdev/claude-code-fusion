@@ -59,7 +59,7 @@ Resolution of a requested model and effort:
 3. `speed` is always set to `standard` when offered, including for a run that names no model, because `fast` bills at a multiple of the list price.
 4. `adaptive` and `fusion-*` pairings are refused as `input` for read only jobs, because they route to models the session does not pin. A write task may pin an exact `fusion-<planner>-sidekick-swe-2-<tier>` variant uid, which records the planner and sidekick on the job, unless the planner is a Claude family model, which would not be an independent lane.
 
-The agent reports the model that served the turn in `_cognition.ai/agent_stopped` (`stats.modelLabel`) and `_cognition.ai/turn_stats`. The companion records it as `observedModel`; when it differs from the selected option's display name — or, for a pairing, names neither the planner nor the sidekick — the companion renders a `model_mismatch` warning and keeps the transport outcome. `billingPool` is `free` for variants whose catalog `cost_tier` is free and `credits` for every priced tier.
+The agent reports the model that served the turn in `_cognition.ai/agent_stopped` (`stats.modelLabel`) and `_cognition.ai/turn_stats`. The companion records it as `observedModel`; when it differs from the selected option's display name — or, for a pairing, names neither the planner nor the sidekick — the companion renders a `model_mismatch` warning and keeps the transport outcome. `billingPool` is `free` for variants whose catalog `cost_tier` is free and `credits` for every priced tier. The `free` pool is cost class `free`; `credits` bill per token and are `metered`, because Devin exposes no usage meter that could tell an included allowance from overage.
 
 ## Protocol stream
 

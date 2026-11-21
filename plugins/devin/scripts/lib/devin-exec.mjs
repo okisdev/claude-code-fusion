@@ -6,6 +6,8 @@ export const TESTED_DEVIN_INTERVAL = { floor: "3000.11", ceiling: "3000.15" };
 
 const READ_TOOLS = ["read", "grep", "glob", "find_file_by_name", "notebook_read", "todo_write", "web_search"];
 const WRITE_TOOLS = [...READ_TOOLS, "edit", "write", "notebook_edit", "exec", "get_output", "kill_shell", "write_to_process"];
+const CONFIG_DENIED_TOOLS = ["webfetch"];
+const RUNNING_TOOL_STATUSES = ["in_progress", "completed"];
 const STREAM_MAX_BYTES = 2 * 1024 * 1024;
 const { appendTail, signalRunGroup, terminateRun: terminateProcessRun, finishProcessGroup, startProcess } = createProcessTransport({
   processLine: processDevinLine,
@@ -162,7 +164,7 @@ async function initializeSession(run) {
     failSetup(run, "Devin must support ACP protocol version 1");
     return;
   }
-  const session = await requestDevin(run, resumeSessionId ? "session/load" : "session/new", { ...(resumeSessionId ? { sessionId: resumeSessionId } : {}), cwd, mcpServers: [] });
+  const session = await requestDevin(run, resumeSessionId ? "session/load" : "session/new", resumeSessionId ? { sessionId: resumeSessionId, cwd, mcpServers: [] } : { cwd, mcpServers: [], _meta: { delegated: true } });
   if (run.ending || run.closed || run.settled) return;
   const sessionId = resumeSessionId ?? session?.sessionId;
   if (!session || typeof sessionId !== "string" || !sessionId.trim()) {
@@ -185,11 +187,11 @@ function processToolUpdate(run, update) {
   }
   if (!run.tools.has(id)) run.outcome.toolCalls += 1;
   run.tools.set(id, tool);
-  if (tool !== "request_scope" && tool !== "mcp_list_servers" && !run.allowedTools.includes(tool)) {
-    run.outcome.policyViolation ??= { tool };
-    finishRun(run);
-    terminateRun(run);
-  }
+  if (tool === "request_scope" || tool === "mcp_list_servers" || run.allowedTools.includes(tool)) return;
+  if (CONFIG_DENIED_TOOLS.includes(tool) && !RUNNING_TOOL_STATUSES.includes(update.status)) return;
+  run.outcome.policyViolation ??= { tool };
+  finishRun(run);
+  terminateRun(run);
 }
 
 function processNotification(run, event) {

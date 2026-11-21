@@ -143,5 +143,5 @@ export function billingPoolForModel(catalog, slugOrUid, effort = "default") {
 
 export function costClassForPool(pool) {
   if (pool === "free" || pool === "first-party") return "free";
-  return pool === "credits" ? "included" : "metered";
+  return "metered";
 }

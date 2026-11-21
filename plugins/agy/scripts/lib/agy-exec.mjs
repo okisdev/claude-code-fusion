@@ -1,8 +1,10 @@
 import { spawnSync } from "node:child_process";
+import os from "node:os";
 import path from "node:path";
 import { browserBlockerDir } from "./agy-home.mjs";
 import { isReadOnlyCommand } from "./agy-command-check.mjs";
 import { createSelectionResolver } from "./agy-models.mjs";
+import { isReadablePath } from "./sensitive-paths.mjs";
 import { clearRunTimers, createProcessTransport, destroyRunStreams, executablePath, inheritChildEnv, runProcess, settleRun as settleProcessRun } from "./process-run.mjs";
 
 export const TESTED_AGY_INTERVAL = { floor: "1.5", ceiling: "1.6" };
@@ -270,7 +272,8 @@ function processResponse(run, event) {
 function permissionOutcome(run, params) {
   const tool = params?.toolCall;
   const allowed = tool?.name === "run_command" && (tool.rawInput?.BypassSandbox === undefined || tool.rawInput.BypassSandbox === false)
-    && isReadOnlyCommand(tool.rawInput?.CommandLine);
+    && isReadOnlyCommand(tool.rawInput?.CommandLine)
+    || tool?.name === "read_file" && isReadablePath(tool.rawInput?.Path, run.realHome);
   const options = Array.isArray(params?.options) ? params.options : [];
   const option = allowed ? options.find((entry) => entry?.kind === "allow_once" && typeof entry.optionId === "string") : null;
   const selected = option ?? options.find((entry) => entry?.kind === "reject_once" && typeof entry.optionId === "string");
@@ -402,7 +405,7 @@ function startAgyRun(run, resolve) {
   if (signal?.aborted) abortRun(run);
 }
 
-export function runAgy({ bin, cwd, env, brief, mode, version, geminiDir, sessionOnly = false, resumeSessionId, resolveSelection = createSelectionResolver({ preserveModel: Boolean(resumeSessionId) }), timeoutMs = 540000, exitGraceMs = 15000, killGraceMs = 5000, launchProcess, signal, onSpawn }) {
+export function runAgy({ bin, cwd, env, brief, mode, version, geminiDir, sessionOnly = false, resumeSessionId, resolveSelection = createSelectionResolver({ preserveModel: Boolean(resumeSessionId) }), timeoutMs = 540000, exitGraceMs = 15000, killGraceMs = 5000, launchProcess, signal, onSpawn, realHome = os.homedir() }) {
   const childEnv = geminiDir ? { ...env, PATH: [browserBlockerDir(geminiDir), env?.PATH].filter(Boolean).join(path.delimiter) } : env;
   return runProcess({ bin, cwd, env: childEnv, brief, mode, version, geminiDir, sessionOnly, resumeSessionId, resolveSelection, timeoutMs, exitGraceMs, killGraceMs, launchProcess, signal, onSpawn }, {
     outcome: {
@@ -411,7 +414,7 @@ export function runAgy({ bin, cwd, env, brief, mode, version, geminiDir, session
     },
     state: {
       exited: false, ending: false, promptSent: false,
-      nextId: 1, pending: new Map(), configOptions: [], tools: new Map(), allowedTools: toolsForMode(mode)
+      nextId: 1, pending: new Map(), configOptions: [], tools: new Map(), allowedTools: toolsForMode(mode), realHome
     },
     start: startAgyRun,
     abort: abortRun

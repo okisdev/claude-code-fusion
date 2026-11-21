@@ -941,8 +941,12 @@ export function runtimeSocketEngine(endpoint, readlink = fs.readlinkSync) {
   return null;
 }
 
-export function runtimeSocketRemedy(endpoint, engine) {
-  const stop = engine === "orbstack" ? " (for OrbStack, run `orb stop`)" : engine === "docker-desktop" ? " (quit Docker Desktop)" : "";
+export function runtimeSocketRemedy(endpoint, engine, readlink = fs.readlinkSync) {
+  let target = null;
+  if (!engine) {
+    try { target = String(readlink(endpoint)); } catch {}
+  }
+  const stop = engine === "orbstack" ? " (for OrbStack, run `orb stop`)" : engine === "docker-desktop" ? " (quit Docker Desktop)" : target ? ` (it resolves to ${target})` : "";
   return `Stop the container engine that owns ${endpoint}${stop}, or route writes to another lane. Do not downgrade the sandbox.`;
 }
 
@@ -957,7 +961,7 @@ export function preflightRuntimeSocketEndpoints({ env = process.env, version = n
     const endpoint = symlinks[0];
     throw securityError(
       "sandbox",
-      `Grok strict sandbox refuses runtime-socket symlink ${endpoint}${runtimeSocketSymlinkTargetsAllowed(version) ? " because its resolved target is outside the deny list or cannot be resolved" : " because this Grok version requires non-symlink endpoints"}. ${runtimeSocketRemedy(endpoint, runtimeSocketEngine(endpoint, readlink))}`
+      `Grok strict sandbox refuses runtime-socket symlink ${endpoint}${runtimeSocketSymlinkTargetsAllowed(version) ? " because its resolved target is outside the deny list or cannot be resolved" : " because this Grok version requires non-symlink endpoints"}. ${runtimeSocketRemedy(endpoint, runtimeSocketEngine(endpoint, readlink), readlink)}`
     );
   }
   return symlinks;

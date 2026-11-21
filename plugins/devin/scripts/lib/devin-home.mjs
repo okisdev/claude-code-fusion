@@ -5,6 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import { ensureHomeLink, ensurePrivateDirectories } from "./private-home.mjs";
 import { withRecordLock } from "./record-lock.mjs";
+import { SENSITIVE_HOME_DIRS, SENSITIVE_HOME_FILES } from "./sensitive-paths.mjs";
 import { listAllJobRecords } from "./state.mjs";
 import { processGroupAlive, processIdentityMatches, processIsDirectlyAlive, validProcessIdentity } from "./process-identity.mjs";
 
@@ -118,14 +119,10 @@ export function buildJobConfig({ configDir, mode, cwd, realHome = os.homedir(), 
   if (!["consult", "review", "write"].includes(mode)) throw new Error(`Invalid Devin mode: ${mode}`);
   const devinDir = path.join(configDir, "devin");
   ensurePrivateDirectories([configDir, devinDir]);
-  const sensitiveDirs = [
-    ".ssh", ".gnupg", ".aws", ".azure", ".kube", ".docker", ".config", ".local/share",
-    ".claude", ".codex", ".grok", ".cursor", ".devin", "Library/Keychains", "Library/Application Support"
-  ];
   const deny = [
     "Fetch(*)",
-    ...sensitiveDirs.map((directory) => `Read(${path.join(realHome, directory)}/**)`),
-    ...[".netrc", ".npmrc", ".git-credentials"].map((file) => `Read(${path.join(realHome, file)})`),
+    ...SENSITIVE_HOME_DIRS.map((directory) => `Read(${path.join(realHome, directory)}/**)`),
+    ...SENSITIVE_HOME_FILES.map((file) => `Read(${path.join(realHome, file)})`),
     `Read(${path.dirname(realCredentialsPath({ env, realHome }))}/**)`,
     ...(homeDir ? ["credentials.toml", "cli/sessions.db"].map((file) => `Read(${path.join(homeDir, ".local", "share", "devin", file)})`) : [])
   ];
