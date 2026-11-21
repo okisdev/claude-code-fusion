@@ -231,8 +231,11 @@ test("quota treats an elapsed fraction of exactly one as unknown pacing", (t) =>
 test("quota derives costClass from rate_limits plan_type", (t) => {
   const box = makeSandbox(t);
   for (const [planType, expected] of [
+    ["go", "included"],
     ["plus", "included"],
     ["pro", "included"],
+    ["prolite", "included"],
+    ["promax", "included"],
     ["team", "included"],
     ["business", "included"],
     ["enterprise", "included"],
@@ -270,4 +273,55 @@ test("quota ignores cached reports whose pools have invalid fields", (t) => {
     fs.writeFileSync(file, JSON.stringify({ ...cached, at: Date.now(), report: { ...cached.report, pools: [pool] } }));
     assert.deepEqual(quota(box).pools, report.pools);
   }
+});
+
+test("a live account rate limit read needs Codex credentials and replaces an older rollout snapshot on the next quota call", async (t) => {
+  const box = makeSandbox(t);
+  rollout(box, { plan_type: "pro", primary: { ...primary, used_percent: 100 } });
+  const resetsAt = Math.floor(Date.now() / 1000) + 6 * 24 * 60 * 60;
+  const live = { rateLimitsByLimitId: { codex: { planType: "promax", primary: { usedPercent: 3, windowDurationMins: 10080, resetsAt }, secondary: null } } };
+  const env = { FAKE_CODEX_ACCOUNT_RATE_LIMITS: JSON.stringify(live) };
+  assert.equal(quota(box, env).pools[0].usedPercent, 100);
+  assert.equal(fs.existsSync(path.join(box.dataDir, "quota-live.refreshing")), false);
+  fs.mkdirSync(box.codexHome, { recursive: true });
+  fs.writeFileSync(path.join(box.codexHome, "auth.json"), "{}");
+  fs.rmSync(path.join(box.dataDir, "quota.json"), { force: true });
+  assert.equal(quota(box, env).pools[0].usedPercent, 100);
+  const liveFile = path.join(box.dataDir, "quota-live.json");
+  const deadline = Date.now() + 10_000;
+  while (!fs.existsSync(liveFile) && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 50));
+  assert.ok(fs.existsSync(liveFile), "live refresh did not write its cache");
+  assert.equal(fs.existsSync(path.join(box.dataDir, "quota.json")), false);
+  const report = quota(box, env);
+  assert.deepEqual(report.pools.map(({ pool, costClass, usedPercent, windowMinutes }) => ({ pool, costClass, usedPercent, windowMinutes })), [{ pool: "codex", costClass: "included", usedPercent: 3, windowMinutes: 10080 }]);
+  assert.equal(report.pools[0].resetsAt, new Date(resetsAt * 1000).toISOString());
+});
+
+test("only one caller acquires the live refresh lease until it expires", (t) => {
+  const box = makeSandbox(t);
+  fs.mkdirSync(box.codexHome, { recursive: true });
+  fs.writeFileSync(path.join(box.codexHome, "auth.json"), "{}");
+  rollout(box, { primary });
+  const lease = path.join(box.dataDir, "quota-live.refreshing");
+  fs.mkdirSync(box.dataDir, { recursive: true });
+  fs.writeFileSync(lease, "held\n");
+  quota(box);
+  assert.equal(fs.readFileSync(lease, "utf8"), "held\n");
+  const expired = new Date(Date.now() - 31_000);
+  fs.utimesSync(lease, expired, expired);
+  fs.rmSync(path.join(box.dataDir, "quota.json"), { force: true });
+  quota(box);
+  assert.equal(fs.readFileSync(lease, "utf8"), "");
+});
+
+test("a failed live read keeps the rollout snapshot and writes no live cache", async (t) => {
+  const box = makeSandbox(t);
+  fs.mkdirSync(box.codexHome, { recursive: true });
+  fs.writeFileSync(path.join(box.codexHome, "auth.json"), "{}");
+  rollout(box, { primary });
+  assert.equal(quota(box).pools[0].usedPercent, 79);
+  assert.ok(fs.existsSync(path.join(box.dataDir, "quota-live.refreshing")));
+  await new Promise((resolve) => setTimeout(resolve, 1500));
+  assert.equal(fs.existsSync(path.join(box.dataDir, "quota-live.json")), false);
+  assert.equal(quota(box).pools[0].usedPercent, 79);
 });

@@ -361,16 +361,16 @@ for (const observed of ["swe-2-high-pro", "GPT-6 Sol Pro"]) {
   });
 }
 
-test("the quota adapter reports a free pool and an included credits pool", () => {
+test("the quota adapter reports a free pool and a metered credits pool", () => {
   const report = quota({ env: {}, dataDir: "/tmp/devin-data" });
   assert.equal(report.engine, "devin");
   assert.equal(report.available, true);
   assert.ok(Date.parse(report.observedAt));
   assert.deepEqual(report.pools, [
     { pool: "free", costClass: "free", usedPercent: null, windowMinutes: null, resetsAt: null, pacing: null },
-    { pool: "credits", costClass: "included", usedPercent: null, windowMinutes: null, resetsAt: null, pacing: null }
+    { pool: "credits", costClass: "metered", usedPercent: null, windowMinutes: null, resetsAt: null, pacing: null }
   ]);
-  assert.equal(report.note, "Devin exposes no usage meter; credits are the subscription's prepaid allowance.");
+  assert.equal(report.note, "Devin exposes no usage meter; credits bill per token, so routing treats them as metered.");
 });
 
 test("unavailable account family fails as setup and unsupported effort as input", (t) => {
@@ -546,6 +546,31 @@ test("a timed out Devin task resumes its session once and delivers the wind down
   assert.ok(h.messages().some((message) => message.method === "session/load" && message.params.sessionId === record.sessionId));
   assert.match(h.messages().find((message) => message.method === "session/prompt").params.prompt[0].text, /^Your time budget is exhausted\. Stop exploring\./);
   assert.match(result.stdout, /warning: timeout_salvaged\nstate: done\n$/);
+});
+
+test("an empty Devin turn resumes its session once with a continue prompt and delivers the answer", (t) => {
+  const h = harness(t, "empty_response");
+  const result = task(h);
+  assertDone(result);
+  assert.equal(h.jobs().length, 1);
+  const [record] = h.jobs();
+  assert.equal(record.salvage.attempted, true);
+  assert.equal(record.salvage.reason, "empty_turn");
+  assert.equal(record.salvage.outcome, "done");
+  assert.equal(record.semanticFailureKind ?? null, null);
+  assert.equal(record.resultText, "fake result");
+  assert.ok(h.messages().some((message) => message.method === "session/load" && message.params.sessionId === record.sessionId));
+  assert.match(h.messages().find((message) => message.method === "session/prompt").params.prompt[0].text, /^Your last turn ended without a response\./);
+  assert.match(result.stdout, /warning: empty_turn_continued\nstate: done\n$/);
+});
+
+test("an empty Devin turn that also broke tool policy fails as policy without a resume", (t) => {
+  const h = harness(t, "empty_response_policy");
+  task(h);
+  const [record] = h.jobs();
+  assert.equal(record.failureKind, "policy");
+  assert.equal(record.salvage ?? null, null);
+  assert.equal(h.messages().some((message) => message.method === "session/load"), false);
 });
 
 test("models and setup expose the family catalog and account plan", (t) => {

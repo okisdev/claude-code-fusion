@@ -109,6 +109,10 @@
     "plugins/devin/scripts/lib/companion-state.mjs",
     "plugins/agy/scripts/lib/companion-state.mjs"
   ],
+  "sensitive-paths.mjs": [
+    "plugins/devin/scripts/lib/sensitive-paths.mjs",
+    "plugins/agy/scripts/lib/sensitive-paths.mjs"
+  ],
   "review.md": [
     "plugins/cursor/prompts/review.md",
     "plugins/devin/prompts/review.md",

@@ -60,7 +60,21 @@ async function waitForFile(file) {
   }
 }
 
-if (UNMODELLED_SUBCOMMANDS.has(args[0])) {
+if (args[0] === "app-server" && process.env.FAKE_CODEX_ACCOUNT_RATE_LIMITS) {
+  let pending = "";
+  process.stdin.setEncoding("utf8");
+  process.stdin.on("data", (chunk) => {
+    pending += chunk;
+    let index;
+    while ((index = pending.indexOf("\n")) >= 0) {
+      const message = JSON.parse(pending.slice(0, index));
+      pending = pending.slice(index + 1);
+      if (message.method === "initialize") process.stdout.write(`${JSON.stringify({ id: message.id, result: { userAgent: "fake" } })}\n`);
+      if (message.method === "account/rateLimits/read") process.stdout.write(`${JSON.stringify({ id: message.id, result: JSON.parse(process.env.FAKE_CODEX_ACCOUNT_RATE_LIMITS) })}\n`);
+    }
+  });
+  await new Promise(() => {});
+} else if (UNMODELLED_SUBCOMMANDS.has(args[0])) {
   process.stderr.write(`error: subcommand not modelled by fake-codex: ${args[0]}\n`);
   process.exit(2);
 }

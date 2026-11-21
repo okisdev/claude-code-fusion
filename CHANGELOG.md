@@ -1,5 +1,15 @@
 # changelog
 
+## 0.0.89
+
+- the Codex companion reads live quota from `codex app-server`'s `account/rateLimits/read` and reports it when it is newer than the rollout telemetry. a stale answer starts one detached refresh behind an exclusive lease, and only when the Codex home holds credentials. quota had only come from Codex runs, so a 100 percent snapshot told routing to avoid Codex, no run refreshed it, and an upgraded plan sat at 0 percent used for a day with one Codex job dispatched. `promax`, `prolite`, and `go` plans count as included.
+- an accepted implementation wave now suggests a read only Antigravity consult that names the changed files, and the breadth engine only while Antigravity is unhealthy. the old suggestion sent `operation: review` to the breadth engine, and companion review mode ignores the brief and reviews the whole working tree diff: Antigravity review timed out in 3 of 3 runs and Devin review in 3 of 7.
+- Antigravity may read a file outside the workspace when its absolute path exists and neither the path nor its resolved target falls under a sensitive home location, symlinked sensitive roots included. every `read_file` request outside the workspace had been refused, which ended runs that read a staged diff in the orchestrator's scratchpad or a dependency's source. Devin and Antigravity share one sensitive path list, which now includes `.gemini`.
+- a Devin `webfetch` call is left to the configuration's `Fetch(*)` denial and fails as `policy` only once it runs. the companion had killed the job on the call itself, before Devin refused it, which was 32 percent of last week's Devin rejections.
+- Devin `credits` are `metered` again, reversing 0.0.88: credits bill per token, Devin exposes no meter that tells an included allowance from overage, and one plan had spent its credits and moved to pay as you go while routing kept treating them as included. the Devin diversity default is `kimi-k3.1-pro` at `high` instead of `muse-wonder` at `xhigh`, which costs about twice as much per token and scored below it on Terminal-Bench 4.1 (47.0 against 59.7). Codex overflow goes to Devin burst only on its free pool, and session context marks metered lane defaults.
+- a Devin task whose turn ended without a response resumes its session once with a prompt to continue, and finishes with `warning: empty_turn_continued`. a policy failure is never resumed this way.
+- a Grok runtime socket refusal names where an unrecognized symlink resolves, so a container engine other than OrbStack or Docker Desktop is identifiable from the message.
+
 ## 0.0.88
 
 - a Devin family default bills the pool of the variant its effort serves, so `swe-2` at `high` routes on the `free` pool instead of `credits`; the old check compared a lowercase `free` against the catalog's `Free` and filed every family with a priced variant under credits. Devin `credits` are now the subscription's prepaid allowance (`included`), not metered. together these had kept the over pace advisory and the metered rule from ever routing work to Devin burst: one host sent 17 burst packages to Antigravity and none to Devin while Codex ran at 3.1 times pace.

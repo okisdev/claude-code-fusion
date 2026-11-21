@@ -29,7 +29,7 @@ export const DEFAULT_ROUTING_DEFAULTS = Object.fromEntries(Object.entries({
     burst: { model: "composer-2.5", effort: "default" }
   },
   devin: {
-    diversity: { model: "muse-wonder", effort: "xhigh" },
+    diversity: { model: "kimi-k3.1-pro", effort: "high" },
     burst: { model: "swe-2", effort: "high" }
   },
   agy: {
@@ -309,7 +309,7 @@ export function renderModelTable(data, { includeNotes = false, env = process.env
   const defaults = mergeRoutingDefaults(data.defaults, env);
   const defaultSentence = routedEngineIds(breadth).map((lane) => ENGINES[lane].roles.map((role, index) => {
     const choice = defaults[lane][role];
-    return `${index === 0 ? `${lane} ` : ""}${role} ${tableCell(choice.model)}@${choice.effort}${includeNotes ? ` (pool: ${tableCell(choice.pool ?? "unknown")}, cost class: ${tableCell(choice.costClass ?? "unknown")})` : ""}`;
+    return `${index === 0 ? `${lane} ` : ""}${role} ${tableCell(choice.model)}@${choice.effort}${includeNotes ? ` (pool: ${tableCell(choice.pool ?? "unknown")}, cost class: ${tableCell(choice.costClass ?? "unknown")})` : choice.costClass === "metered" ? " (metered)" : ""}`;
   }).join(", ")).join("; ");
   lines.push(
     `Breadth engine: ${ENGINES[breadth].displayName} (${breadth}); its briefs go to ${ENGINES[breadth].rescueAgent} with \`${breadth}-role: diversity\` or \`${breadth}-role: burst\`, and ${ENGINES[otherBreadth].displayName} holds no routing seat.`,

@@ -92,6 +92,14 @@ async function prompt(id) {
   if (scenario === "no_result") return process.exit(0);
   if (scenario === "no_result_nonzero") return process.exit(7);
   if (scenario === "hang" || scenario === "wind_down" && !resumed) return;
+  if (scenario === "empty_response_policy" && !resumed) {
+    tool("invoke_subagent");
+    return stopped("empty_response");
+  }
+  if (scenario === "empty_response" && !resumed) {
+    stopped("empty_response");
+    return fail(id, "The model ended its turn without a response. Send a message to continue.");
+  }
   if (scenario === "permission" || scenario === "unknown_request") {
     return emit({ id: scenario === "permission" ? 0 : "client-request", method: scenario === "permission" ? "session/request_permission" : "fs/read_text_file", params: { sessionId, toolCall: { toolCallId: "write:0#c4" }, options: [{ optionId: "allow_once", kind: "allow_once" }] } });
   }
@@ -103,10 +111,16 @@ async function prompt(id) {
     tool("mcp_list_servers");
     update({ sessionUpdate: "tool_call_update", toolCallId: "mcp_list_servers:0#ab", status: "failed", rawOutput: "No MCP servers configured" });
   }
-  if (scenario === "forbidden_tool") return tool("webfetch");
+  if (scenario === "forbidden_tool") return tool("invoke_subagent");
   if (scenario === "forbidden_update") {
     tool("read");
-    return tool("webfetch", "read:0#ab", "tool_call_update");
+    return tool("invoke_subagent", "read:0#ab", "tool_call_update");
+  }
+  if (scenario === "webfetch_denied" || scenario === "webfetch_running") {
+    tool("webfetch");
+    const status = scenario === "webfetch_denied" ? "failed" : "in_progress";
+    update({ sessionUpdate: "tool_call_update", toolCallId: "webfetch:0#ab", status, content: [{ type: "content", content: { type: "text", text: "Permission denied for this tool." } }] });
+    if (scenario === "webfetch_running") return;
   }
   if (scenario === "web_search") tool("web_search");
   if (scenario === "missing_tool") return update({ sessionUpdate: "tool_call", toolCallId: "unknown" });
@@ -128,7 +142,7 @@ async function prompt(id) {
   if (scenario === "stderr_tail") fs.writeSync(2, `${"é".repeat(40000)}tail\n`);
   if (scenario === "network_after_result") fs.writeSync(2, "fetch failed: ECONNRESET\n");
   success();
-  if (scenario === "forbidden_after_result") tool("webfetch");
+  if (scenario === "forbidden_after_result") tool("invoke_subagent");
   if (scenario === "unexpected_signal") process.kill(process.pid, "SIGUSR2");
   if (scenario === "no_final_newline") process.exit(0);
 }
@@ -147,7 +161,7 @@ async function handleMessage(message) {
   if (method === "session/cancel") return;
   if (method === "initialize") {
     if (scenario === "slow_init") return;
-    if (scenario === "forbidden_before_init") return tool("webfetch");
+    if (scenario === "forbidden_before_init") return tool("invoke_subagent");
     if (scenario === "initialize_error") return fail(id, "Initialization failed");
     return reply(id, { protocolVersion: scenario === "bad_protocol_version" ? 2 : 1, agentCapabilities: { loadSession: true }, authMethods: [{ id: "login", name: "Log in" }] });
   }
@@ -157,12 +171,12 @@ async function handleMessage(message) {
     if (method === "session/load") {
       text("old conversation before load result");
       tool(scenario === "replay_forbidden_tool" ? "edit" : "read", "replayed:0#ab");
-      tool(scenario === "replay_forbidden_update" ? "webfetch" : "read", "replayed:0#ab", "tool_call_update");
+      tool(scenario === "replay_forbidden_update" ? "invoke_subagent" : "read", "replayed:0#ab", "tool_call_update");
     }
     reply(id, { ...(scenario === "missing_session" || method === "session/load" ? {} : { sessionId }), modes: { currentModeId: "accept-edits", availableModes: [] }, configOptions });
     if (method === "session/load") {
       text("old conversation after load result");
-      if (scenario === "replay_forbidden_after_load") tool("webfetch", "replayed:1#ab");
+      if (scenario === "replay_forbidden_after_load") tool("invoke_subagent", "replayed:1#ab");
     }
     return;
   }

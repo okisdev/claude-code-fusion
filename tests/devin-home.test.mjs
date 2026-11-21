@@ -174,7 +174,7 @@ test("live companion job defers private session migration", (t) => {
 test("job config contains the exact base policy and consult or review tool denies", (t) => {
   const root = fixture(t);
   const realHome = path.join(root, "real");
-  const sensitive = [".ssh", ".gnupg", ".aws", ".azure", ".kube", ".docker", ".config", ".local/share", ".claude", ".codex", ".grok", ".cursor", ".devin", "Library/Keychains", "Library/Application Support"];
+  const sensitive = [".ssh", ".gnupg", ".aws", ".azure", ".kube", ".docker", ".config", ".local/share", ".gemini", ".claude", ".codex", ".grok", ".cursor", ".devin", "Library/Keychains", "Library/Application Support"];
   const baseDeny = ["Fetch(*)", ...sensitive.map((dir) => `Read(${path.join(realHome, dir)}/**)`), ...[".netrc", ".npmrc", ".git-credentials"].map((file) => `Read(${path.join(realHome, file)})`), `Read(${path.join(realHome, ".local", "share", "devin")}/**)`];
   for (const mode of ["consult", "review", "write"]) {
     const configDir = path.join(root, mode, "config");

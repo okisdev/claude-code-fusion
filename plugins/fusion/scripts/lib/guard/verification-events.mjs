@@ -36,11 +36,10 @@ function settledAcceptedImplementationTaskId(command, toolResponse, env) {
 }
 
 function waveReviewSuggestion(env, sessionId, nowMs) {
-  const breadth = readRoutingDefaults(env, { warn: null }).breadth;
-  const consultHealthy = engineHealth(breadth, "consult", null, { env, now: nowMs, sessionId }).healthy;
-  const engine = consultHealthy ? breadth : "agy";
-  const role = consultHealthy ? "diversity" : "independence";
-  return `Wave settled. Dispatch one cross family review of the working tree diff now, in the same message as your next work: ${ENGINES[engine].rescueAgent} with header \`${engine}-role: ${role} | operation: review | acceptance: findings cite file:line\`.`;
+  const agyHealthy = engineHealth("agy", "consult", null, { env, now: nowMs, sessionId }).healthy;
+  const engine = agyHealthy ? "agy" : readRoutingDefaults(env, { warn: null }).breadth;
+  const role = agyHealthy ? "independence" : "diversity";
+  return `Wave settled. Dispatch one cross family read only review of this wave's changed files now, in the same message as your next work: ${ENGINES[engine].rescueAgent} with header \`${engine}-role: ${role} | read only | acceptance: findings cite file:line\`, naming the changed files in the brief.`;
 }
 
 function suggestSettledWaveReview(env, { sessionId, command, toolResponse, file, now, writeHookText }) {

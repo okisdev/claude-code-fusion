@@ -205,7 +205,7 @@ test("billing pool follows the cost tier of the resolved variant", () => {
 
 test("cost class maps pools and legacy record pool names", () => {
   assert.equal(costClassForPool("free"), "free");
-  assert.equal(costClassForPool("credits"), "included");
+  assert.equal(costClassForPool("credits"), "metered");
   assert.equal(costClassForPool("first-party"), "free");
   assert.equal(costClassForPool("api"), "metered");
 });

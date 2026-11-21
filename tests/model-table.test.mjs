@@ -49,7 +49,8 @@ test("Billing metadata derives from each engine and the cached Devin catalog", (
     families: [
       { slug: "swe-2", aliases: ["swe"], variants: [{ uid: "swe-2-fast", cost_tier: "free" }, { uid: "swe-2-deep", cost_tier: "free" }] },
       { slug: "mixed", aliases: [], variants: [{ uid: "mixed-free", cost_tier: "free" }, { uid: "mixed-paid", cost_tier: "premium" }] },
-      { slug: "muse-wonder", aliases: [], variants: [{ uid: "muse-wonder-xhigh", cost_tier: "premium" }] }
+      { slug: "muse-wonder", aliases: [], variants: [{ uid: "muse-wonder-xhigh", cost_tier: "premium" }] },
+      { slug: "kimi-k3.1-pro", aliases: [], variants: [{ uid: "kimi-k3-1-pro-high", cost_tier: "premium" }] }
     ]
   }));
   const env = { HOME: dir, DEVIN_COMPANION_DATA: dataDir };
@@ -62,10 +63,10 @@ test("Billing metadata derives from each engine and the cached Devin catalog", (
     ["devin", "swe-2", "free", "free"],
     ["devin", "swe", "free", "free"],
     ["devin", "swe-2-fast", "free", "free"],
-    ["devin", "mixed", "credits", "included"],
+    ["devin", "mixed", "credits", "metered"],
     ["devin", "mixed-free", "free", "free"],
-    ["devin", "mixed-paid", "credits", "included"],
-    ["devin", "muse-wonder", "credits", "included"],
+    ["devin", "mixed-paid", "credits", "metered"],
+    ["devin", "muse-wonder", "credits", "metered"],
     ["devin", "unknown", null, null],
     ["other", "unknown", null, null],
     ["claude-fast", "sonnet", null, null]
@@ -78,7 +79,7 @@ test("Billing metadata derives from each engine and the cached Devin catalog", (
   assert.match(table, /\| muse-spark-1\.3 \| cursor \| cognition \| 3 \| 3 \| 3 \| metered \|/);
   const defaults = readRoutingDefaults({ ...env, FUSION_MODEL_ROUTING: path.join(dir, "missing.json") });
   assert.deepEqual(defaults.devin.burst, { model: "swe-2", effort: "high", pool: "free", costClass: "free" });
-  assert.deepEqual(defaults.devin.diversity, { model: "muse-wonder", effort: "xhigh", pool: "credits", costClass: "included" });
+  assert.deepEqual(defaults.devin.diversity, { model: "kimi-k3.1-pro", effort: "high", pool: "credits", costClass: "metered" });
   for (const lane of ["codex", "grok", "agy"]) {
     for (const choice of Object.values(defaults[lane])) {
       assert.equal(choice.pool, lane);
@@ -107,9 +108,9 @@ test("A Devin family default bills the pool of the variant its effort serves", (
   ];
   const result = validateModelRoutingData({ ...ROUTING, breadth: "devin", models, defaults: { devin: { burst: { model: "swe-2", effort: "high" }, diversity: { model: "muse-wonder", effort: "xhigh" } } } }, { env });
   assert.equal(result.ok, true, result.reason);
-  assert.deepEqual(result.data.models.map(({ id, pool, costClass }) => [id, pool, costClass]), [["swe-2", "credits", "included"], ["muse-wonder", "credits", "included"]]);
+  assert.deepEqual(result.data.models.map(({ id, pool, costClass }) => [id, pool, costClass]), [["swe-2", "credits", "metered"], ["muse-wonder", "credits", "metered"]]);
   assert.deepEqual(result.data.defaults.devin.burst, { model: "swe-2", effort: "high", pool: "free", costClass: "free" });
-  assert.deepEqual(result.data.defaults.devin.diversity, { model: "muse-wonder", effort: "xhigh", pool: "credits", costClass: "included" });
+  assert.deepEqual(result.data.defaults.devin.diversity, { model: "muse-wonder", effort: "xhigh", pool: "credits", costClass: "metered" });
 });
 
 test("Devin billing resolves the installed companion and canonical cache directory", (t) => {
@@ -163,7 +164,7 @@ test("Routing reads derive billing metadata from the current Devin cache without
     fs.writeFileSync(path.join(dir, "models-cache.json"), JSON.stringify({ fetchedAt: Date.now(), families: [{ slug: "swe-2", aliases: [], variants: [{ uid: "swe-2-model", cost_tier: tier }] }] }));
     const result = readModelRoutingFile(file, { env });
     assert.equal(result.ok, true, result.reason);
-    assert.equal(result.data.models[0].costClass, tier === "free" ? "free" : "included");
+    assert.equal(result.data.models[0].costClass, tier === "free" ? "free" : "metered");
     assert.equal(result.data.defaults.devin.burst.costClass, result.data.models[0].costClass);
     assert.deepEqual(JSON.parse(fs.readFileSync(file, "utf8")), stored);
   }
@@ -189,7 +190,7 @@ test("Session context table renders scores without Notes and points to config", 
   assert.match(table, /^\|---\|---\|---\|---:\|---:\|---:\|---\|$/m);
   assert.match(table, /^\| codex \| codex \| openai \| 5 \| 4 \| 5 \| included \|$/m);
   assert.doesNotMatch(table, /primary implementation lane|\| Notes \|/);
-  assert.match(table, /^Lane defaults: codex quick gpt-6-sol@xhigh, volume gpt-6-sol@high, flagship gpt-6\.1-sol@xhigh; grok burst grok-4\.7-build-fast@low, independence grok-4\.7-build-fast@low, live-web grok-4\.7-build-fast@high, large-context grok-4\.6@medium; cursor diversity muse-spark-1\.3@xhigh, burst composer-2\.5@default; agy independence gemini-4-neon@high, large-context gemini-4-neon@high, burst gemini-4-neon@medium\.$/m);
+  assert.match(table, /^Lane defaults: codex quick gpt-6-sol@xhigh, volume gpt-6-sol@high, flagship gpt-6\.1-sol@xhigh; grok burst grok-4\.7-build-fast@low, independence grok-4\.7-build-fast@low, live-web grok-4\.7-build-fast@high, large-context grok-4\.6@medium; cursor diversity muse-spark-1\.3@xhigh \(metered\), burst composer-2\.5@default; agy independence gemini-4-neon@high, large-context gemini-4-neon@high, burst gemini-4-neon@medium\.$/m);
   assert.match(table, /\| grok-fast \| grok \| xai \| 3 \| 3 \| 5 \| included \|\nBreadth engine: Cursor \(cursor\); its briefs go to cursor:cursor-rescue with `cursor-role: diversity` or `cursor-role: burst`, and Devin holds no routing seat\.\nBreadth diversity excludes the claude family and the google family served by Antigravity \(agy\); route google consults to agy:agy-rescue\.\nModel notes \(benchmarks, prices, latency\) live in model-routing\.json; `\/fusion:config` shows them\.\n\nLane defaults: [^\n]+\n\nScores feed/);
   assert.match(
     table,

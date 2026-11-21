@@ -101,7 +101,7 @@ async function prompt(id) {
     if (scenario === "permission_empty") text("");
     else if (scenario === "permission_whitespace") text(" \n\t ");
     else text("before permission");
-    const rawInput = { CommandLine: process.env.FAKE_AGY_COMMAND || (scenario === "permission_write" ? "touch outside" : "git status --short"), ...(scenario === "permission_bypass" ? { BypassSandbox: true } : {}) };
+    const rawInput = process.env.FAKE_AGY_READ_PATH !== undefined ? { Path: process.env.FAKE_AGY_READ_PATH } : { CommandLine: process.env.FAKE_AGY_COMMAND || (scenario === "permission_write" ? "touch outside" : "git status --short"), ...(scenario === "permission_bypass" ? { BypassSandbox: true } : {}) };
     const name = process.env.FAKE_AGY_PERMISSION_TOOL || (["permission_read", "permission_empty", "permission_whitespace"].includes(scenario) ? "read_file" : scenario === "permission_edit" ? "edit_file" : "run_command");
     const options = scenario === "permission_no_reject" ? [{ optionId: "approval", kind: "allow_once" }] : scenario === "permission_no_allow" ? [{ optionId: "denial", kind: "reject_once" }] : [{ optionId: "persist", kind: "allow_always" }, { optionId: "denial", kind: "reject_once" }, { optionId: "approval", kind: "allow_once" }];
     return emit({ id: 0, method: "session/request_permission", params: { sessionId, toolCall: { toolCallId: "command", name, rawInput }, options } });

@@ -12,6 +12,7 @@ import { configureRawTransport, createRawCommandTransport as allocateRawCommandT
 import { awaitOutput } from "./lib/await-output.mjs";
 import { resolveTimeoutMs } from "./lib/job-state.mjs";
 import { codexHome, latestRolloutRateLimits } from "./lib/codex-rollout.mjs";
+import { readAccountRateLimits } from "./lib/codex-rate-limits.mjs";
 import { renderFailure } from "./lib/render-footers.mjs";
 import { parseArgs, parseRawArgs, parseServiceTier, parseRecordAcceptanceArgs, splitRawArgumentString } from "./lib/args.mjs";
 import {
@@ -103,8 +104,11 @@ const RESUMABLE_FAILURE_KINDS = new Set(["timeout", "policy", "patch_thrash", "d
 const WIND_DOWN_PROMPT = "Wind down: do not start new work. Finish the smallest coherent deliverable from the work already completed and report the files changed and the verification output.";
 const JOB_ID_PATTERN = /^[a-f0-9]{32}$/;
 const QUOTA_PLAN_COST_CLASS = new Map([
+  ["go", "included"],
   ["plus", "included"],
   ["pro", "included"],
+  ["prolite", "included"],
+  ["promax", "included"],
   ["team", "included"],
   ["business", "included"],
   ["enterprise", "included"],
@@ -219,6 +223,47 @@ function validQuotaPool(pool) {
     && nullable(pool.pacing, (value) => Number.isFinite(value) && value >= 0);
 }
 
+const LIVE_QUOTA_MAX_AGE_MS = 60_000;
+const LIVE_QUOTA_REFRESH_LEASE_MS = 30_000;
+
+function liveQuotaFile() {
+  return path.join(resolveDataDir(), "quota-live.json");
+}
+
+function readLiveQuota(home) {
+  try {
+    const cached = JSON.parse(fs.readFileSync(liveQuotaFile(), "utf8"));
+    return cached.home === home && cached.observation?.rateLimits && Number.isFinite(Date.parse(cached.observation.observedAt)) ? cached.observation : null;
+  } catch {
+    return null;
+  }
+}
+
+function startLiveQuotaRefresh(at) {
+  const lease = path.join(resolveDataDir(), "quota-live.refreshing");
+  try {
+    fs.mkdirSync(path.dirname(lease), { recursive: true, mode: 0o700 });
+    let descriptor;
+    try {
+      descriptor = fs.openSync(lease, "wx", 0o600);
+    } catch (error) {
+      if (error?.code !== "EEXIST" || at - fs.statSync(lease).mtimeMs < LIVE_QUOTA_REFRESH_LEASE_MS) return;
+      fs.rmSync(lease, { force: true });
+      descriptor = fs.openSync(lease, "wx", 0o600);
+    }
+    fs.closeSync(descriptor);
+    spawn(process.execPath, [SELF_PATH, "quota-refresh"], { env: process.env, detached: true, stdio: "ignore", windowsHide: true }).unref();
+  } catch {}
+}
+
+async function handleQuotaRefresh() {
+  const home = codexHome();
+  const observation = await readAccountRateLimits({ bin: process.env.CODEX_BIN?.trim() || "codex" });
+  if (!observation) return;
+  writePrivateStateFile(liveQuotaFile(), `${JSON.stringify({ home, observation })}\n`);
+  fs.rmSync(path.join(resolveDataDir(), "quota.json"), { force: true });
+}
+
 function handleQuota(argv) {
   const { positionals } = commandArgs(argv, { booleanOptions: ["json"] });
   if (positionals.length) throw new CompanionError("The quota command accepts only --json.", "input");
@@ -235,7 +280,10 @@ function handleQuota(argv) {
   } catch {}
   let report = { engine: "codex", available: false, observedAt: new Date(at).toISOString(), pools: [], note: "No rate_limits telemetry found in Codex rollouts." };
   try {
-    const observation = latestRolloutRateLimits();
+    const live = readLiveQuota(home);
+    const rollout = latestRolloutRateLimits();
+    const observation = [live, rollout].filter(Boolean).sort((left, right) => (Date.parse(right.observedAt ?? "") || 0) - (Date.parse(left.observedAt ?? "") || 0))[0] ?? null;
+    if ((!live || !(at - Date.parse(live.observedAt) < LIVE_QUOTA_MAX_AGE_MS)) && fs.existsSync(path.join(home, "auth.json"))) startLiveQuotaRefresh(at);
     if (observation) {
       const observedAt = observation.observedAt;
       const observedMs = Date.parse(observedAt ?? "");
@@ -2245,6 +2293,9 @@ async function main() {
       break;
     case "quota":
       handleQuota(rawArgv);
+      break;
+    case "quota-refresh":
+      await handleQuotaRefresh();
       break;
     case "result":
       await handleResult(rawArgv);

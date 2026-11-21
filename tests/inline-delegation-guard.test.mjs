@@ -892,7 +892,7 @@ test("an accepted implementation settlement suggests one cross family review and
   const context = JSON.parse(emitted.stdout).hookSpecificOutput.additionalContext;
   assert.strictEqual(
     context,
-    "Wave settled. Dispatch one cross family review of the working tree diff now, in the same message as your next work: cursor:cursor-rescue with header `cursor-role: diversity | operation: review | acceptance: findings cite file:line`."
+    "Wave settled. Dispatch one cross family read only review of this wave's changed files now, in the same message as your next work: agy:agy-rescue with header `agy-role: independence | read only | acceptance: findings cite file:line`, naming the changed files in the brief."
   );
 
   const throttled = run(sandbox, settlementPayload(sandbox, secondTaskId), env);
@@ -901,7 +901,7 @@ test("an accepted implementation settlement suggests one cross family review and
   assert.ok(Number.isFinite(Date.parse(readState(sandbox, "session-1").reviewSuggestedAt)));
 });
 
-test("the settled review suggestion names the routed breadth engine and only accepted implementation packages", (t) => {
+test("the settled review suggestion names Antigravity and only accepted implementation packages", (t) => {
   const sandbox = makeSandbox(t);
   const routing = path.join(sandbox.root, "model-routing.json");
   fs.writeFileSync(routing, JSON.stringify({
@@ -935,11 +935,11 @@ test("the settled review suggestion names the routed breadth engine and only acc
   const context = JSON.parse(emitted.stdout).hookSpecificOutput.additionalContext;
   assert.strictEqual(
     context,
-    "Wave settled. Dispatch one cross family review of the working tree diff now, in the same message as your next work: devin:devin-rescue with header `devin-role: diversity | operation: review | acceptance: findings cite file:line`."
+    "Wave settled. Dispatch one cross family read only review of this wave's changed files now, in the same message as your next work: agy:agy-rescue with header `agy-role: independence | read only | acceptance: findings cite file:line`, naming the changed files in the brief."
   );
 });
 
-test("the settled review suggestion falls back to Antigravity when breadth consult health is unhealthy", (t) => {
+test("the settled review suggestion falls back to the routed breadth engine when Antigravity consult health is unhealthy", (t) => {
   const sandbox = makeSandbox(t);
   const now = "2026-07-21T00:10:00.000Z";
   const routing = path.join(sandbox.root, "model-routing.json");
@@ -955,7 +955,7 @@ test("the settled review suggestion falls back to Antigravity when breadth consu
   const failureTaskId = `fusion-${"0".repeat(24)}`;
   createSettledWorker(sandbox, taskId);
   const workerEnv = { ...process.env, ...env };
-  createWorkerRecord({ taskId: failureTaskId, sessionId: "session-1", agentType: "devin:devin-rescue", workspaceRoot: sandbox.workDir, packageType: "consult", limits: {} }, workerEnv);
+  createWorkerRecord({ taskId: failureTaskId, sessionId: "session-1", agentType: "agy:agy-rescue", workspaceRoot: sandbox.workDir, packageType: "consult", limits: {} }, workerEnv);
   updateWorkerRecord(failureTaskId, workerEnv, (record) => ({ ...record, transportStatus: "failed", failureKind: "auth", finishedAt: "2026-07-21T00:05:00.000Z" }));
 
   const emitted = run(sandbox, settlementPayload(sandbox, taskId), { ...env, FUSION_TEST_NOW: now });
@@ -963,7 +963,7 @@ test("the settled review suggestion falls back to Antigravity when breadth consu
   const context = JSON.parse(emitted.stdout).hookSpecificOutput.additionalContext;
   assert.strictEqual(
     context,
-    "Wave settled. Dispatch one cross family review of the working tree diff now, in the same message as your next work: agy:agy-rescue with header `agy-role: independence | operation: review | acceptance: findings cite file:line`."
+    "Wave settled. Dispatch one cross family read only review of this wave's changed files now, in the same message as your next work: devin:devin-rescue with header `devin-role: diversity | read only | acceptance: findings cite file:line`, naming the changed files in the brief."
   );
 });
 
