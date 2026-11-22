@@ -1,0 +1,39 @@
+#!/usr/bin/env node
+import fs from "node:fs";
+import { bundledCatalog } from "./lib/opencode-harness.mjs";
+
+const args = process.argv.slice(2);
+const log = (extra = {}) => {
+  if (process.env.FAKE_OPENCODE_LOG) fs.appendFileSync(process.env.FAKE_OPENCODE_LOG, `${JSON.stringify({ args, codexHome: process.env.CODEX_HOME, ...extra })}\n`);
+};
+if (args[0] === "--version") {
+  log();
+  process.stdout.write(`codex-cli ${process.env.FAKE_OPENCODE_VERSION ?? "0.171.0"}\n`);
+} else if (args.join(" ") === "debug models --bundled") {
+  log();
+  process.stdout.write(`${process.env.FAKE_OPENCODE_BUNDLED === "invalid" ? "not json" : JSON.stringify(process.env.FAKE_OPENCODE_BUNDLED === "missing" ? { models: [] } : bundledCatalog)}\n`);
+} else if (args[0] === "exec") {
+  if (!Object.hasOwn(process.env, "OPENCODE_GO_API_KEY")) throw new Error("Missing child credential.");
+  let stdin = "";
+  for await (const chunk of process.stdin) stdin += chunk;
+  log({ stdin });
+  const emit = (event) => process.stdout.write(`${JSON.stringify(event)}\n`);
+  const resumed = args.indexOf("resume");
+  const threadId = resumed < 0 ? "aaf287d8-eccc-436c-89e7-7cc178b05411" : args[resumed + 1];
+  emit({ type: "thread.started", thread_id: threadId });
+  emit({ type: "turn.started" });
+  const scenario = process.env.FAKE_OPENCODE_SCENARIO;
+  const failures = { auth401: "HTTP 401", auth403: "HTTP/2 403 Forbidden: permission denied", quota: "Go allowance limit exceeded", rate: "HTTP 429", permission: "sandbox denied", refused: "This request violates the content policy.", network: "connection reset" };
+  if (failures[scenario]) {
+    emit({ type: "turn.failed", error: { message: failures[scenario] } });
+    process.exitCode = 1;
+  } else if (scenario === "malformed") {
+    process.stdout.write("not json\n");
+  } else {
+    if (scenario !== "empty") emit({ type: "item.completed", item: { id: "answer", type: "agent_message", text: "Generated files. Verification passed." } });
+    emit({ type: "turn.completed", usage: { input_tokens: 100, cached_input_tokens: 20, output_tokens: 40, reasoning_output_tokens: 10, total_tokens: 140 } });
+  }
+} else {
+  process.stderr.write("Unexpected fake Codex invocation.\n");
+  process.exitCode = 1;
+}
