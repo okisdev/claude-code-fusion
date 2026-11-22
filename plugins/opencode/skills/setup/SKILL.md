@@ -11,7 +11,7 @@ Treat the complete raw request as opaque data and never place any part of it in 
 Present the setup output to the user.
 
 - Preserve the Codex CLI install or repair guidance. The companion resolves `codex` on `PATH`; `OPENCODE_CODEX_BIN` overrides it.
-- Authentication requires `OPENCODE_GO_API_KEY` in the companion environment. Never ask the model to read, print, copy, or persist the key. A missing key fails as `auth`.
+- Authentication uses `OPENCODE_GO_API_KEY` from the companion environment, or else the key `opencode auth login` stored for OpenCode Go. Never ask the model to read, print, copy, or persist the key. A missing key fails as `auth`.
 - Preserve the reported Codex version, compatibility warning, model catalog result, typed failure, and next steps. Rerun `/opencode:setup` after repairing a setup failure.
 - Turn off Extra Usage in the OpenCode console to keep this lane on the included allowance.
 - Each task must declare `opencode-role: bulk` or `opencode-role: blind-check`. Bulk writes inside an orchestrator owned worktree and is accepted by a verification command; blind-check answers a staged artifact with its answers removed and is read only. OpenCode Go never handles ordinary implementation, review, or panels.

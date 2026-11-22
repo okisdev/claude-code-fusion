@@ -1,6 +1,7 @@
 import { spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { errorWithFailure } from "./companion-commands.mjs";
@@ -8,8 +9,29 @@ import { writePrivateStateFile } from "./companion-state.mjs";
 
 export const GO_API_BASE_URL = "https://opencode.ai/inference/go/v1";
 
+function absolute(value) {
+  const trimmed = typeof value === "string" ? value.trim() : "";
+  return path.isAbsolute(trimmed) ? trimmed : null;
+}
+
+export function opencodeAuthFile(env = process.env) {
+  const dataHome = absolute(env.XDG_DATA_HOME) ?? path.join(absolute(env.HOME) ?? os.homedir(), ".local", "share");
+  return path.join(dataHome, "opencode", "auth.json");
+}
+
+export function resolveApiKey(env = process.env) {
+  const fromEnv = env.OPENCODE_GO_API_KEY?.trim();
+  if (fromEnv) return fromEnv;
+  let entry;
+  try { entry = JSON.parse(fs.readFileSync(opencodeAuthFile(env), "utf8"))?.["opencode-go"]; }
+  catch { return null; }
+  return entry?.type === "api" && typeof entry.key === "string" && entry.key.trim() ? entry.key.trim() : null;
+}
+
 export function requireApiKey(env = process.env) {
-  if (!env.OPENCODE_GO_API_KEY?.trim()) throw errorWithFailure("Set OPENCODE_GO_API_KEY before using OpenCode Go.", "auth");
+  const key = resolveApiKey(env);
+  if (!key) throw errorWithFailure("Run opencode auth login and choose OpenCode Go, or set OPENCODE_GO_API_KEY.", "auth");
+  return key;
 }
 
 function readCache(file, maxAgeMs, now) {
@@ -24,8 +46,8 @@ function readCache(file, maxAgeMs, now) {
 
 async function request(endpoint, { env = process.env, sessionId = randomUUID(), fetch = globalThis.fetch } = {}) {
   const headers = { "x-opencode-session": sessionId };
-  if (endpoint === "usage") requireApiKey(env);
-  if (env.OPENCODE_GO_API_KEY) headers.Authorization = `Bearer ${env.OPENCODE_GO_API_KEY}`;
+  const key = endpoint === "usage" ? requireApiKey(env) : resolveApiKey(env);
+  if (key) headers.Authorization = `Bearer ${key}`;
   let response;
   try { response = await fetch(`${GO_API_BASE_URL}/${endpoint}`, { headers, signal: AbortSignal.timeout(15000) }); }
   catch { throw errorWithFailure("OpenCode Go request failed.", "network"); }
@@ -85,7 +107,7 @@ export function quotaPools(usage, now = Date.now()) {
 export async function readQuota({ dataDir, env = process.env, now = Date.now(), ...options }) {
   const report = { engine: "opencode", available: false, observedAt: new Date(now).toISOString(), pools: [], note: null };
   try { requireApiKey(env); }
-  catch { return { ...report, note: "Set OPENCODE_GO_API_KEY to read OpenCode Go quota." }; }
+  catch { return { ...report, note: "Run opencode auth login for OpenCode Go, or set OPENCODE_GO_API_KEY, to read OpenCode Go quota." }; }
   const file = path.join(dataDir, "quota-cache.json");
   const cached = readCache(file, 60000, now);
   if (cached?.report?.engine === "opencode" && Array.isArray(cached.report.pools)) return cached.report;

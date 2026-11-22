@@ -59,7 +59,7 @@ and `tool_mode`, `multi_agent_version`, `multi_agent_reasoning_effort`, `availab
 
 ## Credential
 
-`OPENCODE_GO_API_KEY` comes from the companion's environment. The companion passes it to the Codex child, never writes it to disk, a job record, or a log, and never prints it. The generated `shell_environment_policy` keeps it out of every shell command the model runs; without that exclusion Codex passes the full environment to tool subprocesses. A missing key fails before launch as `auth`.
+The key is `OPENCODE_GO_API_KEY` from the companion's environment when it is set and not blank, otherwise the `opencode-go` entry of the opencode CLI's credential store, `$XDG_DATA_HOME/opencode/auth.json` (default `~/.local/share/opencode/auth.json`), which `opencode auth login` writes as `{ "opencode-go": { "type": "api", "key": "..." } }`. Any other entry type, a blank key, or an unreadable or malformed file counts as no key. The companion reads the store and never writes it. It passes the key to the Codex child as `OPENCODE_GO_API_KEY`, never writes it to disk, a job record, or a log, and never prints it. The generated `shell_environment_policy` keeps it out of every shell command the model runs; without that exclusion Codex passes the full environment to tool subprocesses. A missing key fails before launch as `auth`.
 
 ## Models and quota
 

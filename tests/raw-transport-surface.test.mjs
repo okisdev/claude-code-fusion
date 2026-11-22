@@ -95,6 +95,7 @@ function transportEnv(t, sessionId) {
     AGY_BIN: path.join(root, "missing-cli"),
     OPENCODE_CODEX_BIN: path.join(root, "missing-cli"),
     OPENCODE_GO_API_KEY: "",
+    XDG_DATA_HOME: path.join(root, "xdg-data"),
     CLAUDE_CODE_SESSION_ID: sessionId,
     TEMP: root,
     TMP: root,

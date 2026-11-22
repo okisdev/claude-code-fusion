@@ -2,13 +2,13 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
 import test from "node:test";
-import { GO_API_BASE_URL, readModels, readQuota, quotaPools } from "../plugins/opencode/scripts/lib/opencode-provider.mjs";
+import { GO_API_BASE_URL, opencodeAuthFile, readModels, readQuota, quotaPools, requireApiKey, resolveApiKey } from "../plugins/opencode/scripts/lib/opencode-provider.mjs";
 import { goApiModels, goApiUsage, goModels, goUsage, sandbox } from "./lib/opencode-harness.mjs";
 
 test("models filters tool support, uses the session header, and caches for exactly one hour", async (t) => {
   const box = sandbox(t);
   const calls = [];
-  const options = { dataDir: box.dataDir, env: {}, sessionId: "job-123", now: 10000000, fetch: async (url, init) => {
+  const options = { dataDir: box.dataDir, env: { HOME: box.root }, sessionId: "job-123", now: 10000000, fetch: async (url, init) => {
     calls.push({ url, init });
     return { ok: true, json: async () => ({ data: goApiModels }) };
   } };
@@ -54,7 +54,7 @@ test("usage requires a key, authenticates only the request, and caches quota for
     assert.equal(init.headers.Authorization, "Bearer opencode-test-credential");
     return { ok: true, json: async () => goApiUsage };
   } };
-  const missing = await readQuota({ ...options, env: {} });
+  const missing = await readQuota({ ...options, env: { HOME: box.root } });
   assert.equal(missing.available, false);
   assert.match(missing.note, /OPENCODE_GO_API_KEY/);
   assert.equal(calls, 0);
@@ -66,21 +66,43 @@ test("usage requires a key, authenticates only the request, and caches quota for
   assert.notEqual((await readQuota({ ...options, now: options.now + 60000 })).observedAt, first.observedAt);
   assert.equal(calls, 2);
   assert.equal(fs.readFileSync(path.join(box.dataDir, "quota-cache.json"), "utf8").includes("opencode-test-credential"), false);
-  assert.equal((await readQuota({ ...options, env: {} })).available, false);
+  assert.equal((await readQuota({ ...options, env: { HOME: box.root } })).available, false);
 });
 
 test("Go HTTP failures retain auth, quota, and rate limit kinds", async (t) => {
   for (const [status, failureKind] of [[401, "auth"], [403, "auth"], [402, "quota"], [429, "rate_limited"], [500, "error"]]) {
     const box = sandbox(t);
-    await assert.rejects(readModels({ dataDir: box.dataDir, env: {}, fetch: async () => ({ ok: false, status }) }), { failureKind });
+    await assert.rejects(readModels({ dataDir: box.dataDir, env: { HOME: box.root }, fetch: async () => ({ ok: false, status }) }), { failureKind });
   }
 });
 
 test("invalid provider metadata and network failures never populate a cache", async (t) => {
   const box = sandbox(t);
   for (const body of [{}, { data: [] }, { data: [{ ...goApiModels[0], limit: {} }] }]) {
-    await assert.rejects(readModels({ dataDir: box.dataDir, env: {}, fetch: async () => ({ ok: true, json: async () => body }) }), { failureKind: "setup" });
+    await assert.rejects(readModels({ dataDir: box.dataDir, env: { HOME: box.root }, fetch: async () => ({ ok: true, json: async () => body }) }), { failureKind: "setup" });
   }
-  await assert.rejects(readModels({ dataDir: box.dataDir, env: {}, fetch: async () => { throw new Error("sensitive request details"); } }), { failureKind: "network", message: "OpenCode Go request failed." });
+  await assert.rejects(readModels({ dataDir: box.dataDir, env: { HOME: box.root }, fetch: async () => { throw new Error("sensitive request details"); } }), { failureKind: "network", message: "OpenCode Go request failed." });
   assert.equal(fs.existsSync(path.join(box.dataDir, "models-cache.json")), false);
+});
+
+test("the key comes from the environment first, then the opencode auth login store", (t) => {
+  const box = sandbox(t);
+  const write = (file, value) => { fs.mkdirSync(path.dirname(file), { recursive: true }); fs.writeFileSync(file, typeof value === "string" ? value : JSON.stringify(value)); };
+  const home = { HOME: box.root };
+  assert.equal(opencodeAuthFile(home), path.join(box.root, ".local/share/opencode/auth.json"));
+  assert.equal(opencodeAuthFile({ ...home, XDG_DATA_HOME: path.join(box.root, "xdg") }), path.join(box.root, "xdg/opencode/auth.json"));
+  assert.equal(resolveApiKey(home), null);
+  assert.throws(() => requireApiKey(home), { failureKind: "auth", message: /opencode auth login/ });
+  write(opencodeAuthFile(home), { "opencode-go": { type: "api", key: " stored-credential " } });
+  assert.equal(resolveApiKey(home), "stored-credential");
+  assert.equal(resolveApiKey({ ...home, OPENCODE_GO_API_KEY: "env-credential" }), "env-credential");
+  assert.equal(resolveApiKey({ ...home, OPENCODE_GO_API_KEY: "   " }), "stored-credential");
+  const xdg = { ...home, XDG_DATA_HOME: path.join(box.root, "xdg") };
+  assert.equal(resolveApiKey(xdg), null);
+  write(opencodeAuthFile(xdg), { "opencode-go": { type: "api", key: "xdg-credential" } });
+  assert.equal(resolveApiKey(xdg), "xdg-credential");
+  for (const stored of [{ "opencode-go": { type: "oauth", access: "token" } }, { "opencode-go": { type: "api", key: "" } }, { opencode: { type: "api", key: "zen-credential" } }, "not json"]) {
+    write(opencodeAuthFile(home), stored);
+    assert.equal(resolveApiKey(home), null);
+  }
 });

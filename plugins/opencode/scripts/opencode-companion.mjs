@@ -52,7 +52,7 @@ function classifyFailure(outcome) {
 }
 
 async function runJob({ record, source, dataDir, brief, signal, timeoutMs, exitGraceMs, onProcess, launchProcess }) {
-  requireApiKey();
+  const apiKey = requireApiKey();
   if (record.jobClass !== "task") throw errorWithFailure("OpenCode Go supports only bulk and blind-check tasks.");
   const declared = brief.split(/\r?\n/).filter((line) => line.trim()).slice(0, 12).flatMap((line) => [...line.matchAll(/(?:^|[\s;,|])opencode-role:\s*([^\s;,|]+)/gi)].map((match) => match[1].toLowerCase()));
   if (declared.length > 1) throw errorWithFailure("Declare exactly one OpenCode Go role.");
@@ -71,7 +71,7 @@ async function runJob({ record, source, dataDir, brief, signal, timeoutMs, exitG
   Object.assign(record, fields);
   const args = buildTaskArgs({ cwd: record.cwd, model, effort, write: role === "bulk", skipGitRepoCheck: true, serviceTier: "none", resumeThreadId: source?.sessionId });
   args.push("-c", `model_providers.opencode.http_headers={"x-opencode-session"=${JSON.stringify(record.id)}}`, brief);
-  const outcome = await runCodex({ bin: record.codexBuildPath, args, cwd: record.cwd, env: { ...process.env, CODEX_HOME: homeDir },
+  const outcome = await runCodex({ bin: record.codexBuildPath, args, cwd: record.cwd, env: { ...process.env, OPENCODE_GO_API_KEY: apiKey, CODEX_HOME: homeDir },
     signal, timeoutMs, terminationGraceMs: exitGraceMs, resumeThreadId: source?.sessionId,
     onSpawnAttempt: (pid) => { if (pid) launchProcess(() => ({ pid })); }, onSpawn: (pid) => onProcess(pid), onIdentitySettled: (pid) => onProcess(pid) });
   if (outcome.cleanupComplete === false) state.updateJobRecordFile(state.jobFilePath(dataDir, record.cwd, record.id), {

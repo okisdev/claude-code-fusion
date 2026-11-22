@@ -22,5 +22,5 @@ When the helper returns OpenCode Go output:
 - Do not inspect the repository, verify findings, apply edits, poll unrelated jobs, or continue the task after returning the companion output. Do not replace a failed, cancelled, malformed, or incomplete OpenCode Go run with a Claude side answer.
 - If the helper reports that the Codex CLI is missing, direct the user to `/opencode:setup` and do not improvise alternate install flows.
 - If the helper reports failure kind `setup`, do not retry the unchanged task. Direct the user to upgrade or repair the Codex CLI and rerun `/opencode:setup`; automatic Fusion routing may use another healthy eligible lane meanwhile.
-- If the helper reports failure kind `auth`, direct the user to configure `OPENCODE_GO_API_KEY` in the companion environment and rerun `/opencode:setup`. Do not retry the unchanged task.
+- If the helper reports failure kind `auth`, direct the user to run `opencode auth login` and choose OpenCode Go (or set `OPENCODE_GO_API_KEY`) and rerun `/opencode:setup`. Do not retry the unchanged task.
 - If the helper cannot be invoked, return the invocation failure exactly as reported and stop.
