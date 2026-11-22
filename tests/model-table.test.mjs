@@ -58,6 +58,8 @@ test("Billing metadata derives from each engine and the cached Devin catalog", (
     ["codex", "gpt-6-sol", "codex", "included"],
     ["grok", "grok-4.7", "grok", "included"],
     ["agy", "gemini-4-neon", "agy", "included"],
+    ["opencode", "deepseek-v4.1-flash", "opencode", "included"],
+    ["opencode", "glm-5.3-flash", "opencode", "included"],
     ["cursor", "composer-2.5", "first-party", "included"],
     ["cursor", "muse-spark-1.3", "api", "metered"],
     ["devin", "swe-2", "free", "free"],
@@ -190,7 +192,7 @@ test("Session context table renders scores without Notes and points to config", 
   assert.match(table, /^\|---\|---\|---\|---:\|---:\|---:\|---\|$/m);
   assert.match(table, /^\| codex \| codex \| openai \| 5 \| 4 \| 5 \| included \|$/m);
   assert.doesNotMatch(table, /primary implementation lane|\| Notes \|/);
-  assert.match(table, /^Lane defaults: codex quick gpt-6-sol@xhigh, volume gpt-6-sol@high, flagship gpt-6\.1-sol@xhigh; grok burst grok-4\.7-build-fast@low, independence grok-4\.7-build-fast@low, live-web grok-4\.7-build-fast@high, large-context grok-4\.6@medium; cursor diversity muse-spark-1\.3@xhigh \(metered\), burst composer-2\.5@default; agy independence gemini-4-neon@high, large-context gemini-4-neon@high, burst gemini-4-neon@medium\.$/m);
+  assert.match(table, /^Lane defaults: codex quick gpt-6-sol@xhigh, volume gpt-6-sol@high, flagship gpt-6\.1-sol@xhigh; grok burst grok-4\.7-build-fast@low, independence grok-4\.7-build-fast@low, live-web grok-4\.7-build-fast@high, large-context grok-4\.6@medium; cursor diversity muse-spark-1\.3@xhigh \(metered\), burst composer-2\.5@default; agy independence gemini-4-neon@high, large-context gemini-4-neon@high, burst gemini-4-neon@medium; opencode bulk deepseek-v4\.1-flash@high, blind-check glm-5\.3-flash@high\.$/m);
   assert.match(table, /\| grok-fast \| grok \| xai \| 3 \| 3 \| 5 \| included \|\nBreadth engine: Cursor \(cursor\); its briefs go to cursor:cursor-rescue with `cursor-role: diversity` or `cursor-role: burst`, and Devin holds no routing seat\.\nBreadth diversity excludes the claude family and the google family served by Antigravity \(agy\); route google consults to agy:agy-rescue\.\nModel notes \(benchmarks, prices, latency\) live in model-routing\.json; `\/fusion:config` shows them\.\n\nLane defaults: [^\n]+\n\nScores feed/);
   assert.match(
     table,
@@ -221,7 +223,8 @@ test("Routing defaults merge file choices over the seed and preserve only suppor
     grok: { ...DEFAULT_ROUTING_DEFAULTS.grok, independence: { model: "grok-4.7", effort: "max", pool: "grok", costClass: "included" } },
     cursor: DEFAULT_ROUTING_DEFAULTS.cursor,
     devin: DEFAULT_ROUTING_DEFAULTS.devin,
-    agy: DEFAULT_ROUTING_DEFAULTS.agy
+    agy: DEFAULT_ROUTING_DEFAULTS.agy,
+    opencode: DEFAULT_ROUTING_DEFAULTS.opencode
   });
   assert.match(renderModelTableFromFile(file), /Lane defaults: codex quick gpt-6-sol@high, volume gpt-6-sol@high, flagship gpt-6\.1-sol@xhigh; grok burst grok-4\.7-build-fast@low, independence grok-4\.7@max/);
 });

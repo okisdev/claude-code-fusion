@@ -12,7 +12,7 @@ function readJson(file) {
 test("marketplace and plugin manifest versions stay synchronized", () => {
   const marketplace = readJson(".claude-plugin/marketplace.json");
   const entries = new Map(marketplace.plugins.map((entry) => [entry.name, entry]));
-  assert.deepEqual([...entries.keys()].sort(), ["agy", "codex", "cursor", "devin", "fusion", "grok"]);
+  assert.deepEqual([...entries.keys()].sort(), ["agy", "codex", "cursor", "devin", "fusion", "grok", "opencode"]);
   for (const name of entries.keys()) {
     const manifest = readJson(`plugins/${name}/.claude-plugin/plugin.json`);
     assert.equal(entries.get(name)?.version, marketplace.version);
@@ -24,7 +24,7 @@ test("marketplace and plugin manifest versions stay synchronized", () => {
 });
 
 test("plugins ship no session job monitors", () => {
-  for (const plugin of ["fusion", "codex", "grok", "cursor", "devin", "agy"]) {
+  for (const plugin of ["fusion", "codex", "grok", "cursor", "devin", "agy", "opencode"]) {
     assert.equal(fs.existsSync(path.join(repoRoot, `plugins/${plugin}/monitors/monitors.json`)), false);
     assert.equal(Object.hasOwn(readJson(`plugins/${plugin}/.claude-plugin/plugin.json`), "monitors"), false);
   }

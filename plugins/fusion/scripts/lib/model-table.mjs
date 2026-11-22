@@ -36,12 +36,18 @@ export const DEFAULT_ROUTING_DEFAULTS = Object.fromEntries(Object.entries({
     independence: { model: "gemini-4-neon", effort: "high" },
     "large-context": { model: "gemini-4-neon", effort: "high" },
     burst: { model: "gemini-4-neon", effort: "medium" }
+  },
+  opencode: {
+    bulk: { model: "deepseek-v4.1-flash", effort: "high" },
+    "blind-check": { model: "glm-5.3-flash", effort: "high" }
   }
 }).map(([lane, roles]) => [lane, Object.fromEntries(Object.entries(roles).map(([role, choice]) => [role, { ...choice, ...modelBilling(lane, choice.model, null) }]))]));
 export const DEFAULT_MODEL_ROUTING_MODELS = [
   { id: "gemini-4-neon", lane: "agy", family: ENGINES.agy.family, intelligence: 5, taste: 4, cost: 4, pool: "agy", costClass: "included" },
   { id: "gemini-4-hydrogen", lane: "agy", family: ENGINES.agy.family, intelligence: 4, taste: 3, cost: 5, pool: "agy", costClass: "included" },
-  { id: "gemini-4-argon", lane: "agy", family: ENGINES.agy.family, intelligence: 4, taste: 3, cost: 4, pool: "agy", costClass: "included" }
+  { id: "gemini-4-argon", lane: "agy", family: ENGINES.agy.family, intelligence: 4, taste: 3, cost: 4, pool: "agy", costClass: "included" },
+  { id: "deepseek-v4.1-flash", lane: "opencode", family: "deepseek", intelligence: 3, taste: 3, cost: 5, pool: "opencode", costClass: "included" },
+  { id: "glm-5.3-flash", lane: "opencode", family: "zhipu", intelligence: 3, taste: 3, cost: 5, pool: "opencode", costClass: "included" }
 ];
 const ROUTING_DEFAULT_EFFORTS = new Set(["low", "medium", "high", "xhigh", "max"]);
 

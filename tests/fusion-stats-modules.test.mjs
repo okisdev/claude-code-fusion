@@ -41,8 +41,8 @@ test("fixture ledger keeps JSON and Markdown report bytes", (t) => {
   assert.deepStrictEqual(report.verificationEvidence.recent, { days: 7, accepted: 0, evidenced: 0, rate: 0 });
   assert.deepStrictEqual(report.wrapperDelivery, []);
   const digest = (value) => createHash("sha256").update(value).digest("hex");
-  assert.equal(digest(JSON.stringify(report, null, 2) + "\n"), "5ac974d71f1dff2a534de379db4f13e4b171c77da0d15e57f4fdb91c63478253");
-  assert.equal(digest(renderFusionStats(report)), "4be44bf40d96006964e4c6fb4906ffe42479e12b83f83658ee89c9dffd066780");
+  assert.equal(digest(JSON.stringify(report, null, 2) + "\n"), "96f7a2764ffd8412042b0fe29b77ef282594cb44483a706aa909b7eb973b3470");
+  assert.equal(digest(renderFusionStats(report)), "0a2513a46b25edc3bf92197ccdcd1811a98760d985899bb8c83db31b3c8922f7");
 });
 
 test("evidence sidecars preserve live lock owners and release locks on merge errors", (t) => {

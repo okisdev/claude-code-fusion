@@ -29,7 +29,6 @@ const CODEX_FAILURE_PATTERNS = [
 ];
 const VERIFIED_VERSIONS_FILE = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "verified-versions.json");
 const FUSION_MANIFEST_FILE = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", ".claude-plugin", "plugin.json");
-const ENGINE_BIN_OVERRIDES = { codex: "CODEX_BIN", grok: "GROK_BIN", cursor: "CURSOR_AGENT_BIN", devin: "DEVIN_BIN", agy: "AGY_BIN" };
 
 function codexFailureKind(errorMessage) {
   if (typeof errorMessage !== "string" || !errorMessage.trim()) {
@@ -109,8 +108,9 @@ function wrapperDeliveryAdvisory(records, now, lookbackMs) {
 }
 
 function engineCliAvailable(engine, env) {
-  const override = env[ENGINE_BIN_OVERRIDES[engine]];
-  const binary = typeof override === "string" && override.trim() ? override.trim() : engine === "cursor" ? "cursor-agent" : engine;
+  const descriptor = ENGINES[engine];
+  const override = env[descriptor.binEnv];
+  const binary = typeof override === "string" && override.trim() ? override.trim() : descriptor.binary;
   const candidates = binary.includes(path.sep) ? [path.resolve(binary)] : (env.PATH ?? "").split(path.delimiter).map((directory) => path.join(directory || ".", binary));
   return candidates.some((candidate) => {
     try {
