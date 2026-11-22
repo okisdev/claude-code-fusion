@@ -1,5 +1,9 @@
 # changelog
 
+## 0.0.92
+
+- the OpenCode companion reads the opencode 2 credential store, the active `opencode-go` key row of `opencode.db`'s `credential` table, before the opencode 1 `auth.json`. opencode 2.3 stores logins only in that database, so 0.0.91 read a stale June key from the old file and every Go request returned HTTP 401 on a machine freshly logged in. the database is opened read only in a child process with Node 22's `node:sqlite` experimental warning disabled.
+
 ## 0.0.91
 
 - the OpenCode companion takes its key from `OPENCODE_GO_API_KEY` or, when that is unset or blank, from the `opencode-go` entry `opencode auth login` writes to `$XDG_DATA_HOME/opencode/auth.json` (default `~/.local/share/opencode/auth.json`), so one `opencode auth login` configures the lane and rotates its key. the store is read, never written; an entry other than an api key counts as no key and fails as `auth` with the login hint.

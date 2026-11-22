@@ -1,8 +1,9 @@
 import assert from "node:assert/strict";
 import fs from "node:fs";
+import { createRequire } from "node:module";
 import path from "node:path";
 import test from "node:test";
-import { GO_API_BASE_URL, opencodeAuthFile, readModels, readQuota, quotaPools, requireApiKey, resolveApiKey } from "../plugins/opencode/scripts/lib/opencode-provider.mjs";
+import { GO_API_BASE_URL, opencodeAuthFile, opencodeCredentialDatabase, readModels, readQuota, quotaPools, requireApiKey, resolveApiKey } from "../plugins/opencode/scripts/lib/opencode-provider.mjs";
 import { goApiModels, goApiUsage, goModels, goUsage, sandbox } from "./lib/opencode-harness.mjs";
 
 test("models filters tool support, uses the session header, and caches for exactly one hour", async (t) => {
@@ -105,4 +106,32 @@ test("the key comes from the environment first, then the opencode auth login sto
     write(opencodeAuthFile(home), stored);
     assert.equal(resolveApiKey(home), null);
   }
+});
+
+test("the opencode v2 credential database wins over the legacy auth file and only an active key entry counts", (t) => {
+  const box = sandbox(t);
+  const home = { HOME: box.root };
+  const file = opencodeCredentialDatabase(home);
+  assert.equal(file, path.join(box.root, ".local/share/opencode/opencode.db"));
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.writeFileSync(opencodeAuthFile(home), JSON.stringify({ "opencode-go": { type: "api", key: "legacy-credential" } }));
+  assert.equal(resolveApiKey(home), "legacy-credential");
+  const { DatabaseSync } = createRequire(import.meta.url)("node:sqlite");
+  const db = new DatabaseSync(file);
+  db.exec("CREATE TABLE credential (id text PRIMARY KEY, integration_id text, label text NOT NULL, value text NOT NULL, connector_id text, method_id text, active integer, time_created integer NOT NULL, time_updated integer NOT NULL)");
+  const insert = db.prepare("INSERT INTO credential (id, integration_id, label, value, active, time_created, time_updated) VALUES (?, ?, ?, ?, ?, 1, ?)");
+  insert.run("old", "opencode-go", "API key", JSON.stringify({ type: "key", key: "inactive-credential" }), 0, 3);
+  insert.run("zen", "opencode", "Zen", JSON.stringify({ type: "key", key: "zen-credential" }), 1, 4);
+  insert.run("oauth", "opencode-go", "OAuth", JSON.stringify({ type: "oauth", access: "token" }), 1, 5);
+  assert.equal(resolveApiKey(home), "legacy-credential");
+  insert.run("active", "opencode-go", "OpenCode Go", JSON.stringify({ type: "key", key: " active-credential " }), 1, 2);
+  assert.equal(resolveApiKey(home), "legacy-credential");
+  db.prepare("DELETE FROM credential WHERE id = ?").run("oauth");
+  db.close();
+  assert.equal(resolveApiKey(home), "active-credential");
+  assert.equal(resolveApiKey({ ...home, OPENCODE_GO_API_KEY: "env-credential" }), "env-credential");
+  fs.rmSync(opencodeAuthFile(home));
+  assert.equal(resolveApiKey(home), "active-credential");
+  fs.writeFileSync(file, "not a database");
+  assert.equal(resolveApiKey(home), null);
 });
