@@ -703,7 +703,7 @@ test("Grok job records contribute resolved and unknown models without a companio
 });
 
 test("file-based engine stats use the descriptor registry", () => {
-  assert.deepStrictEqual(Object.keys(FILE_ENGINE_DESCRIPTORS), ["grok", "codex", "cursor", "devin", "agy"]);
+  assert.deepStrictEqual(Object.keys(FILE_ENGINE_DESCRIPTORS), ["grok", "codex", "cursor", "devin", "agy", "opencode"]);
   assert.strictEqual(FILE_ENGINE_DESCRIPTORS.codex.stateEnvVar, "FUSION_CODEX_STATE");
   assert.strictEqual(FILE_ENGINE_DESCRIPTORS.codex.defaultStateRoot({}), path.join(os.homedir(), ".claude", "plugins", "data", "codex-claude-code-fusion", "state"));
   assert.strictEqual(FILE_ENGINE_DESCRIPTORS.codex.defaultStateRoot({ CODEX_COMPANION_DATA: "/adapter-data" }), "/adapter-data/state");
@@ -1268,7 +1268,7 @@ test("pruneDeadWorkspaces never touches a workspace with any running job even wi
 
 test("WORKSPACE_ENGINE_DESCRIPTORS covers every peer engine", () => {
   const ids = WORKSPACE_ENGINE_DESCRIPTORS.map((descriptor) => descriptor.id);
-  assert.deepStrictEqual(ids.sort(), ["agy", "codex", "cursor", "devin", "grok"]);
+  assert.deepStrictEqual(ids.sort(), ["agy", "codex", "cursor", "devin", "grok", "opencode"]);
 });
 
 test("prune-dead treats any unreadable job record as unsafe for the whole workspace", (t) => {

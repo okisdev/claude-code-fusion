@@ -1,5 +1,15 @@
 # changelog
 
+## 0.0.90
+
+- new `opencode` plugin: a bulk lane on the OpenCode Go subscription. it drives the Codex CLI against the Go API with a private `CODEX_HOME`, so writes stay confined by the Codex `workspace-write` sandbox while its health, `opencode` quota pool, and rollouts never touch the Codex engine. roles are `bulk` (writes in an orchestrator owned worktree, accepted only by a verification command the main session reruns) and read only `blind-check` (answers a staged artifact with its answers removed, on another family). a pilot authored a curriculum unit in 9 minutes for about $0.10 to $0.19 of the allowance, with no Codex quota spent.
+- the OpenCode companion generates its Codex model catalog from `codex debug models --bundled`. on Codex fallback metadata a probe run compacted nine times in sixteen minutes and wrote nothing, because the fallback caps context at 272000 tokens and truncates tool output at 10 KB.
+- the generated Codex shell policy excludes `OPENCODE_*`, because Codex passes its full environment to tool subprocesses by default and a probe shell could read the API key.
+- routing adds one bulk generation row: OpenCode `bulk` for many files of one shape accepted by a verification command, a `blind-check` on another family when the command cannot judge content, and the Codex volume tier while OpenCode is not installed or unhealthy. OpenCode never sits on a review, panel, or `independence` seat, and a healthy OpenCode does not satisfy `no-healthy-lane`.
+- the Codex exec stack moved to `shared/companion` and is vendored byte identical into the Codex and OpenCode plugins.
+- engine binaries and their override variables live in the engine registry, so the breaker's CLI check no longer infers a binary from the engine id.
+- `/fusion:smoke` adds an OpenCode `blind-check` probe only when the plugin is installed and its key is set.
+
 ## 0.0.89
 
 - the Codex companion reads live quota from `codex app-server`'s `account/rateLimits/read` and reports it when it is newer than the rollout telemetry. a stale answer starts one detached refresh behind an exclusive lease, and only when the Codex home holds credentials. quota had only come from Codex runs, so a 100 percent snapshot told routing to avoid Codex, no run refreshed it, and an upgraded plan sat at 0 percent used for a day with one Codex job dispatched. `promax`, `prolite`, and `go` plans count as included.

@@ -1,0 +1,23 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-plugin-manifest.json",
+  "name": "opencode",
+  "displayName": "OpenCode Companion",
+  "version": "0.0.90",
+  "engines": {
+    "claude-code": ">=2.1.300"
+  },
+  "description": "Bulk generation on OpenCode Go open weight models through the Codex CLI sandbox.",
+  "author": {
+    "name": "Harry Yep"
+  },
+  "homepage": "https://github.com/okisdev/claude-code-fusion",
+  "repository": "https://github.com/okisdev/claude-code-fusion",
+  "license": "MIT",
+  "keywords": [
+    "opencode",
+    "open-weight",
+    "bulk",
+    "delegation",
+    "orchestration"
+  ]
+}

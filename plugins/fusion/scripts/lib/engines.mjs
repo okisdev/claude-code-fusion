@@ -16,6 +16,8 @@ const ENGINES = Object.freeze({
   codex: engine({
     id: "codex",
     displayName: "Codex",
+    binary: "codex",
+    binEnv: "CODEX_BIN",
     seat: null,
     family: "openai",
     rescueAgent: "codex:codex-rescue",
@@ -38,6 +40,8 @@ const ENGINES = Object.freeze({
   grok: engine({
     id: "grok",
     displayName: "Grok",
+    binary: "grok",
+    binEnv: "GROK_BIN",
     seat: null,
     family: "xai",
     rescueAgent: "grok:grok-rescue",
@@ -60,6 +64,8 @@ const ENGINES = Object.freeze({
   cursor: engine({
     id: "cursor",
     displayName: "Cursor",
+    binary: "cursor-agent",
+    binEnv: "CURSOR_AGENT_BIN",
     seat: "breadth",
     family: null,
     rescueAgent: "cursor:cursor-rescue",
@@ -82,6 +88,8 @@ const ENGINES = Object.freeze({
   devin: engine({
     id: "devin",
     displayName: "Devin",
+    binary: "devin",
+    binEnv: "DEVIN_BIN",
     seat: "breadth",
     family: null,
     rescueAgent: "devin:devin-rescue",
@@ -104,6 +112,8 @@ const ENGINES = Object.freeze({
   agy: engine({
     id: "agy",
     displayName: "Antigravity",
+    binary: "agy",
+    binEnv: "AGY_BIN",
     seat: null,
     family: "google",
     rescueAgent: "agy:agy-rescue",
@@ -122,6 +132,30 @@ const ENGINES = Object.freeze({
     consultOnlyRoles: ["independence", "large-context"],
     efforts: ["default", "low", "medium", "high", "xhigh"],
     unavailablePrefix: "agy unavailable:"
+  }),
+  opencode: engine({
+    id: "opencode",
+    displayName: "OpenCode",
+    binary: "codex",
+    binEnv: "OPENCODE_CODEX_BIN",
+    seat: null,
+    family: null,
+    rescueAgent: "opencode:opencode-rescue",
+    managedAgents: [],
+    companionFile: "opencode-companion.mjs",
+    companionEnv: "FUSION_OPENCODE_COMPANION",
+    hostCheck: false,
+    dataDirName: "opencode-claude-code-fusion",
+    dataEnv: "OPENCODE_COMPANION_DATA",
+    stateEnvs: [],
+    versionField: "codexVersion",
+    verifiedVersionKey: "codex-cli",
+    acceptanceLedger: false,
+    roles: ["bulk", "blind-check"],
+    defaultRole: null,
+    consultOnlyRoles: ["blind-check"],
+    efforts: ["low", "high", "max"],
+    unavailablePrefix: "opencode unavailable:"
   })
 });
 

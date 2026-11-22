@@ -1,6 +1,6 @@
 # Companion outcome contract
 
-This document is the canonical engine agnostic contract for companion plugins that run peer engines for fusion. It defines job records, liveness, rendered outcome lines, failure kinds, background collection, session threading, and stop gate verdict parsing. Per engine documents define each engine's CLI invocation, flags, envelopes, field names, constants, and version pins. The current instances are [docs/codex-contract.md](codex-contract.md), [docs/grok-contract.md](grok-contract.md), and [docs/cursor-contract.md](cursor-contract.md).
+This document is the canonical engine agnostic contract for companion plugins that run peer engines for fusion. It defines job records, liveness, rendered outcome lines, failure kinds, background collection, session threading, and stop gate verdict parsing. Per engine documents define each engine's CLI invocation, flags, envelopes, field names, constants, and version pins. The current instances are [docs/codex-contract.md](codex-contract.md), [docs/grok-contract.md](grok-contract.md), [docs/cursor-contract.md](cursor-contract.md), [docs/devin-contract.md](devin-contract.md), [docs/agy-contract.md](agy-contract.md), and [docs/opencode-contract.md](opencode-contract.md).
 
 ## Job records and lifecycle
 

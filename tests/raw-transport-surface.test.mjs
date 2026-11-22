@@ -45,6 +45,13 @@ const expectedSurfaces = [
   "plugins/devin/skills/setup/SKILL.md",
   "plugins/devin/skills/status/SKILL.md",
   "plugins/devin/skills/task/SKILL.md",
+  "plugins/opencode/agents/opencode-rescue.md",
+  "plugins/opencode/skills/cancel/SKILL.md",
+  "plugins/opencode/skills/history/SKILL.md",
+  "plugins/opencode/skills/result/SKILL.md",
+  "plugins/opencode/skills/setup/SKILL.md",
+  "plugins/opencode/skills/status/SKILL.md",
+  "plugins/opencode/skills/task/SKILL.md",
   "plugins/fusion/agents/job-collector.md",
   "plugins/fusion/skills/stats/SKILL.md",
   "plugins/grok/agents/grok-rescue.md",
@@ -86,6 +93,8 @@ function transportEnv(t, sessionId) {
     CURSOR_AGENT_BIN: path.join(root, "missing-cli"),
     DEVIN_BIN: path.join(root, "missing-cli"),
     AGY_BIN: path.join(root, "missing-cli"),
+    OPENCODE_CODEX_BIN: path.join(root, "missing-cli"),
+    OPENCODE_GO_API_KEY: "",
     CLAUDE_CODE_SESSION_ID: sessionId,
     TEMP: root,
     TMP: root,
@@ -135,7 +144,7 @@ test("every executable private transport surface follows its declared Write tran
 });
 
 test("all rescue wrappers accept only the exact staged envelope before the standalone transport ritual", () => {
-  for (const engine of ["codex", "grok", "cursor", "devin", "agy"]) {
+  for (const engine of ["codex", "grok", "cursor", "devin", "agy", "opencode"]) {
     const file = `plugins/${engine}/agents/${engine}-rescue.md`;
     const content = fs.readFileSync(path.join(repoRoot, file), "utf8");
     assert.equal(content.split("\n").filter((line) => line === stagedTokenBullet).length, 1, file);
@@ -164,6 +173,7 @@ test("every forwarder launches in a background shell, awaits the output file, an
     ["plugins/cursor/agents/cursor-rescue.md", "cursor-companion.mjs"],
     ["plugins/devin/agents/devin-rescue.md", "devin-companion.mjs"],
     ["plugins/agy/agents/agy-rescue.md", "agy-companion.mjs"],
+    ["plugins/opencode/agents/opencode-rescue.md", "opencode-companion.mjs"],
     ["plugins/fusion/agents/job-collector.md", "job-collect.mjs"]
   ];
   for (const [file, script] of forwarders) {
@@ -183,7 +193,7 @@ test("every forwarder launches in a background shell, awaits the output file, an
 });
 
 test("every rescue launch carries the fixed background shell option", () => {
-  for (const engine of ["codex", "grok", "cursor", "devin", "agy"]) {
+  for (const engine of ["codex", "grok", "cursor", "devin", "agy", "opencode"]) {
     const file = `plugins/${engine}/agents/${engine}-rescue.md`;
     const content = fs.readFileSync(path.join(repoRoot, file), "utf8");
     assert.ok(content.includes(`scripts/${engine}-companion.mjs" task --transport-background-shell --raw-args-token TOKEN`), file);
@@ -199,7 +209,7 @@ test("every rescue launch carries the fixed background shell option", () => {
 });
 
 test("runtime skills describe the forwarder launch and keep direct slash commands foreground", () => {
-  for (const engine of ["codex", "grok", "cursor", "devin", "agy"]) {
+  for (const engine of ["codex", "grok", "cursor", "devin", "agy", "opencode"]) {
     const file = `plugins/${engine}/skills/${engine}-cli-runtime/SKILL.md`;
     const runtime = fs.readFileSync(path.join(repoRoot, file), "utf8");
     assert.match(runtime, /a Bash call with `run_in_background: true`, which returns at once with a background id and the path of the output file/, file);
@@ -255,7 +265,7 @@ test("Codex transport-discard removes an unwritten staged request without error"
   assert.equal(fs.existsSync(directory), false);
 });
 
-for (const engine of ["codex", "grok", "cursor", "devin", "agy"]) {
+for (const engine of ["codex", "grok", "cursor", "devin", "agy", "opencode"]) {
   for (const state of ["untouched", "written", "replaced"]) {
     test(`${engine} accepts ${state} empty requests and permits repeated discard after consumption`, (t) => {
       const companion = path.join(repoRoot, `plugins/${engine}/scripts/${engine}-companion.mjs`);
@@ -265,6 +275,7 @@ for (const engine of ["codex", "grok", "cursor", "devin", "agy"]) {
       env.CURSOR_COMPANION_DATA = path.join(data, "cursor-data");
       env.DEVIN_COMPANION_DATA = path.join(data, "devin-data");
       env.AGY_COMPANION_DATA = path.join(data, "agy-data");
+      env.OPENCODE_COMPANION_DATA = path.join(data, "opencode-data");
       const run = (args) => spawnSync(process.execPath, [companion, ...args], { encoding: "utf8", env, timeout: 30_000 });
 
       for (const command of ["status", "history", "setup", ...(engine === "grok" ? ["stats"] : [])]) {
@@ -286,7 +297,7 @@ for (const engine of ["codex", "grok", "cursor", "devin", "agy"]) {
         assert.equal(result.status, command === "setup" && engine === "codex" ? 1 : 0, result.stderr);
         if (command === "setup") {
           const name = engineDisplayName(engine);
-          assert.match(result.stdout, engine === "codex" ? /Codex CLI: unavailable/ : new RegExp(`^# ${name} setup\\n`));
+          assert.match(result.stdout, engine === "codex" ? /Codex CLI: unavailable/ : engine === "opencode" ? /^OpenCode Go setup: needs attention\n/ : new RegExp(`^# ${name} setup\\n`));
           assert.equal(result.stderr, "");
         }
         assert.equal(fs.existsSync(directory), false);

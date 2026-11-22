@@ -119,9 +119,9 @@ test("Rescore keeps notes in routing data and prints the table without installin
   assert.strictEqual(result.status, 0, result.stderr);
   const data = JSON.parse(fs.readFileSync(box.modelRoutingFile, "utf8"));
   assert.strictEqual(data.schemaVersion, MODEL_ROUTING_SCHEMA_VERSION);
-  assert.strictEqual(data.models.length, 4);
-  assert.deepStrictEqual(data.models.slice(0, 3), DEFAULT_MODEL_ROUTING_MODELS);
-  assert.deepStrictEqual(data.models[3], {
+  assert.strictEqual(data.models.length, DEFAULT_MODEL_ROUTING_MODELS.length + 1);
+  assert.deepStrictEqual(data.models.filter((row) => row.lane !== "codex"), DEFAULT_MODEL_ROUTING_MODELS);
+  assert.deepStrictEqual(data.models.find((row) => row.lane === "codex" && row.id === "codex"), {
     id: "codex",
     lane: "codex",
     intelligence: 5,
@@ -232,7 +232,7 @@ test("Show json parses after a score is configured", (t) => {
   assert.strictEqual(data.filePath, box.modelRoutingFile);
   assert.strictEqual(data.configured, true);
   assert.strictEqual(data.valid, true);
-  assert.strictEqual(data.data.models[3].id, "grok-fast");
+  assert.deepStrictEqual(data.data.models.filter((row) => row.lane === "grok").map((row) => row.id), ["grok-fast"]);
   assert.match(data.table, /^\| grok-fast \| grok \| xai \| 3 \| 3 \| 5 \| included \| grok \|  \|$/m);
 });
 
@@ -395,7 +395,7 @@ test("Cursor rescore requires family and accepts default effort", (t) => {
   const args = ["rescore", "composer-2.5", "--intelligence", "4", "--taste", "4", "--cost", "4", "--lane", "cursor"];
   const invalid = run(box, args);
   assert.strictEqual(invalid.status, 1);
-  assert.match(invalid.stderr, /models\[3\]\.family/);
+  assert.strictEqual(invalid.stderr, `fusion-config: Cannot write model routing file: Expected models[${DEFAULT_MODEL_ROUTING_MODELS.length}].family for the cursor lane.\n`);
   assert.strictEqual(run(box, [...args, "--family", "cursor"]).status, 0);
   assert.strictEqual(run(box, ["set-default", "cursor", "burst", "composer-2.5", "default"]).status, 0);
   const listing = run(box, ["show"]);

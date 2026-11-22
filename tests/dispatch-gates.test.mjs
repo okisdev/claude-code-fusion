@@ -18,7 +18,8 @@ function sandbox(t) {
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
   const transcript = path.join(root, "parent.jsonl");
   fs.writeFileSync(transcript, "");
-  const binaries = Object.fromEntries(Object.entries({ codex: "CODEX_BIN", grok: "GROK_BIN", cursor: "CURSOR_AGENT_BIN", devin: "DEVIN_BIN", agy: "AGY_BIN" }).map(([engine, key]) => {
+  const binaries = Object.fromEntries(ENGINE_IDS.map((engine) => {
+    const key = ENGINES[engine].binEnv;
     const file = path.join(root, `${engine}-cli`);
     fs.writeFileSync(file, "#!/bin/sh\nexit 0\n", { mode: 0o700 });
     return [key, file];
@@ -188,7 +189,7 @@ test("SendMessage checks the recorded Claude model instead of a model named in t
   assert.match(denied.permissionDecisionReason, /Fable usage limit/);
 });
 
-for (const engine of ENGINE_IDS) {
+for (const engine of ENGINE_IDS.filter((id) => ENGINES[id].roles.some((role) => ["flagship", "quick", "burst"].includes(role)))) {
   test(`no-healthy-lane checks the routed ${engine} write pool instead of historical pools`, (t) => {
     const box = sandbox(t);
     pacingSetup(box, { breadth: engine === "devin" ? "devin" : "cursor" });
@@ -879,4 +880,40 @@ test("Claude quota without a parsed reset reopens after one hour", (t) => {
   assert.match(engineInfraDenial("session-1", "claude-worker", "continue", box.env, finished + 3_599_999), /2026-11-18T10:00:00.000Z \(1 hour fallback\)/);
   assert.match(engineInfraDenial("session-1", "claude-worker", "continue", box.env, finished + 3_599_999, "", "opus"), /usage limit/);
   assert.equal(engineInfraDenial("session-1", "claude-worker", "continue", box.env, finished + 3_600_000), null);
+});
+
+test("healthy OpenCode bulk and blind-check roles do not block no-healthy-lane", (t) => {
+  const box = sandbox(t);
+  for (const engine of ["codex", "grok", "cursor", "agy"]) {
+    workerRecord(box, { agentType: ENGINES[engine].rescueAgent });
+  }
+  for (const [role, mode] of [["bulk", "write"], ["blind-check", "consult"]]) {
+    healthJob(box, "opencode", role, { status: "done", failureKind: null, mode, billingPool: "opencode" });
+    assert.equal(engineHealth("opencode", mode, "opencode", { env: box.env, sessionId: "session-1" }).healthy, true);
+  }
+  assert.equal(fs.statSync(box.env.OPENCODE_CODEX_BIN).isFile(), true);
+  for (const agent of ["fusion:claude-worker", "fusion:trivial-worker"]) {
+    const result = validateWorkerBrief(fallbackBrief("no-healthy-lane"), agent, box.env);
+    assert.equal(result.ok, true, result.reason);
+  }
+});
+
+test("OpenCode dispatch fills protected defaults and keeps blind-check read only", async (t) => {
+  const box = sandbox(t);
+  for (const [role, model] of [["bulk", "deepseek-v4.1-flash"], ["blind-check", "glm-5.3-flash"]]) {
+    const prompt = `lane: opencode ${role}\nopencode-role: ${role}\nverification: node --test`;
+    const injected = injectedPeerDefaults(prompt, ENGINES.opencode.rescueAgent, box.env);
+    assert.match(injected.prompt, new RegExp(`^--model ${model.replaceAll(".", "\\.")} --effort high -- `));
+    const record = createDispatch({ session_id: "session-1", tool_use_id: role, cwd: box.root, tool_input: { prompt: injected.prompt } }, ENGINES.opencode.rescueAgent, false, box.env);
+    assert.equal(record.requestedModel, model);
+    assert.equal(record.billingPool, "opencode");
+    if (role === "blind-check") {
+      const launchBox = sandbox(t);
+      const output = await launch(launchBox, { subagent_type: ENGINES.opencode.rescueAgent, prompt }, { tool_use_id: role });
+      assert.equal(output.permissionDecision, "allow", output.permissionDecisionReason);
+      assert.match(output.updatedInput.prompt, /^fusion-staged-token: [a-f0-9]{48}\nmode: read-only$/);
+      const token = output.updatedInput.prompt.split("\n")[0].split(": ")[1];
+      assert.equal(fs.readFileSync(path.join(launchBox.root, `opencode-companion-input-${token}`, "request"), "utf8"), injected.prompt);
+    }
+  }
 });
