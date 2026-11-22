@@ -908,11 +908,12 @@ test("OpenCode dispatch fills protected defaults and keeps blind-check read only
     assert.equal(record.requestedModel, model);
     assert.equal(record.billingPool, "opencode");
     if (role === "blind-check") {
-      const output = await launch(box, { subagent_type: ENGINES.opencode.rescueAgent, prompt }, { tool_use_id: role });
+      const launchBox = sandbox(t);
+      const output = await launch(launchBox, { subagent_type: ENGINES.opencode.rescueAgent, prompt }, { tool_use_id: role });
       assert.equal(output.permissionDecision, "allow", output.permissionDecisionReason);
       assert.match(output.updatedInput.prompt, /^fusion-staged-token: [a-f0-9]{48}\nmode: read-only$/);
       const token = output.updatedInput.prompt.split("\n")[0].split(": ")[1];
-      assert.equal(fs.readFileSync(path.join(box.root, `opencode-companion-input-${token}`, "request"), "utf8"), injected.prompt);
+      assert.equal(fs.readFileSync(path.join(launchBox.root, `opencode-companion-input-${token}`, "request"), "utf8"), injected.prompt);
     }
   }
 });
