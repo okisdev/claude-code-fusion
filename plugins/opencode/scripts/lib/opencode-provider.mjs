@@ -3,6 +3,7 @@ import { randomUUID } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { createRequire } from "node:module";
 import { fileURLToPath } from "node:url";
 import { errorWithFailure } from "./companion-commands.mjs";
 import { writePrivateStateFile } from "./companion-state.mjs";
@@ -14,18 +15,50 @@ function absolute(value) {
   return path.isAbsolute(trimmed) ? trimmed : null;
 }
 
-export function opencodeAuthFile(env = process.env) {
-  const dataHome = absolute(env.XDG_DATA_HOME) ?? path.join(absolute(env.HOME) ?? os.homedir(), ".local", "share");
-  return path.join(dataHome, "opencode", "auth.json");
+function opencodeDataDir(env) {
+  return path.join(absolute(env.XDG_DATA_HOME) ?? path.join(absolute(env.HOME) ?? os.homedir(), ".local", "share"), "opencode");
 }
 
-export function resolveApiKey(env = process.env) {
-  const fromEnv = env.OPENCODE_GO_API_KEY?.trim();
-  if (fromEnv) return fromEnv;
+export function opencodeAuthFile(env = process.env) {
+  return path.join(opencodeDataDir(env), "auth.json");
+}
+
+export function opencodeCredentialDatabase(env = process.env) {
+  return path.join(opencodeDataDir(env), "opencode.db");
+}
+
+function trimmedKey(value) {
+  return typeof value === "string" && value.trim() ? value.trim() : null;
+}
+
+function readCredentialDatabase(file) {
+  const { DatabaseSync } = createRequire(import.meta.url)("node:sqlite");
+  const db = new DatabaseSync(file, { readOnly: true });
+  try {
+    const row = db.prepare("SELECT value FROM credential WHERE integration_id = ? AND active = 1 ORDER BY time_updated DESC LIMIT 1").get("opencode-go");
+    const value = row ? JSON.parse(row.value) : null;
+    return value?.type === "key" ? trimmedKey(value.key) : null;
+  } finally { db.close(); }
+}
+
+function storedDatabaseKey(env) {
+  const file = opencodeCredentialDatabase(env);
+  if (!fs.existsSync(file)) return null;
+  const result = spawnSync(process.execPath, ["--disable-warning=ExperimentalWarning", fileURLToPath(import.meta.url), "credential", file], {
+    env: {}, encoding: "utf8", timeout: 10000, maxBuffer: 64 * 1024
+  });
+  return result.status === 0 ? trimmedKey(result.stdout) : null;
+}
+
+function storedAuthFileKey(env) {
   let entry;
   try { entry = JSON.parse(fs.readFileSync(opencodeAuthFile(env), "utf8"))?.["opencode-go"]; }
   catch { return null; }
-  return entry?.type === "api" && typeof entry.key === "string" && entry.key.trim() ? entry.key.trim() : null;
+  return entry?.type === "api" ? trimmedKey(entry.key) : null;
+}
+
+export function resolveApiKey(env = process.env) {
+  return trimmedKey(env.OPENCODE_GO_API_KEY) ?? storedDatabaseKey(env) ?? storedAuthFileKey(env);
 }
 
 export function requireApiKey(env = process.env) {
@@ -133,7 +166,13 @@ export function readProvider(command, { dataDir, maxAgeMs = 3600000, sessionId =
 
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   const [command, dataDir, maxAgeMs, sessionId] = process.argv.slice(2);
-  try {
+  if (command === "credential") {
+    try {
+      const key = readCredentialDatabase(dataDir);
+      if (key) process.stdout.write(key);
+      else process.exitCode = 1;
+    } catch { process.exitCode = 1; }
+  } else try {
     const options = { dataDir, maxAgeMs: Number(maxAgeMs), sessionId };
     if (!["models", "quota"].includes(command)) throw errorWithFailure("Unknown provider operation.");
     const report = await (command === "models" ? readModels(options) : readQuota(options));

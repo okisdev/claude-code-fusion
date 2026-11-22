@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import fs from "node:fs";
+import { createRequire } from "node:module";
 import path from "node:path";
 import test from "node:test";
 import { harness } from "./lib/opencode-harness.mjs";
@@ -26,9 +27,13 @@ test("missing key fails as auth before launching Codex or creating a job", (t) =
 
 test("an opencode auth login key reaches the Codex child when the environment has none", (t) => {
   const box = harness(t, { OPENCODE_GO_API_KEY: undefined, FAKE_OPENCODE_EXPECTED_CREDENTIAL: "stored-test-credential" });
-  const store = path.join(box.env.HOME, ".local/share/opencode/auth.json");
+  const store = path.join(box.env.HOME, ".local/share/opencode/opencode.db");
   fs.mkdirSync(path.dirname(store), { recursive: true });
-  fs.writeFileSync(store, JSON.stringify({ "opencode-go": { type: "api", key: "stored-test-credential" } }));
+  const { DatabaseSync } = createRequire(import.meta.url)("node:sqlite");
+  const db = new DatabaseSync(store);
+  db.exec("CREATE TABLE credential (id text PRIMARY KEY, integration_id text, label text NOT NULL, value text NOT NULL, connector_id text, method_id text, active integer, time_created integer NOT NULL, time_updated integer NOT NULL)");
+  db.prepare("INSERT INTO credential (id, integration_id, label, value, active, time_created, time_updated) VALUES (?, ?, ?, ?, 1, 1, 1)").run("cred", "opencode-go", "OpenCode Go", JSON.stringify({ type: "key", key: "stored-test-credential" }));
+  db.close();
   const result = box.run(["task", "--json", "--", "opencode-role: blind-check\nAnswer the staged questions."]);
   assert.equal(result.status, 0, result.stdout || result.stderr);
   const launch = box.invocations().find((entry) => entry.args[0] === "exec");
