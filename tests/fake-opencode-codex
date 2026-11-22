@@ -16,7 +16,7 @@ if (args[0] === "--version") {
   if (!Object.hasOwn(process.env, "OPENCODE_GO_API_KEY")) throw new Error("Missing child credential.");
   let stdin = "";
   for await (const chunk of process.stdin) stdin += chunk;
-  log({ stdin });
+  log({ stdin, credential: process.env.OPENCODE_GO_API_KEY });
   const emit = (event) => process.stdout.write(`${JSON.stringify(event)}\n`);
   const resumed = args.indexOf("resume");
   const threadId = resumed < 0 ? "aaf287d8-eccc-436c-89e7-7cc178b05411" : args[resumed + 1];

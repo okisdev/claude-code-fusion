@@ -1,5 +1,9 @@
 # changelog
 
+## 0.0.91
+
+- the OpenCode companion takes its key from `OPENCODE_GO_API_KEY` or, when that is unset or blank, from the `opencode-go` entry `opencode auth login` writes to `$XDG_DATA_HOME/opencode/auth.json` (default `~/.local/share/opencode/auth.json`), so one `opencode auth login` configures the lane and rotates its key. the store is read, never written; an entry other than an api key counts as no key and fails as `auth` with the login hint.
+
 ## 0.0.90
 
 - new `opencode` plugin: a bulk lane on the OpenCode Go subscription. it drives the Codex CLI against the Go API with a private `CODEX_HOME`, so writes stay confined by the Codex `workspace-write` sandbox while its health, `opencode` quota pool, and rollouts never touch the Codex engine. roles are `bulk` (writes in an orchestrator owned worktree, accepted only by a verification command the main session reruns) and read only `blind-check` (answers a staged artifact with its answers removed, on another family). a pilot authored a curriculum unit in 9 minutes for about $0.10 to $0.19 of the allowance, with no Codex quota spent.

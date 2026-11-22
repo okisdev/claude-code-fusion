@@ -24,6 +24,19 @@ test("missing key fails as auth before launching Codex or creating a job", (t) =
   }
 });
 
+test("an opencode auth login key reaches the Codex child when the environment has none", (t) => {
+  const box = harness(t, { OPENCODE_GO_API_KEY: undefined, FAKE_OPENCODE_EXPECTED_CREDENTIAL: "stored-test-credential" });
+  const store = path.join(box.env.HOME, ".local/share/opencode/auth.json");
+  fs.mkdirSync(path.dirname(store), { recursive: true });
+  fs.writeFileSync(store, JSON.stringify({ "opencode-go": { type: "api", key: "stored-test-credential" } }));
+  const result = box.run(["task", "--json", "--", "opencode-role: blind-check\nAnswer the staged questions."]);
+  assert.equal(result.status, 0, result.stdout || result.stderr);
+  const launch = box.invocations().find((entry) => entry.args[0] === "exec");
+  assert.equal(launch.credential, "stored-test-credential");
+  assert.equal(launch.args.some((arg) => arg.includes("stored-test-credential")), false);
+  assert.equal(JSON.stringify(box.jobs()).includes("stored-test-credential"), false);
+});
+
 test("missing bundled gpt-5.5 fails as setup before exec", (t) => {
   const box = harness(t, { FAKE_OPENCODE_BUNDLED: "missing" });
   const result = box.run(["task", "--write", "--json", "--", "opencode-role: bulk\nGenerate files."]);
