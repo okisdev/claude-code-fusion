@@ -182,7 +182,7 @@ test("Startup, clear, and compact hooks provide scored or empty routing tables a
       if (state === "scored") {
         assert.match(context, /^\| codex \| codex \| openai \| 5 \| 4 \| 5 \| included \|$/m);
         assert.match(context, /^Breadth engine: Cursor \(cursor\)/m);
-        assert.match(context, /^Lane defaults: codex quick gpt-6-sol@xhigh/m);
+        assert.match(context, /^Lane defaults: codex quick gpt-6\.2-sol@high/m);
         assert.doesNotMatch(context, /primary implementation lane|\| Notes \|/);
       }
       if (state.startsWith("invalid")) {
@@ -376,7 +376,7 @@ test("Previously rendered model scores upgrade to static rules without looking l
   const sandbox = makeSandbox(t);
   writeModelRouting(sandbox.modelRoutingFile);
   const rendered = CANONICAL.replace(STATIC_MODEL_CONTEXT, renderModelTable(readModelRoutingFile(sandbox.modelRoutingFile).data));
-  assert.match(rendered, /^Lane defaults: codex quick gpt-6-sol@xhigh, volume gpt-6-sol@high, flagship gpt-6\.1-sol@xhigh; grok burst grok-4\.7-build-fast@low, independence grok-4\.7-build-fast@low, live-web grok-4\.7-build-fast@high, large-context grok-4\.6@medium; cursor diversity muse-spark-1\.3@xhigh \(metered\), burst composer-2\.5@default; agy independence gemini-4-neon@high, large-context gemini-4-neon@high, burst gemini-4-neon@medium; opencode bulk deepseek-v4\.1-flash@high, blind-check glm-5\.3-flash@high\.$/m);
+  assert.match(rendered, /^Lane defaults: codex quick gpt-6\.2-sol@high, volume gpt-6\.2-sol@medium, flagship gpt-6\.2-astra@xhigh; grok burst grok-4\.7-build-fast@low, independence grok-4\.7-build-fast@low, live-web grok-4\.7-build-fast@high, large-context grok-4\.6@medium; cursor diversity muse-spark-1\.3@xhigh \(metered\), burst composer-2\.5@default; agy independence gemini-4-neon@high, large-context gemini-4-neon@high, burst gemini-4-neon@medium; opencode bulk deepseek-v4\.1-flash@high, blind-check glm-5\.3-flash@high\.$/m);
   assert.strictEqual(hashRulesTemplate(rendered), hashRulesTemplate(CANONICAL));
   fs.mkdirSync(path.dirname(sandbox.rulesFile), { recursive: true });
   fs.writeFileSync(sandbox.rulesFile, rendered, "utf8");

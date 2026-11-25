@@ -55,10 +55,10 @@ test("Codex quick and volume use their own efforts when both default to Sol", (t
   t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
   const env = { FUSION_MODEL_ROUTING: path.join(directory, "missing.json") };
 
-  for (const [role, effort] of [["quick", "xhigh"], ["volume", "high"]]) {
+  for (const [role, effort] of [["quick", "high"], ["volume", "medium"]]) {
     const prompt = `lane: codex ${role}\ngoal: repair`;
-    assert.strictEqual(injectedPeerDefaults(prompt, "codex:codex-rescue", env)?.prompt, `--model gpt-6-sol --effort ${effort} -- ${prompt}`);
-    assert.strictEqual(injectedPeerDefaults(`--model gpt-6-sol -- ${prompt}`, "codex:codex-rescue", env)?.prompt, `--effort ${effort} --model gpt-6-sol -- ${prompt}`);
+    assert.strictEqual(injectedPeerDefaults(prompt, "codex:codex-rescue", env)?.prompt, `--model gpt-6.2-sol --effort ${effort} -- ${prompt}`);
+    assert.strictEqual(injectedPeerDefaults(`--model gpt-6.2-sol -- ${prompt}`, "codex:codex-rescue", env)?.prompt, `--effort ${effort} --model gpt-6.2-sol -- ${prompt}`);
   }
 });
 

@@ -14,9 +14,9 @@ export const MODEL_ROUTING_SCHEMA_VERSION = 2;
 export const MODEL_ROUTING_LANES = new Set([...ENGINE_IDS, "claude-trivial", "claude-fast", "claude-deep", "other"]);
 export const DEFAULT_ROUTING_DEFAULTS = Object.fromEntries(Object.entries({
   codex: {
-    quick: { model: "gpt-6-sol", effort: "xhigh" },
-    volume: { model: "gpt-6-sol", effort: "high" },
-    flagship: { model: "gpt-6.1-sol", effort: "xhigh" }
+    quick: { model: "gpt-6.2-sol", effort: "high" },
+    volume: { model: "gpt-6.2-sol", effort: "medium" },
+    flagship: { model: "gpt-6.2-astra", effort: "xhigh" }
   },
   grok: {
     burst: { model: "grok-4.7-build-fast", effort: "low" },
@@ -30,7 +30,7 @@ export const DEFAULT_ROUTING_DEFAULTS = Object.fromEntries(Object.entries({
   },
   devin: {
     diversity: { model: "kimi-k3.1-pro", effort: "high" },
-    burst: { model: "swe-2", effort: "high" }
+    burst: { model: "swe-2.1", effort: "high" }
   },
   agy: {
     independence: { model: "gemini-4-neon", effort: "high" },

@@ -120,10 +120,10 @@ function healthJob(box, engine, id, fields = {}) {
 test("dispatch resolves implicit and explicit model pools from routing before history", (t) => {
   const box = sandbox(t);
   healthJob(box, "codex", "quota", { failureKind: "quota", billingPool: "codex", requestedModel: "different-model" });
-  for (const model of ["gpt-6.1-sol", "gpt-6-sol"]) {
+  for (const model of ["gpt-6.2-astra", "gpt-6.2-sol"]) {
     healthJob(box, "codex", model, { status: "done", requestedModel: model, billingPool: "obsolete-pool" });
   }
-  for (const prompt of ["lane: codex flagship", "lane: codex quick", "--model gpt-6-sol -- lane: codex flagship", "--model=gpt-6.1-sol --write -- bounded"]) {
+  for (const prompt of ["lane: codex flagship", "lane: codex quick", "--model gpt-6.2-sol -- lane: codex flagship", "--model=gpt-6.2-astra --write -- bounded"]) {
     assert.match(engineInfraDenial("session-1", "codex:codex-rescue", "continue", box.env, Date.now(), prompt), /failure: quota/, prompt);
   }
   healthJob(box, "codex", "custom", { status: "done", requestedModel: "custom-model", billingPool: "custom-pool" });
@@ -136,7 +136,7 @@ test("dispatch resolves implicit and explicit model pools from routing before hi
 test("a table row with an unknown pool remains conservative instead of trusting stale history", (t) => {
   const box = sandbox(t);
   healthJob(box, "devin", "quota", { failureKind: "quota", billingPool: "free", requestedModel: "another-model" });
-  healthJob(box, "devin", "stale", { status: "done", requestedModel: "swe-2", billingPool: "credits" });
+  healthJob(box, "devin", "stale", { status: "done", requestedModel: "swe-2.1", billingPool: "credits" });
   assert.match(engineInfraDenial("session-1", "devin:devin-rescue", "continue", box.env, Date.now(), "lane: devin burst"), /failure: quota/);
 });
 
@@ -156,7 +156,7 @@ test("peer dispatch records preserve the original mode, model, and pool", (t) =>
 for (const mode of ["write", "consult"]) {
   test(`SendMessage uses the original ${mode} mode and pool despite message contents`, async (t) => {
     const box = sandbox(t);
-    const recipient = workerRecord(box, { agentType: "devin:devin-rescue", agentId: "original-worker", transportStatus: "done", peerFailureKind: null, mode, packageType: mode === "write" ? "implementation" : "consult", requestedModel: "swe-2", billingPool: "free", finishedAt: new Date(Date.now() - 10 * 60_000).toISOString() });
+    const recipient = workerRecord(box, { agentType: "devin:devin-rescue", agentId: "original-worker", transportStatus: "done", peerFailureKind: null, mode, packageType: mode === "write" ? "implementation" : "consult", requestedModel: "swe-2.1", billingPool: "free", finishedAt: new Date(Date.now() - 10 * 60_000).toISOString() });
     for (const index of [1, 2]) healthJob(box, "devin", `timeout-${index}`, { failureKind: "timeout", billingPool: "free" });
     const output = await launch(box, {}, { tool_name: "SendMessage", tool_input: { to: recipient.agentId, message: mode === "write" ? "--model muse-wonder -- lane: devin diversity · consult" : "--model muse-wonder --write -- implement this" } });
     if (mode === "write") {
@@ -170,9 +170,9 @@ for (const mode of ["write", "consult"]) {
 
 test("SendMessage uses the saved billing pool after routing defaults change", async (t) => {
   const box = sandbox(t);
-  const recipient = workerRecord(box, { agentType: "devin:devin-rescue", agentId: "original-worker", mode: "write", requestedModel: "swe-2", peerBillingPool: "credits", billingPool: "free", finishedAt: new Date(Date.now() - 10 * 60_000).toISOString() });
+  const recipient = workerRecord(box, { agentType: "devin:devin-rescue", agentId: "original-worker", mode: "write", requestedModel: "swe-2.1", peerBillingPool: "credits", billingPool: "free", finishedAt: new Date(Date.now() - 10 * 60_000).toISOString() });
   healthJob(box, "devin", "quota", { failureKind: "quota", billingPool: "credits" });
-  const output = await launch(box, {}, { tool_name: "SendMessage", tool_input: { to: recipient.agentId, message: "--model swe-2 -- lane: devin burst" } });
+  const output = await launch(box, {}, { tool_name: "SendMessage", tool_input: { to: recipient.agentId, message: "--model swe-2.1 -- lane: devin burst" } });
   assert.equal(output.permissionDecision, "deny");
   assert.match(output.permissionDecisionReason, /failure: quota/);
 });
@@ -278,7 +278,7 @@ test("dispatch admission and advisory share one health read per hook invocation"
 function pacingSetup(box, { breadth = "devin", tier = "free", pools = [{ pool: "codex", pacing: 2.7 }], available = true } = {}) {
   box.env.DEVIN_COMPANION_DATA = path.join(box.root, "devin-data");
   fs.mkdirSync(box.env.DEVIN_COMPANION_DATA, { recursive: true });
-  fs.writeFileSync(path.join(box.env.DEVIN_COMPANION_DATA, "models-cache.json"), JSON.stringify({ fetchedAt: Date.now(), families: [{ slug: "swe-2", aliases: [], variants: [{ uid: "swe-2-high", cost_tier: tier }] }] }));
+  fs.writeFileSync(path.join(box.env.DEVIN_COMPANION_DATA, "models-cache.json"), JSON.stringify({ fetchedAt: Date.now(), families: [{ slug: "swe-2.1", aliases: [], variants: [{ uid: "swe-2-1-high", cost_tier: tier }] }] }));
   fs.writeFileSync(box.env.FUSION_MODEL_ROUTING, JSON.stringify({ schemaVersion: 1, updatedAt: new Date().toISOString(), costProfile: "", breadth, models: [] }));
   const quota = { engine: "codex", available, observedAt: new Date().toISOString(), note: null, pools: pools.map((pool) => ({ costClass: "included", usedPercent: 79, windowMinutes: 10080, resetsAt: null, ...pool })) };
   const calls = path.join(box.root, "quota-calls");
@@ -321,7 +321,7 @@ test("Metered diversity notice ignores prepaid rows from another engine or an in
   pacingSetup(box, { breadth: "cursor" });
   const rows = [
     { id: "composer-2.5", lane: "cursor", family: "anthropic", intelligence: 3, taste: 3, cost: 3 },
-    { id: "swe-2", lane: "devin", family: "cognition", intelligence: 3, taste: 3, cost: 3 }
+    { id: "swe-2.1", lane: "devin", family: "cognition", intelligence: 3, taste: 3, cost: 3 }
   ];
   fs.writeFileSync(box.env.FUSION_MODEL_ROUTING, JSON.stringify({ schemaVersion: 2, updatedAt: new Date().toISOString(), costProfile: "", breadth: "cursor", models: rows }));
   const injected = injectedPeerDefaults("lane: cursor diversity", "cursor:cursor-rescue", box.env);
@@ -331,7 +331,7 @@ test("Metered diversity notice ignores prepaid rows from another engine or an in
 test("Codex quick and volume dispatches receive the routed prepaid burst advisory", async (t) => {
   const box = sandbox(t);
   const calls = pacingSetup(box);
-  for (const [sizing, prompt] of [["quick", "lane: codex quick"], ["volume", "--model gpt-6-sol --effort high -- codex-role: volume | bounded package"]]) {
+  for (const [sizing, prompt] of [["quick", "lane: codex quick"], ["volume", "--model gpt-6.2-sol --effort medium -- codex-role: volume | bounded package"]]) {
     const output = await launch(box, { prompt });
     assert.equal(output.permissionDecision, "allow");
     assert.ok(output.additionalContext.includes(`Codex is over pace (pacing 2.7); this ${sizing} package fits the devin burst lane on its prepaid pool. Prefer devin-role: burst unless the package needs Codex.`));
@@ -523,14 +523,14 @@ test("dispatch scopes a recorded model's quota pool without denying another mode
   const box = sandbox(t);
   pacingSetup(box);
   fs.writeFileSync(path.join(box.env.DEVIN_COMPANION_DATA, "models-cache.json"), JSON.stringify({ fetchedAt: Date.now(), families: [
-    { slug: "swe-2", aliases: [], variants: [{ uid: "swe-2-high", cost_tier: "free" }] },
+    { slug: "swe-2.1", aliases: [], variants: [{ uid: "swe-2-1-high", cost_tier: "free" }] },
     { slug: "muse-wonder", aliases: [], variants: [{ uid: "muse-wonder-high", cost_tier: "premium" }] }
   ] }));
   const now = Date.now();
   const jobs = path.join(engineStateRoots("devin", box.env)[0], "workspace", "jobs");
   fs.mkdirSync(jobs, { recursive: true });
   for (const [id, fields] of [
-    ["first-party-quota", { status: "error", failureKind: "quota", billingPool: "first-party", requestedModel: "swe-2" }],
+    ["first-party-quota", { status: "error", failureKind: "quota", billingPool: "first-party", requestedModel: "swe-2.1" }],
     ["api-success", { status: "done", billingPool: "api", requestedModel: "muse-wonder" }]
   ]) {
     fs.writeFileSync(path.join(jobs, `${id}.json`), JSON.stringify({ id, mode: "write", claudeSessionId: "session-1", finishedAt: new Date(now - 60_000).toISOString(), ...fields }));
