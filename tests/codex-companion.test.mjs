@@ -1046,7 +1046,7 @@ test("task rejects an outdated Codex CLI before execution", (t) => {
 });
 
 test("task proceeds with tested, alpha hotfix, and newer Codex CLI versions", (t) => {
-  for (const version of ["0.154.0", "0.154.1", "0.155.0-alpha.5.1", "0.155.0", "0.156.0", "0.157.1", "0.162.1", "0.169.0", "0.170.0", "0.171.0"]) {
+  for (const version of ["0.154.0", "0.154.1", "0.155.0-alpha.5.1", "0.155.0", "0.156.0", "0.157.1", "0.162.1", "0.169.0", "0.170.0", "0.171.0", "0.172.0", "0.173.0"]) {
     const sandbox = makeSandbox(t);
     const result = runCompanion(["task", "--json", "do work"], {
       cwd: sandbox.workDir,
@@ -2254,12 +2254,12 @@ test("setup verifies authentication and the tested Codex version interval", (t) 
   assert.doesNotMatch(apiKey.stdout, /codex-test-key/);
   const unsupported = runCompanion(["setup", "--json"], {
     cwd: sandbox.workDir,
-    env: envFor(sandbox, { FAKE_CODEX_VERSION: "0.171.0" })
+    env: envFor(sandbox, { FAKE_CODEX_VERSION: "0.173.0" })
   });
   assert.equal(unsupported.status, 1);
   const unsupportedReport = JSON.parse(unsupported.stdout);
   assert.equal(unsupportedReport.ready, false);
-  assert.match(unsupportedReport.compatibility, /newer than the tested interval \(0\.154\.0 to before 0\.171\.0\)/);
+  assert.match(unsupportedReport.compatibility, /newer than the tested interval \(0\.154\.0 to before 0\.173\.0\)/);
   assert.match(unsupportedReport.nextSteps.join("\n"), /A verification pass is advised\./);
 });
 
