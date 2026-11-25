@@ -50,6 +50,7 @@ test("Billing metadata derives from each engine and the cached Devin catalog", (
       { slug: "swe-2", aliases: ["swe"], variants: [{ uid: "swe-2-fast", cost_tier: "free" }, { uid: "swe-2-deep", cost_tier: "free" }] },
       { slug: "mixed", aliases: [], variants: [{ uid: "mixed-free", cost_tier: "free" }, { uid: "mixed-paid", cost_tier: "premium" }] },
       { slug: "muse-wonder", aliases: [], variants: [{ uid: "muse-wonder-xhigh", cost_tier: "premium" }] },
+      { slug: "swe-2.1", aliases: [], variants: [{ uid: "swe-2-1-high-lightning", cost_tier: "premium" }, { uid: "swe-2-1-high", cost_tier: "free" }] },
       { slug: "kimi-k3.1-pro", aliases: [], variants: [{ uid: "kimi-k3-1-pro-high", cost_tier: "premium" }] }
     ]
   }));
@@ -80,7 +81,7 @@ test("Billing metadata derives from each engine and the cached Devin catalog", (
   assert.match(table, /\| composer-2\.5 \| cursor \| cognition \| 3 \| 3 \| 3 \| included \|/);
   assert.match(table, /\| muse-spark-1\.3 \| cursor \| cognition \| 3 \| 3 \| 3 \| metered \|/);
   const defaults = readRoutingDefaults({ ...env, FUSION_MODEL_ROUTING: path.join(dir, "missing.json") });
-  assert.deepEqual(defaults.devin.burst, { model: "swe-2", effort: "high", pool: "free", costClass: "free" });
+  assert.deepEqual(defaults.devin.burst, { model: "swe-2.1", effort: "high", pool: "free", costClass: "free" });
   assert.deepEqual(defaults.devin.diversity, { model: "kimi-k3.1-pro", effort: "high", pool: "credits", costClass: "metered" });
   for (const lane of ["codex", "grok", "agy"]) {
     for (const choice of Object.values(defaults[lane])) {
@@ -192,7 +193,7 @@ test("Session context table renders scores without Notes and points to config", 
   assert.match(table, /^\|---\|---\|---\|---:\|---:\|---:\|---\|$/m);
   assert.match(table, /^\| codex \| codex \| openai \| 5 \| 4 \| 5 \| included \|$/m);
   assert.doesNotMatch(table, /primary implementation lane|\| Notes \|/);
-  assert.match(table, /^Lane defaults: codex quick gpt-6-sol@xhigh, volume gpt-6-sol@high, flagship gpt-6\.1-sol@xhigh; grok burst grok-4\.7-build-fast@low, independence grok-4\.7-build-fast@low, live-web grok-4\.7-build-fast@high, large-context grok-4\.6@medium; cursor diversity muse-spark-1\.3@xhigh \(metered\), burst composer-2\.5@default; agy independence gemini-4-neon@high, large-context gemini-4-neon@high, burst gemini-4-neon@medium; opencode bulk deepseek-v4\.1-flash@high, blind-check glm-5\.3-flash@high\.$/m);
+  assert.match(table, /^Lane defaults: codex quick gpt-6\.2-sol@high, volume gpt-6\.2-sol@medium, flagship gpt-6\.2-astra@xhigh; grok burst grok-4\.7-build-fast@low, independence grok-4\.7-build-fast@low, live-web grok-4\.7-build-fast@high, large-context grok-4\.6@medium; cursor diversity muse-spark-1\.3@xhigh \(metered\), burst composer-2\.5@default; agy independence gemini-4-neon@high, large-context gemini-4-neon@high, burst gemini-4-neon@medium; opencode bulk deepseek-v4\.1-flash@high, blind-check glm-5\.3-flash@high\.$/m);
   assert.match(table, /\| grok-fast \| grok \| xai \| 3 \| 3 \| 5 \| included \|\nBreadth engine: Cursor \(cursor\); its briefs go to cursor:cursor-rescue with `cursor-role: diversity` or `cursor-role: burst`, and Devin holds no routing seat\.\nBreadth diversity excludes the claude family and the google family served by Antigravity \(agy\); route google consults to agy:agy-rescue\.\nModel notes \(benchmarks, prices, latency\) live in model-routing\.json; `\/fusion:config` shows them\.\n\nLane defaults: [^\n]+\n\nScores feed/);
   assert.match(
     table,
@@ -226,7 +227,7 @@ test("Routing defaults merge file choices over the seed and preserve only suppor
     agy: DEFAULT_ROUTING_DEFAULTS.agy,
     opencode: DEFAULT_ROUTING_DEFAULTS.opencode
   });
-  assert.match(renderModelTableFromFile(file), /Lane defaults: codex quick gpt-6-sol@high, volume gpt-6-sol@high, flagship gpt-6\.1-sol@xhigh; grok burst grok-4\.7-build-fast@low, independence grok-4\.7@max/);
+  assert.match(renderModelTableFromFile(file), /Lane defaults: codex quick gpt-6-sol@high, volume gpt-6\.2-sol@medium, flagship gpt-6\.2-astra@xhigh; grok burst grok-4\.7-build-fast@low, independence grok-4\.7@max/);
 });
 
 test("Routing file flagship choice overrides the shipped default", (t) => {
@@ -237,7 +238,7 @@ test("Routing file flagship choice overrides the shipped default", (t) => {
     models: [...ROUTING.models, { id: "gpt-6-astra", lane: "codex", intelligence: 5, taste: 4, cost: 2 }],
     defaults: { codex: { flagship: { model: "gpt-6-astra", effort: "xhigh", pool: "codex", costClass: "included" } } }
   });
-  assert.deepStrictEqual(DEFAULT_ROUTING_DEFAULTS.codex.flagship, { model: "gpt-6.1-sol", effort: "xhigh", pool: "codex", costClass: "included" });
+  assert.deepStrictEqual(DEFAULT_ROUTING_DEFAULTS.codex.flagship, { model: "gpt-6.2-astra", effort: "xhigh", pool: "codex", costClass: "included" });
   assert.deepStrictEqual(readRoutingDefaults({ FUSION_MODEL_ROUTING: file }).codex.flagship, { model: "gpt-6-astra", effort: "xhigh", pool: "codex", costClass: "included" });
   assert.match(renderModelTableFromFile(file), /flagship gpt-6-astra@xhigh/);
 });

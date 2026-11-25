@@ -42,7 +42,7 @@ function sandbox(t) {
         : engine === "cursor"
           ? ["muse-spark-1.3-xhigh", "composer-2.5", "cursor-new"]
           : engine === "devin"
-            ? ["muse-wonder-xhigh", "swe-2", "devin-new"]
+            ? ["muse-wonder-xhigh", "swe-2", "swe-2.1", "devin-new"]
             : ["gemini-4-neon", "gemini-4-hydrogen", "gemini-4-argon"];
     fs.writeFileSync(file, `if (process.argv.slice(2).join(" ") !== "models --json") process.exit(2);\nprocess.stdout.write(JSON.stringify(${JSON.stringify({ engine, models: models.map((id) => ({ id, displayName: id })), source: "test listing" })}));\n`);
     return [engine, file];
@@ -155,7 +155,7 @@ test("Set-default writes a lane choice and prints the updated defaults without i
   assert.match(result.stdout, /Updated codex quick default to gpt-6-sol@high\./);
   const data = JSON.parse(fs.readFileSync(box.modelRoutingFile, "utf8"));
   assert.deepStrictEqual(data.defaults, { codex: { quick: { model: "gpt-6-sol", effort: "high", pool: "codex", costClass: "included" } } });
-  assert.match(result.stdout, /^Lane defaults: codex quick gpt-6-sol@high \(pool: codex, cost class: included\), volume gpt-6-sol@high/m);
+  assert.match(result.stdout, /^Lane defaults: codex quick gpt-6-sol@high \(pool: codex, cost class: included\), volume gpt-6\.2-sol@medium/m);
   assert.strictEqual(fs.existsSync(box.rulesFile), false);
   assert.strictEqual(
     run(box, ["rescore", "grok-4.7", "--intelligence", "5", "--taste", "4", "--cost", "4", "--lane", "grok"]).status,
@@ -324,10 +324,11 @@ test("Audit reports listing drift, unscored models, and Cursor variants per engi
   assert.strictEqual(report.engines.codex.listing.source, "test listing");
   assert.deepStrictEqual(report.engines.codex.configuredButAbsent, ["gpt-5.5-missing"]);
   assert.deepStrictEqual(report.defaults.codex.quick, { model: "gpt-5.6-terra", effort: "high", pool: "codex", costClass: "included" });
-  assert.deepStrictEqual(report.defaults.codex.volume, { model: "gpt-6-sol", effort: "high", pool: "codex", costClass: "included" });
+  assert.deepStrictEqual(report.defaults.codex.volume, { model: "gpt-6.2-sol", effort: "medium", pool: "codex", costClass: "included" });
   assert.deepStrictEqual(report.defaults.grok.burst, { model: "grok-4.7-build-fast", effort: "low", pool: "grok", costClass: "included" });
   assert.deepStrictEqual(report.engines.codex.defaultsAbsent, [
-    { role: "flagship", model: "gpt-6.1-sol" }
+    { role: "volume", model: "gpt-6.2-sol" },
+    { role: "flagship", model: "gpt-6.2-astra" }
   ]);
   assert.deepStrictEqual(report.engines.codex.unscored, ["gpt-5.7-new", "gpt-6-sol", "o3"]);
   assert.deepStrictEqual(report.engines.grok.configuredButAbsent, ["grok-4-missing"]);
@@ -338,8 +339,8 @@ test("Audit reports listing drift, unscored models, and Cursor variants per engi
   assert.strictEqual(fs.readFileSync(box.modelRoutingFile, "utf8"), routingBeforeAudit);
   const text = run(box, ["audit"]);
   assert.match(text.stdout, /codex defaults: quick gpt-5\.6-terra@high/);
-  assert.match(text.stdout, /volume gpt-6-sol@high/);
-  assert.match(text.stdout, /Codex defaults absent: flagship gpt-6\.1-sol/);
+  assert.match(text.stdout, /volume gpt-6\.2-sol@medium/);
+  assert.match(text.stdout, /Codex defaults absent: volume gpt-6\.2-sol, flagship gpt-6\.2-astra/);
   assert.match(text.stdout, /Unconfigured gpt-\* newcomers: gpt-5\.7-new/);
   assert.match(text.stdout, /Cursor unscored models \(no routing seat\): cursor-new/);
 });
