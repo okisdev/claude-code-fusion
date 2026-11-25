@@ -911,10 +911,10 @@ test("Codex version drift uses the registry verified version key", (t) => {
   writeRecord(jobFile(sandbox.codexState, "workspace", "auth"), {
     status: "error",
     failureKind: "auth",
-    codexVersion: "0.171.0",
+    codexVersion: "0.173.0",
     finishedAt: new Date(Date.now() - 2 * 60000).toISOString()
   });
-  assert.match(run(sandbox).stdout, /; codex 0\.171\.0 installed, contract verified on 0\.170\.0/);
+  assert.match(run(sandbox).stdout, /; codex 0\.173\.0 installed, contract verified on 0\.172\.0/);
 });
 
 test("a failure outside the lookback window is silent", (t) => {
