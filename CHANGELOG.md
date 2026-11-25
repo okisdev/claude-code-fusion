@@ -1,5 +1,11 @@
 # changelog
 
+## 0.0.93
+
+- the Codex lane defaults move to the GPT-6.2 models: flagship `gpt-6.2-astra` at `xhigh` (was `gpt-6.1-sol`), quick `gpt-6.2-sol` at `high` (was `gpt-6-sol` at `xhigh`), and volume `gpt-6.2-sol` at `medium` (was `gpt-6-sol` at `high`). on the plan shaped tasks of the 2026-11-25 lane snapshot astra passed 9 of 9 at a 71 s median, where `gpt-6.1-sol` failed one T07 attempt at a 228 s median and showed a 25 percent foreground timeout share in production; the Codex catalog now marks `gpt-6-sol` legacy.
+- the Devin burst default is `swe-2.1` at `high` (was `swe-2`), on the free pool. it passed 12 of 12 across T05, T06, T07, and T09 where `swe-2` passed T07 1 of 3, at a slower median. the diversity default stays `kimi-k3.1-pro`, because `swe-2.1` reported four false defects on each clean review.
+- the Codex companion contract is verified against codex-cli 0.172.0: the 13 disabled feature keys stay registered, the exec event schema is unchanged, and no newly default feature adds an exec tool.
+
 ## 0.0.92
 
 - the OpenCode companion reads the opencode 2 credential store, the active `opencode-go` key row of `opencode.db`'s `credential` table, before the opencode 1 `auth.json`. opencode 2.3 stores logins only in that database, so 0.0.91 read a stale June key from the old file and every Go request returned HTTP 401 on a machine freshly logged in. the database is opened read only in a child process with Node 22's `node:sqlite` experimental warning disabled.
