@@ -76,6 +76,7 @@ test("keeps a fully staged patched file staged and preserves partial staging els
 
 test("refuses every partially staged patched path and preserves both checkouts", (t) => {
   const { main, peer, git, merge } = fixture(t, { file: "base\n", old: "old\n", removed: "base\n" });
+  git(main, "commit", "-q", "--allow-empty", "-m", "target commit");
   for (const file of ["file", "old"]) write(main, file, "staged\n");
   git(main, "add", "file", "old");
   git(main, "rm", "removed");
@@ -154,10 +155,16 @@ test("removes a deleted file from the target working tree", (t) => {
 
 test("keeps conflict markers and unmerged stages while unstaging clean paths", (t) => {
   const { main, peer, git, merge } = fixture(t, { a: "base\n", b: "base\n", c: "base\n" });
+  git(main, "commit", "-q", "--allow-empty", "-m", "target commit");
+  const targetHead = git(main, "rev-parse", "HEAD").trim();
+  const sourceHead = git(peer, "rev-parse", "HEAD").trim();
   for (const file of ["a", "b"]) write(main, file, "main\n");
   for (const file of ["a", "b", "c"]) write(peer, file, "peer\n");
+  const index = git(peer, "rev-parse", "--path-format=absolute", "--git-path", "index").trimEnd();
+  const before = fs.readFileSync(index);
 
-  assert.equal(merge(1).stdout, "conflicted a\nconflicted b\nmerged c\n");
+  assert.equal(merge(1).stdout, `target HEAD ${targetHead} differs from worktree HEAD ${sourceHead}\nconflicted a\nconflicted b\nmerged c\n`);
+  assert.deepEqual(fs.readFileSync(index), before);
   for (const file of ["a", "b"]) {
     assert.match(read(main, file), /<<<<<<< .*\nmain\n=======\npeer\n>>>>>>> /);
     assert.equal(git(main, "show", `:2:${file}`), "main\n");
@@ -165,7 +172,10 @@ test("keeps conflict markers and unmerged stages while unstaging clean paths", (
   }
   assert.equal(read(main, "c"), "peer\n");
   assert.equal(git(main, "status", "--porcelain"), "UU a\nUU b\n M c\n");
-  assert.match(merge(1).stderr, /already conflicted a/);
+  const refusal = merge(1);
+  assert.equal(refusal.stderr, "already conflicted a\nalready conflicted b\n");
+  assert.equal(refusal.stdout, "");
+  assert.deepEqual(fs.readFileSync(index), before);
   assert.equal(git(main, "show", ":2:a"), "main\n");
 });
 
@@ -290,13 +300,15 @@ test("restores partial staging, intent to add and unstaged deletions on a hard f
   git(main, "add", "-N", "new");
   fs.unlinkSync(path.join(main, "missing"));
   for (const file of ["new", "missing"]) write(peer, file, "peer\n");
-  const indexPath = path.join(main, ".git", "index");
-  const before = fs.readFileSync(indexPath);
+  git(peer, "add", "new");
+  write(peer, "new", "revised peer\n");
+  const indexes = [main, peer].map((dir) => git(dir, "rev-parse", "--path-format=absolute", "--git-path", "index").trimEnd());
+  const before = indexes.map((index) => fs.readFileSync(index));
 
   const result = merge(1);
   assert.match(result.stderr, /error: missing:/);
   assert.doesNotMatch(result.stdout, /merged |conflicted /);
-  assert.deepEqual(fs.readFileSync(indexPath), before);
+  assert.deepEqual(indexes.map((index) => fs.readFileSync(index)), before);
   assert.equal(read(main, "file"), "working\n");
   assert.equal(read(main, "new"), "intent\n");
   assert.equal(fs.existsSync(path.join(main, "missing")), false);

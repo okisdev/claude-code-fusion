@@ -69,7 +69,7 @@ function checkPartial(sourceGit, candidates) {
   refusePaths("partially staged", [...candidates].filter((file) => tracked.has(file) || untracked.has(file)));
 }
 
-function mergeInto(target, sourceGit, stageSource) {
+function mergeInto(target, sourceGit) {
   return withLockedIndex(target, (run, commit) => {
     const existingFile = (file) => {
       const stat = fs.lstatSync(path.join(target, file), { throwIfNoEntry: false });
@@ -86,17 +86,12 @@ function mergeInto(target, sourceGit, stageSource) {
 
     sourceGit(["add", "-A"]);
     const patch = sourceGit(["diff", "--cached", "--binary", "--find-renames", "--default-prefix", "--no-color", "--no-ext-diff", "--no-textconv", "HEAD"]);
-    if (!patch.length) {
-      stageSource();
-      console.log("nothing to merge");
-      return 0;
-    }
+    if (!patch.length) return { paths: [], conflicts: new Set() };
     const numstat = records(run(["apply", "--numstat", "-z"], patch));
     const removed = changedPaths(sourceGit, "--cached", "--diff-filter=D", "HEAD");
     const paths = [...new Set([...numstat.map((row) => row.replace(/^[^\t]+\t[^\t]+\t/, "")), ...removed])];
     refusePaths("already conflicted", paths.filter((file) => unmerged.has(file)));
     refusePaths("partially staged", paths.filter((file) => partial.has(file)));
-    stageSource();
 
     const intentToAdd = changedPaths(run, "--diff-filter=A", "--ita-invisible-in-index");
     const deleted = changedPaths(run, "--diff-filter=D");
@@ -116,8 +111,7 @@ function mergeInto(target, sourceGit, stageSource) {
     updatePaths(run, ["reset", "-q", "HEAD"], unstaged, descendants);
     updatePaths(run, ["add", "-N"], unstaged.filter((file) => intentToAdd.has(file) && existingFile(file)));
     commit();
-    for (const file of paths) console.log(`${conflicts.has(file) ? "conflicted" : "merged"} ${display(file)}`);
-    return conflicts.size ? 1 : 0;
+    return { paths, conflicts };
   });
 }
 
@@ -145,8 +139,12 @@ function main(args) {
       }
     }
     if (problems.length) throw new Error(problems.join("\n"));
+    const { paths, conflicts } = mergeInto(target, run);
+    if (!conflicts.size) stageSource();
     if (sourceHead !== targetHead) console.log(`target HEAD ${targetHead} differs from worktree HEAD ${sourceHead}`);
-    return mergeInto(target, run, stageSource);
+    if (!paths.length) console.log("nothing to merge");
+    for (const file of paths) console.log(`${conflicts.has(file) ? "conflicted" : "merged"} ${display(file)}`);
+    return conflicts.size ? 1 : 0;
   });
 }
 

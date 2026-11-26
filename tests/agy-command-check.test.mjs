@@ -172,6 +172,60 @@ test("git -C accepts linked worktrees and refuses unrelated repositories", (t) =
   assert.equal(isReadOnlyCommand(`git -C '${linked}' status --short`, { cwd: root }), false);
 });
 
+test("git -C refuses invalid workspace and target repository metadata", (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "agy-invalid-git-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const cwd = fs.mkdirSync(path.join(root, "workspace"), { recursive: true });
+  const sub = fs.mkdirSync(path.join(cwd, "sub", ".git"), { recursive: true });
+  const external = fs.mkdirSync(path.join(root, "external"), { recursive: true });
+  initCleanRepo(external);
+  fs.writeFileSync(path.join(sub, "HEAD"), "ref: refs/heads/main\n");
+  fs.writeFileSync(path.join(sub, "commondir"), `${path.join(external, ".git")}\n`);
+
+  assert.equal(isReadOnlyCommand("git -C sub status", { cwd }), false);
+  fs.writeFileSync(path.join(cwd, ".git"), "invalid git file\n");
+  assert.equal(isReadOnlyCommand("git -C . status", { cwd }), false);
+});
+
+test("git -C accepts submodules inside the workspace", (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "agy-git-submodule-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const cwd = fs.mkdirSync(path.join(root, "repo"), { recursive: true });
+  const origin = fs.mkdirSync(path.join(root, "origin"), { recursive: true });
+  initCleanRepo(cwd);
+  initCleanRepo(origin);
+  git(cwd, ["-c", "protocol.file.allow=always", "submodule", "add", "-q", origin, "module"]);
+  const sibling = fs.mkdirSync(path.join(cwd, "sibling"), { recursive: true });
+  fs.mkdirSync(path.join(cwd, "module", "nested"));
+
+  assert.equal(isReadOnlyCommand("git -C module -C nested status", { cwd }), true);
+  assert.equal(isReadOnlyCommand("git -C ../module status", { cwd: sibling }), false);
+});
+
+test("git -C walks past directories with incomplete bare repository metadata", (t) => {
+  const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "agy-git-lookalike-"));
+  t.after(() => fs.rmSync(cwd, { recursive: true, force: true }));
+  initCleanRepo(cwd);
+  fs.mkdirSync(path.join(cwd, "nested", "objects"), { recursive: true });
+  fs.writeFileSync(path.join(cwd, "nested", "HEAD"), "ref: refs/heads/main\n");
+  fs.writeFileSync(path.join(cwd, "nested", "refs"), "");
+  assert.equal(isReadOnlyCommand("git -C nested status", { cwd }), true);
+
+  fs.writeFileSync(path.join(cwd, "nested", "commondir"), "missing\n");
+  assert.equal(isReadOnlyCommand("git -C nested status", { cwd }), true);
+});
+
+test("git -C accepts ..metadata inside a workspace without a repository", (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "agy-git-no-repo-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const cwd = path.join(root, "workspace");
+  fs.mkdirSync(path.join(cwd, "..metadata"), { recursive: true });
+  fs.mkdirSync(path.join(root, "..metadata"));
+
+  assert.equal(isReadOnlyCommand("git -C ..metadata status", { cwd }), true);
+  assert.equal(isReadOnlyCommand("git -C ../..metadata status", { cwd }), false);
+});
+
 test("git pathspec globs keep command and option checks", (t) => {
   const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "agy-git-pathspec-"));
   t.after(() => fs.rmSync(cwd, { recursive: true, force: true }));
