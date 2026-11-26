@@ -13,7 +13,18 @@ export { cleanupRawCommandTransportsForSession };
 
 const TESTED_CODEX_INTERVAL = { floor: "0.154.0", ceiling: "0.173.0" };
 const DEFAULT_MODELS = { bulk: "deepseek-v4.1-flash", "blind-check": "glm-5.3-flash" };
-const render = { ...createCompanionRender({ engine: "opencode", engineName: "OpenCode", resolvedEffortField: "resolvedEffort" }), extractFirstJsonObject, validateReviewOutput, renderReviewResult };
+const render = {
+  ...createCompanionRender({
+    engine: "opencode", engineName: "OpenCode", resolvedEffortField: "resolvedEffort",
+    renderFooterDetails(record) {
+      const lines = [];
+      if (record.codexHome) lines.push(`codex-home: ${record.codexHome}`);
+      if (record.sandbox) lines.push(`codex-sandbox: ${record.sandbox}`);
+      return lines;
+    }
+  }),
+  extractFirstJsonObject, validateReviewOutput, renderReviewResult
+};
 const state = { ...sharedState, finishSuccessfulJobRecordFile(file, patch) {
   const current = sharedState.readJobRecordFile(file);
   if (current?.status === "running" && current.cleanupRequired) return current;

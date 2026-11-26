@@ -264,9 +264,28 @@ for (const [scenario, kind] of [["auth401", "auth"], ["auth403", "auth"], ["quot
   });
 }
 
-test("terminal text ends with the shared outcome footer", (t) => {
-  const box = harness(t);
-  const result = box.run(["task", "--write", "--", "opencode-role: bulk\nGenerate files."]);
-  assert.equal(result.status, 0, result.stderr || result.stdout);
-  assert.match(result.stdout, /opencode-session: [^\n]+\njob: [a-f0-9]{32}\nsandbox: [^\n]+\ndelivery: foreground\nsemantic: unverified\n(?:warning: [^\n]+\n)*state: done\n$/);
-});
+for (const [role, mode] of [["blind-check", "read-only"], ["bulk", "workspace-write"]]) {
+  test(`${role} task, result, and status text include Codex details in the shared footer`, (t) => {
+    const box = harness(t);
+    const task = box.run(["task", "--", `opencode-role: ${role}\nCheck the staged artifact.`]);
+    assert.equal(task.status, 0, task.stderr || task.stdout);
+    const [job] = box.jobs();
+    assert.match(job.id, /^[a-f0-9]{32}$/);
+    const footer = [
+      `opencode-session: ${job.sessionId}`,
+      `job: ${job.id}`,
+      `sandbox: ${box.cwd}`,
+      "delivery: foreground",
+      "semantic: unverified",
+      `codex-home: ${path.join(box.dataDir, "codex-home")}`,
+      `codex-sandbox: ${mode}`,
+      ...job.warnings.map((warning) => `warning: ${warning}`),
+      "state: done",
+      ""
+    ].join("\n");
+    for (const output of [task, box.run(["result", job.id]), box.run(["status", job.id])]) {
+      assert.equal(output.status, 0, output.stderr || output.stdout);
+      assert.equal(output.stdout.slice(output.stdout.lastIndexOf("\nopencode-session: ") + 1), footer);
+    }
+  });
+}
