@@ -38,12 +38,14 @@ import {
   renderSessionReport,
   workspaceRootsShareRepository
 } from "../plugins/fusion/scripts/fusion-stats.mjs";
-import { resolveStateDir as guardResolveStateDir, stateFile as guardStateFile } from "../plugins/fusion/scripts/inline-delegation-guard.mjs";
+import { handleInlineDelegationHook, resolveStateDir as guardResolveStateDir, stateFile as guardStateFile } from "../plugins/fusion/scripts/inline-delegation-guard.mjs";
 import { createRawArgsTransport } from "../plugins/fusion/scripts/lib/raw-args-transport.mjs";
 import { MESSAGE_REGISTRY, messageCode } from "../plugins/fusion/scripts/lib/user-messages.mjs";
 import { applyQueuedVerdict, createWorkerRecord, pruneExpiredWorkerRecords, readWorkerRecord, recordWorkerAcceptance, reopenWorkerContinuation, updateWorkerRecord, workerElapsedMs, workerRecordFile } from "../plugins/fusion/scripts/lib/worker-state.mjs";
 import { isStrictDirectRecordArguments, parseRecordArguments, validateArgumentShape } from "../plugins/fusion/scripts/lib/stats/arguments.mjs";
+import { acceptVerifiedWorker } from "../plugins/fusion/scripts/lib/stats/settlement.mjs";
 import { settlementCommand } from "../plugins/fusion/scripts/lib/lifecycle/stop.mjs";
+import { handleLifecycleHook } from "../plugins/fusion/scripts/worker-lifecycle.mjs";
 import { readStatsAuditEvents } from "../plugins/fusion/scripts/lib/stats/fleet.mjs";
 import { gitIsolation } from "./lib/git-fixture.mjs";
 import { createJobRecord as createGrokJobRecord } from "../plugins/grok/scripts/lib/state.mjs";
@@ -708,6 +710,34 @@ test("file-based engine stats use the descriptor registry", () => {
   assert.strictEqual(FILE_ENGINE_DESCRIPTORS.codex.defaultStateRoot({}), path.join(os.homedir(), ".claude", "plugins", "data", "codex-claude-code-fusion", "state"));
   assert.strictEqual(FILE_ENGINE_DESCRIPTORS.codex.defaultStateRoot({ CODEX_COMPANION_DATA: "/adapter-data" }), "/adapter-data/state");
   assert.strictEqual(typeof fileBasedEngineStats, "function");
+});
+
+test("OpenCode stats sum complete recorded usage and exclude incomplete and pending jobs", (t) => {
+  const dir = sandbox(t);
+  const dataDir = path.join(dir, "opencode-data");
+  const jobs = path.join(dataDir, "state", grokWorkspaceSlug(dir), "jobs");
+  fs.mkdirSync(jobs, { recursive: true });
+  const usage = { inputTokens: 73677, cachedInputTokens: 58112, outputTokens: 1621, reasoningOutputTokens: 492, totalTokens: 75298 };
+  for (const [id, fields] of Object.entries({
+    bulk: { status: "done", role: "bulk", usage, usageIsIncomplete: false },
+    "blind-check": { status: "done", role: "blind-check", usage: { inputTokens: 18, cachedInputTokens: 0, outputTokens: 2, reasoningOutputTokens: 0, totalTokens: 20 }, usageIsIncomplete: false },
+    cancelled: { status: "cancelled", usage, usageIsIncomplete: true },
+    malformed: { status: "done", usage: { ...usage, totalTokens: 1 } },
+    unreported: { status: "error", usage: null, usageIsIncomplete: true },
+    running: { status: "running", usage, usageIsIncomplete: false }
+  })) {
+    fs.writeFileSync(path.join(jobs, `${id}.json`), JSON.stringify({ id, engine: "opencode", cwd: dir, ...fields }));
+  }
+
+  const result = run({ cwd: dir, codexState: path.join(dir, "missing-codex") }, ["--json"], { OPENCODE_COMPANION_DATA: dataDir });
+  assert.strictEqual(result.status, 0, result.stderr);
+  const stats = JSON.parse(result.stdout).opencode;
+  assert.strictEqual(stats.totalJobs, 6);
+  assert.deepStrictEqual(stats.tokenUsage, {
+    availability: "partial", scope: "terminal jobs only", jobsWithUsage: 2,
+    jobsWithIncompleteUsage: 2, jobsWithoutUsage: 3, jobsWithUnreportedUsage: 1,
+    totals: { inputTokens: 73695, cachedInputTokens: 58112, outputTokens: 1623, reasoningOutputTokens: 492, totalTokens: 75318 }
+  });
 });
 
 test("Cursor stats report models, billing pools, and exact token coverage", (t) => {
@@ -2159,6 +2189,75 @@ test("--record settles a Fusion task and its Codex peer with direct strict argv"
   assert.strictEqual(readWorkerRecord(taskId, env).acceptance, "accepted");
 });
 
+function verifyCollectedWorkers(dir, env, sessionId) {
+  const bash = { session_id: sessionId, cwd: dir, tool_name: "Bash", tool_use_id: "verify", tool_input: { command: "npm test" } };
+  handleInlineDelegationHook({ ...bash, hook_event_name: "PreToolUse" }, env);
+  return handleInlineDelegationHook({ ...bash, hook_event_name: "PostToolUse", tool_response: { exitCode: 0 } }, env);
+}
+
+test("verification acceptance and its rejection override reach the peer ledger", (t) => {
+  const dir = sandbox(t);
+  const runtime = { cwd: dir, codexState: path.join(dir, "codex-state") };
+  const jobId = "b".repeat(32);
+  const jobFile = writeCodexJob(runtime.codexState, dir, jobId, { status: "error", failureKind: "timeout" });
+  const env = runtimeEnv(runtime, { FUSION_CODEX_COMPANION: writeCodexAcceptanceCompanion(dir, jobFile) });
+  const taskId = `fusion-${"a".repeat(24)}`;
+  createTerminalWorker({ taskId, env, workspaceRoot: dir, peerEngine: "codex", peerJobId: jobId });
+  const collectedAt = new Date(Date.now() - 1000).toISOString();
+  const pending = updateWorkerRecord(taskId, env, (record) => ({
+    ...record, packageType: "implementation", verificationCommand: "npm test", awaitingVerdict: true, finishedAt: collectedAt, collectedAt
+  }));
+  const verify = () => verifyCollectedWorkers(dir, env, pending.sessionId);
+  assert.deepStrictEqual(verify(), {});
+  assert.deepStrictEqual(readWorkerRecord(taskId, env), pending);
+  fs.writeFileSync(jobFile, JSON.stringify({ id: jobId, workspaceRoot: dir, status: "done" }));
+  const advisory = verify().additionalContext;
+  assert.ok(advisory.includes(`--record ${taskId}=rejected`));
+  assert.strictEqual(readWorkerRecord(taskId, env).engineAcceptanceDelivery.status, "delivered");
+  const acceptedPeer = JSON.parse(fs.readFileSync(jobFile, "utf8"));
+  assert.strictEqual(acceptedPeer.semanticStatus, "accepted");
+  assert.strictEqual(acceptedPeer.semanticFailureMessage, "verification passed: npm test");
+  const stats = buildFusionStats({ all: true, cwd: dir, env });
+  assert.strictEqual(stats.verificationEvidence.accepted, 1);
+  assert.strictEqual(stats.verificationEvidence.evidenced, 1);
+  const override = advisory.split("To override, run: ")[1];
+  const rejected = spawnSync(override, { cwd: dir, env, shell: true, encoding: "utf8" });
+  assert.strictEqual(rejected.status, 0, rejected.stderr);
+  assert.throws(() => acceptVerifiedWorker(pending, env), /changed before settlement/);
+  assert.deepStrictEqual(verify(), {});
+  assert.strictEqual(readWorkerRecord(taskId, env).acceptance, "rejected");
+  assert.strictEqual(JSON.parse(fs.readFileSync(jobFile, "utf8")).semanticStatus, "rejected");
+});
+
+test("automatic peer deliveries share a deadline and Stop retries timed out and pending jobs", async (t) => {
+  const dir = sandbox(t);
+  const runtime = { cwd: dir, codexState: path.join(dir, "codex-state") };
+  const companion = writeCodexAcceptanceCompanion(dir);
+  fs.appendFileSync(companion, "\nAtomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 800);\n");
+  const env = runtimeEnv(runtime, { FUSION_CODEX_COMPANION: companion, FUSION_ACCEPTANCE_RETRY_BACKOFF_MS: "0" });
+  const at = new Date(Date.now() - 1000).toISOString();
+  const tasks = [];
+  for (let index = 1; index <= 5; index++) {
+    const taskId = `fusion-${String(index).padStart(24, "0")}`;
+    const jobId = String(index).padStart(32, "0");
+    writeCodexJob(runtime.codexState, dir, jobId, { status: "done" });
+    createTerminalWorker({ taskId, env, workspaceRoot: dir, peerEngine: "codex", peerJobId: jobId });
+    updateWorkerRecord(taskId, env, (record) => ({ ...record, packageType: "implementation", verificationCommand: "npm test", awaitingVerdict: true, collectedAt: at, finishedAt: at }));
+    tasks.push(taskId);
+  }
+  assert.match(verifyCollectedWorkers(dir, env, "session-settlement").additionalContext, /Peer acceptance delivery is pending/);
+  const entries = tasks.map((id) => {
+    const worker = readWorkerRecord(id, env);
+    assert.equal(worker.acceptance, "accepted");
+    return worker.engineAcceptanceDelivery.entries[0];
+  });
+  assert.match(entries[0].lastError, /timed out after 0\.5 seconds/);
+  assert.equal(entries.at(-1).attempts, 0);
+  writeCodexAcceptanceCompanion(dir);
+  await handleLifecycleHook({ hook_event_name: "Stop", session_id: "session-settlement", cwd: dir, background_tasks: [] }, env);
+  for (const id of tasks) assert.equal(readWorkerRecord(id, env).engineAcceptanceDelivery.status, "delivered");
+});
+
 test("--record settles a Codex collector task through the Codex ledger", (t) => {
   const dir = sandbox(t);
   const stateRoot = path.join(dir, "codex-state");
@@ -2354,22 +2453,53 @@ test("--record accepts a safe direct reason and failure kind", (t) => {
   assert.strictEqual(readWorkerRecord(taskId, env).acceptanceFailureKind, "scope_rewrite");
 });
 
-test("--record requires raw-args for direct reasons outside the allowed charset", (t) => {
+test("--record normalizes direct reasons and preserves raw-args reasons", (t) => {
   const dir = sandbox(t);
+  const runtime = { cwd: dir, codexState: path.join(dir, "missing") };
   const env = { FUSION_WORKER_STATE_DIR: path.join(dir, "worker-state") };
-  for (const [index, reason] of ["The result's scope changed.", "The `check` failed.", "x".repeat(301)].entries()) {
-    const taskId = `fusion-${String(index + 1).repeat(24)}`;
-    createTerminalWorker({ taskId, env, workspaceRoot: dir });
-    const direct = runDirect({ cwd: dir, codexState: path.join(dir, "missing") }, ["--record", `${taskId}=rejected`, "--reason", reason], env);
-    assert.strictEqual(direct.status, 1);
-    assert.match(direct.stderr, /allowed charset.*raw-args transport/);
-    assert.strictEqual(readWorkerRecord(taskId, env).acceptance, "unverified");
+  const reasons = [
+    ["The result's scope changed.", "The result s scope changed."],
+    ["The `check` failed.", "The check failed."],
+    ["  “Check”\tfailed…\nworker’s edits — and 1–2 tests 🚫  ", "Check failed... worker s edits - and 1-2 tests"],
+    ["x".repeat(301), "x".repeat(300)]
+  ];
+  for (const [index, [reason, normalized]] of reasons.entries()) {
+    const directId = `fusion-${String(index + 1).repeat(24)}`;
+    const stagedId = `fusion-${String(index + 5).repeat(24)}`;
+    for (const taskId of [directId, stagedId]) createTerminalWorker({ taskId, env, workspaceRoot: dir });
+    const args = ["--record", `${directId}=rejected`, "--reason", reason];
+    assert.strictEqual(parseRecordArguments(args).records[0].reason, normalized);
+    const direct = runDirect(runtime, args, env);
+    assert.strictEqual(direct.status, 0, direct.stderr);
+    assert.strictEqual(readWorkerRecord(directId, env).acceptance, "rejected");
+    assert.strictEqual(readWorkerRecord(directId, env).acceptanceReason, normalized.slice(0, 240));
 
-    const staged = run({ cwd: dir, codexState: path.join(dir, "missing") }, ["--record", `${taskId}=rejected`, "--reason", reason], env);
+    const stagedReason = reason.replace(/[\t\n]/g, " ").trim();
+    const staged = run(runtime, ["--record", `${stagedId}=rejected`, "--reason", stagedReason], env);
     assert.strictEqual(staged.status, 0, staged.stderr);
-    const recordedReason = readWorkerRecord(taskId, env).acceptanceReason;
-    assert.ok(recordedReason);
-    assert.ok(reason.startsWith(recordedReason));
+    assert.strictEqual(readWorkerRecord(stagedId, env).acceptanceReason, stagedReason.slice(0, 240));
+  }
+});
+
+test("--record rejects direct reasons that become empty without writing", (t) => {
+  const dir = sandbox(t);
+  const taskId = `fusion-${"a".repeat(24)}`;
+  const env = { FUSION_WORKER_STATE_DIR: path.join(dir, "worker-state") };
+  createTerminalWorker({ taskId, env, workspaceRoot: dir });
+  const result = runDirect({ cwd: dir, codexState: path.join(dir, "missing") }, ["--record", `${taskId}=rejected`, "--reason", " \t“🚫” ' "], env);
+  assert.strictEqual(result.status, 1);
+  assert.match(result.stderr, /--reason direct text is empty after normalization/);
+  assert.strictEqual(readWorkerRecord(taskId, env).acceptance, "unverified");
+});
+
+test("--record points Claude agent ids to the Fusion task id in the Stop hook", (t) => {
+  const dir = sandbox(t);
+  const runtime = { cwd: dir, codexState: path.join(dir, "missing") };
+  for (const invoke of [runDirect, run]) {
+    const result = invoke(runtime, ["--record", "a0123456789abcdef=accepted"]);
+    assert.notStrictEqual(result.status, 0);
+    assert.strictEqual(result.stdout, "");
+    assert.match(result.stderr, /Claude agent id.*Fusion task ids are fusion- plus 24 lowercase hex digits.*printed by the Stop hook/);
   }
 });
 
@@ -2380,12 +2510,12 @@ test("--record accepts safe per-pair reasons and failure kinds after one flag", 
   const rejectedId = `fusion-${"b".repeat(24)}`;
   for (const taskId of [acceptedId, rejectedId]) createTerminalWorker({ taskId, env, workspaceRoot: dir });
 
-  const result = runDirect({ cwd: dir, codexState: path.join(dir, "missing") }, ["--reason-for", rejectedId, "Check failed: output/incomplete.", "--failure-kind-for", rejectedId, "wrong_approach", "--record", `${acceptedId}=accepted`, `${rejectedId}=rejected`], env);
+  const result = runDirect({ cwd: dir, codexState: path.join(dir, "missing") }, ["--reason-for", rejectedId, "“Check” failed — output/incomplete…", "--failure-kind-for", rejectedId, " wrong_approach 🚫 ", "--record", `${acceptedId}=accepted`, `${rejectedId}=rejected`], env);
 
   assert.strictEqual(result.status, 0, result.stderr);
   assert.strictEqual(readWorkerRecord(acceptedId, env).acceptance, "accepted");
   assert.strictEqual(readWorkerRecord(rejectedId, env).acceptance, "rejected");
-  assert.strictEqual(readWorkerRecord(rejectedId, env).acceptanceReason, "Check failed: output/incomplete.");
+  assert.strictEqual(readWorkerRecord(rejectedId, env).acceptanceReason, "Check failed - output/incomplete...");
   assert.strictEqual(readWorkerRecord(rejectedId, env).acceptanceFailureKind, "wrong_approach");
 });
 
@@ -5114,16 +5244,30 @@ test("Antigravity token evidence rejects inconsistent counters without inventing
   assert.strictEqual(included.usage.outputTokens, 100);
 });
 
-test("Antigravity stats preserve permission failure kinds", (t) => {
+test("Antigravity token evidence marks interrupted usage as partial", () => {
+  const resolve = FILE_ENGINE_DESCRIPTORS.agy.resolveTokenUsage;
+  const usage = { inputTokens: 500, outputTokens: 100, cachedReadTokens: 100, totalTokens: 600 };
+  assert.deepStrictEqual(resolve({ usage, usageIsIncomplete: true }), { availability: "partial", usage: null });
+  assert.deepStrictEqual(resolve({ usage: null, usageIsIncomplete: true }), { availability: "partial", usage: null });
+});
+
+test("Antigravity stats preserve permission failures and exclude incomplete tokens", (t) => {
   const dir = sandbox(t);
   const data = path.join(dir, "agy-data");
   const jobs = path.join(data, "state", grokWorkspaceSlug(dir), "jobs");
   fs.mkdirSync(jobs, { recursive: true });
   const id = "b".repeat(32);
-  fs.writeFileSync(path.join(jobs, `${id}.json`), JSON.stringify({ id, engine: "agy", cwd: dir, status: "error", failureKind: "permission", permissionsRejected: 1, resultText: "" }));
+  fs.writeFileSync(path.join(jobs, `${id}.json`), JSON.stringify({
+    id, engine: "agy", cwd: dir, status: "error", failureKind: "permission", permissionsRejected: 1, resultText: "",
+    usage: { inputTokens: 100, outputTokens: 10, cachedReadTokens: 0, totalTokens: 110 }, usageIsIncomplete: true
+  }));
   const stats = fileBasedEngineStats(FILE_ENGINE_DESCRIPTORS.agy, { env: { AGY_COMPANION_DATA: data }, cwd: dir });
   assert.deepStrictEqual(stats.byStatus, { error: 1 });
   assert.deepStrictEqual(stats.byFailureKind, { permission: 1 });
+  assert.deepStrictEqual(stats.tokenUsage, {
+    availability: "unavailable", scope: "terminal jobs only", jobsWithUsage: 0,
+    jobsWithIncompleteUsage: 1, jobsWithoutUsage: 1, jobsWithUnreportedUsage: 0, totals: null
+  });
 });
 
 test("Antigravity pruning removes orphan runs while preserving runs with job records", (t) => {

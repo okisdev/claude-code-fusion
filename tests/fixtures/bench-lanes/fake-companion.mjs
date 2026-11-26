@@ -8,8 +8,14 @@ const engine = process.env.FAKE_ENGINE;
 const mode = process.env.FAKE_MODE ?? "pass";
 const workspace = value("--cwd");
 const jobId = "a".repeat(32);
+const dataDir = process.env[`${engine.toUpperCase()}_COMPANION_DATA`];
 
-fs.writeFileSync(process.env.FAKE_ARGS_FILE, JSON.stringify({ args, cwd: process.cwd() }));
+fs.writeFileSync(process.env.FAKE_ARGS_FILE, JSON.stringify({
+  args, cwd: process.cwd(), dataDir,
+  codexState: process.env.FUSION_CODEX_STATE,
+  codexStateDir: process.env.FUSION_CODEX_STATE_DIR,
+  claudeEnv: ["CLAUDE_CODE_SESSION_ID", "CLAUDE_CODE_PARENT_SESSION_ID", "CLAUDE_SESSION_ID", "CLAUDE_PLUGIN_DATA", "CLAUDECODE"].filter((key) => Object.hasOwn(process.env, key))
+}));
 if (mode === "timeout") {
   fs.writeFileSync(process.env.FAKE_PID_FILE, String(process.pid));
   spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" });
@@ -34,7 +40,7 @@ if (mode === "timeout") {
     usage: engine === "grok" ? { input_tokens: 12, output_tokens: 8, cache_read_input_tokens: 99 } : { inputTokens: 10, outputTokens: 6, cachedInputTokens: 99 },
     totalCostUsd: 0
   };
-  const jobFile = path.join(process.env[`${engine.toUpperCase()}_COMPANION_DATA`], "state", "workspace", "jobs", `${jobId}.json`);
+  const jobFile = path.join(dataDir, "state", "workspace", "jobs", `${jobId}.json`);
   fs.mkdirSync(path.dirname(jobFile), { recursive: true });
   if (mode === "delayed-record") {
     const publisher = spawn(process.execPath, ["-e", "const fs = require('node:fs'); const path = require('node:path'); setTimeout(() => { fs.mkdirSync(path.dirname(process.argv[1]), { recursive: true }); fs.writeFileSync(process.argv[1], process.argv[2]); }, 300);", jobFile, JSON.stringify(record)], { detached: true, stdio: "ignore" });

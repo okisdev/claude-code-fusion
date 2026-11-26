@@ -81,13 +81,23 @@ export function sessionIdFromArgs(argv, env) {
 }
 
 export const RECORD_REASON_EXAMPLE = 'example: --record <id>=rejected --reason-for <id> "why it failed"';
-const DIRECT_TEXT_PATTERN = /^[A-Za-z0-9 .,:;()\/_+=-]{1,300}$/;
 class DirectTextError extends TypeError {}
 
 function requireDirectText(value, flag) {
-  if (!DIRECT_TEXT_PATTERN.test(value)) {
-    throw new DirectTextError(`${flag} direct text must use the allowed charset [A-Za-z0-9 .,:;()\\/_+=-] and be 1 to 300 characters. Use the raw-args transport for other text.`);
+  const text = typeof value === "string" ? value
+    .replace(/[‘’‚‛]/gu, "'")
+    .replace(/[“”„‟]/gu, '"')
+    .replace(/[\p{Dash_Punctuation}−]/gu, "-")
+    .replace(/…/gu, "...")
+    .replace(/[^A-Za-z0-9 .,:;()\/_+=-]/gu, " ")
+    .replace(/ +/g, " ")
+    .trim()
+    .slice(0, 300)
+    .trimEnd() : "";
+  if (!text) {
+    throw new DirectTextError(`${flag} direct text is empty after normalization.`);
   }
+  return text;
 }
 
 export class UsageError extends Error {}
@@ -166,6 +176,9 @@ function parseRecordPair(value) {
     throw recordReasonGrammarError("--record requires an <id>=<verdict> pair.");
   }
   const id = value.slice(0, separator);
+  if (/^a[0-9a-f]{16}$/i.test(id)) {
+    throw recordReasonGrammarError("--record received a Claude agent id. Fusion task ids are fusion- plus 24 lowercase hex digits and are printed by the Stop hook.");
+  }
   const rawVerdict = value.slice(separator + 1);
   const overrideSuffix = ":accept-failed-transport";
   const acceptFailedTransport = rawVerdict.endsWith(overrideSuffix);
@@ -199,22 +212,19 @@ export function parseRecordArguments(argv, { allowPerPairReasons = false } = {})
     if (token === "--reason-for") {
       const id = argv[index + 1];
       const pairReason = argv[index + 2];
-      if (!allowPerPairReasons && !DIRECT_TEXT_PATTERN.test(pairReason)) {
-        throw recordReasonGrammarError("--reason-for is available only through the raw-args transport.");
-      }
       if ((!FUSION_TASK_ID_PATTERN.test(id) && !ENGINE_JOB_ID_PATTERN.test(id)) || typeof pairReason !== "string" || !pairReason) {
         throw recordReasonGrammarError("--reason-for requires a valid record id and nonempty reason text.");
       }
       if (reasonsById.has(id)) {
         throw recordReasonGrammarError(`Duplicate --reason-for for record ${id}.`);
       }
-      reasonsById.set(id, pairReason);
+      reasonsById.set(id, allowPerPairReasons ? pairReason : requireDirectText(pairReason, token));
       index += 2;
       continue;
     }
     if (token === "--failure-kind-for") {
       const id = argv[index + 1];
-      const pairFailureKind = argv[index + 2];
+      const pairFailureKind = allowPerPairReasons ? argv[index + 2] : requireDirectText(argv[index + 2], token);
       if (!SEMANTIC_FAILURE_KINDS.has(pairFailureKind)) {
         throw new TypeError("The --failure-kind value must be one of intent_override, scope_rewrite, wrong_approach, style_mismatch, oversized.");
       }
@@ -240,12 +250,12 @@ export function parseRecordArguments(argv, { allowPerPairReasons = false } = {})
       if (reason !== null || typeof argv[index + 1] !== "string" || !argv[index + 1]) {
         throw recordReasonGrammarError(reason !== null ? "Duplicate --reason." : "--reason requires nonempty text.");
       }
-      reason = argv[index + 1];
+      reason = allowPerPairReasons ? argv[index + 1] : requireDirectText(argv[index + 1], token);
       index += 1;
       continue;
     }
     if (token === "--failure-kind") {
-      const candidate = argv[index + 1];
+      const candidate = allowPerPairReasons ? argv[index + 1] : requireDirectText(argv[index + 1], token);
       if (!SEMANTIC_FAILURE_KINDS.has(candidate)) {
         throw new TypeError("The --failure-kind value must be one of intent_override, scope_rewrite, wrong_approach, style_mismatch, oversized.");
       }
@@ -336,8 +346,7 @@ export function isStrictDirectRecordArguments(argv) {
         continue;
       }
       if (token === "--reason" || token === "--failure-kind") {
-        const value = argv[index + 1];
-        requireDirectText(value, token);
+        const value = requireDirectText(argv[index + 1], token);
         if (token === "--failure-kind" && !SEMANTIC_FAILURE_KINDS.has(value)) return false;
         index += 1;
         continue;
@@ -345,8 +354,7 @@ export function isStrictDirectRecordArguments(argv) {
       if (token === "--reason-for" || token === "--failure-kind-for") {
         const id = argv[index + 1];
         if (!FUSION_TASK_ID_PATTERN.test(id) && !ENGINE_JOB_ID_PATTERN.test(id)) return false;
-        const value = argv[index + 2];
-        requireDirectText(value, token);
+        const value = requireDirectText(argv[index + 2], token);
         if (token === "--failure-kind-for" && !SEMANTIC_FAILURE_KINDS.has(value)) return false;
         index += 2;
         continue;

@@ -161,8 +161,10 @@ export const FILE_ENGINE_DESCRIPTORS = {
       }
       return nonEmptyString(raw?.failureKind) ?? (raw.status === "cancelled" ? "cancelled" : "error");
     },
-    resolveTokenUsage: peerTokenUsageForJob,
-    emptyTokenTotals: { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, totalTokens: 0 },
+    ...(id === "opencode" ? {} : {
+      resolveTokenUsage: peerTokenUsageForJob,
+      emptyTokenTotals: { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, totalTokens: 0 }
+    }),
     resolveBillingPool(raw) {
       return nonEmptyString(raw?.billingPool);
     },
@@ -404,6 +406,9 @@ function grokTokenUsageForJob(raw) {
 }
 
 function peerTokenUsageForJob(raw) {
+  if (raw?.usageIsIncomplete === true) {
+    return { availability: "partial", usage: null };
+  }
   const value = raw?.usage;
   if (value == null) {
     return { availability: "unavailable", usage: null };
@@ -465,7 +470,7 @@ export function normalizeClaudeWorkerUsage(value) {
 export function tokenUsageForJob(raw, observation) {
   const candidates = [
     { value: raw?.tokenUsage, availability: raw?.tokenUsageAvailability },
-    { value: raw?.usage, availability: raw?.tokenUsageAvailability ?? raw?.usageAvailability },
+    { value: raw?.usage, availability: raw?.usage != null && raw.usageIsIncomplete === true ? "partial" : raw?.tokenUsageAvailability ?? raw?.usageAvailability },
     { value: raw?.result?.tokenUsage, availability: raw?.result?.tokenUsageAvailability ?? raw?.result?.usageAvailability },
     { value: raw?.result?.usage, availability: raw?.result?.tokenUsageAvailability ?? raw?.result?.usageAvailability },
     { value: observation?.tokenUsage, availability: observation?.availability },

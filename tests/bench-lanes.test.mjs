@@ -32,6 +32,8 @@ function sandbox(t) {
       FUSION_GROK_COMPANION: companion,
       FUSION_CURSOR_COMPANION: companion,
       FUSION_DEVIN_COMPANION: companion,
+      FUSION_CODEX_STATE: path.join(root, "codex-state"),
+      FUSION_CODEX_STATE_DIR: path.join(root, "codex-state-compat"),
       CODEX_COMPANION_DATA: path.join(root, "codex-data"),
       GROK_COMPANION_DATA: path.join(root, "grok-data"),
       CURSOR_COMPANION_DATA: path.join(root, "cursor-data"),
@@ -118,6 +120,36 @@ test("devin write attempt resolves the devin companion and records its versions"
   assert.equal(env.engineCliVersions.devin, "fake version");
 });
 
+test("lane companions write per-attempt state without the caller's Claude session", (t) => {
+  const s = sandbox(t);
+  const claudeEnv = {
+    CLAUDE_CODE_SESSION_ID: "caller-session",
+    CLAUDE_CODE_PARENT_SESSION_ID: "parent-session",
+    CLAUDE_SESSION_ID: "legacy-session",
+    CLAUDE_PLUGIN_DATA: path.join(s.root, "plugin-data"),
+    CLAUDECODE: "1"
+  };
+  for (const engine of ["codex", "devin", "grok", "cursor", "codex"]) {
+    const result = run(s, { engine, env: claudeEnv });
+    assert.equal(result.status, 0, result.stderr);
+    const record = records(s).at(-1);
+    assert.equal(record.verdict, "pass");
+    const invocation = JSON.parse(fs.readFileSync(s.env.FAKE_ARGS_FILE, "utf8"));
+    const dataDir = path.join(s.results, "companion-state", record.runId, engine);
+    const stateDir = path.join(dataDir, "state");
+    assert.equal(invocation.dataDir, dataDir);
+    assert.equal(invocation.codexState, path.join(s.results, "companion-state", record.runId, "codex", "state"));
+    assert.equal(invocation.codexStateDir, invocation.codexState);
+    assert.deepEqual(invocation.claudeEnv, []);
+    const job = JSON.parse(fs.readFileSync(path.join(stateDir, "workspace", "jobs", `${record.jobId}.json`), "utf8"));
+    assert.equal(job.cwd, invocation.cwd);
+  }
+  for (const key of ["FUSION_CODEX_STATE", "FUSION_CODEX_STATE_DIR", "CODEX_COMPANION_DATA", "DEVIN_COMPANION_DATA", "GROK_COMPANION_DATA", "CURSOR_COMPANION_DATA"]) {
+    assert.equal(fs.existsSync(s.env[key]), false, key);
+  }
+  assert.equal(fs.existsSync(claudeEnv.CLAUDE_PLUGIN_DATA), false);
+});
+
 test("write verifier failure is a scored fail", (t) => {
   const s = sandbox(t);
   const result = run(s, { env: { FAKE_VERIFY_FAIL: "1" } });
@@ -181,6 +213,9 @@ test("unparseable stdout appends an infrastructure failure", (t) => {
 
 test("missing job record appends an infrastructure failure", (t) => {
   const s = sandbox(t);
+  const productionJobs = path.join(s.env.FUSION_CODEX_STATE, "workspace", "jobs");
+  fs.mkdirSync(productionJobs, { recursive: true });
+  fs.writeFileSync(path.join(productionJobs, `${"a".repeat(32)}.json`), JSON.stringify({ status: "done" }));
   const result = run(s, { fakeMode: "missing-record" });
   assert.equal(result.status, 0, result.stderr);
   assert.equal(records(s)[0].infrastructureFailure.type, "job_record");
