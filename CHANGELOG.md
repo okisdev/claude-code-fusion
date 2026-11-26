@@ -1,5 +1,19 @@
 # changelog
 
+## 0.0.94
+
+- work that reads GitHub or the network routes to Codex with `--write --network`, which reaches the network and runs authenticated `gh`; `claude-fallback: network` passes only while Codex cannot take the package (unhealthy for writes or near exhaustion). 474 Claude worker briefs on one host had used it for pull request verification while the Codex pool sat at 26 percent. posting comments, reviews, and approvals stays in the main session.
+- a collected implementation package settles as accepted by itself when the main session runs its brief's `verification:` command in the package's workspace, in the foreground, after collection, and it passes; the hook names what it settled and the `--record <id>=rejected` override. about half of the acceptance stop blocks on the main host hit sessions whose verification had already passed. matching is per command segment and refuses `||` and `;` chains.
+- the worker brief gate drops the constant `context-mode: isolated` line and accepts an explanation after the `claude-fallback:` reason; these were most of 138 brief denials across two hosts in two weeks.
+- while an engine's breaker is open, the session start advisory and the dispatch deny name each protected role's substitute lane, so a blocked Grok hands `live-web` to a Codex `--web` consult (saying X content is unreachable) and its other roles to Antigravity or Codex.
+- Grok runtime socket diagnostics name Noblock and the resolved link target. `host-check` had kept only the first sentence, so a block caused by Noblock's `/var/run/docker.sock` link was blamed on OrbStack. Grok writes stay refused while `~/.noblock/run/docker.sock` exists, because a macOS strict write shell can still reach a home directory socket.
+- Antigravity's read only checker accepts `git -C` into the delegated repository or one of its worktrees, suffix glob pathspecs and find paths such as `app/[org]`, one trailing `2>/dev/null`, attached numeric git flags such as `-U3`, and `rg -a`; it checks every find start path against the sensitive home directories it would traverse and refuses find symlink following. a turn that ends empty after a refusal gets one follow-up prompt in the same session (`warning: refused_command_continued`). `permission` was 26 of 31 Antigravity errors on the main host. cached input tokens now count toward usage.
+- new `merge-worktree.mjs` merges an orchestrator owned worktree into the checkout it runs from in one command, keeping each target path's staging and naming conflicts, and refuses partially staged target paths, source commits the target lacks, and unresolved source conflicts; 39 hand built `git apply` merge-backs failed in a week, mostly on "does not match index".
+- OpenCode usage is read in the Codex shape the companion stores, so its jobs stop reporting usage unavailable; incomplete peer usage counts as partial.
+- `fusion-stats.mjs --reason` normalizes text to its stored charset instead of failing, and a Claude agent id passed to `--record` gets a message naming the Fusion task id format.
+- bench lane runs give companions a private state root beside the temporary workspace and drop Claude session variables; one bench session had left 119 unsettled jobs in the production ledgers.
+- a Codex quota read that starts a live refresh no longer caches its stale report, which had let a 100 percent rollout snapshot outlive the fresh live read for 60 seconds.
+
 ## 0.0.93
 
 - the Codex lane defaults move to the GPT-6.2 models: flagship `gpt-6.2-astra` at `xhigh` (was `gpt-6.1-sol`), quick `gpt-6.2-sol` at `high` (was `gpt-6-sol` at `xhigh`), and volume `gpt-6.2-sol` at `medium` (was `gpt-6-sol` at `high`). on the plan shaped tasks of the 2026-11-25 lane snapshot astra passed 9 of 9 at a 71 s median, where `gpt-6.1-sol` failed one T07 attempt at a 228 s median and showed a 25 percent foreground timeout share in production; the Codex catalog now marks `gpt-6-sol` legacy.
