@@ -1,5 +1,15 @@
 # changelog
 
+## 0.0.95
+
+- managed Grok runs, model listing, and setup probes run under a private `GROK_HOME` per credential profile in the plugin data dir, so the user's Grok plugins and hooks (a memory plugin's prompt and stop hooks among them) no longer run inside routed work. its `config.toml` is the user's minus the `plugins` and `hooks` tables. refreshes run with `GROK_AUTH_PATH` pointing at the user's credential file (or its configured override), so Grok itself writes the token and the companion never does; under strict, Grok 1.0.92 reads credentials only from a regular `auth.json` inside `GROK_HOME` and refuses to start without `managed_config.lock` there, so each launch gets a one way 0600 copy and the lock. sessions from before the private home, or from another profile, are skipped by `--resume-last` and continuity.
+- Grok 1.0.92 is verified live (consult, resume, and review on a host without the container socket link), so the tested interval moves to before 1.0.93 and the verified pin to 1.0.92.
+- the inline guard's replay pricing keeps the last measured context, scans past `api-request-blob` records for a reading, and prices a session with none from a 20,000 token floor instead of 400,000; the Stop hook backfills MCP, Skill, and text only turns, which were about 23 percent of main loop replay and logged nothing.
+- the cross family wave review suggestion fires when a wave's last implementation result is collected instead of when it is settled, so the review rides with the next dispatch.
+- troubleshooting says a package whose verification binds sockets dispatches with Codex `--write --network`; plain `--write` refuses Unix and loopback binds.
+- `npm test` runs through `tests/run.mjs` with a private `TMPDIR`, so a suite run can no longer prune a live session's companion transports, and timing sensitive tests across the Codex, Grok, Devin, Cursor, and lifecycle suites wait on observable state instead of fixed windows.
+- OpenCode reads the Codex plugin's tested Codex interval, a timed out bench version probe is no pin conflict, Antigravity job records drop the never created `configDir`, and the rules manifest generator keeps previously shipped hashes after a squash merge.
+
 ## 0.0.94
 
 - work that reads GitHub or the network routes to Codex with `--write --network`, which reaches the network and runs authenticated `gh`; `claude-fallback: network` passes only while Codex cannot take the package (unhealthy for writes or near exhaustion). 474 Claude worker briefs on one host had used it for pull request verification while the Codex pool sat at 26 percent. posting comments, reviews, and approvals stays in the main session.
