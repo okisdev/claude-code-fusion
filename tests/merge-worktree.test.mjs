@@ -24,15 +24,15 @@ function fixture(t, files = { file: "base\n" }) {
   git(main, "commit", "-qm", "base");
   git(main, "worktree", "add", "-qb", "peer", peer);
 
-  function merge(status = 0, ...args) {
-    const result = spawnSync(process.execPath, [script, peer, ...args], { cwd: root, env, encoding: "utf8" });
+  function merge(status = 0, cwd = main, ...args) {
+    const result = spawnSync(process.execPath, [script, peer, ...args], { cwd, env, encoding: "utf8" });
     assert.equal(result.status, status, result.error?.message ?? (result.stderr + result.stdout));
     return result;
   }
   return { main, peer, git, merge };
 }
 
-test("merges tracked and new files into the default main tree and leaves the peer staged", (t) => {
+test("merges tracked and new files into the current tree and leaves the peer staged", (t) => {
   const { main, peer, git, merge } = fixture(t);
   write(peer, "file", "first draft\n");
   git(peer, "add", "file");
@@ -59,20 +59,64 @@ test("keeps independent unstaged edits in both the patched file and an unrelated
   assert.equal(git(main, "diff", "--cached"), "");
 });
 
-test("keeps a patched pre-staged file staged and preserves partial staging elsewhere", (t) => {
+test("keeps a fully staged patched file staged and preserves partial staging elsewhere", (t) => {
   const { main, peer, git, merge } = fixture(t, { file: "one\ntwo\nthree\n", other: "base\n" });
   write(main, "file", "staged\ntwo\nthree\n");
   write(main, "other", "other staged\n");
   git(main, "add", "file", "other");
-  write(main, "file", "working\ntwo\nthree\n");
   write(main, "other", "other working\n");
   write(peer, "file", "one\ntwo\npeer\n");
 
   merge();
-  assert.equal(read(main, "file"), "working\ntwo\npeer\n");
+  assert.equal(read(main, "file"), "staged\ntwo\npeer\n");
   assert.equal(git(main, "show", ":file"), read(main, "file"));
   assert.equal(git(main, "show", ":other"), "other staged\n");
   assert.equal(read(main, "other"), "other working\n");
+});
+
+test("refuses every partially staged patched path and preserves both checkouts", (t) => {
+  const { main, peer, git, merge } = fixture(t, { file: "base\n", old: "old\n", removed: "base\n" });
+  for (const file of ["file", "old"]) write(main, file, "staged\n");
+  git(main, "add", "file", "old");
+  git(main, "rm", "removed");
+  for (const file of ["file", "old", "removed"]) write(main, file, "working\n");
+  write(main, "new", "staged addition\n");
+  git(main, "add", "new");
+  write(main, "new", "working addition\n");
+  write(peer, "file", "peer staged\n");
+  git(peer, "add", "file");
+  write(peer, "file", "peer working\n");
+  fs.renameSync(path.join(peer, "old"), path.join(peer, "renamed"));
+  git(peer, "rm", "--cached", "removed");
+  write(peer, "removed", "peer\n");
+  write(peer, "new", "peer addition\n");
+
+  const indexes = [main, peer].map((dir) => git(dir, "rev-parse", "--path-format=absolute", "--git-path", "index").trimEnd());
+  const before = indexes.map((index) => fs.readFileSync(index));
+  const objects = git(main, "count-objects", "-v");
+  const result = merge(1);
+  assert.deepEqual(result.stderr.trimEnd().split("\n").sort(), ["partially staged file", "partially staged new", "partially staged old", "partially staged removed"]);
+  assert.equal(result.stdout, "");
+  assert.deepEqual(indexes.map((index) => fs.readFileSync(index)), before);
+  assert.equal(git(main, "count-objects", "-v"), objects);
+  for (const file of ["file", "old", "removed"]) assert.equal(read(main, file), "working\n");
+  assert.equal(read(main, "new"), "working addition\n");
+  assert.equal(fs.existsSync(path.join(main, "renamed")), false);
+  assert.equal(read(peer, "file"), "peer working\n");
+});
+
+test("allows partial staging when the peer recreates the HEAD version of a staged deletion", (t) => {
+  const { main, peer, git, merge } = fixture(t);
+  write(main, "file", "staged\n");
+  git(main, "add", "file");
+  write(main, "file", "working\n");
+  git(peer, "rm", "--cached", "file");
+  write(peer, "new", "peer\n");
+
+  assert.equal(merge().stdout, "merged new\n");
+  assert.equal(git(main, "show", ":file"), "staged\n");
+  assert.equal(read(main, "file"), "working\n");
+  assert.equal(git(peer, "status", "--porcelain"), "A  new\n");
 });
 
 test("applies a binary patch byte for byte", (t) => {
@@ -132,7 +176,72 @@ test("returns success for an empty source diff", (t) => {
   assert.equal(git(main, "status", "--porcelain"), " M file\n");
 });
 
-test("uses --into and reports diverging HEADs while merging changes from both trees", (t) => {
+test("defaults to the linked worktree containing the current directory", (t) => {
+  const { main, peer, git, merge } = fixture(t);
+  const into = path.join(path.dirname(main), "linked");
+  git(main, "worktree", "add", "--detach", into);
+  const cwd = path.join(into, "nested");
+  fs.mkdirSync(cwd);
+  write(peer, "file", "peer\n");
+
+  assert.equal(merge(0, cwd).stdout, "merged file\n");
+  assert.equal(read(into, "file"), "peer\n");
+  assert.equal(read(main, "file"), "base\n");
+});
+
+test("refuses a target inside the source worktree before staging the peer", (t) => {
+  const { peer, git, merge } = fixture(t);
+  const nested = path.join(peer, "nested");
+  fs.mkdirSync(nested);
+  write(peer, "file", "peer\n");
+
+  assert.match(merge(1, nested).stderr, /same worktree/i);
+  assert.equal(git(peer, "status", "--porcelain"), " M file\n");
+});
+
+test("refuses an independent clone even when both HEADs match", (t) => {
+  const { main, peer, git, merge } = fixture(t);
+  const clone = path.join(path.dirname(main), "clone");
+  git(main, "clone", "-q", main, clone);
+  write(peer, "file", "peer\n");
+
+  assert.match(merge(1, main, "--into", clone).stderr, /common directory/i);
+  assert.equal(git(peer, "status", "--porcelain"), " M file\n");
+  assert.equal(git(clone, "status", "--porcelain"), "");
+});
+
+test("reports the branch and number of source-only commits even with a clean peer", (t) => {
+  const { main, peer, git, merge } = fixture(t);
+  for (const content of ["first", "second"]) {
+    write(peer, "file", content);
+    git(peer, "commit", "-qam", content);
+  }
+  git(main, "commit", "-q", "--allow-empty", "-m", "target commit");
+
+  const result = merge(1);
+  assert.match(result.stderr, /\bpeer\b/);
+  assert.match(result.stderr, /\b2 commits\b/);
+  assert.equal(result.stdout, "");
+  assert.equal(read(main, "file"), "base\n");
+});
+
+test("names every unresolved source path and preserves the unmerged entries", (t) => {
+  const { main, peer, git, merge } = fixture(t, { a: "base\n", b: "base\n" });
+  for (const content of ["first", "second"]) {
+    for (const file of ["a", "b"]) write(main, file, content);
+    git(main, "commit", "-qam", content);
+  }
+  assert.throws(() => git(peer, "cherry-pick", "main"), { status: 1 });
+  const stages = git(peer, "ls-files", "-u");
+  assert.ok(stages);
+
+  const result = merge(1);
+  assert.equal(result.stderr, "source has unresolved conflict a\nsource has unresolved conflict b\n");
+  assert.equal(git(peer, "ls-files", "-u"), stages);
+  assert.equal(git(main, "status", "--porcelain"), "");
+});
+
+test("uses --into and reports differing HEADs while merging changes from both trees", (t) => {
   const { main, peer, git, merge } = fixture(t, { file: "one\ntwo\nthree\n" });
   const into = path.join(path.dirname(main), "other worktree");
   git(main, "worktree", "add", "-qb", "other", into);
@@ -142,7 +251,7 @@ test("uses --into and reports diverging HEADs while merging changes from both tr
 
   const targetHead = git(into, "rev-parse", "HEAD").trim();
   const sourceHead = git(peer, "rev-parse", "HEAD").trim();
-  assert.equal(merge(0, "--into", into).stdout, `target HEAD ${targetHead} differs from worktree HEAD ${sourceHead}\nmerged file\n`);
+  assert.equal(merge(0, main, "--into", into).stdout, `target HEAD ${targetHead} differs from worktree HEAD ${sourceHead}\nmerged file\n`);
   assert.equal(read(into, "file"), "other\ntwo\npeer\n");
   assert.equal(git(into, "diff", "--cached"), "");
   assert.equal(git(main, "status", "--porcelain"), "");
@@ -180,7 +289,7 @@ test("restores partial staging, intent to add and unstaged deletions on a hard f
   write(main, "new", "intent\n");
   git(main, "add", "-N", "new");
   fs.unlinkSync(path.join(main, "missing"));
-  for (const file of ["file", "new", "missing"]) write(peer, file, "peer\n");
+  for (const file of ["new", "missing"]) write(peer, file, "peer\n");
   const indexPath = path.join(main, ".git", "index");
   const before = fs.readFileSync(indexPath);
 
