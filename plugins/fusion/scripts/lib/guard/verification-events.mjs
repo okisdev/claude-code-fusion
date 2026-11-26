@@ -1,9 +1,14 @@
+import { createHash } from "node:crypto";
+import fs from "node:fs";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { ENGINES } from "../engines.mjs";
 import { engineHealth } from "../engine-health.mjs";
 import { readRoutingDefaults } from "../model-table.mjs";
+import { acceptVerifiedWorker } from "../stats/settlement.mjs";
 import { messageCode, tagMessage } from "../user-messages.mjs";
-import { appendToolResponseText, verificationEvidence, verificationResponseFailed } from "../verification-command.mjs";
-import { readWorkerRecord } from "../worker-state.mjs";
+import { appendToolResponseText, commandSegments, isVerificationCommand, verificationEvidence, verificationResponseFailed } from "../verification-command.mjs";
+import { isPendingSettlement, readSessionWorkerRecords, readWorkerRecord } from "../worker-state.mjs";
 import { recordAuditEvent } from "./audit.mjs";
 import { BASH_TOOL, MAIN_LANE, NO_OP_BASH_COMMANDS, NO_OP_HEARTBEAT_DENY_MESSAGE_SLUG, NO_OP_HEARTBEAT_REASON } from "./constants.mjs";
 import { inFlightWorkerTaskSignature, totalDispatches } from "./dispatch.mjs";
@@ -17,6 +22,105 @@ const SETTLE_RECORD_PATTERN = /(?:^|\s)--record(?=[=\s]|$)/;
 const ACCEPTED_TASK_ID_PATTERN = /(?:^|[\s'"])(fusion-[0-9a-f]{24})=accepted(?::accept-failed-transport)?(?=[\s'";|&)]|$)/g;
 const SETTLED_ACCEPTANCE_PATTERN = /\bRecorded accepted\b|"acceptance"\s*:\s*"accepted"/;
 const WAVE_REVIEW_SUGGESTION_MS = 30 * 60 * 1000;
+const LITERAL_CD = /^cd\s+(?:--\s+)?(?:'([^']+)'|"([^"\\$`]+)"|((?:\\.|[^\s"'\\;&|$`~*?\[\]{}<>()#!])+))$/;
+
+function verificationSteps(command) {
+  const segments = commandSegments(command);
+  const steps = [];
+  if (segments[0]?.pipefail && [";", "\n", "\r", "&&"].includes(segments[1]?.separator)) {
+    steps.push({ stages: [segments.shift().command], pipefail: true });
+    segments[0].separator = null;
+  }
+  let directory = null;
+  if (/^cd(?:\s|$)/.test(segments[0]?.command) && segments[1]?.separator === "&&") {
+    const cd = segments.shift().command.match(LITERAL_CD);
+    if (!cd) return null;
+    directory = cd[1] ?? cd[2] ?? cd[3].replace(/\\(.)/g, "$1");
+    if (directory === "-") return null;
+  }
+  for (const segment of segments) {
+    if (!segment.command || /^(?:cd|pushd|popd)(?:\s|$)/.test(segment.command)) return null;
+    if (segment.separator === "|" && steps.length) {
+      steps.at(-1).stages.push(segment.command);
+    } else if (segment.separator === null || segment.separator === "&&") {
+      steps.push({ stages: [segment.command], pipefail: segment.pipefail });
+    } else {
+      return null;
+    }
+  }
+  return steps.length ? { steps, directory } : null;
+}
+
+function matchesVerificationSteps(executed, required, evidence) {
+  const normalize = (pipeline) => pipeline.join(" | ").replace(/\s+2>&1$/, "").replace(/\s+/g, " ");
+  let matched = 0;
+  for (const [index, { stages: pipeline, pipefail }] of executed.entries()) {
+    if (pipeline.length > 1 && !pipefail && !(index === executed.length - 1 && evidence === "output-summary")) continue;
+    const step = required[matched].stages;
+    if (pipeline.length < step.length || pipeline.slice(step.length).some((stage) => !/^(?:tail|head)(?:\s|$)/.test(stage))) continue;
+    if (normalize(pipeline.slice(0, step.length)) !== normalize(step)) continue;
+    matched += 1;
+    if (matched === required.length) return true;
+  }
+  return false;
+}
+
+function bashVerificationStart(input, file, now) {
+  const id = input.tool_use_id;
+  if (typeof id !== "string" || !id) return null;
+  const key = createHash("sha256").update(file).update("\0").update(id).digest("hex");
+  const startFile = path.join(path.dirname(file), `.bash-${key}.json`);
+  try {
+    return withStateLock(startFile, () => {
+      const start = readState(startFile);
+      if (input.hook_event_name === "PreToolUse") {
+        if (!start) writeState(startFile, { at: now });
+      } else if (start) {
+        fs.unlinkSync(startFile);
+        return Date.parse(start.at);
+      }
+      return null;
+    });
+  } catch {
+    return null;
+  }
+}
+
+function settleVerifiedPackages(env, { sessionId, command, evidence, cwd, startedAt, file, now, writeHookText }) {
+  if (!Number.isFinite(startedAt) || typeof cwd !== "string" || !path.isAbsolute(cwd)) return;
+  const executed = verificationSteps(command);
+  if (!executed) return;
+  const directory = fs.realpathSync(path.resolve(cwd, executed.directory ?? "."));
+  const deadline = Date.now() + 2000;
+  const settled = [];
+  const pendingDelivery = [];
+  for (const record of readSessionWorkerRecords(env, sessionId)) {
+    if (!isPendingSettlement(record) || record.packageType !== "implementation" || record.transportStatus !== "done") continue;
+    if (record.peerTransportStatus && !["done", "completed"].includes(record.peerTransportStatus)) continue;
+    if (!(Date.parse(record.collectedAt) < startedAt && Date.parse(record.finishedAt) < startedAt)) continue;
+    if (!isVerificationCommand(record.verificationCommand, env)) continue;
+    const required = verificationSteps(record.verificationCommand);
+    if (!required || !matchesVerificationSteps(executed.steps, required.steps, evidence)) continue;
+    try {
+      if (directory !== fs.realpathSync(record.companionCwd ?? record.workspaceRoot)) continue;
+      if (required.directory && directory !== fs.realpathSync(path.resolve(cwd, required.directory))) continue;
+      const worker = acceptVerifiedWorker(record, env, deadline);
+      if (worker?.acceptance !== "accepted") continue;
+      settled.push(worker.taskId);
+      if (["pending", "failed"].includes(worker.engineAcceptanceDelivery?.status)) pendingDelivery.push(worker.taskId);
+    } catch {
+      continue;
+    }
+  }
+  if (settled.length === 0) return;
+  try {
+    suggestSettledWaveReview(env, { sessionId, file, now, writeHookText });
+  } catch {}
+  const script = fileURLToPath(new URL("../../fusion-stats.mjs", import.meta.url));
+  const pairs = settled.map((id) => `${id}=rejected`).join(" ");
+  const delivery = pendingDelivery.length ? ` Peer acceptance delivery is pending for ${pendingDelivery.join(", ")}.` : "";
+  writeHookText(JSON.stringify(postToolAdvisoryOutput(`Verification passed. Automatically accepted ${settled.join(", ")}.${delivery} To override, run: node "${script}" --record ${pairs} --reason "explain the rejection"`)));
+}
 
 function settledAcceptedImplementationTaskId(command, toolResponse, env) {
   if (!SETTLE_COMMAND_PATTERN.test(command) || !SETTLE_RECORD_PATTERN.test(command) || verificationResponseFailed(toolResponse ?? {})) {
@@ -42,10 +146,7 @@ function waveReviewSuggestion(env, sessionId, nowMs) {
   return `Wave settled. Dispatch one cross family read only review of this wave's changed files now, in the same message as your next work: ${ENGINES[engine].rescueAgent} with header \`${engine}-role: ${role} | read only | acceptance: findings cite file:line\`, naming the changed files in the brief.`;
 }
 
-function suggestSettledWaveReview(env, { sessionId, command, toolResponse, file, now, writeHookText }) {
-  if (settledAcceptedImplementationTaskId(command, toolResponse, env) === null) {
-    return;
-  }
+function suggestSettledWaveReview(env, { sessionId, file, now, writeHookText }) {
   const context = waveReviewSuggestion(env, sessionId, Date.parse(now));
   const claimed = withStateLock(file, () => {
     const state = normalizeState(readState(file), now);
@@ -65,12 +166,18 @@ function suggestSettledWaveReview(env, { sessionId, command, toolResponse, file,
 function handleBash(input, env, { sessionId, toolName, file, now, writeHookText }) {
   if (toolName === BASH_TOOL) {
     const command = extractBashCommand(input.tool_input);
+    const foregroundVerification = !input.tool_input?.run_in_background && isVerificationCommand(command, env);
+    const startedAt = foregroundVerification && ["PreToolUse", "PostToolUse", "PostToolUseFailure"].includes(input.hook_event_name)
+      ? bashVerificationStart(input, file, now) : null;
     if (input.hook_event_name === "PostToolUse") {
       const toolResponse = input.tool_response;
       if (command === null) {
         return;
       }
-      suggestSettledWaveReview(env, { sessionId, command, toolResponse, file, now, writeHookText });
+      if (settledAcceptedImplementationTaskId(command, toolResponse, env) !== null) {
+        suggestSettledWaveReview(env, { sessionId, file, now, writeHookText });
+      }
+      if (!foregroundVerification) return;
       const evidence = verificationEvidence(command, toolResponse, env);
       if (!evidence) {
         return;
@@ -99,6 +206,9 @@ function handleBash(input, env, { sessionId, toolName, file, now, writeHookText 
         },
         env
       );
+      try {
+        settleVerifiedPackages(env, { sessionId, command, evidence, cwd: input.cwd, startedAt, file, now, writeHookText });
+      } catch {}
       return;
     }
     if (input.hook_event_name && input.hook_event_name !== "PreToolUse") {

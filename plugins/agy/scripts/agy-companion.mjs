@@ -35,7 +35,9 @@ function outcomeFields(outcome) {
   return { resolvedModel: outcome.appliedOptions?.model ?? null, resolvedEffort: outcome.resolvedEffort ?? null,
     stopReason: outcome.stopReason ?? null, agentVersion: outcome.agentVersion ?? null,
     permissionsAllowed: outcome.permissionsAllowed ?? 0, permissionsRejected: outcome.permissionsRejected ?? 0,
-    toolCalls: outcome.toolCalls ?? 0, effortApplied: outcome.effortApplied ?? false };
+    toolCalls: outcome.toolCalls ?? 0, effortApplied: outcome.effortApplied ?? false,
+    ...(outcome.refusedCommandContinuation ? { refusedCommandContinuation: true } : {}),
+    ...(outcome.usageIsIncomplete ? { usageIsIncomplete: true } : {}) };
 }
 
 function refusedDetail(outcome) {
@@ -115,18 +117,21 @@ const { cancelJobRecord, run } = createCompanionCommands({
   sessionIdPattern: state.AGY_SESSION_ID_PATTERN,
   sweep: state.sweepAgyRuns,
   jobDirectory: (dataDir, id) => ({ configDir: state.runConfigDir(dataDir, id) }),
-  resumeEligible: (record) => record.failureKind !== "policy",
+  resumeEligible: (record) => record.failureKind !== "policy" && !(record.status === "running" && record.refusedCommandContinuation),
   validateResumeSource() {},
   historyResumable: (record) => record.failureKind !== "policy",
   resolvedEffort: (record) => record.resolvedEffort,
   payloadFields: (record) => ({ stopReason: record.stopReason, agentVersion: record.agentVersion, permissionsAllowed: record.permissionsAllowed, permissionsRejected: record.permissionsRejected }),
   historyFields: (record) => ({ resolvedEffort: record.resolvedEffort }),
   outcomeFields,
-  outcomeWarnings: (outcome) => outcome.permissionsRejected ? [`permission_refused: ${outcome.permissionsRejected} request(s) refused${refusedDetail(outcome)}, which ends the Antigravity turn early`] : [],
+  outcomeWarnings: (outcome) => {
+    if (outcome.refusedCommandContinuation && !classifyAgyFailure(outcome)) return ["refused_command_continued"];
+    return outcome.permissionsRejected ? [`permission_refused: ${outcome.permissionsRejected} request(s) refused${refusedDetail(outcome)}, which ends the Antigravity turn early`] : [];
+  },
   cancelledFields: (outcome) => ({ sessionId: outcome.sessionId, usage: outcome.usage, ...outcomeFields(outcome) }),
   modelDrift: () => null,
   driftWarning: () => "model_mismatch",
-  failureMessage: (outcome) => outcome.policyViolation ? `Antigravity called forbidden tool ${outcome.policyViolation.tool}${outcome.policyViolation.bypassSandbox ? " with sandbox bypass" : ""}.` : outcome.selectionError?.message || outcome.setupError || outcome.rpcError?.message || (outcome.permissionsRejected > 0 && !outcome.resultText?.trim() ? `Antigravity refused ${outcome.permissionsRejected} permission request(s)${refusedDetail(outcome)} and returned no result, so the turn ended early.` : null),
+  failureMessage: (outcome) => outcome.policyViolation ? `Antigravity called forbidden tool ${outcome.policyViolation.tool}${outcome.policyViolation.bypassSandbox ? " with sandbox bypass" : ""}.` : outcome.selectionError?.message || outcome.setupError || outcome.rpcError?.message || (outcome.resultSeen && outcome.permissionsRejected > 0 && !outcome.resultText?.trim() ? `Antigravity refused ${outcome.permissionsRejected} permission request(s)${refusedDetail(outcome)} and returned no result, so the turn ended early.` : null),
   classifyFailure: classifyAgyFailure,
   prepareJob, runJob, waitForCleanup, handleModels, handleSetup
 });

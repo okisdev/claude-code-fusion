@@ -235,6 +235,56 @@ function processNotification(run, event) {
   }
 }
 
+function isTokenCount(value) {
+  return Number.isSafeInteger(value) && value >= 0;
+}
+
+function normalizeUsage(usage) {
+  if (usage == null) return null;
+  const { inputTokens, outputTokens, cachedReadTokens, cachedWriteTokens = 0, thoughtTokens = 0, totalTokens } = usage;
+  if (![inputTokens, outputTokens, cachedReadTokens, cachedWriteTokens, thoughtTokens, totalTokens].every(isTokenCount)) return usage;
+  const cached = cachedReadTokens + cachedWriteTokens;
+  const inclusiveInput = inputTokens + cached;
+  const reportedInput = totalTokens - outputTokens;
+  if (!cached || !isTokenCount(inclusiveInput) || reportedInput === inputTokens + thoughtTokens && cached <= inputTokens) return usage;
+  return reportedInput === inclusiveInput || reportedInput - thoughtTokens === inclusiveInput ? { ...usage, inputTokens: inclusiveInput } : usage;
+}
+
+function recordPromptUsage(outcome, rawUsage) {
+  const usage = normalizeUsage(rawUsage);
+  if (!outcome.refusedCommandContinuation) {
+    outcome.usage = usage;
+    return;
+  }
+  const prior = outcome.usage;
+  if (prior == null || usage == null) {
+    outcome.usage = usage ?? prior;
+    return;
+  }
+  const keys = new Set([...Object.keys(prior), ...Object.keys(usage)]);
+  outcome.usageIsIncomplete = false;
+  outcome.usage = Object.fromEntries([...keys].map((key) => {
+    const first = Object.hasOwn(prior, key) ? prior[key] : undefined;
+    const second = Object.hasOwn(usage, key) ? usage[key] : undefined;
+    if (isTokenCount(first) && isTokenCount(second) && isTokenCount(first + second)) return [key, first + second];
+    outcome.usageIsIncomplete = true;
+    return [key, second ?? first];
+  }));
+}
+
+function continueRefusedTurn(run) {
+  const { outcome } = run;
+  const refused = outcome.refusedPermissions.map(({ tool, command }) => command ?? tool).filter(Boolean);
+  const detail = refused.length ? ` Refused requests: ${JSON.stringify(refused)}.` : "";
+  const text = `Your last turn ended without a response after a permission refusal.${detail} Use read_file and allowed commands to continue from where you stopped, then reply with your final answer to the original request. Do not retry refused requests.`;
+  outcome.refusedCommandContinuation = true;
+  outcome.resultSeen = false;
+  outcome.resultText = "";
+  outcome.stopReason = null;
+  outcome.usageIsIncomplete = true;
+  void requestAgy(run, "session/prompt", { sessionId: outcome.sessionId, prompt: [{ type: "text", text }] });
+}
+
 function processResponse(run, event) {
   const request = run.pending.get(event.id);
   if (!request) {
@@ -262,9 +312,14 @@ function processResponse(run, event) {
       failProtocol(run, "Missing stopReason in prompt result");
       return;
     }
-    run.outcome.resultSeen = true;
-    run.outcome.stopReason = event.result.stopReason;
-    run.outcome.usage = event.result.usage ?? null;
+    const { outcome } = run;
+    outcome.resultSeen = true;
+    outcome.stopReason = event.result.stopReason;
+    recordPromptUsage(outcome, event.result.usage);
+    if (!run.ending && !run.closed && !run.exited && !outcome.refusedCommandContinuation && outcome.permissionsRejected > 0 && !outcome.resultText.trim()) {
+      continueRefusedTurn(run);
+      return;
+    }
     finishRun(run);
   }
 }
@@ -272,7 +327,7 @@ function processResponse(run, event) {
 function permissionOutcome(run, params) {
   const tool = params?.toolCall;
   const allowed = tool?.name === "run_command" && (tool.rawInput?.BypassSandbox === undefined || tool.rawInput.BypassSandbox === false)
-    && isReadOnlyCommand(tool.rawInput?.CommandLine)
+    && isReadOnlyCommand(tool.rawInput?.CommandLine, { cwd: run.options.cwd, realHome: run.realHome })
     || tool?.name === "read_file" && isReadablePath(tool.rawInput?.Path, run.realHome);
   const options = Array.isArray(params?.options) ? params.options : [];
   const option = allowed ? options.find((entry) => entry?.kind === "allow_once" && typeof entry.optionId === "string") : null;
@@ -438,7 +493,7 @@ export function classifyAgyFailure(outcome) {
   }
   if (outcome.signal && !outcome.lateClose && (!outcome.protocolError || outcome.protocolError === "Exit before prompt result")) return "process";
   if (outcome.protocolError) return "protocol";
-  if (outcome.permissionsRejected > 0 && !outcome.resultText?.trim()) return "permission";
+  if (outcome.resultSeen && outcome.permissionsRejected > 0 && !outcome.resultText?.trim()) return "permission";
   if (/^\u26a0\s*(?:\w+\s+)?quota reached\b/i.test(outcome.resultText?.trim().split("\n").at(-1) ?? "")) return "quota";
   if (!outcome.rpcError && (outcome.resultSeen && outcome.stopReason === "end_turn" || outcome.sessionReady)) return null;
   if (outcome.stopReason === "refusal") return "refused";

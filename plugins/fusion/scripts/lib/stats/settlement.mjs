@@ -19,6 +19,7 @@ function resolveEngineJob(jobId, env) {
 }
 
 function writeRecordConfirmation({ kind, engine = null, jobId = null, worker = null, queued = false, asJson, stdout }) {
+  if (!stdout) return;
   if (asJson) {
     stdout.write(`${JSON.stringify(kind === "engine" ? { kind, engine, jobId, acceptance: worker?.acceptance } : { kind, taskId: worker.taskId, acceptance: queued ? worker.pendingVerdict?.acceptance : worker.acceptance, ...(queued ? { queued: true } : {}) })}\n`);
     return;
@@ -34,8 +35,9 @@ function writeRecordConfirmation({ kind, engine = null, jobId = null, worker = n
   stdout.write(`Recorded ${worker.acceptance} for Fusion worker task ${worker.taskId}.\n`);
 }
 
-function settleWorkerRecord({ taskId, verdict, source, reason, failureKind, acceptFailedTransport = false, asJson, env, stdout, stderr }) {
-  const current = readWorkerRecord(taskId, env);
+function settleWorkerRecord({ taskId, verdict, source, reason, failureKind, acceptFailedTransport = false, asJson, env, stdout, stderr, verifiedRecord, deadline }) {
+  const delivery = { taskId, asJson, env, ...(verifiedRecord ? { timeoutMs: 500, deadline } : {}) };
+  const current = verifiedRecord ?? readWorkerRecord(taskId, env);
   const terminal = WORKER_TERMINAL_STATUSES.has(current?.transportStatus) && !hasUnverifiedCollectorIdentity(current);
   const peerJobId = terminal && typeof current.peerJobId === "string" && ENGINE_JOB_ID_PATTERN.test(current.peerJobId) ? current.peerJobId : null;
   const previousJobIds = new Set((Array.isArray(current?.continuations) ? current.continuations : []).flatMap((round) => Array.isArray(round?.peerJobIds) ? round.peerJobIds : []));
@@ -44,11 +46,11 @@ function settleWorkerRecord({ taskId, verdict, source, reason, failureKind, acce
     ...(peerJobId ? [peerJobId] : [])
   ].filter((id) => !previousJobIds.has(id)))] : [];
   if (peerJobIds.length === 0) {
-    const settlement = recordWorkerAcceptance({ taskId, acceptance: verdict, env, source, reason, failureKind, acceptFailedTransport });
+    const settlement = recordWorkerAcceptance({ taskId, acceptance: verdict, env, source, reason, failureKind, acceptFailedTransport, expectedRecord: verifiedRecord });
     let worker = settlement.record;
     if (worker.engineAcceptanceDelivery && !hasUnverifiedCollectorIdentity(worker)) {
       try {
-        worker = deliverWorkerEngineAcceptance({ taskId, env, asJson });
+        worker = deliverWorkerEngineAcceptance(delivery);
       } catch {
         void 0;
       }
@@ -71,22 +73,28 @@ function settleWorkerRecord({ taskId, verdict, source, reason, failureKind, acce
       if (finalPeer) {
         throw error;
       }
-      stderr.write(`Skipped engine settlement for job ${jobId}: ${error instanceof Error ? error.message : String(error)}\n`);
+      stderr?.write(`Skipped engine settlement for job ${jobId}: ${error instanceof Error ? error.message : String(error)}\n`);
       continue;
     }
     if (!finalPeer && !retainedEngines.includes(engine)) {
       continue;
     }
-    const transport = engineAcceptanceTransport({ engine, jobId, acceptance: verdict, acceptFailedTransport, env });
-    if (!finalPeer && verdict === "accepted" && transport.failedTransport && !transport.salvage) {
-      stderr.write(`Skipped engine settlement for ${engineDisplayName(engine)} job ${jobId}: error transport is not a salvage failure.\n`);
-      continue;
+    if (verifiedRecord && finalPeer) {
+      const peer = readEngineJobRecord(engine, jobId, env);
+      if (peer && (peer.status !== "done" || (peer.transportStatus ?? "done") !== "done")) return [];
+    }
+    if (!finalPeer && verdict === "accepted") {
+      const transport = engineAcceptanceTransport({ engine, jobId, acceptance: verdict, acceptFailedTransport, env });
+      if (transport.failedTransport && !transport.salvage) {
+        stderr?.write(`Skipped engine settlement for ${engineDisplayName(engine)} job ${jobId}: error transport is not a salvage failure.\n`);
+        continue;
+      }
     }
     jobs.push({ engine, jobId });
   }
   let settlement;
   try {
-    settlement = recordWorkerAcceptance({ taskId, acceptance: verdict, env, source, reason, failureKind, acceptFailedTransport, engineLedgerWritten: jobs.some(({ jobId }) => jobId === peerJobId), engineAcceptanceDelivery: (record) => prepareEngineAcceptanceDelivery(record, { jobs, acceptFailedTransport }).engineAcceptanceDelivery });
+    settlement = recordWorkerAcceptance({ taskId, acceptance: verdict, env, source, reason, failureKind, acceptFailedTransport, expectedRecord: verifiedRecord, engineLedgerWritten: jobs.some(({ jobId }) => jobId === peerJobId), engineAcceptanceDelivery: (record) => prepareEngineAcceptanceDelivery(record, { jobs, acceptFailedTransport }).engineAcceptanceDelivery });
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     throw new Error(`Fusion worker task ${taskId} was not settled: ${message}`);
@@ -96,7 +104,12 @@ function settleWorkerRecord({ taskId, verdict, source, reason, failureKind, acce
     writeRecordConfirmation({ kind: "worker", worker, queued: true, asJson, stdout });
     return [worker];
   }
-  worker = deliverWorkerEngineAcceptance({ taskId, asJson, env });
+  try {
+    worker = deliverWorkerEngineAcceptance(delivery);
+  } catch (error) {
+    if (!verifiedRecord) throw error;
+  }
+  if (verifiedRecord) return [worker];
   const settledPeers = [];
   for (const { engine, jobId } of jobs) {
     const entry = worker.engineAcceptanceDelivery.entries.find((candidate) => candidate.engine === engine && candidate.jobId === jobId);
@@ -119,6 +132,19 @@ function settleWorkerRecord({ taskId, verdict, source, reason, failureKind, acce
     writeRecordConfirmation({ kind: "engine", engine, jobId, worker, asJson, stdout });
   }
   return [worker, ...settledPeers];
+}
+
+export function acceptVerifiedWorker(record, env, deadline = Date.now() + 2000) {
+  const [worker] = settleWorkerRecord({
+    taskId: record.taskId,
+    verdict: "accepted",
+    source: "main-loop",
+    reason: `verification passed: ${record.verificationCommand.trim()}`,
+    verifiedRecord: record,
+    deadline,
+    env
+  });
+  return worker;
 }
 
 function settleEngineRecord({ jobId, verdict, source, reason, failureKind, acceptFailedTransport = false, asJson, env, stdout }) {

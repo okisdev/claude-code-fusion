@@ -90,8 +90,8 @@ test("1.0.88 consult accepts a denied-target symlink while write still refuses t
     GROK_COMPANION_RUNTIME_SOCKET_CANDIDATES: endpoint,
     GROK_COMPANION_UNDENIED_SOCKET_CANDIDATES: socket
   });
-  const originalLstat = fs.lstatSync;
-  fs.lstatSync = (candidate, ...args) => candidate === socket ? { isSocket: () => true, isSymbolicLink: () => false } : originalLstat(candidate, ...args);
+  const originalStat = fs.statSync;
+  fs.statSync = (candidate, ...args) => candidate === socket ? { isSocket: () => true } : originalStat(candidate, ...args);
   let consult;
   try {
     let launchCalled = false;
@@ -103,7 +103,7 @@ test("1.0.88 consult accepts a denied-target symlink while write still refuses t
     assert.equal(fs.existsSync(sandbox.argsFile), false);
     consult = runGrok(runOptions(sandbox, { grokVersion: "1.0.88", env }));
   } finally {
-    fs.lstatSync = originalLstat;
+    fs.statSync = originalStat;
   }
   const result = await consult;
   assert.equal(result.exitCode, 0);
@@ -146,16 +146,16 @@ test("runtime-socket symlink policy resolves exact deny-list targets only on 1.0
   }
 });
 
-for (const suffix of [".docker/desktop/docker.sock", ".docker/run/docker.sock", ".orbstack/run/docker.sock"]) {
+for (const suffix of [".docker/desktop/docker.sock", ".docker/run/docker.sock", ".orbstack/run/docker.sock", ".noblock/run/docker.sock"]) {
   test(`managed writes block the default per-home socket ${suffix} before spawn`, async (t) => {
     const sandbox = makeSandbox(t);
     const env = envFor(sandbox);
     delete env.GROK_COMPANION_UNDENIED_SOCKET_CANDIDATES;
     const socket = path.join(env.HOME, suffix);
-    const originalLstat = fs.lstatSync;
-    t.mock.method(fs, "lstatSync", (candidate, ...args) => candidate === socket
-      ? { isSocket: () => true, isSymbolicLink: () => false }
-      : originalLstat(candidate, ...args));
+    const originalStat = fs.statSync;
+    t.mock.method(fs, "statSync", (candidate, ...args) => candidate === socket
+      ? { isSocket: () => true }
+      : originalStat(candidate, ...args));
     let launchCalled = false;
 
     await assert.rejects(async () => runGrok(runOptions(sandbox, {
@@ -197,7 +197,7 @@ test("runtime-socket remedies name the engine that owns the symlink", (t) => {
   assert.equal(runtimeSocketEngine(path.join(sandbox.root, "missing.sock")), null);
   assert.match(runtimeSocketRemedy(orbstackEndpoint, "orbstack"), /orb stop/);
   assert.match(runtimeSocketRemedy(desktopEndpoint, "docker-desktop"), /quit Docker Desktop/);
-  assert.equal(runtimeSocketRemedy(plainEndpoint, null), `Stop the container engine that owns ${plainEndpoint} (it resolves to ${plainTarget}), or route writes to another lane. Do not downgrade the sandbox.`);
+  assert.equal(runtimeSocketRemedy(plainEndpoint, null), `Stop the container engine that owns ${plainEndpoint}, or route writes to another lane. The link resolves to ${plainTarget}. Do not downgrade the sandbox.`);
   assert.equal(runtimeSocketRemedy(path.join(sandbox.root, "missing.sock"), null), `Stop the container engine that owns ${path.join(sandbox.root, "missing.sock")}, or route writes to another lane. Do not downgrade the sandbox.`);
   for (const remedy of [runtimeSocketRemedy(orbstackEndpoint, "orbstack"), runtimeSocketRemedy(desktopEndpoint, "docker-desktop"), runtimeSocketRemedy(plainEndpoint, null)]) {
     assert.match(remedy, /Do not downgrade the sandbox\.$/);

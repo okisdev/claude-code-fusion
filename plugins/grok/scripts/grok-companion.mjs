@@ -84,7 +84,7 @@ async function main() {
         check();
       } catch (error) {
         if (error?.failureKind !== "sandbox") throw error;
-        blockers.push({ kind: "sandbox", modes, message: String(error.message).split(/(?<=[.!?])\s+/u)[0] });
+        blockers.push({ kind: "sandbox", modes, message: error.message.replace(/[\r\n\u2028\u2029]+/gu, " ") });
       }
     }
     process.stdout.write(receivedArgv[0] === "--json"

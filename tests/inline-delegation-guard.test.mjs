@@ -15,7 +15,8 @@ import { messageCode, messageTag, tagMessage } from "../plugins/fusion/scripts/l
 import { normalizeState } from "../plugins/fusion/scripts/lib/guard/state.mjs";
 import { resolveAuditDir, resolveStateDir } from "../plugins/fusion/scripts/lib/guard/config.mjs";
 import { ENGINES } from "../plugins/fusion/scripts/lib/engines.mjs";
-import { createWorkerRecord, updateWorkerRecord } from "../plugins/fusion/scripts/lib/worker-state.mjs";
+import { createWorkerRecord, readWorkerRecord, updateWorkerRecord } from "../plugins/fusion/scripts/lib/worker-state.mjs";
+import { handleLifecycleHook } from "../plugins/fusion/scripts/worker-lifecycle.mjs";
 
 const repoRoot = path.join(import.meta.dirname, "..");
 const script = path.join(repoRoot, "plugins", "fusion", "scripts", "inline-delegation-guard.mjs");
@@ -878,6 +879,244 @@ function settlementPayload(sandbox, taskId, { verdict = "accepted", toolResponse
     tool_use_id: toolUseId
   };
 }
+
+function verificationWorker(sandbox, env, index, { sessionId = "session-1", ...fields } = {}) {
+  const taskId = `fusion-${index.toString(16).padStart(24, "0")}`;
+  createWorkerRecord({ taskId, sessionId, agentType: "fusion:claude-worker", workspaceRoot: sandbox.workDir, packageType: "implementation" }, env);
+  return updateWorkerRecord(taskId, env, (record) => ({
+    ...record, transportStatus: "done", finishedAt: "2026-07-21T00:00:00Z", collectedAt: "2026-07-21T00:00:00Z", awaitingVerdict: true, verificationCommand: "node --test", ...fields
+  }));
+}
+
+function runStartedVerification(sandbox, payload, env) {
+  const bash = { tool_use_id: `verify-${++toolUseSequence}`, ...payload };
+  const pre = run(sandbox, { ...bash, hook_event_name: "PreToolUse" }, env);
+  assert.strictEqual(pre.status, 0, pre.stderr);
+  return run(sandbox, bash, env);
+}
+
+test("passing verification accepts matching packages in one advisory and clears the Stop demand", async (t) => {
+  const sandbox = makeSandbox(t);
+  const env = envFor(sandbox, reviewWaveWorkerEnv(sandbox, { FUSION_TEST_NOW: "2026-07-21T00:01:00Z" }));
+  fs.symlinkSync(sandbox.workDir, path.join(sandbox.workDir, "work tree"));
+  const first = verificationWorker(sandbox, env, 1, { verificationCommand: "cd 'work tree' && node --test a.mjs 2>&1 | tail -20 && npm run lint" });
+  const second = verificationWorker(sandbox, env, 2, { verificationCommand: "npm run lint" });
+  const stop = { hook_event_name: "Stop", session_id: "session-1", cwd: sandbox.workDir, background_tasks: [] };
+  assert.strictEqual((await handleLifecycleHook(stop, env)).decision, "block");
+  const payload = verificationPayload(sandbox, { command: "set -o pipefail; cd -- work\\ tree && node   --test\ta.mjs 2>&1 | tail -20 && npm run lint 2>&1 | head -3", toolResponse: { exitCode: 0, stdout: "ℹ fail 0" } });
+  const result = runStartedVerification(sandbox, payload, env);
+  assert.strictEqual(result.status, 0, result.stderr);
+  const advisory = JSON.parse(result.stdout).hookSpecificOutput;
+  assert.strictEqual(advisory.hookEventName, "PostToolUse");
+  assert.ok(advisory.additionalContext.includes(`--record ${first.taskId}=rejected ${second.taskId}=rejected --reason`));
+  assert.match(advisory.additionalContext, /Wave settled\. Dispatch one cross family read only review/);
+  assert.strictEqual(run(sandbox, settlementPayload(sandbox, first.taskId), env).stdout, "");
+  for (const original of [first, second]) {
+    const accepted = readWorkerRecord(original.taskId, env);
+    assert.strictEqual(accepted.acceptance, "accepted");
+    assert.strictEqual(accepted.acceptanceReason, `verification passed: ${original.verificationCommand}`);
+    assert.strictEqual(accepted.awaitingVerdict, false);
+    assert.ok(accepted.acceptanceRecordedAt);
+  }
+  assert.deepStrictEqual(await handleLifecycleHook(stop, env), {});
+  assert.strictEqual(runStartedVerification(sandbox, payload, env).stdout, "");
+});
+
+test("verification leaves ineligible worker records untouched", (t) => {
+  const sandbox = makeSandbox(t);
+  const env = envFor(sandbox, reviewWaveWorkerEnv(sandbox, { FUSION_TEST_NOW: "2026-07-21T00:01:00Z" }));
+  const records = [
+    { verificationCommand: "npm test" },
+    { verificationCommand: null },
+    { verificationCommand: "  " },
+    { packageType: "consult" },
+    { transportStatus: "failed" },
+    { peerTransportStatus: "error" },
+    { collectedAt: null },
+    { finishedAt: null },
+    { collectedAt: "2026-07-21T00:01:00Z" },
+    { collectedAt: "2026-07-21T00:02:00Z" },
+    { awaitingVerdict: false, acceptance: "rejected", acceptanceRecordedAt: "2026-07-21T00:00:01Z" },
+    { sessionId: "another-session" }
+  ].map((fields, index) => verificationWorker(sandbox, env, index, fields));
+  const result = runStartedVerification(sandbox, verificationPayload(sandbox), env);
+  assert.strictEqual(result.status, 0, result.stderr);
+  assert.strictEqual(result.stdout, "");
+  assert.strictEqual(readAuditRecords(sandbox).filter((event) => event.event === "verification").length, 1);
+  for (const record of records) assert.deepStrictEqual(readWorkerRecord(record.taskId, env), record);
+});
+
+test("settlement requires every whole command segment and an unconditional verification", (t) => {
+  const sandbox = makeSandbox(t);
+  const env = envFor(sandbox, reviewWaveWorkerEnv(sandbox, { FUSION_TEST_NOW: "2026-07-21T00:01:00Z" }));
+  const bare = verificationWorker(sandbox, env, 1);
+  const compound = verificationWorker(sandbox, env, 2, { verificationCommand: "node --test && npm run lint" });
+  for (const command of [
+    "node --test tests/other.test.mjs", "false && node --test || npm test", "node --test; npm test",
+    "node --test;", "node --test | cat", "echo 'node --test' && npm test", "npm test # && node --test",
+    "false && node --test && echo word\\ #tag || npm test", "node --test 2>&1 | grep 'fail|pass'"
+  ]) {
+    const result = runStartedVerification(sandbox, verificationPayload(sandbox, { command, toolResponse: { stdout: "ℹ fail 0" } }), env);
+    assert.strictEqual(result.stdout, "", command);
+    assert.deepStrictEqual(readWorkerRecord(bare.taskId, env), bare);
+  }
+  const quoted = verificationPayload(sandbox, { command: "echo 'x || y; z' && node --test 2>&1 | head -20", toolResponse: { stdout: "ℹ fail 0" } });
+  assert.match(runStartedVerification(sandbox, quoted, env).stdout, /Automatically accepted/);
+  assert.strictEqual(readWorkerRecord(bare.taskId, env).acceptance, "accepted");
+  assert.deepStrictEqual(readWorkerRecord(compound.taskId, env), compound);
+});
+
+test("settlement preserves every stage of a required pipeline", (t) => {
+  const sandbox = makeSandbox(t);
+  const env = envFor(sandbox, reviewWaveWorkerEnv(sandbox, { FUSION_TEST_NOW: "2026-07-21T00:01:00Z" }));
+  for (const [index, filter] of ["grep -q integration", "tail -20"].entries()) {
+    const verificationCommand = `npm test | ${filter}`;
+    const worker = verificationWorker(sandbox, env, index, { verificationCommand });
+    runStartedVerification(sandbox, verificationPayload(sandbox, { command: "npm test" }), env);
+    assert.deepStrictEqual(readWorkerRecord(worker.taskId, env), worker);
+    const command = `${verificationCommand} | head -10 && npm run lint`;
+    runStartedVerification(sandbox, verificationPayload(sandbox, { command, toolResponse: { exitCode: 0 } }), env);
+    assert.deepStrictEqual(readWorkerRecord(worker.taskId, env), worker);
+    const payload = verificationPayload(sandbox, { command: `set -o pipefail; ${command}`, toolResponse: { exitCode: 0 } });
+    assert.match(runStartedVerification(sandbox, payload, env).stdout, /Automatically accepted/);
+    assert.strictEqual(readWorkerRecord(worker.taskId, env).acceptance, "accepted");
+  }
+});
+
+test("settlement requires observable evidence for each matched step", (t) => {
+  const sandbox = makeSandbox(t);
+  const env = envFor(sandbox, reviewWaveWorkerEnv(sandbox, { FUSION_TEST_NOW: "2026-07-21T00:01:00Z" }));
+  const verificationCommand = "npm test && npm run lint";
+  const first = verificationWorker(sandbox, env, 1, { verificationCommand });
+  const lint = verificationWorker(sandbox, env, 2, { verificationCommand: "npm run lint" });
+  const masked = "npm test | tail -n 1 && npm run lint";
+  for (const [command, stdout] of [
+    [masked, ""],
+    [`${masked} | tail -n 1`, "ℹ fail 0"],
+    ["npm test && npm run lint | tail -1", ""],
+    [`set -o pipefail; set +o pipefail && ${masked}`, ""],
+    ["npm test | tail -n 1 && set -o pipefail && npm run lint", ""]
+  ]) {
+    runStartedVerification(sandbox, verificationPayload(sandbox, { command, toolResponse: { exitCode: 0, stdout } }), env);
+    assert.deepStrictEqual(readWorkerRecord(first.taskId, env), first, command);
+  }
+  assert.strictEqual(readWorkerRecord(lint.taskId, env).acceptance, "accepted");
+  for (const [index, [command, stdout]] of [
+    [`set -o pipefail; ${masked}`, ""], [verificationCommand, ""], ["npm test && npm run lint | tail -1", "ℹ fail 0"]
+  ].entries()) {
+    const worker = verificationWorker(sandbox, env, index + 3, { verificationCommand });
+    runStartedVerification(sandbox, verificationPayload(sandbox, { command, toolResponse: { exitCode: 0, stdout } }), env);
+    assert.strictEqual(readWorkerRecord(worker.taskId, env).acceptance, "accepted", command);
+  }
+});
+
+test("settlement matches required steps in order and counts repeated steps", (t) => {
+  const sandbox = makeSandbox(t);
+  const env = envFor(sandbox, reviewWaveWorkerEnv(sandbox, { FUSION_TEST_NOW: "2026-07-21T00:01:00Z" }));
+  const buildAndTest = verificationWorker(sandbox, env, 1, { verificationCommand: "npm run build && npm test" });
+  const testTwice = verificationWorker(sandbox, env, 2, { verificationCommand: "npm test && npm test" });
+  runStartedVerification(sandbox, verificationPayload(sandbox, { command: "npm test && npm run build" }), env);
+  for (const worker of [buildAndTest, testTwice]) assert.deepStrictEqual(readWorkerRecord(worker.taskId, env), worker);
+  runStartedVerification(sandbox, verificationPayload(sandbox, { command: "npm test && npm run build && npm run lint && npm test" }), env);
+  for (const worker of [buildAndTest, testTwice]) assert.strictEqual(readWorkerRecord(worker.taskId, env).acceptance, "accepted");
+});
+
+test("rerunning the old suite leaves a collected SendMessage follow-up awaiting its verdict", async (t) => {
+  const sandbox = makeSandbox(t);
+  const env = envFor(sandbox, reviewWaveWorkerEnv(sandbox));
+  const agentId = "resumed-worker";
+  const worker = verificationWorker(sandbox, env, 1, { agentId, acceptance: "accepted", awaitingVerdict: false });
+  const session = { session_id: worker.sessionId, cwd: sandbox.workDir };
+  await handleLifecycleHook({ ...session, hook_event_name: "PostToolUse", tool_name: "SendMessage", tool_input: { to: agentId, message: "check the screenshots" }, tool_response: { success: true, resumedAgentId: agentId } }, env);
+  await handleLifecycleHook({ ...session, hook_event_name: "SubagentStop", agent_type: worker.agentType, agent_id: agentId, last_assistant_message: "screenshots checked\ndelivery: complete\nverification: passed" }, env);
+  const collected = readWorkerRecord(worker.taskId, env);
+  assert.strictEqual(collected.continuationCount, 1);
+  assert.strictEqual(collected.transportStatus, "done");
+  assert.ok(collected.collectedAt);
+  assert.strictEqual(collected.awaitingVerdict, true);
+  const afterCollection = new Date(Date.parse(collected.collectedAt) + 1000).toISOString();
+  const payload = verificationPayload(sandbox, { command: worker.verificationCommand });
+  const rerun = runStartedVerification(sandbox, payload, { ...env, FUSION_TEST_NOW: afterCollection });
+  assert.strictEqual(rerun.status, 0, rerun.stderr);
+  assert.strictEqual(rerun.stdout, "");
+  assert.deepStrictEqual(readWorkerRecord(worker.taskId, env), collected);
+  assert.strictEqual(collected.verificationCommand, null);
+});
+
+test("settlement compares the real verification directory to the package worktree", (t) => {
+  const sandbox = makeSandbox(t);
+  const env = envFor(sandbox, reviewWaveWorkerEnv(sandbox, { FUSION_TEST_NOW: "2026-07-21T00:01:00Z" }));
+  const peerDir = path.join(sandbox.workDir, "peer tree");
+  fs.mkdirSync(peerDir);
+  fs.symlinkSync(peerDir, path.join(sandbox.workDir, "peer-link"));
+  const peer = verificationWorker(sandbox, env, 1, { companionCwd: peerDir });
+  for (const command of ["node --test", "cd missing && node --test", "cd peer-link && cd .. && node --test"]) {
+    assert.strictEqual(runStartedVerification(sandbox, verificationPayload(sandbox, { command }), env).stdout, "");
+    assert.deepStrictEqual(readWorkerRecord(peer.taskId, env), peer);
+  }
+  const main = verificationWorker(sandbox, env, 2);
+  const command = 'cd -- "peer-link" && node --test';
+  assert.match(runStartedVerification(sandbox, verificationPayload(sandbox, { command }), env).stdout, /Automatically accepted/);
+  assert.deepStrictEqual(readWorkerRecord(main.taskId, env), main);
+  assert.strictEqual(readWorkerRecord(peer.taskId, env).acceptance, "accepted");
+});
+
+test("overlapping Bash calls settle only packages finished and collected before their own start", (t) => {
+  const sandbox = makeSandbox(t);
+  const env = envFor(sandbox, reviewWaveWorkerEnv(sandbox));
+  const first = { ...verificationPayload(sandbox), tool_use_id: "early" };
+  const second = { ...first, tool_use_id: "late" };
+  const at = (payload, time) => run(sandbox, payload, { ...env, FUSION_TEST_NOW: `2026-07-21T00:0${time}:00Z` });
+  const during = "2026-07-21T00:02:00Z";
+  const collected = verificationWorker(sandbox, env, 1, { collectedAt: during });
+  const finished = verificationWorker(sandbox, env, 2, { finishedAt: during });
+  at({ ...first, hook_event_name: "PreToolUse" }, 1);
+  at({ ...second, hook_event_name: "PreToolUse" }, 3);
+  for (const payload of [verificationPayload(sandbox), { ...first, tool_use_id: "unknown" }, first]) {
+    assert.strictEqual(at(payload, 4).stdout, "");
+    for (const record of [collected, finished]) assert.deepStrictEqual(readWorkerRecord(record.taskId, env), record);
+  }
+  assert.match(at(second, 5).stdout, /Automatically accepted/);
+  for (const record of [collected, finished]) assert.strictEqual(readWorkerRecord(record.taskId, env).acceptance, "accepted");
+  const next = verificationWorker(sandbox, env, 3);
+  assert.strictEqual(at(second, 6).stdout, "");
+  assert.deepStrictEqual(readWorkerRecord(next.taskId, env), next);
+});
+
+test("a settlement index write error preserves the hook's review suggestion and verification audit", (t) => {
+  const sandbox = makeSandbox(t);
+  const env = envFor(sandbox, reviewWaveWorkerEnv(sandbox, { FUSION_TEST_NOW: "2026-07-21T00:01:00Z" }));
+  const worker = verificationWorker(sandbox, env, 1);
+  const payload = settlementPayload(sandbox, worker.taskId);
+  payload.tool_input.command += " && node --test";
+  const file = path.join(env.FUSION_WORKER_STATE_DIR, "sessions", "session-1.json");
+  fs.unlinkSync(file);
+  fs.mkdirSync(file);
+  const result = runStartedVerification(sandbox, payload, env);
+  assert.match(result.stdout, /Wave settled/);
+  assert.strictEqual(readAuditRecords(sandbox).filter((event) => event.event === "verification").length, 1);
+  assert.deepStrictEqual(readWorkerRecord(worker.taskId, env), worker);
+});
+
+test("a failed, backgrounded, or subagent verification cannot accept a package", (t) => {
+  const sandbox = makeSandbox(t);
+  const env = envFor(sandbox, reviewWaveWorkerEnv(sandbox, { FUSION_TEST_NOW: "2026-07-21T00:01:00Z" }));
+  const record = verificationWorker(sandbox, env, 1);
+  for (const overrides of [
+    { tool_response: { exitCode: 1 } },
+    { tool_response: { stdout: "# fail 1" } },
+    { tool_response: { backgroundTaskId: "running-test" } },
+    { tool_response: { toolUseResult: { status: "async_launched", stdout: "ℹ fail 0" } } },
+    { tool_input: { command: "node --test", run_in_background: true } },
+    { agent_id: "worker" }
+  ]) {
+    const result = runStartedVerification(sandbox, { ...verificationPayload(sandbox), ...overrides }, env);
+    assert.strictEqual(result.status, 0, result.stderr);
+    assert.strictEqual(result.stdout, "");
+    assert.deepStrictEqual(readWorkerRecord(record.taskId, env), record);
+  }
+  assert.strictEqual(readAuditRecords(sandbox).filter((event) => event.event === "verification").length, 0);
+});
 
 test("an accepted implementation settlement suggests one cross family review and throttles per session", (t) => {
   const sandbox = makeSandbox(t);

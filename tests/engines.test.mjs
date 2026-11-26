@@ -24,6 +24,7 @@ import {
   engineRoleFromBrief,
   engineStateRoots,
   isEngineId,
+  roleSubstituteText,
   routedEngineIds
 } from "../plugins/fusion/scripts/lib/engines.mjs";
 
@@ -50,6 +51,7 @@ test("engine constants and definitions are frozen", () => {
     assert.ok(Object.isFrozen(ENGINES[id].stateEnvs));
     assert.ok(Object.isFrozen(ENGINES[id].roles));
     assert.ok(Object.isFrozen(ENGINES[id].consultOnlyRoles));
+    assert.ok(Object.isFrozen(ENGINES[id].roleSubstitutes));
     assert.ok(Object.isFrozen(ENGINES[id].efforts));
   }
 });
@@ -67,6 +69,17 @@ test("consult only roles are defined by the engine registry", () => {
     assert.ok(ENGINES[id].consultOnlyRoles.every((role) => ENGINES[id].roles.includes(role)));
     assert.strictEqual(Object.keys(ENGINES[id])[Object.keys(ENGINES[id]).indexOf("defaultRole") + 1], "consultOnlyRoles");
   }
+});
+
+test("role substitute text lists only requested roles with a registered substitute", () => {
+  assert.strictEqual(roleSubstituteText("grok", ["live-web", "constructor", "large-context"]),
+    "live-web → codex:codex-rescue read only consult with --web (X and other logged-in platform content unavailable), large-context → agy:agy-rescue (agy-role: large-context)");
+  assert.strictEqual(roleSubstituteText("cursor", ["diversity", "burst"]),
+    "diversity → Antigravity independence, burst → Codex quick tier");
+  assert.strictEqual(roleSubstituteText("opencode", ["blind-check"]), "");
+  assert.strictEqual(roleSubstituteText("codex", ENGINES.codex.roles), "");
+  assert.strictEqual(roleSubstituteText("unknown", ["burst"]), "");
+  assert.strictEqual(roleSubstituteText("grok", []), "");
 });
 
 test("lifecycle and guard modules do not import the stats CLI", () => {
@@ -115,6 +128,7 @@ test("Devin registry contract matches the breadth companion", () => {
     roles: devin.roles,
     defaultRole: devin.defaultRole,
     consultOnlyRoles: devin.consultOnlyRoles,
+    roleSubstitutes: devin.roleSubstitutes,
     efforts: devin.efforts,
     unavailablePrefix: devin.unavailablePrefix
   }, {
@@ -124,6 +138,7 @@ test("Devin registry contract matches the breadth companion", () => {
     dataDirName: "devin-claude-code-fusion", dataEnv: "DEVIN_COMPANION_DATA", stateEnvs: [],
     versionField: "devinVersion", verifiedVersionKey: "devin", acceptanceLedger: false,
     roles: ["diversity", "burst"], defaultRole: null, consultOnlyRoles: ["diversity"],
+    roleSubstitutes: { diversity: "Antigravity independence", burst: "Codex quick tier" },
     efforts: ["default", "none", "minimal", "low", "medium", "high", "xhigh", "max"],
     unavailablePrefix: "devin unavailable:"
   });
@@ -297,7 +312,13 @@ test("Antigravity registry contract defines the Google subscription lane", () =>
     dataDirName: "agy-claude-code-fusion", dataEnv: "AGY_COMPANION_DATA", stateEnvs: [],
     versionField: "agyVersion", verifiedVersionKey: "agy", acceptanceLedger: false,
     roles: ["independence", "large-context", "burst"], defaultRole: null,
-    consultOnlyRoles: ["independence", "large-context"], efforts: ["default", "low", "medium", "high", "xhigh"],
+    consultOnlyRoles: ["independence", "large-context"],
+    roleSubstitutes: {
+      independence: "breadth engine diversity with a non-Google model (otherwise Codex read only consult)",
+      "large-context": "breadth engine diversity with a non-Google model (otherwise Codex read only consult)",
+      burst: "Codex quick tier"
+    },
+    efforts: ["default", "low", "medium", "high", "xhigh"],
     unavailablePrefix: "agy unavailable:"
   });
   assert.strictEqual(engineForAgentType("agy:agy-rescue"), "agy");
@@ -323,6 +344,7 @@ test("OpenCode registry contract defines only bulk and blind-check roles", () =>
     dataDirName: "opencode-claude-code-fusion", dataEnv: "OPENCODE_COMPANION_DATA", stateEnvs: [],
     versionField: "codexVersion", verifiedVersionKey: "codex-cli", acceptanceLedger: false,
     roles: ["bulk", "blind-check"], defaultRole: null, consultOnlyRoles: ["blind-check"],
+    roleSubstitutes: { bulk: "Codex volume tier" },
     efforts: ["low", "high", "max"], unavailablePrefix: "opencode unavailable:"
   });
   assert.strictEqual(engineDisplayName("opencode"), "OpenCode");

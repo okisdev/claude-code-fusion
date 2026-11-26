@@ -4,6 +4,7 @@ import fs from "node:fs";
 import { createRequire } from "node:module";
 import path from "node:path";
 import test from "node:test";
+import { buildFusionStats, renderFusionStats } from "../plugins/fusion/scripts/fusion-stats.mjs";
 import { harness } from "./lib/opencode-harness.mjs";
 
 function report(result) {
@@ -176,6 +177,21 @@ test("manual background jobs return a watch instruction and collect through resu
   const watch = box.run(["watch", "--job", launch.jobId]);
   assert.equal(watch.status, 0, watch.stderr);
   assert.match(watch.stdout, /opencode job [a-f0-9]{32} done/);
+});
+
+test("OpenCode usage reaches Fusion stats from a completed job", (t) => {
+  const box = harness(t);
+  const result = box.run(["task", "--json", "--", "opencode-role: bulk\nGenerate files."]);
+  assert.equal(result.status, 0, result.stderr || result.stdout);
+  const usage = { inputTokens: 100, cachedInputTokens: 20, outputTokens: 40, reasoningOutputTokens: 10, totalTokens: 140 };
+  assert.deepEqual(report(result).usage, usage);
+  const [job] = box.jobs();
+  assert.deepEqual(job.usage, usage);
+  assert.equal(job.usageIsIncomplete, false);
+  const stats = buildFusionStats({ env: box.env, cwd: box.cwd });
+  assert.equal(stats.opencode.tokenUsage.availability, "available");
+  assert.deepEqual(stats.opencode.tokenUsage.totals, usage);
+  assert.match(renderFusionStats(stats), /Observed tokens: 140 total, 100 input, 20 cached input, 40 output, 10 reasoning output/);
 });
 
 test("resume retains its role and model and refuses a role change", (t) => {

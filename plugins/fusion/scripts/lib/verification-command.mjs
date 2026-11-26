@@ -287,20 +287,22 @@ function isVerificationSegment(segment, pattern) {
   return matchesPackageManager(head, tokens) || matchesRunner(head, tokens);
 }
 
-function commandSegments(command) {
+function splitCommand(command) {
   const segments = [];
   let start = 0;
   let separator = null;
   let quote = null;
   let escaped = false;
+  let wordStart = true;
   for (let index = 0; index < command.length; index += 1) {
     const character = command[index];
     if (escaped) {
       escaped = false;
       continue;
     }
-    if (character === "\\") {
+    if (character === "\\" && quote !== "'") {
       escaped = true;
+      wordStart = false;
       continue;
     }
     if (quote) {
@@ -311,11 +313,26 @@ function commandSegments(command) {
     }
     if (character === "\"" || character === "'") {
       quote = character;
+      wordStart = false;
+      continue;
+    }
+    if (character === "#" && wordStart) {
+      const segment = command.slice(start, index).trim();
+      if (segment) segments.push({ command: segment, separator });
+      const newline = command.indexOf("\n", index);
+      if (newline === -1) {
+        if (!segment && separator) segments.push({ command: "", separator });
+        return segments;
+      }
+      if (segment) separator = "\n";
+      index = newline;
+      start = index + 1;
       continue;
     }
     const twoCharacterSeparator = command.slice(index, index + 2);
     const separatorLength = twoCharacterSeparator === "&&" || twoCharacterSeparator === "||" ? 2 : character === "|" || character === ";" || character === "\n" || character === "\r" ? 1 : 0;
     if (separatorLength === 0) {
+      wordStart = /\s/.test(character);
       continue;
     }
     const segment = command.slice(start, index).trim();
@@ -324,13 +341,35 @@ function commandSegments(command) {
     }
     separator = twoCharacterSeparator === "&&" || twoCharacterSeparator === "||" ? twoCharacterSeparator : character;
     index += separatorLength - 1;
+    while (index + 1 < command.length && /\s/.test(command[index + 1])) index += 1;
     start = index + 1;
+    wordStart = true;
   }
   const segment = command.slice(start).trim();
-  if (segment) {
+  if (segment || separator) {
     segments.push({ command: segment, separator });
   }
   return segments;
+}
+
+function commandSegments(command) {
+  const segments = splitCommand(command);
+  let pipefail = false;
+  let unconditionalPipefail = false;
+  return segments.map((segment, index) => {
+    const newList = segment.separator === null || [";", "\n", "\r"].includes(segment.separator);
+    if (newList || segment.separator === "||") pipefail = unconditionalPipefail;
+    if (segment.separator !== "|" && segments[index + 1]?.separator !== "|") {
+      if (/^set\s+-[eux]*o\s+pipefail$/.test(segment.command) && segment.separator !== "||") {
+        pipefail = true;
+        if (newList) unconditionalPipefail = true;
+      } else if (/^set\s/.test(segment.command) && !/^set(?:\s+-[eux]+)+$/.test(segment.command)) {
+        pipefail = false;
+        unconditionalPipefail = false;
+      }
+    }
+    return { ...segment, pipefail };
+  });
 }
 
 function verificationCommand(command, env = process.env) {
@@ -341,23 +380,14 @@ function verificationCommand(command, env = process.env) {
   if (!trimmed || trimmed.length > COMMAND_MAX_LENGTH) {
     return { recognized: false, observable: false };
   }
-  const segments = commandSegments(trimmed);
+  const segments = commandSegments(trimmed).filter((segment) => segment.command);
   const pattern = customPattern(env);
   const matchingSegments = segments.map((segment) => isVerificationSegment(segment.command, pattern));
   const lastVerificationIndex = matchingSegments.lastIndexOf(true);
-  let pipefail = false;
-  const pipefailAtSegment = segments.map((segment, index) => {
-    if (/^set\s+-[a-z]*o\s+pipefail$/i.test(segment.command) && segments[index + 1]?.separator !== "|" && segments.slice(1, index + 1).every((previous) => [";", "\n", "\r", "&&"].includes(previous.separator))) {
-      pipefail = true;
-    } else if (/^set\s+\+(?:[a-z]*o)\s+pipefail$/i.test(segment.command)) {
-      pipefail = false;
-    }
-    return pipefail;
-  });
   return {
     recognized: lastVerificationIndex !== -1,
     observable: lastVerificationIndex !== -1 && segments.slice(lastVerificationIndex + 1).every(
-      (segment, offset) => segment.separator === "&&" || (segment.separator === "|" && pipefailAtSegment[lastVerificationIndex + offset])
+      (segment) => segment.separator === "&&" || (segment.separator === "|" && segment.pipefail)
     )
   };
 }
@@ -420,7 +450,11 @@ function verificationEvidence(command, toolResponse, env = process.env) {
   if (!verification.recognized || !toolResponse || typeof toolResponse !== "object" || Array.isArray(toolResponse)) {
     return null;
   }
-  if (verificationResponseFailed(toolResponse)) {
+  if ([toolResponse, toolResponse.toolUseResult].some((result) => result && typeof result === "object" && (
+    verificationResponseFailed(result) || result.backgroundTaskId != null || result.isAsync === true ||
+    result.status === "async_launched" || result.timedOutAfterMs != null ||
+    Object.entries(result).some(([key, value]) => key.startsWith("backgrounded") && value === true)
+  ))) {
     return null;
   }
   const summary = verificationOutputSummary(toolResponse);
@@ -432,6 +466,7 @@ function verificationEvidence(command, toolResponse, env = process.env) {
 
 export {
   appendToolResponseText,
+  commandSegments,
   isVerificationCommand,
   verificationCommand,
   verificationEvidence,

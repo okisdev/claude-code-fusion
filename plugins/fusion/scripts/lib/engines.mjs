@@ -8,6 +8,7 @@ function engine(descriptor) {
     stateEnvs: Object.freeze([...descriptor.stateEnvs]),
     roles: Object.freeze([...descriptor.roles]),
     consultOnlyRoles: Object.freeze([...descriptor.consultOnlyRoles]),
+    roleSubstitutes: Object.freeze({ ...descriptor.roleSubstitutes }),
     efforts: Object.freeze([...descriptor.efforts])
   });
 }
@@ -34,6 +35,7 @@ const ENGINES = Object.freeze({
     roles: ["quick", "volume", "flagship"],
     defaultRole: "quick",
     consultOnlyRoles: [],
+    roleSubstitutes: {},
     efforts: ["low", "medium", "high", "xhigh", "max"],
     unavailablePrefix: "codex unavailable:"
   }),
@@ -58,6 +60,12 @@ const ENGINES = Object.freeze({
     roles: ["burst", "independence", "live-web", "large-context"],
     defaultRole: null,
     consultOnlyRoles: ["live-web", "large-context"],
+    roleSubstitutes: {
+      burst: "Codex quick tier or the breadth engine's burst pool",
+      independence: "agy:agy-rescue (agy-role: independence)",
+      "live-web": "codex:codex-rescue read only consult with --web (X and other logged-in platform content unavailable)",
+      "large-context": "agy:agy-rescue (agy-role: large-context)"
+    },
     efforts: ["low", "medium", "high", "xhigh", "max"],
     unavailablePrefix: "grok unavailable:"
   }),
@@ -82,6 +90,10 @@ const ENGINES = Object.freeze({
     roles: ["diversity", "burst"],
     defaultRole: null,
     consultOnlyRoles: ["diversity"],
+    roleSubstitutes: {
+      diversity: "Antigravity independence",
+      burst: "Codex quick tier"
+    },
     efforts: ["default", "low", "medium", "high", "xhigh", "max"],
     unavailablePrefix: "cursor unavailable:"
   }),
@@ -106,6 +118,10 @@ const ENGINES = Object.freeze({
     roles: ["diversity", "burst"],
     defaultRole: null,
     consultOnlyRoles: ["diversity"],
+    roleSubstitutes: {
+      diversity: "Antigravity independence",
+      burst: "Codex quick tier"
+    },
     efforts: ["default", "none", "minimal", "low", "medium", "high", "xhigh", "max"],
     unavailablePrefix: "devin unavailable:"
   }),
@@ -130,6 +146,11 @@ const ENGINES = Object.freeze({
     roles: ["independence", "large-context", "burst"],
     defaultRole: null,
     consultOnlyRoles: ["independence", "large-context"],
+    roleSubstitutes: {
+      independence: "breadth engine diversity with a non-Google model (otherwise Codex read only consult)",
+      "large-context": "breadth engine diversity with a non-Google model (otherwise Codex read only consult)",
+      burst: "Codex quick tier"
+    },
     efforts: ["default", "low", "medium", "high", "xhigh"],
     unavailablePrefix: "agy unavailable:"
   }),
@@ -154,6 +175,7 @@ const ENGINES = Object.freeze({
     roles: ["bulk", "blind-check"],
     defaultRole: null,
     consultOnlyRoles: ["blind-check"],
+    roleSubstitutes: { bulk: "Codex volume tier" },
     efforts: ["low", "high", "max"],
     unavailablePrefix: "opencode unavailable:"
   })
@@ -184,6 +206,15 @@ function isEngineId(value) {
 
 function engineDisplayName(id) {
   return isEngineId(id) ? ENGINES[id].displayName : null;
+}
+
+function roleSubstituteText(engine, roles) {
+  if (!isEngineId(engine)) return "";
+  const { roleSubstitutes } = ENGINES[engine];
+  return roles
+    .filter((role) => Object.hasOwn(roleSubstitutes, role))
+    .map((role) => `${role} → ${roleSubstitutes[role]}`)
+    .join(", ");
 }
 
 function engineForAgentType(agentType) {
@@ -292,5 +323,6 @@ export {
   engineRoleFromBrief,
   engineStateRoots,
   isEngineId,
+  roleSubstituteText,
   routedEngineIds
 };

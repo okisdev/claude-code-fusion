@@ -225,6 +225,7 @@ function validQuotaPool(pool) {
 
 const LIVE_QUOTA_MAX_AGE_MS = 60_000;
 const LIVE_QUOTA_REFRESH_LEASE_MS = 30_000;
+const LIVE_QUOTA_FAILURE_BACKOFF_MS = 10 * 60_000;
 
 function liveQuotaFile() {
   return path.join(resolveDataDir(), "quota-live.json");
@@ -239,29 +240,61 @@ function readLiveQuota(home) {
   }
 }
 
-function startLiveQuotaRefresh(at) {
-  const lease = path.join(resolveDataDir(), "quota-live.refreshing");
-  try {
-    fs.mkdirSync(path.dirname(lease), { recursive: true, mode: 0o700 });
-    let descriptor;
-    try {
-      descriptor = fs.openSync(lease, "wx", 0o600);
-    } catch (error) {
-      if (error?.code !== "EEXIST" || at - fs.statSync(lease).mtimeMs < LIVE_QUOTA_REFRESH_LEASE_MS) return;
-      fs.rmSync(lease, { force: true });
-      descriptor = fs.openSync(lease, "wx", 0o600);
-    }
-    fs.closeSync(descriptor);
-    spawn(process.execPath, [SELF_PATH, "quota-refresh"], { env: process.env, detached: true, stdio: "ignore", windowsHide: true }).unref();
-  } catch {}
+function recentQuotaFile(file, maxAge) {
+  return Date.now() - fs.statSync(file, { throwIfNoEntry: false })?.mtimeMs < maxAge;
 }
 
-async function handleQuotaRefresh() {
+function finishLiveQuotaRefresh(lease, home, observation) {
+  const dataDir = path.dirname(lease);
+  const failure = path.join(dataDir, "quota-live.failed");
+  try {
+    if (observation) {
+      writePrivateStateFile(liveQuotaFile(), `${JSON.stringify({ home, observation })}\n`);
+      fs.rmSync(path.join(dataDir, "quota.json"), { force: true });
+      fs.rmSync(failure, { force: true });
+    } else {
+      writePrivateStateFile(failure, home);
+    }
+  } finally {
+    fs.rmSync(lease, { force: true });
+  }
+}
+
+function startLiveQuotaRefresh(dataDir, home, live) {
+  const lease = path.join(dataDir, "quota-live.refreshing");
+  if (recentQuotaFile(lease, LIVE_QUOTA_REFRESH_LEASE_MS)) return true;
+  if ((live && Date.now() - Date.parse(live.observedAt) < LIVE_QUOTA_MAX_AGE_MS) || !fs.existsSync(path.join(home, "auth.json"))) return false;
+  const failure = path.join(dataDir, "quota-live.failed");
+  if (recentQuotaFile(failure, LIVE_QUOTA_FAILURE_BACKOFF_MS) && fs.readFileSync(failure, "utf8") === home) return false;
+  const token = generateJobId();
+  fs.mkdirSync(dataDir, { recursive: true, mode: 0o700 });
+  const existing = fs.statSync(lease, { throwIfNoEntry: false });
+  if (existing) {
+    if (Date.now() - existing.mtimeMs < LIVE_QUOTA_REFRESH_LEASE_MS) return true;
+    fs.rmSync(lease, { force: true });
+  }
+  try {
+    fs.writeFileSync(lease, token, { flag: "wx", mode: 0o600 });
+  } catch (error) {
+    if (error.code === "EEXIST") return recentQuotaFile(lease, LIVE_QUOTA_REFRESH_LEASE_MS);
+    throw error;
+  }
+  try {
+    const child = spawn(process.execPath, [SELF_PATH, "quota-refresh", token], { env: process.env, detached: true, stdio: "ignore", windowsHide: true });
+    child.on("error", () => {});
+    child.unref();
+    if (child.pid) return true;
+  } catch {}
+  finishLiveQuotaRefresh(lease, home, null);
+  return false;
+}
+
+async function handleQuotaRefresh(token) {
   const home = codexHome();
-  const observation = await readAccountRateLimits({ bin: process.env.CODEX_BIN?.trim() || "codex" });
-  if (!observation) return;
-  writePrivateStateFile(liveQuotaFile(), `${JSON.stringify({ home, observation })}\n`);
-  fs.rmSync(path.join(resolveDataDir(), "quota.json"), { force: true });
+  const lease = path.join(resolveDataDir(), "quota-live.refreshing");
+  const observation = await readAccountRateLimits({ bin: process.env.CODEX_BIN?.trim() || "codex" }).catch(() => null);
+  const owner = fs.existsSync(lease) ? fs.readFileSync(lease, "utf8") : null;
+  if (owner === (token ?? null)) finishLiveQuotaRefresh(lease, home, observation);
 }
 
 function handleQuota(argv) {
@@ -270,20 +303,23 @@ function handleQuota(argv) {
   const at = Date.now();
   const home = codexHome();
   let file;
+  let live;
+  let refreshing = false;
   try {
-    file = path.join(resolveDataDir(), "quota.json");
+    const dataDir = resolveDataDir();
+    file = path.join(dataDir, "quota.json");
+    live = readLiveQuota(home);
+    refreshing = startLiveQuotaRefresh(dataDir, home, live);
     const cached = JSON.parse(fs.readFileSync(file, "utf8"));
-    if (cached.home === home && Number.isFinite(cached.at) && at >= cached.at && at - cached.at < 60_000 && cached.report?.engine === "codex" && typeof cached.report.available === "boolean" && Array.isArray(cached.report.pools) && cached.report.pools.every(validQuotaPool)) {
-      output(cached.report, true);
+    if (cached.home === home && Number.isFinite(cached.at) && at >= cached.at && at - cached.at < 60_000 && cached.report?.engine === "codex" && cached.report.refreshing !== true && typeof cached.report.available === "boolean" && Array.isArray(cached.report.pools) && cached.report.pools.every(validQuotaPool)) {
+      output(refreshing ? { ...cached.report, refreshing: true } : cached.report, true);
       return;
     }
   } catch {}
   let report = { engine: "codex", available: false, observedAt: new Date(at).toISOString(), pools: [], note: "No rate_limits telemetry found in Codex rollouts." };
   try {
-    const live = readLiveQuota(home);
     const rollout = latestRolloutRateLimits();
     const observation = [live, rollout].filter(Boolean).sort((left, right) => (Date.parse(right.observedAt ?? "") || 0) - (Date.parse(left.observedAt ?? "") || 0))[0] ?? null;
-    if ((!live || !(at - Date.parse(live.observedAt) < LIVE_QUOTA_MAX_AGE_MS)) && fs.existsSync(path.join(home, "auth.json"))) startLiveQuotaRefresh(at);
     if (observation) {
       const observedAt = observation.observedAt;
       const observedMs = Date.parse(observedAt ?? "");
@@ -308,8 +344,9 @@ function handleQuota(argv) {
     report.note = `Could not read Codex quota telemetry: ${error.message}`;
   }
   try {
-    if (file) writePrivateStateFile(file, `${JSON.stringify({ home, at, report })}\n`);
+    if (file && !refreshing) writePrivateStateFile(file, `${JSON.stringify({ home, at, report })}\n`);
   } catch {}
+  if (refreshing) report.refreshing = true;
   output(report, true);
 }
 
@@ -2295,7 +2332,7 @@ async function main() {
       handleQuota(rawArgv);
       break;
     case "quota-refresh":
-      await handleQuotaRefresh();
+      await handleQuotaRefresh(rawArgv[0]);
       break;
     case "result":
       await handleResult(rawArgv);

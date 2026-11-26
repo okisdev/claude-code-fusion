@@ -72,6 +72,8 @@ test("preserves runner failures through && and through pipes with pipefail", () 
     "npm test && git status --short && echo done",
     "set -o pipefail; npm test | tail",
     "set -euo pipefail; npm test 2>&1 | tail -20",
+    "true && set -o pipefail && npm test | tail",
+    "set -o pipefail; set -e; npm test | tail",
     "set -o pipefail; npm test | tail && echo done"
   ]) {
     assert.equal(summaryEvidence(command, ""), "exit-status", command);
@@ -80,6 +82,8 @@ test("preserves runner failures through && and through pipes with pipefail", () 
     assert.equal(summaryEvidence(command, ""), null, command);
   }
   assert.equal(summaryEvidence("true || set -o pipefail; npm test | tail -1", ""), null);
+  assert.equal(summaryEvidence("false && set -o pipefail; npm test | tail -1", ""), null);
+  assert.equal(summaryEvidence("set -o pipefail; set +o 'pipefail' && npm test | tail", ""), null);
   assert.equal(summaryEvidence("set -o pipefail | cat; npm test | tail -1", ""), null);
 });
 
@@ -97,6 +101,20 @@ test("does not credit failed or interrupted tool responses", () => {
   for (const toolResponse of [{ is_error: true }, { isError: true }, { interrupted: true }]) {
     assert.equal(verificationEvidence("npx vitest run 2>&1 | tail -20", { output: "Test Files  3 passed", ...toolResponse }), null);
   }
+});
+
+test("background launch metadata overrides both exit status and a passing output summary", () => {
+  for (const metadata of [
+    { backgroundTaskId: "job-1" }, { isAsync: true }, { status: "async_launched" }, { timedOutAfterMs: 0 },
+    { backgroundedByUser: true }, { backgroundedToDeliverMessage: true }, { backgroundedByTurnAbort: true }
+  ]) {
+    for (const response of [metadata, { toolUseResult: metadata }]) {
+      for (const command of ["npm test", "npm test | tail"]) {
+        assert.equal(summaryEvidence(command, "ℹ fail 0", response), null, JSON.stringify({ command, response }));
+      }
+    }
+  }
+  assert.equal(summaryEvidence("npm test", "", { isAsync: false, toolUseResult: { backgroundedByUser: false } }), "exit-status");
 });
 
 test("keeps final-segment exit-status evidence and rejects mutating commands", () => {

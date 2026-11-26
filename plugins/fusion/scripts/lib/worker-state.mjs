@@ -3,6 +3,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { isDeepStrictEqual } from "node:util";
 
 import { ENGINES, PEER_JOB_FOOTER_AGENTS, isEngineId } from "./engines.mjs";
 import { readJsonFile, withFileLock, writeFileAtomic } from "./storage.mjs";
@@ -382,6 +383,7 @@ export function reopenWorkerContinuation(record, at = new Date().toISOString(), 
     continuationCount: (record.continuationCount ?? 0) + 1,
     lastContinuedAt: at,
     continuationNotificationFloor: notificationFloor,
+    verificationCommand: null,
     transportStatus: "running",
     runtimeAsync: true,
     finishedAt: null,
@@ -710,6 +712,7 @@ export function createWorkerRecord(record, env = process.env) {
       parentTranscriptBytesAtDispatch: Number.isSafeInteger(record.parentTranscriptBytesAtDispatch) ? record.parentTranscriptBytesAtDispatch : null,
       parentContextTokensAtDispatch: Number.isSafeInteger(record.parentContextTokensAtDispatch) ? record.parentContextTokensAtDispatch : null,
       packageType: record.packageType ?? "consult",
+      verificationCommand: record.verificationCommand ?? null,
       briefBytes: Number.isSafeInteger(record.briefBytes) ? record.briefBytes : null,
       briefFile: record.briefFile ?? null,
       fallbackReason: record.fallbackReason ?? null,
@@ -1255,11 +1258,14 @@ export function isSettledWorker(record) {
   return record.acceptanceRecordedAt != null && record.awaitingVerdict !== true;
 }
 
-function updateWorkerAcceptance({ taskId, acceptance, env, source, safeReason, safeFailureKind, validateRecord, acceptFailedTransport = false, queueIfNonTerminal = false, engineAcceptanceDelivery = null }) {
+function updateWorkerAcceptance({ taskId, acceptance, env, source, safeReason, safeFailureKind, validateRecord, expectedRecord, acceptFailedTransport = false, queueIfNonTerminal = false, engineAcceptanceDelivery = null }) {
   let queued = false;
   const updated = updateWorkerRecord(taskId, env, (record) => {
     if (!record) {
       throw new Error(`Fusion worker task ${taskId} was not found.`);
+    }
+    if (expectedRecord && !isDeepStrictEqual(record, expectedRecord)) {
+      throw new Error(`Fusion worker task ${taskId} changed before settlement.`);
     }
     if (!WORKER_TERMINAL_STATUSES.has(record.transportStatus)) {
       if (!queueIfNonTerminal) {
@@ -1295,7 +1301,7 @@ export function validateWorkerAcceptance({ record, taskId, acceptance, source = 
   return { safeReason, safeFailureKind };
 }
 
-export function recordWorkerAcceptance({ taskId, acceptance, env = process.env, source = "main-loop", reason = null, failureKind = null, acceptFailedTransport = false, engineLedgerWritten = false, engineAcceptanceDelivery = null }) {
+export function recordWorkerAcceptance({ taskId, acceptance, env = process.env, source = "main-loop", reason = null, failureKind = null, acceptFailedTransport = false, engineLedgerWritten = false, engineAcceptanceDelivery = null, expectedRecord = null }) {
   const { safeReason, safeFailureKind } = validatedAcceptanceFields(acceptance, source, reason, failureKind);
   const result = updateWorkerAcceptance({
     taskId,
@@ -1304,6 +1310,7 @@ export function recordWorkerAcceptance({ taskId, acceptance, env = process.env, 
     source,
     safeReason,
     safeFailureKind,
+    expectedRecord,
     acceptFailedTransport,
     queueIfNonTerminal: true,
     engineAcceptanceDelivery,

@@ -105,7 +105,7 @@ function infraMessage(engine, kind, elapsed = 5, remaining = 25) {
 }
 
 function fallbackBrief(reason = null) {
-  return `fusion-brief: v1\ncontext-mode: isolated\ngoal: implement a bounded fix\nscope: src/a.mjs\nverification: node --test\n${reason === null ? "" : `claude-fallback: ${reason}\n`}`;
+  return `fusion-brief: v1\ngoal: implement a bounded fix\nscope: src/a.mjs\nverification: node --test\n${reason === null ? "" : `claude-fallback: ${reason}\n`}`;
 }
 
 function healthJob(box, engine, id, fields = {}) {
@@ -151,6 +151,47 @@ test("peer dispatch records preserve the original mode, model, and pool", (t) =>
     assert.equal(bare.requestedModel, null);
     assert.equal(bare.billingPool, pool);
   }
+});
+
+test("staged peer dispatch persists the verification field from the original header", async (t) => {
+  const box = sandbox(t);
+  const prompt = "--model gpt-6.2-astra --effort xhigh --write -- Lane: codex flagship | write | Verification: node --test Case.test.mjs | effort: xhigh\r\n\r\nverification: npm test";
+  const output = await launch(box, { prompt });
+  assertStaged(box, output, prompt);
+  await handleLifecycleHook({
+    hook_event_name: "PostToolUse", tool_name: "Agent", session_id: "session-1", tool_use_id: "tool-1", cwd: box.root,
+    tool_input: output.updatedInput, tool_response: { isAsync: true, agentId: "staged-worker" }
+  }, box.env);
+  assert.equal(readWorkerRecords(box.env)[0].verificationCommand, "node --test Case.test.mjs");
+});
+
+test("peer dispatch reads verification only from the header or envelope", (t) => {
+  const box = sandbox(t);
+  for (const [prompt, expected] of [
+    ["--write -- inspect the changes\r\n  Verification: node --test Case.test.mjs  \r\n\r\nverification: npm test", "node --test Case.test.mjs"],
+    ["lane: codex flagship | write\r\n \t\r\nverification: node --test", null],
+    ["lane: codex flagship | verification: inspect the report\n\nverification: npm test", null],
+    ["grok-role: burst | write | verification: npm test | tail -5", "npm test | tail -5"]
+  ]) {
+    const record = createDispatch({ session_id: "session-1", cwd: box.root, tool_input: { prompt } }, "grok:grok-rescue", false, box.env);
+    assert.equal(record.verificationCommand, expected, prompt);
+  }
+});
+
+test("peer dispatch retains the original verified command if the brief file update fails", (t) => {
+  const box = sandbox(t);
+  const rename = fs.renameSync;
+  let recordWrites = 0;
+  t.mock.method(fs, "renameSync", (from, to) => {
+    if (/\/jobs\/fusion-[\da-f]+\.json$/.test(to) && ++recordWrites === 2) throw new Error("worker record update failed");
+    return rename(from, to);
+  });
+  const prompt = "--write -- lane: codex flagship | verification: npm test";
+  const record = createDispatch({ session_id: "session-1", cwd: box.root, tool_input: { prompt } }, "codex:codex-rescue", false, box.env);
+  assert.equal(recordWrites, 2);
+  assert.equal(record.verificationCommand, "npm test");
+  assert.equal(record.briefFile, null);
+  assert.deepEqual(readWorkerRecords(box.env), [record]);
 });
 
 for (const mode of ["write", "consult"]) {
@@ -232,9 +273,47 @@ test("no-healthy-lane treats a missing or nonexecutable routed CLI as unhealthy"
   assert.equal(validateWorkerBrief(prompt, "fusion:claude-worker", box.env).ok, true);
 });
 
+test("network fallback routes to an available Codex CLI and opens when it is missing", async (t) => {
+  const box = sandbox(t);
+  pacingSetup(box);
+  const prompt = fallbackBrief("network, gh needed");
+  for (const subagent_type of ["fusion:claude-worker", "fusion:trivial-worker"]) {
+    const denied = await launch(box, { subagent_type, prompt });
+    assert.equal(denied.permissionDecision, "deny");
+    assert.match(denied.permissionDecisionReason, /codex:codex-rescue.*--write --network/);
+    assert.match(denied.permissionDecisionReason, /comments or approvals in the main session/i);
+  }
+  assert.deepEqual(readWorkerRecords(box.env), []);
+  fs.unlinkSync(box.env.CODEX_BIN);
+  const allowed = await launch(box, { subagent_type: "fusion:claude-worker", prompt });
+  assert.equal(allowed.permissionDecision, "allow");
+  assert.equal(readWorkerRecords(box.env)[0].fallbackReason, "network");
+});
+
+test("network fallback checks Codex write health even for review packages", (t) => {
+  const box = sandbox(t);
+  pacingSetup(box);
+  const prompt = `${fallbackBrief("network")}package-type: review\n`;
+  for (const index of [1, 2]) healthJob(box, "codex", `consult-${index}`, { mode: "consult", failureKind: "timeout" });
+  healthJob(box, "codex", "quota", { failureKind: "quota", billingPool: "unrelated" });
+  assert.equal(validateWorkerBrief(prompt, "fusion:claude-worker", box.env).ok, false);
+  for (const index of [1, 2]) healthJob(box, "codex", `write-${index}`, { mode: "write", failureKind: "timeout" });
+  assert.equal(validateWorkerBrief(prompt, "fusion:claude-worker", box.env).ok, true);
+});
+
+test("network fallback opens only for current near exhaustion on the Codex pool", (t) => {
+  for (const [pool, usedPercent, resetOffset, allowed] of [
+    ["codex", 89, 60_000, false], ["codex", 90, 60_000, true], ["codex", 99, -60_000, false], ["other", 99, 60_000, false]
+  ]) {
+    const box = sandbox(t);
+    pacingSetup(box, { pools: [{ pool, usedPercent, pacing: 2, resetsAt: new Date(Date.now() + resetOffset).toISOString() }] });
+    assert.equal(validateWorkerBrief(fallbackBrief("network"), "fusion:claude-worker", box.env).ok, allowed, `${pool} ${usedPercent}%`);
+  }
+});
+
 test("envelope fields accept case, whitespace, colon spacing, and one trailing period", async (t) => {
   const box = sandbox(t);
-  const prompt = "\n  FuSiOn-BrIeF : V1.  \n  CoNtExT-MoDe : IsOlAtEd. \n GoAl : inspect one file. \n ScOpE : src/a.mjs. \n AcCePtAnCe : bounded result. \n ClAuDe-FaLlBaCk : PrIvAcY. \n PaCkAgE-TyPe : ReViEw. \n SiZiNg : SmAlL. \n\nclaude-fallback: network\npackage-type: implementation\nsizing: invalid\n";
+  const prompt = "\n  FuSiOn-BrIeF : V1.  \n GoAl : inspect one file. \n ScOpE : src/a.mjs. \n AcCePtAnCe : bounded result. \n ClAuDe-FaLlBaCk : PrIvAcY requires local access. \n PaCkAgE-TyPe : ReViEw. \n SiZiNg : SmAlL. \n\nclaude-fallback: network\npackage-type: implementation\nsizing: invalid\n";
   const validation = validateWorkerBrief(prompt, "fusion:claude-worker", box.env);
   assert.equal(validation.ok, true);
   assert.equal(validation.fallbackReason, "privacy");
@@ -251,7 +330,7 @@ test("body fields cannot supply or duplicate fallback and required envelope fiel
   const box = sandbox(t);
   const missingFallback = `${fallbackBrief()}\nclaude-fallback: privacy\n`;
   assert.equal(validateWorkerBrief(missingFallback, "fusion:claude-worker", box.env).ok, false);
-  for (const field of ["context-mode: isolated", "goal: implement a bounded fix", "scope: src/a.mjs", "verification: node --test"]) {
+  for (const field of ["fusion-brief: v1", "goal: implement a bounded fix", "scope: src/a.mjs", "verification: node --test"]) {
     const prompt = `${fallbackBrief("privacy").replace(`${field}\n`, "")}\n${field}\n`;
     assert.equal(validateWorkerBrief(prompt, "fusion:claude-worker", box.env).ok, false, field);
   }
@@ -466,7 +545,7 @@ test("Pacing advisory respects breadth write health and the burst billing pool",
 for (const agent of ["fusion:claude-worker", "fusion:trivial-worker", "claude-worker", "trivial-worker"]) {
   test(`${agent} denies missing, unknown, and duplicate fallback reasons`, async (t) => {
     const box = sandbox(t);
-    for (const reason of [null, "generic", "privacy\nclaude-fallback: network", "privacy extra"]) {
+    for (const reason of [null, "generic", "privacy\nclaude-fallback: network", "generic, privacy needed", "privacy-policy"]) {
       const output = await launch(box, { subagent_type: agent, prompt: fallbackBrief(reason) });
       assert.equal(output.permissionDecision, "deny");
       assert.match(output.permissionDecisionReason, /network, toolchain, long-build, claude-surface, privacy, no-healthy-lane/);
@@ -753,6 +832,9 @@ test("host blockers deny the first dispatch only for the leading brief mode", as
   const denied = await launch(box, { subagent_type: "grok-rescue", prompt: "--cwd '/tmp/My Project' --write -- bounded package" });
   assert.equal(denied.permissionDecision, "deny");
   assert.match(denied.permissionDecisionReason, /Grok write runs are blocked on this host: sandbox: Socket blocks writes/);
+  assert.doesNotMatch(denied.permissionDecisionReason, /Substitute:/);
+  const burst = await launch(box, { subagent_type: "grok:grok-rescue", prompt: "--write -- grok-role: burst | write | verification: node --test\nbounded package" });
+  assert.match(burst.permissionDecisionReason, /Substitute: burst → Codex quick tier or the breadth engine's burst pool\./);
   assert.deepEqual(readPeerCapacityReservations(box.env), []);
   assert.equal(await launch(box, { subagent_type: "grok:grok-rescue", prompt: "-- consult mentioning --write in prose" }), null);
   writeTranscript(box, [userMessage("use Grok")]);

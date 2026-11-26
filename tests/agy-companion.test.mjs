@@ -206,6 +206,45 @@ test("refused permission requests render a warning with the successful outcome",
   assert.match(result.stdout, /warning: permission_refused: 1 request\(s\) refused \(run_command: touch outside\), which ends the Antigravity turn early\nstate: done\n$/);
 });
 
+test("a recovered refusal renders a continuation warning and records usage from both turns", (t) => {
+  const h = harness(t, "permission_continue");
+  const result = task(h);
+  assertDone(result);
+  assert.match(result.stdout, /^fake result\n/);
+  assert.match(result.stdout, /warning: refused_command_continued\nstate: done\n$/);
+  const [record] = h.jobs();
+  assert.deepEqual(record.warnings, ["refused_command_continued"]);
+  assert.equal(record.permissionsRejected, 1);
+  assert.equal(record.usageIsIncomplete, false);
+  assert.equal(record.usage.totalTokens, 211073);
+  assert.equal(record.usage.inputTokens, 164975);
+});
+
+test("a recovered refusal with usage missing for one turn keeps the reported counts as incomplete", (t) => {
+  const h = harness(t, "permission_continue_no_usage");
+  const result = task(h, ["--json"]);
+  assert.equal(result.status, 0, result.stdout + result.stderr);
+  const payload = JSON.parse(result.stdout);
+  const [record] = h.jobs();
+  assert.deepEqual(payload.warnings, ["refused_command_continued"]);
+  assert.deepEqual(payload.usage, record.usage);
+  assert.equal(payload.usage.totalTokens, 11914);
+  assert.equal(payload.usageIsIncomplete, true);
+  assert.equal(record.usageIsIncomplete, true);
+});
+
+test("a timed out refusal continuation finishes without a third prompt", (t) => {
+  const h = harness(t, "permission_continue_timeout", { AGY_COMPANION_TIMEOUT_MS: "1500" });
+  const result = task(h, ["--json"]);
+  assert.equal(result.status, 1, result.stdout + result.stderr);
+  const [record] = h.jobs();
+  assert.equal(record.failureKind, "timeout");
+  assert.equal(record.salvage, undefined);
+  assert.equal(record.usage.totalTokens, 11914);
+  assert.equal(record.usageIsIncomplete, true);
+  assert.equal(h.messages().filter(({ method }) => method === "session/prompt").length, 2);
+});
+
 test("refused permission requests without a result persist and render a permission failure", (t) => {
   for (const [scenario, args] of [["permission_empty", []], ["permission_whitespace", ["--json"]]]) {
     const h = harness(t, scenario);

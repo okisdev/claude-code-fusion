@@ -10,6 +10,7 @@ import { assertEnvironmentPins, assertManifestPins, cliVersion, collectPluginVer
 import { buildManifest } from "../manifest.mjs";
 import { newestEngineCompanion } from "../../plugins/fusion/scripts/lib/engine-acceptance.mjs";
 import { readEngineJobRecord, resolveEngineStateRoots } from "../../plugins/fusion/scripts/lib/engine-job-state.mjs";
+import { ENGINES as ENGINE_REGISTRY } from "../../plugins/fusion/scripts/lib/engines.mjs";
 
 const DEFAULT_TASK_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "tasks");
 const CURSOR_PLUGIN_FILE = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..", "plugins", "cursor", ".claude-plugin", "plugin.json");
@@ -120,19 +121,34 @@ function prepareWorkspace(fixturesDir) {
   }
 }
 
-async function runCompanion(companion, args, workspace, timeoutMs) {
+function companionEnvironment(tempRoot) {
+  const root = path.join(tempRoot, "companion-state");
+  fs.mkdirSync(root, { recursive: true, mode: 0o700 });
+  const env = Object.fromEntries(Object.entries(process.env).filter(([key]) =>
+    !/^(?:CLAUDECODE$|CLAUDE_ENV_FILE$|CLAUDE_(?:CODE_|PLUGIN_|SESSION(?:_|$)))/.test(key)
+  ));
+  for (const { id, dataEnv, stateEnvs } of Object.values(ENGINE_REGISTRY)) {
+    env[dataEnv] = path.join(root, id);
+    for (const stateEnv of stateEnvs) {
+      env[stateEnv] = path.join(env[dataEnv], "state");
+    }
+  }
+  return env;
+}
+
+async function runCompanion(companion, args, workspace, env, timeoutMs) {
   try {
-    const result = await runBounded(process.execPath, [companion, ...args], { cwd: workspace, env: process.env, timeoutMs, label: "Companion" });
+    const result = await runBounded(process.execPath, [companion, ...args], { cwd: workspace, env, timeoutMs, label: "Companion" });
     return { stdout: result.stdout, stderr: result.stderr, seconds: result.seconds, exit: result.timedOut ? null : result.signal ? null : result.exitCode, failure: result.timedOut ? { type: "timeout", message: `Companion timed out after ${timeoutMs} ms` } : null };
   } catch (error) {
     return { stdout: "", exit: null, seconds: 0, failure: { type: "start", message: error.message } };
   }
 }
 
-async function waitForJob(engine, jobId) {
+async function waitForJob(engine, jobId, env) {
   const deadline = Date.now() + 5000;
   do {
-    const job = readEngineJobRecord(engine, jobId, process.env);
+    const job = readEngineJobRecord(engine, jobId, env);
     if (job) return job;
     if (Date.now() >= deadline) return null;
     await new Promise((resolve) => setTimeout(resolve, Math.min(50, deadline - Date.now())));
@@ -149,8 +165,8 @@ function jobIdFromStdout(stdout, engine) {
   }
 }
 
-function failedJobIdFromState(engine, workspace) {
-  for (const root of resolveEngineStateRoots(engine, process.env)) {
+function failedJobIdFromState(engine, workspace, env) {
+  for (const root of resolveEngineStateRoots(engine, env)) {
     let workspaces;
     try {
       workspaces = fs.readdirSync(root, { withFileTypes: true });
@@ -225,10 +241,11 @@ async function attempt(options) {
     fs.mkdirSync(options.resultsDir, { recursive: true });
     writeEnvOnce(options.resultsDir, taskManifestHash);
     const companionPath = newestEngineCompanion(options.engine, process.env);
+    const companionEnv = companionEnvironment(tempRoot);
     const args = ["task", ...(options.mode === "write" ? ["--write"] : []), "--json", ...(options.model ? ["--model", options.model] : []), ...(options.effort ? ["--effort", options.effort] : []), "--cwd", workspace, "--", briefText];
-    const outcome = companionPath ? await runCompanion(companionPath, args, workspace, options.timeoutMs) : { stdout: "", exit: null, seconds: 0, failure: { type: "start", message: `No ${options.engine} companion found` } };
-    const jobId = outcome.failure ? null : jobIdFromStdout(outcome.stdout, options.engine) ?? (outcome.exit !== 0 ? failedJobIdFromState(options.engine, workspace) : null);
-    const job = jobId ? await waitForJob(options.engine, jobId) : null;
+    const outcome = companionPath ? await runCompanion(companionPath, args, workspace, companionEnv, options.timeoutMs) : { stdout: "", exit: null, seconds: 0, failure: { type: "start", message: `No ${options.engine} companion found` } };
+    const jobId = outcome.failure ? null : jobIdFromStdout(outcome.stdout, options.engine) ?? (outcome.exit !== 0 ? failedJobIdFromState(options.engine, workspace, companionEnv) : null);
+    const job = jobId ? await waitForJob(options.engine, jobId, companionEnv) : null;
     let infrastructureFailure = outcome.failure ?? (!jobId ? { type: "job_id", message: "Companion printed no parseable job id" } : !job ? { type: "job_record", message: `Job record ${jobId} could not be read` } : null);
     let verifyExit = null;
     let verdict = infrastructureFailure ? "infra_failure" : options.mode === "consult" ? "unscored" : "fail";
