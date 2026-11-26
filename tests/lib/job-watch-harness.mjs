@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { spawn, spawnSync } from "node:child_process";
+import { fork, spawnSync } from "node:child_process";
 import { once } from "node:events";
 import fs from "node:fs";
 import os from "node:os";
@@ -38,6 +38,46 @@ export function verifyJobWatch(engine) {
     const env = { PATH: `${bin}${path.delimiter}${process.env.PATH}`, HOME: root, [`${engine.toUpperCase()}_COMPANION_DATA`]: data };
     const run = (args) => spawnSync(process.execPath, [companion, ...args], { env, cwd: root, encoding: "utf8", timeout: 5000 });
     return { root, id, record, file, env, run };
+  }
+
+  async function startWatch(t, box, entrypoint = companion) {
+    const pollMs = 25;
+    const preload = path.join(box.root, "watch-poll.cjs");
+    fs.writeFileSync(preload, `
+const setTimeout = global.setTimeout;
+global.setTimeout = (callback, delay, ...args) => {
+  const timer = setTimeout(callback, delay, ...args);
+  if (delay === ${pollMs}) {
+    global.setTimeout = setTimeout;
+    process.send("watch-poll");
+  }
+  return timer;
+};
+`);
+    box.env[`${engine.toUpperCase()}_COMPANION_WATCH_POLL_MS`] = String(pollMs);
+    const child = fork(entrypoint, ["watch", "--job", box.id], {
+      env: box.env, cwd: box.root, execArgv: ["--require", preload], silent: true
+    });
+    t.after(() => { if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL"); });
+    const output = { stdout: "", stderr: "" };
+    child.stdout.on("data", (chunk) => { output.stdout += chunk; });
+    child.stderr.on("data", (chunk) => { output.stderr += chunk; });
+    const closed = once(child, "close");
+    const ready = await Promise.race([
+      once(child, "message").then(([message]) => message),
+      closed.then(() => null),
+    ]);
+    assert.equal(ready, "watch-poll", output.stderr);
+    assert.equal(output.stdout, "");
+    assert.equal(output.stderr, "");
+    assert.equal(child.exitCode, null);
+    return { closed, output };
+  }
+
+  function replaceRecord(box, patch) {
+    const pending = `${box.file}.tmp`;
+    fs.writeFileSync(pending, JSON.stringify({ ...box.record, ...patch }));
+    fs.renameSync(pending, box.file);
   }
 
   for (const status of ["done", "error", "cancelled"]) {
@@ -112,23 +152,12 @@ export function verifyJobWatch(engine) {
 
   test(`${engine} watch reconciles liveness again after an initially live poll`, { timeout: 5000 }, async (t) => {
     const box = await fixture(t, "running");
-    box.env[`${engine.toUpperCase()}_COMPANION_WATCH_POLL_MS`] = "25";
-    const child = spawn(process.execPath, [companion, "watch", "--job", box.id], { env: box.env, cwd: box.root, stdio: ["ignore", "pipe", "pipe"] });
-    t.after(() => { if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL"); });
-    let stdout = "";
-    let stderr = "";
-    child.stdout.on("data", (chunk) => { stdout += chunk; });
-    child.stderr.on("data", (chunk) => { stderr += chunk; });
-    const closed = once(child, "close");
-    await new Promise((resolve) => setTimeout(resolve, 250));
-    assert.equal(stdout, "");
-    assert.equal(stderr, "");
-    assert.equal(child.exitCode, null);
-    fs.writeFileSync(box.file, JSON.stringify({ ...box.record, createdAt: new Date(Date.now() - 60_000).toISOString() }));
+    const { closed, output } = await startWatch(t, box);
+    replaceRecord(box, { createdAt: new Date(Date.now() - 60_000).toISOString() });
     const [code, signal] = await closed;
-    assert.equal(code, 0, stderr);
+    assert.equal(code, 0, output.stderr);
     assert.equal(signal, null);
-    assert.match(stdout, new RegExp(`^${engine} job ${box.id} orphaned \\(died\\).* /${engine}:result ${box.id}`));
+    assert.match(output.stdout, new RegExp(`^${engine} job ${box.id} orphaned \\(died\\).* /${engine}:result ${box.id}`));
     assert.equal(JSON.parse(fs.readFileSync(box.file, "utf8")).status, "error");
   });
 
@@ -164,23 +193,13 @@ export function verifyJobWatch(engine) {
     const installation = path.join(box.root, "old-plugin");
     fs.cpSync(pluginRoot, installation, { recursive: true });
     const installedCompanion = path.join(installation, "scripts", `${engine}-companion.mjs`);
-    const child = spawn(process.execPath, [installedCompanion, "watch", "--job", box.id], { env: box.env, cwd: box.root, stdio: ["ignore", "pipe", "pipe"] });
-    t.after(() => { if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL"); });
-    let stdout = "";
-    let stderr = "";
-    child.stdout.on("data", (chunk) => { stdout += chunk; });
-    child.stderr.on("data", (chunk) => { stderr += chunk; });
-    const closed = once(child, "close");
-    await new Promise((resolve) => setTimeout(resolve, 700));
-    assert.equal(stdout, "");
-    assert.equal(stderr, "");
-    assert.equal(child.exitCode, null);
+    const { closed, output } = await startWatch(t, box, installedCompanion);
     fs.rmSync(installation, { recursive: true });
-    fs.writeFileSync(box.file, JSON.stringify({ ...box.record, status: "done", finishedAt: new Date().toISOString() }));
+    replaceRecord(box, { status: "done", finishedAt: new Date().toISOString() });
     const [code, signal] = await closed;
-    assert.equal(code, 0, stderr);
+    assert.equal(code, 0, output.stderr);
     assert.equal(signal, null);
-    assert.equal(stdout, `${engine} job ${box.id} done. collect with /${engine}:result ${box.id}; completion notices do not replace collection.\n`);
+    assert.equal(output.stdout, `${engine} job ${box.id} done. collect with /${engine}:result ${box.id}; completion notices do not replace collection.\n`);
   });
 
   test(`${engine} manual receipts name the absolute watch command and managed receipts do not`, async () => {

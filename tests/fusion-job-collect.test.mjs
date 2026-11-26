@@ -18,6 +18,7 @@ function isolatedEnv(root, extra = {}) {
   const runtimeRoot = path.join(root, "runtime");
   return {
     ...inherited,
+    TMPDIR: root,
     HOME: path.join(runtimeRoot, "home"),
     CLAUDE_CODE_SESSION_ID: "fusion-job-collect-test-session",
     FUSION_DATA_DIR: path.join(runtimeRoot, "fusion-data"),

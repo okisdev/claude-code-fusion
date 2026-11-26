@@ -1,6 +1,7 @@
-import { spawnSync } from "node:child_process";
+import { spawnGrokVersion } from "../grok-home.mjs";
 import fs from "node:fs";
 import path from "node:path";
+import { buildGrokChildEnv } from "../grok-exec.mjs";
 import { readQuotaCooldown, resolveDataDir, writeQuotaCooldown } from "../state.mjs";
 import { TESTED_VERSION_MIN, TESTED_VERSION_MAX, GROK_VERSION_PROBE_TIMEOUT_MS, DEFAULT_QUOTA_COOLDOWN_MS } from "./config.mjs";
 import { output, errorWithFailure, oneLineSummary } from "./base.mjs";
@@ -33,9 +34,9 @@ function probeGrokVersion(bin, env = process.env) {
   if (grokVersionCache.has(bin)) {
     return grokVersionCache.get(bin);
   }
-  const result = spawnSync(bin, ["--version"], {
+  const result = spawnGrokVersion(bin, {
     encoding: "utf8",
-    env,
+    env: buildGrokChildEnv(env),
     timeout: GROK_VERSION_PROBE_TIMEOUT_MS,
     windowsHide: true
   });

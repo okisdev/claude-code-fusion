@@ -1,10 +1,12 @@
 import { fileURLToPath } from "node:url";
 import { engineResultCommand, isEngineId } from "../engines.mjs";
+import { recordStoppedTurns } from "../guard/turn.mjs";
 import { tagMessage } from "../user-messages.mjs";
 import { canonicalWorkerAgentType, isPendingSettlement, isSettledWorker, WORKER_TERMINAL_STATUSES, readWorkerRecord, readSessionWorkerRecords, updateWorkerSessionState } from "../worker-state.mjs";
 import { workerBudgetFailure } from "./budget.mjs";
 import { isAutoSettledWrapperApiDeath, regularFileExists, runtimeTaskIsTerminal, settleQueuedVerdict, settleReapedIfActive, settleWrapperApiDeath, statusEvidence, terminalCollectedRecord, terminalCollectionPending, terminalTransportObserved, wrapperApiDeathEvidence, writeFinalTextArtifact } from "./collection.mjs";
 import { finalAssistantTextFromTranscript, reconcileTaskNotifications } from "./notifications.mjs";
+import { claimPendingWaveReview } from "./wave-review.mjs";
 import { blockStop, hookOutput, writeOutput } from "./output.mjs";
 import { activeSessionRecords, sessionRecords, updateLifecycleWorkerRecord } from "./records.mjs";
 import { SETTLE_DEMAND_STALE_MS_ENV, DEFAULT_SETTLE_DEMAND_STALE_MS, FAILED_TASK_NOTIFICATION_STATUSES } from "./constants.mjs";
@@ -313,6 +315,17 @@ function writeWrapperApiDeathRedispatchAdvisory(sessionId, env) {
 }
 
 function handleStop(input, env) {
+  stopSession(input, env);
+  const review = claimPendingWaveReview(input, env);
+  if (review) writeOutput(hookOutput(input.hook_event_name, review));
+}
+
+function stopSession(input, env) {
+  try {
+    recordStoppedTurns(input, env);
+  } catch {
+    void 0;
+  }
   const hasBackgroundTasks = Array.isArray(input.background_tasks);
   const tasks = hasBackgroundTasks ? input.background_tasks : [];
   reconcileTaskNotifications(input, env);

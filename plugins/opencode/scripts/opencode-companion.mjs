@@ -11,7 +11,7 @@ import { createCleanupWaiter, createCompanionCommands, createModelsCommand, erro
 
 export { cleanupRawCommandTransportsForSession };
 
-const TESTED_CODEX_INTERVAL = { floor: "0.154.0", ceiling: "0.171.0" };
+const TESTED_CODEX_INTERVAL = { floor: "0.154.0", ceiling: "0.173.0" };
 const DEFAULT_MODELS = { bulk: "deepseek-v4.1-flash", "blind-check": "glm-5.3-flash" };
 const render = { ...createCompanionRender({ engine: "opencode", engineName: "OpenCode", resolvedEffortField: "resolvedEffort" }), extractFirstJsonObject, validateReviewOutput, renderReviewResult };
 const state = { ...sharedState, finishSuccessfulJobRecordFile(file, patch) {
@@ -25,9 +25,10 @@ function probeCodex(dataDir) {
   const bin = candidate.includes(path.sep) ? path.resolve(candidate) : candidate;
   const probe = getCodexAvailability({ bin, env: { ...process.env, CODEX_HOME: path.join(dataDir, "codex-home") } });
   if (!probe.available) throw errorWithFailure("Codex CLI is unavailable or returned an unsupported version. Install Codex or set OPENCODE_CODEX_BIN.", probe.exitCode === 0 ? "setup" : "missing_cli");
-  const version = probe.version.split(/[.-]/).slice(0, 3).map(Number);
-  if (version[0] === 0 && version[1] < 154) throw errorWithFailure(`Codex CLI ${probe.version} is below tested floor ${TESTED_CODEX_INTERVAL.floor}.`, "setup");
-  return { ...probe, newerThanTested: version[0] > 0 || version[1] >= 171 };
+  const version = probe.version.split("-")[0];
+  const { floor, ceiling } = TESTED_CODEX_INTERVAL;
+  if (version.localeCompare(floor, "en", { numeric: true }) < 0) throw errorWithFailure(`Codex CLI ${probe.version} is below tested floor ${floor}.`, "setup");
+  return { ...probe, newerThanTested: version.localeCompare(ceiling, "en", { numeric: true }) >= 0 };
 }
 
 function prepareJob(options, dataDir) {

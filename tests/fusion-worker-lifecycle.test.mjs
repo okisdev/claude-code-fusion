@@ -18,6 +18,7 @@ import { handleLifecycleHook } from "../plugins/fusion/scripts/worker-lifecycle.
 const repoRoot = path.join(import.meta.dirname, "..");
 const script = path.join(repoRoot, "plugins", "fusion", "scripts", "worker-lifecycle.mjs");
 const statsScript = path.join(repoRoot, "plugins", "fusion", "scripts", "fusion-stats.mjs");
+const WAVE_REVIEW_ADVISORY = /^Wave settled\. Dispatch one cross family read only review/;
 
 function sandbox(t) {
   const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "fusion-worker-test-")));
@@ -40,6 +41,7 @@ function sandbox(t) {
 function envFor(box, extra = {}) {
   return {
     ...process.env,
+    TMPDIR: box.root,
     HOME: box.root,
     FUSION_WORKER_STATE_DIR: box.state,
     FUSION_DATA_DIR: path.join(box.root, "fusion-data"),
@@ -687,6 +689,7 @@ test("parent context advisory fires once at 250k and once at 800k across peer di
   const box = sandbox(t);
   const usage = (tokens) => fs.appendFileSync(box.transcript, `${JSON.stringify({ type: "assistant", message: { usage: { input_tokens: 1000, cache_read_input_tokens: tokens - 1500, cache_creation_input_tokens: 500 } } })}\n`);
   usage(250000);
+  fs.appendFileSync(box.transcript, JSON.stringify({ type: "api-request-blob", data: "x".repeat(600_000) }) + "\n");
   const atThreshold = run(box, dispatch(box));
   assert.match(JSON.parse(atThreshold.stdout).systemMessage, /main loop context is 250k tokens/);
   assert.strictEqual(JSON.parse(atThreshold.stdout).hookSpecificOutput.additionalContext, undefined);
@@ -1006,7 +1009,7 @@ test("Cursor dispatches fill role defaults and preserve explicit model choices",
     if (staged) {
       const token = updated.match(/^fusion-staged-token: ([a-f0-9]{48})\nmode: read-only$/)?.[1];
       assert.ok(token);
-      const file = path.join(os.tmpdir(), `cursor-companion-input-${token}`, "request");
+      const file = path.join(box.root, `cursor-companion-input-${token}`, "request");
       assert.strictEqual(fs.readFileSync(file, "utf8"), expected);
       const discarded = spawnSync(process.execPath, [path.join(repoRoot, "plugins/cursor/scripts/cursor-companion.mjs"), "transport-discard", "--raw-args-token", token], { encoding: "utf8", env: { ...envFor(box), CLAUDE_CODE_SESSION_ID: "session-1" } });
       assert.strictEqual(discarded.status, 0, discarded.stderr);
@@ -3056,6 +3059,9 @@ test("SubagentStop finalizes the record when the final-text artifact write fails
   });
   assert.strictEqual(stopped.status, 0, stopped.stderr);
   assert.strictEqual(stopped.stdout, "");
+  const parent = { hook_event_name: "Stop", session_id: "session-1", cwd: box.cwd, stop_hook_active: true };
+  assert.match(JSON.parse(run(box, parent).stdout).hookSpecificOutput.additionalContext, WAVE_REVIEW_ADVISORY);
+  assert.doesNotMatch(run(box, parent).stdout, /Wave settled/);
 
   const completed = record(box);
   assert.strictEqual(completed.transportStatus, "done");
@@ -4398,7 +4404,7 @@ test("nested structured Agent responses retain their canonical usage", (t) => {
   assert.strictEqual(completed.toolCalls, 2);
 });
 
-test("SubagentStop blocks one incomplete report and then records a verified transport result as unverified", (t) => {
+test("SubagentStop blocks one incomplete report and then records a verified transport result as unverified", async (t) => {
   const box = sandbox(t);
   run(box, dispatch(box));
   run(box, {
@@ -4435,6 +4441,17 @@ test("SubagentStop blocks one incomplete report and then records a verified tran
     last_assistant_message: "summary\ndelivery: complete\nverification: passed"
   });
   assert.strictEqual(second.stdout, "");
+  const parent = { hook_event_name: "PostToolUse", session_id: "session-1", tool_name: "Read", tool_input: { file_path: box.transcript }, cwd: box.cwd };
+  assert.doesNotMatch(run(box, { ...parent, agent_id: "agent-1", agent_type: "fusion:claude-worker" }).stdout, /Wave settled/);
+  const pending = readWorkerSessionState(parent.session_id, envFor(box)).waveReview;
+  assert.strictEqual(pending.pending, true);
+  assert.strictEqual(pending.suggestedAt, undefined);
+  const claims = await Promise.all([runWithClosedStdin(box, parent), runWithClosedStdin(box, parent)]);
+  for (const claim of claims) assert.strictEqual(claim.status, 0, claim.stderr);
+  const delivered = claims.filter((claim) => claim.stdout);
+  assert.strictEqual(delivered.length, 1);
+  assert.match(JSON.parse(delivered[0].stdout).hookSpecificOutput.additionalContext, WAVE_REVIEW_ADVISORY);
+  assert.strictEqual(run(box, parent).stdout, "");
   assert.strictEqual(record(box).transportStatus, "done");
   assert.strictEqual(record(box).acceptance, "unverified");
   assert.strictEqual(record(box).collectionMethod, "subagent_stop");
@@ -5679,7 +5696,7 @@ test("Stop settles a delivered task notification once", (t) => {
     background_tasks: []
   });
   assert.strictEqual(stopped.status, 0);
-  assert.strictEqual(stopped.stdout, "");
+  assert.match(JSON.parse(stopped.stdout).hookSpecificOutput.additionalContext, WAVE_REVIEW_ADVISORY);
   const collected = record(box);
   assert.strictEqual(collected.transportStatus, "done");
   assert.strictEqual(collected.collectionMethod, "task_notification");
@@ -6318,7 +6335,7 @@ test("a queued verdict settles at the notification-driven terminal transition", 
     stop_hook_active: true,
     background_tasks: []
   });
-  assert.strictEqual(stopped.stdout, "");
+  assert.match(JSON.parse(stopped.stdout).hookSpecificOutput.additionalContext, WAVE_REVIEW_ADVISORY);
   assert.doesNotMatch(stopped.stdout, /still in flight/);
   const settled = record(box);
   assert.strictEqual(settled.transportStatus, "done");
@@ -6470,7 +6487,7 @@ test("a queued rejected done transition records the linked engine verdict with a
     background_tasks: []
   }, { FUSION_CODEX_COMPANION: companion, FUSION_TEST_CODEX_COMPANION_ARGS: argsFile });
 
-  assert.strictEqual(stopped.stdout, "");
+  assert.match(JSON.parse(stopped.stdout).hookSpecificOutput.additionalContext, WAVE_REVIEW_ADVISORY);
   const settled = record(box);
   assert.strictEqual(settled.transportStatus, "done");
   assert.strictEqual(settled.acceptance, "rejected");

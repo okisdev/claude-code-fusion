@@ -43,8 +43,16 @@ export function assertManifestPins(env, records, resultsDir) {
 
 export function assertEnvironmentPins(existing, current, resultsDir) {
   for (const key of ["nodeVersion", "os", "pluginVersions", "engineCliVersions", "peerDefaults", "taskTags"]) {
-    if (JSON.stringify(existing[key]) !== JSON.stringify(current[key])) {
-      throw new Error(`${resultsDir}: conflicting environment pin ${key}: existing=${JSON.stringify(existing[key])} vs current=${JSON.stringify(current[key])}`);
+    const existingValue = existing[key];
+    let currentValue = current[key];
+    if (key === "engineCliVersions" && currentValue) {
+      currentValue = Object.fromEntries(Object.entries(currentValue).map(([engine, version]) => {
+        const storedVersion = existingValue?.[engine];
+        return [engine, version === null || storedVersion === null ? storedVersion : version];
+      }));
+    }
+    if (JSON.stringify(existingValue) !== JSON.stringify(currentValue)) {
+      throw new Error(`${resultsDir}: conflicting environment pin ${key}: existing=${JSON.stringify(existingValue)} vs current=${JSON.stringify(current[key])}`);
     }
   }
 }
@@ -160,18 +168,19 @@ export function cliVersion(bin) {
   if (!commandOnPath(bin)) {
     return null;
   }
-  const result = spawnSync(bin, ["--version"], {
-    cwd: REPO_ROOT,
-    env: process.env,
-    encoding: "utf8",
-    timeout: CLI_VERSION_TIMEOUT_MS,
-    maxBuffer: 8 * 1024 * 1024,
-    detached: true
-  });
-  killSpawnGroup(result.pid);
-  if (result.error || result.status !== 0) {
-    return null;
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    const result = spawnSync(bin, ["--version"], {
+      cwd: REPO_ROOT,
+      env: process.env,
+      encoding: "utf8",
+      timeout: CLI_VERSION_TIMEOUT_MS,
+      maxBuffer: 8 * 1024 * 1024,
+      detached: true
+    });
+    killSpawnGroup(result.pid);
+    if (result.error || result.status !== 0) continue;
+    const text = `${result.stdout ?? ""}${result.stderr ?? ""}`.trim();
+    if (text) return text.split(/\r?\n/)[0].trim();
   }
-  const text = `${result.stdout ?? ""}${result.stderr ?? ""}`.trim();
-  return text ? text.split(/\r?\n/)[0].trim() : null;
+  return null;
 }

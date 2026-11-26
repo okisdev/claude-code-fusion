@@ -1,10 +1,11 @@
 import assert from "node:assert";
-import { spawnSync } from "node:child_process";
+import childProcess, { spawnSync } from "node:child_process";
 import fs from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
 import os from "node:os";
 import path from "node:path";
 import { test } from "node:test";
-import { runBounded } from "../bench/lib.mjs";
+import { assertEnvironmentPins, cliVersion, runBounded } from "../bench/lib.mjs";
 
 const repoRoot = path.join(import.meta.dirname, "..");
 const runner = path.join(repoRoot, "bench", "run.mjs");
@@ -368,6 +369,37 @@ test("runner writes env.json with manifest and cheap version capture", (t) => {
   assert.deepStrictEqual(env.taskTags, {
     [sandbox.taskId]: []
   });
+});
+
+test("CLI version probes retry a timeout once", (t) => {
+  const timeout = { error: { code: "ETIMEDOUT" }, status: null };
+  const success = { status: 0, stdout: "codex test 4.5.6\n" };
+  const responses = [timeout, success, timeout, timeout];
+  const probe = t.mock.method(childProcess, "spawnSync", (bin, args) => {
+    assert.strictEqual(bin, process.execPath);
+    assert.deepStrictEqual(args, ["--version"]);
+    return responses.shift();
+  });
+  syncBuiltinESMExports();
+  try {
+    assert.strictEqual(cliVersion(process.execPath), "codex test 4.5.6");
+    assert.strictEqual(probe.mock.callCount(), 2);
+    assert.strictEqual(cliVersion(process.execPath), null);
+    assert.strictEqual(probe.mock.callCount(), 4);
+  } finally {
+    probe.mock.restore();
+    syncBuiltinESMExports();
+  }
+});
+
+test("environment pins accept an unknown CLI version on either side and reject a changed version", () => {
+  const existing = { engineCliVersions: { codex: "codex test 4.5.6", grok: "grok test 1.2.3" } };
+  const current = { engineCliVersions: { ...existing.engineCliVersions, codex: null } };
+  assert.doesNotThrow(() => assertEnvironmentPins(existing, current, "/results"));
+  assert.doesNotThrow(() => assertEnvironmentPins(current, existing, "/results"));
+  current.engineCliVersions.grok = "grok test 2.0.0";
+  assert.throws(() => assertEnvironmentPins(existing, current, "/results"), /conflicting environment pin engineCliVersions/);
+  assert.throws(() => assertEnvironmentPins(current, existing, "/results"), /conflicting environment pin engineCliVersions/);
 });
 
 test("runner records peerDefaults from seeded home configs", (t) => {

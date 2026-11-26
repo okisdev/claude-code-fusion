@@ -4,7 +4,7 @@ import { ENGINES, ENGINE_IDS, engineDataDir } from "../../lib/engines.mjs";
 import { WORKSPACE_ENGINE_DESCRIPTORS, listWorkspaceEntries } from "./aggregation.mjs";
 import { DAY_MS, PRUNE_EVIDENCE, isPathPositivelyAbsent, resolveFusionDataDir } from "./evidence.mjs";
 
-const RUN_DIRECTORY_ENGINES = ENGINE_IDS.filter((id) => id !== "codex" && id !== "grok");
+const RUN_DIRECTORY_ENGINES = ENGINE_IDS.filter((id) => id !== "codex" && id !== "grok" && id !== "agy");
 
 function isWorkspaceDead(jobs, descriptor) {
   for (const raw of jobs) {

@@ -1,4 +1,5 @@
 import { resolveGrokBin, recordedProcessGroupsClean, runningJobLiveness, terminalRecordAttribution, terminateRecordedProcessGroupsSync } from "../grok-exec.mjs";
+import { getProcessIdentity } from "../process-identity.mjs";
 import { nowIso, readJobRecordFile, readLogTail, updateJobRecordFile, updateJobRecordFileWithCurrent, appendJobLog } from "../state.mjs";
 import { output, errorWithFailure, oneLineSummary, boundedTextTail, failureOutcomeMessage } from "./base.mjs";
 import { jobClassForRecord, memoryEnabledForRecord } from "./session.mjs";
@@ -367,6 +368,32 @@ function appendFailureLog(logFile, message) {
   }
 }
 
+function cancelledJobRecord(current) {
+  const outcome = { status: "cancelled", failureKind: "cancelled" };
+  const message = failureOutcomeMessage({ ...outcome, message: "The Grok job was cancelled.", record: current });
+  return {
+    ...current,
+    ...terminalRecordAttribution(current),
+    ...outcome,
+    finishedAt: nowIso(),
+    resultPayload: retainedResultPayload(current, failureResultPayload(current, { ...outcome, message })),
+    cancelRequestedAt: null
+  };
+}
+
+function registerBackgroundWorker(jobFile) {
+  let worker = null;
+  updateJobRecordFileWithCurrent(jobFile, (current) => {
+    if (current.cleanupRequired || current.grokPid != null || (current.pid != null && current.pid !== process.pid)) {
+      return current;
+    }
+    if (current.cancelRequestedAt != null) return cancelledJobRecord(current);
+    worker = { ...current, pid: process.pid, pidIdentity: getProcessIdentity(process.pid) };
+    return worker;
+  });
+  return worker;
+}
+
 function recordSpawnFailure(jobFile, error, context = {}) {
   const message = describeLaunchFailure(error);
   try {
@@ -408,4 +435,4 @@ function recordSpawnFailure(jobFile, error, context = {}) {
   }
 }
 
-export { deadProcessMessage, cleanupRequiredPatch, finishDiedJobRecord, refreshRunningJobRecord, TOKEN_USAGE_FIELDS, TOKEN_USAGE_METRICS, MODEL_USAGE_FIELDS, optionalBoolean, finiteTokenField, tokenUsageObservation, spendObject, modelUsageObservation, observedChannelIncomplete, resultSpendPatch, outcomeFields, observableRecord, taskSuccessPayload, failureResultPayload, retainedResultPayload, failJob, finishTaskStructuredFailure, describeLaunchFailure, launchFailureError, appendFailureLog, recordSpawnFailure };
+export { deadProcessMessage, cleanupRequiredPatch, finishDiedJobRecord, refreshRunningJobRecord, TOKEN_USAGE_FIELDS, TOKEN_USAGE_METRICS, MODEL_USAGE_FIELDS, optionalBoolean, finiteTokenField, tokenUsageObservation, spendObject, modelUsageObservation, observedChannelIncomplete, resultSpendPatch, outcomeFields, observableRecord, taskSuccessPayload, failureResultPayload, retainedResultPayload, failJob, finishTaskStructuredFailure, describeLaunchFailure, launchFailureError, appendFailureLog, cancelledJobRecord, registerBackgroundWorker, recordSpawnFailure };

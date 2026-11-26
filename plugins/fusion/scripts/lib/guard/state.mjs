@@ -91,6 +91,9 @@ function defaultState(now) {
     readStreakReplayTokens: 0,
     reviewSuggestedAt: null,
     turn: null,
+    lastMeasuredTokens: null,
+    lastStopTurn: null,
+    replayTools: [],
     pendingWrites: [],
     dispatches: {},
     dispatchLog: [],
@@ -125,6 +128,10 @@ function normalizeState(existing, now) {
       id: entry.id, tool: entry.tool, epoch: entry.epoch,
       turn: typeof entry.turn === "string" && /^[A-Za-z0-9_:-]{1,160}$/.test(entry.turn) ? entry.turn : null
     })) : [];
+  const turn = normalizeTurn(existing.turn);
+  const turnTime = turn ? `t:${Date.parse(turn.at)}` : null;
+  let lastStopTurn = Object.hasOwn(existing, "lastStopTurn") ? existing.lastStopTurn : turn?.id ?? turnTime;
+  if (turn?.id && (lastStopTurn === turn.key || lastStopTurn === turnTime)) lastStopTurn = turn.id;
   return {
     writeCount,
     writesSinceDispatch,
@@ -137,7 +144,12 @@ function normalizeState(existing, now) {
     readStreakTurns: Number.isSafeInteger(existing.readStreakTurns) && existing.readStreakTurns >= 0 ? existing.readStreakTurns : 0,
     readStreakReplayTokens: Number.isSafeInteger(existing.readStreakReplayTokens) && existing.readStreakReplayTokens >= 0 ? existing.readStreakReplayTokens : 0,
     reviewSuggestedAt: Number.isFinite(Date.parse(existing.reviewSuggestedAt)) ? new Date(existing.reviewSuggestedAt).toISOString() : null,
-    turn: normalizeTurn(existing.turn),
+    turn,
+    lastMeasuredTokens: Number.isSafeInteger(existing.lastMeasuredTokens) && existing.lastMeasuredTokens > 0 ? existing.lastMeasuredTokens : turn?.measured ? turn.tokens : null,
+    lastStopTurn: typeof lastStopTurn === "string" && /^[A-Za-z0-9_:-]{1,160}$/.test(lastStopTurn) ? lastStopTurn : null,
+    replayTools: Array.isArray(existing.replayTools) ? existing.replayTools.filter((tool) =>
+      (normalizeMessageId(tool?.id) || (tool?.id === null && typeof tool.signature === "string" && /^[a-f0-9]{64}$/.test(tool.signature))) &&
+      typeof tool.key === "string" && /^[A-Za-z0-9_:-]{1,160}$/.test(tool.key) && typeof tool.measured === "boolean") : [],
     pendingWrites,
     dispatches,
     dispatchLog,

@@ -2,9 +2,7 @@ import { createHash } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { ENGINES } from "../engines.mjs";
-import { engineHealth } from "../engine-health.mjs";
-import { readRoutingDefaults } from "../model-table.mjs";
+import { claimSettlementWaveReview } from "../lifecycle/wave-review.mjs";
 import { acceptVerifiedWorker } from "../stats/settlement.mjs";
 import { messageCode, tagMessage } from "../user-messages.mjs";
 import { appendToolResponseText, commandSegments, isVerificationCommand, verificationEvidence, verificationResponseFailed } from "../verification-command.mjs";
@@ -21,7 +19,6 @@ const SETTLE_COMMAND_PATTERN = /(?:^|[\s/'"])fusion-stats\.mjs(?=[\s'"]|$)/;
 const SETTLE_RECORD_PATTERN = /(?:^|\s)--record(?=[=\s]|$)/;
 const ACCEPTED_TASK_ID_PATTERN = /(?:^|[\s'"])(fusion-[0-9a-f]{24})=accepted(?::accept-failed-transport)?(?=[\s'";|&)]|$)/g;
 const SETTLED_ACCEPTANCE_PATTERN = /\bRecorded accepted\b|"acceptance"\s*:\s*"accepted"/;
-const WAVE_REVIEW_SUGGESTION_MS = 30 * 60 * 1000;
 const LITERAL_CD = /^cd\s+(?:--\s+)?(?:'([^']+)'|"([^"\\$`]+)"|((?:\\.|[^\s"'\\;&|$`~*?\[\]{}<>()#!])+))$/;
 
 function verificationSteps(command) {
@@ -86,7 +83,7 @@ function bashVerificationStart(input, file, now) {
   }
 }
 
-function settleVerifiedPackages(env, { sessionId, command, evidence, cwd, startedAt, file, now, writeHookText }) {
+function settleVerifiedPackages(env, { sessionId, command, evidence, cwd, startedAt, now, writeHookText }) {
   if (!Number.isFinite(startedAt) || typeof cwd !== "string" || !path.isAbsolute(cwd)) return;
   const executed = verificationSteps(command);
   if (!executed) return;
@@ -106,7 +103,7 @@ function settleVerifiedPackages(env, { sessionId, command, evidence, cwd, starte
       if (required.directory && directory !== fs.realpathSync(path.resolve(cwd, required.directory))) continue;
       const worker = acceptVerifiedWorker(record, env, deadline);
       if (worker?.acceptance !== "accepted") continue;
-      settled.push(worker.taskId);
+      settled.push(worker);
       if (["pending", "failed"].includes(worker.engineAcceptanceDelivery?.status)) pendingDelivery.push(worker.taskId);
     } catch {
       continue;
@@ -114,51 +111,31 @@ function settleVerifiedPackages(env, { sessionId, command, evidence, cwd, starte
   }
   if (settled.length === 0) return;
   try {
-    suggestSettledWaveReview(env, { sessionId, file, now, writeHookText });
+    suggestSettledWaveReview(env, { sessionId, now, writeHookText }, settled);
   } catch {}
   const script = fileURLToPath(new URL("../../fusion-stats.mjs", import.meta.url));
-  const pairs = settled.map((id) => `${id}=rejected`).join(" ");
+  const settledIds = settled.map((record) => record.taskId);
+  const pairs = settledIds.map((id) => `${id}=rejected`).join(" ");
   const delivery = pendingDelivery.length ? ` Peer acceptance delivery is pending for ${pendingDelivery.join(", ")}.` : "";
-  writeHookText(JSON.stringify(postToolAdvisoryOutput(`Verification passed. Automatically accepted ${settled.join(", ")}.${delivery} To override, run: node "${script}" --record ${pairs} --reason "explain the rejection"`)));
+  writeHookText(JSON.stringify(postToolAdvisoryOutput(`Verification passed. Automatically accepted ${settledIds.join(", ")}.${delivery} To override, run: node "${script}" --record ${pairs} --reason "explain the rejection"`)));
 }
 
-function settledAcceptedImplementationTaskId(command, toolResponse, env) {
+function settledAcceptedImplementationRecords(command, toolResponse, env) {
   if (!SETTLE_COMMAND_PATTERN.test(command) || !SETTLE_RECORD_PATTERN.test(command) || verificationResponseFailed(toolResponse ?? {})) {
-    return null;
+    return [];
   }
   const parts = [];
   appendToolResponseText(toolResponse, parts);
   if (!SETTLED_ACCEPTANCE_PATTERN.test(parts.join("\n"))) {
-    return null;
+    return [];
   }
-  for (const match of command.matchAll(ACCEPTED_TASK_ID_PATTERN)) {
-    if (readWorkerRecord(match[1], env)?.packageType === "implementation") {
-      return match[1];
-    }
-  }
-  return null;
+  return Array.from(command.matchAll(ACCEPTED_TASK_ID_PATTERN), ([, taskId]) => readWorkerRecord(taskId, env))
+    .filter((record) => record?.packageType === "implementation");
 }
 
-function waveReviewSuggestion(env, sessionId, nowMs) {
-  const agyHealthy = engineHealth("agy", "consult", null, { env, now: nowMs, sessionId }).healthy;
-  const engine = agyHealthy ? "agy" : readRoutingDefaults(env, { warn: null }).breadth;
-  const role = agyHealthy ? "independence" : "diversity";
-  return `Wave settled. Dispatch one cross family read only review of this wave's changed files now, in the same message as your next work: ${ENGINES[engine].rescueAgent} with header \`${engine}-role: ${role} | read only | acceptance: findings cite file:line\`, naming the changed files in the brief.`;
-}
-
-function suggestSettledWaveReview(env, { sessionId, file, now, writeHookText }) {
-  const context = waveReviewSuggestion(env, sessionId, Date.parse(now));
-  const claimed = withStateLock(file, () => {
-    const state = normalizeState(readState(file), now);
-    const lastMs = Date.parse(state.reviewSuggestedAt ?? "");
-    if (Number.isFinite(lastMs) && Date.parse(now) - lastMs < WAVE_REVIEW_SUGGESTION_MS) {
-      return false;
-    }
-    state.reviewSuggestedAt = now;
-    writeState(file, state);
-    return true;
-  });
-  if (claimed) {
+function suggestSettledWaveReview(env, { sessionId, now, writeHookText }, settled) {
+  const context = claimSettlementWaveReview(env, sessionId, now, settled);
+  if (context) {
     writeHookText(JSON.stringify(postToolAdvisoryOutput(context)));
   }
 }
@@ -174,8 +151,9 @@ function handleBash(input, env, { sessionId, toolName, file, now, writeHookText 
       if (command === null) {
         return;
       }
-      if (settledAcceptedImplementationTaskId(command, toolResponse, env) !== null) {
-        suggestSettledWaveReview(env, { sessionId, file, now, writeHookText });
+      const settled = settledAcceptedImplementationRecords(command, toolResponse, env);
+      if (settled.length > 0) {
+        suggestSettledWaveReview(env, { sessionId, now, writeHookText }, settled);
       }
       if (!foregroundVerification) return;
       const evidence = verificationEvidence(command, toolResponse, env);
@@ -207,7 +185,7 @@ function handleBash(input, env, { sessionId, toolName, file, now, writeHookText 
         env
       );
       try {
-        settleVerifiedPackages(env, { sessionId, command, evidence, cwd: input.cwd, startedAt, file, now, writeHookText });
+        settleVerifiedPackages(env, { sessionId, command, evidence, cwd: input.cwd, startedAt, now, writeHookText });
       } catch {}
       return;
     }

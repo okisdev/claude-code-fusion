@@ -23,6 +23,26 @@ globalThis.setTimeout = (callback, delay, ...args) => {
   };
 }
 
+export function executionTimeoutGate(root, callbackName, releaseFile, delayFile) {
+  const preload = path.join(root, "execution-timeout-gate.cjs");
+  const callbackPrefix = `() => ${callbackName}(`;
+  fs.writeFileSync(preload, `const fs = require("node:fs");
+const original = globalThis.setTimeout;
+globalThis.setTimeout = (callback, delay, ...args) => {
+  if (!String(callback).startsWith(${JSON.stringify(callbackPrefix)})) {
+    return original(callback, delay, ...args);
+  }
+  ${delayFile ? `fs.writeFileSync(${JSON.stringify(delayFile)}, JSON.stringify({ delay }));` : ""}
+  const timer = original(() => {
+    if (fs.existsSync(${JSON.stringify(releaseFile)})) callback(...args);
+    else timer.refresh();
+  }, 25);
+  return timer;
+};
+`);
+  return `--require=${JSON.stringify(preload)}`;
+}
+
 async function workerExited(jobId) {
   const deadline = Date.now() + 10000;
   while (Date.now() < deadline) {

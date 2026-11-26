@@ -13,6 +13,7 @@ import {
 
 const {
   createJobRecord,
+  grokPaths,
   jobFilePath,
   writeBrief,
 } = await import(stateModulePath);
@@ -35,6 +36,7 @@ function seedJob(sandbox, fields) {
   const record = {
     ...createJobRecord({
       id: fields.id,
+      profileKey: grokPaths(envFor(sandbox)).profileKey,
       pid: null,
       mode: fields.mode ?? "consult",
       cwd,

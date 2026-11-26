@@ -1,8 +1,10 @@
-import { normalizeMessageId, readTranscriptTail, transcriptEntryContent } from "./verification.mjs";
+import { normalizeMessageId, transcriptEntryContent } from "./verification.mjs";
+import { TRANSCRIPT_TAIL_MAX_BYTES } from "./constants.mjs";
+import { CONTEXT_SCAN_BYTES, assistantPages, readTranscript, usageContextTokens } from "./transcript.mjs";
 
 const REPLAY_BUDGET_TOKENS_ENV = "FUSION_INLINE_REPLAY_BUDGET_TOKENS";
 const DEFAULT_REPLAY_BUDGET_TOKENS = 2_000_000;
-const NOMINAL_CONTEXT_TOKENS = 400_000;
+const INITIAL_CONTEXT_TOKENS = 20_000;
 const SAME_TURN_MS = 1500;
 const REPLAY_KINDS = ["dispatch", "write", "verify", "settle", "other", "read"];
 
@@ -12,28 +14,35 @@ function resolveReplayBudgetTokens(env = process.env) {
   return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : DEFAULT_REPLAY_BUDGET_TOKENS;
 }
 
-function usageContextTokens(usage) {
-  const counts = [usage?.input_tokens, usage?.cache_read_input_tokens ?? 0, usage?.cache_creation_input_tokens ?? 0];
-  if (!counts.every((value) => Number.isSafeInteger(value) && value >= 0)) return null;
-  const tokens = counts.reduce((total, value) => total + value, 0);
-  return Number.isSafeInteger(tokens) && tokens > 0 ? tokens : null;
-}
-
-function readTurn(transcriptPath, toolUseId) {
-  let latest = null;
-  for (const entry of readTranscriptTail(transcriptPath).toReversed()) {
-    if (entry?.type !== "assistant" || entry.isSidechain === true || entry.isMeta === true) continue;
-    const contextTokens = usageContextTokens(entry.message?.usage);
-    if (toolUseId && transcriptEntryContent(entry).some((block) => block?.type === "tool_use" && block.id === toolUseId)) {
-      return { id: normalizeMessageId(entry.message?.id), contextTokens: contextTokens ?? latest };
+function readTurn(transcriptPath, toolUseId, lastMeasuredTokens = null) {
+  return readTranscript(transcriptPath, (fd, size) => {
+    let id = null;
+    for (const entries of assistantPages(fd, size)) {
+      let latest = null;
+      for (const { entry } of entries) {
+        const tokens = usageContextTokens(entry.message?.usage) || null;
+        latest ??= tokens;
+        if (toolUseId && transcriptEntryContent(entry).some((block) => block?.type === "tool_use" && block.id === toolUseId)) {
+          id = normalizeMessageId(entry.message?.id);
+          if (tokens !== null) return { id, contextTokens: tokens };
+        }
+      }
+      if (latest !== null) return { id, contextTokens: latest };
     }
-    latest ??= contextTokens;
-  }
-  return { id: null, contextTokens: latest };
+    if (lastMeasuredTokens === null && size > CONTEXT_SCAN_BYTES) {
+      for (const entries of assistantPages(fd, TRANSCRIPT_TAIL_MAX_BYTES)) {
+        for (const { entry } of entries.reverse()) {
+          const tokens = usageContextTokens(entry.message?.usage);
+          if (tokens) return { id, contextTokens: tokens };
+        }
+      }
+    }
+    return { id, contextTokens: lastMeasuredTokens };
+  }) ?? { id: null, contextTokens: lastMeasuredTokens };
 }
 
 function turnReplayTokens(turn) {
-  return turn?.contextTokens ?? NOMINAL_CONTEXT_TOKENS;
+  return turn?.contextTokens ?? INITIAL_CONTEXT_TOKENS;
 }
 
 function isNewTurn(previous, turn, now) {
@@ -58,4 +67,4 @@ function formatTokens(tokens) {
   return tokens >= 1_000_000 ? `${(tokens / 1_000_000).toFixed(1)}M` : `${Math.round(tokens / 1000)}k`;
 }
 
-export { REPLAY_BUDGET_TOKENS_ENV, DEFAULT_REPLAY_BUDGET_TOKENS, NOMINAL_CONTEXT_TOKENS, SAME_TURN_MS, REPLAY_KINDS, resolveReplayBudgetTokens, readTurn, turnReplayTokens, isNewTurn, crossedBudgetMultiple, outranksReplayKind, formatTokens };
+export { REPLAY_BUDGET_TOKENS_ENV, DEFAULT_REPLAY_BUDGET_TOKENS, INITIAL_CONTEXT_TOKENS, SAME_TURN_MS, REPLAY_KINDS, resolveReplayBudgetTokens, readTurn, turnReplayTokens, isNewTurn, crossedBudgetMultiple, outranksReplayKind, formatTokens };

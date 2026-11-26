@@ -1,10 +1,8 @@
-import { spawnSync } from "node:child_process";
 import fs from "node:fs";
-import os from "node:os";
-import path from "node:path";
-import { existingUnixSockets, grokAuthStatus, runtimeSocketEndpoints, runtimeSocketEngine, runtimeSocketRemedy, runtimeSocketSymlinkEndpoints, undeniedRuntimeSocketCandidates, undeniedRuntimeSocketRemedy, resolveGrokBin, resolveGrokCapabilities } from "../grok-exec.mjs";
+import { ensureGrokHome, spawnWithGrokAuth } from "../grok-home.mjs";
+import { buildGrokChildEnv, existingUnixSockets, grokAuthStatus, runtimeSocketEndpoints, runtimeSocketEngine, runtimeSocketRemedy, runtimeSocketSymlinkEndpoints, undeniedRuntimeSocketCandidates, undeniedRuntimeSocketRemedy, resolveGrokBin, resolveGrokCapabilities } from "../grok-exec.mjs";
 import { renderSetupReport } from "../render.mjs";
-import { clearQuotaCooldown, ensurePrivateDataDir, resolveDataDir } from "../state.mjs";
+import { clearQuotaCooldown, grokPaths, ensurePrivateDataDir, resolveDataDir } from "../state.mjs";
 import { TESTED_VERSION_MAX } from "./config.mjs";
 import { probeGrokVersion, parseVersion, compareVersion, testedVersionInterval, supportedVersion, activeQuotaCooldown } from "./version.mjs";
 import { output, readConfig, writeConfig, continuityPolicy, parseContinuityPolicy, commandArgs } from "./base.mjs";
@@ -13,123 +11,16 @@ const DOCTOR_PROBE_TIMEOUT_MS = 3000;
 const SHELL_ENVIRONMENT_POLICY_DETAIL =
   "Grok supports [shell_environment_policy] (introduced in 0.2.112, verified through 1.0.30) to control which environment variables reach shell tools in write runs.";
 
-function doctorCommandAdvisory(bin, available) {
+function doctorCommandAdvisory(bin, available, paths) {
   if (!available) {
     return { available: false, detail: "grok is unavailable" };
   }
-  const probe = spawnSync(bin, ["doctor", "--help"], { encoding: "utf8", timeout: DOCTOR_PROBE_TIMEOUT_MS });
+  const probe = spawnWithGrokAuth(paths, bin, ["doctor", "--help"], { encoding: "utf8", env: buildGrokChildEnv(process.env, { paths }), timeout: DOCTOR_PROBE_TIMEOUT_MS });
   const supported = !probe.error && probe.status === 0;
   return {
     available: supported,
     detail: supported ? "grok doctor is available" : "grok doctor is not available on this Grok CLI"
   };
-}
-
-function resolveGrokConfigPath(env = process.env, cwd = process.cwd()) {
-  const grokHome = typeof env.GROK_HOME === "string" && env.GROK_HOME.trim()
-    ? path.resolve(cwd, env.GROK_HOME.trim())
-    : path.join(
-        typeof env.HOME === "string" && env.HOME.trim() ? path.resolve(cwd, env.HOME.trim()) : os.homedir(),
-        ".grok"
-      );
-  return path.join(grokHome, "config.toml");
-}
-
-function shellEnvironmentPolicyPresent(config) {
-  for (const line of config.split(/\r?\n/)) {
-    const trimmed = line.trim();
-    if (!trimmed || trimmed.startsWith("#")) {
-      continue;
-    }
-    if (trimmed.startsWith("[") && !/^\[\[?[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)*\]\]?\s*(?:#.*)?$/.test(trimmed)) {
-      return null;
-    }
-    if (/^\[shell_environment_policy\]\s*(?:#.*)?$/.test(trimmed)) {
-      return true;
-    }
-  }
-  return false;
-}
-
-function shellEnvironmentPolicyAdvisory(env = process.env, cwd = process.cwd()) {
-  let config;
-  try {
-    config = fs.readFileSync(resolveGrokConfigPath(env, cwd), "utf8");
-  } catch {
-    return {
-      available: false,
-      present: false,
-      detail: `${SHELL_ENVIRONMENT_POLICY_DETAIL} The Grok config file is unavailable.`
-    };
-  }
-  const present = shellEnvironmentPolicyPresent(config);
-  if (present == null) {
-    return {
-      available: false,
-      present: false,
-      detail: `${SHELL_ENVIRONMENT_POLICY_DETAIL} The Grok config file could not be parsed.`
-    };
-  }
-  return {
-    available: true,
-    present,
-    detail: `${SHELL_ENVIRONMENT_POLICY_DETAIL} The [shell_environment_policy] table is ${present ? "present" : "not present"}. Presence does not prove the policy restricts the write-run shell environment.`
-  };
-}
-
-function configuredPlugins(env = process.env, cwd = process.cwd()) {
-  let config;
-  try {
-    config = fs.readFileSync(resolveGrokConfigPath(env, cwd), "utf8");
-  } catch {
-    return { enabled: [], disabled: [] };
-  }
-  const lists = { enabled: [], disabled: [] };
-  let inPlugins = false;
-  let pending = null;
-  let value = "";
-  for (const line of config.split(/\r?\n/)) {
-    const trimmed = line.trim();
-    if (!pending && /^\[/.test(trimmed)) inPlugins = /^\[plugins\]\s*(?:#.*)?$/.test(trimmed);
-    if (!inPlugins) continue;
-    if (!pending) {
-      const match = /^(enabled|disabled)\s*=\s*(\[.*)$/.exec(trimmed);
-      if (!match) continue;
-      pending = match[1];
-      value = match[2];
-    } else value += `\n${trimmed}`;
-    if (!value.includes("]")) continue;
-    try {
-      lists[pending] = [...value.matchAll(/"((?:\\.|[^"\\])*)"|'([^']*)'/g)].map((item) => item[2] ?? JSON.parse(`"${item[1]}"`));
-    } catch {
-      lists[pending] = [];
-    }
-    pending = null;
-    value = "";
-  }
-  return lists;
-}
-
-function managedRunHooks(bin, available, env = process.env, cwd = process.cwd()) {
-  const empty = { plugins: [], hookFiles: [] };
-  if (!available) return empty;
-  const inspect = spawnSync(bin, ["inspect", "--json"], { encoding: "utf8", timeout: DOCTOR_PROBE_TIMEOUT_MS });
-  if (inspect.error || inspect.status !== 0) return empty;
-  let plugins;
-  try {
-    plugins = JSON.parse(inspect.stdout).plugins;
-  } catch {
-    return empty;
-  }
-  if (!Array.isArray(plugins)) return empty;
-  const { enabled, disabled } = configuredPlugins(env, cwd);
-  const selected = plugins.filter((plugin) => plugin?.provides?.hooks === true && enabled.includes(plugin.name) && !disabled.includes(plugin.name)).map((plugin) => plugin.name);
-  const hookDir = path.join(path.dirname(resolveGrokConfigPath(env, cwd)), "hooks");
-  let hookFiles = [];
-  try {
-    hookFiles = fs.readdirSync(hookDir, { withFileTypes: true }).filter((entry) => (entry.isFile() || entry.isSymbolicLink()) && entry.name.endsWith(".json")).map((entry) => entry.name).sort();
-  } catch {}
-  return { plugins: selected, hookFiles };
 }
 
 function hostEnvironmentAdvisory(env = process.env, version = null) {
@@ -174,6 +65,14 @@ function handleSetup(argv, transport = {}) {
   const configuredContinuity =
     options.continuity === undefined ? null : parseContinuityPolicy(options.continuity);
 
+  const paths = grokPaths();
+  let present = false;
+  let homeError;
+  try {
+    present = ensureGrokHome(paths);
+  } catch (error) {
+    homeError = error.message;
+  }
   const bin = resolveGrokBin();
   const probe = probeGrokVersion(bin, process.env);
   const available = probe.available;
@@ -205,7 +104,7 @@ function handleSetup(argv, transport = {}) {
     "--no-wait-for-background"
   ];
   let capabilities = { ready: false, detail: available ? "capability probe did not run" : "grok is unavailable", flags: {} };
-  if (available) {
+  if (available && !homeError) {
     try {
       const supported = resolveGrokCapabilities(bin, process.env);
       const flags = Object.fromEntries(capabilityFlags.map((flag) => [flag, supported.has(flag)]));
@@ -221,11 +120,14 @@ function handleSetup(argv, transport = {}) {
     }
   }
 
-  const doctorCommand = doctorCommandAdvisory(bin, available);
-  const shellEnvironmentPolicy = shellEnvironmentPolicyAdvisory(process.env);
-  const hooks = managedRunHooks(bin, available, process.env);
+  const doctorCommand = doctorCommandAdvisory(bin, available && !homeError, paths);
+  const shellEnvironmentPolicy = {
+    available: !homeError,
+    present,
+    detail: homeError ?? `${SHELL_ENVIRONMENT_POLICY_DETAIL} The [shell_environment_policy] table is ${present ? "present" : "not present"}. Presence does not prove the policy restricts the write-run shell environment.`
+  };
   const hostEnvironment = hostEnvironmentAdvisory(process.env, probe.version);
-  const auth = grokAuthStatus(process.env);
+  const auth = grokAuthStatus(paths.auth);
 
   const dataDir = resolveDataDir();
   if (options["clear-quota-cooldown"]) clearQuotaCooldown(dataDir);
@@ -253,7 +155,7 @@ function handleSetup(argv, transport = {}) {
   if (!available) {
     nextSteps.push("Install the grok CLI and make sure `grok --version` works, or point GROK_BIN at the binary.");
   }
-  if (available && !capabilities.ready) {
+  if (available && !homeError && !capabilities.ready) {
     nextSteps.push("Upgrade the grok CLI to a build that exposes the required headless safety capabilities.");
   }
   if (available && newerThanTested) {
@@ -274,11 +176,9 @@ function handleSetup(argv, transport = {}) {
   if (auth.stale) {
     nextSteps.push("Run `grok models` once outside the sandbox to refresh the stored Grok token.");
   }
-  if (hooks.plugins.length > 0 || hooks.hookFiles.length > 0) {
-    nextSteps.push(`Hooks from ${[...hooks.plugins, ...hooks.hookFiles].join(", ")} run inside managed Grok runs, and Grok has no per run switch for them. Remove a plugin from [plugins].enabled in ~/.grok/config.toml to keep it out.`);
-  }
+  if (homeError) nextSteps.push(homeError);
 
-  const ready = available && capabilities.ready && compatible && hostEnvironment.ready && writable && !quotaCooldown;
+  const ready = available && capabilities.ready && compatible && hostEnvironment.ready && writable && !homeError && !quotaCooldown;
   const report = {
     ready,
     writeReady: ready && hostEnvironment.writeReady,
@@ -288,7 +188,7 @@ function handleSetup(argv, transport = {}) {
     capabilities,
     doctorCommand,
     shellEnvironmentPolicy,
-    managedRunHooks: hooks,
+    privateHome: { path: paths.home, ready: !homeError, userPluginsAndHooksExcluded: !homeError },
     hostEnvironment,
     auth,
     dataDir: { path: dataDir, writable, detail: writeDetail },
@@ -299,4 +199,4 @@ function handleSetup(argv, transport = {}) {
   output(options.json ? report : renderSetupReport(report), options.json);
 }
 
-export { DOCTOR_PROBE_TIMEOUT_MS, SHELL_ENVIRONMENT_POLICY_DETAIL, doctorCommandAdvisory, resolveGrokConfigPath, shellEnvironmentPolicyPresent, shellEnvironmentPolicyAdvisory, hostEnvironmentAdvisory, handleSetup };
+export { handleSetup };

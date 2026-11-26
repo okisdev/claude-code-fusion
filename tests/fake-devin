@@ -142,6 +142,7 @@ async function prompt(id) {
   if (scenario === "stderr_tail") fs.writeSync(2, `${"é".repeat(40000)}tail\n`);
   if (scenario === "network_after_result") fs.writeSync(2, "fetch failed: ECONNRESET\n");
   success();
+  if (scenario === "escape_stdio") process.exit(0);
   if (scenario === "forbidden_after_result") tool("invoke_subagent");
   if (scenario === "unexpected_signal") process.kill(process.pid, "SIGUSR2");
   if (scenario === "no_final_newline") process.exit(0);

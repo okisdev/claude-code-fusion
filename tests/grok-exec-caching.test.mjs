@@ -3,6 +3,7 @@ import fs from "node:fs";
 import path from "node:path";
 import test from "node:test";
 
+import { grokPaths } from "../plugins/grok/scripts/lib/state.mjs";
 import { resolveGrokCapabilities, runGrok } from "../plugins/grok/scripts/lib/grok-exec.mjs";
 import { envFor, fakeGrok, makeSandbox, readInvocations } from "./lib/companion-harness.mjs";
 
@@ -68,11 +69,11 @@ test("R1: stale OIDC refresh consumes the managed run deadline", (t) => {
 
 test("R1: auth retry uses the remaining deadline", async (t) => {
   const sandbox = makeSandbox(t);
-  const file = authFile(sandbox);
+  authFile(sandbox);
   const env = envFor(sandbox, {
     FAKE_GROK_MODE: "auth-once-then-hang",
     FAKE_GROK_MODELS_DELAY_MS: "300",
-    FAKE_GROK_MODELS_TOUCH: file
+    FAKE_GROK_MODELS_TOUCH: "1"
   });
   const started = Date.now();
   let result;
@@ -90,7 +91,7 @@ test("R1: auth retry uses the remaining deadline", async (t) => {
 
 test("R2: sandbox polling advances past unrelated growth and assembles partial lines", async (t) => {
   const sandbox = makeSandbox(t);
-  const eventFile = path.join(sandbox.root, "grok-home", "sessions", "sandbox-events.jsonl");
+  const eventFile = path.join(grokPaths(envFor(sandbox)).home, "sessions", "sandbox-events.jsonl");
   const gate = path.join(sandbox.root, "release-sandbox-event");
   const originalOpen = fs.openSync;
   const originalRead = fs.readSync;
@@ -179,7 +180,7 @@ test("R3: disk cache survives module reload and invalidates on each binary key f
   assert.equal(calls(sandbox, "--help").length, 1);
   assert.equal(calls(sandbox, "--version").length, 2);
 
-  probe({ ...env, FAKE_GROK_VERSION_OUTPUT: "grok 1.0.90 (different)" });
+  probe({ ...env, FAKE_GROK_VERSION_OUTPUT: "grok 1.0.93 (different)" });
   assert.equal(calls(sandbox, "--help").length, 2);
   const updated = new Date(Date.now() + 5000);
   fs.utimesSync(binary, updated, updated);

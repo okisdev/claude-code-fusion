@@ -11,13 +11,14 @@ import { newestEngineCompanion } from "../engine-acceptance.mjs";
 import { engineHealth, readEngineHealthRecords } from "../engine-health.mjs";
 import { engineCliAvailable } from "../../breaker-check.mjs";
 import { tagMessage } from "../user-messages.mjs";
+import { latestContextTokens } from "../guard/transcript.mjs";
 import { isVerificationCommand } from "../verification-command.mjs";
 import { canonicalWorkerAgentType, claudeModelFamily, createWorkerRecord, createWorkerTaskId, readPeerCapacityReservations, readWorkerRecord, readWorkerRecords, updateWorkerSessionState, withPeerCapacityReservations, workerRecordFile, writePrivateText, WORKER_TERMINAL_STATUSES } from "../worker-state.mjs";
 import { workerLimits } from "./budget.mjs";
 import { sessionRecords, updateLifecycleWorkerRecord } from "./records.mjs";
 import { withClaudeQuotaFailure } from "./collection.mjs";
 import { finalAssistantTextFromTranscript } from "./notifications.mjs";
-import { PARENT_CONTEXT_ADVISORY_TOKENS_ENV, VERIFICATION_MANIFEST_ENV, DEFAULT_BRIEF_MAX_BYTES, SIZING_ADVISORY_BYTES, DEFAULT_PARENT_CONTEXT_ADVISORY_TOKENS, PARENT_CONTEXT_TAIL_MAX_BYTES, BRIEF_AGENTS } from "./constants.mjs";
+import { PARENT_CONTEXT_ADVISORY_TOKENS_ENV, VERIFICATION_MANIFEST_ENV, DEFAULT_BRIEF_MAX_BYTES, SIZING_ADVISORY_BYTES, DEFAULT_PARENT_CONTEXT_ADVISORY_TOKENS, BRIEF_AGENTS } from "./constants.mjs";
 
 function allowAgentWithTaskId(toolInput, taskId, additionalContext = null) {
   const prompt = promptText(toolInput);
@@ -366,48 +367,7 @@ function releaseHostPeerCapacity(input, env) {
 }
 
 function parentContextTokens(transcriptPath) {
-  if (typeof transcriptPath !== "string" || !path.isAbsolute(transcriptPath)) {
-    return null;
-  }
-  let descriptor;
-  try {
-    descriptor = fs.openSync(transcriptPath, "r");
-    const size = fs.fstatSync(descriptor).size;
-    const length = Math.min(size, PARENT_CONTEXT_TAIL_MAX_BYTES);
-    const start = size - length;
-    const buffer = Buffer.allocUnsafe(length);
-    const read = fs.readSync(descriptor, buffer, 0, length, start);
-    let tail = buffer.subarray(0, read).toString("utf8");
-    if (start > 0) {
-      const newline = tail.indexOf("\n");
-      tail = newline < 0 ? "" : tail.slice(newline + 1);
-    }
-    for (const line of tail.trimEnd().split("\n").reverse()) {
-      try {
-        const entry = JSON.parse(line);
-        if (entry?.type !== "assistant" || entry.isSidechain === true || entry.isMeta === true) {
-          continue;
-        }
-        const usage = entry.message?.usage;
-        const counts = [usage?.input_tokens, usage?.cache_read_input_tokens ?? 0, usage?.cache_creation_input_tokens ?? 0];
-        if (counts.every((value) => Number.isSafeInteger(value) && value >= 0)) {
-          const tokens = counts.reduce((total, value) => total + value, 0);
-          if (Number.isSafeInteger(tokens)) {
-            return tokens;
-          }
-        }
-      } catch {
-        void 0;
-      }
-    }
-  } catch {
-    return null;
-  } finally {
-    if (descriptor != null) {
-      fs.closeSync(descriptor);
-    }
-  }
-  return null;
+  return typeof transcriptPath === "string" && path.isAbsolute(transcriptPath) ? latestContextTokens(transcriptPath) : null;
 }
 
 function verificationManifestPath(env) {

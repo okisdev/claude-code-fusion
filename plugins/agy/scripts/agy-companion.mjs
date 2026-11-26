@@ -116,7 +116,7 @@ const { cancelJobRecord, run } = createCompanionCommands({
   supportsWindDown: true,
   sessionIdPattern: state.AGY_SESSION_ID_PATTERN,
   sweep: state.sweepAgyRuns,
-  jobDirectory: (dataDir, id) => ({ configDir: state.runConfigDir(dataDir, id) }),
+  jobDirectory: () => ({}),
   resumeEligible: (record) => record.failureKind !== "policy" && !(record.status === "running" && record.refusedCommandContinuation),
   validateResumeSource() {},
   historyResumable: (record) => record.failureKind !== "policy",

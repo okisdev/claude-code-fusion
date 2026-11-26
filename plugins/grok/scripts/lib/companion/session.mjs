@@ -1,5 +1,5 @@
 import { normalizeGrokSessionId, sandboxProfileForMode } from "../grok-exec.mjs";
-import { listJobRecords } from "../state.mjs";
+import { grokPaths, listJobRecords } from "../state.mjs";
 
 function inputError(message) {
   const error = new Error(message);
@@ -22,11 +22,12 @@ function terminalJob(job) {
   return job?.status === "done" || job?.status === "error" || job?.status === "cancelled";
 }
 
-function resumeCompatible(job, mode, memory) {
+function resumeCompatible(job, mode, memory, profileKey = grokPaths().profileKey) {
   return (
+    job?.profileKey === profileKey &&
     terminalJob(job) &&
     jobClassForRecord(job) === "task" &&
-    normalizeGrokSessionId(job.sessionId) &&
+    normalizeGrokSessionId(job.sessionId) !== null &&
     job.mode === mode &&
     job.request?.sandboxProfile === sandboxProfileForMode(mode) &&
     memoryEnabledForRecord(job) === memory
@@ -41,11 +42,11 @@ function newestFirst(left, right) {
   );
 }
 
-function sessionMemoryModes(jobs) {
+function sessionMemoryModes(jobs, profileKey = grokPaths().profileKey) {
   const memoryModesBySession = new Map();
   for (const job of jobs) {
     const sessionId = normalizeGrokSessionId(job.sessionId);
-    if (!sessionId || !terminalJob(job) || jobClassForRecord(job) !== "task") {
+    if (job.profileKey !== profileKey || !sessionId || !terminalJob(job) || jobClassForRecord(job) !== "task") {
       continue;
     }
     const modes = memoryModesBySession.get(sessionId) ?? new Set();
@@ -55,18 +56,18 @@ function sessionMemoryModes(jobs) {
   return memoryModesBySession;
 }
 
-function resumableJobs(dataDir, cwd, mode, memory, options = {}) {
+function resumableJobs(dataDir, cwd, mode, memory, profileKey, options = {}) {
   const jobs = listJobRecords(dataDir, cwd);
-  const memoryModesBySession = sessionMemoryModes(jobs);
+  const memoryModesBySession = sessionMemoryModes(jobs, profileKey);
   return jobs
-    .filter((job) => resumeCompatible(job, mode, memory))
+    .filter((job) => resumeCompatible(job, mode, memory, profileKey))
     .filter((job) => memoryModesBySession.get(normalizeGrokSessionId(job.sessionId))?.size === 1)
     .filter((job) => !options.doneOnly || job.status === "done")
     .sort(newestFirst);
 }
 
-function resolveLastSessionJob(dataDir, cwd, claudeSessionId, mode, memory, options = {}) {
-  const finished = resumableJobs(dataDir, cwd, mode, memory, options);
+function resolveLastSessionJob(dataDir, cwd, claudeSessionId, mode, memory, { profileKey = grokPaths().profileKey, ...options } = {}) {
+  const finished = resumableJobs(dataDir, cwd, mode, memory, profileKey, options);
   if (claudeSessionId) {
     const owned = finished.filter((job) => job.claudeSessionId === claudeSessionId);
     if (owned.length === 0) {
@@ -90,15 +91,21 @@ function resolveLastSessionId(dataDir, cwd, claudeSessionId, mode = "consult", m
   return normalizeGrokSessionId(resolveLastSessionJob(dataDir, cwd, claudeSessionId, mode, memory).sessionId);
 }
 
-function validateResumeSession(dataDir, cwd, sessionId, mode, memory) {
+function validateResumeSession(dataDir, cwd, sessionId, mode, memory, profileKey = grokPaths().profileKey) {
   const normalizedSessionId = normalizeGrokSessionId(sessionId);
   if (!normalizedSessionId) {
     throw inputError("Grok session ids must be UUIDs returned by the companion.");
   }
   const allSessionJobs = listJobRecords(dataDir, cwd).filter(
-    (job) => terminalJob(job) && normalizeGrokSessionId(job.sessionId) === normalizedSessionId
+    (job) => normalizeGrokSessionId(job.sessionId) === normalizedSessionId
   );
-  const taskJobs = allSessionJobs.filter((job) => jobClassForRecord(job) === "task");
+  const privateJobs = allSessionJobs.filter((job) => job.profileKey === profileKey);
+  if (allSessionJobs.length && !privateJobs.length) {
+    if (allSessionJobs.some((job) => job.profileKey)) throw inputError("This Grok session belongs to a different credential profile. Start a fresh task.");
+    throw inputError("Pre-isolation sessions cannot resume in the private home. Start a fresh task.");
+  }
+  const finished = privateJobs.filter(terminalJob);
+  const taskJobs = finished.filter((job) => jobClassForRecord(job) === "task");
   const memoryModes = new Set(taskJobs.map(memoryEnabledForRecord));
   if (memoryModes.size > 1) {
     throw inputError(`Grok session ${normalizedSessionId} has inconsistent recorded memory modes and cannot be resumed safely.`);
@@ -120,7 +127,7 @@ function validateResumeSession(dataDir, cwd, sessionId, mode, memory) {
   if (taskJobs.length > 0) {
     throw inputError(`Grok session ${normalizedSessionId} cannot resume in ${mode} mode because its recorded sandbox profile is incompatible. Start a fresh task.`);
   }
-  if (allSessionJobs.length > 0) {
+  if (finished.length > 0) {
     throw inputError(`Grok session ${normalizedSessionId} belongs to a non-task job and cannot be resumed.`);
   }
   throw inputError(`No finished companion task owns Grok session ${normalizedSessionId} in this workspace.`);

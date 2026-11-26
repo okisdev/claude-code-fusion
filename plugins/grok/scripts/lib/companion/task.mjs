@@ -1,16 +1,15 @@
 import fs from "node:fs";
 import { parseArgs } from "../args.mjs";
 import { normalizeGrokSessionId, resolveGrokBin, resolveTimeoutMs, sandboxProfileForMode, runGrok, terminalRecordAttribution } from "../grok-exec.mjs";
-import { getProcessIdentity } from "../process-identity.mjs";
 import { renderBackgroundLaunch, renderTaskResult } from "../render.mjs";
 import { backgroundWatchReceipt } from "../job-watch.mjs";
-import { briefPath, clearQuotaCooldown, claimResumeSessionLease, createJobRecord, createJobRecordFile, generateJobId, jobFilePath, jobLogPath, launchRunningJobProcess, nowIso, readJobRecordFile, resolveDataDir, updateJobRecordFile, finishSuccessfulJobRecordFile, writeBrief } from "../state.mjs";
+import { grokPaths, briefPath, clearQuotaCooldown, claimResumeSessionLease, createJobRecord, createJobRecordFile, generateJobId, jobFilePath, jobLogPath, launchRunningJobProcess, nowIso, readJobRecordFile, resolveDataDir, finishSuccessfulJobRecordFile, writeBrief } from "../state.mjs";
 import { CONTINUE_PROMPT } from "./config.mjs";
 import { resolveGrokCompanionVersion, probeGrokVersion, requireTestedGrokFloor, requireQuotaAvailable } from "./version.mjs";
 import { output, oneLineSummary, failureOutcomeMessage, resolveCwd, validateImplicitRepositoryCwd, findRequestedJobRecord, currentClaudeSessionId, continuityPolicy, parsePositiveInteger, parseJsonSchema, commandArgs, readTaskPrompt, isFusionRoutedPrompt, grokRoleFromPrompt, backgroundDelivery, spawnBackgroundWorker } from "./base.mjs";
 import { inputError, resolveLastSessionJob, validateResumeSession } from "./session.mjs";
 import { grokFailureMessage, classifyFailure, finishJobRecord, resultFailed, failureTail } from "./execution.mjs";
-import { resultSpendPatch, outcomeFields, taskSuccessPayload, failureResultPayload, retainedResultPayload, failJob, finishTaskStructuredFailure, describeLaunchFailure, launchFailureError, appendFailureLog, recordSpawnFailure } from "./outcome.mjs";
+import { resultSpendPatch, outcomeFields, taskSuccessPayload, failureResultPayload, retainedResultPayload, failJob, finishTaskStructuredFailure, describeLaunchFailure, launchFailureError, appendFailureLog, registerBackgroundWorker, recordSpawnFailure } from "./outcome.mjs";
 import { resolveRepositoryTopLevel, consumeTaskStructuredResult } from "./review.mjs";
 import { SELF_PATH } from "./paths.mjs";
 
@@ -33,6 +32,7 @@ async function handleTask(argv, transport = {}) {
   const background = Boolean(options.background);
   const mode = write ? "write" : "consult";
   const memory = Boolean(options.memory);
+  const { profileKey } = grokPaths();
   const selectedContinuityPolicy = continuityPolicy(dataDir);
   const explicitResume = options.resume != null;
   const resumeLast = Boolean(options["resume-last"]);
@@ -52,10 +52,10 @@ async function handleTask(argv, transport = {}) {
   let resumeSource = null;
   let resumeReason = null;
   if (explicitResume) {
-    resumeSource = validateResumeSession(dataDir, cwd, options.resume, mode, memory);
+    resumeSource = validateResumeSession(dataDir, cwd, options.resume, mode, memory, profileKey);
     resumeReason = "explicit";
   } else if (resumeLast) {
-    resumeSource = resolveLastSessionJob(dataDir, cwd, claudeSessionId, mode, memory);
+    resumeSource = resolveLastSessionJob(dataDir, cwd, claudeSessionId, mode, memory, { profileKey });
     resumeReason = "last";
   } else if (
     prompt &&
@@ -65,6 +65,7 @@ async function handleTask(argv, transport = {}) {
     !fusionRouted
   ) {
     resumeSource = resolveLastSessionJob(dataDir, cwd, claudeSessionId, mode, memory, {
+      profileKey,
       doneOnly: true,
       optional: true
     });
@@ -79,7 +80,7 @@ async function handleTask(argv, transport = {}) {
   }
   const role = grokRoleFromPrompt(prompt);
   requireQuotaAvailable(dataDir);
-  const grok = probeGrokVersion(resolveGrokBin(), process.env);
+  const grok = probeGrokVersion(resolveGrokBin());
 
   const jobId = generateJobId();
   const briefFile = briefPath(dataDir, cwd, jobId);
@@ -87,6 +88,7 @@ async function handleTask(argv, transport = {}) {
   const record = {
     ...createJobRecord({
       id: jobId,
+      profileKey,
       companionVersion: resolveGrokCompanionVersion(),
       grokVersion: grok.version,
       pid: background ? null : process.pid,
@@ -124,7 +126,7 @@ async function handleTask(argv, transport = {}) {
     requireQuotaAvailable(dataDir);
     writeBrief(dataDir, cwd, jobId, prompt);
     if (resumeSessionId) {
-      claimResumeSessionLease(dataDir, cwd, resumeSessionId, jobId);
+      claimResumeSessionLease(dataDir, cwd, `${profileKey}/${resumeSessionId}`, jobId);
     }
   } catch (error) {
     recordSpawnFailure(jobFile, error);
@@ -160,6 +162,7 @@ async function handleTask(argv, transport = {}) {
   let result;
   try {
     result = await runGrok({
+      profileKey: record.profileKey,
       grokVersion: grok.version,
       briefFile,
       prompt,
@@ -255,19 +258,16 @@ async function handleTaskWorker(argv) {
     throw new Error(`No job record found for ${jobId}.`);
   }
 
-  const record = found.record;
-  if (record.status !== "running") {
-    return;
-  }
+  const record = registerBackgroundWorker(found.file);
+  if (!record) return;
   const logFile = jobLogPath(dataDir, record.cwd, record.id);
-  updateJobRecordFile(found.file, { pid: process.pid, pidIdentity: getProcessIdentity(process.pid) });
-
   const request = record.request ?? {};
   const timeoutMs = resolveTimeoutMs({ background: true, env: process.env });
 
   try {
     const prompt = fs.readFileSync(record.briefFile, "utf8");
     const result = await runGrok({
+      profileKey: record.profileKey,
       grokVersion: record.grokVersion,
       briefFile: record.briefFile,
       prompt,

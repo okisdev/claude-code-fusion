@@ -1,8 +1,33 @@
 import { createHash } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
+import os from "node:os";
 import { createJobState } from "./job-state.mjs";
 import { withRecordLock } from "./record-lock.mjs";
+
+function canonicalPath(file) {
+  try {
+    return fs.realpathSync.native(file);
+  } catch (error) {
+    if (error.code !== "ENOENT") throw error;
+    if (fs.lstatSync(file, { throwIfNoEntry: false })?.isSymbolicLink()) {
+      return canonicalPath(path.resolve(path.dirname(file), fs.readlinkSync(file)));
+    }
+    return path.join(canonicalPath(path.dirname(file)), path.basename(file));
+  }
+}
+
+export function profileHome(dataDir, profileKey) {
+  return typeof profileKey === "string" && /^[a-f0-9]{16}$/.test(profileKey)
+    ? path.join(dataDir, "homes", profileKey) : null;
+}
+
+export function grokPaths(env = process.env) {
+  const userHome = canonicalPath(path.resolve(env.GROK_HOME?.trim() || path.join(env.HOME?.trim() || os.homedir(), ".grok")));
+  const auth = canonicalPath(path.resolve(env.GROK_AUTH_PATH?.trim() || path.join(userHome, "auth.json")));
+  const profileKey = createHash("sha256").update(JSON.stringify([userHome, auth])).digest("hex").slice(0, 16);
+  return { userHome, auth, profileKey, home: profileHome(resolveDataDir(env), profileKey) };
+}
 
 const LEASE_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
 const MONITOR_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
@@ -18,7 +43,8 @@ const jobState = createJobState({
   lockTimeoutEnv: "GROK_COMPANION_LOCK_TIMEOUT_MS",
   dataDirName: "grok-claude-code-fusion",
   sweepMarker: ".grok-state-sweep.json",
-  recordFields: () => ({
+  recordFields: (fields) => ({
+    profileKey: fields.profileKey ?? grokPaths().profileKey,
     resolvedEffort: null,
     modelUsage: null,
     modelUsageIsIncomplete: null

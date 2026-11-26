@@ -23,7 +23,7 @@ const { buildGrokArgs, NESTED_ENGINE_CLI_DENY_NAMES } = await import(
 const { resolveLastSessionId, validateResumeSessionId } = await import(
   path.join(repoRoot, "plugins", "grok", "scripts", "grok-companion.mjs"),
 );
-const { createJobRecord, jobFilePath, writeBrief, writeJobRecordFile } = await import(
+const { createJobRecord, grokPaths, jobFilePath, writeBrief, writeJobRecordFile } = await import(
   path.join(repoRoot, "plugins", "grok", "scripts", "lib", "state.mjs"),
 );
 
@@ -57,11 +57,12 @@ function singleInvocation(sandbox) {
   return invocations[1];
 }
 
-function seedFinishedSessionJob(sandbox, fields) {
+function seedFinishedSessionJob(sandbox, fields, env = process.env) {
   const briefFile = writeBrief(sandbox.dataDir, sandbox.workDir, fields.id, "seeded session job");
   const record = {
     ...createJobRecord({
       id: fields.id,
+      profileKey: grokPaths(env).profileKey,
       pid: null,
       mode: fields.mode ?? "consult",
       cwd: sandbox.workDir,
@@ -227,19 +228,20 @@ test("resume maps to -r with the given session uuid", (t) => {
   const sandbox = makeSandbox(t);
   const stdinFile = path.join(sandbox.root, "resume-stdin.txt");
   const uuid = "aaaaaaaa-aaaa-7aaa-8aaa-aaaaaaaaaaaa";
+  const env = envFor(sandbox, {
+    CLAUDE_CODE_SESSION_ID: "claude-current",
+    FAKE_GROK_STDIN_FILE: stdinFile,
+  });
   seedFinishedSessionJob(sandbox, {
     id: "explicit-resume",
     claudeSessionId: "claude-current",
     sessionId: uuid,
     createdAt: "2026-01-01T00:00:00.000Z",
     finishedAt: "2026-01-01T00:01:00.000Z",
-  });
+  }, env);
   const result = runCompanion(["task", "--resume", uuid, "continue with the plan"], {
     cwd: sandbox.workDir,
-    env: envFor(sandbox, {
-      CLAUDE_CODE_SESSION_ID: "claude-current",
-      FAKE_GROK_STDIN_FILE: stdinFile,
-    }),
+    env,
   });
   assert.strictEqual(result.status, 0, result.stderr);
   const argv = singleInvocation(sandbox);
@@ -252,19 +254,20 @@ test("resume without a prompt sends the pinned continuation text", (t) => {
   const sandbox = makeSandbox(t);
   const stdinFile = path.join(sandbox.root, "promptless-resume-stdin.txt");
   const uuid = "bbbbbbbb-bbbb-7bbb-8bbb-bbbbbbbbbbbb";
+  const env = envFor(sandbox, {
+    CLAUDE_CODE_SESSION_ID: "claude-current",
+    FAKE_GROK_STDIN_FILE: stdinFile,
+  });
   seedFinishedSessionJob(sandbox, {
     id: "promptless-resume",
     claudeSessionId: "claude-current",
     sessionId: uuid,
     createdAt: "2026-01-01T00:00:00.000Z",
     finishedAt: "2026-01-01T00:01:00.000Z",
-  });
+  }, env);
   const result = runCompanion(["task", "--resume", uuid], {
     cwd: sandbox.workDir,
-    env: envFor(sandbox, {
-      CLAUDE_CODE_SESSION_ID: "claude-current",
-      FAKE_GROK_STDIN_FILE: stdinFile,
-    }),
+    env,
   });
   assert.strictEqual(result.status, 0, result.stderr);
   const argv = singleInvocation(sandbox);

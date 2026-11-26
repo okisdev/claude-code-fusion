@@ -7,6 +7,7 @@ import { test } from "node:test";
 import {
   companion,
   envFor,
+  fakeGrok,
   jobFileFor,
   jobRecords,
   killGroups,
@@ -17,11 +18,13 @@ import {
   waitFor,
   workerExitSignal,
 } from "./lib/companion-harness.mjs";
+import { executionTimeoutGate } from "./lib/execution-budget.mjs";
 import { getProcessIdentity } from "../plugins/grok/scripts/lib/process-identity.mjs";
 
 const {
   createJobRecord,
   generateJobId,
+  grokPaths,
   jobFilePath,
   jobLogPath,
   nowIso,
@@ -69,6 +72,7 @@ test("resume last rejects another Claude session's finished job", (t) => {
   writeJobRecordFile(jobFilePath(sandbox.dataDir, sandbox.workDir, jobId), {
     ...createJobRecord({
       id: jobId,
+      profileKey: grokPaths(envFor(sandbox)).profileKey,
       pid: null,
       mode: "consult",
       cwd: sandbox.workDir,
@@ -109,6 +113,7 @@ test("a running resume owns the workspace session lease and a terminal owner can
   writeJobRecordFile(jobFilePath(sandbox.dataDir, sandbox.workDir, sourceJobId), {
     ...createJobRecord({
       id: sourceJobId,
+      profileKey: grokPaths(envFor(sandbox)).profileKey,
       pid: null,
       mode: "consult",
       cwd: sandbox.workDir,
@@ -679,24 +684,63 @@ test("cancel keeps an unverified process record running when graceful cleanup ca
 
 test("background timeout marks the record error and result reports the failure", async (t) => {
   const sandbox = makeSandbox(t);
-  const env = envFor(sandbox, { FAKE_GROK_MODE: "hang", GROK_COMPANION_TIMEOUT_MS: "500" });
+  const worker = workerExitSignal(sandbox, "task-worker");
+  const ready = path.join(sandbox.root, "grok-ready");
+  const release = path.join(sandbox.root, "grok-expire");
+  const delayFile = path.join(sandbox.root, "grok-timer-delay");
+  const preload = path.join(sandbox.root, "grok-readiness.cjs");
+  fs.writeFileSync(preload, `const fs = require("node:fs");
+if (process.argv[2] === "task-worker") {
+  const now = Date.now;
+  const startedAt = now();
+  Date.now = () => {
+    if (!fs.existsSync(${JSON.stringify(delayFile)})) return startedAt;
+    Date.now = now;
+    return now();
+  };
+}
+if (process.argv[1] === ${JSON.stringify(fakeGrok)}) {
+  process.on("newListener", (event) => {
+    if (event === "SIGTERM") fs.writeFileSync(${JSON.stringify(ready)}, "");
+  });
+}
+`);
+  const gate = executionTimeoutGate(sandbox.root, "expireGrokRun", release, delayFile);
+  const timeoutMs = 1800000;
+  const cleanupReserveMs = 200;
+  const env = envFor(sandbox, {
+    FAKE_GROK_MODE: "hang",
+    NODE_OPTIONS: `${worker.env.NODE_OPTIONS} --require=${JSON.stringify(preload)} ${gate}`,
+  });
   const result = runCompanion(["task", "--background", "slow work"], {
     cwd: sandbox.workDir,
     env,
   });
   assert.strictEqual(result.status, 0, result.stderr);
+  sandbox.registerCleanup(() => {
+    if (fs.existsSync(release)) return worker.waitForExit();
+    const [record] = jobRecords(sandbox.dataDir);
+    killGroups(record?.grokPid, record?.grokPidIdentity);
+    killGroups(record?.pid, record?.pidIdentity);
+  });
+  const timer = await waitFor(() => fs.existsSync(delayFile) && fs.readFileSync(delayFile, "utf8"));
+  assert.strictEqual(JSON.parse(timer).delay, timeoutMs - cleanupReserveMs);
+  await waitFor(() => fs.existsSync(ready));
+  fs.writeFileSync(release, "");
   const failed = await waitFor(() => {
     const current = jobRecords(sandbox.dataDir)[0];
     return current && current.status === "error" ? current : null;
   });
-  assert.match(failed.errorTail, /timed out after 500ms/);
-  assert.match(failed.errorMessage, /timed out after 500ms/);
+  const message = `timed out after ${timeoutMs}ms`;
+  assert.strictEqual(failed.failureKind, "timeout");
+  assert.ok(failed.errorTail.includes(message), failed.errorTail);
+  assert.ok(failed.errorMessage.includes(message), failed.errorMessage);
   assert.doesNotMatch(failed.errorMessage, /\r?\n/);
   assert.strictEqual(failed.exitCode, 143);
   const resultOutput = runCompanion(["result", failed.id], { cwd: sandbox.workDir, env });
   assert.strictEqual(resultOutput.status, 0, resultOutput.stderr);
   assert.ok(resultOutput.stdout.includes("failed"));
-  assert.ok(resultOutput.stdout.includes("timed out after 500ms"));
+  assert.ok(resultOutput.stdout.includes(message));
 });
 
 test("permission-cancelled task ends in an error record, not done", (t) => {
@@ -711,15 +755,17 @@ test("permission-cancelled task ends in an error record, not done", (t) => {
   assert.strictEqual(record.failureKind, "permission");
 });
 
-test("task worker does not launch Grok after cancellation was requested", async (t) => {
+test("task worker does not launch Grok after cancellation was requested", (t) => {
   const sandbox = makeSandbox(t);
   const env = envFor(sandbox);
+  delete env.GROK_COMPANION_CAPABILITIES;
   const jobId = generateJobId();
   const briefFile = writeBrief(sandbox.dataDir, sandbox.workDir, jobId, "say hi");
   const jobFile = jobFilePath(sandbox.dataDir, sandbox.workDir, jobId);
   writeJobRecordFile(jobFile, {
     ...createJobRecord({
       id: jobId,
+      profileKey: grokPaths(env).profileKey,
       mode: "consult",
       cwd: sandbox.workDir,
       briefFile,
@@ -727,20 +773,10 @@ test("task worker does not launch Grok after cancellation was requested", async 
     }),
     cancelRequestedAt: nowIso(),
   });
-  const worker = spawn(process.execPath, [companion, "task-worker", "--job-id", jobId], {
-    cwd: sandbox.workDir,
-    env,
-    stdio: "ignore",
-  });
-  t.after(() => {
-    try {
-      worker.kill("SIGKILL");
-    } catch {}
-  });
-  const cancelled = await waitFor(() => {
-    const current = jobRecords(sandbox.dataDir)[0];
-    return current && current.status === "cancelled" ? current : null;
-  });
+  const worker = runCompanion(["task-worker", "--job-id", jobId], { cwd: sandbox.workDir, env });
+  assert.strictEqual(worker.status, 0, worker.stderr);
+  const [cancelled] = jobRecords(sandbox.dataDir);
+  assert.strictEqual(cancelled.status, "cancelled", cancelled.errorMessage);
   assert.strictEqual(cancelled.failureKind, "cancelled");
   assert.strictEqual(cancelled.exitCode, null);
   assert.strictEqual(cancelled.resultText, null);

@@ -1,5 +1,6 @@
 import { bashWriteEffect } from "./bash-effect.mjs";
 import { hookResult, mergeHookResults } from "../lifecycle/output.mjs";
+import { claimPendingWaveReview } from "../lifecycle/wave-review.mjs";
 import { resolveStateDir } from "./config.mjs";
 import { BASH_TOOL, DELEGATION_TOOLS, READ_TOOLS, TASK_CONTROL_TOOLS } from "./constants.mjs";
 import { handleDispatch, handleTaskControl } from "./dispatch-events.mjs";
@@ -72,7 +73,9 @@ function runHook(env = process.env, input = readHookInput()) {
 
 function executeHook(input, env = process.env) {
   try {
-    return runHook(env, input ?? null);
+    const result = runHook(env, input ?? null);
+    const review = input?.hook_event_name === "PostToolUse" && claimPendingWaveReview(input, env);
+    return review ? mergeHookResults(result, { additionalContext: review }) : result;
   } catch {
     return {};
   }

@@ -106,7 +106,7 @@ if (args[0] === "acp") {
 await import(${JSON.stringify(fileURLToPath(new URL("./fake-devin", import.meta.url)))});
 `;
   fs.writeFileSync(bin, code, { mode: 0o755 });
-  const env = { ...process.env, HOME: home, PATH: `${identityBin}${path.delimiter}${process.env.PATH}`, DEVIN_BIN: bin, DEVIN_COMPANION_DATA: data,
+  const env = { ...process.env, TMPDIR: temp, HOME: home, PATH: `${identityBin}${path.delimiter}${process.env.PATH}`, DEVIN_BIN: bin, DEVIN_COMPANION_DATA: data,
     DEVIN_COMPANION_WAIT_POLL_MS: "20", ...extraEnv };
   const run = (args, input = "") => spawnSync(process.execPath, [companion, ...args], { cwd, env, input, encoding: "utf8", timeout: 30000 });
   const jobs = () => {

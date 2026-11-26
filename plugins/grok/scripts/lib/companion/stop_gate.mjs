@@ -2,7 +2,7 @@ import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import { resolveGrokBin, sandboxProfileForMode, runGrok } from "../grok-exec.mjs";
-import { briefPath, createJobRecord, createJobRecordFile, generateJobId, jobFilePath, jobLogPath, launchRunningJobProcess, nowIso, resolveDataDir, writeBrief } from "../state.mjs";
+import { grokPaths, briefPath, createJobRecord, createJobRecordFile, generateJobId, jobFilePath, jobLogPath, launchRunningJobProcess, nowIso, resolveDataDir, writeBrief } from "../state.mjs";
 import { STOP_GATE_TIMEOUT_MS, STOP_GATE_MAX_TURNS } from "./config.mjs";
 import { resolveGrokCompanionVersion, probeGrokVersion, requireTestedGrokFloor, requireQuotaAvailable } from "./version.mjs";
 import { oneLineSummary, currentClaudeSessionId, isStopGateEnabled, readStdinIfPiped } from "./base.mjs";
@@ -66,14 +66,16 @@ async function handleStopGate() {
     DIFF: target.diff
   });
   requireQuotaAvailable(dataDir);
-  const grok = probeGrokVersion(resolveGrokBin(), process.env);
+  const grok = probeGrokVersion(resolveGrokBin());
 
   const jobId = generateJobId();
   const briefFile = briefPath(dataDir, cwd, jobId);
   const jobFile = jobFilePath(dataDir, cwd, jobId);
+  const { profileKey } = grokPaths();
   createJobRecordFile(jobFile, {
     ...createJobRecord({
       id: jobId,
+      profileKey,
       companionVersion: resolveGrokCompanionVersion(),
       grokVersion: grok.version,
       pid: process.pid,
@@ -104,6 +106,7 @@ async function handleStopGate() {
   let result;
   try {
     result = await runGrok({
+      profileKey,
       grokVersion: grok.version,
       briefFile,
       prompt,

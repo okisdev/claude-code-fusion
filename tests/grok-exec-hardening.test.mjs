@@ -120,25 +120,22 @@ test("persisted PID without identity is left for diagnostic cleanup", async (t) 
   assert.equal(pidAlive(child.pid), true);
 });
 
-for (const authSetting of ["GROK_HOME", "GROK_AUTH_PATH"]) {
-  test(`models refresh resolves relative ${authSetting} against the run cwd`, async (t) => {
-    const sandbox = makeSandbox(t);
-    const relative = authSetting === "GROK_HOME" ? "relative-grok-home" : "relative-auth/auth.json";
-    const auth = authSetting === "GROK_HOME"
-      ? path.join(sandbox.workDir, relative, "auth.json")
-      : path.join(sandbox.workDir, relative);
-    staleAuth(auth);
-    const env = envFor(sandbox, {
-      [authSetting]: relative,
-      FAKE_GROK_MODELS_VALIDATE_STORE: "1"
-    });
-    const result = await runGrok(options(sandbox, env));
-    assert.equal(result.exitCode, 0);
-    assert.equal(result.authRefresh.reason, "stale");
-    assert.equal(result.authRefresh.refreshed, true);
-    assert.equal(modelsCalls(sandbox).length, 1);
+test("models refresh resolves a relative credential override in the parent before changing cwd", async (t) => {
+  const sandbox = makeSandbox(t);
+  const auth = path.join(sandbox.root, "other", "login");
+  staleAuth(auth);
+  const env = envFor(sandbox, {
+    GROK_HOME: path.relative(process.cwd(), path.join(sandbox.root, "relative-grok-home")),
+    GROK_AUTH_PATH: path.relative(process.cwd(), auth),
+    FAKE_GROK_MODELS_VALIDATE_STORE: "1",
+    FAKE_GROK_LOGIN_FILE: auth
   });
-}
+  const result = await runGrok(options(sandbox, env));
+  assert.equal(result.exitCode, 0);
+  assert.equal(result.authRefresh.reason, "stale");
+  assert.equal(result.authRefresh.refreshed, true);
+  assert.equal(modelsCalls(sandbox).length, 1);
+});
 
 test("failed stale refresh persists a 30 minute cooldown while auth failures still refresh", async (t) => {
   const sandbox = makeSandbox(t);

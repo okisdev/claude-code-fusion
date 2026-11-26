@@ -29,6 +29,7 @@ import {
   waitFor
 } from "./lib/codex-companion-harness.mjs";
 import { processInspectionAvailable } from "./lib/companion-harness.mjs";
+import { executionTimeoutGate } from "./lib/execution-budget.mjs";
 import { gitIsolation } from "./lib/git-fixture.mjs";
 
 const processInspectionTests = new Set([
@@ -310,7 +311,7 @@ test("SwiftPM note is not repeated by the printed write resume command", (t) => 
   const note = "Environment note from the Codex companion: SwiftPM cannot nest its own sandbox-exec inside this sandbox, so run SwiftPM with --disable-sandbox, for example swift build --disable-sandbox and swift test --disable-sandbox.";
   const timedOut = runCompanion(["task", "--json", "--write", "start before timeout"], {
     cwd: sandbox.workDir,
-    env: envFor(sandbox, { CODEX_COMPANION_TIMEOUT_MS: "2000", FAKE_CODEX_MODE: "rollout-timeout" })
+    env: rolloutTimeoutEnv(sandbox)
   });
   assert.equal(timedOut.status, 1, timedOut.stderr);
   assert.ok(timedOut.stdout, timedOut.stderr);
@@ -1463,16 +1464,22 @@ test("record-acceptance rejects unknown job ids", (t) => {
   assert.match(result.stderr, new RegExp(`No job record found for ${id}`));
 });
 
+function rolloutTimeoutEnv(sandbox) {
+  const ready = path.join(sandbox.root, "rollout-ready");
+  return envFor(sandbox, {
+    CODEX_COMPANION_TIMEOUT_MS: "2000",
+    FAKE_CODEX_MODE: "rollout-timeout",
+    FAKE_CODEX_READY_FILE: ready,
+    NODE_OPTIONS: executionTimeoutGate(sandbox.root, "executionTimedOut", ready)
+  });
+}
+
 test("foreground timeout persists recovered partial delivery and incomplete cumulative usage", (t) => {
   const sandbox = makeSandbox(t);
   const expectedCompanionVersion = JSON.parse(fs.readFileSync(path.join(repoRoot, "plugins", "codex", ".claude-plugin", "plugin.json"), "utf8")).version;
   const result = runCompanion(["task", "--json", "implement until timeout"], {
     cwd: sandbox.workDir,
-    env: envFor(sandbox, {
-      CODEX_COMPANION_TIMEOUT_MS: "2000",
-      CODEX_HOME: path.join(sandbox.root, "codex-home"),
-      FAKE_CODEX_MODE: "rollout-timeout"
-    })
+    env: rolloutTimeoutEnv(sandbox)
   });
   assert.equal(result.status, 1, result.stderr);
   const record = JSON.parse(result.stdout);
@@ -1501,11 +1508,7 @@ test("a timed out write task prints a write mode resume command", (t) => {
   initializeGitRepository(sandbox);
   const result = runCompanion(["task", "--json", "--write", "implement until timeout"], {
     cwd: sandbox.workDir,
-    env: envFor(sandbox, {
-      CODEX_COMPANION_TIMEOUT_MS: "2000",
-      CODEX_HOME: path.join(sandbox.root, "codex-home"),
-      FAKE_CODEX_MODE: "rollout-timeout"
-    })
+    env: rolloutTimeoutEnv(sandbox)
   });
   assert.equal(result.status, 1, result.stderr);
   assert.ok(result.stdout, result.stderr);
