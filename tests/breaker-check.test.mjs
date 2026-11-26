@@ -589,7 +589,7 @@ test("Grok network failures open only after a consecutive retry and success rese
   assert.strictEqual(opened.status, 0);
   const [advisory, ...substitutes] = opened.stdout.split("\n");
   assert.match(advisory, /^fusion breaker advisory: treat the grok breaker as open unless verified recovered; last failure network \d+ minutes? ago \(2 network across 2 terminal jobs, 12h window, consult mode\)\. Route new work to another eligible healthy lane\.$/);
-  assert.deepStrictEqual(substitutes, [`Grok role substitutes: ${GROK_CONSULT_SUBSTITUTES} ${BREAKER_ADVISORY_TAG}`, ""]);
+  assert.deepStrictEqual(substitutes, [`Grok role substitutes for consult runs: ${GROK_CONSULT_SUBSTITUTES} ${BREAKER_ADVISORY_TAG}`, ""]);
   assert.strictEqual(opened.stderr, "");
 
   writeRecord(jobFile(stateRoot, "workspace", "network-recovered"), {
@@ -1362,7 +1362,7 @@ test("host blockers preserve write and consult scopes in unified health", (t) =>
   assert.equal(engineHealth("grok", "consult", null, { env }).healthy, true);
   assert.equal(engineHealth("grok", "review", null, { env }).healthy, true);
   assert.strictEqual(run(box, { FUSION_GROK_COMPANION: companion }).stdout,
-    `Grok write runs are blocked on this host (sandbox): Writes blocked.\nGrok role substitutes: ${GROK_WRITE_SUBSTITUTES} ${BREAKER_ADVISORY_TAG}\n`);
+    `Grok write runs are blocked on this host (sandbox): Writes blocked.\nGrok role substitutes for write runs: ${GROK_WRITE_SUBSTITUTES} ${BREAKER_ADVISORY_TAG}\n`);
 });
 
 test("a consult success cannot recover write timeouts and a wrapper cannot double count its peer", (t) => {

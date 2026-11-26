@@ -879,11 +879,11 @@ export function undeniedRuntimeSocketCandidates(env = process.env) {
   ];
 }
 
-export function existingUnixSockets(candidates, lstat = fs.lstatSync) {
+export function existingUnixSockets(candidates, stat = fs.statSync) {
   const sockets = [];
   for (const candidate of candidates) {
     try {
-      if (lstat(candidate).isSocket()) {
+      if (stat(candidate).isSocket()) {
         sockets.push(candidate);
       }
     } catch (error) {

@@ -90,8 +90,8 @@ test("1.0.88 consult accepts a denied-target symlink while write still refuses t
     GROK_COMPANION_RUNTIME_SOCKET_CANDIDATES: endpoint,
     GROK_COMPANION_UNDENIED_SOCKET_CANDIDATES: socket
   });
-  const originalLstat = fs.lstatSync;
-  fs.lstatSync = (candidate, ...args) => candidate === socket ? { isSocket: () => true, isSymbolicLink: () => false } : originalLstat(candidate, ...args);
+  const originalStat = fs.statSync;
+  fs.statSync = (candidate, ...args) => candidate === socket ? { isSocket: () => true } : originalStat(candidate, ...args);
   let consult;
   try {
     let launchCalled = false;
@@ -103,7 +103,7 @@ test("1.0.88 consult accepts a denied-target symlink while write still refuses t
     assert.equal(fs.existsSync(sandbox.argsFile), false);
     consult = runGrok(runOptions(sandbox, { grokVersion: "1.0.88", env }));
   } finally {
-    fs.lstatSync = originalLstat;
+    fs.statSync = originalStat;
   }
   const result = await consult;
   assert.equal(result.exitCode, 0);
@@ -152,10 +152,10 @@ for (const suffix of [".docker/desktop/docker.sock", ".docker/run/docker.sock", 
     const env = envFor(sandbox);
     delete env.GROK_COMPANION_UNDENIED_SOCKET_CANDIDATES;
     const socket = path.join(env.HOME, suffix);
-    const originalLstat = fs.lstatSync;
-    t.mock.method(fs, "lstatSync", (candidate, ...args) => candidate === socket
-      ? { isSocket: () => true, isSymbolicLink: () => false }
-      : originalLstat(candidate, ...args));
+    const originalStat = fs.statSync;
+    t.mock.method(fs, "statSync", (candidate, ...args) => candidate === socket
+      ? { isSocket: () => true }
+      : originalStat(candidate, ...args));
     let launchCalled = false;
 
     await assert.rejects(async () => runGrok(runOptions(sandbox, {

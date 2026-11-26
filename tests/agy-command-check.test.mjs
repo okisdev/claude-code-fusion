@@ -4,6 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { isReadOnlyCommand } from "../plugins/agy/scripts/lib/agy-command-check.mjs";
+import { git, initCleanRepo } from "./lib/git-fixture.mjs";
 
 for (const command of ["ls -la", "pwd", "cat README.md", "head -n 20 README.md", "tail -n 10 log.txt", "wc -l README.md", "stat README.md", "grep -n TODO src", "rg --files", "rg -n 'two words' src", 'cat "a file.txt"', "find . -name '*.mjs'", "find . -type f -print", "git status --short", "git log --oneline -5", "git show --stat", "git diff --cached --stat", "git ls-files --cached", "git grep --cached", "git rev-parse --show-toplevel", "git branch", "git branch --list -a -r -v", "git status path", "git log main", "git show HEAD", "git diff HEAD", "git ls-files src", "git grep pattern", "git blame file", "git rev-parse HEAD", "git branch --show-current", "git branch -av", "  pwd\t ",
   'rg -n "kSecAttrAccessGroup|appGroupIdentifier|keychain-access-groups" apps/apple',
@@ -118,7 +119,7 @@ for (const character of "~#!=") {
 for (const command of [
   '"/bin/ls"', "F'O'O=1 ls", "ls=foo", "tail -F x", "tail --follow x", "tail --follow=name x", "tail -nf x", "tail '-nF' x", "tail -'f' x",
   "rg --pre-glob '*.mjs' x", "rg --pre''=sh x", "rg --search-zi x", "rg --unknown x", "rg -nZ x", "rg --hidden=true x", "rg -niZ x", "rg --regexp=",
-  "find . -L", "find . -unknown", "find . -print -delete", "find . -print unexpected", "find . -name", "find . ( -print )", "find . ! -empty",
+  "find -L . -print", "find . -L", "find . -follow -print", "find . -unknown", "find . -print -delete", "find . -print unexpected", "find . -name", "find . ( -print )", "find . ! -empty",
   "git --git-dir=.git log", "git --exec-path=bin log", "git status --unknown", "git status -suZ", "git log -np 20", "git log --oneline=true",
   "git branch -avD main", "git branch -- --list new", "git branch --list=topic", "git branch --all new", "git diff --textconv", "git grep '-nO' sh foo",
   "git log --format --output=x", "git log --pretty --output=x", "git diff -U --output=x", "git diff --unified --output=x", "git show --format --output=x"
@@ -127,8 +128,10 @@ for (const command of [
 }
 
 test("git -C checks each directory relative to the previous one", (t) => {
-  const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "agy-git-cwd-"));
-  t.after(() => fs.rmSync(cwd, { recursive: true, force: true }));
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "agy-git-cwd-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const cwd = fs.mkdirSync(path.join(root, "repo"), { recursive: true });
+  git(cwd, ["init", "-q"]);
   const realHome = path.join(cwd, "home");
   const sensitive = path.join(realHome, ".ssh", "inner");
   fs.mkdirSync(sensitive, { recursive: true });
@@ -145,11 +148,28 @@ test("git -C checks each directory relative to the previous one", (t) => {
   }
 });
 
-test("git -C accepts status in a readable directory outside the workspace", (t) => {
-  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "agy-external-repo-"));
-  t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
-  assert.equal(isReadOnlyCommand(`git -C '${directory}' status --short`), true);
-  assert.equal(isReadOnlyCommand(`git -C '${directory}' status --unknown`), false);
+test("git -C accepts linked worktrees and refuses unrelated repositories", (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "agy-external-repo-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const cwd = fs.mkdirSync(path.join(root, "repo"), { recursive: true });
+  const linked = path.join(root, "linked");
+  const unrelated = fs.mkdirSync(path.join(root, "unrelated"), { recursive: true });
+  const nested = fs.mkdirSync(path.join(cwd, "nested"), { recursive: true });
+  const bare = fs.mkdirSync(path.join(cwd, "bare.git"), { recursive: true });
+  initCleanRepo(cwd);
+  git(cwd, ["worktree", "add", "-q", "--detach", linked]);
+  git(unrelated, ["init", "-q"]);
+  git(nested, ["init", "-q"]);
+  git(bare, ["init", "-q", "--bare"]);
+
+  assert.equal(isReadOnlyCommand(`git -C '${linked}' status --short`, { cwd }), true);
+  assert.equal(isReadOnlyCommand(`git -C '${cwd}' status --short`, { cwd: linked }), true);
+  assert.equal(isReadOnlyCommand(`git -C '${linked}' status --unknown`, { cwd }), false);
+  for (const directory of [unrelated, nested, bare, root]) {
+    assert.equal(isReadOnlyCommand(`git -C '${directory}' status --short`, { cwd }), false);
+    assert.equal(isReadOnlyCommand(`git -C '${directory}' -C '${linked}' status --short`, { cwd }), false);
+  }
+  assert.equal(isReadOnlyCommand(`git -C '${linked}' status --short`, { cwd: root }), false);
 });
 
 test("git pathspec globs keep command and option checks", (t) => {
@@ -238,13 +258,14 @@ test("find validates every starting path against sensitive home directories", (t
   const options = { cwd, realHome };
   for (const command of [
     `find '${homebrew}' '${xcode}' -name "*USB*.h" 2>/dev/null`,
-    "find -L -H -P . src -name '*.mjs' -type f",
+    "find -H -P . src -name '*.mjs' -type f",
     "find apps/web/.legacy/app/[org] -maxdepth 4 -type f",
     "find 'apps/web/.legacy/app/[org]' -maxdepth 4 -type f",
     "find apps/web/.legacy/app/\\[org\\]/knowledge -type f",
     "find src/[a-z]* -type f", "find src* -type f"
   ]) assert.equal(isReadOnlyCommand(command, options), true, command);
   for (const command of [
+    "find -L -H -P . src -name '*.mjs' -type f", "find -P -L . -print", "find -H . -follow -print",
     "find ~/Library -print", "find ~/.local -print", "find ~/ -print",
     `find '${realHome}' -name x`, `find '${directory}' -print`, `find '${library}/Keychains' -print`, "find / -print",
     "find ../Library -print", "find ../.ssh/..metadata -print", "find . src ../.local -print", "find src missing -print",

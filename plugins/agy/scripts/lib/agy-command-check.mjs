@@ -178,7 +178,7 @@ function readableFindPath(word, cwd, realHome, fromHome = false, globOffset) {
 function allowedFind(tokens, globs, homePaths, cwd, realHome) {
   const directory = path.isAbsolute(cwd) ? cwd : `${process.cwd()}${path.sep}${cwd}`;
   let index = 1;
-  while (["-L", "-H", "-P"].includes(tokens[index])) index += 1;
+  while (["-H", "-P"].includes(tokens[index])) index += 1;
   const firstPath = index;
   while (index < tokens.length && !tokens[index].startsWith("-") && !["(", ")", "!"].includes(tokens[index])) {
     if (!readableFindPath(tokens[index], directory, realHome, homePaths.includes(index), globs[index])) return false;
@@ -191,6 +191,43 @@ function allowedFind(tokens, globs, homePaths, cwd, realHome) {
     if (arity === undefined || arity && ++index >= tokens.length) return false;
   }
   return true;
+}
+
+function resolveGitMetadataPath(file, directory, prefix = "") {
+  if (!fs.statSync(file).isFile()) return null;
+  const line = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(fs.readFileSync(file)).replace(/[\r\n]+$/, "");
+  if (!line.startsWith(prefix)) return null;
+  const target = line.slice(prefix.length);
+  if (!target || target.includes("\0")) return null;
+  return fs.realpathSync.native(path.isAbsolute(target) ? target : `${directory}${path.sep}${target}`);
+}
+
+function gitCommonDir(gitDir) {
+  const head = fs.lstatSync(path.join(gitDir, "HEAD"), { throwIfNoEntry: false });
+  if (!head?.isFile() && !head?.isSymbolicLink()) return null;
+  const marker = path.join(gitDir, "commondir");
+  const commonDir = fs.lstatSync(marker, { throwIfNoEntry: false }) ? resolveGitMetadataPath(marker, gitDir) : gitDir;
+  if (!commonDir || (commonDir !== gitDir && path.dirname(gitDir) !== path.join(commonDir, "worktrees"))) return null;
+  if (!["objects", "refs"].every((entry) => fs.statSync(path.join(commonDir, entry), { throwIfNoEntry: false })?.isDirectory())) return null;
+  return commonDir;
+}
+
+function discoverGitCommonDir(start) {
+  let directory = fs.realpathSync.native(start);
+  while (true) {
+    const marker = path.join(directory, ".git");
+    if (fs.lstatSync(marker, { throwIfNoEntry: false })) {
+      const gitDir = fs.statSync(marker).isDirectory()
+        ? fs.realpathSync.native(marker)
+        : resolveGitMetadataPath(marker, directory, "gitdir: ");
+      return gitDir && gitCommonDir(gitDir);
+    }
+    const exists = (entry) => fs.lstatSync(path.join(directory, entry), { throwIfNoEntry: false });
+    if (exists("HEAD") && (exists("commondir") || (exists("objects") && exists("refs")))) return gitCommonDir(directory);
+    const parent = path.dirname(directory);
+    if (parent === directory) return null;
+    directory = parent;
+  }
 }
 
 export function isReadOnlyCommand(command, { cwd = process.cwd(), realHome = os.homedir() } = {}) {
@@ -209,14 +246,18 @@ export function isReadOnlyCommand(command, { cwd = process.cwd(), realHome = os.
   if (program === "rg") return allowedFlags(args, RG_FLAGS, { attachedValues: true });
   if (program !== "git") return true;
   let directory = cwd;
+  let commonDir;
   let index = 1;
   while (tokens[index] === "-C") {
     const target = tokens[index + 1];
     if (!target || globs[index + 1]) return false;
     const requested = path.isAbsolute(target) ? target : `${directory}${path.sep}${target}`;
     try {
+      if (!isReadablePath(requested, realHome)) return false;
       directory = fs.realpathSync.native(requested);
-      if (!isReadablePath(requested, realHome) || !isReadablePath(directory, realHome) || !fs.statSync(directory).isDirectory()) return false;
+      if (!fs.statSync(directory).isDirectory()) return false;
+      commonDir ??= discoverGitCommonDir(cwd);
+      if (!commonDir || discoverGitCommonDir(directory) !== commonDir) return false;
     } catch {
       return false;
     }

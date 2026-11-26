@@ -168,7 +168,8 @@ function run(env = process.env, now = Date.now(), write = (text) => process.stdo
       const { displayName, roles, consultOnlyRoles } = ENGINES[engine];
       const blockedRoles = roles.filter((role) => blockedModes.has(consultOnlyRoles.includes(role) ? "consult" : "write"));
       const substitutes = roleSubstituteText(engine, blockedRoles);
-      if (substitutes) substituteLines.push(`${displayName} role substitutes: ${substitutes}`);
+      const modeScope = blockedModes.size === 1 ? ` for ${[...blockedModes][0]} runs` : "";
+      if (substitutes) substituteLines.push(`${displayName} role substitutes${modeScope}: ${substitutes}`);
     }
   }
   const deliveryAdvisory = wrapperDeliveryAdvisory(workerRecords, now, lookbackMs);

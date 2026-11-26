@@ -134,16 +134,18 @@ test("lane companions write per-attempt state without the caller's Claude sessio
     assert.equal(result.status, 0, result.stderr);
     const record = records(s).at(-1);
     assert.equal(record.verdict, "pass");
+    assert.match(record.jobId, /^[0-9a-f]{32}$/);
+    assert.equal(record.jobState, "done");
     const invocation = JSON.parse(fs.readFileSync(s.env.FAKE_ARGS_FILE, "utf8"));
-    const dataDir = path.join(s.results, "companion-state", record.runId, engine);
-    const stateDir = path.join(dataDir, "state");
+    const stateRoot = path.join(path.dirname(invocation.cwd), "companion-state");
+    const dataDir = path.join(stateRoot, engine);
     assert.equal(invocation.dataDir, dataDir);
-    assert.equal(invocation.codexState, path.join(s.results, "companion-state", record.runId, "codex", "state"));
+    assert.equal(invocation.codexState, path.join(stateRoot, "codex", "state"));
     assert.equal(invocation.codexStateDir, invocation.codexState);
     assert.deepEqual(invocation.claudeEnv, []);
-    const job = JSON.parse(fs.readFileSync(path.join(stateDir, "workspace", "jobs", `${record.jobId}.json`), "utf8"));
-    assert.equal(job.cwd, invocation.cwd);
+    assert.equal(fs.existsSync(stateRoot), false);
   }
+  assert.deepEqual(fs.readdirSync(s.results).sort(), ["env.json", "runs.jsonl", ...records(s).map(({ diffFile }) => path.basename(diffFile))].sort());
   for (const key of ["FUSION_CODEX_STATE", "FUSION_CODEX_STATE_DIR", "CODEX_COMPANION_DATA", "DEVIN_COMPANION_DATA", "GROK_COMPANION_DATA", "CURSOR_COMPANION_DATA"]) {
     assert.equal(fs.existsSync(s.env[key]), false, key);
   }

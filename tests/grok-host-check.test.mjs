@@ -1,15 +1,27 @@
 import assert from "node:assert/strict";
+import { once } from "node:events";
 import fs from "node:fs";
+import { createServer } from "node:net";
 import path from "node:path";
 import { test } from "node:test";
 
 import { envFor, jobRecords, makeSandbox, processInspectionAvailable, readInvocations, runCompanion } from "./lib/companion-harness.mjs";
 import { initFixtureRepo } from "./lib/git-fixture.mjs";
 
-function socketEnv(sandbox, socket) {
-  const preload = path.join(sandbox.root, "socket-lstat.cjs");
-  fs.writeFileSync(preload, 'const fs = require("node:fs"); const original = fs.lstatSync; fs.lstatSync = (candidate, ...args) => candidate === process.env.TEST_ENGINE_SOCKET ? { isSocket: () => true, isSymbolicLink: () => false } : original(candidate, ...args);');
-  return envFor(sandbox, { GROK_COMPANION_UNDENIED_SOCKET_CANDIDATES: socket, TEST_ENGINE_SOCKET: socket, NODE_OPTIONS: `--require=${preload}` });
+function socketEnv(sandbox, socket, target = "") {
+  const preload = path.join(sandbox.root, "socket-stat.cjs");
+  fs.writeFileSync(preload, `
+    const fs = require("node:fs");
+    const stat = fs.statSync;
+    fs.statSync = (candidate, ...args) => {
+      if (candidate === process.env.TEST_ENGINE_SOCKET &&
+          (!process.env.TEST_ENGINE_SOCKET_TARGET || fs.realpathSync.native(candidate) === process.env.TEST_ENGINE_SOCKET_TARGET)) {
+        return { isSocket: () => true };
+      }
+      return stat(candidate, ...args);
+    };
+  `);
+  return envFor(sandbox, { GROK_COMPANION_UNDENIED_SOCKET_CANDIDATES: socket, TEST_ENGINE_SOCKET: socket, TEST_ENGINE_SOCKET_TARGET: target, NODE_OPTIONS: `--require=${preload}` });
 }
 
 function check(sandbox, env, json) {
@@ -95,10 +107,27 @@ test("host-check and setup name Noblock and report its resolved symlink target o
   assert.ok(rendered.stdout.includes(remedy));
 });
 
-test("a Noblock socket without a blocking symlink leaves consult and review available", async (t) => {
+test("a Noblock symlink to a socket blocks writes and leaves consult and review available", async (t) => {
   const sandbox = makeSandbox(t);
-  const socket = path.join(envFor(sandbox).HOME, ".noblock", "run", "docker.sock");
-  const env = { ...socketEnv(sandbox, socket), FAKE_GROK_VERSION_OUTPUT: "grok 1.0.92 (abcdef012345)" };
+  const baseEnv = envFor(sandbox);
+  const socket = path.join(baseEnv.HOME, ".noblock", "run", "docker.sock");
+  const target = path.join(sandbox.root, "engine.sock");
+  fs.mkdirSync(path.dirname(socket), { recursive: true });
+  fs.symlinkSync(target, socket);
+  const server = createServer();
+  let env = baseEnv;
+  try {
+    const listening = once(server, "listening");
+    server.listen(target);
+    await listening;
+    sandbox.registerCleanup(() => new Promise((resolve) => server.close(resolve)));
+  } catch (error) {
+    if (!["EPERM", "EACCES"].includes(error.code)) throw error;
+    t.diagnostic(`Unix socket bind denied (${error.code}); simulating stat for the resolved socket target`);
+    fs.writeFileSync(target, "socket fixture");
+    env = socketEnv(sandbox, socket, target);
+  }
+  env.FAKE_GROK_VERSION_OUTPUT = "grok 1.0.92 (abcdef012345)";
   delete env.GROK_COMPANION_UNDENIED_SOCKET_CANDIDATES;
   const { blockers } = JSON.parse(check(sandbox, env, true));
   assert.deepEqual(blockers.map(({ modes }) => modes), [["write"]]);

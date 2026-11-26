@@ -121,8 +121,8 @@ function prepareWorkspace(fixturesDir) {
   }
 }
 
-function companionEnvironment(resultsDir, runId) {
-  const root = path.join(resultsDir, "companion-state", runId);
+function companionEnvironment(tempRoot) {
+  const root = path.join(tempRoot, "companion-state");
   fs.mkdirSync(root, { recursive: true, mode: 0o700 });
   const env = Object.fromEntries(Object.entries(process.env).filter(([key]) =>
     !/^(?:CLAUDECODE$|CLAUDE_ENV_FILE$|CLAUDE_(?:CODE_|PLUGIN_|SESSION(?:_|$)))/.test(key)
@@ -241,7 +241,7 @@ async function attempt(options) {
     fs.mkdirSync(options.resultsDir, { recursive: true });
     writeEnvOnce(options.resultsDir, taskManifestHash);
     const companionPath = newestEngineCompanion(options.engine, process.env);
-    const companionEnv = companionEnvironment(options.resultsDir, runId);
+    const companionEnv = companionEnvironment(tempRoot);
     const args = ["task", ...(options.mode === "write" ? ["--write"] : []), "--json", ...(options.model ? ["--model", options.model] : []), ...(options.effort ? ["--effort", options.effort] : []), "--cwd", workspace, "--", briefText];
     const outcome = companionPath ? await runCompanion(companionPath, args, workspace, companionEnv, options.timeoutMs) : { stdout: "", exit: null, seconds: 0, failure: { type: "start", message: `No ${options.engine} companion found` } };
     const jobId = outcome.failure ? null : jobIdFromStdout(outcome.stdout, options.engine) ?? (outcome.exit !== 0 ? failedJobIdFromState(options.engine, workspace, companionEnv) : null);
