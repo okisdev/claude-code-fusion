@@ -1,5 +1,6 @@
 import { fileURLToPath } from "node:url";
 import { engineResultCommand, isEngineId } from "../engines.mjs";
+import { recordStoppedTurns } from "../guard/turn.mjs";
 import { tagMessage } from "../user-messages.mjs";
 import { canonicalWorkerAgentType, isPendingSettlement, isSettledWorker, WORKER_TERMINAL_STATUSES, readWorkerRecord, readSessionWorkerRecords, updateWorkerSessionState } from "../worker-state.mjs";
 import { workerBudgetFailure } from "./budget.mjs";
@@ -313,6 +314,11 @@ function writeWrapperApiDeathRedispatchAdvisory(sessionId, env) {
 }
 
 function handleStop(input, env) {
+  try {
+    recordStoppedTurns(input, env);
+  } catch {
+    void 0;
+  }
   const hasBackgroundTasks = Array.isArray(input.background_tasks);
   const tasks = hasBackgroundTasks ? input.background_tasks : [];
   reconcileTaskNotifications(input, env);

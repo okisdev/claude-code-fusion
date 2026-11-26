@@ -16,13 +16,14 @@ const root = path.resolve(import.meta.dirname, "..");
 const scripts = Object.fromEntries(["worker-lifecycle", "inline-delegation-guard", "fusion-hook", "brief-sensor"].map((name) => [name, path.join(root, "plugins", "fusion", "scripts", `${name}.mjs`)]));
 const hooks = JSON.parse(fs.readFileSync(path.join(root, "plugins", "fusion", "hooks", "hooks.json"), "utf8")).hooks;
 
-function sandbox(t) {
+function sandbox(t, contextTokens) {
   const dir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "fusion-dispatch-test-")));
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
   const cwd = path.join(dir, "work");
   const transcript = path.join(dir, "transcript.jsonl");
   fs.mkdirSync(cwd);
-  fs.writeFileSync(transcript, "");
+  const entry = { type: "assistant", message: { id: "msg_initial", usage: { input_tokens: contextTokens } } };
+  fs.writeFileSync(transcript, contextTokens === undefined ? "" : JSON.stringify(entry) + "\n");
   return { dir, cwd, transcript };
 }
 
@@ -333,7 +334,7 @@ test("a guard denial wins over lifecycle output and retains its tagged reason", 
 
 test("the dispatcher retains Bash write charges on both failure callback forms", (t) => {
   for (const event of ["PostToolUseFailure", "PostToolUse"]) {
-    const box = sandbox(t);
+    const box = sandbox(t, 400_000);
     const input = payload(box, "PreToolUse", "Bash", { command: "cat > src/x <<'EOF'\nnew\nEOF" });
     compare(box, input);
     const env = environment(box, "fused");
@@ -352,7 +353,7 @@ test("the dispatcher retains Bash write charges on both failure callback forms",
 
 test("dispatcher preserves replay token advisories for read tools and compound Bash reads", (t) => {
   for (const tool of ["Read", "Bash"]) {
-    const box = sandbox(t);
+    const box = sandbox(t, 400_000);
     for (const variant of ["reference", "fused"]) {
       const dir = environment(box, variant).FUSION_INLINE_GUARD_STATE;
       fs.mkdirSync(dir, { recursive: true });

@@ -112,6 +112,7 @@ function runtimeEnv(env, extraEnv = {}) {
   const root = path.join(path.resolve(env.cwd), ".fusion-stats-runtime");
   return {
     ...inherited,
+    TMPDIR: path.resolve(env.cwd),
     HOME: path.join(root, "home"),
     CLAUDE_CODE_SESSION_ID: "fusion-stats-test-session",
     FUSION_DATA_DIR: path.join(root, "fusion-data"),
@@ -135,7 +136,7 @@ function runtimeEnv(env, extraEnv = {}) {
 
 function run(env, extraArgs = [], extraEnv = {}) {
   const childEnv = runtimeEnv(env, extraEnv);
-  const transport = createRawArgsTransport({ sessionId: childEnv.CLAUDE_CODE_SESSION_ID });
+  const transport = createRawArgsTransport({ sessionId: childEnv.CLAUDE_CODE_SESSION_ID, temporaryRoot: childEnv.TMPDIR });
   fs.writeFileSync(transport.file, extraArgs.map((argument) => JSON.stringify(argument)).join(" "), "utf8");
   return spawnSync(process.execPath, [SCRIPT, "--raw-args-token", transport.token], {
     cwd: env.cwd,
@@ -2900,7 +2901,7 @@ test("--record accepts an apostrophe inside an unquoted reason token", (t) => {
   const env = { FUSION_WORKER_STATE_DIR: stateDir };
   createTerminalWorker({ taskId, env, workspaceRoot: dir });
   const childEnv = runtimeEnv({ cwd: dir, codexState: path.join(dir, "missing") }, env);
-  const transport = createRawArgsTransport({ sessionId: childEnv.CLAUDE_CODE_SESSION_ID });
+  const transport = createRawArgsTransport({ sessionId: childEnv.CLAUDE_CODE_SESSION_ID, temporaryRoot: childEnv.TMPDIR });
   fs.writeFileSync(transport.file, `--record ${taskId}=rejected --reason worker's --failure-kind oversized`);
 
   const result = spawnSync(process.execPath, [SCRIPT, "--raw-args-token", transport.token], { cwd: dir, env: childEnv, encoding: "utf8" });
@@ -4371,7 +4372,7 @@ test("main loop replay reports the exact per-package headline and token shares a
   assert.strictEqual(report.mainLoopReplay.acceptedPackages, report.verificationEvidence.accepted);
   assert.strictEqual(report.mainLoopReplay.tokensPerAcceptedPackage, 312_500_000 / 42);
   const rendered = renderFusionStats(report);
-  assert.ok(rendered.includes("With a credited verification before the verdict: 0 (0.0%)\n- main loop replay in dispatching sessions: 7.4M tokens per accepted package (312.5M tokens over 842 tool turns, 42 accepted packages)\n- replay by kind: read 25% (210 turns), write 12% (101 turns), verify 10% (84 turns), settle 4% (34 turns), dispatch 4% (33 turns), other 45% (380 turns)"));
+  assert.ok(rendered.includes("With a credited verification before the verdict: 0 (0.0%)\n- main loop replay in dispatching sessions: 7.4M tokens per accepted package (312.5M tokens over 842 turns, 42 accepted packages)\n- replay by kind: read 25% (210 turns), write 12% (101 turns), verify 10% (84 turns), settle 4% (34 turns), dispatch 4% (33 turns), other 45% (380 turns)"));
   assert.doesNotMatch(rendered, /replay turns had no context reading/);
   const json = runDirect({ cwd: dir, codexState: env.FUSION_CODEX_STATE }, ["--json"], env);
   assert.strictEqual(json.status, 0, json.stderr);
@@ -4390,7 +4391,7 @@ test("main loop replay reports total tokens when no packages were accepted", (t)
   const report = buildFusionStats({ env, cwd: dir });
   assert.strictEqual(report.mainLoopReplay.acceptedPackages, 0);
   assert.strictEqual(report.mainLoopReplay.tokensPerAcceptedPackage, null);
-  assert.ok(renderFusionStats(report).includes("- main loop replay in dispatching sessions: 312.5M tokens over 842 tool turns, no accepted packages\n"));
+  assert.ok(renderFusionStats(report).includes("- main loop replay in dispatching sessions: 312.5M tokens over 842 turns, no accepted packages\n"));
 });
 
 test("main loop replay follows the recent verification evidence line", (t) => {
@@ -4401,7 +4402,7 @@ test("main loop replay follows the recent verification evidence line", (t) => {
   createWorkerRecord({ taskId: "fusion-recent-replay", sessionId: "replay-session", dispatchToolUseId: "recent", agentType: "fusion:claude-worker", packageType: "implementation", workspaceRoot: dir, limits: {} }, env);
   updateWorkerRecord("fusion-recent-replay", env, (record) => ({ ...record, transportStatus: "done", finishedAt: at, acceptance: "accepted", acceptanceRecordedAt: at }));
   const rendered = renderFusionStats(buildFusionStats({ env, cwd: dir }));
-  assert.ok(rendered.includes("Last 7 days: 1 accepted, 0 with a credited verification (0.0%)\n- main loop replay in dispatching sessions: 400k tokens per accepted package (400k tokens over 1 tool turn, 1 accepted package)\n"));
+  assert.ok(rendered.includes("Last 7 days: 1 accepted, 0 with a credited verification (0.0%)\n- main loop replay in dispatching sessions: 400k tokens per accepted package (400k tokens over 1 turn, 1 accepted package)\n"));
 });
 
 test("main loop replay deduplicates raised kinds and maximum token readings independently per session and turn", (t) => {
@@ -4466,15 +4467,15 @@ test("main loop replay counts nominal context turns once and uses singular label
   const report = buildFusionStats({ env, cwd: dir });
   assert.strictEqual(report.mainLoopReplay.unmeasuredTurns, 1);
   const rendered = renderFusionStats(report);
-  assert.ok(rendered.includes("- main loop replay in dispatching sessions: 400k tokens per accepted package (400k tokens over 1 tool turn, 1 accepted package)\n- replay by kind: write 100% (1 turn)\n- 1 replay turn had no context reading and is priced at 400k tokens\n"));
+  assert.ok(rendered.includes("- main loop replay in dispatching sessions: 400k tokens per accepted package (400k tokens over 1 turn, 1 accepted package)\n- replay by kind: write 100% (1 turn)\n- 1 replay turn had no context reading (400k estimated tokens)\n"));
   const session = buildSessionReport({ env, sessionId: "replay-session" });
   assert.deepStrictEqual(session.mainLoopReplay, report.mainLoopReplay);
-  assert.ok(renderSessionReport(session).includes("- 1 replay turn had no context reading and is priced at 400k tokens\n"));
+  assert.ok(renderSessionReport(session).includes("- 1 replay turn had no context reading (400k estimated tokens)\n"));
 
   writeGuardAuditEvents(env.FUSION_INLINE_GUARD_AUDIT_DIR, "2026-08-01", Array.from({ length: 12 }, (_, index) => replayAuditEvent({ turn: `nominal-${index}`, measured: false })));
   const plural = buildFusionStats({ env, cwd: dir });
   assert.strictEqual(plural.mainLoopReplay.unmeasuredTurns, 12);
-  assert.ok(renderFusionStats(plural).includes("- 12 replay turns had no context reading and are priced at 400k tokens\n"));
+  assert.ok(renderFusionStats(plural).includes("- 12 replay turns had no context reading (4.8M estimated tokens)\n"));
 });
 
 test("main loop replay filters the audit window and session before deduplicating turns and counting packages", (t) => {
@@ -4509,7 +4510,7 @@ test("main loop replay filters the audit window and session before deduplicating
   assert.strictEqual(report.mainLoopReplay.tokensPerAcceptedPackage, 150_000);
   assert.strictEqual(report.mainLoopReplay.unmeasuredTurns, 0);
   assert.deepStrictEqual(report.mainLoopReplay.byKind.dispatch, { tokens: 0, turns: 0 });
-  assert.ok(renderAuditReport(report).includes("- main loop replay in dispatching sessions: 150k tokens per accepted package (300k tokens over 2 tool turns, 2 accepted packages)"));
+  assert.ok(renderAuditReport(report).includes("- main loop replay in this session: 150k tokens per accepted package (300k tokens over 2 turns, 2 accepted packages)"));
   const everySession = buildAuditReport({ env, days: 1, now });
   assert.strictEqual(everySession.mainLoopReplay.totalTokens, 900_000);
   assert.strictEqual(everySession.mainLoopReplay.acceptedPackages, 3);
@@ -4571,7 +4572,7 @@ test("main loop replay scopes tokens to sessions with worker records in each rep
   assert.deepStrictEqual(buildAuditReport({ env, all: true }).mainLoopReplay, all);
 });
 
-test("main loop replay omits sessions without an in scope worker record", (t) => {
+test("aggregate replay omits sessions without an in scope worker record and session reports include them", (t) => {
   const dir = sandbox(t);
   const env = runtimeEnv({ cwd: dir, codexState: path.join(dir, "codex") });
   writeGuardAuditEvents(env.FUSION_INLINE_GUARD_AUDIT_DIR, "2026-08-01", [replayAuditEvent()]);
@@ -4579,12 +4580,12 @@ test("main loop replay omits sessions without an in scope worker record", (t) =>
   for (const [report, render] of [
     [buildFusionStats({ env, cwd: dir }), renderFusionStats],
     [buildFusionStats({ env, cwd: dir, all: true }), renderFusionStats],
-    [buildSessionReport({ env, sessionId: "replay-session" }), renderSessionReport],
     [buildAuditReport({ env, all: true }), renderAuditReport]
   ]) {
     assert.strictEqual(Object.hasOwn(report, "mainLoopReplay"), false);
     assert.doesNotMatch(render(report), /main loop replay|replay by kind|no context reading/);
   }
+  assert.strictEqual(buildSessionReport({ env, sessionId: "replay-session" }).mainLoopReplay.totalTokens, 400_000);
   createWorkerRecord({ taskId: "fusion-outside-replay", sessionId: "replay-session", dispatchToolUseId: "outside", agentType: "fusion:claude-worker", packageType: "implementation", workspaceRoot: sandbox(t), limits: {} }, env);
   assert.strictEqual(Object.hasOwn(buildFusionStats({ env, cwd: dir }), "mainLoopReplay"), false);
   assert.strictEqual(buildFusionStats({ env, cwd: dir, all: true }).mainLoopReplay.totalTokens, 400_000);
@@ -5270,27 +5271,27 @@ test("Antigravity stats preserve permission failures and exclude incomplete toke
   });
 });
 
-test("Antigravity pruning removes orphan runs while preserving runs with job records", (t) => {
+test("Fusion pruning skips Antigravity run directories", (t) => {
   const dir = sandbox(t);
   const data = path.join(dir, "agy-data");
-  const jobs = path.join(data, "state", "workspace", "jobs");
-  fs.mkdirSync(jobs, { recursive: true });
-  fs.writeFileSync(path.join(jobs, "retained.json"), JSON.stringify({ id: "retained", cwd: dir, status: "done" }));
-  for (const id of ["orphan", "retained", "recent"]) {
-    const run = path.join(data, "runs", id);
-    fs.mkdirSync(run, { recursive: true });
-    const old = new Date(Date.now() - 2 * 60 * 60 * 1000);
-    if (id !== "recent") fs.utimesSync(run, old, old);
-  }
+  const orphan = path.join(data, "runs", "orphan");
+  fs.mkdirSync(orphan, { recursive: true });
+  const old = new Date(Date.now() - 2 * 60 * 60 * 1000);
+  fs.utimesSync(orphan, old, old);
   const options = { AGY_COMPANION_DATA: data };
   const base = { cwd: dir, codexState: path.join(dir, "missing-codex") };
   const dry = run(base, ["--prune-dead", "--json"], options);
   assert.strictEqual(dry.status, 0, dry.stderr);
-  assert.deepStrictEqual(JSON.parse(dry.stdout).dead.agyRuns.map((row) => row.jobId), ["orphan"]);
+  const dead = JSON.parse(dry.stdout).dead;
+  assert.deepStrictEqual(dead.agy, []);
+  assert.strictEqual(Object.hasOwn(dead, "agyRuns"), false);
+  const rendered = run(base, ["--prune-dead"], options);
+  assert.strictEqual(rendered.status, 0, rendered.stderr);
+  assert.doesNotMatch(rendered.stdout, /Orphan Antigravity runs/);
   const applied = run(base, ["--prune-dead", "--yes", "--json"], options);
   assert.strictEqual(applied.status, 0, applied.stderr);
-  assert.strictEqual(fs.existsSync(path.join(data, "runs", "orphan")), false);
-  for (const id of ["retained", "recent"]) assert.strictEqual(fs.existsSync(path.join(data, "runs", id)), true);
+  assert.strictEqual(Object.hasOwn(JSON.parse(applied.stdout).dead, "agyRuns"), false);
+  assert.strictEqual(fs.existsSync(orphan), true);
 });
 
 
@@ -5314,4 +5315,79 @@ test("retired worker stats preserve fallback reasons through retention", (t) => 
   let output = "";
   runStats(["--all", "--json"], { env, cwd: dir, stdout: { write: (chunk) => { output += chunk; } } });
   assert.deepEqual(JSON.parse(output).retiredWorkers.fallbackReasons, expected);
+});
+
+test("Stop prices MCP, Skill and text messages once in session stats", async (t) => {
+  const cwd = sandbox(t);
+  const env = runtimeEnv({ cwd, codexState: path.join(cwd, "codex") });
+  const input = { session_id: "stop-replay", cwd, transcript_path: path.join(cwd, "parent.jsonl") };
+  const append = (id, tokens, content, extra = {}) => fs.appendFileSync(input.transcript_path, JSON.stringify({
+    type: "assistant", timestamp: new Date().toISOString(), message: { id, usage: { input_tokens: 10, cache_read_input_tokens: tokens - 10 }, content }, ...extra
+  }) + "\n");
+  const stop = () => handleLifecycleHook({ ...input, hook_event_name: "Stop" }, env);
+  const report = () => {
+    const result = run({ cwd, codexState: env.FUSION_CODEX_STATE }, ["--session", input.session_id, "--json"], env);
+    assert.strictEqual(result.status, 0, result.stderr);
+    return JSON.parse(result.stdout).mainLoopReplay;
+  };
+  append("msg_mcp", 12_000, [{ type: "tool_use", name: "mcp__repo__lookup", id: "mcp_1" }]);
+  append("msg_mcp", 12_000, [{ type: "tool_use", name: "mcp__repo__lookup", id: "mcp_2" }]);
+  append("msg_skill", 13_000, [{ type: "tool_use", name: "Skill", id: "skill_1" }]);
+  append("msg_worker", 900_000, [], { isSidechain: true });
+  append("msg_meta", 900_000, [], { isMeta: true });
+  append("msg_text", 14_000, [{ type: "text", text: "done" }]);
+  const opens = t.mock.method(fs, "openSync");
+  await stop();
+  assert.strictEqual(opens.mock.calls.filter(({ arguments: [file] }) => file === input.transcript_path).length, 1);
+  opens.mock.restore();
+  await stop();
+  const pure = report();
+  assert.strictEqual(pure.totalTurns, 3);
+  assert.strictEqual(pure.unmeasuredTurns, 0);
+  assert.deepStrictEqual(pure.byKind.other, { turns: 3, tokens: 39_000 });
+  assert.deepStrictEqual(readStatsAuditEvents(env).events.map(({ turn, tool }) => [turn, tool]), [
+    ["msg_mcp", "mcp__repo__lookup"], ["msg_skill", "Skill"], ["msg_text", "Stop"]
+  ]);
+
+  createWorkerRecord({ taskId: "fusion-stop-replay", sessionId: input.session_id, dispatchToolUseId: "dispatch", agentType: "fusion:claude-worker", workspaceRoot: cwd, limits: {} }, env);
+  const workspace = runDirect({ cwd, codexState: env.FUSION_CODEX_STATE }, ["--json"], env);
+  assert.strictEqual(workspace.status, 0, workspace.stderr);
+  assert.deepStrictEqual(JSON.parse(workspace.stdout).mainLoopReplay, pure);
+
+  const read = { ...input, hook_event_name: "PreToolUse", tool_use_id: "read_late", tool_name: "Read" };
+  handleInlineDelegationHook(read, env);
+  append("msg_read", 15_000, [{ type: "tool_use", name: "Read", id: read.tool_use_id }]);
+  append("msg_read", 15_000, [{ type: "text", text: "reading" }]);
+  append("msg_final", 16_000, [{ type: "text", text: "finished" }]);
+  await stop();
+  await stop();
+  const mixed = report();
+  assert.strictEqual(mixed.totalTurns, 5);
+  assert.deepStrictEqual(mixed.byKind.read, { turns: 1, tokens: 14_000 });
+  assert.deepStrictEqual(mixed.byKind.other, { turns: 4, tokens: 55_000 });
+  assert.strictEqual(readStatsAuditEvents(env).events.length, 5);
+});
+
+test("Stop replaces a fresh session's provisional replay price once the first tool call is flushed", async (t) => {
+  const cwd = sandbox(t);
+  const env = runtimeEnv({ cwd, codexState: path.join(cwd, "codex") });
+  const input = { session_id: "fresh-session", cwd, transcript_path: path.join(cwd, "parent.jsonl") };
+  handleInlineDelegationHook({ ...input, hook_event_name: "PreToolUse", tool_use_id: "one", tool_name: "Read" }, env);
+  fs.writeFileSync(input.transcript_path, JSON.stringify({ type: "assistant", message: {
+    id: "msg_one", usage: { input_tokens: 100, cache_read_input_tokens: 8_000 }, content: [{ type: "tool_use", name: "Read", id: "one" }]
+  } }) + "\n");
+  await handleLifecycleHook({ ...input, hook_event_name: "Stop" }, env);
+  const events = readStatsAuditEvents(env).events;
+  assert.strictEqual(events[1].turn, events[0].turn);
+  assert.strictEqual(events[1].measured, true);
+  assert.strictEqual(events[1].tokens, 8_100);
+  const replay = buildSessionReport({ env, sessionId: input.session_id }).mainLoopReplay;
+  assert.strictEqual(replay.totalTurns, 1);
+  assert.strictEqual(replay.unmeasuredTurns, 0);
+  assert.deepStrictEqual(replay.byKind.read, { turns: 1, tokens: 8_100 });
+  handleInlineDelegationHook({ ...input, hook_event_name: "PreToolUse", tool_use_id: "two", tool_name: "Read" }, env);
+  const next = readStatsAuditEvents(env).events.at(-1);
+  assert.notStrictEqual(next.turn, events[0].turn);
+  assert.strictEqual(next.measured, true);
+  assert.strictEqual(next.tokens, 8_100);
 });

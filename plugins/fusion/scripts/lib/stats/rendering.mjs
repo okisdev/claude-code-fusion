@@ -2,7 +2,7 @@ import { ENGINES, ENGINE_IDS } from "../engines.mjs";
 import { STATS_PROVIDER_REGISTRY, WORKSPACE_ENGINE_DESCRIPTORS, acceptanceSummary } from "./aggregation.mjs";
 import { FLEET_SHAPED_MIN_WIDTH, hasCoercionLedgerData } from "./fleet.mjs";
 import { formatTraceModel } from "./reports.mjs";
-import { formatTokens, NOMINAL_CONTEXT_TOKENS } from "../guard/replay.mjs";
+import { formatTokens } from "../guard/replay.mjs";
 
 export function renderAuditReport(report) {
   const lines = ["# Fusion inline audit", "", `Scope: ${report.scope}`, "", `Total events: ${report.totalEvents}`, `Sessions: ${report.sessionCount}`];
@@ -20,7 +20,7 @@ export function renderAuditReport(report) {
   }
   renderCounts(lines, "Dispatches by lane", report.dispatchesByLane);
   renderCounts(lines, "Verification evidence", report.verificationByEvidence);
-  renderMainLoopReplay(lines, report.mainLoopReplay);
+  renderMainLoopReplay(lines, report.mainLoopReplay, report.sessionId ? "in this session" : "in dispatching sessions");
   if (report.malformedCount > 0) {
     lines.push("", `Malformed audit entries skipped: ${report.malformedCount}`);
   }
@@ -61,7 +61,7 @@ export function renderSessionReport(report) {
       lines.push(`Malformed audit entries skipped: ${report.guard.malformedCount}`);
     }
   }
-  renderMainLoopReplay(lines, report.mainLoopReplay);
+  renderMainLoopReplay(lines, report.mainLoopReplay, "in this session");
   if (report.workers) {
     lines.push("", "## Claude workers (session scope)", "", `Total jobs: ${report.workers.totalJobs}`);
     renderCounts(lines, "By transport status", report.workers.byTransportStatus);
@@ -104,7 +104,7 @@ export function renderPruneReport(result) {
       lines.push(`- ${candidate.dir} (${candidate.jobCount} job${candidate.jobCount === 1 ? "" : "s"})`);
     }
   }
-  for (const [key, title] of [["observations", "Observation sidecars"], ...ENGINE_IDS.filter((id) => id !== "codex" && id !== "grok").map((id) => [`${id}Runs`, `Orphan ${ENGINES[id].displayName} runs`])]) {
+  for (const [key, title] of [["observations", "Observation sidecars"], ...ENGINE_IDS.filter((id) => Object.hasOwn(result.dead, `${id}Runs`)).map((id) => [`${id}Runs`, `Orphan ${ENGINES[id].displayName} runs`])]) {
     lines.push("", `## ${title}`, "");
     const candidates = result.dead[key] ?? [];
     lines.push(...(candidates.length ? candidates.map((entry) => `- ${entry.dir}`) : ["none found"]));
@@ -316,14 +316,14 @@ function renderCoercionLedger(lines, ledger) {
   lines.push(`Deepest unverified window: ${ledger.deepestUnverifiedWindow ?? 0}`);
 }
 
-function renderMainLoopReplay(lines, replay) {
+function renderMainLoopReplay(lines, replay, scope = "in dispatching sessions") {
   if (!replay || replay.totalTurns === 0) {
     return;
   }
-  const total = `${formatTokens(replay.totalTokens)} tokens over ${replay.totalTurns} tool turn${replay.totalTurns === 1 ? "" : "s"}`;
+  const total = `${formatTokens(replay.totalTokens)} tokens over ${replay.totalTurns} turn${replay.totalTurns === 1 ? "" : "s"}`;
   lines.push(replay.acceptedPackages > 0
-    ? `- main loop replay in dispatching sessions: ${formatTokens(replay.tokensPerAcceptedPackage)} tokens per accepted package (${total}, ${replay.acceptedPackages} accepted package${replay.acceptedPackages === 1 ? "" : "s"})`
-    : `- main loop replay in dispatching sessions: ${total}, no accepted packages`);
+    ? `- main loop replay ${scope}: ${formatTokens(replay.tokensPerAcceptedPackage)} tokens per accepted package (${total}, ${replay.acceptedPackages} accepted package${replay.acceptedPackages === 1 ? "" : "s"})`
+    : `- main loop replay ${scope}: ${total}, no accepted packages`);
   const kinds = ["read", "write", "verify", "settle", "dispatch", "other"]
     .filter((kind) => replay.byKind[kind].turns > 0)
     .map((kind) => {
@@ -332,7 +332,7 @@ function renderMainLoopReplay(lines, replay) {
     });
   lines.push(`- replay by kind: ${kinds.join(", ")}`);
   if (replay.unmeasuredTurns > 0) {
-    lines.push(`- ${replay.unmeasuredTurns} replay turn${replay.unmeasuredTurns === 1 ? "" : "s"} had no context reading and ${replay.unmeasuredTurns === 1 ? "is" : "are"} priced at ${formatTokens(NOMINAL_CONTEXT_TOKENS)} tokens`);
+    lines.push(`- ${replay.unmeasuredTurns} replay turn${replay.unmeasuredTurns === 1 ? "" : "s"} had no context reading (${formatTokens(replay.unmeasuredTokens)} estimated tokens)`);
   }
 }
 

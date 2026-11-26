@@ -6,7 +6,7 @@ import { test } from "node:test";
 import { normalizeAuditEvent } from "../plugins/fusion/scripts/lib/guard/audit.mjs";
 import {
   DEFAULT_REPLAY_BUDGET_TOKENS,
-  NOMINAL_CONTEXT_TOKENS,
+  INITIAL_CONTEXT_TOKENS,
   crossedBudgetMultiple,
   formatTokens,
   isNewTurn,
@@ -30,7 +30,7 @@ function assistant(id, usage, toolUseIds = [], extra = {}) {
 
 test("the replay budget defaults to two million tokens and accepts a positive integer override", () => {
   assert.strictEqual(DEFAULT_REPLAY_BUDGET_TOKENS, 2_000_000);
-  assert.strictEqual(DEFAULT_REPLAY_BUDGET_TOKENS / NOMINAL_CONTEXT_TOKENS, 5);
+  assert.strictEqual(INITIAL_CONTEXT_TOKENS, 20_000);
   assert.strictEqual(resolveReplayBudgetTokens({}), 2_000_000);
   assert.strictEqual(resolveReplayBudgetTokens({ FUSION_INLINE_REPLAY_BUDGET_TOKENS: "500000" }), 500_000);
   assert.strictEqual(resolveReplayBudgetTokens({ FUSION_INLINE_REPLAY_BUDGET_TOKENS: 750_000 }), 750_000);
@@ -55,13 +55,13 @@ test("a turn is the assistant message that holds the tool call, priced at its co
   assert.deepStrictEqual(readTurn(file, null), { id: null, contextTokens: 420_003 });
 });
 
-test("an unreadable transcript prices a turn at the nominal context", (t) => {
+test("an unreadable transcript prices a turn at the initial floor", (t) => {
   assert.deepStrictEqual(readTurn(null, "tool-a"), { id: null, contextTokens: null });
   assert.deepStrictEqual(readTurn(path.join(os.tmpdir(), "replay-test-missing.jsonl"), "tool-a"), { id: null, contextTokens: null });
   const file = transcript(t, [assistant("msg_1", { input_tokens: "many" }, ["tool-a"])]);
   assert.deepStrictEqual(readTurn(file, "tool-a"), { id: "msg_1", contextTokens: null });
-  assert.strictEqual(turnReplayTokens({ id: null, contextTokens: null }), NOMINAL_CONTEXT_TOKENS);
-  assert.strictEqual(turnReplayTokens(null), NOMINAL_CONTEXT_TOKENS);
+  assert.strictEqual(turnReplayTokens({ id: null, contextTokens: null }), INITIAL_CONTEXT_TOKENS);
+  assert.strictEqual(turnReplayTokens(null), INITIAL_CONTEXT_TOKENS);
   assert.strictEqual(turnReplayTokens({ id: "msg_1", contextTokens: 80_000 }), 80_000);
 });
 
@@ -95,7 +95,7 @@ test("an advisory is due when replay crosses the budget and each doubling of it"
   const turns = [];
   for (let turn = 1, total = 0; turn <= 20; turn += 1) {
     const before = total;
-    total += NOMINAL_CONTEXT_TOKENS;
+    total += 400_000;
     if (crossedBudgetMultiple(before, total, budget)) turns.push(turn);
   }
   assert.deepStrictEqual(turns, [5, 10, 20]);
@@ -131,4 +131,25 @@ test("the audit log keeps one replay event per priced tool call", () => {
 test("replay audit events accept hyphens in tool names", () => {
   const event = { at: "2026-07-21T00:00:00.000Z", session: "session-1", event: "replay", lane: "main", tool: "mcp__claude-in-chrome__read_page", turn: "msg_1", kind: "other", tokens: 400_000, measured: false };
   assert.deepStrictEqual(normalizeAuditEvent(event), { schemaVersion: 1, ...event });
+});
+
+test("context lookup skips blob JSON, crosses chunk boundaries, and stops at the scan limit", (t) => {
+  const message = assistant("msg_boundary", { input_tokens: 30_000 }, ["tool"]);
+  message.message.content.push({ type: "text", text: "é".repeat(8000) });
+  const blob = (size) => ({ type: "api-request-blob", role: "assistant", data: "x".repeat(size) });
+  const file = transcript(t, [message, { payload: { type: "assistant" }, type: "api-request-blob" }, blob(250_000), blob(262_144)]);
+  const parsed = [];
+  const parse = JSON.parse;
+  t.mock.method(JSON, "parse", (line, ...args) => {
+    if (line.includes('"api-request-blob"')) parsed.push(line.length);
+    return parse(line, ...args);
+  });
+  assert.deepStrictEqual(readTurn(file, "tool"), { id: "msg_boundary", contextTokens: 30_000 });
+  assert.deepStrictEqual(parsed, []);
+
+  fs.appendFileSync(file, JSON.stringify(blob(4 * 1024 * 1024)) + "\n");
+  const read = t.mock.method(fs, "readSync");
+  assert.deepStrictEqual(readTurn(file, "absent", 12_345), { id: null, contextTokens: 12_345 });
+  assert.strictEqual(read.mock.calls.reduce((bytes, call) => bytes + call.result, 0), 4 * 1024 * 1024);
+  assert.deepStrictEqual(parsed, []);
 });

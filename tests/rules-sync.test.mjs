@@ -5,7 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import { test } from "node:test";
 
-import { buildRulesManifest } from "../plugins/fusion/scripts/generate-rules-manifest.mjs";
+import { buildRulesManifest, main as generateRulesManifest } from "../plugins/fusion/scripts/generate-rules-manifest.mjs";
 import { DEFAULT_MODEL_TABLE_PLACEHOLDER, readModelRoutingFile, renderModelTable } from "../plugins/fusion/scripts/lib/model-table.mjs";
 import { hashRulesTemplate } from "../plugins/fusion/scripts/lib/rules-template.mjs";
 import { messageTag, tagMessage } from "../plugins/fusion/scripts/lib/user-messages.mjs";
@@ -505,7 +505,7 @@ test("Grok rules document source verified headless boundaries", () => {
   const readme = fs.readFileSync(path.join(repoRoot, "README.md"), "utf8");
   const security = fs.readFileSync(path.join(repoRoot, "SECURITY.md"), "utf8");
   const bridgeSentence = "The child sets all eighteen `GROK_CLAUDE_*_ENABLED`, `GROK_CURSOR_*_ENABLED`, and `GROK_CODEX_*_ENABLED` bridge variables to false; upstream currently consumes the six Claude and six Cursor cells plus the Codex sessions cell and reserves the other five Codex cells, and the child also pins `GROK_MANAGED_MCPS_ENABLED=false` because that variable has highest precedence over `[managed_mcps]` in `~/.grok/config.toml` and remote settings.";
-  const hookClaim = "Grok loads hooks from plugins enabled in ~/.grok/config.toml and from ~/.grok/hooks/*.json inside managed runs, verified at 1.0.77. The GROK_CONFIG overlay does not disable them (the plugin stays loaded in GROK_HOOKS_LOG), and allow_managed_hooks_only is read only from policy layers that also bind interactive use, so /grok:setup names them and the repair is the user's [plugins] list.";
+  const hookClaim = "Managed Grok runs use a private `GROK_HOME` with an empty `hooks/` directory. Its `config.toml` omits the user's `plugins` and `hooks` settings and preserves the rest verbatim.";
   const subagentSentence = "`--no-subagents` disables headless subagent spawning (verified on 1.0.77 and 1.0.88); the hard Agent tool deny and `GROK_SUBAGENTS=0` remain independent controls.";
   const rustLogSentence = "Every run forces `RUST_LOG=xai_grok_agent::builder=debug,xai_grok_sandbox=warn,xai_grok_shell::session::acp_session::turn=warn`.";
   const bubblewrapSentence = "On Linux, a strict profile with deny paths re-executes under bubblewrap and refuses to start when `bwrap` is missing or unusable; macOS has no equivalent hard enforcement and relies on Seatbelt application plus best-effort tool denies.";
@@ -524,7 +524,7 @@ test("Grok rules document source verified headless boundaries", () => {
   for (const text of [troubleshooting, runtime, contract, readme, security, doctor]) {
     assert.ok(text.includes(bridgeSentence), "Grok bridge isolation wording must stay synchronized");
   }
-  for (const text of [troubleshooting, contract, readme, security, doctor]) {
+  for (const text of [troubleshooting, runtime, contract, readme, security, doctor]) {
     assert.ok(text.includes(hookClaim), "Grok hook behavior must stay synchronized");
   }
 
@@ -596,7 +596,7 @@ test("Grok rules document source verified headless boundaries", () => {
     assert.match(text, /raw path variants/i);
     assert.match(text, /symbolic links/);
     assert.match(text, /shell or indirect scripts/);
-    assert.match(text, /Narrower exposure (?:requires|needs) a dedicated sandbox profile, an isolated Grok home, an authentication broker, or upstream path-level authorization/);
+    assert.match(text, /Narrower exposure (?:requires|needs) a dedicated sandbox profile, an authentication broker, or upstream path-level authorization/);
   }
 
   assert.match(fs.readFileSync(path.join(repoRoot, "plugins", "fusion", "rules", "troubleshooting.md"), "utf8"), /Strict requests child process network restriction/);
@@ -611,7 +611,7 @@ test("Grok rules document source verified headless boundaries", () => {
   assert.match(fs.readFileSync(path.join(repoRoot, "plugins", "fusion", "rules", "troubleshooting.md"), "utf8"), /all of `\/private\/var\/folders`/);
   assert.match(fs.readFileSync(path.join(repoRoot, "plugins", "fusion", "rules", "troubleshooting.md"), "utf8"), /not the only writable temporary surface/);
   assert.match(fs.readFileSync(path.join(repoRoot, "plugins", "fusion", "rules", "troubleshooting.md"), "utf8"), /sandbox still permits consult `read_file` to reach `~\/\.grok\/auth\.json`/i);
-  assert.match(fs.readFileSync(path.join(repoRoot, "plugins", "fusion", "rules", "troubleshooting.md"), "utf8"), /native MCP servers, plugins, or hooks/);
+  assert.match(fs.readFileSync(path.join(repoRoot, "plugins", "fusion", "rules", "troubleshooting.md"), "utf8"), /native MCP servers from starting during agent construction/);
   assert.match(troubleshooting, /bridge variables gate only loose compatibility imports, not native Grok configuration/);
   for (const sentence of [
     freshSessionSentence,
@@ -669,7 +669,7 @@ test("Grok rules document source verified headless boundaries", () => {
   assert.match(contract, /`cache_creation_input_tokens`/);
   assert.match(contract, /The only incompleteness flags are `usage_is_incomplete` and `cost_is_partial`/);
   assert.match(contract, /no `cancellation-category` field or `model_usage_is_incomplete` field/);
-  assert.match(contract, /Upstream appends to `~\/\.grok\/sessions\/sandbox-events\.jsonl` with no rotation or size cap/);
+  assert.match(contract, /Upstream appends to `\$GROK_HOME\/sessions\/sandbox-events\.jsonl` with no rotation or size cap/);
   assert.match(contract, /The open-source snapshot is per-crate versioned, unversioned as a release train with no tags/);
   assert.match(contract, /Upstream wires only `bypassPermissions` at spawn/);
   assert.match(contract, /Upstream ships ACP today/);
@@ -686,8 +686,9 @@ test("Grok rules document source verified headless boundaries", () => {
   assert.match(runtime, /missing applicable capability fails before launch with failure kind `setup`/i);
   assert.match(runtime, /Hosted `x_search` stays outside managed runs because the fixed `--tools` allowlist governs the toolset/);
   assert.match(setup, /failure kind `setup`/);
-  assert.match(doctor, /native MCP servers, plugins, or hooks under `~\/\.grok`/);
-  assert.match(doctor, /The Grok home is readable under strict, but since 1\.0\.14 strict writes only `~\/\.grok\/sessions` inside it/);
+  assert.match(doctor, /native MCP servers from starting during agent construction/);
+  assert.match(doctor, /privateHome\.userPluginsAndHooksExcluded/);
+  assert.match(doctor, /The Grok home is readable under strict, but since 1\.0\.14 strict writes only `\$GROK_HOME\/sessions` inside it/);
   assert.match(doctor, /entire `~\/Library` on macOS/);
   assert.match(doctor, /best-effort Read denies cover `auth\.json`, `mcp_credentials\.json`/);
   assert.match(doctor, /raw path variants, symbolic links, and shell or indirect scripts can bypass/i);
@@ -700,8 +701,8 @@ test("Grok rules document source verified headless boundaries", () => {
     assert.match(text, /introduced in 0\.2\.112, verified through 1\.0\.41/);
     assert.match(text, /file that is unlinked (?:immediately after open|as soon as it is opened)/);
     assert.match(text, /all of `\/private\/var\/folders`/);
-    assert.match(text, /native MCP servers, plugins, or hooks/);
-    assert.match(text, /Narrower exposure requires a dedicated sandbox profile, an isolated Grok home, an authentication broker, or upstream path-level authorization/);
+    assert.match(text, /native MCP servers from starting during agent construction/);
+    assert.match(text, /Narrower exposure requires a dedicated sandbox profile, an authentication broker, or upstream path-level authorization/);
     assert.doesNotMatch(text, /Native Grok hooks have no single headless disable flag/);
   }
 });
@@ -722,7 +723,7 @@ test("The shipped rules manifest contains the current rules file template hash",
   for (const hash of previous.hashes) assert.ok(manifest.hashes.includes(hash), `missing previously shipped hash ${hash}`);
 });
 
-test("Rules manifest generator hashes only HEAD history and working tree content", (t) => {
+test("Rules manifest generator uses HEAD history, working tree content, and existing hashes", async (t) => {
   const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "fusion-rules-manifest-test-")));
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
   const relativeRulesPath = path.join("plugins", "fusion", "rules", "orchestration.md");
@@ -758,4 +759,17 @@ test("Rules manifest generator hashes only HEAD history and working tree content
     hashes: [hashRulesTemplate(mainContent), hashRulesTemplate(workingTreeContent)].sort()
   });
   assert.ok(!manifest.hashes.includes(hashRulesTemplate(branchOnlyContent)));
+
+  await t.test("Regeneration retains a previously shipped hash absent from Git history", () => {
+    const manifestPath = path.join(root, "plugins", "fusion", "rules-manifest.json");
+    const shippedHash = hashRulesTemplate(OLD_VERSION);
+    fs.writeFileSync(manifestPath, JSON.stringify({ format: 2, hashes: [shippedHash, hashRulesTemplate(mainContent)] }));
+
+    generateRulesManifest({ root, relativeRulesPath, stdout: () => {} });
+
+    assert.deepStrictEqual(JSON.parse(fs.readFileSync(manifestPath, "utf8")), {
+      format: 2,
+      hashes: [...manifest.hashes, shippedHash].sort()
+    });
+  });
 });

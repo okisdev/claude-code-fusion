@@ -640,7 +640,7 @@ export function verificationEvidence(records, audit, all, workspaceRoot) {
 export function summarizeMainLoopReplay(records, audit, all, workspaceRoot) {
   const repositoryCache = new Map();
   const scopedRecords = records.filter((record) => (!audit.sessionId || record.sessionId === audit.sessionId) && (all || workspaceRootsShareRepository(record.workspaceRoot, workspaceRoot, repositoryCache)));
-  const sessions = new Set(scopedRecords.map((record) => record.sessionId));
+  const sessions = new Set(audit.sessionId ? [audit.sessionId] : scopedRecords.map((record) => record.sessionId));
   const turns = new Map();
   let earliestReplayMs = Infinity;
   for (const event of audit.events) {
@@ -649,12 +649,13 @@ export function summarizeMainLoopReplay(records, audit, all, workspaceRoot) {
     }
     earliestReplayMs = Math.min(earliestReplayMs, event.atMs);
     const key = `${event.session}\u0000${event.turn}`;
-    const turn = turns.get(key) ?? { kind: event.kind, tokens: 0, unmeasured: false };
+    const turn = turns.get(key) ?? { kind: event.kind, tokens: 0, unmeasured: false, stopTokens: 0 };
     if (outranksReplayKind(event.kind, turn.kind)) {
       turn.kind = event.kind;
     }
     turn.tokens = Math.max(turn.tokens, event.tokens);
     turn.unmeasured ||= event.measured === false;
+    if (event.tool === "Stop" && event.measured) turn.stopTokens = event.tokens;
     turns.set(key, turn);
   }
   if (turns.size === 0) {
@@ -664,10 +665,15 @@ export function summarizeMainLoopReplay(records, audit, all, workspaceRoot) {
   const byKind = Object.fromEntries(REPLAY_KINDS.map((kind) => [kind, { tokens: 0, turns: 0 }]));
   let totalTokens = 0;
   let unmeasuredTurns = 0;
+  let unmeasuredTokens = 0;
   for (const turn of turns.values()) {
-    totalTokens += turn.tokens;
-    unmeasuredTurns += Number(turn.unmeasured);
-    byKind[turn.kind].tokens += turn.tokens;
+    const tokens = turn.stopTokens || turn.tokens;
+    totalTokens += tokens;
+    if (turn.unmeasured && !turn.stopTokens) {
+      unmeasuredTurns += 1;
+      unmeasuredTokens += tokens;
+    }
+    byKind[turn.kind].tokens += tokens;
     byKind[turn.kind].turns += 1;
   }
   return {
@@ -676,7 +682,8 @@ export function summarizeMainLoopReplay(records, audit, all, workspaceRoot) {
     acceptedPackages,
     tokensPerAcceptedPackage: acceptedPackages > 0 ? totalTokens / acceptedPackages : null,
     byKind,
-    unmeasuredTurns
+    unmeasuredTurns,
+    unmeasuredTokens
   };
 }
 
