@@ -99,6 +99,20 @@ test("does not credit failed or interrupted tool responses", () => {
   }
 });
 
+test("background launch metadata overrides both exit status and a passing output summary", () => {
+  for (const metadata of [
+    { backgroundTaskId: "job-1" }, { isAsync: true }, { status: "async_launched" }, { timedOutAfterMs: 0 },
+    { backgroundedByUser: true }, { backgroundedToDeliverMessage: true }, { backgroundedByTurnAbort: true }
+  ]) {
+    for (const response of [metadata, { toolUseResult: metadata }]) {
+      for (const command of ["npm test", "npm test | tail"]) {
+        assert.equal(summaryEvidence(command, "ℹ fail 0", response), null, JSON.stringify({ command, response }));
+      }
+    }
+  }
+  assert.equal(summaryEvidence("npm test", "", { isAsync: false, toolUseResult: { backgroundedByUser: false } }), "exit-status");
+});
+
 test("keeps final-segment exit-status evidence and rejects mutating commands", () => {
   assert.equal(verificationEvidence("npm test", { is_error: false, output: "1 failed" }), null);
   assert.equal(summaryEvidence("npm install | tail -20", "3 passed"), null);
