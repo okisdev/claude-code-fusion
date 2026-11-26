@@ -7,6 +7,7 @@ import { test } from "node:test";
 import {
   companion,
   envFor,
+  fakeGrok,
   jobFileFor,
   jobRecords,
   killGroups,
@@ -17,6 +18,7 @@ import {
   waitFor,
   workerExitSignal,
 } from "./lib/companion-harness.mjs";
+import { executionTimeoutGate } from "./lib/execution-budget.mjs";
 import { getProcessIdentity } from "../plugins/grok/scripts/lib/process-identity.mjs";
 
 const {
@@ -679,24 +681,43 @@ test("cancel keeps an unverified process record running when graceful cleanup ca
 
 test("background timeout marks the record error and result reports the failure", async (t) => {
   const sandbox = makeSandbox(t);
-  const env = envFor(sandbox, { FAKE_GROK_MODE: "hang", GROK_COMPANION_TIMEOUT_MS: "500" });
+  const worker = workerExitSignal(sandbox, "task-worker");
+  const ready = path.join(sandbox.root, "grok-ready");
+  const preload = path.join(sandbox.root, "grok-readiness.cjs");
+  fs.writeFileSync(preload, `if (process.argv[1] === ${JSON.stringify(fakeGrok)}) {
+  process.on("newListener", (event) => {
+    if (event === "SIGTERM") require("node:fs").writeFileSync(${JSON.stringify(ready)}, "");
+  });
+}
+`);
+  const gate = executionTimeoutGate(sandbox.root, "expireGrokRun", ready);
+  const timeoutMs = 30000;
+  const env = envFor(sandbox, {
+    FAKE_GROK_MODE: "hang",
+    GROK_COMPANION_TIMEOUT_MS: String(timeoutMs),
+    NODE_OPTIONS: `${worker.env.NODE_OPTIONS} --require=${JSON.stringify(preload)} ${gate}`,
+  });
   const result = runCompanion(["task", "--background", "slow work"], {
     cwd: sandbox.workDir,
     env,
   });
   assert.strictEqual(result.status, 0, result.stderr);
+  sandbox.registerCleanup(worker.waitForExit);
   const failed = await waitFor(() => {
     const current = jobRecords(sandbox.dataDir)[0];
     return current && current.status === "error" ? current : null;
   });
-  assert.match(failed.errorTail, /timed out after 500ms/);
-  assert.match(failed.errorMessage, /timed out after 500ms/);
+  const message = `timed out after ${timeoutMs}ms`;
+  assert.strictEqual(failed.failureKind, "timeout");
+  assert.ok(fs.existsSync(ready));
+  assert.ok(failed.errorTail.includes(message), failed.errorTail);
+  assert.ok(failed.errorMessage.includes(message), failed.errorMessage);
   assert.doesNotMatch(failed.errorMessage, /\r?\n/);
   assert.strictEqual(failed.exitCode, 143);
   const resultOutput = runCompanion(["result", failed.id], { cwd: sandbox.workDir, env });
   assert.strictEqual(resultOutput.status, 0, resultOutput.stderr);
   assert.ok(resultOutput.stdout.includes("failed"));
-  assert.ok(resultOutput.stdout.includes("timed out after 500ms"));
+  assert.ok(resultOutput.stdout.includes(message));
 });
 
 test("permission-cancelled task ends in an error record, not done", (t) => {

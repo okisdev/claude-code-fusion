@@ -49,7 +49,7 @@ function harness(t, extraEnv = {}, { withoutHelper = false } = {}) {
     fs.writeFileSync(path.join(identityBin, "sysctl"), "#!/bin/sh\nif /usr/sbin/sysctl -n kern.boottime >/dev/null 2>&1; then exec /usr/sbin/sysctl \"$@\"; fi\nprintf '{ sec = 1, usec = 0 }\\n'\n");
     for (const name of ["ps", "sysctl"]) fs.chmodSync(path.join(identityBin, name), 0o755);
   }
-  const env = { ...process.env, HOME: home, PATH: `${identityBin}${path.delimiter}${process.env.PATH}`, CURSOR_AGENT_BIN: withoutHelper ? helperlessBin : fake, CURSOR_COMPANION_DATA: data, FAKE_CURSOR_LOG: log, ...extraEnv, ...(execMarker ? { FAKE_CURSOR_EXEC_MARKER: execMarker } : {}) };
+  const env = { ...process.env, TMPDIR: temp, HOME: home, PATH: `${identityBin}${path.delimiter}${process.env.PATH}`, CURSOR_AGENT_BIN: withoutHelper ? helperlessBin : fake, CURSOR_COMPANION_DATA: data, FAKE_CURSOR_LOG: log, ...extraEnv, ...(execMarker ? { FAKE_CURSOR_EXEC_MARKER: execMarker } : {}) };
   fs.mkdirSync(data);
   fs.writeFileSync(path.join(data, "fake-cursor-config.json"), JSON.stringify({ scenario: extraEnv.FAKE_CURSOR_SCENARIO, log, helperPidFile: extraEnv.FAKE_CURSOR_HELPER_PID_FILE, execMarker }));
   const run = (args, input = "") => spawnSync(process.execPath, [companion, ...args], { cwd, env, input, encoding: "utf8", timeout: 30000 });

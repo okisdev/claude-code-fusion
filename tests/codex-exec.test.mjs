@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
+import { once } from "node:events";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -51,6 +52,7 @@ const SHORT_TIMEOUT_MS = 750;
 const SHORT_TERMINATION_GRACE_MS = 500;
 const COMPANION_WATCHDOG_TIMEOUT_MS = 30000;
 const PATCH_VERIFICATION_FAILURE = "apply_patch verification failed: Failed to find expected lines in target-file";
+const schedulePoll = setTimeout;
 
 function fixture(t) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "fusion-codex-exec-"));
@@ -108,7 +110,10 @@ async function runFixture(t, mode, options = {}) {
     FAKE_CODEX_MODE: mode,
     FAKE_CODEX_STDIN_FILE: files.stdinFile,
     FAKE_CODEX_TERM_FILE: files.termFile,
-    ...(options.waitForReady || options.readyBeforeTimeout ? { FAKE_CODEX_READY_FILE: files.readyFile } : {}),
+    ...(options.readyBeforeTimeout ? {
+      FAKE_CODEX_READY_FILE: files.readyFile,
+      FAKE_CODEX_READY_BEFORE_STDIN: "true"
+    } : {}),
     ...options.env
   };
   const resumeThreadId = options.resumeThreadId;
@@ -153,22 +158,22 @@ async function runFixture(t, mode, options = {}) {
       }
       options.onSpawnAttempt?.(pid);
     },
-    onSpawn: async (...args) => {
-      if (options.waitForReady) {
-        await waitForFile(files.readyFile);
-      }
-      return options.onSpawn?.(...args);
-    },
+    onSpawn: options.onSpawn,
     onCheckpoint: options.onCheckpoint
   });
   return { files, outcome, args };
 }
 
-function scriptedCodex(body) {
+function scriptedCodex(body, { readStdinFirst = true } = {}) {
   return `#!/usr/bin/env node
 
-for await (const _chunk of process.stdin) {}
-const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+import fs from "node:fs";
+import { setTimeout as delay } from "node:timers/promises";
+
+${readStdinFirst ? "for await (const _chunk of process.stdin) {}" : "process.stdin.resume();"}
+async function waitUntil(predicate) {
+  while (!predicate()) await delay(${LOAD_TOLERANT_POLL_INTERVAL_MS});
+}
 const emit = (event) => process.stdout.write(JSON.stringify(event) + "\\n");
 const usage = { input_tokens: 1, cached_input_tokens: 0, output_tokens: 1, reasoning_output_tokens: 0 };
 emit({ type: "thread.started", thread_id: "thread-123" });
@@ -177,15 +182,15 @@ ${body}`;
 }
 
 async function waitUntil(predicate, timeoutMs = LOAD_TOLERANT_WAIT_TIMEOUT_MS) {
-  const deadline = Date.now() + timeoutMs;
+  const deadline = performance.now() + timeoutMs;
   for (;;) {
     if (predicate()) {
       return;
     }
-    if (Date.now() >= deadline) {
+    if (performance.now() >= deadline) {
       throw new Error("Timed out waiting for process state.");
     }
-    await new Promise((resolve) => setTimeout(resolve, LOAD_TOLERANT_POLL_INTERVAL_MS));
+    await new Promise((resolve) => schedulePoll(resolve, LOAD_TOLERANT_POLL_INTERVAL_MS));
   }
 }
 
@@ -291,18 +296,29 @@ test("a persisted leader identity cannot authorize signaling a leaderless proces
     return;
   }
   const files = fixture(t);
-  const leader = spawn(process.execPath, ["-e", `const { spawn } = require("node:child_process"); spawn(process.execPath, ["-e", ${JSON.stringify(`require("node:fs").writeFileSync(${JSON.stringify(files.childPidFile)}, String(process.pid)); setInterval(() => {}, 1000);`)}], { stdio: "ignore" }); setInterval(() => {}, 1000);`], {
+  const childSource = `
+    const fs = require("node:fs");
+    const pidFile = process.argv[1];
+    fs.writeFileSync(pidFile + ".tmp", String(process.pid));
+    fs.renameSync(pidFile + ".tmp", pidFile);
+    setInterval(() => {}, 1000);
+  `;
+  const leader = spawn(process.execPath, ["-e", `
+    const { spawn } = require("node:child_process");
+    spawn(process.execPath, ["-e", ...process.argv.slice(1)], { stdio: "ignore" });
+    setInterval(() => {}, 1000);
+  `, childSource, files.childPidFile], {
     detached: true,
     stdio: "ignore"
   });
-  leader.unref();
   files.pids.add(leader.pid);
   await waitUntil(() => fs.existsSync(files.childPidFile));
   const childPid = Number(fs.readFileSync(files.childPidFile, "utf8"));
   const identity = getProcessIdentity(leader.pid);
   assert.ok(identity);
+  const leaderExit = once(leader, "exit");
   process.kill(leader.pid, "SIGKILL");
-  await waitForProcessExit(leader.pid, false);
+  assert.deepEqual(await leaderExit, [null, "SIGKILL"]);
   assert.equal(isProcessAlive(leader.pid, null, false), false);
   assert.equal(isProcessAlive(leader.pid), true);
   assert.equal(isProcessAlive(childPid, null, false), true);
@@ -977,7 +993,8 @@ test("event serialization timestamps malformed lines and replaces upstream times
   assert.deepEqual(JSON.parse(observedEventLine("{malformed", observedAt)), { raw: "{malformed", observedAt });
 });
 
-test("lines in one received chunk keep their receive time across a slow checkpoint", async () => {
+test("lines in one received chunk keep their receive time across a slow checkpoint", async (t) => {
+  t.mock.timers.enable({ apis: ["Date"], now: Date.now() });
   let releaseCheckpoint;
   let enterCheckpoint;
   const checkpointEntered = new Promise((resolve) => { enterCheckpoint = resolve; });
@@ -998,7 +1015,7 @@ test("lines in one received chunk keep their receive time across a slow checkpoi
     } }
   });
   await checkpointEntered;
-  await new Promise((resolve) => setTimeout(resolve, 20));
+  t.mock.timers.tick(20);
   releaseCheckpoint();
   await pending;
   assert.deepEqual(persisted.map(({ type }) => type), ["thread.started", "turn.started"]);
@@ -1058,43 +1075,43 @@ test("three consecutive apply_patch verification failures terminate as patch_thr
   assert.match(outcome.errorMessage, /could not land a patch because its context lines did not match the file on disk after 3 consecutive apply_patch verification failures/i);
 });
 
-test("a completed file_change resets the apply_patch verification failure counter", async (t) => {
-  const { outcome } = await runFixture(t, "scripted", {
-    script: scriptedCodex(`process.stderr.write(${JSON.stringify(`${PATCH_VERIFICATION_FAILURE}\n`.repeat(2))});
-await delay(500);
+for (const [name, splitAt] of [
+  ["a completed file_change resets the apply_patch verification failure counter", 0],
+  ["a split apply_patch verification failure is counted once", PATCH_VERIFICATION_FAILURE.indexOf("verification")]
+]) {
+  test(name, async (t) => {
+    const files = fixture(t);
+    const failures = `${PATCH_VERIFICATION_FAILURE}\n`.repeat(2);
+    const { outcome } = await runFixture(t, "scripted", {
+      files,
+      script: scriptedCodex(`
+const logFile = ${JSON.stringify(files.logFile)};
+const patchedFile = ${JSON.stringify(files.readyFile)};
+const waitForLog = (text) => waitUntil(() => fs.existsSync(logFile) && fs.readFileSync(logFile, "utf8") === text);
+${splitAt ? `
+process.stderr.write(${JSON.stringify(failures.slice(0, splitAt))});
+await waitForLog(${JSON.stringify(failures.slice(0, splitAt))});
+` : ""}
+process.stderr.write(${JSON.stringify(failures.slice(splitAt))});
+await waitForLog(${JSON.stringify(failures)});
 emit({ type: "item.completed", item: { id: "patch_1", type: "file_change" } });
-await delay(500);
-process.stderr.write(${JSON.stringify(`${PATCH_VERIFICATION_FAILURE}\n`.repeat(2))});
-await delay(500);
+await waitUntil(() => fs.existsSync(patchedFile));
+process.stderr.write(${JSON.stringify(failures)});
+await waitForLog(${JSON.stringify(failures.repeat(2))});
 emit({ type: "turn.completed", usage });`),
-    timeoutMs: TIMEOUT_TEST_TIMEOUT_MS
+      timeoutMs: TIMEOUT_TEST_TIMEOUT_MS,
+      onCheckpoint: ({ event }) => {
+        if (event?.type === "item.completed" && event.item.type === "file_change") {
+          fs.writeFileSync(files.readyFile, "ready");
+        }
+      }
+    });
+    assert.equal(outcome.status, "done");
+    assert.equal(outcome.failureKind, null);
+    assert.equal(outcome.timedOut, false);
+    assert.equal(outcome.fileChangeCount, 1);
   });
-  assert.equal(outcome.status, "done");
-  assert.equal(outcome.failureKind, null);
-  assert.equal(outcome.timedOut, false);
-  assert.equal(outcome.fileChangeCount, 1);
-});
-
-test("a split apply_patch verification failure is counted once", async (t) => {
-  const splitAt = PATCH_VERIFICATION_FAILURE.indexOf("verification");
-  const { outcome } = await runFixture(t, "scripted", {
-    script: scriptedCodex(`process.stderr.write(${JSON.stringify(PATCH_VERIFICATION_FAILURE.slice(0, splitAt))});
-await delay(500);
-process.stderr.write(${JSON.stringify(`${PATCH_VERIFICATION_FAILURE.slice(splitAt)}\n`)});
-await delay(500);
-process.stderr.write(${JSON.stringify(`${PATCH_VERIFICATION_FAILURE}\n`)});
-await delay(500);
-emit({ type: "item.completed", item: { id: "patch_1", type: "file_change" } });
-await delay(500);
-process.stderr.write(${JSON.stringify(`${PATCH_VERIFICATION_FAILURE}\n`.repeat(2))});
-await delay(500);
-emit({ type: "turn.completed", usage });`),
-    timeoutMs: TIMEOUT_TEST_TIMEOUT_MS
-  });
-  assert.equal(outcome.status, "done");
-  assert.equal(outcome.failureKind, null);
-  assert.equal(outcome.timedOut, false);
-});
+}
 
 test("three UnknownProcessId errors terminate as exec_lost", async (t) => {
   const { outcome } = await runFixture(t, "hang", {
@@ -1112,10 +1129,10 @@ test("timeout terminates the process group", async (t) => {
   const { outcome } = await runFixture(t, "hang", {
     timeoutMs: SHORT_TIMEOUT_MS,
     terminationGraceMs: SHORT_TERMINATION_GRACE_MS,
-    waitForReady: true
+    readyBeforeTimeout: true
   });
   assert.equal(outcome.status, "error");
-  assert.equal(outcome.failureKind, "timeout");
+  assert.equal(outcome.failureKind, "timeout", outcome.errorMessage);
   assert.equal(outcome.timedOut, true);
   await waitForProcessExit(outcome.pid);
   assert.equal(isProcessAlive(outcome.pid), false);
@@ -1127,9 +1144,9 @@ test("an absolute deadline shortens the execution timeout", async (t) => {
     deadlineMs: startedAt + 1200,
     timeoutMs: 6000,
     terminationGraceMs: 100,
-    waitForReady: true
+    readyBeforeTimeout: true
   });
-  assert.equal(outcome.failureKind, "timeout");
+  assert.equal(outcome.failureKind, "timeout", outcome.errorMessage);
   assert.equal(outcome.timedOut, true);
   assert.ok(Date.now() - startedAt < 4500, "the 1.2 s deadline, not the 6 s timeout, ends the run");
   await waitForProcessExit(outcome.pid);
@@ -1146,7 +1163,6 @@ test("a clean exit with inherited output closes after the deadline without timin
     files,
     script: scriptedCodex(`
       const { spawn } = await import("node:child_process");
-      const fs = await import("node:fs");
       const helper = spawn(process.execPath, ["--input-type=module", "--eval", "setTimeout(() => {}, 30000)"], {
         detached: true,
         stdio: ["ignore", "inherit", "inherit"]
@@ -1182,52 +1198,87 @@ test("an exhausted deadline returns a typed timeout without spawning", async (t)
 });
 
 test("a successful close near the timeout stays done while completed output drains", async (t) => {
+  const files = fixture(t);
+  const timeoutMs = 2500;
   const startedAt = Date.now();
-  const { outcome } = await runFixture(t, "scripted", {
-    script: scriptedCodex("await delay(1700); emit({ type: \"turn.completed\", usage });"),
-    timeoutMs: 2500,
+  t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: startedAt });
+  const checkpointRelease = Promise.withResolvers();
+  let checkpointEntered = false;
+  let executionSettled = false;
+  let pid;
+  const execution = runFixture(t, "scripted", {
+    files,
+    script: scriptedCodex(`
+await waitUntil(() => fs.existsSync(${JSON.stringify(files.readyFile)}));
+emit({ type: "turn.completed", usage });`),
+    timeoutMs,
+    onSpawnAttempt: (childPid) => { pid = childPid; },
     onCheckpoint: async ({ event }) => {
+      if (event?.type === "turn.started") {
+        t.mock.timers.tick(1700);
+        fs.writeFileSync(files.readyFile, "ready");
+      }
       if (event?.type === "turn.completed") {
-        await new Promise((resolve) => setTimeout(resolve, 1300));
+        checkpointEntered = true;
+        await checkpointRelease.promise;
       }
     }
+  }).then((result) => {
+    executionSettled = true;
+    return result;
   });
-  assert.equal(outcome.status, "done");
+  try {
+    await waitUntil(() => {
+      if (executionSettled) return true;
+      try {
+        process.kill(pid, 0);
+        return false;
+      } catch (error) {
+        if (error.code !== "ESRCH") throw error;
+      }
+      if (checkpointEntered) return true;
+      t.mock.timers.tick(LOAD_TOLERANT_POLL_INTERVAL_MS);
+      return false;
+    });
+    if (checkpointEntered) t.mock.timers.tick(1300);
+  } finally {
+    checkpointRelease.resolve();
+  }
+  const { outcome } = await execution;
+  assert.equal(outcome.status, "done", outcome.errorMessage);
   assert.equal(outcome.timedOut, false);
   assert.equal(outcome.terminalEvent, "turn.completed");
-  assert.ok(Date.now() - startedAt > 2500);
+  assert.ok(Date.now() - startedAt > timeoutMs);
 });
 
 test("rollout recovery completes before the timeout verdict overrides late checkpoint errors", async (t) => {
   const files = fixture(t);
-  let checkpointEnteredAt = null;
-  let releaseCheckpoint;
-  let enterCheckpoint;
-  const checkpointEntered = new Promise((resolve) => {
-    enterCheckpoint = resolve;
-  });
+  const checkpointEntered = Promise.withResolvers();
+  const checkpointRelease = Promise.withResolvers();
   const execution = runFixture(t, "rollout-timeout", {
+    files,
     env: { CODEX_HOME: path.join(files.dir, "codex-home") },
     timeoutMs: SHORT_TIMEOUT_MS,
     terminationGraceMs: SHORT_TERMINATION_GRACE_MS,
+    readyBeforeTimeout: true,
     onCheckpoint: async ({ event }) => {
-      if (event?.type !== "thread.started" || checkpointEnteredAt != null) {
+      if (event?.type !== "thread.started") {
         return;
       }
-      checkpointEnteredAt = Date.now();
-      enterCheckpoint();
-      await new Promise((resolve) => {
-        releaseCheckpoint = resolve;
-      });
+      checkpointEntered.resolve();
+      await checkpointRelease.promise;
       throw new Error("checkpoint failure after timeout");
     }
   });
   await Promise.race([
-    checkpointEntered,
-    execution.then(() => { throw new Error("Codex exited before the checkpoint"); })
+    checkpointEntered.promise,
+    execution.then((result) => { throw new Error(result.outcome.errorMessage ?? "Codex exited before the checkpoint"); })
   ]);
-  await waitUntil(() => Date.now() >= checkpointEnteredAt + SHORT_TIMEOUT_MS + LOAD_TOLERANT_POLL_INTERVAL_MS);
-  releaseCheckpoint();
+  try {
+    await waitUntil(() => fs.existsSync(files.interruptFile));
+  } finally {
+    checkpointRelease.resolve();
+  }
   const { outcome } = await execution;
 
   assert.ok(["error", "running"].includes(outcome.status));
@@ -1299,7 +1350,8 @@ test("timeout recovers partial output, cumulative usage, and resolved runtime fi
   const { outcome } = await runFixture(t, "rollout-timeout", {
     env: { CODEX_HOME: path.join(files.dir, "codex-home") },
     timeoutMs: SHORT_TIMEOUT_MS,
-    terminationGraceMs: SHORT_TERMINATION_GRACE_MS
+    terminationGraceMs: SHORT_TERMINATION_GRACE_MS,
+    readyBeforeTimeout: true
   });
   assert.equal(outcome.status, "error");
   assert.equal(outcome.failureKind, "timeout");
@@ -1349,7 +1401,7 @@ test("timeout escalates from INT through TERM to KILL when Codex ignores INT and
     timeoutMs: TIMEOUT_TEST_TIMEOUT_MS,
     terminationGraceMs: TIMEOUT_TEST_TERMINATION_GRACE_MS,
     env: { FAKE_CODEX_INT_FILE: interruptFile, FAKE_CODEX_TERM_FILE: termFile },
-    waitForReady: true
+    readyBeforeTimeout: true
   });
   assert.equal(outcome.status, "error");
   assert.equal(outcome.failureKind, "timeout");
@@ -1367,7 +1419,6 @@ test("incomplete timeout cleanup remains nonterminal with process evidence", asy
     files,
     script: scriptedCodex(`
 const { spawn } = await import("node:child_process");
-const fs = await import("node:fs");
 const holder = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], {
   detached: true,
   stdio: ["ignore", process.stdout, process.stderr]
@@ -1376,10 +1427,10 @@ fs.writeFileSync(process.env.FAKE_CODEX_CHILD_PID_FILE, String(holder.pid));
 holder.unref();
 fs.writeFileSync(process.env.FAKE_CODEX_READY_FILE, "ready");
 setInterval(() => {}, 1000);
-`),
+`, { readStdinFirst: false }),
     timeoutMs: 2000,
     terminationGraceMs: 50,
-    waitForReady: true
+    readyBeforeTimeout: true
   });
   assert.equal(outcome.status, "running");
   assert.equal(outcome.failureKind, "timeout");

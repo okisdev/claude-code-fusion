@@ -37,7 +37,7 @@ test("quotes inside a token are literal and opening quotes still require closure
 
 test("the stats CLI reports consumed raw request errors without a stack trace", (t) => {
   const directory = sandbox(t);
-  const env = { ...process.env, CLAUDE_CODE_SESSION_ID: "stats-request-error-test" };
+  const env = { ...process.env, TMPDIR: directory, CLAUDE_CODE_SESSION_ID: "stats-request-error-test" };
   const created = spawnSync(process.execPath, [SCRIPT, "transport-create"], { cwd: directory, env, encoding: "utf8" });
   assert.strictEqual(created.status, 0, created.stderr);
   const transport = JSON.parse(created.stdout);
@@ -132,6 +132,7 @@ test("the stats CLI consumes staged arguments without invoking embedded shell sy
   const marker = path.join(directory, "shell-ran");
   const env = {
     ...process.env,
+    TMPDIR: directory,
     CLAUDE_CODE_SESSION_ID: "fusion-stats-transport-test",
     FUSION_CODEX_STATE: path.join(directory, "missing-codex"),
     FUSION_GROK_COMPANION: path.join(directory, "missing-grok.mjs"),
@@ -158,6 +159,7 @@ test("the stats CLI forwards --accept-failed-transport from staged arguments unc
   fs.writeFileSync(companion, 'import fs from "node:fs";\nfs.writeFileSync(process.env.FUSION_TEST_CODEX_COMPANION_ARGS, JSON.stringify(process.argv.slice(2)));\n');
   const env = {
     ...process.env,
+    TMPDIR: directory,
     CLAUDE_CODE_SESSION_ID: "fusion-stats-transport-acceptance-test",
     FUSION_CODEX_STATE: path.join(directory, "missing-codex"),
     FUSION_CODEX_COMPANION: companion,
@@ -187,6 +189,7 @@ test("the stats CLI forwards --failure-kind-for from staged arguments", (t) => {
   fs.writeFileSync(companion, 'import fs from "node:fs";\nfs.writeFileSync(process.env.FUSION_TEST_CODEX_COMPANION_ARGS, JSON.stringify(process.argv.slice(2)));\n');
   const env = {
     ...process.env,
+    TMPDIR: directory,
     CLAUDE_CODE_SESSION_ID: "fusion-stats-transport-semantic-failure-test",
     FUSION_CODEX_STATE: path.join(directory, "missing-codex"),
     FUSION_CODEX_COMPANION: companion,
@@ -206,6 +209,43 @@ test("the stats CLI forwards --failure-kind-for from staged arguments", (t) => {
   const result = spawnSync(process.execPath, [SCRIPT, "--raw-args-token", transport.token], { cwd: directory, env, encoding: "utf8" });
   assert.strictEqual(result.status, 0, result.stderr);
   assert.deepStrictEqual(JSON.parse(fs.readFileSync(argsFile, "utf8")), ["record-acceptance", "--job-id", jobId, "--acceptance", "rejected", "--source", "main-loop", "--reason", "The output did not satisfy the requested scope.", "--failure-kind", "scope_rewrite"]);
+});
+
+test("the suite prunes its own temp root and leaves the caller's transports untouched", (t) => {
+  const directory = sandbox(t);
+  const { file: sentinel } = createRawArgsTransport({ temporaryRoot: directory });
+  fs.writeFileSync(sentinel, "live request");
+  const stale = new Date(Date.now() - 2 * 60 * 60 * 1000);
+  fs.utimesSync(path.dirname(sentinel), stale, stale);
+  fs.mkdirSync(path.join(directory, "tests"));
+  fs.writeFileSync(path.join(directory, "tests", "prune.test.mjs"), `
+import assert from "node:assert/strict";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { test } from "node:test";
+import { createRawArgsTransport } from ${JSON.stringify(import.meta.resolve("../plugins/fusion/scripts/lib/raw-args-transport.mjs"))};
+
+test("prune stays in the test temp root", () => {
+  const root = os.tmpdir();
+  const { file } = createRawArgsTransport();
+  const request = path.dirname(file);
+  assert.equal(path.dirname(request), root);
+  assert.equal(fs.readdirSync(root).includes(${JSON.stringify(path.basename(path.dirname(sentinel)))}), false);
+  const stale = new Date(${stale.getTime()});
+  fs.utimesSync(request, stale, stale);
+  createRawArgsTransport();
+  assert.equal(fs.existsSync(file), false);
+  fs.writeFileSync("test-tmpdir", root);
+});
+`);
+  const env = { ...process.env, TMPDIR: directory, TMP: directory, TEMP: directory };
+  delete env.NODE_TEST_CONTEXT;
+  const result = spawnSync(process.execPath, [path.join(import.meta.dirname, "run.mjs")], { cwd: directory, env, encoding: "utf8", timeout: 15_000 });
+  assert.ifError(result.error);
+  assert.strictEqual(result.status, 0, result.stdout + result.stderr);
+  assert.strictEqual(fs.readFileSync(sentinel, "utf8"), "live request");
+  assert.strictEqual(fs.existsSync(fs.readFileSync(path.join(directory, "test-tmpdir"), "utf8")), false);
 });
 
 test("Codex prune leaves group- or world-readable aged requests untouched", (t) => {

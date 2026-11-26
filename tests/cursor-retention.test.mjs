@@ -33,7 +33,7 @@ function fixture(t) {
   fs.mkdirSync(data);
   fs.mkdirSync(cwd);
   fs.mkdirSync(realHome);
-  const env = { ...process.env, HOME: realHome, CURSOR_COMPANION_DATA: data, CURSOR_AGENT_BIN: fake };
+  const env = { ...process.env, TMPDIR: root, HOME: realHome, CURSOR_COMPANION_DATA: data, CURSOR_AGENT_BIN: fake };
   const run = (script, args = []) => spawnSync(process.execPath, [script, ...args], { cwd, env, input: "{}", encoding: "utf8", timeout: 30000 });
   const jobs = () => {
     const state = path.join(data, "state");

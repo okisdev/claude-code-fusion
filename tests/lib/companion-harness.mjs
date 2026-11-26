@@ -49,7 +49,7 @@ export function makeSandbox(t) {
         await cleanup();
       }
     } finally {
-      fs.rmSync(root, { recursive: true, force: true, maxRetries: 3, retryDelay: 20 });
+      await fs.promises.rm(root, { recursive: true, force: true, maxRetries: 3, retryDelay: 20 });
     }
   });
   const dataDir = path.join(root, "data");
@@ -70,10 +70,13 @@ export function makeSandbox(t) {
 export function workerExitSignal(sandbox, command) {
   const file = path.join(sandbox.root, `${command}-exited`);
   const hook = path.join(sandbox.root, `${command}-exit-hook.cjs`);
-  fs.writeFileSync(hook, `if (process.argv[2] === ${JSON.stringify(command)}) process.once("exit", () => require("node:fs").writeFileSync(${JSON.stringify(file)}, ""));\n`);
+  fs.writeFileSync(hook, `if (process.argv[2] === ${JSON.stringify(command)}) process.once("exit", () => require("node:fs").writeFileSync(${JSON.stringify(file)}, String(process.pid)));\n`);
   return {
-    env: { NODE_OPTIONS: `--require=${hook}` },
-    waitForExit: () => waitFor(() => fs.existsSync(file)),
+    env: { NODE_OPTIONS: `--require=${JSON.stringify(hook)}` },
+    waitForExit: async () => {
+      const pid = await waitFor(() => fs.existsSync(file) && Number(fs.readFileSync(file, "utf8")));
+      await waitFor(() => !pidAlive(pid));
+    },
   };
 }
 

@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { once } from "node:events";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -456,15 +457,32 @@ test("the final response is drained without a trailing newline", async (t) => {
 test("a detached descendant holding stdout cannot stall completion", async (t) => {
   const root = fixture(t);
   const pidFile = path.join(root, "escaped.pid");
-  let pid;
-  t.after(() => { if (pid) { try { process.kill(pid, "SIGKILL"); } catch {} } });
-  const start = Date.now();
-  const { result } = await fakeRun(t, "escape_stdio", { env: { FAKE_DEVIN_HELPER_PID_FILE: pidFile }, timeoutMs: 10000 });
-  pid = Number(fs.readFileSync(pidFile, "utf8"));
-  assert.equal(classifyDevinFailure(result), null);
-  assert.equal(result.timedOut, false);
-  assert.equal(result.lateClose, false);
-  assert.ok(Date.now() - start < 4000);
+  let leaderExit;
+  const start = performance.now();
+  try {
+    const { result } = await fakeRun(t, "escape_stdio", {
+      env: { FAKE_DEVIN_HELPER_PID_FILE: pidFile },
+      timeoutMs: 10000,
+      onSpawn: (child) => { leaderExit = once(child, "exit"); }
+    });
+    assert.ok(performance.now() - start < 4000);
+    assert.deepEqual(await leaderExit, [0, null]);
+    const pid = Number(fs.readFileSync(pidFile, "utf8"));
+    assert.equal(processGone(pid), false);
+    assert.equal(classifyDevinFailure(result), null);
+    assert.equal(result.timedOut, false);
+    assert.equal(result.lateClose, false);
+  } finally {
+    if (fs.existsSync(pidFile)) {
+      const pid = Number(fs.readFileSync(pidFile, "utf8"));
+      if (!processGone(pid)) {
+        try { process.kill(pid, "SIGKILL"); } catch (error) {
+          if (error.code !== "ESRCH") throw error;
+        }
+      }
+      await waitFor(() => processGone(pid));
+    }
+  }
 });
 
 test("leader exit reaps descendants including ones that ignore SIGTERM", async (t) => {

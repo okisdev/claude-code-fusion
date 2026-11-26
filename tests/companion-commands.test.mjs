@@ -23,7 +23,7 @@ function harness(t, scenario = "done", supportsWindDown = true) {
   const log = path.join(temp, "calls.jsonl");
   const data = path.join(temp, "data");
   const cwd = path.join(temp, "workspace");
-  const env = { ...process.env, DEVIN_COMPANION_DATA: data, DEVIN_COMPANION_TIMEOUT_MS: "77" };
+  const env = { ...process.env, TMPDIR: temp, DEVIN_COMPANION_DATA: data, DEVIN_COMPANION_TIMEOUT_MS: "77" };
   if (["darwin", "freebsd", "openbsd"].includes(process.platform)) {
     const bin = path.join(temp, "identity-bin");
     fs.writeFileSync(path.join(bin, "ps"), '#!/bin/sh\nwhile [ "$#" -gt 0 ]; do if [ "$1" = "-p" ]; then pid="$2"; shift 2; else shift; fi; done\nif kill -0 "$pid" 2>/dev/null; then printf "process-%s\\n" "$pid"; else exit 1; fi\n', { mode: 0o755 });

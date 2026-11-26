@@ -32,6 +32,7 @@ function collectorEnvironment(companion, extra = {}) {
   sessionSequence += 1;
   return {
     ...process.env,
+    TMPDIR: path.dirname(companion),
     CLAUDE_CODE_SESSION_ID: `job-collector-test-${process.pid}-${sessionSequence}`,
     FUSION_CODEX_COMPANION: companion,
     FUSION_GROK_COMPANION: companion,

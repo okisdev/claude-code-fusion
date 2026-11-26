@@ -98,21 +98,28 @@ if (Number.isFinite(delayMs) && delayMs > 0) {
   await new Promise((resolve) => setTimeout(resolve, delayMs));
 }
 
-let prompt = "";
-if (mode === "interrupt-cleanup") {
-  process.stdin.resume();
-} else if (process.env.FAKE_CODEX_CLOSE_STDIN === "true") {
-  process.stdin.destroy();
-  await new Promise((resolve) => setTimeout(resolve, 2000));
-} else {
-  prompt = await drainStdin();
+async function recordInvocation() {
+  let prompt = "";
+  if (mode === "interrupt-cleanup") {
+    process.stdin.resume();
+  } else if (process.env.FAKE_CODEX_CLOSE_STDIN === "true") {
+    process.stdin.destroy();
+    await new Promise((resolve) => setTimeout(resolve, 2000));
+  } else {
+    prompt = await drainStdin();
+  }
+
+  if (process.env.FAKE_CODEX_ARGS_FILE) {
+    fs.writeFileSync(process.env.FAKE_CODEX_ARGS_FILE, JSON.stringify(args));
+  }
+  if (process.env.FAKE_CODEX_STDIN_FILE) {
+    fs.writeFileSync(process.env.FAKE_CODEX_STDIN_FILE, prompt);
+  }
 }
 
-if (process.env.FAKE_CODEX_ARGS_FILE) {
-  fs.writeFileSync(process.env.FAKE_CODEX_ARGS_FILE, JSON.stringify(args));
-}
-if (process.env.FAKE_CODEX_STDIN_FILE) {
-  fs.writeFileSync(process.env.FAKE_CODEX_STDIN_FILE, prompt);
+const invocation = recordInvocation();
+if (process.env.FAKE_CODEX_READY_BEFORE_STDIN !== "true") {
+  await invocation;
 }
 
 const threadId = process.env.FAKE_CODEX_THREAD_ID || "thread-123";
@@ -181,11 +188,17 @@ function writeRollout({ message = "Recovered partial Codex output." } = {}) {
   fs.writeFileSync(file, `${entries.map((entry) => JSON.stringify(entry)).join("\n")}\n`);
 }
 
+function markReady() {
+  if (process.env.FAKE_CODEX_READY_FILE) {
+    fs.writeFileSync(process.env.FAKE_CODEX_READY_FILE, "ready");
+  }
+}
+
 if (process.env.FAKE_CODEX_STDERR) {
   process.stderr.write(process.env.FAKE_CODEX_STDERR);
 }
-if (process.env.FAKE_CODEX_READY_FILE && mode !== "interrupt-cleanup") {
-  fs.writeFileSync(process.env.FAKE_CODEX_READY_FILE, "ready");
+if (!["hang", "rollout-timeout", "ignore-term", "interrupt-cleanup"].includes(mode)) {
+  markReady();
 }
 
 switch (mode) {
@@ -272,14 +285,19 @@ switch (mode) {
     break;
   case "hang":
     start();
+    markReady();
     setInterval(() => {}, 1000);
     break;
   case "rollout-timeout":
     start();
     process.on("SIGINT", () => {
       writeRollout();
+      if (process.env.FAKE_CODEX_INT_FILE) {
+        fs.writeFileSync(process.env.FAKE_CODEX_INT_FILE, "received");
+      }
       process.exit(0);
     });
+    markReady();
     setInterval(() => {}, 1000);
     break;
   case "ignore-term":
@@ -294,9 +312,7 @@ switch (mode) {
         fs.writeFileSync(process.env.FAKE_CODEX_TERM_FILE, "received");
       }
     });
-    if (process.env.FAKE_CODEX_READY_FILE) {
-      fs.writeFileSync(process.env.FAKE_CODEX_READY_FILE, "ready");
-    }
+    markReady();
     setInterval(() => {}, 1000);
     break;
   case "interrupt-cleanup": {
@@ -325,9 +341,7 @@ switch (mode) {
         fs.writeFileSync(process.env.FAKE_CODEX_TERM_FILE, "received");
       }
     });
-    if (process.env.FAKE_CODEX_READY_FILE) {
-      fs.writeFileSync(process.env.FAKE_CODEX_READY_FILE, "ready");
-    }
+    markReady();
     setInterval(() => {}, 1000);
     break;
   }
@@ -368,3 +382,5 @@ switch (mode) {
     process.stderr.write(`unknown fake mode: ${mode}\n`);
     process.exitCode = 2;
 }
+
+await invocation;
