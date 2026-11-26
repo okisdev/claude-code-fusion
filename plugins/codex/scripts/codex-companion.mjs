@@ -312,6 +312,7 @@ function handleQuota(argv) {
   try {
     if (file && !refreshing) writePrivateStateFile(file, `${JSON.stringify({ home, at, report })}\n`);
   } catch {}
+  if (refreshing) report.refreshing = true;
   output(report, true);
 }
 

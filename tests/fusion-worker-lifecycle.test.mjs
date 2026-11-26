@@ -1464,6 +1464,7 @@ test("resumed Fusion worker SubagentStop wins the SendMessage PostToolUse race",
   const box = sandbox(t);
   const taskId = `fusion-${"b".repeat(24)}`;
   createAcceptedCollectedRecord(box, taskId, "racing-worker");
+  updateWorkerRecord(taskId, envFor(box), (current) => ({ ...current, verificationCommand: "node --test" }));
   const toolInput = { to: "racing-worker", message: "finish the next round" };
   run(box, { hook_event_name: "PreToolUse", session_id: "session-1", cwd: box.cwd, transcript_path: box.transcript, tool_name: "SendMessage", tool_input: toolInput });
   const requestedAt = record(box).continuationRequestedAt;
@@ -1479,6 +1480,7 @@ test("resumed Fusion worker SubagentStop wins the SendMessage PostToolUse race",
   assert.strictEqual(completed.stdout, "");
   const beforePost = record(box);
   assert.strictEqual(beforePost.transportStatus, "done");
+  assert.strictEqual(beforePost.verificationCommand, null);
   assert.strictEqual(beforePost.collectionMethod, "subagent_stop");
   assert.strictEqual(fs.readFileSync(beforePost.outputFile, "utf8"), finalMessage);
   run(box, { ...stopPayload, stop_hook_active: true, last_assistant_message: finalMessage });

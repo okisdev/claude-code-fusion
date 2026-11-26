@@ -116,6 +116,25 @@ test("quota cache is shared across processes, keyed by engine set, and refreshes
   assert.equal(fs.readFileSync(calls, "utf8"), "codex\ncodex\ngrok\ncodex\ncodex\n");
 });
 
+test("the aggregate cache picks up a live refresh on the next quota read", (t) => {
+  const box = sandbox(t);
+  const file = path.join(box.root, "report.json");
+  companion(box, "codex", `process.stdout.write((await import("node:fs")).readFileSync(${JSON.stringify(file)}));`);
+  companion(box, "grok");
+  const grok = report([], { engine: "grok", available: false });
+  const stale = report([{ ...pool, usedPercent: 100 }], { refreshing: true });
+  fs.writeFileSync(file, JSON.stringify(stale));
+  assert.deepEqual(quotaResults(box.env), [stale, grok]);
+  fs.writeFileSync(file, JSON.stringify(report()));
+  assert.deepEqual(quotaResults(box.env), [report(), grok]);
+  const cacheFile = path.join(box.env.FUSION_DATA_DIR, `quota-${routedEngineIds().sort().join("-")}.json`);
+  const cached = JSON.parse(fs.readFileSync(cacheFile, "utf8"));
+  fs.writeFileSync(cacheFile, JSON.stringify({ ...cached, results: [stale, grok] }));
+  assert.deepEqual(quotaResults(box.env), [report(), grok]);
+  fs.unlinkSync(file);
+  assert.deepEqual(quotaResults(box.env), [report(), grok]);
+});
+
 test("quota reader uses installed companion resolution and rejects invalid overrides", (t) => {
   const box = sandbox(t);
   const file = path.join(box.root, ".claude", "plugins", "cache", "claude-code-fusion", "codex", "999.0.0", "scripts", ENGINES.codex.companionFile);

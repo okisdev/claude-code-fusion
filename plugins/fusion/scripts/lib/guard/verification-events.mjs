@@ -44,11 +44,20 @@ function verificationSteps(command) {
       return null;
     }
   }
-  const steps = pipelines.map((pipeline) => {
-    while (pipeline.length > 1 && /^(?:tail|head|grep)(?:\s|$)/.test(pipeline.at(-1))) pipeline.pop();
-    return pipeline.join(" | ").replace(/\s+2>&1$/, "").replace(/\s+/g, " ");
-  });
-  return steps.length ? { steps, directory } : null;
+  return pipelines.length ? { steps: pipelines, directory } : null;
+}
+
+function matchesVerificationSteps(executed, required) {
+  const normalize = (pipeline) => pipeline.join(" | ").replace(/\s+2>&1$/, "").replace(/\s+/g, " ");
+  let matched = 0;
+  for (const pipeline of executed) {
+    const step = required[matched];
+    if (pipeline.length < step.length || pipeline.slice(step.length).some((stage) => !/^(?:tail|head)(?:\s|$)/.test(stage))) continue;
+    if (normalize(pipeline.slice(0, step.length)) !== normalize(step)) continue;
+    matched += 1;
+    if (matched === required.length) return true;
+  }
+  return false;
 }
 
 function bashVerificationStart(input, file, now) {
@@ -86,7 +95,7 @@ function settleVerifiedPackages(env, { sessionId, command, cwd, startedAt, file,
     if (!(Date.parse(record.collectedAt) < startedAt && Date.parse(record.finishedAt) < startedAt)) continue;
     if (!isVerificationCommand(record.verificationCommand, env)) continue;
     const required = verificationSteps(record.verificationCommand);
-    if (!required || !required.steps.every((step) => executed.steps.includes(step))) continue;
+    if (!required || !matchesVerificationSteps(executed.steps, required.steps)) continue;
     try {
       if (directory !== fs.realpathSync(record.companionCwd ?? record.workspaceRoot)) continue;
       if (required.directory && directory !== fs.realpathSync(path.resolve(cwd, required.directory))) continue;

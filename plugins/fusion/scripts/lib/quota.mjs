@@ -42,7 +42,7 @@ export function quotaResults(env = process.env, { engines, timeoutMs = 1000 } = 
     const cached = JSON.parse(fs.readFileSync(file, "utf8"));
     const age = Date.now() - cached.fetchedAt;
     if (cached.source === source && age >= 0 && age < 60_000 && Array.isArray(cached.results) &&
-        cached.results.every((result) => selected.includes(result?.engine) && validResult(result))) return cached.results;
+        cached.results.every((result) => selected.includes(result?.engine) && validResult(result) && result.refreshing !== true)) return cached.results;
   } catch {}
   const results = [];
   for (const [index, engine] of selected.entries()) {
@@ -55,6 +55,7 @@ export function quotaResults(env = process.env, { engines, timeoutMs = 1000 } = 
       if (validResult(value, engine)) results.push(value);
     } catch {}
   }
+  if (results.some((result) => result.refreshing === true)) return results;
   try {
     writeFileAtomic(file, `${JSON.stringify({ source, fetchedAt: Date.now(), results })}\n`);
   } catch {}
