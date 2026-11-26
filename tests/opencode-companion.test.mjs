@@ -74,20 +74,25 @@ for (const [role, writeFlag, expectedSandbox, expectedModel] of [
     const result = box.run(["task", ...(writeFlag ? ["--write"] : []), "--json", "--", brief]);
     assert.equal(result.status, 0, result.stderr || result.stdout);
     const output = report(result);
+    const expectedHome = path.join(box.dataDir, "codex-home");
     assert.equal(output.status, "done");
     assert.equal(output.semanticStatus, "unverified");
     assert.equal(output.role, role);
     assert.equal(output.requestedModel, expectedModel);
     assert.equal(output.billingPool, "opencode");
     assert.equal(output.codexVersion, "0.171.0");
+    assert.equal(output.codexHome, expectedHome);
+    assert.equal(output.sandbox, expectedSandbox);
     assert.equal(output.usage.totalTokens, 140);
     const record = box.jobs()[0];
     assert.equal(record.codexVersion, "0.171.0");
+    assert.equal(record.codexHome, expectedHome);
+    assert.equal(record.sandbox, expectedSandbox);
     assert.equal(record.mode, role === "bulk" ? "write" : "consult");
     assert.equal(record.opencodePid, null);
     assert.equal(record.opencodePidIdentity, null);
     const launch = box.invocations().find((entry) => entry.args[0] === "exec");
-    assert.equal(launch.codexHome, path.join(box.dataDir, "codex-home"));
+    assert.equal(launch.codexHome, expectedHome);
     assert.equal(launch.args[launch.args.indexOf("--sandbox") + 1], expectedSandbox);
     assert.equal(launch.args[launch.args.indexOf("--model") + 1], expectedModel);
     assert.equal(launch.args[launch.args.indexOf("--cd") + 1], box.cwd);
@@ -98,9 +103,14 @@ for (const [role, writeFlag, expectedSandbox, expectedModel] of [
     assert.equal(launch.stdin, "");
     assert.equal(launch.args.some((arg) => arg.includes("opencode-test-credential")), false);
     assert.match(fs.readFileSync(path.join(launch.codexHome, "config.toml"), "utf8"), /exclude = \["OPENCODE_\*"\]/);
-    assert.equal(box.run(["status", output.jobId, "--json"]).status, 0);
+    const status = report(box.run(["status", output.jobId, "--json"]));
+    assert.equal(status.status, "done");
+    assert.equal(status.codexHome, expectedHome);
+    assert.equal(status.sandbox, expectedSandbox);
     const collected = report(box.run(["result", output.jobId, "--wait", "--json"]));
     assert.equal(collected.status, "done");
+    assert.equal(collected.codexHome, expectedHome);
+    assert.equal(collected.sandbox, expectedSandbox);
     assert.equal(collected.text, output.text);
     const accepted = box.run(["record-acceptance", "--job-id", output.jobId, "--acceptance", "accepted", "--source", "collector", "--json"]);
     assert.equal(report(accepted).semanticStatus, "accepted");
@@ -254,9 +264,28 @@ for (const [scenario, kind] of [["auth401", "auth"], ["auth403", "auth"], ["quot
   });
 }
 
-test("terminal text ends with the shared outcome footer", (t) => {
-  const box = harness(t);
-  const result = box.run(["task", "--write", "--", "opencode-role: bulk\nGenerate files."]);
-  assert.equal(result.status, 0, result.stderr || result.stdout);
-  assert.match(result.stdout, /opencode-session: [^\n]+\njob: [a-f0-9]{32}\nsandbox: [^\n]+\ndelivery: foreground\nsemantic: unverified\n(?:warning: [^\n]+\n)*state: done\n$/);
-});
+for (const [role, mode] of [["blind-check", "read-only"], ["bulk", "workspace-write"]]) {
+  test(`${role} task, result, and status text include Codex details in the shared footer`, (t) => {
+    const box = harness(t);
+    const task = box.run(["task", "--", `opencode-role: ${role}\nCheck the staged artifact.`]);
+    assert.equal(task.status, 0, task.stderr || task.stdout);
+    const [job] = box.jobs();
+    assert.match(job.id, /^[a-f0-9]{32}$/);
+    const footer = [
+      `opencode-session: ${job.sessionId}`,
+      `job: ${job.id}`,
+      `sandbox: ${box.cwd}`,
+      "delivery: foreground",
+      "semantic: unverified",
+      `codex-home: ${path.join(box.dataDir, "codex-home")}`,
+      `codex-sandbox: ${mode}`,
+      ...job.warnings.map((warning) => `warning: ${warning}`),
+      "state: done",
+      ""
+    ].join("\n");
+    for (const output of [task, box.run(["result", job.id]), box.run(["status", job.id])]) {
+      assert.equal(output.status, 0, output.stderr || output.stdout);
+      assert.equal(output.stdout.slice(output.stdout.lastIndexOf("\nopencode-session: ") + 1), footer);
+    }
+  });
+}

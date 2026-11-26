@@ -13,7 +13,18 @@ export { cleanupRawCommandTransportsForSession };
 
 const TESTED_CODEX_INTERVAL = { floor: "0.154.0", ceiling: "0.173.0" };
 const DEFAULT_MODELS = { bulk: "deepseek-v4.1-flash", "blind-check": "glm-5.3-flash" };
-const render = { ...createCompanionRender({ engine: "opencode", engineName: "OpenCode", resolvedEffortField: "resolvedEffort" }), extractFirstJsonObject, validateReviewOutput, renderReviewResult };
+const render = {
+  ...createCompanionRender({
+    engine: "opencode", engineName: "OpenCode", resolvedEffortField: "resolvedEffort",
+    renderFooterDetails(record) {
+      const lines = [];
+      if (record.codexHome) lines.push(`codex-home: ${record.codexHome}`);
+      if (record.sandbox) lines.push(`codex-sandbox: ${record.sandbox}`);
+      return lines;
+    }
+  }),
+  extractFirstJsonObject, validateReviewOutput, renderReviewResult
+};
 const state = { ...sharedState, finishSuccessfulJobRecordFile(file, patch) {
   const current = sharedState.readJobRecordFile(file);
   if (current?.status === "running" && current.cleanupRequired) return current;
@@ -66,13 +77,15 @@ async function runJob({ record, source, dataDir, brief, signal, timeoutMs, exitG
   const selected = listing.models.find((entry) => entry.id === model);
   if (!selected) throw errorWithFailure(`OpenCode Go model ${model} is unavailable or does not support tools.`);
   if (!selected.capabilities.reasoning.effort.includes(effort)) throw errorWithFailure(`OpenCode Go model ${model} does not support effort ${effort}.`);
-  const { homeDir } = ensurePrivateHome({ dataDir, bin: record.codexBuildPath, codexVersion: record.codexVersion, models: listing.models });
-  const fields = { role, mode: role === "bulk" ? "write" : "consult", requestedModel: model };
+  const { homeDir: codexHome } = ensurePrivateHome({ dataDir, bin: record.codexBuildPath, codexVersion: record.codexVersion, models: listing.models });
+  const write = role === "bulk";
+  const sandbox = write ? "workspace-write" : "read-only";
+  const args = buildTaskArgs({ cwd: record.cwd, model, effort, write, sandboxMode: sandbox, skipGitRepoCheck: true, serviceTier: "none", resumeThreadId: source?.sessionId });
+  args.push("-c", `model_providers.opencode.http_headers={"x-opencode-session"=${JSON.stringify(record.id)}}`, brief);
+  const fields = { role, mode: write ? "write" : "consult", requestedModel: model, codexHome, sandbox };
   state.updateJobRecordFile(state.jobFilePath(dataDir, record.cwd, record.id), fields);
   Object.assign(record, fields);
-  const args = buildTaskArgs({ cwd: record.cwd, model, effort, write: role === "bulk", skipGitRepoCheck: true, serviceTier: "none", resumeThreadId: source?.sessionId });
-  args.push("-c", `model_providers.opencode.http_headers={"x-opencode-session"=${JSON.stringify(record.id)}}`, brief);
-  const outcome = await runCodex({ bin: record.codexBuildPath, args, cwd: record.cwd, env: { ...process.env, OPENCODE_GO_API_KEY: apiKey, CODEX_HOME: homeDir },
+  const outcome = await runCodex({ bin: record.codexBuildPath, args, cwd: record.cwd, env: { ...process.env, OPENCODE_GO_API_KEY: apiKey, CODEX_HOME: codexHome },
     signal, timeoutMs, terminationGraceMs: exitGraceMs, resumeThreadId: source?.sessionId,
     onSpawnAttempt: (pid) => { if (pid) launchProcess(() => ({ pid })); }, onSpawn: (pid) => onProcess(pid), onIdentitySettled: (pid) => onProcess(pid) });
   if (outcome.cleanupComplete === false) state.updateJobRecordFile(state.jobFilePath(dataDir, record.cwd, record.id), {
@@ -112,7 +125,7 @@ const { cancelJobRecord, run } = createCompanionCommands({
   sessionIdPattern: OPENCODE_SESSION_ID_PATTERN, sweep: sweepOpencodeRuns, jobDirectory: () => ({}),
   resumeEligible: (record) => record.failureKind !== "policy", validateResumeSource() {}, historyResumable: (record) => record.failureKind !== "policy",
   resolvedEffort: (record) => record.resolvedEffort,
-  payloadFields: (record) => ({ codexVersion: record.codexVersion, role: record.role }),
+  payloadFields: (record) => ({ codexVersion: record.codexVersion, codexHome: record.codexHome ?? null, sandbox: record.sandbox ?? null, role: record.role }),
   historyFields: (record) => ({ codexVersion: record.codexVersion, resolvedEffort: record.resolvedEffort }),
   outcomeFields, cancelledFields: (outcome) => ({ sessionId: outcome.sessionId, usage: outcome.usage, ...outcomeFields(outcome) }),
   modelDrift: (record, outcome) => outcome.observedModel && outcome.observedModel !== record.requestedModel ? { requested: record.requestedModel, observed: outcome.observedModel } : null,

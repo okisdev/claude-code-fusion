@@ -168,7 +168,7 @@ export function renderReviewResult(review, meta = {}) {
   return `${lines.join("\n").trimEnd()}\n`;
 }
 
-export function createCompanionRender({ engine, engineName, resolvedEffortField, stopCauseField }) {
+export function createCompanionRender({ engine, engineName, resolvedEffortField, stopCauseField, renderFooterDetails = () => [] }) {
   const versionField = `${engine}Version`;
 
   function renderHistoryReport(history, now = Date.now()) {
@@ -233,7 +233,7 @@ export function createCompanionRender({ engine, engineName, resolvedEffortField,
       failureKind,
       ...record
     };
-    const lines = [String(text ?? "").trimEnd() || `${engineName} returned no output.`, "", ...renderFooterLines(job, engine)];
+    const lines = [String(text ?? "").trimEnd() || `${engineName} returned no output.`, "", ...renderFooterLines(job, engine, renderFooterDetails(job))];
     return `${lines.join("\n")}\n`;
   }
 
@@ -318,7 +318,7 @@ export function createCompanionRender({ engine, engineName, resolvedEffortField,
     if (job.status === "error" && logTail) {
       lines.push("", "Log tail:", "", "```text", logTail, "```");
     }
-    lines.push("", ...renderFooterLines(job, engine));
+    lines.push("", ...renderFooterLines(job, engine, renderFooterDetails(job)));
     return `${lines.join("\n").trimEnd()}\n`;
   }
 
