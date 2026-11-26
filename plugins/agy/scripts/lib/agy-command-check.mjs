@@ -257,7 +257,12 @@ export function isReadOnlyCommand(command, { cwd = process.cwd(), realHome = os.
       directory = fs.realpathSync.native(requested);
       if (!fs.statSync(directory).isDirectory()) return false;
       commonDir ??= discoverGitCommonDir(cwd);
-      if (!commonDir || discoverGitCommonDir(directory) !== commonDir) return false;
+      const targetCommonDir = discoverGitCommonDir(directory);
+      if (targetCommonDir !== commonDir) return false;
+      if (!commonDir) {
+        const relative = path.relative(fs.realpathSync.native(cwd), directory);
+        if (relative.startsWith("..") || path.isAbsolute(relative)) return false;
+      }
     } catch {
       return false;
     }
