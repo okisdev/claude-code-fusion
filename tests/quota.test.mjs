@@ -8,6 +8,7 @@ import { ENGINES, ENGINE_IDS, routedEngineIds } from "../plugins/fusion/scripts/
 import { DEFAULT_MODEL_TABLE_PLACEHOLDER } from "../plugins/fusion/scripts/lib/model-table.mjs";
 import { pacingLines, quotaResults } from "../plugins/fusion/scripts/lib/quota.mjs";
 import { messageTag } from "../plugins/fusion/scripts/lib/user-messages.mjs";
+import { companion as codexCompanion, waitFor } from "./lib/codex-companion-harness.mjs";
 
 const scripts = path.join(import.meta.dirname, "..", "plugins", "fusion", "scripts");
 const observedAt = "2026-11-20T00:00:00.000Z";
@@ -133,6 +134,26 @@ test("the aggregate cache picks up a live refresh on the next quota read", (t) =
   assert.deepEqual(quotaResults(box.env), [report(), grok]);
   fs.unlinkSync(file);
   assert.deepEqual(quotaResults(box.env), [report(), grok]);
+});
+
+test("a failed Codex refresh lets subsequent hooks reuse the aggregate", async (t) => {
+  const box = sandbox(t);
+  Object.assign(box.env, {
+    FUSION_CODEX_COMPANION: codexCompanion,
+    CODEX_COMPANION_DATA: path.join(box.root, "codex-data"),
+    CODEX_BIN: path.join(box.root, "missing-cli"),
+    CODEX_HOME: box.root
+  });
+  fs.writeFileSync(path.join(box.root, "auth.json"), "{}");
+  const calls = path.join(box.root, "calls");
+  companion(box, "grok", `const fs = await import("node:fs"); fs.appendFileSync(${JSON.stringify(calls)}, "call\\n"); process.stdout.write(JSON.stringify(${JSON.stringify(report([], { engine: "grok" }))}));`);
+  assert.equal(quotaResults(box.env)[0].refreshing, true);
+  await waitFor(() => !fs.existsSync(path.join(box.env.CODEX_COMPANION_DATA, "quota-live.refreshing")));
+  const results = quotaResults(box.env);
+  assert.equal(results[0].engine, "codex");
+  assert.equal(results[0].refreshing, undefined);
+  assert.deepEqual(quotaResults(box.env), results);
+  assert.equal(fs.readFileSync(calls, "utf8"), "call\ncall\n");
 });
 
 test("quota reader uses installed companion resolution and rejects invalid overrides", (t) => {

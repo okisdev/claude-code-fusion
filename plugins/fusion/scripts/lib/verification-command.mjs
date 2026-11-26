@@ -287,7 +287,7 @@ function isVerificationSegment(segment, pattern) {
   return matchesPackageManager(head, tokens) || matchesRunner(head, tokens);
 }
 
-function commandSegments(command) {
+function splitCommand(command) {
   const segments = [];
   let start = 0;
   let separator = null;
@@ -352,6 +352,26 @@ function commandSegments(command) {
   return segments;
 }
 
+function commandSegments(command) {
+  const segments = splitCommand(command);
+  let pipefail = false;
+  let unconditionalPipefail = false;
+  return segments.map((segment, index) => {
+    const newList = segment.separator === null || [";", "\n", "\r"].includes(segment.separator);
+    if (newList || segment.separator === "||") pipefail = unconditionalPipefail;
+    if (segment.separator !== "|" && segments[index + 1]?.separator !== "|") {
+      if (/^set\s+-[eux]*o\s+pipefail$/.test(segment.command) && segment.separator !== "||") {
+        pipefail = true;
+        if (newList) unconditionalPipefail = true;
+      } else if (/^set\s/.test(segment.command) && !/^set(?:\s+-[eux]+)+$/.test(segment.command)) {
+        pipefail = false;
+        unconditionalPipefail = false;
+      }
+    }
+    return { ...segment, pipefail };
+  });
+}
+
 function verificationCommand(command, env = process.env) {
   if (typeof command !== "string") {
     return { recognized: false, observable: false };
@@ -364,19 +384,10 @@ function verificationCommand(command, env = process.env) {
   const pattern = customPattern(env);
   const matchingSegments = segments.map((segment) => isVerificationSegment(segment.command, pattern));
   const lastVerificationIndex = matchingSegments.lastIndexOf(true);
-  let pipefail = false;
-  const pipefailAtSegment = segments.map((segment, index) => {
-    if (/^set\s+-[a-z]*o\s+pipefail$/i.test(segment.command) && segments[index + 1]?.separator !== "|" && segments.slice(1, index + 1).every((previous) => [";", "\n", "\r", "&&"].includes(previous.separator))) {
-      pipefail = true;
-    } else if (/^set\s+\+(?:[a-z]*o)\s+pipefail$/i.test(segment.command)) {
-      pipefail = false;
-    }
-    return pipefail;
-  });
   return {
     recognized: lastVerificationIndex !== -1,
     observable: lastVerificationIndex !== -1 && segments.slice(lastVerificationIndex + 1).every(
-      (segment, offset) => segment.separator === "&&" || (segment.separator === "|" && pipefailAtSegment[lastVerificationIndex + offset])
+      (segment) => segment.separator === "&&" || (segment.separator === "|" && segment.pipefail)
     )
   };
 }

@@ -26,6 +26,11 @@ const LITERAL_CD = /^cd\s+(?:--\s+)?(?:'([^']+)'|"([^"\\$`]+)"|((?:\\.|[^\s"'\\;
 
 function verificationSteps(command) {
   const segments = commandSegments(command);
+  const steps = [];
+  if (segments[0]?.pipefail && [";", "\n", "\r", "&&"].includes(segments[1]?.separator)) {
+    steps.push({ stages: [segments.shift().command], pipefail: true });
+    segments[0].separator = null;
+  }
   let directory = null;
   if (/^cd(?:\s|$)/.test(segments[0]?.command) && segments[1]?.separator === "&&") {
     const cd = segments.shift().command.match(LITERAL_CD);
@@ -33,25 +38,25 @@ function verificationSteps(command) {
     directory = cd[1] ?? cd[2] ?? cd[3].replace(/\\(.)/g, "$1");
     if (directory === "-") return null;
   }
-  const pipelines = [];
   for (const segment of segments) {
     if (!segment.command || /^(?:cd|pushd|popd)(?:\s|$)/.test(segment.command)) return null;
-    if (segment.separator === "|" && pipelines.length) {
-      pipelines.at(-1).push(segment.command);
+    if (segment.separator === "|" && steps.length) {
+      steps.at(-1).stages.push(segment.command);
     } else if (segment.separator === null || segment.separator === "&&") {
-      pipelines.push([segment.command]);
+      steps.push({ stages: [segment.command], pipefail: segment.pipefail });
     } else {
       return null;
     }
   }
-  return pipelines.length ? { steps: pipelines, directory } : null;
+  return steps.length ? { steps, directory } : null;
 }
 
-function matchesVerificationSteps(executed, required) {
+function matchesVerificationSteps(executed, required, evidence) {
   const normalize = (pipeline) => pipeline.join(" | ").replace(/\s+2>&1$/, "").replace(/\s+/g, " ");
   let matched = 0;
-  for (const pipeline of executed) {
-    const step = required[matched];
+  for (const [index, { stages: pipeline, pipefail }] of executed.entries()) {
+    if (pipeline.length > 1 && !pipefail && !(index === executed.length - 1 && evidence === "output-summary")) continue;
+    const step = required[matched].stages;
     if (pipeline.length < step.length || pipeline.slice(step.length).some((stage) => !/^(?:tail|head)(?:\s|$)/.test(stage))) continue;
     if (normalize(pipeline.slice(0, step.length)) !== normalize(step)) continue;
     matched += 1;
@@ -81,7 +86,7 @@ function bashVerificationStart(input, file, now) {
   }
 }
 
-function settleVerifiedPackages(env, { sessionId, command, cwd, startedAt, file, now, writeHookText }) {
+function settleVerifiedPackages(env, { sessionId, command, evidence, cwd, startedAt, file, now, writeHookText }) {
   if (!Number.isFinite(startedAt) || typeof cwd !== "string" || !path.isAbsolute(cwd)) return;
   const executed = verificationSteps(command);
   if (!executed) return;
@@ -95,7 +100,7 @@ function settleVerifiedPackages(env, { sessionId, command, cwd, startedAt, file,
     if (!(Date.parse(record.collectedAt) < startedAt && Date.parse(record.finishedAt) < startedAt)) continue;
     if (!isVerificationCommand(record.verificationCommand, env)) continue;
     const required = verificationSteps(record.verificationCommand);
-    if (!required || !matchesVerificationSteps(executed.steps, required.steps)) continue;
+    if (!required || !matchesVerificationSteps(executed.steps, required.steps, evidence)) continue;
     try {
       if (directory !== fs.realpathSync(record.companionCwd ?? record.workspaceRoot)) continue;
       if (required.directory && directory !== fs.realpathSync(path.resolve(cwd, required.directory))) continue;
@@ -202,7 +207,7 @@ function handleBash(input, env, { sessionId, toolName, file, now, writeHookText 
         env
       );
       try {
-        settleVerifiedPackages(env, { sessionId, command, cwd: input.cwd, startedAt, file, now, writeHookText });
+        settleVerifiedPackages(env, { sessionId, command, evidence, cwd: input.cwd, startedAt, file, now, writeHookText });
       } catch {}
       return;
     }

@@ -72,6 +72,8 @@ test("preserves runner failures through && and through pipes with pipefail", () 
     "npm test && git status --short && echo done",
     "set -o pipefail; npm test | tail",
     "set -euo pipefail; npm test 2>&1 | tail -20",
+    "true && set -o pipefail && npm test | tail",
+    "set -o pipefail; set -e; npm test | tail",
     "set -o pipefail; npm test | tail && echo done"
   ]) {
     assert.equal(summaryEvidence(command, ""), "exit-status", command);
@@ -80,6 +82,8 @@ test("preserves runner failures through && and through pipes with pipefail", () 
     assert.equal(summaryEvidence(command, ""), null, command);
   }
   assert.equal(summaryEvidence("true || set -o pipefail; npm test | tail -1", ""), null);
+  assert.equal(summaryEvidence("false && set -o pipefail; npm test | tail -1", ""), null);
+  assert.equal(summaryEvidence("set -o pipefail; set +o 'pipefail' && npm test | tail", ""), null);
   assert.equal(summaryEvidence("set -o pipefail | cat; npm test | tail -1", ""), null);
 });
 

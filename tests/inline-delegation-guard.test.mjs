@@ -903,7 +903,7 @@ test("passing verification accepts matching packages in one advisory and clears 
   const second = verificationWorker(sandbox, env, 2, { verificationCommand: "npm run lint" });
   const stop = { hook_event_name: "Stop", session_id: "session-1", cwd: sandbox.workDir, background_tasks: [] };
   assert.strictEqual((await handleLifecycleHook(stop, env)).decision, "block");
-  const payload = verificationPayload(sandbox, { command: "cd -- work\\ tree && node   --test\ta.mjs 2>&1 | tail -20 && npm run lint 2>&1 | head -3", toolResponse: { exitCode: 0, stdout: "ℹ fail 0" } });
+  const payload = verificationPayload(sandbox, { command: "set -o pipefail; cd -- work\\ tree && node   --test\ta.mjs 2>&1 | tail -20 && npm run lint 2>&1 | head -3", toolResponse: { exitCode: 0, stdout: "ℹ fail 0" } });
   const result = runStartedVerification(sandbox, payload, env);
   assert.strictEqual(result.status, 0, result.stderr);
   const advisory = JSON.parse(result.stdout).hookSpecificOutput;
@@ -974,9 +974,39 @@ test("settlement preserves every stage of a required pipeline", (t) => {
     const worker = verificationWorker(sandbox, env, index, { verificationCommand });
     runStartedVerification(sandbox, verificationPayload(sandbox, { command: "npm test" }), env);
     assert.deepStrictEqual(readWorkerRecord(worker.taskId, env), worker);
-    const payload = verificationPayload(sandbox, { command: `${verificationCommand} | head -10 && npm run lint`, toolResponse: { exitCode: 0 } });
+    const command = `${verificationCommand} | head -10 && npm run lint`;
+    runStartedVerification(sandbox, verificationPayload(sandbox, { command, toolResponse: { exitCode: 0 } }), env);
+    assert.deepStrictEqual(readWorkerRecord(worker.taskId, env), worker);
+    const payload = verificationPayload(sandbox, { command: `set -o pipefail; ${command}`, toolResponse: { exitCode: 0 } });
     assert.match(runStartedVerification(sandbox, payload, env).stdout, /Automatically accepted/);
     assert.strictEqual(readWorkerRecord(worker.taskId, env).acceptance, "accepted");
+  }
+});
+
+test("settlement requires observable evidence for each matched step", (t) => {
+  const sandbox = makeSandbox(t);
+  const env = envFor(sandbox, reviewWaveWorkerEnv(sandbox, { FUSION_TEST_NOW: "2026-07-21T00:01:00Z" }));
+  const verificationCommand = "npm test && npm run lint";
+  const first = verificationWorker(sandbox, env, 1, { verificationCommand });
+  const lint = verificationWorker(sandbox, env, 2, { verificationCommand: "npm run lint" });
+  const masked = "npm test | tail -n 1 && npm run lint";
+  for (const [command, stdout] of [
+    [masked, ""],
+    [`${masked} | tail -n 1`, "ℹ fail 0"],
+    ["npm test && npm run lint | tail -1", ""],
+    [`set -o pipefail; set +o pipefail && ${masked}`, ""],
+    ["npm test | tail -n 1 && set -o pipefail && npm run lint", ""]
+  ]) {
+    runStartedVerification(sandbox, verificationPayload(sandbox, { command, toolResponse: { exitCode: 0, stdout } }), env);
+    assert.deepStrictEqual(readWorkerRecord(first.taskId, env), first, command);
+  }
+  assert.strictEqual(readWorkerRecord(lint.taskId, env).acceptance, "accepted");
+  for (const [index, [command, stdout]] of [
+    [`set -o pipefail; ${masked}`, ""], [verificationCommand, ""], ["npm test && npm run lint | tail -1", "ℹ fail 0"]
+  ].entries()) {
+    const worker = verificationWorker(sandbox, env, index + 3, { verificationCommand });
+    runStartedVerification(sandbox, verificationPayload(sandbox, { command, toolResponse: { exitCode: 0, stdout } }), env);
+    assert.strictEqual(readWorkerRecord(worker.taskId, env).acceptance, "accepted", command);
   }
 });
 

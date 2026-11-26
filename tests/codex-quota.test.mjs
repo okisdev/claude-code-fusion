@@ -3,7 +3,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { test } from "node:test";
 import { codexHome, latestRolloutRateLimits, recoverRolloutObservation } from "../plugins/codex/scripts/lib/codex-rollout.mjs";
-import { envFor, makeSandbox, runCompanion } from "./lib/codex-companion-harness.mjs";
+import { envFor, makeSandbox, runCompanion, waitFor } from "./lib/codex-companion-harness.mjs";
 
 const fixture = path.join(import.meta.dirname, "fixtures", "codex-quota.jsonl");
 const observedMs = Math.floor((Date.now() - 3_600_000) / 1000) * 1000;
@@ -292,9 +292,7 @@ test("a live account rate limit read needs Codex credentials and replaces an old
   assert.equal(pending.pools[0].usedPercent, 100);
   assert.equal(pending.refreshing, true);
   const liveFile = path.join(box.dataDir, "quota-live.json");
-  const deadline = Date.now() + 10_000;
-  while (!fs.existsSync(liveFile) && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 50));
-  assert.ok(fs.existsSync(liveFile), "live refresh did not write its cache");
+  await waitFor(() => fs.existsSync(liveFile) && !fs.existsSync(path.join(box.dataDir, "quota-live.refreshing")));
   assert.equal(fs.existsSync(path.join(box.dataDir, "quota.json")), false);
   const report = quota(box, env);
   assert.equal(report.refreshing, undefined);
@@ -316,7 +314,7 @@ test("a quota read during an existing live refresh marks its stale report and sk
   assert.equal(fs.existsSync(path.join(box.dataDir, "quota.json")), false);
 });
 
-test("only one caller acquires the live refresh lease until it expires", (t) => {
+test("only one caller acquires the live refresh lease until it expires", async (t) => {
   const box = makeSandbox(t);
   fs.mkdirSync(box.codexHome, { recursive: true });
   fs.writeFileSync(path.join(box.codexHome, "auth.json"), "{}");
@@ -329,18 +327,38 @@ test("only one caller acquires the live refresh lease until it expires", (t) => 
   const expired = new Date(Date.now() - 31_000);
   fs.utimesSync(lease, expired, expired);
   fs.rmSync(path.join(box.dataDir, "quota.json"), { force: true });
-  quota(box);
-  assert.equal(fs.readFileSync(lease, "utf8"), "");
+  assert.equal(quota(box).refreshing, true);
+  await waitFor(() => !fs.existsSync(lease));
 });
 
-test("a failed live read keeps the rollout snapshot and writes no live cache", async (t) => {
+test("a failed live read releases its lease and caches the rollout until a retry can start", async (t) => {
   const box = makeSandbox(t);
   fs.mkdirSync(box.codexHome, { recursive: true });
   fs.writeFileSync(path.join(box.codexHome, "auth.json"), "{}");
   rollout(box, { primary });
-  assert.equal(quota(box).pools[0].usedPercent, 79);
-  assert.ok(fs.existsSync(path.join(box.dataDir, "quota-live.refreshing")));
-  await new Promise((resolve) => setTimeout(resolve, 1500));
+  const lease = path.join(box.dataDir, "quota-live.refreshing");
+  const failure = path.join(box.dataDir, "quota-live.failed");
+  const pending = quota(box);
+  assert.equal(pending.pools[0].usedPercent, 79);
+  assert.equal(pending.refreshing, true);
+  await waitFor(() => !fs.existsSync(lease));
   assert.equal(fs.existsSync(path.join(box.dataDir, "quota-live.json")), false);
-  assert.equal(quota(box).pools[0].usedPercent, 79);
+  const fallback = quota(box);
+  assert.equal(fallback.pools[0].usedPercent, 79);
+  assert.equal(fallback.refreshing, undefined);
+  assert.equal(fs.existsSync(lease), false);
+  assert.deepEqual(JSON.parse(fs.readFileSync(path.join(box.dataDir, "quota.json"))).report, fallback);
+  const failedAt = fs.statSync(failure).mtimeMs;
+  assert.ok(Date.now() - failedAt < 60_000);
+  const recentFailure = new Date(Date.now() - 9 * 60_000);
+  fs.utimesSync(failure, recentFailure, recentFailure);
+  const expiredLease = new Date(Date.now() - 31_000);
+  fs.writeFileSync(lease, "abandoned");
+  fs.utimesSync(lease, expiredLease, expiredLease);
+  assert.deepEqual(quota(box), fallback);
+  const expired = new Date(Date.now() - 600_001);
+  fs.utimesSync(failure, expired, expired);
+  assert.equal(quota(box).refreshing, true);
+  await waitFor(() => !fs.existsSync(lease));
+  assert.ok(fs.statSync(failure).mtimeMs > expired.getTime());
 });
