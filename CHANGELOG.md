@@ -1,5 +1,9 @@
 # changelog
 
+## 0.0.97
+
+- an Antigravity quota failure records when its quota resets (`quotaResetsAt`, from the `Resets in` notice), and the breaker closes that pool only until then, naming the reset time in the advisory. a five hour window that reset at 20:02 had kept the lane closed for the rest of the 12 hour lookback while `/quota` showed 100 percent, sending reviews to a same family substitute.
+
 ## 0.0.96
 
 - OpenCode job records store the private `CODEX_HOME` the run passed to Codex and the sandbox it requested, and `result` and `status` show them, so the `/fusion:smoke` OpenCode gate checks that the run used a home under the plugin data dir and that `blind-check` ran read only, instead of only finding the directory on disk (#134).

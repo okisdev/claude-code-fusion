@@ -81,7 +81,7 @@ function versionAdvisorySuffix(engine, failure) {
 
 function advisoryLine(engine, failure, now, lookbackMs = DEFAULT_LOOKBACK_HOURS * 60 * 60 * 1000, pool = null) {
   const hoursText = formatLookbackHours(lookbackMs);
-  return `fusion breaker advisory: treat the ${engine}${pool === null || pool === engine ? "" : ` ${pool} pool`} breaker as open unless verified recovered; last failure ${failure.failureKind} ${formatAge(failure.timestamp, now)} (${failure.kindCount} ${failure.failureKind} across ${failure.terminalCount} terminal jobs, ${hoursText}h window${failure.scope === "mode" ? `, ${failure.mode} mode` : ""}). Route new work to another eligible healthy lane.${versionAdvisorySuffix(engine, failure)}`;
+  return `fusion breaker advisory: treat the ${engine}${pool === null || pool === engine ? "" : ` ${pool} pool`} breaker as open ${failure.resetsAt ? `until its quota resets at ${new Date(failure.resetsAt).toISOString().slice(0, 16).replace("T", " ")} UTC` : "unless verified recovered"}; last failure ${failure.failureKind} ${formatAge(failure.timestamp, now)} (${failure.kindCount} ${failure.failureKind} across ${failure.terminalCount} terminal jobs, ${hoursText}h window${failure.scope === "mode" ? `, ${failure.mode} mode` : ""}). Route new work to another eligible healthy lane.${versionAdvisorySuffix(engine, failure)}`;
 }
 
 function wrapperDeliveryAdvisory(records, now, lookbackMs) {

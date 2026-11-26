@@ -476,6 +476,17 @@ export function runAgy({ bin, cwd, env, brief, mode, version, geminiDir, session
   });
 }
 
+const QUOTA_NOTICE = /^⚠\s*(?:\w+\s+)?quota reached\b/i;
+const RESET_UNITS_MS = { d: 86_400_000, h: 3_600_000, m: 60_000, s: 1000 };
+
+export function agyQuotaResetsAt(outcome, now = Date.now()) {
+  const notice = outcome.resultText?.trim().split("\n").at(-1) ?? "";
+  const delay = QUOTA_NOTICE.test(notice) ? /\bResets in ((?:\d+\s*[dhms](?![a-z])\s*)+)/i.exec(notice)?.[1] : null;
+  if (!delay) return null;
+  const at = now + [...delay.matchAll(/(\d+)\s*([dhms])/gi)].reduce((total, [, value, unit]) => total + Number(value) * RESET_UNITS_MS[unit.toLowerCase()], 0);
+  return Number.isFinite(at) && Math.abs(at) <= 8.64e15 ? new Date(at).toISOString() : null;
+}
+
 export function classifyAgyFailure(outcome) {
   const message = [outcome.stderrTail, outcome.rpcError?.message, JSON.stringify(outcome.rpcError?.data), outcome.rpcError?.code].filter((value) => value != null).join("\n");
   if (outcome.cancelled) return "cancelled";
@@ -494,7 +505,7 @@ export function classifyAgyFailure(outcome) {
   if (outcome.signal && !outcome.lateClose && (!outcome.protocolError || outcome.protocolError === "Exit before prompt result")) return "process";
   if (outcome.protocolError) return "protocol";
   if (outcome.resultSeen && outcome.permissionsRejected > 0 && !outcome.resultText?.trim()) return "permission";
-  if (/^\u26a0\s*(?:\w+\s+)?quota reached\b/i.test(outcome.resultText?.trim().split("\n").at(-1) ?? "")) return "quota";
+  if (QUOTA_NOTICE.test(outcome.resultText?.trim().split("\n").at(-1) ?? "")) return "quota";
   if (!outcome.rpcError && (outcome.resultSeen && outcome.stopReason === "end_turn" || outcome.sessionReady)) return null;
   if (outcome.stopReason === "refusal") return "refused";
   if (!outcome.resultSeen && !outcome.rpcError) return "protocol";
