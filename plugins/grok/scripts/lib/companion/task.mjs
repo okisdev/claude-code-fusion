@@ -1,16 +1,15 @@
 import fs from "node:fs";
 import { parseArgs } from "../args.mjs";
 import { normalizeGrokSessionId, resolveGrokBin, resolveTimeoutMs, sandboxProfileForMode, runGrok, terminalRecordAttribution } from "../grok-exec.mjs";
-import { getProcessIdentity } from "../process-identity.mjs";
 import { renderBackgroundLaunch, renderTaskResult } from "../render.mjs";
 import { backgroundWatchReceipt } from "../job-watch.mjs";
-import { grokPaths, briefPath, clearQuotaCooldown, claimResumeSessionLease, createJobRecord, createJobRecordFile, generateJobId, jobFilePath, jobLogPath, launchRunningJobProcess, nowIso, readJobRecordFile, resolveDataDir, updateJobRecordFile, finishSuccessfulJobRecordFile, writeBrief } from "../state.mjs";
+import { grokPaths, briefPath, clearQuotaCooldown, claimResumeSessionLease, createJobRecord, createJobRecordFile, generateJobId, jobFilePath, jobLogPath, launchRunningJobProcess, nowIso, readJobRecordFile, resolveDataDir, finishSuccessfulJobRecordFile, writeBrief } from "../state.mjs";
 import { CONTINUE_PROMPT } from "./config.mjs";
 import { resolveGrokCompanionVersion, probeGrokVersion, requireTestedGrokFloor, requireQuotaAvailable } from "./version.mjs";
 import { output, oneLineSummary, failureOutcomeMessage, resolveCwd, validateImplicitRepositoryCwd, findRequestedJobRecord, currentClaudeSessionId, continuityPolicy, parsePositiveInteger, parseJsonSchema, commandArgs, readTaskPrompt, isFusionRoutedPrompt, grokRoleFromPrompt, backgroundDelivery, spawnBackgroundWorker } from "./base.mjs";
 import { inputError, resolveLastSessionJob, validateResumeSession } from "./session.mjs";
 import { grokFailureMessage, classifyFailure, finishJobRecord, resultFailed, failureTail } from "./execution.mjs";
-import { resultSpendPatch, outcomeFields, taskSuccessPayload, failureResultPayload, retainedResultPayload, failJob, finishTaskStructuredFailure, describeLaunchFailure, launchFailureError, appendFailureLog, recordSpawnFailure } from "./outcome.mjs";
+import { resultSpendPatch, outcomeFields, taskSuccessPayload, failureResultPayload, retainedResultPayload, failJob, finishTaskStructuredFailure, describeLaunchFailure, launchFailureError, appendFailureLog, registerBackgroundWorker, recordSpawnFailure } from "./outcome.mjs";
 import { resolveRepositoryTopLevel, consumeTaskStructuredResult } from "./review.mjs";
 import { SELF_PATH } from "./paths.mjs";
 
@@ -259,13 +258,9 @@ async function handleTaskWorker(argv) {
     throw new Error(`No job record found for ${jobId}.`);
   }
 
-  const record = found.record;
-  if (record.status !== "running") {
-    return;
-  }
+  const record = registerBackgroundWorker(found.file);
+  if (!record) return;
   const logFile = jobLogPath(dataDir, record.cwd, record.id);
-  updateJobRecordFile(found.file, { pid: process.pid, pidIdentity: getProcessIdentity(process.pid) });
-
   const request = record.request ?? {};
   const timeoutMs = resolveTimeoutMs({ background: true, env: process.env });
 

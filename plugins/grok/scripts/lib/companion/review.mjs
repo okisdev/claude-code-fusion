@@ -3,15 +3,14 @@ import fs from "node:fs";
 import path from "node:path";
 import { parseArgs } from "../args.mjs";
 import { resolveGrokBin, resolveTimeoutMs, sandboxProfileForMode, runGrok } from "../grok-exec.mjs";
-import { getProcessIdentity } from "../process-identity.mjs";
 import { extractFirstJsonObject, renderBackgroundLaunch, renderReviewFallback, renderReviewResult, renderTaskResult, validateReviewOutput } from "../render.mjs";
 import { backgroundWatchReceipt } from "../job-watch.mjs";
-import { briefPath, createJobRecord, createJobRecordFile, generateJobId, jobFilePath, jobLogPath, launchRunningJobProcess, nowIso, readJobRecordFile, resolveDataDir, updateJobRecordFile, writeBrief } from "../state.mjs";
+import { briefPath, createJobRecord, createJobRecordFile, generateJobId, jobFilePath, jobLogPath, launchRunningJobProcess, nowIso, readJobRecordFile, resolveDataDir, writeBrief } from "../state.mjs";
 import { REVIEW_OUTPUT_SCHEMA } from "./config.mjs";
 import { resolveGrokCompanionVersion, probeGrokVersion, requireTestedGrokFloor, requireQuotaAvailable } from "./version.mjs";
 import { output, oneLineSummary, boundedTextTail, failureOutcomeMessage, resolveCwd, validateImplicitRepositoryCwd, findRequestedJobRecord, currentClaudeSessionId, commandArgs, backgroundDelivery, spawnBackgroundWorker } from "./base.mjs";
 import { classifyFailure, finishJobRecord, resultFailed } from "./execution.mjs";
-import { resultSpendPatch, outcomeFields, failureResultPayload, retainedResultPayload, failJob, describeLaunchFailure, launchFailureError, appendFailureLog, recordSpawnFailure } from "./outcome.mjs";
+import { resultSpendPatch, outcomeFields, failureResultPayload, retainedResultPayload, failJob, describeLaunchFailure, launchFailureError, appendFailureLog, registerBackgroundWorker, recordSpawnFailure } from "./outcome.mjs";
 import { SELF_PATH, REVIEW_PROMPT_FILE } from "./paths.mjs";
 
 function runGit(args, cwd) {
@@ -402,11 +401,8 @@ async function handleReviewWorker(argv) {
     throw new Error(`No job record found for ${jobId}.`);
   }
 
-  if (found.record.status !== "running") {
-    return;
-  }
-
-  const record = updateJobRecordFile(found.file, { pid: process.pid, pidIdentity: getProcessIdentity(process.pid) });
+  const record = registerBackgroundWorker(found.file);
+  if (!record) return;
   const logFile = jobLogPath(dataDir, record.cwd, record.id);
   try {
     await runReviewJob(record, found.file, { background: true });

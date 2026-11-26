@@ -505,7 +505,7 @@ test("Grok rules document source verified headless boundaries", () => {
   const readme = fs.readFileSync(path.join(repoRoot, "README.md"), "utf8");
   const security = fs.readFileSync(path.join(repoRoot, "SECURITY.md"), "utf8");
   const bridgeSentence = "The child sets all eighteen `GROK_CLAUDE_*_ENABLED`, `GROK_CURSOR_*_ENABLED`, and `GROK_CODEX_*_ENABLED` bridge variables to false; upstream currently consumes the six Claude and six Cursor cells plus the Codex sessions cell and reserves the other five Codex cells, and the child also pins `GROK_MANAGED_MCPS_ENABLED=false` because that variable has highest precedence over `[managed_mcps]` in `~/.grok/config.toml` and remote settings.";
-  const hookClaim = "Managed Grok runs use a private `GROK_HOME` with an empty `hooks/` directory. Its `config.toml` omits the user's `plugins` and `hooks` settings and preserves the rest verbatim.";
+  const hookClaim = "Managed Grok runs use a separate `GROK_HOME` for each resolved user home and credential source. Each private home has an empty `hooks/` directory. Its `config.toml` omits the user's `plugins` and `hooks` settings and preserves the rest verbatim.";
   const subagentSentence = "`--no-subagents` disables headless subagent spawning (verified on 1.0.77 and 1.0.88); the hard Agent tool deny and `GROK_SUBAGENTS=0` remain independent controls.";
   const rustLogSentence = "Every run forces `RUST_LOG=xai_grok_agent::builder=debug,xai_grok_sandbox=warn,xai_grok_shell::session::acp_session::turn=warn`.";
   const bubblewrapSentence = "On Linux, a strict profile with deny paths re-executes under bubblewrap and refuses to start when `bwrap` is missing or unusable; macOS has no equivalent hard enforcement and relies on Seatbelt application plus best-effort tool denies.";
@@ -610,7 +610,7 @@ test("Grok rules document source verified headless boundaries", () => {
   assert.match(fs.readFileSync(path.join(repoRoot, "plugins", "fusion", "rules", "troubleshooting.md"), "utf8"), /always (?:permits|include) `\/tmp` and `\/var\/tmp`/);
   assert.match(fs.readFileSync(path.join(repoRoot, "plugins", "fusion", "rules", "troubleshooting.md"), "utf8"), /all of `\/private\/var\/folders`/);
   assert.match(fs.readFileSync(path.join(repoRoot, "plugins", "fusion", "rules", "troubleshooting.md"), "utf8"), /not the only writable temporary surface/);
-  assert.match(fs.readFileSync(path.join(repoRoot, "plugins", "fusion", "rules", "troubleshooting.md"), "utf8"), /sandbox still permits consult `read_file` to reach `~\/\.grok\/auth\.json`/i);
+  assert.match(troubleshooting, /sandbox still permits consult `read_file` to reach `\$GROK_HOME\/auth\.json`/i);
   assert.match(fs.readFileSync(path.join(repoRoot, "plugins", "fusion", "rules", "troubleshooting.md"), "utf8"), /native MCP servers from starting during agent construction/);
   assert.match(troubleshooting, /bridge variables gate only loose compatibility imports, not native Grok configuration/);
   for (const sentence of [

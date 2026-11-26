@@ -1,11 +1,11 @@
 import path from "node:path";
-import { normalizeGrokSessionId, recordedProcessGroupsClean, terminalRecordAttribution, terminateRecordedProcessGroups } from "../grok-exec.mjs";
+import { normalizeGrokSessionId, recordedProcessGroupsClean, terminateRecordedProcessGroups } from "../grok-exec.mjs";
 import { renderCancelReport, renderHistoryReport, renderJobDetail, renderStatusTable, renderTaskResult } from "../render.mjs";
 import { grokPaths, jobFilePath, jobLogPath, listAllJobRecords, listJobRecords, markDeliveryCollectedFile, nowIso, readJobRecordFile, readLogTail, resolveDataDir, updateJobRecordFile, updateJobRecordFileWithCurrent } from "../state.mjs";
 import { JOB_ID_PATTERN, DEFAULT_HISTORY_LIMIT, HISTORY_STATUSES, HISTORY_MODES, HISTORY_DELIVERIES, HISTORY_DELIVERY_STATUSES, HISTORY_SEMANTIC_STATUSES, HISTORY_FAILURE_KINDS } from "./config.mjs";
 import { output, errorWithFailure, failureOutcomeMessage, resolveCwd, findRequestedJobRecord, currentClaudeSessionId, parseHistoryLimit, commandArgs, resolveWaitPollMs, resolveWaitTimeoutMs, delayMs } from "./base.mjs";
 import { inputError, jobClassForRecord, memoryEnabledForRecord, resumeCompatible, sessionMemoryModes } from "./session.mjs";
-import { cleanupRequiredPatch, refreshRunningJobRecord, outcomeFields, observableRecord, failureResultPayload, retainedResultPayload } from "./outcome.mjs";
+import { cancelledJobRecord, cleanupRequiredPatch, refreshRunningJobRecord, outcomeFields, observableRecord } from "./outcome.mjs";
 import { watchJob } from "../job-watch.mjs";
 
 async function handleWatch(argv) {
@@ -333,27 +333,7 @@ async function handleCancel(argv, transport = {}) {
     if (!terminated || !recordedProcessGroupsClean(current)) {
       return cleanupRequiredPatch(current, "cancelled", cleanupMessage);
     }
-    return {
-      ...current,
-      ...terminalRecordAttribution(current),
-      status: "cancelled",
-      finishedAt: nowIso(),
-      resultPayload: retainedResultPayload(
-        current,
-        failureResultPayload(current, {
-          status: "cancelled",
-          failureKind: "cancelled",
-          message: failureOutcomeMessage({
-            message: "The Grok job was cancelled.",
-            record: current,
-            status: "cancelled",
-            failureKind: "cancelled"
-          })
-        })
-      ),
-      failureKind: "cancelled",
-      cancelRequestedAt: null
-    };
+    return cancelledJobRecord(current);
   });
   if (next.status === "running" && next.cleanupRequired) {
     throw errorWithFailure(failureOutcomeMessage({ message: cleanupMessage, record: next, status: "running", failureKind: "cancelled" }), "cancelled");

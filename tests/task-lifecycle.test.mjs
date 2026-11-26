@@ -24,6 +24,7 @@ import { getProcessIdentity } from "../plugins/grok/scripts/lib/process-identity
 const {
   createJobRecord,
   generateJobId,
+  grokPaths,
   jobFilePath,
   jobLogPath,
   nowIso,
@@ -71,6 +72,7 @@ test("resume last rejects another Claude session's finished job", (t) => {
   writeJobRecordFile(jobFilePath(sandbox.dataDir, sandbox.workDir, jobId), {
     ...createJobRecord({
       id: jobId,
+      profileKey: grokPaths(envFor(sandbox)).profileKey,
       pid: null,
       mode: "consult",
       cwd: sandbox.workDir,
@@ -111,6 +113,7 @@ test("a running resume owns the workspace session lease and a terminal owner can
   writeJobRecordFile(jobFilePath(sandbox.dataDir, sandbox.workDir, sourceJobId), {
     ...createJobRecord({
       id: sourceJobId,
+      profileKey: grokPaths(envFor(sandbox)).profileKey,
       pid: null,
       mode: "consult",
       cwd: sandbox.workDir,
@@ -752,15 +755,17 @@ test("permission-cancelled task ends in an error record, not done", (t) => {
   assert.strictEqual(record.failureKind, "permission");
 });
 
-test("task worker does not launch Grok after cancellation was requested", async (t) => {
+test("task worker does not launch Grok after cancellation was requested", (t) => {
   const sandbox = makeSandbox(t);
   const env = envFor(sandbox);
+  delete env.GROK_COMPANION_CAPABILITIES;
   const jobId = generateJobId();
   const briefFile = writeBrief(sandbox.dataDir, sandbox.workDir, jobId, "say hi");
   const jobFile = jobFilePath(sandbox.dataDir, sandbox.workDir, jobId);
   writeJobRecordFile(jobFile, {
     ...createJobRecord({
       id: jobId,
+      profileKey: grokPaths(env).profileKey,
       mode: "consult",
       cwd: sandbox.workDir,
       briefFile,
@@ -768,20 +773,10 @@ test("task worker does not launch Grok after cancellation was requested", async 
     }),
     cancelRequestedAt: nowIso(),
   });
-  const worker = spawn(process.execPath, [companion, "task-worker", "--job-id", jobId], {
-    cwd: sandbox.workDir,
-    env,
-    stdio: "ignore",
-  });
-  t.after(() => {
-    try {
-      worker.kill("SIGKILL");
-    } catch {}
-  });
-  const cancelled = await waitFor(() => {
-    const current = jobRecords(sandbox.dataDir)[0];
-    return current && current.status === "cancelled" ? current : null;
-  });
+  const worker = runCompanion(["task-worker", "--job-id", jobId], { cwd: sandbox.workDir, env });
+  assert.strictEqual(worker.status, 0, worker.stderr);
+  const [cancelled] = jobRecords(sandbox.dataDir);
+  assert.strictEqual(cancelled.status, "cancelled", cancelled.errorMessage);
   assert.strictEqual(cancelled.failureKind, "cancelled");
   assert.strictEqual(cancelled.exitCode, null);
   assert.strictEqual(cancelled.resultText, null);
