@@ -17,6 +17,8 @@ const verifiedGrokVersion = JSON.parse(fs.readFileSync(new URL("../plugins/fusio
 const fusionVersion = JSON.parse(fs.readFileSync(new URL("../plugins/fusion/.claude-plugin/plugin.json", import.meta.url), "utf8")).version;
 const BREAKER_ADVISORY_TAG = messageTag("breaker-check.breaker-advisory");
 const ESCAPED_BREAKER_ADVISORY_TAG = BREAKER_ADVISORY_TAG.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+const GROK_WRITE_SUBSTITUTES = "burst → Codex quick tier or the breadth engine's burst pool, independence → agy:agy-rescue (agy-role: independence)";
+const GROK_CONSULT_SUBSTITUTES = "live-web → codex:codex-rescue read only consult with --web (X and other logged-in platform content unavailable), large-context → agy:agy-rescue (agy-role: large-context)";
 
 function makeSandbox(t) {
   const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "breaker-check-test-")));
@@ -55,7 +57,7 @@ function writeCompanion(file, source) {
 function envFor(sandbox, extra = {}) {
   const inherited = Object.fromEntries(
     Object.entries(process.env).filter(
-      ([key]) => key !== "HOME" && key !== "CLAUDE_CODE_SESSION_ID" && !/^(?:FUSION|GROK|CODEX|CURSOR|DEVIN|AGY)_/.test(key)
+      ([key]) => key !== "HOME" && key !== "CLAUDE_CODE_SESSION_ID" && !/^(?:FUSION|GROK|CODEX|CURSOR|DEVIN|AGY|OPENCODE)_/.test(key)
     )
   );
   return {
@@ -294,6 +296,7 @@ test("an in-window quota failure prints a grok breaker advisory", (t) => {
   assert.strictEqual(result.status, 0);
   assert.match(result.stdout, /treat the grok breaker as open unless verified recovered/);
   assert.match(result.stdout, /last failure quota \d+ minutes? ago \(1 quota across 1 terminal jobs, 12h window\)/);
+  assert.ok(result.stdout.endsWith(`\nGrok role substitutes: ${GROK_WRITE_SUBSTITUTES}, ${GROK_CONSULT_SUBSTITUTES} ${BREAKER_ADVISORY_TAG}\n`));
   assert.ok(result.stdout.endsWith(`${BREAKER_ADVISORY_TAG}\n`));
   assert.strictEqual(result.stderr, "");
 });
@@ -307,7 +310,7 @@ test("grok breaker version advice reports only a contract drift", (t) => {
     grokVersion: "1.0.99",
     finishedAt: new Date(Date.now() - 2 * 60000).toISOString()
   });
-  assert.ok(run(changed).stdout.includes(`; grok 1.0.99 installed, contract verified on ${verifiedGrokVersion} [fusion:`));
+  assert.ok(run(changed).stdout.includes(`; grok 1.0.99 installed, contract verified on ${verifiedGrokVersion}\nGrok role substitutes:`));
 
   const pinned = makeSandbox(t);
   writeRecord(jobFile(path.join(pinned.grokData, "state"), "workspace", "pinned"), {
@@ -523,6 +526,26 @@ test("Grok and Codex advisories retain their existing order", (t) => {
   assert.match(run(sandbox).stdout, /^fusion breaker advisory: treat the grok breaker.*\nfusion breaker advisory: treat the codex breaker/);
 });
 
+test("the advisory appends one substitute line per blocked engine with mapped roles", (t) => {
+  const sandbox = makeSandbox(t);
+  const env = envFor(sandbox);
+  const finishedAt = new Date(Date.now() - 60_000).toISOString();
+  for (const engine of ["codex", "cursor", "devin", "agy", "opencode"]) {
+    const root = engineStateRoots(engine, env)[0];
+    writeRecord(jobFile(root, "workspace", "auth"), { status: "error", failureKind: "auth", finishedAt });
+  }
+  const result = run(sandbox);
+  assert.strictEqual(result.status, 0);
+  assert.deepStrictEqual(result.stdout.split("\n").slice(-5), [
+    "Cursor role substitutes: diversity → Antigravity independence, burst → Codex quick tier",
+    "Devin role substitutes: diversity → Antigravity independence, burst → Codex quick tier",
+    "Antigravity role substitutes: independence → breadth engine diversity with a non-Google model (otherwise Codex read only consult), large-context → breadth engine diversity with a non-Google model (otherwise Codex read only consult), burst → Codex quick tier",
+    `OpenCode role substitutes: bulk → Codex volume tier ${BREAKER_ADVISORY_TAG}`,
+    ""
+  ]);
+  assert.equal(result.stdout.split(" role substitutes:").length - 1, 4);
+});
+
 test("two Grok rate limits inside the configured window open only the Grok breaker", (t) => {
   const sandbox = makeSandbox(t);
   const stateRoot = path.join(sandbox.grokData, "state");
@@ -539,7 +562,9 @@ test("two Grok rate limits inside the configured window open only the Grok break
 
   const result = run(sandbox);
   assert.strictEqual(result.status, 0);
-  assert.match(result.stdout, new RegExp(`^fusion breaker advisory: treat the grok breaker as open unless verified recovered; last failure rate_limited \\d+ minutes? ago \\(2 rate_limited across 2 terminal jobs, 12h window\\)\\. Route new work to another eligible healthy lane\\. ${ESCAPED_BREAKER_ADVISORY_TAG}\\n$`));
+  const [advisory, ...substitutes] = result.stdout.split("\n");
+  assert.match(advisory, /^fusion breaker advisory: treat the grok breaker as open unless verified recovered; last failure rate_limited \d+ minutes? ago \(2 rate_limited across 2 terminal jobs, 12h window\)\. Route new work to another eligible healthy lane\.$/);
+  assert.deepStrictEqual(substitutes, [`Grok role substitutes: ${GROK_WRITE_SUBSTITUTES}, ${GROK_CONSULT_SUBSTITUTES} ${BREAKER_ADVISORY_TAG}`, ""]);
   assert.strictEqual(result.stderr, "");
 });
 
@@ -562,7 +587,9 @@ test("Grok network failures open only after a consecutive retry and success rese
   });
   const opened = run(sandbox);
   assert.strictEqual(opened.status, 0);
-  assert.match(opened.stdout, new RegExp(`^fusion breaker advisory: treat the grok breaker as open unless verified recovered; last failure network \\d+ minutes? ago \\(2 network across 2 terminal jobs, 12h window, consult mode\\)\\. Route new work to another eligible healthy lane\\. ${ESCAPED_BREAKER_ADVISORY_TAG}\\n$`));
+  const [advisory, ...substitutes] = opened.stdout.split("\n");
+  assert.match(advisory, /^fusion breaker advisory: treat the grok breaker as open unless verified recovered; last failure network \d+ minutes? ago \(2 network across 2 terminal jobs, 12h window, consult mode\)\. Route new work to another eligible healthy lane\.$/);
+  assert.deepStrictEqual(substitutes, [`Grok role substitutes: ${GROK_CONSULT_SUBSTITUTES} ${BREAKER_ADVISORY_TAG}`, ""]);
   assert.strictEqual(opened.stderr, "");
 
   writeRecord(jobFile(stateRoot, "workspace", "network-recovered"), {
@@ -999,7 +1026,8 @@ test("host check reports every blocker from an installed Grok companion in the e
   });
   const result = run(sandbox, { GROK_BIN: process.execPath });
   assert.strictEqual(result.status, 0);
-  assert.match(result.stdout, /^fusion breaker advisory: treat the grok breaker.*\nGrok consult, write, review runs are blocked on this host \(sandbox\): Sandbox setup failed\.\nGrok consult runs are blocked on this host \(auth\): Sign in first\. \[fusion:/);
+  assert.match(result.stdout, /^fusion breaker advisory: treat the grok breaker.*\nGrok consult, write, review runs are blocked on this host \(sandbox\): Sandbox setup failed\.\nGrok consult runs are blocked on this host \(auth\): Sign in first\.\nGrok role substitutes:/);
+  assert.ok(result.stdout.endsWith(`\nGrok role substitutes: ${GROK_WRITE_SUBSTITUTES}, ${GROK_CONSULT_SUBSTITUTES} ${BREAKER_ADVISORY_TAG}\n`));
   assert.ok(result.stdout.endsWith(`${BREAKER_ADVISORY_TAG}\n`));
   assert.strictEqual(result.stderr, "");
 });
@@ -1333,6 +1361,8 @@ test("host blockers preserve write and consult scopes in unified health", (t) =>
   assert.equal(engineHealth("grok", "write", null, { env }).healthy, false);
   assert.equal(engineHealth("grok", "consult", null, { env }).healthy, true);
   assert.equal(engineHealth("grok", "review", null, { env }).healthy, true);
+  assert.strictEqual(run(box, { FUSION_GROK_COMPANION: companion }).stdout,
+    `Grok write runs are blocked on this host (sandbox): Writes blocked.\nGrok role substitutes: ${GROK_WRITE_SUBSTITUTES} ${BREAKER_ADVISORY_TAG}\n`);
 });
 
 test("a consult success cannot recover write timeouts and a wrapper cannot double count its peer", (t) => {

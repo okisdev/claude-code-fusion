@@ -5,7 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { ENGINES, ENGINE_IDS, PEER_RESCUE_AGENT_NAMES } from "./lib/engines.mjs";
+import { ENGINES, ENGINE_IDS, PEER_RESCUE_AGENT_NAMES, roleSubstituteText } from "./lib/engines.mjs";
 import { engineHealth, readEngineHealthRecords } from "./lib/engine-health.mjs";
 import { tagMessage } from "./lib/user-messages.mjs";
 
@@ -142,12 +142,16 @@ function run(env = process.env, now = Date.now(), write = (text) => process.stdo
   const { lookbackMs, workers: workerRecords } = records;
   const lines = [];
   const hostLines = new Set();
+  const substituteLines = [];
   for (const engine of ["grok", ...ENGINE_IDS.filter((id) => id !== "grok"), ...WORKER_BREAKER_LANES]) {
     const seen = new Set();
+    const blockedModes = new Set();
     const pools = new Set([null, ...(records.engines.get(engine) ?? []).map((record) => record.billingPool ?? null)]);
     for (const mode of ["consult", "write"]) {
+      let healthyPool = false;
       for (const pool of pools) {
         const health = engineHealth(engine, mode, pool, { env, now, records });
+        healthyPool ||= health.healthy;
         for (const failure of health.failures) {
           const key = `${failure.scope}:${failure.mode}:${failure.pool}:${failure.failureKind}`;
           if (seen.has(key)) continue;
@@ -158,6 +162,13 @@ function run(env = process.env, now = Date.now(), write = (text) => process.stdo
           hostLines.add(`${ENGINES[engine].displayName} ${modes.join(", ")} runs are blocked on this host (${kind}): ${message}`);
         }
       }
+      if (!healthyPool) blockedModes.add(mode);
+    }
+    if (ENGINES[engine] && blockedModes.size) {
+      const { displayName, roles, consultOnlyRoles } = ENGINES[engine];
+      const blockedRoles = roles.filter((role) => blockedModes.has(consultOnlyRoles.includes(role) ? "consult" : "write"));
+      const substitutes = roleSubstituteText(engine, blockedRoles);
+      if (substitutes) substituteLines.push(`${displayName} role substitutes: ${substitutes}`);
     }
   }
   const deliveryAdvisory = wrapperDeliveryAdvisory(workerRecords, now, lookbackMs);
@@ -169,6 +180,7 @@ function run(env = process.env, now = Date.now(), write = (text) => process.stdo
   if (missingEngines.length) {
     lines.push(`fusion engines unavailable (CLI missing): ${missingEngines.join(", ")}. Skip these lanes.`);
   }
+  lines.push(...substituteLines);
   if (lines.length > 0) {
     write(`${tagMessage("breaker-check.breaker-advisory", lines.join("\n"))}\n`);
   }

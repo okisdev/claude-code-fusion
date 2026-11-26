@@ -4,13 +4,14 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { ENGINES, ENGINE_ID_ALTERNATION, PEER_JOB_FOOTER_AGENTS, engineDisplayName, engineForAgentType, engineRoleFromBrief, fixedEnginePool, routedEngineIds } from "../engines.mjs";
+import { ENGINES, ENGINE_ID_ALTERNATION, PEER_JOB_FOOTER_AGENTS, engineDisplayName, engineForAgentType, engineRoleFromBrief, fixedEnginePool, roleSubstituteText, routedEngineIds } from "../engines.mjs";
 import { readModelRoutingFile, readRoutingDefaults, resolveModelRoutingPath } from "../model-table.mjs";
 import { NEAR_EXHAUSTION_PERCENT, quotaResults } from "../quota.mjs";
 import { newestEngineCompanion } from "../engine-acceptance.mjs";
 import { engineHealth, readEngineHealthRecords } from "../engine-health.mjs";
 import { engineCliAvailable } from "../../breaker-check.mjs";
 import { tagMessage } from "../user-messages.mjs";
+import { isVerificationCommand } from "../verification-command.mjs";
 import { canonicalWorkerAgentType, claudeModelFamily, createWorkerRecord, createWorkerTaskId, readPeerCapacityReservations, readWorkerRecord, readWorkerRecords, updateWorkerSessionState, withPeerCapacityReservations, workerRecordFile, writePrivateText, WORKER_TERMINAL_STATUSES } from "../worker-state.mjs";
 import { workerLimits } from "./budget.mjs";
 import { sessionRecords, updateLifecycleWorkerRecord } from "./records.mjs";
@@ -34,7 +35,7 @@ function promptText(toolInput) {
 function briefEnvelope(prompt) {
   const lines = prompt.trimStart().split(/\r?\n/);
   const end = lines.findIndex((line) => !line.trim());
-  return lines.slice(0, end < 0 ? lines.length : end).map((line) => line.trim().replace(/\.$/, "").trim().replace(/^([^:]+):\s*/, (_, key) => `${key.trim()}: `).toLowerCase());
+  return lines.slice(0, end < 0 ? lines.length : end).map((line) => line.trim());
 }
 
 function leadingCompanionOptions(prompt) {
@@ -124,13 +125,16 @@ function engineInfraDenial(sessionId, agentType, userText, env, now = Date.now()
   const pool = dispatchRecord ? dispatchRecord.peerBillingPool ?? dispatchRecord.billingPool ?? null : dispatchEngineChoice(engine, prompt, env, records).pool;
   const health = engineHealth(engine, mode, pool, { env, now, sessionId, records });
   if (health.healthy) return null;
+  const role = engineRoleFromBrief(engine, leadingCompanionOptions(prompt).brief);
+  const substitute = role ? roleSubstituteText(engine, [role]) : "";
+  const substituteText = substitute ? ` Substitute: ${substitute}.` : "";
   if (health.blockers.length > 0) {
-    return tagMessage("worker-lifecycle.engine-infra-deny", `${engineDisplayName(engine)} ${mode} runs are blocked on this host: ${health.blockers.map((blocker) => `${blocker.kind}: ${blocker.message}`).join("; ")} Route this package to another eligible lane, or name the engine to retry.`);
+    return tagMessage("worker-lifecycle.engine-infra-deny", `${engineDisplayName(engine)} ${mode} runs are blocked on this host: ${health.blockers.map((blocker) => `${blocker.kind}: ${blocker.message}`).join("; ")}${substituteText} Route this package to another eligible lane, or name the engine to retry.`);
   }
   const elapsedMs = now - health.failures[0].timestamp;
   const elapsedMinutes = Math.floor(elapsedMs / 60_000);
   const remainingMinutes = Math.ceil((health.until - now) / 60_000);
-  return tagMessage("worker-lifecycle.engine-infra-deny", `${engineDisplayName(engine)} failed with failure: ${health.reason} ${elapsedMinutes} minutes ago in this session. Route this package to another eligible lane. It reopens after ${remainingMinutes} minutes or after you name the engine in a message.`);
+  return tagMessage("worker-lifecycle.engine-infra-deny", `${engineDisplayName(engine)} failed with failure: ${health.reason} ${elapsedMinutes} minutes ago in this session.${substituteText} Route this package to another eligible lane. It reopens after ${remainingMinutes} minutes or after you name the engine in a message.`);
 }
 
 function injectedPeerDefaults(prompt, agentType, env) {
@@ -505,10 +509,10 @@ function validateWorkerBrief(prompt, agentType, env = process.env) {
   }
   const fallbackWorker = ["fusion:claude-worker", "fusion:trivial-worker"].includes(canonical);
   const fallbackReasons = ["network", "toolchain", "long-build", "claude-surface", "privacy", "no-healthy-lane"];
-  const envelopeLines = briefEnvelope(prompt);
+  const envelopeLines = briefEnvelope(prompt).map((line) => line.replace(/\.$/, "").trim().replace(/^([^:]+):\s*/, (_, key) => `${key.trim()}: `).toLowerCase());
   const envelope = envelopeLines.join("\n");
   const fallbackLines = envelopeLines.filter((line) => /^claude-fallback:/.test(line));
-  const fallbackReason = fallbackWorker && fallbackLines.length === 1 ? fallbackLines[0].match(/^claude-fallback:\s*([^\s]+)\s*$/)?.[1] : null;
+  const fallbackReason = fallbackWorker && fallbackLines.length === 1 ? fallbackLines[0].match(/^claude-fallback:\s*([\w-]+)(?=$|[\s,:;]|\.\s)/)?.[1] : null;
   const maximumBytes = DEFAULT_BRIEF_MAX_BYTES;
   if (Buffer.byteLength(prompt) > maximumBytes) {
     return { ok: false, reason: `Fusion worker brief exceeds ${maximumBytes} bytes; reduce it to the minimal self-contained task context.` };
@@ -516,7 +520,6 @@ function validateWorkerBrief(prompt, agentType, env = process.env) {
   const firstLine = envelopeLines[0];
   const required = [
     [firstLine === "fusion-brief: v1", "fusion-brief: v1 (first line)"],
-    [/^context-mode:\s*isolated\s*$/im, "context-mode: isolated"],
     [/^goal:\s*\S/im, "goal:"],
     [/^scope:\s*\S/im, "scope:"]
   ];
@@ -524,10 +527,10 @@ function validateWorkerBrief(prompt, agentType, env = process.env) {
   if (!/^(?:verification|acceptance):\s*\S/im.test(envelope)) missing.push("verification: or acceptance:");
   if (fallbackWorker && fallbackLines.length === 0) missing.push(`claude-fallback: (${fallbackReasons.join(", ")})`);
   if (fallbackWorker && fallbackLines.length > 0 && !fallbackReasons.includes(fallbackReason)) {
-    return { ok: false, reason: `Fusion worker brief requires exactly one \`claude-fallback:\` line with one of: ${fallbackReasons.join(", ")}. Copy this example and choose the reason:\n\nclaude-fallback: claude-surface` };
+    return { ok: false, reason: `Fusion worker brief requires exactly one \`claude-fallback:\` line starting with one of: ${fallbackReasons.join(", ")}. Copy this example and choose the reason:\n\nclaude-fallback: claude-surface` };
   }
   if (missing.length) {
-    return { ok: false, reason: `Fusion worker brief is missing required lines: ${missing.join(", ")}. Copy this envelope and fill each value:\n\nfusion-brief: v1\ncontext-mode: isolated\ngoal: <task goal>\nscope: <files or boundaries>\nverification: <check or acceptance criterion>${fallbackWorker ? "\nclaude-fallback: claude-surface" : ""}` };
+    return { ok: false, reason: `Fusion worker brief is missing required lines: ${missing.join(", ")}. Copy this envelope and fill each value:\n\nfusion-brief: v1\ngoal: <task goal>\nscope: <files or boundaries>\nverification: <check or acceptance criterion>${fallbackWorker ? "\nclaude-fallback: claude-surface" : ""}` };
   }
 
   if (/\b(?:the conversation above|all previous messages|full parent transcript|inherit(?:ed)? conversation)\b/i.test(prompt)) {
@@ -546,17 +549,21 @@ function validateWorkerBrief(prompt, agentType, env = process.env) {
   if (!packageType) {
     return { ok: false, reason: "Fusion worker brief `package-type:` must be one of `implementation`, `consult`, `review`, `research`, or `design`." };
   }
-  if (fallbackReason === "no-healthy-lane") {
+  if (fallbackReason === "no-healthy-lane" || fallbackReason === "network") {
     const now = Date.now();
     const records = readEngineHealthRecords(env, now);
     const defaults = readRoutingDefaults(env, { warn: null });
-    const mode = packageType === "implementation" ? "write" : "consult";
-    const healthy = routedEngineIds(defaults.breadth).filter((engine) => engineCliAvailable(engine, env) &&
+    const mode = fallbackReason === "network" || packageType === "implementation" ? "write" : "consult";
+    const engines = fallbackReason === "network" ? ["codex"] : routedEngineIds(defaults.breadth);
+    const healthy = engines.filter((engine) => engineCliAvailable(engine, env) &&
       (engine === "codex" ? ["flagship", "quick"] : ["burst"]).some((role) => {
         const choice = defaults[engine]?.[role];
         return choice && !ENGINES[engine].consultOnlyRoles.includes(role) && engineHealth(engine, mode, choice.pool, { env, now, records }).healthy;
       }));
-    if (healthy.length) {
+    if (fallbackReason === "network" && healthy.length && !dispatchCodexQuota(env).exhausted) {
+      return { ok: false, reason: "Route this network package to codex:codex-rescue with `--write --network`. Keep posting comments or approvals in the main session." };
+    }
+    if (fallbackReason === "no-healthy-lane" && healthy.length) {
       return { ok: false, reason: `Fusion worker brief claude-fallback: no-healthy-lane requires every implementation peer lane to be unhealthy for ${mode} mode. Healthy lanes: ${healthy.join(", ")}. Route this package to a healthy lane.` };
     }
   }
@@ -701,6 +708,10 @@ function createDispatch(input, agentType, userBackgroundAuthorized, env, validat
     : null;
   const prompt = typeof reservation?.originalPrompt === "string" ? reservation.originalPrompt : promptText(input.tool_input);
   const peerChoice = PEER_RESCUE_AGENT_NAMES.has(agentType) ? dispatchEngineChoice(engineForAgentType(agentType), prompt, env) : null;
+  const [header = "", ...fields] = briefEnvelope(peerChoice ? leadingCompanionOptions(prompt).brief : prompt);
+  const headerFields = peerChoice ? header.split(/\s*\|(?=\s*(?:[\w-]+\s*:|(?:read[ -]only|write|consult|effort\s+\w+)\s*(?:\||$)))/i) : [header];
+  const verification = [...headerFields, ...fields].map((line) => line.trim()).find((line) => /^verification\s*:/i.test(line));
+  const command = verification?.slice(verification.indexOf(":") + 1).trim();
   const packageType = validation.packageType ?? fallbackPackageType(agentType, prompt);
   const collectorIdentity = canonicalWorkerAgentType(agentType) === "fusion:job-collector" ? collectorRequestIdentity(prompt) : null;
   let parentTranscriptBytesAtDispatch = null;
@@ -725,22 +736,21 @@ function createDispatch(input, agentType, userBackgroundAuthorized, env, validat
     parentTranscriptBytesAtDispatch,
     parentContextTokensAtDispatch: parentContextTokens(input.transcript_path),
     packageType,
+    verificationCommand: isVerificationCommand(command, env) ? command : null,
     briefBytes: validation.briefBytes ?? null,
     fallbackReason: validation.fallbackReason ?? null,
     completionContract: completionContract(agentType, prompt),
     ...collectorIdentity,
     limits: workerLimits(agentType, env, validation.sizing)
   }, env);
-  if (!PEER_RESCUE_AGENT_NAMES.has(agentType)) {
-    return record;
+  if (peerChoice) {
+    try {
+      const briefFile = briefArtifactPath(record, env);
+      writePrivateText(briefFile, prompt);
+      return updateLifecycleWorkerRecord(record.taskId, env, (current) => current ? { ...current, briefFile } : null) ?? record;
+    } catch {}
   }
-  try {
-    const briefFile = briefArtifactPath(record, env);
-    writePrivateText(briefFile, prompt);
-    return updateLifecycleWorkerRecord(record.taskId, env, (current) => current ? { ...current, briefFile } : null);
-  } catch {
-    return record;
-  }
+  return record;
 }
 
 function claimParentContextAdvisory(sessionId, tokens, env) {
