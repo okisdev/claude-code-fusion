@@ -1,6 +1,6 @@
 import fs from "node:fs";
 
-import { resolveAgyBin, probeAgyVersion, compareAgyVersion, TESTED_AGY_INTERVAL, buildAgyChildEnv, runAgy, classifyAgyFailure, redactCredentialValue } from "./lib/agy-exec.mjs";
+import { resolveAgyBin, probeAgyVersion, compareAgyVersion, TESTED_AGY_INTERVAL, buildAgyChildEnv, runAgy, classifyAgyFailure, agyQuotaResetsAt, redactCredentialValue } from "./lib/agy-exec.mjs";
 import { prepareGeminiDirectory, projectConfigFiles } from "./lib/agy-home.mjs";
 import { readModelCatalog, resolveModelRequest, createSelectionResolver } from "./lib/agy-models.mjs";
 import * as render from "./lib/render.mjs";
@@ -32,7 +32,8 @@ async function runJob({ record, source, dataDir, brief, signal, timeoutMs, exitG
 }
 
 function outcomeFields(outcome) {
-  return { resolvedModel: outcome.appliedOptions?.model ?? null, resolvedEffort: outcome.resolvedEffort ?? null,
+  const quotaResetsAt = agyQuotaResetsAt(outcome);
+  return { ...(quotaResetsAt ? { quotaResetsAt } : {}), resolvedModel: outcome.appliedOptions?.model ?? null, resolvedEffort: outcome.resolvedEffort ?? null,
     stopReason: outcome.stopReason ?? null, agentVersion: outcome.agentVersion ?? null,
     permissionsAllowed: outcome.permissionsAllowed ?? 0, permissionsRejected: outcome.permissionsRejected ?? 0,
     toolCalls: outcome.toolCalls ?? 0, effortApplied: outcome.effortApplied ?? false,

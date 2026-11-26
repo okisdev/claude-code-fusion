@@ -4,7 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 
-import { buildAgyChildEnv, classifyAgyFailure, compareAgyVersion, OPERATING_LIMITS_NOTE, probeAgyVersion, redactCredentialValue, resolveAgyBin, runAgy, TESTED_AGY_INTERVAL, toolsForMode } from "../plugins/agy/scripts/lib/agy-exec.mjs";
+import { agyQuotaResetsAt, buildAgyChildEnv, classifyAgyFailure, compareAgyVersion, OPERATING_LIMITS_NOTE, probeAgyVersion, redactCredentialValue, resolveAgyBin, runAgy, TESTED_AGY_INTERVAL, toolsForMode } from "../plugins/agy/scripts/lib/agy-exec.mjs";
 
 const bin = path.resolve("tests/fake-agy");
 
@@ -674,4 +674,12 @@ test("an in band quota notice as the final line fails as quota", () => {
   assert.equal(classifyAgyFailure({ ...base, resultText: "\n⚠ Individual quota reached. Please upgrade your subscription to increase your limits. Resets in 2h47m9s.\n" }), "quota");
   assert.equal(classifyAgyFailure({ ...base, resultText: "Partial findings.\n⚠ Individual quota reached. Resets in 1h." }), "quota");
   assert.equal(classifyAgyFailure({ ...base, resultText: "The quota reached its limit in the old code path." }), null);
+});
+
+test("an in band quota notice records when the quota resets", () => {
+  const now = Date.parse("2026-11-26T11:23:15.000Z");
+  assert.equal(agyQuotaResetsAt({ resultText: "\n⚠ Individual quota reached. Please upgrade your subscription to increase your limits. Resets in 38m46s.\n" }, now), "2026-11-26T12:02:01.000Z");
+  assert.equal(agyQuotaResetsAt({ resultText: "Partial findings.\n⚠ Individual quota reached. Resets in 1d2h." }, now), "2026-11-27T13:23:15.000Z");
+  assert.equal(agyQuotaResetsAt({ resultText: "⚠ Individual quota reached." }, now), null);
+  assert.equal(agyQuotaResetsAt({ resultText: "Resets in 5m, quota reached." }, now), null);
 });

@@ -301,6 +301,27 @@ test("an in-window quota failure prints a grok breaker advisory", (t) => {
   assert.strictEqual(result.stderr, "");
 });
 
+test("a quota failure with a recorded reset closes its pool only until the reset", (t) => {
+  const reset = makeSandbox(t);
+  writeRecord(jobFile(path.join(reset.grokData, "state"), "workspace", "reset"), {
+    status: "error",
+    failureKind: "quota",
+    quotaResetsAt: new Date(Date.now() - 60000).toISOString(),
+    finishedAt: new Date(Date.now() - 30 * 60000).toISOString()
+  });
+  assert.doesNotMatch(run(reset).stdout, /treat the grok breaker as open/);
+
+  const pending = makeSandbox(t);
+  const resetsAt = new Date(Date.now() + 40 * 60000);
+  writeRecord(jobFile(path.join(pending.grokData, "state"), "workspace", "pending"), {
+    status: "error",
+    failureKind: "quota",
+    quotaResetsAt: resetsAt.toISOString(),
+    finishedAt: new Date(Date.now() - 30 * 60000).toISOString()
+  });
+  assert.match(run(pending).stdout, new RegExp(`treat the grok breaker as open until its quota resets at ${resetsAt.toISOString().slice(0, 16).replace("T", " ")} UTC; last failure quota`));
+});
+
 test("grok breaker version advice reports only a contract drift", (t) => {
   assert.strictEqual(verifiedGrokVersion, "1.0.92");
   const changed = makeSandbox(t);
