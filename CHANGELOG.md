@@ -1,5 +1,9 @@
 # changelog
 
+## 0.0.96
+
+- OpenCode job records store the private `CODEX_HOME` the run passed to Codex and the sandbox it requested, and `result` and `status` show them, so the `/fusion:smoke` OpenCode gate checks that the run used a home under the plugin data dir and that `blind-check` ran read only, instead of only finding the directory on disk (#134).
+
 ## 0.0.95
 
 - managed Grok runs, model listing, and setup probes run under a private `GROK_HOME` per credential profile in the plugin data dir, so the user's Grok plugins and hooks (a memory plugin's prompt and stop hooks among them) no longer run inside routed work. its `config.toml` is the user's minus the `plugins` and `hooks` tables. refreshes run with `GROK_AUTH_PATH` pointing at the user's credential file (or its configured override), so Grok itself writes the token and the companion never does; under strict, Grok 1.0.92 reads credentials only from a regular `auth.json` inside `GROK_HOME` and refuses to start without `managed_config.lock` there, so each launch gets a one way 0600 copy and the lock. sessions from before the private home, or from another profile, are skipped by `--resume-last` and continuity.
