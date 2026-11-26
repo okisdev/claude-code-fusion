@@ -4419,6 +4419,7 @@ test("main loop replay deduplicates raised kinds and maximum token readings inde
     replayAuditEvent({ kind: "write", tokens: 100_000 }),
     replayAuditEvent({ kind: "dispatch", tokens: 150_000 }),
     replayAuditEvent({ kind: "read", tokens: 360_000 }),
+    replayAuditEvent({ kind: "read", tokens: 400_000, measured: false }),
     replayAuditEvent({ turn: "turn-2", kind: "verify", tokens: 80_000 }),
     replayAuditEvent({ session: "other-session", kind: "write", tokens: 60_000 }),
     replayAuditEvent({ lane: "worker", tokens: 900_000 }),
@@ -4426,6 +4427,7 @@ test("main loop replay deduplicates raised kinds and maximum token readings inde
   ];
   writeGuardAuditEvents(env.FUSION_INLINE_GUARD_AUDIT_DIR, "2026-08-01", events.toReversed());
   const report = buildFusionStats({ env, cwd: dir });
+  assert.strictEqual(report.mainLoopReplay.unmeasuredTurns, 0);
   assert.strictEqual(report.mainLoopReplay.totalTokens, 500_000);
   assert.strictEqual(report.mainLoopReplay.totalTurns, 3);
   assert.deepStrictEqual(report.mainLoopReplay.byKind, {
@@ -4459,8 +4461,7 @@ test("main loop replay counts nominal context turns once and uses singular label
   const env = runtimeEnv({ cwd: dir, codexState: path.join(dir, "codex") });
   writeGuardAuditEvents(env.FUSION_INLINE_GUARD_AUDIT_DIR, "2026-08-01", [
     replayAuditEvent({ measured: false }),
-    replayAuditEvent({ measured: false, kind: "write" }),
-    replayAuditEvent({ measured: true, kind: "read", tokens: 100_000 })
+    replayAuditEvent({ measured: false, kind: "write" })
   ]);
   createWorkerRecord({ taskId: "fusion-single-replay", sessionId: "replay-session", dispatchToolUseId: "single", agentType: "fusion:claude-worker", packageType: "implementation", workspaceRoot: dir, limits: {} }, env);
   updateWorkerRecord("fusion-single-replay", env, (record) => ({ ...record, transportStatus: "done", finishedAt: "2026-08-01T10:00:00.000Z", acceptance: "accepted", acceptanceRecordedAt: "2026-08-01T10:01:00.000Z" }));
@@ -4515,7 +4516,8 @@ test("main loop replay filters the audit window and session before deduplicating
   assert.strictEqual(everySession.mainLoopReplay.totalTokens, 900_000);
   assert.strictEqual(everySession.mainLoopReplay.acceptedPackages, 3);
   const retained = buildAuditReport({ env, sessionId: "replay-session", all: true, now });
-  assert.strictEqual(retained.mainLoopReplay.totalTokens, 1_100_000);
+  assert.strictEqual(retained.mainLoopReplay.totalTokens, 300_000);
+  assert.strictEqual(retained.mainLoopReplay.unmeasuredTurns, 0);
   assert.strictEqual(retained.mainLoopReplay.acceptedPackages, 3);
   const session = buildSessionReport({ env, sessionId: "other-session" });
   assert.strictEqual(session.mainLoopReplay.totalTokens, 600_000);
@@ -5363,9 +5365,9 @@ test("Stop prices MCP, Skill and text messages once in session stats", async (t)
   await stop();
   const mixed = report();
   assert.strictEqual(mixed.totalTurns, 5);
-  assert.deepStrictEqual(mixed.byKind.read, { turns: 1, tokens: 14_000 });
+  assert.deepStrictEqual(mixed.byKind.read, { turns: 1, tokens: 15_000 });
   assert.deepStrictEqual(mixed.byKind.other, { turns: 4, tokens: 55_000 });
-  assert.strictEqual(readStatsAuditEvents(env).events.length, 5);
+  assert.strictEqual(readStatsAuditEvents(env).events.length, 6);
 });
 
 test("Stop replaces a fresh session's provisional replay price once the first tool call is flushed", async (t) => {
@@ -5378,7 +5380,8 @@ test("Stop replaces a fresh session's provisional replay price once the first to
   } }) + "\n");
   await handleLifecycleHook({ ...input, hook_event_name: "Stop" }, env);
   const events = readStatsAuditEvents(env).events;
-  assert.strictEqual(events[1].turn, events[0].turn);
+  assert.strictEqual(events[1].turn, "msg_one");
+  assert.deepStrictEqual(events[1].replaces, [events[0].turn]);
   assert.strictEqual(events[1].measured, true);
   assert.strictEqual(events[1].tokens, 8_100);
   const replay = buildSessionReport({ env, sessionId: input.session_id }).mainLoopReplay;

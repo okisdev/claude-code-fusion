@@ -3058,7 +3058,10 @@ test("SubagentStop finalizes the record when the final-text artifact write fails
     last_assistant_message: "summary\ndelivery: complete\nverification: passed"
   });
   assert.strictEqual(stopped.status, 0, stopped.stderr);
-  assert.match(JSON.parse(stopped.stdout).hookSpecificOutput.additionalContext, WAVE_REVIEW_ADVISORY);
+  assert.strictEqual(stopped.stdout, "");
+  const parent = { hook_event_name: "Stop", session_id: "session-1", cwd: box.cwd, stop_hook_active: true };
+  assert.match(JSON.parse(run(box, parent).stdout).hookSpecificOutput.additionalContext, WAVE_REVIEW_ADVISORY);
+  assert.doesNotMatch(run(box, parent).stdout, /Wave settled/);
 
   const completed = record(box);
   assert.strictEqual(completed.transportStatus, "done");
@@ -4401,7 +4404,7 @@ test("nested structured Agent responses retain their canonical usage", (t) => {
   assert.strictEqual(completed.toolCalls, 2);
 });
 
-test("SubagentStop blocks one incomplete report and then records a verified transport result as unverified", (t) => {
+test("SubagentStop blocks one incomplete report and then records a verified transport result as unverified", async (t) => {
   const box = sandbox(t);
   run(box, dispatch(box));
   run(box, {
@@ -4437,7 +4440,18 @@ test("SubagentStop blocks one incomplete report and then records a verified tran
     stop_hook_active: true,
     last_assistant_message: "summary\ndelivery: complete\nverification: passed"
   });
-  assert.match(JSON.parse(second.stdout).hookSpecificOutput.additionalContext, WAVE_REVIEW_ADVISORY);
+  assert.strictEqual(second.stdout, "");
+  const parent = { hook_event_name: "PostToolUse", session_id: "session-1", tool_name: "Read", tool_input: { file_path: box.transcript }, cwd: box.cwd };
+  assert.doesNotMatch(run(box, { ...parent, agent_id: "agent-1", agent_type: "fusion:claude-worker" }).stdout, /Wave settled/);
+  const pending = readWorkerSessionState(parent.session_id, envFor(box)).waveReview;
+  assert.strictEqual(pending.pending, true);
+  assert.strictEqual(pending.suggestedAt, undefined);
+  const claims = await Promise.all([runWithClosedStdin(box, parent), runWithClosedStdin(box, parent)]);
+  for (const claim of claims) assert.strictEqual(claim.status, 0, claim.stderr);
+  const delivered = claims.filter((claim) => claim.stdout);
+  assert.strictEqual(delivered.length, 1);
+  assert.match(JSON.parse(delivered[0].stdout).hookSpecificOutput.additionalContext, WAVE_REVIEW_ADVISORY);
+  assert.strictEqual(run(box, parent).stdout, "");
   assert.strictEqual(record(box).transportStatus, "done");
   assert.strictEqual(record(box).acceptance, "unverified");
   assert.strictEqual(record(box).collectionMethod, "subagent_stop");

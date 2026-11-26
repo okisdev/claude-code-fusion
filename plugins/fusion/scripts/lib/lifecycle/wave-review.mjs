@@ -41,32 +41,51 @@ function collectionWave(implementation, collected) {
   return includesCollection ? wave : [];
 }
 
-function claimWaveReview(env, { sessionId, now, collected, settled }) {
+function throttled(state, review, nowMs) {
+  return [state.reviewSuggestedAt, review?.suggestedAt].some((at) => nowMs - Date.parse(at) < WAVE_REVIEW_SUGGESTION_MS);
+}
+
+function queueCollectionWaveReview(env, collected) {
+  const sessionId = normalizeSessionId(collected.sessionId);
+  if (!sessionId) return;
+  const file = stateFile(resolveStateDir(env), sessionId);
+  withStateLock(file, () => {
+    const now = new Date().toISOString();
+    const state = normalizeState(readState(file), now);
+    const review = readWorkerSessionState(sessionId, env)?.waveReview;
+    const collections = review?.collections ?? {};
+    if (throttled(state, review, Date.parse(now)) || collections[collected.taskId] === collected.collectedAt) return;
+    const implementation = readSessionWorkerRecords(env, sessionId, { strict: true }).filter((record) => record.packageType === "implementation");
+    if (implementation.some(awaitingCollection)) return;
+    const wave = collectionWave(implementation, collected).filter((record) => record.collectedAt);
+    if (!wave.some((record) => record.transportStatus === "done")) return;
+    updateWorkerSessionState(sessionId, env, (current) => ({
+      ...current,
+      waveReview: {
+        ...review,
+        collections: { ...collections, ...Object.fromEntries(wave.map((record) => [record.taskId, record.collectedAt])) },
+        pending: true
+      }
+    }));
+  });
+}
+
+function claimSettlementWaveReview(env, sessionId, now, settled) {
   const file = stateFile(resolveStateDir(env), sessionId);
   return withStateLock(file, () => {
     const state = normalizeState(readState(file), now);
     const session = readWorkerSessionState(sessionId, env);
     const review = session?.waveReview;
-    const collections = review?.collections ?? {};
     const nowMs = Date.parse(now);
-    const throttled = [state.reviewSuggestedAt, review?.suggestedAt].some((at) => nowMs - Date.parse(at) < WAVE_REVIEW_SUGGESTION_MS);
-    if (throttled) return null;
-    if (collected) {
-      if (collections[collected.taskId] === collected.collectedAt) return null;
-      const implementation = readSessionWorkerRecords(env, sessionId, { strict: true }).filter((record) => record.packageType === "implementation");
-      if (implementation.some(awaitingCollection)) return null;
-      const wave = collectionWave(implementation, collected).filter((record) => record.collectedAt);
-      if (!wave.some((record) => record.transportStatus === "done")) return null;
+    if (throttled(state, review, nowMs)) return null;
+    if (review?.pending) {
       const context = waveReviewSuggestion(env, sessionId, nowMs);
       updateWorkerSessionState(sessionId, env, (current) => ({
-        ...current,
-        waveReview: {
-          collections: { ...collections, ...Object.fromEntries(wave.map((record) => [record.taskId, record.collectedAt])) },
-          suggestedAt: now
-        }
+        ...current, waveReview: { ...review, pending: false, suggestedAt: now }
       }));
       return context;
     }
+    const collections = review?.collections ?? {};
     const candidates = settled.filter((record) => record.sessionId === sessionId &&
       collections[record.taskId] !== record.collectedAt);
     if (!candidates.length) return null;
@@ -83,13 +102,15 @@ function claimWaveReview(env, { sessionId, now, collected, settled }) {
   });
 }
 
-function claimCollectionWaveReview(env, record) {
-  const sessionId = normalizeSessionId(record.sessionId);
-  return sessionId ? claimWaveReview(env, { sessionId, now: new Date().toISOString(), collected: record }) : null;
+function claimPendingWaveReview(input, env) {
+  if (input.agent_id || !["PostToolUse", "Stop", "UserPromptSubmit"].includes(input.hook_event_name)) return null;
+  const sessionId = normalizeSessionId(input.session_id);
+  try {
+    if (sessionId && readWorkerSessionState(sessionId, env)?.waveReview?.pending) {
+      return claimSettlementWaveReview(env, sessionId, new Date().toISOString(), []);
+    }
+  } catch {}
+  return null;
 }
 
-function claimSettlementWaveReview(env, sessionId, now, settled) {
-  return claimWaveReview(env, { sessionId, now, settled });
-}
-
-export { claimCollectionWaveReview, claimSettlementWaveReview };
+export { queueCollectionWaveReview, claimPendingWaveReview, claimSettlementWaveReview };

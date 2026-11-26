@@ -683,18 +683,30 @@ test("background timeout marks the record error and result reports the failure",
   const sandbox = makeSandbox(t);
   const worker = workerExitSignal(sandbox, "task-worker");
   const ready = path.join(sandbox.root, "grok-ready");
+  const release = path.join(sandbox.root, "grok-expire");
+  const delayFile = path.join(sandbox.root, "grok-timer-delay");
   const preload = path.join(sandbox.root, "grok-readiness.cjs");
-  fs.writeFileSync(preload, `if (process.argv[1] === ${JSON.stringify(fakeGrok)}) {
+  fs.writeFileSync(preload, `const fs = require("node:fs");
+if (process.argv[2] === "task-worker") {
+  const now = Date.now;
+  const startedAt = now();
+  Date.now = () => {
+    if (!fs.existsSync(${JSON.stringify(delayFile)})) return startedAt;
+    Date.now = now;
+    return now();
+  };
+}
+if (process.argv[1] === ${JSON.stringify(fakeGrok)}) {
   process.on("newListener", (event) => {
-    if (event === "SIGTERM") require("node:fs").writeFileSync(${JSON.stringify(ready)}, "");
+    if (event === "SIGTERM") fs.writeFileSync(${JSON.stringify(ready)}, "");
   });
 }
 `);
-  const gate = executionTimeoutGate(sandbox.root, "expireGrokRun", ready);
-  const timeoutMs = 30000;
+  const gate = executionTimeoutGate(sandbox.root, "expireGrokRun", release, delayFile);
+  const timeoutMs = 1800000;
+  const cleanupReserveMs = 200;
   const env = envFor(sandbox, {
     FAKE_GROK_MODE: "hang",
-    GROK_COMPANION_TIMEOUT_MS: String(timeoutMs),
     NODE_OPTIONS: `${worker.env.NODE_OPTIONS} --require=${JSON.stringify(preload)} ${gate}`,
   });
   const result = runCompanion(["task", "--background", "slow work"], {
@@ -702,14 +714,22 @@ test("background timeout marks the record error and result reports the failure",
     env,
   });
   assert.strictEqual(result.status, 0, result.stderr);
-  sandbox.registerCleanup(worker.waitForExit);
+  sandbox.registerCleanup(() => {
+    if (fs.existsSync(release)) return worker.waitForExit();
+    const [record] = jobRecords(sandbox.dataDir);
+    killGroups(record?.grokPid, record?.grokPidIdentity);
+    killGroups(record?.pid, record?.pidIdentity);
+  });
+  const timer = await waitFor(() => fs.existsSync(delayFile) && fs.readFileSync(delayFile, "utf8"));
+  assert.strictEqual(JSON.parse(timer).delay, timeoutMs - cleanupReserveMs);
+  await waitFor(() => fs.existsSync(ready));
+  fs.writeFileSync(release, "");
   const failed = await waitFor(() => {
     const current = jobRecords(sandbox.dataDir)[0];
     return current && current.status === "error" ? current : null;
   });
   const message = `timed out after ${timeoutMs}ms`;
   assert.strictEqual(failed.failureKind, "timeout");
-  assert.ok(fs.existsSync(ready));
   assert.ok(failed.errorTail.includes(message), failed.errorTail);
   assert.ok(failed.errorMessage.includes(message), failed.errorMessage);
   assert.doesNotMatch(failed.errorMessage, /\r?\n/);

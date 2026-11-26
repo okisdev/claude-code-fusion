@@ -23,7 +23,7 @@ globalThis.setTimeout = (callback, delay, ...args) => {
   };
 }
 
-export function executionTimeoutGate(root, callbackName, readyFile) {
+export function executionTimeoutGate(root, callbackName, releaseFile, delayFile) {
   const preload = path.join(root, "execution-timeout-gate.cjs");
   const callbackPrefix = `() => ${callbackName}(`;
   fs.writeFileSync(preload, `const fs = require("node:fs");
@@ -32,8 +32,9 @@ globalThis.setTimeout = (callback, delay, ...args) => {
   if (!String(callback).startsWith(${JSON.stringify(callbackPrefix)})) {
     return original(callback, delay, ...args);
   }
+  ${delayFile ? `fs.writeFileSync(${JSON.stringify(delayFile)}, JSON.stringify({ delay }));` : ""}
   const timer = original(() => {
-    if (fs.existsSync(${JSON.stringify(readyFile)})) callback(...args);
+    if (fs.existsSync(${JSON.stringify(releaseFile)})) callback(...args);
     else timer.refresh();
   }, 25);
   return timer;

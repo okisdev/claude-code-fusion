@@ -12,6 +12,7 @@ import {
   readAuditEvents
 } from "../plugins/fusion/scripts/inline-delegation-guard.mjs";
 import { messageCode, messageTag, tagMessage } from "../plugins/fusion/scripts/lib/user-messages.mjs";
+import { buildSessionReport } from "../plugins/fusion/scripts/lib/stats/reports.mjs";
 import { normalizeState } from "../plugins/fusion/scripts/lib/guard/state.mjs";
 import { resolveAuditDir, resolveStateDir } from "../plugins/fusion/scripts/lib/guard/config.mjs";
 import { ENGINES } from "../plugins/fusion/scripts/lib/engines.mjs";
@@ -1042,7 +1043,8 @@ test("rerunning the old suite leaves a collected SendMessage follow-up awaiting 
   const payload = verificationPayload(sandbox, { command: worker.verificationCommand });
   const rerun = runStartedVerification(sandbox, payload, { ...env, FUSION_TEST_NOW: afterCollection });
   assert.strictEqual(rerun.status, 0, rerun.stderr);
-  assert.strictEqual(rerun.stdout, "");
+  assert.match(JSON.parse(rerun.stdout).hookSpecificOutput.additionalContext, /^Wave settled\./);
+  assert.doesNotMatch(rerun.stdout, /Automatically accepted/);
   assert.deepStrictEqual(readWorkerRecord(worker.taskId, env), collected);
   assert.strictEqual(collected.verificationCommand, null);
 });
@@ -2935,8 +2937,39 @@ function stopReplaySession(t) {
   const stop = () => handleLifecycleHook({ ...input, hook_event_name: "Stop" }, env);
   const state = () => readState(sandbox, input.session_id);
   const events = () => readAuditRecords(sandbox).filter((event) => event.event === "replay");
-  return { sandbox, input, append, stop, state, events };
+  const replay = () => buildSessionReport({ env, sessionId: input.session_id }).mainLoopReplay;
+  return { sandbox, input, append, stop, state, events, replay };
 }
+
+test("Stop bounds peak buffer memory while scanning a 64 MiB request blob", (t) => {
+  const { sandbox, input, append, events } = stopReplaySession(t);
+  append("before", 7000, []);
+  fs.appendFileSync(input.transcript_path, '{"meta":{"type":"assistant"},"type":"api-request-blob","data":"');
+  const chunk = Buffer.alloc(1024 * 1024, "x");
+  for (let i = 0; i < 64; i++) fs.appendFileSync(input.transcript_path, chunk);
+  fs.appendFileSync(input.transcript_path, '"}\n');
+  append("after", 8000, []);
+  const probe = spawnSync(process.execPath, ["--expose-gc", "--input-type=module", "-e", `
+    import fs from "node:fs";
+    import { recordStoppedTurns } from "./plugins/fusion/scripts/lib/guard/turn.mjs";
+    const input = JSON.parse(fs.readFileSync(0, "utf8"));
+    global.gc();
+    const baseline = process.memoryUsage().arrayBuffers;
+    let peak = baseline;
+    const observe = () => { peak = Math.max(peak, process.memoryUsage().arrayBuffers); };
+    const read = fs.readSync;
+    fs.readSync = (...args) => { observe(); return read(...args); };
+    const decode = Buffer.prototype.toString;
+    Buffer.prototype.toString = function (...args) { observe(); return decode.apply(this, args); };
+    recordStoppedTurns(input, process.env);
+    observe();
+    console.log(peak - baseline);
+  `], { cwd: repoRoot, env: envFor(sandbox), input: JSON.stringify(input), encoding: "utf8" });
+  assert.strictEqual(probe.status, 0, probe.stderr);
+  const peak = Number.parseInt(probe.stdout, 10);
+  assert.ok(peak <= 512 * 1024, `peak buffer growth was ${peak} bytes`);
+  assert.deepStrictEqual(events().map(({ turn, tokens }) => [turn, tokens]), [["before", 7000], ["after", 8000]]);
+});
 
 test("Stop respects legacy time and message watermarks across missing and invalid timestamps", async (t) => {
   const at = "2026-07-21T00:00:00Z";
@@ -2963,7 +2996,7 @@ test("Stop respects legacy time and message watermarks across missing and invali
 });
 
 test("Stop consumes every priced key of a message with calls on either side of a flush", async (t) => {
-  const { sandbox, input, append, stop, state, events } = stopReplaySession(t);
+  const { sandbox, input, append, stop, state, events, replay } = stopReplaySession(t);
   const pre = (id, at) => run(sandbox, { ...input, tool_use_id: id }, { FUSION_TEST_NOW: at });
   pre("early", "2026-07-21T00:00:00Z");
   const calls = ["early", "late"].map((id) => ({ type: "tool_use", name: "Read", id }));
@@ -2974,26 +3007,30 @@ test("Stop consumes every priced key of a message with calls on either side of a
     [`t:${Date.parse("2026-07-21T00:00:00Z")}`, false], ["msg_parallel", true]
   ]);
   await stop();
-  assert.deepStrictEqual(events(), before);
+  await stop();
+  const stats = replay();
+  assert.strictEqual(stats.totalTurns, 1);
+  assert.strictEqual(stats.totalTokens, 8000);
+  assert.strictEqual(stats.unmeasuredTurns, 0);
+  assert.strictEqual(stats.unmeasuredTokens, 0);
   assert.deepStrictEqual(state().replayTools, []);
   assert.strictEqual(state().turn, null);
 });
 
 test("Stop matches missing and invalid hook tool IDs to the flushed call", async (t) => {
   for (const tool_use_id of [undefined, "bad id"]) {
-    const { sandbox, input, append, stop, state, events } = stopReplaySession(t);
+    const { sandbox, input, append, stop, state, replay } = stopReplaySession(t);
     if (tool_use_id) append("msg_text", 4000, []);
     run(sandbox, { ...input, tool_use_id, transcript_path: tool_use_id ? input.transcript_path : undefined, tool_input: { ...input.tool_input, limit: 10 } });
-    const [pre] = events();
     const call = { type: "tool_use", name: "Read", input: { limit: 10, ...input.tool_input } };
     append("msg_read", 8100, [{ ...call, id: "flushed" }]);
     append("msg_other", 8200, [{ ...call, id: "other", input: { file_path: "other" } }]);
     await stop();
     await stop();
-    const records = events();
-    assert.deepStrictEqual(records.map(({ turn }) => turn), tool_use_id
-      ? [pre.turn, "msg_text", "msg_other"] : [pre.turn, pre.turn, "msg_other"]);
-    if (!tool_use_id) assert.strictEqual(records[1].tokens, 8100);
+    const stats = replay();
+    assert.strictEqual(stats.totalTurns, tool_use_id ? 3 : 2);
+    assert.strictEqual(stats.totalTokens, tool_use_id ? 20_300 : 16_300);
+    assert.strictEqual(stats.unmeasuredTurns, 0);
     assert.deepStrictEqual(state().replayTools, []);
   }
 });
@@ -3003,7 +3040,7 @@ test("Stop retries from the last successful audit append with the remaining repl
   for (const [id, day] of [["one", "21"], ["two", "22"]]) {
     run(sandbox, { ...input, tool_use_id: id }, { FUSION_TEST_NOW: `2026-07-${day}T00:00:00Z` });
   }
-  const [one, two] = events().map(({ turn }) => turn);
+  const [, two] = events().map(({ turn }) => turn);
   append("msg_one", 100, [{ type: "tool_use", name: "Read", id: "one" }], "2026-07-23T00:00:00Z");
   append("msg_two", 200, [{ type: "tool_use", name: "Read", id: "two" }], "2026-07-24T00:00:00Z");
   const blocked = path.join(sandbox.auditDir, "events-2026-07-24.jsonl");
@@ -3014,7 +3051,7 @@ test("Stop retries from the last successful audit append with the remaining repl
   assert.deepStrictEqual(state().replayTools.map(({ key }) => key), [two]);
   await stop();
   await stop();
-  assert.deepStrictEqual(events().filter(({ measured }) => measured).map(({ turn, tokens }) => [turn, tokens]), [[one, 100], [two, 200]]);
+  assert.deepStrictEqual(events().filter(({ measured }) => measured).map(({ turn, tokens }) => [turn, tokens]), [["msg_one", 100], ["msg_two", 200]]);
   assert.strictEqual(state().lastStopTurn, "msg_two");
   assert.deepStrictEqual(state().replayTools, []);
 });

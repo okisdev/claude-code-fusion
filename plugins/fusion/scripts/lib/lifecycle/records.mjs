@@ -1,9 +1,8 @@
 import fs from "node:fs";
 import path from "node:path";
 import { canonicalWorkerAgentType, isFusionWorkerAgent, WORKER_TERMINAL_STATUSES, readSessionWorkerRecords, refreshWorkerTranscript, reopenWorkerContinuation, updateWorkerRecord } from "../worker-state.mjs";
-import { writeOutput } from "./output.mjs";
 import { observeTerminalTokenUsage } from "./usage.mjs";
-import { claimCollectionWaveReview } from "./wave-review.mjs";
+import { queueCollectionWaveReview } from "./wave-review.mjs";
 
 function updateLifecycleWorkerRecord(taskId, env, updater) {
   let collected = false;
@@ -17,8 +16,7 @@ function updateLifecycleWorkerRecord(taskId, env, updater) {
   observeTerminalTokenUsage(updated, env);
   if (collected) {
     try {
-      const additionalContext = claimCollectionWaveReview(env, updated);
-      if (additionalContext) writeOutput({ hookSpecificOutput: { additionalContext } });
+      queueCollectionWaveReview(env, updated);
     } catch {}
   }
   return updated;

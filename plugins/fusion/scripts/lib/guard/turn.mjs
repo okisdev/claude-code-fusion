@@ -49,7 +49,7 @@ function recordTurn(input, env, { sessionId, toolName, file, now, cwd }) {
     const id = normalizeMessageId(input.tool_use_id);
     if (!id || !state.replayTools.some((tool) => tool.id === id)) {
       state.replayTools.push({
-        id, key: state.turn.key, measured: state.turn.measured,
+        id, key: state.turn.key, measured: state.turn.measured, tokens: state.turn.tokens,
         ...(id ? {} : { signature: toolSignature(toolName, input.tool_input) })
       });
     }
@@ -112,11 +112,14 @@ function recordStoppedTurns(input, env) {
     try {
       for (const { id, at, tokens, tool, kind, priced } of messages) {
         const prior = [...priced].filter((entry) => !matched.has(entry.key));
-        if (!prior.some((entry) => entry.measured)) {
-          if (!tokens) continue;
+        if (!tokens && !prior.some((entry) => entry.measured)) continue;
+        const replaces = [...new Set(prior.map((entry) => entry.key).filter((key) => key.startsWith("t:")))];
+        const alreadyMeasured = prior.some((entry) => entry.key === id && entry.measured && entry.tokens === tokens);
+        if (tokens && (replaces.length || !alreadyMeasured)) {
           appendAuditEvent({
             at: Number.isFinite(Date.parse(at)) ? at : now, session, event: "replay", lane: MAIN_LANE,
-            tool: prior.length ? "Stop" : tool, turn: prior[0]?.key ?? id, kind: kind ?? "other", tokens, measured: true
+            tool: priced.size ? "Stop" : tool, turn: id, kind: kind ?? "other", tokens, measured: true,
+            ...(replaces.length ? { replaces } : {})
           }, env);
         }
         for (const entry of prior) matched.add(entry.key);

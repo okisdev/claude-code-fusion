@@ -10,6 +10,7 @@ import { allowAgentWithTaskId, claimParentContextAdvisory, collectorRequestIdent
 import { reconcileTaskNotifications, taskNotificationTransition } from "./notifications.mjs";
 import { denyTool, hookOutput, writeOutput } from "./output.mjs";
 import { activeSessionRecords, clearContinuationRequest, findSessionWorkerRecord, isAttributedTranscriptPath, parentTranscriptByteSize, recordForAgent, refreshRecord, sendMessageResumed, updateLifecycleWorkerRecord } from "./records.mjs";
+import { claimPendingWaveReview } from "./wave-review.mjs";
 import { canonicalToolResponseUsage } from "./usage.mjs";
 import { CODEX_WRITE_SIZING_ADVISORY_BYTES, FINAL_TEXT_MAX_BYTES, HANDBACK_PLACEHOLDER_PATTERN, READ_ONLY_TOOLS, SIZING_ADVISORY_BYTES, SUBAGENT_HANDBACK_TOOL } from "./constants.mjs";
 
@@ -206,6 +207,12 @@ function preToolUse(input, env) {
 }
 
 function handlePostToolUse(input, env, failed = false) {
+  postToolUse(input, env, failed);
+  const review = claimPendingWaveReview(input, env);
+  if (review) writeOutput(hookOutput(input.hook_event_name, review));
+}
+
+function postToolUse(input, env, failed) {
   if (input.tool_name === "SendMessage" && typeof input.tool_input?.to === "string") {
     const recipient = input.tool_input.to;
     const record = findSessionWorkerRecord((candidate) => (PEER_RESCUE_AGENT_NAMES.has(candidate.agentType) || isFusionWorkerAgent(candidate.agentType)) && [candidate.agentId, candidate.backgroundTaskId].includes(recipient), input.session_id, env);

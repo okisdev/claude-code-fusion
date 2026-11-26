@@ -3,30 +3,68 @@ import { TRANSCRIPT_TAIL_MAX_BYTES } from "./constants.mjs";
 
 const CONTEXT_SCAN_BYTES = 4 * 1024 * 1024;
 
-function isRequestBlob(line) {
-  if (!line.includes('"api-request-blob"')) return false;
+function readChunk(fd, buffer, length, position) {
+  if (fs.readSync(fd, buffer, 0, length, position) !== length) throw new Error("Transcript changed while reading.");
+  return buffer.subarray(0, length);
+}
+
+function* recordChunks(fd, first, offset, length) {
+  const chunkBytes = 4096;
+  for (let pos = 0; pos < first.length; pos += chunkBytes) {
+    yield first.toString("latin1", pos, pos + chunkBytes);
+  }
+  if (first.length === length) return;
+  const buffer = Buffer.allocUnsafe(Math.min(chunkBytes, length - first.length));
+  for (let pos = first.length; pos < length; pos += buffer.length) {
+    yield readChunk(fd, buffer, Math.min(buffer.length, length - pos), offset + pos).toString("latin1");
+  }
+}
+
+function hasAssistantType(fd, first, offset, length) {
   let depth = 0;
-  for (const token of line.matchAll(/"[^"\\]*(?:\\.[^"\\]*)*"|[[\]{}]/g)) {
-    if (token[0] === "{" || token[0] === "[") depth += 1;
-    else if (token[0] === "}" || token[0] === "]") depth -= 1;
-    else if (depth === 1 && token[0] === '"type"') {
-      const value = /^\s*:\s*"([^"]*)"/.exec(line.slice(token.index + 6));
-      if (value) return value[1] === "api-request-blob";
+  let quoted = false;
+  let escaped = false;
+  let token = "";
+  let field = null;
+  const maxTokenLength = "assistant".length * 6;
+  for (const chunk of recordChunks(fd, first, offset, length)) {
+    for (const char of chunk) {
+      if (quoted) {
+        if (char === '"' && !escaped) {
+          quoted = false;
+          if (depth === 1) {
+            if (token.includes("\\") && token.length <= maxTokenLength) token = JSON.parse(`"${token}"`);
+            if (field === null) field = token;
+            else if (field === "type") return token === "assistant";
+          }
+        } else {
+          if (depth === 1 && token.length <= maxTokenLength) token += char;
+          escaped = char === "\\" && !escaped;
+        }
+      } else if (char === '"') {
+        quoted = true;
+        token = "";
+      } else if (char === "{" || char === "[") {
+        depth++;
+      } else if (char === "}" || char === "]") {
+        depth--;
+      } else if (char === "," && depth === 1) {
+        field = null;
+      }
     }
   }
   return false;
 }
 
-function assistantEntry(first, rest, mainOnly) {
-  if (!first.length && !rest.length) return null;
-  if (/^\s*\{\s*"type"\s*:\s*"api-request-blob"/.test(first.toString("utf8", 0, 128))) return null;
-  const line = (rest.length ? Buffer.concat([first, ...rest.toReversed()]) : first).toString("utf8");
-  if (!line.includes('"assistant"') || isRequestBlob(line)) return null;
+function assistantEntry(fd, first, offset, length, mainOnly) {
   try {
-    const entry = JSON.parse(line);
+    if (!length || !hasAssistantType(fd, first, offset, length)) return null;
+    const line = first.length === length ? first : readChunk(fd, Buffer.allocUnsafe(length), length, offset);
+    const entry = JSON.parse(line.toString("utf8"));
     return entry?.type === "assistant" && (!mainOnly || (entry.isSidechain !== true && entry.isMeta !== true)) ? entry : null;
-  } catch {
-    return null;
+  } catch (error) {
+    if (error instanceof SyntaxError) return null;
+    throw error;
   }
 }
 
@@ -46,23 +84,20 @@ function readTranscript(transcriptPath, read) {
 
 function* assistantPages(fd, end, maxBytes = CONTEXT_SCAN_BYTES, mainOnly = true) {
   const floor = Math.max(0, end - maxBytes);
-  let rest = [];
+  const page = Buffer.allocUnsafe(Math.min(end - floor, TRANSCRIPT_TAIL_MAX_BYTES));
+  let lineEnd = end;
   while (end > floor) {
-    const start = Math.max(floor, end - TRANSCRIPT_TAIL_MAX_BYTES);
-    const buffer = Buffer.allocUnsafe(end - start);
-    if (fs.readSync(fd, buffer, 0, buffer.length, start) !== buffer.length) throw new Error("Transcript changed while reading.");
+    const start = Math.max(floor, end - page.length);
+    const buffer = readChunk(fd, page, end - start, start);
     const entries = [];
     let right = buffer.length;
     while (right > 0) {
       const newline = buffer.lastIndexOf(10, right - 1);
-      const first = buffer.subarray(newline + 1, right);
-      if (newline < 0 && start > 0) {
-        rest.push(first);
-        break;
-      }
-      const entry = assistantEntry(first, rest, mainOnly);
-      if (entry) entries.push({ entry, offset: start + newline + 1 });
-      rest = [];
+      if (newline < 0 && start > 0) break;
+      const offset = start + newline + 1;
+      const entry = assistantEntry(fd, buffer.subarray(newline + 1, right), offset, lineEnd - offset, mainOnly);
+      if (entry) entries.push({ entry, offset });
+      lineEnd = offset - 1;
       right = newline;
     }
     yield entries;

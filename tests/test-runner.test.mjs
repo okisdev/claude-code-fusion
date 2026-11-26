@@ -7,6 +7,7 @@ import { test } from "node:test";
 
 const runner = import.meta.resolve("./run.mjs");
 const longDirectoryName = "a".repeat(100);
+const spacedDirectoryName = "a b";
 
 function runRunner(t, action, { tempPath = "alias", cleanupFailure = false } = {}) {
   const fallback = fs.realpathSync("/tmp");
@@ -14,6 +15,7 @@ function runRunner(t, action, { tempPath = "alias", cleanupFailure = false } = {
   t.after(() => fs.rmSync(parent, { recursive: true, force: true }));
   fs.symlinkSync(parent, path.join(parent, "alias"));
   fs.mkdirSync(path.join(parent, longDirectoryName));
+  fs.mkdirSync(path.join(parent, spacedDirectoryName));
 
   const source = `
     import childProcess from "node:child_process";
@@ -80,7 +82,11 @@ test("runner warns on stderr when cleanup fails and preserves a successful exit"
   assert.equal(fs.existsSync(root), true);
 });
 
-for (const [description, tempPath] of [["cannot resolve", "missing"], ["is too long for Unix sockets", longDirectoryName]]) {
+for (const [description, tempPath] of [
+  ["cannot resolve", "missing"],
+  ["is too long for Unix sockets", longDirectoryName],
+  ["contains a space", spacedDirectoryName]
+]) {
   test(`runner falls back to /tmp when the configured temp directory ${description}`, (t) => {
     const { status, stderr, root, fallback } = runRunner(t, "process.exit(0)", { tempPath });
     assert.equal(status, 0, stderr);

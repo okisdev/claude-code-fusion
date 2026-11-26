@@ -7,14 +7,15 @@ import { join } from "node:path";
 const rootPrefix = "fusion-test-";
 const longestSocketPath = `${rootPrefix}XXXXXX/grok-plugin-test-XXXXXX/orbstack/docker.sock`;
 const maxSocketPathBytes = process.platform === "linux" ? 107 : 103;
+const shellSafePath = /^[A-Za-z0-9_./-]+$/;
 let parent;
 try {
   parent = realpathSync(tmpdir());
 } catch {}
-if (!parent || Buffer.byteLength(join(parent, longestSocketPath)) > maxSocketPathBytes) {
+if (!parent || !shellSafePath.test(parent) || Buffer.byteLength(join(parent, longestSocketPath)) > maxSocketPathBytes) {
   parent = realpathSync("/tmp");
 }
-if (!/^[A-Za-z0-9_./-]+$/.test(parent)) {
+if (!shellSafePath.test(parent)) {
   throw new Error(`The test temp directory must have a shell-safe path: ${parent}`);
 }
 

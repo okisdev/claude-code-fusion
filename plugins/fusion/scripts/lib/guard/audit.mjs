@@ -261,7 +261,8 @@ function normalizeAuditEvent(event) {
       turn: event.turn,
       kind: event.kind,
       tokens: event.tokens,
-      measured: event.measured
+      measured: event.measured,
+      ...(event.tool === "Stop" && event.measured && Array.isArray(event.replaces) && event.replaces.every((key) => typeof key === "string" && /^t:-?\d{1,16}$/.test(key)) ? { replaces: event.replaces } : {})
     };
   }
   if (event.event === "warn" && event.reason === READ_STREAK_ADVISORY_REASON && event.lane === MAIN_LANE &&

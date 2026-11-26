@@ -153,3 +153,13 @@ test("context lookup skips blob JSON, crosses chunk boundaries, and stops at the
   assert.strictEqual(read.mock.calls.reduce((bytes, call) => bytes + call.result, 0), 4 * 1024 * 1024);
   assert.deepStrictEqual(parsed, []);
 });
+
+test("a multi-page assistant record can put its type after nested and escaped text", (t) => {
+  const message = assistant("msg_large", { input_tokens: 6300 }, ["large"]);
+  const file = transcript(t, [{
+    metadata: [{ type: "api-request-blob", text: '"}\\'.repeat(100_000) }],
+    message: message.message,
+    type: "assistant"
+  }]);
+  assert.deepStrictEqual(readTurn(file, "large"), { id: "msg_large", contextTokens: 6300 });
+});
