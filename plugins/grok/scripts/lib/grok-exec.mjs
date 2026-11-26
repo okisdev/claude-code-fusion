@@ -1,8 +1,9 @@
-import { spawn, spawnSync } from "node:child_process";
+import { spawn } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { isDeepStrictEqual } from "node:util";
+import { copyGrokAuth, ensureGrokHome, grokPaths, spawnGrokVersion, spawnWithGrokAuth } from "./grok-home.mjs";
 import { executionTimeoutMs } from "./execution-budget.mjs";
 
 import {
@@ -45,7 +46,7 @@ const SANDBOX_FAILURE_PATTERN = /(?:sandbox (?:could not be applied|initializati
 const TOOL_POLICY_FAILURE_PATTERN = /(?:tools allowlist had unmappable entries; keeping full grok toolset|disallowedTools entry matched nothing)/i;
 const TOOL_POLICY_APPLIED_PATTERN = /tools? allowlist applied/i;
 const AUTH_RETRY_FAILURE_PATTERN = /auth 401 retry: no credential was sent/i;
-const AUTH_RETRY_FAILURE_MESSAGE = "Grok sent its model request without a credential and entered its re-authentication retry loop, so the companion stopped it instead of waiting out the retries. Under the strict sandbox this usually means the stored OIDC token expired: grok 1.0.14 and later can write only `~/.grok/sessions` inside the Grok home under strict, so a managed run cannot refresh the token. Run grok once outside the sandbox, for example `grok -p ok`, to refresh it, then rerun.";
+const AUTH_RETRY_FAILURE_MESSAGE = "Grok sent its model request without a credential and entered its re-authentication retry loop, so the companion stopped it instead of waiting out the retries. Under the strict sandbox this usually means the stored OIDC token expired: grok 1.0.14 and later can write only the private sessions directory inside the Grok home under strict, so a managed run cannot refresh the token. Run grok once outside the sandbox, for example `grok -p ok`, to refresh it, then rerun.";
 const AUTH_REFRESH_FAILURE_MESSAGE = "The companion ran `grok models` outside the sandbox to refresh the stored token and it did not refresh, so the refresh token itself may have expired: run `grok login` once, then rerun.";
 const AUTH_STALE_MS = 5 * 60 * 60 * 1000;
 const AUTH_REFRESH_RETRY_MS = 30 * 60 * 1000;
@@ -77,7 +78,7 @@ const capabilityCache = new Map();
 const directCapabilityIdentity = new Map();
 
 function deadlineRemaining(deadline) {
-  return deadline == null ? Infinity : Math.max(0, deadline - Date.now());
+  return deadline == null ? Infinity : Math.max(0, deadline.expiresAt - Date.now());
 }
 
 function runTimeoutError() {
@@ -161,23 +162,10 @@ function permissionRuleContent(value) {
 }
 
 function privateGrokReadDenyRules(env, cwd) {
-  const grokHome = permissionRuleContent(resolveChildGrokHome(env, cwd));
-  return [
-    `Read(${grokHome}/auth.json)`,
-    `Read(${grokHome}/mcp_credentials.json)`,
-    `Read(${grokHome}/config.toml)`,
-    `Read(${grokHome}/sessions/**)`,
-    `Read(${grokHome}/memory/**)`,
-    `Read(${grokHome}/logs/**)`,
-    `Read(${grokHome}/debug/**)`,
-    "Read(**/.grok/auth.json)",
-    "Read(**/.grok/mcp_credentials.json)",
-    "Read(**/.grok/config.toml)",
-    "Read(**/.grok/sessions/**)",
-    "Read(**/.grok/memory/**)",
-    "Read(**/.grok/logs/**)",
-    "Read(**/.grok/debug/**)"
-  ];
+  const { userHome, home } = grokPaths(env, cwd);
+  const protectedPaths = ["auth.json", "mcp_credentials.json", "config.toml", "sessions/**", "memory/**", "logs/**", "debug/**"];
+  const roots = [permissionRuleContent(home), permissionRuleContent(userHome), "**/.grok"];
+  return roots.flatMap((root) => protectedPaths.map((suffix) => `Read(${root}/${suffix})`));
 }
 
 const COMPATIBILITY_ENV_KEYS = [
@@ -205,7 +193,6 @@ const GROK_AUTH_ENV_KEYS = new Set([
   "XAI_API_KEY",
   "GROK_CODE_XAI_API_KEY",
   "GROK_AUTH",
-  "GROK_AUTH_PATH",
   "GROK_AUTH_PROVIDER_COMMAND",
   "GROK_AUTH_PROVIDER_LABEL",
   "GROK_AUTH_TOKEN_TTL",
@@ -251,8 +238,11 @@ function resolveConsultAllowRules(env = process.env) {
     .filter((entry) => /^(?:Read|Grep|WebSearch|WebFetch)(?:\([^(),\r\n]*\))?$/.test(entry));
 }
 
-function buildGrokChildEnv(env = process.env, { memory = false, web = false } = {}) {
-  const childEnv = { ...env };
+export function buildGrokChildEnv(env = process.env, { memory = false, web = false, cwd = process.cwd() } = {}) {
+  const paths = grokPaths(env, cwd);
+  const childEnv = { ...env, GROK_HOME: paths.home };
+  delete childEnv.GROK_CONFIG;
+  delete childEnv.GROK_CONFIG_PATH;
   for (const key of Object.keys(childEnv)) {
     if (
       key.startsWith("CLAUDE_CODE_") ||
@@ -307,11 +297,17 @@ function parseCapabilityList(value) {
   );
 }
 
-export function resolveGrokCapabilities(bin, env = process.env, deadline = null, cwd = process.cwd(), required = []) {
+export function resolveGrokCapabilities(bin, env = process.env, expiresAt = null, cwd = process.cwd(), required = []) {
+  const deadline = expiresAt == null ? null : { expiresAt };
+  return probeGrokCapabilities(bin, env, deadline, cwd, required, grokPaths(env, cwd));
+}
+
+function probeGrokCapabilities(bin, env, deadline, cwd, required, paths) {
+  ensureGrokHome(paths);
   if (Object.hasOwn(env, CAPABILITIES_ENV)) {
     return parseCapabilityList(env[CAPABILITIES_ENV]);
   }
-  const probeEnv = buildGrokChildEnv(env);
+  const probeEnv = buildGrokChildEnv(env, { cwd });
   if (deadline == null && capabilityCache.has(bin)) {
     return capabilityCache.get(bin);
   }
@@ -329,7 +325,7 @@ export function resolveGrokCapabilities(bin, env = process.env, deadline = null,
   let cacheFile = null;
   if (deadline != null) {
     const identity = resolvedBinaryIdentity(bin, env, cwd);
-    const versionProbe = spawnSync(bin, ["--version"], {
+    const versionProbe = spawnGrokVersion(bin, {
       encoding: "utf8", cwd, env: probeEnv, timeout: probeTimeout(deadline, 5000), maxBuffer: 2 * 1024 * 1024
     });
     requireDeadline(deadline);
@@ -358,7 +354,7 @@ export function resolveGrokCapabilities(bin, env = process.env, deadline = null,
     timeout: probeTimeout(deadline, 5000),
     maxBuffer: 2 * 1024 * 1024
   };
-  const probe = spawnSync(bin, ["--help"], probeOptions);
+  const probe = spawnWithGrokAuth(paths, bin, ["--help"], probeOptions, deadline);
   requireDeadline(deadline);
   if (probe.error) {
     throw capabilityError(`Unable to inspect Grok CLI capabilities: ${probe.error.message}`);
@@ -369,7 +365,7 @@ export function resolveGrokCapabilities(bin, env = process.env, deadline = null,
   }
   const capabilities = new Set(`${probe.stdout ?? ""}\n${probe.stderr ?? ""}`.match(CAPABILITY_PATTERN) ?? []);
   for (const [flag, probeFlag] of REQUIRED_CAPABILITY_PROBES) {
-    if (!capabilities.has(flag) && spawnSync(bin, [probeFlag, "--help"], { ...probeOptions, timeout: probeTimeout(deadline, 5000) }).status === 0) {
+    if (!capabilities.has(flag) && spawnWithGrokAuth(paths, bin, [probeFlag, "--help"], { ...probeOptions, timeout: probeTimeout(deadline, 5000) }, deadline).status === 0) {
       capabilities.add(flag);
     }
     requireDeadline(deadline);
@@ -1030,26 +1026,6 @@ function sandboxHandshakeTimeoutMs(env) {
     : SANDBOX_HANDSHAKE_TIMEOUT_MS;
 }
 
-function resolveChildGrokHome(env, cwd) {
-  if (typeof env.GROK_HOME === "string" && env.GROK_HOME.trim()) {
-    return path.resolve(cwd, env.GROK_HOME.trim());
-  }
-  const home = typeof env.HOME === "string" && env.HOME.trim()
-    ? path.resolve(cwd, env.HOME.trim())
-    : os.homedir();
-  return path.join(home, ".grok");
-}
-
-function resolveGrokAuthPaths(env, cwd) {
-  const resolved = { ...env };
-  for (const key of ["GROK_HOME", "GROK_AUTH_PATH"]) {
-    if (typeof resolved[key] === "string" && resolved[key].trim()) {
-      resolved[key] = path.resolve(cwd, resolved[key].trim());
-    }
-  }
-  return resolved;
-}
-
 function staleRefreshRecentlyFailed(dataDir, file) {
   try {
     const attempt = JSON.parse(fs.readFileSync(path.join(dataDir, AUTH_REFRESH_ATTEMPT_FILE), "utf8"));
@@ -1062,9 +1038,7 @@ function staleRefreshRecentlyFailed(dataDir, file) {
 }
 
 export function grokAuthStatus(env = process.env, cwd = process.cwd()) {
-  const file = typeof env.GROK_AUTH_PATH === "string" && env.GROK_AUTH_PATH.trim()
-    ? path.resolve(cwd, env.GROK_AUTH_PATH.trim())
-    : path.join(resolveChildGrokHome(env, cwd), "auth.json");
+  const { auth: file } = grokPaths(env, cwd);
   try {
     const ageMs = Math.max(0, Date.now() - fs.statSync(file).mtimeMs);
     return { file, ageSeconds: Math.floor(ageMs / 1000), stale: ageMs > AUTH_STALE_MS };
@@ -1073,31 +1047,22 @@ export function grokAuthStatus(env = process.env, cwd = process.cwd()) {
   }
 }
 
-function refreshGrokAuth({ bin, env, cwd, capabilities, reason, deadline }) {
+function refreshGrokAuth({ bin, env, paths, capabilities, reason, deadline }) {
   requireDeadline(deadline);
-  const { file } = grokAuthStatus(env, cwd);
-  let beforeMtime = null;
-  try {
-    beforeMtime = fs.statSync(file).mtimeMs;
-  } catch {}
   const attemptedAt = new Date().toISOString();
   const args = capabilities.has("--no-auto-update") ? ["--no-auto-update", "models"] : ["models"];
   const refreshDir = createManagedRunTempDir();
   try {
-    spawnSync(bin, args, {
+    const { authRefreshed } = spawnWithGrokAuth(paths, bin, args, {
       cwd: refreshDir,
       env: { ...env, TMPDIR: refreshDir },
       stdio: "ignore",
       timeout: probeTimeout(deadline, 30000)
-    });
+    }, deadline);
+    return { attemptedAt, refreshed: authRefreshed, reason };
   } finally {
     removeManagedRunTempDir(refreshDir);
   }
-  let refreshed = false;
-  try {
-    refreshed = beforeMtime !== null && fs.statSync(file).mtimeMs > beforeMtime;
-  } catch {}
-  return { attemptedAt, refreshed, reason };
 }
 
 function openSandboxEventLog(file) {
@@ -1664,12 +1629,11 @@ function readSessionSummary(sessionDirectory) {
   }
 }
 
-function readResolvedSessionMetadata(cwd, sessionId, env) {
+function readResolvedSessionMetadata(cwd, sessionId, grokHome) {
   const normalizedSessionId = normalizeGrokSessionId(sessionId);
   if (!cwd || !normalizedSessionId) {
     return null;
   }
-  const grokHome = resolveChildGrokHome(env, cwd);
   const sessionCwd = normalizedFilesystemPath(cwd);
   const sessionsRoot = path.join(grokHome, "sessions");
   if (!sessionCwd) {
@@ -1722,9 +1686,9 @@ function readResolvedSessionMetadata(cwd, sessionId, env) {
   return matching.length === 1 ? readSessionSummary(matching[0]) : null;
 }
 
-function resolvedOutputMetadata(parsed, cwd, env = process.env) {
+function resolvedOutputMetadata(parsed, cwd, home) {
   const sessionId = normalizeGrokSessionId(stringField(parsed, "sessionId", "session_id"));
-  const summary = readResolvedSessionMetadata(cwd, sessionId, env);
+  const summary = readResolvedSessionMetadata(cwd, sessionId, home);
   const modelUsage = objectField(parsed, "modelUsage", "model_usage");
   const modelNames = modelUsage ? Object.keys(modelUsage).filter((name) => name.trim()) : [];
   return {
@@ -1761,7 +1725,7 @@ export function terminalRecordAttribution(record, patch = {}, env = process.env)
       effort: patch?.resolvedEffort ?? partialEnvelope?.effort ?? partialEnvelope?.resolvedEffort ?? record?.resolvedEffort ?? undefined
     },
     record?.cwd,
-    env
+    grokPaths(env, record?.cwd).home
   );
   return {
     resolvedModel: patch?.resolvedModel ?? record?.resolvedModel ?? resolved.model ?? record?.request?.model ?? null,
@@ -2383,7 +2347,7 @@ async function closeGrokChild(run, code, signal) {
   }
   const recognizedEnvelope = envelopeShapeIsValid || structuredErrorMessage != null;
   const metrics = recognizedEnvelope ? headlessMetricsObservation(parsed) : { error: null };
-  const resolved = resolvedOutputMetadata(parsed, run.options.cwd, run.childEnv);
+  const resolved = resolvedOutputMetadata(parsed, run.options.cwd, run.childEnv.GROK_HOME);
   const errorMessage = run.securityFailure?.kind === "sandbox"
     ? `Grok sandbox enforcement failed; refusing the result: ${run.securityFailure.line}`
     : run.securityFailure?.kind === "policy"
@@ -2484,7 +2448,7 @@ function startGrokRun(run, resolve, reject) {
     ? Math.max(0, deadlineRemaining(run.deadline) - MANAGED_CLEANUP_RESERVE_MS) : run.timeoutMs);
   run.timer.unref?.();
 
-  run.sandboxDeadline = Math.min(Date.now() + sandboxHandshakeTimeoutMs(run.env), run.deadline ?? Infinity);
+  run.sandboxDeadline = Math.min(Date.now() + sandboxHandshakeTimeoutMs(run.env), run.deadline?.expiresAt ?? Infinity);
   run.child.stdout.on("data", (chunk) => observeGrokStdout(run, chunk));
   run.child.stderr.on("data", (chunk) => observeGrokStderr(run, chunk));
   run.child.on("error", (error) => finishReject(run, error));
@@ -2515,9 +2479,9 @@ async function finishGrokResult(run, result) {
     return { ...result, timedOut: true, ...(run.authRefresh ? { authRefresh: run.authRefresh } : {}) };
   }
   if (!run.authRefresh && !run.options.authRetry) {
-    run.authRefresh = refreshGrokAuth({ bin: run.bin, env: run.childEnv, cwd: run.options.cwd, capabilities: run.capabilities, reason: "auth-failure", deadline: run.deadline });
+    run.authRefresh = refreshGrokAuth({ bin: run.bin, env: run.childEnv, paths: run.paths, capabilities: run.capabilities, reason: "auth-failure", deadline: run.deadline });
     if (run.authRefresh.refreshed && (result.securityFailureKind === "auth" || run.options.mode !== "write")) {
-      const retry = await runGrok({ ...run.options, authRefresh: run.authRefresh, authRetry: true, managedDeadline: run.deadline });
+      const retry = await runGrok({ ...run.options, authRefresh: run.authRefresh, authRetry: true, managedDeadline: run.deadline.expiresAt });
       if (retry.exitCode === 0 && !retry.timedOut && !retry.errorMessage && !retry.parseError) {
         return retry;
       }
@@ -2535,13 +2499,15 @@ async function finishGrokResult(run, result) {
 
 export function runGrok(options) {
   const startedAt = Date.now();
-  const env = resolveGrokAuthPaths(options.env ?? process.env, options.cwd ?? process.cwd());
+  const env = options.env ?? process.env;
   const bin = options.bin ?? resolveGrokBin(env);
   const timeoutMs = options.timeoutMs ?? resolveTimeoutMs({ background: Boolean(options.background), backgroundShell: Boolean(options.backgroundShell), env });
   const managedRun = !options.args;
-  const deadline = managedRun ? options.managedDeadline ?? startedAt + timeoutMs : null;
+  const deadline = managedRun ? { expiresAt: options.managedDeadline ?? startedAt + timeoutMs } : null;
   requireDeadline(deadline);
   const requestedMode = options.mode === "write" ? "write" : "consult";
+  const paths = grokPaths(env, options.cwd);
+  const childEnv = buildGrokChildEnv(env, options);
   let capabilities = null;
   if (managedRun) {
     const required = ["--prompt-file", "--output-format", "--sandbox", "--tools", "--disallowed-tools", "--deny", "--max-turns", "--no-auto-update", "--no-wait-for-background"];
@@ -2556,7 +2522,7 @@ export function runGrok(options) {
     if (options.jsonSchema) {
       required.push("--json-schema");
     }
-    capabilities = resolveGrokCapabilities(bin, env, deadline, options.cwd ?? process.cwd(), required);
+    capabilities = probeGrokCapabilities(bin, env, deadline, options.cwd ?? process.cwd(), required, paths);
     requireGrokCapabilities(capabilities, required);
     preflightRuntimeSocketEndpoints({
       env,
@@ -2570,7 +2536,6 @@ export function runGrok(options) {
     requireDeadline(deadline);
   }
   const args = options.args ?? buildGrokArgs({ ...options, capabilities, timeoutMs });
-  const childEnv = buildGrokChildEnv(env, { memory: options.memory === true, web: options.web === true });
   const captureProcessIdentity = options.captureProcessIdentity ?? getProcessIdentity;
   let prompt = typeof options.prompt === "string" ? options.prompt : null;
   if (managedRun && prompt == null && options.briefFile) {
@@ -2580,6 +2545,7 @@ export function runGrok(options) {
     throw capabilityError("A managed Grok run requires a prompt for /dev/stdin transport.");
   }
   let authRefresh = options.authRefresh ?? null;
+  let authSnapshot;
   let managedTempDir = null;
   let sandboxLogSnapshot = null;
   let stdoutSpool = null;
@@ -2588,16 +2554,17 @@ export function runGrok(options) {
       managedTempDir = createManagedRunTempDir();
       childEnv.TMPDIR = managedTempDir;
       if (!options.authRetry && !authRefresh) {
-        const auth = grokAuthStatus(childEnv, options.cwd);
+        const auth = grokAuthStatus(env, options.cwd);
         const dataDir = resolveDataDir(env);
         if (auth.ageSeconds !== null && auth.stale && !staleRefreshRecentlyFailed(dataDir, auth.file)) {
-          authRefresh = refreshGrokAuth({ bin, env: childEnv, cwd: options.cwd, capabilities, reason: "stale", deadline });
+          authRefresh = refreshGrokAuth({ bin, env: childEnv, paths, capabilities, reason: "stale", deadline });
           const outcome = authRefresh.refreshed ? "refreshed" : "failed";
           writePrivateDataFile(dataDir, AUTH_REFRESH_ATTEMPT_FILE, `${JSON.stringify({ file: auth.file, ...authRefresh, outcome })}\n`);
           requireDeadline(deadline);
         }
       }
-      sandboxLogSnapshot = captureSandboxEventLog(resolveChildGrokHome(childEnv, options.cwd));
+      authSnapshot = copyGrokAuth(paths, undefined, deadline);
+      sandboxLogSnapshot = captureSandboxEventLog(childEnv.GROK_HOME);
     }
     requireDeadline(deadline);
     stdoutSpool = createStdoutSpool();
@@ -2620,7 +2587,7 @@ export function runGrok(options) {
     : null;
 
   const run = {
-    options, env, bin, timeoutMs, managedRun, deadline, capabilities, args, childEnv,
+    options, env, bin, timeoutMs, managedRun, deadline, capabilities, args, childEnv, paths,
     captureProcessIdentity, prompt, authRefresh, managedTempDir, sandboxLogSnapshot,
     stdoutSpool, expectedSandbox,
     resolve: null, reject: null,
@@ -2632,5 +2599,8 @@ export function runGrok(options) {
     sandboxVerified: !managedRun, policyApplied: !managedRun
   };
   return new Promise((resolve, reject) => startGrokRun(run, resolve, reject))
+    .finally(() => {
+      if (managedRun) copyGrokAuth(paths, authSnapshot, deadline);
+    })
     .then((result) => finishGrokResult(run, result));
 }

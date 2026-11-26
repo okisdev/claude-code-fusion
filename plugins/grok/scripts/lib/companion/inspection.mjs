@@ -1,10 +1,10 @@
 import path from "node:path";
-import { normalizeGrokSessionId, sandboxProfileForMode, recordedProcessGroupsClean, terminalRecordAttribution, terminateRecordedProcessGroups } from "../grok-exec.mjs";
+import { normalizeGrokSessionId, recordedProcessGroupsClean, terminalRecordAttribution, terminateRecordedProcessGroups } from "../grok-exec.mjs";
 import { renderCancelReport, renderHistoryReport, renderJobDetail, renderStatusTable, renderTaskResult } from "../render.mjs";
 import { jobFilePath, jobLogPath, listAllJobRecords, listJobRecords, markDeliveryCollectedFile, nowIso, readJobRecordFile, readLogTail, resolveDataDir, updateJobRecordFile, updateJobRecordFileWithCurrent } from "../state.mjs";
 import { JOB_ID_PATTERN, DEFAULT_HISTORY_LIMIT, HISTORY_STATUSES, HISTORY_MODES, HISTORY_DELIVERIES, HISTORY_DELIVERY_STATUSES, HISTORY_SEMANTIC_STATUSES, HISTORY_FAILURE_KINDS } from "./config.mjs";
 import { output, errorWithFailure, failureOutcomeMessage, resolveCwd, findRequestedJobRecord, currentClaudeSessionId, parseHistoryLimit, commandArgs, resolveWaitPollMs, resolveWaitTimeoutMs, delayMs } from "./base.mjs";
-import { inputError, jobClassForRecord, memoryEnabledForRecord, terminalJob, sessionMemoryModes } from "./session.mjs";
+import { inputError, jobClassForRecord, memoryEnabledForRecord, resumeCompatible, sessionMemoryModes } from "./session.mjs";
 import { cleanupRequiredPatch, refreshRunningJobRecord, outcomeFields, observableRecord, failureResultPayload, retainedResultPayload } from "./outcome.mjs";
 import { watchJob } from "../job-watch.mjs";
 
@@ -67,11 +67,8 @@ function historyJob(record, claudeSessionId, mixedMemorySessions) {
   const sessionId = normalizeGrokSessionId(record?.sessionId);
   const jobClass = jobClassForRecord(record);
   const resumable =
-    terminalJob(record) &&
-    jobClass === "task" &&
-    sessionId != null &&
     mode !== "unknown" &&
-    record?.request?.sandboxProfile === sandboxProfileForMode(mode) &&
+    resumeCompatible(record, mode, memoryEnabledForRecord(record)) &&
     !mixedMemorySessions.has(sessionId);
   return {
     jobId: JOB_ID_PATTERN.test(String(record?.id ?? "")) ? record.id : null,

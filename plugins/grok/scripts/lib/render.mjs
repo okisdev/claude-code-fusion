@@ -529,6 +529,7 @@ export function renderSetupReport(report) {
     `- headless safety capabilities: ${report.capabilities?.ready ? "ready" : `not ready, ${report.capabilities?.detail ?? "not checked"}`}`,
     `- host environment: ${hostLine}`,
     `- data dir: ${report.dataDir.writable ? `writable (${report.dataDir.path})` : `not writable (${report.dataDir.detail})`}`,
+    `- private Grok home: ${report.privateHome.path} (${report.privateHome.ready ? "user plugins and hooks excluded" : "unavailable"})`,
     `- stop gate: ${report.stopGate ? "enabled" : "disabled"}`,
     `- continuity: ${report.continuityPolicy ?? "manual"}`,
     `- grok doctor: ${report.doctorCommand?.available ? "available" : `not available, ${report.doctorCommand?.detail ?? "not checked"}`}`

@@ -393,7 +393,7 @@ test("task records valid Fusion roles and rejects invalid role values", (t) => {
 test("invalid Grok session identifiers fail as transport errors and cannot reach summary paths or resume", (t) => {
   const sandbox = makeSandbox(t);
   const grokHome = path.join(sandbox.root, "grok-home");
-  const escapedSummary = path.join(grokHome, "attacker", "summary.json");
+  const escapedSummary = path.join(sandbox.dataDir, "home", "attacker", "summary.json");
   fs.mkdirSync(path.dirname(escapedSummary), { recursive: true });
   fs.writeFileSync(escapedSummary, JSON.stringify({
     current_model_id: "should-not-be-observed",
@@ -510,6 +510,8 @@ test("resume and write runs retain stdin prompt transport and the requested sand
   const env = envFor(sandbox, {
     FAKE_GROK_REJECT_EXTERNAL_PROMPT: "1",
     FAKE_GROK_STDIN_LOG: stdinLog,
+    FAKE_GROK_RESOLVED_MODEL: "grok-test",
+    FAKE_GROK_VERIFY_RESUME: "1",
     CLAUDE_CODE_SESSION_ID: "claude-current"
   });
 

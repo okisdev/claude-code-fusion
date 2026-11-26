@@ -39,7 +39,8 @@ test("direct managed execution records a stale pre-run refresh", async (t) => {
   const file = authFile(sandbox, 6);
   const modelsEnvFile = path.join(sandbox.root, "direct-models-env.json");
   const result = await runGrok(directOptions(sandbox, envFor(sandbox, {
-    FAKE_GROK_MODELS_TOUCH: file,
+    FAKE_GROK_MODELS_VALIDATE_STORE: "1",
+    FAKE_GROK_LOGIN_FILE: file,
     FAKE_GROK_MODELS_ENV_FILE: modelsEnvFile,
     ANTHROPIC_API_KEY: "must-be-scrubbed",
     XAI_API_KEY: "retained-for-auth",
@@ -57,6 +58,9 @@ test("direct managed execution records a stale pre-run refresh", async (t) => {
   assert.deepEqual(modelsCalls(sandbox), [["--no-auto-update", "models"]]);
   assert.equal(managedCalls(sandbox).length, 1);
   const childEnv = JSON.parse(fs.readFileSync(modelsEnvFile, "utf8"));
+  assert.equal(childEnv.GROK_HOME, path.join(sandbox.dataDir, "home"));
+  assert.equal(childEnv.GROK_AUTH_PATH, undefined);
+  assert.equal(fs.readFileSync(file, "utf8"), "refreshed fixture");
   assert.equal(childEnv.ANTHROPIC_API_KEY, undefined);
   assert.equal(childEnv.XAI_API_KEY, "retained-for-auth");
   assert.equal(childEnv.GROK_TURN_SUMMARY, "false");
@@ -71,22 +75,24 @@ test("direct managed execution retries after auth refresh", async (t) => {
   const file = authFile(sandbox);
   const result = await runGrok(directOptions(sandbox, envFor(sandbox, {
     FAKE_GROK_MODE: "auth-once",
-    FAKE_GROK_MODELS_TOUCH: file
+    FAKE_GROK_MODELS_VALIDATE_STORE: "1",
+    FAKE_GROK_LOGIN_FILE: file
   })));
   assert.equal(result.exitCode, 0);
   assert.equal(result.authRefresh.reason, "auth-failure");
   assert.equal(result.authRefresh.refreshed, true);
   assert.equal(result.authRetry, true);
+  assert.equal(fs.readFileSync(file, "utf8"), "refreshed fixture");
   assert.equal(modelsCalls(sandbox).length, 1);
   assert.equal(managedCalls(sandbox).length, 2);
 });
 
 test("the refresh runs from a private directory, never the task cwd", async (t) => {
   const sandbox = makeSandbox(t);
-  const file = authFile(sandbox, 6);
+  authFile(sandbox, 6);
   const cwdFile = path.join(sandbox.root, "models-cwd.txt");
   const result = await runGrok(directOptions(sandbox, envFor(sandbox, {
-    FAKE_GROK_MODELS_TOUCH: file,
+    FAKE_GROK_MODELS_TOUCH: "1",
     FAKE_GROK_MODELS_CWD_FILE: cwdFile
   })));
   assert.equal(result.exitCode, 0);
@@ -98,10 +104,10 @@ test("the refresh runs from a private directory, never the task cwd", async (t) 
 
 test("a write run with a generic auth failure refreshes but is not rerun", async (t) => {
   const sandbox = makeSandbox(t);
-  const file = authFile(sandbox);
+  authFile(sandbox);
   const result = await runGrok({ ...directOptions(sandbox, envFor(sandbox, {
     FAKE_GROK_MODE: "auth-once",
-    FAKE_GROK_MODELS_TOUCH: file
+    FAKE_GROK_MODELS_TOUCH: "1"
   })), mode: "write" });
   assert.notEqual(result.exitCode, 0);
   assert.equal(result.securityFailureKind, "auth");
@@ -119,6 +125,42 @@ test("direct managed execution does not pre-refresh when auth is missing", async
   assert.equal(modelsCalls(sandbox).length, 0);
 });
 
+test("strict launches replace the private login on rotation and remove it on logout", async (t) => {
+  const sandbox = makeSandbox(t);
+  const source = authFile(sandbox);
+  const options = directOptions(sandbox, envFor(sandbox, { FAKE_GROK_LOGIN_FILE: source }));
+  const home = path.join(sandbox.dataDir, "home");
+  const copy = path.join(home, "auth.json");
+  const lock = path.join(home, "managed_config.lock");
+  fs.mkdirSync(home);
+  fs.symlinkSync(source, copy);
+  fs.writeFileSync(lock, "old", { mode: 0o600 });
+  fs.chmodSync(source, 0o640);
+  const original = fs.statSync(source);
+  const first = await runGrok(options);
+  assert.equal(first.exitCode, 0, first.stderrTail);
+  assert.equal(fs.statSync(source).mode, original.mode);
+  assert.equal(fs.statSync(source).mtimeMs, original.mtimeMs);
+  assert.equal(fs.lstatSync(copy).isFile(), true);
+  const oldCopy = fs.openSync(copy, "r");
+  try {
+    fs.writeFileSync(source, "rotated fixture");
+    fs.unlinkSync(lock);
+    const second = await runGrok(options);
+    assert.equal(second.exitCode, 0, second.stderrTail);
+    assert.equal(fs.readFileSync(oldCopy, "utf8"), "fixture");
+    assert.equal(fs.readFileSync(copy, "utf8"), "rotated fixture");
+  } finally {
+    fs.closeSync(oldCopy);
+  }
+  fs.unlinkSync(source);
+  const loggedOut = await runGrok(options);
+  assert.notEqual(loggedOut.exitCode, 0);
+  assert.match(loggedOut.stderrTail, /Not signed in/);
+  assert.equal(fs.existsSync(copy), false);
+  assert.equal(modelsCalls(sandbox).length, 0);
+});
+
 test("direct auth failure with unchanged mtime keeps auth and login guidance", async (t) => {
   const sandbox = makeSandbox(t);
   authFile(sandbox);
@@ -133,10 +175,10 @@ test("direct auth failure with unchanged mtime keeps auth and login guidance", a
 
 test("a failed retry remains an auth failure", async (t) => {
   const sandbox = makeSandbox(t);
-  const file = authFile(sandbox);
+  authFile(sandbox);
   const result = await runGrok(directOptions(sandbox, envFor(sandbox, {
     FAKE_GROK_MODE: "auth-once-then-error",
-    FAKE_GROK_MODELS_TOUCH: file
+    FAKE_GROK_MODELS_TOUCH: "1"
   })));
   assert.equal(result.securityFailureKind, "auth");
   assert.equal(result.authRefresh.refreshed, true);
@@ -151,7 +193,7 @@ test("stale auth runs one unsandboxed models refresh with the scrubbed child env
   const modelsEnvFile = path.join(sandbox.root, "models-env.json");
   const env = envFor(sandbox, {
     GROK_AUTH_PATH: file,
-    FAKE_GROK_MODELS_TOUCH: file,
+    FAKE_GROK_MODELS_VALIDATE_STORE: "1",
     FAKE_GROK_MODELS_ENV_FILE: modelsEnvFile,
     ANTHROPIC_API_KEY: "must-be-scrubbed",
     XAI_API_KEY: "retained-for-auth",
@@ -170,6 +212,8 @@ test("stale auth runs one unsandboxed models refresh with the scrubbed child env
   assert.deepEqual(modelsCalls(sandbox), [["--no-auto-update", "models"]]);
   assert.equal(managedCalls(sandbox).length, 1);
   const childEnv = JSON.parse(fs.readFileSync(modelsEnvFile, "utf8"));
+  assert.equal(childEnv.GROK_HOME, path.join(sandbox.dataDir, "home"));
+  assert.equal(childEnv.GROK_AUTH_PATH, undefined);
   assert.equal(childEnv.ANTHROPIC_API_KEY, undefined);
   assert.equal(childEnv.CLAUDE_CODE_SESSION_ID, undefined);
   assert.equal(childEnv.XAI_API_KEY, "retained-for-auth");
@@ -198,8 +242,8 @@ test("fresh auth launches without a pre-run refresh", (t) => {
 
 test("auth failure refreshes once and reruns the managed request once", (t) => {
   const sandbox = makeSandbox(t);
-  const file = authFile(sandbox);
-  const env = envFor(sandbox, { FAKE_GROK_MODE: "auth-once", FAKE_GROK_MODELS_TOUCH: file });
+  authFile(sandbox);
+  const env = envFor(sandbox, { FAKE_GROK_MODE: "auth-once", FAKE_GROK_MODELS_TOUCH: "1" });
   const result = runCompanion(["task", "inspect the repository"], { cwd: sandbox.workDir, env });
   assert.equal(result.status, 0, result.stderr);
   assert.equal(modelsCalls(sandbox).length, 1);
@@ -261,4 +305,88 @@ test("setup reports auth age and stale guidance without changing readiness", (t)
   assert.equal(missing.ready, true);
   assert.equal(missing.auth.ageSeconds, null);
   assert.equal(missing.auth.stale, true);
+});
+
+test("a concurrent interactive login wins over a private refresh with the same user mtime", async (t) => {
+  const sandbox = makeSandbox(t);
+  const source = authFile(sandbox, 6);
+  const options = directOptions(sandbox, envFor(sandbox, {
+    FAKE_GROK_ROTATE_ON: "models",
+    FAKE_GROK_CONCURRENT_LOGIN: source,
+    FAKE_GROK_LOGIN_FILE: source
+  }));
+  const result = await runGrok(options);
+  assert.equal(result.exitCode, 0, result.errorMessage);
+  assert.equal(result.authRefresh.refreshed, true);
+  assert.equal(fs.readFileSync(source, "utf8"), "interactive login");
+  assert.equal(fs.readFileSync(path.join(sandbox.dataDir, "home", "auth.json"), "utf8"), "interactive login");
+});
+
+test("setup probes, failed model listings and strict turns publish every credential rotation", async (t) => {
+  const sandbox = makeSandbox(t);
+  const source = authFile(sandbox);
+  const copy = path.join(sandbox.dataDir, "home", "auth.json");
+  fs.chmodSync(source, 0o640);
+  const initial = fs.openSync(source, "r");
+  try {
+    const env = envFor(sandbox, { FAKE_GROK_ROTATE_ON: "--help" });
+    delete env.GROK_COMPANION_CAPABILITIES;
+    const setup = runCompanion(["setup", "--json"], { cwd: sandbox.workDir, env });
+    assert.equal(setup.status, 0, setup.stderr);
+    assert.equal(fs.readFileSync(source, "utf8"), "fixture rotated rotated");
+    assert.equal(fs.readFileSync(initial, "utf8"), "fixture");
+    assert.equal(fs.statSync(source).mode & 0o777, 0o600);
+  } finally {
+    fs.closeSync(initial);
+  }
+  const models = runCompanion(["models"], { cwd: sandbox.workDir, env: envFor(sandbox, {
+    FAKE_GROK_ROTATE_ON: "models", FAKE_GROK_MODELS_EXIT_CODE: "1"
+  }) });
+  assert.equal(models.status, 1, models.stderr);
+  assert.equal(fs.readFileSync(source, "utf8"), "fixture rotated rotated rotated");
+  const result = await runGrok(directOptions(sandbox, envFor(sandbox, { FAKE_GROK_ROTATE_ON: "--sandbox" })));
+  assert.equal(result.exitCode, 0, result.errorMessage);
+  assert.equal(fs.readFileSync(source, "utf8"), "fixture rotated rotated rotated rotated");
+  assert.deepEqual(fs.readFileSync(copy), fs.readFileSync(source));
+});
+
+test("the next invocation recovers a private rotation left before writeback", (t) => {
+  const sandbox = makeSandbox(t);
+  const source = authFile(sandbox);
+  const copy = path.join(sandbox.dataDir, "home", "auth.json");
+  const options = { cwd: sandbox.workDir, env: envFor(sandbox, { FAKE_GROK_MODELS_OUTPUT: "grok-test\n" }) };
+  const first = runCompanion(["models"], options);
+  assert.equal(first.status, 0, first.stderr);
+  fs.writeFileSync(copy, "pending rotation");
+  const next = runCompanion(["models"], options);
+  assert.equal(next.status, 0, next.stderr);
+  assert.equal(fs.readFileSync(copy, "utf8"), "pending rotation");
+  assert.equal(fs.readFileSync(source, "utf8"), "pending rotation");
+});
+
+test("credential copy errors report setup before invoking grok models", (t) => {
+  const sandbox = makeSandbox(t);
+  const env = envFor(sandbox);
+  fs.mkdirSync(path.join(env.GROK_HOME, "auth.json"), { recursive: true });
+  const result = runCompanion(["models", "--json"], { cwd: sandbox.workDir, env });
+  assert.equal(result.status, 1, result.stderr);
+  assert.equal(JSON.parse(result.stderr).failureKind, "setup");
+  assert.match(result.stderr, /regular auth file/);
+  assert.deepEqual(readInvocations(sandbox.argsFile), []);
+});
+
+test("an untracked newer private login is preserved when its source digest is unknown", (t) => {
+  const sandbox = makeSandbox(t);
+  const source = authFile(sandbox, 6);
+  const home = path.join(sandbox.dataDir, "home");
+  fs.mkdirSync(home);
+  const copy = path.join(home, "auth.json");
+  fs.writeFileSync(copy, "untracked rotation", { mode: 0o600 });
+  const result = runCompanion(["models", "--json"], { cwd: sandbox.workDir, env: envFor(sandbox) });
+  assert.equal(result.status, 1, result.stderr);
+  assert.equal(JSON.parse(result.stderr).failureKind, "setup");
+  assert.match(result.stderr, /no recorded source digest/);
+  assert.equal(fs.readFileSync(copy, "utf8"), "untracked rotation");
+  assert.equal(fs.readFileSync(source, "utf8"), "fixture");
+  assert.deepEqual(modelsCalls(sandbox), []);
 });

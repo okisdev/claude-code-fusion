@@ -79,7 +79,7 @@ async function handleTask(argv, transport = {}) {
   }
   const role = grokRoleFromPrompt(prompt);
   requireQuotaAvailable(dataDir);
-  const grok = probeGrokVersion(resolveGrokBin(), process.env);
+  const grok = probeGrokVersion(resolveGrokBin(), process.env, cwd);
 
   const jobId = generateJobId();
   const briefFile = briefPath(dataDir, cwd, jobId);

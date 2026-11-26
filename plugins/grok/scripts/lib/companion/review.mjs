@@ -307,7 +307,7 @@ async function handleReview(argv, transport = {}) {
     DIFF: target.diff
   });
   requireQuotaAvailable(dataDir);
-  const grok = probeGrokVersion(resolveGrokBin(), process.env);
+  const grok = probeGrokVersion(resolveGrokBin(), process.env, cwd);
 
   const jobId = generateJobId();
   const briefFile = briefPath(dataDir, cwd, jobId);

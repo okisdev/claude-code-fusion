@@ -14,6 +14,7 @@ import {
   fakeGrok,
   flagValues,
   grokCompanionCapabilities,
+  jobFileFor,
   jobRecords,
   makeSandbox,
   processInspectionAvailable,
@@ -213,6 +214,26 @@ function directOptions(sandbox, mode, extra = {}) {
   };
 }
 
+function sandboxStartupOptions(sandbox, mode, extraEnv) {
+  const env = envFor(sandbox, { FAKE_GROK_MODE: mode, ...extraEnv });
+  const options = directOptions(sandbox, mode, { env });
+  if (mode === "sandbox-no-event") return options;
+
+  const readyFile = path.join(sandbox.root, "sandbox-ready");
+  const wait = new Int32Array(new SharedArrayBuffer(4));
+  return {
+    ...options,
+    env: { ...options.env, FAKE_GROK_SANDBOX_READY_FILE: readyFile },
+    onSpawn() {
+      const deadline = performance.now() + options.timeoutMs;
+      while (!fs.existsSync(readyFile)) {
+        assert.ok(performance.now() < deadline, "Fake Grok did not publish its sandbox event.");
+        Atomics.wait(wait, 0, 0, 10);
+      }
+    },
+  };
+}
+
 test("managed runs disable Agent while fixed tool allowlists keep x_search out", () => {
   const env = { GROK_COMPANION_CAPABILITIES: grokCompanionCapabilities };
   const toolSurfaces = {
@@ -355,40 +376,105 @@ test("setup reports the injected capability verdict without an extra help probe"
   assert.equal(report.capabilities.ready, true);
   assert.equal(report.capabilities.flags["--tools"], true);
   assert.equal(report.doctorCommand.available, true);
-  assert.equal(report.shellEnvironmentPolicy.available, false);
+  assert.equal(report.shellEnvironmentPolicy.available, true);
   assert.equal(report.shellEnvironmentPolicy.present, false);
-  assert.deepEqual(readInvocations(sandbox.argsFile), [["--version"], ["doctor", "--help"], ["inspect", "--json"]]);
+  assert.deepEqual(readInvocations(sandbox.argsFile), [["--version"], ["doctor", "--help"]]);
 });
 
-test("setup names enabled plugin hooks and hook files from Grok inspect", (t) => {
+test("setup, probes and managed tasks use the user's config without plugin and hook tables", async (t) => {
   const sandbox = makeSandbox(t);
-  writeFreshAuth(sandbox);
-  const grokHome = path.join(sandbox.root, "grok-home");
-  const hookDir = path.join(grokHome, "hooks");
-  fs.mkdirSync(hookDir, { recursive: true });
-  fs.writeFileSync(path.join(grokHome, "config.toml"), '[plugins]\nenabled = [\n  "alpha",\n  "beta",\n]\ndisabled = ["beta"]\n');
-  fs.writeFileSync(path.join(hookDir, "local.json"), "{}");
-  fs.writeFileSync(path.join(hookDir, "ignore.txt"), "{}");
-  const inspect = JSON.stringify({ plugins: [
-    { name: "alpha", provides: { hooks: true } },
-    { name: "beta", provides: { hooks: true } },
-    { name: "gamma", provides: { hooks: true } },
-    { name: "plain", provides: { hooks: false } }
-  ] });
-  const env = envFor(sandbox, { FAKE_GROK_INSPECT_JSON: inspect });
-  const result = runCompanion(["setup", "--json"], { cwd: sandbox.workDir, env });
-  assert.equal(result.status, 0, result.stderr);
-  const report = JSON.parse(result.stdout);
-  const step = "Hooks from alpha, local.json run inside managed Grok runs, and Grok has no per run switch for them. Remove a plugin from [plugins].enabled in ~/.grok/config.toml to keep it out.";
-  assert.deepEqual(report.managedRunHooks, { plugins: ["alpha"], hookFiles: ["local.json"] });
-  assert.deepEqual(report.nextSteps, [step]);
-  const rendered = runCompanion(["setup"], { cwd: sandbox.workDir, env });
-  assert.equal(rendered.status, 0, rendered.stderr);
-  assert.ok(rendered.stdout.includes(step));
-  const failed = runCompanion(["setup", "--json"], { cwd: sandbox.workDir, env: { ...env, FAKE_GROK_INSPECT_FAIL: "1" } });
-  assert.equal(failed.status, 0, failed.stderr);
-  assert.equal(JSON.parse(failed.stdout).ready, true);
-  assert.deepEqual(JSON.parse(failed.stdout).managedRunHooks, { plugins: [], hookFiles: [] });
+  const log = path.join(sandbox.root, "homes.jsonl");
+  const env = envFor(sandbox, { FAKE_GROK_HOME_LOG: log, GROK_CONFIG: '{"plugins":{"enabled":["alpha"]}}' });
+  delete env.GROK_HOME;
+  delete env.GROK_COMPANION_CAPABILITIES;
+  const userHome = path.join(env.HOME, ".grok");
+  const home = path.join(sandbox.dataDir, "home");
+  const auth = path.join(userHome, "auth.json");
+  fs.mkdirSync(path.join(userHome, "hooks"), { recursive: true });
+  fs.writeFileSync(path.join(userHome, "hooks", "local.json"), "{}");
+  fs.writeFileSync(auth, "fixture");
+  env.GROK_CONFIG_PATH = path.join(userHome, "config.toml");
+  const models = "# User defaults\r\n[models] # direct tasks\r\ndefault  = 'grok-test'\r\ndefault_reasoning_effort = 'high'\r\n\r\n";
+  const sandboxConfig = '[sandbox]\nprofile = "workspace"\n';
+  const policy = '[shell_environment_policy]\r\nexclude = [\r\n  "SECRET_*", # private\r\n]\r\ninclude_only = ["PATH"]';
+  fs.writeFileSync(env.GROK_CONFIG_PATH, models
+    + '[plugins]\nenabled = ["alpha"]\n[plugins."alpha.beta"]\nactive = true\n'
+    + '[[plugins.registry]] # local\npath = "/local"\n'
+    + sandboxConfig + "[hooks]\nenabled = true\n[hooks.start]\ncommand = 'local'\n" + policy);
+  const run = (args) => {
+    const result = runCompanion(args, { cwd: sandbox.workDir, env });
+    assert.equal(result.status, 0, result.stderr);
+    return result.stdout;
+  };
+  const report = JSON.parse(run(["setup", "--json"]));
+  assert.deepEqual(report.privateHome, { path: home, ready: true, userPluginsAndHooksExcluded: true });
+  assert.deepEqual(report.nextSteps, []);
+  assert.ok(run(["setup"]).includes(`${home} (user plugins and hooks excluded)`));
+  env.FAKE_GROK_VERIFY_RESUME = "1";
+  env.FAKE_GROK_RESOLVED_MODEL = "grok-test";
+  const options = directOptions(sandbox, "ok", { env });
+  const first = await runGrok(options);
+  assert.equal(first.exitCode, 0, first.errorMessage);
+  const resume = { ...options, resumeSessionId: first.sessionId };
+  const resumed = await runGrok(resume);
+  assert.equal(resumed.exitCode, 0, resumed.errorMessage);
+  assert.equal(resumed.resolvedModel, "grok-test");
+  const calls = fs.readFileSync(log, "utf8").trim().split("\n").map(JSON.parse);
+  for (const { args, ...paths } of calls) {
+    if (args.includes("--version")) {
+      assert.notEqual(paths.GROK_HOME, home);
+      assert.equal(fs.existsSync(paths.GROK_HOME), false);
+    } else {
+      assert.deepEqual(paths, { GROK_HOME: home }, args.join(" "));
+    }
+  }
+  assert.ok(calls.some(({ args }) => args.includes("--help")));
+  assert.ok(calls.some(({ args }) => args.includes("--sandbox")));
+  assert.ok(fs.lstatSync(home).isDirectory());
+  assert.deepEqual(fs.readdirSync(path.join(home, "hooks")), []);
+  assert.deepEqual(fs.readdirSync(path.join(userHome, "hooks")), ["local.json"]);
+  const configFile = path.join(home, "config.toml");
+  assert.deepEqual(fs.readFileSync(configFile), Buffer.from(models + sandboxConfig + policy));
+  assert.ok(calls.filter(({ args }) => args.includes("--sandbox")).every(({ args }) => !args.includes("-m")));
+  assert.deepEqual(fs.readFileSync(path.join(home, "auth.json")), fs.readFileSync(auth));
+  assert.equal(fs.existsSync(path.join(userHome, "sessions")), false);
+  fs.renameSync(path.join(home, "sessions"), path.join(userHome, "sessions"));
+  const missing = await runGrok(resume);
+  assert.notEqual(missing.exitCode, 0);
+  assert.match(missing.stderrTail, /Missing Grok session/);
+  fs.unlinkSync(env.GROK_CONFIG_PATH);
+  run(["setup"]);
+  assert.equal(fs.readFileSync(configFile, "utf8"), "");
+});
+
+test("private config removes complete top-level hook and plugin values and keeps unrelated keys", (t) => {
+  const sandbox = makeSandbox(t);
+  const env = envFor(sandbox);
+  fs.mkdirSync(env.GROK_HOME, { recursive: true });
+  const defaults = 'models.default = "grok-test"\nplugins_extra = true\n';
+  const unrelated = "[[hooks_archive]]\nhooks = '''example\n[plugins]\n'''\n";
+  fs.writeFileSync(path.join(env.GROK_HOME, "config.toml"), defaults
+    + "'hooks' = [\n  ['one'], # nested\n]\nplugins.enabled = ['alpha']\n" + unrelated);
+  const setup = runCompanion(["setup", "--json"], { cwd: sandbox.workDir, env });
+  assert.equal(setup.status, 0, setup.stderr);
+  assert.equal(JSON.parse(setup.stdout).privateHome.ready, true);
+  assert.deepEqual(fs.readFileSync(path.join(sandbox.dataDir, "home", "config.toml")), Buffer.from(defaults + unrelated));
+});
+
+test("a linked private Grok home fails setup without altering the user home", (t) => {
+  const sandbox = makeSandbox(t);
+  const env = envFor(sandbox);
+  fs.mkdirSync(env.GROK_HOME, { recursive: true });
+  const config = path.join(env.GROK_HOME, "config.toml");
+  fs.writeFileSync(config, '[plugins]\nenabled = ["alpha"]\n');
+  fs.symlinkSync(env.GROK_HOME, path.join(sandbox.dataDir, "home"), "dir");
+  const setup = runCompanion(["setup", "--json"], { cwd: sandbox.workDir, env });
+  assert.equal(setup.status, 0, setup.stderr);
+  assert.equal(JSON.parse(setup.stdout).ready, false);
+  assert.throws(() => runGrok(directOptions(sandbox, "ok", { env })),
+    (error) => error.failureKind === "setup" && /real directory/.test(error.message));
+  assert.equal(fs.readFileSync(config, "utf8"), '[plugins]\nenabled = ["alpha"]\n');
+  assert.equal(readInvocations(sandbox.argsFile).some((args) => args.includes("--sandbox")), false);
 });
 
 test("setup accepts newer Grok builds with a warning and rejects older or unparseable builds", (t) => {
@@ -396,21 +482,21 @@ test("setup accepts newer Grok builds with a warning and rejects older or unpars
   writeFreshAuth(newerSandbox);
   const newer = runCompanion(["setup", "--json"], {
     cwd: newerSandbox.workDir,
-    env: envFor(newerSandbox, { FAKE_GROK_VERSION_OUTPUT: "grok 1.0.90 (abcdef012345)" })
+    env: envFor(newerSandbox, { FAKE_GROK_VERSION_OUTPUT: "grok 1.0.93 (abcdef012345)" })
   });
   assert.equal(newer.status, 0, newer.stderr);
   const newerReport = JSON.parse(newer.stdout);
   assert.equal(newerReport.ready, true);
-  assert.equal(newerReport.compatibility, "newer than the tested interval (1.0.14 to before 1.0.90)");
-  assert.deepEqual(newerReport.nextSteps, ["Grok CLI version 1.0.90 is newer than the tested interval (1.0.14 to before 1.0.90); run a verification pass."]);
+  assert.equal(newerReport.compatibility, "newer than the tested interval (1.0.14 to before 1.0.93)");
+  assert.deepEqual(newerReport.nextSteps, ["Grok CLI version 1.0.93 is newer than the tested interval (1.0.14 to before 1.0.93); run a verification pass."]);
 
   const newerRendered = runCompanion(["setup"], {
     cwd: newerSandbox.workDir,
-    env: envFor(newerSandbox, { FAKE_GROK_VERSION_OUTPUT: "grok 1.0.90 (abcdef012345)" })
+    env: envFor(newerSandbox, { FAKE_GROK_VERSION_OUTPUT: "grok 1.0.93 (abcdef012345)" })
   });
   assert.equal(newerRendered.status, 0, newerRendered.stderr);
-  assert.match(newerRendered.stdout, /- compatibility: newer than the tested interval \(1\.0\.14 to before 1\.0\.90\)/);
-  assert.match(newerRendered.stdout, /^- Grok CLI version 1\.0\.90 is newer than the tested interval \(1\.0\.14 to before 1\.0\.90\); run a verification pass\.$/m);
+  assert.match(newerRendered.stdout, /- compatibility: newer than the tested interval \(1\.0\.14 to before 1\.0\.93\)/);
+  assert.match(newerRendered.stdout, /^- Grok CLI version 1\.0\.93 is newer than the tested interval \(1\.0\.14 to before 1\.0\.93\); run a verification pass\.$/m);
 
   const olderSandbox = makeSandbox(t);
   writeFreshAuth(olderSandbox);
@@ -421,8 +507,8 @@ test("setup accepts newer Grok builds with a warning and rejects older or unpars
   assert.equal(older.status, 0, older.stderr);
   const olderReport = JSON.parse(older.stdout);
   assert.equal(olderReport.ready, false);
-  assert.equal(olderReport.compatibility, "outside the tested interval (1.0.14 to before 1.0.90)");
-  assert.deepEqual(olderReport.nextSteps, ["Use a Grok CLI version in the tested interval (1.0.14 to before 1.0.90)."]);
+  assert.equal(olderReport.compatibility, "outside the tested interval (1.0.14 to before 1.0.93)");
+  assert.deepEqual(olderReport.nextSteps, ["Use a Grok CLI version in the tested interval (1.0.14 to before 1.0.93)."]);
 
   const unparseableSandbox = makeSandbox(t);
   writeFreshAuth(unparseableSandbox);
@@ -434,11 +520,11 @@ test("setup accepts newer Grok builds with a warning and rejects older or unpars
   assert.equal(JSON.parse(unparseable.stdout).ready, false);
 });
 
-test("setup reports shell environment policy presence without affecting readiness", (t) => {
+test("setup reports the private shell policy and rejects malformed source config", (t) => {
   const sandbox = makeSandbox(t);
   const configPath = path.join(sandbox.root, "grok-home", "config.toml");
   fs.mkdirSync(path.dirname(configPath), { recursive: true });
-  fs.writeFileSync(configPath, "[shell_environment_policy]\nallow = [\"PATH\"]\n", "utf8");
+  fs.writeFileSync(configPath, "[shell_environment_policy]\ninclude_only = [\"PATH\"]\n", "utf8");
 
   const present = runCompanion(["setup", "--json"], {
     cwd: sandbox.workDir,
@@ -459,7 +545,7 @@ test("setup reports shell environment policy presence without affecting readines
   });
   assert.equal(unparseable.status, 0, unparseable.stderr);
   const unparseableReport = JSON.parse(unparseable.stdout);
-  assert.equal(unparseableReport.ready, true);
+  assert.equal(unparseableReport.ready, false);
   assert.equal(unparseableReport.shellEnvironmentPolicy.available, false);
   assert.equal(unparseableReport.shellEnvironmentPolicy.present, false);
 });
@@ -567,7 +653,7 @@ test("1.0.88 multi-document text uses the final structuredOutput for tasks and r
     const parsed = mode === "task" ? consumeTaskStructuredResult(result, true) : evaluateReviewResult(result);
     assert.equal(parsed.valid, true, parsed.error);
     assert.deepEqual(parsed.value, documents.at(-1));
-    const events = fs.readFileSync(path.join(sandbox.root, "grok-home/sessions/sandbox-events.jsonl"), "utf8").trim().split("\n").map((line) => JSON.parse(line));
+    const events = fs.readFileSync(path.join(sandbox.dataDir, "home/sessions/sandbox-events.jsonl"), "utf8").trim().split("\n").map((line) => JSON.parse(line));
     const applied = events.find((event) => event.event_type === "ProfileApplied");
     assert.equal(applied.platform, "macos/seatbelt");
     assert.ok(applied.deny_paths.some((endpoint) => endpoint.endsWith("/.orbstack/run/docker.sock")));
@@ -623,7 +709,7 @@ test("setup reports grok doctor as unavailable when the subcommand is missing", 
   const report = JSON.parse(result.stdout);
   assert.equal(report.doctorCommand.available, false);
   assert.equal(report.ready, true);
-  assert.deepEqual(readInvocations(sandbox.argsFile), [["--version"], ["doctor", "--help"], ["inspect", "--json"]]);
+  assert.deepEqual(readInvocations(sandbox.argsFile), [["--version"], ["doctor", "--help"]]);
 
   const rendered = runCompanion(["setup"], {
     cwd: sandbox.workDir,
@@ -765,6 +851,7 @@ for (const [mode, warning] of [
     }));
 
     assert.notEqual(result.exitCode, 0);
+    assert.equal(result.timedOut, false);
     assert.match(result.errorMessage, new RegExp(warning.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "i"));
     assert.equal(fs.existsSync(sentinel), false);
   });
@@ -853,34 +940,30 @@ for (const mode of [
   test(`${mode} fails closed before prompt delivery`, async (t) => {
     const sandbox = makeSandbox(t);
     const stdinFile = path.join(sandbox.root, `${mode}-stdin.txt`);
-    const result = await runGrok(directOptions(sandbox, mode, {
-      env: envFor(sandbox, {
-        FAKE_GROK_MODE: mode,
-        FAKE_GROK_STDIN_FILE: stdinFile,
-        GROK_COMPANION_SANDBOX_HANDSHAKE_MS: "2000",
-      }),
+    const result = await runGrok(sandboxStartupOptions(sandbox, mode, {
+      FAKE_GROK_STDIN_FILE: stdinFile,
+      GROK_COMPANION_SANDBOX_HANDSHAKE_MS: "2000",
     }));
 
     assert.equal(result.securityFailureKind, "sandbox");
     assert.match(result.errorMessage, /sandbox enforcement failed/i);
+    if (mode === "sandbox-event-wrong-network") {
+      assert.match(result.errorMessage, /unexpected sandbox network restrictions/i);
+    }
     assert.equal(fs.existsSync(stdinFile), false);
   });
 }
 
 test("sandbox event log rotation fails closed before prompt delivery", async (t) => {
   const sandbox = makeSandbox(t);
-  const grokHome = path.join(sandbox.root, "grok-home");
+  const grokHome = path.join(sandbox.dataDir, "home");
   const eventFile = path.join(grokHome, "sessions", "sandbox-events.jsonl");
   const stdinFile = path.join(sandbox.root, "sandbox-rotation-stdin.txt");
   fs.mkdirSync(path.dirname(eventFile), { recursive: true });
   fs.writeFileSync(eventFile, `${JSON.stringify({ event_type: "ProfileApplied" })}\n`, "utf8");
 
-  const result = await runGrok(directOptions(sandbox, "sandbox-log-rotate", {
-    env: envFor(sandbox, {
-      FAKE_GROK_MODE: "sandbox-log-rotate",
-      FAKE_GROK_STDIN_FILE: stdinFile,
-      GROK_HOME: grokHome,
-    }),
+  const result = await runGrok(sandboxStartupOptions(sandbox, "sandbox-log-rotate", {
+    FAKE_GROK_STDIN_FILE: stdinFile,
   }));
 
   assert.equal(result.securityFailureKind, "sandbox");
@@ -890,18 +973,14 @@ test("sandbox event log rotation fails closed before prompt delivery", async (t)
 
 test("sandbox event log truncation fails closed before prompt delivery", async (t) => {
   const sandbox = makeSandbox(t);
-  const grokHome = path.join(sandbox.root, "grok-home");
+  const grokHome = path.join(sandbox.dataDir, "home");
   const eventFile = path.join(grokHome, "sessions", "sandbox-events.jsonl");
   const stdinFile = path.join(sandbox.root, "sandbox-truncation-stdin.txt");
   fs.mkdirSync(path.dirname(eventFile), { recursive: true });
   fs.writeFileSync(eventFile, `${JSON.stringify({ event_type: "ProfileApplied", padding: "x".repeat(1024) })}\n`, "utf8");
 
-  const result = await runGrok(directOptions(sandbox, "sandbox-log-truncate", {
-    env: envFor(sandbox, {
-      FAKE_GROK_MODE: "sandbox-log-truncate",
-      FAKE_GROK_STDIN_FILE: stdinFile,
-      GROK_HOME: grokHome,
-    }),
+  const result = await runGrok(sandboxStartupOptions(sandbox, "sandbox-log-truncate", {
+    FAKE_GROK_STDIN_FILE: stdinFile,
   }));
 
   assert.equal(result.securityFailureKind, "sandbox");
@@ -1132,11 +1211,10 @@ test("long cwd session metadata resolves through the upstream .cwd layout", (t) 
   assert.ok(Buffer.byteLength(longCwd) < 255);
   assert.ok(Buffer.byteLength(encodedLongCwd) > 255);
 
-  const grokHome = path.join(sandbox.root, "grok-home");
+  const grokHome = path.join(sandbox.dataDir, "home");
   const result = runCompanion(["task", "--json", "resolve long cwd metadata"], {
     cwd: longCwd,
     env: envFor(sandbox, {
-      GROK_HOME: grokHome,
       FAKE_GROK_RESOLVED_MODEL: "grok-long-cwd",
       FAKE_GROK_RESOLVED_EFFORT: "high",
     }),
@@ -1160,11 +1238,10 @@ test("short cwd session metadata uses the upstream URL encoding safe set", (t) =
   const specialCwdPath = path.join(sandbox.workDir, "special !'()*");
   fs.mkdirSync(specialCwdPath, { recursive: true });
   const specialCwd = fs.realpathSync(specialCwdPath);
-  const grokHome = path.join(sandbox.root, "special-session-home");
+  const grokHome = path.join(sandbox.dataDir, "home");
   const result = runCompanion(["task", "--json", "resolve special cwd metadata"], {
     cwd: specialCwd,
     env: envFor(sandbox, {
-      GROK_HOME: grokHome,
       FAKE_GROK_RESOLVED_MODEL: "grok-special-cwd",
       FAKE_GROK_RESOLVED_EFFORT: "high",
     }),
@@ -1186,7 +1263,7 @@ test("session metadata never falls back to a unique record from the wrong cwd", 
   }
   fs.mkdirSync(longCwd, { recursive: true });
   longCwd = fs.realpathSync(longCwd);
-  const grokHome = path.join(sandbox.root, "wrong-session-home");
+  const grokHome = path.join(sandbox.dataDir, "home");
   const sessionId = "11111111-1111-7111-8111-111111111111";
   const wrongDirectory = path.join(grokHome, "sessions", "one-unrelated-candidate");
   fs.mkdirSync(path.join(wrongDirectory, sessionId), { recursive: true });
@@ -1198,7 +1275,7 @@ test("session metadata never falls back to a unique record from the wrong cwd", 
 
   const result = runCompanion(["task", "--json", "do not use wrong cwd metadata"], {
     cwd: longCwd,
-    env: envFor(sandbox, { GROK_HOME: grokHome })
+    env: envFor(sandbox)
   });
 
   assert.equal(result.status, 0, result.stderr);
@@ -1209,7 +1286,7 @@ test("session metadata never falls back to a unique record from the wrong cwd", 
 
 test("short cwd session lookup does not scan unrelated workspace directories", (t) => {
   const sandbox = makeSandbox(t);
-  const grokHome = path.join(sandbox.root, "short-session-home");
+  const grokHome = path.join(sandbox.dataDir, "home");
   const sessionId = "11111111-1111-7111-8111-111111111111";
   const unrelatedDirectory = path.join(grokHome, "sessions", "unrelated-candidate");
   fs.mkdirSync(path.join(unrelatedDirectory, sessionId), { recursive: true });
@@ -1221,11 +1298,61 @@ test("short cwd session lookup does not scan unrelated workspace directories", (
 
   const result = runCompanion(["task", "--json", "use only the exact session directory"], {
     cwd: sandbox.workDir,
-    env: envFor(sandbox, { GROK_HOME: grokHome })
+    env: envFor(sandbox)
   });
 
   assert.equal(result.status, 0, result.stderr);
   const payload = JSON.parse(result.stdout);
   assert.equal(payload.resolvedModel, null);
   assert.equal(payload.resolvedEffort, null);
+});
+
+test("a rejected private home never reaches the Grok version process", (t) => {
+  const sandbox = makeSandbox(t);
+  const log = path.join(sandbox.root, "homes.jsonl");
+  const home = path.join(sandbox.dataDir, "home");
+  const env = envFor(sandbox, { FAKE_GROK_HOME_LOG: log });
+  fs.mkdirSync(path.join(home, "hooks"), { recursive: true });
+  fs.writeFileSync(path.join(home, "hooks", "untrusted.json"), "{}");
+  const setup = runCompanion(["setup", "--json"], { cwd: sandbox.workDir, env });
+  assert.equal(setup.status, 0, setup.stderr);
+  const report = JSON.parse(setup.stdout);
+  assert.equal(report.privateHome.ready, false);
+  assert.equal(report.grok.available, true);
+  const calls = fs.readFileSync(log, "utf8").trim().split("\n").map(JSON.parse);
+  assert.deepEqual(calls.map((call) => call.args), [["--version"]]);
+  assert.notEqual(calls[0].GROK_HOME, home);
+  assert.notEqual(calls[0].GROK_HOME, env.GROK_HOME);
+  assert.equal(fs.existsSync(calls[0].GROK_HOME), false);
+});
+
+test("pre-isolation tasks remain in history and are excluded from every resume path", (t) => {
+  const sandbox = makeSandbox(t);
+  const options = { cwd: sandbox.workDir, env: envFor(sandbox, {
+    CLAUDE_CODE_SESSION_ID: "owner", GROK_COMPANION_CONTINUITY_POLICY: "claude-session"
+  }) };
+  const first = runCompanion(["task", "first task"], options);
+  assert.equal(first.status, 0, first.stderr);
+  const [legacy] = jobRecords(sandbox.dataDir);
+  assert.equal(path.join(sandbox.dataDir, legacy.sessionHome), path.join(sandbox.dataDir, "home"));
+  delete legacy.sessionHome;
+  fs.writeFileSync(jobFileFor(sandbox.dataDir, legacy.id), JSON.stringify(legacy));
+  const history = runCompanion(["history", "--json"], options);
+  assert.equal(history.status, 0, history.stderr);
+  assert.equal(JSON.parse(history.stdout).jobs[0].resumable, false);
+  const explicit = runCompanion(["task", "--resume", legacy.sessionId], options);
+  assert.notEqual(explicit.status, 0);
+  assert.match(explicit.stderr, /^failure: input$/m);
+  assert.match(explicit.stderr, /pre-isolation sessions cannot resume in the private home/i);
+  const last = runCompanion(["task", "--resume-last"], options);
+  assert.notEqual(last.status, 0);
+  assert.match(last.stderr, /^failure: input$/m);
+  const fresh = runCompanion(["task", "second task"], options);
+  assert.equal(fresh.status, 0, fresh.stderr);
+  const calls = readInvocations(sandbox.argsFile).filter((args) => args.includes("--sandbox"));
+  assert.equal(calls.length, 2);
+  assert.ok(calls.every((args) => !args.includes("-r")));
+  const record = jobRecords(sandbox.dataDir).find((record) => record.id !== legacy.id);
+  assert.equal(record.request.continuityPolicy, "claude-session");
+  assert.equal(record.request.resumeReason, null);
 });

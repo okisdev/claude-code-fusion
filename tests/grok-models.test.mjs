@@ -35,10 +35,14 @@ test("models parses named lines and tables while ignoring headings and diagnosti
 
 test("models uses the scrubbed Grok child environment", (t) => {
   const sandbox = makeSandbox(t);
+  const userHome = path.join(sandbox.root, "grok-home");
+  fs.mkdirSync(userHome, { recursive: true });
+  fs.writeFileSync(path.join(userHome, "auth.json"), "fixture");
   const envFile = path.join(sandbox.root, "models-env.json");
   const result = runCompanion(["models"], { cwd: sandbox.workDir, env: envFor(sandbox, {
     FAKE_GROK_MODELS_OUTPUT: "grok-4.6\n",
     FAKE_GROK_MODELS_ENV_FILE: envFile,
+    FAKE_GROK_MODELS_VALIDATE_STORE: "1",
     ANTHROPIC_API_KEY: "must-be-scrubbed",
     XAI_API_KEY: "retained-for-auth",
     CLAUDE_PLUGIN_ROOT: "must-be-scrubbed",
@@ -52,6 +56,9 @@ test("models uses the scrubbed Grok child environment", (t) => {
   }) });
   assert.equal(result.status, 0, result.stderr);
   const childEnv = JSON.parse(fs.readFileSync(envFile, "utf8"));
+  assert.equal(childEnv.GROK_HOME, path.join(sandbox.dataDir, "home"));
+  assert.equal(childEnv.GROK_AUTH_PATH, undefined);
+  assert.equal(fs.readFileSync(path.join(userHome, "auth.json"), "utf8"), "refreshed fixture");
   assert.equal(childEnv.ANTHROPIC_API_KEY, undefined);
   assert.equal(childEnv.CLAUDE_PLUGIN_ROOT, undefined);
   assert.equal(childEnv.XAI_API_KEY, "retained-for-auth");

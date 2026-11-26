@@ -4,6 +4,8 @@ import path from "node:path";
 import { createJobState } from "./job-state.mjs";
 import { withRecordLock } from "./record-lock.mjs";
 
+export const PRIVATE_GROK_HOME = "home";
+
 const LEASE_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
 const MONITOR_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
 const STATE_SWEEP_INTERVAL_MS = 60 * 60 * 1000;
@@ -19,6 +21,7 @@ const jobState = createJobState({
   dataDirName: "grok-claude-code-fusion",
   sweepMarker: ".grok-state-sweep.json",
   recordFields: () => ({
+    sessionHome: PRIVATE_GROK_HOME,
     resolvedEffort: null,
     modelUsage: null,
     modelUsageIsIncomplete: null
