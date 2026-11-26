@@ -211,6 +211,7 @@ async function runReviewJob(record, jobFile, options = {}) {
   try {
     const prompt = fs.readFileSync(record.briefFile, "utf8");
     first = await runGrok({
+      profileKey: record.profileKey,
       grokVersion: record.grokVersion,
       briefFile: record.briefFile,
       prompt,
@@ -307,7 +308,7 @@ async function handleReview(argv, transport = {}) {
     DIFF: target.diff
   });
   requireQuotaAvailable(dataDir);
-  const grok = probeGrokVersion(resolveGrokBin(), process.env, cwd);
+  const grok = probeGrokVersion(resolveGrokBin());
 
   const jobId = generateJobId();
   const briefFile = briefPath(dataDir, cwd, jobId);

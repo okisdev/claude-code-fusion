@@ -21,7 +21,7 @@ Context rules:
 
 - Include context generously. Grok's context window is large; size briefs against the live `grok models` output rather than hardcoded numbers (the flagship default carries a 500k window). Err on the side of pasting relevant code, error output, and prior findings rather than referring to them.
 - Do not reference the Claude conversation, earlier turns, or "the change we discussed". The brief is the only context Grok gets.
-- Do not rely on continuity or memory to supply required task facts. Automatic affinity is limited to ordinary direct tasks with a matching Claude session, exact resolved working directory, mode, and memory setting. Fusion routed work does not receive automatic affinity, while review, stop gate, and `--fresh` start without prior Grok session context.
+- Do not rely on continuity or memory to supply required task facts. Automatic affinity is limited to ordinary direct tasks with a matching Claude session, exact resolved working directory, mode, credential profile, and memory setting. Fusion routed work does not receive automatic affinity, while review, stop gate, and `--fresh` start without prior Grok session context.
 - Treat `--memory` as a data disclosure choice. Upstream first-turn memory injection can add relevant global or workspace memory to the model context sent to xAI, and that internal injection is not blocked by the companion's model-facing Read deny for `$GROK_HOME/memory/**`. Upstream automatic saving usually requires at least three real user prompts in the same resumed session, so one Fusion task should not be expected to create new memory.
 
 Output contract:

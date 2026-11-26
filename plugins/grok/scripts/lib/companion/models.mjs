@@ -1,7 +1,8 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { ensureGrokHome, grokPaths, spawnWithGrokAuth } from "../grok-home.mjs";
+import { ensureGrokHome, spawnWithGrokAuth } from "../grok-home.mjs";
+import { grokPaths } from "../state.mjs";
 import { buildGrokChildEnv, resolveGrokBin } from "../grok-exec.mjs";
 import { output, errorWithFailure, oneLineSummary, commandArgs } from "./base.mjs";
 import { inputError } from "./session.mjs";
@@ -45,7 +46,7 @@ function handleModels(argv, transport = {}) {
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "grok-companion-models-"));
   let result;
   try {
-    result = spawnWithGrokAuth(paths, resolveGrokBin(), ["models"], { cwd: tempDir, env: { ...buildGrokChildEnv(), TMPDIR: tempDir }, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], timeout: 60000, maxBuffer: 4 * 1024 * 1024, windowsHide: true });
+    result = spawnWithGrokAuth(paths, resolveGrokBin(), ["models"], { cwd: tempDir, env: { ...buildGrokChildEnv(process.env, { paths }), TMPDIR: tempDir }, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], timeout: 60000, maxBuffer: 4 * 1024 * 1024, windowsHide: true });
   } finally {
     fs.rmSync(tempDir, { recursive: true, force: true });
   }

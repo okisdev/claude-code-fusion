@@ -3,6 +3,7 @@ import fs from "node:fs";
 import path from "node:path";
 import test from "node:test";
 
+import { grokPaths } from "../plugins/grok/scripts/lib/state.mjs";
 import { envFor, makeSandbox, readInvocations, runCompanion } from "./lib/companion-harness.mjs";
 
 test("models parses the installed Grok bullet listing", (t) => {
@@ -56,8 +57,8 @@ test("models uses the scrubbed Grok child environment", (t) => {
   }) });
   assert.equal(result.status, 0, result.stderr);
   const childEnv = JSON.parse(fs.readFileSync(envFile, "utf8"));
-  assert.equal(childEnv.GROK_HOME, path.join(sandbox.dataDir, "home"));
-  assert.equal(childEnv.GROK_AUTH_PATH, undefined);
+  assert.equal(childEnv.GROK_HOME, grokPaths(envFor(sandbox)).home);
+  assert.equal(childEnv.GROK_AUTH_PATH, path.join(userHome, "auth.json"));
   assert.equal(fs.readFileSync(path.join(userHome, "auth.json"), "utf8"), "refreshed fixture");
   assert.equal(childEnv.ANTHROPIC_API_KEY, undefined);
   assert.equal(childEnv.CLAUDE_PLUGIN_ROOT, undefined);

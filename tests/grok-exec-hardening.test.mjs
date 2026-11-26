@@ -120,13 +120,13 @@ test("persisted PID without identity is left for diagnostic cleanup", async (t) 
   assert.equal(pidAlive(child.pid), true);
 });
 
-test("models refresh resolves the relative user home and ignores inherited auth paths", async (t) => {
+test("models refresh resolves a relative credential override in the parent before changing cwd", async (t) => {
   const sandbox = makeSandbox(t);
-  const auth = path.join(sandbox.workDir, "relative-grok-home", "auth.json");
+  const auth = path.join(sandbox.root, "other", "login");
   staleAuth(auth);
   const env = envFor(sandbox, {
-    GROK_HOME: "relative-grok-home",
-    GROK_AUTH_PATH: "other/auth.json",
+    GROK_HOME: path.relative(process.cwd(), path.join(sandbox.root, "relative-grok-home")),
+    GROK_AUTH_PATH: path.relative(process.cwd(), auth),
     FAKE_GROK_MODELS_VALIDATE_STORE: "1",
     FAKE_GROK_LOGIN_FILE: auth
   });

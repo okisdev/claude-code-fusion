@@ -30,13 +30,13 @@ function resolveGrokCompanionVersion(env = process.env) {
   return cachedGrokCompanionVersion;
 }
 
-function probeGrokVersion(bin, env = process.env, cwd = process.cwd()) {
+function probeGrokVersion(bin, env = process.env) {
   if (grokVersionCache.has(bin)) {
     return grokVersionCache.get(bin);
   }
   const result = spawnGrokVersion(bin, {
     encoding: "utf8",
-    env: buildGrokChildEnv(env, { cwd }),
+    env: buildGrokChildEnv(env),
     timeout: GROK_VERSION_PROBE_TIMEOUT_MS,
     windowsHide: true
   });

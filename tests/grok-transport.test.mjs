@@ -5,6 +5,7 @@ import fs from "node:fs";
 import path from "node:path";
 import test from "node:test";
 
+import { grokPaths } from "../plugins/grok/scripts/lib/state.mjs";
 import {
   envFor,
   flagValues,
@@ -393,7 +394,7 @@ test("task records valid Fusion roles and rejects invalid role values", (t) => {
 test("invalid Grok session identifiers fail as transport errors and cannot reach summary paths or resume", (t) => {
   const sandbox = makeSandbox(t);
   const grokHome = path.join(sandbox.root, "grok-home");
-  const escapedSummary = path.join(sandbox.dataDir, "home", "attacker", "summary.json");
+  const escapedSummary = path.join(grokPaths(envFor(sandbox)).home, "attacker", "summary.json");
   fs.mkdirSync(path.dirname(escapedSummary), { recursive: true });
   fs.writeFileSync(escapedSummary, JSON.stringify({
     current_model_id: "should-not-be-observed",

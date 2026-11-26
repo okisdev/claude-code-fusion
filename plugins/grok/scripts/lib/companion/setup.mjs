@@ -1,8 +1,8 @@
 import fs from "node:fs";
-import { ensureGrokHome, grokPaths, spawnWithGrokAuth } from "../grok-home.mjs";
+import { ensureGrokHome, spawnWithGrokAuth } from "../grok-home.mjs";
 import { buildGrokChildEnv, existingUnixSockets, grokAuthStatus, runtimeSocketEndpoints, runtimeSocketEngine, runtimeSocketRemedy, runtimeSocketSymlinkEndpoints, undeniedRuntimeSocketCandidates, undeniedRuntimeSocketRemedy, resolveGrokBin, resolveGrokCapabilities } from "../grok-exec.mjs";
 import { renderSetupReport } from "../render.mjs";
-import { clearQuotaCooldown, ensurePrivateDataDir, resolveDataDir } from "../state.mjs";
+import { clearQuotaCooldown, grokPaths, ensurePrivateDataDir, resolveDataDir } from "../state.mjs";
 import { TESTED_VERSION_MAX } from "./config.mjs";
 import { probeGrokVersion, parseVersion, compareVersion, testedVersionInterval, supportedVersion, activeQuotaCooldown } from "./version.mjs";
 import { output, readConfig, writeConfig, continuityPolicy, parseContinuityPolicy, commandArgs } from "./base.mjs";
@@ -15,7 +15,7 @@ function doctorCommandAdvisory(bin, available, paths) {
   if (!available) {
     return { available: false, detail: "grok is unavailable" };
   }
-  const probe = spawnWithGrokAuth(paths, bin, ["doctor", "--help"], { encoding: "utf8", env: buildGrokChildEnv(), timeout: DOCTOR_PROBE_TIMEOUT_MS });
+  const probe = spawnWithGrokAuth(paths, bin, ["doctor", "--help"], { encoding: "utf8", env: buildGrokChildEnv(process.env, { paths }), timeout: DOCTOR_PROBE_TIMEOUT_MS });
   const supported = !probe.error && probe.status === 0;
   return {
     available: supported,
@@ -127,7 +127,7 @@ function handleSetup(argv, transport = {}) {
     detail: homeError ?? `${SHELL_ENVIRONMENT_POLICY_DETAIL} The [shell_environment_policy] table is ${present ? "present" : "not present"}. Presence does not prove the policy restricts the write-run shell environment.`
   };
   const hostEnvironment = hostEnvironmentAdvisory(process.env, probe.version);
-  const auth = grokAuthStatus();
+  const auth = grokAuthStatus(paths.auth);
 
   const dataDir = resolveDataDir();
   if (options["clear-quota-cooldown"]) clearQuotaCooldown(dataDir);

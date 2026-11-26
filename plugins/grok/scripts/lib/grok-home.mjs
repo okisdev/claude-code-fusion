@@ -1,19 +1,9 @@
 import { spawnSync } from "node:child_process";
-import { createHash } from "node:crypto";
+import { randomBytes } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { withRecordLock } from "./record-lock.mjs";
-import { PRIVATE_GROK_HOME, ensurePrivateDataDir, resolveDataDir, writePrivateStateFile } from "./state.mjs";
-
-export function grokPaths(env = process.env, cwd = process.cwd()) {
-  const userHome = path.resolve(cwd, env.GROK_HOME?.trim() || path.join(env.HOME?.trim() || os.homedir(), ".grok"));
-  return {
-    userHome,
-    home: path.join(resolveDataDir(env), PRIVATE_GROK_HOME),
-    auth: path.join(userHome, "auth.json")
-  };
-}
+import { writePrivateStateFile } from "./state.mjs";
 
 function* configEntries(source) {
   let entry = "";
@@ -108,91 +98,34 @@ function ensurePolicyLock(home) {
   }
 }
 
-function readAuth(file, privateCopy = false) {
+export function copyGrokAuth({ home, auth }) {
+  const file = path.join(home, "auth.json");
+  const temp = path.join(home, `.auth-${randomBytes(12).toString("hex")}.tmp`);
   let fd;
   try {
-    const flags = fs.constants.O_RDONLY | fs.constants.O_NONBLOCK | (privateCopy ? fs.constants.O_NOFOLLOW : 0);
-    fd = fs.openSync(file, flags);
-    const stat = fs.fstatSync(fd);
-    if (!stat.isFile()) throw new Error(`Expected a regular auth file at ${file}.`);
-    if (privateCopy && stat.nlink !== 1) return null;
-    const content = fs.readFileSync(fd);
-    return { content, hash: createHash("sha256").update(content).digest("hex"), mode: stat.mode & 0o7777, mtimeMs: stat.mtimeMs };
-  } catch (error) {
-    if (error.code === "ENOENT" || (privateCopy && error.code === "ELOOP")) return null;
-    throw error;
-  } finally {
-    if (fd !== undefined) fs.closeSync(fd);
-  }
-}
-
-function installAuth(file, content, expectedHash) {
-  let staging;
-  try {
-    staging = fs.mkdtempSync(path.join(path.dirname(file), ".login-"));
-    const copy = path.join(staging, "auth.json");
-    fs.writeFileSync(copy, content, { mode: 0o600 });
-    fs.chmodSync(copy, 0o600);
-    if (expectedHash !== undefined && readAuth(file)?.hash !== expectedHash) return;
-    fs.renameSync(copy, file);
-  } catch (error) {
-    if (expectedHash === undefined || error.code !== "ENOENT") throw error;
-  } finally {
-    if (staging) fs.rmSync(staging, { recursive: true, force: true });
-  }
-}
-
-export function copyGrokAuth({ home, auth }, startedWith, deadline) {
-  const startedAt = Date.now();
-  try {
-    const file = path.join(home, "auth.json");
-    const stamp = path.join(path.dirname(home), "auth-copy.json");
-    if (![auth, file, stamp].some((entry) => fs.lstatSync(entry, { throwIfNoEntry: false }))) return null;
-    return withRecordLock(stamp, () => {
-      const saved = fs.existsSync(stamp) ? JSON.parse(fs.readFileSync(stamp, "utf8")) : null;
-      const copy = readAuth(file, true);
-      let user = readAuth(auth);
-      const base = saved?.auth === auth ? saved.hash : null;
-      if (copy && saved && saved.auth !== auth && copy.hash !== saved.hash) {
-        throw new Error(`A private credential update is pending for ${saved.auth}. Use its Grok home to synchronize it first.`);
-      }
-      if (!saved && copy && user && copy.hash !== user.hash && copy.mtimeMs > user.mtimeMs) {
-        throw new Error("The newer private Grok login has no recorded source digest. Run grok login in the user home to select the current login.");
-      }
-      const userUnchanged = user && user.hash === base && (startedWith === undefined || startedWith?.hash === base);
-      const touched = copy && startedWith && copy.mtimeMs > startedWith.privateMtimeMs;
-      if (copy && userUnchanged && (copy.hash !== base || touched)) {
-        installAuth(auth, copy.content, base);
-        user = readAuth(auth);
-      }
-      if (!user) {
-        fs.rmSync(file, { force: true });
-        fs.rmSync(stamp, { force: true });
-        return null;
-      }
-      if (copy?.hash !== user.hash || copy.mode !== 0o600) installAuth(file, user.content);
-      if (base !== user.hash) writePrivateStateFile(stamp, JSON.stringify({ auth, hash: user.hash }));
-      return { hash: user.hash, userMtimeMs: user.mtimeMs, privateMtimeMs: fs.statSync(file).mtimeMs };
-    });
+    ensurePolicyLock(home);
+    try {
+      fd = fs.openSync(auth, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK);
+    } catch (error) {
+      if (error.code !== "ENOENT") throw error;
+      fs.rmSync(file, { force: true });
+      return;
+    }
+    if (!fs.fstatSync(fd).isFile()) throw new Error(`Expected a regular auth file at ${auth}.`);
+    fs.writeFileSync(temp, fs.readFileSync(fd), { flag: "wx", mode: 0o600 });
+    fs.chmodSync(temp, 0o600);
+    fs.renameSync(temp, file);
   } catch (error) {
     error.failureKind = "setup";
     throw error;
   } finally {
-    if (deadline) deadline.expiresAt += Date.now() - startedAt;
+    if (fd !== undefined) fs.closeSync(fd);
+    fs.rmSync(temp, { force: true });
   }
 }
 
-export function spawnWithGrokAuth(paths, bin, args, options, deadline) {
-  const before = copyGrokAuth(paths, undefined, deadline);
-  let result;
-  let after;
-  try {
-    result = spawnSync(bin, args, options);
-  } finally {
-    after = copyGrokAuth(paths, before, deadline);
-  }
-  const authRefreshed = before !== null && after !== null && (after.hash !== before.hash || after.userMtimeMs > before.userMtimeMs);
-  return { ...result, authRefreshed };
+export function spawnWithGrokAuth(paths, bin, args, options) {
+  return spawnSync(bin, args, { ...options, env: { ...options.env, GROK_HOME: paths.home, GROK_AUTH_PATH: paths.auth } });
 }
 
 export function spawnGrokVersion(bin, options) {
@@ -206,19 +139,18 @@ export function spawnGrokVersion(bin, options) {
 
 export function ensureGrokHome({ home, userHome }) {
   try {
-    const dataDir = path.dirname(home);
-    ensurePrivateDataDir(dataDir);
-    const target = path.join(fs.realpathSync(dataDir), path.basename(home));
-    if (home === userHome || (fs.existsSync(userHome) && fs.realpathSync(userHome) === target)) {
-      throw new Error("The private Grok home must be separate from the user Grok home.");
-    }
-    for (const directory of [home, path.join(home, "hooks"), path.join(home, "sessions")]) {
+    const homes = path.dirname(home);
+    const dataDir = path.dirname(homes);
+    fs.mkdirSync(dataDir, { recursive: true, mode: 0o700 });
+    fs.chmodSync(dataDir, 0o700);
+    const target = path.join(fs.realpathSync(dataDir), "homes", path.basename(home));
+    if (userHome === target) throw new Error("The private Grok home must be separate from the user Grok home.");
+    for (const directory of [homes, home, path.join(home, "hooks"), path.join(home, "sessions")]) {
       fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
       if (!fs.lstatSync(directory).isDirectory()) throw new Error(`Expected a real directory at ${directory}.`);
       fs.chmodSync(directory, 0o700);
     }
     if (fs.readdirSync(path.join(home, "hooks")).length) throw new Error(`Expected an empty hooks directory in ${home}.`);
-    ensurePolicyLock(home);
     const { config, shellPolicyPresent } = privateConfig(userHome);
     writePrivateStateFile(path.join(home, "config.toml"), config);
     return shellPolicyPresent;

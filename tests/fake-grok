@@ -29,14 +29,8 @@
   const grokHome = path.resolve(process.cwd(), process.env.GROK_HOME);
 
   if (process.env.FAKE_GROK_ROTATE_ON && process.argv.slice(2).includes(process.env.FAKE_GROK_ROTATE_ON)) {
-    const file = path.join(grokHome, "auth.json");
+    const file = process.env.GROK_AUTH_PATH ?? path.join(grokHome, "auth.json");
     fs.writeFileSync(file, fs.readFileSync(file, "utf8") + " rotated");
-    const userFile = process.env.FAKE_GROK_CONCURRENT_LOGIN;
-    if (userFile) {
-      const { atime, mtime } = fs.statSync(userFile);
-      fs.writeFileSync(userFile, "interactive login");
-      fs.utimesSync(userFile, atime, mtime);
-    }
   }
 
   if (process.argv[2] === "doctor") {
@@ -150,7 +144,7 @@
       fs.writeFileSync(process.env.FAKE_GROK_MODELS_CWD_FILE, process.cwd(), "utf8");
     }
     if (process.env.FAKE_GROK_MODELS_VALIDATE_STORE === "1") {
-      const authFile = path.join(grokHome, "auth.json");
+      const authFile = process.env.GROK_AUTH_PATH;
       if (fs.readFileSync(authFile, "utf8") !== "fixture") {
         process.exit(1);
       }
@@ -160,7 +154,7 @@
     }
     if (process.env.FAKE_GROK_MODELS_TOUCH === "1") {
       const now = new Date(Date.now() + 1000);
-      fs.utimesSync(path.join(grokHome, "auth.json"), now, now);
+      fs.utimesSync(process.env.GROK_AUTH_PATH, now, now);
     }
     if (process.env.FAKE_GROK_MODELS_OUTPUT) {
       process.stdout.write(process.env.FAKE_GROK_MODELS_OUTPUT);

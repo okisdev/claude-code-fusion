@@ -6,6 +6,8 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 
+import { createJobRecord, generateJobId, grokPaths, jobFilePath, writePrivateStateFile } from "../plugins/grok/scripts/lib/state.mjs";
+import { validateResumeSession, resolveLastSessionJob } from "../plugins/grok/scripts/lib/companion/session.mjs";
 import { getProcessIdentity } from "../plugins/grok/scripts/lib/process-identity.mjs";
 import { initFixtureRepo } from "./lib/git-fixture.mjs";
 
@@ -388,7 +390,7 @@ test("setup, probes and managed tasks use the user's config without plugin and h
   delete env.GROK_HOME;
   delete env.GROK_COMPANION_CAPABILITIES;
   const userHome = path.join(env.HOME, ".grok");
-  const home = path.join(sandbox.dataDir, "home");
+  const home = grokPaths(env).home;
   const auth = path.join(userHome, "auth.json");
   fs.mkdirSync(path.join(userHome, "hooks"), { recursive: true });
   fs.writeFileSync(path.join(userHome, "hooks", "local.json"), "{}");
@@ -425,7 +427,8 @@ test("setup, probes and managed tasks use the user's config without plugin and h
       assert.notEqual(paths.GROK_HOME, home);
       assert.equal(fs.existsSync(paths.GROK_HOME), false);
     } else {
-      assert.deepEqual(paths, { GROK_HOME: home }, args.join(" "));
+      const expected = args.includes("--sandbox") ? { GROK_HOME: home } : { GROK_HOME: home, GROK_AUTH_PATH: auth };
+      assert.deepEqual(paths, expected, args.join(" "));
     }
   }
   assert.ok(calls.some(({ args }) => args.includes("--help")));
@@ -458,7 +461,7 @@ test("private config removes complete top-level hook and plugin values and keeps
   const setup = runCompanion(["setup", "--json"], { cwd: sandbox.workDir, env });
   assert.equal(setup.status, 0, setup.stderr);
   assert.equal(JSON.parse(setup.stdout).privateHome.ready, true);
-  assert.deepEqual(fs.readFileSync(path.join(sandbox.dataDir, "home", "config.toml")), Buffer.from(defaults + unrelated));
+  assert.deepEqual(fs.readFileSync(path.join(grokPaths(envFor(sandbox)).home, "config.toml")), Buffer.from(defaults + unrelated));
 });
 
 test("a linked private Grok home fails setup without altering the user home", (t) => {
@@ -467,7 +470,8 @@ test("a linked private Grok home fails setup without altering the user home", (t
   fs.mkdirSync(env.GROK_HOME, { recursive: true });
   const config = path.join(env.GROK_HOME, "config.toml");
   fs.writeFileSync(config, '[plugins]\nenabled = ["alpha"]\n');
-  fs.symlinkSync(env.GROK_HOME, path.join(sandbox.dataDir, "home"), "dir");
+  fs.mkdirSync(path.join(sandbox.dataDir, "homes"));
+  fs.symlinkSync(env.GROK_HOME, grokPaths(env).home, "dir");
   const setup = runCompanion(["setup", "--json"], { cwd: sandbox.workDir, env });
   assert.equal(setup.status, 0, setup.stderr);
   assert.equal(JSON.parse(setup.stdout).ready, false);
@@ -653,7 +657,7 @@ test("1.0.88 multi-document text uses the final structuredOutput for tasks and r
     const parsed = mode === "task" ? consumeTaskStructuredResult(result, true) : evaluateReviewResult(result);
     assert.equal(parsed.valid, true, parsed.error);
     assert.deepEqual(parsed.value, documents.at(-1));
-    const events = fs.readFileSync(path.join(sandbox.dataDir, "home/sessions/sandbox-events.jsonl"), "utf8").trim().split("\n").map((line) => JSON.parse(line));
+    const events = fs.readFileSync(path.join(grokPaths(envFor(sandbox)).home, "sessions", "sandbox-events.jsonl"), "utf8").trim().split("\n").map((line) => JSON.parse(line));
     const applied = events.find((event) => event.event_type === "ProfileApplied");
     assert.equal(applied.platform, "macos/seatbelt");
     assert.ok(applied.deny_paths.some((endpoint) => endpoint.endsWith("/.orbstack/run/docker.sock")));
@@ -956,7 +960,7 @@ for (const mode of [
 
 test("sandbox event log rotation fails closed before prompt delivery", async (t) => {
   const sandbox = makeSandbox(t);
-  const grokHome = path.join(sandbox.dataDir, "home");
+  const grokHome = grokPaths(envFor(sandbox)).home;
   const eventFile = path.join(grokHome, "sessions", "sandbox-events.jsonl");
   const stdinFile = path.join(sandbox.root, "sandbox-rotation-stdin.txt");
   fs.mkdirSync(path.dirname(eventFile), { recursive: true });
@@ -973,7 +977,7 @@ test("sandbox event log rotation fails closed before prompt delivery", async (t)
 
 test("sandbox event log truncation fails closed before prompt delivery", async (t) => {
   const sandbox = makeSandbox(t);
-  const grokHome = path.join(sandbox.dataDir, "home");
+  const grokHome = grokPaths(envFor(sandbox)).home;
   const eventFile = path.join(grokHome, "sessions", "sandbox-events.jsonl");
   const stdinFile = path.join(sandbox.root, "sandbox-truncation-stdin.txt");
   fs.mkdirSync(path.dirname(eventFile), { recursive: true });
@@ -1211,7 +1215,7 @@ test("long cwd session metadata resolves through the upstream .cwd layout", (t) 
   assert.ok(Buffer.byteLength(longCwd) < 255);
   assert.ok(Buffer.byteLength(encodedLongCwd) > 255);
 
-  const grokHome = path.join(sandbox.dataDir, "home");
+  const grokHome = grokPaths(envFor(sandbox)).home;
   const result = runCompanion(["task", "--json", "resolve long cwd metadata"], {
     cwd: longCwd,
     env: envFor(sandbox, {
@@ -1238,7 +1242,7 @@ test("short cwd session metadata uses the upstream URL encoding safe set", (t) =
   const specialCwdPath = path.join(sandbox.workDir, "special !'()*");
   fs.mkdirSync(specialCwdPath, { recursive: true });
   const specialCwd = fs.realpathSync(specialCwdPath);
-  const grokHome = path.join(sandbox.dataDir, "home");
+  const grokHome = grokPaths(envFor(sandbox)).home;
   const result = runCompanion(["task", "--json", "resolve special cwd metadata"], {
     cwd: specialCwd,
     env: envFor(sandbox, {
@@ -1263,7 +1267,7 @@ test("session metadata never falls back to a unique record from the wrong cwd", 
   }
   fs.mkdirSync(longCwd, { recursive: true });
   longCwd = fs.realpathSync(longCwd);
-  const grokHome = path.join(sandbox.dataDir, "home");
+  const grokHome = grokPaths(envFor(sandbox)).home;
   const sessionId = "11111111-1111-7111-8111-111111111111";
   const wrongDirectory = path.join(grokHome, "sessions", "one-unrelated-candidate");
   fs.mkdirSync(path.join(wrongDirectory, sessionId), { recursive: true });
@@ -1286,7 +1290,7 @@ test("session metadata never falls back to a unique record from the wrong cwd", 
 
 test("short cwd session lookup does not scan unrelated workspace directories", (t) => {
   const sandbox = makeSandbox(t);
-  const grokHome = path.join(sandbox.dataDir, "home");
+  const grokHome = grokPaths(envFor(sandbox)).home;
   const sessionId = "11111111-1111-7111-8111-111111111111";
   const unrelatedDirectory = path.join(grokHome, "sessions", "unrelated-candidate");
   fs.mkdirSync(path.join(unrelatedDirectory, sessionId), { recursive: true });
@@ -1310,7 +1314,7 @@ test("short cwd session lookup does not scan unrelated workspace directories", (
 test("a rejected private home never reaches the Grok version process", (t) => {
   const sandbox = makeSandbox(t);
   const log = path.join(sandbox.root, "homes.jsonl");
-  const home = path.join(sandbox.dataDir, "home");
+  const home = grokPaths(envFor(sandbox)).home;
   const env = envFor(sandbox, { FAKE_GROK_HOME_LOG: log });
   fs.mkdirSync(path.join(home, "hooks"), { recursive: true });
   fs.writeFileSync(path.join(home, "hooks", "untrusted.json"), "{}");
@@ -1334,8 +1338,9 @@ test("pre-isolation tasks remain in history and are excluded from every resume p
   const first = runCompanion(["task", "first task"], options);
   assert.equal(first.status, 0, first.stderr);
   const [legacy] = jobRecords(sandbox.dataDir);
-  assert.equal(path.join(sandbox.dataDir, legacy.sessionHome), path.join(sandbox.dataDir, "home"));
-  delete legacy.sessionHome;
+  assert.equal(legacy.profileKey, grokPaths(options.env).profileKey);
+  legacy.sessionHome = "home";
+  delete legacy.profileKey;
   fs.writeFileSync(jobFileFor(sandbox.dataDir, legacy.id), JSON.stringify(legacy));
   const history = runCompanion(["history", "--json"], options);
   assert.equal(history.status, 0, history.stderr);
@@ -1355,4 +1360,87 @@ test("pre-isolation tasks remain in history and are excluded from every resume p
   const record = jobRecords(sandbox.dataDir).find((record) => record.id !== legacy.id);
   assert.equal(record.request.continuityPolicy, "claude-session");
   assert.equal(record.request.resumeReason, null);
+});
+
+test("credential profiles isolate private sessions and all task resume paths", (t) => {
+  const sandbox = makeSandbox(t);
+  const primary = envFor(sandbox, { CLAUDE_CODE_SESSION_ID: "owner", GROK_COMPANION_CONTINUITY_POLICY: "claude-session",
+    FAKE_GROK_RESOLVED_MODEL: "model-a", FAKE_GROK_VERIFY_RESUME: "1" });
+  const source = path.join(sandbox.root, "second-login");
+  fs.writeFileSync(source, "second profile");
+  const secondary = { ...primary, GROK_AUTH_PATH: source, FAKE_GROK_RESOLVED_MODEL: "model-b" };
+  const run = (env, ...args) => runCompanion(args, { cwd: sandbox.workDir, env });
+  const first = run(primary, "task", "--json", "first task");
+  assert.equal(first.status, 0, first.stderr);
+  const a = jobRecords(sandbox.dataDir)[0];
+  assert.equal(a.profileKey, grokPaths(primary).profileKey);
+  for (const args of [["--resume", a.sessionId], ["--resume-last"]]) {
+    const rejected = run(secondary, "task", ...args);
+    assert.notEqual(rejected.status, 0);
+    assert.match(rejected.stderr, /^failure: input$/m);
+  }
+  const history = run(secondary, "history", "--json");
+  assert.equal(JSON.parse(history.stdout).jobs[0].resumable, false);
+  const second = run(secondary, "task", "--json", "second task");
+  assert.equal(second.status, 0, second.stderr);
+  const b = jobRecords(sandbox.dataDir).find((job) => job.id !== a.id);
+  assert.equal(b.profileKey, grokPaths(secondary).profileKey);
+  assert.notEqual(b.profileKey, a.profileKey);
+  assert.equal(b.request.resumeReason, null);
+  for (const [env, sourceJob] of [[primary, a], [secondary, b]]) {
+    const next = run(env, "task", "--resume-last", "--json");
+    assert.equal(next.status, 0, next.stderr);
+    const job = jobRecords(sandbox.dataDir).find((entry) => entry.id === JSON.parse(next.stdout).jobId);
+    assert.equal(job.request.resumeSourceJobId, sourceJob.id);
+    assert.equal(job.resolvedModel, env.FAKE_GROK_RESOLVED_MODEL);
+  }
+});
+
+test("session ownership follows the canonical home and login even when two profiles return the same UUID", async (t) => {
+  const sandbox = makeSandbox(t);
+  const env = envFor(sandbox, { FAKE_GROK_RESOLVED_MODEL: "primary-model" });
+  fs.mkdirSync(env.GROK_HOME);
+  const homeAlias = path.join(sandbox.root, "home-link");
+  fs.symlinkSync(env.GROK_HOME, homeAlias);
+  const login = path.join(env.GROK_HOME, "auth.json");
+  const alias = path.join(sandbox.root, "profile-link");
+  fs.writeFileSync(login, "primary");
+  fs.symlinkSync(login, alias);
+  const primary = grokPaths(env);
+  assert.deepEqual(grokPaths({ ...env, GROK_HOME: homeAlias, GROK_AUTH_PATH: alias }), primary);
+  assert.notEqual(grokPaths({ ...env, GROK_HOME: sandbox.workDir, GROK_AUTH_PATH: alias }).profileKey, primary.profileKey);
+
+  const override = path.join(sandbox.root, "other-login");
+  fs.writeFileSync(override, "secondary");
+  const otherEnv = { ...env, GROK_AUTH_PATH: override, FAKE_GROK_RESOLVED_MODEL: "other-model" };
+  const secondary = grokPaths(otherEnv);
+  assert.notEqual(primary.home, secondary.home);
+  let sessionId;
+  for (const [profileEnv, profile] of [[env, primary], [otherEnv, secondary]]) {
+    const result = await runGrok(directOptions(sandbox, "ok", { env: profileEnv, memory: profile === secondary }));
+    assert.equal(result.exitCode, 0, result.errorMessage);
+    assert.equal(result.resolvedModel, profileEnv.FAKE_GROK_RESOLVED_MODEL);
+    const record = createJobRecord({
+      id: generateJobId(), profileKey: profile.profileKey, cwd: sandbox.workDir, jobClass: "task",
+      mode: "consult", status: "done", sessionId: result.sessionId, claudeSessionId: "owner",
+      request: { sandboxProfile: "strict", memory: profile === secondary }
+    });
+    writePrivateStateFile(jobFilePath(sandbox.dataDir, sandbox.workDir, record.id), JSON.stringify(record));
+    if (profile === primary) {
+      sessionId = result.sessionId;
+      assert.throws(() => validateResumeSession(sandbox.dataDir, sandbox.workDir, sessionId, "consult", false, secondary.profileKey),
+        { failureKind: "input", message: /different credential profile/ });
+      assert.equal(resolveLastSessionJob(sandbox.dataDir, sandbox.workDir, "owner", "consult", false,
+        { profileKey: secondary.profileKey, optional: true, doneOnly: true }), null);
+    }
+    assert.equal(result.sessionId, sessionId);
+  }
+  for (const profile of [primary, secondary]) {
+    const memory = profile === secondary;
+    assert.equal(validateResumeSession(sandbox.dataDir, sandbox.workDir, sessionId, "consult", memory, profile.profileKey).profileKey, profile.profileKey);
+    assert.equal(resolveLastSessionJob(sandbox.dataDir, sandbox.workDir, "owner", "consult", memory, { profileKey: profile.profileKey }).profileKey, profile.profileKey);
+    const history = runCompanion(["history", "--json"], { cwd: sandbox.workDir, env: memory ? otherEnv : env });
+    assert.equal(history.status, 0, history.stderr);
+    assert.deepEqual(JSON.parse(history.stdout).jobs.filter((job) => job.resumable).map((job) => job.memoryEnabled), [memory]);
+  }
 });
