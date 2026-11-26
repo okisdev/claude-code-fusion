@@ -13,6 +13,8 @@ const state = createJobState({
   recordFields: (fields) => ({
     codexVersion: fields.codexVersion ?? null,
     codexBuildPath: fields.codexBuildPath ?? null,
+    codexHome: fields.codexHome ?? null,
+    sandbox: fields.sandbox ?? null,
     resolvedEffort: fields.resolvedEffort ?? null
   }),
   requiredRecordFields: ["codexVersion", "codexBuildPath", "resolvedEffort"],
