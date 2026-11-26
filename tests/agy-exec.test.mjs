@@ -106,6 +106,11 @@ test("usage preserves absent and additional keys", async (t) => {
   assert.equal((await fakeRun(t, "extra_usage")).result.usage.vendorTokens, 7);
 });
 
+test("usage includes separately reported cache tokens in inputTokens", async (t) => {
+  const { result } = await fakeRun(t, "separate_cache_usage");
+  assert.deepEqual(result.usage, { totalTokens: 199159, inputTokens: 153100, outputTokens: 46059, cachedReadTokens: 108911, cachedWriteTokens: 0, thoughtTokens: 41861 });
+});
+
 test("the browser blocker leads the child PATH", async (t) => {
   const { log, root } = await fakeRun(t, "success");
   assert.equal(log.firstPathEntry, path.join(root, "bin"));
@@ -205,7 +210,11 @@ input.on("line", (line) => {
   if (message.method === "initialize") return emit({ id: message.id, result: { protocolVersion: 1, agentInfo: { name: "Antigravity", version: "1.5.12" } } });
   if (message.method === "session/new") return emit({ id: message.id, result: { sessionId: session, configOptions: [] } });
   if (message.method === "session/set_mode") return emit({ id: message.id, result: {} });
-  if (message.method === "session/prompt") { promptId = message.id; return request(); }
+  if (message.method === "session/prompt") {
+    promptId = message.id;
+    if (index === refusals.length) return emit({ id: promptId, result: { stopReason: "end_turn", usage: {} } });
+    return request();
+  }
   emit({ id: message.id, error: { code: -32601, message: "Method not found" } });
 });
 input.on("close", () => process.exit(0));
@@ -337,14 +346,48 @@ test("other agent requests receive method-not-found errors", async (t) => {
   assert.deepEqual(log.messages.at(-1), { jsonrpc: "2.0", id: "client-request", error: { code: -32601, message: "Method not found" } });
 });
 
-test("permission refusals without result text fail even after a successful end_turn", async (t) => {
+test("an empty refused turn continues once in the same session", async (t) => {
+  const secret = "s3cr3t-token-value";
+  const { result, log } = await fakeRun(t, "permission_continue", { env: { FAKE_AGY_COMMAND: `file --token ${secret} README.md` } });
+  const prompts = log.messages.filter((message) => message.method === "session/prompt");
+  assert.deepEqual(prompts.map(({ params }) => params.sessionId), [result.sessionId, result.sessionId]);
+  assert.deepEqual(log.messages.filter((message) => ["session/new", "session/load"].includes(message.method)).map(({ method }) => method), ["session/new"]);
+  const followUp = prompts[1].params.prompt[0].text;
+  assert.match(followUp, /file --token \[redacted\] README\.md/);
+  assert.match(followUp, /read_file and allowed commands/);
+  assert.ok(!followUp.includes(secret));
+  assert.equal(result.resultText, "fake result");
+  assert.equal(classifyAgyFailure(result), null);
+  assert.equal(result.permissionsRejected, 1);
+  assert.deepEqual(result.usage, { totalTokens: 211073, inputTokens: 164975, outputTokens: 46098, cachedReadTokens: 120463, cachedWriteTokens: 0, thoughtTokens: 41873 });
+  assert.equal(result.usageIsIncomplete, false);
+});
+
+test("permission refusals without result text after the continuation fail even after a successful end_turn", async (t) => {
   for (const scenario of ["permission_empty", "permission_whitespace"]) {
-    const { result } = await fakeRun(t, scenario);
+    const { result, log } = await fakeRun(t, scenario);
     assert.equal(result.exitCode, 0);
     assert.equal(result.stopReason, "end_turn");
     assert.equal(result.permissionsRejected, 1);
     assert.equal(result.resultText.trim(), "");
     assert.equal(classifyAgyFailure(result), "permission");
+    assert.equal(log.messages.filter(({ method }) => method === "session/prompt").length, 2);
+  }
+});
+
+test("an empty turn without a refusal does not trigger a continuation", async (t) => {
+  const { result, log } = await fakeRun(t, "empty_turn");
+  assert.equal(result.resultText, "");
+  assert.equal(result.permissionsRejected, 0);
+  assert.equal(log.messages.filter(({ method }) => method === "session/prompt").length, 1);
+});
+
+test("approved git directory and glob forms use the active workspace", async (t) => {
+  for (const command of ["git -C . show ed1f54c", "git -C . diff c943403..HEAD", "git ls-files *MessageGroupedParts*"]) {
+    const { result, log } = await fakeRun(t, "permission", { env: { FAKE_AGY_COMMAND: command } });
+    assert.equal(result.permissionsAllowed, 1, command);
+    assert.equal(result.permissionsRejected, 0, command);
+    assert.equal(log.messages.at(-1).result.outcome.optionId, "approval", command);
   }
 });
 
