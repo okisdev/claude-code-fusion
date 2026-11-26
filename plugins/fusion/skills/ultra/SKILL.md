@@ -37,6 +37,7 @@ Launch the fleet in one message:
 
 Synthesize when the fleet returns:
 
+- Merge each accepted worktree facet into the main tree with `node <skill base directory>/../../scripts/merge-worktree.mjs <worktree>`, one facet at a time; resolve any path it reports conflicted before the next.
 - Read every facet result. Produce one coherent answer: for research, a structured report attributing findings to facets and flagging where facets disagreed or left gaps; for implementation, an integrated summary of what each package delivered plus a final verification pass (typecheck and tests) run once over the combined result.
 - Surface contradictions between facets explicitly rather than averaging them away. A facet that failed or returned nothing is a gap to name, not a silent omission.
 - The user gets one synthesized deliverable, not a pile of raw fleet outputs.
