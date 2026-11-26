@@ -279,11 +279,13 @@ function handleQuota(argv) {
     }
   } catch {}
   let report = { engine: "codex", available: false, observedAt: new Date(at).toISOString(), pools: [], note: "No rate_limits telemetry found in Codex rollouts." };
+  let refreshing = false;
   try {
     const live = readLiveQuota(home);
     const rollout = latestRolloutRateLimits();
     const observation = [live, rollout].filter(Boolean).sort((left, right) => (Date.parse(right.observedAt ?? "") || 0) - (Date.parse(left.observedAt ?? "") || 0))[0] ?? null;
-    if ((!live || !(at - Date.parse(live.observedAt) < LIVE_QUOTA_MAX_AGE_MS)) && fs.existsSync(path.join(home, "auth.json"))) startLiveQuotaRefresh(at);
+    refreshing = (!live || !(at - Date.parse(live.observedAt) < LIVE_QUOTA_MAX_AGE_MS)) && fs.existsSync(path.join(home, "auth.json"));
+    if (refreshing) startLiveQuotaRefresh(at);
     if (observation) {
       const observedAt = observation.observedAt;
       const observedMs = Date.parse(observedAt ?? "");
@@ -308,7 +310,7 @@ function handleQuota(argv) {
     report.note = `Could not read Codex quota telemetry: ${error.message}`;
   }
   try {
-    if (file) writePrivateStateFile(file, `${JSON.stringify({ home, at, report })}\n`);
+    if (file && !refreshing) writePrivateStateFile(file, `${JSON.stringify({ home, at, report })}\n`);
   } catch {}
   output(report, true);
 }
