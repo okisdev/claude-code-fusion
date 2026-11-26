@@ -682,4 +682,7 @@ test("an in band quota notice records when the quota resets", () => {
   assert.equal(agyQuotaResetsAt({ resultText: "Partial findings.\n⚠ Individual quota reached. Resets in 1d2h." }, now), "2026-11-27T13:23:15.000Z");
   assert.equal(agyQuotaResetsAt({ resultText: "⚠ Individual quota reached." }, now), null);
   assert.equal(agyQuotaResetsAt({ resultText: "Resets in 5m, quota reached." }, now), null);
+  assert.equal(agyQuotaResetsAt({ resultText: "⚠ Individual quota reached. Resets in 1h 38m 46s." }, now), "2026-11-26T13:02:01.000Z");
+  assert.equal(agyQuotaResetsAt({ resultText: "⚠ Individual quota reached. Resets in 500ms." }, now), null);
+  assert.equal(agyQuotaResetsAt({ resultText: "⚠ Individual quota reached. Resets in 99999999999d." }, now), null);
 });

@@ -163,11 +163,9 @@ function latestFailure(records, scope, mode, pool, engine, now, windowMs) {
     }
     const kind = failureKind(outcome);
     if (FAILURE_STATUSES.has(outcome.status) && failureScope(kind) !== scope) continue;
-    const resetsAt = kind === "quota" ? Date.parse(outcome.quotaResetsAt ?? "") : Number.NaN;
-    if (resetsAt <= now) {
-      immediate = previous = repeated = null;
-      continue;
-    }
+    const resetsAt = kind === "quota" && typeof outcome.quotaResetsAt === "string" ? Date.parse(outcome.quotaResetsAt) : Number.NaN;
+    if (resetsAt <= now) continue;
+    const windowEnd = recordTimestamp(outcome) + windowMs;
     const text = [outcome.errorMessage, outcome.errorTail, outcome.cancelReason].filter((value) => typeof value === "string").join("\n");
     const failure = {
       failureKind: kind,
@@ -176,8 +174,8 @@ function latestFailure(records, scope, mode, pool, engine, now, windowMs) {
       scope,
       mode: scope === "mode" ? mode : null,
       pool: scope === "pool" ? pool : null,
-      resetsAt: Number.isFinite(resetsAt) ? resetsAt : null,
-      until: Math.min(recordTimestamp(outcome) + windowMs, Number.isFinite(resetsAt) ? resetsAt : Number.POSITIVE_INFINITY)
+      resetsAt: resetsAt <= windowEnd ? resetsAt : null,
+      until: resetsAt <= windowEnd ? resetsAt : windowEnd
     };
     if (HARD_FAILURE_KINDS.has(kind) || kind === "quota" || (kind === "permission" && TRANSPORT_PERMISSION_PATTERN.test(text)) || (engine === "agy" && kind === "policy")) {
       immediate = failure;

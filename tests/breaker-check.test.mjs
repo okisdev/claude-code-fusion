@@ -320,6 +320,16 @@ test("a quota failure with a recorded reset closes its pool only until the reset
     finishedAt: new Date(Date.now() - 30 * 60000).toISOString()
   });
   assert.match(run(pending).stdout, new RegExp(`treat the grok breaker as open until its quota resets at ${resetsAt.toISOString().slice(0, 16).replace("T", " ")} UTC; last failure quota`));
+
+  const untimed = makeSandbox(t);
+  const grokState = path.join(untimed.grokData, "state");
+  writeRecord(jobFile(grokState, "workspace", "untimed"), { id: "untimed", status: "error", failureKind: "quota", finishedAt: new Date(Date.now() - 60 * 60000).toISOString() });
+  writeRecord(jobFile(grokState, "workspace", "expired"), { id: "expired", status: "error", failureKind: "quota", quotaResetsAt: new Date(Date.now() - 60000).toISOString(), finishedAt: new Date(Date.now() - 30 * 60000).toISOString() });
+  assert.match(run(untimed).stdout, /treat the grok breaker as open unless verified recovered/);
+
+  const beyond = makeSandbox(t);
+  writeRecord(jobFile(path.join(beyond.grokData, "state"), "workspace", "beyond"), { status: "error", failureKind: "quota", quotaResetsAt: new Date(Date.now() + 24 * 60 * 60000).toISOString(), finishedAt: new Date(Date.now() - 30 * 60000).toISOString() });
+  assert.match(run(beyond).stdout, /treat the grok breaker as open unless verified recovered/);
 });
 
 test("grok breaker version advice reports only a contract drift", (t) => {

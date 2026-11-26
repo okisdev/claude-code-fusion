@@ -481,10 +481,10 @@ const RESET_UNITS_MS = { d: 86_400_000, h: 3_600_000, m: 60_000, s: 1000 };
 
 export function agyQuotaResetsAt(outcome, now = Date.now()) {
   const notice = outcome.resultText?.trim().split("\n").at(-1) ?? "";
-  const delay = QUOTA_NOTICE.test(notice) ? /\bResets in ((?:\d+[dhms])+)/i.exec(notice)?.[1] : null;
+  const delay = QUOTA_NOTICE.test(notice) ? /\bResets in ((?:\d+\s*[dhms](?![a-z])\s*)+)/i.exec(notice)?.[1] : null;
   if (!delay) return null;
-  const ms = [...delay.matchAll(/(\d+)([dhms])/gi)].reduce((total, [, value, unit]) => total + Number(value) * RESET_UNITS_MS[unit.toLowerCase()], 0);
-  return new Date(now + ms).toISOString();
+  const at = now + [...delay.matchAll(/(\d+)\s*([dhms])/gi)].reduce((total, [, value, unit]) => total + Number(value) * RESET_UNITS_MS[unit.toLowerCase()], 0);
+  return Number.isFinite(at) && Math.abs(at) <= 8.64e15 ? new Date(at).toISOString() : null;
 }
 
 export function classifyAgyFailure(outcome) {
