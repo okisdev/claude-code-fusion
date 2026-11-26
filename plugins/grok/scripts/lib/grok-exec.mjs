@@ -874,7 +874,8 @@ export function undeniedRuntimeSocketCandidates(env = process.env) {
   return [
     path.join(home, ".docker", "desktop", "docker.sock"),
     path.join(home, ".docker", "run", "docker.sock"),
-    path.join(home, ".orbstack", "run", "docker.sock")
+    path.join(home, ".orbstack", "run", "docker.sock"),
+    path.join(home, ".noblock", "run", "docker.sock")
   ];
 }
 
@@ -925,12 +926,27 @@ export function runtimeSocketSymlinkEndpoints(candidates, { env = process.env, v
   return symlinks;
 }
 
-export function runtimeSocketEngine(endpoint, readlink = fs.readlinkSync) {
-  let target;
+function runtimeSocketTarget(endpoint, readlink, realpath) {
+  let link;
   try {
-    target = String(readlink(endpoint));
+    link = String(readlink(endpoint));
   } catch {
     return null;
+  }
+  try {
+    return realpath(endpoint);
+  } catch {
+    return path.resolve(path.dirname(endpoint), link);
+  }
+}
+
+export function runtimeSocketEngine(endpoint, readlink = fs.readlinkSync, realpath = fs.realpathSync) {
+  const target = runtimeSocketTarget(endpoint, readlink, realpath);
+  if (!target) {
+    return null;
+  }
+  if (target.includes("/.noblock/")) {
+    return "noblock";
   }
   if (target.includes("/.orbstack/")) {
     return "orbstack";
@@ -941,13 +957,19 @@ export function runtimeSocketEngine(endpoint, readlink = fs.readlinkSync) {
   return null;
 }
 
-export function runtimeSocketRemedy(endpoint, engine, readlink = fs.readlinkSync) {
-  let target = null;
-  if (!engine) {
-    try { target = String(readlink(endpoint)); } catch {}
+export function runtimeSocketRemedy(endpoint, engine, readlink = fs.readlinkSync, realpath = fs.realpathSync) {
+  const target = runtimeSocketTarget(endpoint, readlink, realpath);
+  let stop = "";
+  if (engine === "noblock") {
+    stop = " (for Noblock, quit Noblock or stop its VM)";
+  } else if (engine === "orbstack") {
+    stop = " (for OrbStack, run `orb stop`)";
+  } else if (engine === "docker-desktop") {
+    stop = " (quit Docker Desktop)";
   }
-  const stop = engine === "orbstack" ? " (for OrbStack, run `orb stop`)" : engine === "docker-desktop" ? " (quit Docker Desktop)" : target ? ` (it resolves to ${target})` : "";
-  return `Stop the container engine that owns ${endpoint}${stop}, or route writes to another lane. Do not downgrade the sandbox.`;
+  const targetDetail = target ? ` The link resolves to ${target}.` : "";
+  const contextDetail = engine === "noblock" ? " Noblock's Docker context keeps working without the `/var/run/docker.sock` link." : "";
+  return `Stop the container engine that owns ${endpoint}${stop}, or route writes to another lane.${targetDetail}${contextDetail} Do not downgrade the sandbox.`;
 }
 
 export function preflightRuntimeSocketEndpoints({ env = process.env, version = null, candidates = runtimeSocketEndpoints({ env, version }), lstat = fs.lstatSync, readlink = fs.readlinkSync, realpath = fs.realpathSync } = {}) {
@@ -959,9 +981,10 @@ export function preflightRuntimeSocketEndpoints({ env = process.env, version = n
   }
   if (symlinks.length > 0) {
     const endpoint = symlinks[0];
+    const engine = runtimeSocketEngine(endpoint, readlink, realpath);
     throw securityError(
       "sandbox",
-      `Grok strict sandbox refuses runtime-socket symlink ${endpoint}${runtimeSocketSymlinkTargetsAllowed(version) ? " because its resolved target is outside the deny list or cannot be resolved" : " because this Grok version requires non-symlink endpoints"}. ${runtimeSocketRemedy(endpoint, runtimeSocketEngine(endpoint, readlink), readlink)}`
+      `Grok strict sandbox refuses runtime-socket symlink ${endpoint}${runtimeSocketSymlinkTargetsAllowed(version) ? " because its resolved target is outside the deny list or cannot be resolved" : " because this Grok version requires non-symlink endpoints"}. ${runtimeSocketRemedy(endpoint, engine, readlink, realpath)}`
     );
   }
   return symlinks;
