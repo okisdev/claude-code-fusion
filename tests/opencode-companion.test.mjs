@@ -5,7 +5,7 @@ import { createRequire } from "node:module";
 import path from "node:path";
 import test from "node:test";
 import { buildFusionStats, renderFusionStats } from "../plugins/fusion/scripts/fusion-stats.mjs";
-import { harness } from "./lib/opencode-harness.mjs";
+import { harness, repoRoot } from "./lib/opencode-harness.mjs";
 
 function report(result) {
   assert.equal(result.error, undefined, result.error?.message);
@@ -220,12 +220,27 @@ test("session end removes only its own staged raw transport", (t) => {
   assert.equal(fs.existsSync(transport.file), false);
 });
 
-test("setup reports the Codex version and advises disabling Extra Usage", (t) => {
-  const box = harness(t);
+test("OpenCode and Codex declare the same tested Codex CLI interval", () => {
+  const codex = fs.readFileSync(path.join(repoRoot, "plugins/codex/scripts/codex-companion.mjs"), "utf8");
+  const opencode = fs.readFileSync(path.join(repoRoot, "plugins/opencode/scripts/opencode-companion.mjs"), "utf8");
+  const floor = codex.match(/const TESTED_VERSION_MIN = \[(\d+), (\d+), (\d+)\]/);
+  const ceiling = codex.match(/const TESTED_VERSION_MAX = \[(\d+), (\d+), (\d+)\]/);
+  const interval = opencode.match(/const TESTED_CODEX_INTERVAL = \{ floor: "([^"]+)", ceiling: "([^"]+)" \}/);
+  assert.ok(floor && ceiling && interval, "Expected tested interval constants in both companions");
+  assert.deepEqual(interval.slice(1), [floor.slice(1).join("."), ceiling.slice(1).join(".")]);
+});
+
+test("setup reports the tested Codex version and advises disabling Extra Usage", (t) => {
+  const box = harness(t, { FAKE_OPENCODE_VERSION: "0.172.0" });
   const setup = report(box.run(["setup", "--json"]));
   assert.equal(setup.ready, true);
-  assert.equal(setup.codexVersion, "0.171.0");
+  assert.equal(setup.codexVersion, "0.172.0");
   assert.ok(setup.nextSteps.some((step) => /Turn off Extra Usage/.test(step)));
+  assert.equal(setup.nextSteps.some((step) => /newer than the tested interval/.test(step)), false);
+  const newer = harness(t, { FAKE_OPENCODE_VERSION: setup.testedInterval.ceiling });
+  const newerSetup = report(newer.run(["setup", "--json"]));
+  assert.equal(newerSetup.ready, true);
+  assert.ok(newerSetup.nextSteps.some((step) => /newer than the tested interval/.test(step)));
 });
 
 for (const [scenario, kind] of [["auth401", "auth"], ["auth403", "auth"], ["quota", "quota"], ["rate", "rate_limited"], ["permission", "permission"], ["refused", "refused"], ["network", "network"], ["malformed", "protocol"], ["empty", "error"]]) {

@@ -94,12 +94,11 @@ async function waitForFile(file) {
 
 test("Antigravity record has the contract fields and no Grok usage channels", (t) => {
   const { dataDir, cwd } = sandbox(t);
-  const configDir = runConfigDir(dataDir, "job-1");
   const record = createJobRecord({
     id: "job-1", cwd, mode: "write", briefFile: "brief.md", agyVersion: " 1.5.12 ",
     agyBuildPath: "/usr/local/bin/agy", requestedModel: "gemini-4-neon", resolvedModel: "gemini-4-neon", resolvedEffort: "xhigh",
     observedModel: "Gemini Neon", requestedEffort: "high", effortApplied: false, billingPool: "subscription",
-    role: "burst", requestId: "request-1", configDir, stopReason: "end_turn", warnings: ["project hooks"]
+    role: "burst", requestId: "request-1", stopReason: "end_turn", warnings: ["project hooks"]
   });
   assert.equal(record.engine, "agy");
   assert.equal(record.agyVersion, "1.5.12");
@@ -118,14 +117,13 @@ test("Antigravity record has the contract fields and no Grok usage channels", (t
   assert.equal(record.requestedEffort, "high");
   assert.equal(record.effortApplied, false);
   assert.equal(record.billingPool, "subscription");
-  assert.equal(record.configDir, path.join(dataDir, "runs", "job-1", "config"));
   assert.deepEqual(record.warnings, ["project hooks"]);
   assert.equal(record.usage, null);
   assert.equal(record.usageIsIncomplete, null);
   assert.equal(AGY_SESSION_ID_PATTERN.test("a0123456-789a-4bcd-8ef0-123456789abc"), true);
   assert.equal(AGY_SESSION_ID_PATTERN.test("single"), false);
   assert.equal(AGY_SESSION_ID_PATTERN.test("artistic_Breeze"), false);
-  for (const key of ["cursorVersion", "cursorBuildPath", "homeDir", "grokVersion", "grokPid", "grokPidIdentity", "modelUsage", "modelUsageIsIncomplete", "memoryEnabled"]) {
+  for (const key of ["configDir", "cursorVersion", "cursorBuildPath", "homeDir", "grokVersion", "grokPid", "grokPidIdentity", "modelUsage", "modelUsageIsIncomplete", "memoryEnabled"]) {
     assert.equal(Object.hasOwn(record, key), false, key);
   }
   const empty = createJobRecord({ id: "empty", cwd, mode: "consult" });
@@ -145,47 +143,32 @@ test("Antigravity paths and environment overrides use Antigravity names", (t) =>
   assert.equal(SESSION_ID_ENV, "CLAUDE_CODE_SESSION_ID");
 });
 
-test("terminal jobs preserve shared Gemini conversations while cleaning run artifacts", (t) => {
+test("legacy jobs drop the unused config path and preserve shared Gemini conversations", (t) => {
   const { dataDir, cwd } = sandbox(t);
   const id = "terminal-config";
-  const configDir = runConfigDir(dataDir, id);
-  fs.mkdirSync(configDir, { recursive: true });
-  fs.writeFileSync(path.join(configDir, "config.json"), "{}");
   const sharedSession = path.join(dataDir, "gemini", "agy", "conversations", "session.json");
   fs.mkdirSync(path.dirname(sharedSession), { recursive: true });
   fs.writeFileSync(sharedSession, "session");
   const file = jobFilePath(dataDir, cwd, id);
-  createJobRecordFile(file, createJobRecord({ id, cwd, mode: "consult", configDir }));
+  createJobRecordFile(file, { ...createJobRecord({ id, cwd, mode: "consult" }), configDir: runConfigDir(dataDir, id) });
+  assert.equal(Object.hasOwn(readJobRecordFile(file), "configDir"), false);
+  assert.equal(Object.hasOwn(JSON.parse(fs.readFileSync(file, "utf8")), "configDir"), false);
   finishSuccessfulJobRecordFile(file, { status: "done", resultText: "done", stopReason: "end_turn" });
-  assert.equal(fs.existsSync(configDir), false);
   assert.equal(fs.readFileSync(sharedSession, "utf8"), "session");
   assert.equal(readJobRecordFile(file).stopReason, "end_turn");
 });
 
-test("run sweep removes old unrecorded runs at most once per ten minutes", (t) => {
-  const { dataDir, cwd } = sandbox(t);
+test("Antigravity retention leaves orphan directories alone", (t) => {
+  const { dataDir } = sandbox(t);
   const now = Date.now();
-  const runs = path.join(dataDir, "runs");
-  const orphan = path.join(runs, "orphan");
-  const running = path.join(runs, "running");
+  const orphan = path.join(dataDir, "runs", "orphan");
   fs.mkdirSync(orphan, { recursive: true });
-  fs.mkdirSync(running);
   fs.utimesSync(orphan, new Date(now - 2 * 60 * 60 * 1000), new Date(now - 2 * 60 * 60 * 1000));
-  const runningFile = jobFilePath(dataDir, cwd, "running");
-  createJobRecordFile(runningFile, createJobRecord({ id: "running", cwd, mode: "consult", configDir: runConfigDir(dataDir, "running") }));
-  assert.equal(sweepAgyRuns(dataDir, now), true);
-  assert.equal(fs.existsSync(orphan), false);
-  assert.equal(fs.existsSync(running), true);
-  const next = path.join(runs, "next");
-  fs.mkdirSync(next);
-  fs.utimesSync(next, new Date(now - 2 * 60 * 60 * 1000), new Date(now - 2 * 60 * 60 * 1000));
-  assert.equal(sweepAgyRuns(dataDir, now + 1000), false);
-  assert.equal(fs.existsSync(next), true);
-  assert.equal(sweepAgyRuns(dataDir, now + 10 * 60 * 1000), true);
-  assert.equal(fs.existsSync(next), false);
+  sweepAgyRuns(dataDir, now);
+  assert.equal(fs.existsSync(orphan), true);
 });
 
-test("run sweep prunes expired terminal records and preserves protected jobs", (t) => {
+test("Antigravity retention prunes expired terminal records and preserves protected jobs", (t) => {
   const { dataDir, cwd } = sandbox(t);
   const now = Date.now();
   const old = new Date(now - 91 * 86400000).toISOString();
@@ -225,7 +208,7 @@ test("run sweep prunes expired terminal records and preserves protected jobs", (
   fs.writeFileSync(lease, JSON.stringify({ version: 1, sessionId, ownerJobId: "leased", claimedAt: new Date(now).toISOString() }));
   assert.equal(Object.hasOwn(JSON.parse(fs.readFileSync(removed[4][0], "utf8")), "finishedAt"), false);
   assert.ok(now - fs.statSync(removed[4][0]).mtimeMs >= 90 * 86400000);
-  assert.equal(sweepAgyRuns(dataDir, now), true);
+  sweepAgyRuns(dataDir, now);
   for (const paths of removed) for (const file of paths) assert.equal(fs.existsSync(file), false, file);
   for (const paths of kept) for (const file of paths) assert.equal(fs.existsSync(file), true, file);
 });

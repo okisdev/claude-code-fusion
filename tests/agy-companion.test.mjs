@@ -59,7 +59,7 @@ if (args[0] === "acp") {
 await import(${JSON.stringify(fileURLToPath(new URL("./fake-agy", import.meta.url)))});
 `;
   fs.writeFileSync(bin, code, { mode: 0o755 });
-  const env = { ...process.env, HOME: home, PATH: `${identityBin}${path.delimiter}${process.env.PATH}`, AGY_BIN: bin, AGY_COMPANION_DATA: data,
+  const env = { ...process.env, TMPDIR: temp, HOME: home, PATH: `${identityBin}${path.delimiter}${process.env.PATH}`, AGY_BIN: bin, AGY_COMPANION_DATA: data,
     AGY_COMPANION_WAIT_POLL_MS: "20", ...extraEnv };
   const run = (args, input = "") => spawnSync(process.execPath, [companion, ...args], { cwd, env, input, encoding: "utf8", timeout: 30000 });
   const jobs = () => {
@@ -125,7 +125,8 @@ test("consult records Antigravity fields, subscription pool, and contiguous foot
   assert.equal(record.effortApplied, false);
   assert.equal(record.permissionsAllowed, 0);
   assert.equal(record.permissionsRejected, 0);
-  assert.equal(fs.existsSync(record.configDir), false);
+  assert.equal(Object.hasOwn(record, "configDir"), false);
+  assert.equal(fs.existsSync(path.join(h.data, "runs")), false);
   assert.match(result.stdout, /agy-session: [a-f0-9-]{36}\njob: [a-f0-9]{32}\nsandbox: /);
   assert.match(result.stdout, /delivery: foreground\nsemantic: unverified\nstate: done\n$/);
   assert.deepEqual(h.messages().map((message) => message.method), ["initialize", "session/new", "session/set_mode", "session/set_config_option", "session/set_config_option", "session/prompt"]);
