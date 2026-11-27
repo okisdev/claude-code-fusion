@@ -15,7 +15,7 @@ const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const companion = path.join(root, "plugins/agy/scripts/agy-companion.mjs");
 const fake = path.join(root, "tests/fake-agy");
 
-function harness(t, scenario = "success", extraEnv = {}) {
+function harness(t, scenario = "success", extraEnv = {}, resultText) {
   const temp = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "agy-companion-test-")));
   const home = path.join(temp, "home");
   const cwd = path.join(temp, "workspace");
@@ -34,6 +34,7 @@ function harness(t, scenario = "success", extraEnv = {}) {
     for (const name of ["ps", "sysctl"]) fs.chmodSync(path.join(identityBin, name), 0o755);
   }
   const review = { verdict: "request_changes", summary: "Needs a fix.", findings: [{ severity: "high", file: "sample.txt", line: 1, title: "Bad value", body: "Use the expected value." }] };
+  const responseText = resultText ?? (scenario === "review_ok" ? JSON.stringify(review) : scenario === "review_invalid" ? "no verdict" : undefined);
   const code = `#!/usr/bin/env node
 import fs from "node:fs";
 const args = process.argv.slice(2);
@@ -42,13 +43,13 @@ process.env.FAKE_AGY_LOG = ${JSON.stringify(log)};
 ${Object.entries(extraEnv).filter(([key]) => key.startsWith("FAKE_AGY_")).map(([key, value]) => `process.env[${JSON.stringify(key)}] = ${JSON.stringify(value)};`).join("\n")}
 if (args[0] === "acp") {
   fs.writeFileSync(${JSON.stringify(launch)}, JSON.stringify({ env: process.env, config: JSON.parse(fs.readFileSync(args[args.indexOf("--gemini-dir") + 1] + "/agy/settings.json", "utf8")) }));
-  ${scenario === "review_ok" || scenario === "review_invalid" ? `const original = fs.writeSync;
+  ${responseText !== undefined ? `const original = fs.writeSync;
   fs.writeSync = (fd, data, ...rest) => {
     if (fd === 1 && typeof data === "string" && data.includes("agent_message_chunk")) {
       try {
         const event = JSON.parse(data);
         if (event.params?.update?.sessionUpdate === "agent_message_chunk") {
-          event.params.update.content.text = event.params.update.content.text === "fake " ? ${JSON.stringify(scenario === "review_ok" ? JSON.stringify(review) : "no verdict")} : "";
+          event.params.update.content.text = event.params.update.content.text === "fake " ? ${JSON.stringify(responseText)} : "";
           data = JSON.stringify(event) + "\\n";
         }
       } catch {}
@@ -452,6 +453,28 @@ for (const [scenario, kind] of [["auth_required", "auth"], ["quota", "quota"], [
     assert.equal(h.jobs()[0].billingPool, "subscription");
   });
 }
+
+for (const [kind, notice, message] of [
+  ["auth", "FAILED_PRECONDITION (code 400): User location is not supported for the API use.", "Antigravity returned FAILED_PRECONDITION (code 400): User location is not supported for the API use."],
+  ["quota", "Individual quota reached. Please upgrade your subscription to increase your limits. Resets in 2h16m30s.", "Antigravity returned: Individual quota reached. Please upgrade your subscription to increase your limits. Resets in 2h16m30s."]
+]) {
+  test(`an in band ${kind} notice is rendered and persisted as a job error`, (t) => {
+    const resultText = `\n⚠ ${notice}\n`;
+    const h = harness(t, "success", { FAKE_AGY_VERSION: "1.5.18" }, resultText);
+    const result = task(h, ["--json"]);
+    const [record] = h.jobs();
+    assert.equal(record.exitCode, 0);
+    assert.equal(record.stopReason, "end_turn");
+    assert.equal(record.resultText, resultText);
+    assert.equal(record.status, "error");
+    assert.equal(record.failureKind, kind);
+    assert.equal(record.errorMessage, message);
+    if (kind === "quota") assert.ok(Date.parse(record.quotaResetsAt) > Date.parse(record.finishedAt));
+    assert.equal(result.status, 1, result.stdout + result.stderr);
+    assert.equal(JSON.parse(result.stdout).message, message);
+  });
+}
+
 for (const [scenario, allowed, rejected] of [["permission", 1, 0], ["permission_read", 0, 1], ["permission_write", 0, 1]]) {
   test(`${scenario} persists permission counts in the job and JSON`, (t) => {
     const h = harness(t, scenario);

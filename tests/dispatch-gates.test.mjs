@@ -280,7 +280,7 @@ test("network fallback routes to an available Codex CLI and opens when it is mis
   for (const subagent_type of ["fusion:claude-worker", "fusion:trivial-worker"]) {
     const denied = await launch(box, { subagent_type, prompt });
     assert.equal(denied.permissionDecision, "deny");
-    assert.match(denied.permissionDecisionReason, /codex:codex-rescue.*--write --network/);
+    assert.match(denied.permissionDecisionReason, /codex:codex-rescue with `--write` \(Codex write tasks can reach the network and run authenticated gh\)/);
     assert.match(denied.permissionDecisionReason, /comments or approvals in the main session/i);
   }
   assert.deepEqual(readWorkerRecords(box.env), []);

@@ -521,7 +521,7 @@ function validateWorkerBrief(prompt, agentType, env = process.env) {
         return choice && !ENGINES[engine].consultOnlyRoles.includes(role) && engineHealth(engine, mode, choice.pool, { env, now, records }).healthy;
       }));
     if (fallbackReason === "network" && healthy.length && !dispatchCodexQuota(env).exhausted) {
-      return { ok: false, reason: "Route this network package to codex:codex-rescue with `--write --network`. Keep posting comments or approvals in the main session." };
+      return { ok: false, reason: "Route this network package to codex:codex-rescue with `--write` (Codex write tasks can reach the network and run authenticated gh). Keep posting comments or approvals in the main session." };
     }
     if (fallbackReason === "no-healthy-lane" && healthy.length) {
       return { ok: false, reason: `Fusion worker brief claude-fallback: no-healthy-lane requires every implementation peer lane to be unhealthy for ${mode} mode. Healthy lanes: ${healthy.join(", ")}. Route this package to a healthy lane.` };

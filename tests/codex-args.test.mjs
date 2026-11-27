@@ -90,7 +90,7 @@ test("raw argument parsing rejects options that split prompt text", () => {
 
 test("task style parsing never promotes option shaped prompt suffixes", () => {
   const config = {
-    booleanOptions: ["background", "network", "write"],
+    booleanOptions: ["background", "write"],
     optionsBeforePositionals: true,
     valueOptions: ["cwd", "model", "output-schema"]
   };
