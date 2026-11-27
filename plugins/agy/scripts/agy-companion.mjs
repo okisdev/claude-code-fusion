@@ -1,6 +1,6 @@
 import fs from "node:fs";
 
-import { resolveAgyBin, probeAgyVersion, compareAgyVersion, TESTED_AGY_INTERVAL, buildAgyChildEnv, runAgy, classifyAgyFailure, agyQuotaResetsAt, redactCredentialValue } from "./lib/agy-exec.mjs";
+import { resolveAgyBin, probeAgyVersion, compareAgyVersion, TESTED_AGY_INTERVAL, buildAgyChildEnv, runAgy, classifyAgyFailure, agyQuotaResetsAt, agyResultNotice, redactCredentialValue } from "./lib/agy-exec.mjs";
 import { prepareGeminiDirectory, projectConfigFiles } from "./lib/agy-home.mjs";
 import { readModelCatalog, resolveModelRequest, createSelectionResolver } from "./lib/agy-models.mjs";
 import * as render from "./lib/render.mjs";
@@ -132,7 +132,15 @@ const { cancelJobRecord, run } = createCompanionCommands({
   cancelledFields: (outcome) => ({ sessionId: outcome.sessionId, usage: outcome.usage, ...outcomeFields(outcome) }),
   modelDrift: () => null,
   driftWarning: () => "model_mismatch",
-  failureMessage: (outcome) => outcome.policyViolation ? `Antigravity called forbidden tool ${outcome.policyViolation.tool}${outcome.policyViolation.bypassSandbox ? " with sandbox bypass" : ""}.` : outcome.selectionError?.message || outcome.setupError || outcome.rpcError?.message || (outcome.resultSeen && outcome.permissionsRejected > 0 && !outcome.resultText?.trim() ? `Antigravity refused ${outcome.permissionsRejected} permission request(s)${refusedDetail(outcome)} and returned no result, so the turn ended early.` : null),
+  failureMessage: (outcome) => {
+    if (outcome.policyViolation) return `Antigravity called forbidden tool ${outcome.policyViolation.tool}${outcome.policyViolation.bypassSandbox ? " with sandbox bypass" : ""}.`;
+    const message = outcome.selectionError?.message || outcome.setupError || outcome.rpcError?.message;
+    if (message) return message;
+    if (outcome.resultSeen && outcome.permissionsRejected > 0 && !outcome.resultText?.trim()) {
+      return `Antigravity refused ${outcome.permissionsRejected} permission request(s)${refusedDetail(outcome)} and returned no result, so the turn ended early.`;
+    }
+    return outcome.rpcError || outcome.protocolError ? null : agyResultNotice(outcome)?.message;
+  },
   classifyFailure: classifyAgyFailure,
   prepareJob, runJob, waitForCleanup, handleModels, handleSetup
 });

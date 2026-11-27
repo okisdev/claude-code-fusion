@@ -47,7 +47,7 @@ const processInspectionTests = new Set([
   "a staged Fusion worktree request selects the Codex cwd and workspace root",
   "programmatic stdin ingress preserves opaque raw arguments without a staging file",
   "rescue transport write defaults remain overridable by raw arguments",
-  "task forces safe disabled defaults and rejects network access without write mode",
+  "read-only task disables web search and omits workspace network config",
   "task proceeds with tested, alpha hotfix, and newer Codex CLI versions",
   "structured nonzero diagnostics persist typed auth, quota, and rate limit failures",
   "final response prose cannot promote or reject semantic acceptance",
@@ -481,7 +481,7 @@ test("task stays foreground by default and persists the complete terminal record
   const sandbox = makeSandbox(t);
   initializeGitRepository(sandbox);
   const env = envFor(sandbox);
-  const result = runCompanion(["task", "--write --model gpt-test --effort max --web --network implement this safely"], {
+  const result = runCompanion(["task", "--write --model gpt-test --effort max --web implement this safely"], {
     cwd: sandbox.workDir,
     env
   });
@@ -538,6 +538,7 @@ test("task stays foreground by default and persists the complete terminal record
   assert.equal(entry.record.background, false);
   assert.equal(entry.record.status, "done");
   assert.equal(entry.record.mode, "write");
+  assert.equal(entry.record.request.network, true);
   assert.equal(entry.record.resultText, "Codex completed the task.");
   assert.equal(entry.record.resolvedModel, "gpt-test");
   assert.equal(entry.record.resolvedEffort, "max");
@@ -910,12 +911,14 @@ test("rescue transport write defaults remain overridable by raw arguments", (t) 
     env: envFor(sandbox)
   });
   assert.equal(writeResult.status, 0, writeResult.stderr);
+  assert.ok(readArgs(sandbox).includes("sandbox_workspace_write.network_access=true"));
   const overridden = createTransport(sandbox, "--write=false inspect only");
   const consultResult = runCompanion(["task", "--transport-default-write", "--raw-args-token", overridden.token], {
     cwd: sandbox.workDir,
     env: envFor(sandbox)
   });
   assert.equal(consultResult.status, 0, consultResult.stderr);
+  assert.ok(!readArgs(sandbox).some((value) => value.startsWith("sandbox_workspace_write.network_access=")));
   assert.deepEqual(jobRecords(sandbox).map((record) => record.mode), ["write", "consult"]);
 });
 
@@ -991,7 +994,7 @@ test("Codex slash skills never interpolate raw arguments into shell source", () 
   }
 });
 
-test("task forces safe disabled defaults and rejects network access without write mode", (t) => {
+test("read-only task disables web search and omits workspace network config", (t) => {
   const sandbox = makeSandbox(t);
   const env = envFor(sandbox);
   const completed = runCompanion(["task", "inspect the code"], { cwd: sandbox.workDir, env });
@@ -999,11 +1002,19 @@ test("task forces safe disabled defaults and rejects network access without writ
   const args = readArgs(sandbox);
   assert.ok(args.includes('web_search="disabled"'));
   assert.ok(!args.some((value) => value.startsWith("sandbox_workspace_write.network_access=")));
-  const rejected = runCompanion(["task", "--network inspect the code"], { cwd: sandbox.workDir, env });
-  assert.equal(rejected.status, 1);
-  assert.match(rejected.stderr, /--network requires --write/);
-  assert.match(rejected.stderr, /failure: input/);
   assert.equal(jobRecords(sandbox).length, 1);
+});
+
+test("task rejects the removed --network option in both modes", (t) => {
+  const sandbox = makeSandbox(t);
+  const env = envFor(sandbox);
+  for (const args of [["--network inspect the code"], ["--write", "--network", "edit the code"]]) {
+    const rejected = runCompanion(["task", ...args], { cwd: sandbox.workDir, env });
+    assert.equal(rejected.status, 1);
+    assert.match(rejected.stderr, /Unknown option --network\./);
+    assert.match(rejected.stderr, /failure: input/);
+  }
+  assert.deepEqual(jobRecords(sandbox), []);
 });
 
 test("missing Codex CLI fails before a job is reserved", (t) => {
@@ -2012,6 +2023,7 @@ test("plain native review uses target flags and focus switches to a read only ta
   assert.equal(native.status, 0, native.stderr);
   const nativeArgs = readArgs(sandbox);
   assert.ok(nativeArgs.includes("review"));
+  assert.ok(!nativeArgs.some((value) => value.startsWith("sandbox_workspace_write.network_access=")));
   assert.deepEqual(nativeArgs.slice(-3), ["review", "--base", "main"]);
   assert.equal(fs.readFileSync(sandbox.stdinFile, "utf8"), "");
   const focused = runCompanion(["review", "--base main --focus concurrency safety"], { cwd: sandbox.workDir, env });
@@ -2020,6 +2032,7 @@ test("plain native review uses target flags and focus switches to a read only ta
   assert.ok(!focusedArgs.includes("review"));
   assert.ok(!focusedArgs.includes("--base"));
   assert.equal(focusedArgs[focusedArgs.indexOf("--sandbox") + 1], "read-only");
+  assert.ok(!focusedArgs.some((value) => value.startsWith("sandbox_workspace_write.network_access=")));
   const prompt = fs.readFileSync(sandbox.stdinFile, "utf8");
   assert.match(prompt, /current branch compared with main/);
   assert.match(prompt, /concurrency safety/);

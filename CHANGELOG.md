@@ -1,5 +1,11 @@
 # changelog
 
+## 0.0.98
+
+- every Codex write task runs with workspace network access (DNS, HTTPS, localhost listeners, authenticated `gh`), and the `--network` option is gone; read only tasks and reviews stay offline. 300 of 301 write tasks in two weeks of ledgers ran offline, so verification died on `registry.npmjs.org` lookups and `listen EPERM`, and 72 network packages fell back to Claude workers. the routing rules, doctor audit, and `claude-fallback: network` deny now point at plain `--write`.
+- an Antigravity turn whose final line is an in band service notice (`⚠ <STATUS> (code n): ...`) fails the job: `UNAUTHENTICATED`, `PERMISSION_DENIED`, and `FAILED_PRECONDITION` are `auth`, `RESOURCE_EXHAUSTED` is `quota`, `UNAVAILABLE` is `rate_limited`, anything else is `error`. a `User location is not supported` notice had recorded `done` with exit 0, so the breaker stayed closed and reviews kept routing to a dead lane. quota and service notices now land in `errorMessage` instead of "Antigravity exited with 0".
+- `fusion:claude-worker` ends an acceptance only brief with `coverage: complete` and a verification brief with `verification: passed`, matching the completion contract the lifecycle hook checks. the agent always wrote `verification: passed`, so every consult shaped worker, such as a batch of `verify-pr` runs, recorded a false `delivery` failure.
+
 ## 0.0.97
 
 - an Antigravity quota failure records when its quota resets (`quotaResetsAt`, from the `Resets in` notice), and the breaker closes that pool only until then, naming the reset time in the advisory. a five hour window that reset at 20:02 had kept the lane closed for the rest of the 12 hour lookback while `/quota` showed 100 percent, sending reviews to a same family substitute.

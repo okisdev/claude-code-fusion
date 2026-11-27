@@ -393,7 +393,7 @@ test("task arguments enforce safe headless execution and put global flags before
   assert.throws(() => buildTaskArgs({ approvalPolicy: "on-request" }), /must be never/);
 });
 
-test("task arguments leave model and effort unset while pinning networked tools and internal agents off by default", () => {
+test("read-only task arguments leave model and effort unset while pinning networked tools and internal agents off by default", () => {
   assert.deepEqual(buildTaskArgs(), [
     "exec",
     "--strict-config",
@@ -440,7 +440,7 @@ test("task arguments leave model and effort unset while pinning networked tools 
   assert.ok(buildTaskArgs({ serviceTier: "standard" }).includes("service_tier=standard"));
   assert.ok(!buildTaskArgs({ serviceTier: "none" }).includes("-c"));
   assert.throws(() => buildTaskArgs({ serviceTier: "Priority" }), /Unsupported Codex service tier/);
-  assert.match(buildTaskArgs({ write: true }).join(" "), /sandbox_workspace_write\.network_access=false/);
+  assert.ok(buildTaskArgs({ write: true, network: true }).includes("sandbox_workspace_write.network_access=true"));
   assert.throws(() => buildTaskArgs({ network: true }), /requires a write task/);
 });
 

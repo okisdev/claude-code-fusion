@@ -676,6 +676,44 @@ test("an in band quota notice as the final line fails as quota", () => {
   assert.equal(classifyAgyFailure({ ...base, resultText: "The quota reached its limit in the old code path." }), null);
 });
 
+test("an in band service notice as the final line fails by status", () => {
+  const base = { exitCode: 0, resultSeen: true, sessionReady: true, stopReason: "end_turn" };
+  for (const [status, code, kind] of [
+    ["UNAUTHENTICATED", 401, "auth"],
+    ["PERMISSION_DENIED", 403, "auth"],
+    ["FAILED_PRECONDITION", 400, "auth"],
+    ["RESOURCE_EXHAUSTED", 429, "quota"],
+    ["UNAVAILABLE", 503, "rate_limited"],
+    ["INTERNAL", 500, "error"]
+  ]) {
+    const resultText = `Partial answer.\n⚠ ${status} (code ${code}): Service error.\n \t\n`;
+    assert.equal(classifyAgyFailure({ ...base, resultText }), kind, status);
+  }
+});
+
+test("service notices keep established failure precedence", () => {
+  const base = { resultSeen: true, sessionReady: true, stopReason: "end_turn", resultText: "⚠ UNAVAILABLE (code 503): Try again later." };
+  for (const [fields, kind] of [
+    [{ cancelled: true }, "cancelled"],
+    [{ policyViolation: { tool: "forbidden" } }, "policy"],
+    [{ timedOut: true }, "timeout"],
+    [{ setupError: "setup failed" }, "setup"],
+    [{ rpcError: { message: "Authentication required" } }, "auth"],
+    [{ rpcError: { message: "Internal server error" } }, "error"],
+    [{ protocolError: "Malformed response" }, "protocol"]
+  ]) assert.equal(classifyAgyFailure({ ...base, ...fields }), kind);
+});
+
+test("ordinary answers can mention service notices", () => {
+  const base = { resultSeen: true, sessionReady: true, stopReason: "end_turn" };
+  for (const resultText of [
+    "The ⚠ symbol marks warnings.",
+    "Check whether FAILED_PRECONDITION is handled.",
+    "Example: ⚠ FAILED_PRECONDITION (code 400): Request failed.",
+    "Example:\n⚠ FAILED_PRECONDITION (code 400): Request failed.\nThe request can be retried."
+  ]) assert.equal(classifyAgyFailure({ ...base, resultText }), null, resultText);
+});
+
 test("an in band quota notice records when the quota resets", () => {
   const now = Date.parse("2026-11-26T11:23:15.000Z");
   assert.equal(agyQuotaResetsAt({ resultText: "\n⚠ Individual quota reached. Please upgrade your subscription to increase your limits. Resets in 38m46s.\n" }, now), "2026-11-26T12:02:01.000Z");

@@ -132,7 +132,7 @@ function printUsage() {
   process.stdout.write(
     [
       "Usage:",
-      "  node scripts/codex-companion.mjs task [--prompt-file <path>] [--output-schema <path>] [--write] [--background] [--resume <thread-id>] [--resume-last] [--fresh] [--model <id>] [--effort <level>] [--service-tier <id|none>] [--web] [--network] [--skip-git-repo-check] [--cwd <dir>] [--json] [--] [prompt]",
+      "  node scripts/codex-companion.mjs task [--prompt-file <path>] [--output-schema <path>] [--write] [--background] [--resume <thread-id>] [--resume-last] [--fresh] [--model <id>] [--effort <level>] [--service-tier <id|none>] [--web] [--skip-git-repo-check] [--cwd <dir>] [--json] [--] [prompt]",
       "  node scripts/codex-companion.mjs review [--base <ref>] [--scope <auto|working-tree|branch>] [--focus <text>] [--background] [--model <id>] [--effort <level>] [--service-tier <id|none>] [--cwd <dir>] [--json]",
       "  node scripts/codex-companion.mjs adversarial-review [--base <ref>] [--scope <auto|working-tree|branch>] [--focus <text>] [--background] [--model <id>] [--effort <level>] [--cwd <dir>] [--json]",
       "  node scripts/codex-companion.mjs status [job-id] [--all] [--cwd <dir>] [--json]",
@@ -1658,7 +1658,7 @@ async function handleTask(rawArgv, transport = {}) {
   let releaseTransport = transport.release;
   try {
     const { options, positionals, positionalText } = commandArgs(rawArgv, {
-      booleanOptions: ["background", "fresh", "json", "network", "resume-last", "skip-git-repo-check", "web", "write"],
+      booleanOptions: ["background", "fresh", "json", "resume-last", "skip-git-repo-check", "web", "write"],
       optionsBeforePositionals: true,
       valueOptions: ["cwd", "effort", "model", "output-schema", "prompt-file", "resume", "service-tier"]
     });
@@ -1683,9 +1683,6 @@ async function handleTask(rawArgv, transport = {}) {
     if (!prompt.trim()) {
       throw new CompanionError("Provide a Codex task prompt or --prompt-file.", "input");
     }
-    if (options.network && !write) {
-      throw new CompanionError("--network requires --write because network access applies to the workspace-write sandbox.", "input");
-    }
     const autoSkipGitRepoCheck = write && options.cwd != null && !hasGitAncestor(cwd) && !options["skip-git-repo-check"];
     const skipGitRepoCheck = Boolean(options["skip-git-repo-check"] || autoSkipGitRepoCheck);
     taskGitPreflight(cwd, write, skipGitRepoCheck);
@@ -1699,7 +1696,7 @@ async function handleTask(rawArgv, transport = {}) {
       fresh: Boolean(options.fresh),
       ingress: transport.ingress ?? "argv",
       model: routing.model,
-      network: Boolean(options.network),
+      network: Boolean(write),
       outputSchemaFile,
       resumeSourceJobId: resume.sourceJobId,
       resumeThreadId: resume.threadId,
@@ -2040,7 +2037,6 @@ async function handleWindDown(rawArgv) {
   if (serviceTier !== undefined) argv.push("--service-tier", serviceTier ?? "none");
   if (request.write === true) argv.push("--write");
   if (request.web === true) argv.push("--web");
-  if (request.network === true) argv.push("--network");
   if (request.skipGitRepoCheck === true) argv.push("--skip-git-repo-check");
   argv.push("--", WIND_DOWN_PROMPT);
   await handleTask(argv, { ingress: `wind-down:${jobId}` });
