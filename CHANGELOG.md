@@ -1,5 +1,10 @@
 # changelog
 
+## 0.0.99
+
+- the Codex companion grants existing Gradle, Xcode, SwiftPM, and Cargo cache directories through `--add-dir` for write tasks, so build verification can write its caches outside the workspace. missing directories stay absent, read only tasks keep their existing arguments.
+- `create-worktree.mjs` creates peer worktrees with symlinks to ignored artifacts selected by `.worktreeinclude`, and `merge-worktree.mjs` leaves those links out of the merge so native builds can be verified without manual link cleanup.
+
 ## 0.0.98
 
 - every Codex write task runs with workspace network access (DNS, HTTPS, localhost listeners, authenticated `gh`), and the `--network` option is gone; read only tasks and reviews stay offline. 300 of 301 write tasks in two weeks of ledgers ran offline, so verification died on `registry.npmjs.org` lookups and `listen EPERM`, and 72 network packages fell back to Claude workers. the routing rules, doctor audit, and `claude-fallback: network` deny now point at plain `--write`.
