@@ -1,6 +1,7 @@
 import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
+import { includeSymlinks } from "./lib/worktree-include.mjs";
 
 function git(cwd, args, options = {}) {
   return execFileSync("git", args, {
@@ -69,7 +70,7 @@ function checkPartial(sourceGit, candidates) {
   refusePaths("partially staged", [...candidates].filter((file) => tracked.has(file) || untracked.has(file)));
 }
 
-function mergeInto(target, sourceGit) {
+function mergeInto(target, sourceGit, included) {
   return withLockedIndex(target, (run, commit) => {
     const existingFile = (file) => {
       const stat = fs.lstatSync(path.join(target, file), { throwIfNoEntry: false });
@@ -82,9 +83,10 @@ function mergeInto(target, sourceGit) {
     const unmerged = changedPaths(run, "--diff-filter=U");
     const partial = new Set([...staged].filter((file) => !unmerged.has(file) &&
       (workingChanges.has(file) || (stagedDeletes.has(file) && existingFile(file)))));
-    checkPartial(sourceGit, partial);
+    checkPartial(sourceGit, new Set([...partial].filter((file) => !included.includes(file))));
 
     sourceGit(["add", "-A"]);
+    updatePaths(sourceGit, ["reset", "-q", "HEAD"], included);
     const patch = sourceGit(["diff", "--cached", "--binary", "--find-renames", "--default-prefix", "--no-color", "--no-ext-diff", "--no-textconv", "HEAD"]);
     if (!patch.length) return { paths: [], conflicts: new Set() };
     const numstat = records(run(["apply", "--numstat", "-z"], patch));
@@ -139,7 +141,7 @@ function main(args) {
       }
     }
     if (problems.length) throw new Error(problems.join("\n"));
-    const { paths, conflicts } = mergeInto(target, run);
+    const { paths, conflicts } = mergeInto(target, run, includeSymlinks(source));
     if (!conflicts.size) stageSource();
     if (sourceHead !== targetHead) console.log(`target HEAD ${targetHead} differs from worktree HEAD ${sourceHead}`);
     if (!paths.length) console.log("nothing to merge");

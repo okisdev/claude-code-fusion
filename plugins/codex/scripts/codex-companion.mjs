@@ -117,6 +117,16 @@ const QUOTA_PLAN_COST_CLASS = new Map([
   ["usage", "metered"]
 ]);
 const SWIFTPM_SANDBOX_NOTE = "Environment note from the Codex companion: SwiftPM cannot nest its own sandbox-exec inside this sandbox, so run SwiftPM with --disable-sandbox, for example swift build --disable-sandbox and swift test --disable-sandbox.";
+// Build verification needs writable toolchain caches outside the workspace.
+const TOOLCHAIN_CACHE_DIRECTORIES = [
+  ".gradle",
+  "Library/Developer/Xcode/DerivedData",
+  "Library/Caches/com.apple.dt.Xcode",
+  "Library/Caches/org.swift.swiftpm",
+  "Library/org.swift.swiftpm",
+  ".cargo/registry",
+  ".cargo/git"
+];
 let activeCommandArgv = null;
 let cachedCompanionVersion = null;
 let companionVersionRead = false;
@@ -1206,7 +1216,7 @@ function createReservedJob({ background, brief, codexVersion, companionVersion, 
   });
 }
 
-function executionArgs(record) {
+export function executionArgs(record) {
   const request = record.request ?? {};
   const common = {
     cwd: record.cwd,
@@ -1226,6 +1236,10 @@ function executionArgs(record) {
   }
   return buildTaskArgs({
     ...common,
+    additionalDirectories: request.write === true
+      ? TOOLCHAIN_CACHE_DIRECTORIES.map((directory) => path.join(os.homedir(), directory))
+        .filter((directory) => fs.statSync(directory, { throwIfNoEntry: false })?.isDirectory())
+      : undefined,
     outputSchemaFile: request.outputSchemaFile ?? undefined,
     resumeThreadId: request.resumeThreadId ?? undefined,
     write: request.write === true

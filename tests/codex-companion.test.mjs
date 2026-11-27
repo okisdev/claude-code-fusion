@@ -15,7 +15,7 @@ import {
   writeJobRecordFile
 } from "../plugins/codex/scripts/lib/state.mjs";
 import { getProcessIdentity } from "../plugins/codex/scripts/lib/codex-exec.mjs";
-import { parseTaskHeader, repairRunningRecordSync, runningRecordNeedsReconciliation } from "../plugins/codex/scripts/codex-companion.mjs";
+import { executionArgs, parseTaskHeader, repairRunningRecordSync, runningRecordNeedsReconciliation } from "../plugins/codex/scripts/codex-companion.mjs";
 import {
   companion,
   envFor,
@@ -228,6 +228,54 @@ test("explicit cwd automatically bypasses the Git check for write tasks outside 
   assert.ok(readArgs(sandbox).includes("--skip-git-repo-check"));
   assert.equal(jobRecords(sandbox)[0].request.skipGitRepoCheck, true);
   assert.equal(jobRecords(sandbox)[0].request.skipGitRepoCheckSource, "auto");
+});
+
+test("write tasks grant only existing toolchain cache directories", (t) => {
+  const sandbox = makeSandbox(t);
+  t.mock.method(os, "homedir", () => sandbox.homeDir);
+  const directories = [
+    ".gradle",
+    "Library/Developer/Xcode/DerivedData",
+    "Library/Caches/com.apple.dt.Xcode",
+    "Library/Caches/org.swift.swiftpm",
+    "Library/org.swift.swiftpm",
+    ".cargo/registry",
+    ".cargo/git"
+  ].map((directory) => path.join(sandbox.homeDir, directory));
+  for (const existing of [[], directories, directories.slice(1, -1)]) {
+    for (const directory of directories) {
+      fs.rmSync(directory, { recursive: true, force: true });
+    }
+    for (const directory of existing) {
+      fs.mkdirSync(directory, { recursive: true });
+    }
+    const args = executionArgs({
+      cwd: sandbox.workDir,
+      request: { transport: "task", write: true, skipGitRepoCheck: true }
+    });
+    assert.deepEqual(args.flatMap((value, index) => value === "--add-dir" ? [args[index + 1]] : []), existing);
+    assert.ok(args.includes("workspace-write"));
+    assert.ok(args.includes("sandbox_workspace_write.network_access=false"));
+    for (const directory of directories.filter((directory) => !existing.includes(directory))) {
+      assert.equal(fs.existsSync(directory), false);
+    }
+  }
+});
+
+test("read only task and review arguments ignore toolchain caches", (t) => {
+  const sandbox = makeSandbox(t);
+  t.mock.method(os, "homedir", () => sandbox.homeDir);
+  for (const transport of ["task", "native-review"]) {
+    const cache = path.join(sandbox.homeDir, ".gradle");
+    fs.rmSync(cache, { recursive: true, force: true });
+    const record = { cwd: sandbox.workDir, request: { transport } };
+    const expected = executionArgs(record);
+    fs.mkdirSync(cache);
+    const args = executionArgs(record);
+    assert.deepEqual(args, expected);
+    assert.ok(args.includes("read-only"));
+    assert.ok(!args.includes("--add-dir"));
+  }
 });
 
 test("SwiftPM write tasks receive the sandbox instruction from cwd or repository root", (t) => {

@@ -186,6 +186,59 @@ test("returns success for an empty source diff", (t) => {
   assert.equal(git(main, "status", "--porcelain"), " M file\n");
 });
 
+test("ignores relative include symlinks to the main checkout even when the target is another worktree", (t) => {
+  const { main, peer, git, merge } = fixture(t, { file: "base\n", ".worktreeinclude": "shared/\n" });
+  fs.mkdirSync(path.join(main, "shared"));
+  write(main, "shared/binary", "native\n");
+  fs.symlinkSync(path.relative(peer, path.join(main, "shared")), path.join(peer, "shared"));
+  const into = path.join(path.dirname(main), "another tree");
+  git(main, "worktree", "add", "--detach", into);
+  write(peer, "file", "peer\n");
+
+  assert.equal(merge(0, main, "--into", into).stdout, "merged file\n");
+  assert.equal(read(into, "file"), "peer\n");
+  assert.equal(fs.existsSync(path.join(into, "shared")), false);
+  assert.equal(git(peer, "ls-files", "shared"), "");
+  assert.equal(fs.lstatSync(path.join(peer, "shared")).isSymbolicLink(), true);
+  assert.equal(merge(0, main, "--into", into).stdout, "merged file\n");
+});
+
+test("returns nothing to merge when the only changes are include symlinks", (t) => {
+  const { main, peer, git, merge } = fixture(t, { file: "base\n", ".worktreeinclude": "shared/\n" });
+  fs.mkdirSync(path.join(main, "shared"));
+  write(main, "shared/binary", "native\n");
+  fs.symlinkSync(path.join(main, "shared"), path.join(peer, "shared"));
+
+  assert.equal(merge().stdout, "nothing to merge\n");
+  assert.equal(git(peer, "diff", "--cached"), "");
+  assert.equal(fs.lstatSync(path.join(peer, "shared")).isSymbolicLink(), true);
+});
+
+test("ignores include symlinks after the main artifact has been removed", (t) => {
+  const { main, peer, git, merge } = fixture(t, { file: "base\n", ".worktreeinclude": "shared/\n" });
+  fs.symlinkSync(path.join(fs.realpathSync(main), "shared"), path.join(peer, "shared"));
+
+  assert.equal(merge().stdout, "nothing to merge\n");
+  assert.equal(git(peer, "diff", "--cached"), "");
+  assert.equal(fs.lstatSync(path.join(peer, "shared")).isSymbolicLink(), true);
+});
+
+test("still merges unmatched links and matched links pointing outside the main checkout", (t) => {
+  const { main, peer, git, merge } = fixture(t, { file: "base\n", ".worktreeinclude": "*.a\n" });
+  const into = path.join(path.dirname(main), "another tree");
+  git(main, "worktree", "add", "--detach", into);
+  const outside = path.join(path.dirname(main), "outside");
+  fs.writeFileSync(outside, "external\n");
+  write(main, "external.a", "main artifact\n");
+  fs.symlinkSync(outside, path.join(peer, "external.a"));
+  fs.symlinkSync(path.join(main, "file"), path.join(peer, "ordinary"));
+
+  assert.equal(merge(0, main, "--into", into).stdout, "merged external.a\nmerged ordinary\n");
+  assert.equal(fs.readlinkSync(path.join(into, "external.a")), outside);
+  assert.equal(fs.readlinkSync(path.join(into, "ordinary")), path.join(main, "file"));
+  assert.equal(read(main, "external.a"), "main artifact\n");
+});
+
 test("defaults to the linked worktree containing the current directory", (t) => {
   const { main, peer, git, merge } = fixture(t);
   const into = path.join(path.dirname(main), "linked");
